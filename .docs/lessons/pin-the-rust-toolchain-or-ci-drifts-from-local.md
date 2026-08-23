@@ -63,12 +63,11 @@ one.
 `cargo` and `rustup` read it natively and no other file can supply it to them. Every other
 consumer now reads it:
 
-- **mise** reads it because `.mise.toml` sets
-  `idiomatic_version_file_enable_tools = ["rust"]`. mise's rust tool registers
-  `rust-toolchain.toml` as its version source, parses `channel`, `components`, and
-  `targets` out of it, passes all three to `rustup toolchain install`, and exports
-  `RUSTUP_TOOLCHAIN` with the channel it just read. See
-  https://mise.jdx.dev/configuration.html#idiomatic-version-files.
+- **rustup** reads it natively for any cargo command run in the directory holding it, and
+  installs the channel, components, and targets it names on first use. `.mise.toml` names
+  no Rust version and installs no Rust toolchain, so nothing exports a `RUSTUP_TOOLCHAIN`
+  that would override the file — the section below records why that omission is the
+  design and not an oversight.
 - **The root `Dockerfile`** copies the file into the builder stage before the first cargo
   command. Its base tag reads `rust:slim-bookworm`, which names a Debian release and no
   Rust version, and rustup inside the image resolves the pin.
@@ -92,7 +91,7 @@ documented commands across nine files, including CLAUDE.md's own toolchain table
 single-source design is not done while the commands people are told to run still type the
 version.
 
-## What `RUSTUP_TOOLCHAIN` Actually Does, and When mise Sets It
+## A Per-Directory Toolchain and a Per-Repository Environment Variable Cannot Both Decide
 
 The first fix's artifacts stated that "mise sets `RUSTUP_TOOLCHAIN` for the commands it
 runs." mise sets it **only for a rust toolchain it has installed**: `exec_env` runs per
@@ -104,17 +103,42 @@ installed, and every shell in the repository therefore carried `RUSTUP_TOOLCHAIN
 which overrides `rust-toolchain.toml` entirely — channel, components, and targets alike. A
 shell compiled on 1.97.1 while every file in the repository read 1.98.0.
 
-Naming the pinned version in `.mise.toml` would have fixed that instance and left the
-mechanism intact, because the two files could still be edited apart. Reading the version out
-of `rust-toolchain.toml` removes the mechanism: the exported variable is now derived from
-the file it used to override.
+The second attempt kept mise as the exporter and made the exported value derive from the
+file, through `idiomatic_version_file_enable_tools = ["rust"]`. That removed the
+disagreement between two files and broke every fuzz command, because it answered the wrong
+question. **`RUSTUP_TOOLCHAIN` holds one value for the whole shell, and this repository
+resolves two compilers by directory:** `rust-toolchain.toml` names the stable release the
+workspace compiles on, and `fuzz/rust-toolchain.toml` names the nightly cargo-fuzz needs.
+Measured on this branch with mise 2026.2.22 and rustup 1.29.0: `mise env` at the repository
+root printed `export RUSTUP_TOOLCHAIN=1.98.0`, and with that variable set, `rustc --version`
+inside `fuzz/` reported `1.98.0` rather than the `1.97.0-nightly (20de910db 2026-05-02)` the
+same command reports with the variable unset. Every rewritten fuzz command —
+`cd fuzz && cargo fuzz run <target>` — therefore died on
+`error: the option 'Z' is only accepted on the nightly compiler`, and CLAUDE.md tells
+readers to run `eval "$(mise env)"`, which is exactly how the variable gets into a shell.
+The commands the branch replaced carried `+nightly`, which sets `RUSTUP_TOOLCHAIN` for one
+command and is immune to the exported one; dropping the flag removed that immunity.
 
-Check what a shell resolves with `mise x -- printenv RUSTUP_TOOLCHAIN`; plain `mise env`
-does not print the variable.
+So mise stopped managing Rust. `.mise.toml` names no Rust version and enables no idiomatic
+version file for rust, `README.md` lists rustup among the prerequisites, and rustup reads
+the toolchain file of whichever directory a command runs in — which is the mechanism the
+whole design already rested on. Measured with that configuration, in a directory outside
+any other mise config: `mise env` printed no `RUSTUP_TOOLCHAIN` at the root or in `fuzz/`,
+`rustc --version` reported `1.98.0` at the root, and `1.97.0-nightly` in `fuzz/`.
 
-A variable exported from somewhere other than mise still overrides the file, and nothing
-derives that away. `scripts/hooks/pre-commit` now checks it; the section below on deleting
-checks records why it moved there rather than out.
+The generalisation: **when a tool supplies one value per shell and the repository needs one
+value per directory, deriving that tool's value from the right file does not fix it.**
+Derivation removes disagreement between two files; it does not give a single variable two
+values. Remove the tool from that job instead.
+
+A variable exported from somewhere else still overrides both files, and nothing derives that
+away. Three checks cover what remains: `scripts/check-toolchain-wiring.sh` fails when
+`.mise.toml` names a Rust version source again, `scripts/hooks/pre-commit` compares
+`rustc --version` against the workspace pin before it runs `cargo fmt` and `cargo clippy`,
+and `fuzz/build.rs` fails the fuzz crate's build when cargo resolved a compiler
+`fuzz/rust-toolchain.toml` does not name. The last one also gives the `fuzz-build` CI job
+something to assert: that job runs `cargo check` from `fuzz/`, which passes no `-Z` flag and
+so would have succeeded on stable, reporting green over a broken directory override.
 
 ## `dtolnay/rust-toolchain` Reads No Toolchain File
 
@@ -148,22 +172,18 @@ one command compiling on 1.99.0. Every branch that rebases onto it then finds
 `Rust / clippy` red the next morning, which is the outage this pin exists to prevent,
 reached through the pin file itself.
 
-Routing is one of two properties the derivation cannot supply, because no file states
-which CI jobs a change has to reach. `scripts/check-toolchain-wiring.sh` asserts that
-membership, and `scripts/tests/toolchain-wiring/run-tests.sh` proves the assertion fires.
-The list it checks holds one line per filter and entry: the `rust` filter must list
-`rust-toolchain.toml`, `Dockerfile`, `.dockerignore`, `.clippy.toml`, and `rustfmt.toml`,
-and the `fuzz` filter must list `fuzz/**`, which covers `fuzz/rust-toolchain.toml`.
+Routing is one of the properties the derivation cannot supply, because no file states which
+CI jobs a change has to reach. `scripts/check-toolchain-wiring.sh` asserts it, and
+`scripts/tests/toolchain-wiring/run-tests.sh` proves the assertion fires.
 
-That list needed a criterion, and writing one changed what belongs on it. The `rust` filter
-also lists `crates/**` and `Cargo.toml`, and dropping either produces the identical
-failure — the guarded jobs skip and the aggregator passes. The declared entries share a
-property those two do not: **their omission is invisible on an ordinary pull request.**
-Dropping `crates/**` skips the Rust lane on nearly every pull request and someone notices
-within a day; dropping `rust-toolchain.toml` skips it only on the rare pull request that
-raises the pin — the one that most needs the lane — and nobody notices. The gate covers the
-second class, says so in its header, and says that an `OK` is not a claim that the filters
-are correct.
+The criterion is: **the omission of a path from its filter is invisible on an ordinary pull
+request.** The `rust` filter also lists `crates/**` and `Cargo.toml`, and dropping either
+produces the identical failure — the guarded jobs skip and the aggregator passes. Dropping
+`crates/**` skips the Rust lane on nearly every pull request and someone notices within a
+day; dropping `rust-toolchain.toml` skips it only on the rare pull request that raises the
+pin — the one that most needs the lane — and nobody notices. The gate covers the second
+class, says so in its header, and says that an `OK` is not a claim that the filters are
+correct.
 
 A gate that runs only when a paths filter selects it enforces nothing for a file the filter
 omits. Adding a file that decides how CI builds means adding that file to the filter that
@@ -190,18 +210,39 @@ cargo-deny, and the image build on the new compiler, while `Python / test`,
 pyo3 cdylib link, the UniFFI bindgen run, or the wasm-pack build, the first branch to see
 it is the next one that touches `bindings/python`, and that branch changed no compiler.
 
-All seven filters now list `rust-toolchain.toml`, and `REQUIRED_FILTER_ENTRIES` in the gate
-holds a pair for each, so a filter that drops the entry fails the gate by name.
-`scripts/tests/toolchain-wiring/run-tests.sh` runs one case per pair. `fuzz` is the one
-filter that lists no pin: `fuzz-build` runs `cargo check` with `working-directory: fuzz`,
-where rustup resolves `fuzz/rust-toolchain.toml` instead, and `fuzz/**` already covers that
-file.
-
-The rule the `rust`-only version obscured: **route a file to every filter that guards a job
-whose behaviour the file decides, not to the filter whose name matches the file.**
+The rule the `rust`-only version obscured: **route a file to every lane that guards a job
+whose behaviour the file decides, not to the lane whose name matches the file.**
 `rust-toolchain.toml` sits at the repository root and names a Rust version, which makes the
 `rust` filter the obvious single destination, but the compiler that file selects reaches
 every job that runs cargo.
+
+## Writing the Pin Into Seven Filters, and Then Into a Seven-Pair List, Was the Same Mistake Twice
+
+Listing `rust-toolchain.toml` in seven filters, and asserting that membership with seven
+pairs in the gate, put the pin in fourteen places. Both lists grow with the lanes, and
+neither one tells anyone about a lane added later. CLAUDE.md names the review-pass count as
+the signal that an approach is the wrong one, and five consecutive commits on this one gate
+each closed "one more spelling" of the same hole.
+
+The workflow names the pin once instead. The `changes` job declares a `toolchain` filter
+holding `rust-toolchain.toml`, and each lane's output reads
+`steps.filter.outputs.<lane> == 'true' || steps.filter.outputs.toolchain == 'true'`. The
+gate reads the set of output names out of the workflow rather than out of a list it holds,
+so a lane added later without that OR fails the gate, and nobody has to remember to teach
+the gate about it.
+
+The remaining root-level entries — `Dockerfile`, `.dockerignore`, `.clippy.toml`,
+`rustfmt.toml` — got the same treatment from the other side. Instead of naming the files
+that must be routed, the gate enumerates every root-level file in the git tree and requires
+each one to be routed by the `rust` or `toolchain` filter, or declared in a list of root
+files no compile reads. Every root file is then classified exactly once, and a file added
+at the root later is unclassified, so the gate fails until someone decides which it is.
+That is the property the list of required entries did not have: **an entry nobody added was
+an entry nobody heard about.**
+
+The general form: a check that names the things which must be present fails silently on the
+thing nobody thought of, while a check that enumerates the population and requires each
+member to be classified cannot.
 
 ## Deleting a Check Because Its Reason Changed Is Not the Same as Deleting It Because Its Target Vanished
 
@@ -210,8 +251,8 @@ went out with it.
 
 **The compiler-identity check** ran `rustc --version` and compared it against the pin. Its
 target is any `RUSTUP_TOOLCHAIN` in the environment, from any source — not only from mise.
-Deriving mise's export from the file removed mise as a source and left every other one, so
-the check still has a target. What was wrong with it was its *placement*: it ran in the
+Taking Rust out of `.mise.toml` removed mise as a source and left every other one, so the
+check still has a target. What was wrong with it was its *placement*: it ran in the
 `enforcement / toolchain pin agreement` CI job, and a GitHub runner exports no
 `RUSTUP_TOOLCHAIN`, so it ran only where its target cannot arise. A check placed where its
 target cannot occur reports success forever, which is indistinguishable from the check
@@ -227,8 +268,9 @@ version did not remove that obligation — it moved it, from the tag to the `COP
 `rust-toolchain.toml` into the image. A new Dockerfile that omits that copy compiles on
 whatever the base image ships and builds successfully, so the `docker-image` job cannot
 detect it. So the check moved with the obligation: `scripts/check-toolchain-wiring.sh` finds
-every file that builds from a `rust` base image and fails when it carries no `COPY` of the
-pin.
+every file that builds from a `rust` base image and fails when it does not carry the
+ASSERT-PINNED-RUSTC block, which makes the build itself compare the compiler it resolved
+against the copied-in pin.
 
 The generalisation: when a design change removes a check's *reason*, ask separately whether
 it removed the check's *target*. Bundling both deletions into one line-count reduction is
@@ -294,13 +336,32 @@ the ref was introduced. No pull request runs the scheduled Fuzz workflow, so its
 consecutive failures never appeared on one. Naming the date through the `toolchain` input
 of `@master` gives a ref that resolves.
 
+## `grep -F` Compares Lines, Not Blocks
+
+The container check requires each container file to carry a three-line assertion block
+"verbatim", and it compared with `grep -qzF -- "$ASSERT_BLOCK" "$f"`. grep splits a pattern
+holding newlines into one pattern per line and matches when **any single one** matches, so
+that call accepted a Dockerfile keeping one line of the block with the comparison and the
+`exit 1` deleted, and accepted a Dockerfile holding all three lines in reverse order.
+Measured on GNU grep 3.12, BSD grep 2.6.0-FreeBSD, and ugrep 7.8.4; `-z` changes the input
+record separator and does not change how the pattern is split.
+
+The gate reads the whole file into a variable and uses bash's `[[ $text == *"$block"* ]]`,
+which is a literal substring test over the file and therefore compares the lines in order
+and unbroken. `scripts/tests/toolchain-wiring/run-tests.sh` carries the two cases the old
+comparison passed.
+
+The generalisation: **`grep -F` with a multi-line pattern is a line-membership test, and a
+comment claiming it compares "line for line and in order" describes a command grep does not
+offer.** When a check needs a block comparison, read the file and compare the block.
+
 ## Raising the Pin
 
 1. Edit `channel` in `rust-toolchain.toml`. Nothing else names the version.
-2. Run `mise install`, so the local shell picks up the new toolchain.
-3. Run the CI clippy command from the "Orchestrator verification protocol" section of
-   CLAUDE.md.
-4. Fix everything the new release reports, in that same pull request.
+2. Run the CI clippy command from the "Orchestrator verification protocol" section of
+   CLAUDE.md. rustup downloads the new toolchain, its components, and its targets on that
+   first cargo invocation.
+3. Fix everything the new release reports, in that same pull request.
 
 A new stable release then reports its lints to whoever raised the pin, on the pull request
 that raised it.

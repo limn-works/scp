@@ -90,7 +90,8 @@ Install these manually (one-time):
 
 1. **Homebrew** — https://brew.sh
 2. **mise** — `brew install mise` ([mise.jdx.dev](https://mise.jdx.dev))
-3. **Xcode Command Line Tools** — `xcode-select --install`
+3. **rustup** — `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh` ([rustup.rs](https://rustup.rs)). rustup installs Rust, and mise installs everything else. rustup reads the toolchain file of whichever directory a cargo command runs in, so the workspace compiles on the version `rust-toolchain.toml` names and `fuzz/` compiles on the nightly `fuzz/rust-toolchain.toml` names, with no version written anywhere else. mise would export one `RUSTUP_TOOLCHAIN` for the whole repository, which overrides both files, so `.mise.toml` names no Rust version.
+4. **Xcode Command Line Tools** — `xcode-select --install`
 
 Then activate mise in `~/.zshenv` (ensures availability in all shells, including non-interactive):
 
@@ -103,16 +104,17 @@ mise automatically manages environment variables (`JAVA_HOME`, `ANDROID_HOME`, `
 ### Setup
 
 ```sh
-mise install         # languages, Rust targets, cargo tools, npm globals
+mise install         # languages, cargo tools, npm globals
+cargo --version      # rustup downloads the pinned toolchain and its targets on first use
 ./scripts/setup-toolchain.sh   # Android SDK/NDK (the one thing mise can't do)
 ```
 
-Both commands are idempotent — safe to re-run at any time. Together they install:
+All three commands are idempotent — safe to re-run at any time. Together they install:
 
 | Category | What | Manager |
 |---|---|---|
 | Languages | Java 17 (Zulu), Bun 1.3, Python 3.12, Kotlin 2.3 | mise (pinned in `.mise.toml`) |
-| Rust | The compiler version and cross-compilation targets `rust-toolchain.toml` names, so a local build and a CI build use one compiler | mise (via rustup backend) |
+| Rust | The compiler version and cross-compilation targets `rust-toolchain.toml` names, so a local build and a CI build use one compiler | rustup (reads `rust-toolchain.toml`) |
 | Cargo tools | cargo-nextest, maturin, cargo-deny | mise (cargo backend) |
 | npm globals | @napi-rs/cli | mise (npm backend) |
 | Android | SDK command-line tools, NDK 27.2 | sdkmanager (via Homebrew) |

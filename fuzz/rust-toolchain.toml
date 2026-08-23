@@ -7,9 +7,9 @@
 #     passes that output to every other job; `.github/workflows/ci.yml` reads it in a step
 #     of its fuzz-build job. Neither workflow repeats the date.
 #   - `cargo` and `rustup` read it for a command run inside `fuzz/`.
-#   - mise reads it too, because `.mise.toml` sets
-#     `idiomatic_version_file_enable_tools = ["rust"]`, which registers `rust-toolchain.toml`
-#     as the rust tool's version source in whichever directory holds one.
+#   - `build.rs` beside it reads the channel below and fails this crate's build when the
+#     compiler cargo resolved is not a nightly, naming `RUSTUP_TOOLCHAIN` as the thing that
+#     overrides this file when it is set.
 #
 # THE PINNED DATE is the last nightly the fuzz crate compiles on. Nightlies after
 # 2026-05-03 tightened the `pub(crate)` re-export rules (E0365) and reject openmls 0.8.1's
@@ -22,6 +22,11 @@
 # to run on stable. Every documented fuzz invocation therefore runs from inside this
 # directory — `cd fuzz && cargo fuzz run <target>` — which is why no command in `fuzz/`,
 # in `fuzz/README.md`, or in `fuzz/.claude/CLAUDE.md` names a channel.
+#
+# That directory rule holds only while nothing exports `RUSTUP_TOOLCHAIN`, which overrides
+# a toolchain file entirely. `.mise.toml` names no Rust version and installs no Rust
+# toolchain for exactly that reason, and `scripts/check-toolchain-wiring.sh` fails when it
+# names one again. `build.rs` catches every other exporter at build time.
 #
 # `.github/workflows/fuzz.yml` is the exception: its `cargo fuzz` commands run from the
 # repository root so that `--fuzz-dir fuzz` and the corpus cache paths agree, so it reads

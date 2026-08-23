@@ -1,25 +1,27 @@
-[settings]
-# Read `rust-toolchain.toml` instead of naming a Rust version here.
+# mise installs every tool this repository needs EXCEPT Rust, and it names no Rust
+# version. rustup installs Rust, and README.md lists rustup among the prerequisites.
 #
-# mise installs rust through rustup and, for an installed toolchain, exports
-# `RUSTUP_TOOLCHAIN` for every command it runs. That variable overrides
-# `rust-toolchain.toml` entirely — channel, components, and targets alike — so a
-# `rust = "..."` entry in this file used to decide which compiler a local shell got,
-# and `rust = "stable"` is how a shell came to run 1.97.1 while every file in the
-# repository read 1.98.0. See
+# WHY. mise exports one `RUSTUP_TOOLCHAIN` for every command it runs, and it computes that
+# value once from the directory the shell sat in. `RUSTUP_TOOLCHAIN` overrides a
+# `rust-toolchain.toml` entirely — channel, components, and targets alike. This repository
+# resolves two compilers by directory: `rust-toolchain.toml` names the stable release the
+# workspace compiles on, and `fuzz/rust-toolchain.toml` names the nightly cargo-fuzz needs.
+# One exported value cannot serve both. Giving mise either kind of Rust version source — a
+# `rust` key under `[tools]`, or `rust-toolchain.toml` registered through
+# `idiomatic_version_file_enable_tools` — puts every command in `fuzz/` on the root pin, and
+# `cd fuzz && cargo fuzz run <target>` then dies on
+# `error: the option 'Z' is only accepted on the nightly compiler`.
+#
+# rustup resolves both, per directory, with no environment variable involved: it reads the
+# toolchain file of the directory each command runs in, and on first use installs the
+# channel, components, and targets that file names. Leaving Rust out of this file is what
+# lets rustup do that.
+#
+# `scripts/check-toolchain-wiring.sh` fails when this file names a Rust version source
+# again. `fuzz/build.rs` fails the fuzz build when a `RUSTUP_TOOLCHAIN` from any other
+# source puts that crate on a compiler `fuzz/rust-toolchain.toml` does not name, and
+# `scripts/hooks/pre-commit` does the same for the workspace before it runs cargo. See
 # `.docs/lessons/pin-the-rust-toolchain-or-ci-drifts-from-local.md`.
-#
-# This setting registers `rust-toolchain.toml` as the rust tool's version source, so
-# mise reads `channel`, `components`, and `targets` out of that file, passes them to
-# `rustup toolchain install`, and exports the channel it just read, so the value mise
-# exports is derived from the file and cannot contradict it. When the file names a
-# toolchain rustup has not installed yet, mise exports nothing and rustup reads the same
-# file directly; both paths resolve the channel below. A `RUSTUP_TOOLCHAIN` exported from
-# outside this repository still wins over both, which is why `scripts/hooks/pre-commit`
-# compares `rustc --version` against the pin before it runs cargo.
-# https://mise.jdx.dev/configuration.html#idiomatic-version-files names the setting;
-# the rust tool registers `rust-toolchain.toml` (registry/rust.toml).
-idiomatic_version_file_enable_tools = ["rust"]
 
 [tools]
 java = "zulu-17.64.17"

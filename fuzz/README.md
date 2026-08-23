@@ -33,6 +33,11 @@ needs and no command here names a version. A command run from the repository roo
 the stable pin in the root `rust-toolchain.toml` instead, and cargo-fuzz refuses to run on
 stable.
 
+A `RUSTUP_TOOLCHAIN` set in your shell overrides both files, and `cargo fuzz` then reports
+`error: the option 'Z' is only accepted on the nightly compiler`. `build.rs` in this
+directory reports that cause by name before the build reaches rustc. `.mise.toml` names no
+Rust version so that mise does not export the variable; unset it if something else did.
+
 ```sh
 cd fuzz
 
@@ -45,11 +50,9 @@ rustup toolchain install
 cargo install cargo-fuzz --locked
 ```
 
-Or via mise (if configured in the repo):
-
-```sh
-mise install
-```
+`.mise.toml` lists `cargo:cargo-fuzz`, so `mise install` at the repository root installs the
+cargo-fuzz binary too. It installs no Rust toolchain: rustup owns that, and the command
+above is what fetches the nightly this directory names.
 
 ### Run a single target for 60 seconds
 

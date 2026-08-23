@@ -192,5 +192,6 @@ Every target asserts at minimum **I1** (no panic on any untrusted input). Additi
 - **Wrong `-max_len`** — The default is 4096 bytes. Tier 1 envelope targets need 1 MiB (`-max_len=1048576`). Without this, the fuzzer never generates valid-length blobs.
 - **`Arbitrary` for parser targets** — Breaks mutation-coverage feedback. Use raw bytes + dict for anything that calls `from_bytes` or a string parser.
 - **Running from the repository root** — Will fail. rustup applies the toolchain file of the directory a command runs in, and the root one names stable, which cargo-fuzz refuses. Run every command from inside `fuzz/`, where `rust-toolchain.toml` names the nightly; then no command needs a `+toolchain` flag and none names a version.
+- **Running with `RUSTUP_TOOLCHAIN` set** — Will fail the same way, from inside `fuzz/` too, because that variable overrides a toolchain file entirely. `build.rs` reports the cause and names the variable. `.mise.toml` names no Rust version so mise does not export it; unset it if another tool did.
 - **Checking in crash artifacts** — Always minimize with `fuzz tmin` first, then move to corpus.
 - **Adding the fuzz crate to root workspace** — Never do this. It breaks normal CI.

@@ -8,11 +8,20 @@
 # Prerequisites (install manually first):
 #   - Homebrew: https://brew.sh
 #   - mise: https://mise.jdx.dev (brew install mise)
+#   - rustup: https://rustup.rs
 #   - Xcode Command Line Tools: xcode-select --install
 #
-# mise handles: language versions, Rust targets, cargo tools, npm globals,
-# and environment variables (JAVA_HOME, ANDROID_HOME, NDK linkers, etc.)
-# This script only covers what mise can't: Android SDK/NDK via sdkmanager.
+# mise handles: language versions, cargo tools, npm globals, and environment
+# variables (JAVA_HOME, ANDROID_HOME, NDK linkers, etc.)
+#
+# rustup handles Rust, and `.mise.toml` names no Rust version. rustup reads the
+# toolchain file of whichever directory a cargo command runs in, so the workspace
+# resolves `rust-toolchain.toml` and `fuzz/` resolves `fuzz/rust-toolchain.toml`;
+# mise would export one RUSTUP_TOOLCHAIN for both, which overrides both files.
+# The Rust check below therefore compares `rustc --version` against the pin
+# instead of asking mise what it installed.
+#
+# This script also covers what neither can: Android SDK/NDK via sdkmanager.
 
 set -euo pipefail
 
@@ -65,6 +74,7 @@ section "Prerequisites"
 require_cmd git
 require_cmd brew || true
 require_cmd mise || true
+require_cmd rustup || true
 
 # Xcode CLT
 if xcode-select -p &>/dev/null; then
@@ -74,7 +84,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 2. mise install (languages, Rust targets, cargo tools, npm globals)
+# 2. mise install (languages, cargo tools, npm globals) + the rustup pin
 # ---------------------------------------------------------------------------
 section "mise install"
 
@@ -86,7 +96,7 @@ if $CHECK_MODE; then
   echo ""
 
   # Verify key tools are installed
-  for tool in java bun python kotlin gradle rust; do
+  for tool in java bun python kotlin gradle; do
     if mise ls --installed "$tool" &>/dev/null && [[ -n "$(mise ls --installed "$tool" 2>/dev/null)" ]]; then
       ok "$tool $(mise current "$tool" 2>/dev/null || echo '?')"
     else
@@ -113,13 +123,45 @@ else
   ok "mise install complete"
 
   # Verify key tools
-  for tool in java bun python kotlin gradle rust; do
+  for tool in java bun python kotlin gradle; do
     if mise current "$tool" &>/dev/null; then
       ok "$tool $(mise current "$tool" 2>/dev/null)"
     else
       fail "$tool failed to install"
     fi
   done
+fi
+
+# ---------------------------------------------------------------------------
+# 2b. The Rust toolchain rustup resolves here
+# ---------------------------------------------------------------------------
+# `rust-toolchain.toml` names the version, and rustup installs it the first time a
+# cargo command runs in this directory. This block runs one so the download happens
+# during setup rather than during someone's first build, then compares what the shell
+# resolved against the pin. `RUSTUP_TOOLCHAIN` overrides the file when it is set, and
+# a shell carrying it compiles and lints on a version this repository does not name,
+# so the mismatch is reported rather than left to surface in CI.
+section "Rust toolchain"
+
+RUST_PIN=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
+  "$REPO_ROOT/rust-toolchain.toml" | head -n 1)
+
+if [[ -z "$RUST_PIN" ]]; then
+  fail "rust-toolchain.toml names no [toolchain] channel"
+elif ! command -v rustc &>/dev/null; then
+  fail "rustc not found — install rustup from https://rustup.rs"
+else
+  if ! $CHECK_MODE; then
+    info "Resolving the pinned toolchain ($RUST_PIN)..."
+    cargo --version >/dev/null 2>&1 || true
+  fi
+  RUST_ACTIVE=$(rustc --version 2>/dev/null | sed -nE 's/^rustc ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')
+  if [[ "$RUST_ACTIVE" == "$RUST_PIN" ]]; then
+    ok "rustc $RUST_ACTIVE matches rust-toolchain.toml"
+  else
+    fail "rustc in this shell is ${RUST_ACTIVE:-unreadable}; rust-toolchain.toml names $RUST_PIN"
+    info "RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-<unset>} overrides the file when it is set — unset it"
+  fi
 fi
 
 # ---------------------------------------------------------------------------

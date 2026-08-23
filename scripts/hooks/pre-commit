@@ -49,7 +49,7 @@ if $HAS_RUST && command -v rustc >/dev/null 2>&1; then
   elif [ "$ACTIVE_VERSION" != "$PIN_VERSION" ]; then
     echo "  ✗ rustc in this shell is $ACTIVE_VERSION; rust-toolchain.toml names $PIN_VERSION." >&2
     echo "    RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-<unset>} overrides the file when it is set." >&2
-    echo "    Unset it, or run 'mise install' so mise exports the version the file names." >&2
+    echo "    Unset it, so rustup reads rust-toolchain.toml and installs the version it names." >&2
     exit 1
   fi
 fi

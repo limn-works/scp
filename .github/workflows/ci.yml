@@ -30,14 +30,30 @@ jobs:
   changes:
     needs: check-draft
     runs-on: ubuntu-latest
+    # `rust-toolchain.toml` selects the compiler for every lane below, not only the Rust
+    # one: `python-test` runs `maturin develop`, `typescript-check` runs
+    # `cargo build -p scp-ffi-napi`, the two wasm jobs run `wasm-pack build`, `kotlin-test`
+    # runs `cargo build -p scp-ffi-uniffi`, and `swift-build-test` runs
+    # `build-xcframework.sh`. Every job those outputs guard is written
+    # `if: needs.changes.outputs.<lane> == 'true'`, and the `ci` job that aggregates every
+    # other job's result counts a skipped job as a pass, so a lane the pin does not reach
+    # lets a version bump merge with nothing compiling on the new compiler.
+    #
+    # The `toolchain` filter below holds the pin, and every output ORs it in, so this
+    # workflow names `rust-toolchain.toml` once. `scripts/check-toolchain-wiring.sh` reads
+    # these output names out of this file and fails when one of them drops the OR, so a
+    # lane added later is covered without editing that gate.
     outputs:
-      rust: ${{ steps.filter.outputs.rust }}
-      python: ${{ steps.filter.outputs.python }}
-      typescript: ${{ steps.filter.outputs.typescript }}
-      typescript-wasm: ${{ steps.filter.outputs.typescript-wasm }}
-      scaffold-typescript-web: ${{ steps.filter.outputs.scaffold-typescript-web }}
-      kotlin: ${{ steps.filter.outputs.kotlin }}
-      swift: ${{ steps.filter.outputs.swift }}
+      rust: ${{ steps.filter.outputs.rust == 'true' || steps.filter.outputs.toolchain == 'true' }}
+      python: ${{ steps.filter.outputs.python == 'true' || steps.filter.outputs.toolchain == 'true' }}
+      typescript: ${{ steps.filter.outputs.typescript == 'true' || steps.filter.outputs.toolchain == 'true' }}
+      typescript-wasm: ${{ steps.filter.outputs.typescript-wasm == 'true' || steps.filter.outputs.toolchain == 'true' }}
+      scaffold-typescript-web: ${{ steps.filter.outputs.scaffold-typescript-web == 'true' || steps.filter.outputs.toolchain == 'true' }}
+      kotlin: ${{ steps.filter.outputs.kotlin == 'true' || steps.filter.outputs.toolchain == 'true' }}
+      swift: ${{ steps.filter.outputs.swift == 'true' || steps.filter.outputs.toolchain == 'true' }}
+      # `fuzz-build` is the one job the stable pin does not decide: it runs `cargo check`
+      # with `working-directory: fuzz`, where rustup resolves `fuzz/rust-toolchain.toml`
+      # instead, and the `fuzz` filter's `fuzz/**` entry already covers that file.
       fuzz: ${{ steps.filter.outputs.fuzz }}
     steps:
       - uses: actions/checkout@v5
@@ -45,20 +61,15 @@ jobs:
         id: filter
         with:
           filters: |
+            # The compiler every lane compiles on. The `outputs:` block above ORs this
+            # filter into every other lane, so no other filter repeats the pin.
+            toolchain:
+              - 'rust-toolchain.toml'
             rust:
               - 'crates/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'deny.toml'
-              # `rust-toolchain.toml` chooses the compiler every Rust job below
-              # runs, and every one of those jobs is guarded by
-              # `needs.changes.outputs.rust == 'true'`, while the `ci` job that
-              # aggregates every other job's result counts a skipped job as a
-              # pass. Leaving this entry out lets a pull request that raises the
-              # pin and nothing else merge without clippy, the test lane, the
-              # build, cargo-deny, or the image build ever compiling on the new
-              # compiler.
-              - 'rust-toolchain.toml'
               # The `docker-image` job builds from these two and is guarded by this
               # filter, so a change to either has to reach it.
               - 'Dockerfile'
@@ -69,27 +80,19 @@ jobs:
               # reads it, and the next branch to rebase would find the check red.
               - '.clippy.toml'
               - 'rustfmt.toml'
-              # `scripts/check-toolchain-wiring.sh` fails when any of the five entries
-              # above is absent, and fails the same way when any of the six language
-              # filters below omits `rust-toolchain.toml`. That gate's header states the
-              # criterion for what its list holds.
+              # `scripts/check-toolchain-wiring.sh` enumerates every root-level file in
+              # the git tree and fails when one is listed neither here nor in the
+              # `toolchain` filter, unless that gate declares that no job reads it while
+              # it compiles. A file added at the repository root later fails that gate
+              # until someone classifies it.
             python:
               - 'bindings/python/**'
               - 'crates/scp-ffi/src/**'
               - 'crates/scp-ffi/common/**'
-              # `python-test` runs `maturin develop --release`, which compiles this
-              # workspace's crates on the compiler `rust-toolchain.toml` names. No entry
-              # above matches a pull request that raises the pin and changes nothing else,
-              # so without this entry that pull request skips this job, and the `ci`
-              # aggregator counts the skip as a pass. The same reasoning puts the pin in
-              # the five filters below.
-              - 'rust-toolchain.toml'
             typescript:
               - 'bindings/typescript/**'
               - 'crates/scp-ffi/napi/**'
               - 'crates/scp-ffi/common/**'
-              # `typescript-check` runs `cargo build -p scp-ffi-napi --release`.
-              - 'rust-toolchain.toml'
             typescript-wasm:
               # The full path-dep closure of scp-client-wasm (verified via
               # `cargo tree -p scp-client-wasm -e no-dev`) — a change to any of
@@ -106,31 +109,20 @@ jobs:
               - 'crates/scp-protocol/**'
               - 'crates/scp-event-log/**'
               - 'crates/scp-relay-client/**'
-              # `typescript-wasm-check` runs `wasm-pack build` from the repository
-              # root, which resolves the pin and compiles `scp-client-wasm` on it.
-              - 'rust-toolchain.toml'
             scaffold-typescript-web:
               # The browser scaffold builds against the local @limn-works/scp-ts-wasm
               # package (file: link), so a change to the scaffold OR to that package's
               # surface can break its typecheck / bundle — both must trigger this job.
               - 'scaffolds/typescript-web/**'
               - 'bindings/typescript-wasm/**'
-              # `scaffold-typescript-web-check` builds `bindings/typescript-wasm`
-              # first, which runs that same `wasm-pack build`.
-              - 'rust-toolchain.toml'
             kotlin:
               - 'bindings/kotlin/**'
               - 'crates/scp-ffi/uniffi/**'
               - 'crates/scp-ffi/common/**'
-              # `kotlin-test` runs `cargo build -p scp-ffi-uniffi --features testing`.
-              - 'rust-toolchain.toml'
             swift:
               - 'bindings/swift/**'
               - 'crates/scp-ffi/uniffi/**'
               - 'crates/scp-ffi/common/**'
-              # `swift-build-test` runs `bindings/swift/build-xcframework.sh --dev`,
-              # which runs `cargo build`.
-              - 'rust-toolchain.toml'
             fuzz:
               - 'fuzz/**'
               - 'crates/scp-protocol/**'

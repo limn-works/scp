@@ -2,12 +2,12 @@
 # the version from this file, so no two of them can disagree.
 #
 # WHO READS IT.
-#   - `cargo` and `rustup` read it natively for any command run inside this directory.
-#   - mise reads it because `.mise.toml` sets
-#     `idiomatic_version_file_enable_tools = ["rust"]`, which makes this file the rust
-#     tool's version source. mise passes `channel`, `components`, and `targets` to
-#     `rustup toolchain install` and exports `RUSTUP_TOOLCHAIN` with the channel it
-#     read here.
+#   - `cargo` and `rustup` read it natively for any command run inside this directory,
+#     and rustup installs the channel, components, and targets below on first use.
+#     `.mise.toml` names no Rust version and installs no Rust toolchain, so no
+#     `RUSTUP_TOOLCHAIN` comes between rustup and this file; the comment at the top of
+#     that file records why, which is that `fuzz/` resolves a different compiler and one
+#     exported variable cannot serve both directories.
 #   - `Dockerfile` copies this file into the builder image before any cargo command,
 #     so rustup inside the container resolves the same compiler. The image tag names
 #     a Debian release and no Rust version.
@@ -36,11 +36,11 @@
 # requirement only means something when the local compiler and the CI compiler are the
 # same compiler. See `.docs/lessons/pin-the-rust-toolchain-or-ci-drifts-from-local.md`.
 #
-# HOW TO RAISE IT. Edit `channel` below, run `mise install` so the local shell picks up
-# the new toolchain, run the CI clippy command from the "Orchestrator verification
-# protocol" section of CLAUDE.md, and fix everything the new release reports in that same
-# pull request. Nothing else names a version, so nothing else has to move. Never lower the
-# pin to make a new lint disappear.
+# HOW TO RAISE IT. Edit `channel` below and run the CI clippy command from the
+# "Orchestrator verification protocol" section of CLAUDE.md; rustup downloads the new
+# toolchain the first time a cargo command runs here. Fix everything the new release
+# reports in that same pull request. Nothing else names a version, so nothing else has to
+# move. Never lower the pin to make a new lint disappear.
 #
 # `targets` lists every target some CI job cross-compiles for:
 #   - wasm32-unknown-unknown ......... browser SDK (ci.yml wasm jobs)
@@ -49,7 +49,7 @@
 #   - {aarch64,armv7,x86_64,i686}-linux-android* .. Kotlin SDK
 #   - {x86_64,aarch64}-unknown-linux-gnu, x86_64-pc-windows-msvc .. release
 #     build matrix
-# rustup installs every one of them when it installs this toolchain, and so does mise.
+# rustup installs every one of them when it installs this toolchain.
 #
 # `fuzz/` is a standalone crate outside the workspace and needs nightly, which stable
 # cannot supply. `fuzz/rust-toolchain.toml` names that nightly, and it is the only other

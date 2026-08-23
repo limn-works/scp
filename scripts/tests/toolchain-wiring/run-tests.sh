@@ -1,24 +1,31 @@
 #!/usr/bin/env bash
-# run-tests.sh — exercise both checks in `scripts/check-toolchain-wiring.sh` against
+# run-tests.sh — exercise all three checks in `scripts/check-toolchain-wiring.sh` against
 # canned repositories.
 #
 # WHAT THIS TESTS.
 #   * Check 1 fails when a file that builds from a `rust` base image does not carry the
-#     ASSERT-PINNED-RUSTC block verbatim, and stays silent when it does. That block is
-#     what makes the build compare the compiler it resolved against the pin, so a
-#     container that compiles on the base image's own compiler fails its own build.
-#   * Check 2 fails when a `dorny/paths-filter` filter in `ci.yml` omits a declared
-#     entry, and stays silent when every declared entry is present. Each job that compiles
-#     a crate of this workspace is guarded by such a filter — seven filters guard one, not
-#     only `rust` — and the `ci` job that aggregates every other job's result counts a
-#     skipped job as a pass, so an omitted entry lets a change merge unbuilt. One case per
-#     declared pair asserts the gate names that filter and that entry.
+#     ASSERT-PINNED-RUSTC block verbatim, and stays silent when it does. "Verbatim" means
+#     the three lines, in order, unbroken: a file keeping one line of the block, and a file
+#     holding all three in reverse order, each fail. Those two cases exist because
+#     `grep -F` splits a pattern holding newlines into one pattern per line and matches
+#     when any single one matches, so the earlier `grep -qzF` comparison passed both.
+#   * Check 2 fails when the `toolchain` filter does not hold the pin, when an output of
+#     the `changes` job does not OR that filter in, when the `fuzz` filter drops `fuzz/**`,
+#     and when a root-level file is listed in no filter and declared in no exemption. Each
+#     job that compiles a crate of this workspace is guarded by such an output, and the `ci`
+#     job that aggregates every other job's result counts a skipped job as a pass, so an
+#     unrouted change merges unbuilt.
+#   * Check 3 fails when `.mise.toml` names a Rust version source — a `rust` key under
+#     `[tools]`, or `rust-toolchain.toml` registered through
+#     `idiomatic_version_file_enable_tools`. mise then exports one `RUSTUP_TOOLCHAIN` for
+#     the whole repository, which overrides `fuzz/rust-toolchain.toml` and puts every
+#     `cargo fuzz` command on the workspace's stable compiler.
 #
 # HOW EACH CASE IS BUILT. `run_case` makes a temporary directory, copies the gate into
-# `scripts/`, runs `git init` so the gate's `git grep` search has a work tree, writes the
-# case's `ci.yml` from the `emit_ci` generator below, and writes its optional `Dockerfile`
-# from a heredoc. The gate `cd`s to its own parent's parent, so that directory becomes its
-# repository root.
+# `scripts/`, runs `git init` so the gate's `git grep` search and its root-file listing have
+# a work tree, and writes the case's `ci.yml`, `.mise.toml`, optional `Dockerfile`, and
+# optional extra root files. The gate `cd`s to its own parent's parent, so that directory
+# becomes its repository root.
 #
 # Exit 0 when every case matches its expectation, 1 otherwise.
 
@@ -39,20 +46,42 @@ trap 'rm -rf "$TMP_PARENT"' EXIT
 passed=0
 failed=0
 
-# ── The canned ci.yml ────────────────────────────────────────────────────────────────
+# ── The canned repository ────────────────────────────────────────────────────────────
 #
-# One generator produces every `ci.yml` the check-2 cases use, so a case differs from the
-# passing one by exactly the omission it names. `OMIT` selects that omission: empty omits
-# nothing, "<filter> <entry>" drops one path entry from one filter, and "<filter> *" drops
-# the filter and its header. `run_case` calls its producer with no arguments, so the
-# selection travels in this variable, and every case below sets it.
+# Three generators produce every case's repository, so a case differs from the passing one
+# by exactly the defect it names.
 #
-# Each entry list carries every pair `REQUIRED_FILTER_ENTRIES` declares for that filter,
-# plus at least one entry the gate does not require, so dropping a required entry leaves
-# the filter holding entries and the gate reports the omission rather than the empty
-# filter. A pair added to the gate and not to the loop below still fails against the real
-# `ci.yml` in CI; adding it below is what proves the gate reports that pair by name.
-OMIT=""
+#   OMIT_OUTPUT     — the name of one `changes` output that reads the `toolchain` filter
+#                     literally instead of OR-ing it in, or "" to leave every output whole.
+#   OMIT_FILTER     — "<filter> <entry>" drops one path entry from one filter, "<filter> *"
+#                     drops the filter and its header, "" drops nothing.
+#   MISE_SOURCE     — "none" writes a `.mise.toml` naming no Rust version source, "tools"
+#                     writes a `rust` key under `[tools]`, "idiomatic" writes the
+#                     `idiomatic_version_file_enable_tools` setting, "absent" writes no file.
+#   EXTRA_ROOT_FILE — one more root-level file to create, or "" for none.
+OMIT_OUTPUT=""
+OMIT_FILTER=""
+MISE_SOURCE="none"
+EXTRA_ROOT_FILE=""
+
+# Every output the canned `changes` job declares. `fuzz` is last and is the one output the
+# gate exempts, because `fuzz-build` compiles from `fuzz/` on a different toolchain file.
+CANNED_OUTPUTS=(rust python typescript typescript-wasm scaffold-typescript-web kotlin swift)
+
+emit_outputs() {
+    printf '    outputs:\n'
+    local name
+    for name in "${CANNED_OUTPUTS[@]}"; do
+        if [[ $name == "$OMIT_OUTPUT" ]]; then
+            printf '      %s: ${{ steps.filter.outputs.%s }}\n' "$name" "$name"
+        else
+            printf '      %s: ${{ steps.filter.outputs.%s == '"'"'true'"'"' || steps.filter.outputs.toolchain == '"'"'true'"'"' }}\n' \
+                "$name" "$name"
+        fi
+    done
+    printf '      # The exempt lane: it compiles from `fuzz/` on `fuzz/rust-toolchain.toml`.\n'
+    printf '      fuzz: ${{ steps.filter.outputs.fuzz }}\n'
+}
 
 # emit_filter <name> <entry>...
 #
@@ -62,13 +91,13 @@ OMIT=""
 emit_filter() {
     local name=$1
     shift
-    [[ "$name *" == "$OMIT" ]] && return 0
+    [[ "$name *" == "$OMIT_FILTER" ]] && return 0
     printf '            %s:\n' "$name"
     printf '              # A comment inside a filter block, which the extractor skips.\n'
     printf '\n'
     local entry quote index=0
     for entry in "$@"; do
-        [[ "$name $entry" == "$OMIT" ]] && continue
+        [[ "$name $entry" == "$OMIT_FILTER" ]] && continue
         if (( index % 2 == 0 )); then quote="'"; else quote='"'; fi
         printf '              - %s%s%s\n' "$quote" "$entry" "$quote"
         index=$((index + 1))
@@ -76,55 +105,83 @@ emit_filter() {
 }
 
 emit_ci() {
+    printf 'name: CI\njobs:\n  changes:\n    runs-on: ubuntu-latest\n'
+    emit_outputs
     cat <<'YAML'
-name: CI
-jobs:
-  changes:
-    runs-on: ubuntu-latest
-    # The real workflow names every filter here too, with a value on the same line. The
-    # extractor must start no block on these lines, so every case carries them.
-    outputs:
-      rust: ${{ steps.filter.outputs.rust }}
-      python: ${{ steps.filter.outputs.python }}
-      typescript: ${{ steps.filter.outputs.typescript }}
-      typescript-wasm: ${{ steps.filter.outputs.typescript-wasm }}
-      scaffold-typescript-web: ${{ steps.filter.outputs.scaffold-typescript-web }}
-      kotlin: ${{ steps.filter.outputs.kotlin }}
-      swift: ${{ steps.filter.outputs.swift }}
-      fuzz: ${{ steps.filter.outputs.fuzz }}
     steps:
       - uses: dorny/paths-filter@v3
         id: filter
         with:
           filters: |
 YAML
-    emit_filter rust 'crates/**' 'rust-toolchain.toml' 'Dockerfile' '.dockerignore' \
-        '.clippy.toml' 'rustfmt.toml'
-    emit_filter python 'bindings/python/**' 'rust-toolchain.toml'
-    emit_filter typescript 'bindings/typescript/**' 'rust-toolchain.toml'
-    emit_filter typescript-wasm 'bindings/typescript-wasm/**' 'rust-toolchain.toml'
-    emit_filter scaffold-typescript-web 'scaffolds/typescript-web/**' 'rust-toolchain.toml'
-    emit_filter kotlin 'bindings/kotlin/**' 'rust-toolchain.toml'
-    emit_filter swift 'bindings/swift/**' 'rust-toolchain.toml'
+    emit_filter toolchain 'rust-toolchain.toml'
+    # `Dockerfile` and `.mise.toml` are the root-level files every canned repository holds,
+    # so the `rust` filter routes the first and the gate's exemption list covers the second.
+    emit_filter rust 'crates/**' 'Dockerfile' 'deny.toml'
+    emit_filter python 'bindings/python/**'
+    emit_filter typescript 'bindings/typescript/**'
+    emit_filter typescript-wasm 'bindings/typescript-wasm/**'
+    emit_filter scaffold-typescript-web 'scaffolds/typescript-web/**'
+    emit_filter kotlin 'bindings/kotlin/**'
+    emit_filter swift 'bindings/swift/**'
     emit_filter fuzz 'crates/scp-protocol/**' 'fuzz/**'
+    # A second job, so the gate's output reader stops at the end of the `changes` job
+    # rather than reading another job's outputs as this one's.
+    cat <<'YAML'
+  rust-clippy:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      unrelated: ${{ steps.other.outputs.unrelated }}
+    steps:
+      - run: cargo clippy
+YAML
 }
 
-# A ci.yml whose filters carry every declared entry. Cases that are not about check 2 use
-# it so their only finding can come from check 1.
+emit_mise() {
+    case "$MISE_SOURCE" in
+        none)
+            printf '# mise names no Rust version source. rustup reads the toolchain file of\n'
+            printf '# whichever directory a command runs in.\n[tools]\nbun = "1.3.9"\n"cargo:cargo-fuzz" = "latest"\n'
+            ;;
+        tools)
+            printf '[tools]\nbun = "1.3.9"\nrust = { version = "stable", targets = "wasm32-unknown-unknown" }\n'
+            ;;
+        idiomatic)
+            printf '[settings]\nidiomatic_version_file_enable_tools = ["rust"]\n\n[tools]\nbun = "1.3.9"\n'
+            ;;
+        absent) : ;;
+        *)
+            echo "ERROR: unknown MISE_SOURCE '$MISE_SOURCE'" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# A repository whose ci.yml routes everything and whose .mise.toml names no Rust source.
+# Cases that are not about check 2 or check 3 use these, so their only finding can come
+# from check 1.
 routing_ok() {
     # A prefix assignment on a function call persists in the caller in some bash
     # versions and not others, so assign on its own line and leave no doubt about
     # which cases run against the complete filter set.
-    OMIT=""
+    OMIT_OUTPUT=""
+    OMIT_FILTER=""
     emit_ci
 }
 
-# run_case <name> <expected exit> <required substring|""> <ci.yml producer> [dockerfile producer]
+mise_ok() {
+    MISE_SOURCE="none"
+    emit_mise
+}
+
+# run_case <name> <expected exit> <required substring|""> <ci producer> <mise producer> [dockerfile producer]
 #
 # A required substring of "" asserts only that the gate printed no FAIL line, which covers
 # every message it can produce.
 run_case() {
-    local name=$1 want_exit=$2 want_msg=$3 ci_producer=$4 docker_producer=${5:-}
+    local name=$1 want_exit=$2 want_msg=$3 ci_producer=$4 mise_producer=$5 docker_producer=${6:-}
     local root output actual_exit ok=1
 
     root="$TMP_PARENT/$name"
@@ -132,7 +189,10 @@ run_case() {
     cp "$CHECK" "$root/scripts/"
     git -C "$root" init -q
     "$ci_producer" > "$root/.github/workflows/ci.yml"
+    "$mise_producer" > "$root/.mise.toml"
+    [[ -s "$root/.mise.toml" ]] || rm -f "$root/.mise.toml"
     [[ -n $docker_producer ]] && "$docker_producer" > "$root/Dockerfile"
+    [[ -n $EXTRA_ROOT_FILE ]] && printf 'contents\n' > "$root/$EXTRA_ROOT_FILE"
 
     output=$(bash "$root/scripts/$(basename "$CHECK")" 2>&1)
     actual_exit=$?
@@ -161,40 +221,90 @@ run_case() {
     fi
 }
 
-# ── Check 2: paths-filter routing ────────────────────────────────────────────────────
+# ── Check 2: the pin reaches every lane, and every root file is classified ───────────
 
-run_case "filters-list-every-entry" 0 "" routing_ok
+run_case "everything-routed" 0 "" routing_ok mise_ok
 
-# One case per pair the gate declares, so dropping a pair from the gate fails a case here
-# rather than passing silently. `emit_ci` leaves out exactly the named entry, and the case
-# asserts the gate names that filter and that entry in its message.
-for pair in \
-    "rust rust-toolchain.toml" \
-    "rust Dockerfile" \
-    "rust .dockerignore" \
-    "rust .clippy.toml" \
-    "rust rustfmt.toml" \
-    "python rust-toolchain.toml" \
-    "typescript rust-toolchain.toml" \
-    "typescript-wasm rust-toolchain.toml" \
-    "scaffold-typescript-web rust-toolchain.toml" \
-    "kotlin rust-toolchain.toml" \
-    "swift rust-toolchain.toml" \
-    "fuzz fuzz/**"; do
-    filter_name=${pair%% *}
-    omitted_entry=${pair#* }
-    OMIT="$pair"
-    run_case "${filter_name}-filter-omits-${omitted_entry//\//-}" 1 \
-        "the '$filter_name' paths filter does not list $omitted_entry" emit_ci
+# One case per output the canned `changes` job declares. Dropping the OR from one output
+# leaves that lane skipping on a pull request that raises the pin.
+for output_name in "${CANNED_OUTPUTS[@]}"; do
+    OMIT_OUTPUT="$output_name"
+    OMIT_FILTER=""
+    run_case "output-${output_name}-drops-the-toolchain-or" 1 \
+        "the 'changes' job's '$output_name' output does not read steps.filter.outputs.toolchain" \
+        emit_ci mise_ok
 done
+OMIT_OUTPUT=""
 
-# A filter the workflow declares nowhere, which the gate reports as a filter carrying no
-# path entries rather than passing over.
-OMIT="rust *"
+# The `fuzz` output reads its own filter alone in every case above, and the gate accepts
+# that, because `fuzz-build` compiles on `fuzz/rust-toolchain.toml`. The passing case
+# already proves it; this comment records that the exemption is deliberate.
+
+OMIT_FILTER="toolchain rust-toolchain.toml"
+run_case "toolchain-filter-omits-the-pin" 1 \
+    "declares no 'toolchain:' paths filter with path entries" emit_ci mise_ok
+
+OMIT_FILTER="toolchain *"
+run_case "toolchain-filter-absent-entirely" 1 \
+    "declares no 'toolchain:' paths filter with path entries" emit_ci mise_ok
+
+OMIT_FILTER="fuzz fuzz/**"
+run_case "fuzz-filter-omits-the-fuzz-tree" 1 \
+    "the 'fuzz' paths filter does not list fuzz/**" emit_ci mise_ok
+
+OMIT_FILTER="fuzz *"
+run_case "fuzz-filter-absent-entirely" 1 \
+    "declares no 'fuzz:' paths filter with path entries" emit_ci mise_ok
+
+OMIT_FILTER="rust *"
 run_case "rust-filter-absent-entirely" 1 \
-    "declares no 'rust:' paths filter with path entries" emit_ci
+    "declares no 'rust:' paths filter with path entries" emit_ci mise_ok
 
-OMIT=""
+# A root-level file the `rust` filter stops listing. The gate reads the root of the git
+# tree, so it reports the file rather than an entry someone forgot to declare.
+OMIT_FILTER="rust deny.toml"
+EXTRA_ROOT_FILE="deny.toml"
+run_case "root-file-listed-in-no-filter" 1 \
+    "deny.toml sits at the repository root and neither the 'rust' filter nor the 'toolchain' filter" \
+    emit_ci mise_ok
+
+OMIT_FILTER=""
+EXTRA_ROOT_FILE=""
+
+# A root-level file nobody has classified. This is the case a list of required entries
+# could not have: the file is new, so no list names it, and the gate finds it by
+# enumerating the tree.
+EXTRA_ROOT_FILE="clippy-extra.toml"
+run_case "new-root-file-is-unclassified" 1 \
+    "clippy-extra.toml sits at the repository root" emit_ci mise_ok
+
+# A root-level file the gate's own exemption list declares unread.
+EXTRA_ROOT_FILE="README.md"
+run_case "root-file-declared-unread" 0 "" emit_ci mise_ok
+EXTRA_ROOT_FILE=""
+
+# ── Check 3: mise names no Rust version source ───────────────────────────────────────
+
+mise_names_rust_tool() {
+    MISE_SOURCE="tools"
+    emit_mise
+}
+run_case "mise-names-a-rust-tool-version" 1 \
+    "names a rust tool version" routing_ok mise_names_rust_tool
+
+mise_enables_idiomatic_rust() {
+    MISE_SOURCE="idiomatic"
+    emit_mise
+}
+run_case "mise-registers-rust-toolchain-toml" 1 \
+    "registers rust-toolchain.toml as a mise version source" routing_ok mise_enables_idiomatic_rust
+
+mise_absent() {
+    MISE_SOURCE="absent"
+    emit_mise
+}
+run_case "mise-config-absent" 1 \
+    ".mise.toml does not exist" routing_ok mise_absent
 
 # ── Check 1: every container build asserts the compiler it resolved ──────────────────
 #
@@ -216,7 +326,7 @@ COPY . .
 RUN cargo build --release
 DOCKER
 }
-run_case "container-carries-the-assertion" 0 "" routing_ok docker_carries_the_block
+run_case "container-carries-the-assertion" 0 "" routing_ok mise_ok docker_carries_the_block
 
 # A whole-context copy to a destination other than `.`. A check that read COPY lines
 # rejected this legitimate recipe; requiring the assertion block accepts it, because the
@@ -232,7 +342,23 @@ RUN pin="$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\
 RUN cargo build --release
 DOCKER
 }
-run_case "container-copies-context-to-another-path" 0 "" routing_ok docker_copies_context_elsewhere
+run_case "container-copies-context-to-another-path" 0 "" routing_ok mise_ok \
+    docker_copies_context_elsewhere
+
+# The block ends the file, with no trailing content after its last line. `$(cat file)`
+# drops the trailing newline, so the gate drops the one the heredoc puts on ASSERT_BLOCK;
+# this case fails if it stops doing that.
+docker_ends_with_the_block() {
+    cat <<'DOCKER'
+FROM rust:slim-bookworm AS builder
+WORKDIR /app
+COPY rust-toolchain.toml rust-toolchain.toml
+RUN pin="$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n 1)"; \
+    got="$(rustc --version | cut -d' ' -f2)"; \
+    [ -n "$pin" ] && [ "$got" = "$pin" ] || { echo "image resolved rustc '$got'; rust-toolchain.toml names '$pin'" >&2; exit 1; }
+DOCKER
+}
+run_case "container-ends-with-the-assertion" 0 "" routing_ok mise_ok docker_ends_with_the_block
 
 docker_omits_the_block() {
     cat <<'DOCKER'
@@ -243,7 +369,43 @@ RUN cargo build --release
 DOCKER
 }
 run_case "container-omits-the-assertion" 1 \
-    "does not carry the ASSERT-PINNED-RUSTC block verbatim" routing_ok docker_omits_the_block
+    "does not carry the ASSERT-PINNED-RUSTC block verbatim" routing_ok mise_ok \
+    docker_omits_the_block
+
+# The assertion gutted down to one of its three lines, with the comparison and the
+# `exit 1` replaced by an echo. `grep -qzF` matched this, because it split the three-line
+# pattern into three patterns and matched on the one line that survived.
+docker_keeps_one_line_of_the_block() {
+    cat <<'DOCKER'
+FROM rust:slim-bookworm AS builder
+WORKDIR /app
+COPY rust-toolchain.toml rust-toolchain.toml
+RUN pin="$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n 1)"; \
+    got="$(rustc --version | cut -d' ' -f2)"; \
+    echo "resolved $got, pin $pin"
+RUN cargo build --release
+DOCKER
+}
+run_case "container-keeps-one-line-of-the-assertion" 1 \
+    "does not carry the ASSERT-PINNED-RUSTC block verbatim" routing_ok mise_ok \
+    docker_keeps_one_line_of_the_block
+
+# All three lines present and out of order, which no shell would run as the assertion.
+# `grep -qzF` matched this too, because its split patterns carry no order.
+docker_reverses_the_block() {
+    cat <<'DOCKER'
+FROM rust:slim-bookworm AS builder
+WORKDIR /app
+COPY rust-toolchain.toml rust-toolchain.toml
+RUN [ -n "$pin" ] && [ "$got" = "$pin" ] || { echo "image resolved rustc '$got'; rust-toolchain.toml names '$pin'" >&2; exit 1; }
+    got="$(rustc --version | cut -d' ' -f2)"; \
+RUN pin="$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n 1)"; \
+RUN cargo build --release
+DOCKER
+}
+run_case "container-reverses-the-assertion-lines" 1 \
+    "does not carry the ASSERT-PINNED-RUSTC block verbatim" routing_ok mise_ok \
+    docker_reverses_the_block
 
 # The pin reaches a stage that never compiles. A check that read COPY lines passed this;
 # requiring the assertion in the file catches it, and the assertion itself would fail the
@@ -260,7 +422,7 @@ COPY rust-toolchain.toml /doc/rust-toolchain.toml
 DOCKER
 }
 run_case "container-pins-only-a-stage-that-never-compiles" 1 \
-    "does not carry the ASSERT-PINNED-RUSTC block verbatim" routing_ok \
+    "does not carry the ASSERT-PINNED-RUSTC block verbatim" routing_ok mise_ok \
     docker_pin_reaches_only_the_runtime_stage
 
 # A stage that inherits from an earlier one, or from a non-rust image, names no `rust`
@@ -271,7 +433,7 @@ FROM debian:bookworm-slim AS runtime
 COPY --from=builder /app/target/release/scp-relay /usr/local/bin/scp-relay
 DOCKER
 }
-run_case "container-names-no-rust-image" 0 "" routing_ok docker_names_no_rust_image
+run_case "container-names-no-rust-image" 0 "" routing_ok mise_ok docker_names_no_rust_image
 
 echo ""
 echo "toolchain-wiring cases: $passed passed, $failed failed"
