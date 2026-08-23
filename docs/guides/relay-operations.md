@@ -253,10 +253,13 @@ scp-node
 
 **On a shipped build, the full-node and `--self-host` modes cannot complete a first
 run.** Both need to create an identity, which requires a `PreRotationCustody`
-backend whose only implementation is the test harness, so the node logs
-`application node failed to build` and exits 1. The test
-`pre_rotation_severance_generate_fails_closed` in `crates/scp-node/src/lib.rs` pins
-that behaviour. The real backend is not implemented yet, and the node fails closed
+backend whose only implementation is the test harness, so each exits 1. The
+full-node mode logs `application node failed to build`; `--self-host` logs
+`self-host mode failed`. Two tests in `crates/scp-node/src/lib.rs` pin the two
+paths: `pre_rotation_severance_generate_fails_closed` covers the full node's
+`persist = false` route, and `pre_rotation_severance_persistent_fails_closed`
+covers the `--self-host` route, which `Node::start` normalizes to `Generate` with
+`persist = true`. The real backend is not implemented yet, and the node fails closed
 rather than mint a nullifier-backed identity.
 
 `--relay-only` is unaffected: `run_relay_only` builds a `RelayServer` and no
@@ -378,6 +381,7 @@ take the rest from `NodeConfig::defaults`.
 | `dns_provider: Option<DnsProviderConfig>` | Registers a DID-derived subdomain and this node's public IP with the Limn DNS API at `dns.ctx.network`, which runs the Let's Encrypt DNS-01 challenge and returns the certificate. Setting it REPLACES the `tls` provider and overrides the domain; it falls back to self-signed when the API is unreachable. |
 | `nat: NatSlot` | NAT traversal strategy selection |
 | `network_detector: Option<Arc<dyn NetworkChangeDetector>>` | Network change source |
+| `http3: Option<Http3Config>` | HTTP/3 listener config. Exists only under the `http3` feature, which `scp-node` does not enable by default, so a default build has no such field. |
 
 ---
 

@@ -39,14 +39,19 @@ against is **write access to the crate under test**, not "edits the manifest" �
 draft wrote the narrower indicator as the contract, which is the failure `CLAUDE.md` names
 after Caulfield.
 
-## Eight rounds, twelve bypasses, and what closed each one
+## Eight rounds, twelve bypasses, and which ones the gate closes
 
 Eight review rounds produced twelve bypasses, from seven of those rounds — the round-2
 row records an overclaim rather than a bypass. They do not share one root, and no single
-change closed them. The table below names each bypass and its root; the numbered list
-above names the five mechanisms that answer them. Counting them was itself a source of
-error: three earlier drafts of this paragraph asserted a total, or described a table
-column, that the table three lines below already contradicted.
+change closed them. Nine are closed by the five mechanisms listed above plus the shell
+quoting that answers row 6c. Two are not closed at all and are not meant to be: row 4b
+(any nullifier other than `DhtMode::Memory`) and row 8 (a `build.rs` injecting a cfg),
+both of which need write access to the crate under test.
+
+Counting these was itself a source of error. Four earlier drafts of this paragraph
+asserted a total, described a table column, or claimed a coverage that the table three
+lines below already contradicted. Every one was caught by a reviewer rather than by its
+author, which is the argument for keeping the table adjacent to the prose that counts it.
 
 | Round | Bypass | Root |
 |---|---|---|
@@ -86,7 +91,11 @@ shipped features, then measured the premise and found it false:
 features, because `scp-runtime` dev-depends on `scp-testing`, whose NORMAL
 `scp-core{testing}` edge resolves `scp-runtime/testing` ON. The declaration bought
 nothing and removed the example from the check, so it was reverted. Coverage went
-from four examples to eight.
+from four examples to eight — against the script as it stood that round, which passed
+`--examples` and skipped a feature-gated target silently. The script now names each
+target, so a `required-features` declaration no longer removes one from the count; the
+revert stands on its own ground, which is that the declaration asserted a build failure
+that does not happen.
 
 See `.docs/lessons/first-boot-testing-needs-an-empty-state-directory.md` for the
 measurement trap that nearly refuted one of the findings above.

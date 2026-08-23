@@ -74,7 +74,7 @@ There is **no** relay-served path for site assets and **no** client-side broadca
 pull+decrypt:
 
 - `open_broadcast` (the signature-verifying *client* decryptor,
-  `broadcast.rs:615`) has **zero production callers** — only the host-side
+  `crates/scp-protocol/src/crypto/sender_keys/broadcast.rs:620`) has **zero production callers** — only the host-side
   `open_broadcast_trusted` is wired, inside `scp-node`'s HTTP projection.
 - `broadcast_subscribe` (FFI `crates/scp-ffi/src/context.rs:4873` →
   `subscribe_broadcast` `crates/scp-runtime/src/context/broadcast_helpers.rs:58`)

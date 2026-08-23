@@ -449,7 +449,8 @@ class Node internal constructor(
          * shares that code, so read the message to tell the two apart.
          *
          * @param bridge The [ServerBridge] providing FFI access.
-         * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.
+         * @param identityDid DID string of a pre-existing identity. Passing null
+         *   requests auto-generation, which only a `testing` build provides.
          * @return A [Node] with [relayUrl] and [did] populated.
          */
         suspend fun startInMemory(
@@ -475,7 +476,8 @@ class Node internal constructor(
          *
          * @param bridge The [ServerBridge] providing FFI access.
          * @param dataDir Directory for persistent storage.
-         * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.
+         * @param identityDid DID string of a pre-existing identity. Passing null
+         *   reloads the identity the storage already holds; it never generates one.
          * @param passphrase Passphrase for Argon2id key derivation. Required when identityDid is null.
          * @return A [Node] with [relayUrl] and [did] populated.
          */
@@ -540,7 +542,8 @@ class ServerBridge internal constructor(
      * When [identityDid] is provided, the node uses the pre-existing
      * identity instead of generating a fresh one.
      *
-     * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.
+     * @param identityDid DID string of a pre-existing identity. Passing null
+     *   requests auto-generation, which only a `testing` build provides.
      * @return A [Node] with [Node.relayUrl] and [Node.did] populated.
      */
     suspend fun startNodeInMemory(identityDid: String? = null): Node =
@@ -560,7 +563,8 @@ class ServerBridge internal constructor(
      * Starts a full application node with file-backed storage.
      *
      * @param dataDir Directory for persistent storage.
-     * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.
+     * @param identityDid DID string of a pre-existing identity. Passing null
+     *   reloads the identity the storage already holds; it never generates one.
      * @param passphrase Passphrase for Argon2id key derivation. Required when identityDid is null.
      * @return A [Node] with [Node.relayUrl] and [Node.did] populated.
      */

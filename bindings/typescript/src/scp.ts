@@ -3846,8 +3846,8 @@ export class SCP {
    * run needs a pre-rotation custody backend that only a `testing` build has, so
    * a shipped build rejects it with the message "node startup failed". The NAPI
    * layer attaches no code, so `mapBridgeError` defaults `ScpError.code` to
-   * `SCP-UNKNOWN-0000`; match on the message, not the code. Rather than mint a
-   * nullifier-backed identity. Pass an explicit
+   * `SCP-UNKNOWN-0000`; match on the message, not the code. It fails closed
+   * rather than mint a nullifier-backed identity. Pass an explicit
    * `identityDid`, or point `dataDir` at a directory that already holds one.
    */
   async nodeStartLocal(

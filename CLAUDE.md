@@ -148,8 +148,9 @@ compiles on it, and ci.yml routes every root-level file and every cargo configur
 file to a lane or declares it unread; .mise.toml names no Rust version source),
 check-examples-build-shipped.sh (every example target compiles, and every published
 `examples/*.rs` is some target's source, joined on PATH not on target name; the
-path join, the per-package loop, and the target-driven compile loop are all the
-assertion — see the script header, which also states what the check cannot prove),
+path join, the per-package loop, the target-driven compile loop, the both-layouts
+enumeration, and the unconditional `cargo package --list` failure branch are each
+load-bearing — see the script header, which also states what the check cannot prove),
 pretooluse-enforcement-files.sh,
 CLAUDE.md (enforcement sections).
 When a check fails, fix the code that the check rejected. You may modify an enforcement file for exactly two reasons:

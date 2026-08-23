@@ -16715,6 +16715,11 @@ impl Scp {
 
     /// Per-instance equivalent of the free-function `node_start_local`.
     ///
+    /// Omitting `identity` reloads the identity the storage already holds and
+    /// requires `passphrase`. Creating one on a first run needs a pre-rotation
+    /// custody backend that only a `testing` build has, so a shipped build fails
+    /// closed with `ScpError::Identity`, code `SCP-TRANS-5051`.
+    ///
     /// Starts a file-backed application node at `data_dir`. If `identity`
     /// is supplied, it must have been minted by this `Scp`.
     #[cfg(feature = "server")]
