@@ -411,8 +411,7 @@ pub async fn start_node_in_memory(
 /// a shipped build fails closed with
 /// [`IdentityError::NoPreRotationBackend`] (`SCP-IDENT-1059`) rather than mint a
 /// nullifier-backed identity. Pass an explicit `identity` on a shipped build, or
-/// point `data_dir` at a directory that already holds one. See RFC #2130 and
-/// issue #1729 for the real backend.
+/// point `data_dir` at a directory that already holds one.
 ///
 /// For fully ephemeral setups use [`start_node_in_memory`].
 ///

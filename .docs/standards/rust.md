@@ -347,7 +347,7 @@ cargo deny check
 cargo doc --workspace --no-deps
 ```
 
-## Clearing a security advisory
+## Clearing a Security Advisory
 
 When a RUSTSEC advisory names a workspace dependency, bump the dependency. Add a
 `deny.toml` ignore entry only when no released version clears the advisory, or when a
@@ -375,7 +375,7 @@ and revert every change the advisory did not require. Prove the result resolves 
 whatever `cargo install` left on the machine. An older cargo-deny misses whole advisory
 classes — 0.19.0 reports nothing for the `unsound` class that 0.20.2 raises as an error —
 so a green run from the wrong binary proves nothing, and an `advisory-not-detected`
-warning from the wrong binary condemns a live entry. cargo-deny also reports an advisory
+warning from the wrong binary marks a live entry as unnecessary. cargo-deny also reports an advisory
 against only the highest version of a duplicated crate, so count every copy of the crate
 in `Cargo.lock` before calling an advisory cleared.
 
