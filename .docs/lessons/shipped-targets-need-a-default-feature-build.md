@@ -137,6 +137,21 @@ surfaces it and exits 1.
 
 Run a gate against the defect before committing it, and record both exit codes.
 
+**The negative test can itself return the null result.** This workspace shares one
+cargo target directory across worktrees. A reviewer reintroduced `DhtMode::Memory`
+and the gate reported exit 0 — not because the gate was inert, but because cargo
+considered the example unit fresh while another worktree was building. After
+`touch crates/scp-node/examples/website.rs` the same command gave `E0599` and a
+non-zero exit. An editor that rewrites the file updates its mtime and avoids this;
+a tool that restores identical bytes, or a concurrent build holding the lock, does
+not.
+
+So a green negative test is only evidence when the subject file's mtime moved.
+Touch the file before measuring, and treat an unexpected exit 0 as a suspected
+stale artifact rather than as proof the defect is absent — the failure mode of a
+gate measurement and the failure mode it is meant to detect look identical from
+the exit code alone.
+
 When a gate's comment overstates its reach, the next author reads the comment, believes
 the property is proven, and stops checking. That is the extrapolation-as-contract failure
 `CLAUDE.md` names, written into an enforcement file.
