@@ -46,6 +46,14 @@
 # list carries `scp-node?/testing`. Measured: the workspace-wide form exits 0 on
 # the `DhtMode::Memory` defect; this loop exits 1.
 #
+# TWO RESIDUAL LIMITS, both structural, neither worth another mechanism:
+#   - A target whose body sits behind `#[cfg(...)]` is counted and compiles to
+#     nothing. `checked` counts targets, not lines, so coverage is an upper bound.
+#   - Every remaining bypass models an author editing the manifest of the crate
+#     under test. Defending a gate against edits to its own subject is unbounded;
+#     review is what covers that, and the enforcement-file hook deliberately
+#     protects this script and not `crates/*/Cargo.toml`.
+#
 # See .docs/lessons/shipped-targets-need-a-default-feature-build.md.
 set -euo pipefail
 
@@ -75,16 +83,21 @@ while IFS=$'\t' read -r pkg pkgdir; do
   # error such as a `readme` naming a missing file, and treating that as "no
   # published examples" would drop the crate from assertion 2 in silence.
   if ! RAW="$(cargo package --list -p "$pkg" --allow-dirty 2>&1)"; then
-    if [ -n "$TGT_TSV" ]; then
-      echo "FAIL: 'cargo package --list -p $pkg' failed, so its published file set is unknown." >&2
-      printf '%s\n' "$RAW" >&2
-      status=1
-    fi
+    # Unconditional. Gating this on the package having targets inverts it: an
+    # `autoexamples = false` crate has none, which is exactly the state where a
+    # published example file cannot be seen, so silence there is the failure mode
+    # this branch exists to remove.
+    echo "FAIL: 'cargo package --list -p $pkg' failed, so its published file set is unknown." >&2
+    printf '%s\n' "$RAW" >&2
+    status=1
   else
     # Every target's source path, one per line, for the path join below.
     SRCS="$(printf '%s' "$TGT_TSV" | cut -f2 | sort -u)"
-    # Only top-level `examples/*.rs` is auto-discovered; a file in a subdirectory
-    # (examples/support/mod.rs) is a helper module, not an expected target source.
+    # Cargo auto-discovers BOTH `examples/NAME.rs` and `examples/NAME/main.rs`.
+    # Measured: moving website.rs to examples/website/main.rs keeps the target and
+    # keeps the file published, so a pattern matching only the flat form is blind to
+    # a layout that needs no manifest edit at all. Any other file under examples/
+    # (examples/support/mod.rs) is a helper module and is not expected to be a target.
     while IFS= read -r file; do
       [ -n "$file" ] || continue
       printf '%s\n' "$SRCS" | grep -qxF -- "$file" && continue
@@ -93,7 +106,7 @@ while IFS=$'\t' read -r pkg pkgdir; do
       echo "      entry, drop 'autoexamples = false', or stop publishing the file." >&2
       status=1
     done <<EOF
-$(printf '%s\n' "$RAW" | grep -E '^examples/[^/]+\.rs$' || true)
+$(printf '%s\n' "$RAW" | grep -E '^examples/([^/]+\.rs|[^/]+/main\.rs)$' || true)
 EOF
   fi
 
