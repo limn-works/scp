@@ -20,7 +20,13 @@ env:
   # The one nightly the fuzz crate builds on. Nightlies after this date
   # tightened the `pub(crate)` re-export rules (E0365) and reject openmls
   # 0.8.1's `pub use crate::ciphersuite::signature::*` at prelude.rs:16.
-  # `fuzz/rust-toolchain.toml` records the same date and the unpin condition.
+  # `fuzz/rust-toolchain.toml` records the same date and the unpin condition, and
+  # `scripts/check-toolchain-pin.sh` fails when the two disagree.
+  #
+  # Every job below reaches this value through `dtolnay/rust-toolchain@master` plus a
+  # `toolchain:` input. The action publishes `master`, `stable`, `beta`, `nightly`, and a
+  # branch per released version, but no dated-nightly branch, so the `@nightly-<date>` ref
+  # these jobs used before never resolved and every scheduled run failed at job setup.
   FUZZ_TOOLCHAIN: nightly-2026-05-03
 
 jobs:
@@ -97,10 +103,6 @@ jobs:
       #
       # Unpin to `@nightly` once openmls publishes a fixed prelude (likely
       # 0.8.2 or 0.9) and `crates/scp-runtime` updates its dependency.
-      # The action publishes `master`, `stable`, `beta`, `nightly`, and a branch per
-      # released version, but no dated-nightly branch, so a `@nightly-<date>` ref
-      # never resolved and every scheduled run failed at job setup. Naming the date
-      # through the `toolchain` input is what ci.yml already does.
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.FUZZ_TOOLCHAIN }}
@@ -184,10 +186,6 @@ jobs:
 
       # TEMPORARY: pinned nightly (see the note in fuzz-nightly). Unpin once
       # openmls publishes a fixed prelude and scp-runtime updates its dependency.
-      # The action publishes `master`, `stable`, `beta`, `nightly`, and a branch per
-      # released version, but no dated-nightly branch, so a `@nightly-<date>` ref
-      # never resolved and every scheduled run failed at job setup. Naming the date
-      # through the `toolchain` input is what ci.yml already does.
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.FUZZ_TOOLCHAIN }}
@@ -292,10 +290,6 @@ jobs:
       #
       # Unpin to `@nightly` once openmls publishes a fixed prelude (likely
       # 0.8.2 or 0.9) and `crates/scp-runtime` updates its dependency.
-      # The action publishes `master`, `stable`, `beta`, `nightly`, and a branch per
-      # released version, but no dated-nightly branch, so a `@nightly-<date>` ref
-      # never resolved and every scheduled run failed at job setup. Naming the date
-      # through the `toolchain` input is what ci.yml already does.
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.FUZZ_TOOLCHAIN }}

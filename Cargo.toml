@@ -147,10 +147,7 @@ large_stack_arrays = "allow"
 # do that I/O do not exist yet: `ContextQuerier`'s only impl is a test double, and
 # `LocalHandleQuerier` returns an empty vector from two methods it cannot perform.
 # Removing `async` would write the missing backend's absence into the signature and make
-# adding it a breaking change. Those empty-vector returns are their own defect, separate
-# from this allow: an unavailable capability reads as "no match" instead of failing closed,
-# which the stand-in tenet in CLAUDE.md forbids. Fixing it changes the two methods to
-# return a `Result` and updates every caller across the runtime and the three bridges.
+# adding it a breaking change.
 #
 # `clippy::unused_async` is NOT allowed here — an async function with no await still
 # has to justify itself at every inherent-impl and free-function site.

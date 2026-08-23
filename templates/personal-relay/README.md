@@ -162,7 +162,7 @@ WantedBy=multi-user.target
 ### Docker
 
 ```dockerfile
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.98.0-bookworm AS builder
 WORKDIR /build
 COPY . .
 RUN cargo build --release -p scp-personal-relay

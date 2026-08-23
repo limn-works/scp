@@ -16,9 +16,10 @@
 # Stable version — every one of these compiles the workspace:
 #   1. `rust-toolchain.toml`      channel                   — what plain `cargo` resolves to
 #   2. `.mise.toml`               rust version              — what a mise shell resolves to
-#   3. `Dockerfile`               every `FROM rust:` tag    — the container build, and
-#                                 its `FROM debian:` stage, whose Debian release must
-#                                 equal the builder's
+#   3. every `FROM rust:` tag in `Dockerfile` and in
+#      `templates/personal-relay/README.md` — the two container builds of this
+#      workspace's crates — together with each file's `FROM debian:` stage, whose
+#      Debian release must equal its builder's
 #   4. `.docs/standards/rust.md`  rustc/cargo/clippy/rustfmt rows — the governing standard
 #
 # Nightly version — the standalone fuzz crate needs one, and cargo-fuzz does not run
@@ -86,14 +87,18 @@ require mise_version ".mise.toml [tools] rust version" \
     ".mise.toml" \
     's/^[[:space:]]*rust[[:space:]]*=.*version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p'
 
-# Read EVERY `FROM rust:` line, not just the first: a second stage on another version
-# would otherwise pass unseen.
-docker_versions=$(sed -nE 's|^FROM rust:([^ ]+).*|\1|p' Dockerfile 2>/dev/null || true)
-if [[ ! -f Dockerfile ]]; then
-    report "Dockerfile base image: Dockerfile does not exist"
-elif [[ -z $docker_versions ]]; then
-    report "Dockerfile base image: no 'FROM rust:<version>' line found in Dockerfile"
-fi
+# Every file in the repository that carries a `FROM rust:` line. `templates/personal-relay`
+# is on this list because its README documents a container build of `scp-personal-relay`,
+# whose manifest depends on `crates/*` by path — so that tag selects a compiler for this
+# workspace's code exactly as the root Dockerfile does, and it shipped naming Rust 1.85,
+# which predates the `as_chunks` this workspace now calls.
+DOCKERFILES=(
+    "Dockerfile"
+    "templates/personal-relay/README.md"
+)
+for f in "${DOCKERFILES[@]}"; do
+    [[ -f $f ]] || report "container build: $f does not exist"
+done
 
 # The toolchain table names four tools. Checking only `rustc` would let the clippy row
 # — the tool whose version caused the outage — go stale inside the governing standard.
@@ -125,40 +130,79 @@ fi
 [[ $mise_version == "$pin_version" ]] ||
     report ".mise.toml names rust $mise_version; rust-toolchain.toml names $pin_version"
 
-# Exact equality, including the patch component. A floating tag such as `rust:1.98-slim`
-# resolves to the newest 1.98.x, so the day 1.98.1 ships the container would compile on
-# a compiler the pin does not name — the drift this gate exists to stop, admitted by the
-# gate itself.
-while IFS= read -r tag; do
-    [[ -n $tag ]] || continue
-    base=${tag%%-*}
-    [[ $base == "$pin_version" ]] ||
-        report "Dockerfile builds on rust:$tag; rust-toolchain.toml names $pin_version"
-done <<< "$docker_versions"
+# Read EVERY `FROM rust:` line in every file on the list, not just the first: a second
+# stage on another version would otherwise pass unseen. Require exact equality including
+# the patch component, because a floating tag such as `rust:1.98-slim` resolves to the
+# newest 1.98.x, so the day 1.98.1 ships the container would compile on a compiler the pin
+# does not name — the drift this gate exists to stop, admitted by the gate itself.
+# Reduce every `FROM` line to `<image>:<tag>`, so each check below matches one shape
+# instead of carrying its own spelling of the optional parts. Docker allows flags such as
+# `--platform=` before the image and a `@sha256:` digest after the tag, and a stage name is
+# optional; none of those change which image the line selects.
+from_images() {
+    sed -nE 's|^FROM[[:space:]]+(--[a-z-]+=[^[:space:]]+[[:space:]]+)*([^[:space:]@]+).*|\2|p' "$1"
+}
 
-# The `FROM rust:` tag selects a Debian release as well as a compiler version, and the
-# runtime stage selects one too. glibc is backward compatible only, so a binary the builder
-# links against a newer release's glibc cannot exec on an older one, and the runtime
-# container dies at startup with "version `GLIBC_2.xx' not found". Requiring the version to
-# match leaves that unchecked, because the version is the part of the tag before the first
-# hyphen. Require both stages to name a release, and require the names to be equal. An
-# unsuffixed `rust:1.98.0-slim` names none, so it follows whichever Debian the rust image
-# currently defaults to and changes distribution under the build without the tag changing —
-# which is how `rust:1.85-slim` (Debian 12) became `rust:1.98.0-slim` (Debian 13) during
-# this pin's own first draft.
-builder_suites=$(sed -nE 's|^FROM rust:[^-]+-slim-([a-z]+)[[:space:]].*|\1|p' Dockerfile 2>/dev/null || true)
-runtime_suites=$(sed -nE 's|^FROM debian:([a-z]+)-slim[[:space:]].*|\1|p' Dockerfile 2>/dev/null || true)
-if [[ -z $builder_suites ]]; then
-    report "Dockerfile builder: no 'FROM rust:<version>-slim-<debian-release>' line found; an unsuffixed tag follows whichever Debian the rust image defaults to"
-elif [[ -z $runtime_suites ]]; then
-    report "Dockerfile runtime: no 'FROM debian:<debian-release>-slim' line found"
-else
-    while IFS= read -r suite; do
-        [[ -n $suite ]] || continue
-        grep -qx "$suite" <<< "$runtime_suites" ||
-            report "Dockerfile builds on Debian $suite; its runtime stage runs Debian $(tr '\n' ' ' <<< "$runtime_suites")"
-    done <<< "$builder_suites"
-fi
+# Debian names each release twice — `debian:12-slim` and `debian:bookworm-slim` are the
+# same image — so map the number onto the name before comparing.
+debian_suite() {
+    case $1 in
+        11 | bullseye) printf 'bullseye' ;;
+        12 | bookworm) printf 'bookworm' ;;
+        13 | trixie) printf 'trixie' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+for f in "${DOCKERFILES[@]}"; do
+    [[ -f $f ]] || continue
+    images=$(from_images "$f")
+
+    tags=$(sed -nE 's|^rust:(.+)$|\1|p' <<< "$images")
+    if [[ -z $tags ]]; then
+        report "$f: no 'FROM rust:<version>' line found"
+        continue
+    fi
+    while IFS= read -r tag; do
+        [[ -n $tag ]] || continue
+        [[ ${tag%%-*} == "$pin_version" ]] ||
+            report "$f builds on rust:$tag; rust-toolchain.toml names $pin_version"
+    done <<< "$tags"
+
+    # The `FROM rust:` tag selects a Debian release as well as a compiler version, and the
+    # runtime stage selects one too. glibc is backward compatible only, so a binary the
+    # builder links against a newer release's glibc cannot exec on an older one, and the
+    # runtime container dies at startup with "version `GLIBC_2.xx' not found". Comparing
+    # versions leaves that unchecked, because the version is the part of the tag before the
+    # first hyphen. Accept `rust:<version>-<release>` and `rust:<version>-slim-<release>`,
+    # both of which name a release; a tag ending at `-slim`, or carrying no suffix, names
+    # none, and follows whichever Debian the rust image currently defaults to — which is
+    # how `rust:1.85-slim` (Debian 12) became `rust:1.98.0-slim` (Debian 13) during this
+    # pin's own first draft.
+    builder_raw=$(sed -nE 's|^rust:[^-]+(-slim)?-([a-z0-9]+)$|\2|p' <<< "$images" | grep -vx slim || true)
+    runtime_raw=$(sed -nE 's|^debian:([a-z0-9]+)-slim$|\1|p' <<< "$images" || true)
+    if [[ -z $builder_raw ]]; then
+        report "$f: no 'FROM rust:<version>[-slim]-<debian-release>' line found; a tag naming no release follows whichever Debian the rust image defaults to"
+        continue
+    fi
+    if [[ -z $runtime_raw ]]; then
+        report "$f: no 'FROM debian:<debian-release>-slim' line found"
+        continue
+    fi
+    # Take the set of releases the whole file names, across both stage kinds, and require
+    # it to hold exactly one. Comparing each builder against the set of runtimes would ask
+    # only for membership, and a file with two runtime stages satisfies membership while
+    # one of them still runs an older glibc than the builder linked against.
+    suites=""
+    while IFS= read -r raw; do
+        [[ -n $raw ]] || continue
+        suites+="$(debian_suite "$raw")"$'\n'
+    done <<< "$builder_raw"$'\n'"$runtime_raw"
+    distinct=$(printf '%s' "$suites" | sed '/^$/d' | sort -u)
+    if [[ $(grep -c . <<< "$distinct") -ne 1 ]]; then
+        report "$f names more than one Debian release across its stages: $(tr '\n' ' ' <<< "$distinct")"
+    fi
+done
 
 for tool in rustc cargo clippy rustfmt; do
     var="standard_${tool}_version"
@@ -183,13 +227,24 @@ fi
 
 # `.mise.toml` targets must cover the pin's, because RUSTUP_TOOLCHAIN discards the pin's
 # target list together with its channel.
-pin_targets=$(sed -nE 's/^[[:space:]]*"([a-z0-9_]+-[a-z0-9_.-]+)",?[[:space:]]*$/\1/p' rust-toolchain.toml)
+# Read the whole `targets = [ .. ]` array, however it is wrapped: TOML accepts it inline on
+# one line or spread over several, and matching quoted strings line by line reads nothing
+# from the inline form and then passes. Fail closed when either list is absent.
+pin_targets=$(tr '\n' ' ' < rust-toolchain.toml |
+    sed -nE 's/.*targets[[:space:]]*=[[:space:]]*\[([^]]*)\].*/\1/p' |
+    tr ',' '\n' | sed -nE 's/[^"]*"([^"]+)".*/\1/p')
 mise_targets=$(sed -nE 's/^[[:space:]]*rust[[:space:]]*=.*targets[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' .mise.toml | tr ',' '\n')
-while IFS= read -r t; do
-    [[ -n $t ]] || continue
-    grep -qx "$t" <<< "$mise_targets" ||
-        report ".mise.toml omits target $t, which rust-toolchain.toml lists"
-done <<< "$pin_targets"
+if [[ -z $pin_targets ]]; then
+    report "rust-toolchain.toml: no 'targets = [ .. ]' array found, so the gate cannot check that .mise.toml covers it"
+elif [[ -z $mise_targets ]]; then
+    report ".mise.toml: no 'targets = \"..\"' list found on the rust entry"
+else
+    while IFS= read -r t; do
+        [[ -n $t ]] || continue
+        grep -qx "$t" <<< "$mise_targets" ||
+            report ".mise.toml omits target $t, which rust-toolchain.toml lists"
+    done <<< "$pin_targets"
+fi
 
 # The fuzz crate needs a nightly, because cargo-fuzz does not run on stable. Accept
 # both the dated form and plain `nightly`: unpinning to `nightly` is the step both
