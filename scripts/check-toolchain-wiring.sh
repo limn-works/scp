@@ -142,11 +142,12 @@ else
         # Match the image name after `FROM`, with or without a registry prefix or a tag,
         # and ignore a stage name (`FROM chef AS builder` names no image to pin).
         grep -qiE '^FROM[[:space:]]+([a-z0-9.:-]+/)*rust(:[^[:space:]]*)?([[:space:]]|$)' "$f" || continue
-        # A literal substring test over the whole file, which compares the block line for
-        # line and in order. `grep -F` cannot do this: it splits a pattern holding newlines
-        # into one pattern per line and matches when ANY of them matches, so a file keeping
-        # a single line of the block — or all three lines reversed — satisfies it. Measured
-        # on GNU grep 3.12, BSD grep 2.6.0-FreeBSD, and ugrep 7.8.4, with and without `-z`.
+        # A byte-for-byte substring test over the whole file, so the block's three lines
+        # match in order and unbroken. `grep -F` cannot do this: it splits a pattern
+        # holding newlines into one pattern per line and matches when ANY of them matches,
+        # so a file keeping a single line of the block — or all three lines reversed —
+        # satisfies it. Measured on GNU grep 3.12, BSD grep 2.6.0-FreeBSD, and ugrep 7.8.4,
+        # with and without `-z`.
         file_text=$(cat "$f")
         if [[ $file_text != *"$ASSERT_BLOCK"* ]]; then
             report "$f builds from a 'rust' base image and does not carry the ASSERT-PINNED-RUSTC block verbatim, so its build never checks which compiler the image resolved. Copy the block from $PIN's own consumer, the root Dockerfile, or from the ASSERT_BLOCK definition in this gate."

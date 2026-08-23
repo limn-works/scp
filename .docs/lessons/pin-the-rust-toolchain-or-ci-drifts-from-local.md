@@ -20,9 +20,14 @@ disagree.
 
 State that scope precisely, because the derivation does not close everything. It removes
 every disagreement between two files in the repository. It does not remove a
-`RUSTUP_TOOLCHAIN` exported into a developer's environment from outside the repository,
-which still overrides `rust-toolchain.toml` and which `scripts/hooks/pre-commit` therefore
-checks on every commit.
+`RUSTUP_TOOLCHAIN` exported into a developer's environment, which still overrides both
+toolchain files: `scripts/hooks/pre-commit` compares `rustc --version` against the
+workspace pin on every commit, and `fuzz/build.rs` fails the fuzz crate's build when cargo
+resolved a compiler `fuzz/rust-toolchain.toml` does not name.
+
+The second corollary this branch learned: **a tool that exports one toolchain value per
+shell cannot serve a repository that resolves a different toolchain per directory.** mise
+does that, so mise no longer manages Rust here at all.
 
 ## What Happened
 
@@ -155,7 +160,7 @@ A workflow that needs a version the action must install — the fuzz jobs, which
 nightly — reads the channel in a prior step and passes it as the `toolchain` input to
 `@master`.
 
-## The Paths Filter Has To List the Pin
+## A Change to the Pin Has To Reach the Jobs That Compile On It
 
 `.github/workflows/ci.yml` guards every Rust job with
 `if: needs.changes.outputs.rust == 'true'`, and the `ci` job that aggregates every other
@@ -293,7 +298,9 @@ defects that no other check could reach:
    `aws-lc-sys`, `ring`, and `libsqlite3-sys` compiling SQLCipher each need.
 
 `ci.yml` now carries a `docker-image` job, guarded by the `rust` paths filter, and the
-wiring gate asserts that `Dockerfile` and `.dockerignore` are entries in that filter. The
+wiring gate reaches `Dockerfile` and `.dockerignore` through its root-file enumeration:
+both sit at the repository root, so each must be routed by a filter or declared as a file
+no compile reads. The
 job reads the layer cache everywhere and writes it only on a push to `main`, because a
 cache written on a pull-request ref is readable only by that pull request and would evict
 entries from the 10 GB budget the workspace caches in this workflow share.
@@ -335,6 +342,20 @@ failed at job setup with "unable to find version", and the fuzzer had not execut
 the ref was introduced. No pull request runs the scheduled Fuzz workflow, so its ten
 consecutive failures never appeared on one. Naming the date through the `toolchain` input
 of `@master` gives a ref that resolves.
+
+**Repairing a scheduled workflow and merging on a green pull request proves nothing about
+the schedule, so dispatch it.** `gh workflow run fuzz.yml --ref <branch>` runs the branch's
+copy of a workflow that exists on the default branch. Run 32634187570 did that, and it
+reported two things a green pull request could not: the twelve nightly jobs got past setup,
+installed cargo-fuzz on the dated nightly, and started their fuzzers — and all six weekly
+`Deep Fuzz` jobs died at cargo-fuzz's first rustc invocation on
+`RUSTFLAGS="-Zsanitizer=address,undefined"`, because rustc has no `undefined` sanitizer and
+never has. That second defect predates the action-ref defect, sat behind it, and would have
+outlived the repair: the workflow's last 40 runs record 38 failures and one cancellation.
+
+The rule: **when a change repairs something no required check exercises, run the thing
+before merging the repair.** One dispatch cost a runner hour and found a second defect that
+would otherwise have kept the deep-fuzz lane dark while the repair was recorded as landed.
 
 ## `grep -F` Compares Lines, Not Blocks
 
