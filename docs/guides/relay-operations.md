@@ -77,7 +77,7 @@ scp-relay
 | **Full node** (default) | none | SQLite (SQLCipher) | Generated per start, not persisted | `.well-known/scp` | On a shipped build this exits 1: creating an identity needs a pre-rotation custody backend only a `testing` build has. |
 | **Relay-only** | `--relay-only` | Configurable | None | None | Equivalent to `scp-relay`. The one mode that starts on a shipped build without an existing identity. |
 | **Ephemeral** | `--ephemeral` | All in-memory | Ephemeral DID | `.well-known/scp` | Test harness only. A shipped build exits 1: the mode needs in-memory DHT and custody, which compile only under the `testing` feature. |
-| **Self-host** | `--self-host` | SQLite (SQLCipher) | Persistent DID | Static site + `.well-known/scp` | Hosts a static site on SCP. Opens an inbound port and, unless `SCP_NODE_DHT_MODE=disabled`, publishes the host's IP to the DHT. On a shipped build this exits 1 on every run, for the same reason as the full node. |
+| **Self-host** | `--self-host` | SQLite (SQLCipher) | Persistent DID | Static site + `.well-known/scp` | Hosts a static site on SCP. Opens an inbound port and, unless `SCP_NODE_DHT_MODE=disabled`, publishes the host's IP to the DHT. On a shipped build with no identity in storage this exits 1, on every run, for the same reason as the full node. |
 
 No binary mode enables the dev API. `NodeConfig::defaults` leaves `local_api: None`,
 and neither `main.rs` nor `self_host.rs` sets it, so the endpoints in the dev-API

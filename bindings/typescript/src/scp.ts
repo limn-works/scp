@@ -3822,11 +3822,10 @@ export class SCP {
    * only under the `testing` feature (ADR-062 Decision 1/6). The refusal arrives
    * as a mapped bridge error carrying "auto-generated in-memory node identity is
    * unavailable in this build". A production caller cannot get one from a create
-   * call either. Every writer to the identity registry — create, migrate, rotate,
-   * add-agent, remove-agent — either fails closed on a shipped build before it
-   * writes, or needs an entry already present, so the registry never fills. Pass
-   * an explicit `identityDid` on a production
-   * path.
+   * call either. Every writer to the identity registry — create, migrate,
+   * rotate-key, add-agent, rotate-agent, remove-agent — either fails closed on a shipped build before it
+   * writes, or needs an entry already present, so the registry never fills and
+   * passing `identityDid` finds nothing to resolve.
    */
   async nodeStartInMemory(identityDid?: string | null): Promise<Node> {
     try {
@@ -3855,9 +3854,10 @@ export class SCP {
    *
    * This build fails on EVERY run, not only the first: none of this SDK's create
    * calls mints an identity, so nothing it offers puts one in `dataDir` and the
-   * reload branch never fires. Passing `identityDid` does not help either, because that resolves
-   * through the identity registry, which only the `identityCreate*` calls
-   * populate and those fail closed too.
+   * reload branch never fires. Passing `identityDid` does not help either. Every
+   * writer to the identity registry — create, migrate, rotate-key, add-agent,
+   * rotate-agent, remove-agent — either fails closed on a shipped build before it
+   * writes, or needs an entry already present, so the registry never fills.
    */
   async nodeStartLocal(
     dataDir: string,

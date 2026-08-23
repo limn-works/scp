@@ -480,6 +480,14 @@ class Node internal constructor(
          * shipped build before it writes, or needs an entry already present, so
          * the registry never fills.
          *
+         * On a shipped build, supplying [identityDid] does not work either:
+         * UniFFI's `build_node_identity_from_uniffi` is replaced under
+         * `cfg(not(feature = "testing"))` by a stub that always returns
+         * `ScpException.Identity` with code `SCP-IDENT-1013`, because node
+         * identity portability needs custody access the mobile bridge does not
+         * have. Use platform custody with `IdentitySource::Persisted` on
+         * `NodeConfig` directly.
+         *
          * No passphrase is required when [identityDid] is provided.
          *
          * @param bridge The [ServerBridge] providing FFI access.

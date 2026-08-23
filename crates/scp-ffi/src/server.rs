@@ -662,20 +662,19 @@ impl crate::scp::PyScp {
     /// available ONLY in a ``testing`` build, which wires in-memory key custody,
     /// in-memory storage, and the in-memory DHT client. A shipped build fails
     /// closed rather than run a node backed by an in-memory DHT nullifier
-    /// (ADR-062 Decision 1/6). A production caller cannot get one from a create
-    /// call either. Every writer to the identity registry either fails closed on a
-    /// shipped build before it writes, or needs an entry already present, so
-    /// it would have to supply an explicit
-    /// ``identity_did``.
+    /// (ADR-062 Decision 1/6). Supplying ``identity_did`` instead does not help on
+    /// a shipped build: every writer to the identity registry either fails closed
+    /// before it writes, or needs an entry already present, so the registry never
+    /// fills and the lookup finds nothing.
     ///
     /// The failure reaches Python as ``RuntimeError`` carrying the message
     /// "auto-generated in-memory node identity is unavailable in this build".
     /// It is NOT a ``ValidationError``: only ``MissingPassphrase`` maps to that.
     ///
     /// When ``identity_did`` is provided, the node uses the pre-existing identity
-    /// from the `PyO3` identity registry (populated by ``PyScp::identity_create``).
-    /// This enables identity portability — the same DID persists across node
-    /// restarts.
+    /// from the `PyO3` identity registry (populated by the ``identity_create*``
+    /// and migrate paths, never by ``identity_load``). This enables identity
+    /// portability — the same DID persists across node restarts.
     #[pyo3(name = "node_start_in_memory", signature = (identity_did=None))]
     pub fn node_start_in_memory(
         &self,
@@ -736,7 +735,8 @@ impl crate::scp::PyScp {
     /// hold one and ``identity_did`` cannot be resolved from the registry.
     ///
     /// When ``identity_did`` is provided, the node uses the pre-existing identity
-    /// from the `PyO3` identity registry (populated by ``PyScp::identity_create``).
+    /// from the `PyO3` identity registry (populated by the ``identity_create*``
+    /// and migrate paths, never by ``identity_load``).
     /// No passphrase is required in this mode.
     #[pyo3(name = "node_start_local", signature = (data_dir, identity_did=None, passphrase=None))]
     pub fn node_start_local(

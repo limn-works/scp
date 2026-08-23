@@ -7,7 +7,8 @@ no separate web server and no DNS requirement on the origin). See the runnable e
 `crates/scp-node/examples/website.rs` and the background guide
 [`self-hosting-a-website-on-scp.md`](./self-hosting-a-website-on-scp.md).
 
-**On a shipped build, every recipe below exits 1 on every run.** `host_site` passes
+**On a shipped build with no identity in storage, every recipe below exits 1 — on
+the first run and every later one.** `host_site` passes
 `IdentitySource::Persisted`, and creating an identity needs a `PreRotationCustody` backend
 whose only implementation is the test harness, so the node fails closed rather than mint a
 nullifier-backed identity. Reloading a stored identity carries no gate, but `host_site`

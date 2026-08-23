@@ -308,8 +308,9 @@ pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerEr
 /// network). A shipped (no-`testing`) build FAILS CLOSED with
 /// [`ServerError::AutoGenerateUnavailable`] rather than run a nullifier-backed
 /// node (ADR-062 §Decision 1/6). A production caller cannot supply
-/// `Some(NodeIdentity)` from a create call either, because every shipped create
-/// API fails closed the same way. Self-signed TLS (localhost); relay bound to
+/// `Some(NodeIdentity)` from a create call on this crate's surface either, which
+/// fails closed the same way. (A Rust consumer of `scp-identity` can still mint
+/// one — see issue 2392.) Self-signed TLS (localhost); relay bound to
 /// `127.0.0.1:0` (OS-assigned port).
 ///
 /// When `identity` is `Some(NodeIdentity)`, the node uses the pre-existing
@@ -389,9 +390,11 @@ pub async fn start_node_in_memory(
 ///   `<data_dir>/storage/` — persistent key-value storage for protocol state
 /// - [`BlobStorageBackend::redb`] at `<data_dir>/blobs.redb` — persistent
 ///   relay blob storage
-/// - The production Mainline DHT client, built from `ClientDhtConfig::default()`.
-///   A `testing` build substitutes the `InMemoryDhtClient`
-///   nullifier so tests stay offline; a shipped build never reaches it.
+/// - When `identity` is `None`: the production Mainline DHT client, built from
+///   `ClientDhtConfig::default()`. A `testing` build substitutes the
+///   `InMemoryDhtClient` nullifier so tests stay offline; a shipped build never
+///   reaches it. When `identity` is `Some`, the DID method comes from the
+///   caller's `NodeIdentity` and this function builds no DHT client.
 /// - Self-signed TLS (for the localhost domain)
 /// - Relay bound to `127.0.0.1:0` (OS-assigned port)
 ///
