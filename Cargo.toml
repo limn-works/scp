@@ -114,6 +114,26 @@ cargo_common_metadata = "allow"
 # proptest macro expansion creates large internal runner arrays on the stack;
 # clippy cannot point to the source location so a crate-level allow is needed.
 large_stack_arrays = "allow"
+# `clippy::unused_async_trait_impl` (added in clippy 1.98.0) reports an `async fn`
+# whose body contains no `.await`, inside an impl block. It reaches two kinds of
+# site, and neither one gives the author an edit worth making:
+#
+#  - An inherent impl. `clippy::unused_async` already reports the same function,
+#    and that lint stays on below, so this workspace still forces a written
+#    justification at every such site (84 of them carry one today). Allowing the
+#    second name drops no detection.
+#  - A trait impl. `clippy::unused_async` skips these deliberately, because the
+#    trait declares the method as future-returning and the impl cannot delete the
+#    future. The impl can only re-spell `async fn f(..) -> T` as
+#    `fn f(..) -> impl Future<Output = T> + Send { async move { .. } }`, which
+#    desugars to the identical future. Clippy's own suggested form is not that
+#    re-spelling: it wraps the body's values in `std::future::ready`, which runs
+#    the body at call time instead of at poll time and so moves when a side
+#    effect such as a map insert happens.
+#
+# `clippy::unused_async` is NOT allowed here — an async function with no await
+# still has to justify itself at every inherent-impl and free-function site.
+unused_async_trait_impl = "allow"
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"

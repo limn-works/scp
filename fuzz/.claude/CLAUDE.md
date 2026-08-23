@@ -6,12 +6,12 @@ The `fuzz/` directory is a **standalone cargo-fuzz crate, NOT a workspace member
 
 ## Nightly Rust Required
 
-All `cargo fuzz` commands require the nightly compiler. Always use `+nightly`:
+All `cargo fuzz` commands require the nightly compiler, and one specific nightly: nightlies after 2026-05-03 reject openmls 0.8.1's prelude re-export (E0365). `fuzz/rust-toolchain.toml` pins that date, and the repository root pins stable, so a command you run from the root names the nightly itself:
 
 ```sh
-cargo +nightly fuzz run <target> --fuzz-dir fuzz -- -dict=fuzz/dicts/<dict> -max_total_time=60
-cargo +nightly fuzz list --fuzz-dir fuzz
-cargo +nightly fuzz coverage <target> --fuzz-dir fuzz
+cargo +nightly-2026-05-03 fuzz run <target> --fuzz-dir fuzz -- -dict=fuzz/dicts/<dict> -max_total_time=60
+cargo +nightly-2026-05-03 fuzz list --fuzz-dir fuzz
+cargo +nightly-2026-05-03 fuzz coverage <target> --fuzz-dir fuzz
 ```
 
 Running with stable Rust will fail with a linker or feature error. This is not a configuration bug — it is a libFuzzer requirement.
@@ -35,7 +35,7 @@ fuzz_target!(|data: &[u8]| {
 Run with the corresponding dictionary:
 
 ```sh
-cargo +nightly fuzz run fuzz_outer_envelope --fuzz-dir fuzz \
+cargo +nightly-2026-05-03 fuzz run fuzz_outer_envelope --fuzz-dir fuzz \
   -- -dict=fuzz/dicts/msgpack_outer_envelope.dict \
      -max_total_time=900 -max_len=1048576
 ```
@@ -126,7 +126,7 @@ Forgetting the `-dict=` flag is the single most common cause of poor fuzzer cove
 
 9. **Verify locally:**
    ```sh
-   cargo +nightly fuzz run <target> --fuzz-dir fuzz -- -max_total_time=60
+   cargo +nightly-2026-05-03 fuzz run <target> --fuzz-dir fuzz -- -max_total_time=60
    ```
 
 ## Modifying Existing Targets
@@ -143,7 +143,7 @@ Forgetting the `-dict=` flag is the single most common cause of poor fuzzer cove
 To minimize a crash artifact before checking it in:
 
 ```sh
-cargo +nightly fuzz tmin <target> --fuzz-dir fuzz fuzz/artifacts/<target>/crash-<hash>
+cargo +nightly-2026-05-03 fuzz tmin <target> --fuzz-dir fuzz fuzz/artifacts/<target>/crash-<hash>
 ```
 
 Then move the minimized file to `fuzz/corpus/<target>/`.
@@ -153,7 +153,7 @@ Then move the minimized file to `fuzz/corpus/<target>/`.
 The nightly CI job runs `cargo fuzz cmin` after each run to prevent unbounded corpus growth. When running locally for extended campaigns, do the same:
 
 ```sh
-cargo +nightly fuzz cmin <target> --fuzz-dir fuzz fuzz/corpus/<target>
+cargo +nightly-2026-05-03 fuzz cmin <target> --fuzz-dir fuzz fuzz/corpus/<target>
 ```
 
 ## Fuzz Crate Dependencies
@@ -167,7 +167,7 @@ scp-runtime = { path = "../crates/scp-runtime", features = ["testing"] }
 scp-event-log = { path = "../crates/scp-event-log" }
 ```
 
-If a production crate's public API changes and breaks a fuzz target, fix the fuzz target. Do not skip it. The `fuzz-build` CI check runs `cargo +nightly check --manifest-path fuzz/Cargo.toml` on every PR and will catch this.
+If a production crate's public API changes and breaks a fuzz target, fix the fuzz target. Do not skip it. The `fuzz-build` CI check runs `cargo +nightly-2026-05-03 check --manifest-path fuzz/Cargo.toml` on every PR and will catch this.
 
 ## Security Invariants
 
@@ -191,6 +191,6 @@ Every target asserts at minimum **I1** (no panic on any untrusted input). Additi
 - **Forgetting `-dict=` flag** — MessagePack targets waste 99% of fuzzer time without dictionaries. Coverage will not reach past the first fixmap byte.
 - **Wrong `-max_len`** — The default is 4096 bytes. Tier 1 envelope targets need 1 MiB (`-max_len=1048576`). Without this, the fuzzer never generates valid-length blobs.
 - **`Arbitrary` for parser targets** — Breaks mutation-coverage feedback. Use raw bytes + dict for anything that calls `from_bytes` or a string parser.
-- **Running with stable Rust** — Will fail. Must use `+nightly`.
+- **Running with stable Rust** — Will fail. Every command names `+nightly-2026-05-03`.
 - **Checking in crash artifacts** — Always minimize with `fuzz tmin` first, then move to corpus.
 - **Adding the fuzz crate to root workspace** — Never do this. It breaks normal CI.

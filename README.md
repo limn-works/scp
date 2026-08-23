@@ -112,7 +112,7 @@ Both commands are idempotent — safe to re-run at any time. Together they insta
 | Category | What | Manager |
 |---|---|---|
 | Languages | Java 17 (Zulu), Bun 1.3, Python 3.12, Kotlin 2.3 | mise (pinned in `.mise.toml`) |
-| Rust | Stable toolchain + 10 cross-compilation targets | mise (via rustup backend) |
+| Rust | Rust 1.98.0 + 10 cross-compilation targets — the version `rust-toolchain.toml` pins, so a local build uses the compiler CI uses | mise (via rustup backend) |
 | Cargo tools | cargo-nextest, maturin, cargo-deny | mise (cargo backend) |
 | npm globals | @napi-rs/cli | mise (npm backend) |
 | Android | SDK command-line tools, NDK 27.2 | sdkmanager (via Homebrew) |

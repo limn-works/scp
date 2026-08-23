@@ -109,9 +109,15 @@ jobs:
           key: corpus-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: corpus-${{ matrix.target }}-
 
+      # Every `cargo fuzz` command below names its toolchain explicitly. These
+      # steps run from the repository root, where `rust-toolchain.toml` pins
+      # stable 1.98.0, and cargo-fuzz only runs on nightly. An explicit
+      # `+toolchain` sets RUSTUP_TOOLCHAIN for the command and everything it
+      # spawns, which overrides that file. The same convention already governs
+      # the fuzz-crate check in ci.yml.
       - name: Run fuzzer
         run: |
-          cargo fuzz run ${{ matrix.target }} \
+          cargo +nightly-2026-05-03 fuzz run ${{ matrix.target }} \
             --fuzz-dir fuzz \
             fuzz/corpus/${{ matrix.target }} \
             -- \
@@ -125,7 +131,7 @@ jobs:
       - name: Minimize corpus
         if: always()
         run: |
-          cargo fuzz cmin ${{ matrix.target }} \
+          cargo +nightly-2026-05-03 fuzz cmin ${{ matrix.target }} \
             --fuzz-dir fuzz \
             fuzz/corpus/${{ matrix.target }} \
             || true
@@ -190,7 +196,7 @@ jobs:
         # openmls's decrypt `debug_assert!` and turn every tampered input into a
         # false crash.
         run: |
-          cargo fuzz run fuzz_mls_decrypt -O \
+          cargo +nightly-2026-05-03 fuzz run fuzz_mls_decrypt -O \
             --fuzz-dir fuzz \
             fuzz/corpus/fuzz_mls_decrypt \
             -- \
@@ -203,7 +209,7 @@ jobs:
       - name: Minimize corpus
         if: always()
         run: |
-          cargo fuzz cmin fuzz_mls_decrypt -O \
+          cargo +nightly-2026-05-03 fuzz cmin fuzz_mls_decrypt -O \
             --fuzz-dir fuzz \
             fuzz/corpus/fuzz_mls_decrypt \
             || true
@@ -295,7 +301,7 @@ jobs:
         env:
           RUSTFLAGS: "-Zsanitizer=address,undefined"
         run: |
-          cargo fuzz run ${{ matrix.target }} \
+          cargo +nightly-2026-05-03 fuzz run ${{ matrix.target }} \
             --fuzz-dir fuzz \
             fuzz/corpus/${{ matrix.target }} \
             -- \
@@ -309,7 +315,7 @@ jobs:
       - name: Minimize corpus
         if: always()
         run: |
-          cargo fuzz cmin ${{ matrix.target }} \
+          cargo +nightly-2026-05-03 fuzz cmin ${{ matrix.target }} \
             --fuzz-dir fuzz \
             fuzz/corpus/${{ matrix.target }} \
             || true

@@ -1,0 +1,17 @@
+# `fuzz/` is a standalone cargo-fuzz crate, outside the workspace, and cargo-fuzz
+# only runs on nightly (see the Fuzzing row of CLAUDE.md's toolchain table).
+# The repository root pins stable 1.98.0, so this file pins nightly for anyone
+# whose shell is inside this directory.
+#
+# The pinned date is the last nightly the fuzz crate compiles on. Nightlies
+# after 2026-05-03 tightened the `pub(crate)` re-export rules (E0365) and reject
+# openmls 0.8.1's `pub use crate::ciphersuite::signature::*` at prelude.rs:16.
+# Unpin once openmls publishes a fix or `crates/scp-runtime` moves to a version
+# that re-exports under the new rules. `.github/workflows/fuzz.yml` and the fuzz
+# check in `.github/workflows/ci.yml` name the same nightly.
+#
+# Running from the repository root instead of this directory picks up the root
+# pin, so those commands pass the toolchain explicitly:
+# `cargo +nightly-2026-05-03 fuzz run <target> --fuzz-dir fuzz`.
+[toolchain]
+channel = "nightly-2026-05-03"

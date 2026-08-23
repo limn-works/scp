@@ -1,0 +1,54 @@
+# Pins the Rust compiler for every cargo invocation in this repository.
+#
+# Why the pin exists. Until 2026-08-22 this repository had no toolchain file,
+# and every workflow step installed `dtolnay/rust-toolchain@stable`, which
+# resolves to whichever stable Rust was published most recently. Rust 1.98.0
+# shipped on 2026-08-20; its clippy added `chunks_exact_to_as_chunks` and
+# `unused_async_trait_impl`. The `Rust / clippy` required check started failing
+# on every branch the next morning, and a local run of the identical command on
+# 1.97.1 reported nothing, so nobody could reproduce the failure that was
+# blocking the merge queue. CLAUDE.md requires running CI locally before
+# pushing; that requirement only means something when the local compiler and
+# the CI compiler are the same compiler.
+#
+# How to raise it. Bumping the pin is a deliberate change, not a floating
+# default: raise `channel` here, raise `rust` in `.mise.toml` to the same
+# version (mise exports `RUSTUP_TOOLCHAIN`, which takes precedence over this
+# file, so the two must agree), run the CI clippy command from the
+# "Orchestrator verification protocol" section of CLAUDE.md, and fix everything
+# the new release reports in that same pull request.
+#
+# `targets` lists every target some CI job cross-compiles for, so the pinned
+# toolchain carries them no matter which stable release the `@stable` action
+# steps happen to install alongside it:
+#   - wasm32-unknown-unknown ......... browser SDK (ci.yml wasm jobs)
+#   - {aarch64,x86_64}-apple-darwin .. macOS binaries and the Swift SPM mirror
+#   - aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios .. Swift SDK
+#   - {aarch64,armv7,x86_64,i686}-linux-android* .. Kotlin SDK
+#   - {x86_64,aarch64}-unknown-linux-gnu, x86_64-pc-windows-msvc .. release
+#     build matrix
+#
+# `fuzz/` is a standalone crate outside the workspace and needs nightly. Both
+# `.github/workflows/fuzz.yml` and the fuzz check in `.github/workflows/ci.yml`
+# name that nightly with an explicit `cargo +nightly-2026-05-03`, and an
+# explicit `+toolchain` sets `RUSTUP_TOOLCHAIN` for the whole command tree,
+# which overrides this file. `fuzz/rust-toolchain.toml` pins the same nightly
+# for anyone whose shell is inside that directory.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]
+targets = [
+    "wasm32-unknown-unknown",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-apple-ios",
+    "aarch64-apple-ios-sim",
+    "x86_64-apple-ios",
+    "aarch64-linux-android",
+    "armv7-linux-androideabi",
+    "x86_64-linux-android",
+    "i686-linux-android",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]

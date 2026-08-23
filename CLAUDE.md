@@ -182,13 +182,15 @@ Caulfield asked a model to characterize the director Chris Columbus and got "war
 
 All tools via [mise](https://mise.jdx.dev/) (see `.mise.toml`). **Never use npm or npx** — bun only for JS/TS. System `python3` is Xcode 3.9 — **do not use it**; use `python3.12`.
 
+**Rust is pinned, and raising the pin is a deliberate change.** `rust-toolchain.toml` pins the compiler, its components, and every cross-compilation target CI builds for; `.mise.toml` names the same version because mise exports `RUSTUP_TOOLCHAIN`, which takes precedence over that file; `fuzz/rust-toolchain.toml` pins the nightly that `fuzz/` needs. To raise the version: change `channel` in `rust-toolchain.toml` and `rust` in `.mise.toml` together, run the CI clippy command from the Orchestrator verification protocol below, and fix everything the new release reports in that same pull request. Never lower the pin to make a new lint disappear. See `.docs/lessons/pin-the-rust-toolchain-or-ci-drifts-from-local.md`, which records the merge-queue outage that a floating `@stable` caused.
+
 | Language | Location | Package Manager | Lint | Format | Test | Build |
 |----------|----------|----------------|------|--------|------|-------|
 | **Rust** | `crates/` | cargo (workspace) | `cargo clippy --workspace --all-targets` | `cargo fmt --all` | `cargo test --workspace` (needs `DYLD_LIBRARY_PATH` below) | `cargo build --workspace` |
 | **Python** | `bindings/python/` | pip + maturin | `python3.12 -m ruff check .` | `python3.12 -m ruff format .` | `python3.12 -m pytest tests/ -v` | `maturin develop --release` |
 | **TypeScript** | `bindings/typescript/` | **bun** (not npm) | `bun run lint` (biome) | `bun run format` (biome) | `bun test` | `bun run build` (tsup) |
 | **Kotlin** | `bindings/kotlin/` | Gradle 8.x | `./gradlew detekt` | — | `./gradlew test` | `./gradlew assembleRelease` |
-| **Fuzzing** | `fuzz/` (standalone, not workspace) | cargo-fuzz (**nightly only**) | — | — | `cargo +nightly fuzz run <target> --fuzz-dir fuzz` | `cargo +nightly check --manifest-path fuzz/Cargo.toml` |
+| **Fuzzing** | `fuzz/` (standalone, not workspace) | cargo-fuzz (**nightly only**) | — | — | `cargo +nightly-2026-05-03 fuzz run <target> --fuzz-dir fuzz` | `cargo +nightly-2026-05-03 check --manifest-path fuzz/Cargo.toml` |
 
 **Language-specific gotchas:**
 
@@ -196,7 +198,7 @@ All tools via [mise](https://mise.jdx.dev/) (see `.mise.toml`). **Never use npm 
 - **Kotlin:** JDK 17 (zulu), Gradle 8.x, Kotlin 2.x — all via mise. Run `eval "$(mise env)"` first.
 - **TypeScript:** `bun run check` runs `tsc --noEmit` for type checking. Biome handles both lint and format.
 - **PRD validation:** `python3.12 scripts/validate-prd.py` — run before committing PRD changes.
-- **Fuzzing:** `fuzz/` is a standalone crate — never add it to root `Cargo.toml` members. All commands require `+nightly`. List targets: `cargo +nightly fuzz list --fuzz-dir fuzz`. See ADR-045, the fuzzing infrastructure decision, and `fuzz/README.md`.
+- **Fuzzing:** `fuzz/` is a standalone crate — never add it to root `Cargo.toml` members. All commands name `+nightly-2026-05-03`, the nightly `fuzz/rust-toolchain.toml` pins. List targets: `cargo +nightly-2026-05-03 fuzz list --fuzz-dir fuzz`. See ADR-045, the fuzzing infrastructure decision, and `fuzz/README.md`.
 
 ### Git
 

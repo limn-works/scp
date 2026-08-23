@@ -1137,14 +1137,17 @@ pub fn compute_chunk_manifest_root(chunks: &[OutletStreamChunk]) -> Result<[u8; 
 
     while current.len() > 1 {
         let mut next: Vec<[u8; 32]> = Vec::with_capacity(current.len().div_ceil(2));
-        let mut iter = current.chunks_exact(2);
-        for pair in &mut iter {
-            // chunks_exact yields slices of length 2 → indexing is
-            // bounded; pattern-match keeps clippy.indexing happy too.
-            let [left, right] = pair else { unreachable!() };
+        // `as_chunks::<2>` splits the level into fixed-size pairs plus the
+        // trailing remainder. The remainder holds one hash when the level
+        // has an odd count and is empty otherwise, and the promotion below
+        // consumes it, so no leaf is ever dropped.
+        let (pairs, remainder) = current.as_chunks::<2>();
+        for [left, right] in pairs {
+            // The `[T; 2]` element type makes the two-element destructuring
+            // infallible, so this loop needs neither indexing nor a panic arm.
             next.push(compute_chunk_interior_hash(left, right));
         }
-        if let Some(unpaired) = iter.remainder().first().copied() {
+        if let Some(unpaired) = remainder.first().copied() {
             // Odd-count level: promote the unpaired final hash to the
             // next level verbatim (RFC 6962 §2.1).
             next.push(unpaired);
@@ -3227,5 +3230,38 @@ mod tests {
             golden_root4,
             "4-leaf root golden KAT drift"
         );
+    }
+
+    /// Odd-leaf counts against the independent recursive RFC-6962 MTH.
+    ///
+    /// `compute_chunk_manifest_root` pairs each level with
+    /// `slice::as_chunks::<2>` and promotes the trailing unpaired hash from
+    /// `as_chunks`' remainder. A rewrite that discarded that remainder would
+    /// silently drop the final chunk of every odd level, which would produce
+    /// a manifest root that no longer commits to the last chunk the operator
+    /// signed. `indep_mth` splits at the largest power of two instead of
+    /// pairing levels, so it never consults a remainder and cannot mirror
+    /// that error. This test therefore pins the promotion itself, and the
+    /// `assert_ne!` pair states the property the promotion exists for: an
+    /// odd-count root differs from the root over the same sequence with the
+    /// unpaired final chunk removed.
+    #[test]
+    fn odd_leaf_root_promotes_unpaired_tail() {
+        for n in [1usize, 3, 5, 7, 9] {
+            let chunks: Vec<OutletStreamChunk> =
+                (0..n).map(|i| chunk_of_kind(i as u64, 0)).collect();
+            assert_eq!(
+                compute_chunk_manifest_root(&chunks).unwrap(),
+                indep_mth(&chunks),
+                "{n}-leaf root diverged from independent MTH"
+            );
+            if n > 1 {
+                assert_ne!(
+                    compute_chunk_manifest_root(&chunks).unwrap(),
+                    compute_chunk_manifest_root(&chunks[..n - 1]).unwrap(),
+                    "{n}-leaf root ignored the unpaired final chunk"
+                );
+            }
+        }
     }
 }
