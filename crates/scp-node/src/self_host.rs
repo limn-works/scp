@@ -885,9 +885,8 @@ pub struct HostSiteReady {
 /// Mainline DHT — a location disclosure). [`DhtMode::Disabled`] (no publish) is
 /// the fail-safe, non-disclosing direction and is valid for every reach —
 /// including [`Reach::NatTraversal`], the "reachable but not DHT-discoverable"
-/// config (share the address out-of-band) — never an error. `DhtMode::Memory`
-/// is the test-harness-only analog and is not a shipped option, so it is named
-/// here rather than linked: the variant does not exist on a default build.
+/// config (share the address out-of-band) — never an error. [`DhtMode::Memory`]
+/// is the test-harness-only analog and is not a shipped option.
 ///
 /// See the runnable example at `crates/scp-node/examples/website.rs` and the
 /// guide `.docs/guides/self-hosting-a-website-on-scp.md`.
@@ -2258,11 +2257,8 @@ async fn build_host_site_node<D: scp_identity::DidMethod + 'static>(
     let (nat, upnp_mapper, natpmp_mapper) = derive_host_site_nat_slot(skip_nat);
 
     // `IdentitySource::Persisted` gives the self-host node a STABLE DID across
-    // restarts: it reloads the identity from the root `node_storage`, and creates
-    // and persists one on first boot only under `testing`. On a build without that
-    // feature the create half returns `IdentityError::NoPreRotationBackend`, so a
-    // self-host node starts only against storage that already holds an identity
-    // record whose key handles the custody also holds. `tls` defaults to
+    // restarts: it creates+persists the identity on first boot and reloads it
+    // thereafter from the root `node_storage`. `tls` defaults to
     // `TlsMode::SelfSigned`, a no-op on a no-domain reach.
     let config = NodeConfig {
         dht,

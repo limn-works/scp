@@ -3814,19 +3814,6 @@ export class SCP {
     }
   }
 
-  /**
-   * Starts an application node with in-memory storage.
-   *
-   * Omitting `identityDid` requests auto-generation, which a shipped build
-   * refuses: the in-memory key custody, storage, and DHT client it needs compile
-   * only under the `testing` feature (ADR-062 Decision 1/6). The refusal arrives
-   * as a mapped bridge error carrying "auto-generated in-memory node identity is
-   * unavailable in this build". A production caller cannot get one from a create
-   * call either. Every writer to the identity registry — create, migrate,
-   * rotate-key, add-agent, rotate-agent, remove-agent — either fails closed on a shipped build before it
-   * writes, or needs an entry already present, so the registry never fills and
-   * passing `identityDid` finds nothing to resolve.
-   */
   async nodeStartInMemory(identityDid?: string | null): Promise<Node> {
     try {
       const raw = await (this.#native.nodeStartInMemory as (d: string | null) => Promise<unknown>)(
@@ -3839,28 +3826,6 @@ export class SCP {
     }
   }
 
-  /**
-   * Starts an application node with file-backed storage at `dataDir`.
-   *
-   * Omitting `identityDid` reloads a persistent identity and requires
-   * `passphrase`. The identity record lives under the storage key `scp/identity`
-   * in `<dataDir>/storage/`; `<dataDir>/identity.key` holds only the custody key
-   * material, so copying it alone is not enough. Creating one, on every run,
-   * needs a pre-rotation custody backend that only a `testing` build has, so
-   * a shipped build rejects it with the message "node startup failed". The NAPI
-   * layer attaches no code, so `mapBridgeError` defaults `ScpError.code` to
-   * `SCP-UNKNOWN-0000`; match on the message, not the code. It fails closed
-   * rather than mint a nullifier-backed identity.
-   *
-   * With no identity in `dataDir` this build fails on every run, not only the
-   * first: none of this SDK's create calls mints one, so nothing it offers seeds
-   * that directory. The reload branch needs a directory that already holds an
-   * identity record, and a custody holding that record's key handles. Passing
-   * `identityDid` does not help either. Every
-   * writer to the identity registry — create, migrate, rotate-key, add-agent,
-   * rotate-agent, remove-agent — either fails closed on a shipped build before it
-   * writes, or needs an entry already present, so the registry never fills.
-   */
   async nodeStartLocal(
     dataDir: string,
     identityDid?: string | null,

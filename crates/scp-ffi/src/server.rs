@@ -295,11 +295,8 @@ impl Drop for PyRelayHandle {
 /// Opaque handle to a running SCP application node.
 ///
 /// Created by `node_start_in_memory()` or `node_start_local()`. The node
-/// includes a running relay server, a DID identity, and (optionally) persistent
-/// storage. The identity is generated only when the caller omits one AND the
-/// build enables `testing`; a shipped build that must CREATE one fails closed;
-/// reloading an identity the storage already holds needs no explicit identity
-/// and carries no gate. The HTTP server is **not** started automatically --
+/// includes a running relay server, a generated DID identity, and (optionally)
+/// persistent storage. The HTTP server is **not** started automatically --
 /// only the relay is bound.
 #[pyclass(name = "NodeHandle")]
 pub struct PyNodeHandle {
@@ -577,7 +574,7 @@ impl Drop for PyNodeHandle {
 /// registry.
 ///
 /// Looks up the given DID in the `PyO3` bridge identity registry (populated by
-/// the `identity_create*` and migrate paths, never by `identity_load`) and builds a `NodeIdentity` with a configured DID
+/// `PyScp::identity_create`) and builds a `NodeIdentity` with a configured DID
 /// method instance that can sign on behalf of the identity's custody provider.
 ///
 /// # Errors
@@ -658,25 +655,14 @@ impl crate::scp::PyScp {
 
     /// Starts a full application node with in-memory storage.
     ///
-    /// When ``identity_did`` is ``None`` (the default), auto-generation is
-    /// available ONLY in a ``testing`` build, which wires in-memory key custody,
-    /// in-memory storage, and the in-memory DHT client. A shipped build fails
-    /// closed rather than run a node backed by an in-memory DHT nullifier
-    /// (ADR-062 Decision 1/6). Supplying ``identity_did`` instead does not help on
-    /// a shipped build: every writer to the identity registry either fails closed
-    /// before it writes, or needs an entry already present, so the registry never
-    /// fills and the lookup finds nothing.
-    ///
-    /// The failure reaches Python as ``RuntimeError`` carrying the message
-    /// "auto-generated in-memory node identity is unavailable in this build".
-    /// It is NOT a ``ValidationError``: only ``MissingPassphrase`` maps to that.
+    /// When ``identity_did`` is ``None`` (the default), auto-wires in-memory key
+    /// custody, in-memory storage, in-memory DHT client, self-signed TLS, and a
+    /// relay on an OS-assigned port with a fresh DID.
     ///
     /// When ``identity_did`` is provided, the node uses the pre-existing identity
-    /// from the `PyO3` identity registry (populated by the ``identity_create*``
-    /// and migrate paths, never by ``identity_load``). On a `testing` build that
-    /// enables identity portability — the same DID persists across node restarts.
-    /// On a shipped build the registry is empty, for the reason above, so the
-    /// lookup finds nothing.
+    /// from the `PyO3` identity registry (populated by ``PyScp::identity_create``).
+    /// This enables identity portability — the same DID persists across node
+    /// restarts.
     #[pyo3(name = "node_start_in_memory", signature = (identity_did=None))]
     pub fn node_start_in_memory(
         &self,
@@ -725,21 +711,12 @@ impl crate::scp::PyScp {
     /// Opens (or creates) persistent storage at ``<data_dir>/storage/`` and a redb
     /// blob database at ``<data_dir>/blobs.redb``.
     ///
-    /// When ``identity_did`` is ``None`` (the default), the node reloads a
-    /// persistent identity. The record lives under the storage key
-    /// ``scp/identity`` in ``<data_dir>/storage/``; ``<data_dir>/identity.key``
-    /// holds only the custody key material. The ``passphrase``
-    /// parameter is required in this mode. On a shipped build with no identity in
-    /// ``data_dir`` this fails on every run: creating one needs a pre-rotation
-    /// custody backend that only a ``testing`` build has, so it raises
-    /// ``RuntimeError`` with the message "node startup failed" instead of minting
-    /// a nullifier-backed identity. No create call on this bridge mints one either,
-    /// so that directory only ever comes to hold an identity if a ``testing`` build
-    /// put it there, and the registry ``identity_did`` resolves through stays empty.
+    /// When ``identity_did`` is ``None`` (the default), the node creates or
+    /// reloads a persistent identity from ``<data_dir>/identity.key``. The
+    /// ``passphrase`` parameter is required in this mode.
     ///
     /// When ``identity_did`` is provided, the node uses the pre-existing identity
-    /// from the `PyO3` identity registry (populated by the ``identity_create*``
-    /// and migrate paths, never by ``identity_load``).
+    /// from the `PyO3` identity registry (populated by ``PyScp::identity_create``).
     /// No passphrase is required in this mode.
     #[pyo3(name = "node_start_local", signature = (data_dir, identity_did=None, passphrase=None))]
     pub fn node_start_local(

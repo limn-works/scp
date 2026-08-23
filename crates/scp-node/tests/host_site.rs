@@ -2,7 +2,7 @@
 //! library API (the reusable core behind `scp-node --self-host`).
 //!
 //! Drives the FULL host-a-website flow in-process with no real network
-//! exposure: a hermetic tempdir storage path, the DHT layer off (nothing
+//! exposure: a hermetic tempdir storage path, an in-memory DHT (nothing
 //! published), plaintext HTTP, NAT probing skipped (no router port opened), an
 //! OS-assigned free loopback port, and a caller-controlled shutdown. It then
 //! performs a real HTTP `GET` against the running listener and asserts a `200`
@@ -82,8 +82,8 @@ async fn host_site_serves_a_deployed_site_over_http_and_shuts_down() {
 
     let config = HostSiteConfig {
         // Hermetic + offline: plaintext (no TLS dance), Reach::Local (skip NAT,
-        // no router port), and the DHT layer off — `HostSiteConfig::defaults`
-        // supplies `DhtMode::Disabled`, so nothing is published.
+        // no router port), in-memory DHT (nothing published; Local is a
+        // non-publishing reach so Memory is valid).
         tls: TlsMode::Plaintext,
         site_dir: Some(site_dir.clone()),
         port,

@@ -130,11 +130,8 @@ export class Relay implements AsyncDisposable {
 /**
  * Opaque handle to a running SCP application node.
  *
- * An application node includes a running relay server, a DID identity, and
- * (optionally) persistent storage. The identity is generated only when the
- * caller omits one AND the build enables the `testing` feature; a shipped build
- * that must CREATE one fails closed, and reloading an identity the storage
- * already holds needs no explicit identity and carries no gate. Construct via
+ * An application node includes a running relay server, a generated DID
+ * identity, and (optionally) persistent storage. Construct via
  * `scp.nodeStartInMemory(identity?)` or
  * `scp.nodeStartLocal(dir, identity?, passphrase?)`; those methods
  * dispatch through the {@link SCP} class and call `_fromHandle` to

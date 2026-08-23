@@ -54,7 +54,7 @@ site projection** machinery:
    (`/v1/scp/bridge/*`), which are not mounted on the self-host public surface.
 
    `routing_id = SHA-256(context_id)` (no domain separator —
-   `crates/scp-protocol/src/context/mod.rs:141` `broadcast_routing_id`).
+   `crates/scp-protocol/src/context/mod.rs:122` `broadcast_routing_id`).
    `site_handler` (`crates/scp-node/src/projection.rs`, `fn site_handler`) fetches the encrypted
    blob, **decrypts it server-side** with the broadcast key the node holds
    (`open_broadcast_trusted`, `projection.rs`), and returns **plaintext**
@@ -74,14 +74,14 @@ There is **no** relay-served path for site assets and **no** client-side broadca
 pull+decrypt:
 
 - `open_broadcast` (the signature-verifying *client* decryptor,
-  `crates/scp-protocol/src/crypto/sender_keys/broadcast.rs:620`) has **zero production callers** — only the host-side
+  `broadcast.rs:615`) has **zero production callers** — only the host-side
   `open_broadcast_trusted` is wired, inside `scp-node`'s HTTP projection.
-- `broadcast_subscribe` (FFI `crates/scp-ffi/src/context.rs:4873` →
+- `broadcast_subscribe` (FFI `crates/scp-ffi/src/context.rs:4052` →
   `subscribe_broadcast` `crates/scp-runtime/src/context/broadcast_helpers.rs:58`)
   is **local roster membership bookkeeping only** — it opens no socket and
   decrypts nothing.
 - The generic transport-receive path `deliver_incoming`
-  (`crates/scp-runtime/src/context/messaging_helpers.rs:1451`) is **MLS-only**; it
+  (`crates/scp-runtime/src/context/messaging_helpers.rs:1002`) is **MLS-only**; it
   has no `BroadcastEnvelope` branch.
 
 **Consequence:** "is the website reachable?" reduces exactly to "**is the origin
@@ -113,10 +113,9 @@ Three addressing paths, none requiring DNS-as-central-authority:
 - **No DANE/cert-fingerprint-over-DID.** Only local TOFU relay pinning exists
   (`crates/scp-transport/src/native/cert_pin.rs`). A self-signed node cert can't
   be verified against a DID-published fingerprint yet.
-- ~~**PyO3/NAPI client `identity_resolve` use `InMemoryDhtClient`**~~ — no longer
-  true. `build_ffi_dht_client` (`crates/scp-ffi/common/src/dht.rs`) returns the
-  production Pkarr client whenever the `testing` feature is off, and all three
-  bridges route through it, so every shipped build resolves against the real DHT.
+- **PyO3/NAPI client `identity_resolve` use `InMemoryDhtClient`** (resolve against
+  an empty in-process map, not the network). Only the node binary and the UniFFI
+  per-instance production build hit the real DHT.
 
 ---
 
@@ -391,7 +390,4 @@ home line doesn't have. Honest, not fixable from here.
   identity disclosure the binary gates behind `--self-host` + its banner). No new
   protocol logic, specs, ADRs, or enforcement/capability-matrix changes — a
   packaging/ergonomics refactor of the already-shipped self-host flow.
-  (Historical: ADR-062, capability injection, later made `DhtMode::Memory`
-  test-harness-only and put `DhtMode::Disabled` in its place as the shipped
-  no-publish value. This entry records the default as it stood on its own date.)
 - **2026-06-16 (ADR-052 P3a/P5)** — `ApplicationNodeBuilder` and its `.no_domain()` / `.identity_with_storage()` methods were deleted in ADR-052 Phase B-P3a (PR #1815). The `--self-host` binary path now builds `HostSiteConfig { reach: Reach::NatTraversal, tls, dht, … }` and calls `host_site_until` directly (`crates/scp-node/src/main.rs` `run_self_host`). Updated §3, §4, §5, and §6 to reflect the current API. Running log entries from 2026-06-13/2026-06-14 referenced the former typestate builder and are preserved as historical record.

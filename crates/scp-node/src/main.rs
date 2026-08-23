@@ -8,9 +8,7 @@
 //! 2. **Relay-only** (`--relay-only`): Runs a bare [`RelayServer`], identical
 //!    to the standalone `scp-relay` binary.
 //! 3. **Ephemeral** (`--ephemeral`): Runs a full node with all in-memory
-//!    subsystems — nothing persists across restarts. A test-harness mode: the
-//!    in-memory DHT and custody compile only under the `testing` feature, so a
-//!    shipped build exits 1 on this flag.
+//!    subsystems — nothing persists across restarts.
 //! 4. **Self-host** (`--self-host`): Hosts a static website entirely on SCP
 //!    (no DNS name required) — opens an inbound public port, publishes the host's
 //!    IP to the DHT by default, and serves the site over self-signed HTTPS by default
@@ -63,8 +61,7 @@ struct CliConfig {
 /// Accepts:
 ///   `--relay-only`       — relay-only mode
 ///   `--health`           — TCP health probe
-///   `--ephemeral`        — all in-memory subsystems (test-harness only; a
-///                          shipped build exits 1)
+///   `--ephemeral`        — all in-memory subsystems
 ///   `--storage-path <p>` — `SQLite` database directory
 ///   `--help`             — print usage and exit
 fn parse_args() -> CliConfig {
@@ -140,8 +137,7 @@ USAGE:
 
 OPTIONS:
     --relay-only            Run as a bare relay server only (no identity, no HTTP)
-    --ephemeral             Use in-memory storage for all subsystems (no persistence).
-                            A test-harness mode: a shipped build exits 1 on it.
+    --ephemeral             Use in-memory storage for all subsystems (no persistence)
     --self-host             Host a static site entirely on SCP (no DNS name required).
                             Opens an inbound port to the PUBLIC INTERNET and
                             publishes the host's IP to the DHT by default
@@ -506,16 +502,13 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     // Explicit parse: a typo (e.g. "memroy") must NOT silently fall through to
     // the production DHT, which would publish the host's address to the network.
     match parse_dht_mode_or_exit() {
-        // `parse_dht_mode_or_exit` returns `Disabled` for `SCP_NODE_DHT_MODE=disabled`
-        // whichever path asked for it, so this arm is the only thing that rejects
-        // the value for the full relay node. Do not delete it as unreachable.
+        // `parse_dht_mode_or_exit` never returns `Disabled` for the full relay
+        // node (it exits with guidance to use `--self-host`); this arm exists
+        // only to keep the match exhaustive and fails closed if ever reached.
         scp_node::DhtMode::Disabled => {
             tracing::error!(
                 "DhtMode::Disabled is not a full-relay-node mode — the node must publish its DID. \
-                 --self-host serves a site without publishing when SCP_NODE_DHT_MODE=disabled. \
-                 On a build without the `testing` feature it also exits 1, because creating an \
-                 identity needs a pre-rotation custody backend only that feature supplies; \
-                 --relay-only starts on any build, and has no identity at all."
+                 Use --self-host for a non-publishing hosted site."
             );
             std::process::exit(1);
         }
@@ -647,9 +640,9 @@ fn parse_dht_mode_or_exit() -> scp_node::DhtMode {
 /// describes the cleartext exposure instead.
 ///
 /// `publishes_dht` reflects whether `SCP_NODE_DHT_MODE` resolves to `production`
-/// (publish) vs `disabled` (no publish). Under `disabled` the host's address is
-/// NOT published to the DHT, so the IP<->DID disclosure line is replaced with a
-/// line stating the node is reachable but not DHT-discoverable.
+/// (publish) vs `memory` (no publish). Under `memory` the host's address is NOT
+/// published to the DHT, so the IP<->DID disclosure line is replaced with a line
+/// stating the node is reachable but not DHT-discoverable.
 fn self_host_banner(port: u16, plaintext: bool, publishes_dht: bool) -> String {
     let transport_line = if plaintext {
         "  * Transport is PLAINTEXT HTTP (SCP_NODE_SELF_HOST_PLAINTEXT=1): traffic is\n\
@@ -733,20 +726,18 @@ fn env_flag_is_truthy(value: Option<&str>) -> bool {
 /// Opens an inbound TCP port to the public internet (via NAT-PMP/UPnP when the
 /// `upnp` feature is built). Whether the host's address is published to the
 /// Mainline DHT is governed independently by `SCP_NODE_DHT_MODE`:
-/// `production` (the default) publishes; `disabled` does NOT publish — the node
-/// is still reachable on the opened port, the address is just not
-/// DHT-discoverable (share it out-of-band). `disabled` is valid with NAT probing
-/// on or off. (`memory` compiles only under the `testing` feature, so a shipped
-/// build exits 1 on it.) See the
+/// `production` (the default) publishes; `memory` does NOT publish — the node is
+/// still reachable on the opened port, the address is just not DHT-discoverable
+/// (share it out-of-band). `memory` is valid with NAT probing on or off. See the
 /// startup banner.
 async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf>) {
     let port: u16 = startup::env_or("SCP_NODE_SELF_HOST_PORT", 8443u16);
     let plaintext = self_host_plaintext();
     let skip_nat = self_host_skip_nat();
 
-    // -- DHT mode: production pkarr by default; `disabled` for "reachable but not
+    // -- DHT mode: production pkarr by default; memory for "reachable but not
     //    DHT-discoverable" hosting. Parsed BEFORE the banner so the banner can
-    //    state the actual disclosure posture (disabled = address NOT published). --
+    //    state the actual disclosure posture (memory = address NOT published). --
     let dht_mode = parse_dht_mode_or_exit();
     let publishes_dht = matches!(dht_mode, scp_node::DhtMode::Production);
 
@@ -1135,13 +1126,8 @@ async fn main() {
         {
             eprintln!(
                 "ERROR: --ephemeral is a test-harness mode (in-memory DHT/custody) and is not \
-                 available in this build. Use --relay-only, which needs no identity and starts \
-                 on a shipped build. Dropping --ephemeral does NOT help: the full node creates \
-                 an identity on every start, which needs a pre-rotation custody backend this \
-                 build does not have, on this start or any later one. --self-host reloads \
-                 an identity its storage already holds, so it starts only against a \
-                 directory a testing build seeded, and it publishes the host IP unless \
-                 SCP_NODE_DHT_MODE=disabled."
+                 available in this build. Run without --ephemeral for a persistent node, or set \
+                 SCP_NODE_DHT_MODE=disabled for a non-publishing node."
             );
             std::process::exit(1);
         }
@@ -1423,34 +1409,34 @@ mod tests {
         );
     }
 
-    /// With DHT publishing OFF (`SCP_NODE_DHT_MODE=disabled`), the banner must
-    /// NOT claim the host's IP is published — it must instead state the node is
+    /// With DHT publishing OFF (`SCP_NODE_DHT_MODE=memory`), the banner must NOT
+    /// claim the host's IP is published — it must instead state the node is
     /// reachable but not DHT-discoverable. This is the banner half of the M2
-    /// correction: `disabled` (no publish) is a valid self-host mode that opens
-    /// the port without disclosing the address to the DHT.
+    /// correction: `memory` (no publish) is a valid self-host mode that opens the
+    /// port without disclosing the address to the DHT.
     #[test]
-    fn self_host_banner_disabled_mode_states_no_publish() {
+    fn self_host_banner_memory_mode_states_no_publish() {
         let port = 8443u16;
-        let disabled = self_host_banner(port, false, false);
+        let memory = self_host_banner(port, false, false);
 
         // The port is still opened, so the public-internet exposure stands.
         assert!(
-            disabled.contains("PUBLIC INTERNET"),
-            "disabled-mode banner must still disclose public-internet port exposure"
+            memory.contains("PUBLIC INTERNET"),
+            "memory-mode banner must still disclose public-internet port exposure"
         );
         // But the IP<->identity DHT publication line must be GONE.
         assert!(
-            !disabled.contains("PUBLIC IP will be published"),
-            "disabled-mode banner must NOT claim the public IP is published to the DHT"
+            !memory.contains("PUBLIC IP will be published"),
+            "memory-mode banner must NOT claim the public IP is published to the DHT"
         );
         assert!(
-            !disabled.contains("IP<->identity disclosure"),
-            "disabled-mode banner must NOT claim an IP<->identity disclosure"
+            !memory.contains("IP<->identity disclosure"),
+            "memory-mode banner must NOT claim an IP<->identity disclosure"
         );
         // And it must state the no-publish / not-discoverable posture.
         assert!(
-            disabled.contains("DHT publishing is OFF") && disabled.contains("NOT DHT-discoverable"),
-            "disabled-mode banner must state the address is not published and not DHT-discoverable"
+            memory.contains("DHT publishing is OFF") && memory.contains("NOT DHT-discoverable"),
+            "memory-mode banner must state the address is not published and not DHT-discoverable"
         );
     }
 }

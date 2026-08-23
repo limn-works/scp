@@ -70,26 +70,10 @@ pub struct Node;
 ///   with the same storage it reloads the same DID.
 /// - [`Explicit`](IdentitySource::Explicit) — use a pre-existing identity and
 ///   DID document supplied by the caller.
-///
-/// **On a build without the `testing` feature, creating an identity fails closed**
-/// with `IdentityError::NoPreRotationBackend`: creation commits a pre-rotation
-/// commitment (spec §9.7.4.1 §3), and this workspace's only `PreRotationCustody`
-/// implementation is the test harness (ADR-062 §Decision 6). So `Generate` fails
-/// on every start, and `Persisted` fails whenever its storage holds no identity.
-///
-/// `Persisted`'s reload branch carries no gate and does work on a shipped build,
-/// given two things together: a storage slot that already holds an identity, AND a
-/// `custody` that holds the `#0`, `#active`, and `#agent` handles that identity
-/// names. `validate_persisted_custody` checks both presence and public-key
-/// agreement, so a seeded storage slot paired with a different custody fails with
-/// `NodeError::Storage`, not a serving node. Nothing the node itself writes to that
-/// slot, so in practice a `testing` build produced the pair. `Explicit` is the
-/// variant a shipped node starts from without any such precondition.
 pub enum IdentitySource<K: KeyCustody, D: DidMethod> {
     /// Generate a new identity using the provided key custody and DID method.
     ///
     /// The identity is **not** persisted; a fresh DID is created on every start.
-    /// Without the `testing` feature this fails closed instead — see the enum doc.
     Generate {
         /// Key custody backend that holds the node's signing keys.
         custody: Arc<K>,
@@ -100,14 +84,11 @@ pub enum IdentitySource<K: KeyCustody, D: DidMethod> {
     /// [`NodeConfig::storage`] slot.
     ///
     /// First start: generate via `did_method.create(custody)` and persist.
-    /// Subsequent starts with the same storage: reload the same DID. Without the
-    /// `testing` feature the generate half fails closed; the reload half is ungated
-    /// and works when the storage slot already holds one — see the enum doc.
+    /// Subsequent starts with the same storage: reload the same DID.
     Persisted {
         /// Key custody backend that holds the node's signing keys.
         custody: Arc<K>,
-        /// DID method used to create (and, when creation succeeds, publish) the
-        /// identity.
+        /// DID method used to create (and on first run, publish) the identity.
         did_method: Arc<D>,
     },
     /// Use a pre-existing identity and document (boxed to avoid a large variant
@@ -226,8 +207,7 @@ pub enum TlsMode {
 /// publishing the node's public address bound to its DID, so the privacy-worst
 /// behavior is never the path of least resistance (ADR-052 M2).
 ///
-/// The former default, `DhtMode::Memory` (not linked: the variant does not exist
-/// on a default build), is now **test-harness-only**
+/// The former default, [`Memory`](DhtMode::Memory), is now **test-harness-only**
 /// (compiled only under `feature = "testing"`): its in-memory client is a
 /// §17.17.3 resolve nullifier — it publishes to and resolves from a process-local
 /// map no peer ever sees, silently emptying the DHT resolution namespace
@@ -1227,13 +1207,9 @@ impl Node {
     /// Constructs and starts an [`ApplicationNode`] from a [`NodeConfig`]
     /// without requiring encrypted storage.
     ///
-    /// **Testing only.** Production code must use [`Node::start`]. Gated on
-    /// `allow_unencrypted_storage`, which relaxes the `EncryptedStorage` bound.
-    ///
-    /// That gate does NOT keep this out of a release build: `crates/scp-ffi/common`
-    /// enables the feature on its `scp-node` dependency with no cfg, so all three
-    /// shipped bridges reach this function through `start_node_in_memory` and
-    /// `start_node_local`. Tracked as issue 2389.
+    /// **Testing only.** Production code must use [`Node::start`]. Feature-gated
+    /// so it cannot be reached in a release build (preserving the
+    /// `EncryptedStorage` seal).
     ///
     /// # Errors
     ///
@@ -1367,9 +1343,7 @@ mod tests {
             // Domain is publishing-capable; this test opts into Production to
             // exercise the public-hosting path (advisory in P1 — the test's
             // TestDidDht uses an in-memory client, so nothing is published
-            // offline). `DhtMode::Disabled` would be equally valid (see Test 11);
-            // `DhtMode::Memory` would not compile here, because scp-node's own
-            // test build does not enable scp-node's `testing` feature.
+            // offline). `DhtMode::Memory` would be equally valid (see Test 11).
             dht: DhtMode::Production,
             ..NodeConfig::defaults(
                 Reach::Domain {
@@ -1684,15 +1658,15 @@ mod tests {
     // --- Test 11: Domain + DhtMode::Disabled is VALID (the fail-safe direction) --
 
     #[tokio::test]
-    async fn domain_plus_dht_disabled_is_valid() {
+    async fn domain_plus_dht_memory_is_valid() {
         // `NodeConfig::defaults` yields `dht: DhtMode::Disabled`. `DhtMode::Disabled`
         // (do not publish the address to the DHT) is the fail-safe, non-disclosing
         // direction and is valid for EVERY reach, including a publishing-capable
         // `Reach::Domain`: "reachable on the domain, but the address is not
         // published to the DHT; share it out-of-band" — the more-private config.
         // Only `DhtMode::Production` discloses, so only it is an explicit opt-in
-        // (M2); `Disabled` is never an error. This is the positive companion to
-        // Test 12 (NatTraversal + Disabled).
+        // (M2); `Memory` is never an error. This is the positive companion to
+        // Test 12 (NatTraversal + Memory).
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             ..NodeConfig::defaults(
@@ -1721,14 +1695,13 @@ mod tests {
     // --- Test 12: NatTraversal + DhtMode::Disabled is VALID --------------------
 
     #[tokio::test]
-    async fn nat_traversal_plus_dht_disabled_is_valid() {
+    async fn nat_traversal_plus_dht_memory_is_valid() {
         // `Reach::NatTraversal` + `DhtMode::Disabled` is the first-class
         // "reachable-but-not-DHT-discoverable" config: publicly reachable via NAT
         // traversal, but the address is NOT published to the DHT (share it
-        // out-of-band). `Disabled` is the fail-safe, non-disclosing direction and
-        // must never be rejected; only `DhtMode::Production` discloses (M2). The
-        // `--self-host` path honours `SCP_NODE_DHT_MODE=disabled` for this config;
-        // the full relay node rejects it, because it must publish its DID.
+        // out-of-band). `Memory` is the fail-safe, non-disclosing direction and
+        // must never be rejected; only `DhtMode::Production` discloses (M2). This
+        // is exactly the `SCP_NODE_DHT_MODE=memory` capability the binary exposes.
         let external_addr = SocketAddr::from(([198, 51, 100, 7], 32891));
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),

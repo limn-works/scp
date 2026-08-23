@@ -3097,16 +3097,7 @@ class SCP:
     # region Server
 
     async def node_start_in_memory(self, identity_did: str | None = None) -> Any:
-        """Delegate to ``_scp_core.SCP.node_start_in_memory`` (returns :class:`Node`).
-
-        Passing ``identity_did=None`` requests auto-generation, which a shipped
-        build refuses: the in-memory key custody, storage, and DHT client it
-        needs compile only under the ``testing`` feature (ADR-062 Decision 1/6).
-        The refusal arrives as ``RuntimeError`` carrying "auto-generated
-        in-memory node identity is unavailable in this build". A production caller
-        cannot get one from a create call either, because this SDK's create calls
-        fail closed the same way.
-        """
+        """Delegate to ``_scp_core.SCP.node_start_in_memory`` (returns :class:`Node`)."""
         from scp_sdk.server import Node
 
         raw = await asyncio.to_thread(self._native.node_start_in_memory, identity_did)
@@ -3115,26 +3106,7 @@ class SCP:
     async def node_start_local(
         self, data_dir: str, identity_did: str | None = None, passphrase: str | None = None
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.node_start_local`` (returns :class:`Node`).
-
-        Passing ``identity_did=None`` reloads a persistent identity and requires
-        ``passphrase``. The identity record lives under the storage key
-        ``scp/identity`` in ``<data_dir>/storage/``; ``<data_dir>/identity.key``
-        holds only the custody key material, so copying it alone is not enough.
-        CREATING one, on every run, needs a pre-rotation custody backend that only
-        a ``testing`` build has, so a shipped build raises ``RuntimeError`` carrying
-        the message "node startup failed" rather than mint a nullifier-backed
-        identity. No error code reaches the caller on this path.
-        With no identity in ``data_dir`` this build fails on every run, not only
-        the first: none of this SDK's create calls mints one, so nothing it offers
-        seeds that directory. The reload branch needs a directory that already
-        holds an identity record, and a custody holding that record's key
-        handles. Passing ``identity_did``
-        does not help either. Every writer to the identity registry — create,
-        migrate, rotate-key, add-agent, rotate-agent, remove-agent — either fails closed on a
-        shipped build before it writes, or needs an entry already present, so the
-        registry never fills.
-        """
+        """Delegate to ``_scp_core.SCP.node_start_local`` (returns :class:`Node`)."""
         from scp_sdk.server import Node
 
         raw = await asyncio.to_thread(

@@ -378,14 +378,6 @@ impl Scp {
     /// basis of the cross-bridge parity test (ADR-046). `testing_seed` is
     /// only valid for `"in_memory"` custody; other custody types reject
     /// it with `SCP-VALID-7009`.
-    ///
-    /// On a shipped (no-`testing`) build this FAILS CLOSED before it reaches the
-    /// pre-rotation step: `"in_memory"` returns `SCP-IDENT-1008` and
-    /// `"platform"`/`"software"` return `SCP-IDENT-1003`, and those are the only
-    /// three strings `validate_custody_type` admits. Use
-    /// `identityCreateWithCustody`, whose callback custody is the one napi path
-    /// that reaches pre-rotation — and that fails closed too, with
-    /// `SCP-IDENT-1059`.
     #[napi(js_name = "identityCreate")]
     // napi-rs requires `async` for the Promise return type. Without the
     // in-memory-custody backend the only `.await` (the `"in_memory"` arm) is
@@ -560,14 +552,6 @@ impl Scp {
     ///
     /// Same as [`Self::identity_create`] but the resulting identity also
     /// includes an `#agent` verification method in the DID document.
-    ///
-    /// On a shipped (no-`testing`) build this FAILS CLOSED before it reaches the
-    /// pre-rotation step: `"in_memory"` returns `SCP-IDENT-1008` and
-    /// `"platform"`/`"software"` return `SCP-IDENT-1003`, and those are the only
-    /// three strings `validate_custody_type` admits. Use
-    /// `identityCreateWithCustody`, whose callback custody is the one napi path
-    /// that reaches pre-rotation — and that fails closed too, with
-    /// `SCP-IDENT-1059`.
     #[napi(js_name = "identityCreateWithAgentKey")]
     // napi-rs requires `async` for the Promise return type. Without the
     // in-memory-custody backend the only `.await` (the `"in_memory"` arm) is
@@ -691,11 +675,6 @@ impl Scp {
     ///
     /// The callbacks run on the JS thread; the pre-rotation seed is generated
     /// locally (it never traverses the consumer callbacks), per ADR-006.
-    ///
-    /// On a shipped (no-`testing`) build this FAILS CLOSED with `SCP-IDENT-1059`.
-    /// Callback custody is the one napi path that reaches the pre-rotation step,
-    /// and every identity commits a pre-rotation commitment at creation, whose
-    /// only `PreRotationCustody` implementation is the test harness.
     #[napi(
         js_name = "identityCreateWithCustody",
         ts_return_type = "Promise<NapiIdentity>"
@@ -4564,10 +4543,6 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function `node_start_in_memory`.
-    ///
-    /// Omitting `identity_did` requests auto-generation, which a shipped build
-    /// refuses: the in-memory custody, storage, and DHT client it needs compile
-    /// only under the `testing` feature. The refusal carries no error code.
     #[napi(js_name = "nodeStartInMemory")]
     pub async fn node_start_in_memory(
         &self,
@@ -4577,13 +4552,6 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function `node_start_local`.
-    ///
-    /// Omitting `identity_did` reloads the identity the storage already holds and
-    /// requires `passphrase`. On a shipped build with no identity in storage this
-    /// fails on every run:
-    /// creating an identity needs a pre-rotation
-    /// custody backend that only a `testing` build has, so a shipped build fails
-    /// closed with the message "node startup failed" and no error code.
     #[napi(js_name = "nodeStartLocal")]
     pub async fn node_start_local(
         &self,

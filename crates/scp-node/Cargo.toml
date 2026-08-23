@@ -32,7 +32,7 @@ scp-transport = { path = "../scp-transport", version = "=0.1.0-beta.2", features
 # LONGER enabled here: the production `Node::start` / first-start create path
 # previously minted an `InMemoryPreRotationCustody` (a §17.17.2 security
 # nullifier); with no real pre-rotation backend yet (RFC #2130 / #1729) it now
-# FAILS CLOSED with a typed `IdentityError`. `software_platform`
+# FAILS CLOSED with a typed `IdentityError` (SCP-IDENT-1059). `software_platform`
 # supplies crypto primitives; `in-memory-storage` is the durability-only dev
 # storage affordance. `ApplicationNode::dev` / `start_for_testing` re-add
 # `scp-platform/testing` via this crate's own `testing` feature only.

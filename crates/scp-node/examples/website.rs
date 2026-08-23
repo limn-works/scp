@@ -19,9 +19,9 @@
 //! build fails closed here instead of minting a nullifier-backed identity. The
 //! trailing tag is part of the message the program prints, quoted verbatim.
 //! Reloading a stored identity carries no gate and works on a shipped build. What
-//! fails is creating one, so `$XDG_DATA_HOME/scp/node` only ever comes to hold an
-//! identity if a `testing` build put it there. Given such a directory, this
-//! example serves the site on a shipped build too.
+//! fails is creating one. Given a storage directory that already holds an
+//! identity, and a custody holding that identity's key handles, this example
+//! serves the site on a shipped build too.
 //!
 //! This is a safe LOCAL demo: it uses `TlsMode::Plaintext` (plain HTTP),
 //! `Reach::Local` (no NAT/UPnP probe, loopback-only addressing), and

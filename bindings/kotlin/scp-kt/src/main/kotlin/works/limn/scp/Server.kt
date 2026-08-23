@@ -38,8 +38,7 @@ interface ServerBindings {
     /**
      * Starts a full application node with in-memory storage.
      *
-     * @param identityDid DID string of a pre-existing identity. Passing null requests
-     *   auto-generation, which only a `testing` build provides.
+     * @param identityDid DID string of a pre-existing identity, or null to generate a fresh identity.
      * @return JSON-encoded node handle with `relayUrl`, `relayPort`, and `did` fields.
      */
     fun nodeStartInMemory(identityDid: String? = null): String
@@ -48,8 +47,7 @@ interface ServerBindings {
      * Starts a full application node with file-backed storage.
      *
      * @param dataDir Directory for persistent storage.
-     * @param identityDid DID string of a pre-existing identity. Passing null reloads the
-     *   identity the storage already holds, and creates one only on a `testing` build.
+     * @param identityDid DID string of a pre-existing identity, or null to generate a fresh identity.
      * @param passphrase Passphrase for Argon2id key derivation. Required when identityDid is null.
      * @return JSON-encoded node handle with `relayUrl`, `relayPort`, and `did` fields.
      */
@@ -188,7 +186,7 @@ internal data class NodeInfo(
  *
  * Implements [AutoCloseable] so it can be used with Kotlin's `use` extension:
  * ```kotlin
- * Relay.startInMemory(bridge).use { relay ->
+ * Relay.startInMemory().use { relay ->
  *     println(relay.relayUrl)
  * } // shutdown() called automatically
  * ```
@@ -261,15 +259,12 @@ class Relay internal constructor(
  * Opaque handle to a running SCP application node.
  *
  * Created via [Node.Companion.startInMemory] or [Node.Companion.startLocal].
- * The node includes a running relay server, a DID identity, and (optionally)
- * persistent storage. The identity is generated only when the caller omits one
- * AND the build enables `testing`; a shipped build that must CREATE one fails
- * closed, and reloading an identity the storage already holds needs no explicit
- * identity and carries no gate.
+ * The node includes a running relay server, a generated DID identity, and
+ * (optionally) persistent storage.
  *
  * Implements [AutoCloseable] so it can be used with Kotlin's `use` extension:
  * ```kotlin
- * Node.startInMemory(bridge).use { node ->
+ * Node.startInMemory().use { node ->
  *     println(node.relayUrl)
  *     println(node.did)
  * } // shutdown() called automatically
@@ -434,29 +429,15 @@ class Node internal constructor(
         /**
          * Starts a full application node with in-memory storage.
          *
-         * When [identityDid] is provided, a shipped build REJECTS it: UniFFI's
-         * `build_node_identity_from_uniffi` is replaced under
-         * `cfg(not(feature = "testing"))` by a stub that always returns
-         * `ScpException.Identity` with code `SCP-IDENT-1013`. On a `testing`
-         * build the node uses the pre-existing identity, so the same DID
-         * persists across restarts.
+         * When [identityDid] is provided, the node uses the pre-existing
+         * identity instead of generating a fresh one. This enables identity
+         * portability -- the same DID persists across node restarts.
          *
-         * Passing null for [identityDid] requests auto-generation, which is
-         * available ONLY in a `testing` build (in-memory key custody, in-memory
-         * storage, and the in-memory DHT client). A shipped build fails closed
-         * rather than run a node backed by an in-memory DHT nullifier. A
-         * production caller cannot get one from a create call either, because
-         * this SDK's create calls fail closed the same way. Self-signed TLS; relay on an
-         * OS-assigned port.
-         *
-         * The failure arrives as `ScpException.Validation` with code
-         * `SCP-VALID-7004` and the message "auto-generated in-memory node
-         * identity is unavailable in this build". A missing storage passphrase
-         * shares that code, so read the message to tell the two apart.
+         * Auto-wires in-memory key custody, in-memory storage, in-memory DHT
+         * client, self-signed TLS, and a relay on an OS-assigned port.
          *
          * @param bridge The [ServerBridge] providing FFI access.
-         * @param identityDid DID string of a pre-existing identity. Passing null
-         *   requests auto-generation, which only a `testing` build provides.
+         * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.
          * @return A [Node] with [relayUrl] and [did] populated.
          */
         suspend fun startInMemory(
@@ -468,35 +449,15 @@ class Node internal constructor(
          * Starts a full application node with file-backed storage.
          *
          * When [identityDid] is provided, the node uses the pre-existing
-         * identity. When `null`, the node reloads a persistent identity via
-         * `FileKeyCustody`, and [passphrase] is required. CREATING one, on
-         * every run, needs a pre-rotation custody backend that only a `testing`
-         * build has, so a shipped build fails closed rather than mint a
-         * nullifier-backed identity. The failure arrives as
-         * `ScpException.Identity` with code `SCP-TRANS-5051` and the message
-         * "node identity operation failed".
-         * With no identity in [dataDir] this build fails on every run, not only
-         * the first: none of this SDK's create calls mints one, so nothing it
-         * offers seeds that directory. The reload branch needs a directory that
-         * already holds an identity record, and a custody holding that record's
-         * key handles. Passing [identityDid] does not help either, for the
-         * reason below.
-         *
-         * On a shipped build, supplying [identityDid] does not work:
-         * UniFFI's `build_node_identity_from_uniffi` is replaced under
-         * `cfg(not(feature = "testing"))` by a stub that always returns
-         * `ScpException.Identity` with code `SCP-IDENT-1013`, because node
-         * identity portability needs custody access the mobile bridge does not
-         * have. Use platform custody with `IdentitySource::Persisted` on
-         * `NodeConfig` directly.
+         * identity. When `null`, the node creates or reloads a persistent
+         * identity via `FileKeyCustody`. The [passphrase] parameter is
+         * required in this mode.
          *
          * No passphrase is required when [identityDid] is provided.
          *
          * @param bridge The [ServerBridge] providing FFI access.
          * @param dataDir Directory for persistent storage.
-         * @param identityDid DID string of a pre-existing identity. Passing null
-         *   reloads the identity the storage already holds, and creates one only on a
-         *   `testing` build.
+         * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.
          * @param passphrase Passphrase for Argon2id key derivation. Required when identityDid is null.
          * @return A [Node] with [relayUrl] and [did] populated.
          */
@@ -558,12 +519,10 @@ class ServerBridge internal constructor(
     /**
      * Starts a full application node with in-memory storage.
      *
-     * When [identityDid] is provided, a shipped build REJECTS it with
-     * `SCP-IDENT-1013`; on a `testing` build the node uses the pre-existing
+     * When [identityDid] is provided, the node uses the pre-existing
      * identity instead of generating a fresh one.
      *
-     * @param identityDid DID string of a pre-existing identity. Passing null
-     *   requests auto-generation, which only a `testing` build provides.
+     * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.
      * @return A [Node] with [Node.relayUrl] and [Node.did] populated.
      */
     suspend fun startNodeInMemory(identityDid: String? = null): Node =
@@ -583,9 +542,7 @@ class ServerBridge internal constructor(
      * Starts a full application node with file-backed storage.
      *
      * @param dataDir Directory for persistent storage.
-     * @param identityDid DID string of a pre-existing identity. Passing null
-     *   reloads the identity the storage already holds, and creates one only on a
-     *   `testing` build.
+     * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.
      * @param passphrase Passphrase for Argon2id key derivation. Required when identityDid is null.
      * @return A [Node] with [Node.relayUrl] and [Node.did] populated.
      */

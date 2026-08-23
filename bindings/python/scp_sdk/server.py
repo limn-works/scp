@@ -87,11 +87,8 @@ class Relay:
 class Node:
     """Opaque handle to a running SCP application node.
 
-    An application node includes a running relay server, a DID identity, and
-    (optionally) persistent storage. The identity is generated only when the
-    caller omits one AND the build enables ``testing``; a shipped build that must
-    CREATE one fails closed, and reloading an identity the storage already holds
-    needs no explicit identity and carries no gate. Construct via
+    An application node includes a running relay server, a generated DID
+    identity, and (optionally) persistent storage. Construct via
     :meth:`scp_sdk.SCP.node_start_in_memory` or
     :meth:`scp_sdk.SCP.node_start_local`.
     """

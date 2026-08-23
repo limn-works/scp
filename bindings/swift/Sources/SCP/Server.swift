@@ -96,11 +96,8 @@ public struct Relay: Sendable {
 
 /// Ergonomic wrapper around a running SCP application node.
 ///
-/// An application node includes a running relay server, a DID identity, and
-/// (optionally) persistent storage. The identity is generated only when the
-/// caller omits one AND the build enables `testing`; a shipped build that must
-/// CREATE one fails closed, and reloading an identity the storage already holds
-/// needs no explicit identity and carries no gate. Use the static factory
+/// An application node includes a running relay server, a generated DID
+/// identity, and (optionally) persistent storage. Use the static factory
 /// methods ``startInMemory(scp:identity:)`` or
 /// ``startLocal(scp:dataDir:identity:passphrase:)`` to create an instance.
 ///
@@ -139,30 +136,16 @@ public struct Node: Sendable {
 
     /// Starts a full application node with in-memory storage.
     ///
-    /// When `identity` is provided, a shipped build REJECTS it: UniFFI's
-    /// `build_node_identity_from_uniffi` is replaced under
-    /// `cfg(not(feature = "testing"))` by a stub that always returns
-    /// ``ScpError/Identity`` with code `SCP-IDENT-1013`, because node identity
-    /// portability needs custody access the mobile bridge does not have. On a
-    /// `testing` build the node uses the pre-existing identity, so the same DID
-    /// persists across restarts.
+    /// When `identity` is provided, the node uses the pre-existing identity
+    /// instead of generating a fresh one. This enables identity portability --
+    /// the same DID persists across node restarts.
     ///
-    /// Passing `nil` for `identity` requests auto-generation, which is available
-    /// ONLY in a `testing` build (in-memory key custody, in-memory storage, and
-    /// the in-memory DHT client). A shipped build fails closed rather than run a
-    /// node backed by an in-memory DHT nullifier. A production caller cannot get
-    /// one from a create call either, because this SDK's create calls fail closed
-    /// the same way. Self-signed TLS; relay on an OS-assigned port.
-    ///
-    /// The failure arrives as `ScpError.Validation` with code
-    /// `SCP-VALID-7004` and the message "auto-generated in-memory node identity
-    /// is unavailable in this build". A missing storage passphrase shares that
-    /// code, so read `msg` to tell the two apart.
+    /// Auto-wires in-memory key custody, in-memory storage, in-memory DHT
+    /// client, self-signed TLS, and a relay on an OS-assigned port.
     ///
     /// - Parameters:
     ///   - scp: The SDK-level ``SCP`` instance that will own the minted handle.
-    ///   - identity: A pre-existing ``Identity``. Passing `nil` requests
-    ///     auto-generation, which only a `testing` build provides.
+    ///   - identity: A pre-existing ``Identity`` to use, or `nil` to generate a fresh one.
     /// - Returns: A ``Node`` with ``relayUrl`` and ``did`` populated.
     /// - Throws: ``ScpError`` if startup fails.
     public static func startInMemory(
@@ -175,28 +158,9 @@ public struct Node: Sendable {
 
     /// Starts a full application node with file-backed storage.
     ///
-    /// When `identity` is provided, the node uses the pre-existing identity
-    /// (on a `testing` build only).
-    /// When `nil`, the node reloads a persistent identity via `FileKeyCustody`,
-    /// and the `passphrase` parameter is required. CREATING one, on every run,
-    /// needs a pre-rotation custody backend that only a `testing` build has, so
-    /// a shipped build throws rather than mint a nullifier-backed identity.
-    /// The failure arrives as `ScpError.Identity` with code `SCP-TRANS-5051` and
-    /// the message "node identity operation failed".
-    ///
-    /// With no identity in `dataDir` this build fails on every run, not only the
-    /// first: none of this SDK's create calls mints one, so nothing it offers seeds
-    /// that directory. The reload branch needs a directory that already holds an
-    /// identity record, and a custody holding that record's key handles. Passing
-    /// `identity` does not help either, for a
-    /// reason specific to this bridge: see the `SCP-IDENT-1013` note below.
-    ///
-    /// On a shipped build, supplying `identity` does not work either: UniFFI's
-    /// `build_node_identity_from_uniffi` is `#[cfg(not(feature = "testing"))]`-
-    /// replaced by a stub that always returns ``ScpError/Identity`` with code
-    /// `SCP-IDENT-1013`, because node identity portability needs custody access
-    /// the mobile bridge does not have. Use platform custody with
-    /// `IdentitySource::Persisted` on `NodeConfig` directly.
+    /// When `identity` is provided, the node uses the pre-existing identity.
+    /// When `nil`, the node creates or reloads a persistent identity via
+    /// `FileKeyCustody`. The `passphrase` parameter is required in this mode.
     ///
     /// No passphrase is required when `identity` is provided.
     ///
@@ -206,9 +170,7 @@ public struct Node: Sendable {
     /// - Parameters:
     ///   - scp: The SDK-level ``SCP`` instance that will own the minted handle.
     ///   - dataDir: Directory for persistent storage.
-    ///   - identity: A pre-existing ``Identity``. Passing `nil` reloads the
-    ///     identity the storage already holds, and creates one only on a `testing`
-    ///     build.
+    ///   - identity: A pre-existing ``Identity`` to use, or `nil` to generate a fresh one.
     ///   - passphrase: Passphrase for Argon2id key derivation. Required when
     ///     `identity` is `nil`.
     /// - Returns: A ``Node`` with ``relayUrl`` and ``did`` populated.

@@ -50,14 +50,8 @@ pub type ConcreteDidMethod = DidDht<FfiDhtClient, SystemClock>;
 ///
 /// When `Some(NodeIdentity)` is passed to [`start_node_in_memory`] or
 /// [`start_node_local`], the node uses this identity instead of generating
-/// a fresh one. On a `testing` build that enables identity portability — the
-/// same DID persists across node restarts and can be shared across FFI bridge
-/// instances. No bridge hands a shipped-build caller one: `PyO3` and napi
-/// resolve it from an identity registry that never fills, and `UniFFI` rejects
-/// any supplied identity with `SCP-IDENT-1013`. Every field is `pub` and the
-/// struct carries no `#[non_exhaustive]`, so a Rust consumer depending on this
-/// crate by path constructs one directly — `publish = false` does not stop a
-/// path dependency.
+/// a fresh one. This enables identity portability — the same DID persists
+/// across node restarts and can be shared across FFI bridge instances.
 pub struct NodeIdentity {
     /// The SCP identity containing key handles and DID string.
     pub identity: ScpIdentity,
@@ -310,13 +304,11 @@ pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerEr
 /// When `identity` is `None` (auto-generate): available ONLY in a `testing`
 /// build via the test-harness `ApplicationNode::dev` (in-memory key custody,
 /// [`InMemoryStorage`](scp_platform::in_memory::InMemoryStorage), and the
-/// `InMemoryDhtClient` nullifier — no real DHT
+/// [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) nullifier — no real DHT
 /// network). A shipped (no-`testing`) build FAILS CLOSED with
 /// [`ServerError::AutoGenerateUnavailable`] rather than run a nullifier-backed
-/// node (ADR-062 §Decision 1/6). A production caller cannot supply
-/// `Some(NodeIdentity)` from a create call on this crate's surface either, which
-/// fails closed the same way. (A Rust consumer of `scp-identity` can still mint
-/// one — see issue 2392.) Self-signed TLS (localhost); relay bound to
+/// node (ADR-062 §Decision 1/6); production callers pass an explicit
+/// `Some(NodeIdentity)`. Self-signed TLS (localhost); relay bound to
 /// `127.0.0.1:0` (OS-assigned port).
 ///
 /// When `identity` is `Some(NodeIdentity)`, the node uses the pre-existing
@@ -328,9 +320,7 @@ pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerEr
 ///
 /// # Errors
 ///
-/// Returns [`ServerError::AutoGenerateUnavailable`] when `identity` is `None` on a
-/// shipped build, where ADR-062 §Decision 6 severed the auto-generate arm, and
-/// [`ServerError::Node`] if relay binding, identity generation, or TLS
+/// Returns [`ServerError::Node`] if relay binding, identity generation, or TLS
 /// provisioning fails.
 pub async fn start_node_in_memory(
     identity: Option<NodeIdentity>,
@@ -339,8 +329,7 @@ pub async fn start_node_in_memory(
         // Auto-generate uses the test-harness `ApplicationNode::dev` (in-memory
         // DHT nullifier), compiled only under `testing` (ADR-062 §Decision 1).
         // A shipped build fails closed rather than running a nullifier-backed
-        // node. A production caller cannot get one from this crate's create
-        // surface either, which fails closed the same way.
+        // node; callers pass an explicit `Some(NodeIdentity)` in production.
         #[cfg(any(test, feature = "testing"))]
         None => scp_node::ApplicationNode::dev(0).await?,
         #[cfg(not(any(test, feature = "testing")))]
@@ -396,11 +385,8 @@ pub async fn start_node_in_memory(
 ///   `<data_dir>/storage/` — persistent key-value storage for protocol state
 /// - [`BlobStorageBackend::redb`] at `<data_dir>/blobs.redb` — persistent
 ///   relay blob storage
-/// - When `identity` is `None`: the production Mainline DHT client, built from
-///   `ClientDhtConfig::default()`. A `testing` build substitutes the
-///   `InMemoryDhtClient` nullifier so tests stay offline; a shipped build never
-///   reaches it. When `identity` is `Some`, the DID method comes from the
-///   caller's `NodeIdentity` and this function builds no DHT client.
+/// - [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) (no real DHT
+///   network — suitable for local-only use)
 /// - Self-signed TLS (for the localhost domain)
 /// - Relay bound to `127.0.0.1:0` (OS-assigned port)
 ///
@@ -410,31 +396,16 @@ pub async fn start_node_in_memory(
 /// # Identity modes
 ///
 /// When `identity` is `Some(NodeIdentity)`, the node uses the pre-existing
-/// identity. On a `testing` build that enables identity portability — the same
-/// DID persists across node restarts and can be shared across FFI bridge
-/// instances. On a shipped build see the note on [`NodeIdentity`]: no bridge
-/// gives a caller a way to obtain one.
+/// identity. This enables identity portability — the same DID persists
+/// across node restarts and can be shared across FFI bridge instances.
 ///
-/// When `identity` is `None`, the node reloads a persistent identity via
-/// [`FileKeyCustody`](scp_platform::file::FileKeyCustody), whose keystore is
-/// `<data_dir>/identity.key` (the identity record itself lives under the storage
-/// key `scp/identity` in `<data_dir>/storage/`). The `passphrase` parameter is
+/// When `identity` is `None`, the node creates or reloads a persistent
+/// identity via [`FileKeyCustody`](scp_platform::file::FileKeyCustody)
+/// backed by `<data_dir>/identity.key`. The `passphrase` parameter is
 /// required in this mode — there is no environment variable fallback.
 ///
-/// With no identity in storage, a shipped build fails here on every run, not only
-/// the first. Reloading a DID from storage carries no gate and does work; creating
-/// one needs a `PreRotationCustody`
-/// backend (spec §9.7.4.1 §3) whose only implementation is the test-harness
-/// `InMemoryPreRotationCustody`, so `IdentityError::NoPreRotationBackend` comes
-/// back instead. This crate's own create surface fails closed the same way, so
-/// nothing an FFI caller can invoke puts an identity into `data_dir` and the
-/// reload branch needs a slot that already holds an identity record and a custody
-/// that holds that record's key handles. (A Rust consumer of `scp-identity` can still mint
-/// one: `DidMethod::create` takes a caller-supplied `PreRotationCustody`, and that
-/// trait is not sealed — see issue 2392.) `identity` is a different matter — every field of `ScpIdentity` and
-/// `DidDocument` is public, so a caller CAN assemble one by hand, and such an
-/// identity carries a pre-rotation commitment whose preimage no custody holds,
-/// which makes spec §9.7.4.1 Layer-2 recovery permanently impossible for it.
+/// On first run, a new DID is generated and persisted to storage. On
+/// subsequent runs, the same DID is reloaded from storage.
 ///
 /// For fully ephemeral setups use [`start_node_in_memory`].
 ///
@@ -445,13 +416,6 @@ pub async fn start_node_in_memory(
 /// - The filesystem storage cannot be initialized ([`ServerError::Platform`])
 /// - The redb blob database cannot be opened ([`ServerError::Storage`])
 /// - No passphrase provided when `identity` is `None` ([`ServerError::MissingPassphrase`])
-/// - `identity` is `None` on a shipped build AND `data_dir` holds no identity,
-///   because creating one needs a `PreRotationCustody` backend that only a
-///   `testing` build has ([`ServerError::Node`], whose `user_message` is "node
-///   startup failed"). The reload branch succeeds only when the directory holds
-///   an identity record AND the custody holds that record's key handles; with the
-///   record present and the handles absent it returns [`ServerError::Storage`],
-///   because `validate_persisted_custody` runs on every reload.
 /// - Relay binding, identity generation, or TLS fails ([`ServerError::Node`])
 pub async fn start_node_local(
     data_dir: &Path,

@@ -7,7 +7,7 @@ SCP relays are untrusted dumb pipes that store and forward opaque, encrypted blo
 SCP provides two relay deployment options:
 
 1. **`scp-relay`** -- A standalone relay binary. Accepts WebSocket connections, stores blobs, and forwards them to subscribers. No identity, no HTTP server, no DID document.
-2. **`scp-node`** -- A full application node that composes a relay, a DID identity, HTTP endpoints (`.well-known/scp`, broadcast projection), and TLS provisioning into a single deployable unit. The dev API is a library-only surface; no binary mode enables it.
+2. **`scp-node`** -- A full application node that composes a relay, a DID identity, HTTP endpoints (`.well-known/scp`, dev API, broadcast projection), and TLS provisioning into a single deployable unit.
 
 Both binaries are configured via environment variables and CLI flags. Both share the same `RelayServer` core (defined in `crates/scp-transport/src/native/server.rs`).
 
@@ -70,29 +70,22 @@ scp-relay
 
 ### scp-node modes
 
-`scp-node` supports four modes (defined in `crates/scp-node/src/main.rs`):
+`scp-node` supports three modes (defined in `crates/scp-node/src/main.rs`):
 
 | Mode | Flag | Storage | Identity | HTTP | Use case |
 |------|------|---------|----------|------|----------|
-| **Full node** (default) | none | SQLite (SQLCipher) | Generated per start, not persisted | `.well-known/scp` | On a shipped build this exits 1: creating an identity needs a pre-rotation custody backend only a `testing` build has. |
-| **Relay-only** | `--relay-only` | Configurable | None | None | Equivalent to `scp-relay`. The one mode that starts on a shipped build without an existing identity. |
-| **Ephemeral** | `--ephemeral` | All in-memory | Ephemeral DID | `.well-known/scp` | Test harness only. A shipped build exits 1: the mode needs in-memory DHT and custody, which compile only under the `testing` feature. |
-| **Self-host** | `--self-host` | SQLite (SQLCipher) | Persistent DID | Static site + `.well-known/scp` | Hosts a static site on SCP. Opens an inbound port and, unless `SCP_NODE_DHT_MODE=disabled`, publishes the host's IP to the DHT. On a shipped build with no identity in storage this exits 1, on every run, for the same reason as the full node. |
-
-No binary mode enables the dev API. `NodeConfig::defaults` leaves `local_api: None`,
-and neither `main.rs` nor `self_host.rs` sets it, so the endpoints in the dev-API
-section below are reachable only from a library caller that sets the field.
+| **Full node** (default) | none | SQLite (SQLCipher) | Persistent DID | `.well-known/scp` + dev API | Production deployment |
+| **Relay-only** | `--relay-only` | Configurable | None | None | Equivalent to `scp-relay` |
+| **Ephemeral** | `--ephemeral` | All in-memory | Ephemeral DID | `.well-known/scp` + dev API | Development and testing |
 
 ```bash
-# Full node (production) — on a shipped build this exits 1: creating an
-# identity needs a pre-rotation custody backend only a `testing` build has.
+# Full node (production)
 SCP_NODE_DOMAIN=relay.example.com scp-node
 
 # Relay-only mode
 scp-node --relay-only
 
-# Ephemeral mode — test harness only; a shipped build exits 1 on this flag.
-# Build with `--features testing` to use it.
+# Ephemeral mode (everything in memory)
 SCP_NODE_DOMAIN=localhost scp-node --ephemeral
 ```
 
@@ -125,8 +118,7 @@ Additional `RelayConfig` fields with fixed defaults (not configurable via env va
 | `rate_limit_subscribes_per_minute` | `20` | SUBSCRIBE operations per minute per connection |
 | `delivery_jitter_ms` | `50` | Random delivery delay for metadata privacy |
 | `bridge_secret` | `None` | Shared secret for internal bridge auth |
-| `bridge` | `BridgeRole::Disabled` | Whether BRIDGE operations are accepted |
-| `did_record_validation` | `DidRecordValidation::Enabled` | Whether the relay validates stored DID records |
+| `supports_bridge` | `false` | Whether BRIDGE operations are accepted |
 
 ### Node-specific configuration
 
@@ -134,18 +126,12 @@ These only apply to `scp-node` (not `scp-relay`):
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `SCP_NODE_DOMAIN` | (required for the full node) | Domain for full node mode. Not read by `--relay-only` or `--self-host`. |
+| `SCP_NODE_DOMAIN` | (required) | Domain for full node mode |
 | `SCP_NODE_BIND_ADDR` | `0.0.0.0:9000` | HTTP server bind address |
 | `SCP_NODE_TLS_SELF_SIGNED` | `false` | Use self-signed TLS (development only) |
 | `SCP_NODE_PROJECTION_RATE_LIMIT` | `60` | Per-IP rate limit for projection endpoints |
-| `SCP_NODE_DHT_MODE` | `production` | DHT client mode. `production` publishes the node's DID so peers can discover it. `disabled` turns the DHT layer off and is honoured only by `--self-host`; a full relay node rejects it and exits. |
+| `SCP_NODE_DHT_MODE` | `production` | DHT client mode: `production` or `memory` |
 | `SCP_NODE_DHT_GATEWAYS` | (none) | Comma-separated DHT HTTP gateway URLs |
-| `SCP_NODE_SELF_HOST` | `0` | Enable self-host mode (equivalent to `--self-host`) |
-| `SCP_NODE_SITE_DIR` | (none) | Directory of static files to serve under self-host |
-| `SCP_NODE_SELF_HOST_PORT` | `8443` | Port the hosted site listens on |
-| `SCP_NODE_SELF_HOST_PLAINTEXT` | `0` | Serve plain HTTP instead of self-signed HTTPS |
-| `SCP_NODE_SELF_HOST_NO_NAT` | `0` | Skip the NAT/UPnP probe |
-| `SCP_NODE_SELF_HOST_REFRESH_SECS` | `1800` | Seconds between self-host site re-deploys, to beat the blob TTL |
 | `SCP_STORAGE_PATH` | `$XDG_DATA_HOME/scp/node` | SQLite database directory |
 | `SCP_STORAGE_KEY` | (auto-generated) | Hex-encoded 32-byte SQLCipher encryption key |
 
@@ -156,12 +142,7 @@ scp-node [OPTIONS]
 
 OPTIONS:
     --relay-only            Run as a bare relay server (no identity, no HTTP)
-    --ephemeral             Use in-memory storage for all subsystems (no persistence).
-                            A test-harness mode: a shipped build exits 1 on it.
-    --self-host             Host a static site on SCP (no DNS name required).
-                            Opens an inbound port and publishes the host's IP to
-                            the DHT unless SCP_NODE_DHT_MODE=disabled.
-    --site-dir <PATH>       Directory of static files to serve under --self-host
+    --ephemeral             Use in-memory storage for all subsystems
     --storage-path <PATH>   SQLite database directory
     --health                TCP health probe (exit 0/1)
     --help, -h              Show help
@@ -254,8 +235,8 @@ kill -TERM $(pidof scp-relay)
 The full node (`scp-node` without `--relay-only`) starts an `ApplicationNode` (defined in `crates/scp-node/src/lib.rs`) that composes:
 
 - A relay server (internal, on a random port with bridge secret auth)
-- A DID identity, generated per start and NOT persisted: the full-node path passes `IdentitySource::Generate`, which `Node::start` maps to `persist = false`
-- An HTTP server serving `.well-known/scp`, WebSocket upgrade, and broadcast projection (the dev API stays off: `NodeConfig::defaults` leaves `local_api: None` and no binary mode sets it)
+- A DID identity (persistent across restarts via SQLite)
+- An HTTP server serving `.well-known/scp`, WebSocket upgrade, dev API, and broadcast projection
 - Automatic TLS provisioning via ACME (or self-signed for development)
 
 ### Production deployment
@@ -267,120 +248,43 @@ SCP_STORAGE_PATH=/var/lib/scp/node \
 scp-node
 ```
 
-**On a shipped build, the full-node and `--self-host` modes cannot complete a first
-run.** Both need to create an identity, which requires a `PreRotationCustody`
-backend whose only implementation is the test harness, so each exits 1. The
-full-node mode logs `application node failed to build`; `--self-host` logs
-`self-host mode failed`. Two tests in `crates/scp-node/src/lib.rs` pin the two
-paths: `pre_rotation_severance_generate_fails_closed` covers the full node's
-`persist = false` route, and `pre_rotation_severance_persistent_fails_closed`
-covers the `--self-host` route, which `Node::start` normalizes to `Generate` with
-`persist = true`. The real backend is not implemented yet, and the node fails closed
-rather than mint a nullifier-backed identity.
-
-`--relay-only` is unaffected: `run_relay_only` builds a `RelayServer` and no
-identity at all, so it starts on a shipped build.
-
-The steps below therefore describe what the binary does once that backend lands,
-and what a `testing` build does today:
-
+On first run, the node:
 1. Creates the storage directory and generates a SQLCipher encryption key (stored at `$SCP_STORAGE_PATH/.key`, mode 0600).
 2. Generates a new Ed25519 identity and publishes the DID document to the DHT.
 3. Starts the internal relay server with bridge secret authentication.
 4. Provisions a TLS certificate via ACME (unless `SCP_NODE_TLS_SELF_SIGNED=1`).
 5. Starts the HTTP server with `.well-known/scp` endpoint.
 
-The full-node mode fails on **every** run, not only the first. `main.rs` passes
-`IdentitySource::Generate`, `Node::start` maps every arm but `Persisted` to
-`persist = false`, and the resolver returns before it reads storage. So that mode
-never writes an identity either, and the "subsequent runs reload it" case cannot
-arise from it. The reload path is real and ungated, but only the `--self-host`
-flow and the FFI `start_node_local` surface reach it, because those pass
-`IdentitySource::Persisted` — and both still fail closed whenever storage holds no
-identity, because nothing on a shipped path creates the one they would reload. Given
-a storage slot and matching custody that a `testing` build already wrote, the reload
-branch is ungated and does serve.
+On subsequent runs, the node loads the existing identity from SQLite and reuses the DID.
 
 ### Development deployment
 
 ```bash
-# Self-signed TLS; the node still publishes its DID so peers can find it.
-# `--ephemeral` is omitted because a shipped build exits 1 on it. Storage persists
-# to disk; the identity does not, because the full-node path passes
-# `IdentitySource::Generate`, which `Node::start` maps to `persist = false`.
+# Self-signed TLS, in-memory DHT
 SCP_NODE_DOMAIN=localhost \
 SCP_NODE_TLS_SELF_SIGNED=1 \
-scp-node
+SCP_NODE_DHT_MODE=memory \
+scp-node --ephemeral
 ```
-
-A full relay node has no non-publishing DHT mode, because a relay whose DID
-never reaches the DHT cannot be discovered.
-
-`--self-host` does NOT publish nothing by default. `parse_dht_mode_or_exit`
-defaults `SCP_NODE_DHT_MODE` to `production`, so a bare `scp-node --self-host`
-publishes the host's public IP bound to its DID to the global Mainline DHT, and
-the binary prints a banner saying so. Set `SCP_NODE_DHT_MODE=disabled` to get a
-node that publishes nothing.
 
 ### Programmatic usage (Rust SDK)
 
 ```rust
 use std::sync::Arc;
-use scp_did::DidDocument;
-use scp_dht::PkarrDhtClient;
-use scp_identity::{DidDht, ScpIdentity};
-use scp_node::{
-    DhtMode, ExplicitIdentity, IdentitySource, Node, NodeConfig, Reach, TlsMode,
-};
-use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
-use scp_transport::native::storage::BlobStorageBackend;
+use scp_node::ApplicationNodeBuilder;
+use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 
-// `load_node_identity`, `load_node_did_document`, `build_did_method`, and
-// `open_encrypted_storage` are yours to write; this shows the config shape and the
-// type annotations it needs, not a runnable program.
-//
-// `PkarrDhtClient`, `scp_platform::sqlite`, and `BlobStorageBackend::sqlite` each
-// sit behind a feature that is off by default in its own crate, and you do not
-// need to enable any of them: depending on `scp-node` is enough. Cargo unifies the
-// features `scp-node` requests on its own edges into the single build of each
-// dependency, for an external consumer exactly as inside this workspace. Drop
-// `scp-node` from your dependencies and the `scp_dht` and `scp_platform::sqlite`
-// imports stop resolving; `BlobStorageBackend` still imports, and the
-// `::sqlite(...)` constructor is what disappears.
-//
-// The node's own identity paths cannot CREATE one on a shipped build: that needs a
-// `PreRotationCustody` backend which only a `testing` build has, so
-// `IdentitySource::Generate` fails on every start and `::Persisted` fails whenever
-// storage holds no identity.
-//
-// A Rust consumer CAN mint one, because `PreRotationCustody` is an unsealed public
-// trait and `DidMethod::create` takes `&impl PreRotationCustody`. Note what that
-// does NOT mean: `Identity::create` and `Identity::create_ephemeral` both route
-// through the severed `create_inner` and return `NoPreRotationBackend`, so the
-// working path is implementing the trait yourself and calling `DidMethod::create`.
-// See issue 2392 — the severance is enforced at the API, not by construction. This
-// snippet shows the config shape for that case.
-let identity: ScpIdentity = load_node_identity()?;
-let document: DidDocument = load_node_did_document()?;
-let did_method: Arc<DidDht<PkarrDhtClient>> = build_did_method()?;
-let storage: SqliteStorage = open_encrypted_storage(&storage_dir, &storage_key)?;
+let custody = Arc::new(InMemoryKeyCustody::new());
+let did_method = Arc::new(InMemoryDidDht::new());
 
-// `IdentitySource` is generic over the custody and DID-method types, and the
-// `Explicit` arm carries no custody value, so the custody parameter has to be
-// named. `crates/scp-ffi/common/src/server.rs` writes the same turbofish.
-let node = Node::start(NodeConfig {
-    dht: DhtMode::Production,
-    tls: TlsMode::Acme { email: Some("admin@example.com".into()) },
-    ..NodeConfig::defaults(
-        Reach::Domain { domain: "relay.example.com".into() },
-        IdentitySource::<SqliteKeyCustody, DidDht<PkarrDhtClient>>::Explicit(
-            Box::new(ExplicitIdentity { identity, document, did_method }),
-        ),
-        storage,
-        BlobStorageBackend::sqlite(&blob_db)?, // durable backend for a public node
-    )
-})
-.await?;
+let node = ApplicationNodeBuilder::new()
+    .storage(InMemoryStorage::new())
+    .domain("localhost")
+    .generate_identity_with(custody, did_method)
+    .bind_addr("127.0.0.1:0".parse().unwrap())
+    .http_bind_addr("0.0.0.0:9000".parse().unwrap())
+    .build()
+    .await?;
 
 println!("DID: {}", node.identity().did());
 println!("Relay URL: {}", node.relay_url());
@@ -390,30 +294,24 @@ println!("Relay addr: {}", node.relay().bound_addr());
 node.serve(axum::Router::new(), shutdown_signal()).await?;
 ```
 
-### `NodeConfig` fields
+### ApplicationNodeBuilder methods
 
-ADR-052 replaced `ApplicationNodeBuilder` with one flat config struct plus
-`Node::start`. There is no builder and no `.build()`; set the fields you need and
-take the rest from `NodeConfig::defaults`.
-
-| Field | Description |
-|-------|-------------|
-| `reach: Reach` | How the node is reached: `Domain`, `NatTraversal`, `Tunnel`, or `Local` |
-| `identity: IdentitySource<K, D>` | `Generate`, `Persisted`, or `Explicit` |
-| `storage: S` | Platform storage backend; `Node::start` requires `EncryptedStorage` |
-| `blob_storage: BlobStorageBackend` | Relay blob backend (required, no default) |
-| `tls: TlsMode` | `Acme`, `SelfSigned`, `Plaintext`, `Terminated`, or `Custom` |
-| `dht: DhtMode` | `Disabled` (default, no publish) or `Production` |
-| `bind_addr: Option<SocketAddr>` | Internal relay bind address |
-| `http_bind_addr: Option<SocketAddr>` | Public HTTP server bind address |
-| `local_api: Option<SocketAddr>` | Dev API bind address; `None` disables it |
-| `cors_origins: Option<Vec<String>>` | Allowed CORS origins |
-| `dht_gateways: Vec<String>` | DHT HTTP gateway URLs. Carried but not threaded end-to-end: `split_config` discards it, so setting it has no effect today. |
-| `projection_rate_limit: Option<u32>` | Per-IP rate limit for projection endpoints |
-| `dns_provider: Option<DnsProviderConfig>` | Registers a DID-derived subdomain and this node's public IP with the Limn DNS API at `dns.ctx.network`, which runs the Let's Encrypt DNS-01 challenge and returns the certificate. Setting it REPLACES the `tls` provider and overrides the domain; it falls back to self-signed when the API is unreachable. |
-| `nat: NatSlot` | NAT traversal strategy selection |
-| `network_detector: Option<Arc<dyn NetworkChangeDetector>>` | Network change source |
-| `http3: Option<Http3Config>` | HTTP/3 listener config. Exists only under the `http3` feature, which `scp-node` does not enable by default, so a default build has no such field. |
+| Method | Description |
+|--------|-------------|
+| `storage(s)` | Set the platform storage backend |
+| `domain(d)` | Set the domain for TLS and DID document |
+| `no_domain()` | Zero-config mode (spec SS10.12.8) |
+| `generate_identity_with(custody, did_method)` | Generate a new identity on build |
+| `explicit_identity(identity, document, did_method)` | Use a pre-existing identity |
+| `identity_with_storage(custody, did_method)` | Persist/reload identity via storage |
+| `bind_addr(addr)` | Internal relay bind address |
+| `http_bind_addr(addr)` | Public HTTP server bind address |
+| `tls_provider(provider)` | Custom TLS certificate provider |
+| `relay_config(config)` | Override RelayConfig |
+| `local_api()` | Enable the dev API with a generated bearer token |
+| `projection_rate_limit(n)` | Per-IP rate limit for projection endpoints |
+| `nat_strategy(strategy)` | Override NAT traversal strategy |
+| `build()` | Build and start the node (async) |
 
 ---
 
@@ -444,8 +342,6 @@ pub struct CertificateData {
 For development, set `SCP_NODE_TLS_SELF_SIGNED=1`:
 
 ```bash
-# On a shipped build this exits 1, like every full-node invocation: creating an
-# identity needs a pre-rotation custody backend only a `testing` build has.
 SCP_NODE_DOMAIN=localhost \
 SCP_NODE_TLS_SELF_SIGNED=1 \
 scp-node
@@ -470,10 +366,9 @@ pub trait TlsProvider: Send + Sync {
 Per spec section 9.13, all relay connections use TLS 1.3. The `CertResolver` (defined in `crates/scp-node/src/tls.rs`) supports hot-reloading certificates without restarting the server:
 
 ```rust
-// Hot-swap certificate after ACME renewal. `update` takes a rustls
-// `CertifiedKey` and returns (), so there is nothing to `?`.
+// Hot-swap certificate after ACME renewal
 if let Some(resolver) = node.cert_resolver() {
-    resolver.update(new_certified_key);
+    resolver.update(new_cert_data)?;
 }
 ```
 
@@ -522,7 +417,7 @@ SCP_RELAY_LOG_LEVEL=warn scp-relay
 
 ### Dev API (scp-node only)
 
-When enabled by setting `local_api: Some(addr)` on `NodeConfig`, the dev API provides endpoints for inspection and testing:
+When enabled via `ApplicationNodeBuilder::local_api()`, the dev API provides endpoints for inspection and testing:
 
 ```bash
 # The dev token is printed at startup
@@ -536,7 +431,7 @@ The dev API serves endpoints for identity info, context management, relay status
 
 ## 9. NAT Traversal and Zero-Config
 
-`scp-node` supports zero-config deployment behind NAT (spec section 10.12.8). When `reach` is `Reach::NatTraversal` rather than `Reach::Domain`, the node probes its network environment and selects the best reachability tier:
+`scp-node` supports zero-config deployment behind NAT (spec section 10.12.8). When `no_domain()` is used instead of `domain()`, the node probes its network environment and selects the best reachability tier:
 
 | Tier | Method | Relay URL format |
 |------|--------|-----------------|

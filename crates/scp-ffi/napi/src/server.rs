@@ -255,11 +255,8 @@ impl Drop for NapiRelayHandle {
 /// Opaque handle to a running SCP application node.
 ///
 /// Created by `node_start_in_memory` or `node_start_local`. The node
-/// includes a running relay server, a DID identity, and (optionally) persistent
-/// storage. The identity is generated only when the caller omits one AND the
-/// build enables `testing`; a shipped build that must CREATE one fails closed;
-/// reloading an identity the storage already holds needs no explicit identity
-/// and carries no gate. The HTTP server is **not** started automatically —
+/// includes a running relay server, a generated DID identity, and (optionally)
+/// persistent storage. The HTTP server is **not** started automatically —
 /// only the relay is bound.
 #[napi]
 pub struct NapiNodeHandle {
@@ -501,8 +498,8 @@ impl Drop for NapiNodeHandle {
 
 /// Builds a [`NodeIdentity`] from the NAPI identity registry for a given DID.
 ///
-/// Looks up the DID in the global identity registry (populated by the
-/// `identity_create*`, migrate, rotate, and agent-key paths) and constructs a `NodeIdentity` with a properly
+/// Looks up the DID in the global identity registry (populated by
+/// `identity_create`) and constructs a `NodeIdentity` with a properly
 /// configured `DidDht` instance that has signing capability.
 ///
 /// # Errors
@@ -611,11 +608,6 @@ pub(crate) async fn relay_start_local_on(
 // ---------------------------------------------------------------------------
 
 /// Per-bridge-instance implementation of `node_start_in_memory`.
-///
-/// With `identity_did = None` this requests auto-generation, which a shipped
-/// build refuses: the in-memory custody, storage, and DHT client it needs
-/// compile only under the `testing` feature. The refusal arrives as a plain
-/// error whose message names the unavailable auto-generation, with no code.
 pub(crate) async fn node_start_in_memory_on(
     bi: &Arc<NapiBridgeInstance>,
     identity_did: Option<String>,
@@ -648,14 +640,6 @@ pub(crate) async fn node_start_in_memory_on(
 }
 
 /// Per-bridge-instance implementation of `node_start_local`.
-///
-/// With `identity_did = None` this reloads a persistent identity and requires a
-/// passphrase. On a shipped build with no identity in storage this fails on every
-/// run: creating an identity
-/// needs a pre-rotation custody backend
-/// that only a `testing` build has, so a shipped build fails closed with
-/// a plain error whose message is "node startup failed" rather than mint a
-/// nullifier-backed identity. No error code reaches the caller on this path.
 pub(crate) async fn node_start_local_on(
     bi: &Arc<NapiBridgeInstance>,
     data_dir: String,

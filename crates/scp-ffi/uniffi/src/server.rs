@@ -326,11 +326,8 @@ impl Drop for RelayHandle {
 ///
 /// Created by [`Scp::node_start_in_memory`](crate::scp::Scp::node_start_in_memory)
 /// or [`Scp::node_start_local`](crate::scp::Scp::node_start_local). The
-/// node includes a running relay server, a DID identity, and (optionally)
-/// persistent storage. The identity is generated only when the caller omits one
-/// AND the build enables `testing`; a shipped build that must CREATE one fails closed;
-/// reloading an identity the storage already holds needs no explicit identity
-/// and carries no gate. The HTTP server is **not** started
+/// node includes a running relay server, a generated DID identity, and
+/// (optionally) persistent storage. The HTTP server is **not** started
 /// automatically -- only the relay is bound.
 #[derive(uniffi::Object)]
 pub struct NodeHandle {

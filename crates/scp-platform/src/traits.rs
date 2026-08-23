@@ -613,20 +613,13 @@ pub enum PreRotationCustodyError {
 /// boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PreRotationCustodyKind {
-    /// In-process registry. Satisfies the §9.7.4.1 §3 type-level isolation
-    /// requirement (separate custody object, distinct handle type) but does NOT
-    /// satisfy the substrate isolation requirement — the pre-rotation key
-    /// co-resides in the same process memory as operational keys.
-    ///
-    /// NOT a production default. ADR-062 §Decision 6 severed it: the only
-    /// implementation is `InMemoryPreRotationCustody`, compiled under
-    /// `feature = "testing"`, and every production FFI/SDK create path fails
-    /// closed rather than reach for it. The code depends on the custody string,
-    /// not on the bridge: every bridge rejects `in_memory` with `SCP-IDENT-1008`
-    /// and an unwired platform/software custody with `SCP-IDENT-1003` before the
-    /// pre-rotation step, and returns `SCP-IDENT-1059` on the paths that reach it —
-    /// callback custody on all three, `"file"` custody on `PyO3`, and migrate.
-    /// passkey-PRF / hardware-token / Shamir backends are a separate workstream.
+    /// Shipped-but-degraded default backend: in-process registry. Satisfies
+    /// the §9.7.4.1 §3 type-level isolation requirement (separate custody
+    /// object, distinct handle type) but does NOT satisfy the substrate
+    /// isolation requirement — the pre-rotation key co-resides in the same
+    /// process memory as operational keys. Used as the default in production
+    /// FFI/SDK paths until passkey-PRF / hardware-token / Shamir backends
+    /// are wired in as a follow-up workstream.
     InMemory,
     /// FIDO2/U2F hardware security key. Highest security per §9.7.4.1 §4.
     HardwareSecurityKey,
@@ -734,12 +727,10 @@ pub enum PreRotationCustodyKind {
 /// backup). Modeling UX inside the trait would force concrete
 /// flows that don't generalize.
 ///
-/// The only implementation in this workspace, `InMemoryPreRotationCustody`, is
-/// compiled under `feature = "testing"` and is process-memory only — it satisfies
-/// the trait's type-level isolation but not §9.7.4.1 §3 substrate isolation. It is
-/// not linked here because the path does not resolve on a default build. No
-/// production backend ships yet, so every production create path fails closed.
-/// Note that this trait is not sealed: a consumer can implement it (issue 2392).
+/// Today's shipped backend ([`InMemoryPreRotationCustody`](super::testing::InMemoryPreRotationCustody))
+/// is process-memory only — it satisfies the trait's type-level
+/// isolation but not §9.7.4.1 §3 substrate isolation. Production
+/// backends are a separate workstream.
 ///
 /// # Concurrency
 ///

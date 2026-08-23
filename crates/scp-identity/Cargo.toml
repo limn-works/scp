@@ -19,8 +19,7 @@ scp-dht = { path = "../scp-dht", version = "=0.1.0-beta.2" }
 # Phase B-P3e) previously minted an `InMemoryPreRotationCustody` (a §17.17.2
 # security nullifier) on its production `Identity::create` path. With no real
 # pre-rotation backend yet (RFC #2130 / #1729), that create path now FAILS CLOSED
-# with a typed `IdentityError` (surfaced across the FFI as SCP-IDENT-1059)
-# rather than mint the nullifier —
+# with a typed `IdentityError` (SCP-IDENT-1059) rather than mint the nullifier —
 # so `scp-platform/testing` is gone from the shipped graph. The `testing`
 # crate-feature (below) re-adds it for the test harness only. `software_platform`
 # supplies the Ed25519/X25519 crypto primitives. `in-memory-storage` is NOT
