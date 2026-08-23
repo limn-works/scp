@@ -137,7 +137,8 @@ USAGE:
 
 OPTIONS:
     --relay-only            Run as a bare relay server only (no identity, no HTTP)
-    --ephemeral             Use in-memory storage for all subsystems (no persistence)
+    --ephemeral             Use in-memory storage for all subsystems (no persistence).
+                            A test-harness mode: a shipped build exits 1 on it.
     --self-host             Host a static site entirely on SCP (no DNS name required).
                             Opens an inbound port to the PUBLIC INTERNET and
                             publishes the host's IP to the DHT by default
@@ -1409,34 +1410,34 @@ mod tests {
         );
     }
 
-    /// With DHT publishing OFF (`SCP_NODE_DHT_MODE=memory`), the banner must NOT
-    /// claim the host's IP is published — it must instead state the node is
+    /// With DHT publishing OFF (`SCP_NODE_DHT_MODE=disabled`), the banner must
+    /// NOT claim the host's IP is published — it must instead state the node is
     /// reachable but not DHT-discoverable. This is the banner half of the M2
-    /// correction: `memory` (no publish) is a valid self-host mode that opens the
-    /// port without disclosing the address to the DHT.
+    /// correction: `disabled` (no publish) is a valid self-host mode that opens
+    /// the port without disclosing the address to the DHT.
     #[test]
-    fn self_host_banner_memory_mode_states_no_publish() {
+    fn self_host_banner_disabled_mode_states_no_publish() {
         let port = 8443u16;
-        let memory = self_host_banner(port, false, false);
+        let disabled = self_host_banner(port, false, false);
 
         // The port is still opened, so the public-internet exposure stands.
         assert!(
-            memory.contains("PUBLIC INTERNET"),
-            "memory-mode banner must still disclose public-internet port exposure"
+            disabled.contains("PUBLIC INTERNET"),
+            "disabled-mode banner must still disclose public-internet port exposure"
         );
         // But the IP<->identity DHT publication line must be GONE.
         assert!(
-            !memory.contains("PUBLIC IP will be published"),
-            "memory-mode banner must NOT claim the public IP is published to the DHT"
+            !disabled.contains("PUBLIC IP will be published"),
+            "disabled-mode banner must NOT claim the public IP is published to the DHT"
         );
         assert!(
-            !memory.contains("IP<->identity disclosure"),
-            "memory-mode banner must NOT claim an IP<->identity disclosure"
+            !disabled.contains("IP<->identity disclosure"),
+            "disabled-mode banner must NOT claim an IP<->identity disclosure"
         );
         // And it must state the no-publish / not-discoverable posture.
         assert!(
-            memory.contains("DHT publishing is OFF") && memory.contains("NOT DHT-discoverable"),
-            "memory-mode banner must state the address is not published and not DHT-discoverable"
+            disabled.contains("DHT publishing is OFF") && disabled.contains("NOT DHT-discoverable"),
+            "disabled-mode banner must state the address is not published and not DHT-discoverable"
         );
     }
 }

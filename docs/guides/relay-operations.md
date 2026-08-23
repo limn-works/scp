@@ -273,21 +273,22 @@ want a node that publishes nothing.
 ### Programmatic usage (Rust SDK)
 
 ```rust
-use std::sync::Arc;
-use scp_node::ApplicationNodeBuilder;
-use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
+use scp_node::{DhtMode, IdentitySource, Node, NodeConfig, Reach, TlsMode};
+use scp_transport::native::storage::BlobStorageBackend;
 
-let custody = Arc::new(InMemoryKeyCustody::new());
-let did_method = Arc::new(InMemoryDidDht::new());
-
-let node = ApplicationNodeBuilder::new()
-    .storage(InMemoryStorage::new())
-    .domain("localhost")
-    .generate_identity_with(custody, did_method)
-    .bind_addr("127.0.0.1:0".parse().unwrap())
-    .http_bind_addr("0.0.0.0:9000".parse().unwrap())
-    .build()
-    .await?;
+// `dht: DhtMode::Production` publishes this node's address bound to its DID, so
+// peers can discover it. That disclosure is a deliberate opt-in, never a default.
+let node = Node::start(NodeConfig {
+    dht: DhtMode::Production,
+    tls: TlsMode::Acme { email: Some("admin@example.com".into()) },
+    ..NodeConfig::defaults(
+        Reach::Domain { domain: "relay.example.com".into() },
+        IdentitySource::Generate { custody, did_method },
+        storage,
+        BlobStorageBackend::sqlite(&blob_db)?, // durable backend for a public node
+    )
+})
+.await?;
 
 println!("DID: {}", node.identity().did());
 println!("Relay URL: {}", node.relay_url());
