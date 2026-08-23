@@ -347,6 +347,34 @@ cargo deny check
 cargo doc --workspace --no-deps
 ```
 
+## Clearing a security advisory
+
+When a RUSTSEC advisory names a workspace dependency, bump the dependency. Add a
+`deny.toml` ignore entry only when no released version clears the advisory, or when a
+dependency this workspace does not control blocks the upgrade. State that blocking
+upgrade in the entry's comment, and delete the entry in the same change that takes the
+fix — an ignore entry for a patched advisory is a false record.
+
+**Choosing the version.** Take the newest release whose dependency floors this workspace
+already satisfies. Reject a newer release that raises a floor on a native-code dependency
+to supply a capability the workspace does not use, because recompiling a vendored C
+library across every cross-compiled target adds build risk and no security. Decide from
+evidence rather than from the version number: `diff` the candidate's `Cargo.toml` against
+the current one, and read the upstream release notes for every version in between.
+
+**Applying the bump.** Use `cargo update -p <crate> --precise <version>`. A bare
+`cargo update -p <crate>` re-resolves unrelated edges, so read the whole `Cargo.lock` diff
+and revert every change the advisory did not require. Prove the result resolves with
+`cargo metadata --locked --all-features`.
+
+**Verifying.** Run the cargo-deny version `EmbarkStudios/cargo-deny-action@v2` pins, not
+whatever `cargo install` left on the machine. An older cargo-deny misses whole advisory
+classes — 0.19.0 reports nothing for the `unsound` class that 0.20.2 raises as an error —
+so a green run from the wrong binary proves nothing, and an `advisory-not-detected`
+warning from the wrong binary condemns a live entry. cargo-deny also reports an advisory
+against only the highest version of a duplicated crate, so count every copy of the crate
+in `Cargo.lock` before calling an advisory cleared.
+
 ## CI Matrix
 
 Tests are organized into three tiers. See `specs/16-test-infrastructure.md` §16.15 for the full tier definitions, §16.13 test assignments, and feature flag conventions.
