@@ -40,9 +40,10 @@ stable pin, where cargo-fuzz's `-Z` flags are rejected. rustup resolves both wit
 variable involved, `README.md` lists rustup among the prerequisites, and
 `scripts/check-toolchain-wiring.sh` fails when `.mise.toml` names a Rust version source
 again. A `RUSTUP_TOOLCHAIN` exported from anywhere else still overrides both files:
-`scripts/hooks/pre-commit` compares `rustc --version` against the workspace pin before it
-runs cargo, and `fuzz/build.rs` fails the fuzz build when that crate resolves a compiler
-`fuzz/rust-toolchain.toml` does not name.
+`scripts/check-resolved-rustc.sh` compares `rustc --version` against the workspace pin, and
+`scripts/check-toolchain-wiring.sh`, `scripts/hooks/pre-commit`, and
+`scripts/setup-toolchain.sh` each run it; `fuzz/build.rs` fails the fuzz build when that
+crate resolves a compiler `fuzz/rust-toolchain.toml` does not name.
 
 To raise the version: edit `channel` in `rust-toolchain.toml`, run the CI clippy command,
 and fix everything the new release reports in that same pull request. rustup downloads the
@@ -56,7 +57,7 @@ so no group setting would have avoided it — and the `Rust / clippy` required c
 every branch overnight while local runs on 1.97.1 reported a clean pass. See
 `.docs/lessons/pin-the-rust-toolchain-or-ci-drifts-from-local.md`.
 
-`scripts/check-toolchain-wiring.sh` checks the three properties the derivation cannot
+`scripts/check-toolchain-wiring.sh` checks the four properties the derivation cannot
 supply.
 
 First, that every file Docker builds from a `rust` base image carries the ASSERT-PINNED-RUSTC
@@ -136,6 +137,27 @@ holds a `rust` key, rather than matching a line: TOML reaches one key many ways,
 `rust = { version = "…" }`, `"rust" = "…"`, `[tools.rust]`, `[tools."rust"]`,
 `tools.rust = "…"`, `rust.version = "…"`, and `rust = ["…"]`. The line matcher the check ran
 before read four of the eight and reported OK for the other four.
+
+Fourth, that the compiler this shell resolves is the version the pin names. The first three
+checks read files, and `RUSTUP_TOOLCHAIN` lives in the environment, so a shell carrying it
+passes all three while every local `cargo clippy` runs on a compiler this repository does
+not name. `scripts/check-resolved-rustc.sh` holds that comparison, and
+`scripts/hooks/pre-commit` and `scripts/setup-toolchain.sh` run the same file, so one place
+states the criterion. It fails on the variable holding any value, because rustup applies the
+variable in place of the whole toolchain file and `RUSTUP_TOOLCHAIN=1.98.0` therefore drops
+the 13 targets the file lists while resolving the pinned version. It then compares
+`rustc --version` against the channel. rustup's shim installs the toolchain a directory
+selects the first time a compiler runs there, and installing this pin's 13 targets downloads
+about 2 GB, so the comparison runs only when `rustup toolchain list` already holds the
+channel; where it does not, no compiler has resolved in the directory and rustup installs
+exactly the channel on first use. The script prints which of the two it did.
+
+mise is one source of that variable and not the only one. **Every agent worktree under
+`.claude/worktrees/` sits inside the repository root, and mise loads a configuration file
+from every ancestor directory, so a `.mise.toml` in the shared checkout that names a Rust
+version re-exports `RUSTUP_TOOLCHAIN` into every worktree beneath it — including worktrees
+whose own `.mise.toml` names none.** `mise tool rust` prints the file a value came from
+under `Config Source`.
 
 The `Dockerfile` base tag selects a Debian release, so keep the builder stage and the
 runtime stage on the same one. The builder reads `rust:slim-bookworm` and the runtime reads

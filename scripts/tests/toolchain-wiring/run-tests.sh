@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run-tests.sh — exercise all three checks in `scripts/check-toolchain-wiring.sh` against
+# run-tests.sh — exercise all four checks in `scripts/check-toolchain-wiring.sh` against
 # canned repositories.
 #
 # WHAT THIS TESTS.
@@ -41,12 +41,24 @@
 #     of that key holds the gate's parse to all eight spellings mise resolves, and three
 #     further cases cover a tool whose name merely holds the letters `rust`, the setting
 #     naming a tool other than rust, and a document TOML rejects.
+#   * Check 4 fails when `RUSTUP_TOOLCHAIN` holds a value, which replaces the toolchain file
+#     entirely, and when the compiler answering in the repository reports a version other
+#     than the channel the pin names. It passes, and says so, in the one state where running
+#     the compiler would make rustup install the pin: rustup holding no such toolchain. It
+#     fails closed when the pin is absent, when the pin names no channel, and when
+#     `scripts/check-resolved-rustc.sh` is absent. Every other case in this file runs with a
+#     compiler that agrees with the pin, so each one also proves check 4 stays silent then.
+#     One state has no case: `rustc` absent from PATH, which a canned repository cannot
+#     produce without also taking `bash`, `sed`, and `grep` off PATH.
 #
-# HOW EACH CASE IS BUILT. `run_case` makes a temporary directory, writes the gate into
-# `scripts/`, runs `git init` so the gate's `git grep` search and its file listings have a
-# work tree, and writes the case's `ci.yml`, `.mise.toml`, optional `Dockerfile`, optional
-# extra root file, and every path in EXTRA_FILES. The gate `cd`s to its own parent's parent,
-# so that directory becomes its repository root. No canned repository holds
+# HOW EACH CASE IS BUILT. `run_case` makes a temporary directory, writes the gate and
+# `scripts/check-resolved-rustc.sh` into `scripts/`, runs `git init` so the gate's
+# `git grep` search and its file listings have a work tree, and writes the case's `ci.yml`,
+# `.mise.toml`, `rust-toolchain.toml`, optional `Dockerfile`, optional extra root file, and
+# every path in EXTRA_FILES. It also writes a `rustc` and a `rustup` into `stub-bin/` and
+# leads PATH with that directory, so check 4 reads the case's answers rather than the
+# toolchain of whoever runs this harness. The gate `cd`s to its own parent's parent, so that
+# directory becomes its repository root. No canned repository holds
 # `templates/personal-relay/README.md`, the one path BUILT_FROM_DOCUMENTATION names, so
 # every case also proves that a list entry naming an absent file reports nothing.
 #
@@ -88,12 +100,57 @@ failed=0
 #                     canned repository, or "" to copy the gate unchanged. One case uses it
 #                     to put a name Docker builds into the gate's own quotation list, which
 #                     no repository file can do.
+#   PIN_CHANNEL     — the channel the canned `rust-toolchain.toml` names, or "" to write
+#                     the file with no `channel` key. PIN_PRESENT="no" writes no file.
+#   STUB_RUSTC      — the version the canned `rustc` on PATH reports.
+#   STUB_RUSTUP     — the channel the canned `rustup toolchain list` reports as installed,
+#                     or "" to report an empty list.
+#   CASE_RUSTUP_TOOLCHAIN — the value of `RUSTUP_TOOLCHAIN` in the gate's environment. The
+#                     empty string leaves the variable holding nothing, which the gate reads
+#                     the same way it reads an unset variable, so no case has to unset it.
+#   COPY_RESOLVED_RUSTC — "no" leaves `scripts/check-resolved-rustc.sh` out of the canned
+#                     repository, which is the one defect no file's contents can express.
 OMIT_OUTPUT=""
 OMIT_FILTER=""
 MISE_SOURCE="none"
 EXTRA_ROOT_FILE=""
 EXTRA_FILES=()
 GATE_TRANSFORM=""
+PIN_PRESENT="yes"
+PIN_CHANNEL="1.98.0"
+STUB_RUSTC="1.98.0"
+STUB_RUSTUP="1.98.0"
+CASE_RUSTUP_TOOLCHAIN=""
+COPY_RESOLVED_RUSTC="yes"
+
+RESOLVED_RUSTC_CHECK="$REPO_ROOT/scripts/check-resolved-rustc.sh"
+if [[ ! -f "$RESOLVED_RUSTC_CHECK" ]]; then
+    echo "ERROR: $RESOLVED_RUSTC_CHECK does not exist" >&2
+    exit 1
+fi
+
+# The canned repository's rustup and rustc. Check 4 asks rustup which toolchains it holds
+# before it runs rustc, so a case controls both answers and neither stub reaches the
+# network or the real rustup directory.
+emit_stub_rustup() {
+    printf '#!/usr/bin/env bash\n'
+    printf 'if [ "${1:-}" = "toolchain" ] && [ "${2:-}" = "list" ]; then\n'
+    if [[ -n $STUB_RUSTUP ]]; then
+        printf '  echo "%s-x86_64-unknown-linux-gnu (default)"\n' "$STUB_RUSTUP"
+    fi
+    printf 'fi\n'
+}
+
+emit_stub_rustc() {
+    printf '#!/usr/bin/env bash\n'
+    printf 'echo "rustc %s (0123456789 2026-08-18)"\n' "$STUB_RUSTC"
+}
+
+emit_pin() {
+    printf '[toolchain]\n'
+    [[ -n $PIN_CHANNEL ]] && printf 'channel = "%s"\n' "$PIN_CHANNEL"
+    printf 'components = ["clippy", "rustfmt"]\n'
+}
 
 # Every output the canned `changes` job declares. `fuzz` is last and is the one output the
 # gate exempts, because `fuzz-build` compiles from `fuzz/` on a different toolchain file.
@@ -255,12 +312,17 @@ run_case() {
     local root output actual_exit ok=1
 
     root="$TMP_PARENT/$name"
-    mkdir -p "$root/scripts" "$root/.github/workflows"
+    mkdir -p "$root/scripts" "$root/.github/workflows" "$root/stub-bin"
     if [[ -n $GATE_TRANSFORM ]]; then
         "$GATE_TRANSFORM" < "$CHECK" > "$root/scripts/$(basename "$CHECK")"
     else
         cp "$CHECK" "$root/scripts/"
     fi
+    [[ $COPY_RESOLVED_RUSTC == "yes" ]] && cp "$RESOLVED_RUSTC_CHECK" "$root/scripts/"
+    [[ $PIN_PRESENT == "yes" ]] && emit_pin > "$root/rust-toolchain.toml"
+    emit_stub_rustup > "$root/stub-bin/rustup"
+    emit_stub_rustc > "$root/stub-bin/rustc"
+    chmod +x "$root/stub-bin/rustup" "$root/stub-bin/rustc"
     git -C "$root" init -q
     "$ci_producer" > "$root/.github/workflows/ci.yml"
     "$mise_producer" > "$root/.mise.toml"
@@ -275,7 +337,11 @@ run_case() {
         done
     fi
 
-    output=$(bash "$root/scripts/$(basename "$CHECK")" 2>&1)
+    # The canned `stub-bin` leads PATH so check 4 reads the case's rustup and rustc rather
+    # than the ones running this harness, and `RUSTUP_TOOLCHAIN` carries the case's value
+    # rather than whatever the harness's own shell holds.
+    output=$(PATH="$root/stub-bin:$PATH" RUSTUP_TOOLCHAIN="$CASE_RUSTUP_TOOLCHAIN" \
+        bash "$root/scripts/$(basename "$CHECK")" 2>&1)
     actual_exit=$?
 
     if [[ -n "$want_msg" ]] && ! grep -Fq -- "$want_msg" <<< "$output"; then
@@ -910,6 +976,62 @@ GATE_TRANSFORM=gate_declares_a_dockerfile_a_quotation
 run_case "quotation-list-cannot-name-a-file-docker-builds" 1 \
     "whose basename is a name Docker builds" routing_ok mise_ok docker_omits_the_block
 GATE_TRANSFORM=""
+
+# ── Check 4: the compiler this shell resolves ────────────────────────────────────────
+#
+# Every case above runs with a canned rustc reporting the canned pin's channel and a canned
+# rustup holding it, so each one also proves that check 4 stays silent when the compiler
+# agrees. The cases below vary one answer at a time.
+
+# `RUSTUP_TOOLCHAIN` replaces the toolchain file entirely, so the gate fails on the variable
+# holding a value. This case's rustc reports the pinned version, which is what makes the
+# case prove that the version the variable selects does not excuse it: the pin's components
+# and targets are gone either way.
+CASE_RUSTUP_TOOLCHAIN="stable"
+run_case "rustup-toolchain-set-while-the-compiler-matches" 1 \
+    "RUSTUP_TOOLCHAIN=stable is set in this environment" routing_ok mise_ok
+CASE_RUSTUP_TOOLCHAIN=""
+
+# The compiler answers with another version, which is the drift that blocked the merge
+# queue: a local clippy run reports nothing the pinned release's clippy reports.
+STUB_RUSTC="1.97.1"
+run_case "resolved-compiler-disagrees-with-the-pin" 1 \
+    "rustc in this directory is 1.97.1, and rust-toolchain.toml names 1.98.0" \
+    routing_ok mise_ok
+STUB_RUSTC="1.98.0"
+
+# rustup holds no pinned toolchain, so no compiler has resolved here and rustup installs the
+# channel the file names on first use. The gate passes and says which of the two it did, so
+# a reader never takes the skip for a comparison. This is the state of a CI runner for a job
+# that compiles nothing, and the canned rustc reports a mismatching version to prove the
+# gate never ran it.
+STUB_RUSTUP=""
+STUB_RUSTC="1.97.1"
+run_case "rustup-holds-no-pinned-toolchain" 0 \
+    "rustup holds no 1.98.0 toolchain" routing_ok mise_ok
+STUB_RUSTUP="1.98.0"
+STUB_RUSTC="1.98.0"
+
+# The pin is unreadable. Both cases fail closed rather than reporting a compiler that
+# matches nothing.
+PIN_PRESENT="no"
+run_case "pin-file-absent" 1 \
+    "rust-toolchain.toml does not exist, so this directory names no Rust version" \
+    routing_ok mise_ok
+PIN_PRESENT="yes"
+
+PIN_CHANNEL=""
+run_case "pin-file-names-no-channel" 1 \
+    "rust-toolchain.toml names no [toolchain] channel" routing_ok mise_ok
+PIN_CHANNEL="1.98.0"
+
+# The script holding the comparison is absent. The gate reports that rather than counting
+# check 4 as passed, which is what `.docs/lessons/coverage-gates-must-fail-closed.md`
+# requires of every check here.
+COPY_RESOLVED_RUSTC="no"
+run_case "resolved-rustc-check-absent" 1 \
+    "scripts/check-resolved-rustc.sh does not exist" routing_ok mise_ok
+COPY_RESOLVED_RUSTC="yes"
 
 echo ""
 echo "toolchain-wiring cases: $passed passed, $failed failed"

@@ -18,8 +18,9 @@
 # toolchain file of whichever directory a cargo command runs in, so the workspace
 # resolves `rust-toolchain.toml` and `fuzz/` resolves `fuzz/rust-toolchain.toml`;
 # mise would export one RUSTUP_TOOLCHAIN for both, which overrides both files.
-# The Rust check below therefore compares `rustc --version` against the pin
-# instead of asking mise what it installed.
+# The Rust check below therefore runs `scripts/check-resolved-rustc.sh`, which
+# compares `rustc --version` against the pin, instead of asking mise what it
+# installed.
 #
 # This script also covers what neither can: Android SDK/NDK via sdkmanager.
 
@@ -137,31 +138,29 @@ fi
 # ---------------------------------------------------------------------------
 # `rust-toolchain.toml` names the version, and rustup installs it the first time a
 # cargo command runs in this directory. This block runs one so the download happens
-# during setup rather than during someone's first build, then compares what the shell
-# resolved against the pin. `RUSTUP_TOOLCHAIN` overrides the file when it is set, and
-# a shell carrying it compiles and lints on a version this repository does not name,
-# so the mismatch is reported rather than left to surface in CI.
+# during setup rather than during someone's first build, then hands the comparison to
+# `scripts/check-resolved-rustc.sh`. `--check` runs no cargo command, so a machine that
+# has not resolved the pin yet reports that state rather than downloading 2 GB during a
+# verification pass.
 section "Rust toolchain"
 
-RUST_PIN=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
-  "$REPO_ROOT/rust-toolchain.toml" | head -n 1)
+if ! $CHECK_MODE && command -v cargo &>/dev/null; then
+  info "Resolving the toolchain rust-toolchain.toml names..."
+  cargo --version >/dev/null 2>&1 || true
+fi
 
-if [[ -z "$RUST_PIN" ]]; then
-  fail "rust-toolchain.toml names no [toolchain] channel"
-elif ! command -v rustc &>/dev/null; then
-  fail "rustc not found — install rustup from https://rustup.rs"
+# `scripts/check-resolved-rustc.sh` holds the comparison, so this script,
+# `scripts/hooks/pre-commit`, and `scripts/check-toolchain-wiring.sh` all read one file's
+# answer. It prints one line per finding and names no severity, so this script styles each
+# line the way it styles every other line it prints.
+if RESOLVED_RUSTC=$(bash "$REPO_ROOT/scripts/check-resolved-rustc.sh" 2>&1); then
+  while IFS= read -r line; do
+    if [[ -n "$line" ]]; then ok "$line"; fi
+  done <<< "$RESOLVED_RUSTC"
 else
-  if ! $CHECK_MODE; then
-    info "Resolving the pinned toolchain ($RUST_PIN)..."
-    cargo --version >/dev/null 2>&1 || true
-  fi
-  RUST_ACTIVE=$(rustc --version 2>/dev/null | sed -nE 's/^rustc ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')
-  if [[ "$RUST_ACTIVE" == "$RUST_PIN" ]]; then
-    ok "rustc $RUST_ACTIVE matches rust-toolchain.toml"
-  else
-    fail "rustc in this shell is ${RUST_ACTIVE:-unreadable}; rust-toolchain.toml names $RUST_PIN"
-    info "RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-<unset>} overrides the file when it is set — unset it"
-  fi
+  while IFS= read -r line; do
+    if [[ -n "$line" ]]; then fail "$line"; fi
+  done <<< "$RESOLVED_RUSTC"
 fi
 
 # ---------------------------------------------------------------------------

@@ -47,9 +47,28 @@ run resolve different compilers.
 - **State what the derivation does not cover.** It removes every disagreement between two
   files in this repository. It does not remove a `RUSTUP_TOOLCHAIN` that a developer's
   environment exports from somewhere else, so each point that resolves a compiler checks
-  for itself: `scripts/hooks/pre-commit` compares `rustc --version` against the workspace
-  pin before it runs `cargo fmt` and `cargo clippy`, and `fuzz/build.rs` fails the fuzz
+  for itself: `scripts/check-resolved-rustc.sh` holds the comparison, and
+  `scripts/check-toolchain-wiring.sh`, `scripts/hooks/pre-commit`, and
+  `scripts/setup-toolchain.sh` each run it — the gate on every invocation, the hook on every
+  commit, neither conditioned on which files a commit stages. `fuzz/build.rs` fails the fuzz
   crate's build when the compiler cargo resolved is not a nightly.
+- **A nested worktree inherits the parent checkout's tool configuration, so a stale parent
+  checkout reconfigures every worktree under it.** The agent worktrees sit at
+  `<repository root>/.claude/worktrees/<name>`, inside the repository root, and mise loads a
+  configuration file from every ancestor of the directory a command runs in. Each worktree
+  therefore ran with its own `.mise.toml`, which named no Rust version, *and* with the shared
+  checkout's, which still named one because that checkout's `main` pointed behind the commit
+  removing the key — and mise offers a child configuration no way to remove a tool a parent
+  configuration named. `mise tool rust` names the file a value came from, and
+  `mise config ls` lists every file mise loaded.
+- **A check's placement decides where it can fire, and so does every condition guarding
+  it.** Moving the compiler comparison out of CI, where no `RUSTUP_TOOLCHAIN` arises, and
+  into `scripts/hooks/pre-commit` put it where its target arises. In the hook it then sat
+  behind `if $HAS_RUST`, true only when the commit stages a file whose name ends in `.rs`,
+  which narrowed it back to a subset of commits that excludes one staging `Cargo.toml`,
+  `.cargo/config.toml`, a workflow, or a gate script — each of which changes how the
+  workspace compiles. Ask of every guard the same question the placement rule asks: in the
+  state this check exists to catch, does the guard let it run?
 - **A container build's base tag selects a Debian release, and glibc is backward compatible
   only.** A builder stage that links against a newer release's glibc produces binaries that
   cannot exec against an older runtime stage, which dies at startup with
