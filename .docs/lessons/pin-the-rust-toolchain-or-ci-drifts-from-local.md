@@ -249,6 +249,19 @@ The general form: a check that names the things which must be present fails sile
 thing nobody thought of, while a check that enumerates the population and requires each
 member to be classified cannot.
 
+**Rejected alternative: write the `rust` filter as `'**'` followed by exclusions.** That
+inverts the default so an unlisted path runs the lane, which is the safe direction, and it
+would retire the root-file classification. Two things argue against it. First, it does not
+work as written under the action's default: dorny/paths-filter's README says its
+`predicate-quantifier` input defaults to `'some'` — "File is included if it matches at least
+one pattern (default)" — so `'**'` alone makes the filter true for every pull request, and
+the `!`-prefixed exclusions only subtract under `'some-with-excludes'`. Switching the
+quantifier changes matching for all eight filters in the block at once. Second, the cost is
+recurring: with `'**'` minus a directory list, every commit under `.claude/agent-memory/`
+and `.docs/` runs clippy, the test lane, both production builds, cargo-deny, and the ~6 GB
+`docker-image` build, against a failure mode that arises when someone adds a Rust-compiling
+path outside `crates/`.
+
 ## Deleting a Check Because Its Reason Changed Is Not the Same as Deleting It Because Its Target Vanished
 
 Two checks in the 426-line gate had nothing to do with version agreement, and both nearly
