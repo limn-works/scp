@@ -583,6 +583,14 @@ jobs:
           # udp/coap alongside ring-backed quic/http3), so a single combined
           # invocation covers all four.
           cargo clippy -p scp-transport --features quic,http3,udp,coap --all-targets -- -D warnings
+          # The sweep above passes `--features ...testing`, so an example that
+          # compiles only under a `testing`-gated construct still passes it. A
+          # shipped example must build on the default feature set: `website.rs`
+          # selected `DhtMode::Memory` after ADR-062, capability injection,
+          # moved that variant behind `feature = "testing"`, and no job rejected
+          # it. Lint every example with default features so a shipped example
+          # cannot reach a test-only construct.
+          cargo clippy --workspace --examples -- -D warnings
 
   # Matrix jobs must always expand so each OS variant reports a status
   # to branch protection. Step-level `if` skips the heavy work instead.

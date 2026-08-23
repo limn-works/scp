@@ -6,7 +6,7 @@
 //!
 //! This is a safe LOCAL demo: it uses `TlsMode::Plaintext` (plain HTTP),
 //! `Reach::Local` (no NAT/UPnP probe, loopback-only addressing), and
-//! `DhtMode::Memory` — so NO router port is opened and NOTHING is published to
+//! `DhtMode::Disabled` — so NO router port is opened and NOTHING is published to
 //! the network. (The listener binds `0.0.0.0`, so it is also reachable on the
 //! LAN at the host's local IP, but never beyond it.) For PUBLIC hosting, pass
 //! `Reach::NatTraversal` or `Reach::Tunnel { public_url }` to `defaults(...)`, set
@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     host_site(HostSiteConfig {
         tls: TlsMode::Plaintext,
-        dht: DhtMode::Memory,
+        dht: DhtMode::Disabled,
         // `CARGO_MANIFEST_DIR` makes the sample-site path independent of the
         // directory `cargo run` is invoked from.
         site_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/website-site").into()),

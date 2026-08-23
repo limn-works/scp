@@ -384,7 +384,7 @@ home line doesn't have. Honest, not fixable from here.
   over `host_site_until` (env/CLI parsing, the loud banner, and the live-URL
   print stay binary-only via an `on_ready` callback). A runnable example lives at
   `crates/scp-node/examples/website.rs` (`cargo run -p scp-node --example
-  website`). The library default is **fail-safe**: `DhtMode::Memory` publishes
+  website`). The library default is **fail-safe**: `DhtMode::Disabled` publishes
   nothing; public hosting is a deliberate `DhtMode::Production` opt-in (which
   publishes the host's address bound to its DID to the DHT — the same IP-to-
   identity disclosure the binary gates behind `--self-host` + its banner). No new
