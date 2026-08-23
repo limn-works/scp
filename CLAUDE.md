@@ -142,6 +142,10 @@ bridge_ratchet_baseline.json, ratchet/once-lock-count.json,
 check-shipped-feature-graph.sh (ADR-062 §Decision 6 G1 — the shipped-artifact
 feature-graph ⊆-allowlist prove-absence gate; the allowlist permits durability-only
 features only, ZERO nullifier exceptions),
+check-examples-build-shipped.sh (per-package example lint on shipped features; the
+per-package loop is the assertion — collapsing it into `cargo clippy --workspace
+--examples` makes the gate inert, because a workspace-wide selection unifies
+dev-dependency features and turns `scp-node/testing` back on),
 pretooluse-enforcement-files.sh,
 CLAUDE.md (enforcement sections).
 When a check fails, fix the code that the check rejected. You may modify an enforcement file for exactly two reasons:

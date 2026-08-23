@@ -197,6 +197,7 @@ required-features = ["testing"]
 
 [[example]]
 name = "identity"
+required-features = ["testing"]
 
 [[example]]
 name = "context"
