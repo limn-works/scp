@@ -92,7 +92,7 @@ skipped. In `.github/workflows/ci.yml` the pin decides seven lanes, not one:
 
 | Lane | The jobs it guards whose behaviour the pin decides |
 |--------|----------------------------------------------------|
-| `rust` | `rust-fmt`, `rust-clippy`, `rust-test`, `rust-test-napi-production`, `rust-build-pyo3-production`, `rust-build-uniffi-production`, `rust-doc`, `rust-deny`, and `docker-image` |
+| `rust` | `rust-fmt`, `rust-clippy`, `rust-test`, `rust-test-napi-production`, `rust-build-pyo3-production`, `rust-build-uniffi-production`, `rust-doc`, `rust-deny`, `docker-image`, and `template-personal-relay` |
 | `python` | `python-test` runs `maturin develop --release` |
 | `typescript` | `typescript-check` runs `cargo build -p scp-ffi-napi --release` |
 | `typescript-wasm` | `typescript-wasm-check` runs `wasm-pack build` from the repository root |
@@ -128,6 +128,22 @@ nothing else is rare, so an omitted entry stays invisible. A file added to eithe
 population fails the gate until someone classifies it. The `fuzz` lane is exempt from the
 pin: `fuzz-build` runs `cargo check` with `working-directory: fuzz`, where rustup resolves
 `fuzz/rust-toolchain.toml`, and the `fuzz` filter's `fuzz/**` entry covers that file.
+
+A third population takes no declaration at all: every file a Rust source under `crates/`
+names in `include_str!` or `include_bytes!`. `rustc` reads such a file while it builds the
+target the calling source belongs to, so the file decides whether `cargo test --workspace`
+passes whatever its extension is, and the `rust` filter has to route it. This repository
+embeds 49 files that hold no Rust — `CLAUDE.md`, the four language SDKs' sources that
+`crates/scp-testing/tests/integration/sdk_wrapper.rs` asserts on,
+`.docs/standards/sdk-capability-matrix.json` that
+`crates/scp-testing/tests/integration/ffi_conformance.rs` reads, the outlet conformance
+vectors, and two JSON files under `scripts/` — and no filter routed any of them until this
+check existed. `CLAUDE.md` sat in
+the gate's declared-unread list under "No job compiles from them" while
+`crates/scp-testing/tests/integration/pipeline_wiring.rs` embedded it and asserted on two
+of its headings. The check reads those calls out of the tree and reports such a file even
+when the declared-unread list names it, which is the one claim in that list a gate can
+falsify. See `.docs/lessons/a-check-that-does-not-run-reports-success.md`.
 
 `scripts/check-ci-aggregator.sh` closes the other half of the same criterion. Everything
 above turns on the fact that a skipped job reports success, and the `ci` job of

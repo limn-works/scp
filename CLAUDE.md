@@ -144,8 +144,9 @@ feature-graph ⊆-allowlist prove-absence gate; the allowlist permits durability
 features only, ZERO nullifier exceptions),
 check-toolchain-wiring.sh (every container build asserts which compiler it resolved;
 the changes job of every paths-filtered workflow routes a pin change to every lane that
-compiles on it, and ci.yml routes every root-level file and every cargo configuration
-file to a lane or declares it unread; .mise.toml names no Rust version source),
+compiles on it, and ci.yml routes every root-level file, every cargo configuration
+file, and every file a Rust target embeds with include_str!/include_bytes! to a lane, or
+declares it unread; .mise.toml names no Rust version source),
 check-ci-aggregator.sh (the `ci` job of .github/workflows/ci.yml needs every job that
 workflow declares and reads every one of their results, so no job can fail while the one
 required status check reports success),

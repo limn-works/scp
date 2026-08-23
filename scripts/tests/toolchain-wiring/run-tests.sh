@@ -28,6 +28,12 @@
 #     compiles a crate of this workspace is guarded by such an output, and the `ci` job that
 #     aggregates every other job's result counts a skipped job as a pass, so an unrouted
 #     change merges unbuilt.
+#   * Check 2e fails when a file a Rust source under `crates/` embeds with `include_str!`
+#     reaches no entry of the `rust` filter or the `toolchain` filter, and it fails on such
+#     a file even when NO_RUST_JOB_READS declares it unread — which is the case `CLAUDE.md`
+#     was in while `crates/scp-testing/tests/integration/pipeline_wiring.rs` asserted on its
+#     headings. A crate source that embeds nothing reports nothing, because no rule of this
+#     repository requires an embed to exist.
 #   * Check 2 reads every workflow whose jobs a paths filter guards, not `ci.yml` alone.
 #     The cases write a second workflow that compiles on the pin and hold the gate to
 #     reporting the same two defects there; a workflow that declares no paths-filter step
@@ -84,15 +90,18 @@ failed=0
 #   EXTRA_ROOT_FILE — one more root-level file to create, or "" for none.
 #   EXTRA_FILES     — path and producer-function name, in pairs, for files below the root.
 #                     `run_case` creates each parent directory.
+#   EXTRA_RUST_ENTRIES — further path entries for the `rust` filter, or an empty array.
 #   GATE_TRANSFORM  — the name of a function that rewrites the gate on its way into the
-#                     canned repository, or "" to copy the gate unchanged. One case uses it
-#                     to put a name Docker builds into the gate's own quotation list, which
-#                     no repository file can do.
+#                     canned repository, or "" to copy the gate unchanged. Two cases use it:
+#                     one puts a name Docker builds into the gate's own quotation list, and
+#                     one declares an embedded file unread in NO_RUST_JOB_READS. No
+#                     repository file can produce either.
 OMIT_OUTPUT=""
 OMIT_FILTER=""
 MISE_SOURCE="none"
 EXTRA_ROOT_FILE=""
 EXTRA_FILES=()
+EXTRA_RUST_ENTRIES=()
 GATE_TRANSFORM=""
 
 # Every output the canned `changes` job declares. `fuzz` is last and is the one output the
@@ -148,7 +157,7 @@ YAML
     emit_filter toolchain 'rust-toolchain.toml' '.cargo/**'
     # `Dockerfile` and `.mise.toml` are the root-level files every canned repository holds,
     # so the `rust` filter routes the first and the gate's exemption list covers the second.
-    emit_filter rust 'crates/**' 'Dockerfile' 'deny.toml'
+    emit_filter rust 'crates/**' 'Dockerfile' 'deny.toml' ${EXTRA_RUST_ENTRIES[@]+"${EXTRA_RUST_ENTRIES[@]}"}
     emit_filter python 'bindings/python/**'
     emit_filter typescript 'bindings/typescript/**'
     emit_filter typescript-wasm 'bindings/typescript-wasm/**'
@@ -541,6 +550,85 @@ run_case "nested-cargo-config-under-an-unrouted-directory" 1 \
 # A pull request that edits it runs the Rust lane already, so the gate reports nothing.
 EXTRA_FILES=("crates/scp-mls/.cargo/config.toml" cargo_config_wasm_rustflags)
 run_case "nested-cargo-config-routed-by-the-rust-filter" 0 "" emit_ci mise_ok
+EXTRA_FILES=()
+
+# ── Check 2e: the files a Rust target compiles in ────────────────────────────────────
+#
+# `rustc` reads a file named in `include_str!` or `include_bytes!` while it builds the
+# target the calling source belongs to, so that file decides whether `cargo test
+# --workspace` passes. `CLAUDE.md` was such a file, sat in NO_RUST_JOB_READS under "No job
+# compiles from them", and no filter routed it. The cases below cover the routed file, the
+# unrouted one, and the declared-unread one that the check exists to report.
+
+crate_source_embedding_a_root_file() {
+    cat <<'RUST'
+//! A test target that asserts on a file outside this crate.
+#[test]
+fn notes_hold_the_heading() {
+    let notes = include_str!("../../../NOTES.md");
+    assert!(notes.contains("## Enforcement"));
+}
+RUST
+}
+
+crate_source_embedding_a_file_below_docs() {
+    cat <<'RUST'
+//! A test target that asserts on a file under `docs/`.
+#[test]
+fn notes_hold_the_heading() {
+    let notes = include_str!("../../../docs/NOTES.md");
+    assert!(notes.contains("## Enforcement"));
+}
+RUST
+}
+
+crate_source_embedding_nothing() {
+    printf '//! A crate source that embeds no file.\npub fn answer() -> u8 { 42 }\n'
+}
+
+notes_document() {
+    printf '# Notes\n\n## Enforcement\n\nText the test asserts on.\n'
+}
+
+# The embedded file sits under `docs/`, which no entry of the canned `rust` filter routes.
+# The root-file enumeration cannot see it, because its path holds a slash, so check 2e is
+# the only check that reports it.
+EXTRA_FILES=("crates/scp-testing/tests/wiring.rs" crate_source_embedding_a_file_below_docs
+             "docs/NOTES.md" notes_document)
+run_case "embedded-file-routed-by-no-filter" 1 \
+    "docs/NOTES.md is embedded into a Rust target with include_str! or include_bytes!" \
+    emit_ci mise_ok
+
+# The same repository with an entry that routes the directory the file sits in.
+EXTRA_RUST_ENTRIES=('docs/**')
+run_case "embedded-file-routed-by-the-rust-filter" 0 "" emit_ci mise_ok
+EXTRA_RUST_ENTRIES=()
+
+# A crate source that embeds nothing, in a repository that is otherwise routed. The check
+# requires no embed to exist, so it reports nothing.
+EXTRA_FILES=("crates/scp-testing/src/lib.rs" crate_source_embedding_nothing)
+run_case "crate-source-embedding-nothing" 0 "" emit_ci mise_ok
+
+# The regression this check was added for: a root-level file that a Rust test target embeds
+# and that NO_RUST_JOB_READS declares unread. Check 2c takes that declaration at face value
+# and reports nothing, so check 2e is what reports the file.
+gate_declares_notes_unread() {
+    awk '{ print } /^NO_RUST_JOB_READS=\(/ { print "    \"NOTES.md\"" }'
+}
+EXTRA_FILES=("crates/scp-testing/tests/wiring.rs" crate_source_embedding_a_root_file
+             "NOTES.md" notes_document)
+GATE_TRANSFORM=gate_declares_notes_unread
+run_case "embedded-root-file-declared-unread-in-the-gate" 1 \
+    "NOTES.md is embedded into a Rust target with include_str! or include_bytes!" \
+    emit_ci mise_ok
+GATE_TRANSFORM=""
+
+# The same repository with the `rust` filter routing that root file. Both checks pass, so a
+# reader can see that the declaration was the only thing standing between the file and the
+# lane that compiles it.
+EXTRA_RUST_ENTRIES=('NOTES.md')
+run_case "embedded-root-file-routed-by-the-rust-filter" 0 "" emit_ci mise_ok
+EXTRA_RUST_ENTRIES=()
 EXTRA_FILES=()
 
 # ── Check 3: mise names no Rust version source ───────────────────────────────────────

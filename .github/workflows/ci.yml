@@ -96,6 +96,30 @@ jobs:
               # `template-personal-relay` compiles the crate under this prefix and is
               # guarded by this filter, so a change to the template has to reach it.
               - 'templates/personal-relay/**'
+              # The entries below hold no Rust source. A Rust test target embeds each one
+              # with `include_str!` and asserts on its text, so `cargo test --workspace`
+              # compiles the file's current contents and fails when they stop satisfying
+              # the assertion. `crates/scp-testing/tests/integration/pipeline_wiring.rs`
+              # embeds `CLAUDE.md` and requires two of its headings;
+              # `crates/scp-testing/tests/integration/ffi_conformance.rs` embeds
+              # `.docs/standards/sdk-capability-matrix.json`;
+              # `crates/scp-testing/tests/integration/sdk_wrapper.rs` embeds the four
+              # language SDKs' sources; the JSON files under `tests/conformance/vectors/`
+              # and `bindings/typescript-wasm/tests/fixtures/` are the inputs of the outlet
+              # known-answer tests. `scripts/check-toolchain-wiring.sh` reads every such
+              # call out of `crates/**/*.rs` and fails when one names a path no filter here
+              # routes, so a file embedded later is covered without anyone editing this
+              # list.
+              - 'CLAUDE.md'
+              - '.docs/standards/sdk-capability-matrix.json'
+              - 'scripts/bridge-aliases.json'
+              - 'scripts/ffi-export-allowlist.json'
+              - 'tests/conformance/vectors/**'
+              - 'bindings/python/scp_sdk/**'
+              - 'bindings/typescript/src/**'
+              - 'bindings/typescript-wasm/tests/fixtures/**'
+              - 'bindings/swift/Sources/SCP/**'
+              - 'bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/**'
               # `scripts/check-toolchain-wiring.sh` enumerates every root-level file in
               # the git tree, and every cargo configuration file the tree holds at any
               # depth, and fails when one is listed neither here nor in the `toolchain`

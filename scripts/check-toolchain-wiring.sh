@@ -143,12 +143,36 @@
 #   where rustup resolves `fuzz/rust-toolchain.toml`, so the `fuzz` filter's `fuzz/**`
 #   entry is what routes a change to that nightly.
 #
-#   Checks 2c and 2d read `ci.yml` alone, because the `rust` and `fuzz` filters they name
-#   live there and guard the jobs that compile from those files.
+#   2e — THE FILES A RUST TARGET COMPILES IN. THE CRITERION: a file whose contents rustc
+#   reads while it builds a target of this workspace decides whether that target compiles
+#   and whether its assertions hold, whatever the file's extension or directory. `rustc`
+#   reads such a file when a source file names it in `include_str!` or `include_bytes!`,
+#   and the gate enumerates those calls out of `crates/**/*.rs` — every workspace member
+#   lives under `crates/` — resolves each path against the calling file's directory, and
+#   requires the `rust` filter or the `toolchain` filter to route it.
+#
+#   NO_RUST_JOB_READS is a list of claims the gate otherwise takes at face value, and this
+#   check is what falsifies the one kind of claim it can. `CLAUDE.md` sat in that list
+#   under "No job compiles from them" while
+#   `crates/scp-testing/tests/integration/pipeline_wiring.rs` embedded it with
+#   `include_str!` and asserted on two of its headings, so a pull request that renamed
+#   either heading skipped `rust-clippy` and `rust-test` and turned `cargo test
+#   --workspace` red on `main` for the next branch that touched `crates/**`.
+#
+#   WHAT THIS SEARCH DOES NOT COVER, stated rather than implied: it reads a string literal
+#   written on one line and holding no backslash, which is the shape every call in this
+#   tree uses. A path assembled with `concat!`, spread across a line continuation, or
+#   produced by another macro goes undiscovered, so under-detection is this search's
+#   failure mode. It reads only `crates/**/*.rs`, which leaves out the `.rs` files under
+#   `scripts/tests/*/fixtures/`, and no cargo target compiles those.
+#
+#   Checks 2c, 2d, and 2e read `ci.yml` alone, because the `rust` and `fuzz` filters they
+#   name live there and guard the jobs that compile from those files.
 #
 # An `OK` from check 2 is not a claim that the filters are correct. It says the pin reaches
-# every lane of every paths-filtered workflow, and that every root-level file and every
-# cargo configuration file is classified. A `rust` filter stripped of `crates/**` still
+# every lane of every paths-filtered workflow, that every root-level file and every cargo
+# configuration file is classified, and that the `rust` filter routes every file a Rust
+# target embeds. A `rust` filter stripped of `crates/**` still
 # passes, and it does not need this gate: that omission reveals itself.
 #
 # ── CHECK 3: mise names no Rust version source ───────────────────────────────────────
@@ -341,11 +365,14 @@ fi
 # enumerates — every root-level file, and every cargo configuration file at any depth —
 # must be routed by the `rust` filter or by the `toolchain` filter. Adding a file here is a
 # claim that changing it cannot change what any compile produces, and the gate takes that
-# claim at face value — it is the one judgement this check cannot make.
+# claim at face value, apart from the one part of it check 2e falsifies: a file a Rust
+# target embeds with `include_str!` or `include_bytes!` is one a compile reads, and 2e
+# reports it whichever list holds it. `CLAUDE.md` is not below for that reason —
+# `crates/scp-testing/tests/integration/pipeline_wiring.rs` embeds it and asserts on its
+# headings, and the `rust` filter in `ci.yml` routes it.
 NO_RUST_JOB_READS=(
     # Documentation and licensing. No job compiles from them.
     "CHANGELOG.md"
-    "CLAUDE.md"
     "CONTRIBUTING.md"
     "GETTING-STARTED.md"
     "LICENSE"
@@ -414,6 +441,52 @@ routed_by() {
         fi
     done <<< "$entries"
     return 1
+}
+
+# Print one path with its `.` and `..` segments resolved, so a path written relative to a
+# source file compares against a filter entry written from the repository root.
+#
+# The resolution is textual, which is what a filter entry compares against: neither
+# `dorny/paths-filter` nor this gate follows a symbolic link, and both read the path git
+# reports.
+normalize_path() {
+    local path=$1 out="" part
+    while [[ -n $path ]]; do
+        part=${path%%/*}
+        if [[ $part == "$path" ]]; then path=""; else path=${path#*/}; fi
+        case $part in
+            "" | ".") ;;
+            "..")
+                if [[ $out == */* ]]; then out=${out%/*}; else out=""; fi
+                ;;
+            *)
+                if [[ -z $out ]]; then out=$part; else out="$out/$part"; fi
+                ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+# Print every path a Rust source file under `crates/` embeds at compile time, one per line,
+# resolved against the embedding file's directory.
+#
+# `--others` matters for the same reason it does in check 1: a call added but not yet
+# committed is what a pre-push run has to cover. A literal holding a backslash is left out,
+# because the search reads one line and such a literal continues onto the next.
+compile_time_embedded_paths() {
+    local file literal resolved
+    while IFS= read -r file; do
+        [[ -n $file ]] || continue
+        [[ -f $file ]] || continue
+        while IFS= read -r literal; do
+            [[ -n $literal ]] || continue
+            case $literal in *\\*) continue ;; esac
+            resolved=$(normalize_path "$(dirname "$file")/$literal")
+            [[ -n $resolved ]] || continue
+            printf '%s\n' "$resolved"
+        done < <(grep -oE 'include_(str|bytes)!\([[:space:]]*"[^"]*"' "$file" 2>/dev/null \
+            | sed -E 's/^include_(str|bytes)!\([[:space:]]*"//; s/"$//')
+    done < <(git ls-files --cached --others --exclude-standard -- 'crates/*.rs' 2>/dev/null || true)
 }
 
 # Print `<output name>=<expression>` for every output the `changes` job declares.
@@ -548,6 +621,23 @@ else
                 report "$build_file $population neither the 'rust' filter nor the '$TOOLCHAIN_FILTER' filter in $CI_WORKFLOW routes it, and NO_RUST_JOB_READS in this gate does not declare it unread. A pull request that changes only that file leaves the filter output 'false', every job the filter guards skips, and the 'ci' aggregator job counts a skipped job as a pass. List it in the filter that guards the jobs it decides, or declare it in NO_RUST_JOB_READS."
             done <<< "$(printf '%s\n%s\n' "$root_files" "$cargo_config_files" | sed '/^$/d' | sort -u)"
         fi
+
+        # 2e — every file a Rust target embeds at compile time is routed to the Rust lane.
+        #
+        # A tree whose Rust sources embed nothing yields nothing here, and the gate reports
+        # nothing, because no rule of this repository requires an embed to exist. What
+        # holds the search itself to working is `scripts/tests/toolchain-wiring/run-tests.sh`,
+        # which runs a canned repository holding one embed past this gate and requires the
+        # message below; the CI job runs those cases in the step after this one.
+        while IFS= read -r embedded; do
+            [[ -n $embedded ]] || continue
+            # A path no file sits at cannot be a live embed: rustc fails the build on it,
+            # so no green run depends on routing it.
+            [[ -f $embedded ]] || continue
+            if routed_by "$embedded" "$rust_entries"; then continue; fi
+            if routed_by "$embedded" "$toolchain_entries"; then continue; fi
+            report "$embedded is embedded into a Rust target with include_str! or include_bytes!, and neither the 'rust' filter nor the '$TOOLCHAIN_FILTER' filter in $CI_WORKFLOW routes it. 'cargo test --workspace' and 'cargo clippy --workspace --all-targets' compile that file's current contents, so a pull request that changes only it leaves the filter output 'false', skips 'rust-clippy' and 'rust-test', and merges green while the assertions that read it go unrun. List its path, or the prefix that covers it, in the 'rust' filter."
+        done <<< "$(compile_time_embedded_paths | sort -u)"
     fi
 
     # 2d — the fuzz nightly reaches the job that compiles on it.
@@ -625,7 +715,7 @@ fi
 
 if [[ $fail -eq 0 ]]; then
     printf 'OK: every container build asserts it resolved the compiler %s names\n' "$PIN"
-    printf 'OK: every lane of every paths-filtered workflow routes a %s change, and every root-level file and cargo configuration file is routed or declared unread\n' "$PIN"
+    printf 'OK: every lane of every paths-filtered workflow routes a %s change; every root-level file and cargo configuration file is routed or declared unread; every file a Rust target embeds is routed\n' "$PIN"
     printf 'OK: %s names no Rust version source, so rustup resolves each directory from its own toolchain file\n' "$MISE_CONFIG"
     exit 0
 fi
