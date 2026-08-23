@@ -650,7 +650,8 @@ pub(crate) async fn node_start_in_memory_on(
 /// Per-bridge-instance implementation of `node_start_local`.
 ///
 /// With `identity_did = None` this reloads a persistent identity and requires a
-/// passphrase. Creating one on a first run needs a pre-rotation custody backend
+/// passphrase. On a shipped build this fails on every run: creating an identity
+/// needs a pre-rotation custody backend
 /// that only a `testing` build has, so a shipped build fails closed with
 /// a plain error whose message is "node startup failed" rather than mint a
 /// nullifier-backed identity. No error code reaches the caller on this path.

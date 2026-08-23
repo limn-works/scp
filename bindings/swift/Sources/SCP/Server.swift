@@ -172,15 +172,17 @@ public struct Node: Sendable {
     ///
     /// When `identity` is provided, the node uses the pre-existing identity.
     /// When `nil`, the node reloads a persistent identity via `FileKeyCustody`,
-    /// and the `passphrase` parameter is required. CREATING one on a first run
+    /// and the `passphrase` parameter is required. CREATING one, on every run,
     /// needs a pre-rotation custody backend that only a `testing` build has, so
     /// a shipped build throws rather than mint a nullifier-backed identity.
     /// The failure arrives as `ScpError.Identity` with code `SCP-TRANS-5051` and
     /// the message "node identity operation failed".
     ///
-    /// This build fails on EVERY run, not only the first: no shipped path creates
-    /// an identity anywhere, so nothing can put one in `dataDir` and nothing can
-    /// hand you one to pass. Both remedies wait on a real pre-rotation backend.
+    /// This build fails on EVERY run, not only the first: no shipped create API
+    /// mints an identity, so nothing can put one in `dataDir` and the reload branch
+    /// never fires. Passing `identity` does not help either, because that resolves
+    /// through the identity registry, which only the identity-create calls populate
+    /// and those fail closed too.
     ///
     /// No passphrase is required when `identity` is provided.
     ///

@@ -3821,7 +3821,9 @@ export class SCP {
    * refuses: the in-memory key custody, storage, and DHT client it needs compile
    * only under the `testing` feature (ADR-062 Decision 1/6). The refusal arrives
    * as a mapped bridge error carrying "auto-generated in-memory node identity is
-   * unavailable in this build". Pass an explicit `identityDid` on a production
+   * unavailable in this build". A production caller cannot get one from a create
+   * call either, because every shipped create API fails closed the same way. Pass
+   * an explicit `identityDid` on a production
    * path.
    */
   async nodeStartInMemory(identityDid?: string | null): Promise<Node> {
@@ -3849,9 +3851,11 @@ export class SCP {
    * `SCP-UNKNOWN-0000`; match on the message, not the code. It fails closed
    * rather than mint a nullifier-backed identity.
    *
-   * This build fails on EVERY run, not only the first: no shipped path creates an
-   * identity anywhere, so nothing can put one in `dataDir` and nothing can hand
-   * you one to pass. Both remedies wait on a real pre-rotation backend.
+   * This build fails on EVERY run, not only the first: no shipped create API mints
+   * an identity, so nothing can put one in `dataDir` and the reload branch never
+   * fires. Passing `identityDid` does not help either, because that resolves
+   * through the identity registry, which only the `identityCreate*` calls
+   * populate and those fail closed too.
    */
   async nodeStartLocal(
     dataDir: string,

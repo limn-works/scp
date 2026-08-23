@@ -3120,14 +3120,15 @@ class SCP:
         ``passphrase``. The identity record lives under the storage key
         ``scp/identity`` in ``<data_dir>/storage/``; ``<data_dir>/identity.key``
         holds only the custody key material, so copying it alone is not enough. CREATING one on a
-        first run needs a pre-rotation custody backend that only a ``testing``
+        every run needs a pre-rotation custody backend that only a ``testing``
         build has, so a shipped build raises ``RuntimeError`` carrying
         the message "node startup failed" rather than mint a nullifier-backed
         identity. No error code reaches the caller on this path.
-        This build fails on EVERY run, not only the first: no shipped path
-        creates an identity anywhere, so nothing can put one in ``data_dir``
-        and nothing can hand you one to pass. Both remedies wait on a real
-        pre-rotation backend.
+        This build fails on EVERY run, not only the first: no shipped create
+        API mints an identity, so nothing can put one in ``data_dir`` and the
+        reload branch never fires. Passing ``identity_did`` does not help either,
+        because that resolves through the identity registry, which only the
+        ``identity_create*`` calls populate and those fail closed too.
         """
         from scp_sdk.server import Node
 

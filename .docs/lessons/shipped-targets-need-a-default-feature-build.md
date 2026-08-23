@@ -39,11 +39,12 @@ against is **write access to the crate under test**, not "edits the manifest" â€
 draft wrote the narrower indicator as the contract, which is the failure `CLAUDE.md` names
 after Caulfield.
 
-## Eight rounds, twelve bypasses, and which ones the gate closes
+## Eight rounds, eleven measured bypasses, and which ones the gate closes
 
 The table below has thirteen rows. Two are not measured bypasses: row 2 records an
 overclaim, and row 8 is a hypothesis two reproduction attempts failed to demonstrate. The
-remaining eleven are measured bypasses, found across seven of the eight rounds. They do
+remaining eleven are measured bypasses, found across six of the eight rounds â€”
+rounds 1, 3, 4, 5, 6, and 7. They do
 not share one root, and no single change closed them.
 
 Ten of the eleven are closed: rows 1, 3, 4a, 4c, 5, 6a, 6b, 7a, and 7b by the five

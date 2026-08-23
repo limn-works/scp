@@ -662,7 +662,9 @@ impl crate::scp::PyScp {
     /// available ONLY in a ``testing`` build, which wires in-memory key custody,
     /// in-memory storage, and the in-memory DHT client. A shipped build fails
     /// closed rather than run a node backed by an in-memory DHT nullifier
-    /// (ADR-062 Decision 1/6), so a production caller passes an explicit
+    /// (ADR-062 Decision 1/6). A production caller cannot get one from a create
+    /// call either, because every shipped create API fails closed the same way, so
+    /// it would have to supply an explicit
     /// ``identity_did``.
     ///
     /// The failure reaches Python as ``RuntimeError`` carrying the message
@@ -725,13 +727,12 @@ impl crate::scp::PyScp {
     /// persistent identity. The record lives under the storage key
     /// ``scp/identity`` in ``<data_dir>/storage/``; ``<data_dir>/identity.key``
     /// holds only the custody key material. The ``passphrase``
-    /// parameter is required in this mode. CREATING one on a first run needs a
-    /// pre-rotation custody backend that only a ``testing`` build has, so a
-    /// shipped build raises ``RuntimeError`` with the message "node startup
-    /// failed" instead
-    /// of minting a nullifier-backed identity. Pass an
-    /// explicit ``identity_did``, or point ``data_dir`` at a directory that
-    /// already holds an identity.
+    /// parameter is required in this mode. On a shipped build this fails on EVERY
+    /// run: creating an identity needs a pre-rotation custody backend that only a
+    /// ``testing`` build has, so it raises ``RuntimeError`` with the message
+    /// "node startup failed" instead of minting a nullifier-backed identity. No
+    /// shipped create API mints one either, so ``data_dir`` never comes to hold
+    /// one and ``identity_did`` cannot be resolved from the registry.
     ///
     /// When ``identity_did`` is provided, the node uses the pre-existing identity
     /// from the `PyO3` identity registry (populated by ``PyScp::identity_create``).
