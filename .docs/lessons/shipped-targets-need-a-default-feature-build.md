@@ -41,11 +41,12 @@ after Caulfield.
 
 ## Eight rounds, twelve bypasses, and what closed each one
 
-Twelve distinct ways past this gate were found across eight review rounds. They do
-not share one root, and no single change closed them; the table below names each
-root and the mechanism that answers it. Counting them was itself a source of error:
-two earlier drafts of this paragraph asserted totals that the table three lines
-below already contradicted.
+Eight review rounds produced twelve bypasses, from seven of those rounds — the round-2
+row records an overclaim rather than a bypass. They do not share one root, and no single
+change closed them. The table below names each bypass and its root; the numbered list
+above names the five mechanisms that answer them. Counting them was itself a source of
+error: three earlier drafts of this paragraph asserted a total, or described a table
+column, that the table three lines below already contradicted.
 
 | Round | Bypass | Root |
 |---|---|---|

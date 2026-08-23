@@ -16693,6 +16693,12 @@ impl Scp {
     /// Starts an in-memory application node. If `identity` is supplied, it
     /// must have been minted by this `Scp` (cross-instance handles are
     /// rejected via the `CoreFields::check_handle` call).
+    ///
+    /// Omitting `identity` requests auto-generation, which a shipped build
+    /// refuses: the in-memory custody, storage, and DHT client it needs compile
+    /// only under the `testing` feature. The refusal arrives as
+    /// `ScpError::Validation` with code `SCP-VALID-7004`, which a missing storage
+    /// passphrase also uses, so read the message to tell the two apart.
     #[cfg(feature = "server")]
     pub async fn node_start_in_memory(
         &self,

@@ -96,8 +96,10 @@ public struct Relay: Sendable {
 
 /// Ergonomic wrapper around a running SCP application node.
 ///
-/// An application node includes a running relay server, a generated DID
-/// identity, and (optionally) persistent storage. Use the static factory
+/// An application node includes a running relay server, a DID identity, and
+/// (optionally) persistent storage. The identity is generated only when the
+/// caller omits one AND the build enables `testing`; a shipped build that must
+/// CREATE one fails closed. Use the static factory
 /// methods ``startInMemory(scp:identity:)`` or
 /// ``startLocal(scp:dataDir:identity:passphrase:)`` to create an instance.
 ///
@@ -170,7 +172,7 @@ public struct Node: Sendable {
     /// When `nil`, the node reloads a persistent identity via `FileKeyCustody`,
     /// and the `passphrase` parameter is required. CREATING one on a first run
     /// needs a pre-rotation custody backend that only a `testing` build has, so
-    /// a shipped build throws rather than mint a nullifier-backed identity
+    /// a shipped build throws rather than mint a nullifier-backed identity.
     /// The failure arrives as `ScpError.Identity` with code `SCP-TRANS-5051` and
     /// the message "node identity operation failed". Pass an identity, or point
     /// `dataDir` at a directory that already holds one.
