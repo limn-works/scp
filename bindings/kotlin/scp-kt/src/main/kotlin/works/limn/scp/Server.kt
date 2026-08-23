@@ -436,9 +436,14 @@ class Node internal constructor(
          * Passing null for [identityDid] requests auto-generation, which is
          * available ONLY in a `testing` build (in-memory key custody, in-memory
          * storage, and the in-memory DHT client). A shipped build fails closed
-         * with `AutoGenerateUnavailable` rather than run a node backed by an
-         * in-memory DHT nullifier, so a production caller passes an identity.
-         * Self-signed TLS; relay on an OS-assigned port.
+         * rather than run a node backed by an in-memory DHT nullifier, so a
+         * production caller passes an identity. Self-signed TLS; relay on an
+         * OS-assigned port.
+         *
+         * The failure arrives as `ScpException.Validation` with code
+         * `SCP-VALID-7004` and the message "auto-generated in-memory node
+         * identity is unavailable in this build". A missing storage passphrase
+         * shares that code, so read the message to tell the two apart.
          *
          * @param bridge The [ServerBridge] providing FFI access.
          * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.

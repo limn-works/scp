@@ -657,10 +657,14 @@ impl crate::scp::PyScp {
     ///
     /// When ``identity_did`` is ``None`` (the default), auto-generation is
     /// available ONLY in a ``testing`` build, which wires in-memory key custody,
-    /// in-memory storage, and the in-memory DHT client. A shipped build FAILS
-    /// CLOSED with ``AutoGenerateUnavailable`` rather than run a node backed by
-    /// an in-memory DHT nullifier (ADR-062 Decision 1/6), so a production caller
-    /// passes an explicit ``identity_did``.
+    /// in-memory storage, and the in-memory DHT client. A shipped build fails
+    /// closed rather than run a node backed by an in-memory DHT nullifier
+    /// (ADR-062 Decision 1/6), so a production caller passes an explicit
+    /// ``identity_did``.
+    ///
+    /// The failure reaches Python as ``RuntimeError`` carrying the message
+    /// "auto-generated in-memory node identity is unavailable in this build".
+    /// It is NOT a ``ValidationError``: only ``MissingPassphrase`` maps to that.
     ///
     /// When ``identity_did`` is provided, the node uses the pre-existing identity
     /// from the `PyO3` identity registry (populated by ``PyScp::identity_create``).

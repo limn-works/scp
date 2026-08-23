@@ -3097,7 +3097,15 @@ class SCP:
     # region Server
 
     async def node_start_in_memory(self, identity_did: str | None = None) -> Any:
-        """Delegate to ``_scp_core.SCP.node_start_in_memory`` (returns :class:`Node`)."""
+        """Delegate to ``_scp_core.SCP.node_start_in_memory`` (returns :class:`Node`).
+
+        Passing ``identity_did=None`` requests auto-generation, which a shipped
+        build refuses: the in-memory key custody, storage, and DHT client it
+        needs compile only under the ``testing`` feature (ADR-062 Decision 1/6).
+        The refusal arrives as ``RuntimeError`` carrying "auto-generated
+        in-memory node identity is unavailable in this build". Pass an explicit
+        ``identity_did`` on a production path.
+        """
         from scp_sdk.server import Node
 
         raw = await asyncio.to_thread(self._native.node_start_in_memory, identity_did)

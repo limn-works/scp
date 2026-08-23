@@ -142,10 +142,14 @@ public struct Node: Sendable {
     ///
     /// Passing `nil` for `identity` requests auto-generation, which is available
     /// ONLY in a `testing` build (in-memory key custody, in-memory storage, and
-    /// the in-memory DHT client). A shipped build throws
-    /// ``ScpError`` with `AutoGenerateUnavailable` rather than run a node backed
-    /// by an in-memory DHT nullifier, so a production caller passes an identity.
-    /// Self-signed TLS; relay on an OS-assigned port.
+    /// the in-memory DHT client). A shipped build fails closed rather than run a
+    /// node backed by an in-memory DHT nullifier, so a production caller passes
+    /// an identity. Self-signed TLS; relay on an OS-assigned port.
+    ///
+    /// The failure arrives as `ScpError.Validation` with code
+    /// `SCP-VALID-7004` and the message "auto-generated in-memory node identity
+    /// is unavailable in this build". A missing storage passphrase shares that
+    /// code, so read `msg` to tell the two apart.
     ///
     /// - Parameters:
     ///   - scp: The SDK-level ``SCP`` instance that will own the minted handle.
