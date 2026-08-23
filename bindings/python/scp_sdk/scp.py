@@ -3124,8 +3124,10 @@ class SCP:
         build has, so a shipped build raises ``RuntimeError`` carrying
         the message "node startup failed" rather than mint a nullifier-backed
         identity. No error code reaches the caller on this path.
-        Pass an explicit ``identity_did``, or point ``data_dir`` at a
-        directory that already holds an identity.
+        This build fails on EVERY run, not only the first: no shipped path
+        creates an identity anywhere, so nothing can put one in ``data_dir``
+        and nothing can hand you one to pass. Both remedies wait on a real
+        pre-rotation backend.
         """
         from scp_sdk.server import Node
 

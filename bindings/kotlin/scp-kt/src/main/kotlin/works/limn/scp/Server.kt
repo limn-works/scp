@@ -471,8 +471,10 @@ class Node internal constructor(
          * nullifier-backed identity. The failure arrives as
          * `ScpException.Identity` with code `SCP-TRANS-5051` and the message
          * "node identity operation failed".
-         * Pass an identity, or point [dataDir] at a directory that already
-         * holds one.
+         * This build fails on EVERY run, not only the first: no shipped path
+         * creates an identity anywhere, so nothing can put one in [dataDir] and
+         * nothing can hand you one to pass. Both remedies wait on a real
+         * pre-rotation backend.
          *
          * No passphrase is required when [identityDid] is provided.
          *

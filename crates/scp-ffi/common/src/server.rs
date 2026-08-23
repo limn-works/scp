@@ -406,13 +406,13 @@ pub async fn start_node_in_memory(
 /// key `scp/identity` in `<data_dir>/storage/`). The `passphrase` parameter is
 /// required in this mode — there is no environment variable fallback.
 ///
-/// On subsequent runs the same DID is reloaded from storage. Creating one on
-/// the FIRST run needs a `PreRotationCustody` backend (spec §9.7.4.1 §3), and
-/// the only implementation is the test-harness `InMemoryPreRotationCustody`, so
-/// a shipped build fails closed with
-/// `IdentityError::NoPreRotationBackend` rather than mint a
-/// nullifier-backed identity. Pass an explicit `identity` on a shipped build, or
-/// point `data_dir` at a directory that already holds one.
+/// A shipped build fails here on EVERY run, not only the first. Reloading a DID
+/// from storage carries no gate, but creating one needs a `PreRotationCustody`
+/// backend (spec §9.7.4.1 §3) whose only implementation is the test-harness
+/// `InMemoryPreRotationCustody`, so `IdentityError::NoPreRotationBackend` comes
+/// back instead. Because no shipped path creates an identity anywhere, nothing
+/// can put one into `data_dir` and nothing can hand the caller one to pass as
+/// `identity`: both remedies are unreachable until a real backend lands.
 ///
 /// For fully ephemeral setups use [`start_node_in_memory`].
 ///

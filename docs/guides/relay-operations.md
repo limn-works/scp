@@ -77,7 +77,7 @@ scp-relay
 | **Full node** (default) | none | SQLite (SQLCipher) | Generated per start, not persisted | `.well-known/scp` | On a shipped build this exits 1: creating an identity needs a pre-rotation custody backend only a `testing` build has. |
 | **Relay-only** | `--relay-only` | Configurable | None | None | Equivalent to `scp-relay`. The one mode that starts on a shipped build without an existing identity. |
 | **Ephemeral** | `--ephemeral` | All in-memory | Ephemeral DID | `.well-known/scp` | Test harness only. A shipped build exits 1: the mode needs in-memory DHT and custody, which compile only under the `testing` feature. |
-| **Self-host** | `--self-host` | SQLite (SQLCipher) | Persistent DID | Static site + `.well-known/scp` | Hosts a static site on SCP. Opens an inbound port and, unless `SCP_NODE_DHT_MODE=disabled`, publishes the host's IP to the DHT. On a shipped build the first run exits 1, for the same reason as the full node; it starts once storage holds an identity. |
+| **Self-host** | `--self-host` | SQLite (SQLCipher) | Persistent DID | Static site + `.well-known/scp` | Hosts a static site on SCP. Opens an inbound port and, unless `SCP_NODE_DHT_MODE=disabled`, publishes the host's IP to the DHT. On a shipped build this exits 1 on every run, for the same reason as the full node. |
 
 No binary mode enables the dev API. `NodeConfig::defaults` leaves `local_api: None`,
 and neither `main.rs` nor `self_host.rs` sets it, so the endpoints in the dev-API
@@ -296,8 +296,8 @@ The full-node mode fails on **every** run, not only the first. `main.rs` passes
 never writes an identity either, and the "subsequent runs reload it" case cannot
 arise from it. The reload path is real and ungated, but only the `--self-host`
 flow and the FFI `start_node_local` surface reach it, because those pass
-`IdentitySource::Persisted` — and both still fail closed on a first run, when
-there is nothing stored to reload.
+`IdentitySource::Persisted` — and both still fail closed, because nothing on a
+shipped path ever creates the identity they would reload.
 
 ### Development deployment
 
@@ -348,7 +348,7 @@ use scp_transport::native::storage::BlobStorageBackend;
 //
 // A shipped build cannot CREATE an identity: that needs a `PreRotationCustody`
 // backend which only a `testing` build has, so `IdentitySource::Generate` and
-// `::Persisted` both fail closed on a first run. Load the
+// `::Persisted` both fail closed on every run. Load the
 // identity you already hold and pass it explicitly.
 let identity: ScpIdentity = load_node_identity()?;
 let document: DidDocument = load_node_did_document()?;
@@ -434,6 +434,8 @@ pub struct CertificateData {
 For development, set `SCP_NODE_TLS_SELF_SIGNED=1`:
 
 ```bash
+# On a shipped build this exits 1, like every full-node invocation: creating an
+# identity needs a pre-rotation custody backend only a `testing` build has.
 SCP_NODE_DOMAIN=localhost \
 SCP_NODE_TLS_SELF_SIGNED=1 \
 scp-node
@@ -458,9 +460,10 @@ pub trait TlsProvider: Send + Sync {
 Per spec section 9.13, all relay connections use TLS 1.3. The `CertResolver` (defined in `crates/scp-node/src/tls.rs`) supports hot-reloading certificates without restarting the server:
 
 ```rust
-// Hot-swap certificate after ACME renewal
+// Hot-swap certificate after ACME renewal. `update` takes a rustls
+// `CertifiedKey` and returns (), so there is nothing to `?`.
 if let Some(resolver) = node.cert_resolver() {
-    resolver.update(new_cert_data)?;
+    resolver.update(new_certified_key);
 }
 ```
 
@@ -523,7 +526,7 @@ The dev API serves endpoints for identity info, context management, relay status
 
 ## 9. NAT Traversal and Zero-Config
 
-`scp-node` supports zero-config deployment behind NAT (spec section 10.12.8). When `no_domain()` is used instead of `domain()`, the node probes its network environment and selects the best reachability tier:
+`scp-node` supports zero-config deployment behind NAT (spec section 10.12.8). When `reach` is `Reach::NatTraversal` rather than `Reach::Domain`, the node probes its network environment and selects the best reachability tier:
 
 | Tier | Method | Relay URL format |
 |------|--------|-----------------|

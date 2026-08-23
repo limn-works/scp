@@ -15,12 +15,14 @@ cargo run -p scp-node --example website
 
 Then open the printed URL in a browser.
 
-**On a machine with no existing SCP identity this exits 1 instead.** `host_site`
-asks for `IdentitySource::Persisted`, and creating a new identity needs a
+**On a shipped build this exits 1 on every run.** `host_site` asks for
+`IdentitySource::Persisted`, and creating a new identity needs a
 `PreRotationCustody` backend whose only implementation is the test harness, so a
 shipped build fails closed rather than mint a nullifier-backed identity. The
-example's own doc comment quotes the exact error. Once an identity exists under
-`$XDG_DATA_HOME/scp/node`, the example loads it and serves the site.
+example's own doc comment quotes the exact error. Reloading a stored identity
+carries no gate, but no shipped path creates one anywhere, so
+`$XDG_DATA_HOME/scp/node` never comes to hold one. Build with `--features
+testing` to run the example end to end.
 
 ### What this example does
 
@@ -54,6 +56,6 @@ SCP_NODE_DHT_MODE=disabled scp-node --self-host --site-dir ./my-site
 `--self-host` on its own defaults to publishing: `SCP_NODE_DHT_MODE` defaults to
 `production`, which puts the host's public IP, bound to its DID, on the global
 Mainline DHT. Set it to `disabled` for a site that publishes nothing. This path
-shares the first-run limit above.
+hits the same wall as the example above.
 
 [`scp_node::host_site`]: https://docs.rs/scp-node
