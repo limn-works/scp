@@ -4579,7 +4579,8 @@ impl Scp {
     /// Per-instance equivalent of the free-function `node_start_local`.
     ///
     /// Omitting `identity_did` reloads the identity the storage already holds and
-    /// requires `passphrase`. Creating one on a first run needs a pre-rotation
+    /// requires `passphrase`. On a shipped build this fails on every run:
+    /// creating an identity needs a pre-rotation
     /// custody backend that only a `testing` build has, so a shipped build fails
     /// closed with the message "node startup failed" and no error code.
     #[napi(js_name = "nodeStartLocal")]

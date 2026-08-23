@@ -307,8 +307,9 @@ pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerEr
 /// `InMemoryDhtClient` nullifier — no real DHT
 /// network). A shipped (no-`testing`) build FAILS CLOSED with
 /// [`ServerError::AutoGenerateUnavailable`] rather than run a nullifier-backed
-/// node (ADR-062 §Decision 1/6); production callers pass an explicit
-/// `Some(NodeIdentity)`. Self-signed TLS (localhost); relay bound to
+/// node (ADR-062 §Decision 1/6). A production caller cannot supply
+/// `Some(NodeIdentity)` from a create call either, because every shipped create
+/// API fails closed the same way. Self-signed TLS (localhost); relay bound to
 /// `127.0.0.1:0` (OS-assigned port).
 ///
 /// When `identity` is `Some(NodeIdentity)`, the node uses the pre-existing
@@ -410,9 +411,12 @@ pub async fn start_node_in_memory(
 /// from storage carries no gate, but creating one needs a `PreRotationCustody`
 /// backend (spec §9.7.4.1 §3) whose only implementation is the test-harness
 /// `InMemoryPreRotationCustody`, so `IdentityError::NoPreRotationBackend` comes
-/// back instead. Because no shipped path creates an identity anywhere, nothing
-/// can put one into `data_dir` and nothing can hand the caller one to pass as
-/// `identity`: both remedies are unreachable until a real backend lands.
+/// back instead. No shipped CREATE API mints an identity, so nothing can put one
+/// into `data_dir` and the reload branch never fires: that remedy waits on a real
+/// backend. `identity` is a different matter — every field of `ScpIdentity` and
+/// `DidDocument` is public, so a caller CAN assemble one by hand, and such an
+/// identity carries a pre-rotation commitment whose preimage no custody holds,
+/// which makes spec §9.7.4.1 Layer-2 recovery permanently impossible for it.
 ///
 /// For fully ephemeral setups use [`start_node_in_memory`].
 ///
@@ -423,7 +427,7 @@ pub async fn start_node_in_memory(
 /// - The filesystem storage cannot be initialized ([`ServerError::Platform`])
 /// - The redb blob database cannot be opened ([`ServerError::Storage`])
 /// - No passphrase provided when `identity` is `None` ([`ServerError::MissingPassphrase`])
-/// - `identity` is `None` on a first run of a shipped build, because creating an
+/// - `identity` is `None` on a shipped build, on every run, because creating an
 ///   identity needs a `PreRotationCustody` backend that only a `testing` build
 ///   has ([`ServerError::Node`], whose `user_message` is "node startup failed")
 /// - Relay binding, identity generation, or TLS fails ([`ServerError::Node`])
