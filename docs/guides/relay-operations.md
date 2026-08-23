@@ -348,8 +348,9 @@ use scp_transport::native::storage::BlobStorageBackend;
 //
 // A shipped build cannot CREATE an identity: that needs a `PreRotationCustody`
 // backend which only a `testing` build has, so `IdentitySource::Generate` and
-// `::Persisted` both fail closed on every run, and no shipped create API mints
-// one, so there is no identity to load unless you assembled it yourself. This
+// `::Persisted` both fail closed on every run, and the node's own identity paths
+// never mint one, so there is no identity to load unless you minted it through
+// `scp-identity` directly. This
 // snippet shows the config shape for that case.
 let identity: ScpIdentity = load_node_identity()?;
 let document: DidDocument = load_node_did_document()?;

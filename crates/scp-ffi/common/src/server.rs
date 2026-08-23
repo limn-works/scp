@@ -321,7 +321,9 @@ pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerEr
 ///
 /// # Errors
 ///
-/// Returns [`ServerError::Node`] if relay binding, identity generation, or TLS
+/// Returns [`ServerError::AutoGenerateUnavailable`] when `identity` is `None` on a
+/// shipped build, where ADR-062 §Decision 6 severed the auto-generate arm, and
+/// [`ServerError::Node`] if relay binding, identity generation, or TLS
 /// provisioning fails.
 pub async fn start_node_in_memory(
     identity: Option<NodeIdentity>,
@@ -330,7 +332,8 @@ pub async fn start_node_in_memory(
         // Auto-generate uses the test-harness `ApplicationNode::dev` (in-memory
         // DHT nullifier), compiled only under `testing` (ADR-062 §Decision 1).
         // A shipped build fails closed rather than running a nullifier-backed
-        // node; callers pass an explicit `Some(NodeIdentity)` in production.
+        // node. A production caller cannot get one from this crate's create
+        // surface either, which fails closed the same way.
         #[cfg(any(test, feature = "testing"))]
         None => scp_node::ApplicationNode::dev(0).await?,
         #[cfg(not(any(test, feature = "testing")))]
@@ -411,9 +414,11 @@ pub async fn start_node_in_memory(
 /// from storage carries no gate, but creating one needs a `PreRotationCustody`
 /// backend (spec §9.7.4.1 §3) whose only implementation is the test-harness
 /// `InMemoryPreRotationCustody`, so `IdentityError::NoPreRotationBackend` comes
-/// back instead. No shipped CREATE API mints an identity, so nothing can put one
-/// into `data_dir` and the reload branch never fires: that remedy waits on a real
-/// backend. `identity` is a different matter — every field of `ScpIdentity` and
+/// back instead. This crate's own create surface fails closed the same way, so
+/// nothing an FFI caller can invoke puts an identity into `data_dir` and the
+/// reload branch never fires. (A Rust consumer of `scp-identity` can still mint
+/// one: `DidMethod::create` takes a caller-supplied `PreRotationCustody`, and that
+/// trait is not sealed — see issue 2392.) `identity` is a different matter — every field of `ScpIdentity` and
 /// `DidDocument` is public, so a caller CAN assemble one by hand, and such an
 /// identity carries a pre-rotation commitment whose preimage no custody holds,
 /// which makes spec §9.7.4.1 Layer-2 recovery permanently impossible for it.

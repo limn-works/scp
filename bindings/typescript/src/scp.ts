@@ -3822,7 +3822,9 @@ export class SCP {
    * only under the `testing` feature (ADR-062 Decision 1/6). The refusal arrives
    * as a mapped bridge error carrying "auto-generated in-memory node identity is
    * unavailable in this build". A production caller cannot get one from a create
-   * call either, because every shipped create API fails closed the same way. Pass
+   * call either. Every writer to the identity registry — create, migrate, rotate,
+   * add-agent, remove-agent — either fails closed on a shipped build before it
+   * writes, or needs an entry already present, so the registry never fills. Pass
    * an explicit `identityDid` on a production
    * path.
    */
@@ -3844,16 +3846,16 @@ export class SCP {
    * Omitting `identityDid` reloads a persistent identity and requires
    * `passphrase`. The identity record lives under the storage key `scp/identity`
    * in `<dataDir>/storage/`; `<dataDir>/identity.key` holds only the custody key
-   * material, so copying it alone is not enough. Creating one on a first
-   * run needs a pre-rotation custody backend that only a `testing` build has, so
+   * material, so copying it alone is not enough. Creating one, on every run,
+   * needs a pre-rotation custody backend that only a `testing` build has, so
    * a shipped build rejects it with the message "node startup failed". The NAPI
    * layer attaches no code, so `mapBridgeError` defaults `ScpError.code` to
    * `SCP-UNKNOWN-0000`; match on the message, not the code. It fails closed
    * rather than mint a nullifier-backed identity.
    *
-   * This build fails on EVERY run, not only the first: no shipped create API mints
-   * an identity, so nothing can put one in `dataDir` and the reload branch never
-   * fires. Passing `identityDid` does not help either, because that resolves
+   * This build fails on EVERY run, not only the first: none of this SDK's create
+   * calls mints an identity, so nothing it offers puts one in `dataDir` and the
+   * reload branch never fires. Passing `identityDid` does not help either, because that resolves
    * through the identity registry, which only the `identityCreate*` calls
    * populate and those fail closed too.
    */

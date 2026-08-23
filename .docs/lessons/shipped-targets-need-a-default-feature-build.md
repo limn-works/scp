@@ -33,7 +33,7 @@ of them reopens a bypass this repository has already measured:
    crate having targets inverts it, because `autoexamples = false` empties the target set
    and that is exactly when a published example is invisible.
 
-Bypass 8 is closed by none of them, and deliberately so: a `build.rs` can inject any cfg
+Row 8 is answered by none of them, and deliberately so: a `build.rs` can inject any cfg
 into every target of its own package. The criterion for what this gate cannot defend
 against is **write access to the crate under test**, not "edits the manifest" — an earlier
 draft wrote the narrower indicator as the contract, which is the failure `CLAUDE.md` names
@@ -74,7 +74,7 @@ above name their rows: a bare total drifts from the table, and an enumeration do
 | 3 | `required-features = ["testing"]` | cargo skips the target and exits 0 |
 | 4a | `autoexamples = false` | file ships, target absent, target-sourced list blind |
 | 4b | any nullifier but `DhtMode::Memory` | dev-dependencies, unclosable |
-| 4c | `required-features` as standing exemption | bought nothing, hid four examples |
+| 4c | `required-features` as standing exemption | bought nothing; the guard was satisfied rather than skipped, because the dev-dependency back-edge resolves `scp-runtime/testing` ON |
 | 5 | `cargo package --list` exit 101 swallowed | manifest error dropped a crate in silence |
 | 6a | `[[example]] path = "examples/decoy/website.rs"` | name join saw `website` on both sides |
 | 6b | `exclude = ["examples/*"]` | file-driven loop skipped the package |
@@ -105,7 +105,7 @@ shipped features, then measured the premise and found it false:
 features, because `scp-runtime` dev-depends on `scp-testing`, whose NORMAL
 `scp-core{testing}` edge resolves `scp-runtime/testing` ON. The declaration bought
 nothing and removed the example from the check, so it was reverted. Coverage went
-from four examples to eight — against the script as it stood that round, which passed
+from four counted targets to eight — against the script as it stood that round, which passed
 `--examples` and skipped a feature-gated target silently. The script now names each
 target, so a `required-features` declaration no longer removes one from the count; the
 revert stands on its own ground, which is that the declaration asserted a build failure

@@ -280,11 +280,11 @@ pub const IDENT_1058: &str = "SCP-IDENT-1058";
 /// pre-rotation step. `PyO3` reaches it from `identity_create` (it accepts
 /// `"file"` custody); napi and `UniFFI` reject their three custody strings first
 /// (`SCP-IDENT-1008` / `SCP-IDENT-1003`) and reach it only through callback
-/// custody. The non-creation paths differ by bridge: napi and `UniFFI` also
+/// custody. All three surface it from `identity_migrate`. napi and `UniFFI` also
 /// surface it from `rotate_key`, `add_agent_key`, `rotate_agent_key`, and
-/// `remove_agent_key`; `PyO3` surfaces it from `identity_migrate` only, and its
-/// `rotate_key` / `add_agent_key` carry no fail-closed arm at all, so they return
-/// a registry-miss code instead. That divergence is a cross-bridge parity gap,
+/// `remove_agent_key`; none of `PyO3`'s four — `rotate_key`, `add_agent_key`,
+/// `rotate_agent_key`, `remove_agent_key` — carries a fail-closed arm at all, so
+/// they return a registry-miss code instead. That divergence is a cross-bridge parity gap,
 /// not a documentation one.
 ///
 /// NOT surfaced by `scp-node`, which does not depend on this crate: its

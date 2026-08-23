@@ -663,7 +663,8 @@ impl crate::scp::PyScp {
     /// in-memory storage, and the in-memory DHT client. A shipped build fails
     /// closed rather than run a node backed by an in-memory DHT nullifier
     /// (ADR-062 Decision 1/6). A production caller cannot get one from a create
-    /// call either, because every shipped create API fails closed the same way, so
+    /// call either. Every writer to the identity registry either fails closed on a
+    /// shipped build before it writes, or needs an entry already present, so
     /// it would have to supply an explicit
     /// ``identity_did``.
     ///
@@ -731,8 +732,8 @@ impl crate::scp::PyScp {
     /// run: creating an identity needs a pre-rotation custody backend that only a
     /// ``testing`` build has, so it raises ``RuntimeError`` with the message
     /// "node startup failed" instead of minting a nullifier-backed identity. No
-    /// shipped create API mints one either, so ``data_dir`` never comes to hold
-    /// one and ``identity_did`` cannot be resolved from the registry.
+    /// create call on this bridge mints one either, so ``data_dir`` never comes to
+    /// hold one and ``identity_did`` cannot be resolved from the registry.
     ///
     /// When ``identity_did`` is provided, the node uses the pre-existing identity
     /// from the `PyO3` identity registry (populated by ``PyScp::identity_create``).
