@@ -32,9 +32,10 @@
 # repository whose jobs report through one collected result. `docs.yml`'s `publish-docs`
 # job downloads the four documentation artifacts and deploys them on a release tag: it
 # reads no `needs.<job>.result`, and `if: startsWith(github.ref, 'refs/tags/scp-core@')`
-# keeps it off every pull request. `codeql.yml` reports its own job. `fuzz.yml` runs on a
-# schedule and on `workflow_dispatch`, so no pull request waits on it. A second aggregator
-# added later needs its own entry in this file, which does not discover one on its own.
+# keeps it off every pull request. `codeql.yml` declares one job, `analyze`, which reports
+# as its own status check. `fuzz.yml` runs on a schedule and on `workflow_dispatch`, so no
+# pull request waits on it. A second aggregator added later needs its own entry in this
+# file, which does not discover one on its own.
 #
 # WHAT THE PARSE DOES NOT COVER, stated rather than implied: it reads job names as the
 # keys indented two spaces under the top-level `jobs:` mapping, and reads the aggregator's
