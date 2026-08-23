@@ -65,11 +65,12 @@
 # inert, and the gate skips it rather than reporting it.
 #
 # WHAT THE CLASSIFICATION SEARCH DOES NOT COVER, stated rather than implied: it matches a
-# `FROM` line that opens a line apart from leading whitespace, in either case. A container
-# build that reaches the keyword some other way — a line continuation, a file a script
-# generates, a Dockerfile packed into an archive — goes undiscovered when its name is one
-# the first rule does not cover. Under-detection is that search's failure mode. The
-# name rule carries no such gap, because it reads the path rather than the file's text.
+# whole `FROM` instruction, written to Dockerfile's grammar for that instruction, opening a
+# line apart from leading whitespace, in either case. A container build that reaches the
+# keyword some other way — a line continuation, a file a script generates, a Dockerfile
+# packed into an archive — goes undiscovered when its name is one the first rule does not
+# cover. Under-detection is that search's failure mode. The name rule carries no such gap,
+# because it reads the path rather than the file's text.
 #
 # ── CHECK 2: the CI paths filters route a change to the jobs that build from it ──────
 #
@@ -94,24 +95,41 @@
 #   so a lane added later without the OR fails here, and no list in this file has to learn
 #   about it.
 #
-#   2c — ROOT-LEVEL FILES, CLASSIFIED EXHAUSTIVELY. A root-level file is the class whose
-#   omission from a filter no ordinary pull request reveals: dropping `crates/**` from the
-#   `rust` filter skips the Rust lane on nearly every pull request and someone notices
-#   within a day, while dropping `.clippy.toml` skips it only on the rare pull request that
-#   edits a lint threshold and changes nothing else. So the gate enumerates every
-#   root-level file in the git tree and requires each one to be either routed — listed in
-#   the `rust` filter or in the `toolchain` filter — or named in NO_RUST_JOB_READS below.
-#   A file added at the root later is unclassified, and the gate fails until someone
-#   decides which it is. That is the property a list of required entries did not have: an
-#   entry nobody added was an entry nobody heard about.
+#   2c — THE BUILD-CONFIGURATION FILES, CLASSIFIED EXHAUSTIVELY. THE CRITERION: a path
+#   whose omission from a filter no ordinary pull request reveals. Dropping `crates/**`
+#   from the `rust` filter skips the Rust lane on nearly every pull request and someone
+#   notices within a day, while dropping `.clippy.toml` skips it only on the rare pull
+#   request that edits a lint threshold and changes nothing else.
+#
+#   Two populations satisfy that criterion, and the gate enumerates both from the git tree
+#   rather than from a list someone remembered to add:
+#
+#     * Every root-level file. A pull request that edits one of these and nothing else is
+#       rare, and each one configures a build tool rather than holding source a lane
+#       compiles.
+#     * Every cargo configuration file, at any depth. Cargo's documented configuration
+#       discovery walks from the directory a command runs in up to the filesystem root and
+#       reads `.cargo/config.toml` — and the pre-2019 spelling `.cargo/config` — at each
+#       step, so each such file in this tree sets rustflags, target settings, or a build
+#       target for every cargo command run below it. `.cargo/config.toml` at this
+#       repository's root is what selects getrandom's wasm backend, and one commit has
+#       ever touched it — the one that created it — which is how it reached no filter and
+#       nobody noticed.
+#
+#   The gate requires each member of both populations to be either routed — matched by an
+#   entry of the `rust` filter or of the `toolchain` filter — or named in
+#   NO_RUST_JOB_READS below. A file added to either population later is unclassified, and
+#   the gate fails until someone decides which it is. That is the property a list of
+#   required entries did not have: an entry nobody added was an entry nobody heard about.
 #
 #   2d — THE FUZZ PIN. `fuzz-build` runs `cargo check` with `working-directory: fuzz`,
 #   where rustup resolves `fuzz/rust-toolchain.toml`, so the `fuzz` filter's `fuzz/**`
 #   entry is what routes a change to that nightly.
 #
 # An `OK` from check 2 is not a claim that the filters are correct. It says the pin reaches
-# every lane and that every root-level file is classified. A `rust` filter stripped of
-# `crates/**` still passes, and it does not need this gate: that omission reveals itself.
+# every lane and that every root-level file and every cargo configuration file is
+# classified. A `rust` filter stripped of `crates/**` still passes, and it does not need
+# this gate: that omission reveals itself.
 #
 # ── CHECK 3: mise names no Rust version source ───────────────────────────────────────
 #
@@ -142,6 +160,11 @@ CI_WORKFLOW=".github/workflows/ci.yml"
 MISE_CONFIG=".mise.toml"
 PIN="rust-toolchain.toml"
 TOOLCHAIN_FILTER="toolchain"
+# A path cargo reads as configuration. Cargo's documented discovery walks from the
+# directory a command runs in up to the filesystem root and reads `.cargo/config.toml` at
+# each step; `config` without the extension is the spelling cargo read before 1.39 and
+# still accepts.
+CARGO_CONFIG_NAME='(^|/)\.cargo/config(\.toml)?$'
 
 fail=0
 report() {
@@ -175,10 +198,26 @@ read -r -d '' QUOTES_A_CONTAINER_BUILD <<'LIST' || true
 scripts/tests/toolchain-wiring/run-tests.sh
 LIST
 
-# A `FROM` line naming a `rust` base image: opening a line apart from leading whitespace,
-# in either case, with or without a registry prefix and with or without a tag. A stage name
+# A `FROM` line naming a `rust` base image, matched against Dockerfile's own grammar for
+# the instruction: `FROM [--flag=value]… <image>[:<tag>|@<digest>] [AS <name>]`, and
+# nothing after the optional stage name but the end of the line. The keyword opens a line
+# apart from leading whitespace, in either case, because Docker accepts both. A stage name
 # does not match, because `FROM chef AS builder` names no image whose compiler to pin.
-FROM_RUST_IMAGE='^[[:space:]]*FROM[[:space:]]+([a-z0-9._:-]+/)*rust(:[^[:space:]]*)?([[:space:]]|$)'
+#
+# The end-of-line anchor is what keeps an English sentence out. Docker's FROM instruction
+# permits nothing after the image reference except `AS <name>`, so a line reading
+# "from rust sources by uniffi." cannot be a FROM instruction, and an earlier revision of
+# this expression matched it: it ended at `([[:space:]]|$)`, which accepted any text after
+# the image. The phrase "from Rust" opens a sentence in fifteen tracked files, and where a
+# Markdown paragraph wraps decides whether one of them starts a line, so that revision
+# failed `enforcement / toolchain wiring` — the check every pull request runs — on a
+# reflowed paragraph. Narrowing the expression to the instruction's grammar drops no
+# container build, because a container build's FROM line follows that grammar.
+#
+# The remaining false-positive shape, stated rather than implied: a sentence whose line
+# reads "from rust as <word>" and ends there matches, because that text is also a valid
+# FROM instruction. Its author lists the file in QUOTES_A_CONTAINER_BUILD.
+FROM_RUST_IMAGE='^[[:space:]]*FROM[[:space:]]+(--[a-zA-Z-]+=[^[:space:]]+[[:space:]]+)*([a-z0-9._:-]+/)*rust(:[^[:space:]]+|@[a-z0-9]+:[a-fA-F0-9]+)?([[:space:]]+AS[[:space:]]+[A-Za-z0-9._-]+)?[[:space:]]*$'
 
 # The names `docker build` reads: its default, and the two conventional spellings `-f`
 # names. Podman reads the `Containerfile` spellings, and `docker build -f` accepts them.
@@ -254,10 +293,11 @@ fi
 
 # ── Check 2 ──────────────────────────────────────────────────────────────────────────
 #
-# Root-level files that no job in `ci.yml` reads while it compiles anything. Every other
-# root-level file must appear in the `rust` filter or in the `toolchain` filter. Adding a
-# file here is a claim that changing it cannot change what any compile produces, and the
-# gate takes that claim at face value — it is the one judgement this check cannot make.
+# Files that no job in `ci.yml` reads while it compiles anything. Every other file check 2c
+# enumerates — every root-level file, and every cargo configuration file at any depth —
+# must be routed by the `rust` filter or by the `toolchain` filter. Adding a file here is a
+# claim that changing it cannot change what any compile produces, and the gate takes that
+# claim at face value — it is the one judgement this check cannot make.
 NO_RUST_JOB_READS=(
     # Documentation and licensing. No job compiles from them.
     "CHANGELOG.md"
@@ -300,6 +340,36 @@ filter_entries() {
             exit
         }
     ' "$wf" | sed -nE "s/^[[:space:]]*-[[:space:]]*[\"']?([^\"']*)[\"']?[[:space:]]*$/\1/p"
+}
+
+# Answer whether one path entry list routes one path.
+#
+# dorny/paths-filter matches an entry with picomatch, and this gate reimplements two of
+# picomatch's shapes rather than its grammar: an entry that names the path exactly, and an
+# entry `<prefix>/**`, which picomatch matches against every path under `<prefix>/`. Those
+# are the two shapes the `rust` and `toolchain` filters use for the files check 2c
+# enumerates. An entry written any other way routes nothing here, so a filter that reaches a
+# file only through a third shape fails this gate rather than passing it, and its author
+# writes the file's path or its directory prefix out.
+#
+# The `<prefix>/**` rule holds for a path whose later segments begin with a dot, such as
+# `crates/scp-mls/.cargo/config.toml`, only because the action enables picomatch's `dot`
+# option: `src/filter.ts` on the v3 tag defines `const MatchOptions = { dot: true }` and
+# passes it to every `picomatch(...)` call it makes. Measured against picomatch 4.0.3,
+# `crates/**` matches that path under `dot: true` and does not match it under picomatch's
+# default. Should a future version of the action drop that option, this helper reports a
+# nested cargo configuration file as routed while the filter skips it.
+routed_by() {
+    local path=$1 entries=$2 entry prefix
+    while IFS= read -r entry; do
+        [[ -n $entry ]] || continue
+        if [[ $entry == "$path" ]]; then return 0; fi
+        if [[ $entry == */'**' ]]; then
+            prefix=${entry%'**'}
+            if [[ $path == "$prefix"* ]]; then return 0; fi
+        fi
+    done <<< "$entries"
+    return 1
 }
 
 # Print `<output name>=<expression>` for every output the `changes` job declares.
@@ -355,29 +425,39 @@ else
         done <<< "$outputs"
     fi
 
-    # 2c — every root-level file is routed or declared unread.
+    # 2c — every root-level file and every cargo configuration file is routed or declared
+    # unread.
     rust_entries=$(filter_entries "$CI_WORKFLOW" "rust")
     if [[ -z $rust_entries ]]; then
-        report "$CI_WORKFLOW declares no 'rust:' paths filter with path entries, so the gate cannot check which root-level files it routes"
+        report "$CI_WORKFLOW declares no 'rust:' paths filter with path entries, so the gate cannot check which build-configuration files it routes"
     else
-        root_files=$(git ls-files --cached --others --exclude-standard 2>/dev/null | grep -v '/' || true)
+        tracked_files=$(git ls-files --cached --others --exclude-standard 2>/dev/null || true)
+        root_files=$(grep -v '/' <<< "$tracked_files" || true)
+        cargo_config_files=$(grep -E "$CARGO_CONFIG_NAME" <<< "$tracked_files" || true)
         if [[ -z $root_files ]]; then
-            report "git listed no root-level files, so the gate cannot check that each one is routed to a lane or declared unread"
+            report "git listed no root-level files, so the gate cannot check that each build-configuration file is routed to a lane or declared unread"
         else
-            while IFS= read -r root_file; do
-                [[ -n $root_file ]] || continue
-                if grep -qxF -- "$root_file" <<< "$rust_entries"; then continue; fi
-                if grep -qxF -- "$root_file" <<< "$toolchain_entries"; then continue; fi
+            while IFS= read -r build_file; do
+                [[ -n $build_file ]] || continue
+                if routed_by "$build_file" "$rust_entries"; then continue; fi
+                if routed_by "$build_file" "$toolchain_entries"; then continue; fi
                 declared=0
                 for unread in "${NO_RUST_JOB_READS[@]}"; do
-                    if [[ $root_file == "$unread" ]]; then
+                    if [[ $build_file == "$unread" ]]; then
                         declared=1
                         break
                     fi
                 done
                 if [[ $declared -eq 1 ]]; then continue; fi
-                report "$root_file sits at the repository root and neither the 'rust' filter nor the '$TOOLCHAIN_FILTER' filter in $CI_WORKFLOW lists it, and NO_RUST_JOB_READS in this gate does not declare it unread. A pull request that changes only that file leaves the filter output 'false', every job the filter guards skips, and the 'ci' aggregator job counts a skipped job as a pass. List it in the filter that guards the jobs it decides, or declare it in NO_RUST_JOB_READS."
-            done <<< "$root_files"
+                # Name which population put the file in front of the reader. A file can be
+                # in both, and the cargo sentence is the one that explains the reach.
+                if grep -qE "$CARGO_CONFIG_NAME" <<< "$build_file"; then
+                    population="is a cargo configuration file, which cargo reads for every command run below its directory, and"
+                else
+                    population="sits at the repository root and"
+                fi
+                report "$build_file $population neither the 'rust' filter nor the '$TOOLCHAIN_FILTER' filter in $CI_WORKFLOW routes it, and NO_RUST_JOB_READS in this gate does not declare it unread. A pull request that changes only that file leaves the filter output 'false', every job the filter guards skips, and the 'ci' aggregator job counts a skipped job as a pass. List it in the filter that guards the jobs it decides, or declare it in NO_RUST_JOB_READS."
+            done <<< "$(printf '%s\n%s\n' "$root_files" "$cargo_config_files" | sed '/^$/d' | sort -u)"
         fi
     fi
 
@@ -405,7 +485,7 @@ fi
 
 if [[ $fail -eq 0 ]]; then
     printf 'OK: every container build asserts it resolved the compiler %s names\n' "$PIN"
-    printf 'OK: every lane in the ci.yml changes job routes a %s change, and every root-level file is routed or declared unread\n' "$PIN"
+    printf 'OK: every lane in the ci.yml changes job routes a %s change, and every root-level file and cargo configuration file is routed or declared unread\n' "$PIN"
     printf 'OK: %s names no Rust version source, so rustup resolves each directory from its own toolchain file\n' "$MISE_CONFIG"
     exit 0
 fi

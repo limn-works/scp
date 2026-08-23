@@ -39,8 +39,12 @@ jobs:
     # other job's result counts a skipped job as a pass, so a lane the pin does not reach
     # lets a version bump merge with nothing compiling on the new compiler.
     #
-    # The `toolchain` filter below holds the pin, and every output ORs it in, so this
-    # workflow names `rust-toolchain.toml` once. `scripts/check-toolchain-wiring.sh` reads
+    # `.cargo/config.toml` reaches every one of those lanes for the same reason: cargo
+    # reads a `.cargo/config.toml` out of every ancestor of the directory a cargo command
+    # runs in, so the rustflags it sets apply to each of those compiles.
+    #
+    # The `toolchain` filter below holds both files, and every output ORs that filter in,
+    # so this workflow names each of them once. `scripts/check-toolchain-wiring.sh` reads
     # these output names out of this file and fails when one of them drops the OR, so a
     # lane added later is covered without editing that gate.
     outputs:
@@ -61,10 +65,19 @@ jobs:
         id: filter
         with:
           filters: |
-            # The compiler every lane compiles on. The `outputs:` block above ORs this
-            # filter into every other lane, so no other filter repeats the pin.
+            # The files that decide how every lane compiles, rather than what any one lane
+            # compiles. The `outputs:` block above ORs this filter into every other lane,
+            # so no other filter repeats an entry listed here.
             toolchain:
               - 'rust-toolchain.toml'
+              # Cargo reads `.cargo/config.toml` out of every ancestor directory of the
+              # one a cargo command runs in, so this file reaches every cargo invocation
+              # in this workspace and every `wasm-pack build` under it. Its
+              # `[target.wasm32-unknown-unknown]` stanza sets the rustflag that selects
+              # getrandom's wasm backend, and `typescript-wasm-check` and
+              # `scaffold-typescript-web-check` fail to link without it. A `[build]`
+              # stanza added there would change what every other lane compiles.
+              - '.cargo/**'
             rust:
               - 'crates/**'
               - 'Cargo.toml'
@@ -81,10 +94,11 @@ jobs:
               - '.clippy.toml'
               - 'rustfmt.toml'
               # `scripts/check-toolchain-wiring.sh` enumerates every root-level file in
-              # the git tree and fails when one is listed neither here nor in the
-              # `toolchain` filter, unless that gate declares that no job reads it while
-              # it compiles. A file added at the repository root later fails that gate
-              # until someone classifies it.
+              # the git tree, and every cargo configuration file the tree holds at any
+              # depth, and fails when one is listed neither here nor in the `toolchain`
+              # filter, unless that gate declares that no job reads it while it compiles.
+              # A file added at the repository root later, or a `.cargo/config.toml`
+              # added under any directory, fails that gate until someone classifies it.
             python:
               - 'bindings/python/**'
               - 'crates/scp-ffi/src/**'

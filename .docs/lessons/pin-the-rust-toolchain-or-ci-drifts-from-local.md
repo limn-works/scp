@@ -239,11 +239,26 @@ the gate about it.
 The remaining root-level entries — `Dockerfile`, `.dockerignore`, `.clippy.toml`,
 `rustfmt.toml` — got the same treatment from the other side. Instead of naming the files
 that must be routed, the gate enumerates every root-level file in the git tree and requires
-each one to be routed by the `rust` or `toolchain` filter, or declared in a list of root
-files no compile reads. Every root file is then classified exactly once, and a file added
+each one to be routed by the `rust` or `toolchain` filter, or declared in a list of files
+no compile reads. Every root file is then classified exactly once, and a file added
 at the root later is unclassified, so the gate fails until someone decides which it is.
 That is the property the list of required entries did not have: **an entry nobody added was
 an entry nobody heard about.**
+
+**The first version of that enumeration read the criterion off the wrong feature.** The
+criterion is a path whose omission from a filter no ordinary pull request reveals, and the
+enumeration kept only paths holding no slash, which is a property of where the four files
+that prompted it happened to sit. `.cargo/config.toml` satisfies the criterion and holds a
+slash: cargo reads it out of every ancestor of the directory a command runs in, its
+`[target.wasm32-unknown-unknown]` stanza is what selects getrandom's wasm backend for
+`wasm-pack build`, no filter listed it, and a `[build]` stanza added there would change
+what every crate in the workspace compiles to. A pull request deleting that stanza and
+changing nothing else skipped every job, and the aggregator reported success. The
+enumeration now covers a second population derived from cargo's own documented
+configuration discovery — every `.cargo/config.toml` and `.cargo/config` in the tree, at
+any depth — and the pin's filter lists `.cargo/**`, so the population and the routing meet.
+**Writing an enumeration from the examples in front of you reproduces their incidental
+shape; derive it from the criterion instead.**
 
 The general form: a check that names the things which must be present fails silently on the
 thing nobody thought of, while a check that enumerates the population and requires each

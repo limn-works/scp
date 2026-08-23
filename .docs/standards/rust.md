@@ -76,6 +76,13 @@ fails on a file neither list names. Writing a container build under a name outsi
 rule is therefore still caught, and quoting a Dockerfile in an architecture decision record
 or a runbook no longer forces the author to break the quotation.
 
+That classification search matches a whole `FROM` instruction, written to Dockerfile's
+grammar for it: an optional flag, an image reference, an optional tag or digest, an
+optional `AS <name>`, and then the end of the line. The end-of-line anchor keeps English
+prose out. Docker permits nothing after the image reference but `AS <name>`, so a Markdown
+line reading "from rust sources by uniffi." cannot be a FROM instruction, and an earlier
+expression that stopped at the image reference failed the gate on exactly that sentence.
+
 Second, that `.github/workflows/ci.yml` routes a change to the jobs that build from it.
 Each job that compiles a crate of this workspace is guarded by
 `if: needs.changes.outputs.<lane> == 'true'`, and the `ci` job that aggregates every other
@@ -93,13 +100,21 @@ that reads it skipped. The pin decides seven lanes, not one:
 | `swift` | `swift-build-test` runs `bindings/swift/build-xcframework.sh --dev`, which calls `cargo build` |
 
 Rather than list the pin in seven filters, the `changes` job declares one `toolchain`
-filter holding `rust-toolchain.toml` and ORs it into every lane's output, so the workflow
-names the pin once. The gate reads the set of outputs out of the workflow, so a lane added
-later without the OR fails it. The gate also enumerates every root-level file in the git
-tree and requires each one to be listed in the `rust` or `toolchain` filter, or declared in
-the gate's own list of root files no compile reads — which makes a file added at the root
-later fail until someone classifies it. The `fuzz` lane is exempt from the pin: `fuzz-build`
-runs `cargo check` with `working-directory: fuzz`, where rustup resolves
+filter and ORs it into every lane's output, so the workflow names each file that filter
+holds once. That filter holds two: `rust-toolchain.toml`, and `.cargo/**`, because cargo
+reads a `.cargo/config.toml` out of every ancestor of the directory a command runs in, and
+this repository's root one sets the rustflag that selects getrandom's wasm backend. The
+gate reads the set of outputs out of the workflow, so a lane added later without the OR
+fails it.
+
+The gate also enumerates two populations of file and requires each member to be routed by
+an entry of the `rust` or `toolchain` filter, or declared in the gate's own list of files
+no compile reads: every root-level file, and — derived from cargo's documented
+configuration discovery — every `.cargo/config.toml` and `.cargo/config` in the tree at any
+depth. Both populations share the criterion that a pull request editing one member and
+nothing else is rare, so an omitted entry stays invisible. A file added to either
+population fails the gate until someone classifies it. The `fuzz` lane is exempt from the
+pin: `fuzz-build` runs `cargo check` with `working-directory: fuzz`, where rustup resolves
 `fuzz/rust-toolchain.toml`, and the `fuzz` filter's `fuzz/**` entry covers that file.
 
 Third, that `.mise.toml` names no Rust version source, for the reason the mise paragraph

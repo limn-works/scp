@@ -16,12 +16,18 @@
 #     gate's QUOTES_A_CONTAINER_BUILD list names passes, and one neither list names fails
 #     with the message that asks its author which of the two it is. A quotation entry naming
 #     a file Docker builds by name is a contradiction the gate reports.
+#   * Check 1's classification search matches a whole `FROM` instruction written to
+#     Dockerfile's grammar, so a Markdown line opening "from rust sources by uniffi."
+#     reports nothing, while a real FROM instruction under a name Docker does not build —
+#     with a `--platform` flag, with a digest, or bare — still asks its author to classify
+#     the file.
 #   * Check 2 fails when the `toolchain` filter does not hold the pin, when an output of
 #     the `changes` job does not OR that filter in, when the `fuzz` filter drops `fuzz/**`,
-#     and when a root-level file is listed in no filter and declared in no exemption. Each
-#     job that compiles a crate of this workspace is guarded by such an output, and the `ci`
-#     job that aggregates every other job's result counts a skipped job as a pass, so an
-#     unrouted change merges unbuilt.
+#     when a root-level file is listed in no filter and declared in no exemption, and when a
+#     cargo configuration file at any depth is routed by no filter entry. Each job that
+#     compiles a crate of this workspace is guarded by such an output, and the `ci` job that
+#     aggregates every other job's result counts a skipped job as a pass, so an unrouted
+#     change merges unbuilt.
 #   * Check 3 fails when `.mise.toml` names a Rust version source — a `rust` key under
 #     `[tools]`, or `rust-toolchain.toml` registered through
 #     `idiomatic_version_file_enable_tools`. mise then exports one `RUSTUP_TOOLCHAIN` for
@@ -29,8 +35,8 @@
 #     `cargo fuzz` command on the workspace's stable compiler.
 #
 # HOW EACH CASE IS BUILT. `run_case` makes a temporary directory, writes the gate into
-# `scripts/`, runs `git init` so the gate's `git grep` search and its root-file listing have
-# a work tree, and writes the case's `ci.yml`, `.mise.toml`, optional `Dockerfile`, optional
+# `scripts/`, runs `git init` so the gate's `git grep` search and its file listings have a
+# work tree, and writes the case's `ci.yml`, `.mise.toml`, optional `Dockerfile`, optional
 # extra root file, and every path in EXTRA_FILES. The gate `cd`s to its own parent's parent,
 # so that directory becomes its repository root. No canned repository holds
 # `templates/personal-relay/README.md`, the one path BUILT_FROM_DOCUMENTATION names, so
@@ -131,7 +137,7 @@ emit_ci() {
         with:
           filters: |
 YAML
-    emit_filter toolchain 'rust-toolchain.toml'
+    emit_filter toolchain 'rust-toolchain.toml' '.cargo/**'
     # `Dockerfile` and `.mise.toml` are the root-level files every canned repository holds,
     # so the `rust` filter routes the first and the gate's exemption list covers the second.
     emit_filter rust 'crates/**' 'Dockerfile' 'deny.toml'
@@ -268,9 +274,11 @@ OMIT_OUTPUT=""
 # that, because `fuzz-build` compiles on `fuzz/rust-toolchain.toml`. The passing case
 # already proves it; this comment records that the exemption is deliberate.
 
+# The `toolchain` filter keeps its other entry and drops the pin, which reaches check 2a's
+# second branch. The case below drops the filter and its header, which reaches the first.
 OMIT_FILTER="toolchain rust-toolchain.toml"
 run_case "toolchain-filter-omits-the-pin" 1 \
-    "declares no 'toolchain:' paths filter with path entries" emit_ci mise_ok
+    "the 'toolchain' paths filter does not list rust-toolchain.toml" emit_ci mise_ok
 
 OMIT_FILTER="toolchain *"
 run_case "toolchain-filter-absent-entirely" 1 \
@@ -310,6 +318,55 @@ run_case "new-root-file-is-unclassified" 1 \
 EXTRA_ROOT_FILE="README.md"
 run_case "root-file-declared-unread" 0 "" emit_ci mise_ok
 EXTRA_ROOT_FILE=""
+
+# ── Check 2c: cargo configuration files, which sit below the root ────────────────────
+#
+# Cargo reads `.cargo/config.toml` out of every ancestor of the directory a command runs
+# in, so each such file sets rustflags for every cargo command below it. The root-file
+# enumeration cannot see one, because its path holds a slash; the cases below cover the
+# separate enumeration that does. `.cargo/config.toml` at this repository's root selects
+# getrandom's wasm backend, and no filter routed it until the case below existed.
+
+cargo_config_wasm_rustflags() {
+    cat <<'TOML'
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
+TOML
+}
+
+EXTRA_FILES=(".cargo/config.toml" cargo_config_wasm_rustflags)
+OMIT_FILTER="toolchain .cargo/**"
+run_case "cargo-config-routed-by-no-filter" 1 \
+    ".cargo/config.toml is a cargo configuration file, which cargo reads for every command run below its directory" \
+    emit_ci mise_ok
+
+# The same file with the glob entry restored. `.cargo/**` names no path exactly, so this
+# case is what proves the gate matches a `<prefix>/**` entry against a path under it.
+OMIT_FILTER=""
+run_case "cargo-config-routed-by-a-glob-entry" 0 "" emit_ci mise_ok
+
+# The spelling cargo read before 1.39 and still accepts. The gate enumerates it under the
+# same rule, so dropping the glob entry reports it too.
+cargo_config_legacy_name() {
+    printf '[build]\nrustflags = ["-C", "target-cpu=native"]\n'
+}
+EXTRA_FILES=(".cargo/config" cargo_config_legacy_name)
+OMIT_FILTER="toolchain .cargo/**"
+run_case "extensionless-cargo-config-routed-by-no-filter" 1 \
+    ".cargo/config is a cargo configuration file" emit_ci mise_ok
+
+# A cargo configuration file under a directory no filter routes. Its rustflags reach every
+# cargo command run below `deploy/`, and no lane runs when it changes alone.
+OMIT_FILTER=""
+EXTRA_FILES=("deploy/.cargo/config.toml" cargo_config_wasm_rustflags)
+run_case "nested-cargo-config-under-an-unrouted-directory" 1 \
+    "deploy/.cargo/config.toml is a cargo configuration file" emit_ci mise_ok
+
+# A cargo configuration file inside the tree the `rust` filter's `crates/**` entry routes.
+# A pull request that edits it runs the Rust lane already, so the gate reports nothing.
+EXTRA_FILES=("crates/scp-mls/.cargo/config.toml" cargo_config_wasm_rustflags)
+run_case "nested-cargo-config-routed-by-the-rust-filter" 0 "" emit_ci mise_ok
+EXTRA_FILES=()
 
 # ── Check 3: mise names no Rust version source ───────────────────────────────────────
 
@@ -567,8 +624,8 @@ run_case "documented-recipe-with-the-assertion" 0 "" routing_ok mise_ok
 EXTRA_FILES=()
 
 # A SQL query whose `FROM` clause opens a line. The matcher requires the token `rust`
-# followed by a tag, whitespace, or the end of the line, so `rust_crates` does not match and
-# the file needs no entry in either list.
+# followed by a tag, a digest, ` AS <name>`, or the end of the line, so `rust_crates` does
+# not match and the file needs no entry in either list.
 sql_selects_from_a_table() {
     cat <<'SQL'
 SELECT id, name
@@ -578,6 +635,63 @@ SQL
 }
 EXTRA_FILES=("crates/scp-node/queries/crates.sql" sql_selects_from_a_table)
 run_case "sql-from-clause-is-not-a-container-build" 0 "" routing_ok mise_ok
+EXTRA_FILES=()
+
+# ── Check 1: an English sentence is not a FROM instruction ───────────────────────────
+#
+# Docker's FROM instruction permits nothing after the image reference but `AS <name>`, so
+# the matcher anchors at the end of the line. An earlier expression ended at
+# `([[:space:]]|$)` and accepted any text after the image, so a Markdown line opening
+# "from rust sources by uniffi." failed `enforcement / toolchain wiring` — the check every
+# pull request runs — and its author's ways out were to declare the prose a quotation of a
+# container build or to rewrap the paragraph. The phrase "from Rust" opens a sentence in
+# fifteen tracked files of this repository, and where a paragraph wraps decides whether one
+# of them starts a line.
+prose_sentence_opens_with_from_rust() {
+    cat <<'DOC'
+# How the Swift bindings are produced
+
+`build-xcframework.sh` generates the Swift API
+from rust sources by uniffi.
+The generated files are not checked in.
+DOC
+}
+EXTRA_FILES=(".docs/standards/swift-bindings.md" prose_sentence_opens_with_from_rust)
+run_case "prose-sentence-opening-with-from-rust-is-not-a-container-build" 0 "" \
+    routing_ok mise_ok
+EXTRA_FILES=()
+
+# The narrowing drops no container build, and these three cases hold the matcher to that.
+# Each writes a real FROM instruction into a file whose name Docker does not build, so the
+# gate reaches it through the classification search alone and asks its author to classify
+# it. A regression in the expression turns each of them green.
+container_build_under_an_unconventional_name() {
+    cat <<'DOCKER'
+FROM rust:slim-bookworm AS builder
+WORKDIR /app
+RUN cargo build --release
+DOCKER
+}
+EXTRA_FILES=("deploy/relay-image" container_build_under_an_unconventional_name)
+run_case "container-build-under-an-unconventional-name-is-unclassified" 1 \
+    "holds a FROM line naming a 'rust' base image, and neither list in this gate classifies it" \
+    routing_ok mise_ok
+
+container_build_with_a_platform_flag() {
+    printf 'FROM --platform=$BUILDPLATFORM rust:1.98.0-slim-bookworm AS builder\n'
+}
+EXTRA_FILES=("deploy/relay-image" container_build_with_a_platform_flag)
+run_case "container-build-with-a-platform-flag-is-unclassified" 1 \
+    "holds a FROM line naming a 'rust' base image, and neither list in this gate classifies it" \
+    routing_ok mise_ok
+
+container_build_pinned_by_digest() {
+    printf 'FROM ghcr.io/library/rust@sha256:9f2c1e4b7a\n'
+}
+EXTRA_FILES=("deploy/relay-image" container_build_pinned_by_digest)
+run_case "container-build-pinned-by-digest-is-unclassified" 1 \
+    "holds a FROM line naming a 'rust' base image, and neither list in this gate classifies it" \
+    routing_ok mise_ok
 EXTRA_FILES=()
 
 # The gate's quotation list naming a file Docker builds by name. No repository file can
