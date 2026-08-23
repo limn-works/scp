@@ -22,7 +22,7 @@ use axum::routing::get;
 use scp_clock::SystemClock;
 use scp_dht::PkarrDhtClient;
 use scp_identity::{DidDht, IdentityError, SequenceStore};
-use scp_node::{ApplicationNodeBuilder, TlsProvider};
+use scp_node::{DhtMode, IdentitySource, Node, NodeConfig, Reach, TlsMode, TlsProvider};
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_platform::traits::Storage;
 use scp_transport::native::storage::BlobStorageBackend;
@@ -241,27 +241,6 @@ impl TlsProvider for ManualTlsProvider {
     }
 }
 
-/// TLS provider that generates a self-signed certificate (development only).
-struct SelfSignedTlsProvider {
-    domain: String,
-}
-
-impl TlsProvider for SelfSignedTlsProvider {
-    fn provision(
-        &self,
-    ) -> Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<scp_node::tls::CertificateData, scp_node::tls::TlsError>,
-                > + Send
-                + '_,
-        >,
-    > {
-        let domain = self.domain.clone();
-        Box::pin(async move { scp_node::tls::generate_self_signed(&domain) })
-    }
-}
-
 // ---------------------------------------------------------------------------
 // DHT client
 // ---------------------------------------------------------------------------
@@ -308,12 +287,11 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .unwrap_or_else(|_| {
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                        .unwrap_or_else(|_| std::process::exit(1))
-                });
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .unwrap_or_else(|_| {
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                    .unwrap_or_else(|_| std::process::exit(1))
+            });
         tokio::select! {
             _ = ctrl_c => {}
             _ = sigterm.recv() => {}
@@ -375,8 +353,7 @@ async fn main() {
     };
 
     let node_storage = open_sqlite_or_exit(&config.storage_path, &storage_key);
-    let custody_storage =
-        open_sqlite_or_exit(&config.storage_path.join("custody"), &storage_key);
+    let custody_storage = open_sqlite_or_exit(&config.storage_path.join("custody"), &storage_key);
 
     let custody = match SqliteKeyCustody::new(custody_storage).await {
         Ok(c) => Arc::new(c),
@@ -394,8 +371,7 @@ async fn main() {
         storage: Arc::clone(&node_storage_arc),
     });
 
-    let sign_fn =
-        DidDht::<PkarrDhtClient, SystemClock>::make_sign_fn(Arc::clone(&custody));
+    let sign_fn = DidDht::<PkarrDhtClient, SystemClock>::make_sign_fn(Arc::clone(&custody));
     let did_method = Arc::new(DidDht::with_client_signer_and_store(
         dht_client,
         cache,
@@ -410,15 +386,37 @@ async fn main() {
         std::process::exit(1);
     });
 
-    // Determine the domain. Without a domain, use no_domain (NAT-traversed) mode.
+    // Determine the domain. Without a domain, the node is reached through NAT
+    // traversal (§10.12.8) and publishes a `ws://` relay URL.
     let domain = config.domain.clone();
 
-    // Re-open a fresh SQLite handle for the ApplicationNodeBuilder (the
-    // Arc<SqliteStorage> above is used for the sequence store; the builder
-    // needs its own handle for ProtocolRepository).
-    let builder_storage = open_sqlite_or_exit(&config.storage_path, &storage_key);
+    // Re-open a fresh SQLite handle for the node (the `Arc<SqliteStorage>` above
+    // backs the BEP44 sequence store; `Node::start` needs its own handle for
+    // `ProtocolRepository`).
+    let node_config_storage = open_sqlite_or_exit(&config.storage_path, &storage_key);
 
-    match domain {
+    // `IdentitySource::Persisted` is load-or-create: the first start generates a
+    // DID and writes it to `node_config_storage`, and every later start with the
+    // same storage reloads that same DID. A relay whose DID changed on restart
+    // would invalidate every published DHT record pointing at it.
+    let identity = IdentitySource::Persisted {
+        custody: Arc::clone(&custody),
+        did_method: Arc::clone(&did_method),
+    };
+
+    // This relay publishes its DID document to the global Mainline DHT so peers
+    // can discover it, which `DhtMode::Production` selects. That publishes the
+    // host's public address bound to the node DID, and `NodeConfig::defaults`
+    // leaves it `Disabled` precisely so no node discloses an address by omission.
+    // A personal relay's whole purpose is to be reachable, so it opts in here.
+    let dht = DhtMode::Production;
+
+    // The relay listener stays on loopback; the public HTTP listener carries the
+    // WebSocket upgrade and terminates TLS.
+    let relay_bind_addr = Some(SocketAddr::from(([127, 0, 0, 1], 0)));
+    let http_bind_addr = Some(config.bind_addr);
+
+    let node = match domain {
         Some(ref domain_str) => {
             tracing::info!(
                 domain = %domain_str,
@@ -427,16 +425,10 @@ async fn main() {
                 "starting personal relay (domain mode)"
             );
 
-            let mut builder = ApplicationNodeBuilder::new()
-                .storage(builder_storage)
-                .domain(domain_str)
-                .identity_with_storage(Arc::clone(&custody), Arc::clone(&did_method))
-                .blob_storage(blob_storage)
-                .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-                .http_bind_addr(config.bind_addr);
-
-            // TLS provider selection: manual certs > self-signed > ACME (default).
-            if let (Some(cert_path), Some(key_path)) =
+            // TLS selection: manual certificates, then self-signed, then ACME.
+            // ACME is the default because a domain-reached relay that browsers
+            // must trust needs a CA-issued certificate.
+            let tls = if let (Some(cert_path), Some(key_path)) =
                 (config.tls_cert_path.clone(), config.tls_key_path.clone())
             {
                 tracing::info!(
@@ -444,50 +436,39 @@ async fn main() {
                     key = %key_path.display(),
                     "using manual TLS certificates"
                 );
-                builder = builder.tls_provider(Arc::new(ManualTlsProvider {
+                TlsMode::Custom(Arc::new(ManualTlsProvider {
                     cert_path,
                     key_path,
-                }));
+                }))
             } else if config.tls_self_signed {
                 tracing::warn!(
                     "using self-signed TLS certificate (development only, not trusted by browsers)"
                 );
-                builder = builder.tls_provider(Arc::new(SelfSignedTlsProvider {
-                    domain: domain_str.clone(),
-                }));
-            } else if let Some(ref email) = config.acme_email {
-                tracing::info!(email = %email, "ACME email set for Let's Encrypt");
-                builder = builder.acme_email(email);
-            }
-
-            let node = match builder.build().await {
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to build application node");
-                    std::process::exit(1);
+                TlsMode::SelfSigned
+            } else {
+                if let Some(ref email) = config.acme_email {
+                    tracing::info!(email = %email, "ACME email set for Let's Encrypt");
+                }
+                TlsMode::Acme {
+                    email: config.acme_email.clone(),
                 }
             };
 
-            // Initialize BEP44 sequence number from persistent store / DHT.
-            let did = node.identity().did().to_owned();
-            if let Err(e) = did_method.initialize_sequence(&did).await {
-                tracing::error!(
-                    error = %e,
-                    "failed to initialize BEP44 sequence -- DID publishing may fail"
-                );
-            }
-
-            tracing::info!(
-                did = %node.identity().did(),
-                relay_url = %node.relay_url(),
-                relay_internal_addr = %node.relay().bound_addr(),
-                "personal relay identity ready -- DID published to DHT"
-            );
-
-            if let Err(e) = node.serve(app_router(), shutdown_signal()).await {
-                tracing::error!(error = %e, "relay exited with error");
-                std::process::exit(1);
-            }
+            Node::start(NodeConfig {
+                tls,
+                dht,
+                bind_addr: relay_bind_addr,
+                http_bind_addr,
+                ..NodeConfig::defaults(
+                    Reach::Domain {
+                        domain: domain_str.clone(),
+                    },
+                    identity,
+                    node_config_storage,
+                    blob_storage,
+                )
+            })
+            .await
         }
         None => {
             tracing::info!(
@@ -496,42 +477,52 @@ async fn main() {
                 "starting personal relay (no-domain / NAT-traversed mode)"
             );
 
-            let builder = ApplicationNodeBuilder::new()
-                .storage(builder_storage)
-                .no_domain()
-                .identity_with_storage(Arc::clone(&custody), Arc::clone(&did_method))
-                .blob_storage(blob_storage)
-                .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-                .http_bind_addr(config.bind_addr);
-
-            let node = match builder.build().await {
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to build application node");
-                    std::process::exit(1);
-                }
-            };
-
-            let did = node.identity().did().to_owned();
-            if let Err(e) = did_method.initialize_sequence(&did).await {
-                tracing::error!(
-                    error = %e,
-                    "failed to initialize BEP44 sequence -- DID publishing may fail"
-                );
-            }
-
-            tracing::info!(
-                did = %node.identity().did(),
-                relay_url = %node.relay_url(),
-                relay_internal_addr = %node.relay().bound_addr(),
-                "personal relay identity ready -- DID published to DHT"
-            );
-
-            if let Err(e) = node.serve(app_router(), shutdown_signal()).await {
-                tracing::error!(error = %e, "relay exited with error");
-                std::process::exit(1);
-            }
+            // `Reach::NatTraversal` drops the `tls` field: the engine provisions
+            // no certificate for a node with no DNS name, so the fail-safe
+            // `TlsMode::SelfSigned` that `NodeConfig::defaults` fills in is never
+            // read on this path.
+            Node::start(NodeConfig {
+                dht,
+                bind_addr: relay_bind_addr,
+                http_bind_addr,
+                ..NodeConfig::defaults(
+                    Reach::NatTraversal,
+                    identity,
+                    node_config_storage,
+                    blob_storage,
+                )
+            })
+            .await
         }
+    };
+
+    let node = match node {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to start application node");
+            std::process::exit(1);
+        }
+    };
+
+    // Initialize the BEP44 sequence number from the persistent store / DHT.
+    let did = node.identity().did().to_owned();
+    if let Err(e) = did_method.initialize_sequence(&did).await {
+        tracing::error!(
+            error = %e,
+            "failed to initialize BEP44 sequence -- DID publishing may fail"
+        );
+    }
+
+    tracing::info!(
+        did = %node.identity().did(),
+        relay_url = %node.relay_url(),
+        relay_internal_addr = %node.relay().bound_addr(),
+        "personal relay identity ready -- DID published to DHT"
+    );
+
+    if let Err(e) = node.serve(app_router(), shutdown_signal()).await {
+        tracing::error!(error = %e, "relay exited with error");
+        std::process::exit(1);
     }
 
     tracing::info!("personal relay stopped");

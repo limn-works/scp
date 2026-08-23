@@ -18,13 +18,11 @@ This template builds a single-binary relay that:
 - Port 443 reachable from the internet (for ACME challenges and client connections)
 - Port 80 temporarily reachable during initial certificate provisioning (ACME HTTP-01)
 
-**This template does not currently compile against the workspace.** `src/main.rs:25`
-imports `scp_node::ApplicationNodeBuilder`, which the ADR-052 node-construction refactor
-deleted in favour of `Node::start(NodeConfig { .. })`, so `cargo build` stops at that import
-with `error[E0432]`. Issue #2384, the non-workspace crates that no longer compile, tracks the
-port. Every recipe below — the quick start, the systemd unit, and the Docker block — is
-correct once that lands, and the Docker recipe compiles on the version
-`rust-toolchain.toml` names, because it copies that file into the image.
+This crate declares its own `[workspace]` table, so `cargo clippy --workspace` at the
+repository root never reaches it. The `Rust / personal-relay template` job in
+`.github/workflows/ci.yml` runs `cargo check` against this manifest on every pull request
+that touches a `crates/*` path or this directory, so a constructor change that breaks the
+recipes below fails there rather than in your build.
 
 ## Quick start
 

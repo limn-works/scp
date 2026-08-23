@@ -93,6 +93,9 @@ jobs:
               # reads it, and the next branch to rebase would find the check red.
               - '.clippy.toml'
               - 'rustfmt.toml'
+              # `template-personal-relay` compiles the crate under this prefix and is
+              # guarded by this filter, so a change to the template has to reach it.
+              - 'templates/personal-relay/**'
               # `scripts/check-toolchain-wiring.sh` enumerates every root-level file in
               # the git tree, and every cargo configuration file the tree holds at any
               # depth, and fails when one is listed neither here nor in the `toolchain`
@@ -823,6 +826,42 @@ jobs:
           cache-from: type=gha,scope=docker-image
           cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=docker-image,ignore-error=true' || '' }}
 
+  # `templates/personal-relay` declares its own `[workspace]` table, so it is not a member
+  # of the root workspace and `cargo clippy --workspace` never reaches it. Nothing else in
+  # this workflow compiles it either, and it stopped compiling when the ADR-052 node
+  # construction refactor replaced `ApplicationNodeBuilder` with `Node::start(NodeConfig
+  # { .. })` — an operator following the README found that, not a check.
+  #
+  # `scripts/check-toolchain-wiring.sh` lists `templates/personal-relay/README.md` in
+  # BUILT_FROM_DOCUMENTATION, which claims that Docker builds the block that file holds.
+  # This job is what makes the claim checkable: it compiles the crate the block builds, so
+  # the next `crates/*` constructor change that breaks the template fails here instead of
+  # in an operator's container build.
+  #
+  # `cargo check --all-targets` rather than `cargo build --release`: the failure this job
+  # exists to catch is a name or a signature the template no longer resolves, which type
+  # checking reports, and the release build of the same dependency graph runs in
+  # `docker-image` already.
+  #
+  # This job compiles one of the four Rust crates in this repository that declare their
+  # own `[workspace]` table. Widening it to enumerate every such crate waits on the other
+  # three compiling again.
+  template-personal-relay:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    name: Rust / personal-relay template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      # The template is a separate cargo workspace, so it needs its own cache entry;
+      # `Swatinem/rust-cache` keys on the manifest and lockfile under this directory.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: templates/personal-relay
+      - name: Type-check the template
+        run: cargo check --manifest-path templates/personal-relay/Cargo.toml --all-targets
+
   # ── Python ──────────────────────────────────────────────────────────
   python-lint:
     needs: changes
@@ -1422,6 +1461,7 @@ jobs:
       - bridge-instance-lifecycle
       - toolchain-wiring
       - docker-image
+      - template-personal-relay
       - no-mutable-globals-rust
       - no-mutable-globals-python
       - no-mutable-globals-ts
@@ -1475,6 +1515,7 @@ jobs:
             "${{ needs.bridge-instance-lifecycle.result }}" \
             "${{ needs.toolchain-wiring.result }}" \
             "${{ needs.docker-image.result }}" \
+            "${{ needs.template-personal-relay.result }}" \
             "${{ needs.no-mutable-globals-rust.result }}" \
             "${{ needs.no-mutable-globals-python.result }}" \
             "${{ needs.no-mutable-globals-ts.result }}" \
