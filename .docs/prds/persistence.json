@@ -1,6 +1,6 @@
 {
   "project": "scp",
-  "description": "Persistence and storage layer for SCP. Covers serialization prerequisites, ProtocolRepository modules (event_log, nonce refactor, transport, sender keys, DID cache/TOFU, economic governance), Migratable trait and schema versioning, ContextPersistence trait and manager wiring, storage conformance macros, production storage adapters (SQLite, Filesystem), BlobStore adapters (SQLite, redb, PostgreSQL, S3-compatible), MLS StorageProvider bridge, platform-specific adapters (Android, iOS, CombinedNode, SyncableStorage, LocalBlobCache, relay state), and end-to-end integration tests. SyncableStorage and LocalBlobCache are PRD-originated designs implementing the deployment patterns described in section 17.1, not directly specified in a dedicated spec section.",
+  "description": "Persistence and storage layer for SCP. Covers serialization prerequisites, ProtocolRepository modules (event_log, nonce refactor, transport, sender keys, DID cache/TOFU, economic governance), Migratable trait and schema versioning, ContextPersistence trait and manager wiring, storage conformance macros, production storage adapters (SQLite, Filesystem), BlobStorage adapters (SQLite, redb, PostgreSQL, S3-compatible), MLS StorageProvider bridge, platform-specific adapters (Android, iOS, CombinedNode, SyncableStorage, LocalBlobCache, relay state), and end-to-end integration tests. SyncableStorage and LocalBlobCache are PRD-originated designs implementing the deployment patterns described in section 17.1, not directly specified in a dedicated spec section.",
   "gates": [
     {
       "id": "gate-persist-0",
@@ -994,7 +994,7 @@
         "crates/scp-testing/src/conformance/blob_store.rs",
         "crates/scp-testing/src/conformance/mod.rs"
       ],
-      "description": "Create the `blob_store_conformance!()` macro specified in sections 17.11 and 17.13. The macro takes a factory closure and generates 11 tests per the BlobStore conformance suite: (1) store/get roundtrip, (2) missing blob returns None, (3) TTL expiry (expired blob not returned), (4) query by routing_id returns results in stored_at order, (5) query with since filter, (6) query with limit, (7) delete removes blob, (8) store returns correct SHA-256 blob_id, (9) concurrent store + purge is safe, (10) purge_expired removes only expired blobs, (11) query empty routing_id returns empty Vec. Apply to `InMemoryBlobStorage` first.",
+      "description": "Create the `blob_store_conformance!()` macro specified in sections 17.11 and 17.13. The macro takes a factory closure and generates 11 tests per the BlobStorage conformance suite: (1) store/get roundtrip, (2) missing blob returns None, (3) TTL expiry (expired blob not returned), (4) query by routing_id returns results in stored_at order, (5) query with since filter, (6) query with limit, (7) delete removes blob, (8) store returns correct SHA-256 blob_id, (9) concurrent store + purge is safe, (10) purge_expired removes only expired blobs, (11) query empty routing_id returns empty Vec. Apply to `InMemoryBlobStorage` first.",
       "acceptanceCriteria": [
         "`blob_store_conformance!()` macro defined in `scp-testing/src/conformance/blob_store.rs` and registered in `conformance/mod.rs`",
         "Macro factory closure receives a controllable clock (or equivalent) for deterministic TTL and purge_expired testing",
@@ -1262,7 +1262,7 @@
         "crates/scp-transport/src/native/combined.rs",
         "crates/scp-transport/Cargo.toml"
       ],
-      "description": "Implement `CombinedNodeStorage` for personal node pattern per section 17.1 deployment patterns. Single SQLite database containing both `kv` table (client ProtocolRepository) and `blobs` table (relay BlobStore). Implements BOTH `Storage` and `BlobStorage` traits on one struct. Behind `combined` feature flag in `scp-transport`. This is a PRD-originated design implementing the deployment pattern described in section 17.1, not a directly specified component.",
+      "description": "Implement `CombinedNodeStorage` for personal node pattern per section 17.1 deployment patterns. Single SQLite database containing both `kv` table (client ProtocolRepository) and `blobs` table (relay BlobStorage). Implements BOTH `Storage` and `BlobStorage` traits on one struct. Behind `combined` feature flag in `scp-transport`. This is a PRD-originated design implementing the deployment pattern described in section 17.1, not a directly specified component.",
       "acceptanceCriteria": [
         "`CombinedNodeStorage` struct behind `combined` feature flag with single SQLite database containing both `kv` and `blobs` tables",
         "Implements `Storage` trait (delegates to kv table) and `BlobStorage` trait (delegates to blobs table)",

@@ -4,7 +4,7 @@
 
 **Date:** 2026-03-04
 
-**Status:** unexecuted. No document in the §4 Option B set exists, §5.2's TLS-presentation-language notation appears in no spec, and the §10 success criteria hold nowhere. This file is the only record of those decisions, so it is a plan, not an inventory of unfixed defects. §1.3 marks each conflict resolved as it is resolved, and the strikethroughs there are the record of what has already been fixed in the specs.
+**Status:** unexecuted. No document in the §4 Option B set exists, §5.2's TLS-presentation-language notation appears in no spec, and the §10 success criteria hold nowhere. This file is both a plan and an inventory. It records the extraction decisions in §4, §5, and §10 that nothing else in the repository records, and its §1.3 heading "Conflicts and Inconsistencies:" lists thirteen spec conflicts, of which nine are still open. A strikethrough plus ✅ **Resolved** marks a conflict whose fix landed in the specs. Item 3 shows what an open item looks like: `crates/scp-node/src/well_known.rs:155` still writes the `.well-known/scp` `handles` field as `None`.
 
 ---
 
@@ -45,7 +45,7 @@ These are interleaved within the same sections, sometimes within the same paragr
 - No formal grammar (ABNF, CDDL, TLS presentation language) for any message type
 - No language-neutral test vectors
 - No protocol evolution mechanism (no numbered proposal process)
-- Specs 13 (versioning) and 14 (governance) are stubs — 10 and 9 lines respectively
+- Spec 14 (protocol governance) is a stub — 9 lines. Spec 13 (versioning) was a 10-line stub when this audit ran; it now runs 321 lines (see §1.3 item 6)
 - Several spec sections reference Rust crate paths as "implementation location"
 - ADRs mix protocol-level decisions with implementation-level decisions (crate layout, trait design, feature flags)
 
@@ -55,7 +55,7 @@ These are interleaved within the same sections, sometimes within the same paragr
 3. **Handles field:** Spec §22.6.1 added a "handles" field to .well-known/scp, but this was written after SCP-143 (.well-known/scp story) was marked done. The spec is ahead of the implementation. Protocol spec should include it.
 4. **Handle query parameter:** Spec §22.9.1 added a "handle" query parameter to scp:// URIs, but SCP-142 (scp:// URI story) was already done. Same situation — spec is ahead.
 5. **ProtocolRepository scope:** Spec §17.4 describes ProtocolRepository as a thick abstraction layer with ~55+ typed methods covering all domain areas. Implementation has ProtocolRepository with only the economy module complete. The protocol spec should not describe ProtocolRepository at all — it's an implementation pattern, not a protocol requirement. The protocol should define key conventions and serialization format.
-6. **Spec 13 (Versioning):** 10 lines of aspirational prose. No concrete version negotiation protocol, no ProtocolVersion type definition, no minimum version enforcement mechanism. This is a gap that needs to be filled before the protocol spec can be complete.
+6. ~~**Spec 13 (Versioning).**~~ ✅ **Resolved.** Spec 13 held 10 lines of prose when this audit ran and now holds 321 lines. §13.1 defines the protocol version number, §13.4 defines version negotiation, and §13.4's context-level `min_protocol_version` parameter on `ContextParams` (line 169) enforces a minimum version.
 7. **Spec 14 (Protocol Governance):** 9 lines about foundation governance trajectory. Not a protocol specification — it's a project governance statement. Does not belong in the protocol spec.
 8. **Spec §3.10.10 DidResolver trait:** The section defines the resolution protocol (§3.10.4) in language-agnostic terms AND defines a Rust trait. The protocol part is normative; the Rust trait is implementation. Need to separate.
 9. **Spec §17.2 Storage trait:** Defined as a Rust trait with async fn signatures. The protocol need is "implementations must provide key-value storage with these operations" — the Rust syntax is implementation.
@@ -354,7 +354,7 @@ This is a P0 gap for the Identity document — the multi-key architecture and sh
 | §17.3 Key Convention | **P** | Key format specification — **normative** (implementations must use these keys) |
 | §17.4 ProtocolRepository | **I** | Thick layer wrapping Storage — implementation pattern |
 | §17.5-6 Backend adapters | **I** | SQLite, redb, filesystem — implementation |
-| §17.7 BlobStore backends | **P/I** | BlobStore interface is protocol; specific backends are implementation |
+| §17.7 BlobStorage backends | **P/I** | The `BlobStorage` interface is protocol; specific backends are implementation |
 | §17.8 Migratable trait | **I** | Migration pattern — implementation |
 | §17.9 Serialization | **P** | MessagePack with version envelopes — **normative** |
 | §17.10 MLS Storage Bridge | **I** | OpenMLS integration — implementation |

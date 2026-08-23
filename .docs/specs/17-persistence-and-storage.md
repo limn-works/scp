@@ -798,7 +798,7 @@ Implement the 5 required async methods of the `BlobStorage` trait (`store`, `get
 
 ```rust
 #[cfg(test)]
-blob_store_conformance!(|| MyCustomBlobStore::new(clock.clone()));
+blob_store_conformance!(|| MyCustomBlobStorage::new(clock.clone()));
 ```
 
 The conformance suite generates 19 tests: store/retrieve roundtrip, missing blob returns None, TTL expiry, query by routing_id in stored_at order, query with since filter, query with limit, delete removes blob, store returns SHA-256 blob_id, concurrent store + purge safety, purge removes only expired blobs, query for unknown routing_id returns empty, streaming store roundtrip, streaming get roundtrip, full streaming roundtrip, streaming empty body, content_length hint is advisory, streaming get for nonexistent blob, streaming-stored blob findable via query, and streaming get for expired blob.

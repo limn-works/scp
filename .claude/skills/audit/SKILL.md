@@ -273,7 +273,7 @@ After each stage completes, save a checkpoint:
     └── ...
 ```
 
-`.gitignore` line 58 excludes `.claude/agent-memory/audit/`, so git never tracks
+`.gitignore` carries a `.claude/agent-memory/audit/` entry, so git never tracks
 what this phase writes. These files list unfixed defects, and this repository is
 public.
 

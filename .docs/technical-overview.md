@@ -142,7 +142,7 @@ crates/
   scp-mcp/           — MCP server adapter (exposes SCP contexts as MCP tool surfaces)
 ```
 
-**Storage:** MessagePack serialization with version envelopes. SQLite (bundled-sqlcipher) as universal default. BlobStore backends: SQLite, redb, PostgreSQL, S3-compatible.
+**Storage:** MessagePack serialization with version envelopes. SQLite (bundled-sqlcipher) as universal default. BlobStorage backends: SQLite, redb, PostgreSQL, S3-compatible.
 
 ### What makes it different
 

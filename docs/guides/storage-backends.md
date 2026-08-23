@@ -329,12 +329,12 @@ use scp_transport::native::storage::{
     system_clock,
 };
 
-pub struct MyBlobStore {
+pub struct MyBlobStorage {
     // ... your backend state ...
     clock: ClockFn,
 }
 
-impl MyBlobStore {
+impl MyBlobStorage {
     /// Production constructor using the real system clock.
     pub fn new(/* backend config */) -> Self {
         Self {
@@ -357,7 +357,7 @@ impl MyBlobStore {
 
 ```rust
 #[async_trait::async_trait]
-impl BlobStorage for MyBlobStore {
+impl BlobStorage for MyBlobStorage {
     async fn store(
         &self,
         routing_id: [u8; 32],
@@ -472,7 +472,7 @@ mod tests {
             let c = clock.clone();
             Arc::new(move || c.load(std::sync::atomic::Ordering::Relaxed))
         };
-        let store = MyBlobStore::with_clock(clock_fn);
+        let store = MyBlobStorage::with_clock(clock_fn);
         (store, clock)
     });
 }
@@ -485,7 +485,7 @@ use scp_testing::conformance::blob_store::test_helpers::make_test_clock;
 
 blob_store_conformance!({
     let (clock_fn, clock) = make_test_clock();
-    let store = MyBlobStore::with_clock(clock_fn);
+    let store = MyBlobStorage::with_clock(clock_fn);
     (store, clock)
 });
 ```

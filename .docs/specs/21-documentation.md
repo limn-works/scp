@@ -380,7 +380,7 @@ cd bindings/kotlin && ./gradlew dokkaHtml
 - How to register with `TransportManager`
 
 ### Storage backend guide (docs/guides/storage-backends.md)
-- What the `Storage` trait and `BlobStore` trait require
+- What the `Storage` trait and `BlobStorage` trait require
 - How to implement (step by step)
 - How to test with conformance macros
 - Performance considerations

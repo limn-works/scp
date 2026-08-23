@@ -44,15 +44,14 @@ crates/
       trait.rs              # ADR-005: TransportAdapter trait
       manager.rs            # ADR-012: Multi-transport routing
       native/               # ADR-004: SCP native relay
-        blob_store.rs       # BlobStorage trait (§16.4.1) — relay storage abstraction
+        storage.rs          # BlobStorage trait (§17.7) — relay storage abstraction
   scp-testing/              # §16: Network simulation test harness (dev-dependency only)
     Cargo.toml
     src/
       lib.rs
       clock.rs              # SimulatedClock (§16.3)
-      relay/                # InMemoryRelay, InMemoryBlobStorage, BehaviorMode
-        mod.rs
-        blob_store.rs       # InMemoryBlobStorage (§16.4.2)
+      relay/                # InMemoryRelay, StoredBlob, BehaviorMode, SubscriptionRegistry
+        mod.rs              # InMemoryRelay + StoredBlob — the relay stores blobs in its own HashMap (§16.4.1)
         behavior.rs         # BehaviorMode enum, fault injection configs (§16.4.4)
         subscription.rs     # SubscriptionRegistry (§16.4.5)
       transport.rs          # InMemoryTransport — TransportAdapter impl (§16.5)
@@ -189,7 +188,7 @@ redb = "2"
 | `tracing` | 0.1.x | all crates | Structured logging |
 | `axum` | latest | scp-mcp | HTTP server (MCP SSE transport) |
 | `jsonschema` | latest | scp-core | JSON Schema validation (tool schemas) |
-| `async-trait` | latest | scp-transport, scp-testing | Async trait support (BlobStore, TransportAdapter) |
+| `async-trait` | latest | scp-transport, scp-testing | Async trait support (BlobStorage, TransportAdapter) |
 | `proptest` | 1.x | all crates (dev) | Property-based testing |
 | `scp-testing` | path | all crates (dev) | Network simulation harness, trait conformance macros (§16) |
 | `pyo3` | 0.23+ | crates/scp-ffi/pyo3 | Python FFI |

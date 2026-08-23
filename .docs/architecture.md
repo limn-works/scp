@@ -323,7 +323,7 @@ scp/
 │   │
 │   ├── scp-testing/           # Network simulation test harness (§16, dev-dependency)
 │   │   ├── clock.rs           # SimulatedClock (manual time control)
-│   │   ├── relay/             # InMemoryRelay, BlobStorage, BehaviorMode, SubscriptionRegistry
+│   │   ├── relay/             # InMemoryRelay, StoredBlob, BehaviorMode, SubscriptionRegistry
 │   │   ├── transport.rs       # InMemoryTransport (TransportAdapter over InMemoryRelay)
 │   │   ├── simulator/         # NetworkSimulator, SimulatedIdentity, NetworkTopology
 │   │   ├── builder.rs         # ScenarioBuilder (fluent API for test setup)
@@ -1031,7 +1031,7 @@ Go, C#, and Java SDKs are not currently implemented. The scaffolding directories
 
 ### 4.0 Definition: Functioning Network
 
-The six per-phase Build and Test lists below decompose the work. This section states the end-to-end criterion those phases build toward, so a reader decides whether the whole system works by checking twelve capabilities against one binding gate, rather than by reading six phase lists and inferring an answer from them.
+The six per-phase Build and Test lists below decompose the work. This section states the end-to-end criterion those phases build toward: a reader checks the twelve capabilities listed here, each one exercised through an SDK binding, and that check alone decides whether the whole system works.
 
 A functioning SCP network means two or more nodes can:
 
@@ -1050,7 +1050,7 @@ A functioning SCP network means two or more nodes can:
 
 Every capability above must work through at least one SDK binding (Python).
 
-A production-readiness execution plan, written on 2026-03-08 and since deleted, first stated this definition. That plan's remaining 630 lines tracked the production-readiness backlog — the GitHub issues numbered #290 through #401 — and every one of those issues closed. The three gaps that plan listed as REMAINING are built: `MetadataRecord` at `crates/scp-protocol/src/context/metadata.rs:53`, `EquivocationAlert` at `crates/scp-protocol/src/sync/mod.rs:302`, and `ChunkEnvelope` at `crates/scp-protocol/src/envelope/chunk.rs:70`. The tracker was deleted because it had been executed, and this definition moved here because nothing else in the repository states it.
+A production-readiness execution plan first stated this definition. The production-readiness audit (commit a621499b3f) added that plan on 2026-03-05 as `EXECUTION_PLAN.md`, and a file move (commit 3f29cfabe1) relocated it to `.docs/prod-readiness-exec-plan.md` on 2026-03-06. A later commit updated the plan's `Current State` section on 2026-03-08, and that section's heading carried the 2026-03-08 date. The plan's first 23 lines carried its title and the definition above. Its remaining 632 lines hold a Parallelization Map, a Dependency Graph, a Critical Path Timeline, a Conflict Identification section, and a tracker for the GitHub issues numbered #290 through #401. That Conflict Identification section's four tables rule on conflicts the spec audit found, on issues whose scope the audit widened, and on the order in which items touching one file had to land. Every one of the tracked issues closed. The three gaps that plan listed as REMAINING are built: `MetadataRecord` at `crates/scp-protocol/src/context/metadata.rs:53`, `EquivocationAlert` at `crates/scp-protocol/src/sync/mod.rs:302`, and `ChunkEnvelope` at `crates/scp-protocol/src/envelope/chunk.rs:70`. This change deletes that plan because its work is done, and keeps this definition here because nothing else in the repository states it.
 
 ### Phase 1: Crypto Proof
 

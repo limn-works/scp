@@ -24,7 +24,7 @@
 //! 18. `store_streaming_query_interop` — streaming-stored blob findable via query
 //! 19. `get_streaming_expired` — `get_streaming` returns None for expired blobs
 //!
-//! See spec section 17.11 "Custom `BlobStore` Adapters" and 17.13 "Conformance Testing".
+//! See spec section 17.11 "Custom `BlobStorage` Adapters" and 17.13 "Conformance Testing".
 
 /// Generates 19 conformance tests for a `BlobStorage` implementation.
 ///

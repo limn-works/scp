@@ -426,7 +426,7 @@ fn conf_008_leave_context() {
 }
 
 /// CONF-009: Governance — Propose Role Change and Vote
-/// Layer: Context | Tier: Core | Spec: §6.4
+/// Layer: Context | Tier: Core | Spec: §5.9, §9.5.2
 #[test]
 fn conf_009_governance_majority_vote() {
     println!("=== CONF-009: Governance — Majority Vote ===");
@@ -471,7 +471,7 @@ fn conf_009_governance_majority_vote() {
 }
 
 /// CONF-010: Governance — Threshold Voting (k-of-n)
-/// Layer: Context | Tier: Core | Spec: §6.4
+/// Layer: Context | Tier: Core | Spec: §5.9
 #[test]
 fn conf_010_governance_threshold_voting() {
     println!("=== CONF-010: Governance — Threshold Voting (3-of-5) ===");
@@ -523,7 +523,7 @@ fn conf_010_governance_threshold_voting() {
 }
 
 /// CONF-011: Context Parameter Update Through Governance
-/// Layer: Context | Tier: Core | Spec: §5.6, §6.4
+/// Layer: Context | Tier: Core | Spec: §5.6, §5.9
 #[tokio::test]
 async fn conf_011_context_parameter_update() {
     println!("=== CONF-011: Context Parameter Update ===");
@@ -1822,7 +1822,7 @@ async fn conf_040_cross_implementation_join() {
 }
 
 /// CONF-041: Mixed-Implementation Governance Vote
-/// Layer: Interop | Tier: Full | Spec: §6.4
+/// Layer: Interop | Tier: Full | Spec: §5.9, §9.5.2
 #[test]
 fn conf_041_cross_implementation_vote() {
     println!("=== CONF-041: Mixed-Implementation Governance Vote ===");
