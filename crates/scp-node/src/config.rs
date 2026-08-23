@@ -71,14 +71,17 @@ pub struct Node;
 /// - [`Explicit`](IdentitySource::Explicit) — use a pre-existing identity and
 ///   DID document supplied by the caller.
 ///
-/// **On a build without the `testing` feature, `Generate` and `Persisted` both
-/// fail closed on every start** with `IdentityError::NoPreRotationBackend`:
-/// creating an identity commits a pre-rotation commitment (spec §9.7.4.1 §3),
-/// and this workspace's only `PreRotationCustody` implementation is the test
-/// harness (ADR-062 §Decision 6). `Persisted` never reaches its reload branch,
-/// because nothing the node does puts an identity in storage to reload.
-/// `Explicit` is the only variant a shipped node starts from, and the caller
-/// supplies the identity from outside.
+/// **On a build without the `testing` feature, creating an identity fails closed**
+/// with `IdentityError::NoPreRotationBackend`: creation commits a pre-rotation
+/// commitment (spec §9.7.4.1 §3), and this workspace's only `PreRotationCustody`
+/// implementation is the test harness (ADR-062 §Decision 6). So `Generate` fails
+/// on every start, and `Persisted` fails whenever its storage holds no identity.
+///
+/// `Persisted`'s reload branch carries no gate and does work on a shipped build:
+/// given a storage slot that already holds an identity, the node starts and serves.
+/// Nothing the node itself does puts one there, so in practice that slot was
+/// written by a `testing` build. `Explicit` is the variant a shipped node starts
+/// from without any such precondition.
 pub enum IdentitySource<K: KeyCustody, D: DidMethod> {
     /// Generate a new identity using the provided key custody and DID method.
     ///
@@ -95,8 +98,8 @@ pub enum IdentitySource<K: KeyCustody, D: DidMethod> {
     ///
     /// First start: generate via `did_method.create(custody)` and persist.
     /// Subsequent starts with the same storage: reload the same DID. Without the
-    /// `testing` feature the generate half fails closed, so the reload half never
-    /// has anything to reload — see the enum doc.
+    /// `testing` feature the generate half fails closed; the reload half is ungated
+    /// and works when the storage slot already holds one — see the enum doc.
     Persisted {
         /// Key custody backend that holds the node's signing keys.
         custody: Arc<K>,
@@ -1221,9 +1224,13 @@ impl Node {
     /// Constructs and starts an [`ApplicationNode`] from a [`NodeConfig`]
     /// without requiring encrypted storage.
     ///
-    /// **Testing only.** Production code must use [`Node::start`]. Feature-gated
-    /// so it cannot be reached in a release build (preserving the
-    /// `EncryptedStorage` seal).
+    /// **Testing only.** Production code must use [`Node::start`]. Gated on
+    /// `allow_unencrypted_storage`, which relaxes the `EncryptedStorage` bound.
+    ///
+    /// That gate does NOT keep this out of a release build: `crates/scp-ffi/common`
+    /// enables the feature on its `scp-node` dependency with no cfg, so all three
+    /// shipped bridges reach this function through `start_node_in_memory` and
+    /// `start_node_local`. Tracked as issue 2389.
     ///
     /// # Errors
     ///

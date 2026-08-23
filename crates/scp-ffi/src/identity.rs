@@ -2616,9 +2616,10 @@ impl crate::scp::PyScp {
 
     /// Executes the custody migration protocol for the given DID.
     ///
-    /// This method creates a `CustodyMigrationOrchestrator` and runs the
-    /// 5-step migration protocol using an FFI backend that succeeds for all
-    /// operations by default.
+    /// This method creates a `CustodyMigrationOrchestrator` and runs the 5-step
+    /// migration protocol against `NotConfiguredMigrationBackend`, whose five
+    /// operations each return "custody migration backend not configured" until an
+    /// SDK layer supplies a real one. It does not succeed by default.
     ///
     /// # Arguments
     ///

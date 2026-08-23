@@ -15,14 +15,15 @@ cargo run -p scp-node --example website
 
 Then open the printed URL in a browser.
 
-**On a shipped build this exits 1 on every run.** `host_site` asks for
+**On a shipped build with no identity in storage, this exits 1 — on the first run
+and every later one.** `host_site` asks for
 `IdentitySource::Persisted`, and creating a new identity needs a
 `PreRotationCustody` backend whose only implementation is the test harness, so a
 shipped build fails closed rather than mint a nullifier-backed identity. The
 example's own doc comment quotes the exact error. Reloading a stored identity
-carries no gate, but the node's own identity paths never mint one, so
-`$XDG_DATA_HOME/scp/node` never comes to hold one. Build with `--features
-testing` to run the example end to end.
+carries no gate and works on a shipped build; what fails is creating one, so
+`$XDG_DATA_HOME/scp/node` only ever comes to hold an identity if a `testing` build
+put it there. Build with `--features testing` to run the example end to end.
 
 ### What this example does
 

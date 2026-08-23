@@ -160,12 +160,28 @@ Three jobs each looked like they covered it and none did:
 ## The trap in the obvious widening
 
 Widening the pull-request job to `cargo clippy --workspace --all-targets` on default
-features looks strictly better and fails today: `scp-ffi-uniffi`'s inline `#[cfg(test)]`
-module in `src/bridge.rs` needs the `testing` feature and is a lib-test target, not a
-`[[test]]` target, so it carries no `required-features` guard and cannot drop out. The
-same defect makes `release.yml`'s clippy step fail whenever that workflow runs.
+features looks strictly better and fails today. Three targets need the `testing`
+feature without declaring it, and cargo aborts after the first, so measuring one at a
+time is what finds them all:
+
+| Target | Default-features result |
+|---|---|
+| `scp-ffi-uniffi` lib test (inline `#[cfg(test)]` in `src/bridge.rs`) | 8 compile errors |
+| `scp-ffi-uniffi` `tests/lifecycle.rs` | `E0599` on `Scp::new_in_memory_for_test` |
+| `scp-node` lib test (inline `#[cfg(test)]` in `src/lib.rs`) | compiles; 348 passed, 44 failed |
+
+`lifecycle` is fixed on this branch, because a `[[test]]` target can declare
+`required-features` and its two sibling stanzas already do. The other two are inline
+`#[cfg(test)]` modules, which that key cannot gate: each needs module-level gating, a
+split into `[[test]]` targets, or a widened feature, and each of those changes what a
+test asserts. Filed as issue 2393. The `scp-node` failures are the sharp case — those
+44 tests pass under `testing` and fail on default features because the code under test
+now fails closed, so gating them hides a real signal.
+
+The same defect makes `release.yml`'s clippy step fail whenever that workflow runs.
 Its trigger is `workflow_dispatch`, not a tag push, so the step has never run on a
-merge and the breakage stayed invisible.
+merge and the breakage stayed invisible. That step alone is issue 2386; the three
+targets behind it are 2393.
 
 Run the widened invocation before adopting it.
 

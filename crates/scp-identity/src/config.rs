@@ -517,7 +517,7 @@ mod tests {
         match result {
             Err(IdentityError::NoPreRotationBackend) => {}
             Err(other) => {
-                panic!("expected NoPreRotationBackend (SCP-IDENT-1059), got: {other:?}")
+                panic!("expected NoPreRotationBackend, got: {other:?}")
             }
             Ok(_) => panic!(
                 "expected fail-closed NoPreRotationBackend, got Ok — the in-memory \
@@ -542,7 +542,7 @@ mod tests {
         match result {
             Err(IdentityError::NoPreRotationBackend) => {}
             Err(other) => {
-                panic!("expected NoPreRotationBackend (SCP-IDENT-1059), got: {other:?}")
+                panic!("expected NoPreRotationBackend, got: {other:?}")
             }
             Ok(_) => panic!(
                 "expected fail-closed NoPreRotationBackend, got Ok — the in-memory \

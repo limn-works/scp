@@ -620,8 +620,11 @@ pub enum PreRotationCustodyKind {
     ///
     /// NOT a production default. ADR-062 §Decision 6 severed it: the only
     /// implementation is `InMemoryPreRotationCustody`, compiled under
-    /// `feature = "testing"`, and every production FFI/SDK create path returns
-    /// `SCP-IDENT-1059` rather than reach for it. passkey-PRF / hardware-token /
+    /// `feature = "testing"`, and every production FFI/SDK create path fails
+    /// closed rather than reach for it. The code differs by path: `PyO3`'s
+    /// `identity_create` and all three bridges' callback-custody and migrate paths
+    /// return `SCP-IDENT-1059`; napi and `UniFFI` reject their three custody
+    /// strings earlier, with `SCP-IDENT-1008` or `SCP-IDENT-1003`. passkey-PRF / hardware-token /
     /// Shamir backends are a separate workstream.
     InMemory,
     /// FIDO2/U2F hardware security key. Highest security per §9.7.4.1 §4.

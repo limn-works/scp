@@ -140,6 +140,7 @@ public struct Node: Sendable {
     /// Starts a full application node with in-memory storage.
     ///
     /// When `identity` is provided, the node uses the pre-existing identity
+    /// (on a `testing` build only — see below)
     /// instead of generating a fresh one. This enables identity portability --
     /// the same DID persists across node restarts.
     ///
@@ -171,7 +172,8 @@ public struct Node: Sendable {
 
     /// Starts a full application node with file-backed storage.
     ///
-    /// When `identity` is provided, the node uses the pre-existing identity.
+    /// When `identity` is provided, the node uses the pre-existing identity
+    /// (on a `testing` build only).
     /// When `nil`, the node reloads a persistent identity via `FileKeyCustody`,
     /// and the `passphrase` parameter is required. CREATING one, on every run,
     /// needs a pre-rotation custody backend that only a `testing` build has, so
@@ -181,10 +183,15 @@ public struct Node: Sendable {
     ///
     /// This build fails on EVERY run, not only the first: none of this SDK's create
     /// calls mints an identity, so nothing it offers puts one in `dataDir` and the
-    /// reload branch never fires. Passing `identity` does not help either. Every
-    /// writer to the identity registry — create, migrate, rotate, add-agent,
-    /// remove-agent — either fails closed on a shipped build before it writes, or
-    /// needs an entry already present, so the registry never fills.
+    /// reload branch never fires. Passing `identity` does not help either, for a
+    /// reason specific to this bridge: see the `SCP-IDENT-1013` note below.
+    ///
+    /// On a shipped build, supplying `identity` does not work either: UniFFI's
+    /// `build_node_identity_from_uniffi` is `#[cfg(not(feature = "testing"))]`-
+    /// replaced by a stub that always returns ``ScpError/Identity`` with code
+    /// `SCP-IDENT-1013`, because node identity portability needs custody access
+    /// the mobile bridge does not have. Use platform custody with
+    /// `IdentitySource::Persisted` on `NodeConfig` directly.
     ///
     /// No passphrase is required when `identity` is provided.
     ///

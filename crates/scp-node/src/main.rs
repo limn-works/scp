@@ -512,10 +512,10 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
         scp_node::DhtMode::Disabled => {
             tracing::error!(
                 "DhtMode::Disabled is not a full-relay-node mode — the node must publish its DID. \
-                 --self-host serves a site without publishing when SCP_NODE_DHT_MODE=disabled, \
-                 but on this build it also exits 1: creating an identity needs a pre-rotation \
-                 custody backend that only a testing build has. --relay-only is the one mode \
-                 that starts here, and it has no identity at all."
+                 --self-host serves a site without publishing when SCP_NODE_DHT_MODE=disabled. \
+                 On a build without the `testing` feature it also exits 1, because creating an \
+                 identity needs a pre-rotation custody backend only that feature supplies; \
+                 --relay-only starts on any build, and has no identity at all."
             );
             std::process::exit(1);
         }
