@@ -28,11 +28,19 @@
 #     compiles a crate of this workspace is guarded by such an output, and the `ci` job that
 #     aggregates every other job's result counts a skipped job as a pass, so an unrouted
 #     change merges unbuilt.
-#   * Check 3 fails when `.mise.toml` names a Rust version source — a `rust` key under
-#     `[tools]`, or `rust-toolchain.toml` registered through
+#   * Check 2 reads every workflow whose jobs a paths filter guards, not `ci.yml` alone.
+#     The cases write a second workflow that compiles on the pin and hold the gate to
+#     reporting the same two defects there; a workflow that declares no paths-filter step
+#     and a workflow whose extension GitHub Actions does not run report nothing; and a
+#     repository where no workflow declares a paths-filter step fails rather than passing.
+#   * Check 3 fails when `.mise.toml` names a Rust version source — a `rust` key under the
+#     `tools` table, or `rust-toolchain.toml` registered through
 #     `idiomatic_version_file_enable_tools`. mise then exports one `RUSTUP_TOOLCHAIN` for
 #     the whole repository, which overrides `fuzz/rust-toolchain.toml` and puts every
-#     `cargo fuzz` command on the workspace's stable compiler.
+#     `cargo fuzz` command on the workspace's stable compiler. One case per TOML spelling
+#     of that key holds the gate's parse to all eight spellings mise resolves, and three
+#     further cases cover a tool whose name merely holds the letters `rust`, the setting
+#     naming a tool other than rust, and a document TOML rejects.
 #
 # HOW EACH CASE IS BUILT. `run_case` makes a temporary directory, writes the gate into
 # `scripts/`, runs `git init` so the gate's `git grep` search and its file listings have a
@@ -168,11 +176,50 @@ emit_mise() {
             printf '# mise names no Rust version source. rustup reads the toolchain file of\n'
             printf '# whichever directory a command runs in.\n[tools]\nbun = "1.3.9"\n"cargo:cargo-fuzz" = "latest"\n'
             ;;
+        # The eight TOML spellings that put a `rust` key in the `tools` table. Measured
+        # against mise 2026.2.22, `mise current rust` prints 1.97.1 for each one, and the
+        # `grep -E '^[[:space:]]*"?rust"?[[:space:]]*='` the gate ran before matched the
+        # first three and the last one and reported OK for the middle four.
         tools)
             printf '[tools]\nbun = "1.3.9"\nrust = { version = "stable", targets = "wasm32-unknown-unknown" }\n'
             ;;
+        tools-plain)
+            printf '[tools]\nbun = "1.3.9"\nrust = "1.97.1"\n'
+            ;;
+        tools-quoted-key)
+            printf '[tools]\nbun = "1.3.9"\n"rust" = "1.97.1"\n'
+            ;;
+        tools-subtable)
+            printf '[tools]\nbun = "1.3.9"\n\n[tools.rust]\nversion = "1.97.1"\n'
+            ;;
+        tools-quoted-subtable)
+            printf '[tools]\nbun = "1.3.9"\n\n[tools."rust"]\nversion = "1.97.1"\n'
+            ;;
+        tools-dotted-key)
+            printf 'tools.rust = "1.97.1"\n\n[env]\nCARGO_TERM_COLOR = "always"\n'
+            ;;
+        tools-dotted-inside-tools)
+            printf '[tools]\nbun = "1.3.9"\nrust.version = "1.97.1"\n'
+            ;;
+        tools-array)
+            printf '[tools]\nbun = "1.3.9"\nrust = ["1.97.1"]\n'
+            ;;
+        # A tool whose name holds the four letters `rust` and is not the `rust` tool. mise
+        # installs a cargo package here, and rustup still resolves each directory.
+        tools-name-contains-rust)
+            printf '[tools]\nbun = "1.3.9"\n"cargo:rustfilt" = "latest"\n'
+            ;;
         idiomatic)
             printf '[settings]\nidiomatic_version_file_enable_tools = ["rust"]\n\n[tools]\nbun = "1.3.9"\n'
+            ;;
+        idiomatic-top-level)
+            printf 'idiomatic_version_file_enable_tools = ["rust"]\n\n[tools]\nbun = "1.3.9"\n'
+            ;;
+        idiomatic-other-tool)
+            printf '[settings]\nidiomatic_version_file_enable_tools = ["node"]\n\n[tools]\nbun = "1.3.9"\n'
+            ;;
+        malformed)
+            printf '[tools\nrust = "1.97.1"\n'
             ;;
         absent) : ;;
         *)
@@ -319,6 +366,134 @@ EXTRA_ROOT_FILE="README.md"
 run_case "root-file-declared-unread" 0 "" emit_ci mise_ok
 EXTRA_ROOT_FILE=""
 
+# ── Check 2a/2b: a second workflow whose jobs a paths filter guards ──────────────────
+#
+# The criterion binds every workflow that guards a job with a paths filter, and the gate
+# enumerates them from the tree rather than reading `ci.yml` alone. `.github/workflows/
+# docs.yml` is the workflow that made the difference: its `rust-docs` job runs
+# `cargo doc --workspace --document-private-items`, which compiles every crate on the
+# pinned compiler, and its filter listed no toolchain file, so a pull request that raised
+# the pin skipped it while the gate printed OK.
+#
+# Each case below writes the second workflow through EXTRA_FILES, which puts it below the
+# repository root, so check 2c's root-file enumeration does not report it and check 2's
+# workflow loop is the only source of a finding.
+
+# A second paths-filtered workflow wired the way `docs.yml` is: one `toolchain` filter
+# holding the pin, and the one output OR-ing that filter in.
+docs_workflow_routes_the_pin() {
+    cat <<'YAML'
+name: SDK Docs
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      docs: ${{ steps.filter.outputs.docs == 'true' || steps.filter.outputs.toolchain == 'true' }}
+    steps:
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            toolchain:
+              - 'rust-toolchain.toml'
+              - '.cargo/**'
+            docs:
+              - 'crates/scp-runtime/src/**'
+  rust-docs:
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo doc --workspace --document-private-items
+YAML
+}
+EXTRA_FILES=(".github/workflows/docs.yml" docs_workflow_routes_the_pin)
+run_case "second-paths-filtered-workflow-routes-the-pin" 0 "" routing_ok mise_ok
+
+# The same workflow with its output reading its own filter alone. A pull request that
+# raises the pin then skips `rust-docs`, the one job that runs rustdoc over the workspace.
+docs_workflow_output_drops_the_or() {
+    cat <<'YAML'
+name: SDK Docs
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      docs: ${{ steps.filter.outputs.docs }}
+    steps:
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            toolchain:
+              - 'rust-toolchain.toml'
+              - '.cargo/**'
+            docs:
+              - 'crates/scp-runtime/src/**'
+  rust-docs:
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo doc --workspace --document-private-items
+YAML
+}
+EXTRA_FILES=(".github/workflows/docs.yml" docs_workflow_output_drops_the_or)
+run_case "second-workflow-output-drops-the-toolchain-or" 1 \
+    "docs.yml: the 'changes' job's 'docs' output does not read steps.filter.outputs.toolchain" \
+    routing_ok mise_ok
+
+# The same workflow whose `toolchain` filter keeps its other entry and drops the pin.
+docs_workflow_omits_the_pin() {
+    docs_workflow_routes_the_pin | grep -v "^              - 'rust-toolchain.toml'$"
+}
+EXTRA_FILES=(".github/workflows/docs.yml" docs_workflow_omits_the_pin)
+run_case "second-workflow-toolchain-filter-omits-the-pin" 1 \
+    "docs.yml: the 'toolchain' paths filter does not list rust-toolchain.toml" \
+    routing_ok mise_ok
+
+# The same workflow with no `toolchain` filter at all, which is how `docs.yml` stood
+# before this check read it.
+docs_workflow_declares_no_toolchain_filter() {
+    docs_workflow_routes_the_pin | grep -v -e "^            toolchain:$" \
+        -e "^              - 'rust-toolchain.toml'$" -e "^              - '.cargo/\*\*'$"
+}
+EXTRA_FILES=(".github/workflows/docs.yml" docs_workflow_declares_no_toolchain_filter)
+run_case "second-workflow-declares-no-toolchain-filter" 1 \
+    "docs.yml declares no 'toolchain:' paths filter with path entries" routing_ok mise_ok
+
+# A workflow whose jobs no paths filter guards. Every job in it runs on every pull request,
+# so a pin change reaches each one and the workflow needs no `toolchain` filter.
+workflow_without_a_paths_filter() {
+    cat <<'YAML'
+name: CodeQL
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: github/codeql-action/init@v3
+      - run: cargo build --workspace
+YAML
+}
+EXTRA_FILES=(".github/workflows/codeql.yml" workflow_without_a_paths_filter)
+run_case "workflow-without-a-paths-filter-needs-no-toolchain-filter" 0 "" routing_ok mise_ok
+
+# A disabled workflow. GitHub Actions runs a file under `.github/workflows/` whose
+# extension is `.yml` or `.yaml`, so this one starts nothing and the gate leaves it out
+# even though it declares a paths-filter step and routes no toolchain file.
+EXTRA_FILES=(".github/workflows/pr-review.yml.disabled" docs_workflow_declares_no_toolchain_filter)
+run_case "disabled-workflow-is-not-checked" 0 "" routing_ok mise_ok
+EXTRA_FILES=()
+
+# No workflow declares a paths-filter step. The gate reports that rather than passing over
+# a repository whose routing it could not read.
+ci_without_a_paths_filter_step() {
+    routing_ok | grep -v '^      - uses: dorny/paths-filter@v3$'
+}
+run_case "no-workflow-declares-a-paths-filter-step" 1 \
+    "no workflow under .github/workflows/ declares a dorny/paths-filter step" \
+    ci_without_a_paths_filter_step mise_ok
+
 # ── Check 2c: cargo configuration files, which sit below the root ────────────────────
 #
 # Cargo reads `.cargo/config.toml` out of every ancestor of the directory a command runs
@@ -369,20 +544,51 @@ run_case "nested-cargo-config-routed-by-the-rust-filter" 0 "" emit_ci mise_ok
 EXTRA_FILES=()
 
 # ── Check 3: mise names no Rust version source ───────────────────────────────────────
+#
+# Every spelling below puts the key `rust` in the table `tools`, and mise 2026.2.22
+# resolves each one. The gate parses the document and reads that key, so one case per
+# spelling holds the parse to the whole set rather than to the four a line matcher read.
 
-mise_names_rust_tool() {
-    MISE_SOURCE="tools"
+# The one producer every case below passes to `run_case`, and the global it reads. Naming
+# the spelling in a global rather than in a closure keeps each case one line long.
+MISE_SOURCE_UNDER_TEST=""
+emit_mise_under_test() {
+    MISE_SOURCE="$MISE_SOURCE_UNDER_TEST"
     emit_mise
 }
-run_case "mise-names-a-rust-tool-version" 1 \
-    "names a rust tool version" routing_ok mise_names_rust_tool
 
-mise_enables_idiomatic_rust() {
-    MISE_SOURCE="idiomatic"
-    emit_mise
+# mise_source_case <spelling> <case name> <expected exit> <required substring|"">
+mise_source_case() {
+    MISE_SOURCE_UNDER_TEST=$1
+    run_case "$2" "$3" "$4" routing_ok emit_mise_under_test
 }
-run_case "mise-registers-rust-toolchain-toml" 1 \
-    "registers rust-toolchain.toml as a mise version source" routing_ok mise_enables_idiomatic_rust
+
+names_a_rust_key="gives the rust tool a version: its 'tools' table holds a 'rust' key"
+
+mise_source_case tools "mise-names-a-rust-tool-inline-table" 1 "$names_a_rust_key"
+mise_source_case tools-plain "mise-names-a-rust-tool-plain-string" 1 "$names_a_rust_key"
+mise_source_case tools-quoted-key "mise-names-a-rust-tool-quoted-key" 1 "$names_a_rust_key"
+mise_source_case tools-subtable "mise-names-a-rust-tool-in-a-subtable" 1 "$names_a_rust_key"
+mise_source_case tools-quoted-subtable "mise-names-a-rust-tool-in-a-quoted-subtable" 1 "$names_a_rust_key"
+mise_source_case tools-dotted-key "mise-names-a-rust-tool-through-a-dotted-key" 1 "$names_a_rust_key"
+mise_source_case tools-dotted-inside-tools "mise-names-a-rust-tool-dotted-inside-tools" 1 "$names_a_rust_key"
+mise_source_case tools-array "mise-names-a-rust-tool-as-an-array" 1 "$names_a_rust_key"
+
+# A tool name holding the letters `rust` is not the `rust` tool, and the gate reads the key
+# rather than the letters.
+mise_source_case tools-name-contains-rust "mise-names-a-tool-whose-name-contains-rust" 0 ""
+
+registers_the_pin="registers rust-toolchain.toml as a mise version source"
+mise_source_case idiomatic "mise-registers-rust-toolchain-toml-under-settings" 1 "$registers_the_pin"
+mise_source_case idiomatic-top-level "mise-registers-rust-toolchain-toml-at-the-top-level" 1 "$registers_the_pin"
+
+# The same setting naming a tool that is not rust. rustup still resolves each directory.
+mise_source_case idiomatic-other-tool "mise-registers-an-idiomatic-file-for-another-tool" 0 ""
+
+# A document no TOML parser accepts. The gate reports the parse failure rather than
+# passing over a file it could not read.
+mise_source_case malformed "mise-config-is-not-a-toml-document" 1 \
+    "is not a TOML document tomllib accepts"
 
 mise_absent() {
     MISE_SOURCE="absent"

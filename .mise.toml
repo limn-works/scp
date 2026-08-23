@@ -18,7 +18,10 @@
 # lets rustup do that.
 #
 # `scripts/check-toolchain-wiring.sh` fails when this file names a Rust version source
-# again. `fuzz/build.rs` fails the fuzz build when a `RUSTUP_TOOLCHAIN` from any other
+# again. That gate parses this file as TOML and asks whether the `tools` table holds a
+# `rust` key, so every spelling TOML offers for that key — `[tools.rust]`, a dotted
+# `tools.rust =`, a quoted key, an inline table — reaches the same answer.
+# `fuzz/build.rs` fails the fuzz build when a `RUSTUP_TOOLCHAIN` from any other
 # source puts that crate on a compiler `fuzz/rust-toolchain.toml` does not name, and
 # `scripts/hooks/pre-commit` does the same for the workspace before it runs cargo. See
 # `.docs/lessons/pin-the-rust-toolchain-or-ci-drifts-from-local.md`.

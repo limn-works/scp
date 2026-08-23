@@ -365,6 +365,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      # The mise check parses `.mise.toml` with `tomllib`, which the Python standard
+      # library has held since 3.11, and it fails when no interpreter on PATH imports it.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - run: bash scripts/check-toolchain-wiring.sh
       - name: Run toolchain-wiring cases
         run: bash scripts/tests/toolchain-wiring/run-tests.sh

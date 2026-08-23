@@ -83,11 +83,12 @@ prose out. Docker permits nothing after the image reference but `AS <name>`, so 
 line reading "from rust sources by uniffi." cannot be a FROM instruction, and an earlier
 expression that stopped at the image reference failed the gate on exactly that sentence.
 
-Second, that `.github/workflows/ci.yml` routes a change to the jobs that build from it.
-Each job that compiles a crate of this workspace is guarded by
-`if: needs.changes.outputs.<lane> == 'true'`, and the `ci` job that aggregates every other
-job's result counts a skipped job as a pass, so an unrouted change merges with every job
-that reads it skipped. The pin decides seven lanes, not one:
+Second, that every workflow whose jobs a paths filter guards routes a change to the jobs
+that build from it. Each job that compiles a crate of this workspace is guarded by
+`if: needs.changes.outputs.<lane> == 'true'`, and a skipped job reports success rather than
+absence: the `ci` job that aggregates every other job's result counts a skip as a pass, and
+so does branch protection. An unrouted change therefore merges with every job that reads it
+skipped. In `.github/workflows/ci.yml` the pin decides seven lanes, not one:
 
 | Lane | The jobs it guards whose behaviour the pin decides |
 |--------|----------------------------------------------------|
@@ -107,6 +108,17 @@ this repository's root one sets the rustflag that selects getrandom's wasm backe
 gate reads the set of outputs out of the workflow, so a lane added later without the OR
 fails it.
 
+`.github/workflows/docs.yml` carries the same two pieces for the same reason: its
+`rust-docs` job runs `cargo doc --workspace --document-private-items`, which compiles every
+crate on the pinned compiler, and it is the one job in this repository that runs rustdoc
+over the whole workspace while `scp-runtime` denies `rustdoc::broken_intra_doc_links`. The
+gate enumerates the workflows it checks from the tree — each tracked file under
+`.github/workflows/` whose extension GitHub Actions runs and that declares a
+`dorny/paths-filter` step — so a paths-filtered workflow added later is covered without
+anyone editing the gate. A workflow that narrows itself with `on: pull_request: paths:`
+instead needs no `toolchain` filter: a required check whose workflow never starts stays
+pending and blocks the merge, so that mechanism fails closed on its own.
+
 The gate also enumerates two populations of file and requires each member to be routed by
 an entry of the `rust` or `toolchain` filter, or declared in the gate's own list of files
 no compile reads: every root-level file, and — derived from cargo's documented
@@ -118,7 +130,12 @@ pin: `fuzz-build` runs `cargo check` with `working-directory: fuzz`, where rustu
 `fuzz/rust-toolchain.toml`, and the `fuzz` filter's `fuzz/**` entry covers that file.
 
 Third, that `.mise.toml` names no Rust version source, for the reason the mise paragraph
-above states.
+above states. The gate parses that file with `tomllib` and asks whether the `tools` table
+holds a `rust` key, rather than matching a line: TOML reaches one key many ways, and mise
+2026.2.22 resolves `rust` to the same version through all eight of `rust = "…"`,
+`rust = { version = "…" }`, `"rust" = "…"`, `[tools.rust]`, `[tools."rust"]`,
+`tools.rust = "…"`, `rust.version = "…"`, and `rust = ["…"]`. The line matcher the check ran
+before read four of the eight and reported OK for the other four.
 
 The `Dockerfile` base tag selects a Debian release, so keep the builder stage and the
 runtime stage on the same one. The builder reads `rust:slim-bookworm` and the runtime reads

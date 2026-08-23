@@ -445,6 +445,81 @@ file's contents happen to carry.** A keyword search answers "does this text ment
 container build", and a document that explains one mentions it exactly as loudly as a
 Dockerfile does.
 
+## The Criterion Bound Every Workflow, and the Check Read One File
+
+The gate's check 2 states its criterion as "a change to a file that decides how a CI job
+compiles must make that job run", and its code opened
+`CI_WORKFLOW=".github/workflows/ci.yml"` and read that file alone. Two workflows in this
+repository guard jobs with a `dorny/paths-filter` step, and the second one violated the
+criterion while the gate printed OK.
+
+`.github/workflows/docs.yml` runs `rust-docs`, whose step is
+`cargo doc --workspace --document-private-items`. That command compiles every crate of this
+workspace, so `rust-toolchain.toml` selects the compiler it runs and `.cargo/config.toml`
+sets the rustflags it compiles under. The `docs` paths filter that guards the job listed
+`Cargo.toml`, `Cargo.lock`, `crates/*/Cargo.toml`, `bindings/**`, and nine
+`crates/<name>/src/**` globs, and no toolchain file. A pull request whose only change is
+`channel = "1.99.0"` therefore matched nothing in that filter, `rust-docs` skipped, and the
+pin merged with no rustdoc run on the new compiler. `rust-docs` is the one job in this
+repository that runs rustdoc over the whole workspace, and `scp-runtime` denies
+`rustdoc::broken_intra_doc_links`, so 1.99.0's first new rustdoc diagnostic would appear on
+the next pull request that touched `crates/scp-runtime/src/**`, against code its author did
+not write. That workflow's header already records the same job going unrun once: three
+broken intra-doc links rode `main` for ten days.
+
+The fix routes the pin in `docs.yml` the way `ci.yml` routes it — one `toolchain` filter,
+ORed into the `docs` output — and makes the gate enumerate the workflows it checks from the
+tree: each tracked file under `.github/workflows/` whose extension GitHub Actions runs, and
+that declares a `dorny/paths-filter` step. A paths-filtered workflow added later is then
+covered without anyone editing the gate.
+
+`on: pull_request: paths:` is the other way a workflow narrows what it runs, and the
+criterion does not bind it. A required check whose workflow never starts stays pending and
+blocks the merge, so that mechanism fails closed on its own; the skipped-job mechanism is
+the one that reports success for a job nothing ran.
+
+The generalisation, and it is the same one this file records for the `rust` filter and for
+the root-file enumeration, arriving a third time by a third route: **a gate whose criterion
+quantifies over a population must enumerate that population, and a constant naming one
+member is not an enumeration.** `CI_WORKFLOW` reads as a configuration knob. It was a
+one-element list nobody wrote down as a list.
+
+## A Line Matcher Reads One Spelling Per Pattern; a Parser Reads the Key
+
+Check 3 asks whether `.mise.toml` gives its rust tool a version, and it asked with
+`grep -qE '^[[:space:]]*"?rust"?[[:space:]]*='`. TOML reaches one key many ways. Measured
+against mise 2026.2.22, `mise current rust` prints `1.97.1` for every one of these eight,
+and the grep matched four of them:
+
+| Spelling | The grep read it |
+|---|---|
+| `[tools]` / `rust = "1.97.1"` | yes |
+| `[tools]` / `rust = { version = "1.97.1" }` | yes |
+| `[tools]` / `"rust" = "1.97.1"` | yes |
+| `[tools]` / `rust = ["1.97.1"]` | yes |
+| `[tools.rust]` / `version = "1.97.1"` | no |
+| `[tools."rust"]` / `version = "1.97.1"` | no |
+| `tools.rust = "1.97.1"` | no |
+| `[tools]` / `rust.version = "1.97.1"` | no |
+
+Any of the last four passes the gate and still puts every command in `fuzz/` on the
+workspace's stable pin, where `cargo fuzz run <target>` dies on `error: the option 'Z' is
+only accepted on the nightly compiler`, and puts every developer shell on whatever mise
+installed rather than on the pin — the drift the pin exists to end.
+
+Adding four patterns would have been the fifth round of "one more spelling" this file
+already records twice. The check parses the file with `tomllib` instead and asks the
+structural question: does the table `tools` hold the key `rust`. All eight spellings answer
+yes, and a ninth nobody has written answers yes too, because TOML's grammar decides the
+answer rather than a pattern. It reads `idiomatic_version_file_enable_tools` the same way,
+at the top level and under a `settings` table, which are the two placements TOML permits for
+a setting. A document `tomllib` rejects fails the check rather than passing over it.
+
+The generalisation: **when a file has a grammar and a parser for it, a check over that file
+reads the parse, not the text.** A pattern over source text answers "does a line look like
+the thing", and a format that spells one thing eight ways makes that question and the real
+one different questions.
+
 ## An Advisory Ignore Records the Day Somebody Wrote It
 
 `deny.toml` suppressed RUSTSEC-2026-0098, RUSTSEC-2026-0099, and RUSTSEC-2026-0104 with the
