@@ -405,8 +405,14 @@ pub async fn start_node_in_memory(
 /// backed by `<data_dir>/identity.key`. The `passphrase` parameter is
 /// required in this mode — there is no environment variable fallback.
 ///
-/// On first run, a new DID is generated and persisted to storage. On
-/// subsequent runs, the same DID is reloaded from storage.
+/// On subsequent runs the same DID is reloaded from storage. Creating one on
+/// the FIRST run needs a [`PreRotationCustody`] backend (spec §9.7.4.1 §3), and
+/// the only implementation is the test-harness `InMemoryPreRotationCustody`, so
+/// a shipped build fails closed with
+/// [`IdentityError::NoPreRotationBackend`] (`SCP-IDENT-1059`) rather than mint a
+/// nullifier-backed identity. Pass an explicit `identity` on a shipped build, or
+/// point `data_dir` at a directory that already holds one. See RFC #2130 and
+/// issue #1729 for the real backend.
 ///
 /// For fully ephemeral setups use [`start_node_in_memory`].
 ///
@@ -417,6 +423,9 @@ pub async fn start_node_in_memory(
 /// - The filesystem storage cannot be initialized ([`ServerError::Platform`])
 /// - The redb blob database cannot be opened ([`ServerError::Storage`])
 /// - No passphrase provided when `identity` is `None` ([`ServerError::MissingPassphrase`])
+/// - `identity` is `None` on a first run of a shipped build, because creating an
+///   identity needs a `PreRotationCustody` backend that only a `testing` build
+///   has ([`ServerError::Node`] wrapping `SCP-IDENT-1059`)
 /// - Relay binding, identity generation, or TLS fails ([`ServerError::Node`])
 pub async fn start_node_local(
     data_dir: &Path,

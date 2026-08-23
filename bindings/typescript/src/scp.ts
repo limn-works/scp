@@ -3836,6 +3836,16 @@ export class SCP {
     }
   }
 
+  /**
+   * Starts an application node with file-backed storage at `dataDir`.
+   *
+   * Omitting `identityDid` reloads a persistent identity from
+   * `<dataDir>/identity.key` and requires `passphrase`. Creating one on a first
+   * run needs a pre-rotation custody backend that only a `testing` build has, so
+   * a shipped build rejects it with `SCP-IDENT-1059` rather than mint a
+   * nullifier-backed identity (RFC #2130, issue #1729). Pass an explicit
+   * `identityDid`, or point `dataDir` at a directory that already holds one.
+   */
   async nodeStartLocal(
     dataDir: string,
     identityDid?: string | null,

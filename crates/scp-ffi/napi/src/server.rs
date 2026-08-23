@@ -255,8 +255,10 @@ impl Drop for NapiRelayHandle {
 /// Opaque handle to a running SCP application node.
 ///
 /// Created by `node_start_in_memory` or `node_start_local`. The node
-/// includes a running relay server, a generated DID identity, and (optionally)
-/// persistent storage. The HTTP server is **not** started automatically —
+/// includes a running relay server, a DID identity, and (optionally) persistent
+/// storage. The identity is generated only when the caller omits one AND the
+/// build enables `testing`; a shipped build requires an explicit identity and
+/// fails closed otherwise. The HTTP server is **not** started automatically —
 /// only the relay is bound.
 #[napi]
 pub struct NapiNodeHandle {
@@ -640,6 +642,11 @@ pub(crate) async fn node_start_in_memory_on(
 }
 
 /// Per-bridge-instance implementation of `node_start_local`.
+///
+/// With `identity_did = None` this reloads a persistent identity and requires a
+/// passphrase. Creating one on a first run needs a pre-rotation custody backend
+/// that only a `testing` build has, so a shipped build fails closed with
+/// `SCP-IDENT-1059` rather than mint a nullifier-backed identity.
 pub(crate) async fn node_start_local_on(
     bi: &Arc<NapiBridgeInstance>,
     data_dir: String,

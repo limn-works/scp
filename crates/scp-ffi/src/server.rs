@@ -295,8 +295,10 @@ impl Drop for PyRelayHandle {
 /// Opaque handle to a running SCP application node.
 ///
 /// Created by `node_start_in_memory()` or `node_start_local()`. The node
-/// includes a running relay server, a generated DID identity, and (optionally)
-/// persistent storage. The HTTP server is **not** started automatically --
+/// includes a running relay server, a DID identity, and (optionally) persistent
+/// storage. The identity is generated only when the caller omits one AND the
+/// build enables `testing`; a shipped build requires an explicit identity and
+/// fails closed otherwise. The HTTP server is **not** started automatically --
 /// only the relay is bound.
 #[pyclass(name = "NodeHandle")]
 pub struct PyNodeHandle {
@@ -718,9 +720,14 @@ impl crate::scp::PyScp {
     /// Opens (or creates) persistent storage at ``<data_dir>/storage/`` and a redb
     /// blob database at ``<data_dir>/blobs.redb``.
     ///
-    /// When ``identity_did`` is ``None`` (the default), the node creates or
-    /// reloads a persistent identity from ``<data_dir>/identity.key``. The
-    /// ``passphrase`` parameter is required in this mode.
+    /// When ``identity_did`` is ``None`` (the default), the node reloads a
+    /// persistent identity from ``<data_dir>/identity.key``. The ``passphrase``
+    /// parameter is required in this mode. CREATING one on a first run needs a
+    /// pre-rotation custody backend that only a ``testing`` build has, so a
+    /// shipped build raises ``RuntimeError`` carrying ``SCP-IDENT-1059`` instead
+    /// of minting a nullifier-backed identity (RFC #2130, issue #1729). Pass an
+    /// explicit ``identity_did``, or point ``data_dir`` at a directory that
+    /// already holds an identity.
     ///
     /// When ``identity_did`` is provided, the node uses the pre-existing identity
     /// from the `PyO3` identity registry (populated by ``PyScp::identity_create``).
