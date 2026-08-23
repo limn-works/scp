@@ -19,45 +19,96 @@ dev-depends on `scp-ffi-common` with `features = ["testing"]`, that crate's `tes
 list carries `scp-node?/testing`, the weak edge fires, and every example in the workspace
 compiles with `scp-node/testing` ON.
 
-`scripts/check-examples-build-shipped.sh` derives the package list from `cargo metadata`
-and loops. Do not collapse the loop back into `--workspace`.
+Source the file list from `cargo package --list`, not from `cargo metadata` example
+targets. The two sets differ in both directions: `autoexamples = false` removes a target
+while the file still ships, and `required-features` removes a target from a filter while
+the file still ships. `scripts/check-examples-build-shipped.sh` reads the published file
+set, fails when a published `examples/NAME.rs` has no matching target, and loops per
+package. Do not collapse the loop back into `--workspace`.
 
-## Three bypasses on one gate is the signal to reframe
+## Four rounds, six bypasses, and the reframe that ended it
 
-The gate took three review rounds, and each round produced a different way past it.
-`CLAUDE.md` names that pattern: more than about three passes surfacing "a new spelling
-of the same bypass" means the approach is non-convergent, so stop and reframe rather
-than patch again.
+Each review round produced a different way past this gate. `CLAUDE.md` names the
+pattern: more than about three passes surfacing "a new spelling of the same bypass"
+means the approach is non-convergent, so stop and reframe.
 
 | Round | Bypass | Why it worked |
 |---|---|---|
 | 1 | `cargo clippy --workspace --examples` | A workspace-wide selection unifies dev-dependency features, so `scp-node/testing` was ON for every example. |
 | 2 | (scope overclaimed, not a bypass) | The comment promised a property two live feature leaks broke. |
-| 3 | Add `required-features = ["testing"]` to the example | Cargo skips a target whose required features are unmet, warns, and exits 0. The loop read exit 0 as a pass. |
+| 3 | `required-features = ["testing"]` on the example | Cargo skips a target whose required features are unmet, warns, and exits 0. |
+| 4a | `autoexamples = false` plus a stray `examples/*.rs` | The file still ships; no target exists; a target-sourced list cannot see it. |
+| 4b | Any nullifier other than `DhtMode::Memory` | Cargo gives an example its crate's dev-dependencies, which carry `scp-dht/testing` and `scp-platform/testing`. |
+| 4c | `required-features` as a standing exemption | The four `scp-runtime` examples compile on default features anyway; the declaration only hid them. |
 
-Patching round 3 in the same shape — special-casing `required-features` — would have
-invited a fourth spelling. The reframe was to stop asking "does the loop pass?" and pin
-the answer instead: `scripts/examples-shipped-baseline.txt` records which example targets
-must build on default features, and the check fails when an entry leaves that set. A
-manifest edit that removes an example from the check now changes a checked-in file, which
-is the ratchet pattern this repository already uses for bridge symmetry and `OnceLock`
-counts.
+Rounds 1 through 3 were patched in the same shape each time, and each patch invited
+the next spelling. What ended it was changing where the check gets its truth.
 
-Two mechanics carry the property, and both are load-bearing:
+**The reframe: ask what SHIPS, not what cargo selects.** `cargo package --list`
+reports the files that reach crates.io. `cargo metadata` reports targets, and the
+two sets differ in both directions — `autoexamples = false` removes a target while
+the file still ships, and `required-features` removes a target from a filter while
+the file still ships. Sourcing from the published file set closes 4a and 4c at once
+and made the baseline ratchet that round 3 added unnecessary, so it was deleted. A
+reframe that removes a mechanism is a better sign than one that adds one.
 
-- **Name each target.** `cargo clippy -p P --examples` silently no-ops when every example
-  in `P` is feature-gated, and cargo's own "no targets matched" warning is not promoted by
-  `-D warnings`. Naming a target whose required features are unmet is a hard error.
-- **Ratchet the set.** Without the baseline, the count can fall to zero one manifest edit
-  at a time and every job stays green.
+**4b could not be closed, so the claim was withdrawn instead.** An example is a dev
+target and cargo gives it the crate's dev-dependencies; no invocation switches that
+off. The check therefore proves that a published example compiles for a consumer,
+and proves nothing about which constructs it names. The script says so in the
+imperative, because the earlier version's comment claimed the stronger property and
+a reviewer had to measure it to find out otherwise.
+
+Two guards remain load-bearing and must not be simplified away:
+
+- **Per-package invocation.** Naming the package keeps dev-dependency unification
+  to that package. The workspace-wide form is inert.
+- **File-set sourcing.** A published `examples/NAME.rs` with no matching target is a
+  failure, because nothing compiles it in CI or for a consumer.
+
+## A first run that passes can be your own leftover state
+
+A reviewer reported that `crates/scp-node/examples/website.rs` compiles and still
+fails at runtime. Running it printed `Site is live — open: http://localhost:18099/`,
+which reads as a refutation. It was not one. The run reused an identity an earlier
+run had already persisted under `$XDG_DATA_HOME/scp/node`, so it took the load
+branch and never reached the branch that creates one.
+
+Pointing `XDG_DATA_HOME` at an empty directory reproduced the report exactly:
+
+```
+$ XDG_DATA_HOME=/tmp/fresh PORT=18101 cargo run -q -p scp-node --example website
+Error: NodeBuild("identity error: no production pre-rotation custody backend
+available; pre-rotation recovery custody is not yet implemented — see #1729 / RFC #2130")
+exit 1
+```
+
+`host_site` asks for `IdentitySource::Persisted`. Creating a new identity needs a
+`PreRotationCustody` backend, and `grep -rn "impl.*PreRotationCustody for" crates/`
+returns exactly one implementation, the test-harness
+`InMemoryPreRotationCustody`. So a shipped build fails closed rather than mint a
+nullifier-backed identity — the no-stand-ins tenet working as designed, and a fact
+the example's own "Run this, then open the printed URL" instruction did not carry
+until this branch added it.
+
+When a run is supposed to exercise first-boot behaviour, point every state
+directory the program reads at an empty one. A green first run on a developer
+machine proves the second run works.
 
 ## `required-features` hides an example from CI and does not stop it shipping
 
-`cargo package --list -p scp-runtime` lists all four of that crate's examples, and all
-four declare `required-features = ["testing"]`. So the declaration is a CI-visibility
-switch, not a shipping switch. Any rule that reads it as a statement about what ships is
-wrong. `crates/scp-runtime/examples/identity.rs` still ships while importing
-`scp_dht::InMemoryDhtClient` and printing "Published to DHT successfully."
+`cargo package --list -p scp-runtime` lists all four of that crate's examples. So the
+declaration is a CI-visibility switch, not a shipping switch, and any rule that reads
+it as a statement about what ships is wrong.
+
+This branch added `required-features = ["testing"]` to
+`crates/scp-runtime/examples/identity.rs` on the premise that it could not build on
+shipped features, then measured the premise and found it false:
+`cargo clippy -p scp-runtime --example identity -- -D warnings` exits 0 on default
+features, because `scp-runtime` dev-depends on `scp-testing`, whose NORMAL
+`scp-core{testing}` edge resolves `scp-runtime/testing` ON. The declaration bought
+nothing and removed the example from the check, so it was reverted. Coverage went
+from four examples to eight.
 
 ## Measure a gate against the defect, never against the fixed tree
 
@@ -107,23 +158,26 @@ Run the widened invocation before adopting it.
 
 ## What the check does not cover
 
-Cargo gives an example its own crate's dev-dependencies, and no invocation switches that
-off, so two leaks stay open and neither is closable.
+Cargo builds an example as a dev target and gives it the crate's dev-dependencies. No
+invocation switches that off, so the check cannot keep a test-only construct out of an
+example, and it does not claim to.
 
 **A dependency crate's `testing`, enabled by the linted crate's own dev-deps.**
 `crates/scp-node/Cargo.toml` dev-depends on `scp-platform` and `scp-dht` with
-`features = ["testing"]`, so `scp_platform::testing` stays reachable from a scp-node
-example.
+`features = ["testing"]`, so an example naming `scp_platform::testing::InMemoryKeyCustody`
+or `scp_dht::InMemoryDhtClient` compiles and passes.
 
-**A dev-dependency back-edge that re-enables the linted crate's own `testing`.**
-`scp-runtime` and `scp-transport` dev-depend on `scp-testing`, whose **normal**
-`scp-core{testing}` edge resolves `scp-runtime/testing` ON — which also satisfies the
-`required-features` guards on those crates' own examples.
+**The same reach through a testing helper crate.** `scp-runtime` and `scp-transport`
+dev-depend on `scp-testing`, whose **normal** dependencies carry `scp-platform{testing}`
+and `scp-dht{testing}`. For `scp-runtime` that edge additionally resolves
+`scp-runtime/testing` ON, through `scp-testing`'s normal `scp-core{testing}` dependency.
+`scp-transport` has no `testing` feature of its own — an earlier draft of this file said
+it did, which a reviewer caught by reading the manifest.
 
-So the check rejects an example naming a construct behind its own crate's `testing`, in a
-crate whose dev-dependency graph does not turn that feature back on. `scp-node` is the
-only workspace member where that holds today. It proves nothing about a reader who copies
-an example out and depends on the published crate.
+So the check proves that a published example compiles for someone who installs the crate.
+It proves nothing about which constructs that example names. `DhtMode::Memory` was caught
+only because it sits behind `scp-node`'s OWN `testing` feature, which scp-node's
+dev-dependencies do not enable.
 
 ## How to apply
 
