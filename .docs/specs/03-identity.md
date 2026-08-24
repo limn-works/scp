@@ -1474,7 +1474,7 @@ pub struct ScpIdAuthentication {
 1. A `did:dht` resolver (BEP44 lookup plus a did:dht DNS-packet decode — the packet is what the method's own resolvers already parse).
 2. SHA-256 (standard, available everywhere).
 3. An Ed25519 signature verifier (PureEdDSA per RFC 8032 §5.1.6).
-4. An HTTPS client and a JSON parser, needed only to accept `#agent`-signed responses (§3.11.9 step 1b).
+4. An SCP relay client, a DID-record frame decoder and a JSON parser, needed only to accept `#agent`-signed responses (§3.11.9 step 1b). The relay client speaks the QUERY operation (ADR-004) over the WebSocket endpoint `wss://<host>/scp/v1` that §18.2.2 of `.docs/specs/18-addressability-and-deployment.md` fixes for a relay; the decoder reads the DID-record frame (§9.10.12) the relay stores, whose 105-byte binary prefix a JSON parser cannot read.
 
 This is intentional. SCPID is designed to be implementable by services that have no other relationship with SCP. A relying party that accepts `#active` only needs the first three.
 
@@ -1486,7 +1486,17 @@ A service that wants to accept SCP DID authentication without running SCP softwa
 
    a. *The Mainline lookup gives you the bootstrap core, not the whole document.* Use any `did:dht` resolver library — `did-dht` (Rust), `@decentralized-identity/did-dht` (JS), or raw BEP44 lookups via any DHT client. What the BEP44 value carries is a **bencoded DNS packet compressed per RFC 1035 §4.1.4**, which is what the did:dht method specifies and what its resolver libraries already decode. It is **not** JSON, and a JSON parser applied to it fails. The decoded core carries the identity's `#active` verification method, its pre-rotation commitment and its relay list (§18.2.2C) — enough to verify an `#active`-signed response and nothing more.
 
-   b. *An `#agent`-signed response needs one more fetch.* `#agent` lives on SCP's relay layer, not on Mainline. Take a relay URL from the core's `SCPRelay` entries and QUERY it for the full document, which is canonical JSON (§18.2.2A) and does parse with a JSON parser. **The core's silence about `#agent` is not evidence that the identity has no agent key** — a relying party that treats it that way rejects valid authentications (§3.10.10). If no relay answers, fail the verification rather than concluding anything.
+   b. *An `#agent`-signed response needs one more fetch, and that fetch is not an HTTPS GET of JSON.* `#agent` lives on SCP's relay layer, not on Mainline. Take a relay URL from the core's `SCPRelay` entries: §18.2.2 of `.docs/specs/18-addressability-and-deployment.md` fixes it as the SCP relay WebSocket endpoint `wss://<host>/scp/v1`, which a self-hosted relay resolved from a DID document MAY serve over `ws://` at an IP literal, so reach it with the relay's QUERY operation (ADR-004) and not with an HTTPS request. Address the query at `did_routing_id = SHA-256("scp:did:" || did_string)` (§3.10.2). Four steps turn what a relay returns into a document:
+
+      i. *Decode the frame.* The relay returns a raw blob that is a DID-record frame (§9.10.12), not JSON: a 105-byte fixed prefix (`version` 1 byte, `public_key` 32 bytes, `seq` 8 bytes big-endian, `signature` 64 bytes) followed by `value` as the trailing remainder. Discard a blob whose `version` you do not implement, a blob shorter than 105 bytes, and a blob whose `value` is empty — §9.10.12 requires a decoder to discard rather than partially parse.
+
+      ii. *Verify the BEP44 signature, against the DID's key.* Verify `signature` over the bencoded buffer `3:seqi<seq>e1:v<value>` using the Ed25519 key you decoded from the DID string in step 1a (§9.6.1). **Ignore the frame's own `public_key` field** — §9.10.12 makes the framing bytes unsigned, so a verifier that trusts that field accepts a substituted record.
+
+      iii. *Check the sequence number.* Accept `seq` only when it is at least the highest `seq` you have already accepted for this DID on the relay layer, and never compare it against a Mainline sequence number (§3.10.7).
+
+      iv. *Parse the value.* `value` is the full DID document as canonical JSON (§18.2.2A), and a JSON parser reads it.
+
+   **The core's silence about `#agent` is not evidence that the identity has no agent key** — a relying party that treats it that way rejects valid authentications (§3.10.10). If no relay answers, or no relay returns a blob that survives steps i through iii, fail the verification rather than concluding anything.
 
    For SCPID verification, records MUST be cached for no more than 300 seconds. The general §3.10.4 caching policy (24h/7d) does NOT apply to SCPID verification — authentication requires current key state.
 
@@ -1496,4 +1506,4 @@ A service that wants to accept SCP DID authentication without running SCP softwa
 
 4. **Nonce management.** Store issued nonces with their `expires_at`. Reject duplicates. Prune expired entries. For distributed deployments, use a strongly-consistent store or HMAC-based nonce generation (§3.11.6).
 
-No SCP SDK, no MLS, no context management. For an `#active`-signed response the entire verification path is: one Mainline lookup + one did:dht DNS-packet decode + one SHA-256 + one Ed25519 verify. An `#agent`-signed response adds one relay QUERY and one JSON parse.
+No SCP SDK, no MLS, no context management. For an `#active`-signed response the entire verification path is: one Mainline lookup + one did:dht DNS-packet decode + one SHA-256 + one Ed25519 verify. An `#agent`-signed response adds one relay QUERY over a WebSocket, one DID-record frame decode, one BEP44 signature verify and one JSON parse.

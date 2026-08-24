@@ -275,23 +275,6 @@ const DEVICE_ATTESTATION_SERVICE_TYPE: &str = "ScpDeviceAttestation";
 /// The fragment identifier for device attestation service entries.
 const DEVICE_ATTESTATION_FRAGMENT: &str = "device-attestation";
 
-/// Number of retired agent keys `prune_retired_agent_keys` keeps.
-///
-/// ADR-003 §4a and §4a′ (`.docs/adrs/phase-1.md`) state no cap on retained
-/// `#retired-agent-{sequence}` entries, so this constant and
-/// `prune_retired_agent_keys` prune against a bound no artifact states. The
-/// rationale they carried — bounding document size — measured against
-/// Mainline's 1,000-byte BEP44 cap. The two-encoding split moves every retired
-/// verification method onto the relay layer (§18.2.2C of
-/// `.docs/specs/18-addressability-and-deployment.md`), where §18.2.2D bounds
-/// the document at 262,039 bytes and one retired agent key costs 269 of them,
-/// which admits roughly 990 rotations of one identity.
-///
-/// ADR-003 §4a authorizes removing this constant, `prune_retired_agent_keys`,
-/// the call that invokes it, and the assertions that encode the count of 2. It
-/// imposes no order on that removal.
-const MAX_RETIRED_AGENT_KEYS: usize = 2;
-
 /// The service type string for `ScpIdentityLinkAttestation` entries (§3.5.3).
 const IDENTITY_LINK_ATTESTATION_SERVICE_TYPE: &str = "ScpIdentityLinkAttestation";
 
@@ -1054,9 +1037,14 @@ impl DidDocument {
     /// Rotates the `#agent` verification method, retaining the old key as a
     /// retired key.
     ///
-    /// The old `#agent` key is renamed to `#retired-agent-{sequence}`. At most
-    /// 2 retired agent keys are retained; older ones are pruned (bounded
-    /// retention). The new key becomes `#agent`.
+    /// The old `#agent` key is renamed to `#retired-agent-{sequence}` and the
+    /// new key becomes `#agent`. The document retains every
+    /// `#retired-agent-{sequence}` entry its rotations produce, under no cap,
+    /// and this method prunes none of them: ADR-003 §4a′
+    /// (`.docs/adrs/phase-1.md`) states that retention, and §18.2.2D of
+    /// `.docs/specs/18-addressability-and-deployment.md` bounds the relay-layer
+    /// document at 262,039 bytes, which is the only bound that reaches a
+    /// retired entry.
     ///
     /// Only `#0` (Identity Key) can authorize this operation — enforcement is
     /// at the signing/verification layer, not in this method.
@@ -1099,9 +1087,6 @@ impl DidDocument {
             public_key_multibase: multibase_encode(new_public_key),
         };
         self.verification_method.push(new_agent_vm);
-
-        // Prune retired agent keys to at most MAX_RETIRED_AGENT_KEYS.
-        self.prune_retired_agent_keys();
 
         // authentication and assertionMethod already reference #agent by
         // fragment, so no update needed — the new VM takes over the reference.
@@ -1147,42 +1132,6 @@ impl DidDocument {
                 fragment.starts_with("retired-agent-")
             })
             .count()
-    }
-
-    /// Prunes retired agent keys to at most [`MAX_RETIRED_AGENT_KEYS`],
-    /// keeping the most recent (highest sequence number).
-    fn prune_retired_agent_keys(&mut self) {
-        // Collect (index, sequence) pairs for retired agent keys.
-        let mut retired: Vec<(usize, u64)> = self
-            .verification_method
-            .iter()
-            .enumerate()
-            .filter_map(|(i, vm)| {
-                let fragment = vm.id.rsplit_once('#').map(|(_, f)| f)?;
-                let seq_str = fragment.strip_prefix("retired-agent-")?;
-                let seq: u64 = seq_str.parse().ok()?;
-                Some((i, seq))
-            })
-            .collect();
-
-        if retired.len() <= MAX_RETIRED_AGENT_KEYS {
-            return;
-        }
-
-        // Sort by sequence descending — keep the highest.
-        retired.sort_by_key(|entry| std::cmp::Reverse(entry.1));
-
-        // Indices to remove (the ones beyond the retention limit).
-        let mut remove_indices: Vec<usize> = retired[MAX_RETIRED_AGENT_KEYS..]
-            .iter()
-            .map(|(i, _)| *i)
-            .collect();
-
-        // Sort descending so removal doesn't shift earlier indices.
-        remove_indices.sort_unstable_by(|a, b| b.cmp(a));
-        for idx in remove_indices {
-            self.verification_method.remove(idx);
-        }
     }
 }
 
@@ -1975,8 +1924,11 @@ mod tests {
     }
 
     #[test]
-    fn rotate_agent_key_bounded_retention() {
-        let did = "did:dht:zBoundedRetire";
+    fn rotate_agent_key_retains_every_retired_key_uncapped() {
+        // ADR-003 §4a′ (`.docs/adrs/phase-1.md`): a DID document retains every
+        // `#retired-agent-{sequence}` entry its rotations produce, under no
+        // cap, and no rotation prunes one.
+        let did = "did:dht:zUncappedRetire";
         let identity_pk = [1u8; 32];
         let active_pk = [2u8; 32];
         let commitment = [5u8; 32];
@@ -1989,47 +1941,38 @@ mod tests {
             Some(&[10u8; 32]),
         );
 
-        // Rotate 3 times: should retain at most 2 retired keys
-        doc.rotate_agent_key(&[11u8; 32], 1).unwrap();
-        assert_eq!(doc.retired_agent_key_count(), 1);
+        // Rotate six times. The retained count equals the number of rotations
+        // performed at every step, which the deleted cap of 2 would break from
+        // the third rotation onward.
+        for seq in 1..=6u64 {
+            let new_key = [u8::try_from(10 + seq).unwrap(); 32];
+            doc.rotate_agent_key(&new_key, seq).unwrap();
+            assert_eq!(
+                doc.retired_agent_key_count(),
+                usize::try_from(seq).unwrap(),
+                "retained count must equal the number of rotations performed"
+            );
+        }
 
-        doc.rotate_agent_key(&[12u8; 32], 2).unwrap();
-        assert_eq!(doc.retired_agent_key_count(), 2);
+        // Every sequence from the first rotation onward is still resolvable,
+        // including the two the cap of 2 pruned first.
+        for seq in 1..=6u64 {
+            assert!(
+                doc.verification_method_by_fragment(&format!("retired-agent-{seq}"))
+                    .is_some(),
+                "#retired-agent-{seq} must survive every later rotation"
+            );
+        }
 
-        doc.rotate_agent_key(&[13u8; 32], 3).unwrap();
-        // Should be pruned to 2 (the 2 most recent: sequences 2 and 3)
-        assert_eq!(doc.retired_agent_key_count(), 2);
-
-        // Verify the most recent retired keys are retained
-        assert!(
-            doc.verification_method_by_fragment("retired-agent-3")
-                .is_some()
-        );
-        assert!(
-            doc.verification_method_by_fragment("retired-agent-2")
-                .is_some()
-        );
-        // Oldest should be pruned
-        assert!(
-            doc.verification_method_by_fragment("retired-agent-1")
-                .is_none()
-        );
-
-        // One more rotation
-        doc.rotate_agent_key(&[14u8; 32], 4).unwrap();
-        assert_eq!(doc.retired_agent_key_count(), 2);
-        assert!(
-            doc.verification_method_by_fragment("retired-agent-4")
-                .is_some()
-        );
-        assert!(
-            doc.verification_method_by_fragment("retired-agent-3")
-                .is_some()
-        );
-        assert!(
-            doc.verification_method_by_fragment("retired-agent-2")
-                .is_none()
-        );
+        // Each retired entry keeps the key it retired, so a verifier reading
+        // an old content signature finds the key that made it.
+        for seq in 1..=6u64 {
+            let vm = doc
+                .verification_method_by_fragment(&format!("retired-agent-{seq}"))
+                .unwrap();
+            let expected = [u8::try_from(9 + seq).unwrap(); 32];
+            assert_eq!(vm.public_key_multibase, multibase_encode(&expected));
+        }
 
         doc.validate_agent_keys().unwrap();
     }

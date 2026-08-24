@@ -1058,14 +1058,6 @@ The fixture documents **12 known-input / known-output vectors**, each signed und
 | `operator_did` | string | The signing operator's DID (the same across all vectors for determinism). |
 | `operator_public_key` | hex string | The operator's Ed25519 verifying key (32 bytes / 64 hex). |
 
-## 25.25 DID Document Encodings (§18.2.2A, §18.2.2C)
-
-Both encodings §18.2.2A defines are byte-deterministic, and neither has a pinned vector. §3.10.12 assigns both to the #2297 slice, and the vectors land with the code that produces them, because a KAT that no implementation can currently generate would pin nothing.
-
-**Vector 30 — relay-layer canonical JSON.** Pins `DidDocument::to_json` after §18.2.2A's canonicalization rules replace `serde_json::to_string_pretty`: RFC 8785 key ordering at every nesting level, no inter-token whitespace, NFC. Fixture inputs are the three Ed25519 public keys and the SHA-256 pre-rotation commitment; the expected output is the exact octet string the BEP44 signature covers. Two SDKs that disagree here produce different signatures for one identity state, which is what the rules exist to prevent. The vector also pins `publicKeyMultibase` in its `0xed01`-prefixed form (§18.2.2A), so a regression to the bare-32-byte encoding fails it.
-
-**Vector 31 — Mainline bootstrap-core DNS packet.** Pins the did:dht encoding §18.2.2C fixes: the root record's `v=;vm=;auth=;asm=;inv=;del=;svc=` rdata, the `_kN._did.` and `_sN._did.` records, `t=` carrying the SCP service type verbatim, `id=` carrying the entry's fragment without the `#`, `a=` omitted at the registry default, TTL 7200, RFC 1035 §4.1.4 compression, and the bencoded `v` value the 1,000-byte cap measures. The fixture carries the bootstrap core at one and at three `SCPRelay` entries, whose bencoded lengths §18.2.2D states, so a change to any field's encoding moves a pinned number rather than passing silently. A decoder vector reads each packet back to its records through the compression pointers.
-
 ### 25.24.1 Vector index
 
 | # | Name | Shape |
@@ -1117,3 +1109,11 @@ cargo test -p scp-testing --test conformance \
 ```
 
 The regenerator is `#[ignore]` by default so the default `cargo test` run does not write to disk. Fixture drift (live code changes that should but do not invalidate the JSON) is caught by `CONF-046`, which compares the on-disk file byte-for-byte to the generator's current output.
+
+## 25.25 DID Document Encodings (§18.2.2A, §18.2.2C)
+
+Both encodings §18.2.2A defines are byte-deterministic, and neither has a pinned vector. §3.10.12 assigns both to the #2297 slice, and the vectors land with the code that produces them, because a KAT that no implementation can currently generate would pin nothing.
+
+**Vector 38 — relay-layer canonical JSON.** Pins `DidDocument::to_json` after §18.2.2A's canonicalization rules replace `serde_json::to_string_pretty`: RFC 8785 key ordering at every nesting level, no inter-token whitespace, NFC. Fixture inputs are the three Ed25519 public keys and the SHA-256 pre-rotation commitment; the expected output is the exact octet string the BEP44 signature covers. Two SDKs that disagree here produce different signatures for one identity state, which is what the rules exist to prevent. The vector also pins `publicKeyMultibase` in its `0xed01`-prefixed form (§18.2.2A), so a regression to the bare-32-byte encoding fails it.
+
+**Vector 39 — Mainline bootstrap-core DNS packet.** Pins the did:dht encoding §18.2.2C fixes: the root record's `v=;vm=;auth=;asm=;inv=;del=;svc=` rdata, the `_kN._did.` and `_sN._did.` records, `t=` carrying the SCP service type verbatim, `id=` carrying the entry's fragment without the `#`, `a=` omitted at the registry default, TTL 7200, RFC 1035 §4.1.4 compression, and the bencoded `v` value the 1,000-byte cap measures. The fixture carries the bootstrap core at one and at three `SCPRelay` entries, whose bencoded lengths §18.2.2D states, so a change to any field's encoding moves a pinned number rather than passing silently. A decoder vector reads each packet back to its records through the compression pointers.

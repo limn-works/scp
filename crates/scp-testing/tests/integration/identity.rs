@@ -183,7 +183,9 @@ async fn agent_key_rotation() {
 }
 
 #[tokio::test]
-async fn agent_key_max_retired() {
+async fn agent_key_retention_is_uncapped() {
+    // ADR-003 §4a′ (`.docs/adrs/phase-1.md`): a DID document retains every
+    // `#retired-agent-{sequence}` entry its rotations produce, under no cap.
     let custody = InMemoryKeyCustody::new();
     let (_identity, mut doc) = create_test_identity(&custody).await;
 
@@ -192,19 +194,27 @@ async fn agent_key_max_retired() {
     let pub_0 = custody.public_key(&k0).await.unwrap();
     doc.add_agent_key(pub_0.as_bytes()).unwrap();
 
-    // Rotate 3 times — max retired is 2, so the oldest should be pruned.
-    for seq in 1..=3 {
+    // Rotate five times. The retained count equals the number of rotations
+    // performed, and every retired fragment stays resolvable.
+    for seq in 1..=5u64 {
         let k = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let pub_k = custody.public_key(&k).await.unwrap();
         doc.rotate_agent_key(pub_k.as_bytes(), seq).unwrap();
+
+        assert_eq!(
+            doc.retired_agent_key_count(),
+            usize::try_from(seq).unwrap(),
+            "retained count must equal the number of rotations performed"
+        );
     }
 
-    // MAX_RETIRED_AGENT_KEYS = 2
-    assert!(
-        doc.retired_agent_key_count() <= 2,
-        "retired agent key count must not exceed MAX_RETIRED_AGENT_KEYS (2), got: {}",
-        doc.retired_agent_key_count()
-    );
+    for seq in 1..=5u64 {
+        assert!(
+            doc.verification_method_by_fragment(&format!("retired-agent-{seq}"))
+                .is_some(),
+            "#retired-agent-{seq} must survive every later rotation"
+        );
+    }
 }
 
 #[tokio::test]

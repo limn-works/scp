@@ -271,15 +271,6 @@ pub enum IdentityError {
         count: usize,
     },
 
-    /// Too many retired agent keys in the DID document.
-    #[error("too many retired agent keys: found {count}, maximum is {max}")]
-    TooManyRetiredAgentKeys {
-        /// The number of retired agent keys found.
-        count: usize,
-        /// The maximum allowed.
-        max: usize,
-    },
-
     /// A DHT publish step inside [`DidDht::migrate_identity`](crate::dht::DidDht::migrate_identity)
     /// failed AFTER the irreversible cold-custody mutation (step 5
     /// `destroy_after_migration`) — meaning the caller cannot simply
