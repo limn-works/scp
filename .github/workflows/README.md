@@ -93,6 +93,7 @@ The `build-matrix.yml` workflow builds release artifacts for all SDK targets:
 | `typescript-napi` | napi-rs native addon | Linux (x86_64, aarch64), macOS (x86_64, aarch64), Windows (x86_64) |
 | `swift-xcframework` | XCFramework + DocC docs + Swift sources (`swift-sources`) | macOS universal2, iOS arm64, iOS Simulator |
 | `kotlin-aar` | UniFFI jniLibs (`kotlin-jnilibs`) + generated Kotlin bindings (`kotlin-bindings`); the job compiles `scp-kt` and `scp-kt-android` so a Kotlin compile error fails this gate, and `release.yml` assembles the published AAR again at publish time | Android (arm64, armv7, x86_64, x86) |
+| `kotlin-jvm-natives` | One UniFFI cdylib per JNA resource prefix (`kotlin-jvm-natives-<target>`), which `release.yml` stages into the `works.limn:scp-kt` JAR resources so the JVM coordinate loads on a machine that installed no SCP library | Linux (x86_64, aarch64), macOS (x86_64, aarch64), Windows (x86_64) |
 | `cbindgen` | C ABI shared library | Linux, macOS, Windows (same as Rust) |
 | `aggregate` | Combined release bundle | All of the above |
 

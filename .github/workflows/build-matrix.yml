@@ -409,6 +409,102 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
+  # Kotlin — JVM native libraries for works.limn:scp-kt
+  #
+  # The published JVM coordinate carries UniFFI's generated loader, which calls
+  # JNA's `Native.load("scp_ffi_uniffi", ...)`. JNA searches `jna.library.path`,
+  # then the system library path, then the classpath at
+  # `<Platform.RESOURCE_PREFIX>/<mapSharedLibraryName(name)>`. A consumer who
+  # installed no SCP library reaches only the third search, so the JAR must carry
+  # one library per resource prefix or every SCP call throws
+  # `UnsatisfiedLinkError`. `.docs/scaffold/kotlin.md` section "Maven Central
+  # Publishing" lists the platforms the package carries, and `matrix.include`
+  # below is that list. `scripts/check-release-pipeline.py` reads these rows as
+  # the set the `publish-maven` job of release.yml must stage.
+  #
+  # This job compiles the crate the `cbindgen` job below also compiles, and it
+  # does not download that job's artifact: the comment on that job's cargo step
+  # calls the command a stand-in until a future story adds a cbindgen crate, so
+  # that artifact states nothing about what the published JAR needs.
+  # ---------------------------------------------------------------------------
+  kotlin-jvm-natives:
+    name: Kotlin JVM native (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            jna-prefix: linux-x86-64
+            lib-file: libscp_ffi_uniffi.so
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            jna-prefix: linux-aarch64
+            lib-file: libscp_ffi_uniffi.so
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            jna-prefix: darwin-x86-64
+            lib-file: libscp_ffi_uniffi.dylib
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            jna-prefix: darwin-aarch64
+            lib-file: libscp_ffi_uniffi.dylib
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            jna-prefix: win32-x86-64
+            lib-file: scp_ffi_uniffi.dll
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (aarch64-linux)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      # Default features only. `allow_in_memory_custody` swaps a production
+      # custody provider for `InMemoryKeyCustody`, which CLAUDE.md forbids on a
+      # shipped path, and the `kotlin-aar` job above builds the Android
+      # libraries the same way.
+      - name: Build cdylib
+        run: cargo build --release --target ${{ matrix.target }} -p scp-ffi-uniffi
+
+      - name: Stage library under its JNA resource prefix (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          mkdir -p "jvm-natives/${{ matrix.jna-prefix }}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.lib-file }}" \
+             "jvm-natives/${{ matrix.jna-prefix }}/${{ matrix.lib-file }}"
+
+      - name: Stage library under its JNA resource prefix (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force "jvm-natives/${{ matrix.jna-prefix }}" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.lib-file }}" "jvm-natives/${{ matrix.jna-prefix }}/${{ matrix.lib-file }}"
+
+      # `if-no-files-found: error` fails this leg when the staging step produced
+      # nothing, so release.yml never reaches the Central Portal with a JAR that
+      # is missing a platform.
+      - name: Upload JVM native library
+        uses: actions/upload-artifact@v4
+        with:
+          name: kotlin-jvm-natives-${{ matrix.target }}
+          path: jvm-natives/
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
   # C ABI — cbindgen shared library for Go, C#, Java JNA consumers
   # ---------------------------------------------------------------------------
   cbindgen:
@@ -476,6 +572,7 @@ jobs:
       - typescript-napi
       - swift-xcframework
       - kotlin-aar
+      - kotlin-jvm-natives
       - cbindgen
     steps:
       - name: Download all artifacts

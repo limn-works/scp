@@ -650,10 +650,12 @@ jobs:
   # Maven Central via the Central Portal (vanniktech `publishAndReleaseToMavenCentral`,
   # which uploads + auto-releases — no OSSRH staging close/release).
   #
-  # This job runs NO cargo build. Both native inputs are precomputed in the
+  # This job runs NO cargo build. Every native input is precomputed in the
   # credential-free build matrix and downloaded here: the Android jniLibs
   # (kotlin-jnilibs) re-staged so Gradle assembles the AAR with native libraries,
-  # and the UniFFI Kotlin bindings (kotlin-bindings) placed into the scp-kt module
+  # the desktop JVM libraries (kotlin-jvm-natives-*) staged into the scp-kt
+  # module's JAR resources so the JVM coordinate loads on a consumer machine, and
+  # the UniFFI Kotlin bindings (kotlin-bindings) placed into the scp-kt module
   # so the publish runs with `-x generateUniffiBindings`. Keeping cargo out of the
   # credential-bearing step means no dependency build script ever executes with the
   # Maven signing key or Portal token in its environment.
@@ -675,6 +677,17 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
+      # The "Verify every JVM platform carries a native library" step below runs
+      # scripts/check-release-pipeline.py, which reads two workflow files.
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Pinned so a breaking PyYAML release cannot change that step's verdict.
+      - name: Install verifier dependencies
+        run: pip install 'PyYAML>=6,<7'
+
       - name: Download Android jniLibs
         uses: actions/download-artifact@v4
         with:
@@ -686,6 +699,30 @@ jobs:
         with:
           name: kotlin-bindings
           path: bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/
+
+      # works.limn:scp-kt is a plain JVM coordinate, so a consumer installs no
+      # SCP library of their own and UniFFI's loader reaches JNA's last search
+      # step, the classpath. Each `kotlin-jvm-natives-*` artifact holds one
+      # `<JNA resource prefix>/<library>` directory; `merge-multiple` unions them
+      # into the module's resources, and Gradle's processResources task copies
+      # that tree into the JAR. Without this step the published JAR carries the
+      # loader and no library for it to load, and every SCP call throws
+      # UnsatisfiedLinkError.
+      - name: Download JVM native libraries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: kotlin-jvm-natives-*
+          merge-multiple: true
+          path: bindings/kotlin/scp-kt/src/main/resources/
+
+      # download-artifact reports success when its pattern matches some of the
+      # artifacts the build matrix uploads, so compare the staged tree against
+      # the `kotlin-jvm-natives` matrix of build-matrix.yml before the Central
+      # Portal takes a deployment it will not let this pipeline replace.
+      - name: Verify every JVM platform carries a native library
+        run: |
+          python3 scripts/check-release-pipeline.py \
+            --verify-staged-natives bindings/kotlin/scp-kt/src/main/resources
 
       # publishAndReleaseToMavenCentral uploads a Portal deployment and triggers
       # its release. `-x generateUniffiBindings` uses the downloaded bindings
