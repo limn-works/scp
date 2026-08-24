@@ -1151,6 +1151,59 @@ impl Node {
     /// seal). For testing with unencrypted backends, use
     /// [`Node::start_for_testing`].
     ///
+    /// # Structural seal test (ADR-052 §AC-9)
+    ///
+    /// ADR-052 rejected demoting the seal to a runtime check, promising instead
+    /// that the bound is "additionally backed by a structural test that the
+    /// unencrypted path is unreachable from the production constructor." These
+    /// two doctests are that test.
+    ///
+    /// A plaintext backend (`FilesystemStorage` — key-per-file, no encryption)
+    /// **must not compile** against this constructor. `EncryptedStorage` is
+    /// sealed inside `scp-platform`, so no downstream crate can vote a
+    /// plaintext backend in:
+    ///
+    /// ```compile_fail,E0277
+    /// use scp_identity::DidMethod;
+    /// use scp_node::{Node, NodeConfig};
+    /// use scp_platform::filesystem::FilesystemStorage;
+    /// use scp_platform::traits::KeyCustody;
+    ///
+    /// // E0277: the trait bound `FilesystemStorage: EncryptedStorage`
+    /// // is not satisfied.
+    /// fn unsealed<K: KeyCustody + 'static, D: DidMethod + 'static>(
+    ///     config: NodeConfig<K, D, FilesystemStorage>,
+    /// ) {
+    ///     let _fut = Node::start(config);
+    /// }
+    /// ```
+    ///
+    /// The **same** call over the **same** backend wrapped in
+    /// `EncryptingAdapter` does compile. This pairing is what makes the
+    /// assertion above sound: a bare `compile_fail` passes for *any* error, so
+    /// the positive control proves the failure is attributable to the storage
+    /// type rather than to a typo or an unrelated breakage:
+    ///
+    /// ```
+    /// use scp_identity::DidMethod;
+    /// use scp_node::{Node, NodeConfig};
+    /// use scp_platform::encrypting_adapter::EncryptingAdapter;
+    /// use scp_platform::filesystem::FilesystemStorage;
+    /// use scp_platform::traits::KeyCustody;
+    ///
+    /// fn sealed<K: KeyCustody + 'static, D: DidMethod + 'static>(
+    ///     config: NodeConfig<K, D, EncryptingAdapter<FilesystemStorage>>,
+    /// ) {
+    ///     let _fut = Node::start(config);
+    /// }
+    /// ```
+    ///
+    /// These run in CI's `Rust / doc` job (`cargo test --workspace --doc`).
+    /// `cargo nextest` does not execute doctests; the compiling half of the
+    /// pair is additionally covered by
+    /// `crates/scp-node/tests/encrypted_storage_seal.rs`, which every test lane
+    /// builds.
+    ///
     /// # Errors
     ///
     /// Returns [`NodeError::InvalidConfig`] for contradictory configs (e.g.
@@ -1207,9 +1260,46 @@ impl Node {
     /// Constructs and starts an [`ApplicationNode`] from a [`NodeConfig`]
     /// without requiring encrypted storage.
     ///
-    /// **Testing only.** Production code must use [`Node::start`]. Feature-gated
-    /// so it cannot be reached in a release build (preserving the
-    /// `EncryptedStorage` seal).
+    /// **Testing only.** Production code must use [`Node::start`].
+    ///
+    /// # The seal does NOT currently hold — this function IS reachable from shipped SDK paths
+    ///
+    /// This function is gated on `#[cfg(any(test, feature =
+    /// "allow_unencrypted_storage"))]`, and spec §17.5 states that "production
+    /// code (FFI bridges, application nodes, SDK wrappers) must NOT enable this
+    /// feature." That prohibition is currently violated: four shipped bridge
+    /// manifests enable `allow_unencrypted_storage` on their `scp-node`
+    /// dependency edge, and all three bridges have `default = ["server"]`, so
+    /// the gate is open in every shipped bridge artifact.
+    ///
+    /// - `crates/scp-ffi/common/Cargo.toml` (`scp-node` dep)
+    /// - `crates/scp-ffi/Cargo.toml` (`PyO3`, `scp-node` dep)
+    /// - `crates/scp-ffi/napi/Cargo.toml` (napi-rs, `scp-node` dep)
+    /// - `crates/scp-ffi/uniffi/Cargo.toml` (`UniFFI`, `scp-node` dep)
+    ///
+    /// The remaining unsealed call sites behind those manifest edges are both
+    /// arms of `scp_ffi_common::server::start_node_local` (the persistent
+    /// file-backed front door), which builds over the plaintext
+    /// `FilesystemStorage`. `start_node_in_memory` no longer reaches this
+    /// function — it wraps its ephemeral store in `EncryptingAdapter` and goes
+    /// through [`Node::start`].
+    ///
+    /// Sealing `start_node_local` requires deciding what backs *persistent*
+    /// encrypted storage there (`SQLCipher` `SqliteStorage` vs.
+    /// `EncryptingAdapter<FilesystemStorage>`) plus the coupled `passphrase`
+    /// API change across four SDK surfaces; the four manifest edges can only be
+    /// removed once that lands, since removing them earlier breaks the build.
+    /// Do not restate the seal as holding until both are done.
+    ///
+    /// What *is* mechanically guaranteed today is the trait-bound split itself:
+    /// [`Node::start`] is `where S: EncryptedStorage`, so a plaintext backend
+    /// cannot reach the *production* constructor no matter which feature flags
+    /// are on. That half is proven by the `compile_fail,E0277` doctests on
+    /// [`Node::start`] and `ProtocolRepository::new`, with their positive
+    /// controls in `crates/scp-node/tests/encrypted_storage_seal.rs` (ADR-052
+    /// §AC-9). What those doctests do **not** prove — and what this section
+    /// exists to record — is that nothing shipped calls the function you are
+    /// reading.
     ///
     /// # Errors
     ///

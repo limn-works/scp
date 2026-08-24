@@ -48,7 +48,14 @@ custody = ["dep:scp-platform"]
 # auto-generate path FAILS CLOSED (`ServerError::AutoGenerateUnavailable`) on a
 # shipped build instead of running a nullifier-backed node. No test-harness
 # platform edge is present, transitively or otherwise — G1 proves it.
-server = ["dep:scp-transport", "dep:scp-node", "dep:scp-platform", "scp-platform/in-memory-storage", "scp-platform/filesystem", "scp-platform/file", "dep:scp-identity", "dep:tokio", "dep:tokio-util", "dep:tracing", "dep:thiserror"]
+#
+# `scp-platform/encrypting` + `dep:rand` back the `EncryptingAdapter` wrap on
+# `start_node_in_memory`'s ephemeral store: the shipped in-memory front door
+# goes through the production `Node::start` (`EncryptedStorage`-bounded), not
+# `Node::start_for_testing` (spec §17.5). `encrypting` is already unconditional
+# on this crate's `scp-platform` edge; it is restated here so the `server`
+# feature is self-contained.
+server = ["dep:scp-transport", "dep:scp-node", "dep:scp-platform", "scp-platform/in-memory-storage", "scp-platform/filesystem", "scp-platform/file", "scp-platform/encrypting", "dep:scp-identity", "dep:rand", "dep:tokio", "dep:tokio-util", "dep:tracing", "dep:thiserror"]
 
 [dependencies]
 scp-core = { path = "../../scp-core", optional = true }

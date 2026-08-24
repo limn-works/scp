@@ -18,6 +18,7 @@ use scp_did::DidDocument;
 use scp_identity::ScpIdentity;
 use scp_identity::dht::DidDht;
 use scp_node::{DhtMode, ExplicitIdentity, IdentitySource, Node, NodeConfig, NodeError, Reach};
+use scp_platform::encrypting_adapter::EncryptingAdapter;
 use scp_platform::file::FileKeyCustody;
 use scp_platform::in_memory::InMemoryStorage;
 
@@ -299,13 +300,31 @@ pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerEr
 // ApplicationNode startup
 // ---------------------------------------------------------------------------
 
-/// Starts a full application node with in-memory storage.
+/// Ephemeral storage backend for [`start_node_in_memory`]: the durability-only
+/// [`InMemoryStorage`] wrapped in an [`EncryptingAdapter`] under a per-node
+/// `OsRng` AES-256-GCM key.
+///
+/// The wrap is what makes the ephemeral backend satisfy the sealed
+/// `EncryptedStorage` bound, so this shipped `server`-feature front door goes
+/// through the production [`Node::start`] constructor rather than
+/// `Node::start_for_testing`. This is the canonical spec §17.5 pattern, already
+/// used by
+/// [`build_event_log_provider`](crate::bridge_runtime::build_event_log_provider).
+pub type EncryptedInMemoryStorage = EncryptingAdapter<InMemoryStorage>;
+
+/// Starts a full application node with encrypted in-memory storage.
+///
+/// Storage is the ephemeral [`EncryptedInMemoryStorage`] — `InMemoryStorage`
+/// under a per-node `OsRng` AES-256-GCM [`EncryptingAdapter`] — so the node is
+/// built through the production [`Node::start`] constructor and its
+/// `EncryptedStorage` bound. Nothing on this path reaches
+/// `Node::start_for_testing`.
 ///
 /// When `identity` is `None` (auto-generate): available ONLY in a `testing`
-/// build via the test-harness `ApplicationNode::dev` (in-memory key custody,
-/// [`InMemoryStorage`](scp_platform::in_memory::InMemoryStorage), and the
-/// [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) nullifier — no real DHT
-/// network). A shipped (no-`testing`) build FAILS CLOSED with
+/// build via the test-harness `ApplicationNode::dev` (in-memory key custody and
+/// the [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) nullifier — no real DHT
+/// network; its storage is the same encrypted in-memory backend). A shipped
+/// (no-`testing`) build FAILS CLOSED with
 /// [`ServerError::AutoGenerateUnavailable`] rather than run a nullifier-backed
 /// node (ADR-062 §Decision 1/6); production callers pass an explicit
 /// `Some(NodeIdentity)`. Self-signed TLS (localhost); relay bound to
@@ -324,7 +343,7 @@ pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerEr
 /// provisioning fails.
 pub async fn start_node_in_memory(
     identity: Option<NodeIdentity>,
-) -> Result<scp_node::ApplicationNode<InMemoryStorage>, ServerError> {
+) -> Result<scp_node::ApplicationNode<EncryptedInMemoryStorage>, ServerError> {
     let node = match identity {
         // Auto-generate uses the test-harness `ApplicationNode::dev` (in-memory
         // DHT nullifier), compiled only under `testing` (ADR-062 §Decision 1).
@@ -340,7 +359,16 @@ pub async fn start_node_in_memory(
             // reproduced by the default `TlsMode::SelfSigned`. `Domain` is a
             // publishing reach, so M2 requires `DhtMode::Production` (advisory
             // in P1 — the in-memory DHT client publishes nothing).
-            Node::start_for_testing(NodeConfig {
+            //
+            // Constructed via the PRODUCTION `Node::start` (spec §17.5: FFI
+            // bridges must not rely on the `allow_unencrypted_storage` escape
+            // hatch). The ephemeral `InMemoryStorage` is wrapped in
+            // `EncryptingAdapter` under a fresh `OsRng` AES-256-GCM key, which
+            // satisfies the sealed `EncryptedStorage` bound — the canonical
+            // §17.5 pattern already used by `build_event_log_provider`.
+            let mut storage_key = Zeroizing::new([0u8; 32]);
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *storage_key);
+            Node::start(NodeConfig {
                 bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
                 dht: DhtMode::Production,
                 ..NodeConfig::defaults(
@@ -358,7 +386,7 @@ pub async fn start_node_in_memory(
                             did_method: id.did_method,
                         },
                     )),
-                    InMemoryStorage::new(),
+                    EncryptingAdapter::new(InMemoryStorage::new(), storage_key),
                     // Explicit durability-only selection for this in-memory
                     // server front door (SCP-CAPINJECT-010): the blob backend is
                     // a required selection, never a runtime default.
@@ -548,14 +576,15 @@ pub async fn start_node_local(
 ///
 /// `ApplicationNode<S>` is generic over `S: Storage`. The `Storage` trait uses
 /// RPITIT and is not object-safe, so we cannot use `dyn Storage`. Instead we
-/// use a closed enum over `InMemoryStorage` and `FilesystemStorage`.
+/// use a closed enum over [`EncryptedInMemoryStorage`] and `FilesystemStorage`.
 ///
 /// This mirrors the pattern established by [`RunningRelay`] — shared in
 /// `scp-ffi-common` so each FFI bridge wraps this rather than duplicating the
 /// enum and its dispatch methods.
 pub enum RunningNode {
-    /// In-memory storage variant (ephemeral — suitable for tests/demos).
-    InMemory(scp_node::ApplicationNode<InMemoryStorage>),
+    /// Encrypted in-memory storage variant (ephemeral — suitable for
+    /// tests/demos). See [`EncryptedInMemoryStorage`].
+    InMemory(scp_node::ApplicationNode<EncryptedInMemoryStorage>),
     /// Filesystem-backed storage variant (persistent — suitable for local dev).
     Filesystem(scp_node::ApplicationNode<scp_platform::filesystem::FilesystemStorage>),
 }
