@@ -18,6 +18,30 @@ import works.limn.scp.bridge.CoroutineBridge
  *
  * All methods are blocking JNA calls into Rust and must be dispatched
  * on [kotlinx.coroutines.Dispatchers.IO].
+ *
+ * ## This interface has no production implementer, and that is deliberate
+ *
+ * No production class implements [ServerBindings]. The only implementer is
+ * `StubServerBindings` in the test source set. Because no production Kotlin
+ * code reaches these operations, all ten `Server` operations in
+ * `.docs/standards/sdk-capability-matrix.json` carry `"kotlin": false` with a
+ * matching `exemptions.kotlin` reason.
+ *
+ * [ServerBindings] and [ServerBridge] stay in scp-kt because Alec ruled on
+ * 2026-08-17: "let's keep kotlin false but not forever. we can add impls
+ * later." Do not delete either type, and do not read either type as a working
+ * capability.
+ *
+ * scp-kt is a plain JVM library, so a relay IS implementable here: a relay is
+ * an inbound listener (`TcpListener::bind`,
+ * `crates/scp-transport/src/native/server.rs:446`), and a JVM server binds
+ * ports. The separate Android module scp-kt-android depends on scp-kt, and
+ * Android is not a relay or node environment: a phone sits behind carrier
+ * CGNAT with no routable address, and Doze plus Android's
+ * background-execution limits kill a persistent listener.
+ *
+ * Whoever implements [ServerBindings] flips those ten matrix cells back to
+ * `true` and removes their exemptions.
  */
 interface ServerBindings {
     /**
@@ -476,6 +500,20 @@ class Node internal constructor(
  * All operations delegate through the coroutine bridge to UniFFI-generated
  * Rust functions. Provides relay and application node startup/shutdown as
  * suspend functions with proper dispatcher assignment.
+ *
+ * ## Every method here runs against a [ServerBindings] that only tests supply
+ *
+ * [ServerBridge] delegates to [ServerBindings], and no production class
+ * implements [ServerBindings] — see the note on that interface for the full
+ * state. All ten `Server` operations in
+ * `.docs/standards/sdk-capability-matrix.json` therefore carry
+ * `"kotlin": false` with a matching `exemptions.kotlin` reason.
+ *
+ * [ServerBridge] stays in scp-kt because Alec ruled on 2026-08-17: "let's keep
+ * kotlin false but not forever. we can add impls later." Do not delete this
+ * class, and do not read it as a working capability. A JVM implementation of
+ * [ServerBindings] makes every method here live, and whoever writes it flips
+ * those ten matrix cells back to `true` and removes their exemptions.
  */
 class ServerBridge internal constructor(
     private val bindings: ServerBindings,
