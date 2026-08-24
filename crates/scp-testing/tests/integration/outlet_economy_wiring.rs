@@ -69,6 +69,9 @@ use scp_core::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockin
 use scp_core::economy::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 use scp_did::DID;
 use scp_platform::in_memory::InMemoryStorage;
+use scp_protocol::context::outlets::error_codes::{
+    CODE_ECONOMIC_FAULT, SLUG_ECONOMIC_BUDGET_EXCEEDED,
+};
 use scp_runtime::context::actor::commands::QueriesCommand;
 
 // ---------------------------------------------------------------------------
@@ -539,8 +542,8 @@ async fn invoke_outlet_with_economy_rejects_insufficient_budget() {
     // sub-fault (e.g. insufficient-funds) is caught. (The inner `SCP-ECON-12010`
     // "no budget" string is remapped and never surfaces here.)
     assert!(
-        msg.contains("SCP-OUTLET-6150") && msg.contains("economic.budget-exceeded"),
-        "expected SCP-OUTLET-6150 economic.budget-exceeded error, got: {msg}"
+        msg.contains(CODE_ECONOMIC_FAULT) && msg.contains(SLUG_ECONOMIC_BUDGET_EXCEEDED),
+        "expected {CODE_ECONOMIC_FAULT} {SLUG_ECONOMIC_BUDGET_EXCEEDED} error, got: {msg}"
     );
 
     // The velocity entry recorded during Phase-1 reserve must have been rolled
