@@ -275,10 +275,21 @@ const DEVICE_ATTESTATION_SERVICE_TYPE: &str = "ScpDeviceAttestation";
 /// The fragment identifier for device attestation service entries.
 const DEVICE_ATTESTATION_FRAGMENT: &str = "device-attestation";
 
-/// Maximum number of retired agent keys to retain in a DID document.
+/// Number of retired agent keys `prune_retired_agent_keys` keeps.
 ///
-/// When rotating the `#agent` key, older retired keys beyond this limit are
-/// pruned to bound document size. Per ADR-039, this is set to 2.
+/// ADR-003 §4a and §4a′ (`.docs/adrs/phase-1.md`) state no cap on retained
+/// `#retired-agent-{sequence}` entries, so this constant and
+/// `prune_retired_agent_keys` prune against a bound no artifact states. The
+/// rationale they carried — bounding document size — measured against
+/// Mainline's 1,000-byte BEP44 cap. The two-encoding split moves every retired
+/// verification method onto the relay layer (§18.2.2C of
+/// `.docs/specs/18-addressability-and-deployment.md`), where §18.2.2D bounds
+/// the document at 262,039 bytes and one retired agent key costs 269 of them,
+/// which admits roughly 990 rotations of one identity.
+///
+/// ADR-003 §4a authorizes removing this constant, `prune_retired_agent_keys`,
+/// the call that invokes it, and the assertions that encode the count of 2. It
+/// imposes no order on that removal.
 const MAX_RETIRED_AGENT_KEYS: usize = 2;
 
 /// The service type string for `ScpIdentityLinkAttestation` entries (§3.5.3).
