@@ -1,0 +1,320 @@
+# A Workspace-Wide `--examples` Lint Turns On the Feature It Is Meant to Exclude
+
+**Date:** 2026-08-22
+**Source:** branch `fix/rustls-webpki-advisories` — `crates/scp-node/examples/website.rs`
+did not compile on a default build, no pull-request job rejected it, and the first
+gate written to reject it accepted it.
+
+## The Rule
+
+A build target that ships to a user MUST be compiled by a job that gates the pull
+request. `cargo package --list -p scp-node` lists `examples/website.rs`, so a broken
+example ships to crates.io.
+
+`scripts/check-examples-build-shipped.sh` carries five mechanisms, and deleting any one
+of them reopens a bypass this repository has already measured:
+
+1. **Lint one package at a time.** `cargo clippy --workspace --examples` unifies
+   dev-dependency features across every member — `crates/scp-ffi` dev-depends on
+   `scp-ffi-common` with `features = ["testing"]`, whose `testing` list carries
+   `scp-node?/testing` — so every example compiles with `scp-node/testing` ON and the
+   check goes inert.
+2. **Iterate targets, not published files, when compiling.** `exclude = ["examples/*"]`
+   empties the published set while the target still exists, and a file-driven loop skips
+   the package in silence.
+3. **Join published file to target on `src_path`, never on target name.** A
+   `[[example]] path =` key can bind the name `website` to a decoy file while
+   `examples/website.rs` still ships with no target. A name join sees the name on both
+   sides and reports success for a file it never opened.
+4. **Enumerate both auto-discovered layouts.** Cargo discovers `examples/NAME.rs` and
+   `examples/NAME/main.rs`. A pattern matching only the first is blind to a layout that
+   needs no manifest edit.
+5. **Report a `cargo package --list` failure unconditionally.** Gating that branch on the
+   crate having targets inverts it, because `autoexamples = false` empties the target set
+   and that is exactly when a published example is invisible.
+
+Row 8 is answered by none of them, and deliberately so: a `build.rs` can inject any cfg
+into every target of its own package. The criterion for what this gate cannot defend
+against is **write access to the crate under test**, not "edits the manifest" — an earlier
+draft wrote the narrower indicator as the contract, which is the failure `CLAUDE.md` names
+after Caulfield.
+
+## Eight rounds, eleven measured bypasses, and which ones the gate closes
+
+The table below has thirteen rows. Two are not measured bypasses: row 2 records an
+overclaim, and row 8 is a hypothesis two reproduction attempts failed to demonstrate. The
+remaining eleven are measured bypasses, found across six of the eight rounds —
+rounds 1, 3, 4, 5, 6, and 7. They do
+not share one root, and no single change closed them.
+
+Ten of the eleven are closed: rows 1, 3, 4a, 4c, 5, 6a, 6b, 7a, and 7b by the five
+mechanisms listed above, and row 6c by reading with `while IFS= read -r` instead of
+word-splitting.
+
+Row 4b (any nullifier other than `DhtMode::Memory`) is the one open bypass, and is meant
+to be: cargo gives an example its crate's dev-dependencies and no invocation switches that
+off.
+
+Row 8 (a `build.rs` injecting a cfg) is not demonstrated. Two attempts to reproduce it
+made the gate exit 1, because the injected cfg desynchronizes the lib from its dependency
+features and the lib itself stops compiling. It stays in the table as an untested
+hypothesis rather than a measured bypass. The residual limit does not rest on it: a writer
+of the crate under test controls what its targets compile against, which is the criterion,
+and `build.rs` is one instance of that access rather than the reason for it.
+
+Counting these was itself a source of error. Five earlier drafts of this paragraph
+asserted a total, described a table column, or claimed a coverage that the table three
+lines below already contradicted, and a reviewer caught every one. That is why the counts
+above name their rows: a bare total drifts from the table, and an enumeration does not.
+
+| Round | Bypass | Root |
+|---|---|---|
+| 1 | `cargo clippy --workspace --examples` | dev-dep unification turned `scp-node/testing` ON |
+| 2 | (scope overclaimed, not a bypass) | comment promised more than the check delivers |
+| 3 | `required-features = ["testing"]` | cargo skips the target and exits 0 |
+| 4a | `autoexamples = false` | file ships, target absent, target-sourced list blind |
+| 4b | any nullifier but `DhtMode::Memory` | dev-dependencies, unclosable |
+| 4c | `required-features` as standing exemption | bought nothing; the guard was satisfied rather than skipped, because the dev-dependency back-edge resolves `scp-runtime/testing` ON |
+| 5 | `cargo package --list` exit 101 swallowed | manifest error dropped a crate in silence |
+| 6a | `[[example]] path = "examples/decoy/website.rs"` | name join saw `website` on both sides |
+| 6b | `exclude = ["examples/*"]` | file-driven loop skipped the package |
+| 6c | filename containing a space | unquoted `for` word-split past both checks |
+| 7a | `examples/website/main.rs` directory layout | cargo auto-discovers it and publishes it; the enumerating regex matched only the flat form |
+| 7b | `autoexamples = false` + a `cargo package --list` failure | the failure branch was gated on the crate having targets, which that key empties |
+| 8 | `crates/scp-node/build.rs` printing `cargo::rustc-cfg=feature="testing"` | cargo auto-discovers `build.rs` with no manifest key, and the cfg reaches every target of the package |
+
+7a needed no manifest edit and no adversary. Cargo auto-discovers both
+`examples/NAME.rs` and `examples/NAME/main.rs`; the check's regex encoded only the
+first, and the comment above it stated the false rule as fact. A join is only as
+sound as the set it enumerates, and the enumerator was wrong about cargo.
+
+6a kept the reported count at eight and printed `── scp-node::website` for a file it
+never opened. A check that joins on name reports success for whichever file the name
+currently points at.
+
+## `required-features` hides an example from CI and does not stop it shipping
+
+`cargo package --list -p scp-runtime` listed all four of that crate's examples while one
+of them carried the declaration. So the declaration is a CI-visibility switch, not a
+shipping switch, and any rule that reads it as a statement about what ships is wrong. The
+crate still publishes all four.
+
+This branch added `required-features = ["testing"]` to
+`crates/scp-runtime/examples/identity.rs` on the premise that it could not build on
+shipped features, then measured the premise and found it false:
+`cargo clippy -p scp-runtime --example identity -- -D warnings` exits 0 on default
+features, because `scp-runtime` dev-depends on `scp-testing`, whose NORMAL
+`scp-core{testing}` edge resolves `scp-runtime/testing` ON. The declaration bought
+nothing and removed the example from the check, so it was reverted. Coverage went
+from four counted targets to eight — against the script as it stood that round, which passed
+`--examples` and skipped a feature-gated target silently. The script now names each
+target, so a `required-features` declaration no longer removes one from the count; the
+revert stands on its own ground, which is that the declaration asserted a build failure
+that does not happen.
+
+## An example a consumer cannot compile names a missing feature edge, not a file to stop publishing
+
+`crates/scp-runtime/examples/identity.rs` constructs `InMemoryDhtClient`, which `scp-dht`
+compiles only under `scp-dht/testing`. Before this branch, one edge alone reached that
+feature from `scp-runtime`: the `[dev-dependencies]` entry
+`scp-dht = { path = "../scp-dht", features = ["testing"] }`. Cargo strips a path-only
+dev-dependency from a published manifest, so a consumer of the published crate reached an
+unresolved import that no feature flag resolved.
+
+This branch first answered that by adding `exclude = ["examples/identity.rs"]` to
+`crates/scp-runtime/Cargo.toml`. The key does stop the file shipping, measured:
+`cargo package --list -p scp-runtime --allow-dirty` printed the path before the key and
+printed three examples after it, with no warning and exit 0, and
+`cargo package --no-verify -p scp-runtime --allow-dirty` printed `warning: ignoring example
+identity as examples/identity.rs is not included in the published package`.
+
+A reviewer then traced the cause one step further. `scp-runtime` declares `scp-dht` as a
+normal dependency, which survives publication, and every other consumer of `scp-dht` in
+this workspace already carries `scp-dht/testing` inside its own `testing` feature list:
+`crates/scp-identity/Cargo.toml`, `crates/scp-node/Cargo.toml`, `crates/scp-ffi/Cargo.toml`,
+`crates/scp-ffi/napi/Cargo.toml`, `crates/scp-ffi/common/Cargo.toml`, and
+`crates/scp-ffi/uniffi/Cargo.toml`. Story SCP-CAPINJECT-001 of the capability-injection PRD,
+`.docs/prds/adr062-capability-injection.json`, requires that edge of each consumer, and
+`scp-runtime` was the one consumer that omitted it. Adding `scp-dht/testing` to the
+`testing` list in `crates/scp-runtime/Cargo.toml` makes the example compile for a consumer,
+so the branch deleted the `package.exclude` key and the crate publishes all four examples
+again.
+
+The prove-absence gate does not object. `scripts/check-shipped-feature-graph.sh` asserts
+that each shipped artifact's resolved feature set is a subset of its allowlist, and no
+shipped artifact resolves `scp-runtime/testing`, so `InMemoryDhtClient` stays absent from
+every shipped graph.
+
+**The rule.** When an example fails to compile against the feature set publication produces,
+name the feature the missing item sits behind and decide whether the crate is entitled to
+activate it. Excluding the file deletes the symptom and leaves the feature-list divergence
+in the manifest, where the next example that names the same type meets it again.
+
+### Measure the consumer state with a probe crate
+
+Building the packaged crate cannot answer this question in this workspace:
+`cargo package --no-verify -p scp-runtime --allow-dirty` exits 101 with `failed to prepare
+local package for uploading` and `no matching package named scp-clock found`, because the
+path dependencies are not on crates.io. A probe crate answers it instead. Give a scratch
+crate outside the workspace a path dependency on `scp-runtime` with
+`features = ["testing"]`, add plain path dependencies on the crates the examples name
+directly, copy the example files into its `examples/` directory, and copy
+`examples/support/` with them. Cargo does not resolve a dependency's `[dev-dependencies]`,
+so the probe resolves the feature set publication produces.
+
+Measured on that probe with `scp-dht/testing` absent from the `testing` list:
+`cargo build --example identity` exits 101 with one error, `unresolved import
+scp_dht::InMemoryDhtClient`, carrying rustc's note `the item is gated behind the testing
+feature`. The `scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody}`
+imports in that same file resolve in that same failing build, which is the direct evidence
+that `scp-runtime/testing` carried `scp-platform/testing` to a consumer and carried nothing
+to `scp-dht`. Measured on the same probe with the edge added: `cargo build --example
+identity --example context --example messaging --example outlets` exits 0. Run the failing
+case first and the passing case second, because a run against the fixed tree alone
+distinguishes nothing — the trap the next section records.
+
+## Measure a gate against the defect, never against the fixed tree
+
+The workspace-wide line was written, run against the **fixed** tree, observed green, and
+committed. Green on a fixed tree is the null result: it distinguishes nothing. Two
+reviewers independently read the resolved features and reported that the line was inert.
+
+Reintroducing `DhtMode::Memory` settled it:
+
+| Invocation | `DhtMode::Memory` restored | `required-features` added | Clean tree |
+|---|---|---|---|
+| `cargo clippy --workspace --examples -- -D warnings` | **exit 0** | exit 0 | exit 0 |
+| `cargo clippy -p scp-node --examples -- -D warnings` | exit 101, `E0599` | **exit 0** | exit 0 |
+| `bash scripts/check-examples-build-shipped.sh` | exit 1, `E0599` | exit 1, names the target | exit 0 |
+
+The table carries two defect columns and one control column, so the case below is
+the third defect, not a fourth. It was found later: renaming
+`crates/scp-node/README.md` makes `cargo package --list` exit 101, and an earlier
+version of the check discarded that exit code, so scp-node dropped out in silence —
+7 examples checked instead of 8, with `website.rs` never linted. The check now
+surfaces it and exits 1.
+
+Run a gate against the defect before committing it, and record both exit codes.
+
+**The negative test can itself return the null result.** This workspace shares one
+cargo target directory across worktrees. A reviewer reintroduced `DhtMode::Memory`
+and the gate reported exit 0 — not because the gate was inert, but because cargo
+considered the example unit fresh while another worktree was building. After
+`touch crates/scp-node/examples/website.rs` the same command gave `E0599` and a
+non-zero exit. An editor that rewrites the file updates its mtime and avoids this;
+a tool that restores identical bytes, or a concurrent build holding the lock, does
+not.
+
+So a green negative test is only evidence when the subject file's mtime moved.
+Touch the file before measuring, and treat an unexpected exit 0 as a suspected
+stale artifact rather than as proof the defect is absent — the failure mode of a
+gate measurement and the failure mode it is meant to detect look identical from
+the exit code alone.
+
+**A run that reads persisted state returns the null result too.** A reviewer
+reported that `crates/scp-node/examples/website.rs` compiles on default features
+and still exits 1 at run time. Running the example printed
+`Site is live — open: http://localhost:18099/`, which reads as a refutation of the
+report. The run refuted nothing. It found an identity under `$XDG_DATA_HOME/scp/node`
+that an earlier run had persisted, so it took the branch that loads an identity and
+never reached the branch that creates one. Pointing `XDG_DATA_HOME` at an empty
+directory and running the example again reproduced the reviewer's report exactly:
+the program exited 1 and printed `NodeBuild("identity error: no production
+pre-rotation custody backend available; ...")`. The example's own doc comment in
+`crates/scp-node/examples/website.rs` quotes the full message.
+
+So point every state directory the program reads at an empty one before you measure
+behavior that a populated directory changes.
+
+When a gate's comment overstates its reach, the next author reads the comment, believes
+the property is proven, and stops checking. That is the extrapolation-as-contract failure
+`CLAUDE.md` names, written into an enforcement file.
+
+## What happened
+
+ADR-062, capability injection, moved `DhtMode::Memory` behind
+`#[cfg(feature = "testing")]` because its in-memory client is a §17.17.3 resolve
+nullifier. `crates/scp-node/examples/website.rs` kept selecting that variant, so
+`cargo check -p scp-node --examples` failed with `E0599` on a default build.
+
+Three jobs each looked like they covered it and none did:
+
+- `.github/workflows/ci.yml` runs `cargo clippy --workspace --all-targets` with
+  `--features ...testing`, so the example compiled.
+- `.github/workflows/build-matrix.yml` runs `cargo build --release` without
+  `--examples`, and only on a release tag or a `workflow_call`.
+- `.github/workflows/release.yml` runs `cargo clippy --workspace --all-targets` on
+  default features, but on `workflow_dispatch` — after the merge, not before it.
+
+## The trap in the obvious widening
+
+Widening the pull-request job to `cargo clippy --workspace --all-targets` on default
+features looks strictly better and fails today. Three targets need the `testing`
+feature without declaring it, and cargo aborts after the first, so measuring one at a
+time is what finds them all:
+
+| Target | Default-features result |
+|---|---|
+| `scp-ffi-uniffi` lib test (inline `#[cfg(test)]` in `src/bridge.rs`) | 8 compile errors |
+| `scp-ffi-uniffi` `tests/lifecycle.rs` | `E0599` on `Scp::new_in_memory_for_test` |
+| `scp-node` lib test (inline `#[cfg(test)]` in `src/lib.rs`) | compiles; 348 passed, 44 failed |
+
+`lifecycle` is fixed on this branch, because a `[[test]]` target can declare
+`required-features` and its two sibling stanzas already do. The other two are inline
+`#[cfg(test)]` modules, which that key cannot gate: each needs module-level gating, a
+split into `[[test]]` targets, or a widened feature, and each of those changes what a
+test asserts. Filed as issue 2393. The `scp-node` failures are the sharp case — those
+44 tests pass under `testing` and fail on default features because the code under test
+now fails closed, so gating them hides a real signal.
+
+The same defect makes `release.yml`'s clippy step fail whenever that workflow runs.
+Its trigger is `workflow_dispatch`, not a tag push, so the step has never run on a
+merge and the breakage stayed invisible. That step alone is issue 2386; the three
+targets behind it are 2393.
+
+Run the widened invocation before adopting it.
+
+## What the check does not cover
+
+The script header states this in full; it is the text an editor of the gate reads.
+In short: cargo builds an example as a dev target and gives it the crate's
+dev-dependencies, and no invocation switches that off, so the check proves that
+every example target compiles in this workspace and proves neither that an example
+compiles for someone who installs the crate nor anything about which constructs it
+names. `DhtMode::Memory` was caught only because it sits behind `scp-node`'s OWN
+`testing` feature, which scp-node's dev-dependencies do not enable.
+
+One correction worth keeping: `scp-transport` has no `testing` feature of its own.
+An earlier draft of this file said it did, and a reviewer caught it by reading the
+manifest.
+
+## How to apply
+
+- Before writing that a job would have caught a break, name the job and read its trigger.
+  A job gated on `push: tags:` or `workflow_dispatch` gates a release, not a pull request.
+- When a feature flag moves a construct out of a shipped build, grep the whole repository
+  for the construct's name — examples, the `README.md` beside the example, operator
+  guides, environment-variable tables, and the source of the crate that declares the flag.
+  This branch's first sweep searched documentation and stopped there, so it reported five
+  files: `crates/scp-node/examples/README.md`, `crates/scp-node/tests/self_host.rs`,
+  `.docs/guides/deploying-an-scp-website.md`, `.docs/guides/self-hosting-a-website-on-scp.md`,
+  and `docs/guides/relay-operations.md`, which advertised `SCP_NODE_DHT_MODE=memory` to
+  operators when a shipped `scp-node` exits 1 on it.
+- A second sweep, run because the first enumeration was presented as complete, found the
+  stale name inside `crates/scp-node/src` itself — the crate the flag lives in:
+  `config.rs` carried a comment asserting that `SCP_NODE_DHT_MODE=memory` "is exactly the
+  capability the binary exposes", `main.rs` carried a rustdoc comment documenting the
+  no-publish banner case as `SCP_NODE_DHT_MODE=memory`, and `config.rs` carried three
+  tests whose names said `dht_memory` while their bodies passed `DhtMode::Disabled`.
+  Do not read an earlier sweep's file list as the sweep. Re-run the grep.
+- Grep test names, not only code and prose. A test name is a claim about what the test
+  covers, and replacing a value inside the body leaves the name behind:
+  `nat_traversal_plus_dht_memory_is_valid` kept its name after ADR-062, capability
+  injection, replaced its `DhtMode::Memory` with `DhtMode::Disabled`.
+- Search both documentation trees. This repository has `.docs/` and a separate lowercase
+  `docs/`, and a sweep of one misses the other.
+
+Filed as issue 2386, "release.yml's clippy step cannot pass: scp-ffi-uniffi's inline test
+module needs the testing feature." It is filed rather than fixed because the two available
+fixes are not equivalent, and one of them removes a release-time assertion — which
+`CLAUDE.md` says a human approves.

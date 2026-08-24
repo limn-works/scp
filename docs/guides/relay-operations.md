@@ -130,7 +130,7 @@ These only apply to `scp-node` (not `scp-relay`):
 | `SCP_NODE_BIND_ADDR` | `0.0.0.0:9000` | HTTP server bind address |
 | `SCP_NODE_TLS_SELF_SIGNED` | `false` | Use self-signed TLS (development only) |
 | `SCP_NODE_PROJECTION_RATE_LIMIT` | `60` | Per-IP rate limit for projection endpoints |
-| `SCP_NODE_DHT_MODE` | `production` | DHT client mode: `production` or `memory` |
+| `SCP_NODE_DHT_MODE` | `production` | DHT client mode. The full node accepts only `production`, because it must publish its DID to be discoverable. `--self-host` also accepts `disabled`, which turns the DHT layer off so the node publishes nothing. `--ephemeral`, which only a `--features testing` build carries, ignores this variable and always uses the in-memory client. A shipped binary rejects every other value, including `memory`, whose match arm compiles only under `--features testing`. The binary logs `unrecognized SCP_NODE_DHT_MODE` and exits 1. |
 | `SCP_NODE_DHT_GATEWAYS` | (none) | Comma-separated DHT HTTP gateway URLs |
 | `SCP_STORAGE_PATH` | `$XDG_DATA_HOME/scp/node` | SQLite database directory |
 | `SCP_STORAGE_KEY` | (auto-generated) | Hex-encoded 32-byte SQLCipher encryption key |
@@ -260,12 +260,29 @@ On subsequent runs, the node loads the existing identity from SQLite and reuses 
 ### Development deployment
 
 ```bash
-# Self-signed TLS, in-memory DHT
+# Self-signed TLS. This run publishes the host's address bound to its DID to the
+# global Mainline DHT, because the full node accepts only SCP_NODE_DHT_MODE=production.
 SCP_NODE_DOMAIN=localhost \
 SCP_NODE_TLS_SELF_SIGNED=1 \
-SCP_NODE_DHT_MODE=memory \
-scp-node --ephemeral
+scp-node
 ```
+
+A shipped binary exits 1 on `--ephemeral` and on `SCP_NODE_DHT_MODE=memory`. The
+`--ephemeral` dispatch (`crates/scp-node/src/main.rs`, the `config.ephemeral` arm of
+`main`) and the `"memory"` match arm (`parse_dht_mode_or_exit`) both compile only under
+`--features testing`, so ADR-062, capability injection, keeps the in-memory DHT client
+and the in-memory key custody out of every released build. To run the fully in-memory
+development node, build the test-harness binary:
+
+```bash
+SCP_NODE_DOMAIN=localhost SCP_NODE_TLS_SELF_SIGNED=1 \
+cargo run -p scp-node --features testing -- --ephemeral
+```
+
+Ephemeral mode ignores `SCP_NODE_DHT_MODE`, because it wires the in-memory DHT
+client unconditionally. Pass `SCP_NODE_DHT_MODE=memory` to a `--features testing`
+build only when you want the persistent full node to keep its SQLite storage while
+its DHT stays process-local.
 
 ### Programmatic usage (Rust SDK)
 

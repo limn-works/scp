@@ -43,6 +43,9 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
+// The only use of the `Clock` trait method in this file sits inside a
+// `#[cfg(feature = "testing")]` block, so the import carries the same gate.
+#[cfg(feature = "testing")]
 use scp_clock::Clock;
 use scp_did::DidDocument;
 // Production DHT construction (real fail-closed Pkarr) and the `testing`
@@ -2613,9 +2616,10 @@ impl crate::scp::PyScp {
 
     /// Executes the custody migration protocol for the given DID.
     ///
-    /// This method creates a `CustodyMigrationOrchestrator` and runs the
-    /// 5-step migration protocol using an FFI backend that succeeds for all
-    /// operations by default.
+    /// This method creates a `CustodyMigrationOrchestrator` and runs the 5-step
+    /// migration protocol against `NotConfiguredMigrationBackend`, whose five
+    /// operations each return "custody migration backend not configured" until an
+    /// SDK layer supplies a real one. It does not succeed by default.
     ///
     /// # Arguments
     ///

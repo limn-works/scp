@@ -41,6 +41,7 @@ PROTECTED_REPO_RELATIVE_PATHS=(
     "scripts/pure-helpers-allowlist.txt"
     "scripts/check-construction-pattern.py"
     "scripts/check-toolchain-wiring.sh"
+    "scripts/check-examples-build-shipped.sh"
     "scripts/hooks/pretooluse-enforcement-files.sh"
 )
 

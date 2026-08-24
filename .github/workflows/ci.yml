@@ -83,6 +83,9 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'deny.toml'
+              # The rust-clippy job runs scripts/check-examples-build-shipped.sh,
+              # so a change to that gate must trigger the job that runs it.
+              - 'scripts/check-examples-build-shipped.sh'
               # The `docker-image` job builds from these two and is guarded by this
               # filter, so a change to either has to reach it.
               - 'Dockerfile'
@@ -160,7 +163,7 @@ jobs:
 
   # ── Fail-closed pre-rotation (ADR-062 §Decision 6 / SCP-CAPINJECT-006) ──
   # Runs the production (no-`testing`) identity-creation paths and asserts they
-  # FAIL CLOSED with the typed IdentityError::NoPreRotationBackend (SCP-IDENT-1059)
+  # FAIL CLOSED with the typed IdentityError::NoPreRotationBackend
   # rather than minting the severed in-memory pre-rotation nullifier. These tests
   # are `#[cfg(not(feature = "testing"))]`, so they compile/run ONLY in the bare
   # build where the nullifier is severed (the workspace test lane runs WITH
@@ -169,7 +172,7 @@ jobs:
   # silent nullifier fallback, `Ok(_)` trips the assertion.
   fail-closed-pre-rotation:
     needs: check-draft
-    name: Fail-closed pre-rotation (SCP-IDENT-1059)
+    name: Fail-closed pre-rotation (NoPreRotationBackend)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -563,6 +566,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # scripts/check-examples-build-shipped.sh parses cargo metadata with jq.
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -583,6 +589,10 @@ jobs:
           # udp/coap alongside ring-backed quic/http3), so a single combined
           # invocation covers all four.
           cargo clippy -p scp-transport --features quic,http3,udp,coap --all-targets -- -D warnings
+          # Asserts two things: every example target compiles, and every
+          # published examples/*.rs is some target's source. The script header
+          # states what the check cannot prove; do not restate it here.
+          bash scripts/check-examples-build-shipped.sh
 
   # Matrix jobs must always expand so each OS variant reports a status
   # to branch protection. Step-level `if` skips the heavy work instead.

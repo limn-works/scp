@@ -347,6 +347,48 @@ cargo deny check
 cargo doc --workspace --no-deps
 ```
 
+## Clearing a Security Advisory
+
+When a RUSTSEC advisory names a workspace dependency, bump the dependency. Add a
+`deny.toml` ignore entry only when no released version clears the advisory, or when a
+dependency this workspace does not control blocks the upgrade. State that blocking
+upgrade in the entry's comment, and delete the entry in the same change that takes the
+fix — an ignore entry for a patched advisory is a false record.
+
+**Choosing the version.** Take the newest release whose dependency floors this workspace
+already satisfies. Reject a newer release that raises a floor on a native-code dependency
+to supply a capability the workspace does not use, because recompiling a vendored C
+library across every cross-compiled target adds build risk and no security. The case that
+produced this rule: rustls-webpki 0.103.14 raised its `aws-lc-rs` floor from 1.14 to 1.18
+to expose ML-DSA, which would have moved `aws-lc-sys` 0.39.0 to 0.44.0 and its vendored
+AWS-LC 1.71.0 to 5.5.0 under twelve of the thirteen targets CI compiles for — every
+one but `wasm32-unknown-unknown`: the packages CI compiles for that target
+(`scp-client-wasm`, `scp-mls`, `scp-relay-client`, and their wasm-safe leaves) pull in
+no `aws-lc-sys`, though a workspace-wide `cargo tree --target wasm32-unknown-unknown`
+does show it, via `scp-node`, which CI never builds for wasm32 — for an algorithm this
+workspace never asserts; 0.103.13 cleared the same three advisories and moved nothing.
+Establish that by evidence: `diff` the candidate's `Cargo.toml` against the current one,
+and read the upstream release notes for every version in between.
+
+**Applying the bump.** Use `cargo update -p <crate> --precise <version>`. A bare
+`cargo update -p <crate>` re-resolves unrelated edges, so read the whole `Cargo.lock` diff
+and revert every change the advisory did not require. Prove the result resolves with
+`cargo metadata --locked --all-features`.
+
+**Verifying.** Run the cargo-deny version `EmbarkStudios/cargo-deny-action@v2` pins, not
+whatever `cargo install` left on the machine. CI's verdict is the one that gates the merge,
+so a local run only predicts CI when the binary matches. `.mise.toml` declares
+`"cargo:cargo-deny" = "latest"`, which pins nothing and drifts, so check the installed
+version rather than assuming the toolchain manifest supplied the pinned one. Two
+diagnostics decide the outcome and both are version-sensitive: an `error` fails the run,
+and an `advisory-not-detected` warning marks an ignore entry as unnecessary. Do not delete
+an entry on an `advisory-not-detected` from an unpinned binary. Count every copy of the crate in
+`Cargo.lock` before calling an advisory cleared: a bump that adds a patched version on top
+of unpatched duplicates leaves the unpatched ones compiling into the shipped artifact.
+Measured on 0.20.2, cargo-deny does emit one diagnostic per affected copy — both
+`libcrux-sha3 0.0.6` and `0.0.7` are reported — so the count is a check on the fix, not a
+compensation for the tool.
+
 ## CI Matrix
 
 Tests are organized into three tiers. See `specs/16-test-infrastructure.md` §16.15 for the full tier definitions, §16.13 test assignments, and feature flag conventions.
