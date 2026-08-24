@@ -50,10 +50,16 @@ pub use dht::{
 };
 pub use relay_querier::RealMultiRelayQuerier;
 pub use republish::RepublishManager;
-pub use resolution::{InMemoryRelayQuerier, RelayQuerier, RelayQueryRecord, did_routing_id};
+/// Test-only relay querier. The `cfg` keeps this in-memory double out of every
+/// shipped build; production resolves through
+/// `scp_transport::native::TransportRelayQuerier`.
+#[cfg(any(test, feature = "testing"))]
+pub use resolution::InMemoryRelayQuerier;
+pub use resolution::{RelayQuerier, RelayQueryRecord, did_routing_id};
 pub use resolver::{
-    DidResolver, DualLayerHealingPublisher, DualLayerResolver, HealingPublisher, MultiRelayQuerier,
-    NoOpHealer, NoOpRelayQuerier, ResolutionSource, ResolvedDidDocument, StaleLayer,
+    BootstrapRelays, DidResolver, DualLayerHealingPublisher, DualLayerResolver, HealingPublisher,
+    LayerAvailability, LayerStatus, MultiRelayQuerier, NoHealing, ResolutionOutcome,
+    ResolutionSource, ResolvedDidDocument, StaleLayer,
 };
 
 use serde::{Deserialize, Serialize};
@@ -239,13 +245,48 @@ pub enum IdentityError {
 
     /// A relay querier has no live connection to the specified relay URL.
     ///
-    /// Returned by `TransportRelayQuerier` (Slice 011b) when the relay
-    /// connection pool does not hold an active connection to the requested
-    /// relay URL and cannot establish one in time. Callers (`RealMultiRelayQuerier`)
-    /// treat this as a soft failure and advance to the next relay in priority
-    /// order — identical to `RelayQueryFailed` in terms of fall-through behavior.
+    /// Returned by `TransportRelayQuerier` when no transport is bound for the
+    /// requested relay URL. `RealMultiRelayQuerier` treats this as a soft
+    /// failure and advances to the next relay in priority order — identical to
+    /// `RelayQueryFailed` in fall-through behavior. When it is the outcome for
+    /// EVERY relay, the composer returns an error rather than `Ok(None)`, so the
+    /// resolver records the relay layer as unavailable instead of reporting that
+    /// the relays hold no record (§3.10.4).
     #[error("relay not connected: {0}")]
     RelayNotConnected(String),
+
+    /// No resolution layer answered, and the cache held no usable document
+    /// (§3.10.4, "Both layers fail"; error `DID_RESOLUTION_FAILED`, code 5010).
+    ///
+    /// Distinct from an absent DID: this error says the resolver learned
+    /// nothing, not that nobody published the DID. The resolver never fabricates
+    /// a document to avoid returning it.
+    #[error("DID resolution failed for {did}: {reason}")]
+    ResolutionFailed {
+        /// The DID string the caller asked the resolver to resolve.
+        did: String,
+        /// Which layers could not answer.
+        reason: String,
+    },
+
+    /// Every resolution layer answered, and none holds a document for this DID
+    /// (§3.10.4).
+    ///
+    /// Distinct from [`Self::DhtNotFound`], which names one layer, and from
+    /// [`Self::ResolutionFailed`], which says the resolver learned nothing. This
+    /// error is the only one that asserts the DID is absent, and it is reachable
+    /// only when every layer reported on the DID.
+    #[error("no resolution layer holds a document for {0}")]
+    ResolutionNotFound(String),
+
+    /// A resolution layer served a document older than one this process already
+    /// accepted for the same DID (§3.10.7).
+    ///
+    /// The resolver rejects the document rather than reinstating a rotated-out
+    /// key, and reports the rejection so a caller can distinguish a downgrade
+    /// attempt from an absent DID.
+    #[error("sequence downgrade detected: {0}")]
+    SequenceDowngrade(String),
 
     /// The resolved document has a stale sequence number (lower than last known).
     #[error("stale sequence number: received {received}, last known {last_known}")]

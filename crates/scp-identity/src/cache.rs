@@ -250,6 +250,45 @@ impl<C: Clock> DidCache<C> {
         age > ttl
     }
 
+    /// Returns a cached document whose age is at or below `max_age_secs`,
+    /// ignoring the per-entry refresh TTL.
+    ///
+    /// [`get`](DidCache::get) answers the question "is this entry fresh enough
+    /// to serve instead of resolving?" and applies the 24-hour active-contact /
+    /// 7-day inactive-contact refresh interval. This method answers a different
+    /// question: "the resolution layers gave nothing — does the cache still hold
+    /// a document I am allowed to serve?" Spec §3.10.4 ("Both layers fail")
+    /// bounds that at 7 days regardless of the entry's refresh tier, so the
+    /// caller passes the bound it must apply.
+    pub async fn get_within_max_age(
+        &self,
+        did: &str,
+        max_age_secs: u64,
+    ) -> Option<DidResolutionResult> {
+        let entries = self.entries.lock().await;
+        let entry = entries.get(did)?.clone();
+        drop(entries);
+
+        let age = self.clock.now_secs().saturating_sub(entry.last_verified);
+        if age > max_age_secs {
+            return None;
+        }
+
+        let staleness = if age > STALENESS_THRESHOLD_SECS {
+            Staleness::Stale {
+                last_verified: entry.last_verified,
+            }
+        } else {
+            Staleness::Fresh
+        };
+
+        Some(DidResolutionResult {
+            document: entry.document,
+            staleness,
+            sequence: entry.sequence,
+        })
+    }
+
     /// Returns the cached sequence number for a DID, if present.
     pub async fn cached_sequence(&self, did: &str) -> Option<u64> {
         let entries = self.entries.lock().await;

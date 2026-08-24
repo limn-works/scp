@@ -69,6 +69,9 @@ scp-identity = { path = "../scp-identity" }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
 scp-transport = { path = "../scp-transport" }
 scp-ffi-common = { path = "../scp-ffi/common", features = ["resolvers"] }
+# Test-only: z-base-32 builds the `did:dht:z…` fixture the pipeline-wiring
+# relay-resolution assertion resolves (spec §3.10.2).
+z-base-32 = { workspace = true }
 # async-trait: the compromise-recovery integration test implements the async
 # `RecoveryBackend` trait (ADR-049 Decision 7) with a mock backend.
 async-trait = { workspace = true }

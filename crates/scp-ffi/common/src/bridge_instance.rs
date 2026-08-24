@@ -336,6 +336,16 @@ pub struct CoreFields {
     /// See #311 for the unification design.
     did_resolver: OnceLock<Arc<IdentityBackedDidResolver>>,
 
+    /// The relay layer of this instance's DID resolution (spec §3.10.2).
+    ///
+    /// Built with the instance, before any relay connection exists, and bound to
+    /// a live transport by [`bind_relay_transport`](Self::bind_relay_transport)
+    /// as each `transport_connect` establishes one. The resolver reads the bound
+    /// set on every resolve, so a relay connected after the resolver was built is
+    /// reachable (§3.10.4 step 3a). One querier per instance, never a process
+    /// global, so two bridge instances never share relay bindings.
+    relay_querier: Arc<scp_transport::native::TransportRelayQuerier>,
+
     /// Shared DHT client backing the production DID resolver.
     ///
     /// Retained on the instance so that `identity_create` publishes freshly
@@ -565,6 +575,7 @@ impl CoreFields {
             economy_antispam: DashMap::new(),
             bridge_state: DashMap::new(),
             did_resolver: OnceLock::new(),
+            relay_querier: Arc::new(scp_transport::native::TransportRelayQuerier::new()),
             dht_client: OnceLock::new(),
             resolver_cache: OnceLock::new(),
             shutdown_hooks: Mutex::new(Vec::new()),
@@ -650,6 +661,7 @@ impl CoreFields {
             economy_antispam: DashMap::new(),
             bridge_state: DashMap::new(),
             did_resolver: OnceLock::new(),
+            relay_querier: Arc::new(scp_transport::native::TransportRelayQuerier::new()),
             dht_client: OnceLock::new(),
             resolver_cache: OnceLock::new(),
             shutdown_hooks: Mutex::new(Vec::new()),
@@ -1228,7 +1240,17 @@ impl CoreFields {
     /// reference without keeping the `RwLock` guard alive across `.await`
     /// points.
     ///
-    /// Replaces any previous transport manager.
+    /// Replaces any previous transport manager, and drops every relay binding
+    /// the previous manager's adapters backed.
+    ///
+    /// The two release together because a binding is a strong `Arc` on an
+    /// adapter the transport manager owns. A binding that outlived its manager
+    /// would keep the adapter alive past teardown, so
+    /// `NativeRelayAdapter::drop` — the only thing that cancels the
+    /// cover-traffic and heartbeat tasks and closes the socket — would never
+    /// run, and DID resolution would keep querying that dead connection. A
+    /// caller that installs a manager therefore binds each of its adapters
+    /// afterwards, via [`Self::bind_relay_transport`].
     ///
     /// If the instance is shut down, logs a warning but still sets the
     /// transport — matching the `bridge_instance()` / `context_manager()`
@@ -1257,6 +1279,10 @@ impl CoreFields {
                 "bridge instance is suspended — call resume() before setting transport".to_owned(),
             ));
         }
+        // Release the outgoing manager's relay bindings before installing the
+        // new manager. See this method's doc comment for why the two release
+        // together.
+        self.relay_querier.clear();
         let mut guard = self
             .transport
             .write()
@@ -1276,11 +1302,18 @@ impl CoreFields {
     /// After this, relay-based operations will fail until a new transport
     /// manager is set.
     ///
+    /// Drops every relay binding as well, so this instance releases its last
+    /// `Arc` on each connected adapter. Without that, `NativeRelayAdapter::drop`
+    /// never runs after a `suspend()` or a `shutdown()`: the cover-traffic and
+    /// heartbeat tasks keep transmitting and the WebSocket stays open on an
+    /// instance the caller believes it tore down.
+    ///
     /// # Errors
     ///
     /// Returns `Err` if the `RwLock` is poisoned.
     #[allow(clippy::significant_drop_tightening)]
     pub fn clear_transport(&self) -> Result<(), TransportLockError> {
+        self.relay_querier.clear();
         let mut guard = self
             .transport
             .write()
@@ -1571,13 +1604,25 @@ impl CoreFields {
         // spawned task panicked (empty `results`, no per-URL failure).
         let mut first_failure: Option<LifecycleError> = first_panic_failure;
         let mut connected_count = 0_usize;
+        // Each reconnected adapter, kept so the relay layer of DID resolution
+        // can be re-bound to the connection this cycle just opened. `resume`
+        // replaces the whole `TransportManager`, which drops the pre-suspend
+        // bindings, so without re-binding the resolver would hold no relay at
+        // all and report the relay layer unavailable for the rest of the process
+        // (§3.10.4 step 3a).
+        let mut reconnected: Vec<(String, Arc<dyn scp_transport::TransportAdapter>)> = Vec::new();
         for (url, outcome) in results {
             match outcome {
                 Ok(adapter) => {
+                    // Share ONE connected adapter between the `TransportManager`
+                    // that sends over it and the DID relay querier that runs
+                    // QUERY over it, exactly as `transport_connect` does.
+                    let shared: Arc<dyn scp_transport::TransportAdapter> = Arc::from(adapter);
                     // `add_adapter` may return an `EvictionOutcome` if we hit the
                     // connection budget; we don't surface it here because the
                     // caller's reconnect intent is best-effort multi-relay.
-                    let _eviction = manager.add_adapter(Box::new(adapter));
+                    let _eviction = manager.add_adapter(Box::new(Arc::clone(&shared)));
+                    reconnected.push((url.clone(), shared));
                     connected_count += 1;
                 }
                 Err(reason) => {
@@ -1612,6 +1657,7 @@ impl CoreFields {
             // tasks exit — so the socket closes cleanly rather than
             // leaking.
             drop(manager);
+            drop(reconnected);
             return Err(LifecycleError::ReconnectFailed {
                 url: String::new(),
                 reason:
@@ -1637,6 +1683,13 @@ impl CoreFields {
                 }
                 true
             } else {
+                // Re-bind the relay layer of DID resolution onto the
+                // connections this cycle opened, so a resolve after resume
+                // queries the live socket instead of reporting the relay layer
+                // unavailable (§3.10.4 step 3a).
+                for (url, adapter) in reconnected {
+                    self.bind_relay_transport(url, adapter);
+                }
                 false
             }
         } else {
@@ -2193,6 +2246,39 @@ impl CoreFields {
         if self.did_resolver.set(resolver).is_err() {
             tracing::warn!("set_did_resolver called but resolver already initialized — ignoring");
         }
+    }
+
+    /// Returns this instance's relay-layer DID querier (spec §3.10.2).
+    ///
+    /// The querier exists from instance construction, so a caller may compose it
+    /// into a resolver before any relay is connected and bind transports later.
+    #[must_use]
+    pub fn relay_querier(&self) -> Arc<scp_transport::native::TransportRelayQuerier> {
+        Arc::clone(&self.relay_querier)
+    }
+
+    /// Binds a connected relay transport into this instance's relay-layer DID
+    /// querier, so DID QUERY (§3.10.2) runs over the same connection the rest of
+    /// the bridge already uses for this relay.
+    ///
+    /// Bridges call this from `transport_connect`, immediately after
+    /// [`Self::set_transport`]. Binding is idempotent: a later bind for the same
+    /// URL replaces the earlier adapter.
+    pub fn bind_relay_transport(
+        &self,
+        relay_url: impl Into<String>,
+        adapter: Arc<dyn scp_transport::TransportAdapter>,
+    ) {
+        self.relay_querier.bind(relay_url, adapter);
+    }
+
+    /// Removes a relay's DID-QUERY binding, so a resolver stops asking a relay
+    /// this instance walked away from.
+    ///
+    /// Bridges call this from `transport_disconnect`, alongside
+    /// [`Self::remove_relay_url`].
+    pub fn unbind_relay_transport(&self, relay_url: &str) {
+        self.relay_querier.unbind(relay_url);
     }
 
     /// Returns the shared DHT client backing the DID resolver, if initialized.

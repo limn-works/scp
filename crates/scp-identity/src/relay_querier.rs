@@ -31,7 +31,7 @@ use tracing::{debug, warn};
 
 use crate::IdentityError;
 use crate::dht::extract_public_key;
-use crate::resolution::{RelayQuerier, did_routing_id, verify_relay_record};
+use crate::resolution::{RelayQuerier, RelayQueryAnswer, did_routing_id, verify_relay_record};
 use crate::resolver::{MultiRelayQuerier, RelayRecord};
 
 /// The relay QUERY `limit` and the per-relay candidate-verification budget —
@@ -116,6 +116,16 @@ const PER_RELAY_TIMEOUT: Duration = Duration::from_secs(5);
 /// intra-relay candidate scan. The cap trades an unbounded-verification `DoS` for
 /// a suppression vector that a malicious relay already possesses for free.
 ///
+/// # Answering versus failing (§3.10.4)
+///
+/// The composer returns `Ok(None)` only when at least one relay answered and no
+/// relay held a valid record. It returns `Err` when the relay layer could not
+/// answer at all — an empty URL list, or every relay erroring, timing out, or
+/// having no bound transport. The [`DualLayerResolver`](crate::resolver::DualLayerResolver)
+/// turns that `Err` into [`LayerStatus::Unavailable`](crate::resolver::LayerStatus::Unavailable),
+/// so a caller never reads an unreachable relay layer as evidence that nobody
+/// published the DID.
+///
 /// # Layering
 ///
 /// This composer owns **intra-relay candidate selection** (highest-seq among
@@ -173,51 +183,99 @@ impl<Q: RelayQuerier + 'static> MultiRelayQuerier for RealMultiRelayQuerier<Q> {
             // provenance differs.
             //
             // `routing_id` is `[u8; 32]` (Copy); each task gets its own copy.
-            let mut tasks: JoinSet<(String, Vec<_>)> = JoinSet::new();
+            //
+            // An empty URL list means no relay is available to ask, which the
+            // composer reports as a layer failure rather than as "the relays
+            // hold no record for this DID" (§3.10.4).
+            if relay_urls.is_empty() {
+                return Err(IdentityError::RelayNotConnected(format!(
+                    "no relay URL is available to query for {did}"
+                )));
+            }
+
+            let relay_count = relay_urls.len();
+            let mut tasks: JoinSet<(String, Option<RelayQueryAnswer>)> = JoinSet::new();
             for relay_url in relay_urls {
                 let inner = Arc::clone(&inner);
                 tasks.spawn(async move {
-                    let candidates = match tokio::time::timeout(
+                    // `None` means this relay could not be reached (error or
+                    // timeout); `Some(answer)` means it responded.
+                    let answer = match tokio::time::timeout(
                         PER_RELAY_TIMEOUT,
                         inner.query(&relay_url, &routing_id),
                     )
                     .await
                     {
-                        Ok(Ok(v)) => v,
+                        Ok(Ok(v)) => Some(v),
                         Ok(Err(e)) => {
                             debug!(relay_url = %relay_url, error = %e, "relay query failed — skipping relay");
-                            Vec::new()
+                            None
                         }
                         Err(_elapsed) => {
                             debug!(relay_url = %relay_url, "relay query timed out — skipping relay");
-                            Vec::new()
+                            None
                         }
                     };
-                    (relay_url, candidates)
+                    (relay_url, answer)
                 });
             }
 
             // Track the highest-seq valid record across all relays (§3.10.4 step 5
             // / §3.10.7: "the highest valid sequence number wins").
             let mut best: Option<RelayRecord> = None;
+            // How many relays gave this composer usable evidence about the DID.
+            //
+            // **The criterion (§3.10.4):** a relay answered when it responded
+            // AND either stored nothing at the routing ID, or served at least
+            // one record that verified against the DID-derived key. A relay that
+            // could not be reached gave no evidence; so did a relay whose every
+            // blob the resolver discarded, because §3.10.4 discards a bad
+            // signature and an undecodable frame each "as if the relay had
+            // failed". Counting such a relay would let anyone who can write one
+            // junk blob to a routing ID convert a suppression attack into a
+            // caller-visible claim that nobody published the DID.
+            let mut relays_that_answered = 0_usize;
 
             while let Some(join_result) = tasks.join_next().await {
                 // Transport errors and relay timeouts are already handled inside
-                // the spawned task: they return an empty Vec and skip the relay
-                // without aborting the sweep. A JoinError here is a task panic —
-                // a bug, but still must not abort the sweep.
-                let (relay_url, candidates) = match join_result {
+                // the spawned task: they yield `None` and skip the relay without
+                // aborting the sweep. A JoinError here is a task panic — a bug,
+                // but still must not abort the sweep.
+                let (relay_url, answer) = match join_result {
                     Ok(task_output) => task_output,
                     Err(e) => {
                         warn!(error = %e, "relay query task panicked unexpectedly");
                         continue;
                     }
                 };
+                let Some(answer) = answer else {
+                    continue;
+                };
+
+                if answer.holds_nothing() {
+                    // The relay responded and stored no blob at all, which is it
+                    // reporting that it holds no record for this DID.
+                    relays_that_answered += 1;
+                    continue;
+                }
+
+                if answer.undecodable > 0 {
+                    warn!(
+                        relay_url = %relay_url,
+                        did = %did,
+                        undecodable = answer.undecodable,
+                        "relay returned blobs that do not decode as DID-record frames — discarding each as if the relay had failed (§3.10.4)"
+                    );
+                }
+
+                // This relay served blobs. It answered only if one of them
+                // verifies; track that across the candidate loop below.
+                let mut this_relay_served_a_valid_record = false;
 
                 // Apply a defensive cap: an untrusted relay must not be able to
                 // drive O(N) Ed25519 verifications per resolve (§3.10.8). This is
                 // a `DoS` budget, not a suppression control — see the type doc.
-                for record in candidates.into_iter().take(MAX_CANDIDATES_PER_RELAY) {
+                for record in answer.candidates.into_iter().take(MAX_CANDIDATES_PER_RELAY) {
                     // Shared verify: BEP44 signature + UTF-8/JSON + self-cert.
                     // Cross-DID substitution is cryptographically impossible:
                     // the embedded identity key must match the DID suffix, and
@@ -234,6 +292,8 @@ impl<Q: RelayQuerier + 'static> MultiRelayQuerier for RealMultiRelayQuerier<Q> {
                         continue;
                     }
 
+                    this_relay_served_a_valid_record = true;
+
                     // Highest-seq valid record wins (§3.10.4 step 5, §3.10.7).
                     if best.as_ref().is_none_or(|b| record.seq > b.seq) {
                         best = Some(RelayRecord {
@@ -244,6 +304,28 @@ impl<Q: RelayQuerier + 'static> MultiRelayQuerier for RealMultiRelayQuerier<Q> {
                         });
                     }
                 }
+
+                if this_relay_served_a_valid_record {
+                    relays_that_answered += 1;
+                } else {
+                    warn!(
+                        relay_url = %relay_url,
+                        did = %did,
+                        "relay served blobs but none verified — treating this relay as failed, never as one reporting the DID absent (§3.10.4)"
+                    );
+                }
+            }
+
+            // No relay answered: the relay layer gave the resolver no usable
+            // evidence, which the resolver must not read as "the relays hold no
+            // record for this DID" (§3.10.4). One relay answering is enough for
+            // `Ok`, because the layer then produced a real answer from a real
+            // source.
+            if relays_that_answered == 0 {
+                return Err(IdentityError::RelayQueryFailed(format!(
+                    "none of the {relay_count} relays queried for {did} reported on it: each one \
+                     failed, timed out, or served only records the resolver discarded"
+                )));
             }
 
             // The resolver re-verifies the returned record (defense in depth)
@@ -499,12 +581,115 @@ mod tests {
             .await;
 
         let composer = RealMultiRelayQuerier::new(Arc::new(inner));
+        let error = composer
+            .query(&did, &["wss://relay-a.example.com/scp/v1".to_owned()])
+            .await
+            .expect_err(
+                "the only relay served a record that failed self-certification, which §3.10.4 \
+                 discards as if the relay had failed, so no relay reported on this DID",
+            );
+
+        assert!(
+            matches!(error, IdentityError::RelayQueryFailed(_)),
+            "a relay whose every record the resolver discarded reports a failed query, never \
+             `Ok(None)` — `Ok(None)` would tell the resolver the relay layer answered and holds \
+             nothing, which turns tampering into a claim that nobody published the DID; got \
+             {error:?}"
+        );
+    }
+
+    /// A relay that serves a well-framed record whose BEP44 signature does not
+    /// verify must read as a relay that FAILED, never as one reporting the DID
+    /// absent (§3.10.4, "One layer returns invalid signature. The response is
+    /// discarded as if the layer had failed").
+    ///
+    /// Without this rule a hostile relay plants one junk blob at a DID's routing
+    /// ID and the caller is told nobody published that DID.
+    #[tokio::test]
+    async fn relay_serving_only_an_invalid_signature_reports_a_failed_query() {
+        let (vk, sk) = make_ed25519_keypair();
+        let did = did_from_public_key(&vk);
+        let routing_id = did_routing_id(&did);
+
+        // Correctly self-certifying, correctly framed — but the signature is
+        // over different bytes, so BEP44 verification rejects it.
+        let mut tampered = signed_record(&did, vk.as_bytes(), &sk, 4);
+        tampered.signature[0] ^= 0xFF;
+
+        let inner = InMemoryRelayQuerier::new();
+        inner
+            .insert("wss://relay-a.example.com/scp/v1", &routing_id, tampered)
+            .await;
+
+        let composer = RealMultiRelayQuerier::new(Arc::new(inner));
+        let error = composer
+            .query(&did, &["wss://relay-a.example.com/scp/v1".to_owned()])
+            .await
+            .expect_err("a relay serving only a bad-signature record did not report on the DID");
+
+        assert!(
+            matches!(error, IdentityError::RelayQueryFailed(_)),
+            "expected a failed relay query, got {error:?}"
+        );
+    }
+
+    /// A relay that responds and stores NOTHING at the routing ID did report on
+    /// the DID, so the composer returns the honest empty answer.
+    ///
+    /// This is the other half of the criterion: the rule above must not collapse
+    /// into "the relay layer never answers".
+    #[tokio::test]
+    async fn relay_storing_nothing_reports_that_it_holds_no_record() {
+        let (vk, _sk) = make_ed25519_keypair();
+        let did = did_from_public_key(&vk);
+
+        let composer = RealMultiRelayQuerier::new(Arc::new(InMemoryRelayQuerier::new()));
         let result = composer
             .query(&did, &["wss://relay-a.example.com/scp/v1".to_owned()])
             .await
-            .unwrap();
+            .expect("a relay that responded with no blob at all answered");
 
-        assert!(result.is_none(), "self-certification failure => no record");
+        assert!(
+            result.is_none(),
+            "the relay answered and holds no record for this DID"
+        );
+    }
+
+    /// One relay serving only junk must not suppress a second relay that serves
+    /// the genuine record: the layer answers on the strength of the good relay.
+    #[tokio::test]
+    async fn one_junk_relay_does_not_suppress_a_relay_holding_the_record() {
+        let (vk, sk) = make_ed25519_keypair();
+        let did = did_from_public_key(&vk);
+        let routing_id = did_routing_id(&did);
+
+        let mut tampered = signed_record(&did, vk.as_bytes(), &sk, 4);
+        tampered.signature[0] ^= 0xFF;
+        let genuine = signed_record(&did, vk.as_bytes(), &sk, 9);
+
+        let inner = InMemoryRelayQuerier::new();
+        inner
+            .insert("wss://relay-a.example.com/scp/v1", &routing_id, tampered)
+            .await;
+        inner
+            .insert("wss://relay-b.example.com/scp/v1", &routing_id, genuine)
+            .await;
+
+        let composer = RealMultiRelayQuerier::new(Arc::new(inner));
+        let record = composer
+            .query(
+                &did,
+                &[
+                    "wss://relay-a.example.com/scp/v1".to_owned(),
+                    "wss://relay-b.example.com/scp/v1".to_owned(),
+                ],
+            )
+            .await
+            .expect("relay-b reported on the DID")
+            .expect("relay-b served the genuine record");
+
+        assert_eq!(record.seq, 9);
+        assert_eq!(record.relay_url, "wss://relay-b.example.com/scp/v1");
     }
 
     /// Cross-relay shadow-defeat — stale-valid (§3.10.7): relay-a holds a
@@ -556,14 +741,21 @@ mod tests {
         );
     }
 
-    /// An empty relay list returns `Ok(None)` immediately without querying.
+    /// An empty relay list means no relay is available to ask, which is not the
+    /// same claim as "the relays hold no record for this DID". The composer
+    /// returns `RelayNotConnected` so `DualLayerResolver` marks the relay layer
+    /// unavailable instead of counting it as an answered absence (spec §3.10.4,
+    /// "One layer fails, the other reports the DID absent").
     #[tokio::test]
-    async fn empty_relay_list_returns_none() {
+    async fn empty_relay_list_is_an_error_not_an_absence() {
         let (vk, _sk) = make_ed25519_keypair();
         let did = did_from_public_key(&vk);
         let composer = RealMultiRelayQuerier::new(Arc::new(InMemoryRelayQuerier::new()));
-        let result = composer.query(&did, &[]).await.unwrap();
-        assert!(result.is_none());
+        let result = composer.query(&did, &[]).await;
+        assert!(
+            matches!(result, Err(IdentityError::RelayNotConnected(_))),
+            "an empty relay list must surface as RelayNotConnected, not Ok(None)"
+        );
     }
 
     /// A malformed DID string (not `did:dht:z...`) returns `Err` immediately.

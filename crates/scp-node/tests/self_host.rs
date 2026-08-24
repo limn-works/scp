@@ -119,6 +119,11 @@ struct BuiltNode {
     /// stored broadcast envelopes — exactly what any connecting external
     /// participant can ever retrieve — and assert it is ciphertext.
     blob_storage: scp_transport::native::storage::BlobStorageBackend,
+    /// The relay layer of the co-located participant's DID resolution, shared
+    /// between `key_resolver()` and the `DeploySiteParams` this node deploys
+    /// with, so `deploy_site` binds the node's loopback relay into the same
+    /// querier the resolver reads (§3.10.2).
+    relay_querier: Arc<scp_transport::native::TransportRelayQuerier>,
     _tmp: tempfile::TempDir,
 }
 
@@ -128,11 +133,14 @@ impl BuiltNode {
     /// client and `DidCache` (ADR-053 / spec §10.17, SHB-002) — the same shape
     /// the production `host_site` path uses, never the `|_, _| None` stub.
     fn key_resolver(&self) -> scp_core::context::governance::KeyResolver {
+        let bootstrap: Arc<dyn scp_identity::BootstrapRelays> = self.relay_querier.clone();
         let resolver = Arc::new(scp_identity::DualLayerResolver::new(
-            Arc::new(scp_identity::resolver::NoOpRelayQuerier),
+            Arc::new(scp_identity::RealMultiRelayQuerier::new(Arc::clone(
+                &self.relay_querier,
+            ))),
             Arc::clone(&self.dht_client),
             Arc::clone(&self.cache),
-            Vec::new(),
+            bootstrap,
         ));
         scp_node::colocated_document_vm_key_resolver(resolver, tokio::runtime::Handle::current())
     }
@@ -218,6 +226,7 @@ async fn build_self_host_node() -> BuiltNode {
         dht_client,
         cache,
         blob_storage: blob_storage_handle,
+        relay_querier: Arc::new(scp_transport::native::TransportRelayQuerier::new()),
         _tmp: tmp,
     }
 }
@@ -244,6 +253,7 @@ async fn self_host_deploys_embedded_site_and_serves_index_over_http() {
         dht_client: _dht_client,
         cache: _cache,
         blob_storage: _blob_storage,
+        relay_querier,
         _tmp,
     } = built;
     let node_did = node.identity().did().to_owned();
@@ -283,6 +293,7 @@ async fn self_host_deploys_embedded_site_and_serves_index_over_http() {
         hostname: "selfhost.scp.local".to_owned(),
         signing_key_handle,
         key_resolver,
+        relay_querier,
         custody: custody.as_ref(),
         durable,
         assets: &assets,
@@ -369,6 +380,7 @@ async fn build_deployer(built: &BuiltNode, context_id: &str) -> scp_node::SelfHo
         "selfhost.scp.local".to_owned(),
         signing_key_handle,
         built.key_resolver(),
+        Arc::clone(&built.relay_querier),
         durable,
     )
     .await
@@ -839,12 +851,16 @@ async fn self_host_shares_single_root_storage_handle_and_serves() {
 
     // -- The REAL document-derived governance resolver over the node's shared
     //    DHT client + cache (ADR-053 / spec §10.17, SHB-002). --
+    let relay_querier = Arc::new(scp_transport::native::TransportRelayQuerier::new());
     let key_resolver = {
+        let bootstrap: Arc<dyn scp_identity::BootstrapRelays> = relay_querier.clone();
         let resolver = Arc::new(scp_identity::DualLayerResolver::new(
-            Arc::new(scp_identity::resolver::NoOpRelayQuerier),
+            Arc::new(scp_identity::RealMultiRelayQuerier::new(Arc::clone(
+                &relay_querier,
+            ))),
             Arc::clone(&dht_client),
             Arc::clone(&cache),
-            Vec::new(),
+            bootstrap,
         ));
         scp_node::colocated_document_vm_key_resolver(resolver, tokio::runtime::Handle::current())
     };
@@ -859,6 +875,7 @@ async fn self_host_shares_single_root_storage_handle_and_serves() {
         &storage_key,
         "selfhost-shared-storage-deploy",
         key_resolver,
+        relay_querier,
     )
     .await;
 
@@ -880,6 +897,7 @@ async fn deploy_embedded_and_assert_serves<S>(
     storage_key: &Zeroizing<[u8; 32]>,
     deploy_id: &str,
     key_resolver: scp_core::context::governance::KeyResolver,
+    relay_querier: Arc<scp_transport::native::TransportRelayQuerier>,
 ) where
     S: scp_platform::EncryptedStorage + 'static,
 {
@@ -904,6 +922,7 @@ async fn deploy_embedded_and_assert_serves<S>(
             hostname: "selfhost.scp.local".to_owned(),
             signing_key_handle,
             key_resolver,
+            relay_querier,
             custody,
             durable,
             assets: &assets,

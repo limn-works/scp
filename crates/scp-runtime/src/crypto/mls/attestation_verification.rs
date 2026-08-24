@@ -61,7 +61,9 @@
 
 use scp_clock::Clock;
 use scp_identity::IdentityError;
-use scp_identity::resolver::DidResolver;
+use scp_identity::resolver::{DidResolver, ResolutionOutcome};
+#[cfg(test)]
+use scp_identity::resolver::{LayerAvailability, LayerStatus};
 use scp_mls::{
     AttestationLeafGroundTruth, AttestationResolutionVerifyError, AttestationTrigger,
     KeyPackageAttestation, ScpCredential, verify_attestation_with_resolution,
@@ -129,10 +131,22 @@ pub enum AttestationRuntimeVerifyError {
     #[error("attestation signer DID resolution failed (fail-closed): {0}")]
     Resolution(#[from] IdentityError),
 
-    /// §9.7.1 "Resolution failure policy": resolving the signer's DID returned
-    /// no document (`Ok(None)`). Fail-closed on Add — no cache fallback.
+    /// §9.7.1 "Resolution failure policy": every resolution layer answered and
+    /// none holds a document for the signer's DID. Fail-closed on Add — no cache
+    /// fallback.
     #[error("attestation signer DID resolved to no document (fail-closed)")]
     ResolutionNotFound,
+
+    /// §9.7.1 "Resolution failure policy": no document came back, and at least
+    /// one resolution layer could not answer, so the absence is not evidence
+    /// that nobody published the DID (§3.10.4). Fail-closed on Add exactly as
+    /// [`Self::ResolutionNotFound`] is, and reported separately so an operator
+    /// reading the error sees a reachability failure rather than a missing DID.
+    #[error("attestation signer DID did not resolve: {layers} could not answer (fail-closed)")]
+    ResolutionLayerUnavailable {
+        /// The layers that could not answer.
+        layers: &'static str,
+    },
 
     /// The current-key + freshness seam (Layer A, §9.7.1 checks 1–2) or the
     /// delegated pure core (checks 3–13) rejected. Surfaced verbatim.
@@ -216,10 +230,19 @@ pub async fn verify_add_attestation<R: DidResolver + ?Sized>(
     // supplied by dependency injection (#2211, no-dev-stand-in tenet).
     let resolved_at = clock.now_secs();
     let resolved_document = match resolver.resolve(signer_did).await {
-        Ok(Some(found)) => found.document,
+        Ok(ResolutionOutcome::Found(found)) => found.document,
         // §9.7.1 "Resolution failure policy" — Add is fail-closed. There is NO
-        // fallback to a stale/pre-rotation cached document.
-        Ok(None) => return Err(AttestationRuntimeVerifyError::ResolutionNotFound),
+        // fallback to a stale/pre-rotation cached document. Both absent arms
+        // reject; they are reported separately so the error names whether the
+        // DID is absent or a layer was unreachable (§3.10.4).
+        Ok(ResolutionOutcome::Absent { layers }) if layers.any_unavailable() => {
+            return Err(AttestationRuntimeVerifyError::ResolutionLayerUnavailable {
+                layers: layers.unavailable_layers(),
+            });
+        }
+        Ok(ResolutionOutcome::Absent { .. }) => {
+            return Err(AttestationRuntimeVerifyError::ResolutionNotFound);
+        }
         Err(source) => return Err(AttestationRuntimeVerifyError::Resolution(source)),
     };
 
@@ -350,18 +373,25 @@ mod tests {
         fn resolve(
             &self,
             _did: &str,
-        ) -> impl Future<Output = Result<Option<ResolvedDidDocument>, IdentityError>> + Send
-        {
+        ) -> impl Future<Output = Result<ResolutionOutcome, IdentityError>> + Send {
             self.called.store(true, Ordering::SeqCst);
             let outcome = self.outcome.clone();
             async move {
                 match outcome {
-                    MockOutcome::Found(document) => Ok(Some(ResolvedDidDocument {
-                        document,
-                        seq: 1,
-                        source: ResolutionSource::MainlineDht,
-                    })),
-                    MockOutcome::NotFound => Ok(None),
+                    MockOutcome::Found(document) => {
+                        Ok(ResolutionOutcome::Found(ResolvedDidDocument {
+                            document,
+                            seq: 1,
+                            source: ResolutionSource::MainlineDht,
+                        }))
+                    }
+                    // Both layers answered and neither holds the DID.
+                    MockOutcome::NotFound => Ok(ResolutionOutcome::Absent {
+                        layers: LayerAvailability {
+                            relay: LayerStatus::Answered,
+                            dht: LayerStatus::Answered,
+                        },
+                    }),
                     MockOutcome::Error => Err(IdentityError::DhtResolveFailed(
                         "mock resolver error".to_owned(),
                     )),

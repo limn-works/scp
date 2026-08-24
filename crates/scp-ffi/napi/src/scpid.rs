@@ -236,9 +236,7 @@ mod tests {
     #[cfg(feature = "testing")]
     use scp_dht::InMemoryDhtClient;
     #[cfg(feature = "testing")]
-    use scp_identity::resolver::DualLayerResolver;
-    #[cfg(feature = "testing")]
-    use scp_identity::{DidCache, NoOpRelayQuerier};
+    use scp_identity::DidCache;
     #[cfg(feature = "testing")]
     use std::sync::Arc;
 
@@ -431,16 +429,15 @@ mod tests {
 
         // Verify using IdentityBackedDidResolver — the same type the bridge
         // function uses via the BridgeInstance DID resolver.
-        let dual = DualLayerResolver::new(
-            Arc::new(NoOpRelayQuerier),
+        // Compose through the SAME builder the shipped bridge calls, so this
+        // test exercises the production relay+DHT composition (§3.10.4).
+        let dual = scp_ffi_common::build_production_did_resolver(
+            Arc::new(scp_transport::native::TransportRelayQuerier::new()),
             dht_client,
             Arc::new(DidCache::new()),
-            Vec::new(),
         );
-        let resolver = scp_ffi_common::IdentityBackedDidResolver::new(
-            Arc::new(dual),
-            tokio::runtime::Handle::current(),
-        );
+        let resolver =
+            scp_ffi_common::IdentityBackedDidResolver::new(dual, tokio::runtime::Handle::current());
         let auth = core_verify(&resolver, &response, &challenge).await.unwrap();
 
         assert_eq!(auth.did, identity.did);

@@ -18,7 +18,7 @@ use mainline::async_dht::AsyncDht;
 use mainline::{Dht, MutableItem};
 use tracing::{debug, info, warn};
 
-use super::{DhtClient, DhtRecord};
+use super::{DhtClient, DhtLookup, DhtRecord};
 use crate::DhtError;
 
 /// Default timeout for DHT operations.
@@ -101,27 +101,80 @@ impl PkarrDhtClient {
         PkarrDhtClientBuilder::default()
     }
 
+    /// Reports whether Mainline DHT nodes answered a lookup for `public_key`.
+    ///
+    /// `mainline`'s value lookup yields the records it found and says nothing
+    /// about who replied, so a lookup that finds no record looks identical to a
+    /// lookup nobody received. This method asks the same target again and reads
+    /// the responding-node set, which is the evidence that a real DHT source
+    /// reported on the key. The caller runs it only before claiming absence, so
+    /// a resolve that found a record pays nothing for it (§3.10.4).
+    ///
+    /// Returns `false` when no node replied and when the probe exceeded the
+    /// client's DHT timeout, so a client that reached nobody never claims the
+    /// DHT reported absence.
+    async fn mainline_nodes_answered(&self, public_key: &[u8; 32]) -> bool {
+        let target = MutableItem::target_from_key(public_key, None);
+        match tokio::time::timeout(self.dht_timeout, self.dht.get_closest_nodes(target)).await {
+            Ok(nodes) => {
+                let responded = !nodes.is_empty();
+                debug!(
+                    responding_nodes = nodes.len(),
+                    "probed the Mainline DHT for nodes that answered this target"
+                );
+                responded
+            }
+            Err(_elapsed) => {
+                warn!(
+                    timeout_secs = self.dht_timeout.as_secs(),
+                    "Mainline DHT responder probe timed out — treating the layer as unreachable"
+                );
+                false
+            }
+        }
+    }
+
     /// Attempts to resolve a BEP44 record via HTTP gateway fallback.
     ///
-    /// Queries each configured gateway in order. The first successful
-    /// response is returned. Gateway URL format:
+    /// Queries each configured gateway in order. The first successful response
+    /// is returned. Gateway URL format:
     /// `GET {base_url}/{z-base-32-encoded-public-key}`
     ///
     /// Response format (binary):
     /// - Bytes 0..64: Ed25519 signature
     /// - Bytes 64..72: sequence number (big-endian i64, cast to u64)
     /// - Bytes 72..: value (DID document bytes)
-    async fn resolve_via_gateway(
-        &self,
-        public_key: &[u8; 32],
-    ) -> Result<Option<DhtRecord>, DhtError> {
+    ///
+    /// # Returns
+    ///
+    /// [`DhtLookup::Record`] when a gateway served a signature-verified record.
+    /// [`DhtLookup::NoRecord`] when at least one gateway responded 404, which is
+    /// that gateway reporting it holds no record for the key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DhtError::DhtResolveFailed`] when no gateway reported on the
+    /// key: none is configured, or every request errored, returned a non-404
+    /// error status, or returned a body this client rejected. Reporting
+    /// `NoRecord` there would let anyone who blocks gateway traffic manufacture
+    /// a claim that nobody published the key (§3.10.4).
+    async fn resolve_via_gateway(&self, public_key: &[u8; 32]) -> Result<DhtLookup, DhtError> {
         let Some(http_client) = &self.http_client else {
-            return Ok(None);
+            return Err(DhtError::DhtResolveFailed(
+                "no HTTP gateway is configured, so no gateway reported on this key".to_owned(),
+            ));
         };
 
         if self.gateway_urls.is_empty() {
-            return Ok(None);
+            return Err(DhtError::DhtResolveFailed(
+                "no HTTP gateway is configured, so no gateway reported on this key".to_owned(),
+            ));
         }
+
+        // A gateway that answers 404 reports that it holds no record for this
+        // key, which is an answer. A gateway that errors, times out, or returns
+        // a body this client rejects reports nothing.
+        let mut gateways_that_answered_absent = 0_usize;
 
         // Encode the public key as z-base-32 for the URL path.
         let key_encoded = zbase32::encode(public_key);
@@ -130,100 +183,120 @@ impl PkarrDhtClient {
             let url = format!("{gateway_url}/{key_encoded}");
             debug!(url = %url, "querying HTTP gateway for BEP44 record");
 
-            match http_client.get(&url).send().await {
-                Ok(response) => {
-                    if !response.status().is_success() {
-                        if response.status().as_u16() == 404 {
-                            debug!(
-                                gateway = %gateway_url,
-                                "gateway returned 404 — record not found"
-                            );
-                            continue;
-                        }
-                        warn!(
-                            gateway = %gateway_url,
-                            status = %response.status(),
-                            "gateway returned error status"
-                        );
-                        continue;
-                    }
-
-                    match response.bytes().await {
-                        Ok(body) => {
-                            if body.len() < GATEWAY_HEADER_SIZE {
-                                warn!(
-                                    gateway = %gateway_url,
-                                    body_len = body.len(),
-                                    "gateway response too short (need >= {GATEWAY_HEADER_SIZE} bytes)"
-                                );
-                                continue;
-                            }
-
-                            let mut signature = [0u8; 64];
-                            signature.copy_from_slice(&body[..64]);
-
-                            let seq_bytes: [u8; 8] = body[64..72].try_into().map_err(|_| {
-                                DhtError::DhtResolveFailed(
-                                    "invalid sequence bytes in gateway response".to_owned(),
-                                )
-                            })?;
-                            let seq_i64 = i64::from_be_bytes(seq_bytes);
-                            // BEP44 uses i64 but our trait uses u64. Negative
-                            // sequence numbers are invalid; treat as 0.
-                            let seq = u64::try_from(seq_i64).unwrap_or(0);
-
-                            let value = body[GATEWAY_HEADER_SIZE..].to_vec();
-
-                            // Verify BEP44 Ed25519 signature before trusting
-                            // the gateway response. Without this, a malicious
-                            // gateway could inject inflated sequence numbers
-                            // (poisoning initialize_sequence) or fake documents.
-                            if let Err(e) =
-                                crate::verify_bep44_signature(public_key, &signature, &value, seq)
-                            {
-                                warn!(
-                                    gateway = %gateway_url,
-                                    error = %e,
-                                    "gateway returned record with invalid BEP44 signature — skipping"
-                                );
-                                continue;
-                            }
-
-                            info!(
-                                gateway = %gateway_url,
-                                seq = seq,
-                                value_len = value.len(),
-                                "resolved BEP44 record via HTTP gateway (signature verified)"
-                            );
-
-                            return Ok(Some(DhtRecord {
-                                value,
-                                signature,
-                                seq,
-                            }));
-                        }
-                        Err(e) => {
-                            warn!(
-                                gateway = %gateway_url,
-                                error = %e,
-                                "failed to read gateway response body"
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        gateway = %gateway_url,
-                        error = %e,
-                        "HTTP gateway request failed"
-                    );
-                }
+            match Self::query_one_gateway(http_client, gateway_url, &url, public_key).await {
+                GatewayReply::Record(record) => return Ok(DhtLookup::Record(record)),
+                GatewayReply::HoldsNothing => gateways_that_answered_absent += 1,
+                GatewayReply::NoReport => {}
             }
         }
 
-        // All gateways failed or returned 404.
-        Ok(None)
+        if gateways_that_answered_absent > 0 {
+            return Ok(DhtLookup::NoRecord);
+        }
+
+        Err(DhtError::DhtResolveFailed(format!(
+            "all {} HTTP gateway requests failed, so no gateway reported on this key",
+            self.gateway_urls.len()
+        )))
     }
+
+    /// Asks one gateway about `public_key` and classifies what it said.
+    async fn query_one_gateway(
+        http_client: &reqwest::Client,
+        gateway_url: &str,
+        url: &str,
+        public_key: &[u8; 32],
+    ) -> GatewayReply {
+        let response = match http_client.get(url).send().await {
+            Ok(response) => response,
+            Err(e) => {
+                warn!(gateway = %gateway_url, error = %e, "HTTP gateway request failed");
+                return GatewayReply::NoReport;
+            }
+        };
+
+        if !response.status().is_success() {
+            if response.status().as_u16() == 404 {
+                debug!(
+                    gateway = %gateway_url,
+                    "gateway returned 404 — the gateway reports it holds no record"
+                );
+                return GatewayReply::HoldsNothing;
+            }
+            warn!(
+                gateway = %gateway_url,
+                status = %response.status(),
+                "gateway returned error status"
+            );
+            return GatewayReply::NoReport;
+        }
+
+        let body = match response.bytes().await {
+            Ok(body) => body,
+            Err(e) => {
+                warn!(gateway = %gateway_url, error = %e, "failed to read gateway response body");
+                return GatewayReply::NoReport;
+            }
+        };
+
+        if body.len() < GATEWAY_HEADER_SIZE {
+            warn!(
+                gateway = %gateway_url,
+                body_len = body.len(),
+                "gateway response too short (need >= {GATEWAY_HEADER_SIZE} bytes)"
+            );
+            return GatewayReply::NoReport;
+        }
+
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(&body[..64]);
+
+        let Ok(seq_bytes): Result<[u8; 8], _> = body[64..72].try_into() else {
+            warn!(gateway = %gateway_url, "invalid sequence bytes in gateway response");
+            return GatewayReply::NoReport;
+        };
+        // BEP44 uses i64 but this trait uses u64. A negative sequence number is
+        // invalid; treat it as 0 so the signature check below rejects it.
+        let seq = u64::try_from(i64::from_be_bytes(seq_bytes)).unwrap_or(0);
+
+        let value = body[GATEWAY_HEADER_SIZE..].to_vec();
+
+        // Verify the BEP44 Ed25519 signature before trusting the gateway.
+        // Without this a malicious gateway could inject inflated sequence
+        // numbers (poisoning `initialize_sequence`) or fake documents.
+        if let Err(e) = crate::verify_bep44_signature(public_key, &signature, &value, seq) {
+            warn!(
+                gateway = %gateway_url,
+                error = %e,
+                "gateway returned record with invalid BEP44 signature — skipping"
+            );
+            return GatewayReply::NoReport;
+        }
+
+        info!(
+            gateway = %gateway_url,
+            seq = seq,
+            value_len = value.len(),
+            "resolved BEP44 record via HTTP gateway (signature verified)"
+        );
+
+        GatewayReply::Record(DhtRecord {
+            value,
+            signature,
+            seq,
+        })
+    }
+}
+
+/// What one HTTP gateway said about a key (§3.10.4).
+enum GatewayReply {
+    /// The gateway served a record whose BEP44 signature verified.
+    Record(DhtRecord),
+    /// The gateway answered 404: it holds no record for the key.
+    HoldsNothing,
+    /// The gateway reported nothing usable — the request failed, the status was
+    /// an error other than 404, or the body did not survive validation.
+    NoReport,
 }
 
 // Trait uses RPITIT with explicit `+ Send` bound; async fn in trait
@@ -293,7 +366,7 @@ impl DhtClient for PkarrDhtClient {
     fn resolve(
         &self,
         public_key: &[u8; 32],
-    ) -> impl Future<Output = Result<Option<DhtRecord>, DhtError>> + Send {
+    ) -> impl Future<Output = Result<DhtLookup, DhtError>> + Send {
         async move {
             debug!("resolving BEP44 mutable item from Mainline DHT");
 
@@ -304,7 +377,11 @@ impl DhtClient for PkarrDhtClient {
             )
             .await;
 
-            match dht_result {
+            // Did the Mainline lookup itself report on this key? A lookup that
+            // returned no record only reports absence when DHT nodes answered
+            // it: an offline client's lookup also completes with nothing
+            // (§3.10.4).
+            let mainline_reported_absent = match dht_result {
                 Ok(Some(item)) => {
                     let seq_i64 = item.seq();
                     let seq = u64::try_from(seq_i64).unwrap_or(0);
@@ -315,7 +392,7 @@ impl DhtClient for PkarrDhtClient {
                         "resolved BEP44 record from Mainline DHT"
                     );
 
-                    return Ok(Some(DhtRecord {
+                    return Ok(DhtLookup::Record(DhtRecord {
                         value: item.value().to_vec(),
                         signature: *item.signature(),
                         seq,
@@ -323,17 +400,34 @@ impl DhtClient for PkarrDhtClient {
                 }
                 Ok(None) => {
                     debug!("no BEP44 record found on Mainline DHT, trying gateways");
+                    self.mainline_nodes_answered(public_key).await
                 }
                 Err(_elapsed) => {
                     warn!(
                         timeout_secs = self.dht_timeout.as_secs(),
                         "Mainline DHT resolve timed out, trying gateways"
                     );
+                    // A lookup this client abandoned reports nothing, however
+                    // many nodes were about to answer it.
+                    false
+                }
+            };
+
+            // Fall back to the HTTP gateways. A gateway that serves a record or
+            // reports 404 answers for the whole layer.
+            match self.resolve_via_gateway(public_key).await {
+                Ok(lookup) => Ok(lookup),
+                Err(gateway_error) => {
+                    if mainline_reported_absent {
+                        Ok(DhtLookup::NoRecord)
+                    } else {
+                        Err(DhtError::DhtResolveFailed(format!(
+                            "no Mainline DHT node and no gateway reported on this key \
+                             ({gateway_error})"
+                        )))
+                    }
                 }
             }
-
-            // Fallback to HTTP gateways if configured.
-            self.resolve_via_gateway(public_key).await
         }
     }
 }
@@ -450,5 +544,94 @@ impl PkarrDhtClientBuilder {
             dht_timeout: self.dht_timeout,
             gateway_timeout: self.gateway_timeout,
         })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// Builds a client whose only gateways refuse every connection, so no
+    /// gateway can report on any key. The DHT socket binds, and the test never
+    /// reaches the network through it.
+    fn client_with_dead_gateways(count: usize) -> PkarrDhtClient {
+        let mut builder = PkarrDhtClient::builder().dht_timeout(Duration::from_millis(50));
+        for offset in 0..count {
+            // A loopback port nothing listens on: every request errors at
+            // connect, which is the "gateway did not respond" case.
+            builder = builder.gateway_url(format!("http://127.0.0.1:{}", 9 + offset));
+        }
+        builder.build().expect("bind a local DHT socket")
+    }
+
+    /// **The criterion under test:** the gateway arm answers only when a gateway
+    /// reported on the key. Every gateway request failing is a reachability
+    /// failure, and reporting it as `NoRecord` would let anyone who blocks
+    /// gateway traffic manufacture a claim that nobody published the key
+    /// (§3.10.4).
+    #[tokio::test]
+    async fn every_gateway_failing_reports_no_answer_rather_than_an_absence() {
+        let client = client_with_dead_gateways(2);
+
+        let error = client
+            .resolve_via_gateway(&[5u8; 32])
+            .await
+            .expect_err("no gateway responded, so the gateway arm reported nothing");
+
+        assert!(
+            matches!(error, DhtError::DhtResolveFailed(_)),
+            "expected DhtResolveFailed, got {error:?}"
+        );
+    }
+
+    /// With no gateway configured the gateway arm has no source at all, so it
+    /// reports no answer rather than an absence. This is the shipped bridge
+    /// default, whose gateway list is empty.
+    #[tokio::test]
+    async fn no_configured_gateway_reports_no_answer() {
+        let client = PkarrDhtClient::builder()
+            .dht_timeout(Duration::from_millis(50))
+            .build()
+            .expect("bind a local DHT socket");
+
+        let error = client
+            .resolve_via_gateway(&[6u8; 32])
+            .await
+            .expect_err("an unconfigured gateway arm reports on nothing");
+
+        assert!(
+            matches!(error, DhtError::DhtResolveFailed(_)),
+            "expected DhtResolveFailed, got {error:?}"
+        );
+    }
+
+    /// The full `resolve` path: a client that reaches no Mainline node and no
+    /// gateway reports a failure, never [`DhtLookup::NoRecord`].
+    #[tokio::test]
+    async fn resolve_with_no_reachable_source_reports_no_answer() {
+        // `no_bootstrap` leaves the routing table empty, so the lookup reaches
+        // no Mainline node — the offline-device case.
+        let dht = Dht::builder()
+            .no_bootstrap()
+            .build()
+            .expect("bind a local DHT socket");
+        let client = PkarrDhtClient {
+            dht: dht.as_async(),
+            gateway_urls: Vec::new(),
+            http_client: None,
+            dht_timeout: Duration::from_millis(500),
+            gateway_timeout: Duration::from_millis(500),
+        };
+
+        let error = client
+            .resolve(&[7u8; 32])
+            .await
+            .expect_err("no DHT node and no gateway reported on this key");
+
+        assert!(
+            matches!(error, DhtError::DhtResolveFailed(_)),
+            "expected DhtResolveFailed, got {error:?}"
+        );
     }
 }

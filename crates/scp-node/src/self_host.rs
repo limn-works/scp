@@ -136,6 +136,16 @@ pub struct DeploySiteParams<'a, C: KeyCustody> {
     /// [`DualLayerResolver`](scp_identity::DualLayerResolver) that shares the
     /// node's [`DidCache`](scp_identity::DidCache); never the `|_, _| None` stub.
     pub key_resolver: scp_core::context::governance::KeyResolver,
+    /// The relay layer of DID resolution (spec §3.10.2) — the SAME
+    /// [`TransportRelayQuerier`](scp_transport::native::TransportRelayQuerier)
+    /// the `key_resolver` above was composed over.
+    ///
+    /// [`deploy_site`] binds the node's loopback relay connection into it, so a
+    /// DID record stored on that relay resolves over the connection the
+    /// supervisor already holds. Passing a different querier here than the one
+    /// behind `key_resolver` leaves the resolver's relay layer permanently
+    /// unbound, which it reports as an unavailable layer.
+    pub relay_querier: Arc<scp_transport::native::TransportRelayQuerier>,
     /// The caller's key custody backend. Borrowed for the publish dispatch.
     pub custody: &'a C,
     /// The loopback supervisor's durable providers — the saga journal + the
@@ -282,6 +292,7 @@ where
         hostname,
         signing_key_handle,
         key_resolver,
+        relay_querier,
         custody,
         durable,
         assets,
@@ -294,6 +305,7 @@ where
         hostname,
         signing_key_handle,
         key_resolver,
+        relay_querier,
         durable,
     )
     .await?;
@@ -350,6 +362,7 @@ impl SelfHostDeployer {
         hostname: String,
         signing_key_handle: scp_platform::KeyHandle,
         key_resolver: scp_core::context::governance::KeyResolver,
+        relay_querier: Arc<scp_transport::native::TransportRelayQuerier>,
         durable: scp_core::context::supervisor::DurableProviders,
     ) -> Result<Self, SelfHostError>
     where
@@ -363,9 +376,15 @@ impl SelfHostDeployer {
         // and the durable saga journal over the SAME `Storage` backend as
         // `mls_storage` — guaranteed by the `DurableProviders` newtype (§17.16 /
         // ADR-049).
-        let supervisor =
-            connect_loopback_supervisor(node, &node_did, &author_did, key_resolver, durable)
-                .await?;
+        let supervisor = connect_loopback_supervisor(
+            node,
+            &node_did,
+            &author_did,
+            key_resolver,
+            relay_querier,
+            durable,
+        )
+        .await?;
         node.register_broadcast_context(context_id.clone(), Some("SCP Self-Host Site".to_owned()))
             .await
             .map_err(|e| SelfHostError::RegisterContext(e.to_string()))?;
@@ -518,7 +537,9 @@ pub fn colocated_document_vm_key_resolver<R: scp_identity::resolver::DidResolver
             // No ambient runtime: drive the resolve directly on `handle`.
             Err(_) => {
                 let outcome = handle.block_on(resolver.resolve(&did_owned)); // ci-allow: block-on: co-located KeyResolver async→sync bridge (no-runtime branch)
-                let doc = outcome.ok().flatten()?;
+                let doc = outcome
+                    .ok()
+                    .and_then(scp_identity::ResolutionOutcome::into_found)?;
                 scp_identity::resolver::verifying_key_from_document(&doc.document, kid)
             }
             Ok(current) => match current.runtime_flavor() {
@@ -527,7 +548,9 @@ pub fn colocated_document_vm_key_resolver<R: scp_identity::resolver::DidResolver
                     let outcome = tokio::task::block_in_place(|| {
                         handle.block_on(resolver.resolve(&did_owned)) // ci-allow: block-on: co-located KeyResolver async→sync bridge (multi-thread branch re-enters handle)
                     }); // ci-allow: block-on: co-located KeyResolver async→sync bridge (multi-thread block_in_place; mirrors stop_and_wait / try_consume_hard_rate_limit_from_any_context)
-                    let doc = outcome.ok().flatten()?;
+                    let doc = outcome
+                        .ok()
+                        .and_then(scp_identity::ResolutionOutcome::into_found)?;
                     scp_identity::resolver::verifying_key_from_document(&doc.document, kid)
                 }
                 // Current-thread runtime: `block_in_place` would panic. Drive the
@@ -573,9 +596,12 @@ fn colocated_resolve_vm_on_dedicated_thread<R: scp_identity::resolver::DidResolv
         };
         let outcome = rt.block_on(resolver.resolve(&did_owned)); // ci-allow: block-on: co-located KeyResolver async→sync bridge (dedicated current-thread runtime for the current-thread-runtime regime; mirrors run_rate_limit_on_dedicated_thread)
         // Any error or absent document is a per-lookup miss (fail closed).
-        let key = outcome.ok().flatten().and_then(|doc| {
-            scp_identity::resolver::verifying_key_from_document(&doc.document, kid)
-        });
+        let key = outcome
+            .ok()
+            .and_then(scp_identity::ResolutionOutcome::into_found)
+            .and_then(|doc| {
+                scp_identity::resolver::verifying_key_from_document(&doc.document, kid)
+            });
         let _ = tx.send(key);
     });
     // A join/recv error (the thread panicked before sending) fails closed.
@@ -602,14 +628,16 @@ async fn connect_loopback_supervisor<S>(
     node_did: &str,
     author_did: &scp_did::DID,
     key_resolver: scp_core::context::governance::KeyResolver,
+    relay_querier: Arc<scp_transport::native::TransportRelayQuerier>,
     durable: scp_core::context::supervisor::DurableProviders,
 ) -> Result<Arc<scp_core::context::supervisor::Supervisor>, SelfHostError>
 where
     S: Storage + 'static,
 {
     let relay_port = node.relay().bound_addr().port();
+    let relay_url = format!("ws://127.0.0.1:{relay_port}/scp/v1");
     let sourced = scp_transport::relay::connection::SourcedRelayUrl {
-        url: format!("ws://127.0.0.1:{relay_port}/scp/v1"),
+        url: relay_url.clone(),
         source: scp_transport::relay::connection::RelayUrlSource::DhtResolved,
     };
     let profile = scp_transport::profile::TransportProfile::platform_default();
@@ -623,9 +651,14 @@ where
     .await
     .map_err(|e| SelfHostError::RelayConnect(e.to_string()))?;
 
-    let transport: Box<dyn scp_core::context::builder::ContextTransportProvider> = Box::new(
-        scp_transport::provider::RelayTransportProvider::new(adapter),
-    );
+    // Share ONE connection between the supervisor's transport provider and the
+    // relay layer of DID resolution, so a DID record on this relay resolves over
+    // the connection already open rather than over a second one (§3.10.2).
+    let shared: Arc<dyn scp_transport::TransportAdapter> = Arc::new(adapter);
+    relay_querier.bind(relay_url, Arc::clone(&shared));
+
+    let transport: Box<dyn scp_core::context::builder::ContextTransportProvider> =
+        Box::new(scp_transport::provider::RelayTransportProvider::new(shared));
     let crypto = Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
         node_did.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
@@ -1331,6 +1364,10 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let handle = tokio::runtime::Handle::current();
+    // ONE relay querier per hosted site: the co-located participant's resolver
+    // reads it, and `connect_loopback_supervisor` binds the node's own relay
+    // connection into it (§3.10.2, §3.10.4 step 3a).
+    let relay_querier = Arc::new(scp_transport::native::TransportRelayQuerier::new());
     match dht_mode {
         DhtMode::Disabled => {
             tracing::info!(
@@ -1343,12 +1380,21 @@ where
             let key_resolver = build_shared_cache_key_resolver(
                 Arc::clone(did_method.dht_client()),
                 Arc::clone(did_method.cache()),
+                Arc::clone(&relay_querier),
                 handle,
             );
             // `sequence_store` is unused for a non-publishing node; drop it
             // explicitly so the move is intentional, not an oversight.
             drop(sequence_store);
-            serve_hosted_site(common, did_method, key_resolver, seq_init, shutdown).await
+            serve_hosted_site(
+                common,
+                did_method,
+                key_resolver,
+                relay_querier,
+                seq_init,
+                shutdown,
+            )
+            .await
         }
         // Gated `feature = "testing"` ONLY (ADR-062 A5) to match the
         // `DhtMode::Memory` variant's single activation path.
@@ -1363,9 +1409,18 @@ where
             let key_resolver = build_shared_cache_key_resolver(
                 Arc::clone(did_method.dht_client()),
                 Arc::clone(did_method.cache()),
+                Arc::clone(&relay_querier),
                 handle,
             );
-            serve_hosted_site(common, did_method, key_resolver, seq_init, shutdown).await
+            serve_hosted_site(
+                common,
+                did_method,
+                key_resolver,
+                relay_querier,
+                seq_init,
+                shutdown,
+            )
+            .await
         }
         DhtMode::Production => {
             tracing::warn!(
@@ -1382,9 +1437,18 @@ where
             let key_resolver = build_shared_cache_key_resolver(
                 Arc::clone(did_method.dht_client()),
                 Arc::clone(did_method.cache()),
+                Arc::clone(&relay_querier),
                 handle,
             );
-            serve_hosted_site(common, did_method, key_resolver, seq_init, shutdown).await
+            serve_hosted_site(
+                common,
+                did_method,
+                key_resolver,
+                relay_querier,
+                seq_init,
+                shutdown,
+            )
+            .await
         }
     }
 }
@@ -1398,21 +1462,27 @@ where
 /// Sharing the cache is load-bearing: the cache-level sequence check inside
 /// [`resolve`](scp_identity::resolver::DidResolver::resolve) is the authoritative
 /// anti-rollback guard, and operating on the node's shared cache keeps the
-/// participant's view consistent with the node's. The relay layer is a
-/// [`NoOpRelayQuerier`](scp_identity::resolver::NoOpRelayQuerier): the node's own
-/// loopback relay is a protocol-unaware blob pipe (§10.4), not a DID-document
-/// QUERY source, so DID resolution flows through the DHT layer (and cache).
+/// participant's view consistent with the node's.
+///
+/// The relay layer is the production
+/// [`TransportRelayQuerier`](scp_transport::native::TransportRelayQuerier) the
+/// caller passes in. [`connect_loopback_supervisor`] binds the node's own relay
+/// connection into it, so a DID record stored on that relay resolves over the
+/// same connection the supervisor already uses (§3.10.2, §3.10.4 step 3a). Until
+/// that bind happens the querier holds no transport and reports the relay layer
+/// unavailable, which the resolver records as such rather than as "no such DID".
 fn build_shared_cache_key_resolver<D: scp_dht::DhtClient + 'static>(
     dht_client: Arc<D>,
     cache: Arc<DidCache>,
+    relay_querier: Arc<scp_transport::native::TransportRelayQuerier>,
     handle: tokio::runtime::Handle,
 ) -> scp_core::context::governance::KeyResolver {
-    let relay = Arc::new(scp_identity::resolver::NoOpRelayQuerier);
+    let bootstrap_relays: Arc<dyn scp_identity::BootstrapRelays> = relay_querier.clone();
     let resolver = Arc::new(scp_identity::DualLayerResolver::new(
-        relay,
+        Arc::new(scp_identity::RealMultiRelayQuerier::new(relay_querier)),
         dht_client,
         cache,
-        Vec::new(),
+        bootstrap_relays,
     ));
     colocated_document_vm_key_resolver(resolver, handle)
 }
@@ -1456,6 +1526,7 @@ async fn serve_hosted_site<D, F>(
     common: ServeHostedSite,
     did_method: Arc<D>,
     key_resolver: scp_core::context::governance::KeyResolver,
+    relay_querier: Arc<scp_transport::native::TransportRelayQuerier>,
     seq_init: SeqInitFn,
     shutdown: F,
 ) -> Result<(), HostSiteError>
@@ -1521,6 +1592,7 @@ where
         &node_did,
         &context_id,
         key_resolver,
+        relay_querier,
     )
     .await
     {
@@ -2301,6 +2373,7 @@ async fn build_host_site_deployer<S>(
     node_did: &str,
     context_id: &str,
     key_resolver: scp_core::context::governance::KeyResolver,
+    relay_querier: Arc<scp_transport::native::TransportRelayQuerier>,
 ) -> Result<SelfHostDeployer, HostSiteError>
 where
     S: scp_platform::EncryptedStorage + 'static,
@@ -2329,6 +2402,7 @@ where
         SELF_HOST_HOSTNAME.to_owned(),
         signing_key_handle,
         key_resolver,
+        relay_querier,
         durable,
     )
     .await
@@ -2876,11 +2950,13 @@ mod tests {
 
         // Build the co-located participant resolver over the SHARED cache + DHT,
         // exactly as the production `host_site` path wires it.
+        let relay_querier = Arc::new(scp_transport::native::TransportRelayQuerier::new());
+        let bootstrap: Arc<dyn scp_identity::BootstrapRelays> = relay_querier.clone();
         let resolver = Arc::new(scp_identity::DualLayerResolver::new(
-            Arc::new(scp_identity::resolver::NoOpRelayQuerier),
+            Arc::new(scp_identity::RealMultiRelayQuerier::new(relay_querier)),
             Arc::clone(&dht),
             Arc::clone(&cache),
-            Vec::new(),
+            bootstrap,
         ));
         let key_resolver =
             colocated_document_vm_key_resolver(resolver, tokio::runtime::Handle::current());
@@ -2945,11 +3021,13 @@ mod tests {
         // Build the co-located participant resolver over the SHARED cache + DHT,
         // exactly as the production `host_site` path wires it. `Handle::current()`
         // here is the bare-`#[tokio::test]` CURRENT-THREAD runtime handle.
+        let relay_querier = Arc::new(scp_transport::native::TransportRelayQuerier::new());
+        let bootstrap: Arc<dyn scp_identity::BootstrapRelays> = relay_querier.clone();
         let resolver = Arc::new(scp_identity::DualLayerResolver::new(
-            Arc::new(scp_identity::resolver::NoOpRelayQuerier),
+            Arc::new(scp_identity::RealMultiRelayQuerier::new(relay_querier)),
             Arc::clone(&dht),
             Arc::clone(&cache),
-            Vec::new(),
+            bootstrap,
         ));
         let key_resolver =
             colocated_document_vm_key_resolver(resolver, tokio::runtime::Handle::current());

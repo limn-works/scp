@@ -19,7 +19,7 @@ use ed25519_dalek::VerifyingKey;
 
 mod dht_client;
 
-pub use dht_client::{DhtClient, DhtRecord, DisabledDhtClient};
+pub use dht_client::{DhtClient, DhtLookup, DhtRecord, DisabledDhtClient};
 // `InMemoryDhtClient` is a §17.17.3 resolve nullifier — never shippable. It is
 // compiled only under the `testing` feature — the SINGLE activation path
 // (ADR-062 §Decision 1 / A5; never a bare `#[cfg(test)]` disjunct), so a shipped
@@ -51,10 +51,13 @@ pub enum DhtError {
     #[error("BEP44 signature verification failed: {0}")]
     Bep44SignatureInvalid(String),
 
-    /// The DHT layer is disabled (`DhtMode::Disabled`). Publishing is refused
-    /// (fail-closed — no address is disclosed); resolution returns `Ok(None)`,
-    /// never a fabricated record. Emitted by [`DisabledDhtClient::publish`].
-    #[error("DHT layer disabled: publish refused (fail-closed — no address disclosed)")]
+    /// The DHT layer is disabled (`DhtMode::Disabled`). Both operations are
+    /// refused fail-closed: publishing discloses no address, and resolution
+    /// reports that the arm reached no DHT node rather than claiming the DHT
+    /// holds no record. Emitted by [`DisabledDhtClient`].
+    #[error(
+        "DHT layer disabled: the arm reached no DHT node (fail-closed — no address disclosed, no absence claimed)"
+    )]
     Disabled,
 }
 

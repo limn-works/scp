@@ -24,8 +24,10 @@
 //!    [`DualLayerResolver`](crate::resolver::DualLayerResolver) (§3.10.4/§3.10.7).
 //!
 //! The [`RelayQuerier`] trait abstracts relay QUERY operations so that
-//! `scp-core` does not depend on `scp-transport`. Production implementations
-//! live in `scp-transport`; tests use [`InMemoryRelayQuerier`].
+//! `scp-core` does not depend on `scp-transport`. The production implementation
+//! is `scp_transport::native::TransportRelayQuerier`; tests use
+//! `InMemoryRelayQuerier`, which this module compiles only under
+//! `cfg(any(test, feature = "testing"))`.
 
 use sha2::{Digest, Sha256};
 
@@ -85,8 +87,9 @@ pub struct RelayQueryRecord {
 
 /// Abstraction over relay QUERY operations for DID document resolution.
 ///
-/// Production implementations (in `scp-transport`) send QUERY messages to SCP
-/// relays. Tests use [`InMemoryRelayQuerier`] backed by a `HashMap`.
+/// The production implementation (`scp_transport::native::TransportRelayQuerier`)
+/// sends QUERY messages to SCP relays. Tests use `InMemoryRelayQuerier`, backed
+/// by a `HashMap` and compiled only under `cfg(any(test, feature = "testing"))`.
 ///
 /// This trait is defined in `scp-identity` so that the resolution logic does not
 /// depend on `scp-transport` (§3.10.12 phase integration).
@@ -122,7 +125,11 @@ pub trait RelayQuerier: Send + Sync {
     ///
     /// # Returns
     ///
-    /// A (possibly empty) vector of every decodable, **unverified** candidate.
+    /// A [`RelayQueryAnswer`] carrying every decodable, **unverified**
+    /// candidate, plus the number of blobs the relay returned that did not
+    /// decode. The composer needs the second number because §3.10.4 requires it
+    /// to discard an undecodable blob "as if the relay had failed", which it
+    /// cannot do if the implementation silently drops the blob.
     ///
     /// # Errors
     ///
@@ -131,7 +138,48 @@ pub trait RelayQuerier: Send + Sync {
         &self,
         relay_url: &str,
         routing_id: &[u8; 32],
-    ) -> impl Future<Output = Result<Vec<RelayQueryRecord>, IdentityError>> + Send;
+    ) -> impl Future<Output = Result<RelayQueryAnswer, IdentityError>> + Send;
+}
+
+/// What one relay returned for a routing ID (§3.10.4).
+///
+/// An implementation constructs this only after the relay responded. A relay
+/// that could not be reached yields [`IdentityError`] instead, so the composer
+/// never counts an unreached relay as one that answered.
+#[derive(Debug, Clone, Default)]
+pub struct RelayQueryAnswer {
+    /// Every blob at the routing ID that decoded as a DID-record frame,
+    /// **unverified**. The composer BEP44-verifies each one.
+    pub candidates: Vec<RelayQueryRecord>,
+    /// How many blobs the relay returned that did not decode as a DID-record
+    /// frame (§9.10.12).
+    ///
+    /// §3.10.4 discards each undecodable blob "as if the relay had failed", so
+    /// a relay that returned only undecodable blobs gave the composer no usable
+    /// evidence about the DID and must not be counted as having answered.
+    pub undecodable: usize,
+}
+
+impl RelayQueryAnswer {
+    /// Builds an answer from a relay that returned only decodable blobs.
+    #[must_use]
+    pub const fn from_candidates(candidates: Vec<RelayQueryRecord>) -> Self {
+        Self {
+            candidates,
+            undecodable: 0,
+        }
+    }
+
+    /// Returns `true` when the relay responded and stored nothing at the
+    /// routing ID.
+    ///
+    /// That is the one shape in which a relay reports absence directly: it held
+    /// no blob at all, so there is nothing for the resolver to discard and
+    /// nothing left unexplained.
+    #[must_use]
+    pub const fn holds_nothing(&self) -> bool {
+        self.candidates.is_empty() && self.undecodable == 0
+    }
 }
 
 /// Verifies a raw relay `(value, signature, seq)` record against a DID and
@@ -179,11 +227,14 @@ pub(crate) fn verify_relay_record(
 ///
 /// Multiple records may be stored at the same key (co-located candidates) via
 /// repeated `insert` calls; they are returned by `query` in insertion order.
-/// This is the ONLY in-memory relay implementation; it is NOT gated behind
-/// `#[cfg(any(test, feature = "testing"))]` in Slice 011a — that demotion is
-/// Slice 011b scope. Until 011b lands, `NoOpRelayQuerier` continues to ship as
-/// the production stand-in that fails honestly (returns `Ok(None)`, ADR-062
-/// §Decision 5).
+///
+/// This type is a test double and the `cfg` below keeps it out of every shipped
+/// build: a default-feature compile of `scp-identity` does not contain it, so no
+/// production caller can reach it. The relay layer a shipped build resolves
+/// through is `scp_transport::native::TransportRelayQuerier`, composed under
+/// `RealMultiRelayQuerier` by `scp_ffi_common::build_production_did_resolver`
+/// (spec §3.10.4 step 3a).
+#[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Default)]
 pub struct InMemoryRelayQuerier {
     /// Map from (`relay_url`, `routing_id`) to the ordered list of stored
@@ -193,6 +244,7 @@ pub struct InMemoryRelayQuerier {
     items: tokio::sync::Mutex<std::collections::HashMap<(String, [u8; 32]), Vec<RelayQueryRecord>>>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl InMemoryRelayQuerier {
     /// Creates a new empty in-memory relay querier.
     #[must_use]
@@ -217,12 +269,13 @@ impl InMemoryRelayQuerier {
 // Trait uses RPITIT with explicit `+ Send` bound; async fn in trait
 // does not guarantee Send futures, so manual impl Future is required.
 #[allow(clippy::manual_async_fn)]
+#[cfg(any(test, feature = "testing"))]
 impl RelayQuerier for InMemoryRelayQuerier {
     fn query(
         &self,
         relay_url: &str,
         routing_id: &[u8; 32],
-    ) -> impl Future<Output = Result<Vec<RelayQueryRecord>, IdentityError>> + Send {
+    ) -> impl Future<Output = Result<RelayQueryAnswer, IdentityError>> + Send {
         async move {
             let records = self
                 .items
@@ -231,7 +284,9 @@ impl RelayQuerier for InMemoryRelayQuerier {
                 .get(&(relay_url.to_owned(), *routing_id))
                 .cloned()
                 .unwrap_or_default();
-            Ok(records)
+            // `insert` takes an already-decoded record, so this double stores no
+            // undecodable blob.
+            Ok(RelayQueryAnswer::from_candidates(records))
         }
     }
 }
@@ -327,18 +382,20 @@ mod tests {
         let out = RelayQuerier::query(&querier, "wss://r/scp/v1", &routing_id)
             .await
             .unwrap();
-        assert_eq!(out.len(), 2, "both co-located records returned");
-        assert_eq!(out[0].seq, 1);
-        assert_eq!(out[1].seq, 2);
+        assert_eq!(out.candidates.len(), 2, "both co-located records returned");
+        assert_eq!(out.candidates[0].seq, 1);
+        assert_eq!(out.candidates[1].seq, 2);
+        assert_eq!(out.undecodable, 0);
     }
 
-    /// An unknown routing ID yields an empty vector (not an error).
+    /// An unknown routing ID yields an empty answer (not an error): the relay
+    /// responded and stored nothing there.
     #[tokio::test]
     async fn in_memory_querier_unknown_routing_id_is_empty() {
         let querier = InMemoryRelayQuerier::new();
         let out = RelayQuerier::query(&querier, "wss://r/scp/v1", &[9u8; 32])
             .await
             .unwrap();
-        assert!(out.is_empty());
+        assert!(out.holds_nothing());
     }
 }

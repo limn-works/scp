@@ -301,8 +301,7 @@ mod tests {
     use std::sync::Arc;
 
     use scp_dht::InMemoryDhtClient;
-    use scp_identity::resolver::DualLayerResolver;
-    use scp_identity::{DidCache, NoOpRelayQuerier};
+    use scp_identity::DidCache;
 
     fn default_scp() -> crate::scp::PyScp {
         crate::scp::PyScp::new_in_memory_for_test()
@@ -451,16 +450,15 @@ mod tests {
         // function uses via the BridgeInstance DID resolver. This validates that the
         // `scp_identity::resolver::DidResolver` impl on
         // `IdentityBackedDidResolver` works end-to-end.
-        let dual = DualLayerResolver::new(
-            Arc::new(NoOpRelayQuerier),
+        // Compose through the SAME builder the shipped bridge calls, so this
+        // test exercises the production relay+DHT composition (§3.10.4).
+        let dual = scp_ffi_common::build_production_did_resolver(
+            Arc::new(scp_transport::native::TransportRelayQuerier::new()),
             dht_client,
             Arc::new(DidCache::new()),
-            Vec::new(),
         );
-        let resolver = scp_ffi_common::IdentityBackedDidResolver::new(
-            Arc::new(dual),
-            tokio::runtime::Handle::current(),
-        );
+        let resolver =
+            scp_ffi_common::IdentityBackedDidResolver::new(dual, tokio::runtime::Handle::current());
         let auth = scpid_verify(&resolver, &response, &challenge)
             .await
             .unwrap();

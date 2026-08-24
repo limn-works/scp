@@ -36,6 +36,13 @@
       "stories": [
         "SCP-RELAYRES-005"
       ]
+    },
+    {
+      "id": "gate-relayres-6",
+      "name": "Production wiring of the relay READ layer + honest per-layer resolution outcome",
+      "stories": [
+        "SCP-RELAYRES-006"
+      ]
     }
   ],
   "stories": [
@@ -301,6 +308,82 @@
         "phase": "2",
         "feature": "issue #482 — relay-based DID resolution (Model B)",
         "completes": "SCP-CAPINJECT-001 A2 (DhtMode::Disabled self-DID + peer resolution via relay)"
+      }
+    },
+    {
+      "id": "SCP-RELAYRES-006",
+      "title": "Wire the relay READ layer into every production DID resolver, delete NoOpRelayQuerier, and make a layer that cannot answer distinguishable from a DID nobody published",
+      "gate": "gate-relayres-6",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-identity/src/resolver.rs",
+        "crates/scp-identity/src/relay_querier.rs",
+        "crates/scp-identity/src/lib.rs",
+        "crates/scp-transport/src/traits.rs",
+        "crates/scp-transport/src/native/relay_querier.rs",
+        "crates/scp-ffi/common/src/resolvers.rs",
+        "crates/scp-ffi/common/src/bridge_instance.rs",
+        "crates/scp-ffi/common/tests/relay_did_resolution.rs",
+        "crates/scp-ffi/src/identity.rs",
+        "crates/scp-ffi/src/transport.rs",
+        "crates/scp-ffi/napi/src/identity.rs",
+        "crates/scp-ffi/napi/src/transport.rs",
+        "crates/scp-ffi/uniffi/src/bridge.rs",
+        "crates/scp-node/src/self_host.rs",
+        "crates/scp-runtime/src/crypto/mls/attestation_verification.rs",
+        "crates/scp-testing/tests/integration/pipeline_wiring.rs"
+      ],
+      "description": "SCP-RELAYRES-002 built the relay READ components and no production code constructed them. `RealMultiRelayQuerier` (crates/scp-identity/src/relay_querier.rs) and `TransportRelayQuerier` (crates/scp-transport/src/native/relay_querier.rs) both sit on `main` with zero production construction sites, while every production `DualLayerResolver` — the PyO3 bridge (crates/scp-ffi/src/identity.rs), the napi-rs bridge (crates/scp-ffi/napi/src/identity.rs), the UniFFI bridge (crates/scp-ffi/uniffi/src/bridge.rs), and the scp-node co-located participant (crates/scp-node/src/self_host.rs) — passes `NoOpRelayQuerier` and an empty bootstrap-relay list, so every DID resolution runs through the DHT alone. This story constructs the real composer at all four sites and deletes `NoOpRelayQuerier`, which the 2026-08-17 amendment to ADR-062 §Decision 5 reclassifies from 'NOT a nullifier' to a nullifier: its `Ok(None)` reads at every caller as 'the relays hold no record for this DID', so it reported a query result it never obtained. Each bridge sources its relay URLs from spec §18.5.1 priority 1 (relay URLs the caller explicitly configured): the bridge binds each live relay transport into its per-instance `TransportRelayQuerier` as `transport_connect` establishes it, and unbinds on disconnect, so the resolver queries exactly the relays the instance is connected to and never a stale snapshot. The story also closes the honesty gap spec §3.10.4 names in 'One layer fails, the other reports the DID absent': `DidResolver::resolve` returns `ResolutionOutcome` (`Found` or `Absent { layers }`) instead of `Option<ResolvedDidDocument>`, `RealMultiRelayQuerier` returns `Err` when no relay answered, `TransportRelayQuerier` returns `IdentityError::RelayNotConnected` for an unbound relay instead of an empty candidate list, and `IdentityBackedDidResolver` maps an unavailable layer to `ResolutionError::NetworkUnavailable` rather than `NotFound`. Scope boundaries: the relay WRITE path is SCP-RELAYRES-004, relay-side slot-exclusivity validation is SCP-RELAYRES-003, and the end-to-end publish-then-resolve round trip is SCP-RELAYRES-005 — this story wires and tests the READ half only.",
+      "acceptanceCriteria": [
+        "`NoOpRelayQuerier` no longer exists anywhere: `grep -rn 'NoOpRelayQuerier' crates/ bindings/` returns zero matches.",
+        "Every production `DualLayerResolver` construction composes the real relay querier: `grep -rn 'RealMultiRelayQuerier' crates/scp-ffi/src/identity.rs crates/scp-ffi/napi/src/identity.rs crates/scp-ffi/uniffi/src/bridge.rs crates/scp-node/src/self_host.rs` matches at all four files, and no production `DualLayerResolver::new` call site passes a querier type other than `RealMultiRelayQuerier`.",
+        "A DID published only to a relay resolves: a test seeds a `DidRecordV1` frame at `did_routing_id(did)` on a relay transport bound into a `TransportRelayQuerier`, leaves the DHT client empty, resolves through the same builder the bridges call, and asserts `ResolutionOutcome::Found` whose `source` is `ResolutionSource::ScpRelay`.",
+        "A DID published only to the DHT still resolves: a test seeds the record in the DHT client only, binds no relay, and asserts `ResolutionOutcome::Found` whose `source` is `ResolutionSource::MainlineDht` — the pre-existing DHT path is unbroken.",
+        "Relay-layer failure is distinguishable from DID absence: a test whose bound relay adapter returns a transport error, with an empty DHT, asserts `ResolutionOutcome::Absent` carrying `LayerStatus::Unavailable` for the relay layer and `LayerStatus::Answered` for the DHT layer; a second test where both layers answer with no record asserts both layers `Answered`; and a third asserts `IdentityBackedDidResolver` maps the first to `ResolutionError::NetworkUnavailable` and the second to `ResolutionError::NotFound`.",
+        "An unbound relay URL fails closed with a typed error, never an empty candidate list: a test calls `TransportRelayQuerier::query` for a URL it never bound and asserts `Err(IdentityError::RelayNotConnected(_))`.",
+        "The resolver queries the relays the instance is connected to, not a construction-time snapshot: a test builds the resolver first, binds a relay afterwards, then resolves and asserts the relay-served document is returned.",
+        "`crates/scp-testing/tests/integration/pipeline_wiring.rs` gains an assertion that calls the shared production resolver builder with real arguments (a real `TransportRelayQuerier`, a real DHT client, a real `DidCache`) and asserts the composed resolver reaches the relay layer.",
+        "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command from CLAUDE.md with all listed features and `-D warnings`; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
+        "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
+      ],
+      "actionItems": [
+        "In crates/scp-identity/src/resolver.rs: delete `NoOpRelayQuerier` and its `MultiRelayQuerier` impl; add `ResolutionOutcome`, `LayerAvailability`, and `LayerStatus`; change `DidResolver::resolve` to return `Result<ResolutionOutcome, IdentityError>`; track each layer's status through `DualLayerResolver::resolve` and return `IdentityError::ResolutionFailed` when both layers are unavailable and the cache holds nothing.",
+        "In crates/scp-identity/src/resolver.rs: add a `BootstrapRelays` trait and take `Arc<dyn BootstrapRelays>` on `DualLayerResolver` in place of `Vec<String>`, with an impl for `Vec<String>` so a static list still works.",
+        "In crates/scp-identity/src/relay_querier.rs: return `Err` from `RealMultiRelayQuerier::query` when the relay URL list is empty or every queried relay errored or timed out, and `Ok(None)` only when a relay answered and held no valid record.",
+        "In crates/scp-transport/src/native/relay_querier.rs: return `IdentityError::RelayNotConnected(relay_url)` for an unbound relay URL; add a `bound_relay_urls` accessor and a `BootstrapRelays` impl over it.",
+        "In crates/scp-transport/src/traits.rs: add `impl TransportAdapter for Arc<dyn TransportAdapter>` mirroring the existing `Box<dyn TransportAdapter>` impl, so one connected adapter serves both the `TransportManager` and the relay querier.",
+        "In crates/scp-ffi/common/src/bridge_instance.rs: hold one `Arc<TransportRelayQuerier>` per bridge instance and expose it; in crates/scp-ffi/common/src/resolvers.rs add the single shared builder that composes `DualLayerResolver` over `RealMultiRelayQuerier<TransportRelayQuerier>` and map an unavailable layer to `ResolutionError::NetworkUnavailable`.",
+        "Call the shared builder from crates/scp-ffi/src/identity.rs, crates/scp-ffi/napi/src/identity.rs, and crates/scp-ffi/uniffi/src/bridge.rs; bind and unbind the live adapter in each bridge's transport connect and disconnect paths.",
+        "In crates/scp-node/src/self_host.rs: build the co-located participant's resolver over a real `TransportRelayQuerier` and bind the loopback relay adapter into it once `connect_loopback_supervisor` establishes the connection.",
+        "Update the `ResolutionOutcome` consumers in crates/scp-runtime/src/crypto/mls/attestation_verification.rs and crates/scp-node/src/self_host.rs; write the relay-only, DHT-only, unavailable-versus-absent, unbound-relay, and late-bind tests; add the pipeline_wiring assertion; run full CI and the review roster."
+      ],
+      "blockedBy": [
+        "SCP-RELAYRES-002"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.4 Resolution Protocol"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.10 DidResolver Trait"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.5.1 Bootstrap Priority Order"
+        },
+        {
+          "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md",
+          "section": "### 5. Credentials (E2), blob (E3), relay-publisher default (E4) — classified + storied now (live SCP-CAPSEL fixes)"
+        }
+      ],
+      "details": {
+        "phase": "2",
+        "feature": "issue #482 — relay-based DID resolution (Model B)",
+        "builds_on": "SCP-RELAYRES-002 — the READ components exist on main and nothing constructs them"
       }
     }
   ]

@@ -19,15 +19,26 @@
 //! # Architecture
 //!
 //! - [`DidResolver`] — Trait for unified DID resolution (§3.10.10).
+//! - [`ResolutionOutcome`] — Found, or absent with each layer's status.
+//! - [`LayerAvailability`] / [`LayerStatus`] — Which layers answered (§3.10.4).
 //! - [`ResolvedDidDocument`] — Resolution result with provenance metadata.
 //! - [`ResolutionSource`] — Which layer served the document.
 //! - [`MultiRelayQuerier`] — Trait abstracting SCP relay QUERY operations.
+//! - [`BootstrapRelays`] — Supplies the relay URLs to query (§3.10.4 step 3a).
 //! - [`HealingPublisher`] — Trait abstracting republish to a stale layer (§3.10.7).
 //! - [`DualLayerResolver`] — Composes relay + DHT resolution in parallel.
+//!
+//! # Absence is not failure
+//!
+//! A layer that cannot answer never reads as "no such DID". The resolver records
+//! each layer as [`LayerStatus::Answered`] or [`LayerStatus::Unavailable`] and
+//! hands that record to the caller in [`ResolutionOutcome::Absent`]; when neither
+//! layer answers it returns [`IdentityError::ResolutionFailed`] (§3.10.4).
 //!
 //! See SCP-241 and SCP-245 in `.docs/prds/reachability.json`.
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,7 +50,7 @@ use crate::dht::extract_public_key;
 use crate::republish::RelayPublisher;
 use crate::resolution::{did_routing_id, verify_relay_record};
 use scp_clock::{Clock, SystemClock};
-use scp_dht::{DhtClient, DhtRecord};
+use scp_dht::{DhtClient, DhtLookup};
 use scp_did::{DidDocument, decode_multibase_key};
 
 // ---------------------------------------------------------------------------
@@ -55,13 +66,124 @@ use scp_did::{DidDocument, decode_multibase_key};
 pub trait DidResolver: Send + Sync {
     /// Resolves a DID string to its document via parallel dual-layer resolution.
     ///
-    /// Returns `Ok(Some(resolved))` if the DID was found on any layer or in
-    /// cache. Returns `Ok(None)` if neither layer has the document and the
-    /// cache is empty. Returns `Err(...)` only on unrecoverable errors.
+    /// Returns [`ResolutionOutcome::Found`] when a layer (or the cache) served a
+    /// document that verified against the DID-derived key. Returns
+    /// [`ResolutionOutcome::Absent`] when no layer served a document; the
+    /// [`LayerAvailability`] it carries tells the caller which layers answered,
+    /// so a DID nobody published is distinguishable from a DID whose only holder
+    /// was unreachable (§3.10.4, "One layer fails, the other reports the DID
+    /// absent"). Returns [`IdentityError::ResolutionFailed`] when no layer could
+    /// answer and the cache holds nothing (§3.10.4, "Both layers fail").
     fn resolve(
         &self,
         did: &str,
-    ) -> impl Future<Output = Result<Option<ResolvedDidDocument>, IdentityError>> + Send;
+    ) -> impl Future<Output = Result<ResolutionOutcome, IdentityError>> + Send;
+}
+
+/// Whether one resolution layer answered a query (§3.10.4).
+///
+/// **The criterion the resolver applies:** a layer **answered** when a source in
+/// it gave the resolver usable evidence about this DID — either a record that
+/// verified against the DID-derived key and passed the rollback guard, or an
+/// affirmative report from a reached source that it holds no record. A layer is
+/// **unavailable** in every other case, because the resolver learned nothing
+/// about the DID from it.
+///
+/// The evidence that a layer gave no usable answer (each of these makes a layer
+/// unavailable, and the list is what the criterion admits, not the criterion
+/// itself): every source errored or timed out; no source had a live connection;
+/// the arm is switched off; every record a source served failed BEP44
+/// verification, failed self-certification, failed to decode as a DID-record
+/// frame, or carried a sequence number below the cache high-water mark.
+///
+/// Splitting the two is load-bearing. `Answered` on both layers is what makes an
+/// [`ResolutionOutcome::Absent`] read as "nobody published this DID", so a layer
+/// that reported `Answered` without asking anyone would let whoever suppressed
+/// that layer manufacture a proof of absence (§3.10.4, "One layer fails, the
+/// other reports the DID absent").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerStatus {
+    /// A source in this layer gave the resolver usable evidence about the DID.
+    Answered,
+    /// No source in this layer gave the resolver usable evidence about the DID.
+    Unavailable,
+}
+
+impl LayerStatus {
+    /// Returns `true` when this layer could not answer.
+    #[must_use]
+    pub const fn is_unavailable(self) -> bool {
+        matches!(self, Self::Unavailable)
+    }
+}
+
+/// Which resolution layers answered a resolution attempt (§3.10.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayerAvailability {
+    /// The SCP relay layer (§3.10.2).
+    pub relay: LayerStatus,
+    /// The Mainline DHT layer (§3.10.3).
+    pub dht: LayerStatus,
+}
+
+impl LayerAvailability {
+    /// Returns `true` when at least one layer could not answer, so the caller
+    /// must not read the absent result as proof that nobody published the DID.
+    #[must_use]
+    pub const fn any_unavailable(self) -> bool {
+        self.relay.is_unavailable() || self.dht.is_unavailable()
+    }
+
+    /// Names the layers that could not answer, for an error message a reader
+    /// can act on. Returns an empty string when both layers answered.
+    #[must_use]
+    pub const fn unavailable_layers(self) -> &'static str {
+        match (self.relay, self.dht) {
+            (LayerStatus::Unavailable, LayerStatus::Unavailable) => "SCP relay layer, Mainline DHT",
+            (LayerStatus::Unavailable, LayerStatus::Answered) => "SCP relay layer",
+            (LayerStatus::Answered, LayerStatus::Unavailable) => "Mainline DHT",
+            (LayerStatus::Answered, LayerStatus::Answered) => "",
+        }
+    }
+}
+
+/// What a resolution attempt produced (§3.10.4).
+#[derive(Debug, Clone)]
+pub enum ResolutionOutcome {
+    /// A layer (or the cache) served a document that verified against the key
+    /// the DID string encodes.
+    Found(ResolvedDidDocument),
+    /// No layer served a document for this DID.
+    ///
+    /// `layers` records which layers answered. A caller reads
+    /// [`LayerAvailability::any_unavailable`] to decide whether this absence is
+    /// evidence that nobody published the DID (both layers answered) or only
+    /// evidence that the layers it could reach hold nothing (§3.10.4).
+    Absent {
+        /// Which layers answered this attempt.
+        layers: LayerAvailability,
+    },
+}
+
+impl ResolutionOutcome {
+    /// Returns the resolved document when a layer served one.
+    #[must_use]
+    pub const fn found(&self) -> Option<&ResolvedDidDocument> {
+        match self {
+            Self::Found(doc) => Some(doc),
+            Self::Absent { .. } => None,
+        }
+    }
+
+    /// Consumes the outcome and returns the resolved document when a layer
+    /// served one.
+    #[must_use]
+    pub fn into_found(self) -> Option<ResolvedDidDocument> {
+        match self {
+            Self::Found(doc) => Some(doc),
+            Self::Absent { .. } => None,
+        }
+    }
 }
 
 /// A resolved DID document with provenance metadata.
@@ -140,13 +262,55 @@ pub trait MultiRelayQuerier: Send + Sync {
     ///
     /// # Returns
     ///
-    /// `Ok(Some(record))` if a relay has the document. `Ok(None)` if no relay
-    /// has it. `Err(...)` on network/protocol errors.
+    /// `Ok(Some(record))` when a relay served a record that verified.
+    /// `Ok(None)` when at least one relay responded and stored nothing at the
+    /// routing ID — the honest "a relay I reached holds nothing" answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(...)` when no relay reported on the DID: the URL list was
+    /// empty, or every queried relay errored, timed out, had no live
+    /// connection, or served only records the resolver discarded (§3.10.4
+    /// discards a bad signature and an undecodable frame each "as if the relay
+    /// had failed"). The [`DualLayerResolver`] reports that as
+    /// [`LayerStatus::Unavailable`] rather than folding it into a not-found
+    /// (§3.10.4, "One layer fails, the other reports the DID absent").
     fn query(
         &self,
         did: &str,
         relay_urls: &[String],
     ) -> impl Future<Output = Result<Option<RelayRecord>, IdentityError>> + Send;
+}
+
+// ---------------------------------------------------------------------------
+// Bootstrap relay supply (§3.10.4 step 3a, §18.5.1)
+// ---------------------------------------------------------------------------
+
+/// Supplies the relay URLs a resolver queries when it holds no cached relay list
+/// for a DID (§3.10.4 step 3a: "identity's published relays if known, else
+/// bootstrap relays from §18.5.1").
+///
+/// The resolver reads this on every `resolve` rather than capturing a list at
+/// construction time. A bridge builds its DID resolver at FFI init, before any
+/// relay connection exists, so a construction-time snapshot would pin the
+/// resolver to the empty set forever. The production implementation in
+/// `scp-transport` returns the relay URLs whose transports are currently bound,
+/// which is spec §18.5.1 priority 1 — the relays the caller explicitly
+/// configured and the bridge connected.
+pub trait BootstrapRelays: Send + Sync {
+    /// Returns the relay URLs to query, in priority order.
+    ///
+    /// An empty result means the caller configured no relay, which the relay
+    /// layer reports as unavailable rather than as "no relay holds this DID".
+    fn bootstrap_relay_urls(&self) -> Vec<String>;
+}
+
+/// A fixed relay list, for a caller that knows its relays up front and never
+/// changes them (an operator-configured resolver, a test).
+impl BootstrapRelays for Vec<String> {
+    fn bootstrap_relay_urls(&self) -> Vec<String> {
+        self.clone()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -213,10 +377,20 @@ pub trait HealingPublisher: Send + Sync {
 // DualLayerResolver
 // ---------------------------------------------------------------------------
 
-/// Per-layer timeout for parallel resolution. Each of the relay and DHT
-/// layers is given this much time to respond before being treated as a
-/// timeout (returning `Ok(None)`).
+/// Per-layer timeout for parallel resolution. Each of the relay and DHT layers
+/// is given this much time to respond; a layer that exceeds it reports
+/// [`LayerStatus::Unavailable`].
 const LAYER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How old a cached document may be and still be served when neither layer
+/// answered (§3.10.4, "Both layers fail": "less than 7 days old").
+///
+/// This is not the cache's refresh TTL. [`DidCache::get`] refreshes an active
+/// contact every 24 hours, and step 1 of `resolve` applies that TTL. This
+/// constant governs the separate last-resort path: both layers gave the
+/// resolver nothing, so a document the cache still holds beats failing the
+/// caller's UCAN or attestation check.
+const BOTH_LAYERS_FAIL_CACHE_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// Composes SCP relay QUERY with Mainline DHT resolution in parallel.
 ///
@@ -225,10 +399,17 @@ const LAYER_TIMEOUT: Duration = Duration::from_secs(10);
 /// 2. Extract the public key from the DID string.
 /// 3. Initiate both relay QUERY and DHT resolve concurrently via `tokio::join!`
 ///    with per-layer 10-second timeouts.
-/// 4. Both layers are awaited; the result with the highest sequence number wins.
-/// 5. On a seq tie, the relay result is preferred (lower latency for subsequent ops).
-/// 6. When one layer times out, the other's valid result is used.
-/// 7. When both fail or return nothing, returns `Ok(None)`.
+/// 4. Both layers are awaited; each layer's record is BEP44-verified and checked
+///    against the cache's sequence high-water mark.
+/// 5. The surviving record with the highest sequence number wins; on a tie the
+///    relay record wins (lower latency for subsequent ops).
+/// 6. When one layer gives no usable evidence, the other's verified record is
+///    used.
+/// 7. When at least one layer answered and neither served a record, returns
+///    `Ok(ResolutionOutcome::Absent { layers })`. When neither layer answered,
+///    returns a cached document under
+///    [`BOTH_LAYERS_FAIL_CACHE_MAX_AGE_SECS`] old, and
+///    `Err(IdentityError::ResolutionFailed)` when the cache holds none.
 /// 8. Cache the result.
 /// 9. If both layers returned valid documents with different seq numbers,
 ///    trigger protocol-level healing (§3.10.7): asynchronously republish the
@@ -239,13 +420,16 @@ pub struct DualLayerResolver<
     R: MultiRelayQuerier,
     D: DhtClient,
     C: Clock = SystemClock,
-    H: HealingPublisher = NoOpHealer,
+    H: HealingPublisher = NoHealing,
 > {
     relay_querier: Arc<R>,
     dht_client: Arc<D>,
     cache: Arc<DidCache<C>>,
-    /// Bootstrap relay URLs used when the identity's relays are not known.
-    bootstrap_relays: Vec<String>,
+    /// Supplies the relay URLs to query when the cache holds no relay list for
+    /// the DID (§3.10.4 step 3a). Read on every `resolve`, never snapshotted at
+    /// construction, because a bridge builds its resolver before it connects a
+    /// relay.
+    bootstrap_relays: Arc<dyn BootstrapRelays>,
     /// Optional healing publisher for protocol-level healing (§3.10.7, SCP-245).
     ///
     /// When set, the resolver triggers an asynchronous best-effort republish
@@ -253,15 +437,24 @@ pub struct DualLayerResolver<
     healing_publisher: Option<Arc<H>>,
 }
 
-/// A no-op healing publisher used as the default type parameter.
+/// The healing-publisher type parameter for a resolver built without healing.
 ///
-/// This exists only to provide a concrete default for the `H` type parameter
-/// on [`DualLayerResolver`] so that existing construction sites that do not
-/// need healing remain unchanged.
-pub struct NoOpHealer;
+/// Uninhabited by construction: [`DualLayerResolver::new`] expresses "no healing"
+/// by storing `healing_publisher: None`, and no value of this type exists, so a
+/// caller cannot hand [`DualLayerResolver::with_healing`] a publisher that
+/// reports a successful republish without publishing anything.
+pub enum NoHealing {}
 
 #[allow(clippy::manual_async_fn)]
-impl HealingPublisher for NoOpHealer {
+impl HealingPublisher for NoHealing {
+    // `NoHealing` is uninhabited, so no `&NoHealing` can exist at run time and
+    // this body is unreachable by construction. `clippy::uninhabited_references`
+    // warns that dereferencing a reference to an uninhabited type is undefined
+    // behaviour; producing that reference in the first place is what no caller
+    // can do. The zero-arm `match` is what makes this impl total without
+    // fabricating a success value the caller would read as a completed
+    // republish.
+    #[allow(clippy::uninhabited_references)]
     fn heal(
         &self,
         _did: &str,
@@ -271,25 +464,7 @@ impl HealingPublisher for NoOpHealer {
         _seq: u64,
         _public_key: &[u8; 32],
     ) -> impl Future<Output = Result<(), IdentityError>> + Send {
-        async { Ok(()) }
-    }
-}
-
-/// A no-op relay querier that always returns `Ok(None)`.
-///
-/// Used when no production relay querier is available (e.g., before transport
-/// setup). The `DualLayerResolver` falls back to DHT-only resolution when the
-/// relay layer returns `None`.
-pub struct NoOpRelayQuerier;
-
-#[allow(clippy::manual_async_fn)]
-impl MultiRelayQuerier for NoOpRelayQuerier {
-    fn query(
-        &self,
-        _did: &str,
-        _relay_urls: &[String],
-    ) -> impl Future<Output = Result<Option<RelayRecord>, IdentityError>> + Send {
-        async { Ok(None) }
+        async move { match *self {} }
     }
 }
 
@@ -368,12 +543,16 @@ impl<D: DhtClient + 'static, R: RelayPublisher + 'static> HealingPublisher
 
 impl<R: MultiRelayQuerier, D: DhtClient, C: Clock> DualLayerResolver<R, D, C> {
     /// Creates a new dual-layer resolver without healing.
+    ///
+    /// `bootstrap_relays` is read on every `resolve`, so a caller may pass a
+    /// live source (the relay querier's bound-transport set) and connect relays
+    /// after this call.
     #[must_use]
     pub const fn new(
         relay_querier: Arc<R>,
         dht_client: Arc<D>,
         cache: Arc<DidCache<C>>,
-        bootstrap_relays: Vec<String>,
+        bootstrap_relays: Arc<dyn BootstrapRelays>,
     ) -> Self {
         Self {
             relay_querier,
@@ -399,7 +578,7 @@ impl<R: MultiRelayQuerier, D: DhtClient, C: Clock, H: HealingPublisher>
         relay_querier: Arc<R>,
         dht_client: Arc<D>,
         cache: Arc<DidCache<C>>,
-        bootstrap_relays: Vec<String>,
+        bootstrap_relays: Arc<dyn BootstrapRelays>,
         healing_publisher: Arc<H>,
     ) -> Self {
         Self {
@@ -425,18 +604,18 @@ impl<
     fn resolve(
         &self,
         did: &str,
-    ) -> impl Future<Output = Result<Option<ResolvedDidDocument>, IdentityError>> + Send {
+    ) -> impl Future<Output = Result<ResolutionOutcome, IdentityError>> + Send {
         let did = did.to_owned();
         let relay_querier = Arc::clone(&self.relay_querier);
         let dht_client = Arc::clone(&self.dht_client);
         let cache = Arc::clone(&self.cache);
-        let bootstrap_relays = self.bootstrap_relays.clone();
+        let bootstrap_relays = Arc::clone(&self.bootstrap_relays);
         let healing_publisher = self.healing_publisher.clone();
 
         async move {
             // Step 1: Check cache for a fresh entry.
             if let Some(cached) = cache.get(&did).await {
-                return Ok(Some(ResolvedDidDocument {
+                return Ok(ResolutionOutcome::Found(ResolvedDidDocument {
                     document: cached.document,
                     seq: cached.sequence,
                     source: ResolutionSource::Cache,
@@ -446,18 +625,28 @@ impl<
             // Step 2: Extract the public key from the DID string.
             let public_key = extract_public_key(&did)?;
 
-            // Step 3: Determine relay URLs.
-            // Use cached relay URLs (even from expired entries) to prefer an
-            // identity's known relays over bootstrap relays. Falls back to
-            // bootstrap relays when no cached entry exists at all.
-            let relay_urls = cache
-                .cached_relay_urls(&did)
-                .await
-                .unwrap_or(bootstrap_relays);
+            // Step 3: Determine relay URLs, in the priority order §3.10.4 step
+            // 3a states: "the identity's own relays (from a previously cached
+            // DID document), then bootstrap relays". Both lists are queried, so
+            // a DID document that advertises a relay this instance never
+            // connected does not displace the relays it did connect. Reading the
+            // bootstrap source here — not at construction — is what lets a
+            // bridge build its resolver before it connects a relay (§18.5.1
+            // priority 1).
+            let relay_urls = relay_query_order(
+                cache.cached_relay_urls(&did).await.unwrap_or_default(),
+                bootstrap_relays.bootstrap_relay_urls(),
+            );
 
             // Step 4: Initiate both layers in parallel using tokio::join!
             // with per-layer timeouts (LAYER_TIMEOUT). Both layers are
             // awaited; the result with the highest sequence number wins.
+            //
+            // A timeout, an error, and "no source in this layer answered" are
+            // all the SAME thing to a caller — the layer could not answer — and
+            // each is recorded as `LayerStatus::Unavailable` rather than folded
+            // into a not-found (§3.10.4, "One layer fails, the other reports the
+            // DID absent").
             let relay_fut = async {
                 match tokio::time::timeout(LAYER_TIMEOUT, relay_querier.query(&did, &relay_urls))
                     .await
@@ -465,64 +654,82 @@ impl<
                     Ok(result) => result,
                     Err(_elapsed) => {
                         debug!(did = %did, "relay layer timed out");
-                        Ok(None)
+                        Err(IdentityError::RelayQueryFailed(format!(
+                            "every relay query exceeded the {}s layer timeout",
+                            LAYER_TIMEOUT.as_secs()
+                        )))
                     }
                 }
             };
             let dht_fut = async {
                 match tokio::time::timeout(LAYER_TIMEOUT, dht_client.resolve(&public_key)).await {
-                    Ok(result) => result,
+                    Ok(result) => result.map_err(IdentityError::from),
                     Err(_elapsed) => {
                         debug!(did = %did, "DHT layer timed out");
-                        Ok(None)
+                        Err(IdentityError::DhtResolveFailed(format!(
+                            "the DHT lookup exceeded the {}s layer timeout",
+                            LAYER_TIMEOUT.as_secs()
+                        )))
                     }
                 }
             };
 
             let (relay_result, dht_result) = tokio::join!(relay_fut, dht_fut);
 
-            // Validate both results independently. The validate functions
-            // return `ValidatedRecord` which bundles the resolved document with
-            // the raw BEP44 bytes and signature needed for healing (SCP-245).
-            let relay_validated = validate_relay_result(relay_result, &did, &public_key);
-            // The DHT transport yields `DhtError`; map it into `IdentityError`
-            // so `validate_dht_result` keeps its single error taxonomy.
-            let dht_validated =
-                validate_dht_result(dht_result.map_err(IdentityError::from), &did, &public_key);
-
-            // Step 5: Reject results with sequence numbers lower than the
-            // last known cached sequence. Prevents rollback attacks where an
-            // attacker serves a validly-signed but outdated document after
-            // cache TTL expiry.
+            // Step 5: Verify each layer's record and reject one whose sequence
+            // number is below the last cached sequence. The rollback guard
+            // defeats an attacker who replays a validly-signed but superseded
+            // document after cache TTL expiry.
+            //
+            // Each layer's status is read off the SURVIVING evidence, never off
+            // the raw querier result. §3.10.4 discards a bad signature and an
+            // undecodable frame each "as if the layer had failed", so a layer
+            // whose every record the resolver discarded must report
+            // `Unavailable` — otherwise tampering on one layer manufactures the
+            // caller-visible claim that nobody published the DID.
             let cached_seq = cache.cached_sequence(&did).await;
-            let relay_validated = relay_validated.and_then(|rec| {
-                if let Some(min_seq) = cached_seq
-                    && rec.resolved.seq < min_seq
+            let relay_evidence = relay_evidence(relay_result, &did, &public_key, cached_seq);
+            let dht_evidence = dht_evidence(dht_result, &did, &public_key, cached_seq);
+
+            let layers = LayerAvailability {
+                relay: relay_evidence.status(),
+                dht: dht_evidence.status(),
+            };
+
+            // §3.10.4 "Both layers fail": neither layer gave the resolver usable
+            // evidence. Serve a cached document under 7 days old — step 1
+            // already returned any entry inside its refresh TTL, which is 24
+            // hours for an active contact, so this path covers the window
+            // between that TTL and 7 days. The resolver never fabricates a
+            // document: with no such entry it reports the failure.
+            if layers.relay.is_unavailable() && layers.dht.is_unavailable() {
+                if let Some(cached) = cache
+                    .get_within_max_age(&did, BOTH_LAYERS_FAIL_CACHE_MAX_AGE_SECS)
+                    .await
                 {
                     warn!(
                         did = %did,
-                        received_seq = rec.resolved.seq,
-                        cached_seq = min_seq,
-                        "relay returned stale seq, rejecting"
+                        unavailable_layers = %layers.unavailable_layers(),
+                        "no resolution layer answered — serving the cached document (§3.10.4)"
                     );
-                    return None;
+                    return Ok(ResolutionOutcome::Found(ResolvedDidDocument {
+                        document: cached.document,
+                        seq: cached.sequence,
+                        source: ResolutionSource::Cache,
+                    }));
                 }
-                Some(rec)
-            });
-            let dht_validated = dht_validated.and_then(|rec| {
-                if let Some(min_seq) = cached_seq
-                    && rec.resolved.seq < min_seq
-                {
-                    warn!(
-                        did = %did,
-                        received_seq = rec.resolved.seq,
-                        cached_seq = min_seq,
-                        "DHT returned stale seq, rejecting"
-                    );
-                    return None;
-                }
-                Some(rec)
-            });
+                return Err(IdentityError::ResolutionFailed {
+                    did: did.clone(),
+                    reason: format!(
+                        "no resolution layer answered ({}) and the cache holds no document under {} days old",
+                        layers.unavailable_layers(),
+                        BOTH_LAYERS_FAIL_CACHE_MAX_AGE_SECS / (24 * 60 * 60),
+                    ),
+                });
+            }
+
+            let relay_validated = relay_evidence.into_record();
+            let dht_validated = dht_evidence.into_record();
 
             // Step 6: Pick the result with the highest sequence number.
             // On a tie, prefer relay (lower latency for subsequent operations).
@@ -540,9 +747,198 @@ impl<
             // Step 8: Trigger protocol-level healing (§3.10.7, SCP-245).
             maybe_trigger_healing(healing_info, healing_publisher, &did, &public_key);
 
-            Ok(result)
+            Ok(
+                result.map_or(ResolutionOutcome::Absent { layers }, |resolved| {
+                    ResolutionOutcome::Found(resolved)
+                }),
+            )
         }
     }
+}
+
+/// Orders the relays a resolve queries: the identity's own relays first, then
+/// the bootstrap relays, with each URL appearing once (§3.10.4 step 3a).
+///
+/// Both lists are queried. Returning only the identity's own relays would drop
+/// the relays this instance actually connected out of the query set, and the
+/// production querier answers only for a relay it has a live transport for, so
+/// a DID document advertising an unbound relay would make the relay layer
+/// unavailable for that DID forever.
+fn relay_query_order(identity_relays: Vec<String>, bootstrap_relays: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::with_capacity(identity_relays.len() + bootstrap_relays.len());
+    let mut ordered = Vec::with_capacity(identity_relays.len() + bootstrap_relays.len());
+    for url in identity_relays.into_iter().chain(bootstrap_relays) {
+        if seen.insert(url.clone()) {
+            ordered.push(url);
+        }
+    }
+    ordered
+}
+
+/// What one resolution layer gave the resolver about a DID (§3.10.4).
+///
+/// **The criterion:** a layer answered when a source in it gave the resolver
+/// usable evidence — a record that survived verification and the rollback
+/// guard, or an affirmative report from a reached source that it holds no
+/// record. Every other outcome is [`Self::NoAnswer`], which the resolver
+/// reports as [`LayerStatus::Unavailable`].
+///
+/// This type exists so the status is a function of what SURVIVED validation.
+/// Deriving it from the querier's `Ok`/`Err` alone let a layer that served only
+/// tampered records report that it answered, which turned relay tampering into
+/// a caller-visible claim that nobody published the DID.
+enum LayerEvidence {
+    /// A source served a record that verified and passed the rollback guard.
+    Record(Box<ValidatedRecord>),
+    /// A reached source reported that it holds no record for this DID.
+    HoldsNothing,
+    /// No source gave usable evidence about this DID.
+    NoAnswer,
+}
+
+impl LayerEvidence {
+    /// Reports whether this layer answered, per the criterion on
+    /// [`LayerStatus`].
+    const fn status(&self) -> LayerStatus {
+        match self {
+            Self::Record(_) | Self::HoldsNothing => LayerStatus::Answered,
+            Self::NoAnswer => LayerStatus::Unavailable,
+        }
+    }
+
+    /// Returns the surviving record, if this layer served one.
+    fn into_record(self) -> Option<ValidatedRecord> {
+        match self {
+            Self::Record(record) => Some(*record),
+            Self::HoldsNothing | Self::NoAnswer => None,
+        }
+    }
+}
+
+/// Builds the relay layer's evidence from the composer's result (§3.10.4).
+fn relay_evidence(
+    result: Result<Option<RelayRecord>, IdentityError>,
+    did: &str,
+    public_key: &[u8; 32],
+    cached_seq: Option<u64>,
+) -> LayerEvidence {
+    let record = match result {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            debug!(did, "a relay reported that it holds no record for this DID");
+            return LayerEvidence::HoldsNothing;
+        }
+        Err(e) => {
+            debug!(did, layer = "SCP relay", error = %e, "resolution layer gave no usable evidence");
+            return LayerEvidence::NoAnswer;
+        }
+    };
+
+    // Defense in depth: the composer already verified this record, and the
+    // resolver verifies it again against the DID-derived key.
+    let validated = match verify_relay_record(
+        did,
+        public_key,
+        &record.value,
+        &record.signature,
+        record.seq,
+    ) {
+        Ok(document) => ValidatedRecord {
+            resolved: ResolvedDidDocument {
+                document,
+                seq: record.seq,
+                source: ResolutionSource::ScpRelay {
+                    relay_url: record.relay_url,
+                },
+            },
+            raw_value: record.value,
+            raw_signature: record.signature,
+        },
+        Err(e) => {
+            warn!(did, error = %e, "relay record verification failed — discarding it as if the relay had failed (§3.10.4)");
+            return LayerEvidence::NoAnswer;
+        }
+    };
+
+    guard_rollback(validated, cached_seq, did, "SCP relay")
+}
+
+/// Builds the DHT layer's evidence from the client's lookup (§3.10.4).
+fn dht_evidence(
+    result: Result<DhtLookup, IdentityError>,
+    did: &str,
+    public_key: &[u8; 32],
+    cached_seq: Option<u64>,
+) -> LayerEvidence {
+    let record = match result {
+        Ok(DhtLookup::Record(record)) => record,
+        Ok(DhtLookup::NoRecord) => {
+            debug!(
+                did,
+                "a DHT source reported that it holds no record for this DID"
+            );
+            return LayerEvidence::HoldsNothing;
+        }
+        Err(e) => {
+            debug!(did, layer = "Mainline DHT", error = %e, "resolution layer gave no usable evidence");
+            return LayerEvidence::NoAnswer;
+        }
+    };
+
+    let validated = match verify_relay_record(
+        did,
+        public_key,
+        &record.value,
+        &record.signature,
+        record.seq,
+    ) {
+        Ok(document) => ValidatedRecord {
+            resolved: ResolvedDidDocument {
+                document,
+                seq: record.seq,
+                source: ResolutionSource::MainlineDht,
+            },
+            raw_value: record.value,
+            raw_signature: record.signature,
+        },
+        Err(e) => {
+            warn!(did, error = %e, "DHT record verification failed — discarding it as if the layer had failed (§3.10.4)");
+            return LayerEvidence::NoAnswer;
+        }
+    };
+
+    guard_rollback(validated, cached_seq, did, "Mainline DHT")
+}
+
+/// Drops a validated record whose sequence number is below the last sequence the
+/// cache recorded for this DID, and reports the layer as having given no usable
+/// evidence.
+///
+/// This is the rollback guard: an attacker who replays a validly-signed but
+/// superseded document after the cache TTL expires would otherwise reinstate a
+/// rotated-out key (§3.10.7). A replayed record is a suppression attempt, not a
+/// report that the layer holds nothing, so the layer reports `Unavailable`
+/// rather than letting the replay become evidence of absence. The rejection is
+/// logged with both sequence numbers because a caller sees only the status.
+fn guard_rollback(
+    record: ValidatedRecord,
+    cached_seq: Option<u64>,
+    did: &str,
+    layer_name: &str,
+) -> LayerEvidence {
+    if let Some(min_seq) = cached_seq
+        && record.resolved.seq < min_seq
+    {
+        warn!(
+            did,
+            layer = layer_name,
+            received_seq = record.resolved.seq,
+            cached_seq = min_seq,
+            "resolution layer returned a stale sequence number, rejecting it as if the layer had failed"
+        );
+        return LayerEvidence::NoAnswer;
+    }
+    LayerEvidence::Record(Box::new(record))
 }
 
 /// Picks the winning resolution result and detects sequence divergence for
@@ -574,7 +970,25 @@ fn pick_winner_and_detect_divergence(
                     raw_signature: dht_rec.raw_signature,
                     fresher_seq: dht_rec.resolved.seq,
                 }),
-                Ordering::Equal => None,
+                Ordering::Equal => {
+                    // §3.10.4: "Both layers succeed, same sequence number. The
+                    // documents MUST be byte-identical (same key signs both,
+                    // same content). If they differ despite identical sequence
+                    // numbers, this indicates a bug in the publishing
+                    // implementation. The resolver MUST log a warning and accept
+                    // either document." Compare the signed BEP44 bytes, because
+                    // those are what the owner's key actually covers.
+                    if relay_rec.raw_value != dht_rec.raw_value {
+                        warn!(
+                            did = %relay_rec.resolved.document.id,
+                            seq = relay_rec.resolved.seq,
+                            "the relay and the Mainline DHT hold different documents at the same \
+                             sequence number, which means the publisher signed two documents at \
+                             one seq — accepting the relay's copy (§3.10.4)"
+                        );
+                    }
+                    None
+                }
             };
 
             // Highest seq wins; on tie, relay preferred.
@@ -673,104 +1087,6 @@ struct ValidatedRecord {
     raw_signature: [u8; 64],
 }
 
-/// Validates a relay resolution result: verifies BEP44 signature, deserializes
-/// document, and wraps in `ValidatedRecord`.
-///
-/// Network errors and verification failures are logged (not silently swallowed)
-/// and mapped to `None` so that the other layer can still provide a result.
-///
-/// The raw BEP44 bytes and signature are retained in the `ValidatedRecord` for
-/// protocol-level healing (§3.10.7, SCP-245).
-fn validate_relay_result(
-    result: Result<Option<RelayRecord>, IdentityError>,
-    did: &str,
-    public_key: &[u8; 32],
-) -> Option<ValidatedRecord> {
-    let record = match result {
-        Ok(Some(record)) => record,
-        Ok(None) => {
-            debug!(did, "relay returned no document");
-            return None;
-        }
-        Err(e) => {
-            debug!(did, error = %e, "relay query failed");
-            return None;
-        }
-    };
-
-    match verify_relay_record(
-        did,
-        public_key,
-        &record.value,
-        &record.signature,
-        record.seq,
-    ) {
-        Ok(document) => Some(ValidatedRecord {
-            resolved: ResolvedDidDocument {
-                document,
-                seq: record.seq,
-                source: ResolutionSource::ScpRelay {
-                    relay_url: record.relay_url,
-                },
-            },
-            raw_value: record.value,
-            raw_signature: record.signature,
-        }),
-        Err(e) => {
-            warn!(did, error = %e, "relay record verification failed");
-            None
-        }
-    }
-}
-
-/// Validates a DHT resolution result: verifies BEP44 signature, deserializes
-/// document, and wraps in `ValidatedRecord`.
-///
-/// Network errors and verification failures are logged (not silently swallowed)
-/// and mapped to `None` so that the other layer can still provide a result.
-///
-/// The raw BEP44 bytes and signature are retained in the `ValidatedRecord` for
-/// protocol-level healing (§3.10.7, SCP-245).
-fn validate_dht_result(
-    result: Result<Option<DhtRecord>, IdentityError>,
-    did: &str,
-    public_key: &[u8; 32],
-) -> Option<ValidatedRecord> {
-    let record = match result {
-        Ok(Some(record)) => record,
-        Ok(None) => {
-            debug!(did, "DHT returned no document");
-            return None;
-        }
-        Err(e) => {
-            debug!(did, error = %e, "DHT resolve failed");
-            return None;
-        }
-    };
-
-    match verify_relay_record(
-        did,
-        public_key,
-        &record.value,
-        &record.signature,
-        record.seq,
-    ) {
-        Ok(document) => Some(ValidatedRecord {
-            resolved: ResolvedDidDocument {
-                document,
-                seq: record.seq,
-                source: ResolutionSource::MainlineDht,
-            },
-            raw_value: record.value,
-            raw_signature: record.signature,
-        }),
-        Err(e) => {
-            warn!(did, error = %e, "DHT record verification failed");
-            None
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Document → verifying-key extraction (ADR-053 / spec §10.17)
 // ---------------------------------------------------------------------------
@@ -855,7 +1171,7 @@ mod tests {
     use crate::resolution::did_routing_id;
     use scp_clock::TestClock;
     use scp_dht::bep44_signable;
-    use scp_dht::{DhtError, DhtRecord, InMemoryDhtClient};
+    use scp_dht::{DhtError, InMemoryDhtClient};
     use scp_did::{DidDocument, SigningKeyId};
 
     // -----------------------------------------------------------------------
@@ -971,7 +1287,7 @@ mod tests {
         fn resolve(
             &self,
             public_key: &[u8; 32],
-        ) -> impl Future<Output = Result<Option<DhtRecord>, DhtError>> + Send {
+        ) -> impl Future<Output = Result<DhtLookup, DhtError>> + Send {
             let delay = self.delay;
             let key = *public_key;
             async move {
@@ -999,8 +1315,212 @@ mod tests {
             relay,
             dht,
             cache,
-            vec!["wss://bootstrap.example.com/scp/v1".to_owned()],
+            Arc::new(vec!["wss://bootstrap.example.com/scp/v1".to_owned()]),
         )
+    }
+
+    // -----------------------------------------------------------------------
+    // Relay query order (§3.10.4 step 3a)
+    // -----------------------------------------------------------------------
+
+    /// A relay layer that records the URL list the resolver handed it, and
+    /// answers only for the URLs the test names as holding the record.
+    struct UrlRecordingRelayQuerier {
+        /// The URL list from the most recent `query`, in the order received.
+        seen_urls: Mutex<Vec<String>>,
+        /// URL -> the record that relay serves.
+        records: Mutex<std::collections::HashMap<String, RelayRecord>>,
+    }
+
+    impl UrlRecordingRelayQuerier {
+        fn new() -> Self {
+            Self {
+                seen_urls: Mutex::new(Vec::new()),
+                records: Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+
+        async fn serve(&self, relay_url: &str, record: RelayRecord) {
+            self.records
+                .lock()
+                .await
+                .insert(relay_url.to_owned(), record);
+        }
+
+        async fn seen(&self) -> Vec<String> {
+            self.seen_urls.lock().await.clone()
+        }
+    }
+
+    impl MultiRelayQuerier for UrlRecordingRelayQuerier {
+        fn query(
+            &self,
+            _did: &str,
+            relay_urls: &[String],
+        ) -> impl Future<Output = Result<Option<RelayRecord>, IdentityError>> + Send {
+            let urls = relay_urls.to_vec();
+            async move {
+                *self.seen_urls.lock().await = urls.clone();
+                let records = self.records.lock().await;
+                // Mirror the production composer: a URL nothing serves is a
+                // relay that could not be reached.
+                let mut any_reached = false;
+                let mut best: Option<RelayRecord> = None;
+                for url in &urls {
+                    if let Some(record) = records.get(url) {
+                        any_reached = true;
+                        if best.as_ref().is_none_or(|b| record.seq > b.seq) {
+                            best = Some(record.clone());
+                        }
+                    }
+                }
+                if any_reached {
+                    Ok(best)
+                } else {
+                    Err(IdentityError::RelayQueryFailed(
+                        "no relay in the list was reachable (test)".to_owned(),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// `relay_query_order` puts the identity's own relays first and the
+    /// bootstrap relays after, and lists each URL once.
+    #[test]
+    fn relay_query_order_puts_identity_relays_first_and_keeps_bootstrap() {
+        let ordered = relay_query_order(
+            vec![
+                "wss://alice/scp/v1".to_owned(),
+                "wss://both/scp/v1".to_owned(),
+            ],
+            vec![
+                "wss://both/scp/v1".to_owned(),
+                "wss://bound/scp/v1".to_owned(),
+            ],
+        );
+
+        assert_eq!(
+            ordered,
+            vec![
+                "wss://alice/scp/v1".to_owned(),
+                "wss://both/scp/v1".to_owned(),
+                "wss://bound/scp/v1".to_owned(),
+            ],
+            "§3.10.4 step 3a orders the identity's own relays before the bootstrap relays, \
+             and a URL in both lists is queried once"
+        );
+    }
+
+    /// A DID whose cached document advertises relays this instance never
+    /// connected must not lose the relays it DID connect.
+    ///
+    /// The production querier answers only for a relay with a live transport
+    /// and never dials, so replacing the bootstrap set with the cached list
+    /// would make the relay layer unavailable forever for exactly the
+    /// identities whose relays the cache knows.
+    #[tokio::test]
+    async fn a_dids_own_advertised_relays_do_not_displace_the_bootstrap_relays() {
+        let (signing_key, did, mut doc) = make_test_identity();
+
+        // The cached document advertises a relay nothing connected.
+        doc.set_relay_services(&["wss://alice-relay.example.com/scp/v1"])
+            .unwrap();
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = Arc::new(DidCache::with_clock(Arc::clone(&clock)));
+        cache.insert(&did, doc.clone(), 1).await;
+        // Age past the inactive refresh TTL so step 1 does not short-circuit,
+        // while `cached_relay_urls` still reads the advertised relay.
+        clock.advance(8 * 24 * 60 * 60);
+
+        // The BOOTSTRAP relay — the one this instance connected — holds seq 4.
+        let (value, signature) = sign_document(&signing_key, &doc, 4);
+        let relay = Arc::new(UrlRecordingRelayQuerier::new());
+        relay
+            .serve(
+                "wss://bootstrap.example.com/scp/v1",
+                RelayRecord {
+                    value,
+                    signature,
+                    seq: 4,
+                    relay_url: "wss://bootstrap.example.com/scp/v1".to_owned(),
+                },
+            )
+            .await;
+
+        let dht = Arc::new(InMemoryDhtClient::new());
+        let resolver = make_resolver(Arc::clone(&relay), dht, cache);
+
+        let outcome = resolver
+            .resolve(&did)
+            .await
+            .expect("resolution must succeed");
+
+        assert_eq!(
+            relay.seen().await,
+            vec![
+                "wss://alice-relay.example.com/scp/v1".to_owned(),
+                "wss://bootstrap.example.com/scp/v1".to_owned(),
+            ],
+            "the DID's own relay is queried first, and the bound bootstrap relay still follows"
+        );
+        let found = outcome
+            .found()
+            .expect("the bootstrap relay served the record");
+        assert_eq!(found.seq, 4);
+        assert_eq!(
+            found.source,
+            ResolutionSource::ScpRelay {
+                relay_url: "wss://bootstrap.example.com/scp/v1".to_owned()
+            }
+        );
+    }
+
+    /// The other half of the order: a record held ONLY by the relay the DID's
+    /// own document advertises resolves, once that relay is reachable.
+    #[tokio::test]
+    async fn a_did_resolves_from_the_relay_only_its_own_document_names() {
+        let (signing_key, did, mut doc) = make_test_identity();
+
+        doc.set_relay_services(&["wss://alice-relay.example.com/scp/v1"])
+            .unwrap();
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = Arc::new(DidCache::with_clock(Arc::clone(&clock)));
+        cache.insert(&did, doc.clone(), 1).await;
+        clock.advance(8 * 24 * 60 * 60);
+
+        let (value, signature) = sign_document(&signing_key, &doc, 6);
+        let relay = Arc::new(UrlRecordingRelayQuerier::new());
+        relay
+            .serve(
+                "wss://alice-relay.example.com/scp/v1",
+                RelayRecord {
+                    value,
+                    signature,
+                    seq: 6,
+                    relay_url: "wss://alice-relay.example.com/scp/v1".to_owned(),
+                },
+            )
+            .await;
+
+        let resolver = make_resolver(relay, Arc::new(InMemoryDhtClient::new()), cache);
+
+        let outcome = resolver
+            .resolve(&did)
+            .await
+            .expect("resolution must succeed");
+        let found = outcome
+            .found()
+            .expect("the DID's own relay served the record");
+
+        assert_eq!(found.seq, 6);
+        assert_eq!(
+            found.source,
+            ResolutionSource::ScpRelay {
+                relay_url: "wss://alice-relay.example.com/scp/v1".to_owned()
+            },
+            "a relay URL that appears only inside the DID's own document is queried"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1044,7 +1564,7 @@ mod tests {
             .expect("should not timeout — both layers respond quickly")
             .unwrap();
 
-        let resolved = result.expect("should resolve successfully");
+        let resolved = result.into_found().expect("should resolve successfully");
         assert_eq!(resolved.seq, 1);
         // On tie (both seq=1), relay is preferred.
         assert_eq!(
@@ -1082,7 +1602,7 @@ mod tests {
             .expect("should not timeout — both layers respond quickly")
             .unwrap();
 
-        let resolved = result.expect("should resolve successfully");
+        let resolved = result.into_found().expect("should resolve successfully");
         assert_eq!(resolved.seq, 1);
         assert_eq!(resolved.source, ResolutionSource::MainlineDht);
         assert_eq!(resolved.document, doc);
@@ -1132,7 +1652,7 @@ mod tests {
             .expect("should not timeout")
             .unwrap();
 
-        let resolved = result.expect("should resolve successfully");
+        let resolved = result.into_found().expect("should resolve successfully");
         // Both layers are awaited via join!. Relay has seq=5, DHT has seq=1.
         // Highest seq wins, so relay's seq=5 must be the result.
         assert_eq!(resolved.seq, 5);
@@ -1182,7 +1702,7 @@ mod tests {
             .expect("should not timeout")
             .unwrap();
 
-        let resolved = result.expect("should resolve successfully");
+        let resolved = result.into_found().expect("should resolve successfully");
         // With join!, both layers are awaited. DHT has higher seq (5), so it wins.
         assert_eq!(resolved.seq, 5);
         assert_eq!(resolved.source, ResolutionSource::MainlineDht);
@@ -1213,7 +1733,7 @@ mod tests {
             .expect("should not timeout")
             .unwrap();
 
-        let resolved = result.expect("should resolve successfully");
+        let resolved = result.into_found().expect("should resolve successfully");
         assert_eq!(resolved.seq, 1);
         assert_eq!(resolved.source, ResolutionSource::MainlineDht);
     }
@@ -1249,7 +1769,7 @@ mod tests {
             .expect("should not timeout")
             .unwrap();
 
-        let resolved = result.expect("should resolve successfully");
+        let resolved = result.into_found().expect("should resolve successfully");
         assert_eq!(resolved.seq, 1);
         assert_eq!(
             resolved.source,
@@ -1260,8 +1780,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn both_fail_returns_none() {
-        // Both layers fail. Should return Ok(None).
+    async fn both_layers_failing_is_an_error_not_an_absence() {
+        // §3.10.4 "Both layers fail": with no usable cache entry the resolver
+        // reports DID_RESOLUTION_FAILED. Returning an absence here would tell
+        // the caller nobody published the DID, which the resolver did not learn.
         let (_signing_key, did, _doc) = make_test_identity();
 
         let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
@@ -1276,10 +1798,43 @@ mod tests {
 
         let result = tokio::time::timeout(Duration::from_secs(2), resolver.resolve(&did))
             .await
-            .expect("should not timeout")
-            .unwrap();
+            .expect("should not timeout");
 
-        assert!(result.is_none(), "both layers failed, should return None");
+        match result {
+            Err(IdentityError::ResolutionFailed { did: failed, .. }) => assert_eq!(failed, did),
+            other => panic!("both layers failed, expected ResolutionFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_failure_is_distinguishable_from_a_did_nobody_published() {
+        // §3.10.4 "One layer fails, the other reports the DID absent": the
+        // absent result names the relay layer as unavailable, so a caller does
+        // not read an unreachable relay as proof the DID does not exist.
+        let (_signing_key, did, _doc) = make_test_identity();
+
+        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        relay.set_should_fail(true).await;
+        let dht = Arc::new(DelayedDhtClient::new(Duration::from_millis(10)));
+
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = Arc::new(DidCache::with_clock(Arc::clone(&clock)));
+        let resolver = make_resolver(relay, dht, cache);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), resolver.resolve(&did))
+            .await
+            .expect("should not timeout")
+            .expect("the DHT answered, so resolution must not fail");
+
+        match result {
+            ResolutionOutcome::Absent { layers } => {
+                assert_eq!(layers.relay, LayerStatus::Unavailable);
+                assert_eq!(layers.dht, LayerStatus::Answered);
+                assert!(layers.any_unavailable());
+                assert_eq!(layers.unavailable_layers(), "SCP relay layer");
+            }
+            ResolutionOutcome::Found(doc) => panic!("nothing was published, yet got {doc:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1299,7 +1854,17 @@ mod tests {
             .expect("should not timeout")
             .unwrap();
 
-        assert!(result.is_none(), "no documents stored, should return None");
+        // Both layers ANSWERED and neither holds the document, so this is a
+        // genuine absence — not a layer failure (§3.10.4).
+        match result {
+            ResolutionOutcome::Absent { layers } => {
+                assert_eq!(layers.relay, LayerStatus::Answered);
+                assert_eq!(layers.dht, LayerStatus::Answered);
+            }
+            ResolutionOutcome::Found(doc) => {
+                panic!("no documents stored, yet resolution returned {doc:?}")
+            }
+        }
     }
 
     #[tokio::test]
@@ -1323,7 +1888,7 @@ mod tests {
             .expect("should return from cache immediately")
             .unwrap();
 
-        let resolved = result.expect("should resolve from cache");
+        let resolved = result.into_found().expect("should resolve from cache");
         assert_eq!(resolved.seq, 3);
         assert_eq!(resolved.source, ResolutionSource::Cache);
         assert_eq!(resolved.document, doc);
@@ -1349,7 +1914,7 @@ mod tests {
 
         // First resolve — from DHT.
         let result = resolver.resolve(&did).await.unwrap();
-        assert!(result.is_some());
+        assert!(result.found().is_some());
 
         // Verify it's now cached.
         let cached = cache.get(&did).await;
@@ -1462,7 +2027,9 @@ mod tests {
 
         // Relay's corrupt signature should be logged and ignored.
         // DHT's valid result should be returned.
-        let resolved = result.expect("should resolve from DHT despite relay verification error");
+        let resolved = result
+            .into_found()
+            .expect("should resolve from DHT despite relay verification error");
         assert_eq!(resolved.seq, 1);
         assert_eq!(resolved.source, ResolutionSource::MainlineDht);
         assert_eq!(resolved.document, doc);
@@ -1508,15 +2075,78 @@ mod tests {
 
         let resolver = make_resolver(relay, dht, cache);
 
-        let result = tokio::time::timeout(Duration::from_secs(2), resolver.resolve(&did))
+        let error = tokio::time::timeout(Duration::from_secs(2), resolver.resolve(&did))
             .await
             .expect("should not timeout")
+            .expect_err(
+                "both layers served a replayed seq=1 record and the resolver discarded both, so \
+                 neither layer reported on the DID",
+            );
+
+        // A replay is a suppression attempt, not a report that the layer holds
+        // nothing. Reporting `Absent { relay: Answered, dht: Answered }` here
+        // would tell the caller nobody published a DID whose owner is publishing
+        // it at seq=5. The 8-day-old cache entry is past the §3.10.4 7-day
+        // bound, so the resolver has nothing left to serve and fails.
+        assert!(
+            matches!(error, IdentityError::ResolutionFailed { .. }),
+            "expected ResolutionFailed, got {error:?}"
+        );
+    }
+
+    /// Both layers rejected for staleness, with a cache entry inside the
+    /// §3.10.4 7-day bound: the resolver serves the cached document rather than
+    /// failing the caller's UCAN or attestation check.
+    #[tokio::test]
+    async fn both_layers_unavailable_serves_a_cached_document_under_seven_days() {
+        let (signing_key, did, doc) = make_test_identity();
+        let (value, signature) = sign_document(&signing_key, &doc, 1);
+        let public_key = signing_key.verifying_key();
+
+        let doc_v5 = DidDocument::new(&did, public_key.as_bytes(), &[20u8; 32], &[30u8; 32]);
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = Arc::new(DidCache::with_clock(Arc::clone(&clock)));
+        cache.insert(&did, doc_v5, 5).await;
+        // Mark the DID an active contact, whose refresh TTL is 24 hours, then
+        // advance past that TTL but stay inside the 7-day bound.
+        cache.mark_active(&did).await;
+        clock.advance(30 * 60 * 60);
+
+        // Both layers replay seq=1, which the rollback guard discards.
+        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        relay
+            .insert(
+                &did,
+                RelayRecord {
+                    value: value.clone(),
+                    signature,
+                    seq: 1,
+                    relay_url: "wss://relay1.example.com/scp/v1".to_owned(),
+                },
+            )
+            .await;
+        let dht = Arc::new(DelayedDhtClient::new(Duration::from_millis(10)));
+        dht.inner
+            .publish(public_key.as_bytes(), &signature, &value, 1)
+            .await
             .unwrap();
 
-        // Both seq=1 results must be rejected (< cached seq=5).
+        let resolver = make_resolver(relay, dht, Arc::clone(&cache));
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), resolver.resolve(&did))
+            .await
+            .expect("should not timeout")
+            .expect("a cached document under 7 days old is served when no layer answers");
+
+        let found = outcome.found().expect("the cached document is served");
+        assert_eq!(
+            found.seq, 5,
+            "the cached seq=5 document, not the seq=1 replay"
+        );
         assert!(
-            result.is_none(),
-            "stale seq=1 should be rejected when cached seq=5 exists"
+            matches!(found.source, ResolutionSource::Cache),
+            "§3.10.4 labels this answer resolution_source: cache, got {:?}",
+            found.source
         );
     }
 
@@ -1552,7 +2182,9 @@ mod tests {
             .expect("should not timeout")
             .unwrap();
 
-        let resolved = result.expect("seq=7 > cached seq=5, should be accepted");
+        let resolved = result
+            .into_found()
+            .expect("seq=7 > cached seq=5, should be accepted");
         assert_eq!(resolved.seq, 7);
     }
 
@@ -1644,7 +2276,7 @@ mod tests {
             relay,
             dht,
             cache,
-            vec!["wss://bootstrap.example.com/scp/v1".to_owned()],
+            Arc::new(vec!["wss://bootstrap.example.com/scp/v1".to_owned()]),
             healer,
         )
     }
@@ -1695,7 +2327,7 @@ mod tests {
             .unwrap();
 
         // DHT's seq=5 should win.
-        let resolved = result.expect("should resolve successfully");
+        let resolved = result.into_found().expect("should resolve successfully");
         assert_eq!(resolved.seq, 5);
         assert_eq!(resolved.source, ResolutionSource::MainlineDht);
 
@@ -1760,7 +2392,7 @@ mod tests {
             .unwrap();
 
         // Relay's seq=5 should win.
-        let resolved = result.expect("should resolve successfully");
+        let resolved = result.into_found().expect("should resolve successfully");
         assert_eq!(resolved.seq, 5);
         assert_eq!(
             resolved.source,
@@ -1821,7 +2453,7 @@ mod tests {
             .expect("should not timeout")
             .unwrap();
 
-        let resolved = result.expect("should resolve");
+        let resolved = result.into_found().expect("should resolve");
         assert_eq!(resolved.seq, 3);
 
         // Give time for any healing task to complete (there should be none).
@@ -1867,7 +2499,7 @@ mod tests {
             .expect("should not timeout")
             .unwrap();
 
-        let resolved = result.expect("should resolve from relay");
+        let resolved = result.into_found().expect("should resolve from relay");
         assert_eq!(resolved.seq, 3);
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1928,7 +2560,9 @@ mod tests {
             .unwrap();
 
         // The resolve result must NOT be affected by healing failure.
-        let resolved = result.expect("should resolve despite healing failure");
+        let resolved = result
+            .into_found()
+            .expect("should resolve despite healing failure");
         assert_eq!(resolved.seq, 5);
         assert_eq!(resolved.source, ResolutionSource::MainlineDht);
 
@@ -1983,7 +2617,7 @@ mod tests {
             .unwrap();
 
         // Should still resolve correctly.
-        let resolved = result.expect("should resolve");
+        let resolved = result.into_found().expect("should resolve");
         assert_eq!(resolved.seq, 5);
 
         // No healing publisher configured — nothing should happen (no panic).

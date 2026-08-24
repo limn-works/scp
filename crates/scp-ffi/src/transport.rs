@@ -180,9 +180,21 @@ impl crate::scp::PyScp {
                 // `connect_sourced` with a profile auto-starts it via
                 // `finalize_connection` (#1532 AC6).
 
+                // Share ONE connected adapter between the two consumers of this
+                // relay: the `TransportManager` that sends and subscribes over
+                // it, and the DID relay querier that runs QUERY over it
+                // (§3.10.2). Without the share, DID resolution would need a
+                // second connection to the same relay.
+                let shared: Arc<dyn scp_transport::TransportAdapter> = Arc::from(adapter);
+
                 // Wrap the adapter in a TransportManager for multi-relay support.
-                let manager = scp_transport::TransportManager::new(adapter);
+                let manager = scp_transport::TransportManager::new(Box::new(Arc::clone(&shared)));
                 crate::runtime::set_transport_manager(bi, manager)?;
+
+                // Bind the same connection into the relay layer of DID
+                // resolution, so a DID published to this relay resolves
+                // (§3.10.4 step 3a).
+                bi.core.bind_relay_transport(url.clone(), shared);
 
                 // Register the URL on the bridge's pending-reconnect set so
                 // `BridgeInstanceCore::resume` can rebuild the transport after
@@ -244,6 +256,9 @@ impl crate::scp::PyScp {
         // not reopen it after an explicit disconnect (#1678).
         if let Some(ref url) = disconnecting_url {
             bi.core.remove_relay_url(url);
+            // Stop the DID resolver from querying a relay this caller walked
+            // away from (§3.10.4 step 3a).
+            bi.core.unbind_relay_transport(url);
         }
 
         // Clear the currently-connected URL on the per-bridge instance.
@@ -454,10 +469,17 @@ impl crate::scp::PyScp {
             .map_err(ScpPyError::from)?;
         let scoring_url = relay_url.to_owned();
 
+        // Share ONE connected adapter between the `TransportManager` that sends
+        // over it and the DID relay querier that runs QUERY over it, exactly as
+        // `transport_connect` does. Without the bind, DID resolution never
+        // queries this relay, and the cross-relay fan-out §3.10.8 relies on for
+        // suppression resistance collapses back to the connect-time relay.
+        let shared: Arc<dyn scp_transport::TransportAdapter> = Arc::from(adapter);
         let count = crate::runtime::with_transport_manager_mut(bi, |manager| {
-            let _eviction = manager.add_adapter(adapter);
+            let _eviction = manager.add_adapter(Box::new(Arc::clone(&shared)));
             Ok(manager.adapter_count())
         })?;
+        bi.core.bind_relay_transport(relay_url.to_owned(), shared);
 
         // Spawn suppression → scoring bridge task.
         //

@@ -130,8 +130,19 @@ fn auto_wire_context_manager(
                 ))
             }) {
                 Ok(relay_adapter) => {
-                    let manager = scp_transport::TransportManager::new(relay_adapter);
+                    // Share ONE connected adapter between the
+                    // `TransportManager` and the DID relay querier, exactly as
+                    // `transport_connect` does. A bridge whose relay arrives
+                    // through auto-wire otherwise composes its resolver over a
+                    // querier with zero bindings, so every resolve reports the
+                    // relay layer unavailable (§3.10.4 step 3a).
+                    let shared: std::sync::Arc<dyn scp_transport::TransportAdapter> =
+                        std::sync::Arc::from(relay_adapter);
+                    let manager = scp_transport::TransportManager::new(Box::new(
+                        std::sync::Arc::clone(&shared),
+                    ));
                     let _ = crate::runtime::set_transport_manager(bi, manager);
+                    bi.core.bind_relay_transport(relay_url.to_owned(), shared);
                 }
                 Err(e) => {
                     tracing::warn!(
