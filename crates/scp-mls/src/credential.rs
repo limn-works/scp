@@ -426,7 +426,7 @@ mod tests {
         );
     }
 
-    /// A KeyPackage attestation is a bearer capability a holder presents now,
+    /// A `KeyPackage` attestation is a bearer capability a holder presents now,
     /// so §9.7.1 check 1 of the security-model spec binds it to the current
     /// `#active`/`#agent` only. A rotation therefore makes this resolver answer
     /// the new key, and an attestation the retired key signed fails against it.

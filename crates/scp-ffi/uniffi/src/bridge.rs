@@ -306,7 +306,7 @@ fn no_pre_rotation_backend() -> ScpError {
 /// vote-signature verification) sees the rotated `#active` key and rejects
 /// signatures from the retired one. Publishing into a throwaway client would
 /// leave the resolver permanently serving the stale, pre-rotation document, so
-/// the retired key would keep passing every current-key check: a KeyPackage
+/// the retired key would keep passing every current-key check: a `KeyPackage`
 /// attestation (§9.7.1 check 1 of the security-model spec) and a live DID
 /// authentication (§3.11.4 steps 7 and 8 of the identity spec).
 ///
@@ -354,7 +354,7 @@ fn rotation_publish_client(
 /// so the re-published (higher-`seq`) document lands in the SAME per-instance
 /// client the resolver reads from — NOT a fresh per-call client, which would let
 /// the re-published document land somewhere the resolver never sees, so the
-/// retired key would keep passing every current-key check: a KeyPackage
+/// retired key would keep passing every current-key check: a `KeyPackage`
 /// attestation (§9.7.1 check 1 of the security-model spec) and a live DID
 /// authentication (§3.11.4 steps 7 and 8 of the identity spec).
 // Only reached from the testing-gated identity rotate/agent-key/migrate paths
@@ -9521,7 +9521,7 @@ fn ensure_did_resolver_initialized_on(
 /// DHT. Without this invalidation a freshly rotated identity keeps resolving to
 /// its pre-rotation document — and pre-rotation `#active` key — until the TTL
 /// expires, so the retired key keeps passing every current-key check: a
-/// KeyPackage attestation (§9.7.1 check 1 of the security-model spec) and a live
+/// `KeyPackage` attestation (§9.7.1 check 1 of the security-model spec) and a live
 /// DID authentication (§3.11.4 steps 7 and 8 of the identity spec). The rotation
 /// re-publish (higher BEP44 `seq`) has already landed in the shared DHT client
 /// (`rotation_publish_client`); this drops the resolver's stale copy so the
@@ -19644,7 +19644,7 @@ mod tests {
     ///
     /// NOTE ON SCOPE: the `Sealed` happy-path (the full creator-seal ->
     /// joiner-open round-trip) is NOT asserted at THIS bridge layer. The §5.13.3
-    /// `0xFF02` KeyPackage-capabilities path IS green (9fe3b4c9b) — the runtime
+    /// `0xFF02` `KeyPackage`-capabilities path IS green (9fe3b4c9b) — the runtime
     /// already proves the round-trip in `spawn_from_welcome_tests`, and the `PyO3`
     /// / real-napi peers assert it end-to-end. `UniFFI` cannot: the invitee's
     /// `#active` verifying key is resolved through the DID resolver, and the
@@ -24042,7 +24042,7 @@ mod tests {
     /// subsequent resolve re-queries the DHT and serves the new key. Without the
     /// invalidation the resolver would keep serving the pre-rotation document
     /// (and its retired `#active` key) for the multi-day cache TTL, so the
-    /// retired key would keep passing every current-key check: a KeyPackage
+    /// retired key would keep passing every current-key check: a `KeyPackage`
     /// attestation (§9.7.1 check 1 of the security-model spec) and a live DID
     /// authentication (§3.11.4 steps 7 and 8 of the identity spec).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

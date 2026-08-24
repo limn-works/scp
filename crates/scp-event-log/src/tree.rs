@@ -462,6 +462,15 @@ pub fn leaf_hash(event: &Event) -> Result<[u8; 32], EventLogError> {
 /// it occupies. §23.13 paragraph 1 therefore has this function accept a
 /// `#retired-{n}` or `#retired-agent-{n}` method the resolved document still
 /// carries, so that a later rotation does not retroactively unmake authorship.
+///
+/// That acceptance carries no sequence condition, and this function can impose
+/// none. It accepts a retired method for a leaf at every `event.sequence`,
+/// including one an event log records long after the rotation, because it holds
+/// no pair of values to compare: a DID document's publish sequence counts that
+/// document's revisions and `event.sequence` counts one context's events.
+/// Removal is what stops a retained key from signing new content, and the
+/// rotation that retired it is not.
+///
 /// A retired method is referenced by neither `authentication` nor
 /// `assertionMethod` — [`DidDocument::retire_active_key`] rebuilds both arrays
 /// as `#active` plus `#agent` — so this function reaches those keys through

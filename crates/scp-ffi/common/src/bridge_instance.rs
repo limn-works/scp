@@ -2414,7 +2414,7 @@ impl CoreFields {
     /// DHT. Without this invalidation a freshly rotated identity keeps resolving
     /// to its pre-rotation document — and pre-rotation `#active` key — until the
     /// TTL expires, so the retired key keeps passing every current-key check: a
-    /// KeyPackage attestation (§9.7.1 check 1 of the security-model spec) and a
+    /// `KeyPackage` attestation (§9.7.1 check 1 of the security-model spec) and a
     /// live DID authentication (§3.11.4 steps 7 and 8 of the identity spec). The
     /// rotation re-publish (higher BEP44 `seq`) has already landed in the shared DHT
     /// client; this drops the resolver's stale copy so the next resolve reads the

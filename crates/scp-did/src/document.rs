@@ -685,7 +685,9 @@ impl DidDocument {
     }
 
     /// Returns every retired key this document still carries that a verifier
-    /// accepts for a content signature, sorted by fragment.
+    /// accepts for a content signature, ordered by holder and then by rotation
+    /// sequence, most recent first: retired `#active` keys before retired
+    /// `#agent` keys.
     ///
     /// A content signature is a statement about the past. §23.13 paragraph 1 of
     /// the sync spec accepts a retired method on an event-log leaf for that
@@ -798,18 +800,20 @@ impl DidDocument {
     }
 
     /// Classifies a bare fragment as a retired `#active` key, a retired
-    /// `#agent` key, or neither.
+    /// `#agent` key, or neither, dropping the sequence
+    /// [`retired_fragment_sequence`] reports.
     ///
-    /// Tests the `retired-agent-` prefix first, because `retired-` is a prefix
-    /// of it and would otherwise claim every retired agent fragment.
+    /// [`retired_fragment_sequence`]: Self::retired_fragment_sequence
     fn retired_fragment_holder(fragment: &str) -> Option<SigningKeyId> {
         Self::retired_fragment_sequence(fragment).map(|(holder, _)| holder)
     }
 
-    /// Classifies a bare fragment as [`retired_fragment_holder`] does and also
-    /// reports the rotation sequence its identifier carries.
+    /// Classifies a bare fragment as a retired `#active` key, a retired
+    /// `#agent` key, or neither, and reports the rotation sequence its
+    /// identifier carries.
     ///
-    /// [`retired_fragment_holder`]: Self::retired_fragment_holder
+    /// Tests the `retired-agent-` prefix first, because `retired-` is a prefix
+    /// of it and would otherwise claim every retired agent fragment.
     fn retired_fragment_sequence(fragment: &str) -> Option<(SigningKeyId, u64)> {
         let (rest, holder) =
             if let Some(rest) = fragment.strip_prefix(RETIRED_AGENT_FRAGMENT_PREFIX) {
@@ -935,6 +939,21 @@ impl DidDocument {
                          leaves a document describing no identity; §9.12 of the \
                          security-model spec recovers an Identity Key compromise with \
                          migrate_identity"
+                    .to_owned(),
+            });
+        }
+
+        // An empty fragment reaches the same misreading the leading-`#` strip
+        // above exists to prevent: `""` and `"#"` build `{id}#`, match nothing,
+        // and answer `Ok(false)`, which a caller performing §9.12 compromise
+        // recovery reads as "already gone".
+        if fragment.is_empty() {
+            return Err(DidError::UnusableVerificationMethod {
+                fragment: fragment.to_owned(),
+                did: self.id.clone(),
+                reason: "a fragment names one method within this document and cannot be \
+                         empty; pass `active`, `agent`, or a retired fragment \
+                         `historical_assertion_keys` reports"
                     .to_owned(),
             });
         }
@@ -1624,12 +1643,22 @@ impl DidDocument {
     ///
     /// # Errors
     ///
-    /// Returns [`DidError::AgentKeyNotFound`] if no `#agent` VM exists.
+    /// Returns [`DidError::MultipleAgentKeys`] when this document already
+    /// carries `{self.id}#agent` more than once, and
+    /// [`DidError::AgentKeyNotFound`] when it carries none.
     pub fn rotate_agent_key(
         &mut self,
         new_public_key: &[u8],
         sequence: u64,
     ) -> Result<(), DidError> {
+        // Every reader rejects a repeated identifier, so a rotation must not
+        // write one. The rename below moves every `{self.id}#agent` entry to
+        // one `#retired-agent-{sequence}` identifier, so a document carrying
+        // two of them would end with two entries under that identifier, and
+        // `historical_assertion_keys` would then return neither — a silent
+        // revocation §9.12 of the security-model spec assigns to
+        // `remove_verification_method` alone.
+        self.validate_agent_keys()?;
         if !self.has_agent_key() {
             return Err(DidError::AgentKeyNotFound);
         }
@@ -2073,14 +2102,20 @@ mod tests {
     }
 
     /// A rotation writes the sequence into the identifier, so ordering by that
-    /// sequence and ordering by the identifier string disagree once a document
-    /// passes ten rotations. The reported order is the rotation order.
+    /// sequence and ordering by the identifier string disagree. The reported
+    /// order is the rotation order, most recent first.
+    ///
+    /// Sequences 1, 2, and 10 discriminate the two orderings. A two-element
+    /// fixture of 2 and 10 does not: ascending fragment order and descending
+    /// sequence order both report `retired-10` before `retired-2`, so such a
+    /// fixture passes with the sequence sort deleted.
     #[test]
     fn historical_assertion_keys_orders_by_sequence_not_by_fragment_string() {
         let did = "did:dht:zSequenceOrder";
         let mut doc = document_with_active(did);
-        doc.retire_active_key(&curve_point(30), 2);
-        doc.retire_active_key(&curve_point(31), 10);
+        doc.retire_active_key(&curve_point(30), 1);
+        doc.retire_active_key(&curve_point(31), 2);
+        doc.retire_active_key(&curve_point(32), 10);
 
         let historical = doc.historical_assertion_keys();
         assert_eq!(
@@ -2088,8 +2123,36 @@ mod tests {
                 .iter()
                 .map(|key| key.fragment.as_str())
                 .collect::<Vec<_>>(),
-            vec!["retired-10", "retired-2"],
-            "sorting the fragment as a string would put retired-10 before retired-2"
+            vec!["retired-10", "retired-2", "retired-1"],
+            "the rotation sequence orders this result; ascending fragment order \
+             would report retired-1 before retired-2"
+        );
+    }
+
+    /// The reported order groups by holder before it orders by sequence:
+    /// retired `#active` keys first, retired `#agent` keys after, each group
+    /// most recent first. Deleting the holder half of the sort key interleaves
+    /// the two groups by sequence and fails this test.
+    #[test]
+    fn historical_assertion_keys_reports_retired_active_keys_before_retired_agent_keys() {
+        let did = "did:dht:zHolderOrder";
+        let mut doc = document_with_agent(did);
+        doc.retire_active_key(&curve_point(50), 3);
+        doc.rotate_agent_key(&curve_point(51), 4)
+            .expect("rotating an existing #agent key succeeds");
+
+        let historical = doc.historical_assertion_keys();
+        assert_eq!(
+            historical
+                .iter()
+                .map(|key| (key.fragment.as_str(), key.holder))
+                .collect::<Vec<_>>(),
+            vec![
+                ("retired-3", SigningKeyId::Active),
+                ("retired-agent-4", SigningKeyId::Agent),
+            ],
+            "a retired #active key at a lower sequence still precedes a retired \
+             #agent key at a higher one"
         );
     }
 
@@ -2134,6 +2197,57 @@ mod tests {
             doc.signing_key_for(SigningKeyId::Active, VerificationRelationship::Assertion)
                 .is_ok(),
             "the refusal removes nothing"
+        );
+    }
+
+    /// An empty fragment names no method, and `Ok(false)` would report it as
+    /// already removed — the misreading the leading-`#` strip exists to
+    /// prevent. `"#"` strips to the same empty string.
+    #[test]
+    fn remove_verification_method_refuses_an_empty_fragment() {
+        let did = "did:dht:zRemoveEmpty";
+
+        for spelling in ["", "#"] {
+            let mut doc = document_with_active(did);
+            let error = doc
+                .remove_verification_method(spelling)
+                .expect_err("an empty fragment names no method in this document");
+            assert!(
+                matches!(error, DidError::UnusableVerificationMethod { .. }),
+                "{spelling:?} must be unusable rather than absent"
+            );
+            assert!(
+                doc.signing_key_for(SigningKeyId::Active, VerificationRelationship::Assertion)
+                    .is_ok(),
+                "the refusal removes nothing"
+            );
+        }
+    }
+
+    /// A rotation renames every `{did}#agent` entry to one
+    /// `#retired-agent-{sequence}` identifier, so a document already carrying
+    /// two of them would put two entries under that identifier and
+    /// `historical_assertion_keys` would return neither. That is a revocation
+    /// §9.12 of the security-model spec assigns to removal, so the rotation
+    /// refuses the document instead of mutating it.
+    #[test]
+    fn rotate_agent_key_refuses_a_document_carrying_two_agent_methods() {
+        let did = "did:dht:zTwoAgentMethods";
+        let mut doc = document_with_agent(did);
+        doc.verification_method.push(VerificationMethod {
+            id: format!("{did}#agent"),
+            method_type: ED25519_VERIFICATION_KEY_TYPE.to_owned(),
+            controller: did.to_owned(),
+            public_key_multibase: multibase_encode(&curve_point(60)),
+        });
+
+        let error = doc
+            .rotate_agent_key(&curve_point(61), 1)
+            .expect_err("a document carrying two #agent methods is malformed");
+        assert!(matches!(error, DidError::MultipleAgentKeys { count: 2 }));
+        assert!(
+            doc.historical_assertion_keys().is_empty(),
+            "the refusal writes no retired identifier"
         );
     }
 

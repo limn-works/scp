@@ -20,8 +20,11 @@ event signature against whatever it returned. Two consequences followed:
    every key event an owner ever performs — including a removal, which is the one act
    §9.12 defines as revocation.
 
-`BridgeDidResolver` in `crates/scp-ffi/common/src/resolvers.rs` collapsed `#active`
-onto that same function, so this is a class rather than one site.
+`BridgeDidResolver` in `crates/scp-ffi/common/src/resolvers.rs` collapses `#active` onto
+that same function, so this is a class rather than one site. That resolver still does it:
+`resolve_public_key` returns `extract_public_key_from_did(did)`, and
+`DispatchDidResolver::new` selects it whenever a bridge instance has not run
+`identity_create`. See Affected Files below for why this branch left it.
 
 ## Why It Matters
 
@@ -128,8 +131,19 @@ rejects authorship a rotation was never meant to unmake.
   `#agent` siblings, fixed by matching a whole identifier;
   `historical_assertion_keys` and `remove_verification_method`, which supply the soft
   and hard halves of the rule.
-- `crates/scp-ffi/common/src/resolvers.rs` — `BridgeDidResolver::extract_public_key`,
-  fixed by taking a `SigningKeyId` and calling `signing_key_for`.
+- `crates/scp-ffi/common/src/resolvers.rs` — `IdentityBackedDidResolver::extract_public_key`,
+  fixed by taking a `SigningKeyId` and calling `signing_key_for`. The sibling
+  `BridgeDidResolver::resolve_public_key` in the same file is unfixed: it returns the
+  DID-string `#0` key, and its `resolve_public_key_by_kid` inherits a trait default that
+  routes `SigningKeyId::Active` to that same key. Every bridge reaches it: all three
+  `DispatchDidResolver::new` call sites — `crates/scp-ffi/src/ucan.rs`,
+  `crates/scp-ffi/napi/src/ucan.rs`, `crates/scp-ffi/uniffi/src/bridge.rs` — select
+  `BridgeDidResolver` whenever a bridge instance has not run `identity_create`. The
+  branch `origin/fix/ffi-resolvers-blockers-r1-r5` deletes both `BridgeDidResolver` and
+  `DispatchDidResolver`; no open pull request carries that branch yet, and nobody has
+  decided whether the deletion or a fail-closed `BridgeDidResolver` is the fix. This
+  branch left it because Alec scoped this change to the event-log verifier, the bridge
+  login of `verify_bridge_jwt`, and the `IdentityBackedDidResolver` UCAN path.
 - `crates/scp-node/src/bridge_auth.rs` — `verify_bridge_jwt`, fixed by decoding the
   `kid` header through `SigningKeyId::from_fragment` and calling `signing_key_for`
   against `authentication`, with no fragment-string fallback.

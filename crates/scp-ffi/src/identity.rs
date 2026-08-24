@@ -279,7 +279,7 @@ async fn publish_to_resolver_dht_for(
 /// verification) sees the rotated `#active` key and rejects signatures from the
 /// retired one. Publishing into a throwaway client would leave the resolver
 /// permanently serving the stale, pre-rotation document, so the retired key
-/// would keep passing every current-key check: a KeyPackage attestation
+/// would keep passing every current-key check: a `KeyPackage` attestation
 /// (§9.7.1 check 1 of the security-model spec) and a live DID authentication
 /// (§3.11.4 steps 7 and 8 of the identity spec).
 ///

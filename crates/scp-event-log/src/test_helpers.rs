@@ -21,12 +21,17 @@ pub fn test_keypair() -> (ed25519_dalek::VerifyingKey, ed25519_dalek::SigningKey
     (verifying_key, signing_key)
 }
 
-/// Encodes a signing key's owner as a canonical `did:dht:z<z-base-32>` test
-/// DID whose payload is `SHA-256(verifying_key)`, never that key itself.
+/// Encodes a signing key's owner as a canonical `did:dht:z<z-base-32>` test DID.
+///
+/// The DID's payload is the Ed25519 public key of
+/// `SigningKey::from_bytes(SHA-256(verifying_key))`, never `verifying_key`
+/// itself. That payload has to be a curve point, because
+/// `DidDocument::identity_key` decodes `#0` and rejects a value that is not
+/// one; a raw SHA-256 digest is not a curve point in general.
 ///
 /// Two properties follow, and both matter:
 ///
-/// - A verifier recovering a key from a DID string gets `SHA-256(verifying_key)`,
+/// - A verifier recovering a key from a DID string gets that derived key,
 ///   which signs nothing any test holds. A regression toward `#0` — a key every
 ///   DID string encodes — therefore fails every test built on these helpers,
 ///   rather than passing because a signer's key happens to sit in both places.
@@ -62,7 +67,7 @@ pub fn identity_key_for(
 const UNUSED_PRE_ROTATION_COMMITMENT: [u8; 32] = [0x5A; 32];
 
 /// Recovers a DID string's own payload, which [`did_from_pubkey`] derived as
-/// `SHA-256(signing key)`.
+/// the public key of `SigningKey::from_bytes(SHA-256(verifying_key))`.
 ///
 /// A test document publishes that payload as its `#0` Identity Key, so a
 /// document stays self-consistent with a DID string that names it while `#0`

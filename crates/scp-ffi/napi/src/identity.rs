@@ -235,7 +235,7 @@ pub(crate) fn ensure_did_resolver_initialized_on(
 /// DHT. Without this invalidation a freshly rotated identity keeps resolving to
 /// its pre-rotation document — and pre-rotation `#active` key — until the TTL
 /// expires, so the retired key keeps passing every current-key check: a
-/// KeyPackage attestation (§9.7.1 check 1 of the security-model spec) and a live
+/// `KeyPackage` attestation (§9.7.1 check 1 of the security-model spec) and a live
 /// DID authentication (§3.11.4 steps 7 and 8 of the identity spec). The rotation
 /// re-publish (higher BEP44 `seq`) has already landed in the shared DHT client;
 /// this drops the resolver's stale copy so the next resolve reads the fresh document.
@@ -359,7 +359,7 @@ impl fmt::Debug for OpaqueInMemoryKeyCustody {
 /// key is rejected on the next resolve. Fails closed if the shared client is
 /// somehow absent (a fresh client would let the re-published document land
 /// somewhere the resolver never reads, so the retired key would keep passing
-/// every current-key check — a KeyPackage attestation (§9.7.1 check 1 of the
+/// every current-key check — a `KeyPackage` attestation (§9.7.1 check 1 of the
 /// security-model spec) and a live DID authentication (§3.11.4 steps 7 and 8 of
 /// the identity spec); and, in a shipped build, the in-memory arm does not even
 /// exist).
@@ -1521,7 +1521,7 @@ mod tests {
     /// new key. Without the invalidation the resolver would keep serving the
     /// pre-rotation document (and its retired `#active` key) for the multi-day
     /// cache TTL, so the retired key would keep passing every current-key check:
-    /// a KeyPackage attestation (§9.7.1 check 1 of the security-model spec) and
+    /// a `KeyPackage` attestation (§9.7.1 check 1 of the security-model spec) and
     /// a live DID authentication (§3.11.4 steps 7 and 8 of the identity spec).
     #[test]
     fn rotate_key_invalidates_resolver_cache() {
