@@ -25,3 +25,8 @@ artifact diverged) so future passes trace faster.
   `scp-client-wasm::WasmScpClient`; `resubscribe_all` was not (inter-layer gap). Also: type
   renames (Socket→RelaySink) leave stray doc refs; native reciprocal-announce is a legit
   recorded follow-up.
+- [MCP #1341 resources/subscribe vs ADR-015](mcp_1341_subscribe_adr015.md) — SHIPPED on
+  `fix/mcp-subscribe-honest`: subscribe/listChanged honest+structural, `resource:{type}`
+  deleted (typed `ResourceKind`), SSE+stdio pumps owned via `AbortOnDrop` (leak closed),
+  stdio tests drive the shipped loop, transport pairing fails closed, Lagged over-notifies.
+  Only ADR-015 AC7 (dynamic tool list) + AC8 (Rust serve binary) remain genuinely open.

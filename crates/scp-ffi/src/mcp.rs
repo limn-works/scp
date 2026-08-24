@@ -60,9 +60,13 @@ use crate::validate;
 // ---------------------------------------------------------------------------
 
 /// Maximum bytes to read for a single line from an MCP transport.
-/// 10 MiB is generous for JSON-RPC messages (typical MCP responses are < 1 MiB)
-/// while still preventing unbounded allocation from a malicious peer.
-const MAX_LINE_BYTES: u64 = 10 * 1024 * 1024;
+///
+/// Re-exported from [`scp_mcp::stdio::MAX_LINE_BYTES`] rather than redeclared:
+/// the client transport here and the server transport in `scp-mcp` frame the
+/// same JSON-RPC line protocol, so a peer that is within the limit on one side
+/// must be within it on the other. Three independent copies of the constant
+/// could drift into exactly that asymmetry.
+use scp_mcp::stdio::MAX_LINE_BYTES;
 
 /// Read a line from `reader` into `buf`, bounded to [`MAX_LINE_BYTES`].
 ///
@@ -655,7 +659,22 @@ impl FfiBridgeProvider {
 
 impl ContextProvider for FfiBridgeProvider {
     fn active_context_ids(&self) -> Vec<String> {
-        self.context_ids.clone()
+        // Configured ∩ live: a context the agent has left is no longer served,
+        // so its tools and resources drop out of `tools/list` and
+        // `resources/list` without restarting the server (ADR-015 AC7).
+        let Ok(bi) = self.upgrade_bi() else {
+            return Vec::new();
+        };
+        self.context_ids
+            .iter()
+            .filter(|id| {
+                crate::runtime::with_context(&bi, id, |rt| {
+                    Ok(rt.role_state.members.contains(&self.agent_did))
+                })
+                .unwrap_or(false)
+            })
+            .cloned()
+            .collect()
     }
 
     fn agent_role(&self, context_id: &str) -> Option<String> {
@@ -1148,6 +1167,48 @@ impl ContextProvider for FfiBridgeProvider {
         Ok(output)
     }
 
+    fn validate_resource_access(
+        &self,
+        context_id: &str,
+        resource: scp_mcp::server::ResourceKind,
+    ) -> Result<(), String> {
+        use scp_core::context::roles::Capability;
+        use scp_mcp::server::ResourceKind;
+
+        let bi = self.upgrade_bi()?;
+        crate::runtime::with_context(&bi, context_id, |rt| {
+            // `Events` and `Members` require `messages:read`: per spec §5.3.1's
+            // role table an `observer` — whose sole capability is
+            // `messages:read` — "can see all content and membership", so that
+            // grant is exactly the authority to read the event stream and the
+            // roster.
+            //
+            // `Tools` carries no separate grant because its contents are the
+            // capability-filtered tool list; an agent with no tool capabilities
+            // reads `[]` rather than being denied. This is deliberately NOT a
+            // `validate_capability("resource:tools")` call — that name resolves
+            // to `Capability::Custom("resource:tools")`, which appears in no
+            // ceiling and no role catalogue, so gating on it denied every
+            // client on every bridge unconditionally.
+            let permitted = match resource {
+                ResourceKind::Events | ResourceKind::Members => rt
+                    .role_state
+                    .member_has_capability(&self.agent_did, &Capability::MessagesRead),
+                ResourceKind::Tools => rt.role_state.members.contains(&self.agent_did),
+            };
+            if permitted {
+                Ok(())
+            } else {
+                Err(ScpPyError::context(format!(
+                    "agent lacks messages:read in context '{context_id}' — required to read \
+                     scp://{context_id}/{}",
+                    resource.uri_suffix()
+                )))
+            }
+        })
+        .map_err(|e| format!("{e}"))
+    }
+
     fn context_members(&self, context_id: &str) -> Vec<MemberInfo> {
         // Returns empty if the bridge has been dropped — matches the
         // "unknown context" fallback semantics of this trait method.
@@ -1193,12 +1254,6 @@ impl ContextProvider for FfiBridgeProvider {
         })
         .unwrap_or_else(|_| serde_json::json!({ "event_count": 0 }))
     }
-
-    fn subscribe_resource(&self, _uri: &str) -> Result<(), String> {
-        // Resource subscriptions are not yet wired to the transport layer.
-        // Accept the subscription silently.
-        Ok(())
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1215,12 +1270,6 @@ pub(crate) struct McpServerState {
     transport: String,
     /// Whether the server has been stopped.
     stopped: bool,
-    /// The real MCP server, wrapped in Arc<Mutex> for thread-safe access
-    /// from the transport task and bridge functions. Never read directly —
-    /// kept alive as an ownership anchor (the transport task closure holds
-    /// a clone of this Arc).
-    #[allow(dead_code)] // Ownership anchor — dropping this Arc would stop the server.
-    server: Arc<Mutex<McpServer<FfiBridgeProvider>>>,
     /// Shutdown signal sender. Dropping this signals the transport task to stop.
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     /// Handle to the tokio task running the transport. Used by `server_wait`.
@@ -1334,133 +1383,94 @@ impl crate::scp::PyScp {
             agent_did: identity_did.to_owned(),
             context_ids: context_ids.clone(),
             outlet_timeout_ms: FFI_OUTLET_TIMEOUT_MS,
-            agent_ucan_token: ucan_token.clone(),
+            agent_ucan_token: ucan_token,
 
             agent_proof_tokens: None,
         };
-        let server = McpServer::new(provider);
-        let server = Arc::new(Mutex::new(server));
 
         // Create a shutdown channel.
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         // Start the transport task on the tokio runtime.
         let rt = crate::runtime()?;
-        let server_clone = Arc::clone(&server);
         let transport_mode = transport.to_owned();
-        let sse_agent_did = identity_did.to_owned();
-        let sse_context_ids = context_ids.clone();
-        let sse_ucan_token = ucan_token;
-        // `sse_bi` is a `Weak` reference so the SSE server task cannot
-        // pin `PyBridgeInstance` alive. Same rationale as `provider.bi`.
-        let sse_bi: std::sync::Weak<crate::runtime::PyBridgeInstance> = Arc::downgrade(&bi_arc);
         // Capture the cancel token so the server task exits when the
         // instance is dropped, even if the caller never calls
         // `py_mcp_server_stop`. Cloning a `CancellationToken` does not
         // extend the instance's lifetime.
         let cancel_token = bi_arc.core.cancel_token();
 
+        // Resource subscriptions are backed by the supervisor's context event
+        // broadcast channel. Subscribe *before* spawning so no event emitted
+        // between here and the transport loop starting is missed.
+        //
+        // `subscribe_events()` returns `None` only for a supervisor built
+        // without the channel; production supervisors always enable it (see
+        // `crate::runtime::build_supervisor`). When it is `None` the transport
+        // advertises `resources.subscribe: false` and rejects
+        // `resources/subscribe` — the capability is honestly absent rather
+        // than accepted-and-never-delivered.
+        // Absence degrades only this capability: the server still serves
+        // `tools/*` and `resources/list|read`, and honestly advertises
+        // `resources.subscribe: false`. Serving is NOT failed outright — that
+        // would deny working functionality over an optional feature.
+        let context_events = match crate::runtime::supervisor(bi) {
+            Ok(supervisor) => supervisor.subscribe_events(),
+            Err(e) => {
+                tracing::warn!("MCP server: no supervisor attached ({e})");
+                None
+            }
+        };
+        if context_events.is_none() {
+            tracing::warn!(
+                "MCP server: no context event source — resource subscriptions \
+                 will be advertised as unsupported and rejected if requested"
+            );
+        }
+
+        // One call decides both halves: the server that advertises
+        // `resources.subscribe` and the pump that honours it, folded into one
+        // `McpServerForTransport` value. There is no setter that could
+        // desynchronize them, and only one server is built per serve call — two
+        // servers over one event source would each advertise subscriptions while
+        // only one had the pump.
+        let server = McpServer::with_optional_event_source(provider, context_events);
+
         let task_handle = rt.spawn(async move {
             match transport_mode.as_str() {
                 "stdio" => {
-                // Run the MCP server over stdio. The `run_stdio` function
-                // processes stdin/stdout until EOF. We also listen for the
-                // shutdown signal AND the bridge instance's cancel token
-                // so `emergency_cancel_tasks()` from the instance's
-                // `Drop` impl can terminate this task even when the
-                // caller never invoked `py_mcp_server_stop`.
-                tokio::select! {
-                    _ = shutdown_rx => {
-                        // Shutdown signal received -- exit cleanly.
-                    }
-                    () = cancel_token.cancelled() => {
-                        tracing::debug!(
-                            "MCP stdio server task exiting — bridge instance cancelled"
-                        );
-                    }
-                    () = async {
-                        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-
-                        // The real `run_stdio` takes &mut McpServer by value.
-                        // We need to run it with our Arc<Mutex> server.
-                        // Since `run_stdio` processes stdin line by line, we
-                        // replicate its logic here using the shared server.
-                        let stdin = tokio::io::stdin();
-                        let mut stdout = tokio::io::stdout();
-                        let mut reader = tokio::io::BufReader::new(stdin);
-                        let mut line = String::new();
-
-                        loop {
-                            line.clear();
-                            match reader.read_line(&mut line).await {
-                                Ok(0) | Err(_) => break, // EOF or read error
-                                Ok(_) => {}
-                            }
-                            // Bound check after read — server-side stdin comes
-                            // from the local parent process, not a remote peer,
-                            // so the risk is lower. This guards against oversized
-                            // payloads from a misbehaving MCP client.
-                            if line.len() as u64 > MAX_LINE_BYTES {
-                                break;
-                            }
-
-                            let trimmed = line.trim();
-                            if trimmed.is_empty() {
-                                continue;
-                            }
-
-                            // Parse and dispatch the request.
-                            let response = {
-                                let request: Result<scp_mcp::protocol::JsonRpcRequest, _> =
-                                    serde_json::from_str(trimmed);
-                                match request {
-                                    Ok(req) => {
-                                        server_clone
-                                            .lock()
-                                            .map_or(None, |mut srv| srv.handle_request(&req))
-                                    }
-                                    Err(e) => {
-                                        Some(scp_mcp::protocol::JsonRpcResponse::error(
-                                            scp_mcp::protocol::RequestId::Number(0),
-                                            scp_mcp::protocol::JsonRpcError {
-                                                code: scp_mcp::protocol::PARSE_ERROR,
-                                                message: format!("failed to parse: {e}"),
-                                                data: None,
-                                            },
-                                        ))
-                                    }
-                                }
-                            };
-
-                            if let Some(resp) = response
-                                && let Ok(json) = serde_json::to_string(&resp)
-                                && (stdout.write_all(json.as_bytes()).await.is_err()
-                                    || stdout.write_all(b"\n").await.is_err()
-                                    || stdout.flush().await.is_err())
-                            {
-                                tracing::warn!("MCP stdio server: stdout write failed, stopping");
-                                break;
+                    // Run the MCP server over stdio via the shared
+                    // `scp_mcp::stdio::run_stdio` loop. It owns stdout so the
+                    // response writer and the resource-subscription event pump
+                    // interleave as whole lines, and it parses JSON-RPC
+                    // notifications correctly (a bare `JsonRpcRequest` decode
+                    // rejects them — they carry no `id`). The server and its pump
+                    // travel as the single `server` bundle, so the loop cannot be
+                    // handed one without the other.
+                    //
+                    // We also listen for the shutdown signal AND the bridge
+                    // instance's cancel token so `emergency_cancel_tasks()`
+                    // from the instance's `Drop` impl can terminate this task
+                    // even when the caller never invoked `py_mcp_server_stop`.
+                    tokio::select! {
+                        _ = shutdown_rx => {
+                            // Shutdown signal received -- exit cleanly.
+                        }
+                        () = cancel_token.cancelled() => {
+                            tracing::debug!(
+                                "MCP stdio server task exiting — bridge instance cancelled"
+                            );
+                        }
+                        result = scp_mcp::stdio::run_stdio(server) => {
+                            if let Err(e) = result {
+                                tracing::error!("MCP stdio server error: {e}");
                             }
                         }
-                    } => {}
+                    }
                 }
-            }
                 "sse" => {
-                    // For SSE, run_sse takes ownership of the McpServer and
-                    // binds to a configurable address. We create a dedicated
-                    // server instance using the captured identity and context
-                    // IDs (avoids re-extracting from the mutex which would
-                    // create a stale-data race window).
-                    let provider = FfiBridgeProvider {
-                        bi: sse_bi,
-                        agent_did: sse_agent_did,
-                        context_ids: sse_context_ids,
-                        outlet_timeout_ms: FFI_OUTLET_TIMEOUT_MS,
-                        agent_ucan_token: sse_ucan_token,
-
-                        agent_proof_tokens: None,
-                    };
-                    let sse_server = McpServer::new(provider);
+                    // `run_sse` takes ownership of the `McpServer` directly —
+                    // no mutex wrapper, since the SSE transport owns it.
                     let config = scp_mcp::sse::SseConfig::new(std::net::SocketAddr::from((
                         [127, 0, 0, 1],
                         0,
@@ -1485,7 +1495,7 @@ impl crate::scp::PyScp {
                         sse_shutdown_trigger.shutdown();
                     });
 
-                    let result = scp_mcp::sse::run_sse(sse_server, config, sse_shutdown).await;
+                    let result = scp_mcp::sse::run_sse(server, config, sse_shutdown).await;
                     if let Err(e) = result {
                         tracing::error!("MCP SSE server error: {e}");
                     }
@@ -1501,7 +1511,6 @@ impl crate::scp::PyScp {
             context_ids,
             transport: transport.to_owned(),
             stopped: false,
-            server,
             shutdown_tx: Some(shutdown_tx),
             task_handle: Some(task_handle),
         };
@@ -2578,19 +2587,27 @@ mod tests {
         // Hold the Arc alive for the duration of the test so the Weak
         // inside the provider upgrades successfully (#1549 round-2).
         let bi = __bi();
+        let creator = "did:dht:z6MkTest";
+        let live_a = setup_test_context(&bi, creator, false);
+        let live_b = setup_test_context(&bi, creator, false);
+
         let provider = FfiBridgeProvider {
             bi: Arc::downgrade(&bi),
-            agent_did: "did:dht:z6MkTest".to_owned(),
-            context_ids: vec!["ctx-1".to_owned(), "ctx-2".to_owned()],
+            agent_did: creator.to_owned(),
+            // A third id the agent does not participate in: configuring a
+            // context is not the same as being a member of it.
+            context_ids: vec![live_a.clone(), live_b.clone(), "ctx-not-joined".to_owned()],
             outlet_timeout_ms: FFI_OUTLET_TIMEOUT_MS,
             agent_ucan_token: None,
 
             agent_proof_tokens: None,
         };
-        assert_eq!(
-            provider.active_context_ids(),
-            vec!["ctx-1".to_owned(), "ctx-2".to_owned()]
-        );
+
+        // ADR-015 AC7: the served set is configured ∩ live participation, so a
+        // context the agent is not (or is no longer) a member of drops out
+        // without restarting the server. A static snapshot of the configured
+        // list could never satisfy that.
+        assert_eq!(provider.active_context_ids(), vec![live_a, live_b]);
     }
 
     #[test]
@@ -3265,21 +3282,6 @@ mod tests {
         assert!(active.is_empty(), "should return empty set for empty input");
     }
 
-    #[test]
-    fn ffi_bridge_provider_subscribe_resource_accepts() {
-        let bi = __bi();
-        let provider = FfiBridgeProvider {
-            bi: Arc::downgrade(&bi),
-            agent_did: "did:dht:z6MkTest".to_owned(),
-            context_ids: vec![],
-            outlet_timeout_ms: FFI_OUTLET_TIMEOUT_MS,
-            agent_ucan_token: None,
-
-            agent_proof_tokens: None,
-        };
-        assert!(provider.subscribe_resource("scp://ctx/events").is_ok());
-    }
-
     // -----------------------------------------------------------------------
     // Outlet handler registration and dispatch (SCP-212)
     // -----------------------------------------------------------------------
@@ -3674,8 +3676,9 @@ mod tests {
 
             agent_proof_tokens: None,
         };
-        let server = McpServer::new(provider);
-        let server = Arc::new(Mutex::new(server));
+        // The registry entry no longer holds the server (the transport task
+        // owns it), so the provider is only built here to prove construction.
+        drop(McpServer::new(provider));
         let handle = generate_handle_id("mcp-server");
 
         server_registry_of(&bi).insert(
@@ -3685,7 +3688,6 @@ mod tests {
                 context_ids: vec![ctx_id.clone()],
                 transport: "stdio".to_owned(),
                 stopped: true, // Already stopped.
-                server,
                 shutdown_tx: None,
                 task_handle: None,
             },
@@ -3724,8 +3726,9 @@ mod tests {
 
             agent_proof_tokens: None,
         };
-        let server = McpServer::new(provider);
-        let server = Arc::new(Mutex::new(server));
+        // The registry entry no longer holds the server (the transport task
+        // owns it), so the provider is only built here to prove construction.
+        drop(McpServer::new(provider));
         let handle = generate_handle_id("mcp-server");
 
         server_registry_of(&bi).insert(
@@ -3735,7 +3738,6 @@ mod tests {
                 context_ids: vec![ctx_id.clone()],
                 transport: "stdio".to_owned(),
                 stopped: false, // Still running.
-                server,
                 shutdown_tx: None,
                 task_handle: None,
             },
@@ -3763,6 +3765,224 @@ mod tests {
         let _ = stats.known_contexts;
         let _ = stats.identities;
         let _ = stats.relay_connected;
+    }
+
+    // -----------------------------------------------------------------------
+    // FfiBridgeProvider::validate_resource_access — answered from real role
+    // state (#1341 parity with the NAPI and UniFFI providers)
+    // -----------------------------------------------------------------------
+
+    /// Builds an [`FfiBridgeProvider`] over `bi` serving `context_id` on
+    /// behalf of `agent_did`, with no UCAN material.
+    fn pyo3_mcp_provider(
+        bi: &std::sync::Arc<crate::runtime::PyBridgeInstance>,
+        context_id: &str,
+        agent_did: &str,
+    ) -> FfiBridgeProvider {
+        FfiBridgeProvider {
+            bi: Arc::downgrade(bi),
+            agent_did: agent_did.to_owned(),
+            context_ids: vec![context_id.to_owned()],
+            outlet_timeout_ms: FFI_OUTLET_TIMEOUT_MS,
+            agent_ucan_token: None,
+            agent_proof_tokens: None,
+        }
+    }
+
+    fn mcp_request(method: &str, params: serde_json::Value) -> JsonRpcRequest {
+        JsonRpcRequest {
+            jsonrpc: scp_mcp::protocol::JSONRPC_VERSION.to_owned(),
+            method: method.to_owned(),
+            params: Some(params),
+            id: scp_mcp::protocol::RequestId::Number(1),
+        }
+    }
+
+    /// Completes the MCP handshake and returns the advertised
+    /// `capabilities.resources.subscribe` flag.
+    fn initialize_and_read_subscribe_flag(server: &mut McpServer<FfiBridgeProvider>) -> bool {
+        let response = server
+            .handle_request(&mcp_request(
+                scp_mcp::protocol::METHOD_INITIALIZE,
+                serde_json::json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": { "name": "pyo3-test" },
+                }),
+            ))
+            .expect("initialize must produce a response");
+        let result = response.result.expect("initialize must succeed");
+        result["capabilities"]["resources"]["subscribe"]
+            .as_bool()
+            .expect("resources.subscribe must be advertised as a bool")
+    }
+
+    /// `validate_resource_access` answers from the context's REAL role state:
+    /// the creator (an admin holding `messages:read` under the default
+    /// ceiling) reads every resource; a non-member is denied — the gate is
+    /// real, not a blanket allow.
+    #[test]
+    fn ffi_bridge_provider_validates_resource_access_from_role_state() {
+        use scp_mcp::server::ResourceKind;
+
+        let creator = "did:dht:z6MkCreatorResAccess";
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, false);
+
+        let provider = pyo3_mcp_provider(&bi, &ctx_id, creator);
+        for kind in [
+            ResourceKind::Events,
+            ResourceKind::Members,
+            ResourceKind::Tools,
+        ] {
+            assert!(
+                provider.validate_resource_access(&ctx_id, kind).is_ok(),
+                "the context creator must be able to read scp://{ctx_id}/{}",
+                kind.uri_suffix()
+            );
+        }
+
+        // Negative control: a DID that is not a member of the context is
+        // denied every resource — `Events`/`Members` for lack of
+        // `messages:read`, `Tools` for lack of membership.
+        let outsider = pyo3_mcp_provider(&bi, &ctx_id, "did:dht:z6MkNotAMember");
+        for kind in [
+            ResourceKind::Events,
+            ResourceKind::Members,
+            ResourceKind::Tools,
+        ] {
+            assert!(
+                outsider.validate_resource_access(&ctx_id, kind).is_err(),
+                "a non-member must not be able to read scp://{ctx_id}/{}",
+                kind.uri_suffix()
+            );
+        }
+
+        // Unknown context: fails closed rather than defaulting open.
+        assert!(
+            provider
+                .validate_resource_access("ctx-does-not-exist", ResourceKind::Events)
+                .is_err(),
+            "an unknown context must be denied"
+        );
+
+        crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // Resource subscriptions (#1341): honest advertisement + delivery.
+    // Mirrors the NAPI (`mcp_subscribe_*_napi`) and UniFFI test pairs — PyO3
+    // is the reference bridge, so it carries the same pair.
+    // -----------------------------------------------------------------------
+
+    /// Negative half of #1341. With no event receiver wired — what
+    /// `py_mcp_serve` produces when `Supervisor::subscribe_events()` yields
+    /// `None` — the server must advertise `resources.subscribe: false` AND
+    /// reject `resources/subscribe` with a typed `METHOD_NOT_FOUND`, never
+    /// accept-and-drop.
+    #[test]
+    fn mcp_subscribe_rejected_when_no_event_source_wired_pyo3() {
+        let creator = "did:dht:z6MkSubUnwired";
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, false);
+        let uri = format!("scp://{ctx_id}/events");
+
+        let mut server = McpServer::new(pyo3_mcp_provider(&bi, &ctx_id, creator));
+        assert!(
+            !server.event_source_wired(),
+            "a server built by McpServer::new must fail closed on subscriptions"
+        );
+        assert!(
+            !initialize_and_read_subscribe_flag(&mut server),
+            "an unwired server must advertise resources.subscribe: false"
+        );
+
+        let response = server
+            .handle_request(&mcp_request(
+                scp_mcp::protocol::METHOD_RESOURCES_SUBSCRIBE,
+                serde_json::json!({ "uri": uri }),
+            ))
+            .expect("resources/subscribe must produce a response");
+        let error = response
+            .error
+            .expect("resources/subscribe must be rejected when no event source is wired");
+        assert_eq!(
+            error.code,
+            scp_mcp::protocol::METHOD_NOT_FOUND,
+            "rejection must be a typed method-not-found, got: {error:?}"
+        );
+        assert!(
+            !server.is_subscribed(&uri),
+            "a rejected subscribe must not register a subscription"
+        );
+
+        crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    /// Positive half of #1341. Wired with the REAL
+    /// `Supervisor::subscribe_events()` receiver — the exact source
+    /// `py_mcp_serve` hands to `McpServer::with_optional_event_source` — the
+    /// server advertises the capability, accepts the subscription, and
+    /// `notifications_for_event` (the function the transport pump drives per
+    /// received event) emits a real `notifications/resources/updated`.
+    #[test]
+    fn mcp_subscribe_delivers_notifications_when_event_source_wired_pyo3() {
+        let creator = "did:dht:z6MkSubWired";
+        let bi = __bi();
+        // `setup_test_context` attaches the supervisor (register_context →
+        // init_context_manager_for_test), whose event broadcast channel is
+        // always enabled.
+        let ctx_id = setup_test_context(&bi, creator, false);
+        let uri = format!("scp://{ctx_id}/events");
+
+        let receiver = crate::runtime::supervisor(&bi)
+            .expect("supervisor must be attached after setup_test_context")
+            .subscribe_events()
+            .expect("the PyO3 supervisor must expose a context event receiver");
+        // `with_event_source` is what `with_optional_event_source(Some(rx))`
+        // routes to; the bundle's `into_parts` is crate-private to scp-mcp,
+        // so cross-crate tests use the lower-level pair constructor.
+        let (mut server, _pump) =
+            McpServer::with_event_source(pyo3_mcp_provider(&bi, &ctx_id, creator), receiver);
+
+        assert!(
+            initialize_and_read_subscribe_flag(&mut server),
+            "a wired server must advertise resources.subscribe: true"
+        );
+
+        let response = server
+            .handle_request(&mcp_request(
+                scp_mcp::protocol::METHOD_RESOURCES_SUBSCRIBE,
+                serde_json::json!({ "uri": uri }),
+            ))
+            .expect("resources/subscribe must produce a response");
+        assert!(
+            response.error.is_none(),
+            "subscribe must succeed on a wired server, got: {:?}",
+            response.error
+        );
+        assert!(server.is_subscribed(&uri));
+
+        // `ContextEvent::Expired` invalidates the events/members/tools
+        // resources, so the pump must push an update for the subscribed URI.
+        let notifications = server.notifications_for_event(
+            &ctx_id,
+            &scp_core::context::membership::ContextEvent::Expired,
+        );
+        assert!(
+            notifications.iter().any(|n| {
+                n.method == scp_mcp::protocol::METHOD_RESOURCES_UPDATED
+                    && n.params
+                        .as_ref()
+                        .and_then(|p| p.get("uri"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(uri.as_str())
+            }),
+            "a subscribed resource must receive notifications/resources/updated, \
+             got: {notifications:?}"
+        );
+
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     // -----------------------------------------------------------------------
@@ -3849,14 +4069,36 @@ mod tests {
             "error must mention the dropped bridge"
         );
 
-        // subscribe_resource is a no-op that does not touch `bi`; still Ok.
-        assert!(provider.subscribe_resource("scp://x").is_ok());
+        // validate_resource_access: fails closed for every resource kind —
+        // a resource whose role state can no longer be read must be denied,
+        // never silently admitted.
+        for kind in [
+            scp_mcp::server::ResourceKind::Events,
+            scp_mcp::server::ResourceKind::Members,
+            scp_mcp::server::ResourceKind::Tools,
+        ] {
+            let vra = provider.validate_resource_access("ctx-dropped", kind);
+            assert!(
+                vra.is_err(),
+                "validate_resource_access must reject {kind:?} when bridge is dropped"
+            );
+            assert!(
+                vra.unwrap_err()
+                    .contains("bridge instance has been dropped"),
+                "error must mention the dropped bridge"
+            );
+        }
 
-        // active_context_ids & agent_did don't touch the weak at all.
-        assert_eq!(
-            provider.active_context_ids(),
-            vec!["ctx-dropped".to_owned()]
+        // active_context_ids: empty. It now resolves live participation
+        // through the bridge, so a dropped instance means nothing is served —
+        // which is the fail-closed answer: serving a context whose membership
+        // can no longer be checked would be worse than serving none.
+        assert!(
+            provider.active_context_ids().is_empty(),
+            "a dropped bridge must serve no contexts"
         );
+
+        // agent_did is provider-local and does not touch the weak at all.
         assert_eq!(provider.agent_did(), "did:dht:z6MkDropped");
     }
 }

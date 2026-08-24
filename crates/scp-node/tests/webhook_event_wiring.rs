@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use ed25519_dalek::{SigningKey, Verifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use scp_core::context::membership::ContextEvent;
+use scp_core::context::membership::{ContextEvent, ContextEventEnvelope};
 use scp_did::DID;
 use scp_node::webhook::{WebhookDispatcher, WebhookTarget, spawn_event_consumer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -271,11 +271,11 @@ async fn context_event_reaches_webhook_dispatcher_end_to_end() {
     assert!(registered, "target registration should succeed");
 
     // The exact channel type Supervisor::subscribe_events() hands out.
-    let (tx, rx) = tokio::sync::broadcast::channel::<(String, ContextEvent)>(1024);
+    let (tx, rx) = tokio::sync::broadcast::channel::<ContextEventEnvelope>(1024);
     let consumer = spawn_event_consumer(rx, Arc::clone(&dispatcher));
 
     // Emit a MemberJoined event exactly as the actor handlers would.
-    tx.send((
+    tx.send(ContextEventEnvelope::new(
         "ctx-wire".to_owned(),
         ContextEvent::MemberJoined {
             member_did: DID::from("did:key:carol"),
@@ -355,10 +355,10 @@ async fn consumer_respects_context_scoping() {
         )
         .await;
 
-    let (tx, rx) = tokio::sync::broadcast::channel::<(String, ContextEvent)>(1024);
+    let (tx, rx) = tokio::sync::broadcast::channel::<ContextEventEnvelope>(1024);
     let consumer = spawn_event_consumer(rx, Arc::clone(&dispatcher));
 
-    tx.send((
+    tx.send(ContextEventEnvelope::new(
         "ctx-wire".to_owned(),
         ContextEvent::MemberLeft {
             member_did: DID::from("did:key:dave"),
@@ -382,7 +382,7 @@ async fn consumer_respects_context_scoping() {
 #[tokio::test]
 async fn consumer_exits_cleanly_on_channel_close() {
     let dispatcher = Arc::new(WebhookDispatcher::new());
-    let (tx, rx) = tokio::sync::broadcast::channel::<(String, ContextEvent)>(8);
+    let (tx, rx) = tokio::sync::broadcast::channel::<ContextEventEnvelope>(8);
     let consumer = spawn_event_consumer(rx, dispatcher);
 
     // Drop the sender → channel closes → consumer should return (not hang).
@@ -450,11 +450,11 @@ async fn consumer_drains_past_a_slow_target() {
         )
         .await;
 
-    let (tx, rx) = tokio::sync::broadcast::channel::<(String, ContextEvent)>(1024);
+    let (tx, rx) = tokio::sync::broadcast::channel::<ContextEventEnvelope>(1024);
     let consumer = spawn_event_consumer(rx, Arc::clone(&dispatcher));
 
     // Enqueue the SLOW-context event first, then the FAST-context event.
-    tx.send((
+    tx.send(ContextEventEnvelope::new(
         "ctx-slow".to_owned(),
         ContextEvent::MemberJoined {
             member_did: DID::from("did:key:slow"),
@@ -462,7 +462,7 @@ async fn consumer_drains_past_a_slow_target() {
         },
     ))
     .expect("send slow event");
-    tx.send((
+    tx.send(ContextEventEnvelope::new(
         "ctx-fast".to_owned(),
         ContextEvent::MemberJoined {
             member_did: DID::from("did:key:fast"),
@@ -669,10 +669,10 @@ async fn consumer_abort_tears_down_in_flight_inner_dispatch() {
         .await;
     assert!(registered, "target registration should succeed");
 
-    let (tx, rx) = tokio::sync::broadcast::channel::<(String, ContextEvent)>(1024);
+    let (tx, rx) = tokio::sync::broadcast::channel::<ContextEventEnvelope>(1024);
     let consumer = spawn_event_consumer(rx, Arc::clone(&dispatcher));
 
-    tx.send((
+    tx.send(ContextEventEnvelope::new(
         "ctx-held".to_owned(),
         ContextEvent::MemberJoined {
             member_did: DID::from("did:key:held"),

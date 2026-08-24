@@ -59,7 +59,7 @@ use scp_clock::Clock;
 use scp_did::{DID, SigningKeyId};
 use scp_protocol::context::ContextError;
 use scp_protocol::context::governance::KeyResolver;
-use scp_protocol::context::membership::ContextEvent;
+use scp_protocol::context::membership::{ContextEvent, ContextEventEnvelope};
 use scp_protocol::context::pseudonym::{
     self, PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement, PseudonymAnnouncementDecision,
     classify_pseudonym_announcement, is_pseudonym_announcement_payload,
@@ -84,7 +84,7 @@ use crate::context::supervisor::MessageSigner;
 
 /// Alias for the broadcast channel used to fan out [`ContextEvent`]s to
 /// external subscribers (webhook dispatcher, SDK event streams).
-pub type ContextEventSender = tokio::sync::broadcast::Sender<(String, ContextEvent)>;
+pub type ContextEventSender = tokio::sync::broadcast::Sender<ContextEventEnvelope>;
 
 /// Default TTL (in seconds) for sealed message blobs sent through the
 /// transport. 300s = 5 minutes — short enough to limit replay surface,

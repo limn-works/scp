@@ -2926,6 +2926,156 @@ fn b3_webhook_dispatch_wired() {
 }
 
 // ===========================================================================
+// MCP resource subscriptions — advertised capability must be backed (#1341)
+// ===========================================================================
+
+/// `resources/subscribe` MUST be backed by a real runtime event source on
+/// every bridge.
+///
+/// The original defect: `McpServer` hard-coded `ResourceServerCapability {
+/// subscribe: true }` at `initialize` while `ContextProvider::subscribe_resource`
+/// returned `Ok(())` and did nothing on PyO3/UniFFI (NAPI returned `Err`). A
+/// client received a successful subscription and then never received a single
+/// `notifications/resources/updated` — a false guarantee on a shipped path,
+/// plus a three-way divergence between bridges.
+///
+/// # Why this is no longer a source-text gate
+///
+/// The first fix derived the advertisement from a `subscriptions_enabled` bool
+/// that a public `enable_subscriptions()` setter could flip on any server, so
+/// three `str::contains` assertions stood in for the invariant: that the flag
+/// was never hard-coded, that the provider seam stayed deleted, and that both
+/// transports called the setter next to the pump. Those were a weaker,
+/// source-text restatement of a property the type system can hold outright,
+/// which `CLAUDE.md` names as an anti-pattern ("Enforce mechanically … the type
+/// system — not documentation") and which the ast-gate lesson calls
+/// non-convergent.
+///
+/// `McpServer::with_event_source` now returns `(McpServer, ContextEventPump)`
+/// and is the *only* thing that sets the flag; `enable_subscriptions` is gone.
+/// A server that advertises the capability and a pump that delivers it are one
+/// value produced by one call, so:
+///
+/// - the advertisement cannot be hard-coded — no literal reaches the field;
+/// - it cannot be enabled without a receiver — there is no other constructor
+///   that sets it;
+/// - the pump cannot be forgotten — `ContextEventPump` is `#[must_use]` and a
+///   transport is the only thing that can consume it.
+///
+/// The three string-search assertions were therefore REMOVED as redundant with
+/// a strictly stronger compile-time guarantee (the one legitimate reason to
+/// remove an enforcement assertion). What remains below is the part the type
+/// system genuinely cannot see: that each bridge *sources* its receiver from
+/// the Supervisor and hands it to a transport, rather than passing `None` and
+/// honestly-but-uselessly advertising nothing.
+#[test]
+fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
+    // Every bridge must obtain the Supervisor receiver and construct its
+    // server through the constructor that pairs the flag with the pump. A
+    // bridge that called `McpServer::new` would compile and serve, but would
+    // advertise `resources.subscribe: false` forever — a silent capability
+    // regression the type system cannot catch because both constructors are
+    // legitimate.
+    let pyo3_mcp_src = include_str!("../../../../crates/scp-ffi/src/mcp.rs");
+    let napi_mcp_src = include_str!("../../../../crates/scp-ffi/napi/src/mcp.rs");
+    let uniffi_mcp_src = include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs");
+    for (bridge, src) in [
+        ("PyO3", pyo3_mcp_src),
+        ("NAPI", napi_mcp_src),
+        ("UniFFI", uniffi_mcp_src),
+    ] {
+        // Scope the source-text search to the PRODUCTION portion — everything
+        // before the trailing `#[cfg(test)]\nmod tests { ... }`. Each bridge's
+        // own unit tests call `subscribe_events()` and construct wired servers,
+        // so a whole-file `contains` would stay green even if a real regression
+        // moved the wiring out of the serve function and only a test still named
+        // the symbol. `mod tests {` is the single conventional test-module
+        // marker in all three files; the production serve functions precede it.
+        let prod = production_source(src);
+        assert!(
+            prod.contains("subscribe_events()"),
+            "{bridge} MCP serve must obtain the Supervisor ContextEvent receiver \
+             on its PRODUCTION path (a test-module occurrence does not count)"
+        );
+        assert!(
+            prod.contains("with_optional_event_source"),
+            "{bridge} MCP serve must build its McpServer through the constructor \
+             that pairs the advertised capability with the pump that honours it — \
+             McpServer::new would silently downgrade to resources.subscribe: false"
+        );
+    }
+}
+
+/// Returns the production portion of a Rust source file: everything before the
+/// trailing `#[cfg(test)] mod tests { ... }`.
+///
+/// Source-text wiring gates must not be satisfiable by a bridge's own unit
+/// tests, which legitimately name the same production symbols. Splitting on the
+/// conventional `mod tests {` marker keeps the search on shipped code.
+fn production_source(src: &str) -> &str {
+    src.split_once("mod tests {").map_or(src, |(prod, _)| prod)
+}
+
+/// Resource authorization must run the SAME predicate for `resources/read` and
+/// `resources/subscribe`, and every bridge must answer it from real state.
+///
+/// Two defects motivated this. First, `resources/subscribe` skipped the
+/// authorization tier `resources/read` enforced, so a client could hold a live
+/// subscription to a resource it could not read and learn from notification
+/// timing that denied state was changing. Second, the tier `resources/read` DID
+/// enforce named a `resource:{kind}` capability that appears in no ceiling, no
+/// role catalogue and no UCAN stem — `Capability::new` resolves it to a
+/// `Custom` value no context grants — so it denied every client on every bridge
+/// unconditionally, making the whole resource surface dead while
+/// `resources/list` kept advertising it.
+///
+/// `ContextProvider::validate_resource_access` is a required trait method with
+/// no default, so a bridge cannot forget to answer it, and it takes the typed
+/// `ResourceKind` rather than a string, so no `resource:`-prefixed name can be
+/// synthesized again. This test pins the part the types cannot see: that each
+/// bridge answers from context role state rather than a stand-in.
+#[test]
+fn mcp_resource_access_is_answered_from_real_role_state() {
+    // The former negative assertion — `!server_src.contains("format!(\"resource:{")`
+    // — was removed as redundant with a strictly stronger compile-time
+    // guarantee (the one legitimate reason to drop an enforcement assertion).
+    // `ContextProvider::validate_resource_access` takes a typed `ResourceKind`,
+    // not a string, so no `resource:{kind}` capability name can be synthesized
+    // from it at all; a source-text denylist chasing one spelling of a
+    // now-unrepresentable value is exactly the negative-value redundancy the
+    // over-engineering guard names. The positive wiring pins below — that each
+    // bridge answers from the real capability catalogue — are the part the
+    // types cannot see and are retained.
+    for (bridge, src) in [
+        (
+            "PyO3",
+            include_str!("../../../../crates/scp-ffi/src/mcp.rs"),
+        ),
+        (
+            "NAPI",
+            include_str!("../../../../crates/scp-ffi/napi/src/mcp.rs"),
+        ),
+        (
+            "UniFFI",
+            include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs"),
+        ),
+    ] {
+        // Scope to the PRODUCTION portion, exactly as the event-source gate
+        // above does: PyO3's and UniFFI's test modules also name
+        // `Capability::MessagesRead`, so a whole-file `contains` would stay
+        // green if the production authorization path regressed and only a test
+        // still named the symbol.
+        assert!(
+            production_source(src).contains("Capability::MessagesRead"),
+            "{bridge} must authorize the events/members resources against the real \
+             capability catalogue (spec §5.3.1: `messages:read` is what lets an \
+             observer see content and membership) on its PRODUCTION path — a \
+             test-module occurrence does not count"
+        );
+    }
+}
+
+// ===========================================================================
 // Durable saga journal — production supervisor construction (§17.16 / ADR-049)
 // ===========================================================================
 
