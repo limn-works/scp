@@ -270,9 +270,10 @@ jobs:
       # generates the UniFFI bindings into the single committed file
       # Sources/SCP/Internal/ScpBindings.swift (no duplicate scp_ffi_uniffi.swift at
       # the target root), writes ScpFFI.h + module.modulemap into the XCFramework's
-      # Headers, and packages ScpFFI.xcframework. Production mode → no
-      # allow_in_memory_custody / testing features. Reimplementing these steps
-      # inline previously diverged (duplicate bindings, wrong header name).
+      # Headers, and packages ScpFFI.xcframework. Production mode passes no
+      # `testing` feature, and `testing` is the feature that gates the in-memory
+      # custody arm. Reimplementing these steps inline previously diverged: the
+      # inline steps wrote duplicate bindings and named the header wrongly.
       - name: Build XCFramework
         working-directory: bindings/swift
         run: ./build-xcframework.sh
@@ -470,10 +471,10 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
 
-      # Default features only. `allow_in_memory_custody` swaps a production
-      # custody provider for `InMemoryKeyCustody`, which CLAUDE.md forbids on a
-      # shipped path, and the `kotlin-aar` job above builds the Android
-      # libraries the same way.
+      # Default features only. The `testing` feature swaps a production custody
+      # provider for `InMemoryKeyCustody`, which CLAUDE.md forbids on a shipped
+      # path, and the `kotlin-aar` job above builds the Android libraries the
+      # same way.
       - name: Build cdylib
         run: cargo build --release --target ${{ matrix.target }} -p scp-ffi-uniffi
 
