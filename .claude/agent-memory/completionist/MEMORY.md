@@ -29,5 +29,12 @@ artifact diverged) so future passes trace faster.
   `scp-client-wasm::WasmScpClient`; `resubscribe_all` was not (inter-layer gap). Also: type
   renames (Socket→RelaySink) leave stray doc refs; native reciprocal-announce is a legit
   recorded follow-up.
-- [SCP-245 per-layer healing](scp245_per_layer_healing.md) — 1/9 criteria met; the only healing
-  trigger is a cross-layer seq comparison, and no construction site enables healing.
+- [SCP-245 per-layer healing](scp245_per_layer_healing.md) — 4/9 criteria met, all scaffolding;
+  the only healing trigger is a cross-layer seq comparison, no construction site enables
+  healing, and the story was re-scoped rather than superseded.
+- [SCP-241 dual-layer resolution](scp241_dual_layer_resolution.md) — 4/15 criteria met; the
+  resolver still implements the deleted cross-layer highest-seq design, and `BootstrapCore`
+  exists nowhere in `crates/`, which alone voids seven criteria.
+- [SCP-007 two-encoding verdict](scp007_two_encoding_verdict.md) — 15/23 criteria met, keep pending;
+  no `SCP-IDENT-1061`, no `BootstrapCore`, no DNS encoder, and `RepublishManager` has zero
+  non-test construction sites.
