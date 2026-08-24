@@ -498,8 +498,9 @@ mod tests {
         // key). Check 1 passes (an #active VM exists), but the delegated pure
         // core's check 3 fails: the signature does not verify against the
         // RESOLVED current key. This proves the resolved document — not some
-        // ignored default — drives check 3 at the runtime layer (§9.12
-        // rotation-is-revocation).
+        // ignored default — drives check 3 at the runtime layer, which is what
+        // makes a rotation revoke every outstanding attestation (§9.7.1 check 1
+        // of the security-model spec).
         let fx = add_fixture(TEST_DID);
         let rotated_doc = did_doc_with_active(&fresh_pub()); // NOT fx.signer_pub
         let resolver = MockResolver::new(MockOutcome::Found(rotated_doc));

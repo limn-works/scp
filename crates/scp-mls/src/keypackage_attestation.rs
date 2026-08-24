@@ -571,9 +571,11 @@ pub fn verify_attestation(
     use AttestationVerifyError as E;
 
     // --- Check 3: signature over the §9.5.1 signing hash against the CURRENT
-    // key (rotation ⇒ revocation). The attestation's eight fields are all inside
-    // the signed hash, so this authenticates every field the bindings below
-    // compare; a tampered attestation field fails here.
+    // key. Binding to the current key is what makes rotating `#active`/`#agent`
+    // revoke every outstanding KeyPackage attestation — §9.7.1 check 1 of the
+    // security-model spec states that rule. The attestation's eight fields are
+    // all inside the signed hash, so this authenticates every field the bindings
+    // below compare; a tampered attestation field fails here.
     scp_crypto::verify_ed25519_signature(
         ctx.resolved_current_vm_pubkey,
         &attestation.signing_hash(),
@@ -718,7 +720,9 @@ pub enum AttestationResolutionVerifyError {
         age_secs: u64,
     },
 
-    /// Check 1 (§9.7.1; §9.12 rotation-is-revocation): the credential's
+    /// Check 1 (§9.7.1 check 1 of the security-model spec — binding an
+    /// attestation to the current key is what makes a rotation revoke every
+    /// outstanding attestation): the credential's
     /// `signing_key_id` names **no current** `#active`/`#agent` verification
     /// method in the resolved document — it is absent, or has been rotated away
     /// and now lives only under a `#retired-*` fragment. Rejected **without**
@@ -773,7 +777,9 @@ pub enum AttestationResolutionVerifyError {
 ///    `resolved_current_vm_pubkey` set to the extracted current key and delegate
 ///    **unchanged** to [`verify_attestation`]. A rotated-away-but-present key
 ///    thus surfaces as the existing [`AttestationVerifyError::SignatureInvalid`]
-///    (check 3, rotation ⇒ revocation, §9.12).
+///    (check 3). Binding to the current key is what revokes every outstanding
+///    attestation on a rotation — §9.7.1 check 1 of the security-model spec
+///    states that rule.
 ///
 /// # Errors
 ///
@@ -1920,7 +1926,8 @@ mod resolution_seam_tests {
 
     #[test]
     fn current_active_retired_is_current_key_not_found() {
-        // Model rotation-is-revocation (§9.12): the signer's key survives in the
+        // Model the attestation revocation a rotation performs (§9.7.1 check 1
+        // of the security-model spec): the signer's key survives in the
         // document ONLY under a #retired-1 fragment (the current #active is gone).
         // `resolve_signing_key("active")` finds nothing → CurrentKeyNotFound, and
         // the pure core is never reached.

@@ -1029,6 +1029,14 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     ///
     /// **The DID string does NOT change. The Identity Key does NOT change.**
     ///
+    /// This is the **soft** act. It retains the old key under the
+    /// `#retired-{sequence}` identifier, and §23.13 paragraph 1 of the sync spec
+    /// accepts that retained method on an event-log leaf, so the old key keeps
+    /// verifying content the owner already signed. An owner recovering from a
+    /// compromise calls [`DidDocument::remove_verification_method`] on the
+    /// retired identifier instead, because §9.12 of the security-model spec
+    /// assigns revocation of a content signature to removal alone.
+    ///
     /// After rotation, the caller MUST issue MLS Update proposals in all active
     /// contexts and revoke/reissue UCAN tokens signed by the old active key.
     ///
@@ -1270,6 +1278,14 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     /// `#agent` key to `#retired-agent-{sequence}`, installs the new key as
     /// `#agent`), signs the document with the Identity Key, and publishes to
     /// the DHT.
+    ///
+    /// This is the **soft** act. It retains the old key under the
+    /// `#retired-agent-{sequence}` identifier, and §23.13 paragraph 1 of the
+    /// sync spec accepts that retained method on an event-log leaf, so the old
+    /// key keeps verifying content the owner already signed. An owner recovering
+    /// from a compromise calls [`DidDocument::remove_verification_method`] on
+    /// the retired identifier instead, because §9.12 of the security-model spec
+    /// assigns revocation of a content signature to removal alone.
     ///
     /// # Arguments
     ///

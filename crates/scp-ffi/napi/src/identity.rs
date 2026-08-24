@@ -199,7 +199,10 @@ pub(crate) fn ensure_did_resolver_initialized_on(
     // post-rotation re-publishes drop the stale cached document (see
     // `invalidate_resolver_cache`) — without it a rotated identity keeps
     // resolving to its pre-rotation document (and pre-rotation `#active` key) for
-    // the multi-day resolver-cache TTL, defeating rotation's revocation purpose.
+    // the multi-day resolver-cache TTL, so the retired key keeps passing every
+    // current-key check: a KeyPackage attestation (§9.7.1 check 1 of the
+    // security-model spec) and a live DID authentication (§3.11.4 steps 7 and 8
+    // of the identity spec).
     // The set-then-re-read closes the same concurrent-first-init race as the
     // client above: a losing thread must not leave the stored resolver wrapping
     // one cache while `resolver_cache()` (what invalidation targets) returns
@@ -231,9 +234,11 @@ pub(crate) fn ensure_did_resolver_initialized_on(
 /// multi-day TTL and short-circuits on a cached hit without re-querying the
 /// DHT. Without this invalidation a freshly rotated identity keeps resolving to
 /// its pre-rotation document — and pre-rotation `#active` key — until the TTL
-/// expires, defeating rotation's revocation purpose. The rotation re-publish
-/// (higher BEP44 `seq`) has already landed in the shared DHT client; this drops
-/// the resolver's stale copy so the next resolve reads the fresh document.
+/// expires, so the retired key keeps passing every current-key check: a
+/// KeyPackage attestation (§9.7.1 check 1 of the security-model spec) and a live
+/// DID authentication (§3.11.4 steps 7 and 8 of the identity spec). The rotation
+/// re-publish (higher BEP44 `seq`) has already landed in the shared DHT client;
+/// this drops the resolver's stale copy so the next resolve reads the fresh document.
 /// Best-effort: a no-op when no resolver cache is wired on this instance.
 ///
 /// Delegates to the shared [`BridgeInstanceCore::invalidate_resolver_cache`]
@@ -353,8 +358,11 @@ impl fmt::Debug for OpaqueInMemoryKeyCustody {
 /// (higher-`seq`) document lands where DID resolution will see it and the retired
 /// key is rejected on the next resolve. Fails closed if the shared client is
 /// somehow absent (a fresh client would let the re-published document land
-/// somewhere the resolver never reads, silently defeating rotation's revocation
-/// purpose; and, in a shipped build, the in-memory arm does not even exist).
+/// somewhere the resolver never reads, so the retired key would keep passing
+/// every current-key check — a KeyPackage attestation (§9.7.1 check 1 of the
+/// security-model spec) and a live DID authentication (§3.11.4 steps 7 and 8 of
+/// the identity spec); and, in a shipped build, the in-memory arm does not even
+/// exist).
 // Only reached from the `testing`-gated rotation / migration methods
 // (production create fails closed, so no identity exists to rotate — ADR-062
 // §Decision 6).
@@ -1512,7 +1520,9 @@ mod tests {
     /// entry is gone — so a subsequent resolve re-queries the DHT and serves the
     /// new key. Without the invalidation the resolver would keep serving the
     /// pre-rotation document (and its retired `#active` key) for the multi-day
-    /// cache TTL, silently defeating rotation's revocation purpose.
+    /// cache TTL, so the retired key would keep passing every current-key check:
+    /// a KeyPackage attestation (§9.7.1 check 1 of the security-model spec) and
+    /// a live DID authentication (§3.11.4 steps 7 and 8 of the identity spec).
     #[test]
     fn rotate_key_invalidates_resolver_cache() {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");

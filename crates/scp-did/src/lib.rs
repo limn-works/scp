@@ -20,8 +20,9 @@ pub mod attestation;
 pub mod document;
 
 pub use document::{
-    DidDocument, DidError, DidRotationEvent, ED25519_VERIFICATION_KEY_TYPE, MigrationProof,
-    PreRotationProof, Service, VerificationMethod, VerificationRelationship, decode_multibase_key,
+    DidDocument, DidError, DidRotationEvent, ED25519_VERIFICATION_KEY_TYPE, HistoricalAssertionKey,
+    MigrationProof, PreRotationProof, Service, VerificationMethod, VerificationRelationship,
+    decode_multibase_key,
 };
 
 use serde::{Deserialize, Serialize};
@@ -208,10 +209,22 @@ impl SigningKeyId {
     ///
     /// `#0` is absent: ADR-039's key-property table marks an Identity Key
     /// "Signs operational actions: No", and §9.7.4 of the security-model spec
-    /// confines it to DID document updates plus pre-rotation commitments. A
-    /// `#retired-{n}` fragment is absent because this enum has two variants,
-    /// which is what keeps a rotated key out of every path that takes a
-    /// `SigningKeyId`.
+    /// confines it to DID document updates plus pre-rotation commitments.
+    ///
+    /// A `#retired-{n}` or `#retired-agent-{n}` fragment is absent because this
+    /// enum has two variants, which is what keeps a rotated key out of every
+    /// path that takes a `SigningKeyId` — and every such path decides something
+    /// **now**: §3.11.4 steps 7 and 8 of the identity spec authenticate a live
+    /// session, and §9.7.1 check 1 of the security-model spec verifies a
+    /// `KeyPackage` attestation, which is a bearer capability a holder presents
+    /// now. A path verifying a **content** signature — a statement an actor made
+    /// in the past — accepts a retired key instead, per §23.13 paragraph 1 of
+    /// the sync spec, and reaches it through
+    /// [`DidDocument::historical_assertion_keys`](crate::DidDocument::historical_assertion_keys)
+    /// rather than through this constant. That method reports a
+    /// [`SigningKeyId`] of its own for each retired key it returns, because a
+    /// rotation moves a key between identifiers without moving it between
+    /// holders.
     pub const OPERATIONAL: [Self; 2] = [Self::Active, Self::Agent];
 
     /// Returns the full DID document fragment reference (e.g., `"#active"` or `"#agent"`).

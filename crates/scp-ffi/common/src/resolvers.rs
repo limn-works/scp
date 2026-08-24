@@ -468,7 +468,12 @@ impl IdentityBackedDidResolver {
     /// [`DidDocument::retire_active_key`](scp_did::DidDocument::retire_active_key)
     /// does to every key it rotates out — supplies no key here, so a rotated
     /// key stops verifying as soon as an owner publishes the document that
-    /// retired it.
+    /// retired it. A UCAN is a bearer capability a holder presents now, which
+    /// is the class §9.12 of the security-model spec binds to the current key.
+    /// §23.13 paragraph 1 of the sync spec states the opposite rule for an
+    /// event-log leaf, which is content, and a verifier reaches a retired key
+    /// there through `DidDocument::historical_assertion_keys` rather than
+    /// through this function.
     ///
     /// **`assertionMethod` is this crate's choice, and §18.2.2A of the
     /// addressability spec assigns a UCAN a different array.** That section is

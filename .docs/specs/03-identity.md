@@ -1203,6 +1203,8 @@ The relying party verifies a response:
     the holder of the DID's signing_key_id verification method.
 ```
 
+**This procedure authenticates a live session, and it governs no historical content signature.** Step 7 admits `#active` and `#agent` only, and step 8 requires the resolved document to reference the named method under `authentication`. Together those two steps reject a `#retired-{n}` or `#retired-agent-{n}` method, which is correct here: an `ScpIdResponse` proves that a holder controls the DID **now**, so a key an owner rotated away must not produce one. Verifying a signature over a record an actor produced in the past is a different duty and takes a different rule — §23.13 paragraph 1 of the sync spec accepts a retired method on an event-log leaf, so that a rotation does not retroactively unmake authorship, and §9.12 of the security-model spec states the hygiene-rotation versus compromise-removal distinction that rule rests on. A relying party MUST NOT reuse a historical-verification path to satisfy steps 7 and 8.
+
 **Error responses.** The relying party SHOULD return structured errors:
 
 | Condition | Error | Code |

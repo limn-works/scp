@@ -1400,8 +1400,11 @@ pub fn resolver_cache(bi: &PyBridgeInstance) -> Option<Arc<scp_identity::cache::
 ///
 /// The resolver caches resolved documents with a multi-day TTL. Without this,
 /// a freshly rotated identity would keep resolving to its pre-rotation document
-/// (and pre-rotation `#active` key) until the cache TTL expired — defeating
-/// rotation's revocation purpose. Best-effort: a no-op when no cache is wired.
+/// (and pre-rotation `#active` key) until the cache TTL expired, so the retired
+/// key would keep passing every current-key check: a KeyPackage attestation
+/// (§9.7.1 check 1 of the security-model spec) and a live DID authentication
+/// (§3.11.4 steps 7 and 8 of the identity spec). Best-effort: a no-op when no
+/// cache is wired.
 pub fn invalidate_resolver_cache(bi: &PyBridgeInstance, did: &str, rt: &tokio::runtime::Runtime) {
     // Delegates to the shared `BridgeInstanceCore::invalidate_resolver_cache`
     // (the single implementation of the invalidation body); the sync PyO3 bridge

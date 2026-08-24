@@ -808,7 +808,17 @@ fn verify_remote_checkpoint_authenticity(
     // `#active`, then `#agent` — and to accept the checkpoint when either one
     // verifies. `key_resolver` reads a key out of the sender's DID document
     // under `assertionMethod`, so a method an owner withdrew on rotation
-    // supplies nothing and a rotated key stops verifying.
+    // supplies nothing: this code applies the current-key rule, and a key its
+    // owner rotated away stops verifying a checkpoint here.
+    //
+    // Whether the current-key rule is the right rule for a checkpoint is OPEN.
+    // §23.12 item 1 keeps that rule until a human decides, because it is the
+    // narrower of the two candidates, and `.docs/specs/00-open-questions.md`
+    // carries the entry. §23.13 paragraph 1 accepts a retained `#retired-{n}`
+    // method on an event-log leaf, and a checkpoint reads both ways: it states
+    // something about the past, which is the property that makes a leaf content,
+    // and §9.9.3 of the security-model spec also feeds it into an equivocation
+    // decision a client makes now.
     //
     // Trying only `#active` rejected every checkpoint agent software signed,
     // which §23.12 item 1 has always admitted.

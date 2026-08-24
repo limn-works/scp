@@ -48,16 +48,35 @@ use scp_clock::Clock;
 pub enum CompromiseTier {
     /// Agent Signing Key (`#agent`) compromise — most common case.
     ///
-    /// The agent runtime is typically less secure than device HSM. Recovery:
-    /// publish new DID document removing/replacing `#agent` VM, revoke only
-    /// agent-scoped UCANs, MLS `Update`, new `KeyPackages`. No identity
+    /// The agent runtime is typically less secure than device HSM. §9.12 step 1
+    /// of the security-model spec requires the human to publish a DID document
+    /// that **removes** the compromised `#agent` method from
+    /// `verificationMethod` entirely and then installs the replacement — remove
+    /// first, add second. `rotate_agent_key` (ADR-003 §4a / ADR-039) is the soft
+    /// half: it retains the compromised key as `#retired-agent-{sequence}`,
+    /// which §23.13 paragraph 1 of the sync spec accepts on an event-log leaf,
+    /// so the attacker keeps signing content every honest verifier accepts. Step
+    /// 1 runs on a trusted device, outside this module, so the caller that runs
+    /// it MUST drop the retired identifier with
+    /// `DidDocument::remove_verification_method` before it hands this module a
+    /// [`KeyRotationOutcome`]. Recovery then revokes only agent-scoped UCANs,
+    /// issues an MLS `Update`, and publishes new `KeyPackages`. No identity
     /// migration.
     Agent,
 
     /// Active Signing Key (`#active`) compromise.
     ///
-    /// Calls `rotate_active_key` (ADR-003 §4a). DID string unchanged. Includes
-    /// PSK re-encryption (step 6).
+    /// §9.12 step 1 of the security-model spec requires the owner to publish a
+    /// DID document that **removes** the compromised method from
+    /// `verificationMethod` entirely, not the `rotate_active_key` retirement of
+    /// ADR-003 §4a: that retirement keeps the compromised key as
+    /// `#retired-{sequence}`, and §23.13 paragraph 1 of the sync spec accepts a
+    /// retained `#retired-{n}` method on an event-log leaf, so the compromised
+    /// key keeps signing content that verifies. Step 1 runs on a trusted device,
+    /// outside this module, so the caller that runs it MUST drop the retired
+    /// identifier with `DidDocument::remove_verification_method` before it hands
+    /// this module a [`KeyRotationOutcome`]. DID string unchanged. Includes PSK
+    /// re-encryption (step 6).
     ActiveSigning,
 
     /// Identity Key (`#0`) compromise — rare, most severe.
@@ -707,6 +726,12 @@ impl CompromiseRecoveryOrchestrator {
 /// Builds a [`KeyRotationOutcome`] for agent key compromise (tier 1).
 ///
 /// The DID does not change. Only `#agent` key scope is rotated.
+///
+/// This records the rotation half of step 1 and nothing else: §9.12 step 1 of
+/// the security-model spec also requires the owner to remove the compromised
+/// `#agent` method from `verificationMethod`, and `rotated_key_scopes` names no
+/// removal. A caller that rotated without removing has left the compromised key
+/// signing event-log leaves that §23.13 paragraph 1 of the sync spec accepts.
 #[must_use]
 pub fn agent_key_rotation_outcome(did: &DID, rotated_at: u64) -> KeyRotationOutcome {
     KeyRotationOutcome {
@@ -721,6 +746,12 @@ pub fn agent_key_rotation_outcome(did: &DID, rotated_at: u64) -> KeyRotationOutc
 /// Builds a [`KeyRotationOutcome`] for active signing key compromise (tier 2).
 ///
 /// The DID does not change. Only `#active` key scope is rotated.
+///
+/// This records the rotation half of step 1 and nothing else: §9.12 step 1 of
+/// the security-model spec also requires the owner to remove the compromised
+/// `#active` method from `verificationMethod`, and `rotated_key_scopes` names no
+/// removal. A caller that rotated without removing has left the compromised key
+/// signing event-log leaves that §23.13 paragraph 1 of the sync spec accepts.
 #[must_use]
 pub fn active_key_rotation_outcome(did: &DID, rotated_at: u64) -> KeyRotationOutcome {
     KeyRotationOutcome {

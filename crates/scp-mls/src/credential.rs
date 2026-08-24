@@ -426,6 +426,66 @@ mod tests {
         );
     }
 
+    /// A KeyPackage attestation is a bearer capability a holder presents now,
+    /// so §9.7.1 check 1 of the security-model spec binds it to the current
+    /// `#active`/`#agent` only. A rotation therefore makes this resolver answer
+    /// the new key, and an attestation the retired key signed fails against it.
+    ///
+    /// The same rotation leaves that retired key verifying a content signature
+    /// (§23.13 paragraph 1 of the sync spec, reached through
+    /// `DidDocument::historical_assertion_keys`). This test asserts both halves,
+    /// because the difference between them is the rule, not an accident of
+    /// which array a rotation happens to rewrite.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn resolve_signing_key_refuses_a_rotated_out_active_key() {
+        let retired_key = fresh_ed25519_pub();
+        let new_active_key = fresh_ed25519_pub();
+        let mut doc = test_did_doc(&retired_key, None);
+        doc.retire_active_key(&new_active_key, 1);
+
+        let cred = ScpCredential::new(TEST_DID.to_string(), None, SigningKeyId::Active).unwrap();
+        let resolved = cred.resolve_signing_key(&doc).unwrap();
+        assert_eq!(
+            resolved, new_active_key,
+            "an attestation verifier resolves the current #active key"
+        );
+        assert_ne!(
+            resolved, retired_key,
+            "an attestation the retired key signed verifies against nothing this \
+             resolver returns"
+        );
+
+        let historical = doc.historical_assertion_keys();
+        assert_eq!(historical.len(), 1);
+        assert_eq!(
+            historical[0].public_key, retired_key,
+            "the same retired key stays reachable for a content signature"
+        );
+    }
+
+    /// A rotated-out `#agent` key is likewise unreachable for an attestation,
+    /// and reachable for a content signature.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn resolve_signing_key_refuses_a_rotated_out_agent_key() {
+        let active_key = fresh_ed25519_pub();
+        let retired_agent_key = fresh_ed25519_pub();
+        let new_agent_key = fresh_ed25519_pub();
+        let mut doc = test_did_doc(&active_key, Some(&retired_agent_key));
+        doc.rotate_agent_key(&new_agent_key, 1).unwrap();
+
+        let cred = ScpCredential::new(TEST_DID.to_string(), None, SigningKeyId::Agent).unwrap();
+        let resolved = cred.resolve_signing_key(&doc).unwrap();
+        assert_eq!(resolved, new_agent_key);
+        assert_ne!(resolved, retired_agent_key);
+
+        let historical = doc.historical_assertion_keys();
+        assert_eq!(historical.len(), 1);
+        assert_eq!(historical[0].public_key, retired_agent_key);
+        assert_eq!(historical[0].holder, SigningKeyId::Agent);
+    }
+
     #[test]
     #[allow(clippy::unwrap_used)]
     fn resolve_signing_key_active_with_agent_present_still_returns_active() {

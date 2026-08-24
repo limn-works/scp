@@ -262,6 +262,47 @@ pub struct VerificationMethod {
     pub public_key_multibase: String,
 }
 
+/// A key a Layer 1 rotation moved aside, which still verifies a content
+/// signature this document's subject produced before that rotation.
+///
+/// [`DidDocument::historical_assertion_keys`] returns one of these per retired
+/// verification method a document still carries. §23.13 paragraph 1 of the sync
+/// spec states the rule that makes such a key usable: an event-log leaf records
+/// what an actor did at the sequence it occupies, so a later rotation does not
+/// retroactively unmake that authorship.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoricalAssertionKey {
+    /// Fragment identifying the method, without a leading `#` — for example
+    /// `retired-1` or `retired-agent-2`.
+    ///
+    /// A caller reports this string when a key rejects a signature, so an
+    /// operator reading a log sees which method a verifier tried.
+    pub fragment: String,
+
+    /// Which holder signed with this key before an owner rotated it out.
+    ///
+    /// [`SigningKeyId::Active`] for a `retired-{n}` fragment and
+    /// [`SigningKeyId::Agent`] for a `retired-agent-{n}` fragment. ADR-039
+    /// gives `#active` and `#agent` distinct holders — a human and agent
+    /// software — and a rotation moves a key between identifiers without moving
+    /// it between holders, so a verifier reports the same holder it would have
+    /// reported before the rotation.
+    pub holder: SigningKeyId,
+
+    /// The rotation sequence the fragment carries: `2` for `retired-2`.
+    ///
+    /// A rotation assigns this from the DID document's own monotone publish
+    /// sequence (`DidMethod::rotate_active_key` and `rotate_agent_key` in
+    /// `scp-identity`), so a higher value names a more recent retirement.
+    /// [`DidDocument::historical_assertion_keys`] orders by it, most recent
+    /// first, and applies no bound against it — see that method's retention
+    /// note for why a read-side bound would revoke rather than protect.
+    pub sequence: u64,
+
+    /// The raw 32-byte Ed25519 public key the method publishes.
+    pub public_key: [u8; 32],
+}
+
 /// A service entry within a DID Document.
 ///
 /// Used for the `PreRotationCommitment` service that publishes the SHA-256
@@ -332,6 +373,17 @@ const DEVICE_ATTESTATION_FRAGMENT: &str = "device-attestation";
 /// When rotating the `#agent` key, older retired keys beyond this limit are
 /// pruned to bound document size. Per ADR-039, this is set to 2.
 const MAX_RETIRED_AGENT_KEYS: usize = 2;
+
+/// Fragment prefix [`DidDocument::retire_active_key`] writes ahead of a rotation
+/// sequence, producing `retired-{sequence}` (ADR-003, DID creation, item 4a).
+const RETIRED_ACTIVE_FRAGMENT_PREFIX: &str = "retired-";
+
+/// Fragment prefix [`DidDocument::rotate_agent_key`] writes ahead of a rotation
+/// sequence, producing `retired-agent-{sequence}` (ADR-039).
+///
+/// Longer than [`RETIRED_ACTIVE_FRAGMENT_PREFIX`] and sharing its opening
+/// characters, so a classifier tests this one first.
+const RETIRED_AGENT_FRAGMENT_PREFIX: &str = "retired-agent-";
 
 /// The service type string for `ScpIdentityLinkAttestation` entries (§3.5.3).
 const IDENTITY_LINK_ATTESTATION_SERVICE_TYPE: &str = "ScpIdentityLinkAttestation";
@@ -630,6 +682,286 @@ impl DidDocument {
         }
 
         Ok(key)
+    }
+
+    /// Returns every retired key this document still carries that a verifier
+    /// accepts for a content signature, sorted by fragment.
+    ///
+    /// A content signature is a statement about the past. §23.13 paragraph 1 of
+    /// the sync spec accepts a retired method on an event-log leaf for that
+    /// reason: a leaf records what an actor did at the sequence it occupies, and
+    /// a later rotation must not retroactively unmake that authorship. §9.12 of
+    /// the security-model spec states the matching hard rule — an owner revokes
+    /// a compromised key by removing its method from `verification_method`
+    /// entirely, and a method this document no longer carries is absent from
+    /// this result.
+    ///
+    /// # Why this is separate from `signing_key_for`
+    ///
+    /// [`retire_active_key`](Self::retire_active_key) rebuilds `authentication`
+    /// and `assertion_method` as `#active` plus `#agent`, so a retired method is
+    /// referenced by neither array. Gating a historical-verification path on
+    /// `assertion_method` membership therefore finds nothing, and
+    /// [`signing_key_for`](Self::signing_key_for) takes a [`SigningKeyId`],
+    /// which has two variants and can name no retired fragment. This method
+    /// gates on document facts a rotation leaves intact instead. Keeping the two
+    /// resolvers apart also keeps each call site honest about which duty it
+    /// performs: a caller authenticating a live session calls `signing_key_for`
+    /// and gets the relationship gate, and a caller verifying past authorship
+    /// calls this method and gets the criterion below.
+    ///
+    /// # Which methods qualify
+    ///
+    /// **The criterion:** this document's own Layer 1 rotation produced the
+    /// method. [`retire_active_key`](Self::retire_active_key) and
+    /// [`rotate_agent_key`](Self::rotate_agent_key) are the only two operations
+    /// that produce one, and each writes one identifier shape.
+    ///
+    /// **The three facts that decide it:**
+    ///
+    /// - an identifier equal to `{self.id}#retired-{n}` or
+    ///   `{self.id}#retired-agent-{n}`, carried exactly once, where `{n}` is the
+    ///   decimal rendering of a `u64` with no leading zero — the exact output of
+    ///   the two rotation operations, so `#retired-01` and `#retired-x` name no
+    ///   historical key;
+    /// - a `type` of [`ED25519_VERIFICATION_KEY_TYPE`];
+    /// - a `controller` equal to `{self.id}`.
+    ///
+    /// A method failing any of the three is absent from the result rather than
+    /// reported as an error, because a document may carry a method some other
+    /// DID identifies and that method supplies nothing here.
+    ///
+    /// # Retention bound — a write-side property, not a check performed here
+    ///
+    /// ADR-003, DID creation, item 4a states what retention a rotation applies,
+    /// and [`rotate_agent_key`](Self::rotate_agent_key) prunes on the agent side
+    /// when it runs. This method applies no bound of its own: it returns every
+    /// retired method the document it is handed carries.
+    ///
+    /// A caller must not read a write-side retention rule as a bound on this
+    /// result. A DID document is a record its own subject publishes, and a
+    /// verifier reads it
+    /// after it crosses a DHT that neither enforces nor attests how the
+    /// document was produced. An owner who hand-writes fifty `#retired-{n}`
+    /// methods publishes a document all three facts above admit, so the size of
+    /// this result is a number the document's publisher chooses. Capping it
+    /// here would not fix that — it would hand the same publisher a second
+    /// lever, since freshly published high-sequence methods would displace the
+    /// genuinely rotated ones and silently revoke them, which §9.12 of the
+    /// security-model spec says only removal does. The criterion above needs a
+    /// rotation a verifier can check, which a Layer 1 rotation does not
+    /// currently produce. `.docs/specs/00-open-questions.md` carries that
+    /// question.
+    #[must_use]
+    pub fn historical_assertion_keys(&self) -> Vec<HistoricalAssertionKey> {
+        let mut fragments: Vec<(String, SigningKeyId, u64)> = self
+            .verification_method
+            .iter()
+            .filter_map(|vm| {
+                let fragment = vm.id.strip_prefix(&self.id)?.strip_prefix('#')?;
+                let (holder, sequence) = Self::retired_fragment_sequence(fragment)?;
+                Some((fragment.to_owned(), holder, sequence))
+            })
+            .collect();
+        // Sort by fragment, not by the tuple: a fragment already decides a
+        // holder and a sequence, so two entries sharing a fragment share both
+        // and `dedup_by` collapses them. `verification_method_key` below then
+        // rejects the survivor, because a repeated identifier fails the
+        // exactly-once fact.
+        fragments.sort_unstable_by(|(left, _, _), (right, _, _)| left.cmp(right));
+        fragments.dedup_by(|(left, _, _), (right, _, _)| left == right);
+
+        // Report retired `#active` keys before retired `#agent` keys, and the
+        // most recent retirement of each kind first. `SigningKeyId` implements
+        // no ordering, so the holder sorts through a `bool`. Sorting by
+        // sequence rather than by the fragment string keeps `retired-10` after
+        // `retired-2` instead of before it.
+        fragments.sort_by_key(|(_, holder, sequence)| {
+            (
+                matches!(holder, SigningKeyId::Agent),
+                std::cmp::Reverse(*sequence),
+            )
+        });
+
+        fragments
+            .into_iter()
+            .filter_map(|(fragment, holder, sequence)| {
+                let public_key = self.verification_method_key(&fragment).ok()?;
+                Some(HistoricalAssertionKey {
+                    fragment,
+                    holder,
+                    sequence,
+                    public_key,
+                })
+            })
+            .collect()
+    }
+
+    /// Classifies a bare fragment as a retired `#active` key, a retired
+    /// `#agent` key, or neither.
+    ///
+    /// Tests the `retired-agent-` prefix first, because `retired-` is a prefix
+    /// of it and would otherwise claim every retired agent fragment.
+    fn retired_fragment_holder(fragment: &str) -> Option<SigningKeyId> {
+        Self::retired_fragment_sequence(fragment).map(|(holder, _)| holder)
+    }
+
+    /// Classifies a bare fragment as [`retired_fragment_holder`] does and also
+    /// reports the rotation sequence its identifier carries.
+    ///
+    /// [`retired_fragment_holder`]: Self::retired_fragment_holder
+    fn retired_fragment_sequence(fragment: &str) -> Option<(SigningKeyId, u64)> {
+        let (rest, holder) =
+            if let Some(rest) = fragment.strip_prefix(RETIRED_AGENT_FRAGMENT_PREFIX) {
+                (rest, SigningKeyId::Agent)
+            } else {
+                (
+                    fragment.strip_prefix(RETIRED_ACTIVE_FRAGMENT_PREFIX)?,
+                    SigningKeyId::Active,
+                )
+            };
+
+        // A rotation writes `format!("{sequence}")` for a `u64`, which never
+        // carries a sign, a leading zero, or leading whitespace. Requiring the
+        // parsed value to render back to the same string admits exactly the
+        // strings a rotation writes, so `retired-01` and `retired-+1` name no
+        // historical key rather than aliasing one that exists.
+        let sequence: u64 = rest.parse().ok()?;
+        (sequence.to_string() == rest).then_some((holder, sequence))
+    }
+
+    /// Drops every retired key `holder` names beyond the `max` most recent,
+    /// ordered by the rotation sequence its identifier carries.
+    ///
+    /// [`rotate_agent_key`](Self::rotate_agent_key) is the one caller, and
+    /// ADR-003, DID creation, item 4a states the retention this enforces. A key
+    /// this method drops is a key
+    /// [`historical_assertion_keys`](Self::historical_assertion_keys) never
+    /// returns again, so pruning decides how far back a reader can check
+    /// authorship.
+    ///
+    /// [`retire_active_key`](Self::retire_active_key) calls nothing here, and
+    /// item 4a as published states a cap for the `#active` side too — at most
+    /// the 2 most recent retired active keys. This crate has never enforced
+    /// that half, so a document keeps every `#retired-{sequence}` method its
+    /// `#active` rotations wrote. `.docs/specs/00-open-questions.md` records
+    /// the disagreement between item 4a and this code, and names the open pull
+    /// request that deletes both caps.
+    ///
+    /// Identifies a method the way every other document-fact gate here does,
+    /// by `{self.id}#{fragment}`, so a method some other DID identifies inside
+    /// this document is left alone rather than pruned.
+    fn prune_retired_keys(&mut self, holder: SigningKeyId, max: usize) {
+        let did = self.id.clone();
+        let mut retired: Vec<(usize, u64)> = self
+            .verification_method
+            .iter()
+            .enumerate()
+            .filter_map(|(index, vm)| {
+                let fragment = vm.id.strip_prefix(&did)?.strip_prefix('#')?;
+                let (fragment_holder, sequence) = Self::retired_fragment_sequence(fragment)?;
+                (fragment_holder == holder).then_some((index, sequence))
+            })
+            .collect();
+
+        if retired.len() <= max {
+            return;
+        }
+
+        // Highest sequence first, so the tail past `max` is the oldest set.
+        retired.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+        let mut remove_indices: Vec<usize> =
+            retired[max..].iter().map(|(index, _)| *index).collect();
+        // Descending, so removing one index never shifts another still pending.
+        remove_indices.sort_unstable_by(|left, right| right.cmp(left));
+        for index in remove_indices {
+            self.verification_method.remove(index);
+        }
+    }
+
+    /// Removes the verification method this document identifies as
+    /// `{self.id}#{fragment}`, along with every `authentication` and
+    /// `assertion_method` reference to it.
+    ///
+    /// This is the compromise-recovery act of §9.12 of the security-model spec.
+    /// Rotation is soft — [`retire_active_key`](Self::retire_active_key) and
+    /// [`rotate_agent_key`](Self::rotate_agent_key) retain the old key under a
+    /// `#retired-*` identifier, and
+    /// [`historical_assertion_keys`](Self::historical_assertion_keys) keeps
+    /// returning it, so a content signature that key produced keeps verifying.
+    /// Removal is hard: a method this document no longer carries verifies
+    /// nothing, at any sequence, for any reader. An owner recovering from a key
+    /// compromise removes the compromised method rather than retiring it.
+    ///
+    /// Returns `true` when it removed a method, and `false` when this document
+    /// carried none under that identifier.
+    ///
+    /// A caller publishes the resulting document — signed by the Identity Key,
+    /// per §9.12 step 1 — for the removal to reach any other reader.
+    /// `scp_identity::DidDht` composes that step from three of its own
+    /// operations: `rotate_active_key` or `rotate_agent_key` installs the
+    /// replacement key and retains the compromised one under a `#retired-*`
+    /// identifier, this method drops that identifier from the returned
+    /// document — [`historical_assertion_keys`](Self::historical_assertion_keys)
+    /// reports which identifier the rotation assigned — and
+    /// `publish_document` signs the result with `#0` and writes
+    /// it to the DHT. An owner who stops after the rotation has performed the
+    /// soft act and left the compromised key signing content.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DidError::UnusableVerificationMethod`] when `fragment` names
+    /// the Identity Key (`0`). A `did:dht` string is z-base-32 of that key, so
+    /// removing it leaves a document that self-certifies nothing and that every
+    /// verifier rejects. §9.12 assigns Identity Key compromise to
+    /// `migrate_identity` (ADR-003, DID creation, item 4b), which mints a new
+    /// DID rather than editing this one.
+    pub fn remove_verification_method(&mut self, fragment: &str) -> Result<bool, DidError> {
+        // `SigningKeyId::as_fragment` renders `#active` and `Display` renders
+        // the same, while `SigningKeyId::fragment` renders `active`, and
+        // `verification_method_id` below builds `{id}#{fragment}` from the bare
+        // form. Accepting one leading `#` makes both spellings name the same
+        // method. Without this, `remove_verification_method(id.as_fragment())`
+        // builds `{id}##active`, matches nothing, and answers `Ok(false)` — a
+        // caller would read that as "already gone" while a compromised key
+        // stayed in the document, on the one path §9.12 relies on.
+        let fragment = fragment.strip_prefix('#').unwrap_or(fragment);
+
+        if fragment == IDENTITY_KEY_FRAGMENT {
+            return Err(DidError::UnusableVerificationMethod {
+                fragment: fragment.to_owned(),
+                did: self.id.clone(),
+                reason: "an Identity Key is what a did:dht string encodes, so removing it \
+                         leaves a document describing no identity; §9.12 of the \
+                         security-model spec recovers an Identity Key compromise with \
+                         migrate_identity"
+                    .to_owned(),
+            });
+        }
+
+        // A fragment still carrying `#` is a full DID URL or a nested
+        // identifier, never a fragment this document assigns. Answering
+        // `Ok(false)` would report it as absent; it is unusable.
+        if fragment.contains('#') {
+            return Err(DidError::UnusableVerificationMethod {
+                fragment: fragment.to_owned(),
+                did: self.id.clone(),
+                reason: "a fragment names one method within this document and carries no \
+                         further '#'; pass `active`, `agent`, or a retired fragment \
+                         `historical_assertion_keys` reports, not a full DID URL"
+                    .to_owned(),
+            });
+        }
+
+        let method_id = self.verification_method_id(fragment);
+        let before = self.verification_method.len();
+        self.verification_method.retain(|vm| vm.id != method_id);
+        self.authentication
+            .retain(|reference| *reference != method_id);
+        self.assertion_method
+            .retain(|reference| *reference != method_id);
+
+        Ok(self.verification_method.len() != before)
     }
 
     /// Returns the `PreRotationCommitment` service, if present.
@@ -1090,6 +1422,14 @@ impl DidDocument {
     /// becomes `#active`. Authentication and assertion method references are
     /// updated to point to the new active key.
     ///
+    /// This is the **soft** act. It retains the old key under the
+    /// `#retired-{sequence}` identifier, and §23.13 paragraph 1 of the sync spec
+    /// accepts that retained method on an event-log leaf, so the old key keeps
+    /// verifying content the owner already signed. An owner recovering from a
+    /// compromise calls [`remove_verification_method`](Self::remove_verification_method)
+    /// on the retired identifier instead, because §9.12 of the security-model
+    /// spec assigns revocation of a content signature to removal alone.
+    ///
     /// # Arguments
     ///
     /// * `new_active_public_key` - The raw 32-byte Ed25519 public key for the
@@ -1143,8 +1483,11 @@ impl DidDocument {
     /// and from the `authentication` / `assertion_method` arrays.
     /// `#0` (Identity Key) and any `#retired-*` / `#retired-agent-*`
     /// entries from prior Layer-1 rotations are preserved — `#0`
-    /// continues to authorize `alsoKnownAs` republishes, and the
-    /// retired-key history remains auditable.
+    /// continues to authorize `alsoKnownAs` republishes, and every
+    /// retained `#retired-*` method keeps verifying content: §23.13
+    /// paragraph 1 of the sync spec accepts a retired method the
+    /// resolved document still carries on an event-log leaf, so those
+    /// entries verify a new signature and not only an audited history.
     ///
     /// Used by `DidDht::migrate_identity` (in the downstream `scp-identity`
     /// crate) when republishing the
@@ -1258,6 +1601,15 @@ impl DidDocument {
     /// 2 retired agent keys are retained; older ones are pruned (bounded
     /// retention). The new key becomes `#agent`.
     ///
+    /// This is the **soft** act. It retains the old key under the
+    /// `#retired-agent-{sequence}` identifier, and §23.13 paragraph 1 of the
+    /// sync spec accepts that retained method on an event-log leaf, so the old
+    /// key keeps verifying content the owner already signed. An owner recovering
+    /// from a compromise calls
+    /// [`remove_verification_method`](Self::remove_verification_method) on the
+    /// retired identifier instead, because §9.12 of the security-model spec
+    /// assigns revocation of a content signature to removal alone.
+    ///
     /// Only `#0` (Identity Key) can authorize this operation — enforcement is
     /// at the signing/verification layer, not in this method.
     ///
@@ -1305,7 +1657,7 @@ impl DidDocument {
         self.verification_method.push(new_agent_vm);
 
         // Prune retired agent keys to at most MAX_RETIRED_AGENT_KEYS.
-        self.prune_retired_agent_keys();
+        self.prune_retired_keys(SigningKeyId::Agent, MAX_RETIRED_AGENT_KEYS);
 
         // authentication and assertionMethod already reference #agent by
         // fragment, so no update needed — the new VM takes over the reference.
@@ -1344,50 +1696,20 @@ impl DidDocument {
         self.verification_method
             .iter()
             .filter(|vm| {
-                // Match #retired-agent-{N} but not #retired-{N} (which are
-                // retired active keys from retire_active_key).
-                let Some(fragment) = vm.id.rsplit_once('#').map(|(_, f)| f) else {
-                    return false;
-                };
-                fragment.starts_with("retired-agent-")
+                // Identify a method the way every other document-fact gate here
+                // does, by `{self.id}#{fragment}`, and classify it the way
+                // `historical_assertion_keys` does. Suffix-matching `#` counted
+                // a method some other DID identifies inside this document, and
+                // `starts_with` counted a non-canonical `retired-agent-007`
+                // that no rotation writes and no verifier accepts — so this
+                // count disagreed with the set it is read as measuring.
+                vm.id
+                    .strip_prefix(&self.id)
+                    .and_then(|rest| rest.strip_prefix('#'))
+                    .and_then(Self::retired_fragment_holder)
+                    .is_some_and(|holder| matches!(holder, SigningKeyId::Agent))
             })
             .count()
-    }
-
-    /// Prunes retired agent keys to at most [`MAX_RETIRED_AGENT_KEYS`],
-    /// keeping the most recent (highest sequence number).
-    fn prune_retired_agent_keys(&mut self) {
-        // Collect (index, sequence) pairs for retired agent keys.
-        let mut retired: Vec<(usize, u64)> = self
-            .verification_method
-            .iter()
-            .enumerate()
-            .filter_map(|(i, vm)| {
-                let fragment = vm.id.rsplit_once('#').map(|(_, f)| f)?;
-                let seq_str = fragment.strip_prefix("retired-agent-")?;
-                let seq: u64 = seq_str.parse().ok()?;
-                Some((i, seq))
-            })
-            .collect();
-
-        if retired.len() <= MAX_RETIRED_AGENT_KEYS {
-            return;
-        }
-
-        // Sort by sequence descending — keep the highest.
-        retired.sort_by_key(|entry| std::cmp::Reverse(entry.1));
-
-        // Indices to remove (the ones beyond the retention limit).
-        let mut remove_indices: Vec<usize> = retired[MAX_RETIRED_AGENT_KEYS..]
-            .iter()
-            .map(|(i, _)| *i)
-            .collect();
-
-        // Sort descending so removal doesn't shift earlier indices.
-        remove_indices.sort_unstable_by(|a, b| b.cmp(a));
-        for idx in remove_indices {
-            self.verification_method.remove(idx);
-        }
     }
 }
 
@@ -1602,6 +1924,369 @@ mod tests {
         let svc = doc.pre_rotation_service().unwrap();
         assert_eq!(svc.service_type, "PreRotationCommitment");
         assert!(svc.service_endpoint.starts_with("sha256:"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Historical assertion keys (§23.13 ¶1 of the sync spec, §9.12 of the
+    // security-model spec)
+    // -----------------------------------------------------------------------
+
+    /// Derives a valid Ed25519 curve point from a one-byte seed.
+    ///
+    /// `decode_multibase_key` runs `VerifyingKey::from_bytes`, so a filler
+    /// array such as `[2u8; 32]` decompresses to no curve point and every
+    /// key resolver rejects it.
+    fn curve_point(seed: u8) -> [u8; 32] {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+            .verifying_key()
+            .to_bytes()
+    }
+
+    /// Builds a document for `did` carrying `#0`, `#active`, and `#agent`.
+    fn document_with_agent(did: &str) -> DidDocument {
+        DidDocument::new_with_agent_key(
+            did,
+            &curve_point(1),
+            &curve_point(2),
+            &[3u8; 32],
+            Some(&curve_point(4)),
+        )
+    }
+
+    /// Builds a document for `did` carrying `#0` and `#active`.
+    fn document_with_active(did: &str) -> DidDocument {
+        DidDocument::new(did, &curve_point(1), &curve_point(2), &[3u8; 32])
+    }
+
+    /// A rotated `#active` key leaves `assertion_method` and stays verifiable
+    /// as `retired-1`, reported under the holder it had before the rotation.
+    #[test]
+    fn historical_assertion_keys_returns_a_rotated_active_key_under_its_holder() {
+        let did = "did:dht:zHistoricalActive";
+        let mut doc = document_with_active(did);
+        doc.retire_active_key(&curve_point(9), 1);
+
+        assert!(
+            !doc.assertion_method.contains(&format!("{did}#retired-1")),
+            "a rotation leaves a retired method out of assertionMethod, which is \
+             why signing_key_for cannot reach it"
+        );
+
+        let historical = doc.historical_assertion_keys();
+        assert_eq!(historical.len(), 1, "one rotation retains one key");
+        assert_eq!(historical[0].fragment, "retired-1");
+        assert_eq!(historical[0].holder, SigningKeyId::Active);
+        assert_eq!(historical[0].public_key, curve_point(2));
+    }
+
+    /// A rotated `#agent` key answers `SigningKeyId::Agent`, so a verifier keeps
+    /// attributing its signatures to agent software rather than to a human
+    /// (ADR-039).
+    #[test]
+    fn historical_assertion_keys_returns_a_rotated_agent_key_under_its_holder() {
+        let did = "did:dht:zHistoricalAgent";
+        let mut doc = document_with_agent(did);
+        doc.rotate_agent_key(&curve_point(9), 1).unwrap();
+
+        let historical = doc.historical_assertion_keys();
+        assert_eq!(historical.len(), 1);
+        assert_eq!(historical[0].fragment, "retired-agent-1");
+        assert_eq!(
+            historical[0].holder,
+            SigningKeyId::Agent,
+            "retired-agent-{{n}} carries the agent holder, not the active one"
+        );
+        assert_eq!(historical[0].public_key, curve_point(4));
+    }
+
+    /// Only the two identifier shapes a Layer 1 rotation writes qualify. A
+    /// fragment that merely opens with `retired-` names no historical key.
+    #[test]
+    fn historical_assertion_keys_admits_only_the_two_rotation_identifier_shapes() {
+        let did = "did:dht:zHistoricalShapes";
+        let mut doc = document_with_active(did);
+
+        for fragment in [
+            "retired-01",
+            "retired-x",
+            "retired-",
+            "retired-1x",
+            "retired--1",
+            "retired-agent-01",
+            "retired-agent-",
+            "retired_1",
+            "retiredx-1",
+        ] {
+            doc.verification_method.push(VerificationMethod {
+                id: format!("{did}#{fragment}"),
+                method_type: ED25519_VERIFICATION_KEY_TYPE.to_owned(),
+                controller: did.to_owned(),
+                public_key_multibase: multibase_encode(&curve_point(7)),
+            });
+        }
+
+        assert!(
+            doc.historical_assertion_keys().is_empty(),
+            "no rotation writes any of those identifiers"
+        );
+    }
+
+    /// `retire_active_key` prunes nothing: four rotations leave four retired
+    /// methods, and each one still supplies the key it published. This test
+    /// pins the behavior this crate has always had. ADR-003, DID creation,
+    /// item 4a states a cap of the 2 most recent retired active keys that this
+    /// crate has never enforced, and `.docs/specs/00-open-questions.md` records
+    /// that disagreement.
+    #[test]
+    fn retire_active_key_retains_every_retired_active_key_it_wrote() {
+        let did = "did:dht:zActiveRetention";
+        let mut doc = document_with_active(did);
+
+        // Rotation `n` retires whatever `#active` held before it ran: rotation 1
+        // retires the key `document_with_active` installed, and rotation `n`
+        // above 1 retires the key rotation `n - 1` installed.
+        let mut retired_by_rotation = vec![curve_point(2)];
+        for sequence in 1..=4_u64 {
+            let replacement = curve_point(20 + u8::try_from(sequence).unwrap());
+            doc.retire_active_key(&replacement, sequence);
+            retired_by_rotation.push(replacement);
+        }
+
+        let historical = doc.historical_assertion_keys();
+        assert_eq!(
+            historical
+                .iter()
+                .map(|key| key.sequence)
+                .collect::<Vec<_>>(),
+            vec![4, 3, 2, 1],
+            "four rotations retain four retired active keys, most recent first"
+        );
+        for sequence in 1..=4_usize {
+            let expected = retired_by_rotation[sequence - 1];
+            assert!(
+                historical
+                    .iter()
+                    .any(|key| key.sequence == sequence as u64 && key.public_key == expected),
+                "retired-{sequence} still publishes the key that rotation retired"
+            );
+        }
+    }
+
+    /// A rotation writes the sequence into the identifier, so ordering by that
+    /// sequence and ordering by the identifier string disagree once a document
+    /// passes ten rotations. The reported order is the rotation order.
+    #[test]
+    fn historical_assertion_keys_orders_by_sequence_not_by_fragment_string() {
+        let did = "did:dht:zSequenceOrder";
+        let mut doc = document_with_active(did);
+        doc.retire_active_key(&curve_point(30), 2);
+        doc.retire_active_key(&curve_point(31), 10);
+
+        let historical = doc.historical_assertion_keys();
+        assert_eq!(
+            historical
+                .iter()
+                .map(|key| key.fragment.as_str())
+                .collect::<Vec<_>>(),
+            vec!["retired-10", "retired-2"],
+            "sorting the fragment as a string would put retired-10 before retired-2"
+        );
+    }
+
+    /// `SigningKeyId::as_fragment` renders `#active` and `SigningKeyId::fragment`
+    /// renders `active`. Both name one method, so both remove it. Before this,
+    /// the `#`-carrying spelling built `{did}##active`, matched nothing, and
+    /// answered `Ok(false)` — which a caller performing §9.12 compromise
+    /// recovery would read as "already gone" while the key stayed published.
+    #[test]
+    fn remove_verification_method_accepts_both_fragment_spellings() {
+        let did = "did:dht:zRemoveSpelling";
+
+        for spelling in [
+            SigningKeyId::Active.fragment(),
+            SigningKeyId::Active.as_fragment(),
+        ] {
+            let mut doc = document_with_active(did);
+            assert!(
+                doc.remove_verification_method(spelling).unwrap(),
+                "{spelling} names the #active method this document carries"
+            );
+            assert!(
+                doc.signing_key_for(SigningKeyId::Active, VerificationRelationship::Assertion)
+                    .is_err(),
+                "a removed method resolves to no key under {spelling}"
+            );
+        }
+    }
+
+    /// A full DID URL is not a fragment this document assigns. Reporting it as
+    /// absent would tell a caller the method is gone; it is unusable instead.
+    #[test]
+    fn remove_verification_method_refuses_a_fragment_carrying_a_further_hash() {
+        let did = "did:dht:zRemoveDidUrl";
+        let mut doc = document_with_active(did);
+
+        let error = doc
+            .remove_verification_method(&format!("{did}#active"))
+            .expect_err("a DID URL names no fragment within this document");
+        assert!(matches!(error, DidError::UnusableVerificationMethod { .. }));
+        assert!(
+            doc.signing_key_for(SigningKeyId::Active, VerificationRelationship::Assertion)
+                .is_ok(),
+            "the refusal removes nothing"
+        );
+    }
+
+    /// `retired_agent_key_count` is read as the measure of the ADR-003 item 4a
+    /// bound, so it must count what `historical_assertion_keys` returns. A
+    /// suffix match counted a method some other DID identifies inside this
+    /// document, and a `starts_with` counted a non-canonical sequence no
+    /// rotation writes — both inflate the count past the set it measures.
+    #[test]
+    fn retired_agent_key_count_counts_only_this_documents_canonical_retirements() {
+        let did = "did:dht:zAgentCount";
+        let other = "did:dht:zSomeoneElse";
+        let mut doc = document_with_agent(did);
+        doc.rotate_agent_key(&curve_point(40), 1)
+            .expect("rotating an existing #agent key succeeds");
+
+        for id in [
+            format!("{other}#retired-agent-9"),
+            format!("{did}#retired-agent-007"),
+        ] {
+            doc.verification_method.push(VerificationMethod {
+                id,
+                method_type: ED25519_VERIFICATION_KEY_TYPE.to_owned(),
+                controller: did.to_owned(),
+                public_key_multibase: multibase_encode(&curve_point(41)),
+            });
+        }
+
+        assert_eq!(
+            doc.retired_agent_key_count(),
+            1,
+            "a foreign identifier and a non-canonical sequence are not this \
+             document's retirements"
+        );
+        assert_eq!(
+            doc.retired_agent_key_count(),
+            doc.historical_assertion_keys()
+                .iter()
+                .filter(|key| matches!(key.holder, SigningKeyId::Agent))
+                .count(),
+            "the count and the set it measures agree"
+        );
+    }
+
+    /// The three document facts gate a retired method exactly as they gate a
+    /// current one: another DID's identifier, another key suite, and another
+    /// controller each supply nothing.
+    #[test]
+    fn historical_assertion_keys_rejects_a_method_failing_a_document_fact() {
+        let did = "did:dht:zHistoricalFacts";
+        let other = "did:dht:zSomeoneElse";
+        let mut doc = document_with_active(did);
+
+        // An identifier some other DID carries.
+        doc.verification_method.push(VerificationMethod {
+            id: format!("{other}#retired-1"),
+            method_type: ED25519_VERIFICATION_KEY_TYPE.to_owned(),
+            controller: other.to_owned(),
+            public_key_multibase: multibase_encode(&curve_point(7)),
+        });
+        // This DID's identifier, another key suite.
+        doc.verification_method.push(VerificationMethod {
+            id: format!("{did}#retired-2"),
+            method_type: "X25519KeyAgreementKey2020".to_owned(),
+            controller: did.to_owned(),
+            public_key_multibase: multibase_encode(&curve_point(7)),
+        });
+        // This DID's identifier, another controller.
+        doc.verification_method.push(VerificationMethod {
+            id: format!("{did}#retired-3"),
+            method_type: ED25519_VERIFICATION_KEY_TYPE.to_owned(),
+            controller: other.to_owned(),
+            public_key_multibase: multibase_encode(&curve_point(7)),
+        });
+        // This DID's identifier, carried twice.
+        for _ in 0..2 {
+            doc.verification_method.push(VerificationMethod {
+                id: format!("{did}#retired-4"),
+                method_type: ED25519_VERIFICATION_KEY_TYPE.to_owned(),
+                controller: did.to_owned(),
+                public_key_multibase: multibase_encode(&curve_point(7)),
+            });
+        }
+
+        assert!(
+            doc.historical_assertion_keys().is_empty(),
+            "each method fails one of the three document facts"
+        );
+    }
+
+    /// Removing a method drops it from `verification_method` and from both
+    /// relationship arrays, which is the §9.12 compromise-recovery act.
+    #[test]
+    fn remove_verification_method_drops_the_method_and_every_reference() {
+        let did = "did:dht:zRemoveActive";
+        let mut doc = document_with_agent(did);
+        assert!(doc.assertion_method.contains(&format!("{did}#active")));
+
+        assert!(doc.remove_verification_method("active").unwrap());
+
+        assert!(doc.verification_method_by_fragment("active").is_none());
+        assert!(!doc.authentication.contains(&format!("{did}#active")));
+        assert!(!doc.assertion_method.contains(&format!("{did}#active")));
+        assert!(
+            doc.signing_key_for(SigningKeyId::Active, VerificationRelationship::Assertion)
+                .is_err(),
+            "a removed method supplies no key"
+        );
+    }
+
+    /// Removing a retired method is what stops a compromised key verifying
+    /// content, since a rotation on its own retains it.
+    #[test]
+    fn remove_verification_method_drops_a_retired_key_from_the_historical_set() {
+        let did = "did:dht:zRemoveRetired";
+        let mut doc = document_with_active(did);
+        doc.retire_active_key(&curve_point(9), 1);
+        assert_eq!(doc.historical_assertion_keys().len(), 1);
+
+        assert!(doc.remove_verification_method("retired-1").unwrap());
+
+        assert!(
+            doc.historical_assertion_keys().is_empty(),
+            "a removed method verifies nothing, at any sequence"
+        );
+    }
+
+    /// Removing nothing reports `false` rather than an error.
+    #[test]
+    fn remove_verification_method_reports_false_for_an_absent_method() {
+        let did = "did:dht:zRemoveAbsent";
+        let mut doc = document_with_active(did);
+
+        assert!(!doc.remove_verification_method("retired-7").unwrap());
+    }
+
+    /// `#0` is what a `did:dht` string encodes, so removing it would leave a
+    /// document describing no identity. §9.12 sends an Identity Key compromise
+    /// to `migrate_identity` instead.
+    #[test]
+    fn remove_verification_method_refuses_the_identity_key() {
+        let did = "did:dht:zRemoveIdentity";
+        let mut doc = document_with_active(did);
+
+        let error = doc.remove_verification_method("0").unwrap_err();
+        assert!(
+            matches!(error, DidError::UnusableVerificationMethod { .. }),
+            "expected UnusableVerificationMethod, got {error:?}"
+        );
+        assert!(
+            doc.verification_method_by_fragment("0").is_some(),
+            "a refused removal leaves the document untouched"
+        );
     }
 
     #[test]

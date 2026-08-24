@@ -23,7 +23,8 @@ use subtle::ConstantTimeEq;
 use super::{Event, EventLog, EventLogError, EventType};
 use scp_crypto::verify_ed25519_signature;
 use scp_did::{
-    DID, DidDocument, SigningKeyId, VerificationRelationship, extract_public_key_from_did,
+    DID, DidDocument, HistoricalAssertionKey, SigningKeyId, VerificationRelationship,
+    extract_public_key_from_did,
 };
 
 /// The genesis sentinel hash used as `prev_hash` for the first event.
@@ -405,9 +406,12 @@ pub fn leaf_hash(event: &Event) -> Result<[u8; 32], EventLogError> {
 ///
 /// # Why a document rather than a DID string
 ///
-/// A DID string encodes an Identity Key (`#0`) that never rotates, so a verifier
-/// recovering its key from that string would accept a rotated or retired signing
-/// key forever. §23.13 paragraph 1 requires resolution from an actor's DID
+/// A DID string encodes an Identity Key (`#0`), which signs no operational
+/// action: ADR-039's key-property table says so, and §9.7.4 of the
+/// security-model spec confines `#0` to DID document updates plus pre-rotation
+/// commitments. A verifier recovering a key from that string would therefore
+/// accept a key an actor never signs content with, and reject every key an
+/// actor does. §23.13 paragraph 1 requires resolution from an actor's DID
 /// document, and ADR-011's dependency on ADR-003 states that same rule for an
 /// event signature. A caller resolves a document and passes it here; this crate
 /// performs no I/O, which keeps it synchronous and wasm-safe (ADR-057 crate
@@ -421,9 +425,13 @@ pub fn leaf_hash(event: &Event) -> Result<[u8; 32], EventLogError> {
 /// describes `event.actor_did` and that a key it names verifies a signature; it
 /// cannot check where that document came from, how recently a caller fetched it,
 /// or whether a resolver validated its BEP44 signature and sequence number
-/// (§3.10.4). A caller passing a document cached before a key rotation therefore
-/// gets acceptance of a key an actor has since retired. Rotation revokes a key
-/// exactly as fast as a caller re-resolves.
+/// (§3.10.4). What that costs a caller depends on which act it missed. A
+/// document cached before a **rotation** costs nothing here: a rotation retains
+/// the old key as `#retired-{n}` and this function accepts it either way. A
+/// document cached before a **removal** is what a stale caller pays for, because
+/// removal is the §9.12 compromise-recovery act, so a caller passing a
+/// pre-removal document accepts a compromised key. Removal revokes a key exactly
+/// as fast as a caller re-resolves.
 ///
 /// # Fail-closed conditions
 ///
@@ -434,17 +442,45 @@ pub fn leaf_hash(event: &Event) -> Result<[u8; 32], EventLogError> {
 ///   (§3.8, §9.6.1).
 /// - A document carries more than one `#agent` verification method, which
 ///   ADR-039's structural constraint tells a verifier to reject.
-/// - A named method declares a type other than
+/// - A current `#active` or `#agent` method declares a type other than
 ///   [`ED25519_VERIFICATION_KEY_TYPE`](scp_did::ED25519_VERIFICATION_KEY_TYPE),
 ///   names a controller other than an actor,
 ///   or is absent from `assertionMethod`, so a document never authorized it to
 ///   sign an assertion.
-/// - A document names neither `#active` nor `#agent`.
-/// - No named key verifies a signature.
+/// - A document carries no method this function accepts, current or retired.
+/// - Two accepted methods publish one key under different holders, so no
+///   signature says which holder produced it.
+/// - No accepted key verifies a signature.
 ///
 /// Each condition returns [`EventLogError::InvalidSignature`], which §23.13
 /// paragraph 2 names as a rejection reason an SDK logs. None reaches for a key
 /// recovered from a DID string.
+///
+/// # Why a retired key still verifies
+///
+/// An event-log leaf is content: it records what an actor did at the sequence
+/// it occupies. §23.13 paragraph 1 therefore has this function accept a
+/// `#retired-{n}` or `#retired-agent-{n}` method the resolved document still
+/// carries, so that a later rotation does not retroactively unmake authorship.
+/// A retired method is referenced by neither `authentication` nor
+/// `assertionMethod` — [`DidDocument::retire_active_key`] rebuilds both arrays
+/// as `#active` plus `#agent` — so this function reaches those keys through
+/// [`DidDocument::historical_assertion_keys`], which gates on identifier shape,
+/// key type, and controller instead of on relationship membership.
+///
+/// A retired method verifies content and nothing else. §9.7.1 check 1 of the
+/// security-model spec binds a `KeyPackage` attestation to the current
+/// `#active`/`#agent` only, because an attestation is a bearer capability a
+/// holder presents now, and §3.11.4 steps 7 and 8 of the identity spec bind a
+/// live DID authentication the same way. Removing a method from
+/// `verificationMethod` is what revokes it for content, and §9.12 of the
+/// security-model spec assigns that removal to key compromise.
+///
+/// A `SigningKeyId` this function returns names a **holder**, not a fragment.
+/// A `#retired-{n}` method answers [`SigningKeyId::Active`] and a
+/// `#retired-agent-{n}` method answers [`SigningKeyId::Agent`], because ADR-039
+/// gives the two fragments distinct holders and a rotation moves a key between
+/// identifiers without moving it between holders.
 ///
 /// # Errors
 ///
@@ -502,37 +538,65 @@ pub fn verify_event_signature(
         .map_err(|reason| reject(format!("actor DID document is malformed: {reason}")))?;
 
     let canonical_hash = compute_event_canonical_hash(event);
-    let mut failures = Vec::with_capacity(SigningKeyId::OPERATIONAL.len());
-    let mut usable_keys = Vec::with_capacity(SigningKeyId::OPERATIONAL.len());
+    let mut failures = Vec::new();
 
+    // A current operational key: `assertionMethod` authorizes it, so
+    // `signing_key_for` reads that array and reports why a method it rejects
+    // supplies nothing.
+    let mut usable_keys: Vec<(String, SigningKeyId, [u8; 32])> = Vec::new();
     for signing_key_id in SigningKeyId::OPERATIONAL {
         match actor_document.signing_key_for(signing_key_id, VerificationRelationship::Assertion) {
-            Ok(public_key) => usable_keys.push((signing_key_id, public_key)),
+            Ok(public_key) => usable_keys.push((
+                signing_key_id.as_fragment().to_owned(),
+                signing_key_id,
+                public_key,
+            )),
             Err(error) => failures.push(error.to_string()),
         }
     }
 
+    // A key a Layer 1 rotation moved aside. §23.13 paragraph 1 accepts it for a
+    // content signature, and `historical_assertion_keys` gates it on identifier
+    // shape, key type, and controller, because a rotation leaves it referenced
+    // by neither relationship array.
+    usable_keys.extend(actor_document.historical_assertion_keys().into_iter().map(
+        |HistoricalAssertionKey {
+             fragment,
+             holder,
+             public_key,
+             // The rotation sequence orders the set `historical_assertion_keys`
+             // returns. A verifier tries every key it is given, so the order
+             // decides only which failure it reports first.
+             sequence: _,
+         }| (format!("#{fragment}"), holder, public_key),
+    ));
+
     // ADR-039 gives `#active` and `#agent` distinct holders — a human and agent
-    // software — so an owner publishing one key under both fragments erases a
-    // distinction a returned `SigningKeyId` reports. Answering `Active` for a
-    // signature agent software produced would attribute an agent's action to a
-    // human, which ADR-039's accountability argument rests on keeping apart.
-    if let [(_, first_key), (_, second_key)] = usable_keys.as_slice()
-        && first_key == second_key
-    {
-        return Err(reject(format!(
-            "DID document for {} publishes one key under both #active and #agent, \
-             so no signature says which holder produced it",
-            actor_document.id
-        )));
+    // software — so a document publishing one key under two fragments with
+    // different holders erases a distinction a returned `SigningKeyId` reports.
+    // Answering `Active` for a signature agent software produced would attribute
+    // an agent's action to a human, which ADR-039's accountability argument
+    // rests on keeping apart. A rotation carries a key's holder along with it,
+    // so `#agent` matching `#retired-agent-1` says only that an owner rotated to
+    // the key it already held, and that pair keeps one holder.
+    for (index, (fragment, holder, public_key)) in usable_keys.iter().enumerate() {
+        if let Some((other_fragment, _, _)) = usable_keys[index + 1..]
+            .iter()
+            .find(|(_, other_holder, other_key)| other_key == public_key && other_holder != holder)
+        {
+            return Err(reject(format!(
+                "DID document for {} publishes one key under both {fragment} and \
+                 {other_fragment}, so no signature says which holder produced it",
+                actor_document.id
+            )));
+        }
     }
 
-    for (signing_key_id, public_key) in usable_keys {
+    for (fragment, holder, public_key) in usable_keys {
         match verify_ed25519_signature(&public_key, &canonical_hash, &event.signature) {
-            Ok(()) => return Ok(signing_key_id),
+            Ok(()) => return Ok(holder),
             Err(error) => failures.push(format!(
-                "{} key of {} rejected a signature: {error}",
-                signing_key_id.as_fragment(),
+                "{fragment} key of {} rejected a signature: {error}",
                 actor_document.id
             )),
         }
@@ -1328,7 +1392,7 @@ mod tests {
     }
 
     #[test]
-    fn append_rejects_event_signed_by_rotated_active_key() {
+    fn append_accepts_event_signed_by_rotated_active_key() {
         let (old_verifying_key, old_signing_key) = test_keypair();
         let (new_verifying_key, _new_signing_key) = test_keypair();
         let did = did_from_pubkey(&old_verifying_key);
@@ -1344,22 +1408,52 @@ mod tests {
                 .is_some(),
             "a rotated document retains its old key as #retired-1"
         );
+        assert!(
+            !actor_document
+                .assertion_method
+                .contains(&format!("{did}#retired-1")),
+            "a rotation leaves #retired-1 out of assertionMethod, so a \
+             relationship gate would find nothing"
+        );
 
         let mut log = EventLog::new("ctx-rotated-active".to_owned());
         let event = genesis_event(&did, &old_signing_key);
 
-        let result = append(&mut log, &event, &actor_document);
-        match result {
-            Err(EventLogError::InvalidSignature { sequence, reason }) => {
-                assert_eq!(sequence, 0);
-                assert!(
-                    reason.contains("#active"),
-                    "rejection names a method it tried: {reason}"
-                );
-            }
-            other => panic!("expected InvalidSignature, got {other:?}"),
-        }
-        assert_eq!(event_count(&log), 0, "a rejected event leaves no leaf");
+        // An event-log leaf is content, so a rotation does not retroactively
+        // unmake authorship (§23.13 ¶1).
+        assert_eq!(append(&mut log, &event, &actor_document).unwrap(), 0);
+        assert_eq!(
+            verify_event_signature(&event, &actor_document).unwrap(),
+            SigningKeyId::Active,
+            "a #retired-{{n}} method reports the holder it had before the rotation"
+        );
+    }
+
+    #[test]
+    fn verify_event_signature_rejects_event_signed_by_a_removed_active_key() {
+        let (old_verifying_key, old_signing_key) = test_keypair();
+        let (new_verifying_key, _new_signing_key) = test_keypair();
+        let did = did_from_pubkey(&old_verifying_key);
+
+        // §9.12 compromise recovery: an owner installs a new `#active` and
+        // removes the compromised method from the document entirely, rather
+        // than retaining it as `#retired-1`.
+        let mut actor_document = test_did_document(&did, &old_verifying_key);
+        actor_document.retire_active_key(new_verifying_key.as_bytes(), 1);
+        assert!(
+            actor_document
+                .remove_verification_method("retired-1")
+                .expect("removing a retired method is permitted"),
+            "the document carried #retired-1 before the removal"
+        );
+
+        let event = genesis_event(&did, &old_signing_key);
+        let error = verify_event_signature(&event, &actor_document)
+            .expect_err("a removed verification method verifies nothing");
+        assert!(
+            matches!(error, EventLogError::InvalidSignature { .. }),
+            "expected InvalidSignature, got {error:?}"
+        );
     }
 
     #[test]
@@ -1377,7 +1471,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_event_signature_rejects_rotated_agent_key() {
+    fn verify_event_signature_accepts_rotated_agent_key_and_reports_the_agent_holder() {
         let (active_verifying_key, _active_signing_key) = test_keypair();
         let (old_agent_verifying_key, old_agent_signing_key) = test_keypair();
         let (new_agent_verifying_key, new_agent_signing_key) = test_keypair();
@@ -1389,17 +1483,86 @@ mod tests {
             .rotate_agent_key(new_agent_verifying_key.as_bytes(), 1)
             .expect("rotating an existing #agent key succeeds");
 
+        // A retired #agent key verifies an event it signed while current, and
+        // reports `Agent` — ADR-039 attributes that signature to agent
+        // software, and a rotation moves a key between identifiers without
+        // moving it between holders.
         let old_key_event = genesis_event(&did, &old_agent_signing_key);
-        let error = verify_event_signature(&old_key_event, &actor_document)
-            .expect_err("a retired #agent key verifies no event");
+        assert_eq!(
+            verify_event_signature(&old_key_event, &actor_document)
+                .expect("a retired #agent key verifies an event it signed"),
+            SigningKeyId::Agent
+        );
+
+        let new_key_event = genesis_event(&did, &new_agent_signing_key);
+        assert_eq!(
+            verify_event_signature(&new_key_event, &actor_document)
+                .expect("a current #agent key verifies an event"),
+            SigningKeyId::Agent
+        );
+    }
+
+    #[test]
+    fn verify_event_signature_rejects_an_agent_key_pruned_by_bounded_retention() {
+        let (active_verifying_key, _active_signing_key) = test_keypair();
+        let (first_agent_verifying_key, first_agent_signing_key) = test_keypair();
+        let did = did_from_pubkey(&active_verifying_key);
+
+        // `DidDocument::rotate_agent_key` prunes retired agent keys past
+        // `MAX_RETIRED_AGENT_KEYS`, so three rotations drop the first agent key
+        // out of the document. A key a document does not carry verifies
+        // nothing, for the same reason a removed one does: this function reads
+        // verification methods and recovers no key from the DID string. Whoever
+        // changes that write-side retention deletes this test with it.
+        let mut actor_document =
+            test_did_document_with_agent(&did, &active_verifying_key, &first_agent_verifying_key);
+        for sequence in 1..=3 {
+            let (next_agent_verifying_key, _next_agent_signing_key) = test_keypair();
+            actor_document
+                .rotate_agent_key(next_agent_verifying_key.as_bytes(), sequence)
+                .expect("rotating an existing #agent key succeeds");
+        }
+        assert_eq!(
+            actor_document.retired_agent_key_count(),
+            2,
+            "rotate_agent_key keeps MAX_RETIRED_AGENT_KEYS retired agent keys"
+        );
+
+        let event = genesis_event(&did, &first_agent_signing_key);
+        let error = verify_event_signature(&event, &actor_document)
+            .expect_err("a key pruned out of a document verifies nothing");
         assert!(
             matches!(error, EventLogError::InvalidSignature { .. }),
             "expected InvalidSignature, got {error:?}"
         );
+    }
 
-        let new_key_event = genesis_event(&did, &new_agent_signing_key);
-        verify_event_signature(&new_key_event, &actor_document)
-            .expect("a current #agent key verifies an event");
+    #[test]
+    fn verify_event_signature_rejects_one_key_published_as_active_and_retired_agent() {
+        let (shared_verifying_key, shared_signing_key) = test_keypair();
+        let (agent_verifying_key, _agent_signing_key) = test_keypair();
+        let did = did_from_pubkey(&shared_verifying_key);
+
+        // An owner rotates `#agent` and then republishes that retired agent key
+        // as the current `#active`. One key would then answer two holders, and
+        // a returned `SigningKeyId` would attribute agent software's past
+        // actions to a human.
+        let mut actor_document =
+            test_did_document_with_agent(&did, &shared_verifying_key, &shared_verifying_key);
+        actor_document
+            .rotate_agent_key(agent_verifying_key.as_bytes(), 1)
+            .expect("rotating an existing #agent key succeeds");
+
+        let event = genesis_event(&did, &shared_signing_key);
+        let error = verify_event_signature(&event, &actor_document)
+            .expect_err("one key under two holders says nothing about who signed");
+        match error {
+            EventLogError::InvalidSignature { reason, .. } => assert!(
+                reason.contains("#active") && reason.contains("#retired-agent-1"),
+                "rejection names both identifiers: {reason}"
+            ),
+            other => panic!("expected InvalidSignature, got {other:?}"),
+        }
     }
 
     #[test]

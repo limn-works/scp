@@ -607,8 +607,14 @@ fn verify_bridge_jwt(
     // `authentication`. `signing_key_for` reads the document's own array, so a
     // key an owner rotated out supplies none: ADR-003, DID creation, item 4a
     // moves both relationship references to the new key and retains the old one
-    // as `#retired-{sequence}` for audit, and §9.12 of the security-model spec
-    // makes that rotation the revocation act.
+    // as `#retired-{sequence}`. Moving that reference revokes the old key for a
+    // live session, and it revokes nothing else. §23.13 paragraph 1 of the sync
+    // spec accepts the same retained method on an event-log leaf, because a
+    // leaf records what an actor did at the sequence it occupies and a later
+    // rotation must not retroactively unmake that authorship. §9.12 of the
+    // security-model spec states that hygiene-rotation versus
+    // compromise-removal distinction, and assigns compromise recovery to
+    // removing the method from `verificationMethod` entirely.
     //
     // The two steps cover disjoint inputs. Step 7 decides which header values
     // become a `SigningKeyId`; step 8 decides which of the two an owner still

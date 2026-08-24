@@ -51,6 +51,20 @@ caller can write.
   key resolver on document facts" was falsified by a resolver the sweep did not find. Either
   enumerate the set the claim covers, or write the claim over the set you checked.
 
+**One resolver reads no relationship on purpose, and it is not this class.**
+`DidDocument::historical_assertion_keys` returns every `#retired-{n}` and
+`#retired-agent-{n}` key a document still carries, and it reads neither `authentication` nor
+`assertionMethod`. A Layer 1 rotation moves both references to the new key (ADR-003, DID
+creation, item 4a), so a relationship gate on a historical-verification path finds nothing —
+§23.13 paragraph 1 of the sync spec accepts a retired method on an event-log leaf, because a
+leaf records what an actor did at the sequence it occupies. The method stays closed on the
+two properties this lesson cares about: it takes no fragment argument, and it admits only the
+two identifier shapes the two rotation operations write, each carried exactly once with an
+`Ed25519VerificationKey2020` type and the document's own DID as controller. A caller cannot
+steer it at a fragment. A caller that needs a key for a decision it makes now calls
+`signing_key_for` instead, and §9.12 of the security-model spec states which duty takes which
+resolver.
+
 Related: `.docs/lessons/did-string-key-verifies-no-content-signature.md` (the sibling class:
 a resolver that reads no document at all), and
 `.docs/lessons/ast-gate-checks-definition-not-name-resolution.md` (a check that reads a name

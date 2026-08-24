@@ -859,7 +859,12 @@ fn validate_dht_result(
 /// - `document`'s `assertionMethod` array does not reference that method, which
 ///   is what a Layer 1 rotation withdraws — ADR-003, DID creation, item 4a
 ///   moves both relationship references to the new key and retains the old one
-///   as `#retired-{sequence}` for audit;
+///   as `#retired-{sequence}` for historical verification. This function serves
+///   a decision a caller makes now, so it reads the relationship array and
+///   returns no retired key. `verify_event_signature` in `scp-event-log` serves
+///   past authorship instead and reaches a retired key through
+///   `DidDocument::historical_assertion_keys`, per §23.13 paragraph 1 of the
+///   sync spec;
 /// - its `publicKeyMultibase` value does not decode to a valid Ed25519 curve
 ///   point.
 ///
