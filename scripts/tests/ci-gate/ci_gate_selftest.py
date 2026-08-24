@@ -40,7 +40,11 @@ nothing:
                returned and uploaded the result as `windows-signed`. That
                pipeline runs zero times over an empty set and exits 0, so a
                Windows build leg that produced no binary published an artifact
-               named as signed that carried nothing signed.
+               named as signed that carried nothing signed. Jobs sign-apple and
+               sign-maven pipe a `find` into a `while read` loop over the same
+               empty set and upload `swift-xcframework-signed` and
+               `maven-signed`, so this check selects a job by the `-signed`
+               suffix on an artifact name rather than by naming sign-windows.
   path-closure A `fuzz` filter listed nine of the thirteen crates a fuzz build
                reads. It omitted scp-relay-client, which fuzz/Cargo.toml
                declares as a direct dependency, and omitted scp-core,
@@ -50,7 +54,13 @@ nothing:
                no crate, and a `dep = { workspace = true }` entry carries its
                `path` in a workspace manifest, so an inherited crate and
                everything it reaches dropped out of a closure this check
-               compares a filter against.
+               compares a filter against. A crate directory is also not the
+               whole of what a build reads: neither filter named the root
+               Cargo.toml that publishes every `workspace = true` entry, and
+               the `typescript-wasm` filter named no Cargo.lock either, so a
+               dependency bump touching only those two files skipped
+               fuzz-build, typescript-wasm-check and
+               scaffold-typescript-web-check while `ci` reported success.
   event-name   An aggregate read an absent GITHUB_EVENT_NAME as "", so
                `if: github.event_name == 'pull_request'` on job cross-layer
                judged false and a skipped cross-layer passed on a pull request.
@@ -180,9 +190,24 @@ PATH_DEP_CLOSURE_FILTERS = {
     "typescript-wasm": "crates/scp-client-wasm/Cargo.toml",
 }
 
-# Rejects an empty .dll set. Job sign-windows in release.yml must run it before
-# it uploads an artifact named `windows-signed`.
-GUARD_SCRIPT = "scripts/assert-nonempty-dll-set.sh"
+# Rejects an empty signing-input set. Every release.yml job that uploads an
+# artifact whose name asserts a signature must run it before that upload.
+GUARD_SCRIPT = "scripts/assert-nonempty-signing-set.sh"
+
+# CRITERION for check_signing_guard: an artifact name ending in this suffix
+# tells a consumer the artifact's contents are signed, so the job publishing it
+# must first prove its signing loop had files to sign. Job publish-spm reads
+# `swift-xcframework-signed` and writes that bundle's URL and SHA-256 into
+# bindings/swift/Package.swift, so an unsigned bundle under that name reaches
+# every Swift Package Manager consumer.
+SIGNED_ARTIFACT_SUFFIX = "-signed"
+
+# A FLOOR under the suffix criterion, not the criterion itself. Renaming
+# `maven-signed` to `maven-release` would empty the suffix match and leave
+# check_signing_guard passing over zero uploads, so these three jobs must appear
+# in whatever that match finds. Add a job here when release.yml gains a fourth
+# signing job.
+SIGNING_JOBS = {"sign-apple", "sign-windows", "sign-maven"}
 
 # CRITERION: a `uses:` ref names a branch or a tag that action's own repository
 # publishes. A ref naming anything else fails a run in about six seconds with
@@ -660,6 +685,66 @@ def path_dependency_closure(manifest: Path, root: Path | None = None) -> set[str
     return directories
 
 
+def pattern_covers(patterns: set[str], path: str) -> bool:
+    """Report whether a dorny/paths-filter pattern set selects one file path.
+
+    A filter lists a file either by naming it (`'Cargo.toml'`) or by naming a
+    directory glob above it (`'fuzz/**'` selects `fuzz/Cargo.lock`). Those two
+    shapes are the only ones the filters this file reads use, so this covers
+    them and nothing else; a filter written with a `*.toml` wildcard would read
+    here as not covering, which errs toward reporting a gap rather than toward
+    reporting a pass.
+    """
+    if path in patterns:
+        return True
+    return any(
+        pattern.endswith("/**") and path.startswith(pattern[: -len("**")])
+        for pattern in patterns
+    )
+
+
+def resolution_manifests(manifest: Path, root: Path | None = None) -> set[str]:
+    """Return every manifest and lockfile a build from `manifest` resolves against.
+
+    path_dependency_closure returns crate DIRECTORIES, and a cargo build reads
+    two files that sit in no crate it compiles:
+
+    - The workspace manifest each crate in the closure inherits from. Every
+      `crates/scp-*` manifest carries entries reading `dep = { workspace = true }`
+      and `edition.workspace = true`, whose values live in the repository root
+      Cargo.toml, so a change confined to `[workspace.dependencies]` changes what
+      a fuzz build and a wasm32 build compile while touching no crate directory.
+    - The lockfile governing the starting manifest's workspace, which pins the
+      version cargo resolves for every one of those entries. fuzz/Cargo.toml
+      carries its own `[workspace]` table and its own fuzz/Cargo.lock, so a
+      change to the repository root Cargo.lock does NOT reach a fuzz build; this
+      returns the lockfile beside the starting manifest's workspace, never the
+      repository root lockfile by default.
+
+    Returns paths relative to `root`, so a caller compares them against a path
+    filter through pattern_covers.
+    """
+    root = (REPO if root is None else root).resolve()
+    start = manifest.resolve()
+    files: set[str] = set()
+
+    _, start_workspace = workspace_dependency_specs(start)
+    lockfile = start_workspace / "Cargo.lock"
+    if lockfile.is_file():
+        files.add(str(lockfile.relative_to(root)))
+
+    crate_manifests = [start] + [
+        (root / directory / "Cargo.toml")
+        for directory in path_dependency_closure(manifest, root)
+    ]
+    for crate_manifest in crate_manifests:
+        _, workspace_base = workspace_dependency_specs(crate_manifest)
+        workspace_manifest = (workspace_base / "Cargo.toml").resolve()
+        if workspace_manifest != crate_manifest.resolve():
+            files.add(str(workspace_manifest.relative_to(root)))
+    return files
+
+
 def check_path_dep_closures(jobs: dict) -> None:
     """Each named filter lists every directory its crate's build reads."""
     filters = path_filters(jobs)
@@ -683,6 +768,23 @@ def check_path_dep_closures(jobs: dict) -> None:
             not missing,
             f"missing {[directory + '/**' for directory in missing]} — a change to "
             f"one of those skips every job this filter selects",
+        )
+        # A crate directory is not the whole of what a build reads: the
+        # workspace manifest supplying every `workspace = true` entry, and the
+        # lockfile pinning what those entries resolve to, sit outside every
+        # directory above. Omitting them let a dependency bump touching only
+        # Cargo.toml and Cargo.lock skip fuzz-build, typescript-wasm-check and
+        # scaffold-typescript-web-check under a green `ci`.
+        unlisted = sorted(
+            path
+            for path in resolution_manifests(REPO / manifest)
+            if not pattern_covers(patterns, path)
+        )
+        check(
+            f"filter {filter_name!r} lists the manifests its build resolves against",
+            not unlisted,
+            f"missing {unlisted} — a change confined to one of those changes what "
+            f"this filter's jobs compile while every one of them skips",
         )
 
 
@@ -757,6 +859,67 @@ def check_closure_reads_workspace_inheritance() -> None:
         )
 
 
+def check_resolution_manifests_reach_the_workspace() -> None:
+    """The files a build resolves against include its workspace manifest and lock.
+
+    CRITERION: resolution_manifests returns every file cargo reads to decide
+    what a build compiles, beyond the crate directories path_dependency_closure
+    already returns. A member crate carrying `dep = { workspace = true }` reads
+    that entry's version out of a workspace manifest and its resolved version
+    out of that workspace's lockfile, so a change confined to either changes
+    what the build compiles while touching no crate directory.
+
+    Two negative cases hold the boundary. A crate whose own manifest carries the
+    `[workspace]` table contributes no separate workspace manifest, because
+    `fuzz/**` already covers fuzz/Cargo.toml. A workspace holding no Cargo.lock
+    contributes no lockfile, because a filter cannot list a file the tree does
+    not carry.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch) / "inherits"
+        root.mkdir()
+        consumer = write_inheritance_fixture(root, publish_leaf=True)
+
+        without_lock = resolution_manifests(consumer, root=root)
+        check(
+            "a build resolving against a workspace manifest lists that manifest",
+            without_lock == {"Cargo.toml"},
+            f"returned {sorted(without_lock)}, want ['Cargo.toml'] — a "
+            f"`workspace = true` entry reads its version out of that manifest",
+        )
+
+        (root / "Cargo.lock").write_text("version = 4\n")
+        with_lock = resolution_manifests(consumer, root=root)
+        check(
+            "a build lists the lockfile of the workspace it resolves in",
+            with_lock == {"Cargo.toml", "Cargo.lock"},
+            f"returned {sorted(with_lock)}, want ['Cargo.lock', 'Cargo.toml'] — a "
+            f"lockfile pins what every inherited entry resolves to",
+        )
+
+        # A standalone crate carrying its own `[workspace]` table, the shape
+        # fuzz/Cargo.toml has. Its own manifest and its own lockfile sit inside
+        # the directory a filter already names, so neither is returned; the
+        # enclosing workspace's lockfile must not be returned either, because
+        # this crate never resolves against it.
+        standalone = root / "standalone"
+        standalone.mkdir()
+        (standalone / "Cargo.toml").write_text(
+            '[package]\nname = "scp-fixture-standalone"\nversion = "0.0.0"\n\n'
+            "[workspace]\n\n"
+            "[dependencies]\n"
+            'scp-fixture-leaf = { path = "../crates/scp-fixture-leaf" }\n'
+        )
+        reached = resolution_manifests(standalone / "Cargo.toml", root=root)
+        check(
+            "a crate carrying its own workspace table lists no enclosing lockfile",
+            reached == {"Cargo.toml"},
+            f"returned {sorted(reached)}, want ['Cargo.toml'] — this crate resolves "
+            f"in its own workspace, and its leaf dependency inherits from the "
+            f"enclosing one",
+        )
+
+
 def check_filter_outputs_gate_jobs(jobs: dict) -> None:
     """A `changes` filter output appears only in a job-level `if:`.
 
@@ -787,40 +950,66 @@ def check_filter_outputs_gate_jobs(jobs: dict) -> None:
 
 
 def check_signing_guard(documents: list[tuple[Path, dict]]) -> None:
-    """Job sign-windows rejects an empty DLL set before it uploads one.
+    """Every job publishing a `-signed` artifact rejects an empty input set first.
 
-    CRITERION: in release.yml, job sign-windows runs
-    scripts/assert-nonempty-dll-set.sh at a step index below its
-    actions/upload-artifact step. Its signing loop iterated whatever
-    Get-ChildItem returned, ran zero times over an empty set, exited 0, and let
-    the upload publish artifact `windows-signed` carrying nothing signed.
+    CRITERION: in release.yml, a job that uploads an artifact whose name ends in
+    SIGNED_ARTIFACT_SUFFIX runs GUARD_SCRIPT at a step index below that upload.
+    Each of the three signing loops iterates whatever a file search returned, and
+    a search matching nothing makes the loop run zero times and exit 0, after
+    which the upload publishes an artifact whose name asserts a signature the
+    artifact does not carry.
 
-    This pins one job's wiring and nothing else. Whether that script rejects an
-    empty set is a separate question, which
-    scripts/tests/sign-windows/run-tests.sh answers by running it against
-    fixture directories.
+    The suffix is a mechanical proxy for that criterion, so SIGNING_JOBS holds a
+    floor under it: renaming an artifact out of the suffix would otherwise leave
+    this check passing over zero uploads.
+
+    This pins wiring and nothing else. Whether GUARD_SCRIPT rejects an empty set
+    is a separate question, which scripts/tests/signing-guard/run-tests.sh
+    answers by running it against fixture directories.
     """
-    # Looked up by key, not filtered for: a renamed workflow or a deleted job
-    # raises a KeyError here rather than leaving this check running over nothing
-    # and reporting a pass.
-    steps = {path.name: doc for path, doc in documents}["release.yml"]["jobs"][
-        "sign-windows"
-    ]["steps"]
-    guard = [
-        index
-        for index, step in enumerate(steps)
-        if GUARD_SCRIPT in str(step.get("run") or "")
-    ]
-    upload = [
-        index
-        for index, step in enumerate(steps)
-        if str(step.get("uses") or "").startswith("actions/upload-artifact")
-    ]
+    # Looked up by key, not filtered for: a renamed workflow raises a KeyError
+    # here rather than leaving this check running over nothing and reporting a
+    # pass.
+    jobs = {path.name: doc for path, doc in documents}["release.yml"]["jobs"]
+
+    guarded_jobs = set()
+    for job_id, job in sorted(jobs.items()):
+        steps = job.get("steps") or []
+        uploads = [
+            index
+            for index, step in enumerate(steps)
+            if isinstance(step, dict)
+            and str(step.get("uses") or "").startswith("actions/upload-artifact")
+            and str((step.get("with") or {}).get("name", "")).endswith(
+                SIGNED_ARTIFACT_SUFFIX
+            )
+        ]
+        if not uploads:
+            continue
+        guarded_jobs.add(job_id)
+        guard = [
+            index
+            for index, step in enumerate(steps)
+            if isinstance(step, dict) and GUARD_SCRIPT in str(step.get("run") or "")
+        ]
+        names = [
+            str((steps[index].get("with") or {}).get("name", "")) for index in uploads
+        ]
+        check(
+            f"release.yml:{job_id} runs {GUARD_SCRIPT} before it uploads {', '.join(names)}",
+            bool(guard) and min(guard) < min(uploads),
+            f"guard at steps {guard}, upload at steps {uploads} — an empty "
+            f"signing set otherwise reaches {', '.join(names)}",
+        )
+
+    missing = sorted(SIGNING_JOBS - guarded_jobs)
     check(
-        f"release.yml:sign-windows runs {GUARD_SCRIPT} before it uploads",
-        bool(guard) and bool(upload) and min(guard) < min(upload),
-        f"guard at steps {guard}, upload at steps {upload} — an empty DLL set "
-        f"otherwise reaches an artifact named windows-signed",
+        "release.yml: every known signing job publishes a "
+        f"{SIGNED_ARTIFACT_SUFFIX} artifact this check can see",
+        not missing,
+        f"{', '.join(missing)} uploads no artifact whose name ends in "
+        f"{SIGNED_ARTIFACT_SUFFIX}, so the suffix criterion above ran over zero "
+        "of its uploads",
     )
 
 
@@ -891,7 +1080,10 @@ def main() -> int:
     for path, doc in documents:
         check_windows_shell(path, doc)
 
-    print("empty-input — a signing job rejects an empty DLL set before uploading one")
+    print(
+        "empty-input — a job publishing a -signed artifact rejects an empty "
+        "input set first"
+    )
     check_signing_guard(documents)
 
     print("coverage — every job reaches a required status check")
@@ -915,6 +1107,7 @@ def main() -> int:
 
     print("path-closure — a path filter covers every crate its jobs compile")
     check_closure_reads_workspace_inheritance()
+    check_resolution_manifests_reach_the_workspace()
     check_path_dep_closures(jobs)
 
     print("step-filter — a filter output gates a job, never a step")

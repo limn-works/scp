@@ -255,9 +255,24 @@ jobs:
           security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PWD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
           security list-keychain -d user -s "$KEYCHAIN_PATH"
 
+      # Runs before signing, so a release fails before an unsigned XCFramework
+      # can reach an artifact named `swift-xcframework-signed`. A checkout
+      # supplies this script, which the download step above does not.
+      - name: Check out this repository
+        uses: actions/checkout@v5
+        with:
+          path: repo
+
+      - name: Assert the XCFramework carries libraries to sign
+        shell: bash
+        run: bash repo/scripts/assert-nonempty-signing-set.sh --name '*.a' --name '*.dylib' xcframework
+
       - name: Codesign XCFramework
         run: |
-          find xcframework/ -name "*.a" -o -name "*.dylib" | while read -r lib; do
+          # Step "Assert the XCFramework carries libraries to sign" above has
+          # already rejected an empty set, which this loop would otherwise run
+          # zero times over and exit 0 on.
+          find xcframework/ -type f \( -name "*.a" -o -name "*.dylib" \) | while read -r lib; do
             codesign --force --sign "Developer ID Application" \
               --options runtime \
               --timestamp \
@@ -299,7 +314,7 @@ jobs:
 
       - name: Assert a Windows build leg produced DLLs to sign
         shell: bash
-        run: bash repo/scripts/assert-nonempty-dll-set.sh windows-artifacts windows-cbindgen
+        run: bash repo/scripts/assert-nonempty-signing-set.sh --name '*.dll' windows-artifacts windows-cbindgen
 
       - name: Import Authenticode certificate
         env:
@@ -366,10 +381,25 @@ jobs:
           echo "allow-preset-passphrase" >> ~/.gnupg/gpg-agent.conf
           gpgconf --reload gpg-agent
 
+      # Runs before signing, so a release fails before an unsigned bundle can
+      # reach an artifact named `maven-signed`. A checkout supplies this script,
+      # which the download step above does not.
+      - name: Check out this repository
+        uses: actions/checkout@v5
+        with:
+          path: repo
+
+      - name: Assert the Maven bundle carries artifacts to sign
+        shell: bash
+        run: bash repo/scripts/assert-nonempty-signing-set.sh --name '*.aar' --name '*.jar' --name '*.pom' maven-artifacts
+
       - name: Sign artifacts
         env:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
+          # Step "Assert the Maven bundle carries artifacts to sign" above has
+          # already rejected an empty set, which this loop would otherwise run
+          # zero times over and exit 0 on.
           find maven-artifacts/ -type f \( -name "*.aar" -o -name "*.jar" -o -name "*.pom" \) | while read -r file; do
             gpg --batch --yes --passphrase "$GPG_PASSPHRASE" \
               --pinentry-mode loopback \

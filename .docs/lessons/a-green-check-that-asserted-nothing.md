@@ -116,6 +116,18 @@ The same step also swallowed a signing failure: `signtool` is a native command, 
 non-zero exit sets `$LASTEXITCODE` without stopping a pwsh script, and only a last
 invocation's code reaches GitHub, so one failed signature among many passed as green.
 
+Two sibling jobs carried the identical loop, and the first round of this fix reached
+neither. Job `sign-apple` piped
+`find xcframework/ -name "*.a" -o -name "*.dylib"` into a `while read` loop and uploaded
+`xcframework/` as `swift-xcframework-signed`, which job `publish-spm` then writes into
+`bindings/swift/Package.swift` as a URL and a SHA-256, so every Swift Package Manager
+consumer would install an unsigned XCFramework. Job `sign-maven` piped a `find` over
+`*.aar`, `*.jar` and `*.pom` into a `while read` loop and uploaded `maven-artifacts/` as
+`maven-signed`. A guard written for one job's file extension guards one job; the guard is
+now `scripts/assert-nonempty-signing-set.sh`, which takes its `--name` globs from its
+caller, and the ci-gate assertion selects its jobs by the `-signed` suffix on an uploaded
+artifact name rather than by naming `sign-windows`.
+
 **9. A new guard that reads an absent input as a benign value.** Fixing shapes 2 and 3
 introduced two of these, in the guards those fixes added. `scripts/ci-aggregate-result.py`
 refuses to guess at a `needs.changes.outputs.<key>` that job never published, because
@@ -135,6 +147,25 @@ criterion over inputs it can read, so an input it cannot read stops it: this agg
 exits 3 on an absent event name, and this closure now resolves an inherited entry against
 a workspace manifest and raises on an inherited name no workspace publishes.
 
+**10. A check whose criterion names a narrower object than the defect it hunts.**
+`check_path_dep_closures` stated its criterion over crate DIRECTORIES, and
+`path_dependency_closure` returns a directory only for an entry carrying a `path` key. It
+therefore could not require a filter to name the root `Cargo.toml`, even though it opens
+that manifest itself to resolve every `workspace = true` entry, and could not require a
+`Cargo.lock` either. Measured on this tree: `path_dependency_closure(fuzz/Cargo.toml)`
+returned thirteen `crates/scp-*` directories and no manifest, and `'Cargo.toml' in
+path_filters(jobs)['fuzz']` was `False`. So a dependency bump changing only `Cargo.toml`
+and `Cargo.lock` — the shape of the h2 0.4.18 and rustls-webpki 0.103.13 advisory updates
+— set `rust=true`, `fuzz=false` and `typescript-wasm=false`, skipped `fuzz-build`,
+`typescript-wasm-check` and `scaffold-typescript-web-check`, and `scripts/ci-aggregate-result.py`
+read all three skips as authorized. `resolution_manifests` now returns the workspace
+manifest each crate in a closure inherits from, plus the lockfile of the workspace the
+starting manifest resolves in, and `check_path_dep_closures` requires a filter to cover
+both. It returns the root `Cargo.lock` for `typescript-wasm`, whose crate is workspace
+member 15, and does not return it for `fuzz`, whose `fuzz/Cargo.toml` carries its own
+`[workspace]` table and resolves against `fuzz/Cargo.lock`. Widen a criterion to name
+every object the build reads, not the subset the walk already produced.
+
 ## Tests holding these closed
 
 - `scripts/tests/ci-gate/run-tests.sh` — asserts every job sets a `timeout-minutes`, that
@@ -143,28 +174,45 @@ a workspace manifest and raises on an inherited name no workspace publishes.
   Rust-only change, that any job reading a runtime-scaling input sizes its budget from
   that input and covers every permitted option, that no step gates itself on a `changes`
   filter output, that the `fuzz` and `typescript-wasm` filters cover the path-dependency
-  closure of the manifests they guard, that job `sign-windows` runs its non-empty-input
-  guard before its upload, that an aggregate rejects a skipped dependency its
+  closure of the manifests they guard, that every release.yml job uploading a `-signed`
+  artifact runs its non-empty-input guard before that upload and that all three known
+  signing jobs stay inside that suffix match, that an aggregate rejects a skipped
+  dependency its
   condition selected to run, that an aggregate run without `GITHUB_EVENT_NAME` exits 3
   rather than accepting a skipped `cross-layer`, and that a closure over a two-crate
   fixture reaches a leaf whose entry reads `workspace = true` and raises on an inherited
-  name no workspace publishes.
+  name no workspace publishes, and that the manifest set a build resolves against holds
+  the workspace manifest an inherited entry reads, holds that workspace's `Cargo.lock`
+  once one exists, and holds no enclosing lockfile for a crate carrying its own
+  `[workspace]` table.
 - `scripts/tests/cross-layer/run-tests.sh` — plants an FFI export at a first line and at
   a last line of a 155 KB diff, proves that gate finds both, then plants a missing export
   and proves it still rejects that.
-- `scripts/tests/sign-windows/run-tests.sh` — runs `scripts/assert-nonempty-dll-set.sh`
-  against fixture directories: a nested `.dll` is found, a directory holding only `.lib`
-  and `.txt` is rejected, a directory that was never downloaded is rejected, and naming no
-  directory at all is rejected.
+- `scripts/tests/signing-guard/run-tests.sh` — runs
+  `scripts/assert-nonempty-signing-set.sh` against fixture directories for all three
+  signing jobs: a nested `.dll` is found, a directory holding only `.lib` and `.txt` is
+  rejected, an XCFramework carrying headers and an `Info.plist` but no `.a` or `.dylib` is
+  rejected, a directory whose own name ends in `.a` does not count as a library, a Maven
+  directory holding only a log and a `.module` file is rejected, a directory that was
+  never downloaded is rejected, and naming no directory at all is rejected.
 - `scripts/tests/enforcement-files-hook/run-tests.sh` — three cases pad a `tee`, a
   redirect and a `sed -i` at a protected file past 64 KB and assert the hook still exits 2.
 - `scripts/check-saga-gating-granularity.sh --self-test` — fixture (h) pads each of three
   supervisor function bodies past 64 KB, leaving every token on an early line, and asserts
-  that a supervisor satisfying every positive assertion is still accepted. Fixtures (i)
-  and (j) plant a `"standing-"` literal in the extractor, (i) in a short body and (j) on
-  an early line of a padded one, and assert both are rejected: a failure of (i) alone
-  means P5 is dead, and a failure of (j) alone means P5's verdict depends on how long that
-  body is. P5 carried no behavioral proof before, which is why its fail-open survived.
+  that a supervisor satisfying every positive assertion is still accepted. That padding is
+  live code carrying a `//` tail, because `has_overlap_reject_in_reserve` deletes every
+  `//` tail before it opens the pipe: measured, 1200 comment padding lines made a
+  71,117-byte body reach that probe as 6,227 bytes, which never fills a pipe buffer, so
+  fixture (h) passed with `grep -Fq` restored inside that probe while the same mutation of
+  either other probe failed it. The replacement padding measures 150,007 bytes raw and
+  129,117 stripped.
+  `assert_body_exceeds_pipe_buffer` now measures each padded body the way its probe
+  measures it and fails the self-test by name when one falls under 65,536 bytes, so a
+  verdict assertion cannot outlive the precondition it rests on. Fixtures (i) and (j)
+  plant a `"standing-"` literal in the extractor, (i) in a short body and (j) on an early
+  line of a padded one, and assert both are rejected: a failure of (i) alone means P5 is
+  dead, and a failure of (j) alone means P5's verdict depends on how long that body is. P5
+  carried no behavioral proof before, which is why its fail-open survived.
 - `scripts/check-shipped-feature-graph.sh --self-test` — builds a 200 KB synthetic
   `cargo tree` output with a `scp-testing v0.1.0` node on its first line and on its last
   line, and asserts the crate-node probe reports that node present in both, then asserts a
