@@ -215,7 +215,10 @@ All tools via [mise](https://mise.jdx.dev/) (see `.mise.toml`). **Never use npm 
 - Always open a PR when work is complete and double-zero reviewed — do not wait to be asked (see the Change protocol). Opening the PR is part of finishing the work, not a separate step that requires permission.
 - Clean, linear history
 - Unexpected changes: back off, read, understand before acting. Never discard without understanding first
-- No stashing/branch switching unless 100% confident. No destructive git ops unless told to or integrated upstream
+- **NEVER run `git stash`** — no form, no reason, no exception. Not as a real step, not as inert filler, not chained behind a `;` in a compound command. There is no "confident enough" threshold that unlocks it
+- **NEVER run `git checkout <ref> -- <path>`.** To read another revision's version of a file, use `git show <rev>:<path>`. To actually restore one, do it deliberately — show the current content first, confirm the overwrite is intended, and only then write
+- Both bans are unconditional because both failures are SILENT: the working tree looks clean afterwards, so the destroyed work is either discovered hours later or misread as a genuine code finding when a grep returns baseline content
+- No branch switching unless 100% confident. No destructive git ops unless told to or integrated upstream
 
 ## Agents
 
