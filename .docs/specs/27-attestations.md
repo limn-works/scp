@@ -127,7 +127,7 @@ F1's `Renewal metadata` cell is blank because `IdentityLinkAttestation` declares
 
 *Derivation from the matrix above, ordered by how many families carry the property.*
 
-**No property in the matrix is common to all eight.** The three widest are a claim, at eight of eight; a timestamp, at seven of eight; and a named subject, at six of eight.
+**All eight families carry a claim payload.** No other property in the matrix reaches all eight: the next two widest are a timestamp, at seven of eight, and a named subject, at six of eight.
 
 1. **A claim — eight of eight.** Every family carries an assertion. In F3 the assertion is the platform token's own semantics, opaque to SCP: the type is a newtype over `Vec<u8>` whose doc comment states "The token format is platform-specific (e.g., Apple App Attest, Android `SafetyNet`)" (`crates/scp-platform/src/traits.rs:236`). In F4 the assertion is the pair of custody-model enum values.
 2. **A timestamp — seven of eight.** F3 carries none: `DeviceAttestation::attest()` takes no arguments and returns only the token bytes (`crates/scp-platform/src/traits.rs:802`), so the token's time, where it exists, lives inside the platform payload that SCP does not parse.
@@ -148,7 +148,7 @@ F1's `Renewal metadata` cell is blank because `IdentityLinkAttestation` declares
 
 **Only F1 and F2 share the envelope of §7.4.1 of the trust spec.** F5, F6, F7, and F8 carry a flat, purpose-built field set. F3 and F4 carry no envelope at all.
 
-*Derivation:* the eight families share no field-level property, so the matrix supplies no evidence that they form one category. Whether they form one category is open question OQ-1.
+*Derivation:* a claim is the one property all eight families carry, and the seven signed structures of §9.5.2 of the security spec that this section leaves out carry a claim too, because §7.4 of the trust spec's "signed claims by identities about something" admits all ten structures §9.5.2 tabulates as signed (§27.1.2, on the undecided membership criterion). Every other property in the matrix leaves at least one of the eight families out. So the matrix carries no property that all eight families have and the other seven structures lack, and it supplies no evidence that the eight form one category. Whether they form one category is open question OQ-1.
 
 ## 27.3 Canonical signing construction
 
