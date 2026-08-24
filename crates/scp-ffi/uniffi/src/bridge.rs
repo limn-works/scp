@@ -633,8 +633,12 @@ fn resolve_identity_custody(identity: &Identity) -> Option<Arc<UniffiKeyCustody>
 }
 
 /// Resolves the retained custody on a [`ContextHandle`] into a
-/// [`UniffiKeyCustody`] enum, for the production context ops that sign over it
-/// (`ucan_mint`, `ucan_delegate`).
+/// [`UniffiKeyCustody`] enum, for `ucan_mint`, which signs with a context
+/// creator's key and writes that creator's DID into `iss`.
+///
+/// `ucan_delegate` does NOT call this helper: a delegation signs with its own
+/// delegator's key, which [`ucan_delegate_impl`] reads from a DID-keyed
+/// identity custody registry instead.
 ///
 /// Resolution order mirrors [`resolve_identity_custody`] (and the handle's own
 /// `resolve_uniffi_signing_key` / `sign_export_snapshot_via_custody`): the
@@ -5595,35 +5599,55 @@ async fn ucan_mint_impl(
 }
 
 /// Inner implementation of [`ucan_delegate`].
+///
+/// Signs each delegation with that delegation's own delegator key, which this
+/// function reads from `bi`'s DID-keyed identity custody registry under
+/// `delegator_did`. It never signs with a context creator's key.
+///
+/// [`delegate_ucan`](scp_core::crypto::ucan::mint::delegate_ucan) writes
+/// `params.delegator_did` into a token's `iss` field and signs that token with
+/// `params.delegator_key`, so those two arguments must name one principal. An
+/// earlier revision passed `handle.signing_key` — a context creator's key — as
+/// `delegator_key` while passing a caller's `delegator_did`, which let a caller
+/// name principal A and obtain a token that principal B's key signed. `PyO3`'s
+/// bridge (`crates/scp-ffi/src/ucan.rs`) and napi's bridge
+/// (`crates/scp-ffi/napi/src/ucan.rs`) read both values from their own identity
+/// registries for that reason, and this function now matches them.
+///
+/// A `delegator_did` absent from `bi`'s registry fails closed with
+/// `SCP-IDENT-1001`, matching what `PyO3` and napi return for that same miss.
 async fn ucan_delegate_impl(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     handle: Arc<ContextHandle>,
     delegator_did: String,
     delegatee_did: String,
     parent_token: String,
     capabilities: Vec<String>,
 ) -> Result<Arc<UcanToken>, ScpError> {
+    // Read a delegator's own custody and active signing key out of this
+    // instance's registry, which every `identity_create*` path populates. A
+    // DashMap reference guard is not `Send`, so this clones both values out
+    // before a spawned task below awaits anything.
+    let (delegator_custody, delegator_key) = {
+        let entry = identity_custody_registry(bi)
+            .get(&delegator_did)
+            .ok_or_else(|| ScpError::Identity {
+                msg: format!(
+                    "UCAN delegation signs with a delegator's own key, and identity \
+                     '{delegator_did}' is not registered on this bridge instance — create it \
+                     via identityCreate / identityCreateWithCustody"
+                ),
+                code: codes::IDENT_1001.to_owned(),
+            })?;
+        let (custody, key) = entry.value();
+        (Arc::clone(custody), *key)
+    };
+
     runtime()
         .spawn(async move {
             use scp_core::crypto::ucan::Attenuation;
             use scp_core::crypto::ucan::mint::{DelegateParams, delegate_ucan};
             use scp_core::crypto::ucan::validate::parse_ucan;
-
-            // Resolve the retained key custody (callback first, then in-memory
-            // in testing builds) and the signing key from the
-            // context handle. Externally-loaded handles retain no custody and
-            // fail closed with SCP-IDENT-1017.
-            let custody = resolve_context_custody(&handle).ok_or_else(|| ScpError::Identity {
-                msg: "UCAN delegation requires retained signing custody — the context \
-                          creator identity has no retained custody (it was externally loaded)"
-                    .to_owned(),
-                code: codes::IDENT_1017.to_owned(),
-            })?;
-            let signing_key = handle.signing_key.ok_or_else(|| ScpError::Identity {
-                msg: "UCAN delegation requires retained signing custody — the context creator \
-                          identity has no active signing key"
-                    .to_owned(),
-                code: codes::IDENT_1017.to_owned(),
-            })?;
 
             // Parse the parent token.
             let parsed_parent = parse_ucan(&parent_token).map_err(|e| ScpError::Permission {
@@ -5667,7 +5691,7 @@ async fn ucan_delegate_impl(
             let params = DelegateParams {
                 parent_token: &parsed_parent,
                 delegator_did: &delegator_did,
-                delegator_key: &signing_key,
+                delegator_key: &delegator_key,
                 delegatee_did: &delegatee_did,
                 attenuated_capabilities: &attenuations,
                 lifetime_secs: 3600,
@@ -5677,7 +5701,7 @@ async fn ucan_delegate_impl(
                 ceiling,
             };
 
-            let token = delegate_ucan(&params, &*custody, &scp_clock::SystemClock)
+            let token = delegate_ucan(&params, &*delegator_custody, &scp_clock::SystemClock)
                 .await
                 .map_err(ScpError::from)?;
 
@@ -15781,6 +15805,10 @@ impl Scp {
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
+    ///
+    /// Signs each delegation with `delegator_did`'s own key, read from this
+    /// instance's identity custody registry. A `delegator_did` that this
+    /// instance has not registered returns `SCP-IDENT-1001`.
     pub async fn ucan_delegate(
         &self,
         handle: Arc<ContextHandle>,
@@ -15800,6 +15828,7 @@ impl Scp {
             validate_capability_uri(cap)?;
         }
         ucan_delegate_impl(
+            &self.inner,
             handle,
             delegator_did,
             delegatee_did,
@@ -24206,20 +24235,58 @@ mod tests {
             .expect("UCAN signature must verify against the callback #active key");
     }
 
+    /// Registers a callback-custody identity for `did` on `scp`'s bridge
+    /// instance, mirroring what `identity_create_with_custody` records, and
+    /// returns that identity's `#active` verifying key so a test can check
+    /// which principal signed a token.
+    async fn register_callback_identity(
+        scp: &Arc<crate::scp::Scp>,
+        did: &str,
+    ) -> ed25519_dalek::VerifyingKey {
+        let callback_custody = Arc::new(CallbackKeyCustody::new(Box::new(ProdLikeCustody::new())));
+        let signing_key = callback_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("callback custody generates an Ed25519 #active key");
+        let public_key = callback_custody
+            .public_key(&signing_key)
+            .await
+            .expect("callback custody exposes the #active public key");
+        let pk_bytes: [u8; 32] = public_key
+            .into_bytes()
+            .try_into()
+            .expect("Ed25519 public key is 32 bytes");
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes)
+            .expect("custody public key is a valid Ed25519 verifying key");
+
+        register_identity_custody(
+            &scp.inner,
+            did,
+            &Arc::new(UniffiKeyCustody::Callback(callback_custody)),
+            signing_key,
+        )
+        .expect("registering a delegator identity must succeed");
+
+        verifying_key
+    }
+
     /// `ucan_delegate` must work over callback custody (production path): a child
-    /// token delegated from a callback-minted parent verifies against the same
-    /// `#active` public key. Pins that `ucan_delegate_impl` is un-gated and
-    /// resolves custody via `resolve_context_custody`.
+    /// token delegated from a callback-minted parent verifies against its
+    /// delegator identity's `#active` public key. Pins that
+    /// `ucan_delegate_impl` is un-gated and signs through whichever callback
+    /// custody an identity custody registry holds for that delegator.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ucan_delegate_works_over_callback_custody() {
         let scp = scp_test();
-        let (handle, verifying_key) = callback_context_handle(&scp).await;
+        let (handle, _creator_key) = callback_context_handle(&scp).await;
+        let delegator_did = "did:dht:z6MkCallbackDelegator";
+        let delegator_key = register_callback_identity(&scp, delegator_did).await;
 
         // Mint a parent token first (callback custody), then delegate from it —
-        // both must route through the callback signing path.
+        // both must route through a callback signing path.
         let parent = ucan_mint_impl(
             Arc::clone(&handle),
-            "did:dht:z6MkCallbackDelegator".to_owned(),
+            delegator_did.to_owned(),
             vec!["messages:write".to_owned()],
             None,
         )
@@ -24227,8 +24294,9 @@ mod tests {
         .expect("parent ucan_mint over callback custody must succeed");
 
         let child = ucan_delegate_impl(
+            &scp.inner,
             handle,
-            "did:dht:z6MkCallbackDelegator".to_owned(),
+            delegator_did.to_owned(),
             "did:dht:z6MkCallbackDelegatee".to_owned(),
             parent.encoded.clone(),
             vec!["messages:write".to_owned()],
@@ -24236,7 +24304,76 @@ mod tests {
         .await
         .expect("ucan_delegate over callback custody must succeed");
 
-        assert_encoded_ucan_signature_verifies(&child.encoded, &verifying_key);
+        assert_encoded_ucan_signature_verifies(&child.encoded, &delegator_key);
+    }
+
+    /// A delegation must carry the signature of whichever principal
+    /// `delegator_did` names, and must never carry a context creator's
+    /// signature in its place.
+    ///
+    /// `delegate_ucan` writes `delegator_did` into `iss` and signs with
+    /// `delegator_key`. An earlier revision of `ucan_delegate_impl` passed
+    /// `handle.signing_key` — a context creator's key — as `delegator_key`,
+    /// so a caller naming any DID received a token that claimed issuance by
+    /// that DID while a context creator's key had signed it. This test fails
+    /// against that revision on both assertions below.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_delegate_signs_with_delegator_key_not_context_creator_key() {
+        use base64::Engine;
+        use ed25519_dalek::Verifier;
+
+        let scp = scp_test();
+        let (handle, creator_key) = callback_context_handle(&scp).await;
+        let delegator_did = "did:dht:z6MkDistinctDelegator";
+        assert_ne!(
+            delegator_did, handle.creator_did,
+            "this test only means something when a delegator differs from a creator"
+        );
+        let delegator_key = register_callback_identity(&scp, delegator_did).await;
+
+        // A context creator mints a parent token whose audience is that
+        // delegator, which is what lets that delegator sub-delegate from it.
+        let parent = ucan_mint_impl(
+            Arc::clone(&handle),
+            delegator_did.to_owned(),
+            vec!["messages:write".to_owned()],
+            None,
+        )
+        .await
+        .expect("parent ucan_mint over callback custody must succeed");
+
+        let child = ucan_delegate_impl(
+            &scp.inner,
+            handle,
+            delegator_did.to_owned(),
+            "did:dht:z6MkDistinctDelegatee".to_owned(),
+            parent.encoded.clone(),
+            vec!["messages:write".to_owned()],
+        )
+        .await
+        .expect("ucan_delegate must succeed for a registered delegator");
+
+        assert_eq!(
+            child.data.issuer, delegator_did,
+            "a delegation names its delegator as its issuer"
+        );
+        // That delegator's key signed it.
+        assert_encoded_ucan_signature_verifies(&child.encoded, &delegator_key);
+
+        // That context creator's key did not sign it.
+        let (signing_input, sig_b64) = child
+            .encoded
+            .rsplit_once('.')
+            .expect("encoded UCAN has a signature segment");
+        let sig_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(sig_b64)
+            .expect("signature segment is base64url");
+        let sig =
+            ed25519_dalek::Signature::from_slice(&sig_bytes).expect("token signature is 64 bytes");
+        assert!(
+            creator_key.verify(signing_input.as_bytes(), &sig).is_err(),
+            "a delegation must not carry a context creator's signature"
+        );
     }
 
     /// `event_log_checkpoint` must work over callback custody (production path):
@@ -24317,9 +24454,10 @@ mod tests {
     // -----------------------------------------------------------------------
     // Checkpoint sender_did ↔ signing-identity binding
     //
-    // The UniFFI bridge has no DID-keyed identity registry, so the recorded
-    // `sender_did` is bound to the signing `Identity` explicitly inside
-    // `event_log_checkpoint_by_did_impl` (the `did != identity.did` guard).
+    // `event_log_checkpoint_by_did_impl` signs with whichever custody its
+    // `Identity` argument carries, and never with a custody it looks up by DID,
+    // so it binds a recorded `sender_did` to that `Identity` explicitly through
+    // its `did != identity.did` guard.
     // Without it a caller could record a checkpoint as signed by an arbitrary
     // DID while signing with an unrelated identity's key — a provenance
     // forgery. These tests pin that guard so a future re-order or removal of
@@ -24377,9 +24515,14 @@ mod tests {
     //
     // A context handle / identity that retains no custody (externally loaded:
     // `in_memory_custody`, `signing_key`, `callback_custody` all `None`) must
-    // reject UCAN mint, UCAN delegate, and event-log checkpoint with the
-    // canonical missing-signing-custody code — not an overloaded
-    // permission/nonce code.
+    // reject UCAN mint and event-log checkpoint with a canonical
+    // missing-signing-custody code — not an overloaded permission/nonce code.
+    //
+    // UCAN delegate sits outside this group: it signs with its own delegator's
+    // key, which it reads from an identity custody registry and never from a
+    // context handle, so its fail-closed code is a registry-miss
+    // `SCP-IDENT-1001` that PyO3 and napi also return (see
+    // `ucan_delegate_unregistered_delegator_returns_ident_1001`).
 
     #[tokio::test]
     async fn ucan_mint_without_retained_custody_returns_ident_1017() {
@@ -24403,27 +24546,33 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn ucan_delegate_without_retained_custody_returns_ident_1017() {
+    /// A `delegator_did` that this bridge instance never registered must fail
+    /// closed with `SCP-IDENT-1001`, matching what `PyO3`'s and napi's delegate
+    /// paths return for that same registry miss. A context handle carrying full
+    /// callback custody keeps a creator's key available throughout, so no
+    /// creator-key fallback can hide behind a missing key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_delegate_unregistered_delegator_returns_ident_1001() {
         let scp = scp_test();
-        let handle = test_handle_for(&scp);
+        let (handle, _creator_key) = callback_context_handle(&scp).await;
 
-        // The handle-borne custody check fires before any parent-token parsing.
+        // This delegator registry lookup fires before any parent-token parsing.
         let result = ucan_delegate_impl(
+            &scp.inner,
             handle,
-            "did:dht:z6MkDelegator".to_owned(),
+            "did:dht:z6MkUnregisteredDelegator".to_owned(),
             "did:dht:z6MkDelegatee".to_owned(),
             "header.payload.signature".to_owned(),
             vec!["messages:write".to_owned()],
         )
         .await;
         let Err(err) = result else {
-            panic!("delegate without retained custody must fail")
+            panic!("delegate for an unregistered delegator must fail")
         };
         let err_str = err.to_string();
         assert!(
-            err_str.contains(codes::IDENT_1017),
-            "expected SCP-IDENT-1017, got: {err_str}"
+            err_str.contains(codes::IDENT_1001),
+            "expected SCP-IDENT-1001, got: {err_str}"
         );
     }
 

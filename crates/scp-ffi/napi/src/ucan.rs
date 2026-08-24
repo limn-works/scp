@@ -1451,9 +1451,9 @@ mod tests {
     //
     // NOTE: the NAPI `ucan_delegate_on` path resolves the delegator key from
     // the identity registry (`with_identity`), so its no-custody condition
-    // surfaces as the registry-miss SCP-IDENT-1001, not IDENT-1017. The
-    // delegate→IDENT-1017 routing is a UniFFI-shaped concern (handle-borne
-    // custody) and is covered by the UniFFI inline test.
+    // surfaces as the registry-miss SCP-IDENT-1001, not IDENT-1017. All three
+    // bridges resolve a delegator key that way, so no bridge routes delegate to
+    // IDENT-1017.
     // -----------------------------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
