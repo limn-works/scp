@@ -57,16 +57,27 @@ second process and a second object in this process alike; the per-object mutex
 they held before excluded neither, so two concurrent creations each appended at
 one index and the later write replaced the earlier — **one generated private key
 never reached disk while both callers read success, and both handles then named
-the surviving entry**. Each entry's ciphertext now binds `key_type ‖
-entry_index` as AES-256-GCM associated data, and every read path compares an
-entry's stored `key_type` byte against the type its handle names before
-decrypting. Without those two rules, a handle whose entry the file had since
-refilled decrypted an X25519 static secret, and `SigningKey::from_bytes`, which
-accepts any 32 bytes, turned that secret into an Ed25519 signing key that
-returned a signature. **A handle that names an entry the file has refilled now
-reports an error instead of signing.** `destroy_key` re-encrypts every entry it
-moves down one index, because that index is part of what an entry's ciphertext
-commits to.
+the surviving entry**. Each entry now carries a 16-byte `entry_id` that custody
+draws once and no later write changes; a handle records that identifier, every
+read finds its entry by comparing identifiers, and each entry's ciphertext binds
+`key_type | entry_id` as AES-256-GCM associated data. Every read path also
+compares an entry's stored `key_type` byte against the type its handle names
+before decrypting, which turns a changed type byte into an error naming both
+types rather than an opaque decryption failure.
+
+A handle that recorded a position instead read whichever key a later write moved
+into that position. `destroy_key` moves every entry after the removed one down
+one position, so a handle another custody object minted before that call named
+an entry that had left. Where both entries held one key type — two Ed25519 keys
+of one identity, which is what `#0`, `#active`, and `#agent` are — the stored
+type byte matched, and re-encrypting a moved entry under its new position made
+the associated data match too, so AES-256-GCM accepted a key its caller never
+designated and `sign` returned a signature under it. `destroy_key` reached the
+same key by position and destroyed it. **A handle whose entry left the file now
+reports an error on `sign`, on `public_key`, on `dh_agree`, and on
+`destroy_key`, and every other handle keeps reading its own key.**
+`destroy_key` copies each entry it moves byte for byte, because no entry's
+ciphertext commits to a position.
 
 **A relay names its blob storage backend.**
 `scp_transport::startup::storage_from_env` substituted `sqlite` when
