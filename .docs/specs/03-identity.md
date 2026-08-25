@@ -917,7 +917,13 @@ The full resolution sequence:
       the highest-seq valid record. This is the full document, and it is
       authoritative for every field (§3.10).
    b. Mainline layer. Take the valid record. This is the bootstrap core, and
-      it is authoritative for the core's four elements (§18.2.2C).
+      it is authoritative for each of the core's four elements
+      (§18.2.2C), and that includes a missing `PreRotationCommitment`
+      record. Criterion 3 puts the entry in the core whenever the
+      document carries it, so a core without the record states that
+      the identity published no commitment. §3.10.10's
+      unresolved-rather-than-absent rule covers the relay-layer
+      entries the core never carries, not this one.
    c. The resolver MUST NOT compare a relay-layer sequence number against a
       Mainline sequence number, and MUST NOT discard one layer's record
       because the other layer returned a higher number. The two layers carry
@@ -1124,15 +1130,23 @@ pub enum ResolvedDidDocument {
 /// The four elements the Mainline layer carries (§18.2.2C). This type has
 /// no field for any relay-layer entry, so a caller holding a bootstrap-core
 /// resolution cannot read `SCPCapabilities`, `alsoKnownAs`, `#agent` or any
-/// other relay-layer entry off it and receive an empty answer.
+/// other relay-layer entry off it and receive an empty answer. `#0`,
+/// `#active` and the relay list are present on every identity; the
+/// pre-rotation commitment is the one element an identity may not carry.
 pub struct BootstrapCore {
     /// `#0`, derived from the DID string (§9.6.1) rather than from key
     /// bytes the core carries.
     pub identity_key: VerificationMethod,
     /// `#active`.
     pub active_key: VerificationMethod,
-    /// The `PreRotationCommitment` service entry.
-    pub pre_rotation_commitment: Service,
+    /// The `PreRotationCommitment` service entry, present when the
+    /// identity published one. §18.2.2A bounds the entry at one and does
+    /// not require it, because whether an identity may be created carrying
+    /// no commitment is Discussion #1553, the non-committing-identity
+    /// question. `None` here states that the identity published no
+    /// commitment, which ADR-003 §4c invariant 7 reads as the input to its
+    /// MODERATE-assurance migration branch.
+    pub pre_rotation_commitment: Option<Service>,
     /// The `SCPRelay` service entries, in publication order.
     pub relays: Vec<Service>,
 }

@@ -161,7 +161,7 @@ Every SDK MUST produce byte-identical bytes to every other SDK for the same iden
 | `capabilityDelegation` | Yes | MUST reference only `#0`. |
 | `capabilityInvocation` | Yes | MUST reference `#0` and `#active`. |
 | `alsoKnownAs` | No | At most one entry, and it names the DID that a Layer 2 identity migration moved this identity to (§9.12). Absent on an identity that has not migrated. |
-| `service` | Yes | At least one `SCPRelay` entry required. Exactly one `PreRotationCommitment` entry required: ADR-003 acceptance criterion 1 constructs it on every identity, and §9.12 reads it on every rotation, so a document without it cannot have its rotations verified. Every other type is optional. Each entry satisfies the three criteria in §18.2.2B. |
+| `service` | Yes | At least one `SCPRelay` entry required. At most one `PreRotationCommitment` entry. ADR-003 acceptance criterion 1 (`.docs/adrs/phase-1.md`) constructs one on every identity the shipped creation path builds, and `DidMethod::create` (`crates/scp-identity/src/dht.rs:2012`) takes a `PreRotationCustody` implementation it cannot omit. ADR-003 §4c invariant 7 defines what a verifier does with a document that publishes none: `pre_rotation_proof` MAY be `None`, and the migration verifies at MODERATE assurance. Whether an identity may be created carrying no commitment is Discussion #1553, the non-committing-identity question, which a human decides alongside issue #1729, the pre-rotation custody backend, so this row caps the count at one and does not make the entry mandatory. Every other type is optional. Each entry satisfies the three criteria in §18.2.2B. |
 | `service[].id` | Yes | Fragment identifier (e.g., `#scp-relay-1`). Unique within the document. |
 | `service[].type` | Yes | One of the types in §18.2.2. |
 
@@ -214,7 +214,7 @@ A value that satisfies neither MUST NOT appear in the document. The clearest cas
 
 The reason the criterion exists: §18.2.2D caps the bytes a publisher may emit on each layer, and §18.2.2D's parse-side companion bounds what a resolver deserializes from an untrusted source. An entry class whose count the owner can raise without limit therefore makes the document unpublishable at the publishing end and a memory-amplification input at the resolving end.
 
-The test asks what raises the count. An entry class whose count the owner raises by taking one more action of a kind the protocol invites it to repeat — creating another context, enrolling another device, publishing another outlet — appears as **one** pointer entry naming where a verifier fetches the list. An entry class whose count the protocol fixes (one `#0`, one `#active`, at most one `#agent`, one `PreRotationCommitment`, one `alsoKnownAs` target) or whose count this specification caps with a number (at most 64 `ScpIdentityLinkAttestation` entries, §3.5.3) appears as a value.
+The test asks what raises the count. An entry class whose count the owner raises by taking one more action of a kind the protocol invites it to repeat — creating another context, enrolling another device, publishing another outlet — appears as **one** pointer entry naming where a verifier fetches the list. An entry class whose count the protocol fixes (one `#0`, one `#active`, at most one `#agent`, at most one `PreRotationCommitment`, one `alsoKnownAs` target) or whose count this specification caps with a number (at most 64 `ScpIdentityLinkAttestation` entries, §3.5.3) appears as a value.
 
 Two entry classes fail this criterion as §18.2.2 and §5.14.11 write them today, and both become pointers:
 
@@ -250,7 +250,7 @@ Note that the relay layer's own DID record does not depend on clause (b). A reso
 
 ### 18.2.2C The Mainline Bootstrap Core
 
-The Mainline DHT layer carries a **bootstrap core**: the entries criterion 3 of §18.2.2B admits, which are the entries a resolver needs before any relay has answered it. The core carries exactly four things:
+The Mainline DHT layer carries a **bootstrap core**: the entries criterion 3 of §18.2.2B admits, which are the entries a resolver needs before any relay has answered it. The core carries these four elements and nothing else:
 
 | Element | Why criterion 3 admits it |
 |---------|---------------------------|
@@ -260,6 +260,8 @@ The Mainline DHT layer carries a **bootstrap core**: the entries criterion 3 of 
 | The `SCPRelay` service entries | Clause (a): level 2 of §18.5.1 is where the SDK first learns of any relay, so a pointer to a relay list would name a relay the resolver cannot yet reach. |
 
 Everything else a DID document carries — `SCPCapabilities`, `IdentityPrivateState`, `SCPBroadcastContext`, `ParticipationStatements`, `AttestationRevocations`, `ScpIdentityLinkAttestation`, `alsoKnownAs`, and the `#agent` verification method — lives on the relay layer only. A resolver holding the bootstrap core holds the relay list, so it fetches the full document from a relay rather than reading those entries out of Mainline.
+
+**The table lists which entry classes the core admits, and three of the four are present on every identity.** The `PreRotationCommitment` record appears in the core when the relay-layer document carries the entry, and §18.2.2A bounds that entry at one without requiring it, so a core built for an identity that published no commitment carries three elements. Whether an identity may be created carrying no commitment is Discussion #1553, the non-committing-identity question, which a human decides alongside issue #1729, the pre-rotation custody backend; ADR-003 §4c invariant 7 (`.docs/adrs/phase-1.md`) already defines how a verifier handles the document that results. Criterion 3 decides which entry classes the core carries, and it does not decide whether an identity publishes a commitment.
 
 **The Mainline encoding is the did:dht method's DNS-packet encoding, and the method specification fixes it.** The did:dht method specification, § "Operations → Create" step 4 and § "DIDs as DNS Records", states: "Compress the DNS packet as per [RFC1035] section 4.1.4", and "`v` MUST be set to a bencoded compressed DNS packet from the prior step" (https://did-dht.com, `#create` and `#dids-as-dns-records`). RFC 1035 §4.1.4 defines DNS message name-pointer compression. **The method specifies no other compression, and the string "gzip" does not appear anywhere in it.** Issue #2297, "DID documents do not fit their transport", says did:dht "requires a gzipped DNS packet"; that sentence is wrong and the method specification governs.
 
