@@ -1148,48 +1148,33 @@ fn resolve_future(
 // MLS key package generation helper (#1324)
 // ---------------------------------------------------------------------------
 
-/// Generates serialized MLS key package bytes for a given DID.
+/// Refuses to generate MLS `KeyPackage` bytes on the single-process
+/// membership path, because that path cannot produce a `KeyPackage` §9.7.1
+/// accepts.
 ///
-/// Ported from the NAPI bridge (`generate_mls_key_package_bytes` in
-/// `napi/src/context.rs`) as part of issue #1324. Creates an SCP credential
-/// for the DID, generates a fresh MLS key package, and returns the
-/// TLS-serialized bytes suitable for passing to
-/// `ContextManager::join_context`.
+/// Two of the leaf's four attested public keys (§9.5.2 fields 2–5) are
+/// unavailable here. The `scp_wrapping_key` (`0xFF01`) value is one: this path
+/// "retains no joiner private state", so any wrapping key it published would
+/// advertise a secret it had already discarded, and §9.5.2 field 5 binds that
+/// value into the attestation. The private MLS halves are the other: the
+/// generated signer and provider were discarded, so the leaf could never open
+/// a Welcome addressed to it.
 ///
-/// Uses [`generate_key_package_with_context_params`] with `None` so the leaf
-/// **declares the `0xFF02` (`scp_context_params`) capability** — mandatory to
-/// be added to an encrypted context group (`valn0502`, §5.13.3). The base
-/// `generate_key_package` (which declares no SCP capabilities) produces a KP
-/// that real MLS rejects from a context group ("the capabilities of the add
-/// proposal are insufficient for this group"). No wrapping-key leaf extension
-/// is attached: this single-process membership path retains no joiner private
-/// state, so a wrapping key here would advertise a key whose secret is
-/// discarded; sender-key distribution to such a member is correctly skipped.
+/// The supported join path is `reserve_key_package` → the context creator's
+/// `add_member` → `context_join_from_welcome`. That path mints through the
+/// identity's `KeyPackageStoreActor`, which signs the attestation with the
+/// identity's `#active` custody key and retains the private halves.
+///
+/// # Errors
+///
+/// Always returns a crypto error naming the supported path.
 fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, crate::error::ScpPyError> {
-    use scp_core::crypto::mls::credential::ScpCredential;
-    use scp_core::crypto::mls::group::generate_key_package_with_context_params;
-    use tls_codec::Serialize as TlsSerializeTrait;
-
-    let cred =
-        ScpCredential::new(did.to_owned(), None, scp_did::SigningKeyId::Active).map_err(|e| {
-            crate::error::ScpPyError::crypto(format!(
-                "failed to create SCP credential for MLS key package: {e}"
-            ))
-        })?;
-
-    let (kp_bundle, _signer, _provider) =
-        generate_key_package_with_context_params(&cred, None, &scp_clock::SystemClock).map_err(
-            |e| crate::error::ScpPyError::crypto(format!("MLS key package generation failed: {e}")),
-        )?;
-
-    kp_bundle
-        .key_package()
-        .tls_serialize_detached()
-        .map_err(|e| {
-            crate::error::ScpPyError::crypto(format!(
-                "MLS key package TLS serialization failed: {e}"
-            ))
-        })
+    Err(crate::error::ScpPyError::crypto(format!(
+        "cannot mint an MLS KeyPackage for '{did}' on this path: it publishes no \
+         scp_wrapping_key and discards the joiner's private key material, so the \
+         §9.7.1 KeyPackage attestation has no wrapping key to bind and the leaf could \
+         not open a Welcome. Use reserve_key_package + context_join_from_welcome."
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -2726,6 +2711,35 @@ impl crate::scp::PyScp {
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = Arc::clone(sup);
         let owning = scp_did::DID(owning_did.to_owned());
+
+        // §9.7.1: a pooled KeyPackage carries an attestation signed by this
+        // identity's `#active` custody key, and the KeyPackage actor reads its
+        // signer at spawn — so both ports are registered BEFORE the reserve
+        // that spawns it. The actor refuses to mint without a signer, so a
+        // registration that arrived late would fail the reserve rather than
+        // pool an unattested KeyPackage.
+        let (custody, active_handle) = crate::runtime::with_identity(bi, owning_did, |entry| {
+            Ok((entry.custody.clone(), entry.identity.active_signing_key))
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let did_resolver = crate::runtime::did_resolver(bi).map(Arc::clone);
+        let sup_for_ports = Arc::clone(&sup);
+        let owning_for_ports = owning.clone();
+        rt.block_on(async move {
+            scp_ffi_common::attestation_ports::register_attestation_ports(
+                &sup_for_ports,
+                owning_for_ports,
+                custody,
+                active_handle,
+                scp_did::SigningKeyId::Active,
+                did_resolver,
+            )
+            .await
+        })
+        .map_err(|e| {
+            PyRuntimeError::new_err(format!("registering KeyPackage attestation ports: {e}"))
+        })?;
+
         let (reservation_id, kp_public) = rt
             .block_on(async move { sup.reserve_key_package(owning).await })
             .map_err(|e| PyRuntimeError::new_err(format!("reserve_key_package failed: {e}")))?;

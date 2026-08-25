@@ -352,12 +352,13 @@ fn receiving_a_distribution_stamps_no_event_and_no_leaf() {
 fn add_with_missing_wrapping_extension_is_rejected_fail_closed() {
     // ADR-057 sender-key distribution INVARIANT 3: an add whose KeyPackage leaf
     // carries no scp_wrapping_key extension must be rejected — a member no peer can
-    // HPKE-seal a sender key to must not be admitted. The driver always publishes a
-    // wrapping key, so this crafts a PLAIN KeyPackage via raw `scp-mls` (a
-    // dev-dependency) to exercise the guard.
+    // HPKE-seal a sender key to must not be admitted. Every SCP mint path now
+    // carries the extension, so no conformant peer produces this shape; the
+    // fixture below models what a NON-conformant implementation publishes,
+    // which is exactly the input the receiver-side guard defends against.
     use scp_did::SigningKeyId;
     use scp_mls::ScpCredential;
-    use scp_mls::group::generate_key_package;
+    use scp_mls::mint_non_conformant_key_package_for_testing;
     use tls_codec::Serialize as _;
 
     let relay = Relay::new();
@@ -368,7 +369,8 @@ fn add_with_missing_wrapping_extension_is_rejected_fail_closed() {
     let bob_cred =
         ScpCredential::new(BOB_DID.to_owned(), None, SigningKeyId::Active).expect("bob credential");
     let (bundle, _signer, _provider) =
-        generate_key_package(&bob_cred, &SystemClock).expect("plain key package");
+        mint_non_conformant_key_package_for_testing(&bob_cred, &SystemClock)
+            .expect("plain key package");
     let plain_kp = bundle
         .key_package()
         .tls_serialize_detached()
@@ -415,7 +417,7 @@ fn snapshot_v3_persists_wrapping_and_directory_for_post_restore_distribution() {
 
     // Bob over caller-supplied (shared, restorable) storage.
     let mut bob = {
-        let signer = Arc::new(LocalSigner::active(BOB_DID));
+        let signer = Arc::new(LocalSigner::active_for_testing(BOB_DID));
         let clock: Arc<dyn Clock> = Arc::new(TestClock::new(SystemClock.now_secs() + 100));
         relay.party_with(signer, Arc::clone(&bob_storage), clock)
     };
@@ -457,7 +459,7 @@ fn snapshot_v3_persists_wrapping_and_directory_for_post_restore_distribution() {
     // keypair + directory + the installed sender-key store) and re-subscribes to
     // his restore-stable pseudonym, so Alice's fan-out reaches him.
     let mut bob2 = {
-        let signer = Arc::new(LocalSigner::active(BOB_DID));
+        let signer = Arc::new(LocalSigner::active_for_testing(BOB_DID));
         let clock: Arc<dyn Clock> = Arc::new(TestClock::new(SystemClock.now_secs() + 150));
         relay.party_with(signer, Arc::clone(&bob_storage), clock)
     };

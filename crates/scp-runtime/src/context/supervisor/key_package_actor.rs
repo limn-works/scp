@@ -123,6 +123,7 @@ use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
 
 use crate::context::builder::ContextTransportProvider;
+use crate::crypto::mls::attestation_signer::KeyPackageAttestationSigner;
 use crate::crypto::mls::backend::{MlsBackend, SignerState};
 use crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter;
 use scp_did::SigningKeyId;
@@ -715,8 +716,17 @@ pub(in crate::context) struct KeyPackageStoreDeps {
     pub transport: Arc<dyn ContextTransportProvider>,
     /// Wall-clock source for reservation timestamps.
     pub clock: Arc<dyn Clock>,
-    /// Optional wrapping pubkey published in each generated KP's leaf node.
+    /// The identity's published `scp_wrapping_key` (`0xFF01`) public key,
+    /// carried in every generated KP's leaf node (§9.16.1) and bound by the
+    /// KeyPackage attestation (§9.5.2 field 5). `None` until the identity
+    /// publishes one, in which case replenish fails closed rather than
+    /// generating a leaf whose attestation binds a key the leaf lacks.
     pub wrapping_pubkey: Option<[u8; 32]>,
+    /// Signs each generated KeyPackage's attestation with the identity's
+    /// `#active`/`#agent` custody key (§9.7.1). `None` until the bridge
+    /// registers a signer for this identity, in which case replenish fails
+    /// closed rather than pooling unattested KeyPackages.
+    pub attestation_signer: Option<Arc<dyn KeyPackageAttestationSigner>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -736,8 +746,12 @@ pub struct KeyPackageStoreActor {
     /// `None` only on a malformed-DID wiring bug, in which case replenish
     /// fail-closes rather than pooling inert KPs.
     credential: Option<ScpCredential>,
-    /// Optional wrapping pubkey published in each KP leaf node (§9.16.1).
+    /// The identity's published `scp_wrapping_key` (`0xFF01`) public key
+    /// (§9.16.1), which the KeyPackage attestation binds (§9.5.2 field 5).
     wrapping_pubkey: Option<[u8; 32]>,
+    /// Signs each generated KeyPackage's attestation (§9.7.1). `None` leaves
+    /// this actor unable to mint, and replenish then fails closed.
+    attestation_signer: Option<Arc<dyn KeyPackageAttestationSigner>>,
     /// MLS primitives backend — the replenish source + fused-join executor.
     mls: Arc<dyn MlsBackend>,
     /// Durable KV for the Class-S reservation journal + KP records.
@@ -782,12 +796,22 @@ impl KeyPackageStoreActor {
         // construction only fails on a malformed DID, which would be a
         // supervisor wiring bug — surface it as a degraded actor whose
         // replenish FAIL-CLOSES (typed errors), never pooling inert KPs.
-        let credential = ScpCredential::new(identity.0.clone(), None, SigningKeyId::Active).ok();
+        // §9.7.1 check 10 requires the leaf credential and its attestation to
+        // name the SAME verification method, so the credential's
+        // `signing_key_id` is read off the attestation signer rather than
+        // hardcoded. With no signer registered the actor cannot mint at all,
+        // and the persona it would have used does not matter.
+        let signing_key_id = deps
+            .attestation_signer
+            .as_ref()
+            .map_or(SigningKeyId::Active, |signer| signer.signing_key_id());
+        let credential = ScpCredential::new(identity.0.clone(), None, signing_key_id).ok();
 
         let actor = Self {
             identity,
             credential,
             wrapping_pubkey: deps.wrapping_pubkey,
+            attestation_signer: deps.attestation_signer,
             mls: deps.mls,
             mls_storage: deps.mls_storage,
             transport: deps.transport,
@@ -1714,7 +1738,7 @@ impl KeyPackageStoreActor {
     ///
     /// On the first generate error: stop, persist what we have, and reply
     /// `Ok(count)` if any were generated (partial-retain, mirroring
-    /// `KeyPackageBuffer::replenish`) else `Err(CryptoFailed)`. New pool
+    /// the deleted `scp-mls` buffer) else `Err(CryptoFailed)`. New pool
     /// entries are persisted as KP records (Class-C-acceptable: a lost
     /// unreserved KP is just regenerated; only reserved/consumed transitions
     /// are Class S). Fail-closes if the credential is absent (malformed-DID
@@ -1741,6 +1765,26 @@ impl KeyPackageStoreActor {
             ));
         };
 
+        // §9.7.1 makes both of these prerequisites of a mintable KeyPackage,
+        // and both fail closed: an unattested leaf names a DID no verifier can
+        // check, and a leaf with no `scp_wrapping_key` (`0xFF01`) gives §9.7.1
+        // check 6 nothing to compare the attestation against. Pooling either
+        // shape would publish a KeyPackage every Add verifier rejects.
+        let Some(signer) = self.attestation_signer.clone() else {
+            return Err(ContextError::CryptoFailed(format!(
+                "no KeyPackage-attestation signer registered for {}; refusing to generate \
+                 unattested key packages (§9.7.1)",
+                self.identity.0
+            )));
+        };
+        let Some(wrapping_pubkey) = self.wrapping_pubkey else {
+            return Err(ContextError::CryptoFailed(format!(
+                "no scp_wrapping_key published for {}; the KeyPackage attestation binds it \
+                 (§9.5.2 field 5), so refusing to generate an unbindable key package",
+                self.identity.0
+            )));
+        };
+
         let current = self.pool.len() + self.reserved.len();
         if current >= MIN_BUFFER {
             return Ok(0);
@@ -1752,7 +1796,7 @@ impl KeyPackageStoreActor {
         for _ in 0..deficit {
             match self
                 .mls
-                .generate_key_package(&credential, self.wrapping_pubkey.as_ref())
+                .generate_attested_key_package(&credential, &wrapping_pubkey, signer.as_ref())
                 .await
             {
                 Ok(generated_kp) => {

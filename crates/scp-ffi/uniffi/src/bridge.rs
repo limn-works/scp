@@ -77,54 +77,35 @@ use scp_ffi_common::validate::{
 
 use crate::{decrement_handle_count, increment_handle_count, runtime};
 
-/// Generates a real MLS key package for a joining member.
+/// Refuses to generate MLS `KeyPackage` bytes on the single-process membership
+/// path, because that path cannot produce a `KeyPackage` §9.7.1 accepts.
 ///
-/// Mirrors the NAPI bridge's `generate_mls_key_package_bytes`: builds an
-/// [`ScpCredential`] from the joiner's DID and TLS-serializes a fresh
-/// `KeyPackage` bundle produced by `generate_key_package_with_context_params`.
-/// The output bytes are what `NodeMlsFactory::validate_key_package` and
-/// `NodeMlsFactory::add_member` require — the old `FfiBridgeCrypto` stub
-/// used to accept `None`, but real MLS rejects it.
+/// Two of the leaf's four attested public keys (§9.5.2 fields 2–5) are
+/// unavailable here. The `scp_wrapping_key` (`0xFF01`) value is one: this path
+/// retains no joiner private state, so any wrapping key it published would
+/// advertise a secret it had already discarded, and §9.5.2 field 5 binds that
+/// value into the attestation. The private MLS halves are the other: the
+/// generated signer and provider were discarded, so the leaf could never open a
+/// Welcome addressed to it.
 ///
-/// Uses `None` for the wrapping key so the leaf **declares the `0xFF02`
-/// (`scp_context_params`) capability** — mandatory to be added to an encrypted
-/// context group (`valn0502`, §5.13.3) — without attaching a wrapping-key leaf
-/// extension (this single-process membership path retains no joiner private
-/// state). The base `generate_key_package` declares no SCP capabilities and
-/// real MLS rejects it from a context group.
+/// The supported join path is `reserve_key_package` → the context creator's
+/// `add_member` → `context_join_from_welcome`. That path mints through the
+/// identity's `KeyPackageStoreActor`, which signs the attestation with the
+/// identity's `#active` custody key and retains the private halves.
 ///
 /// # Errors
 ///
-/// Returns `ScpError::Crypto` if the DID format is invalid (must be
-/// `did:dht:z…`), key package generation fails, or TLS serialization fails.
+/// Always returns `ScpError::Crypto` naming the supported path.
 fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, ScpError> {
-    use scp_core::crypto::mls::credential::ScpCredential;
-    use scp_core::crypto::mls::group::generate_key_package_with_context_params;
-    use tls_codec::Serialize as TlsSerializeTrait;
-
-    let cred =
-        ScpCredential::new(did.to_owned(), None, scp_did::SigningKeyId::Active).map_err(|e| {
-            ScpError::Crypto {
-                msg: format!("failed to create SCP credential for MLS key package: {e}"),
-                code: codes::CRYPTO_4010.to_owned(),
-            }
-        })?;
-
-    let (kp_bundle, _signer, _provider) =
-        generate_key_package_with_context_params(&cred, None, &scp_clock::SystemClock).map_err(
-            |e| ScpError::Crypto {
-                msg: format!("MLS key package generation failed: {e}"),
-                code: codes::CRYPTO_4011.to_owned(),
-            },
-        )?;
-
-    kp_bundle
-        .key_package()
-        .tls_serialize_detached()
-        .map_err(|e| ScpError::Crypto {
-            msg: format!("MLS key package TLS serialization failed: {e}"),
-            code: codes::CRYPTO_4012.to_owned(),
-        })
+    Err(ScpError::Crypto {
+        msg: format!(
+            "cannot mint an MLS KeyPackage for '{did}' on this path: it publishes no \
+             scp_wrapping_key and discards the joiner's private key material, so the \
+             §9.7.1 KeyPackage attestation has no wrapping key to bind and the leaf could \
+             not open a Welcome. Use reserve_key_package + context_join_from_welcome."
+        ),
+        code: codes::CRYPTO_4011.to_owned(),
+    })
 }
 
 /// Outlet handler function type: maps JSON input to JSON output (or error string).

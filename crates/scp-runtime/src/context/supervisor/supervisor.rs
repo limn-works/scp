@@ -1349,6 +1349,12 @@ pub struct Supervisor {
     /// Per-identity X25519 wrapping keys. Wrapped in `ArcSwap` so
     /// rotation is atomic; outer `DashMap` keyed by DID.
     pub(in crate::context::supervisor) wrapping_keys: DashMap<DID, ArcSwap<WrappingKeyPair>>,
+    /// Per-identity KeyPackage-attestation signers (§9.7.1). Each bridge
+    /// registers one over the custody key it already holds for that identity;
+    /// [`Self::build_kp_store_deps`] hands it to the identity's
+    /// `KeyPackageStoreActor`, which cannot mint without it.
+    pub(in crate::context::supervisor) attestation_signers:
+        DashMap<DID, Arc<dyn crate::crypto::mls::attestation_signer::KeyPackageAttestationSigner>>,
     /// Persistence backend; stored so `spawn_actor` / `crash_recovery`
     /// can plumb it through to per-actor state.
     // Operational in Phase 2 of post-review-round-1 plan (actor model wiring).
@@ -1851,6 +1857,7 @@ impl Supervisor {
             standing_contexts: ArcSwap::new(Arc::new(HashMap::new())),
             local_dids: Arc::new(ArcSwap::new(Arc::new(HashSet::new()))),
             wrapping_keys: DashMap::new(),
+            attestation_signers: DashMap::new(),
             persistence,
             write_lock,
             bootstrap_spawn_lock,
@@ -2597,6 +2604,57 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Registers the `KeyPackage`-attestation signer for `did` (§9.7.1;
+    /// ADR-057 Amendment 2026-08-01).
+    ///
+    /// Every `KeyPackage` this identity mints carries an attestation signed by
+    /// this signer's `#active`/`#agent` custody key, which is what binds the
+    /// ephemeral MLS leaf key to the DID. Until a bridge registers one, the
+    /// identity's `KeyPackageStoreActor` refuses to generate `KeyPackage`s.
+    ///
+    /// Registering a second signer for the same DID replaces the first, which
+    /// is how a key rotation takes effect: subsequent mints sign under the new
+    /// key. Already-published `KeyPackage`s signed by the retired key are
+    /// deleted and replaced by the rotation path (§9.7.1 "On key rotation").
+    ///
+    /// A `KeyPackageStoreActor` already spawned for `did` keeps the signer it
+    /// was spawned with, so registration precedes the first mint for that
+    /// identity.
+    pub async fn set_attestation_signer(
+        self: &Arc<Self>,
+        did: DID,
+        signer: Arc<dyn crate::crypto::mls::attestation_signer::KeyPackageAttestationSigner>,
+    ) {
+        let _guard = self.write_lock.lock().await;
+        self.attestation_signers.insert(did, signer);
+    }
+
+    /// Attaches the DID-document resolver the MLS backend uses for the §9.7.1
+    /// attestation current-key checks on every `Add` (checks 1–2).
+    ///
+    /// The resolver is process-wide rather than per-identity: it resolves the
+    /// **joiner's** DID, which is a remote identity, so one canonical resolver
+    /// (§3.10.4 dual-layer resolution) serves every admission. Until a bridge
+    /// attaches one, `validate_key_package` rejects every `Add` whose signer
+    /// DID resolution covers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::NotInitialized`] when
+    /// [`Self::with_providers`] has not populated the crypto slot, because the
+    /// MLS backend the resolver attaches to lives behind it.
+    pub fn set_attestation_resolver(
+        self: &Arc<Self>,
+        resolver: Arc<dyn crate::crypto::mls::attestation_signer::DidDocumentResolver>,
+    ) -> Result<(), ContextError> {
+        use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED;
+        let crypto = self
+            .crypto_ref()
+            .ok_or_else(|| ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned()))?;
+        crypto.mls_backend().set_attestation_resolver(resolver);
+        Ok(())
+    }
+
     /// Get-or-spawn this identity's
     /// [`KeyPackageStoreActor`](crate::context::supervisor::key_package_actor::KeyPackageStoreActor),
     /// returning a clone of its handle.
@@ -2735,6 +2793,13 @@ impl Supervisor {
             .wrapping_keys
             .get(identity)
             .map(|entry| entry.value().load_full().public);
+        // The identity's `#active`/`#agent` attestation signer (§9.7.1).
+        // Absent → the actor fails closed on replenish rather than pooling
+        // unattested KeyPackages.
+        let attestation_signer = self
+            .attestation_signers
+            .get(identity)
+            .map(|entry| Arc::clone(entry.value()));
 
         Ok(
             crate::context::supervisor::key_package_actor::KeyPackageStoreDeps {
@@ -2743,6 +2808,7 @@ impl Supervisor {
                 transport,
                 clock,
                 wrapping_pubkey,
+                attestation_signer,
             },
         )
     }
@@ -15874,6 +15940,13 @@ fn reply_with_error(cmd: QueriesCommand, err: ContextError) {
     clippy::similar_names
 )]
 mod tests {
+
+    /// A fresh attestation signer for one mint (§9.7.1). Reports `#active`,
+    /// which every credential here names, because
+    /// `generate_attested_key_package` rejects a persona mismatch.
+    fn test_attestation_signer() -> crate::crypto::mls::attestation_signer::TestAttestationSigner {
+        crate::crypto::mls::attestation_signer::TestAttestationSigner::generate().0
+    }
     use super::*;
     use crate::context::supervisor::saga_journal::ProtocolRepositorySagaJournal;
     use scp_platform::in_memory::InMemoryStorage;
@@ -16737,7 +16810,7 @@ mod tests {
         )
         .expect("valid credential");
         let generated = backend
-            .generate_key_package(&joiner, None)
+            .generate_attested_key_package(&joiner, &[0x5C_u8; 32], &test_attestation_signer())
             .await
             .expect("generate kp");
 

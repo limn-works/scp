@@ -25,6 +25,11 @@ zeroize = { workspace = true }
 # Test-only: supplies `SystemClock` for the MLS group fixtures, which now take
 # an injected `Clock` for KeyPackage `Lifetime` stamping (ADR-057 §Prereq-1).
 scp-clock = { path = "../scp-clock", version = "=0.1.0-beta.2" }
+# Test-only: the attestation-signing key the `scp-mls` test mint takes, now that
+# every KeyPackage carries a signed §9.7.1 attestation.
+scp-core = { path = "../scp-core", features = ["testing"] }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
 
 [lints]
 workspace = true

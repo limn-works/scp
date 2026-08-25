@@ -187,6 +187,11 @@ mod resolvers;
 #[cfg(feature = "resolvers")]
 pub use resolvers::*;
 
+// The two custody-backed KeyPackage-attestation ports (§9.7.1) every bridge
+// registers on its Supervisor. Requires both the resolver stack and custody.
+#[cfg(all(feature = "resolvers", feature = "custody"))]
+pub mod attestation_ports;
+
 // Discovery result mapping (ContextDiscoverySource → trust/resolution metadata).
 // Requires scp-core types.
 #[cfg(feature = "resolvers")]

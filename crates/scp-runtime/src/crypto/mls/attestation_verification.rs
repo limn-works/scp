@@ -1,6 +1,5 @@
-//! Async, native `DidResolver`-backed KeyPackage-attestation verification —
-//! §9.7.1 verifier checks 1–2 wired to real DID resolution (CRYPTO-22 S4,
-//! Layer B).
+//! Async, resolver-backed `KeyPackage`-attestation verification for the
+//! **Add** path — §9.7.1 verifier checks 1–13 wired to real DID resolution.
 //!
 //! The pure, wasm-safe seam
 //! ([`scp_mls::verify_attestation_with_resolution`], Layer A) enforces
@@ -13,59 +12,81 @@
 //!
 //! This module is the **runtime caller** that produces those inputs. It:
 //!
-//! 1. resolves the attestation signer's DID through the injected canonical
-//!    [`DidResolver`] (§3.10.4 dual-layer resolution) — never a `NoOp` / `Stub` /
-//!    in-memory stand-in (the no-dev-stand-in tenet; #2211);
+//! 1. resolves the attestation signer's DID through the injected
+//!    [`DidDocumentResolver`] — the `dyn`-safe face of the canonical §3.10.4
+//!    dual-layer resolver, never a `NoOp` / `Stub` / in-memory stand-in (the
+//!    no-dev-stand-in tenet);
 //! 2. applies the §9.7.1 **"Resolution failure policy"**: a resolution
-//!    failure (`Err`) or not-found (`Ok(None)`) is **fail-closed** — a typed
-//!    reject with NO fallback to a stale/pre-rotation cached document;
-//! 3. stamps `resolved_at` = the injected [`Clock`]'s time at the
-//!    [`DidResolver::resolve`] call (HONEST — never a fabricated/hardcoded
-//!    constant); and
+//!    failure (`Err`), a not-found (`Ok(None)`), and an unwired resolver are
+//!    each **fail-closed** — a typed reject with NO fallback to a
+//!    stale/pre-rotation cached document;
+//! 3. stamps `resolved_at` = the injected [`Clock`]'s time at the resolve call
+//!    (HONEST — never a fabricated/hardcoded constant); and
 //! 4. delegates to Layer A.
 //!
-//! # Testing carve-out (compiled out of shipped artifacts)
+//! # Where it runs
 //!
-//! Under `#[cfg(any(test, feature = "testing"))]` only, a **positive
-//! whitelist** admitting exactly the `did:test:` and `did:key:` prefixes skips
-//! DID-document resolution so the extensive non-`did:dht:` test suite runs
-//! without a live resolver. This mirrors
-//! [`NodeMlsFactory::validate_creator_identity`](super::provider::NodeMlsFactory::validate_creator_identity).
-//! It is keyed on the `did:test:` / `did:key:` prefixes — **not** on
-//! `did:dht:z`, and `did:web:*` is deliberately **not** exempt (§9.7.1
-//! "Fail-closed scope"). On a shipped (no-`testing`) build the whole block is
-//! absent, so every DID — `did:dht:*` and `did:web:*` alike — is resolved and
-//! fail-closed.
+//! `ProductionMlsBackend::validate_key_package` calls
+//! [`verify_add_attestation`] on every `KeyPackage` an admission path presents.
+//! Both admission paths — `execute_add_member` (the governance invite) and
+//! `join_context` (the self-join) — reach a joiner's `KeyPackage` only through
+//! that method, so one call there covers every `Add`.
 //!
-//! # Scope (CRYPTO-22 S4)
+//! # Testing carve-out (folds away in shipped artifacts)
 //!
-//! This is the Add fail-closed + current-key + testing-carve-out path only. It
-//! reads exactly [`DidResolver::resolve`] and stamps `resolved_at` from the
-//! clock; it reads **no** document-age field from the resolver (the canonical
-//! `ResolvedDidDocument` exposes none today). Resolver-side privacy-cache
-//! freshness enforcement — that a document served from the §9.10.7 24h/7d cache
-//! and older than `MAX_ATTESTATION_KEY_RESOLUTION_STALENESS` MUST force a fresh
-//! re-resolution — is the boundary-stable **SCP-CRYPTO22-005** follow-on (it
-//! needs a resolver-freshness seam that touches the shared #2211 resolver, out
-//! of this story's scope). The already-admitted-member **Update
-//! last-known-good grace** branch (§9.7.1 "Resolution failure policy", Update
-//! bullet) is likewise deferred; until it lands, an Update whose resolution
-//! fails also fails closed here (the conservative default — the grace would
-//! only *loosen* this, so its absence never masks a missing backend). This
-//! function is NOT yet wired into the `ContextManager` / `Supervisor` / pipeline —
-//! that live Add-path wiring is S6/S7 and is gated on SCP-CRYPTO22-005.
+//! [`resolution_exempt`] admits exactly the `did:test:` and `did:key:` prefixes
+//! and only when this artifact is a test binary or carries the `testing`
+//! feature, so the extensive non-`did:dht:` test suite runs without a live
+//! resolver. On a shipped build the `cfg!` folds to `false` and no DID is
+//! exempt — `did:dht:*` and `did:web:*` alike resolve and fail closed (§9.7.1
+//! "Fail-closed scope"). The carve-out skips **resolution**, never the
+//! attestation's presence: a leaf carrying no `0xFF03` extension is rejected
+//! before this function runs.
 //!
-//! See spec §9.7.1 (checks 1–2, resolution failure policy, fail-closed scope),
-//! §9.18.7 (the 300s staleness bound), §9.14 (clock skew), and
+//! # Scope
+//!
+//! This is the Add path. Resolver-side privacy-cache freshness enforcement —
+//! that a document served from the §9.10.7 24h/7d cache and older than
+//! `MAX_ATTESTATION_KEY_RESOLUTION_STALENESS` MUST force a fresh
+//! re-resolution — needs a resolver-freshness seam this trait does not yet
+//! expose, and the already-admitted-member **Update last-known-good grace**
+//! (§9.7.1 "Resolution failure policy", Update bullet) is likewise not
+//! implemented; until it lands, an Update whose resolution fails also fails
+//! closed (the conservative default — the grace would only *loosen* this, so
+//! its absence never masks a missing backend).
+//!
+//! See spec §9.7.1 (checks 1–13, resolution failure policy, fail-closed
+//! scope), §9.18.7 (the 300s staleness bound), §9.14 (clock skew), and
 //! ADR-057 Amendment (2026-08-01).
 
 use scp_clock::Clock;
-use scp_identity::IdentityError;
-use scp_identity::resolver::DidResolver;
 use scp_mls::{
     AttestationLeafGroundTruth, AttestationResolutionVerifyError, AttestationTrigger,
     KeyPackageAttestation, ScpCredential, verify_attestation_with_resolution,
 };
+
+use super::attestation_signer::{DidDocumentResolveError, DidDocumentResolver};
+
+/// Reports whether `did` is exempt from DID-document resolution for the §9.7.1
+/// attestation current-key check.
+///
+/// **The criterion:** a DID is exempt when this artifact was built as a test
+/// binary or with the `testing` feature **and** the DID names one of the two
+/// non-resolvable test methods, `did:test:` or `did:key:`. On a shipped build
+/// `cfg!(any(test, feature = "testing"))` is `false`, so the whole expression
+/// folds to `false` and no DID is exempt — `did:dht:*` and `did:web:*` alike
+/// resolve and fail closed (§9.7.1 "Fail-closed scope"). This mirrors
+/// [`NodeMlsFactory::validate_creator_identity`](super::provider::NodeMlsFactory::validate_creator_identity),
+/// which gates its own carve-out through the same `cfg!` mechanism.
+///
+/// Both admission paths — [`verify_add_attestation`] here and
+/// `ProductionMlsBackend::validate_key_package` — call this one function, so
+/// the exempt set has a single definition and the two paths cannot drift.
+#[must_use]
+pub(crate) fn resolution_exempt(did: &str) -> bool {
+    cfg!(any(test, feature = "testing"))
+        && (did.starts_with("did:test:") || did.starts_with("did:key:"))
+}
 
 /// The Add-path leaf/credential ground-truth for the async runtime seam
 /// [`verify_add_attestation`].
@@ -127,7 +148,13 @@ pub enum AttestationRuntimeVerifyError {
     /// §9.7.1 "Resolution failure policy": resolving the signer's DID errored.
     /// Fail-closed on Add — NO fallback to a stale/pre-rotation cached document.
     #[error("attestation signer DID resolution failed (fail-closed): {0}")]
-    Resolution(#[from] IdentityError),
+    Resolution(#[from] DidDocumentResolveError),
+
+    /// No DID-document resolver was wired, so §9.7.1 checks 1–2 cannot run.
+    /// Fail-closed: an unresolvable attestation is rejected, never accepted
+    /// unverified.
+    #[error("no DID-document resolver wired for attestation verification (fail-closed)")]
+    ResolverUnavailable,
 
     /// §9.7.1 "Resolution failure policy": resolving the signer's DID returned
     /// no document (`Ok(None)`). Fail-closed on Add — no cache fallback.
@@ -188,8 +215,8 @@ pub enum AttestationRuntimeVerifyError {
 ///
 /// Returns [`AttestationRuntimeVerifyError`] on a resolution failure
 /// (fail-closed) or on any Layer-A/pure-core check failure.
-pub async fn verify_add_attestation<R: DidResolver + ?Sized>(
-    resolver: &R,
+pub(crate) async fn verify_add_attestation(
+    resolver: Option<&dyn DidDocumentResolver>,
     clock: &dyn Clock,
     attestation: &KeyPackageAttestation,
     ground_truth: &AttestationAddGroundTruth<'_>,
@@ -203,20 +230,18 @@ pub async fn verify_add_attestation<R: DidResolver + ?Sized>(
     // Keyed on `did:test:` / `did:key:` ONLY (never `did:dht:z`); `did:web:*`
     // is not exempt (§9.7.1 "Fail-closed scope"). Mirrors
     // `validate_creator_identity`.
-    #[cfg(any(test, feature = "testing"))]
-    {
-        if signer_did.starts_with("did:test:") || signer_did.starts_with("did:key:") {
-            return Ok(());
-        }
+    if resolution_exempt(signer_did) {
+        return Ok(());
     }
 
     // Stamp `resolved_at` from the injected clock at the resolve call (HONEST —
     // never a hardcoded constant), then resolve through the canonical injected
     // resolver (§3.10.4). NEVER a NoOp/Stub/in-memory stand-in — the resolver is
     // supplied by dependency injection (#2211, no-dev-stand-in tenet).
+    let resolver = resolver.ok_or(AttestationRuntimeVerifyError::ResolverUnavailable)?;
     let resolved_at = clock.now_secs();
-    let resolved_document = match resolver.resolve(signer_did).await {
-        Ok(Some(found)) => found.document,
+    let resolved_document = match resolver.resolve_document(signer_did).await {
+        Ok(Some(document)) => document,
         // §9.7.1 "Resolution failure policy" — Add is fail-closed. There is NO
         // fallback to a stale/pre-rotation cached document.
         Ok(None) => return Err(AttestationRuntimeVerifyError::ResolutionNotFound),
@@ -260,10 +285,8 @@ mod tests {
     use rand::rngs::OsRng;
     use scp_clock::Clock;
     use scp_did::{DidDocument, SigningKeyId};
-    use scp_identity::resolver::{ResolutionSource, ResolvedDidDocument};
     use scp_mls::ScpCredential;
     use scp_mls::keypackage_attestation::AttestationVerifyError;
-    use std::future::Future;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     const ISSUED: u64 = 1_700_000_000;
@@ -319,9 +342,9 @@ mod tests {
         }
     }
 
-    /// A `DidResolver` that returns a preset outcome and records whether it was
-    /// called — so a test can assert the carve-out SKIPS resolution while a
-    /// non-exempt DID does NOT.
+    /// A `DidDocumentResolver` that returns a preset outcome and records whether
+    /// it was called — so a test can assert the carve-out SKIPS resolution while
+    /// a non-exempt DID does NOT.
     struct MockResolver {
         outcome: MockOutcome,
         called: AtomicBool,
@@ -346,26 +369,19 @@ mod tests {
         }
     }
 
-    impl DidResolver for MockResolver {
-        fn resolve(
+    #[async_trait::async_trait]
+    impl DidDocumentResolver for MockResolver {
+        async fn resolve_document(
             &self,
             _did: &str,
-        ) -> impl Future<Output = Result<Option<ResolvedDidDocument>, IdentityError>> + Send
-        {
+        ) -> Result<Option<DidDocument>, DidDocumentResolveError> {
             self.called.store(true, Ordering::SeqCst);
-            let outcome = self.outcome.clone();
-            async move {
-                match outcome {
-                    MockOutcome::Found(document) => Ok(Some(ResolvedDidDocument {
-                        document,
-                        seq: 1,
-                        source: ResolutionSource::MainlineDht,
-                    })),
-                    MockOutcome::NotFound => Ok(None),
-                    MockOutcome::Error => Err(IdentityError::DhtResolveFailed(
-                        "mock resolver error".to_owned(),
-                    )),
-                }
+            match self.outcome.clone() {
+                MockOutcome::Found(document) => Ok(Some(document)),
+                MockOutcome::NotFound => Ok(None),
+                MockOutcome::Error => Err(DidDocumentResolveError::Failed(
+                    "mock resolver error".to_owned(),
+                )),
             }
         }
     }
@@ -452,7 +468,13 @@ mod tests {
         let resolver = MockResolver::new(MockOutcome::Found(did_doc_with_active(&fx.signer_pub)));
         let clock = FixedClock(NOW);
 
-        let result = verify_add_attestation(&resolver, &clock, &fx.att, &fx.ground_truth()).await;
+        let result = verify_add_attestation(
+            Some(&resolver as &dyn DidDocumentResolver),
+            &clock,
+            &fx.att,
+            &fx.ground_truth(),
+        )
+        .await;
 
         assert!(result.is_ok(), "expected Ok, got {result:?}");
         assert!(resolver.was_called(), "a did:dht: signer MUST be resolved");
@@ -473,9 +495,14 @@ mod tests {
         let resolver = MockResolver::new(MockOutcome::Found(did_doc_with_active(&fx.signer_pub)));
         let clock = SteppingClock::new(vec![NOW, NOW + 400]);
 
-        let err = verify_add_attestation(&resolver, &clock, &fx.att, &fx.ground_truth())
-            .await
-            .unwrap_err();
+        let err = verify_add_attestation(
+            Some(&resolver as &dyn DidDocumentResolver),
+            &clock,
+            &fx.att,
+            &fx.ground_truth(),
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -505,9 +532,14 @@ mod tests {
         let resolver = MockResolver::new(MockOutcome::Found(rotated_doc));
         let clock = FixedClock(NOW);
 
-        let err = verify_add_attestation(&resolver, &clock, &fx.att, &fx.ground_truth())
-            .await
-            .unwrap_err();
+        let err = verify_add_attestation(
+            Some(&resolver as &dyn DidDocumentResolver),
+            &clock,
+            &fx.att,
+            &fx.ground_truth(),
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -529,9 +561,14 @@ mod tests {
         let resolver = MockResolver::new(MockOutcome::Error);
         let clock = FixedClock(NOW);
 
-        let err = verify_add_attestation(&resolver, &clock, &fx.att, &fx.ground_truth())
-            .await
-            .unwrap_err();
+        let err = verify_add_attestation(
+            Some(&resolver as &dyn DidDocumentResolver),
+            &clock,
+            &fx.att,
+            &fx.ground_truth(),
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(err, AttestationRuntimeVerifyError::Resolution(_)),
@@ -546,9 +583,14 @@ mod tests {
         let resolver = MockResolver::new(MockOutcome::NotFound);
         let clock = FixedClock(NOW);
 
-        let err = verify_add_attestation(&resolver, &clock, &fx.att, &fx.ground_truth())
-            .await
-            .unwrap_err();
+        let err = verify_add_attestation(
+            Some(&resolver as &dyn DidDocumentResolver),
+            &clock,
+            &fx.att,
+            &fx.ground_truth(),
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(err, AttestationRuntimeVerifyError::ResolutionNotFound),
@@ -568,7 +610,13 @@ mod tests {
         let resolver = MockResolver::new(MockOutcome::Error);
         let clock = FixedClock(NOW);
 
-        let result = verify_add_attestation(&resolver, &clock, &fx.att, &fx.ground_truth()).await;
+        let result = verify_add_attestation(
+            Some(&resolver as &dyn DidDocumentResolver),
+            &clock,
+            &fx.att,
+            &fx.ground_truth(),
+        )
+        .await;
 
         assert!(result.is_ok(), "did:test: signer must skip resolution");
         assert!(
@@ -583,7 +631,13 @@ mod tests {
         let resolver = MockResolver::new(MockOutcome::Error);
         let clock = FixedClock(NOW);
 
-        let result = verify_add_attestation(&resolver, &clock, &fx.att, &fx.ground_truth()).await;
+        let result = verify_add_attestation(
+            Some(&resolver as &dyn DidDocumentResolver),
+            &clock,
+            &fx.att,
+            &fx.ground_truth(),
+        )
+        .await;
 
         assert!(result.is_ok(), "did:key: signer must skip resolution");
         assert!(!resolver.was_called());
@@ -598,9 +652,14 @@ mod tests {
         let resolver = MockResolver::new(MockOutcome::Error);
         let clock = FixedClock(NOW);
 
-        let err = verify_add_attestation(&resolver, &clock, &fx.att, &fx.ground_truth())
-            .await
-            .unwrap_err();
+        let err = verify_add_attestation(
+            Some(&resolver as &dyn DidDocumentResolver),
+            &clock,
+            &fx.att,
+            &fx.ground_truth(),
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             resolver.was_called(),

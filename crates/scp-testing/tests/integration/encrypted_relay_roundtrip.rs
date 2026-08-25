@@ -35,9 +35,8 @@ use std::sync::Arc;
 use futures::StreamExt;
 
 use scp_core::crypto::mls::credential::ScpCredential;
-use scp_core::crypto::mls::group::{
-    ScpMlsGroup, add_member, create_group, generate_key_package, join_group,
-};
+use scp_core::crypto::mls::group::{ScpMlsGroup, add_member, create_group, join_group};
+use scp_core::crypto::mls::keypackage_mint::mint_key_package_for_testing;
 use scp_core::crypto::sender_keys::{
     SenderKeyStore, generate_sender_key, handle_sender_key_request, open_sender_key_response,
     publish_sender_key_epoch_advance, request_sender_key, verify_epoch_advance,
@@ -258,8 +257,13 @@ async fn alice_bob_encrypted_message_via_relay() {
     // ---------------------------------------------------------------
     let bob_cred =
         ScpCredential::new(bob_id.did.clone(), None, scp_did::SigningKeyId::Active).unwrap();
-    let (bob_kp_bundle, bob_signer, bob_provider) =
-        generate_key_package(&bob_cred, &scp_clock::SystemClock).unwrap();
+    let (bob_kp_bundle, bob_signer, bob_provider) = mint_key_package_for_testing(
+        &bob_cred,
+        &[0x5C; 32],
+        &scp_clock::SystemClock,
+        &ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng),
+    )
+    .unwrap();
 
     // ---------------------------------------------------------------
     // Step 6: Alice adds Bob to the group using his key package (ADR-001)

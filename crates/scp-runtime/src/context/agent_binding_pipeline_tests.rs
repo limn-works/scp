@@ -579,6 +579,30 @@ mod live_supervisor_send {
             .expect("actor minted an access key for Bob during add-member")
     }
 
+    /// Gives Bob's supervisor a `KeyPackage`-attestation signer and gives both
+    /// supervisors the resolver that names its key.
+    ///
+    /// §9.7.1 binds a pooled leaf to Bob's DID through a signed `0xFF03`
+    /// attestation: Bob's `KeyPackage` actor refuses to mint without a signer,
+    /// and Alice's Add path refuses to verify without a resolver. The pair is
+    /// built together so the document Alice resolves names the key Bob's mint
+    /// signed with, and the resolver reaches both supervisors because each one
+    /// owns its own MLS backend.
+    async fn wire_bob_attestation(bob_sup: &Arc<Supervisor>, alice_sup: &Arc<Supervisor>) {
+        let (signer, resolver) =
+            crate::crypto::mls::attestation_signer::TestDidDocumentResolver::paired_with_signer();
+        let resolver = Arc::new(resolver);
+        bob_sup
+            .set_attestation_signer(DID::from(BOB_DID), Arc::new(signer))
+            .await;
+        bob_sup
+            .set_attestation_resolver(Arc::clone(&resolver) as Arc<_>)
+            .expect("bob's crypto provider is initialized");
+        alice_sup
+            .set_attestation_resolver(resolver as Arc<_>)
+            .expect("alice's crypto provider is initialized");
+    }
+
     /// Runs the real governance add-member path so Bob becomes a true MLS member
     /// of Alice's actor-owned group, then bootstraps Bob's standalone provider
     /// (Welcome join + sender-key processing) so it can open Alice's later
@@ -627,6 +651,9 @@ mod live_supervisor_send {
             )
             .await
             .expect("publish bob's wrapping key");
+
+        wire_bob_attestation(&bob_sup, sup).await;
+
         let (reservation_id, bob_kp_bytes) = bob_sup
             .reserve_key_package(DID::from(BOB_DID))
             .await

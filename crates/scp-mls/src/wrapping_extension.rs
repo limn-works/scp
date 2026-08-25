@@ -218,6 +218,9 @@ pub fn find_leaf_index_by_did(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
 mod tests {
     use super::*;
+    use crate::keypackage_mint::mint_key_package_for_testing;
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
     use scp_clock::SystemClock;
 
     #[test]
@@ -321,13 +324,10 @@ mod tests {
 
         let bob_cred = test_credential("bob");
         let bob_wrapping = [0xBB_u8; 32];
+        let bob_att_key = SigningKey::generate(&mut OsRng);
         let (bob_kp, bob_signer, bob_provider) =
-            crate::group::generate_key_package_with_wrapping_key(
-                &bob_cred,
-                Some(&bob_wrapping),
-                &SystemClock,
-            )
-            .unwrap();
+            mint_key_package_for_testing(&bob_cred, &bob_wrapping, &SystemClock, &bob_att_key)
+                .unwrap();
 
         let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
         let add_result =
@@ -361,13 +361,10 @@ mod tests {
         // Add Bob to enable epoch advance.
         let bob_cred = test_credential("bob");
         let bob_wrapping = [0xDD_u8; 32];
+        let bob_att_key = SigningKey::generate(&mut OsRng);
         let (bob_kp, bob_signer, bob_provider) =
-            crate::group::generate_key_package_with_wrapping_key(
-                &bob_cred,
-                Some(&bob_wrapping),
-                &SystemClock,
-            )
-            .unwrap();
+            mint_key_package_for_testing(&bob_cred, &bob_wrapping, &SystemClock, &bob_att_key)
+                .unwrap();
         let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
         let add_result =
             crate::group::add_member(&mut alice_group, bob_kp_in, &SystemClock).unwrap();
@@ -406,8 +403,10 @@ mod tests {
 
         // Add Bob so we can do updates.
         let bob_cred = test_credential("bob");
+        let bob_att_key = SigningKey::generate(&mut OsRng);
         let (bob_kp, _bob_signer, _bob_provider) =
-            crate::group::generate_key_package(&bob_cred, &SystemClock).unwrap();
+            mint_key_package_for_testing(&bob_cred, &[0xB0_u8; 32], &SystemClock, &bob_att_key)
+                .unwrap();
         let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
         let _add_result = crate::group::add_member(&mut group, bob_kp_in, &SystemClock).unwrap();
 

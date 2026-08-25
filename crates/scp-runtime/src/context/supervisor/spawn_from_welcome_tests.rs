@@ -343,6 +343,47 @@ async fn set_bob_wrapping(sup: &Arc<Supervisor>, bob: &DID) {
     )
     .await
     .expect("set bob's wrapping key");
+
+    // §9.7.1 binds the pooled leaf to its DID through a signed `0xFF03`
+    // attestation, and the KeyPackage actor refuses to mint without a signer.
+    // The key is fixed rather than generated, so a supervisor that later ADDS
+    // this leaf can build the resolver naming it without the minting supervisor
+    // handing the value over — see `install_bob_attestation_resolver`.
+    sup.set_attestation_signer(
+        bob.clone(),
+        Arc::new(
+            crate::crypto::mls::attestation_signer::TestAttestationSigner::new(
+                bob_attestation_key(),
+                scp_did::SigningKeyId::Active,
+            ),
+        ),
+    )
+    .await;
+    install_bob_attestation_resolver(sup);
+}
+
+/// Bob's fixed `KeyPackage`-attestation signing key.
+///
+/// Distinct from [`bob_signing_key`], which signs §5.12.3 invitation bundles.
+/// This one signs the §9.7.1 `0xFF03` leaf attestation, and it is fixed so every
+/// supervisor that verifies one of Bob's leaves resolves the same `#active` key.
+fn bob_attestation_key() -> SigningKey {
+    SigningKey::from_bytes(&[0xB9; 32])
+}
+
+/// Wires the DID-document resolver naming [`bob_attestation_key`] as `#active`
+/// onto `sup`.
+///
+/// §9.7.1 checks 1 and 2 resolve the signer's document on every Add, and the Add
+/// path fails closed when no resolver is wired, so a supervisor that adds one of
+/// Bob's pooled leaves needs this whether or not it minted the leaf.
+fn install_bob_attestation_resolver(sup: &Arc<Supervisor>) {
+    sup.set_attestation_resolver(Arc::new(
+        crate::crypto::mls::attestation_signer::TestDidDocumentResolver::new(
+            bob_attestation_key().verifying_key().to_bytes(),
+        ),
+    ))
+    .expect("the supervisor's crypto provider is initialized");
 }
 
 /// Resolves `ALICE_DID` / `BOB_DID` / `MALLORY_DID` to their fixed #active
@@ -2321,6 +2362,10 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
     //     0xFF02 via `reserve_bob_kp`'s wrapping-key publish). `bob_crypto` is
     //     retained by the fixture but unused — the round-trip relocated to fullstack.
     let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    // Alice's supervisor ADDS the leaf Bob's supervisor minted, and §9.7.1
+    // resolves the signer's document on the adder's side, so the resolver goes
+    // on Alice's backend too.
+    install_bob_attestation_resolver(&alice_sup);
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&bob_sup, &bob).await;
 
     // (c) Alice invites Bob: the add is routed through the context actor's
@@ -2502,6 +2547,10 @@ async fn invite_member_broadcasts_the_add_commit_to_existing_members() {
         .expect("alice creates the encrypted context");
 
     let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    // Alice's supervisor ADDS the leaf Bob's supervisor minted, and §9.7.1
+    // resolves the signer's document on the adder's side, so the resolver goes
+    // on Alice's backend too.
+    install_bob_attestation_resolver(&alice_sup);
     let (_reservation_id, kp_public_bytes) = reserve_bob_kp(&bob_sup, &bob).await;
 
     let outcome = alice_sup
@@ -2565,6 +2614,10 @@ async fn invite_member_into_voting_context_is_rejected() {
         .expect("alice creates the voting context");
 
     let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    // Alice's supervisor ADDS the leaf Bob's supervisor minted, and §9.7.1
+    // resolves the signer's document on the adder's side, so the resolver goes
+    // on Alice's backend too.
+    install_bob_attestation_resolver(&alice_sup);
     let (_reservation_id, kp_public_bytes) = reserve_bob_kp(&bob_sup, &bob).await;
 
     let err = alice_sup
@@ -2634,6 +2687,10 @@ async fn invite_member_by_non_admin_is_rejected() {
     // Bob (NOT the admin, not even a member) reserves a KeyPackage and attempts
     // to invite himself using HIS OWN signing key as the proposer.
     let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    // Alice's supervisor ADDS the leaf Bob's supervisor minted, and §9.7.1
+    // resolves the signer's document on the adder's side, so the resolver goes
+    // on Alice's backend too.
+    install_bob_attestation_resolver(&alice_sup);
     let (_reservation_id, kp_public_bytes) = reserve_bob_kp(&bob_sup, &bob).await;
 
     let result = alice_sup
@@ -2740,6 +2797,10 @@ async fn invite_member_rolls_back_the_add_on_delivery_failure() {
         .expect("alice creates the encrypted context");
 
     let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    // Alice's supervisor ADDS the leaf Bob's supervisor minted, and §9.7.1
+    // resolves the signer's document on the adder's side, so the resolver goes
+    // on Alice's backend too.
+    install_bob_attestation_resolver(&alice_sup);
     let (_reservation_id, kp_public_bytes) = reserve_bob_kp(&bob_sup, &bob).await;
 
     let result = alice_sup

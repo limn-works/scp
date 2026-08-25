@@ -249,11 +249,14 @@ pub fn export_media_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
     use scp_clock::SystemClock;
     use scp_core::crypto::mls::credential::ScpCredential;
     use scp_core::crypto::mls::group::{
-        add_member, create_group, destroy_group, generate_key_package, join_group, remove_member,
+        add_member, create_group, destroy_group, join_group, remove_member,
     };
+    use scp_core::crypto::mls::keypackage_mint::mint_key_package_for_testing;
 
     #[allow(clippy::unwrap_used)]
     fn test_credential(name: &str) -> ScpCredential {
@@ -351,8 +354,13 @@ mod tests {
 
         // Add Bob -- this advances the epoch.
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, _bob_signer, _bob_provider) =
-            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_provider) = mint_key_package_for_testing(
+            &bob_cred,
+            &[0x33; 32],
+            &SystemClock,
+            &SigningKey::generate(&mut OsRng),
+        )
+        .unwrap();
         let bob_kp = bob_kp_bundle.key_package().clone().into();
         let _add_result = add_member(&mut group, bob_kp, &SystemClock).unwrap();
 
@@ -372,8 +380,13 @@ mod tests {
 
         // Add Bob.
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, _bob_signer, _bob_provider) =
-            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_provider) = mint_key_package_for_testing(
+            &bob_cred,
+            &[0x33; 32],
+            &SystemClock,
+            &SigningKey::generate(&mut OsRng),
+        )
+        .unwrap();
         let bob_kp = bob_kp_bundle.key_package().clone().into();
         let _add_result = add_member(&mut group, bob_kp, &SystemClock).unwrap();
 
@@ -422,8 +435,13 @@ mod tests {
         let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
 
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, bob_signer, bob_provider) =
-            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let (bob_kp_bundle, bob_signer, bob_provider) = mint_key_package_for_testing(
+            &bob_cred,
+            &[0x33; 32],
+            &SystemClock,
+            &SigningKey::generate(&mut OsRng),
+        )
+        .unwrap();
         let bob_kp = bob_kp_bundle.key_package().clone().into();
         let add_result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
 

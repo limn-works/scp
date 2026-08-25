@@ -56,7 +56,8 @@ use scp_media::signaling::{
 };
 
 use scp_mls::credential::ScpCredential;
-use scp_mls::group::{add_member, create_group, generate_key_package, join_group};
+use scp_mls::group::{add_member, create_group, join_group};
+use scp_mls::mint_key_package_for_testing;
 use scp_protocol::context::params::Capability as ParamCapability;
 
 use scp_platform::in_memory::{InMemoryPush, InMemoryStorage};
@@ -560,8 +561,13 @@ fn media_session_mls_key_derivation() {
         scp_did::SigningKeyId::Active,
     )
     .expect("bob credential");
-    let (bob_kp_bundle, bob_signer, bob_provider) =
-        generate_key_package(&bob_cred, &scp_clock::SystemClock).expect("bob key package");
+    let (bob_kp_bundle, bob_signer, bob_provider) = mint_key_package_for_testing(
+        &bob_cred,
+        &[0x5C; 32],
+        &scp_clock::SystemClock,
+        &ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng),
+    )
+    .expect("bob key package");
     let bob_kp = bob_kp_bundle.key_package().clone().into();
     let add_result =
         add_member(&mut alice_group, bob_kp, &scp_clock::SystemClock).expect("add bob");
@@ -992,8 +998,13 @@ fn media_session_keys_derived_from_mls_group_state() {
         scp_did::SigningKeyId::Active,
     )
     .expect("bob cred");
-    let (bob_kp_bundle, bob_signer, bob_provider) =
-        generate_key_package(&bob_cred, &scp_clock::SystemClock).expect("bob kp");
+    let (bob_kp_bundle, bob_signer, bob_provider) = mint_key_package_for_testing(
+        &bob_cred,
+        &[0x5C; 32],
+        &scp_clock::SystemClock,
+        &ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng),
+    )
+    .expect("bob kp");
     let bob_kp = bob_kp_bundle.key_package().clone().into();
     let add_result =
         add_member(&mut alice_group, bob_kp, &scp_clock::SystemClock).expect("add bob");
