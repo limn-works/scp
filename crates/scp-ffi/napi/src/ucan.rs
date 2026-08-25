@@ -734,8 +734,11 @@ pub(crate) fn build_proof_resolver(
     if let Some(tokens) = proof_tokens {
         for encoded in tokens {
             let token = parse_ucan(encoded).map_err(ScpNapiError::from)?;
-            // Use compute_cid (SHA-256 of encoded JWT string) — NOT
-            // compute_revocation_cid (SHA-256 of JSON-serialized payload).
+            // Both helpers hash the same bytes — the encoded JWT string — and
+            // differ only in how they render the digest. `compute_cid` prefixes
+            // the 64 hex characters with `bafyrei`; `compute_revocation_cid`
+            // returns the 64 hex characters alone. A proof-chain key is the
+            // `bafyrei`-prefixed form, so this call uses `compute_cid`.
             let cid = scp_core::crypto::ucan::mint::compute_cid(&token);
             proofs.insert(cid, token);
         }

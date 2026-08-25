@@ -28,7 +28,7 @@ BlobStorage trait (store/get/query/delete/purge_expired with routing_id + TTL)
 Backend adapter (SQLite, redb, PostgreSQL, S3-compatible, in-memory)
 ```
 
-The `BlobStore` trait (defined in `scp-transport/native/`) handles encrypted message blobs with routing metadata and time-to-live semantics. Relay operators choose a backend based on deployment scale.
+The `BlobStorage` trait (defined in `scp-transport/native/`) handles encrypted message blobs with routing metadata and time-to-live semantics. Relay operators choose a backend based on deployment scale.
 
 ### Why Thin Trait + Thick Protocol Layer
 
@@ -563,7 +563,7 @@ A **custodial remote thin client** — the node holding the protocol engine, MLS
 
 ### PostgreSQL Is NOT First-Party for Client Storage
 
-The client SDK does not need Postgres — SQLite covers all native platforms including server-side agents. Server-side deployments wanting Postgres can implement the 6-method trait trivially. PostgreSQL IS first-party for `BlobStore` (relay storage) — see section 17.7.
+The client SDK does not need Postgres — SQLite covers all native platforms including server-side agents. Server-side deployments wanting Postgres can implement the 6-method trait trivially. PostgreSQL IS first-party for `BlobStorage` (relay storage) — see section 17.7.
 
 ### FilesystemStorage
 
@@ -580,17 +580,19 @@ base_dir/
         00000000000000000001  # serialized event
 ```
 
-## 17.7 First-Party BlobStore Adapters (Relay/Server)
+## 17.7 First-Party BlobStorage Adapters (Relay/Server)
 
-Relay blob storage is a provider capability governed by the general capability-selection principle (§17.17): the backend selection is mandatory and fails closed (SCP-CAPSEL-8000/8001), the runtime never defaults it (SCP-CAPSEL-8002), and `InMemoryBlobStore` is a durability-only development arm (SCP-CAPSEL-8010/8011) — explicitly selectable, never a default or fallback, never the sole reachable arm in a shipped relay.
+Relay blob storage is a provider capability governed by the general capability-selection principle (§17.17): the backend selection is mandatory and fails closed (SCP-CAPSEL-8000/8001), the runtime never defaults it (SCP-CAPSEL-8002), and `InMemoryBlobStorage` is a durability-only development arm (SCP-CAPSEL-8010/8011) — explicitly selectable, never a default or fallback, never the sole reachable arm in a shipped relay.
 
 | Adapter | Backend | Good for | Ships in |
 |---------|---------|----------|----------|
-| `InMemoryBlobStore` | `HashMap` + secondary index | Testing, dev | Phase 1 (exists) |
+| `InMemoryBlobStorage` | `HashMap` + secondary index | Testing, dev | Phase 1 (exists) |
 | `SqliteBlobStore` | `rusqlite` | Personal relays, agent workstations, small deployments | Phase 2 |
 | `RedbBlobStore` | redb (pure Rust B-tree DB) | Medium relays, embedded scenarios | Phase 2 |
 | `PostgresBlobStore` | `sqlx` + PostgreSQL | Production/enterprise relays | Phase 5 |
 | `S3BlobStore` | `aws-sdk-s3` (Apache-2.0) | Large-scale relays, cloud deployments | Phase 5 |
+
+**`blob_id` is caller-computed, and no adapter re-hashes it (normative).** `blob_id` is `SHA-256(blob content)`. The caller computes it and passes it to `store` and to `store_streaming`; the relay computes it incrementally over the wire, before either call. A `BlobStorage` adapter MUST store and return the `blob_id` its caller supplied, and MUST NOT re-hash the content to derive one. A conformance run therefore asserts that `store` returns the caller's `blob_id` unchanged (§16.12.6), not that `store` derived a hash of its own.
 
 ### Why redb
 
@@ -651,7 +653,7 @@ The `BlobStorage` trait provides streaming variants of `store` and `get` for bac
 
 **Content length:** `store_streaming` accepts an optional content length hint. Backends MAY use this for pre-allocation or capacity checks. Backends MUST NOT trust it for security decisions — the actual streamed length governs.
 
-**blob_id computation:** For `store_streaming`, the caller provides the `blob_id` (SHA-256 of the complete blob content). The relay computes this incrementally via streaming SHA-256 as it receives the blob over the wire, before calling `store_streaming`. The storage layer does not re-hash.
+**blob_id computation:** `store_streaming` follows the caller-computed `blob_id` rule stated in §17.7. The relay computes `SHA-256(blob content)` incrementally via streaming SHA-256 as it receives the blob over the wire, then passes that `blob_id` to `store_streaming`. The storage layer does not re-hash.
 
 **Native overrides:** Backends where streaming is materially beneficial (S3, future PostgreSQL large objects) override the defaults. The `S3BlobStore` streams directly to/from S3 using the AWS SDK's `ByteStream` without buffering the full blob.
 
@@ -794,13 +796,13 @@ storage_conformance!(|| MyCustomStorage::new());
 
 The conformance suite tests: store/retrieve roundtrip, missing key returns None, delete removes, list_keys with prefix filtering, list_keys returns sorted results, delete_prefix removes all matching keys, exists returns true/false correctly, and concurrent access safety.
 
-### Custom BlobStore Adapters
+### Custom BlobStorage Adapters
 
 Implement the 5 required async methods of the `BlobStorage` trait (`store`, `get`, `query`, `delete`, `purge_expired`). The 2 streaming methods (`store_streaming`, `get_streaming`) have default implementations that delegate to the `Vec<u8>` methods — override them only if your backend benefits from avoiding full materialization (see §17.7.1). Run the `blob_store_conformance!()` macro.
 
 ```rust
 #[cfg(test)]
-blob_store_conformance!(|| MyCustomBlobStore::new(clock.clone()));
+blob_store_conformance!(|| MyCustomBlobStorage::new(clock.clone()));
 ```
 
 The conformance suite generates 19 tests: store/retrieve roundtrip, missing blob returns None, TTL expiry, query by routing_id in stored_at order, query with since filter, query with limit, delete removes blob, store returns SHA-256 blob_id, concurrent store + purge safety, purge removes only expired blobs, query for unknown routing_id returns empty, streaming store roundtrip, streaming get roundtrip, full streaming roundtrip, streaming empty body, content_length hint is advisory, streaming get for nonexistent blob, streaming-stored blob findable via query, and streaming get for expired blob.
@@ -811,10 +813,10 @@ The following are explicitly named as "build your own" — not first-party, but 
 
 | Technology | Trait | Notes |
 |------------|-------|-------|
-| RocksDB | `BlobStore` | Best for extremely write-heavy relays. C++ dependency, heavy binary. |
-| LMDB (heed/heed3) | `Storage` or `BlobStore` | Best read performance. heed3 has encryption-at-rest. C dependency. |
-| MySQL/MariaDB | `BlobStore` | One sqlx feature flag away from the PostgreSQL adapter. |
-| Valkey (Redis fork, BSD-3) | -- | Cache layer in front of persistent BlobStore. Not a direct adapter. |
+| RocksDB | `BlobStorage` | Best for extremely write-heavy relays. C++ dependency, heavy binary. |
+| LMDB (heed/heed3) | `Storage` or `BlobStorage` | Best read performance. heed3 has encryption-at-rest. C dependency. |
+| MySQL/MariaDB | `BlobStorage` | One sqlx feature flag away from the PostgreSQL adapter. |
+| Valkey (Redis fork, BSD-3) | -- | Cache layer in front of persistent BlobStorage. Not a direct adapter. |
 
 **Explicitly excluded:** sled (perpetual beta, unstable on-disk format), LevelDB (superseded by RocksDB), FoundationDB/TiKV (cluster-only, too heavy for protocol-level storage), DuckDB (OLAP, wrong use case), Redis (non-OSI license since 2024 — use Valkey instead).
 

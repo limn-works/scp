@@ -8,10 +8,11 @@
 - Hardware custody (Secure Enclave / TEE): device-local secret, device-local by design.
 - The earlier ADR-027 "use public key bytes" amendment was REJECTED. Do not "fix" correct private-seed code toward the public key.
 
-### High: publicKey() triggers biometric under .required policy
-- `publicKey()` calls `fetchPrivateKeyBytes` (line 547) which hits biometric-gated Keychain item
-- ADR-025 explicitly states publicKey and destroyKey should NOT require biometric auth
-- Fix: store public key bytes separately or in metadata, retrieve without biometric gate
+### FIXED (was a HIGH): publicKey() triggered a biometric prompt
+- `publicKey(_:)` (`Sources/SCP/Platform/AppleKeyCustody.swift:593`) reads the cached public key out of Keychain metadata attributes at `:602-606` and returns it. It reaches no key material, so it raises no Face ID or Touch ID prompt.
+- `storePrivateKeyBytes` (`:406`) takes a non-optional `publicKeyBytes` and writes it into `KeyMetadata.publicKeyBase64` at `:412-415`, so every key this class stores carries the cached public key.
+- One residue: an item stored by a build that predates the metadata cache carries no `publicKeyBase64`, and `publicKey` then falls back to `fetchPrivateKeyBytes` at `:610`, which does prompt. The code comments that fallback as such at `:608-609`.
+- The class doc at `:209-211` now states what the code does: `publicKey` and `destroyKey` require no biometric authentication.
 
 ### Key patterns in AppleKeyCustody
 - Keys stored as `kSecClassGenericPassword` items with JSON metadata in `kSecAttrLabel`

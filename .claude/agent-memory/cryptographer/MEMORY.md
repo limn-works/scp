@@ -180,7 +180,6 @@
 - PRE-EXISTING: migration proof hash (dht.rs:607) has var-length concat ambiguity (old_did||new_did)
 
 ### Spec-Level Crypto Audit (2026-03-05)
-- See [spec-audit-findings.md](spec-audit-findings.md) for full findings
 - 9 CRITICAL, 11 HIGH, 8 MEDIUM, 5 LOW findings across 09-security-model.md, 03-identity.md, 07-trust-validation-and-capabilities.md
 - Root pattern: migration proof (line 350) correctly uses length prefixes + domain sep, but 8+ other hash constructions don't
 - BroadcastEnvelope is the ONLY signature without a domain separator
@@ -190,8 +189,8 @@
 
 ### Phase 0/1 Production Readiness Review (2026-03-06)
 - Sender key protocol: JSON->MessagePack (to_vec_named) SOUND, all 4 serialization points + 25 test sites
-- HPKE domain separator: "scp-sender-key-hpke-v1" -> "scp-sender-key-v1" per spec. Prefix matches but full info param still incomplete (see spec-audit)
-- PRE-EXISTING HIGH: hpke_seal/hpke_open pass only domain prefix to HKDF info, NOT context_id||sender_did||epoch_bytes per spec 9.16.2. No AAD on AES-GCM. Tracked in spec-audit.
+- HPKE domain separator: "scp-sender-key-hpke-v1" -> "scp-sender-key-v1" per spec. FIXED since: the info param is now complete.
+- FIXED (was a HIGH): hpke_seal/hpke_open passed only the domain prefix to the HKDF info and set no AAD. `crates/scp-protocol/src/crypto/sender_keys/key_protocol_verify.rs:845` now builds the info as `"scp-sender-key-v1" || BE32(len(context_id)) || context_id || BE32(len(sender_did)) || sender_did || BE64(epoch)`, `:869` builds the matching AAD, and `hpke_seal_sender_key` at `:904` passes both to `hpke::seal`. Spec 9.16.2 is satisfied.
 - InnerEnvelope: deny_unknown_fields added, SOUND. Provenance nested struct lacks it (mitigated by provenance_hash). Sender key wire types also lack it.
 - ProtocolRepository: to_vec -> to_vec_named SOUND, backward-compatible deserialization
 - Dedup cache TTL: 1h -> 24h per spec 9.8.2(b), SOUND

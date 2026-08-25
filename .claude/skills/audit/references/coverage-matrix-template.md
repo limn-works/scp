@@ -78,4 +78,4 @@ Every `✗`, `~`, or `?` cell is a potential finding. Investigate and validate e
 
 ## Matrix Storage
 
-Save completed matrices to `.claude/agent-memory/audit/matrix.md` for cross-session continuity. Update the matrix as findings are validated or resolved.
+Save completed matrices to `.claude/agent-memory/audit/matrix.md` for cross-session continuity. Update the matrix as findings are validated or resolved. `.gitignore` carries a `.claude/agent-memory/audit/` entry, so git never tracks the matrix.

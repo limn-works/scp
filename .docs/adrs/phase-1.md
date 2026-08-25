@@ -553,7 +553,7 @@ Implement a WebSocket-based store-and-forward relay server and its corresponding
 - **Language:** Rust
 - **Server framework:** `tokio` + `tokio-tungstenite` (WebSocket) or `axum` with WebSocket support
 - **Client library:** `tokio-tungstenite` (client-side WebSocket)
-- **Storage:** In-memory for Phase 1 (HashMap keyed by `routing_id`). Persistent storage (SQLite, redb) for production. See §17.7 for first-party BlobStore adapters.
+- **Storage:** In-memory for Phase 1 (HashMap keyed by `routing_id`). Persistent storage (SQLite, redb) for production. See §17.7 for first-party BlobStorage adapters.
 - **Crate:** `scp-transport`
 - **Module:** `scp-transport/native/`
 

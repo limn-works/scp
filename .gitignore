@@ -54,3 +54,13 @@ bindings/python/tests/bridge_parity/helpers/swift_bridge_runner/.build/
 # recorded by the default `--test perf_baseline` run; never committed (one box's
 # numbers must not become a cross-machine gate reference).
 crates/scp-runtime/tests/perf_baseline.json
+
+# Agent memory stays in version control. CLAUDE.md's Project Map lists
+# `.claude/agent-memory/` as a repository directory, and a memory that a fresh
+# clone cannot read does not exist for the agent that wrote it. One subdirectory
+# is the exception: the audit skill (`.claude/skills/audit/SKILL.md` §5.1) writes
+# a checkpoint, a coverage matrix, and per-finding notes into the directory below
+# on every run, and each of those files is an inventory of this codebase's
+# unfixed defects, which this public repository never tracks. This entry names
+# that one directory and excludes nothing else under `.claude/agent-memory/`.
+.claude/agent-memory/audit/

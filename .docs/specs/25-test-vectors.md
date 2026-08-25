@@ -149,7 +149,7 @@ Canonical hash input changes:
   (replaces the SHA-256(0x00) sentinel)
 ```
 
-## 25.5 Vote Signing Vectors (§6.4)
+## 25.5 Vote Signing Vectors (§9.5.2)
 
 Domain: `"SCP-VOTE-V1:"`
 
@@ -511,7 +511,7 @@ Canonical hash input:
 Total: 14 + 24 + 21 + 23 + 8 = 90 bytes
 ```
 
-## 25.11 Proposal ID Vectors (§6.4)
+## 25.11 Proposal ID Vectors (§9.5.2)
 
 Domain: `"SCP-PROPOSAL-V1:"`
 
