@@ -283,3 +283,6 @@ Notes:
 ### RESIDUAL low-sev: BUN_TEST=0 and BUN_TEST=false OPEN seam (length>0 only). Moot post-bundle (seam unreachable). Suggest falsey-value guard.
 ### FINDING gate soundness: check-sdk-coverage.py accepts a TYPE name as proof of runtime capability
 - _extract_typescript_symbols folds interface/type_alias names into same set as runtime fns. _to_pascal(op) then matches a type. PROVEN: Governance/member_role matches `MemberRole` type not SCP.contextMemberRole; MCP/connect_client matches `McpClient` interface (alias also lists DELETED connectMcp; real impl mcpClientConnectStdio/Sse). Gate stays GREEN after deleting all runtime impls if same-named type survives. 2/184 TS ops affected. Softer re-intro of the suffix-match gap the PR claims closed. NOTE: file now in enforcement allowlist (CLAUDE.md) — report, don't self-edit.
+
+## ADR-039 permission model (commit 832ed9b2f9)
+- [Attack surfaces](pr-adr039-permission-model-spec.md) — #agent can mint a root UCAN granting itself the whole ceiling (SCP-AB-025 pending); step 6b runs before parent signature verification; rule 2 is inert by construction.

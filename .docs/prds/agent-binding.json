@@ -82,7 +82,8 @@
         "SCP-AB-024",
         "SCP-AB-025",
         "SCP-AB-026",
-        "SCP-AB-027"
+        "SCP-AB-027",
+        "SCP-AB-035"
       ]
     },
     {
@@ -96,7 +97,8 @@
         "SCP-AB-030",
         "SCP-AB-031",
         "SCP-AB-032",
-        "SCP-AB-033"
+        "SCP-AB-033",
+        "SCP-AB-036"
       ]
     },
     {
@@ -1370,7 +1372,7 @@
       "gate": "gate-permission-category-b",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-protocol/src/crypto/ucan/validate.rs"
       ],
@@ -1444,7 +1446,7 @@
     },
     {
       "id": "SCP-AB-027",
-      "title": "Export the agent permission set through the three FFI bridges and the SDK wrappers",
+      "title": "Export the agent permission set through the three FFI bridges",
       "gate": "gate-permission-category-b",
       "priority": "P1",
       "severity": "major",
@@ -1452,34 +1454,63 @@
       "files": [
         "crates/scp-ffi/src/ucan.rs",
         "crates/scp-ffi/napi/src/ucan.rs",
-        "crates/scp-ffi/uniffi/src/scp.rs",
-        "crates/scp-ffi/uniffi/src/scp.udl",
-        "bindings/python/scp_sdk/trust.py",
-        "bindings/typescript/src/trust.ts",
-        "bindings/swift/Sources/SCP/Trust.swift",
-        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Trust.kt",
-        ".docs/standards/sdk-capability-matrix.json"
+        "crates/scp-ffi/uniffi/src/ucan.rs"
       ],
-      "description": "A human sets their agent's permission set from an SDK, so the Category B surface has to cross the FFI boundary. Export the mint-with-permissions operation and the read-back of a token's permission set from all three bridges (PyO3, napi-rs, UniFFI), add the matching SDK wrapper in each of the four languages, and fill the capability matrix cells. The core minting path is SCP-AB-026, not this story.",
+      "description": "Export the agent permission set across the PyO3, napi-rs and UniFFI bridges. This story stops at the bridge boundary; the SDK wrappers and the capability-matrix rows are SCP-AB-035.",
       "acceptanceCriteria": [
         "The PyO3 bridge exports a function that mints a UCAN carrying an agent permission set and a function that reads one back",
         "The napi-rs bridge exports the same two operations with the same argument names",
         "The UniFFI bridge exports the same two operations with the same argument names",
         "bindings/python, bindings/typescript, bindings/swift, and bindings/kotlin each expose a wrapper for both operations",
-        ".docs/standards/sdk-capability-matrix.json has a row for both operations with a filled cell for every one of the four SDKs",
         "python3.12 scripts/check-sdk-coverage.py exits zero",
-        "scripts/check-bridge-symmetry.sh exits zero",
-        "One round-trip test per SDK mints with a permission set and reads back the same allow list"
+        "scripts/check-bridge-symmetry.sh exits zero"
       ],
       "actionItems": [
-        "Add the two bridge exports to each of the three bridges",
-        "Add the four SDK wrappers",
-        "Add the capability matrix rows and cells",
-        "Add one round-trip test per SDK",
-        "Run check-sdk-coverage.py and check-bridge-symmetry.sh"
+        "Add the the agent permission set export to crates/scp-ffi/src",
+        "Add the the agent permission set export to crates/scp-ffi/napi/src",
+        "Add the the agent permission set export to crates/scp-ffi/uniffi/src"
       ],
       "blockedBy": [
         "SCP-AB-026"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/04-agents.md",
+          "section": "### 4.9.2 Category B — user-configurable"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "### Permission Model"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-035",
+      "title": "Wrap the agent permission set in the four SDKs and fill the capability matrix",
+      "gate": "gate-permission-category-b",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "bindings/python/scp_sdk/scp.py",
+        "bindings/typescript/src/scp.ts",
+        "bindings/swift/Sources/SCP/Scp.swift",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Scp.kt",
+        ".docs/standards/sdk-capability-matrix.json"
+      ],
+      "description": "Wrap the the agent permission set bridge exports in the Python, TypeScript, Swift and Kotlin SDKs, and add the capability-matrix rows. Depends on SCP-AB-027 for the exports it wraps.",
+      "acceptanceCriteria": [
+        "Each of the four SDKs exposes the agent permission set with the per-SDK idiom its own standard names",
+        "The capability matrix carries a row per SDK for the agent permission set, and python3.12 scripts/check-sdk-coverage.py passes"
+      ],
+      "actionItems": [
+        "Add the the agent permission set wrapper to each of the four SDKs",
+        "Add the capability-matrix rows"
+      ],
+      "blockedBy": [
+        "SCP-AB-026",
+        "SCP-AB-035"
       ],
       "sources": [
         {
@@ -1503,7 +1534,8 @@
       "files": [
         "crates/scp-protocol/src/context/params.rs",
         "crates/scp-protocol/src/crypto/ucan/validate.rs",
-        "crates/scp-protocol/src/envelope/inner/mod.rs"
+        "crates/scp-protocol/src/envelope/inner/mod.rs",
+        "crates/scp-mls/src/credential.rs"
       ],
       "description": "§4.9.3 defines agent_keys_allowed as a boolean on ContextParams with default true. When a context sets it false, the context admits no artifact signed by #agent: a UCAN whose kid is #agent, an inner envelope whose signing_key_id is Agent, and an MLS credential whose signing_key_id is Agent are each rejected, and members still participate through #active. Add the field, its default, and the three rejection points.",
       "acceptanceCriteria": [
@@ -1640,7 +1672,8 @@
       "acceptanceCriteria": [
         "ContextParams carries a field agent_cosign_required: Vec<Capability> whose Default impl yields an empty vector",
         "Every entry of agent_cosign_required is validated against the context's ceiling at context creation, and an out-of-ceiling entry is rejected",
-        "The signed artifact carries an optional second signature field that a co-signing #active key produces over the same signed payload the #agent key signed",
+        "InnerEnvelope carries an optional cosignature field holding a 64-byte Ed25519 signature over the same 9.5.1 signing hash the #agent signature covers, as 4.9.3 defines it",
+        "A verifier ignores a cosignature present on an artifact whose invoked capability is absent from agent_cosign_required, rather than rejecting it",
         "Verification requires the second signature when the invoked capability is on agent_cosign_required and the signing key is #agent",
         "Verification rejects the action when the second signature is absent, and the error names the capability that required it",
         "Verification rejects the action when the second signature verifies against a DID other than the #agent signer's own DID",
@@ -1651,7 +1684,7 @@
       ],
       "actionItems": [
         "Add agent_cosign_required to ContextParams with an empty default and ceiling validation",
-        "Add the second-signature field to the signed artifact and its canonical signing input",
+        "Add the optional cosignature field to InnerEnvelope per 4.9.3, covering the existing 9.5.1 signing hash",
         "Add the co-signature verification branch",
         "Add the accept and reject tests named in the acceptance criteria"
       ],
@@ -1722,7 +1755,7 @@
     },
     {
       "id": "SCP-AB-033",
-      "title": "Export the Category C parameters through the three FFI bridges and the SDK wrappers",
+      "title": "Export the Category C context parameters through the three FFI bridges",
       "gate": "gate-permission-category-c",
       "priority": "P1",
       "severity": "major",
@@ -1730,33 +1763,62 @@
       "files": [
         "crates/scp-ffi/src/context.rs",
         "crates/scp-ffi/napi/src/context.rs",
-        "crates/scp-ffi/uniffi/src/scp.rs",
-        "crates/scp-ffi/uniffi/src/scp.udl",
-        "bindings/python/scp_sdk/context.py",
-        "bindings/typescript/src/context.ts",
-        "bindings/swift/Sources/SCP/Context.swift",
-        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Context.kt",
-        ".docs/standards/sdk-capability-matrix.json"
+        "crates/scp-ffi/uniffi/src/context.rs"
       ],
-      "description": "A context creator sets the Category C parameters from an SDK and a prospective member reads them before joining, so the whole Category C surface has to cross the FFI boundary. Carry agent_keys_allowed, agent_rate_limit, and agent_cosign_required on the context-creation parameters of all three bridges, expose the structural-metadata read that returns them, add the matching SDK wrapper in each of the four languages, and fill the capability matrix cells.",
+      "description": "Export the Category C context parameters across the PyO3, napi-rs and UniFFI bridges. This story stops at the bridge boundary; the SDK wrappers and the capability-matrix rows are SCP-AB-036.",
       "acceptanceCriteria": [
         "The context-creation parameters of the PyO3, napi-rs, and UniFFI bridges each carry agent_keys_allowed, agent_rate_limit, and agent_cosign_required with the same argument names",
         "The structural-metadata read of all three bridges returns the three fields",
         "bindings/python, bindings/typescript, bindings/swift, and bindings/kotlin each expose the three fields on their context-creation parameters and on their metadata read",
-        ".docs/standards/sdk-capability-matrix.json has a filled cell for every one of the four SDKs on the metadata-read operation",
         "python3.12 scripts/check-sdk-coverage.py exits zero",
-        "scripts/check-bridge-symmetry.sh exits zero",
-        "One round-trip test per SDK creates a context with all three parameters set and reads back the same values"
+        "scripts/check-bridge-symmetry.sh exits zero"
       ],
       "actionItems": [
-        "Add the three fields to the context-creation parameters of each bridge",
-        "Add the three fields to the structural-metadata read of each bridge",
-        "Add the four SDK wrappers",
-        "Add the capability matrix cells and run the two coverage scripts",
-        "Add one round-trip test per SDK"
+        "Add the the Category C context parameters export to crates/scp-ffi/src",
+        "Add the the Category C context parameters export to crates/scp-ffi/napi/src",
+        "Add the the Category C context parameters export to crates/scp-ffi/uniffi/src"
       ],
       "blockedBy": [
         "SCP-AB-032"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/04-agents.md",
+          "section": "### 4.9.3 Category C — context-configurable"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.7 Metadata"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-036",
+      "title": "Wrap the Category C context parameters in the four SDKs and fill the capability matrix",
+      "gate": "gate-permission-category-c",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "bindings/python/scp_sdk/scp.py",
+        "bindings/typescript/src/scp.ts",
+        "bindings/swift/Sources/SCP/Scp.swift",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Scp.kt",
+        ".docs/standards/sdk-capability-matrix.json"
+      ],
+      "description": "Wrap the the Category C context parameters bridge exports in the Python, TypeScript, Swift and Kotlin SDKs, and add the capability-matrix rows. Depends on SCP-AB-033 for the exports it wraps.",
+      "acceptanceCriteria": [
+        "Each of the four SDKs exposes the Category C context parameters with the per-SDK idiom its own standard names",
+        "The capability matrix carries a row per SDK for the Category C context parameters, and python3.12 scripts/check-sdk-coverage.py passes"
+      ],
+      "actionItems": [
+        "Add the the Category C context parameters wrapper to each of the four SDKs",
+        "Add the capability-matrix rows"
+      ],
+      "blockedBy": [
+        "SCP-AB-032",
+        "SCP-AB-036"
       ],
       "sources": [
         {

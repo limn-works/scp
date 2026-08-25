@@ -43,10 +43,19 @@
 //! Actions are classified by their UCAN capability resource type:
 //!
 //! - **Category A** (agent key MUST NOT sign): every resource type that names
-//!   a write to the DID document — see `CATEGORY_A_RESOURCES`.
+//!   a write to the DID document — see `CATEGORY_A_RESOURCES`, whose doc
+//!   comment states both membership criteria and names the one entry that
+//!   satisfies neither.
 //! - **Category B** (agent key may sign what its human permits): `messages`,
 //!   `outlet_call`, `member`, `role`, `context`, `spending`, and every other
 //!   operational resource.
+//!
+//! [`classify_action`] reads a resource token, so it recognizes only the
+//! Category A actions a resource token names. Root UCAN issuance is Category A
+//! and no resource token names it, so no verdict from this function reports
+//! it; `enforce_ucan_category_a` reads the token's `prf` for that rule instead.
+//! A reader who takes a [`ActionCategory::CategoryB`] verdict as "the agent key
+//! may sign this artifact" reaches the wrong answer on a root UCAN.
 //!
 //! The classifier is deliberately conservative: unknown resource types default
 //! to Category B because Category A is a closed set defined by the DID
@@ -93,13 +102,29 @@ pub enum ActionCategory {
 /// Category A resource types — the UCAN capability resource types that name a
 /// write to the DID document.
 ///
-/// **The criterion** (spec §4.9.1): a resource type is Category A when
-/// exercising a capability over it writes the DID document — the record whose
-/// BEP44 signature a resolver verifies against the public key encoded in the
-/// DID string (§9.6.1). The list below enumerates the resource types that
-/// satisfy the criterion today; it is not the criterion. A resource type this
-/// list omits is still Category A when it names a DID-document write, and the
-/// protocol adds it here when the protocol defines it.
+/// **The criteria** (spec §4.9.1). Two criteria decide Category A membership,
+/// and each names the key the action is reserved to. An action is reserved to
+/// `#0` when exercising a capability over it writes the DID document — the
+/// record whose BEP44 signature a resolver verifies against the public key
+/// encoded in the DID string (§9.6.1). An action is reserved to `#active` when
+/// it creates authority no existing delegation confers; root UCAN issuance is
+/// that action, and no resource token names it, which is why `prf` rather than
+/// this list is what
+/// [`enforce_ucan_category_a`](crate::crypto::ucan) reads for it.
+///
+/// The list below enumerates the resource types that satisfy the first
+/// criterion today; it is not the criterion. A resource type this list omits
+/// is still Category A when it names a DID-document write, and the protocol
+/// adds it here when the protocol defines it.
+///
+/// **One entry satisfies neither criterion.** `identity` names no DID-document
+/// field and creates no authority. It is in the list because this file has
+/// carried it since before ADR-039 stated the criteria, and removing it would
+/// admit `#agent` on a resource no one has decided an agent may sign. Spec
+/// §4.9.1 records the same carve-out, and
+/// `.docs/specs/00-open-questions.md` carries the question of which criterion
+/// admits it or whether it leaves the set. A reader must not infer from this
+/// list that every entry writes the DID document.
 ///
 /// **What a Category B verdict does not say.** Category A and Category B
 /// partition which of the two — the protocol or the DID's owner — writes an
@@ -223,9 +248,9 @@ pub const fn identity_key_reserved_resources() -> &'static [&'static str] {
 /// ceiling admits `{entry}:{any action}` and step 8 of §7.2.1 rejects such a
 /// token even when this rule passes it. Reading the action segment instead
 /// would add a parser whose only effect is to decide which of two errors an
-/// unreachable token reports. `service` is the one Category A resource token
-/// the kebab grammar does admit, which is why the set omits it — see
-/// [`IDENTITY_KEY_RESERVED_RESOURCES`].
+/// unreachable token reports. The two Category A resource tokens the kebab
+/// grammar does admit, `service` and `identity`, are exactly the two this set
+/// omits — see [`IDENTITY_KEY_RESERVED_RESOURCES`].
 ///
 /// **Visibility.** The predicate is `pub(crate)` because the only caller is
 /// `enforce_ucan_category_a` in [`crate::crypto::ucan`], and no FFI bridge

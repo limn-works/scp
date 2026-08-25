@@ -60,7 +60,8 @@ pub const fn ucan_error_code(err: &UcanError) -> &'static str {
         | UcanError::KeyScopeMismatch { .. }
         | UcanError::SelfDelegationWithoutKeyScope
         | UcanError::CategoryAViolation { .. }
-        | UcanError::IdentityKeyReservedCapability { .. } => codes::PERM_3001,
+        | UcanError::IdentityKeyReservedCapability { .. }
+        | UcanError::AgentRootIssuance { .. } => codes::PERM_3001,
 
         // Expiry / validity window. Natural `PERM_3007` candidates —
         // held back pending test_trust.py update (see fn doc).
@@ -150,6 +151,9 @@ mod tests {
             UcanError::IdentityKeyReservedCapability {
                 action: "did_document:update".to_owned(),
                 kid: "#active".to_owned(),
+            },
+            UcanError::AgentRootIssuance {
+                kid: "#agent".to_owned(),
             },
             // Expiry / validity window
             UcanError::ExpiryTooFar(90_000_u64),

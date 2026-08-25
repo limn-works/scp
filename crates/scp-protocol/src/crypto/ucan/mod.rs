@@ -233,6 +233,28 @@ pub enum UcanError {
         kid: String,
     },
 
+    /// The agent key (`#agent`) signed a root UCAN, which ADR-039 reserves to
+    /// the Active Signing Key (`#active`).
+    ///
+    /// A root token carries an empty `prf`, so its authority derives from the
+    /// issuer's own key rather than from a parent token. Every capability a
+    /// context ceiling admits is Category B, so
+    /// [`UcanError::CategoryAViolation`] does not fire on such a token and an
+    /// agent that could issue one would grant itself every capability inside
+    /// the ceiling without a human signature anywhere in the chain.
+    ///
+    /// This is a custody violation in the same sense
+    /// [`UcanError::CategoryAViolation`] is: the agent key crossed a boundary
+    /// the protocol fixes. It carries its own variant because no capability
+    /// names the overreach — the empty `prf` does.
+    ///
+    /// See spec §4.9.1, the `#active` criterion, and §7.2.1 step 6b rule 3.
+    #[error("agent key signed a root UCAN, which requires the active signing key (kid={kid})")]
+    AgentRootIssuance {
+        /// The key identifier that signed the token (always `"#agent"`).
+        kid: String,
+    },
+
     /// The revoker is not authorized to revoke the token (must be the token's
     /// issuer or the context creator).
     #[error("revocation unauthorized: {0}")]
