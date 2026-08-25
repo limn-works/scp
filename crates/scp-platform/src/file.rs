@@ -2566,17 +2566,14 @@ mod tests {
         );
     }
 
-    /// Concurrent `generate_keypair` ↔ `destroy_key` MUST NOT corrupt
-    /// the handle map. Holding `handle_map` across the entire
-    /// append-and-insert path is what guarantees this: without it, a
-    /// concurrent `destroy_key` could rewrite the file and shift
-    /// `entry_index` values between our `append_entry` and the map
-    /// insert, leaving the new handle pointing at a stale slot. The
-    /// test pre-creates a victim key, then races a `generate_keypair`
-    /// against `destroy_key` on the victim and asserts that whatever
-    /// handle came back from `generate_keypair` decrypts cleanly (i.e.
-    /// the recorded `entry_index` still references its real ciphertext
-    /// in the file).
+    /// Concurrent `generate_keypair` ↔ `destroy_key` MUST NOT corrupt the
+    /// handle map. `generate_keypair` holds `handle_map` across its whole
+    /// append-and-insert path, so no reader observes a handle this object has
+    /// not recorded yet, and the identifier `append_entry` returns names the
+    /// entry it wrote for that entry's whole life. The test pre-creates a
+    /// victim key, races a `generate_keypair` against `destroy_key` on the
+    /// victim, and asserts that the handle `generate_keypair` returned reads
+    /// back its own key.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn generate_keypair_concurrent_destroy_does_not_corrupt_handle_map() {
         use std::sync::Arc;
@@ -2611,10 +2608,9 @@ mod tests {
         let new_handle = task_gen.await.unwrap();
         task_destroy.await.unwrap();
 
-        // The new handle MUST decrypt cleanly. If `generate_keypair`
-        // had captured a stale `entry_index` from before
-        // `destroy_key`'s shift, `public_key` would fail to decrypt
-        // (or recover a different key than the one we wrote).
+        // The new handle MUST decrypt cleanly: it names the identifier
+        // `append_entry` drew for the entry it wrote, and the concurrent
+        // `destroy_key` removed another entry.
         let _public = custody
             .public_key(&new_handle)
             .await
@@ -2626,9 +2622,9 @@ mod tests {
             .await
             .expect("new handle must sign after concurrent destroy");
 
-        // All other pre-existing handles MUST still decrypt cleanly
-        // (the destroy path is responsible for shifting their indices,
-        // and `generate_keypair` must not interleave a stale insert).
+        // Every other pre-existing handle MUST still decrypt cleanly. The
+        // destroy moved two entries down one position each, and no handle
+        // names a position.
         for h in &handles {
             let _ = custody
                 .public_key(h)
