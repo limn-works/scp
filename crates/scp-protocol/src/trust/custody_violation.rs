@@ -7,12 +7,15 @@
 //!    verifiable violations are recorded — behavioral anomalies are explicitly
 //!    excluded (they are soft trust signals, not violations).
 //!
-//! 2. **Category A enforcement**: DID document modifications (add/remove keys,
-//!    change services, alter relays, pre-rotation commitments, identity
-//!    migration) MUST be signed by the human's Active Signing Key (`#active`).
-//!    If an agent key (`#agent`) attempts a Category A action, the verification
-//!    point rejects the action and emits a [`ScpCustodyViolationAttestation`]
-//!    with the violating signature as evidence.
+//! 2. **Category A enforcement**: an agent key (`#agent`) MUST NOT sign a
+//!    Category A action. When one does, the verification point rejects the
+//!    action and emits a [`ScpCustodyViolationAttestation`] with the violating
+//!    signature as evidence. ADR-039 reserves each Category A action to a
+//!    named human key: a DID-document write (add/remove keys, change services,
+//!    alter relays, pre-rotation commitments, identity migration) requires the
+//!    Identity Key (`#0`), and root UCAN issuance requires the Active Signing
+//!    Key (`#active`). Spec §4.9.1 states the membership criterion for each
+//!    reservation.
 //!
 //! # Types
 //!
@@ -27,19 +30,30 @@
 //!
 //! # Action Classification
 //!
+//! ADR-039 defines three permission categories. Category A and Category B
+//! partition the protocol's actions and answer one question — who writes the
+//! signing-key rule for this action, the protocol or the DID's owner. Category
+//! C partitions nothing: it is a second axis on which a context restricts what
+//! an agent may do inside that context. [`classify_action`] answers the first
+//! question only, so a [`ActionCategory::CategoryB`] verdict says the protocol
+//! leaves the rule to the DID's owner, and says nothing about whether any
+//! context admits the action. Spec §4.9 states all three categories and §4.9.4
+//! states what a verifier does when the two axes disagree.
+//!
 //! Actions are classified by their UCAN capability resource type:
 //!
-//! - **Category A** (human-only): `did_document`, `verification_method`,
-//!   `identity`, `pre_rotation`, `service`, `relay_config` — any resource
-//!   that modifies the DID document itself.
-//! - **Category B/C** (agent-permitted): `messages`, `outlet_call`, `member`,
-//!   `role`, `context`, `spending`, and all other operational resources.
+//! - **Category A** (agent key MUST NOT sign): every resource type that names
+//!   a write to the DID document — see `CATEGORY_A_RESOURCES`.
+//! - **Category B** (agent key may sign what its human permits): `messages`,
+//!   `outlet_call`, `member`, `role`, `context`, `spending`, and every other
+//!   operational resource.
 //!
 //! The classifier is deliberately conservative: unknown resource types default
-//! to Category B (agent-permitted) because Category A is a closed set defined
-//! by the DID document's own structure.
+//! to Category B because Category A is a closed set defined by the DID
+//! document's own structure.
 //!
-//! See ADR-039 in `.docs/adrs/phase-6.md` and spec section §3.6.
+//! See ADR-039, the shared-DID human-agent identity model, in
+//! `.docs/adrs/phase-1.md`, and spec §4.9 in `.docs/specs/04-agents.md`.
 
 use std::collections::HashMap;
 
@@ -53,18 +67,22 @@ use scp_did::{DID, SigningKeyId};
 
 /// Classification of a protocol action for custody enforcement.
 ///
-/// Category A actions modify the DID document and MUST be signed by the
-/// human's Active Signing Key (`#active`). Category B actions are operational
-/// and may be signed by either key.
+/// The protocol fixes the signing-key rule for a Category A action and leaves
+/// the rule for a Category B action to the human who owns the DID. Neither
+/// verdict speaks for Category C, which a context sets on its own axis
+/// (§4.9.3, §4.9.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ActionCategory {
-    /// DID document modifications — human-only (`#active` key required).
+    /// DID document writes — the agent key (`#agent`) MUST NOT sign one, and
+    /// ADR-039 reserves the write itself to the Identity Key (`#0`).
     ///
     /// Includes: add/remove verification methods, change services, alter
     /// relay configuration, pre-rotation commitments, identity migration.
     CategoryA,
 
-    /// Operational actions — agent key (`#agent`) permitted.
+    /// Operational actions — the agent key (`#agent`) signs the ones its
+    /// human enumerated in `fct.scp_agent_permissions` (§4.9.2), and the
+    /// context the action runs in may still forbid it (§4.9.3).
     ///
     /// Includes: messaging, outlet invocation, member management, role
     /// assignment, context operations, spending, and all other non-DID-
@@ -72,12 +90,23 @@ pub enum ActionCategory {
     CategoryB,
 }
 
-/// Category A resource types — the closed set of UCAN capability resource
-/// types that modify the DID document.
+/// Category A resource types — the UCAN capability resource types that name a
+/// write to the DID document.
 ///
-/// This is a protocol constant: any resource type not in this list is
-/// Category B by definition, because Category A is bounded by the DID
-/// document's own structure.
+/// **The criterion** (spec §4.9.1): a resource type is Category A when
+/// exercising a capability over it writes the DID document — the record whose
+/// BEP44 signature a resolver verifies against the public key encoded in the
+/// DID string (§9.6.1). The list below enumerates the resource types that
+/// satisfy the criterion today; it is not the criterion. A resource type this
+/// list omits is still Category A when it names a DID-document write, and the
+/// protocol adds it here when the protocol defines it.
+///
+/// **What a Category B verdict does not say.** Category A and Category B
+/// partition which of the two — the protocol or the DID's owner — writes an
+/// action's signing-key rule. Category C is a separate axis: a context
+/// restricts what an agent may do inside it whatever this list says (§4.9.3),
+/// so a resource type absent from this list is Category B and may still be
+/// forbidden by the context the action runs in.
 const CATEGORY_A_RESOURCES: &[&str] = &[
     "did_document",
     "verification_method",
@@ -89,11 +118,11 @@ const CATEGORY_A_RESOURCES: &[&str] = &[
     "key_management",
 ];
 
-/// Returns the closed set of Category A resource types.
+/// Returns the Category A resource types — the resource types the agent key
+/// (`#agent`) MUST NOT sign.
 ///
-/// These are the UCAN capability resource types that modify the DID document
-/// and therefore require human (`#active`) signing. Exposed for conformance
-/// testing against mirror implementations.
+/// `CATEGORY_A_RESOURCES` states the membership criterion these entries
+/// satisfy. Exposed for conformance testing against mirror implementations.
 ///
 /// # Examples
 ///
@@ -109,10 +138,127 @@ pub const fn category_a_resources() -> &'static [&'static str] {
     CATEGORY_A_RESOURCES
 }
 
+/// The Category A resource types ADR-039 reserves to the Identity Key (`#0`).
+///
+/// **The criterion** (spec §4.9.1): a resource type belongs here when ADR-039
+/// names `#0` as the key that performs the action — the three bullets that
+/// read "requires `#0`" cover DID document updates (add/remove keys, change
+/// services, alter relays), pre-rotation commitments, and identity migration.
+/// The entries below are the resource tokens that name those writes; they are
+/// evidence that an action is a DID-document write, not the test for whether
+/// it is one.
+///
+/// **Why this set matters to a UCAN verifier.** [`scp_did::SigningKeyId`]
+/// admits `#active` and `#agent` and nothing else, so `#0` never signs a UCAN.
+/// A UCAN that grants a capability over one of these resource types therefore
+/// conveys authority no key on the token can hold, whatever key signed it.
+/// Authority for a DID-document write comes from the `#0` signature on the
+/// published document (§9.6.1, §9.7.4), never from a capability token.
+///
+/// **Two Category A resource types are absent, each for its own reason.**
+///
+/// `identity` is absent because ADR-039 names no key reservation for a resource
+/// token spelled `identity`. Reserving it to `#0` on the strength of its name
+/// would decide a question ADR-039 left open, so a verifier admits `#active` on
+/// it until ADR-039 states the reservation.
+///
+/// `service` is absent because two namespaces spell it the same way and this
+/// set cannot tell them apart. A context declares custom ceiling entries under
+/// the grammar `{resource}:{action}` where each segment matches `[a-z0-9-]+`
+/// and the entry names no built-in (§5.3.1.1), and `service:read` satisfies
+/// that grammar, so a context may put it in its own ceiling and mean its own
+/// service registry by it. `service` is the only one of ADR-039's seven
+/// DID-document resource tokens the grammar admits — the other six carry an
+/// underscore, which the grammar forbids in a custom entry. Reserving `service`
+/// to `#0` would therefore reject a capability a context legitimately declared,
+/// so a verifier admits `#active` on it, exactly as it does on `origin/main`.
+/// Rule 1 still rejects an `#agent` signature over it. `.docs/specs/00-open-questions.md`
+/// records which namespace owns the token.
+///
+/// Neither absence widens what a UCAN can do to a DID document: authority for a
+/// DID-document write comes from the `#0` signature on the published document,
+/// and a capability token conveys none of it whatever this set says.
+const IDENTITY_KEY_RESERVED_RESOURCES: &[&str] = &[
+    "did_document",
+    "verification_method",
+    "key_management",
+    "pre_rotation",
+    "relay_config",
+    "did_migration",
+];
+
+/// Returns the Category A resource types reserved to the Identity Key (`#0`).
+///
+/// `IDENTITY_KEY_RESERVED_RESOURCES` states the membership criterion these
+/// entries satisfy. Exposed for conformance testing against mirror
+/// implementations.
+///
+/// # Examples
+///
+/// ```
+/// use scp_protocol::trust::custody_violation::identity_key_reserved_resources;
+///
+/// let resources = identity_key_reserved_resources();
+/// assert!(resources.contains(&"did_document"));
+/// assert!(!resources.contains(&"messages"));
+/// ```
+#[must_use]
+pub const fn identity_key_reserved_resources() -> &'static [&'static str] {
+    IDENTITY_KEY_RESERVED_RESOURCES
+}
+
+/// Reports whether ADR-039 reserves this UCAN capability resource type to the
+/// Identity Key (`#0`).
+///
+/// A verifier rejects a capability token granting such a resource whatever key
+/// signed the token, because `#0` never signs a UCAN (§4.9.1 rule 2).
+///
+/// **The decision reads the resource segment and ignores the action segment**,
+/// so this function reports `true` for `did_document:read` as well as for
+/// `did_document:update`, while §4.9.1's criterion names a DID-document
+/// *write*. Rejecting the read spelling rejects nothing a context can grant:
+/// each of the six entries carries an underscore, `is_kebab_token` in
+/// [`crate::context::roles`] forbids an underscore in a custom ceiling entry
+/// (§5.3.1.1), and none of the six is a built-in capability, so no context
+/// ceiling admits `{entry}:{any action}` and step 8 of §7.2.1 rejects such a
+/// token even when this rule passes it. Reading the action segment instead
+/// would add a parser whose only effect is to decide which of two errors an
+/// unreachable token reports. `service` is the one Category A resource token
+/// the kebab grammar does admit, which is why the set omits it — see
+/// [`IDENTITY_KEY_RESERVED_RESOURCES`].
+///
+/// **Visibility.** The predicate is `pub(crate)` because the only caller is
+/// `enforce_ucan_category_a` in [`crate::crypto::ucan`], and no FFI bridge
+/// exports it. A mirror implementation reads the same set through the public
+/// [`identity_key_reserved_resources`] and applies `contains` itself, so
+/// narrowing the visibility withholds nothing a conformance test needs.
+///
+/// # Examples
+///
+/// ```
+/// use scp_protocol::trust::custody_violation::identity_key_reserved_resources;
+///
+/// let reserved = identity_key_reserved_resources();
+/// assert!(reserved.contains(&"pre_rotation"));
+/// assert!(!reserved.contains(&"messages"));
+/// // `identity` is Category A, and ADR-039 names no key reservation for it.
+/// assert!(!reserved.contains(&"identity"));
+/// // `service` is Category A, and a context may also declare it as a custom
+/// // ceiling entry, so a verifier admits `#active` on it.
+/// assert!(!reserved.contains(&"service"));
+/// ```
+#[must_use]
+pub(crate) fn requires_identity_key(resource: &str) -> bool {
+    IDENTITY_KEY_RESERVED_RESOURCES.contains(&resource)
+}
+
 /// Classifies an action by its UCAN capability resource type.
 ///
-/// Returns [`ActionCategory::CategoryA`] if the resource type modifies the
-/// DID document, [`ActionCategory::CategoryB`] otherwise.
+/// Returns [`ActionCategory::CategoryA`] if the resource type names a write to
+/// the DID document, [`ActionCategory::CategoryB`] otherwise. A
+/// [`ActionCategory::CategoryB`] verdict states that the DID's owner writes
+/// the signing-key rule for the action; it does not state that any context
+/// admits the action, which Category C decides on its own axis (§4.9.3).
 ///
 /// The resource type corresponds to the `{resource}` component of an SCP
 /// capability URI: `scp:ctx:{context_id}/{resource}:{action}`.
