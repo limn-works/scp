@@ -61,6 +61,15 @@ nothing:
                dependency bump touching only those two files skipped
                fuzz-build, typescript-wasm-check and
                scaffold-typescript-web-check while `ci` reported success.
+  shipped-config
+               Job rust-build-uniffi-production ran `cargo build` alone under a
+               note calling a prod-config test lane a separate follow-up, so
+               `identity_create_in_memory_rejected_without_feature` — the uniffi
+               proof that a shipped build rejects `in_memory` custody with
+               SCP-IDENT-1008 — executed in no lane. Every lane running uniffi
+               tests enables `scp-ffi-uniffi/testing`, which compiles that test
+               out. The pass that added a test step to the pyo3 twin left this
+               job's note in place.
   event-name   An aggregate read an absent GITHUB_EVENT_NAME as "", so
                `if: github.event_name == 'pull_request'` on job cross-layer
                judged false and a skipped cross-layer passed on a pull request.
@@ -208,6 +217,53 @@ SIGNED_ARTIFACT_SUFFIX = "-signed"
 # in whatever that match finds. Add a job here when release.yml gains a fourth
 # signing job.
 SIGNING_JOBS = {"sign-apple", "sign-windows", "sign-maven"}
+
+# CRITERION: a bridge's shipped-build assertion — a `#[test]` the bridge gates
+# `#[cfg(not(feature = "testing"))]`, which proves that a build carrying no
+# `testing` feature fails closed where a `testing` build mints an in-memory
+# nullifier — must be EXECUTED by some ci.yml job. Every lane that runs a
+# bridge's tests otherwise enables that bridge's `testing` feature, which
+# compiles such a test out, so the only lane that can execute one is a lane
+# building that bridge in its production configuration. A production-config job
+# that runs `cargo build` alone compiles the assertion and runs it never.
+#
+# Job rust-build-uniffi-production was build-only and carried a note calling a
+# prod-config test lane a separate follow-up, so
+# `identity_create_in_memory_rejected_without_feature` in
+# crates/scp-ffi/uniffi/src/lib.rs — the uniffi proof that a shipped build
+# rejects `in_memory` custody with SCP-IDENT-1008 — ran in no lane while `ci`
+# reported success and build-matrix.yml shipped that bridge in an iOS
+# XCFramework and an Android AAR.
+#
+# Each key is a ci.yml job; each value is the set of packages whose
+# shipped-build assertions that job must run.
+SHIPPED_CONFIG_LANES = {
+    "rust-build-pyo3-production": {"scp-ffi"},
+    "rust-build-uniffi-production": {"scp-ffi-uniffi"},
+    "rust-test-napi-production": {"scp-ffi-napi", "scp-ffi-common"},
+}
+
+# Packages outside SHIPPED_CONFIG_LANES that carry shipped-build assertions,
+# each paired with the ci.yml job that runs them. A check below requires each
+# job named here to exist, and a package carrying such an assertion while
+# appearing in neither table fails that check by name — so a crate cannot gain
+# one without someone recording which lane runs it.
+#
+# Nothing in this repository enables `scp-identity/testing`, so job rust-test's
+# `cargo nextest run --workspace` compiles that crate's two assertions. Job
+# fail-closed-pre-rotation names scp-node's two in an `-E` filter.
+NON_BRIDGE_SHIPPED_ASSERTION_LANES = {
+    "scp-identity": "rust-test",
+    "scp-node": "fail-closed-pre-rotation",
+}
+
+# Attributes that mark a Rust function as a test, and the attribute that
+# compiles an item only into a build carrying no `testing` feature. A scan below
+# reads attributes written one per line, on the lines above the `fn` they
+# annotate, which is the layout `cargo fmt` produces and job rust-fmt enforces.
+TEST_ATTRIBUTE = re.compile(r"^#\[(?:tokio::)?test\b")
+SHIPPED_ONLY_ATTRIBUTE = '#[cfg(not(feature = "testing"))]'
+RUST_FN_NAME = re.compile(r"\bfn\s+(\w+)")
 
 # CRITERION: a `uses:` ref names a branch or a tag that action's own repository
 # publishes. A ref naming anything else fails a run in about six seconds with
@@ -920,6 +976,191 @@ def check_resolution_manifests_reach_the_workspace() -> None:
         )
 
 
+def cargo_test_commands(job: dict) -> list[list[str]]:
+    """Return every `cargo test` / `cargo nextest run` command a job's steps run.
+
+    Each command comes back as a token list with every `${{ … }}` collapsed to
+    one token. A `--no-run` command drops out: it compiles a test binary and
+    executes no assertion, so it cannot satisfy a criterion about running one.
+    """
+    commands = []
+    for step in job.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        for line in logical_lines(step.get("run") or ""):
+            if not line.startswith(("cargo test ", "cargo nextest run ")):
+                continue
+            tokens = split_command(line)
+            if "--no-run" in tokens:
+                continue
+            commands.append(tokens)
+    return commands
+
+
+def command_packages(tokens: list[str]) -> set[str]:
+    """Return the packages a cargo command selects by `-p` or `--package`."""
+    packages, take_next = set(), False
+    for token in tokens:
+        if take_next:
+            packages.add(token)
+            take_next = False
+        elif token in {"-p", "--package"}:
+            take_next = True
+    return packages
+
+
+def command_enables_testing(tokens: list[str], package: str) -> bool:
+    """Whether a cargo command names `testing` for `package` in `--features`.
+
+    Reads what the command writes down. A `testing` feature another crate's
+    feature table turns on transitively is invisible here, which is why the
+    criterion this serves rests on a lane's own `--no-tests=fail`: nextest exits
+    4 when a selection is empty, so a transitive edge that deleted a
+    shipped-build assertion reds that lane rather than passing it.
+    """
+    for index, token in enumerate(tokens):
+        if token != "--features" or index + 1 >= len(tokens):
+            continue
+        for feature in tokens[index + 1].split(","):
+            if feature.strip() in {"testing", f"{package}/testing"}:
+                return True
+    return False
+
+
+def command_selects(tokens: list[str], test_name: str) -> bool:
+    """Whether a cargo command runs `test_name`, given it selects its package.
+
+    A command carrying no name filter runs every test its package compiles. A
+    command carrying an `-E` filterset or a positional filter runs `test_name`
+    only when that text names it.
+    """
+    filters = []
+    for index, token in enumerate(tokens):
+        if token in {"-E", "--filter-expr", "--filterset"} and index + 1 < len(tokens):
+            filters.append(tokens[index + 1])
+    filters += positional_filters(" ".join(shlex.quote(t) for t in tokens))
+    if not filters:
+        return True
+    return any(test_name in text for text in filters)
+
+
+def owning_package(source: Path) -> str:
+    """Return the package name of the nearest ancestor manifest of `source`.
+
+    Resolves a file to a package by walking up to the first Cargo.toml carrying
+    a `[package]` table, rather than by matching a directory prefix: a prefix
+    map put crates/scp-ffi/tests/ in no package, and a bridge assertion added
+    there would have gone unscanned.
+    """
+    for directory in source.parents:
+        manifest = directory / "Cargo.toml"
+        if manifest.is_file():
+            table = tomllib.loads(manifest.read_text()).get("package")
+            if table and "name" in table:
+                return str(table["name"])
+        # The root manifest declares a virtual workspace and no package, so the
+        # walk stops here rather than leaving this repository.
+        if directory == REPO:
+            break
+    raise SystemExit(f"{source}: no ancestor Cargo.toml declares a package")
+
+
+def shipped_build_assertions() -> dict[str, dict[str, Path]]:
+    """Return each package's shipped-build assertions, by test-function name.
+
+    A shipped-build assertion is a function carrying both a test attribute and
+    SHIPPED_ONLY_ATTRIBUTE, in either order and with other attributes and
+    comment lines between them. Reads every `.rs` file under crates/, so a
+    package this repository adds later is scanned without editing this file.
+    """
+    found: dict[str, dict[str, Path]] = {}
+    for source in sorted((REPO / "crates").rglob("*.rs")):
+        attributes: list[str] = []
+        for line in source.read_text().splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#["):
+                attributes.append(stripped)
+                continue
+            if not stripped or stripped.startswith("//"):
+                continue
+            name = RUST_FN_NAME.search(stripped)
+            if (
+                name
+                and any(TEST_ATTRIBUTE.match(a) for a in attributes)
+                and SHIPPED_ONLY_ATTRIBUTE in attributes
+            ):
+                package = owning_package(source)
+                found.setdefault(package, {})[name.group(1)] = source
+            attributes = []
+    return found
+
+
+def check_shipped_build_assertions_run(jobs: dict) -> None:
+    """Every bridge's shipped-build assertions run in a production-config lane.
+
+    CRITERION: stated at SHIPPED_CONFIG_LANES. Two checks carry it. The first
+    requires each job in that table to run a test command over each package it
+    names, with that package's `testing` feature absent from `--features` — a
+    FLOOR, so a package holding no shipped-build assertion today still gets a
+    lane that would run one tomorrow. The second scans every `.rs` file under
+    crates/ and requires each shipped-build assertion it finds to be selected by
+    some lane's command, or to sit in a package
+    NON_BRIDGE_SHIPPED_ASSERTION_LANES pairs with the job that runs it.
+    """
+    executing: dict[str, list[list[str]]] = {}
+    for job_id, packages in sorted(SHIPPED_CONFIG_LANES.items()):
+        # Looked up by key so a renamed job raises a KeyError here rather than
+        # leaving this check running over nothing and reporting a pass.
+        commands = cargo_test_commands(jobs[job_id])
+        for package in sorted(packages):
+            selecting = [
+                tokens
+                for tokens in commands
+                if package in command_packages(tokens)
+                and not command_enables_testing(tokens, package)
+            ]
+            executing.setdefault(package, []).extend(selecting)
+            check(
+                f"{job_id} runs {package}'s tests with `testing` off",
+                bool(selecting),
+                f"this job runs no `cargo test`/`cargo nextest run` over {package} "
+                f"that leaves `testing` off, so every "
+                f'`#[cfg(not(feature = "testing"))]` test in {package} compiles '
+                f"in a lane that never executes it",
+            )
+
+    for package, job_id in sorted(NON_BRIDGE_SHIPPED_ASSERTION_LANES.items()):
+        check(
+            f"{job_id}, which runs {package}'s shipped-build assertions, exists",
+            job_id in jobs,
+            f"ci.yml defines no job {job_id}",
+        )
+
+    lane_packages = {
+        package for names in SHIPPED_CONFIG_LANES.values() for package in names
+    }
+    for package, assertions in sorted(shipped_build_assertions().items()):
+        if package in NON_BRIDGE_SHIPPED_ASSERTION_LANES:
+            continue
+        check(
+            f"{package}'s shipped-build assertions belong to a lane this check reads",
+            package in lane_packages,
+            f"{package} defines {sorted(assertions)} and appears in neither "
+            f"SHIPPED_CONFIG_LANES nor NON_BRIDGE_SHIPPED_ASSERTION_LANES, so no "
+            f"entry here states which job runs them",
+        )
+        for test_name, source in sorted(assertions.items()):
+            check(
+                f"{source.relative_to(REPO)}:{test_name} runs in a shipped-config lane",
+                any(
+                    command_selects(tokens, test_name)
+                    for tokens in executing.get(package, [])
+                ),
+                f"no command in {sorted(SHIPPED_CONFIG_LANES)} selects it, so this "
+                f"fail-closed proof executes nowhere",
+            )
+
+
 def check_filter_outputs_gate_jobs(jobs: dict) -> None:
     """A `changes` filter output appears only in a job-level `if:`.
 
@@ -1112,6 +1353,12 @@ def main() -> int:
 
     print("step-filter — a filter output gates a job, never a step")
     check_filter_outputs_gate_jobs(jobs)
+
+    print(
+        "shipped-config — a production-config lane runs its bridge's fail-closed "
+        "assertions"
+    )
+    check_shipped_build_assertions_run(jobs)
 
     print(
         "zero-test — a filtered test selection that matches nothing must exit non-zero"

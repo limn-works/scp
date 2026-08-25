@@ -1,6 +1,6 @@
-# A Green Check That Asserted Nothing: Nine Ways CI Reported Success Over Zero Work
+# A Green Check That Asserted Nothing: Eleven Ways CI Reported Success Over Zero Work
 
-**Date:** 2026-08-16, extended 2026-08-17 and 2026-08-22
+**Date:** 2026-08-16, extended 2026-08-17, 2026-08-22 and 2026-08-25
 **Source:** branch `fix/ci-enforces-what-it-claims` — `.github/workflows/ci.yml`, `.github/workflows/fuzz.yml`, `.github/workflows/release.yml`, `scripts/check-cross-layer.sh`, `scripts/check-shipped-feature-graph.sh`
 
 ## Rule
@@ -10,7 +10,7 @@ fail on whichever defect it exists to catch, and keep that failure as a test. Ev
 defect below produced a green check while work behind it never ran, and every one passed
 review because a check *looked* like it was doing its job.
 
-## Nine failure shapes
+## Eleven failure shapes
 
 **1. A command that treats "nothing matched" as success.** `cargo test -p scp-node --lib
 pre_rotation_severance` exits 0 when a filter selects no test. Two tests it named
@@ -166,6 +166,39 @@ member 15, and does not return it for `fuzz`, whose `fuzz/Cargo.toml` carries it
 `[workspace]` table and resolves against `fuzz/Cargo.lock`. Widen a criterion to name
 every object the build reads, not the subset the walk already produced.
 
+**11. A job that compiles an assertion and runs it in no lane.** Job
+`rust-build-uniffi-production` ran `cargo build -p scp-ffi-uniffi --features server` and
+nothing else, under a note reading "the uniffi test suite assumes in-memory custody and
+does not compile in prod config, so a full prod-config test lane is a separate follow-up".
+`identity_create_in_memory_rejected_without_feature` at `crates/scp-ffi/uniffi/src/lib.rs`
+asserts that a shipped uniffi build rejects `in_memory` custody with SCP-IDENT-1008, and
+it carries `#[cfg(not(feature = "testing"))]`. The three lanes that run uniffi tests —
+`rust-test`, `rust-doc`, and the release conformance job — each enable
+`scp-ffi-uniffi/testing`, which compiles that assertion out, so it executed nowhere while
+`ci` reported success and `build-matrix.yml` shipped that bridge in an iOS XCFramework and
+an Android AAR at tag time. The pass that fixed shape 1 in the pyo3 twin deleted that
+job's identical note and left this one standing, which is shape 4's rule — fixing one
+instance is not finishing — applied to a deferral rather than to a grep.
+
+The note reported a real compile failure, unlike the pyo3 note beside it, and that
+difference is what made the deferral survive review. Measured before this change,
+`cargo test -p scp-ffi-uniffi --features server --lib --no-run` exited 101 with eight
+resolution errors, all in `crates/scp-ffi/uniffi/src/bridge.rs`: four sites named
+`testing`-gated items — the `pre_rotation_custody` field, `make_dht_with_signer`,
+`DidCache`, `DualLayerResolver`, `NoOpRelayQuerier` — from tests carrying only
+`#[cfg(test)]`. Adding `#[cfg(feature = "testing")]` to those four sites, and to the
+`InMemoryDhtClient` import their tests were the last users of, makes that target compile
+and moves no test out of a lane: job `rust-test` enables `scp-ffi-uniffi/testing` and runs
+each of them there exactly as before. A compile failure is an impediment to fix, not a
+reason to leave an assertion unrun: this one took five added attributes and one widened
+import gate.
+`check_shipped_build_assertions_run` in `scripts/tests/ci-gate/ci_gate_selftest.py` now
+scans every `.rs` file under `crates/` for a test carrying
+`#[cfg(not(feature = "testing"))]` and requires each one to sit in a package some
+production-config lane's command selects, or in a package a second table pairs with the
+job that runs it. A crate that gains such a test and names no lane fails that check by
+name.
+
 ## Tests holding these closed
 
 - `scripts/tests/ci-gate/run-tests.sh` — asserts every job sets a `timeout-minutes`, that
@@ -173,7 +206,11 @@ every object the build reads, not the subset the walk already produced.
   test-name filter on either side of a `--`, that four binding test jobs run on a
   Rust-only change, that any job reading a runtime-scaling input sizes its budget from
   that input and covers every permitted option, that no step gates itself on a `changes`
-  filter output, that the `fuzz` and `typescript-wasm` filters cover the path-dependency
+  filter output, that each of the three production-config bridge jobs runs a test command
+  over its own package with that package's `testing` feature absent, that every
+  `#[cfg(not(feature = "testing"))]` test under `crates/` is selected by one of those
+  commands or belongs to a package paired with the job that runs it, that the `fuzz` and
+  `typescript-wasm` filters cover the path-dependency
   closure of the manifests they guard, that every release.yml job uploading a `-signed`
   artifact runs its non-empty-input guard before that upload and that all three known
   signing jobs stay inside that suffix match, that an aggregate rejects a skipped

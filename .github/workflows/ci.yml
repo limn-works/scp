@@ -850,13 +850,27 @@ jobs:
   # the mobile (iOS XCFramework / Android .aar) production libs at release time,
   # so a PR could re-gate a production op behind the test-only feature and break
   # the production lib unnoticed until release. This is the per-PR guard against
-  # that over-gating regression class. Build-only (lib + bins): the uniffi test
-  # suite assumes in-memory custody and does not compile in prod config, so a
-  # full prod-config test lane is a separate follow-up.
+  # that over-gating regression class.
+  #
+  # This job carried a "build-only" note claiming a uniffi test suite assumes
+  # in-memory custody and does not compile in prod config. The pass that deleted
+  # the identical note from the pyo3 lane above left this one standing. That
+  # note reported a real compile failure: measured before this change,
+  # `cargo test -p scp-ffi-uniffi --features server --lib --no-run` exited 101
+  # with eight resolution errors, every one of them in
+  # crates/scp-ffi/uniffi/src/bridge.rs, where four sites named
+  # `testing`-gated items from tests carrying only `#[cfg(test)]`. Those four
+  # sites now carry `#[cfg(feature = "testing")]`, so this crate's `--lib` test
+  # target compiles in the shipped configuration, and a second step below runs
+  # the shipped-build fail-closed assertion it holds.
+  #
+  # Gating those tests on `testing` moves no assertion out of a lane: job
+  # rust-test enables `scp-ffi-uniffi/testing` and runs each of them there,
+  # exactly as it did before.
   rust-build-uniffi-production:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    name: Rust / build (uniffi production config)
+    name: Rust / build + fail-closed test (uniffi production config)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -866,11 +880,32 @@ jobs:
           df -h /
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
       - name: Build uniffi bridge in production config (no in-memory custody)
         run: |
           # Default features = production: `server` on, no `testing`.
           cargo build -p scp-ffi-uniffi --features server
+      - name: Shipped uniffi fail-closed assertion
+        run: |
+          # `identity_create_in_memory_rejected_without_feature` at
+          # crates/scp-ffi/uniffi/src/lib.rs:710 asserts that a shipped uniffi
+          # build rejects `in_memory` custody with SCP-IDENT-1008. It carries
+          # `#[cfg(not(feature = "testing"))]`. The three lanes that run uniffi
+          # tests each enable `scp-ffi-uniffi/testing`, which compiles that test
+          # out: job rust-test and job rust-doc in this file, and job
+          # conformance in release.yml. It therefore executed in no lane,
+          # while this job built the bridge and tested nothing, and
+          # build-matrix.yml ships that bridge in an iOS XCFramework and an
+          # Android AAR at tag time.
+          #
+          # `--no-tests=fail` exits 4 rather than 0 when a feature flip selects
+          # zero tests. `check_shipped_build_assertions_run` in
+          # scripts/tests/ci-gate/ci_gate_selftest.py rejects this workflow when
+          # a `#[cfg(not(feature = "testing"))]` test this bridge defines is
+          # absent from the filter below.
+          cargo nextest run --no-tests=fail -p scp-ffi-uniffi --features server --lib \
+            -E 'test(identity_create_in_memory_rejected_without_feature)'
 
   rust-doc:
     needs: changes
