@@ -1017,18 +1017,17 @@ class SCP:
             self._native.remove_identity_link_attestation, did, attestation_id
         )
 
-    async def verify_identity_link_attestation(
-        self, attestation_json: str, issuer_public_key_hex: str
-    ) -> Any:
-        """Delegate to ``_scp_core.py_verify_identity_link_attestation``.
+    async def verify_identity_link_attestation(self, attestation_json: str) -> Any:
+        """Delegate to ``_scp_core.SCP.identity_verify_link_attestation``.
 
-        ADR-048 §1: pure helper exposed as a module-level free function.
+        Step 1 of spec §3.5.4 resolves the issuer's DID document and reads the
+        ``#active`` or ``#agent`` public key out of it, so the caller passes only
+        the attestation. Passing the issuer key in let a caller sign an
+        attestation with a key it minted, pass that same key in, and read back
+        ``True`` for a DID it does not control.
         """
-        mod = _native_mod()
         return await asyncio.to_thread(
-            mod.py_verify_identity_link_attestation,
-            attestation_json,
-            issuer_public_key_hex,
+            self._native.identity_verify_link_attestation, attestation_json
         )
 
     # endregion Identity

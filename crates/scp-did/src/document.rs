@@ -714,7 +714,8 @@ impl DidDocument {
     /// # Errors
     ///
     /// Returns [`DidError::DocumentSerializationError`] if adding this entry
-    /// would exceed the maximum of 10 identity link attestation entries (§3.5.3).
+    /// would exceed [`MAX_IDENTITY_LINK_ATTESTATIONS`], the maximum of 64
+    /// identity link attestation entries that §3.5.3 of the identity spec sets.
     pub fn set_identity_link_attestation(
         &mut self,
         platform: &str,

@@ -94,7 +94,7 @@ use scp_ffi_common::validate::{
 use crate::ScpError;
 use crate::bridge::{
     ContextHandle, UniffiKeyCustody, decode_asserted_nonce, enforce_caller_principal_binding,
-    identity_custody_registry, map_saga_error, resolve_uniffi_signing_key,
+    identity_state_registry, map_saga_error, resolve_uniffi_signing_key,
     validate_outlet_ucan_uniffi,
 };
 use crate::runtime::UniffiBridgeInstance;
@@ -221,7 +221,7 @@ async fn resolve_stream_signer(
     identity_did: &str,
 ) -> Result<BridgeCustodyStreamSigner, ScpError> {
     let (custody, handle) = {
-        let registry = identity_custody_registry(bi);
+        let registry = identity_state_registry(bi);
         let entry = registry
             .get(identity_did)
             .ok_or_else(|| ScpError::Context {
@@ -235,8 +235,7 @@ async fn resolve_stream_signer(
                 // (SCP-OUT-047 pass-3a cross-bridge alignment).
                 code: codes::CTX_2001.to_owned(),
             })?;
-        let (custody, key_handle) = entry.value();
-        (Arc::clone(custody), *key_handle)
+        (Arc::clone(&entry.custody), entry.active_key)
     };
     let public_key = custody
         .public_key(&handle)
@@ -1118,7 +1117,7 @@ async fn resolve_context_active_signing_key_by_id(
             code: codes::CTX_2001.to_owned(),
         })?;
     let (custody, key_handle) = {
-        let registry = identity_custody_registry(bi);
+        let registry = identity_state_registry(bi);
         let entry = registry.get(&creator_did).ok_or_else(|| ScpError::Context {
             msg: format!(
                 "no local identity custody for context creator '{creator_did}' — streaming-saga \
@@ -1129,8 +1128,7 @@ async fn resolve_context_active_signing_key_by_id(
             // PyO3 bridges surface (SCP-OUT-047 pass-3a cross-bridge alignment).
             code: codes::CTX_2001.to_owned(),
         })?;
-        let (custody, key_handle) = entry.value();
-        (Arc::clone(custody), *key_handle)
+        (Arc::clone(&entry.custody), entry.active_key)
     };
     custody
         .export_ed25519_signing_key(&key_handle)
@@ -1554,7 +1552,7 @@ pub(crate) async fn outlet_streaming_saga_recover_truncated_close_impl(
     // Authenticate the reconnect caller: it MUST be an identity hosted by this
     // bridge instance (§6.2.4 Caller authentication), never an envelope-asserted
     // value.
-    if !identity_custody_registry(bi).contains_key(caller_did) {
+    if !identity_state_registry(bi).contains_key(caller_did) {
         return Err(ScpError::Context {
             msg: format!(
                 "caller_did '{caller_did}' is not an identity hosted by this bridge instance — \

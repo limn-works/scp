@@ -918,6 +918,15 @@ impl Scp {
                 .iter()
                 .map(|s| s.service_endpoint.clone())
                 .collect(),
+            services: document
+                .service
+                .iter()
+                .map(|s| crate::identity::NapiServiceEntry {
+                    id: s.id.clone(),
+                    service_type: s.service_type.clone(),
+                    service_endpoint: s.service_endpoint.clone(),
+                })
+                .collect(),
             has_agent_key,
             agent_public_key,
         })
@@ -1011,10 +1020,54 @@ impl Scp {
                     code: codes::VALID_7403.to_owned(),
                 });
             }
+            // §3.5.3: the issuer's DID document enumerates that issuer's
+            // identity links, so write the service entry into a copy of the
+            // document and publish that copy. The registry push below runs only
+            // after the publish succeeds, so the attestation store never holds
+            // an envelope that no resolver advertises.
+            let mut document = entry.document.clone();
+            document
+                .set_identity_link_attestation(&attestation.claim.platform, &attestation.id)
+                .map_err(|e| ScpNapiError::Identity {
+                    message: format!(
+                        "failed to add the DID document service entry for attestation {}: {e}",
+                        attestation.id
+                    ),
+                    code: codes::VALID_7403.to_owned(),
+                })?;
+
+            let dht = crate::identity::make_dht_with_signer(&entry.custody)?;
+            tokio::task::block_in_place(|| {
+                rt.block_on(async {
+                    // `initialize_sequence` lifts this method's BEP44 sequence
+                    // past the record the resolver already serves, so the
+                    // republished document overwrites it instead of being a
+                    // silent no-op.
+                    dht.initialize_sequence(&did).await?;
+                    dht.publish_document(&entry.identity, &document).await
+                })
+            })
+            .map_err(|e| {
+                tracing::warn!(
+                    did = %did,
+                    attestation_id = %attestation.id,
+                    error = %e,
+                    "identityCreateLinkAttestation: DID document publish failed — \
+                     the attestation was not stored"
+                );
+                ScpNapiError::from(e)
+            })?;
+
+            entry.document = document;
             entry.identity_link_attestations.push(attestation.clone());
             Ok(())
         })
         .map_err(NapiError::from)?;
+
+        // The republished document carries a higher BEP44 sequence; drop the
+        // resolver's stale copy so the next resolution enumerates the new
+        // service entry.
+        crate::identity::invalidate_resolver_cache(bi, &did).await;
 
         serde_json::to_string(&attestation).map_err(|e| {
             NapiError::from(ScpNapiError::Identity {
@@ -1038,31 +1091,156 @@ impl Scp {
         .map_err(NapiError::from)
     }
 
-    /// Per-instance equivalent of `identity_remove_link_attestation`.
+    /// Revokes an identity link attestation by removing it.
+    ///
+    /// Removes the attestation's `ScpIdentityLinkAttestation` service entry from
+    /// the issuer's DID document and republishes that document, which §3.5.3
+    /// requires of every revocation, then drops the envelope from the identity
+    /// registry.
+    ///
+    /// # Publish failure fails the call
+    ///
+    /// A caller that reads `true` believes no resolver still advertises the
+    /// link. Dropping the envelope while the document publish failed would make
+    /// that belief false, so this method publishes first and keeps both the
+    /// document and the envelope when the publish returns an error.
+    ///
+    /// # Errors
+    ///
+    /// Throws `SCP-IDENT-1001` when the DID is not registered on this instance,
+    /// and the DHT publish error code when the document republish fails.
     #[napi(js_name = "identityRemoveLinkAttestation")]
-    pub fn identity_remove_link_attestation(
+    pub async fn identity_remove_link_attestation(
         &self,
         did: String,
         attestation_id: String,
     ) -> napi::Result<bool> {
-        crate::runtime::with_identity_mut(&self.inner, &did, |entry| {
-            let before = entry.identity_link_attestations.len();
+        let bi = &*self.inner;
+        let rt = tokio::runtime::Handle::try_current().map_err(|e| {
+            NapiError::from(ScpNapiError::Identity {
+                message: format!("no tokio runtime: {e}"),
+                code: codes::IDENT_1041.to_owned(),
+            })
+        })?;
+
+        let removed = crate::runtime::with_identity_mut(bi, &did, |entry| {
+            if !entry
+                .identity_link_attestations
+                .iter()
+                .any(|a| a.id == attestation_id)
+            {
+                return Ok(false);
+            }
+
+            // §3.5.3: the service entry MUST leave the document on revocation.
+            // Publish the document without the entry before dropping the
+            // envelope, so the registry never holds fewer attestations than the
+            // published document advertises.
+            let mut document = entry.document.clone();
+            document.remove_identity_link_attestation(&attestation_id);
+
+            let dht = crate::identity::make_dht_with_signer(&entry.custody)?;
+            tokio::task::block_in_place(|| {
+                rt.block_on(async {
+                    dht.initialize_sequence(&did).await?;
+                    dht.publish_document(&entry.identity, &document).await
+                })
+            })
+            .map_err(|e| {
+                tracing::warn!(
+                    did = %did,
+                    attestation_id = %attestation_id,
+                    error = %e,
+                    "identityRemoveLinkAttestation: DID document publish failed — \
+                     the attestation is still discoverable and stays stored"
+                );
+                ScpNapiError::from(e)
+            })?;
+
+            entry.document = document;
             entry
                 .identity_link_attestations
                 .retain(|a| a.id != attestation_id);
-            Ok(entry.identity_link_attestations.len() < before)
+            Ok(true)
         })
-        .map_err(NapiError::from)
+        .map_err(NapiError::from)?;
+
+        if removed {
+            crate::identity::invalidate_resolver_cache(bi, &did).await;
+        }
+        Ok(removed)
     }
 
-    // `identity_verify_link_attestation` is exposed as a module-level free
-    // fn at `crates/scp-ffi/napi/src/identity.rs::identity_verify_link_attestation`
-    // per ADR-048 §1 — pure Ed25519 signature verification touches no
-    // bridge-instance state. The TypeScript SDK's
-    // `SCP.identityVerifyLinkAttestation` routes through `addon.X` per the
-    // dispatcher-invariant test. Moved out of the `Scp` impl in PR-E #28
-    // along with the cleanup of the `let _ = &self.inner;` gate-defang that
-    // CLAUDE.md flags as "Gaming enforcement tests with dead references".
+    /// Verifies an identity link attestation against the issuer's DID document.
+    ///
+    /// Step 1 of §3.5.4 resolves the issuer's DID document and extracts its
+    /// `#active` or `#agent` public key; step 2 checks the Ed25519 signature on
+    /// the envelope against that key. This method performs both against this
+    /// instance's identity registry and DHT resolver, so the caller supplies
+    /// only the attestation. The earlier signature took the public key from the
+    /// caller, which let a caller sign an attestation with a key it minted, pass
+    /// that same key in, and read back `true` for a DID it does not control.
+    ///
+    /// Returns `true` when a key published in the issuer's document verifies the
+    /// envelope and the envelope is neither revoked nor expired.
+    ///
+    /// # Errors
+    ///
+    /// Throws `SCP-IDENT-1044` when the JSON does not parse, when the issuer's
+    /// DID does not resolve, or when the resolved document publishes neither an
+    /// `#active` nor an `#agent` verification method.
+    #[napi(js_name = "identityVerifyLinkAttestation")]
+    pub async fn identity_verify_link_attestation(
+        &self,
+        attestation_json: String,
+    ) -> napi::Result<bool> {
+        use scp_core::identity::attestation::IdentityLinkAttestation;
+
+        let attestation: IdentityLinkAttestation = serde_json::from_str(&attestation_json)
+            .map_err(|e| {
+                NapiError::from(ScpNapiError::Identity {
+                    message: format!("failed to parse attestation JSON: {e}"),
+                    code: codes::IDENT_1044.to_owned(),
+                })
+            })?;
+
+        let bi = &*self.inner;
+        let issuer = attestation.issuer.0.clone();
+
+        // §3.5.4 step 1: the issuer's document supplies the verifying key. Read
+        // this instance's registry copy first — `identity_resolve` reads it the
+        // same way — and fall back to the DHT for a DID this instance never
+        // created.
+        let local_doc =
+            crate::runtime::with_identity(bi, &issuer, |entry| Ok(entry.document.clone())).ok();
+        let document = if let Some(doc) = local_doc {
+            doc
+        } else {
+            let dht = crate::identity::shared_did_method()?;
+            dht.resolve(&issuer)
+                .await
+                .map_err(|e| NapiError::from(ScpNapiError::from(e)))?
+        };
+
+        // §3.5.4 steps 3 and 4 read the clock to reject a revoked or expired
+        // envelope.
+        let now_secs = {
+            use scp_clock::Clock as _;
+            scp_clock::SystemClock.now_secs()
+        };
+
+        scp_ffi_common::attestation::verify_link_attestation_against_document(
+            &attestation,
+            &document,
+            now_secs,
+        )
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Identity {
+                message: e.to_string(),
+                code: codes::IDENT_1044.to_owned(),
+            })
+        })
+    }
 
     /// Per-instance equivalent of `identity_execute_recovery` (spec §9.12).
     ///
@@ -4882,6 +5060,170 @@ impl Scp {
 // rejected-upstream callers never consume a permit") and the busy-error
 // shape are both validated without depending on orchestrator timing.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// §3.5.3 / §3.5.4 — identity link attestations in the issuer's DID document
+//
+// §3.5.3 of the identity spec publishes an identity link attestation as an
+// `ScpIdentityLinkAttestation` service entry in the issuer's DID document and
+// requires a revocation to remove that entry. §3.5.4 step 1 reads the verifying
+// key out of the issuer's RESOLVED document rather than from the caller.
+//
+// Every method under test drives a DHT publish through
+// `tokio::task::block_in_place`, which a current-thread runtime rejects, so
+// each test runs on a multi-thread runtime.
+// ---------------------------------------------------------------------------
+#[cfg(all(test, feature = "testing"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod link_attestation_document_tests {
+    use super::*;
+
+    /// Resolves `did` through the process-shared DHT client every publish on
+    /// this bridge writes into, so a test reads the document a resolver would
+    /// serve rather than the copy the identity registry holds.
+    async fn resolve_published_document(did: &str) -> scp_did::DidDocument {
+        crate::identity::shared_did_method()
+            .expect("the bridge builds a DID method over the shared DHT client")
+            .resolve(did)
+            .await
+            .expect("the bridge published a document for this DID")
+    }
+
+    /// §3.5.3: creating an identity link attestation publishes it as an
+    /// `ScpIdentityLinkAttestation` service entry in the issuer's DID document.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_link_attestation_writes_a_service_entry_into_the_did_document() {
+        let scp = Scp::new_in_memory_for_test();
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("in-memory identity creation succeeds under `testing`");
+        let did = identity.did();
+
+        let attestation_json = scp
+            .identity_create_link_attestation(
+                did.clone(),
+                "github.com".to_owned(),
+                "alice".to_owned(),
+                "https://example.com/proof-alice".to_owned(),
+                "signed_post".to_owned(),
+                None,
+            )
+            .await
+            .expect("creating a link attestation succeeds");
+        let attestation: serde_json::Value =
+            serde_json::from_str(&attestation_json).expect("the bridge returns attestation JSON");
+        let attestation_id = attestation["id"]
+            .as_str()
+            .expect("an attestation carries an id")
+            .to_owned();
+
+        let document = resolve_published_document(&did).await;
+        let entries = document.identity_link_attestations();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the published DID document must carry exactly one \
+             ScpIdentityLinkAttestation service entry after one create (§3.5.3)"
+        );
+        assert_eq!(entries[0].platform, "github.com");
+        assert_eq!(entries[0].attestation_id, attestation_id);
+    }
+
+    /// §3.5.3: when an attestation is revoked, the corresponding service entry
+    /// MUST be removed from the DID document.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remove_link_attestation_clears_the_service_entry_from_the_did_document() {
+        let scp = Scp::new_in_memory_for_test();
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("in-memory identity creation succeeds under `testing`");
+        let did = identity.did();
+
+        let attestation_json = scp
+            .identity_create_link_attestation(
+                did.clone(),
+                "github.com".to_owned(),
+                "bob".to_owned(),
+                "https://example.com/proof-bob".to_owned(),
+                "signed_post".to_owned(),
+                None,
+            )
+            .await
+            .expect("creating a link attestation succeeds");
+        let attestation: serde_json::Value =
+            serde_json::from_str(&attestation_json).expect("the bridge returns attestation JSON");
+        let attestation_id = attestation["id"]
+            .as_str()
+            .expect("an attestation carries an id")
+            .to_owned();
+
+        let removed = scp
+            .identity_remove_link_attestation(did.clone(), attestation_id)
+            .await
+            .expect("revoking an attestation this instance holds succeeds");
+        assert!(removed, "the attestation this test created must be removed");
+
+        let document = resolve_published_document(&did).await;
+        assert!(
+            document.identity_link_attestations().is_empty(),
+            "revoking the attestation must remove its service entry from the \
+             issuer's published DID document (§3.5.3)"
+        );
+    }
+
+    /// §3.5.4 step 1: verification reads the issuer's public key out of the
+    /// issuer's resolved DID document, so an envelope naming an issuer whose
+    /// document publishes no key that signed it fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn verify_link_attestation_rejects_an_issuer_document_without_the_signing_key() {
+        let scp = Scp::new_in_memory_for_test();
+        let signer = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("in-memory identity creation succeeds under `testing`");
+        let other = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("in-memory identity creation succeeds under `testing`");
+
+        let attestation_json = scp
+            .identity_create_link_attestation(
+                signer.did(),
+                "github.com".to_owned(),
+                "carol".to_owned(),
+                "https://example.com/proof-carol".to_owned(),
+                "dns_record".to_owned(),
+                None,
+            )
+            .await
+            .expect("creating a link attestation succeeds");
+
+        assert!(
+            scp.identity_verify_link_attestation(attestation_json.clone())
+                .await
+                .expect("verification against the signer's own document succeeds"),
+            "an attestation signed by the issuer's own #active key must verify"
+        );
+
+        // Renaming the issuer points step 1 at a document that publishes a
+        // different pair of keys, neither of which signed this envelope.
+        let mut forged: serde_json::Value =
+            serde_json::from_str(&attestation_json).expect("the bridge returns attestation JSON");
+        forged["issuer"] = serde_json::Value::String(other.did());
+        let forged_json = serde_json::to_string(&forged).expect("re-serializing the envelope");
+
+        assert!(
+            !scp.identity_verify_link_attestation(forged_json)
+                .await
+                .expect("verification against a resolvable issuer document returns a verdict"),
+            "verification must reject an attestation whose issuer document \
+             publishes no key that signed it (§3.5.4 steps 1-2)"
+        );
+    }
+}
+
 #[cfg(all(test, feature = "testing"))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod concurrency_cap_tests {

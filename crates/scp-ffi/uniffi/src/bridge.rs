@@ -315,9 +315,10 @@ fn no_pre_rotation_backend() -> ScpError {
 /// client (and, in a shipped build, the in-memory arm does not even exist).
 /// Mirrors the `PyO3` bridge's `rotation_publish_client`.
 ///
-/// Only reached from the testing-gated identity create/rotate/migrate paths
-/// (production create fails closed first — ADR-062 §Decision 6).
-#[cfg(feature = "testing")]
+/// The identity-link-attestation write path republishes the issuer's document in
+/// a bare production build too, so this helper is not `testing`-gated. The
+/// create / rotate / migrate callers remain `testing`-gated for their own
+/// reasons (production create fails closed first — ADR-062 §Decision 6).
 fn rotation_publish_client(
     bi: &crate::runtime::UniffiBridgeInstance,
 ) -> Result<Arc<FfiDhtClient>, ScpError> {
@@ -353,9 +354,10 @@ fn rotation_publish_client(
 /// client the resolver reads from — NOT a fresh per-call client, which would let
 /// the re-published document land somewhere the resolver never sees, silently
 /// defeating rotation's revocation purpose.
-// Only reached from the testing-gated identity rotate/agent-key/migrate paths
-// (production create fails closed first — ADR-062 §Decision 6).
-#[cfg(feature = "testing")]
+// The identity-link-attestation write path republishes the issuer's document in
+// a bare production build too, so this helper is not `testing`-gated. The
+// rotate / agent-key / migrate callers remain `testing`-gated for their own
+// reasons (production create fails closed first — ADR-062 §Decision 6).
 #[allow(clippy::type_complexity)]
 fn make_dht_with_signer<C: KeyCustody + Send + Sync + 'static>(
     custody: &Arc<C>,
@@ -1872,6 +1874,33 @@ pub struct DIDDocument {
     pub also_known_as: Vec<String>,
     /// Service endpoint URLs declared in the DID document.
     pub service_endpoints: Vec<String>,
+    /// The document's service entries, each carrying its fragment id, its type,
+    /// and its endpoint.
+    ///
+    /// §3.5.3 of the identity spec publishes an identity link attestation as a
+    /// service entry of type `ScpIdentityLinkAttestation` and tells a consumer
+    /// to discover an issuer's links by filtering the resolved document's
+    /// services on that type. `service_endpoints` drops the type, so a consumer
+    /// reading only that field cannot tell which endpoint belongs to which
+    /// service. The `PyO3` bridge's `PyDIDDocument.services` exposes the same
+    /// three fields.
+    pub services: Vec<DIDServiceEntry>,
+}
+
+/// One service entry of a DID document.
+///
+/// See ADR-002 (DID) and §3.5.3 of the identity spec, which defines the
+/// `ScpIdentityLinkAttestation` service entry.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct DIDServiceEntry {
+    /// Full DID URI with fragment, such as
+    /// `did:dht:z...#attestation-github.com--0`.
+    pub id: String,
+    /// The service type, such as `ScpIdentityLinkAttestation`.
+    pub service_type: String,
+    /// The endpoint the entry points at. For an identity link attestation this
+    /// is the hex-encoded attestation ID (§3.5.2).
+    pub service_endpoint: String,
 }
 
 /// Context creation parameters.
@@ -2801,6 +2830,8 @@ impl Identity {
                     .await
                     .map_err(ScpError::from)?;
 
+                record_published_document(&self.bi, &new_identity, &new_document);
+
                 let verifying_key_hex =
                     snapshot_verifying_key_hex(callback.as_ref(), &new_identity.identity_key).await;
 
@@ -2847,6 +2878,8 @@ impl Identity {
                     .rotate(core_id, &custody.0)
                     .await
                     .map_err(ScpError::from)?;
+
+                record_published_document(&self.bi, &new_identity, &new_document);
 
                 let verifying_key_hex =
                     snapshot_verifying_key_hex(&custody.0, &new_identity.identity_key).await;
@@ -2983,7 +3016,12 @@ impl Identity {
 
             // Clone what we need for the spawned task.
             let identity_clone = core_id.clone();
-            let doc_clone = core_doc.clone();
+            // Base the republish on the document this instance last published,
+            // not on the snapshot this handle was minted with. §3.5.3 puts an
+            // identity link attestation into the document as a service entry, so
+            // an agent-key republish over a stale snapshot would drop every entry
+            // written after this handle was minted.
+            let doc_clone = registered_document(&self.bi, &self.did, core_doc);
             let did = self.did.clone();
             let custody_type = self.custody_type.clone();
             // Carry forward whichever custody the original handle held so the
@@ -3013,6 +3051,11 @@ impl Identity {
                         .add_agent_key(&identity_clone, &doc_clone, &*custody)
                         .await
                         .map_err(ScpError::from)?;
+
+                    // The registry is this instance's record of what it last
+                    // published for the DID, so refresh it before the next
+                    // republish reads it.
+                    record_published_document(&bi, &updated_identity, &updated_doc);
 
                     let verifying_key_hex =
                         snapshot_verifying_key_hex(&*custody, &updated_identity.identity_key).await;
@@ -3101,7 +3144,12 @@ impl Identity {
 
             // Clone what we need for the spawned task.
             let identity_clone = core_id.clone();
-            let doc_clone = core_doc.clone();
+            // Base the republish on the document this instance last published,
+            // not on the snapshot this handle was minted with. §3.5.3 puts an
+            // identity link attestation into the document as a service entry, so
+            // an agent-key republish over a stale snapshot would drop every entry
+            // written after this handle was minted.
+            let doc_clone = registered_document(&self.bi, &self.did, core_doc);
             let did = self.did.clone();
             let custody_type = self.custody_type.clone();
             // Carry forward whichever custody the original handle held so the
@@ -3131,6 +3179,11 @@ impl Identity {
                         .remove_agent_key(&identity_clone, &doc_clone)
                         .await
                         .map_err(ScpError::from)?;
+
+                    // The registry is this instance's record of what it last
+                    // published for the DID, so refresh it before the next
+                    // republish reads it.
+                    record_published_document(&bi, &updated_identity, &updated_doc);
 
                     let verifying_key_hex =
                         snapshot_verifying_key_hex(&*custody, &updated_identity.identity_key).await;
@@ -3220,7 +3273,12 @@ impl Identity {
 
             // Clone what we need for the spawned task.
             let identity_clone = core_id.clone();
-            let doc_clone = core_doc.clone();
+            // Base the republish on the document this instance last published,
+            // not on the snapshot this handle was minted with. §3.5.3 puts an
+            // identity link attestation into the document as a service entry, so
+            // an agent-key republish over a stale snapshot would drop every entry
+            // written after this handle was minted.
+            let doc_clone = registered_document(&self.bi, &self.did, core_doc);
             let did = self.did.clone();
             let custody_type = self.custody_type.clone();
             // Carry forward whichever custody the original handle held so the
@@ -3250,6 +3308,11 @@ impl Identity {
                         .rotate_agent_key(&identity_clone, &doc_clone, &*custody)
                         .await
                         .map_err(ScpError::from)?;
+
+                    // The registry is this instance's record of what it last
+                    // published for the DID, so refresh it before the next
+                    // republish reads it.
+                    record_published_document(&bi, &updated_identity, &updated_doc);
 
                     let verifying_key_hex =
                         snapshot_verifying_key_hex(&*custody, &updated_identity.identity_key).await;
@@ -4072,57 +4135,93 @@ fn identity_link_attestation_registry(
     bi.identity_link_attestation_registry().as_ref()
 }
 
-/// Retained identity custody for attestation verification (keyed by DID).
+/// One identity's retained state on a bridge instance, keyed by DID in
+/// [`identity_state_registry`].
 ///
-/// Stores the custody and active signing key handle for identities that have
-/// created attestations, so that `identity_verify_link_attestation` can look
-/// up the issuer's public key without requiring the caller to pass the
-/// Identity object.
+/// The `PyO3` bridge's `IdentityEntry` and the napi bridge's
+/// `NapiIdentityEntry` hold the same three values, so this struct puts the
+/// `UniFFI` bridge on the same shape.
+pub(crate) struct UniffiIdentityEntry {
+    /// The custody provider that holds this identity's key material.
+    pub(crate) custody: Arc<UniffiKeyCustody>,
+    /// The handle of the `#active` signing key inside `custody`.
+    pub(crate) active_key: scp_platform::KeyHandle,
+    /// The identity's key handles and DID string.
+    pub(crate) identity: ScpIdentity,
+    /// The DID document this instance last published for the identity.
+    ///
+    /// Every operation that republishes the document — key rotation, the three
+    /// agent-key operations, migration, and both identity-link-attestation
+    /// operations — reads its base document from here and writes the published
+    /// result back. An `Identity` handle carries a `core_document` snapshot
+    /// taken when that handle was minted, so a handle that a later operation
+    /// superseded would republish a document missing whatever the later
+    /// operation wrote.
+    pub(crate) document: CoreDidDocument,
+}
+
+/// Retained identity state for the production identity ops (keyed by DID).
+///
+/// Stores the custody, the active signing key handle, the `ScpIdentity`, and
+/// the current DID document, so that `identity_verify_link_attestation` reads
+/// the issuer's public key out of the issuer's own document and
+/// `identity_remove_link_attestation` republishes that document from a DID
+/// alone.
 ///
 /// Phase D (#1695): operates directly on the caller's `Scp`'s
 /// `UniffiBridgeInstance` — there is no process-wide fallback.
 ///
-/// Typed over [`UniffiKeyCustody`] so the registry — and the production
-/// identity ops that read it (`scpid_sign`, `identity_create_link_attestation`,
-/// `identity_remove*`) — exist in bare production builds, not only when
-/// `testing` is enabled.
-pub(crate) fn identity_custody_registry(
+/// The custody is typed over [`UniffiKeyCustody`] so the registry — and the
+/// production identity ops that read it (`scpid_sign`,
+/// `identity_create_link_attestation`, `identity_remove*`) — exist in bare
+/// production builds, not only when `testing` is enabled.
+pub(crate) fn identity_state_registry(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
-) -> &dashmap::DashMap<String, (Arc<UniffiKeyCustody>, scp_platform::KeyHandle)> {
-    bi.identity_custody_registry.as_ref()
+) -> &dashmap::DashMap<String, UniffiIdentityEntry> {
+    bi.identity_state_registry.as_ref()
 }
 
-/// Registers an in-memory identity's custody + active signing key in the
-/// per-instance identity custody registry, keyed by `did`.
+/// Registers an identity's custody, active signing key, `ScpIdentity`, and DID
+/// document in the per-instance identity state registry, keyed by `did`.
 ///
-/// Shared by `identity_create` (so a freshly created in-memory identity is
-/// immediately present in the registry, matching the NAPI bridge whose
-/// `identity_create` registers a bundled entry) and the link-attestation
-/// path (which needs the custody retained for later re-signing). Centralizing
-/// the entry/cap logic keeps the two call sites in sync and avoids duplicating
-/// the TOCTOU-safe capacity check.
+/// Called by every `identity_create*` path (so a freshly created identity is
+/// immediately present in the registry, matching the napi bridge whose
+/// `identity_create` registers a bundled entry) and by every operation that
+/// republishes the identity's DID document — key rotation, the three agent-key
+/// operations, and migration — so the registry always describes the document
+/// this instance published last. Centralizing the entry/cap logic keeps the
+/// call sites in sync and avoids duplicating the TOCTOU-safe capacity check.
 ///
 /// Uses the `entry()` API to avoid a TOCTOU window between `contains_key` and
 /// `insert`:
-/// - Occupied: always updates to the caller's current key. The `UniFFI`
-///   `Identity` is an immutable `Arc` snapshot — the held key is the one the
-///   caller signs with; after a legitimate rotation the stale handle is
+/// - Occupied: always updates to the caller's current key and document. The
+///   `UniFFI` `Identity` is an immutable `Arc` snapshot — the held key is the
+///   one the caller signs with; after a legitimate rotation the stale handle is
 ///   replaced.
 /// - Vacant: enforces `UNIFFI_CUSTODY_REGISTRY_CAP` before inserting,
 ///   surfacing `SCP-VALID-7403` on overflow.
-fn register_identity_custody(
+fn register_identity_state(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     did: &str,
     custody: &Arc<UniffiKeyCustody>,
     active_key: scp_platform::KeyHandle,
+    identity: &ScpIdentity,
+    document: &CoreDidDocument,
 ) -> Result<(), ScpError> {
     use scp_ffi_common::error_codes as codes;
 
-    let registry = identity_custody_registry(bi);
+    let build = || UniffiIdentityEntry {
+        custody: Arc::clone(custody),
+        active_key,
+        identity: identity.clone(),
+        document: document.clone(),
+    };
+
+    let registry = identity_state_registry(bi);
     let len = registry.len();
     match registry.entry(did.to_owned()) {
         dashmap::mapref::entry::Entry::Occupied(mut occ) => {
-            occ.insert((Arc::clone(custody), active_key));
+            occ.insert(build());
         }
         dashmap::mapref::entry::Entry::Vacant(vac) => {
             if len >= UNIFFI_CUSTODY_REGISTRY_CAP {
@@ -4134,10 +4233,45 @@ fn register_identity_custody(
                     code: codes::VALID_7403.to_owned(),
                 });
             }
-            vac.insert((Arc::clone(custody), active_key));
+            vac.insert(build());
         }
     }
     Ok(())
+}
+
+/// Returns the DID document this instance last published for `did`.
+///
+/// Every `identity_create*` path registers an entry, and every operation that
+/// republishes the document writes the published result back through
+/// [`record_published_document`], so the registry copy is the current one.
+/// A DID that left the registry — `identity_remove`, `identity_remove_if_present`,
+/// or instance shutdown — falls back to `handle_document`, the snapshot the
+/// caller's `Identity` handle carries, rather than failing an operation that
+/// holds every value it needs.
+fn registered_document(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    did: &str,
+    handle_document: &CoreDidDocument,
+) -> CoreDidDocument {
+    identity_state_registry(bi)
+        .get(did)
+        .map_or_else(|| handle_document.clone(), |entry| entry.document.clone())
+}
+
+/// Records the identity and DID document an operation just published.
+///
+/// A no-op when the DID has no registry entry, which happens only after
+/// `identity_remove` or instance shutdown dropped it.
+fn record_published_document(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    identity: &ScpIdentity,
+    document: &CoreDidDocument,
+) {
+    if let Some(mut entry) = identity_state_registry(bi).get_mut(&identity.did) {
+        entry.active_key = identity.active_signing_key;
+        entry.identity = identity.clone();
+        entry.document = document.clone();
+    }
 }
 
 /// Creates an identity link attestation for an external platform identity.
@@ -4181,6 +4315,17 @@ async fn identity_create_link_attestation_impl(
             .to_owned(),
         code: codes::IDENT_1040.to_owned(),
     })?;
+    // §3.5.3 publishes the attestation as a service entry in the issuer's DID
+    // document, so a handle that carries no document cannot create one.
+    let core_document = identity
+        .core_document
+        .as_ref()
+        .ok_or_else(|| ScpError::Identity {
+            msg: "identity link attestation requires a retained DID document — \
+                  the attestation is published as a service entry in it"
+                .to_owned(),
+            code: codes::IDENT_1040.to_owned(),
+        })?;
 
     // Build unsigned attestation using shared pipeline.
     let built = scp_ffi_common::attestation::build_unsigned_attestation(
@@ -4222,41 +4367,104 @@ async fn identity_create_link_attestation_impl(
         })?;
     attestation.signature = sig.as_bytes().to_vec();
 
-    // Store custody for later verification lookups. Shared with
-    // `identity_create` so the registry contract stays in sync.
-    register_identity_custody(bi, &identity.did, &custody, active_key)?;
-
-    // Use entry() API to avoid TOCTOU between contains_key and insert.
+    // §3.5.3 caps a DID at 64 identity link attestations and names
+    // `MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID` the single source of truth for
+    // that cap across bridges, so refuse a 65th before publishing anything.
     {
-        let registry = identity_link_attestation_registry(bi);
-        let len = registry.len();
-        match registry.entry(identity.did.clone()) {
-            dashmap::mapref::entry::Entry::Occupied(mut occ) => {
-                if occ.get().len() >= MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID {
-                    return Err(ScpError::Identity {
-                        msg: format!(
-                            "DID has reached the per-identity attestation limit \
-                             ({MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID}) — cannot store additional attestations"
-                        ),
-                        code: codes::VALID_7403.to_owned(),
-                    });
-                }
-                occ.get_mut().push(attestation.clone());
-            }
-            dashmap::mapref::entry::Entry::Vacant(vac) => {
-                if len >= UNIFFI_LINK_ATTESTATION_REGISTRY_CAP {
-                    return Err(ScpError::Identity {
-                        msg: format!(
-                            "link attestation registry has reached capacity \
-                             ({UNIFFI_LINK_ATTESTATION_REGISTRY_CAP}) — cannot store additional attestations"
-                        ),
-                        code: codes::VALID_7402.to_owned(),
-                    });
-                }
-                vac.insert(vec![attestation.clone()]);
-            }
+        let stored = identity_link_attestation_registry(bi)
+            .get(&identity.did)
+            .map_or(0, |entry| entry.len());
+        if stored >= MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID {
+            return Err(ScpError::Identity {
+                msg: format!(
+                    "DID has reached the per-identity attestation limit \
+                     ({MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID}) — cannot store additional attestations"
+                ),
+                code: codes::VALID_7403.to_owned(),
+            });
         }
     }
+
+    // §3.5.3: the issuer's DID document enumerates that issuer's identity
+    // links, so write the service entry into the document this instance last
+    // published and republish it. `set_identity_link_attestation` applies the
+    // same 64-entry cap to the document.
+    let mut document = registered_document(bi, &identity.did, core_document);
+    document
+        .set_identity_link_attestation(&attestation.claim.platform, &attestation.id)
+        .map_err(|e| ScpError::Identity {
+            msg: format!(
+                "failed to add the DID document service entry for attestation {}: {e}",
+                attestation.id
+            ),
+            code: codes::VALID_7403.to_owned(),
+        })?;
+
+    // Refuse a new DID before publishing when the attestation store is full, so
+    // the publish below never leaves the document advertising an attestation
+    // this instance declined to store.
+    {
+        let registry = identity_link_attestation_registry(bi);
+        if !registry.contains_key(&identity.did)
+            && registry.len() >= UNIFFI_LINK_ATTESTATION_REGISTRY_CAP
+        {
+            return Err(ScpError::Identity {
+                msg: format!(
+                    "link attestation registry has reached capacity \
+                     ({UNIFFI_LINK_ATTESTATION_REGISTRY_CAP}) — cannot store additional attestations"
+                ),
+                code: codes::VALID_7402.to_owned(),
+            });
+        }
+    }
+
+    // A caller that receives an attestation JSON believes any party resolving
+    // the issuer's DID can discover the link. Storing the envelope while the
+    // document publish failed would make that belief false, so publish first and
+    // store nothing when the publish returns an error.
+    let publish_client = rotation_publish_client(bi)?;
+    let dht = make_dht_with_signer(&custody, publish_client);
+    let publish_did = identity.did.clone();
+    let publish_identity = core_id.clone();
+    let publish_document = document.clone();
+    let publish_result = runtime()
+        .spawn(async move {
+            // `initialize_sequence` lifts this method's BEP44 sequence past the
+            // record the resolver already serves, so the republished document
+            // overwrites it instead of being a silent no-op.
+            dht.initialize_sequence(&publish_did).await?;
+            dht.publish_document(&publish_identity, &publish_document)
+                .await
+        })
+        .await
+        .map_err(|e| ScpError::Identity {
+            msg: format!("tokio join error during DID document publish: {e}"),
+            code: codes::IDENT_1041.to_owned(),
+        })?;
+    publish_result.map_err(|e| {
+        tracing::warn!(
+            did = %identity.did,
+            attestation_id = %attestation.id,
+            error = %e,
+            "identity_create_link_attestation: DID document publish failed — \
+             the attestation was not stored"
+        );
+        ScpError::from(e)
+    })?;
+
+    // Record the published document alongside the custody and active signing
+    // key. `identity_create` registers the same entry, so an identity that
+    // reaches this point through either path leaves one registry contract.
+    register_identity_state(bi, &identity.did, &custody, active_key, core_id, &document)?;
+
+    // Drop the resolver's stale copy so the next resolution enumerates the new
+    // service entry.
+    invalidate_resolver_cache(bi, &identity.did).await;
+
+    identity_link_attestation_registry(bi)
+        .entry(identity.did.clone())
+        .or_default()
+        .push(attestation.clone());
 
     serde_json::to_string(&attestation).map_err(|e| ScpError::Identity {
         msg: format!("failed to serialize attestation: {e}"),
@@ -4288,6 +4496,15 @@ pub async fn identity_resolve(did: String) -> Result<DIDDocument, ScpError> {
                     .iter()
                     .map(|s| s.service_endpoint.clone())
                     .collect(),
+                services: document
+                    .service
+                    .iter()
+                    .map(|s| DIDServiceEntry {
+                        id: s.id.clone(),
+                        service_type: s.service_type.clone(),
+                        service_endpoint: s.service_endpoint.clone(),
+                    })
+                    .collect(),
             })
         })
         .await
@@ -4311,33 +4528,16 @@ pub async fn identity_verify_device_attestation(
     identity_verify_device_attestation_impl(did, token_base64).await
 }
 
-/// Verifies the Ed25519 signature on an identity link attestation.
-///
-/// Signature verification is a pure function and does not require
-/// in-memory custody — only the issuer's Ed25519 public key. ADR-048 §1:
-/// pure helper, no per-instance state.
-///
-/// See spec §3.5.1.
-#[uniffi::export]
-#[allow(clippy::needless_pass_by_value)]
-pub fn identity_verify_link_attestation(
-    attestation_json: String,
-    issuer_public_key_hex: String,
-) -> Result<bool, ScpError> {
-    use scp_core::identity::attestation::IdentityLinkAttestation;
-
-    let attestation: IdentityLinkAttestation =
-        serde_json::from_str(&attestation_json).map_err(|e| ScpError::Identity {
-            msg: format!("failed to parse attestation JSON: {e}"),
-            code: codes::IDENT_1044.to_owned(),
-        })?;
-
-    let pub_bytes = hex::decode(&issuer_public_key_hex).map_err(|e| ScpError::Identity {
-        msg: format!("invalid issuer_public_key_hex: {e}"),
-        code: codes::IDENT_1044.to_owned(),
-    })?;
-    Ok(attestation.verify_signature(&pub_bytes).is_ok())
-}
+// `identity_verify_link_attestation` is a method on `Scp`, defined with the
+// other identity-link operations.
+//
+// It read as a free function under ADR-048 §1 on the premise that verification
+// is pure Ed25519 signature verification needing no bridge-instance state. That
+// premise held only because the caller passed the issuer's public key in, which
+// is the fail-open §3.5.4 forbids: whoever picks the key decides the answer.
+// Step 1 of §3.5.4 reads the key out of the issuer's RESOLVED DID document, and
+// resolution runs against this instance's registry and DHT client, so the
+// operation reads instance state by construction.
 
 // ---------------------------------------------------------------------------
 // Free functions — context lifecycle operations
@@ -5629,7 +5829,7 @@ async fn ucan_delegate_impl(
     // DashMap reference guard is not `Send`, so this clones both values out
     // before a spawned task below awaits anything.
     let (delegator_custody, delegator_key) = {
-        let entry = identity_custody_registry(bi)
+        let entry = identity_state_registry(bi)
             .get(&delegator_did)
             .ok_or_else(|| ScpError::Identity {
                 msg: format!(
@@ -5639,8 +5839,7 @@ async fn ucan_delegate_impl(
                 ),
                 code: codes::IDENT_1001.to_owned(),
             })?;
-        let (custody, key) = entry.value();
-        (Arc::clone(custody), *key)
+        (Arc::clone(&entry.custody), entry.active_key)
     };
 
     runtime()
@@ -6257,7 +6456,7 @@ pub(crate) async fn enforce_caller_principal_binding(
     caller_context_id: &str,
     caller_did: &str,
 ) -> Result<(), ScpError> {
-    if !identity_custody_registry(bi).contains_key(caller_did) {
+    if !identity_state_registry(bi).contains_key(caller_did) {
         return Err(ScpError::SagaAborted {
             msg: format!(
                 "caller_did '{caller_did}' is not an identity hosted by this bridge instance — \
@@ -6389,7 +6588,7 @@ async fn sign_export_snapshot_via_custody(
 /// 1. **Local identity custody** — if the creator is a local identity (the
 ///    common self-export case: a device importing a context it exported), the
 ///    verifying key is derived directly from its `#active` custody signing key
-///    held in this instance's [`identity_custody_registry`]. This works even
+///    held in this instance's [`identity_state_registry`]. This works even
 ///    when the DID document has not been published to the DHT (in-memory
 ///    identities are not auto-published), which is exactly the self-import
 ///    round-trip the previous resolver-only path could not satisfy.
@@ -6451,10 +6650,9 @@ async fn resolve_local_custody_verifying_key(
     // Clone the custody Arc and key handle out of the registry under a short
     // guard scope so no DashMap reference is held across the `.await`.
     let (custody, key_handle) = {
-        let registry = identity_custody_registry(bi);
+        let registry = identity_state_registry(bi);
         let entry = registry.get(did)?;
-        let (custody, handle) = entry.value();
-        (Arc::clone(custody), *handle)
+        (Arc::clone(&entry.custody), entry.active_key)
     };
 
     let public_key = custody.public_key(&key_handle).await.ok()?;
@@ -9518,9 +9716,11 @@ fn ensure_did_resolver_initialized_on(
 /// Delegates to the shared [`BridgeInstanceCore::invalidate_resolver_cache`]
 /// (the single implementation of the invalidation body, shared across bridges).
 ///
-/// Only reached from the testing-gated identity rotate/agent-key/migrate paths
-/// (production create fails closed first — ADR-062 §Decision 6).
-#[cfg(feature = "testing")]
+/// The identity-link-attestation write path (`Scp::identity_create_link_attestation`
+/// and `Scp::identity_remove_link_attestation`) republishes the issuer's document
+/// in a bare production build too, so this helper is not `testing`-gated. The
+/// rotate / agent-key / migrate callers remain `testing`-gated for their own
+/// reasons (production create fails closed first — ADR-062 §Decision 6).
 async fn invalidate_resolver_cache(bi: &crate::runtime::UniffiBridgeInstance, did: &str) {
     bi.core.invalidate_resolver_cache(did).await;
 }
@@ -9675,11 +9875,13 @@ impl Scp {
                             // entry/cap logic with the link-attestation path.
                             // Done before `identity` is moved into the handle so
                             // the DID and active signing key are still available.
-                            register_identity_custody(
+                            register_identity_state(
                                 &bi,
                                 &identity.did,
                                 &Arc::new(UniffiKeyCustody::InMemory(Arc::clone(&key_custody))),
                                 identity.active_signing_key,
+                                &identity,
+                                &document,
                             )?;
 
                             // Publish the freshly minted document into the shared
@@ -9826,11 +10028,13 @@ impl Scp {
                     // identity creation registers a bundled entry. Done before
                     // `identity` and `callback_custody` are moved into the handle so
                     // the DID and active signing key are still available.
-                    register_identity_custody(
+                    register_identity_state(
                         &bi,
                         &identity.did,
                         &Arc::new(UniffiKeyCustody::Callback(Arc::clone(&callback_custody))),
                         identity.active_signing_key,
+                        &identity,
+                        &document,
                     )?;
 
                     // Publish the freshly minted document into the shared resolver
@@ -10004,26 +10208,165 @@ impl Scp {
         })
     }
 
-    /// Per-instance equivalent of the free-function
-    /// `identity_remove_link_attestation`.
+    /// Revokes an identity link attestation by removing it.
     ///
-    /// Mutates the link-attestation registry on `&*self.inner`.
+    /// Removes the attestation's `ScpIdentityLinkAttestation` service entry from
+    /// the issuer's DID document and republishes that document, which §3.5.3
+    /// requires of every revocation, then drops the envelope from this
+    /// instance's link-attestation registry.
     ///
-    /// See spec §3.5.1.
-    #[must_use]
-    pub fn identity_remove_link_attestation(&self, did: String, attestation_id: String) -> bool {
+    /// # Publish failure fails the call
+    ///
+    /// A caller that reads `true` believes no resolver still advertises the
+    /// link. Dropping the envelope while the document publish failed would make
+    /// that belief false, so this method publishes first and keeps both the
+    /// document and the envelope when the publish returns an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Identity` when the DID document republish fails.
+    /// Returns `Ok(false)` when this instance holds no identity or no matching
+    /// attestation for `did`, which leaves nothing to revoke.
+    ///
+    /// See spec §3.5.1, §3.5.3.
+    pub async fn identity_remove_link_attestation(
+        &self,
+        did: String,
+        attestation_id: String,
+    ) -> Result<bool, ScpError> {
+        let bi = &self.inner;
+
         // Phase D (#1695): per-`Scp` registry lookups — no default fallback.
-        // Verify the caller owns the DID by checking the identity custody registry.
-        if !identity_custody_registry(&self.inner).contains_key(&did) {
-            return false;
+        // The identity state registry both proves the caller owns the DID and
+        // supplies the custody, `ScpIdentity`, and document the republish needs.
+        let Some((custody, identity, mut document)) =
+            identity_state_registry(bi).get(&did).map(|entry| {
+                (
+                    Arc::clone(&entry.custody),
+                    entry.identity.clone(),
+                    entry.document.clone(),
+                )
+            })
+        else {
+            return Ok(false);
+        };
+
+        let holds_attestation = identity_link_attestation_registry(bi)
+            .get(&did)
+            .is_some_and(|entry| entry.iter().any(|a| a.id == attestation_id));
+        if !holds_attestation {
+            return Ok(false);
         }
 
-        let Some(mut entry) = identity_link_attestation_registry(&self.inner).get_mut(&did) else {
-            return false;
+        // §3.5.3: the service entry MUST leave the document on revocation.
+        document.remove_identity_link_attestation(&attestation_id);
+
+        let publish_client = rotation_publish_client(bi)?;
+        let dht = make_dht_with_signer(&custody, publish_client);
+        let publish_did = did.clone();
+        let publish_identity = identity.clone();
+        let publish_document = document.clone();
+        let publish_result = runtime()
+            .spawn(async move {
+                dht.initialize_sequence(&publish_did).await?;
+                dht.publish_document(&publish_identity, &publish_document)
+                    .await
+            })
+            .await
+            .map_err(|e| ScpError::Identity {
+                msg: format!("tokio join error during DID document publish: {e}"),
+                code: codes::IDENT_1041.to_owned(),
+            })?;
+        publish_result.map_err(|e| {
+            tracing::warn!(
+                did = %did,
+                attestation_id = %attestation_id,
+                error = %e,
+                "identity_remove_link_attestation: DID document publish failed — \
+                 the attestation is still discoverable and stays stored"
+            );
+            ScpError::from(e)
+        })?;
+
+        record_published_document(bi, &identity, &document);
+        invalidate_resolver_cache(bi, &did).await;
+
+        let Some(mut entry) = identity_link_attestation_registry(bi).get_mut(&did) else {
+            return Ok(false);
         };
         let before = entry.len();
         entry.retain(|a| a.id != attestation_id);
-        entry.len() < before
+        Ok(entry.len() < before)
+    }
+
+    /// Verifies an identity link attestation against the issuer's DID document.
+    ///
+    /// Step 1 of §3.5.4 resolves the issuer's DID document and extracts its
+    /// `#active` or `#agent` public key; step 2 checks the Ed25519 signature on
+    /// the envelope against that key. This method performs both against this
+    /// instance's identity registry and DHT client, so the caller supplies only
+    /// the attestation. The earlier signature took the public key from the
+    /// caller, which let a caller sign an attestation with a key it minted, pass
+    /// that same key in, and read back `true` for a DID it does not control.
+    ///
+    /// Returns `true` when a key published in the issuer's document verifies the
+    /// envelope and the envelope is neither revoked nor expired.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SCP-IDENT-1044` when the JSON does not parse, when the issuer's
+    /// DID does not resolve, or when the resolved document publishes neither an
+    /// `#active` nor an `#agent` verification method.
+    ///
+    /// See spec §3.5.1, §3.5.4.
+    pub async fn identity_verify_link_attestation(
+        &self,
+        attestation_json: String,
+    ) -> Result<bool, ScpError> {
+        use scp_core::identity::attestation::IdentityLinkAttestation;
+
+        let attestation: IdentityLinkAttestation = serde_json::from_str(&attestation_json)
+            .map_err(|e| ScpError::Identity {
+                msg: format!("failed to parse attestation JSON: {e}"),
+                code: codes::IDENT_1044.to_owned(),
+            })?;
+
+        let bi = &self.inner;
+        let issuer = attestation.issuer.0.clone();
+
+        // §3.5.4 step 1: the issuer's document supplies the verifying key. Read
+        // this instance's registry copy first, and resolve through the DHT for a
+        // DID this instance never created.
+        let local_document = identity_state_registry(bi)
+            .get(&issuer)
+            .map(|entry| entry.document.clone());
+        let document = if let Some(doc) = local_document {
+            doc
+        } else {
+            let client = rotation_publish_client(bi)?;
+            let did_method = DidDht::with_client(client);
+            let resolve_issuer = issuer.clone();
+            runtime()
+                .spawn(async move { did_method.resolve(&resolve_issuer).await })
+                .await
+                .map_err(|e| ScpError::Identity {
+                    msg: format!("tokio join error during DID resolution: {e}"),
+                    code: codes::IDENT_1044.to_owned(),
+                })?
+                .map_err(ScpError::from)?
+        };
+
+        let now_secs = scp_clock::SystemClock.now_secs();
+
+        scp_ffi_common::attestation::verify_link_attestation_against_document(
+            &attestation,
+            &document,
+            now_secs,
+        )
+        .map_err(|e| ScpError::Identity {
+            msg: e.to_string(),
+            code: codes::IDENT_1044.to_owned(),
+        })
     }
 
     /// Removes a DID from this instance's SCP-side identity registry.
@@ -10043,7 +10386,7 @@ impl Scp {
     /// valid DID, mirroring the `PyO3` reference bridge's `identity_remove`.
     pub fn identity_remove(&self, did: String) -> Result<(), ScpError> {
         validate_did(&did)?;
-        identity_custody_registry(&self.inner).remove(&did);
+        identity_state_registry(&self.inner).remove(&did);
         identity_link_attestation_registry(&self.inner).remove(&did);
         Ok(())
     }
@@ -10064,9 +10407,7 @@ impl Scp {
     /// `identity_remove_if_present`.
     pub fn identity_remove_if_present(&self, did: String) -> Result<bool, ScpError> {
         validate_did(&did)?;
-        let removed = identity_custody_registry(&self.inner)
-            .remove(&did)
-            .is_some();
+        let removed = identity_state_registry(&self.inner).remove(&did).is_some();
         identity_link_attestation_registry(&self.inner).remove(&did);
         Ok(removed)
     }
@@ -17139,7 +17480,11 @@ impl Scp {
 
             let old_did = identity.did.clone();
             let old_identity = core_id.clone();
-            let old_document = core_document.clone();
+            // Migration republishes the OLD DID's document with an
+            // `alsoKnownAs` entry, so base it on what this instance last
+            // published rather than on this handle's snapshot (see
+            // `registered_document`).
+            let old_document = registered_document(&self.inner, &old_did, core_document);
             let custody_type = identity.custody_type.clone();
             let instance_id = identity.instance_id;
 
@@ -17256,14 +17601,32 @@ impl Scp {
                         }
                         {
                             // Re-register under the new DID with the migrated active
-                            // signing key. `migrate_identity` rotates the active key,
-                            // so the old entry's key handle is stale (and destroyed);
-                            // reuse the same custody enum but swap in the new handle.
-                            let registry = identity_custody_registry(&bi);
-                            if let Some((_, (custody_enum, _stale_handle))) =
-                                registry.remove(&old_did)
-                            {
-                                registry.insert(new_did, (custody_enum, new_active_key));
+                            // signing key, `ScpIdentity`, and DID document.
+                            // `migrate_identity` rotates the active key, so the old
+                            // entry's key handle is stale (and destroyed); reuse the
+                            // same custody enum but swap in the new handle, and carry
+                            // the migrated document so a later document republish
+                            // starts from what migration published.
+                            let registry = identity_state_registry(&bi);
+                            let previous = registry.remove(&old_did);
+                            if let (
+                                Some((_, previous_entry)),
+                                Some(migrated_identity),
+                                Some(migrated_document),
+                            ) = (
+                                previous,
+                                handle.core_id.as_ref(),
+                                handle.core_document.as_ref(),
+                            ) {
+                                registry.insert(
+                                    new_did,
+                                    UniffiIdentityEntry {
+                                        custody: previous_entry.custody,
+                                        active_key: new_active_key,
+                                        identity: migrated_identity.clone(),
+                                        document: migrated_document.clone(),
+                                    },
+                                );
                             }
                         }
 
@@ -17360,14 +17723,32 @@ impl Scp {
                         }
                         {
                             // Re-register under the new DID with the migrated active
-                            // signing key. `migrate_identity` rotates the active key,
-                            // so the old entry's key handle is stale (and destroyed);
-                            // reuse the same custody enum but swap in the new handle.
-                            let registry = identity_custody_registry(&bi);
-                            if let Some((_, (custody_enum, _stale_handle))) =
-                                registry.remove(&old_did)
-                            {
-                                registry.insert(new_did, (custody_enum, new_active_key));
+                            // signing key, `ScpIdentity`, and DID document.
+                            // `migrate_identity` rotates the active key, so the old
+                            // entry's key handle is stale (and destroyed); reuse the
+                            // same custody enum but swap in the new handle, and carry
+                            // the migrated document so a later document republish
+                            // starts from what migration published.
+                            let registry = identity_state_registry(&bi);
+                            let previous = registry.remove(&old_did);
+                            if let (
+                                Some((_, previous_entry)),
+                                Some(migrated_identity),
+                                Some(migrated_document),
+                            ) = (
+                                previous,
+                                handle.core_id.as_ref(),
+                                handle.core_document.as_ref(),
+                            ) {
+                                registry.insert(
+                                    new_did,
+                                    UniffiIdentityEntry {
+                                        custody: previous_entry.custody,
+                                        active_key: new_active_key,
+                                        identity: migrated_identity.clone(),
+                                        document: migrated_document.clone(),
+                                    },
+                                );
                             }
                         }
 
@@ -17455,11 +17836,13 @@ impl Scp {
                             // entry/cap logic with the link-attestation path.
                             // Done before `identity` is moved into the handle so
                             // the DID and active signing key are still available.
-                            register_identity_custody(
+                            register_identity_state(
                                 &bi,
                                 &identity.did,
                                 &Arc::new(UniffiKeyCustody::InMemory(Arc::clone(&key_custody))),
                                 identity.active_signing_key,
+                                &identity,
+                                &document,
                             )?;
 
                             // Publish the freshly minted document into the shared
@@ -17538,7 +17921,7 @@ impl Scp {
         // `identity_create*`). A DID this instance does not own is rejected
         // here so a co-resident caller cannot drive recovery against arbitrary
         // DIDs. `SCP-IDENT-1020` matches NAPI/PyO3.
-        if !identity_custody_registry(&self.inner).contains_key(&did) {
+        if !identity_state_registry(&self.inner).contains_key(&did) {
             return Err(ScpError::Identity {
                 msg: format!(
                     "identity_execute_recovery: DID '{did}' is not owned by this SCP instance — \
@@ -19150,6 +19533,162 @@ mod tests {
     /// logic through an owned `Scp` instance.
     fn scp_test() -> Arc<crate::scp::Scp> {
         crate::scp::Scp::new_in_memory_for_test()
+    }
+
+    // -----------------------------------------------------------------------
+    // §3.5.3 / §3.5.4 — identity link attestations in the issuer's DID document
+    // -----------------------------------------------------------------------
+
+    /// Resolves `did` through the instance's own DHT client — the client every
+    /// publish on that instance writes into — so a test reads the document a
+    /// resolver would serve rather than the copy the registry holds.
+    #[cfg(feature = "testing")]
+    async fn resolve_published_document(scp: &Arc<crate::scp::Scp>, did: &str) -> CoreDidDocument {
+        let client = rotation_publish_client(&scp.inner).expect("instance has a DHT client");
+        DidDht::with_client(client)
+            .resolve(did)
+            .await
+            .expect("the instance published a document for this DID")
+    }
+
+    /// §3.5.3: creating an identity link attestation publishes it as an
+    /// `ScpIdentityLinkAttestation` service entry in the issuer's DID document.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn create_link_attestation_writes_a_service_entry_into_the_did_document() {
+        let scp = scp_test();
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("in-memory identity creation succeeds under `testing`");
+        let did = identity.did();
+
+        let proof = r#"{"type":"signed_post_verified","post_url":"https://x.com/alice/status/1","nonce":"abc","posted_at":1700000200}"#;
+        let attestation_json = scp
+            .identity_create_link_attestation(
+                Arc::clone(&identity),
+                "x.com".to_owned(),
+                "@alice".to_owned(),
+                proof.to_owned(),
+                "signed_post".to_owned(),
+                None,
+            )
+            .await
+            .expect("creating a link attestation succeeds");
+        let attestation: serde_json::Value =
+            serde_json::from_str(&attestation_json).expect("the bridge returns attestation JSON");
+        let attestation_id = attestation["id"]
+            .as_str()
+            .expect("an attestation carries an id")
+            .to_owned();
+
+        let document = resolve_published_document(&scp, &did).await;
+        let entries = document.identity_link_attestations();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the published DID document must carry exactly one \
+             ScpIdentityLinkAttestation service entry after one create (§3.5.3)"
+        );
+        assert_eq!(entries[0].platform, "x.com");
+        assert_eq!(entries[0].attestation_id, attestation_id);
+    }
+
+    /// §3.5.3: when an attestation is revoked, the corresponding service entry
+    /// MUST be removed from the DID document.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn remove_link_attestation_clears_the_service_entry_from_the_did_document() {
+        let scp = scp_test();
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("in-memory identity creation succeeds under `testing`");
+        let did = identity.did();
+
+        let proof = r#"{"type":"signed_post_verified","post_url":"https://x.com/bob/status/2","nonce":"def","posted_at":1700000300}"#;
+        let attestation_json = scp
+            .identity_create_link_attestation(
+                Arc::clone(&identity),
+                "x.com".to_owned(),
+                "@bob".to_owned(),
+                proof.to_owned(),
+                "signed_post".to_owned(),
+                None,
+            )
+            .await
+            .expect("creating a link attestation succeeds");
+        let attestation: serde_json::Value =
+            serde_json::from_str(&attestation_json).expect("the bridge returns attestation JSON");
+        let attestation_id = attestation["id"]
+            .as_str()
+            .expect("an attestation carries an id")
+            .to_owned();
+
+        let removed = scp
+            .identity_remove_link_attestation(did.clone(), attestation_id)
+            .await
+            .expect("revoking an attestation this instance holds succeeds");
+        assert!(removed, "the attestation this test created must be removed");
+
+        let document = resolve_published_document(&scp, &did).await;
+        assert!(
+            document.identity_link_attestations().is_empty(),
+            "revoking the attestation must remove its service entry from the \
+             issuer's published DID document (§3.5.3)"
+        );
+    }
+
+    /// §3.5.4 step 1: verification reads the issuer's public key out of the
+    /// issuer's resolved DID document, so an envelope naming an issuer whose
+    /// document publishes no key that signed it fails.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn verify_link_attestation_rejects_an_issuer_document_without_the_signing_key() {
+        let scp = scp_test();
+        let signer = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("in-memory identity creation succeeds under `testing`");
+        let other = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("in-memory identity creation succeeds under `testing`");
+
+        let proof = r#"{"type":"signed_post_verified","post_url":"https://x.com/carol/status/3","nonce":"ghi","posted_at":1700000400}"#;
+        let attestation_json = scp
+            .identity_create_link_attestation(
+                Arc::clone(&signer),
+                "x.com".to_owned(),
+                "@carol".to_owned(),
+                proof.to_owned(),
+                "signed_post".to_owned(),
+                None,
+            )
+            .await
+            .expect("creating a link attestation succeeds");
+
+        assert!(
+            scp.identity_verify_link_attestation(attestation_json.clone())
+                .await
+                .expect("verification against the signer's own document succeeds"),
+            "an attestation signed by the issuer's own #active key must verify"
+        );
+
+        // Renaming the issuer points step 1 at a document that publishes a
+        // different pair of keys, neither of which signed this envelope.
+        let mut forged: serde_json::Value =
+            serde_json::from_str(&attestation_json).expect("the bridge returns attestation JSON");
+        forged["issuer"] = serde_json::Value::String(other.did());
+        let forged_json = serde_json::to_string(&forged).expect("re-serializing the envelope");
+
+        assert!(
+            !scp.identity_verify_link_attestation(forged_json)
+                .await
+                .expect("verification against a resolvable issuer document returns a verdict"),
+            "verification must reject an attestation whose issuer document \
+             publishes no key that signed it (§3.5.4 steps 1-2)"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -23720,8 +24259,12 @@ mod tests {
 
         // The identity is now registered (custody registry populated by the
         // attestation path), so removal of the just-created attestation succeeds.
+        let removed = scp
+            .identity_remove_link_attestation(did, attestation_id)
+            .await
+            .expect("removing an existing attestation on a registered DID must succeed");
         assert!(
-            scp.identity_remove_link_attestation(did, attestation_id),
+            removed,
             "removing an existing attestation on a registered DID must report true"
         );
     }
@@ -24259,11 +24802,38 @@ mod tests {
         let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes)
             .expect("custody public key is a valid Ed25519 verifying key");
 
-        register_identity_custody(
+        // The registry entry also carries an `ScpIdentity` and a DID document.
+        // This fixture registers a caller-chosen `did` rather than one derived
+        // from a minted identity key, so it mints a second key in the SAME
+        // custody for `#0` and builds the document over both real public keys.
+        // The pre-rotation commitment is all zeroes because this fixture never
+        // migrates the identity; the UCAN delegation path under test reads only
+        // the custody and the `#active` handle.
+        let identity_key = callback_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("callback custody generates an Ed25519 #0 key");
+        let identity_public_key = callback_custody
+            .public_key(&identity_key)
+            .await
+            .expect("callback custody exposes the #0 public key");
+        let scp_identity = ScpIdentity {
+            identity_key,
+            active_signing_key: signing_key,
+            agent_signing_key: None,
+            pre_rotation_commitment: [0u8; 32],
+            did: did.to_owned(),
+        };
+        let document =
+            CoreDidDocument::new(did, identity_public_key.as_bytes(), &pk_bytes, &[0u8; 32]);
+
+        register_identity_state(
             &scp.inner,
             did,
             &Arc::new(UniffiKeyCustody::Callback(callback_custody)),
             signing_key,
+            &scp_identity,
+            &document,
         )
         .expect("registering a delegator identity must succeed");
 
@@ -25381,7 +25951,7 @@ mod tests {
         /// `context_id_to_bytes`/`is_member` path is reachable), but `caller_did`
         /// is a syntactically-valid `did:dht:…` string that was NEVER created on
         /// this instance — so it is absent from the per-instance identity custody
-        /// registry. Axis (a) (`identity_custody_registry.contains_key`) trips
+        /// registry. Axis (a) (`identity_state_registry.contains_key`) trips
         /// FIRST and the saga is aborted with `SCP-SAGA-13050` BEFORE the producer
         /// runs — no governance/resolver scaffolding is needed. A valid nonce hex
         /// and a near-now timestamp ensure the binding (not nonce/validation) is
@@ -25469,7 +26039,7 @@ mod tests {
         /// rejected.
         ///
         /// `stranger` IS created on this instance (so axis (a),
-        /// `identity_custody_registry.contains_key`, passes) but is NOT a member of
+        /// `identity_state_registry.contains_key`, passes) but is NOT a member of
         /// the caller context A (owned by `owner`). Axis (b)
         /// (`supervisor.is_member`) trips and the saga aborts with `SCP-SAGA-13050`
         /// BEFORE the producer runs.
@@ -25561,7 +26131,7 @@ mod tests {
         /// caller. The ONLY thing that can reject it is axis (a): the caller DID was
         /// never `identity_create`'d, so it is absent from this instance's identity
         /// custody registry. The test therefore fails closed iff the bridge's
-        /// `identity_custody_registry.contains_key` axis (a) check is removed, and is
+        /// `identity_state_registry.contains_key` axis (a) check is removed, and is
         /// INDEPENDENT of axis (b) by construction.
         ///
         /// Gated on `testing`: that feature is what enables
@@ -25622,7 +26192,7 @@ mod tests {
                 "precondition: caller must be a genuine member of caller_ctx so axis (b) passes"
             );
             assert!(
-                !identity_custody_registry(&bi).contains_key(&member_but_unhosted_caller),
+                !identity_state_registry(&bi).contains_key(&member_but_unhosted_caller),
                 "precondition: caller must NOT be hosted so axis (a) is the sole guard"
             );
 
@@ -25667,7 +26237,7 @@ mod tests {
                     // rejection that fits is axis (a). Asserting its exact substring
                     // makes this test fail closed iff
                     // `enforce_caller_principal_binding`'s
-                    // `identity_custody_registry.contains_key` check is removed.
+                    // `identity_state_registry.contains_key` check is removed.
                     assert!(
                         msg.contains("is not an identity hosted by this bridge instance"),
                         "must be rejected by the bridge axis-(a) custody check (the sole guard for a \

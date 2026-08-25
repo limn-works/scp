@@ -570,7 +570,7 @@ export interface Bridge {
     platformId: string | null,
   ): Promise<string>;
   identityLinkAttestations(did: string): string;
-  identityRemoveLinkAttestation(did: string, attestationId: string): boolean;
+  identityRemoveLinkAttestation(did: string, attestationId: string): Promise<boolean>;
 
   /**
    * Removes a DID from this instance's SCP-side identity registry.
@@ -583,10 +583,7 @@ export interface Bridge {
    * if the identity was found and removed, `false` otherwise.
    */
   identityRemoveIfPresent(did: string): boolean;
-  identityVerifyLinkAttestation(
-    attestationJson: string,
-    issuerPublicKeyHex: string,
-  ): Promise<boolean>;
+  identityVerifyLinkAttestation(attestationJson: string): Promise<boolean>;
 
   // Recovery and custody migration (spec §9.12, §3.2.1)
   identityExecuteRecovery(did: string, tier: string, contextIds: string[]): Promise<string>;

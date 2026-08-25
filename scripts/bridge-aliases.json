@@ -2797,7 +2797,7 @@
       "canonical": "identity_verify_link_attestation",
       "category": "identity",
       "pyo3": [
-        "verify_identity_link_attestation"
+        "identity_verify_link_attestation"
       ],
       "uniffi": [
         "identity_verify_link_attestation"

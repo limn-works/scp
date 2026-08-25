@@ -183,15 +183,17 @@
         },
         {
           "name": "verify_attestation",
-          "python": false,
-          "typescript": false,
+          "python": true,
+          "typescript": true,
           "kotlin": true,
-          "swift": false,
-          "exemptions": {
-            "python": "bridge does not export verify_link_attestation",
-            "typescript": "bridge does not export verify_link_attestation",
-            "swift": "UniFFI bridge does not export verify_link_attestation"
-          }
+          "swift": true
+        },
+        {
+          "name": "write_attestation_service_entry",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
         }
       ]
     },

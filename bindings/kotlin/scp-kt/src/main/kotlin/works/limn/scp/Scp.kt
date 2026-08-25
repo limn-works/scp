@@ -1344,8 +1344,14 @@ class SCP internal constructor(
      */
     suspend fun identityRemoveAgentKey(identity: Identity): Identity = identity.removeAgentKey()
 
-    /** Forwards to [NativeScp.identityRemoveLinkAttestation] on [inner]. */
-    fun identityRemoveLinkAttestation(
+    /**
+     * Forwards to [NativeScp.identityRemoveLinkAttestation] on [inner].
+     *
+     * Spec section 3.5.3 requires a revocation to remove the attestation's
+     * `ScpIdentityLinkAttestation` service entry from the issuer's DID document,
+     * so the bridge republishes that document before it drops the envelope.
+     */
+    suspend fun identityRemoveLinkAttestation(
         did: String,
         attestationId: String,
     ): Boolean =
@@ -1407,18 +1413,14 @@ class SCP internal constructor(
         )
 
     /**
-     * Routes through the UniFFI-generated free function
-     * [uniffi.scp.identityVerifyLinkAttestation]. ADR-048 §1 + §7
-     * Kotlin bullet.
+     * Forwards to [NativeScp.identityVerifyLinkAttestation] on [inner].
+     *
+     * Step 1 of spec section 3.5.4 resolves the issuer's DID document through
+     * this instance's registry and DHT client, so the operation is a method on
+     * the bridge instance rather than a free function.
      */
-    fun identityVerifyLinkAttestation(
-        attestationJson: String,
-        issuerPublicKeyHex: String,
-    ): Boolean =
-        uniffi.scp.identityVerifyLinkAttestation(
-            attestationJson = attestationJson,
-            issuerPublicKeyHex = issuerPublicKeyHex,
-        )
+    suspend fun identityVerifyLinkAttestation(attestationJson: String): Boolean =
+        inner.identityVerifyLinkAttestation(attestationJson = attestationJson)
 
     /** Forwards to [NativeScp.isLocalDid] on [inner]. */
     suspend fun isLocalDid(did: String): Boolean = inner.isLocalDid(did = did)

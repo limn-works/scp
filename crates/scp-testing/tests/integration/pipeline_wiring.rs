@@ -207,6 +207,16 @@ const NAPI_UCAN_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/uc
 const PYO3_TRUST_SRC: &str = include_str!("../../../../crates/scp-ffi/src/trust.rs");
 const NAPI_TRUST_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/trust.rs");
 
+// Identity bridge sources for the §3.5.3 identity-link-attestation service
+// entry. Creating an attestation writes an `ScpIdentityLinkAttestation` service
+// entry into the issuer's DID document and publishes the document; revoking one
+// removes the entry and publishes again; verifying one reads the issuer's key
+// out of the RESOLVED document (§3.5.4 step 1). PyO3's three bodies live in
+// `identity.rs`, NAPI's in `scp.rs`, and UniFFI's in `bridge.rs`
+// (`UNIFFI_BRIDGE_SRC`, declared above).
+const PYO3_IDENTITY_SRC: &str = include_str!("../../../../crates/scp-ffi/src/identity.rs");
+const NAPI_SCP_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/scp.rs");
+
 // =========================================================================
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
@@ -243,7 +253,13 @@ const NAPI_TRUST_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/t
 // core `scp_core::trust::check_capability_requirements` call and the production
 // `IdentityDidPublicKeyResolver`. The 2J joiner (+4) and capability-admission
 // (+3) additions are disjoint, so the merged floor is 48 + 4 + 3 = 55.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 55;
+// Raised 55 -> 64 when the §3.5.3 identity-link-attestation service entry was
+// wired through all three native bridges: three assertions per bridge pin the
+// create path to `set_identity_link_attestation` + `publish_document`, the
+// revoke path to `remove_identity_link_attestation` + `publish_document`, and
+// the verify path to resolving the issuer's document instead of taking the
+// issuer's key from its caller. Pure coverage expansion.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -3413,23 +3429,30 @@ fn uniffi_saga_export_wires_binding_chokepoint_and_producer() {
         "UniFFI cross-context saga export must dispatch to the producer \
          start_cross_context_outlet_invocation_saga"
     );
-    // UniFFI authenticates the hosted caller against the per-instance custody
-    // registry (`identity_custody_registry(bi).contains_key`) rather than the
+    // UniFFI authenticates the hosted caller against the per-instance identity
+    // registry (`identity_state_registry(bi).contains_key`) rather than the
     // PyO3/NAPI `identity_registry_contains` helper — a per-SDK idiom difference,
     // same authenticated-principal property. Both legs (registry presence +
     // context membership via `is_member`) must be present.
+    //
+    // The needle read `identity_custody_registry` until that registry's entry
+    // gained the identity's `ScpIdentity` and `DidDocument`, which the §3.5.3
+    // identity-link-attestation service-entry publish reads and writes. The
+    // accessor was renamed `identity_state_registry` because the old name named
+    // one of the four values the entry now holds. This repoints the needle at
+    // the renamed accessor; it checks the same call in the same function body.
     assert!(
         fn_body_contains(
             UNIFFI_BRIDGE_SRC,
             "enforce_caller_principal_binding",
-            "identity_custody_registry",
+            "identity_state_registry",
         ) && fn_body_contains(
             UNIFFI_BRIDGE_SRC,
             "enforce_caller_principal_binding",
             "is_member",
         ),
         "UniFFI enforce_caller_principal_binding must check the per-instance \
-         identity_custody_registry AND is_member (authenticated-principal \
+         identity_state_registry AND is_member (authenticated-principal \
          binding, ADR-049 §3a:94)"
     );
 }
@@ -3531,6 +3554,209 @@ fn ac8_streaming_saga_seal_commits_once_no_per_chunk_2pc() {
     assert!(
         !loop_body.contains("PrepareBStreaming"),
         "AC8: the per-chunk pump loop body must NOT run Prepare-B per chunk"
+    );
+}
+
+// ===========================================================================
+// Identity link attestations reach the issuer's DID document (§3.5.3, §3.5.4)
+// ===========================================================================
+//
+// §3.5.3 of the identity spec publishes an identity link attestation as an
+// `ScpIdentityLinkAttestation` service entry in the issuer's DID document, so
+// that any party resolving that document enumerates the issuer's links without
+// querying a separate registry, and it requires a revocation to remove the
+// corresponding entry. §3.5.4 step 1 reads the verifying key out of the
+// issuer's RESOLVED document rather than from the caller.
+//
+// Each assertion below names a call together with its first real argument, so a
+// dead reference (`let _ = set_identity_link_attestation;`) cannot satisfy it.
+
+/// Removes every ASCII whitespace character from `body`.
+///
+/// A needle that names a call together with its arguments would otherwise
+/// depend on where rustfmt broke the argument list across lines.
+fn without_whitespace(body: &str) -> String {
+    body.chars().filter(|c| !c.is_ascii_whitespace()).collect()
+}
+
+/// Returns `fn_name`'s body from `source` with all ASCII whitespace removed.
+///
+/// Panics when `source` defines no function called `fn_name`, which is itself
+/// the finding: the assertion's subject moved or was deleted.
+fn packed_fn_body(source: &str, fn_name: &str) -> String {
+    let body = extract_fn_body(source, fn_name)
+        .unwrap_or_else(|| panic!("pipeline_wiring: no function named `{fn_name}` in source"));
+    without_whitespace(&body)
+}
+
+/// The `PyO3` create path must write the service entry and publish the document.
+#[test]
+fn pyo3_link_attestation_create_writes_the_did_document() {
+    let body = packed_fn_body(PYO3_IDENTITY_SRC, "create_identity_link_attestation");
+    assert!(
+        body.contains("set_identity_link_attestation(&attestation.claim.platform"),
+        "PyO3 create_identity_link_attestation must write the §3.5.3 service \
+         entry into the issuer's DID document, passing the attestation's own \
+         platform and ID"
+    );
+    assert!(
+        body.contains("publish_document(&entry.identity,&document)"),
+        "PyO3 create_identity_link_attestation must publish the updated DID \
+         document, so a resolver serves the new service entry (§3.5.3)"
+    );
+}
+
+/// The `PyO3` revoke path must clear the service entry and publish the document.
+#[test]
+fn pyo3_link_attestation_remove_clears_the_did_document() {
+    let body = packed_fn_body(PYO3_IDENTITY_SRC, "remove_identity_link_attestation");
+    assert!(
+        body.contains("document.remove_identity_link_attestation(&id_owned)"),
+        "PyO3 remove_identity_link_attestation must remove the revoked \
+         attestation's service entry from the issuer's DID document (§3.5.3)"
+    );
+    assert!(
+        body.contains("publish_document(&entry.identity,&document)"),
+        "PyO3 remove_identity_link_attestation must publish the document \
+         without the entry, so no resolver still advertises the link (§3.5.3)"
+    );
+}
+
+/// `PyO3` verification must read the key from the issuer's resolved document.
+#[test]
+fn pyo3_link_attestation_verify_reads_the_issuer_document() {
+    let signature = extract_fn_signature(PYO3_IDENTITY_SRC, "identity_verify_link_attestation")
+        .expect("PyO3 bridge defines identity_verify_link_attestation");
+    assert!(
+        !signature.contains("issuer_public_key"),
+        "PyO3 identity_verify_link_attestation must NOT take the issuer's key \
+         from its caller — §3.5.4 step 1 reads it from the issuer's resolved \
+         DID document, and a caller-supplied key lets the caller decide the answer"
+    );
+    let body = packed_fn_body(PYO3_IDENTITY_SRC, "identity_verify_link_attestation");
+    assert!(
+        body.contains("did_method.resolve(&attestation.issuer.0)"),
+        "PyO3 identity_verify_link_attestation must resolve the DID the \
+         attestation names as its issuer (§3.5.4 step 1)"
+    );
+    assert!(
+        body.contains("verify_link_attestation_against_document(&attestation,&document,"),
+        "PyO3 identity_verify_link_attestation must check the signature against \
+         the resolved document (§3.5.4 step 2)"
+    );
+}
+
+/// The NAPI create path must write the service entry and publish the document.
+#[test]
+fn napi_link_attestation_create_writes_the_did_document() {
+    let body = packed_fn_body(NAPI_SCP_SRC, "identity_create_link_attestation");
+    assert!(
+        body.contains("set_identity_link_attestation(&attestation.claim.platform"),
+        "NAPI identity_create_link_attestation must write the §3.5.3 service \
+         entry into the issuer's DID document, passing the attestation's own \
+         platform and ID"
+    );
+    assert!(
+        body.contains("publish_document(&entry.identity,&document)"),
+        "NAPI identity_create_link_attestation must publish the updated DID \
+         document, so a resolver serves the new service entry (§3.5.3)"
+    );
+}
+
+/// The NAPI revoke path must clear the service entry and publish the document.
+#[test]
+fn napi_link_attestation_remove_clears_the_did_document() {
+    let body = packed_fn_body(NAPI_SCP_SRC, "identity_remove_link_attestation");
+    assert!(
+        body.contains("document.remove_identity_link_attestation(&attestation_id)"),
+        "NAPI identity_remove_link_attestation must remove the revoked \
+         attestation's service entry from the issuer's DID document (§3.5.3)"
+    );
+    assert!(
+        body.contains("publish_document(&entry.identity,&document)"),
+        "NAPI identity_remove_link_attestation must publish the document \
+         without the entry, so no resolver still advertises the link (§3.5.3)"
+    );
+}
+
+/// NAPI verification must read the key from the issuer's resolved document.
+#[test]
+fn napi_link_attestation_verify_reads_the_issuer_document() {
+    let signature = extract_fn_signature(NAPI_SCP_SRC, "identity_verify_link_attestation")
+        .expect("NAPI bridge defines identity_verify_link_attestation");
+    assert!(
+        !signature.contains("issuer_public_key"),
+        "NAPI identity_verify_link_attestation must NOT take the issuer's key \
+         from its caller — §3.5.4 step 1 reads it from the issuer's resolved \
+         DID document, and a caller-supplied key lets the caller decide the answer"
+    );
+    let body = packed_fn_body(NAPI_SCP_SRC, "identity_verify_link_attestation");
+    assert!(
+        body.contains("dht.resolve(&issuer)"),
+        "NAPI identity_verify_link_attestation must resolve the DID the \
+         attestation names as its issuer (§3.5.4 step 1)"
+    );
+    assert!(
+        body.contains("verify_link_attestation_against_document(&attestation,&document,"),
+        "NAPI identity_verify_link_attestation must check the signature against \
+         the resolved document (§3.5.4 step 2)"
+    );
+}
+
+/// The `UniFFI` create path must write the service entry and publish the document.
+#[test]
+fn uniffi_link_attestation_create_writes_the_did_document() {
+    let body = packed_fn_body(UNIFFI_BRIDGE_SRC, "identity_create_link_attestation_impl");
+    assert!(
+        body.contains("set_identity_link_attestation(&attestation.claim.platform"),
+        "UniFFI identity_create_link_attestation must write the §3.5.3 service \
+         entry into the issuer's DID document, passing the attestation's own \
+         platform and ID"
+    );
+    assert!(
+        body.contains("publish_document(&publish_identity,&publish_document)"),
+        "UniFFI identity_create_link_attestation must publish the updated DID \
+         document, so a resolver serves the new service entry (§3.5.3)"
+    );
+}
+
+/// The `UniFFI` revoke path must clear the service entry and publish the document.
+#[test]
+fn uniffi_link_attestation_remove_clears_the_did_document() {
+    let body = packed_fn_body(UNIFFI_BRIDGE_SRC, "identity_remove_link_attestation");
+    assert!(
+        body.contains("document.remove_identity_link_attestation(&attestation_id)"),
+        "UniFFI identity_remove_link_attestation must remove the revoked \
+         attestation's service entry from the issuer's DID document (§3.5.3)"
+    );
+    assert!(
+        body.contains("publish_document(&publish_identity,&publish_document)"),
+        "UniFFI identity_remove_link_attestation must publish the document \
+         without the entry, so no resolver still advertises the link (§3.5.3)"
+    );
+}
+
+/// `UniFFI` verification must read the key from the issuer's resolved document.
+#[test]
+fn uniffi_link_attestation_verify_reads_the_issuer_document() {
+    let signature = extract_fn_signature(UNIFFI_BRIDGE_SRC, "identity_verify_link_attestation")
+        .expect("UniFFI bridge defines identity_verify_link_attestation");
+    assert!(
+        !signature.contains("issuer_public_key"),
+        "UniFFI identity_verify_link_attestation must NOT take the issuer's key \
+         from its caller — §3.5.4 step 1 reads it from the issuer's resolved \
+         DID document, and a caller-supplied key lets the caller decide the answer"
+    );
+    let body = packed_fn_body(UNIFFI_BRIDGE_SRC, "identity_verify_link_attestation");
+    assert!(
+        body.contains("did_method.resolve(&resolve_issuer)"),
+        "UniFFI identity_verify_link_attestation must resolve the DID the \
+         attestation names as its issuer (§3.5.4 step 1)"
+    );
+    assert!(
+        body.contains("verify_link_attestation_against_document(&attestation,&document,"),
+        "UniFFI identity_verify_link_attestation must check the signature \
+         against the resolved document (§3.5.4 step 2)"
     );
 }
 

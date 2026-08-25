@@ -231,16 +231,19 @@ pub struct UniffiBridgeInstance {
     /// [`BridgeInstanceCore::bridge_specific_shutdown`].
     pub(crate) ucan_registry: Arc<DashMap<String, UcanContextState>>,
 
-    /// Retained identity custody for the production identity ops, keyed by DID.
+    /// Retained identity state for the production identity ops, keyed by DID.
     ///
     /// Previously stored type-erased in `CoreFields::identity_registry` AND
-    /// as a bridge-local `OnceLock` in `bridge.rs::identity_custody_registry`.
-    /// Both paths are unified here: `bridge.rs::identity_custody_registry`
+    /// as a bridge-local `OnceLock` in `bridge.rs::identity_custody_registry`
+    /// (renamed `identity_state_registry` when the entry gained the identity's
+    /// `ScpIdentity` and `DidDocument`).
+    /// Both paths are unified here: `bridge.rs::identity_state_registry`
     /// now returns a reference to this field on the caller's own
     /// `UniffiBridgeInstance` (Phase D, #1695, deleted the process-wide
     /// default that the earlier `OnceLock` path backed).
     ///
-    /// Typed to [`UniffiKeyCustody`](crate::bridge::UniffiKeyCustody) — an
+    /// The custody is typed to
+    /// [`UniffiKeyCustody`](crate::bridge::UniffiKeyCustody) — an
     /// enum over the callback (production) and in-memory (`testing`,
     /// dev/desktop) backends — so the registry, the accessor, and the
     /// `scpid_sign` / `identity_create_link_attestation` / `identity_remove*`
@@ -250,17 +253,18 @@ pub struct UniffiBridgeInstance {
     /// `testing` gate, silently dropping them from the released
     /// Swift/Kotlin SDKs.
     ///
+    /// The entry also carries the `ScpIdentity` and the current `DidDocument`,
+    /// which makes this instance — not any one `Identity` handle — the single
+    /// authority on what the issuer's published document contains. §3.5.3 of the
+    /// identity spec puts an identity link attestation into that document as a
+    /// service entry, and `identity_remove_link_attestation` takes a DID rather
+    /// than a handle, so both attestation operations and every key operation
+    /// that republishes the document read and write it here. The `PyO3` and napi
+    /// bridges keep the same three values in one per-instance registry entry.
+    ///
     /// Cleared on shutdown — dropping the `Arc<UniffiKeyCustody>` values
     /// zeroizes any underlying key material via the custody provider's `Drop`.
-    pub(crate) identity_custody_registry: Arc<
-        DashMap<
-            String,
-            (
-                Arc<crate::bridge::UniffiKeyCustody>,
-                scp_platform::KeyHandle,
-            ),
-        >,
-    >,
+    pub(crate) identity_state_registry: Arc<DashMap<String, crate::bridge::UniffiIdentityEntry>>,
 
     /// Protocol repository used for trust aggregation + event log persistence.
     ///
@@ -413,7 +417,7 @@ impl UniffiBridgeInstance {
         Self {
             core: CoreFields::new(),
             ucan_registry: Arc::new(DashMap::new()),
-            identity_custody_registry: Arc::new(DashMap::new()),
+            identity_state_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
             identity_link_attestation_registry: Arc::new(DashMap::new()),
             context_handle_registry: Arc::new(DashMap::new()),
@@ -448,7 +452,7 @@ impl UniffiBridgeInstance {
         Self {
             core: CoreFields::with_persistence(persistence),
             ucan_registry: Arc::new(DashMap::new()),
-            identity_custody_registry: Arc::new(DashMap::new()),
+            identity_state_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
             identity_link_attestation_registry: Arc::new(DashMap::new()),
             context_handle_registry: Arc::new(DashMap::new()),
@@ -596,7 +600,7 @@ impl UniffiBridgeInstance {
         Self {
             core: CoreFields::with_persistence_arc(persistence),
             ucan_registry: Arc::new(DashMap::new()),
-            identity_custody_registry: Arc::new(DashMap::new()),
+            identity_state_registry: Arc::new(DashMap::new()),
             protocol_repository,
             identity_link_attestation_registry: Arc::new(DashMap::new()),
             context_handle_registry: Arc::new(DashMap::new()),
@@ -655,24 +659,16 @@ impl UniffiBridgeInstance {
     /// otherwise.
     ///
     /// Marked `#[allow(dead_code)]` because bridge callers currently reach
-    /// the registry via the free helper `bridge::identity_custody_registry()`
+    /// the registry via the free helper `bridge::identity_state_registry()`
     /// which dereferences this field directly. The typed accessor is kept
     /// for any future per-instance callers that prefer the typed path; it
     /// is not gated on any pending work.
     #[must_use]
     #[allow(dead_code)]
-    pub(crate) const fn identity_custody_registry(
+    pub(crate) const fn identity_state_registry(
         &self,
-    ) -> &Arc<
-        DashMap<
-            String,
-            (
-                Arc<crate::bridge::UniffiKeyCustody>,
-                scp_platform::KeyHandle,
-            ),
-        >,
-    > {
-        &self.identity_custody_registry
+    ) -> &Arc<DashMap<String, crate::bridge::UniffiIdentityEntry>> {
+        &self.identity_state_registry
     }
 
     /// Returns a reference to the protocol repository variant.
@@ -1217,7 +1213,7 @@ impl BridgeInstanceCore for UniffiBridgeInstance {
         // zeroizes any key material they hold via the custody provider's
         // `Drop` impl.
         self.ucan_registry.clear();
-        self.identity_custody_registry.clear();
+        self.identity_state_registry.clear();
         // Release the SQLite advisory lock on `{dir}/scp.db.lock` for the
         // `Sqlite` variant. Other `Arc<SqliteStorage>` holders
         // (`CoreFields::persistence`, `ContextManager`) keep the storage
@@ -1608,7 +1604,7 @@ mod tests {
         // typed interface (DashMap, Arc).
         let bi = UniffiBridgeInstance::new_uniffi();
         assert!(bi.ucan_registry().is_empty());
-        assert!(bi.identity_custody_registry().is_empty());
+        assert!(bi.identity_state_registry().is_empty());
 
         // ucan_registry is `Arc<DashMap<...>>` — typed, not Box<dyn Any>.
         bi.ucan_registry.insert(
