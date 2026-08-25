@@ -60,6 +60,14 @@ const JWT_ALG_EDDSA: &str = "EdDSA";
 /// The JWT `typ` header value.
 const JWT_TYP: &str = "JWT";
 
+/// How long an outgoing platform key identifier keeps authenticating after a
+/// rotation replaces it (24 hours, in seconds).
+///
+/// Spec §12.10.2 step 5: "During a 24-hour rotation period, a bridge node
+/// accepts signatures under either identifier; at rotation close, a bridge node
+/// deletes an outgoing identifier."
+const PLATFORM_KEY_ROTATION_WINDOW_SECS: u64 = 86_400;
+
 /// Maximum allowed timestamp drift for webhook signature verification
 /// (300 seconds = 5 minutes).
 ///
@@ -214,6 +222,19 @@ pub struct WebhookKeyBinding {
 
     /// The bridge instance this key signs for.
     pub bridge_id: String,
+
+    /// Unix timestamp (seconds) after which this identifier authenticates
+    /// nothing, or `None` while it is the bridge's current identifier.
+    ///
+    /// Spec §12.10.2 step 5 rotates a platform key by registering a fresh
+    /// identifier and accepting signatures under either identifier for 24
+    /// hours, then deleting the outgoing one.
+    /// [`rotate_platform_key`](StorageBridgeLookup::rotate_platform_key) stamps
+    /// this field on the identifier a rotation retires, and
+    /// [`verify_webhook_signature`] refuses a signature that arrives after it,
+    /// so an outgoing key stops authenticating at rotation close whether or not
+    /// a node has deleted the record yet.
+    pub valid_until: Option<u64>,
 }
 
 /// Validated webhook authentication context extracted by the middleware.
@@ -371,6 +392,185 @@ pub enum BridgeAdmissionError {
         /// The cooperative bridge missing its key material.
         bridge_id: String,
     },
+
+    /// A re-admission named a platform key identifier this bridge does not
+    /// already hold, while it still holds another one.
+    ///
+    /// Writing that identifier would leave this bridge holding two live
+    /// identifiers at once, so a platform holding either key would keep
+    /// authenticating webhook requests with no rotation window and no
+    /// governance record. Spec §12.10.2 step 5 routes a change of identifier
+    /// through `UpdateBridgePlatformKey`, which
+    /// [`rotate_platform_key`](StorageBridgeLookup::rotate_platform_key)
+    /// performs, so admission refuses it.
+    #[error(
+        "bridge {bridge_id} already holds platform key identifier {stored_key_id}, \
+         so a registration naming {incoming_key_id} would leave two live \
+         identifiers; spec 12.10.2 step 5 rotates through UpdateBridgePlatformKey, \
+         so name {stored_key_id} in this record and rotate onto \
+         {incoming_key_id} instead"
+    )]
+    PlatformKeyIdentifierChanged {
+        /// The bridge whose identifier a re-admission tried to move.
+        bridge_id: String,
+        /// An identifier that bridge already holds.
+        stored_key_id: String,
+        /// The identifier the incoming registration names.
+        incoming_key_id: String,
+    },
+
+    /// A rotation named an identifier some bridge already stores.
+    ///
+    /// Spec §12.10.2 step 5 requires a new identifier to differ from an
+    /// identifier this bridge's current key sits under, so a request signed
+    /// under either key names exactly one of them, and step 3 forbids one
+    /// identifier naming two bridges.
+    #[error(
+        "platform key identifier {key_id} is already stored, so bridge \
+         {bridge_id} cannot rotate onto it"
+    )]
+    PlatformKeyIdentifierInUse {
+        /// The bridge asking to rotate.
+        bridge_id: String,
+        /// The identifier that rotation named.
+        key_id: String,
+    },
+
+    /// A rotation named a bridge whose mode registers no platform key.
+    ///
+    /// Spec §12.2.1 carries `platform_key` and `platform_key_id` only for
+    /// cooperative mode, and §12.10.2 verifies a webhook signature only for a
+    /// bridge that registered one, so rotating a key onto any other mode would
+    /// store a key nothing reads.
+    #[error("bridge {bridge_id} is not cooperative, so it stores no platform key to rotate")]
+    BridgeNotCooperative {
+        /// The bridge a rotation named.
+        bridge_id: String,
+    },
+
+    /// A rotation named an identifier no webhook request could carry.
+    ///
+    /// Spec §12.2.1 bounds a platform key identifier to 1–128 bytes of
+    /// printable US-ASCII, and §12.10.2 sends that identifier in
+    /// `X-SCP-Platform-Key-Id` and covers it in every signed payload, so an
+    /// identifier outside that shape names a key no signature can select.
+    #[error("platform key identifier {key_id} is not a valid identifier: {reason}")]
+    InvalidPlatformKeyId {
+        /// The identifier a rotation named.
+        key_id: String,
+        /// What `validate_platform_key_id` reported.
+        reason: String,
+    },
+
+    /// The system clock reported a time before the Unix epoch.
+    ///
+    /// A rotation stamps a wall-clock deadline onto an outgoing identifier, and
+    /// a clock this far wrong would stamp a deadline that has already passed or
+    /// never arrives, so the rotation fails rather than writing one.
+    #[error("system clock is before the Unix epoch, so a rotation deadline cannot be computed")]
+    ClockBeforeEpoch,
+}
+
+// ---------------------------------------------------------------------------
+// DID document resolution
+// ---------------------------------------------------------------------------
+
+/// Object-safe DID document resolution for the bridge authentication path.
+///
+/// [`DidMethod`](scp_identity::DidMethod) is not object-safe, because its
+/// methods return `impl Future`. `StorageBridgeLookup` holds this trait instead,
+/// for the reason [`DidPublisher`](crate::DidPublisher) exists: `NodeState`
+/// carries the bridge lookup as `Arc<dyn BridgeLookup>` and cannot name a
+/// concrete DID method type.
+///
+/// The `did:dht` implementation verifies a record's BEP44 signature and its
+/// self-certification before it returns a document, so whatever this trait
+/// returns is a document the DID's own key signed.
+pub trait BridgeDidResolver: Send + Sync {
+    /// Resolves `did` to its published DID document.
+    fn resolve<'a>(
+        &'a self,
+        did: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<DidDocument, scp_identity::IdentityError>>
+                + Send
+                + 'a,
+        >,
+    >;
+}
+
+/// Wraps any [`DidMethod`](scp_identity::DidMethod) as a [`BridgeDidResolver`].
+pub struct DidMethodResolver<D: scp_identity::DidMethod> {
+    /// The DID method this resolver delegates to.
+    inner: Arc<D>,
+}
+
+impl<D: scp_identity::DidMethod> DidMethodResolver<D> {
+    /// Wraps `inner` so a bridge lookup can resolve through it.
+    #[must_use]
+    pub const fn new(inner: Arc<D>) -> Self {
+        Self { inner }
+    }
+}
+
+impl<D: scp_identity::DidMethod + 'static> BridgeDidResolver for DidMethodResolver<D> {
+    fn resolve<'a>(
+        &'a self,
+        did: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<DidDocument, scp_identity::IdentityError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(self.inner.resolve(did))
+    }
+}
+
+/// How long a resolved operator DID document authenticates a bearer token
+/// before this node resolves it again (300 seconds).
+///
+/// Spec §12.10.2 permits a node to cache a resolved document with a TTL, and
+/// §3.11.7 step 5 of `.docs/specs/03-identity.md` applies a 300-second
+/// freshness window to the comparable SCPID authentication path. An operator
+/// who rotates or revokes a signing key republishes their DID document, and
+/// this window bounds how long this node keeps honouring the key that operator
+/// retired.
+const DID_DOCUMENT_TTL_SECS: u64 = 300;
+
+/// How long a node waits before it resolves one operator DID again (30
+/// seconds).
+///
+/// A bearer request whose cached document passed [`DID_DOCUMENT_TTL_SECS`]
+/// starts a DHT lookup, so a caller's request rate would otherwise set this
+/// node's outbound DHT rate. This interval caps that at one lookup per operator
+/// DID per 30 seconds, whether the previous lookup succeeded or failed, and a
+/// request that arrives inside the interval with no fresh document is refused
+/// rather than answered from the stale one.
+const DID_RESOLUTION_RETRY_SECS: u64 = 30;
+
+/// A DID document together with the wall-clock second this node fetched it.
+///
+/// The timestamp is what makes the cache expire: [`DID_DOCUMENT_TTL_SECS`]
+/// after a fetch, `resolve_did_document` resolves the DID again instead of
+/// answering from this record. Storage keeps the timestamp too, so a document
+/// fetched shortly before a restart stays usable for the rest of its window
+/// rather than resetting it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedDidDocument {
+    /// The document a resolution returned.
+    document: DidDocument,
+    /// Unix timestamp (seconds) of that resolution.
+    fetched_at: u64,
+}
+
+impl CachedDidDocument {
+    /// Reports whether this record is still inside its TTL at `now`.
+    const fn is_fresh_at(&self, now: u64) -> bool {
+        now.saturating_sub(self.fetched_at) < DID_DOCUMENT_TTL_SECS
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -382,17 +582,22 @@ pub enum BridgeAdmissionError {
 /// Implementors provide the bridge registry and DID resolution needed
 /// by [`bridge_auth_middleware`]. This decouples the auth layer from
 /// specific storage and identity implementations.
+#[async_trait::async_trait]
 pub trait BridgeLookup: Send + Sync + 'static {
     /// Look up a bridge by its ID.
     ///
     /// Returns `None` if no bridge with the given ID is registered.
     fn find_bridge(&self, bridge_id: &str) -> Option<BridgeConnector>;
 
-    /// Resolve a DID document for the given DID string.
+    /// Resolves a DID document for the given DID string, fresh enough to decide
+    /// a bearer token.
     ///
-    /// Returns `None` if the DID cannot be resolved. Implementations
-    /// MAY cache resolved documents with TTL (spec section 12.10.2).
-    fn resolve_did_document(&self, did: &str) -> Option<DidDocument>;
+    /// Returns `None` when the DID cannot be resolved. An implementation MAY
+    /// answer from a cache (spec §12.10.2), and it MUST NOT answer from a
+    /// cached document older than its own TTL: an operator who rotates a
+    /// signing key republishes their DID document, and a node answering from an
+    /// unbounded cache would keep verifying tokens signed by the retired key.
+    async fn resolve_did_document(&self, did: &str) -> Option<DidDocument>;
 
     /// Look up a pre-registered webhook signing key by key ID.
     ///
@@ -443,21 +648,32 @@ pub struct StorageBridgeLookup<S: Storage> {
     repo: Arc<ProtocolRepository<S>>,
     /// In-memory cache of bridge connectors keyed by bridge ID.
     bridges: std::sync::RwLock<HashMap<String, BridgeConnector>>,
-    /// In-memory cache of DID documents keyed by DID string.
-    did_docs: std::sync::RwLock<HashMap<String, DidDocument>>,
+    /// Cache of resolved DID documents keyed by DID string, each carrying the
+    /// second this node fetched it.
+    did_docs: std::sync::RwLock<HashMap<String, CachedDidDocument>>,
     /// In-memory cache of webhook signing keys keyed by key ID.
     webhook_keys: std::sync::RwLock<HashMap<String, WebhookKeyBinding>>,
+    /// The second this node last started resolving each operator DID, keyed by
+    /// DID string. `DID_RESOLUTION_RETRY_SECS` reads it, and only a DID an
+    /// admitted bridge names ever gets an entry, so this map is bounded by the
+    /// bridges an operator admitted.
+    did_resolution_attempts: std::sync::RwLock<HashMap<String, u64>>,
+    /// Resolves an operator DID when no cached document is fresh enough to
+    /// decide a bearer token.
+    resolver: Arc<dyn BridgeDidResolver>,
     /// The expected JWT audience (node URL).
     audience: String,
-    /// Serializes [`admit_registration`](Self::admit_registration) against
-    /// [`set_bridge_status`](Self::set_bridge_status).
+    /// Serializes [`admit_registration`](Self::admit_registration),
+    /// [`set_bridge_status`](Self::set_bridge_status), and
+    /// [`rotate_platform_key`](Self::rotate_platform_key) against each other.
     ///
-    /// Each of those two methods reads a stored record, decides on it, and then
-    /// writes several records. Running them concurrently for one bridge lets a
-    /// revocation land between an admission's read and its writes, which would
-    /// return a bridge governance revoked to `Active` carrying a freshly stored
-    /// webhook key. Holding this lock across each whole method makes that
-    /// interleaving impossible.
+    /// Each of those three methods reads a stored record, decides on it, and
+    /// then writes several records. Running them concurrently for one bridge
+    /// lets a revocation land between an admission's read and its writes, which
+    /// would return a bridge governance revoked to `Active` carrying a freshly
+    /// stored webhook key, and lets two rotations each read one live identifier
+    /// and each write a second. Holding this lock across each whole method
+    /// makes both interleavings impossible.
     lifecycle: tokio::sync::Mutex<()>,
 }
 
@@ -489,15 +705,25 @@ impl<S: Storage> StorageBridgeLookup<S> {
 
     /// Creates a new `StorageBridgeLookup` with an empty cache.
     ///
+    /// `resolver` is what this lookup resolves an operator DID through once a
+    /// cached document passes [`DID_DOCUMENT_TTL_SECS`], so a node wires its own
+    /// DID method here through [`DidMethodResolver`].
+    ///
     /// Call [`load_from_storage`](Self::load_from_storage) after construction
     /// to hydrate the cache from persisted data.
     #[must_use]
-    pub fn new(repo: Arc<ProtocolRepository<S>>, audience: String) -> Self {
+    pub fn new(
+        repo: Arc<ProtocolRepository<S>>,
+        audience: String,
+        resolver: Arc<dyn BridgeDidResolver>,
+    ) -> Self {
         Self {
             repo,
             bridges: std::sync::RwLock::new(HashMap::new()),
             did_docs: std::sync::RwLock::new(HashMap::new()),
             webhook_keys: std::sync::RwLock::new(HashMap::new()),
+            did_resolution_attempts: std::sync::RwLock::new(HashMap::new()),
+            resolver,
             audience,
             lifecycle: tokio::sync::Mutex::new(()),
         }
@@ -515,7 +741,14 @@ impl<S: Storage> StorageBridgeLookup<S> {
     /// # Errors
     ///
     /// Returns `Err` if a storage operation fails.
+    ///
+    /// Performs whichever rotation closes fell due while this node was down
+    /// through
+    /// [`close_rotations_that_closed_while_down`](Self::close_rotations_that_closed_while_down),
+    /// before it loads any key into the cache.
     pub async fn load_from_storage(&self) -> Result<(), scp_platform::PlatformError> {
+        self.close_rotations_that_closed_while_down().await?;
+
         let storage = self.repo.storage();
 
         // Load bridges — collect from storage first, then insert into cache.
@@ -540,13 +773,17 @@ impl<S: Storage> StorageBridgeLookup<S> {
             }
         }
 
-        // Load DID documents — collect from storage first, then insert into cache.
+        // Load DID documents — collect from storage first, then insert into
+        // cache. Each record carries the second this node resolved it, so a
+        // document that passed `DID_DOCUMENT_TTL_SECS` while the node was down
+        // is stale on arrival and `resolve_did_document` resolves it again
+        // before it decides a token.
         let doc_keys = storage.list_keys(BRIDGE_DID_DOC_PREFIX).await?;
         let mut loaded_docs = Vec::new();
         for key in &doc_keys {
             if let Some(data) = storage.retrieve(key).await? {
-                if let Ok(doc) = serde_json::from_slice::<DidDocument>(&data) {
-                    loaded_docs.push(doc);
+                if let Ok(cached) = serde_json::from_slice::<CachedDidDocument>(&data) {
+                    loaded_docs.push(cached);
                 } else {
                     tracing::warn!(key = %key, "skipping DID document with invalid JSON");
                 }
@@ -557,8 +794,8 @@ impl<S: Storage> StorageBridgeLookup<S> {
                 .did_docs
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for doc in loaded_docs {
-                cache.insert(doc.id.clone(), doc);
+            for cached in loaded_docs {
+                cache.insert(cached.document.id.clone(), cached);
             }
         }
 
@@ -626,6 +863,34 @@ impl<S: Storage> StorageBridgeLookup<S> {
         Ok(())
     }
 
+    /// Deletes every platform key identifier whose rotation window closed
+    /// while this node was not running.
+    ///
+    /// Spec §12.10.2 step 5 deletes an outgoing identifier at rotation close,
+    /// and a node that was down at that moment performs the delete here.
+    /// [`verify_webhook_signature`] refuses a signature under an expired
+    /// identifier whether or not this has run, so this deletes a record that
+    /// already authenticates nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a storage read or delete fails.
+    async fn close_rotations_that_closed_while_down(
+        &self,
+    ) -> Result<(), scp_platform::PlatformError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let closed = self.close_expired_rotations(now).await?;
+        if closed > 0 {
+            tracing::info!(
+                closed,
+                "deleted platform key identifiers whose rotation window had closed"
+            );
+        }
+        Ok(())
+    }
+
     /// Writes a bridge connector to storage and to the cache.
     ///
     /// [`admit_registration`](Self::admit_registration) and
@@ -664,13 +929,31 @@ impl<S: Storage> StorageBridgeLookup<S> {
     /// A connector lands last, so no request reaches a bridge whose operator
     /// document or webhook key is still missing.
     ///
+    /// Admission installs a bridge's first platform key and changes none
+    /// afterwards: §12.10.6 step 1 states that "a bridge node MUST NOT
+    /// substitute key material through admission", and §12.10.2 step 5 routes
+    /// every later change through `UpdateBridgePlatformKey`, which
+    /// [`rotate_platform_key`](Self::rotate_platform_key) performs.
+    ///
+    /// `operator_document` is what an operator asserts their own DID publishes,
+    /// and it decides a bearer token for at most [`DID_DOCUMENT_TTL_SECS`];
+    /// after that [`BridgeLookup::resolve_did_document`] resolves the DID and
+    /// verifies what the DID's own key signed.
+    ///
     /// # Errors
     ///
     /// Returns [`BridgeAdmissionError::OperatorDocumentMismatch`] when
     /// `operator_document` names a DID other than the bridge operator,
     /// [`BridgeAdmissionError::BridgeRevoked`] when a stored record already
-    /// retired this bridge id, [`BridgeAdmissionError::WebhookKeyIdBoundElsewhere`]
+    /// retired this bridge id, [`BridgeAdmissionError::BridgeIdentityChanged`]
+    /// when a stored record under this bridge id names a different operator,
+    /// context, platform, or mode,
+    /// [`BridgeAdmissionError::WebhookKeyIdBoundElsewhere`]
     /// when another bridge already holds this key identifier,
+    /// [`BridgeAdmissionError::PlatformKeyChanged`] when this bridge already
+    /// holds different key material under this identifier,
+    /// [`BridgeAdmissionError::PlatformKeyIdentifierChanged`] when this bridge
+    /// already holds a different identifier,
     /// [`BridgeAdmissionError::CooperativeRegistrationMissingKey`] when a
     /// cooperative registration carries no key material, and
     /// [`BridgeAdmissionError::Storage`] when a storage write fails.
@@ -747,33 +1030,75 @@ impl<S: Storage> StorageBridgeLookup<S> {
                 });
             };
 
-            // A replay carries the same key material. A registration that
-            // changes it is a key rotation, and §12.10.2 step 5 routes a
-            // rotation through `UpdateBridgePlatformKey` with a fresh
-            // identifier and a 24-hour window, so admission refuses to
-            // substitute a key silently.
-            let stored_key = self.stored_webhook_key(key_id).await?;
-            if let Some(stored) = stored_key.as_ref()
-                && stored.bridge_id == connector.bridge_id
-                && stored.public_key != platform_key
-            {
-                return Err(BridgeAdmissionError::PlatformKeyChanged {
-                    bridge_id: connector.bridge_id,
-                    key_id: key_id.to_owned(),
-                });
-            }
-
-            let already_stored = stored_key.is_some();
-            self.register_webhook_key(key_id, &connector.bridge_id, platform_key)
+            // Admission installs a bridge's first platform key and never
+            // changes one afterwards. §12.10.6 step 1 states the rule a node
+            // applies here: "A bridge node MUST NOT substitute key material
+            // through admission", because §12.10.2 step 5 routes every later
+            // change through `UpdateBridgePlatformKey`, which
+            // `rotate_platform_key` performs. Deciding on what this bridge
+            // already holds — rather than on the incoming identifier alone —
+            // is what keeps a second admission from leaving two live
+            // identifiers, each of which would authenticate a webhook request
+            // with no rotation window and no governance record.
+            let mut held = self
+                .stored_webhook_keys_for_bridge(&connector.bridge_id)
                 .await?;
-            if !already_stored {
-                written_key_id = Some(key_id.to_owned());
+            let under_this_id = held
+                .iter()
+                .find(|(held_key_id, _)| held_key_id == key_id)
+                .map(|(_, binding)| binding.clone());
+
+            match under_this_id {
+                // This bridge already holds the identifier this record names,
+                // carrying the same bytes: an operator replaying a
+                // registration after a partial failure or a restart. Writing
+                // again would clear a rotation deadline a later rotation
+                // stamped onto this identifier, which would return a retired
+                // key to service, so this writes nothing.
+                Some(stored) if stored.public_key == platform_key => {}
+                Some(_) => {
+                    return Err(BridgeAdmissionError::PlatformKeyChanged {
+                        bridge_id: connector.bridge_id,
+                        key_id: key_id.to_owned(),
+                    });
+                }
+                None if !held.is_empty() => {
+                    let (stored_key_id, _) = held.swap_remove(0);
+                    return Err(BridgeAdmissionError::PlatformKeyIdentifierChanged {
+                        bridge_id: connector.bridge_id,
+                        stored_key_id,
+                        incoming_key_id: key_id.to_owned(),
+                    });
+                }
+                None => {
+                    // This bridge holds no key material, so this is its first
+                    // admission. `register_webhook_key` still refuses an
+                    // identifier a second bridge holds (§12.10.2 step 3).
+                    self.register_webhook_key(key_id, &connector.bridge_id, platform_key)
+                        .await?;
+                    written_key_id = Some(key_id.to_owned());
+                }
             }
         }
 
+        // The operator supplies this document, so it is what that operator
+        // asserts their own DID publishes. It is stamped with the current
+        // second like a resolved one, which means it decides a bearer token for
+        // at most `DID_DOCUMENT_TTL_SECS`; after that `resolve_did_document`
+        // resolves this DID from the DHT and replaces it with the document that
+        // DID's own key signed. An operator gains nothing from a fabricated
+        // document during that window, because the same operator chose which
+        // bridge and which operator DID this admission names.
+        let admitted_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+
         // A later write that fails leaves no key behind, so a failed admission
         // never squats an identifier a second bridge would then be refused.
-        if let Err(e) = self.register_did_document(operator_document).await {
+        if let Err(e) = self
+            .register_did_document(operator_document, admitted_at)
+            .await
+        {
             self.undo_webhook_key(written_key_id.as_deref()).await;
             return Err(e.into());
         }
@@ -904,7 +1229,7 @@ impl<S: Storage> StorageBridgeLookup<S> {
         self.store_connector(connector).await?;
 
         if revoking {
-            for key_id in self.stored_webhook_key_ids_for_bridge(bridge_id).await? {
+            for (key_id, _) in self.stored_webhook_keys_for_bridge(bridge_id).await? {
                 self.deregister_webhook_key(&key_id).await?;
             }
         }
@@ -912,7 +1237,8 @@ impl<S: Storage> StorageBridgeLookup<S> {
         Ok(())
     }
 
-    /// Writes a DID document to storage and to the cache.
+    /// Writes a DID document to storage and to the cache, stamped with the
+    /// second `fetched_at` names.
     ///
     /// Private for the reason [`store_connector`](Self::store_connector) is:
     /// a caller reaching it directly would install a signing key for an
@@ -922,16 +1248,123 @@ impl<S: Storage> StorageBridgeLookup<S> {
     async fn register_did_document(
         &self,
         doc: DidDocument,
+        fetched_at: u64,
     ) -> Result<(), scp_platform::PlatformError> {
         let key = format!("{BRIDGE_DID_DOC_PREFIX}{}", doc.id);
-        let data = serde_json::to_vec(&doc)
+        let did = doc.id.clone();
+        let cached = CachedDidDocument {
+            document: doc,
+            fetched_at,
+        };
+        let data = serde_json::to_vec(&cached)
             .map_err(|e| scp_platform::PlatformError::StorageError(e.to_string()))?;
         self.repo.storage().store(&key, &data).await?;
         self.did_docs
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(doc.id.clone(), doc);
+            .insert(did, cached);
         Ok(())
+    }
+
+    /// Returns a DID document fresh enough to decide a bearer token, resolving
+    /// it when no cached record is.
+    ///
+    /// [`BridgeLookup::resolve_did_document`] delegates here. A cached record
+    /// inside [`DID_DOCUMENT_TTL_SECS`] answers directly. Past that, this
+    /// resolves the DID through [`BridgeDidResolver`] — which for `did:dht`
+    /// verifies the record's BEP44 signature and its self-certification — and
+    /// stores what it resolved. A failed resolution answers `None` rather than
+    /// the stale record, because the stale record may name a key its owner
+    /// retired, and every caller of this method treats `None` as a rejection.
+    ///
+    /// Two guards bound what a request rate turns into DHT traffic: only a DID
+    /// some admitted bridge names as its operator is resolvable at all, and one
+    /// DID starts at most one resolution per [`DID_RESOLUTION_RETRY_SECS`].
+    async fn resolve_did_document_fresh(&self, did: &str) -> Option<DidDocument> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+
+        {
+            let cache = self
+                .did_docs
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = cache.get(did)
+                && cached.is_fresh_at(now)
+            {
+                return Some(cached.document.clone());
+            }
+        }
+
+        // A resolution reaches the DHT, and a bearer token carries a caller's
+        // own `iss`, so resolving whatever a token names would let an
+        // unauthenticated caller drive one network lookup per request against
+        // any DID it chose. Only a DID some admitted bridge names as its
+        // operator is resolvable, which bounds that set by what an operator
+        // admitted, and `authorize_bearer_request` refuses a token whose `iss`
+        // does not equal its own bridge's operator anyway.
+        {
+            let bridges = self
+                .bridges
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !bridges.values().any(|bridge| bridge.operator_did.0 == did) {
+                return None;
+            }
+        }
+
+        // One resolution per DID per `DID_RESOLUTION_RETRY_SECS` bounds what a
+        // request rate can turn into DHT traffic. The attempt is recorded
+        // before the await, so concurrent requests for one stale DID start one
+        // lookup between them rather than one each.
+        {
+            let mut attempts = self
+                .did_resolution_attempts
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(last) = attempts.get(did)
+                && now.saturating_sub(*last) < DID_RESOLUTION_RETRY_SECS
+            {
+                return None;
+            }
+            attempts.insert(did.to_owned(), now);
+        }
+
+        let document = match self.resolver.resolve(did).await {
+            Ok(document) => document,
+            Err(e) => {
+                tracing::debug!(
+                    did = %did,
+                    error = %e,
+                    "could not resolve an operator DID document, so this request is not authorized"
+                );
+                return None;
+            }
+        };
+
+        // A resolver that answered a document for a different DID would install
+        // one operator's keys under another operator's name.
+        if document.id != did {
+            tracing::warn!(
+                requested = %did,
+                resolved = %document.id,
+                "a DID resolution returned a document naming a different DID"
+            );
+            return None;
+        }
+
+        if let Err(e) = self.register_did_document(document.clone(), now).await {
+            // The document verified; only persisting it failed. Answering with
+            // it keeps this request working, and the next request resolves
+            // again because nothing was cached.
+            tracing::warn!(
+                did = %did,
+                error = %e,
+                "could not store a resolved operator DID document"
+            );
+        }
+        Some(document)
     }
 
     /// Registers a webhook signing key against the bridge instance it signs
@@ -983,10 +1416,37 @@ impl<S: Storage> StorageBridgeLookup<S> {
             });
         }
 
-        let binding = WebhookKeyBinding {
-            public_key,
-            bridge_id: bridge_id.to_owned(),
-        };
+        // A key this method writes is the bridge's current identifier, so it
+        // carries no rotation deadline. `rotate_platform_key` stamps one onto
+        // whichever identifier it retires.
+        self.store_webhook_key_binding(
+            key_id,
+            WebhookKeyBinding {
+                public_key,
+                bridge_id: bridge_id.to_owned(),
+                valid_until: None,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Writes one webhook key binding to storage and to the cache.
+    ///
+    /// [`register_webhook_key`](Self::register_webhook_key) and
+    /// [`rotate_platform_key`](Self::rotate_platform_key) call this after they
+    /// check what spec §12.10.2 steps 3 and 5 require, so it stays private: a
+    /// caller reaching it directly would move one bridge's identifier onto a
+    /// second bridge, and would write outside the lifecycle lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when serialization or the storage write fails.
+    async fn store_webhook_key_binding(
+        &self,
+        key_id: &str,
+        binding: WebhookKeyBinding,
+    ) -> Result<(), scp_platform::PlatformError> {
         let key = format!("{BRIDGE_WEBHOOK_KEY_PREFIX}{key_id}");
         let data = serde_json::to_vec(&binding)
             .map_err(|e| scp_platform::PlatformError::StorageError(e.to_string()))?;
@@ -998,21 +1458,25 @@ impl<S: Storage> StorageBridgeLookup<S> {
         Ok(())
     }
 
-    /// Returns every webhook key identifier stored against `bridge_id`.
+    /// Returns every webhook key identifier stored against `bridge_id`, paired
+    /// with the binding it names.
     ///
     /// Bridge revocation reads this list from storage to destroy a revoked
-    /// bridge's signing keys (spec §12.2.2 step 6). Reading a cache that failed
-    /// to hydrate would leave a revoked bridge's key in storage, which the next
-    /// restart would then load back.
+    /// bridge's signing keys (spec §12.2.2 step 6), admission reads it to
+    /// refuse a second live identifier, and
+    /// [`rotate_platform_key`](Self::rotate_platform_key) reads it to stamp a
+    /// rotation deadline onto whichever identifiers a rotation retires. Reading
+    /// a cache that failed to hydrate would leave a revoked bridge's key in
+    /// storage, which the next restart would then load back.
     ///
     /// # Errors
     ///
     /// Returns `Err` when a storage read fails, so revocation reports a failure
     /// rather than reporting that it destroyed keys it could not see.
-    async fn stored_webhook_key_ids_for_bridge(
+    async fn stored_webhook_keys_for_bridge(
         &self,
         bridge_id: &str,
-    ) -> Result<Vec<String>, scp_platform::PlatformError> {
+    ) -> Result<Vec<(String, WebhookKeyBinding)>, scp_platform::PlatformError> {
         let storage = self.repo.storage();
         let mut owned = Vec::new();
         for key in storage.list_keys(BRIDGE_WEBHOOK_KEY_PREFIX).await? {
@@ -1023,14 +1487,192 @@ impl<S: Storage> StorageBridgeLookup<S> {
                 continue;
             };
             if binding.bridge_id == bridge_id {
-                owned.push(
+                owned.push((
+                    key.strip_prefix(BRIDGE_WEBHOOK_KEY_PREFIX)
+                        .unwrap_or(&key)
+                        .to_owned(),
+                    binding,
+                ));
+            }
+        }
+        Ok(owned)
+    }
+
+    /// Rotates a cooperative bridge's platform webhook key onto a fresh
+    /// identifier, and retires whichever identifiers that bridge already holds.
+    ///
+    /// Spec §12.10.2 step 5 defines the `UpdateBridgePlatformKey` governance
+    /// action this performs: a platform publishes a new key under an identifier
+    /// that differs from the one its current key sits under, a bridge node
+    /// accepts signatures under either identifier for 24 hours, and at rotation
+    /// close it deletes the outgoing identifier. Each retired identifier
+    /// carries [`WebhookKeyBinding::valid_until`] from this call, and
+    /// [`verify_webhook_signature`] refuses a signature that arrives after that
+    /// deadline, so an outgoing key stops authenticating at rotation close even
+    /// when its record outlives it. This call and
+    /// [`load_from_storage`](Self::load_from_storage) delete whichever records
+    /// are already past their deadline.
+    ///
+    /// Rotation is the only path that retires a key short of revoking a bridge:
+    /// §12.2.1 makes `Revoked` terminal, so revocation is not a remedy an
+    /// operator can undo, and [`admit_registration`](Self::admit_registration)
+    /// refuses to move an identifier so that no admission leaves two live keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeAdmissionError::BridgeNotRegistered`] when no stored
+    /// record names `bridge_id`, [`BridgeAdmissionError::BridgeRevoked`] when
+    /// that record is revoked, [`BridgeAdmissionError::BridgeNotCooperative`]
+    /// when its mode registers no platform key,
+    /// [`BridgeAdmissionError::PlatformKeyIdentifierInUse`] when any bridge
+    /// already stores `new_key_id`,
+    /// [`BridgeAdmissionError::InvalidPlatformKeyId`] when `new_key_id` breaks
+    /// the shape §12.2.1 requires,
+    /// [`BridgeAdmissionError::WebhookKeyIdBoundElsewhere`] when a second
+    /// bridge holds `new_key_id`, [`BridgeAdmissionError::ClockBeforeEpoch`]
+    /// when the system clock reports a time before the Unix epoch, and
+    /// [`BridgeAdmissionError::Storage`] when a storage read or write fails.
+    pub async fn rotate_platform_key(
+        &self,
+        bridge_id: &str,
+        new_key_id: &str,
+        new_platform_key: [u8; 32],
+    ) -> Result<(), BridgeAdmissionError> {
+        // Held for the same reason `admit_registration` holds it: this method
+        // reads several records, decides on them, and then writes several.
+        let _lifecycle = self.lifecycle.lock().await;
+
+        // A webhook request selects a key through `X-SCP-Platform-Key-Id`, and
+        // `verify_webhook_signature` applies this same rule to that header, so
+        // an identifier that fails it names a key no signature could select.
+        scp_core::bridge::registration::validate_platform_key_id(new_key_id).map_err(|reason| {
+            BridgeAdmissionError::InvalidPlatformKeyId {
+                key_id: new_key_id.to_owned(),
+                reason,
+            }
+        })?;
+
+        // Storage, not the cache, for the reason `stored_bridge` exists.
+        let Some(connector) = self.stored_bridge(bridge_id).await? else {
+            return Err(BridgeAdmissionError::BridgeNotRegistered {
+                bridge_id: bridge_id.to_owned(),
+            });
+        };
+        if connector.status == BridgeStatus::Revoked {
+            return Err(BridgeAdmissionError::BridgeRevoked {
+                bridge_id: bridge_id.to_owned(),
+            });
+        }
+        if connector.mode != BridgeMode::Cooperative {
+            return Err(BridgeAdmissionError::BridgeNotCooperative {
+                bridge_id: bridge_id.to_owned(),
+            });
+        }
+
+        // §12.10.2 step 5 requires the new identifier to differ from an
+        // identifier the current key sits under, and step 3 forbids one
+        // identifier naming two bridges, so a stored record under this
+        // identifier refuses the rotation — unless it is this rotation's own
+        // result, which is how an operator replays a rotation after a partial
+        // failure or a restart. A replay writes nothing, so it neither extends
+        // an outgoing identifier's window nor deletes one early.
+        if let Some(stored) = self.stored_webhook_key(new_key_id).await? {
+            if stored.bridge_id == bridge_id
+                && stored.public_key == new_platform_key
+                && stored.valid_until.is_none()
+            {
+                return Ok(());
+            }
+            return Err(BridgeAdmissionError::PlatformKeyIdentifierInUse {
+                bridge_id: bridge_id.to_owned(),
+                key_id: new_key_id.to_owned(),
+            });
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .map_err(|_| BridgeAdmissionError::ClockBeforeEpoch)?;
+        let rotation_close = now.saturating_add(PLATFORM_KEY_ROTATION_WINDOW_SECS);
+
+        // Every identifier this bridge holds is dated before the incoming one
+        // lands, so a write that fails part-way through never leaves two
+        // identifiers live with no deadline between them — which is the state
+        // this method exists to prevent. A failure here leaves the outgoing
+        // identifier dated and still usable for its window, and a rerun dates
+        // nothing twice, because the arms below leave a dated identifier alone.
+        for (key_id, binding) in self.stored_webhook_keys_for_bridge(bridge_id).await? {
+            match binding.valid_until {
+                // An identifier a previous rotation already retired, whose
+                // deadline has passed: this is that rotation's close.
+                Some(deadline) if deadline <= now => {
+                    self.deregister_webhook_key(&key_id).await?;
+                }
+                // An identifier a previous rotation retired whose window is
+                // still open keeps its own deadline, because moving that
+                // deadline forward would extend a window §12.10.2 step 5 caps
+                // at 24 hours.
+                Some(_) => {}
+                None => {
+                    self.store_webhook_key_binding(
+                        &key_id,
+                        WebhookKeyBinding {
+                            valid_until: Some(rotation_close),
+                            ..binding
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        // `register_webhook_key` still refuses an identifier a second bridge
+        // holds (§12.10.2 step 3), and the check above already refused one this
+        // bridge holds.
+        self.register_webhook_key(new_key_id, bridge_id, new_platform_key)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Deletes every stored webhook key whose rotation window closed at or
+    /// before `now`.
+    ///
+    /// [`load_from_storage`](Self::load_from_storage) runs this at startup, so
+    /// a node that was down across a rotation close performs that close before
+    /// it serves a request. [`verify_webhook_signature`] refuses a signature
+    /// under an expired identifier whether or not this has run, so this deletes
+    /// a record that already authenticates nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a storage read or delete fails.
+    async fn close_expired_rotations(
+        &self,
+        now: u64,
+    ) -> Result<usize, scp_platform::PlatformError> {
+        let storage = self.repo.storage();
+        let mut expired = Vec::new();
+        for key in storage.list_keys(BRIDGE_WEBHOOK_KEY_PREFIX).await? {
+            let Some(data) = storage.retrieve(&key).await? else {
+                continue;
+            };
+            let Ok(binding) = serde_json::from_slice::<WebhookKeyBinding>(&data) else {
+                continue;
+            };
+            if binding.valid_until.is_some_and(|deadline| deadline <= now) {
+                expired.push(
                     key.strip_prefix(BRIDGE_WEBHOOK_KEY_PREFIX)
                         .unwrap_or(&key)
                         .to_owned(),
                 );
             }
         }
-        Ok(owned)
+        let closed = expired.len();
+        for key_id in expired {
+            self.deregister_webhook_key(&key_id).await?;
+        }
+        Ok(closed)
     }
 
     /// Removes a webhook signing key by ID.
@@ -1058,17 +1700,14 @@ impl<S: Storage> StorageBridgeLookup<S> {
     }
 }
 
+#[async_trait::async_trait]
 impl<S: Storage + 'static> BridgeLookup for StorageBridgeLookup<S> {
     fn find_bridge(&self, bridge_id: &str) -> Option<BridgeConnector> {
         self.cached_bridge(bridge_id)
     }
 
-    fn resolve_did_document(&self, did: &str) -> Option<DidDocument> {
-        self.did_docs
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(did)
-            .cloned()
+    async fn resolve_did_document(&self, did: &str) -> Option<DidDocument> {
+        self.resolve_did_document_fresh(did).await
     }
 
     fn find_webhook_key(&self, key_id: &str) -> Option<WebhookKeyBinding> {
@@ -1105,7 +1744,10 @@ fn decode_jwt_segment(segment: &str) -> Result<Vec<u8>, String> {
 /// # Errors
 ///
 /// Returns a human-readable error string if any check fails.
-fn verify_bridge_jwt(token: &str, lookup: &dyn BridgeLookup) -> Result<BridgeJwtClaims, String> {
+async fn verify_bridge_jwt(
+    token: &str,
+    lookup: &dyn BridgeLookup,
+) -> Result<BridgeJwtClaims, String> {
     // Step 1: Split into three segments.
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
@@ -1141,9 +1783,13 @@ fn verify_bridge_jwt(token: &str, lookup: &dyn BridgeLookup) -> Result<BridgeJwt
     let claims: BridgeJwtClaims = serde_json::from_slice(&payload_bytes)
         .map_err(|e| format!("invalid JWT payload JSON: {e}"))?;
 
-    // Step 4: Resolve the issuer's DID document.
+    // Step 4: Resolve the issuer's DID document. This resolves the DID again
+    // whenever no cached document is inside `DID_DOCUMENT_TTL_SECS`, so an
+    // operator who rotates or revokes a signing key stops this node honouring
+    // the retired key within that window.
     let did_doc = lookup
         .resolve_did_document(&claims.iss)
+        .await
         .ok_or_else(|| format!("could not resolve DID document for issuer: {}", claims.iss))?;
 
     // Step 5: Extract the signing public key.
@@ -1270,7 +1916,7 @@ fn reject_inactive_bridge(bridge: &BridgeConnector) -> Option<(StatusCode, Json<
 /// # Errors
 ///
 /// Returns the HTTP status and body the middleware sends when any check fails.
-fn authorize_bearer_request(
+async fn authorize_bearer_request(
     headers: &axum::http::HeaderMap,
     lookup: &dyn BridgeLookup,
 ) -> Result<BridgeAuthContext, (StatusCode, Json<ApiError>)> {
@@ -1287,7 +1933,9 @@ fn authorize_bearer_request(
         }
     };
 
-    let claims = verify_bridge_jwt(token, lookup).map_err(bridge_not_authorized)?;
+    let claims = verify_bridge_jwt(token, lookup)
+        .await
+        .map_err(bridge_not_authorized)?;
 
     let Some(bridge) = lookup.find_bridge(&claims.scp_bridge_id) else {
         return Err(bridge_not_authorized(format!(
@@ -1340,7 +1988,7 @@ pub async fn bridge_auth_middleware<L: BridgeLookup>(
     mut req: Request<Body>,
     next: Next,
 ) -> impl IntoResponse {
-    let auth_ctx = match authorize_bearer_request(req.headers(), lookup.as_ref()) {
+    let auth_ctx = match authorize_bearer_request(req.headers(), lookup.as_ref()).await {
         Ok(ctx) => ctx,
         Err(rejection) => return rejection.into_response(),
     };
@@ -1362,7 +2010,7 @@ pub async fn bridge_auth_middleware_dyn(
     mut req: Request<Body>,
     next: Next,
 ) -> impl IntoResponse {
-    let auth_ctx = match authorize_bearer_request(req.headers(), lookup.as_ref()) {
+    let auth_ctx = match authorize_bearer_request(req.headers(), lookup.as_ref()).await {
         Ok(ctx) => ctx,
         Err(rejection) => return rejection.into_response(),
     };
@@ -1441,6 +2089,19 @@ pub fn verify_webhook_signature(
     let binding = lookup
         .find_webhook_key(key_id)
         .ok_or_else(|| format!("unknown platform key ID: {key_id}"))?;
+
+    // Spec §12.10.2 step 5 closes a rotation window 24 hours after a rotation
+    // registers a replacement identifier, and an outgoing identifier
+    // authenticates nothing after that. `close_expired_rotations` deletes the
+    // record, and this check refuses the signature whether or not that delete
+    // has run yet, so the deadline decides the answer rather than the delete.
+    if let Some(deadline) = binding.valid_until
+        && now_secs > deadline
+    {
+        return Err(format!(
+            "platform key ID {key_id} was retired by a rotation that closed at {deadline}"
+        ));
+    }
 
     let verifying_key = VerifyingKey::from_bytes(&binding.public_key)
         .map_err(|e| format!("invalid platform public key: {e}"))?;
@@ -1717,6 +2378,7 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl BridgeLookup for TestBridgeLookup {
         fn find_bridge(&self, bridge_id: &str) -> Option<BridgeConnector> {
             self.bridges
@@ -1725,7 +2387,7 @@ mod tests {
                 .cloned()
         }
 
-        fn resolve_did_document(&self, did: &str) -> Option<DidDocument> {
+        async fn resolve_did_document(&self, did: &str) -> Option<DidDocument> {
             self.did_docs
                 .iter()
                 .find(|(d, _)| d == did)
@@ -1749,6 +2411,67 @@ mod tests {
         WebhookKeyBinding {
             public_key,
             bridge_id: bridge_id.to_owned(),
+            valid_until: None,
+        }
+    }
+
+    /// A [`BridgeDidResolver`] that answers from a fixed table, so a test can
+    /// drive the TTL path without a DHT.
+    #[derive(Default)]
+    struct TestDidResolver {
+        documents: std::sync::Mutex<HashMap<String, DidDocument>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TestDidResolver {
+        fn publish(&self, doc: DidDocument) {
+            self.documents
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(doc.id.clone(), doc);
+        }
+
+        fn retract(&self, did: &str) {
+            self.documents
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(did);
+        }
+
+        /// Answers `did` with `document`, whatever DID that document names.
+        fn answer(&self, did: &str, document: DidDocument) {
+            self.documents
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(did.to_owned(), document);
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl BridgeDidResolver for TestDidResolver {
+        fn resolve<'a>(
+            &'a self,
+            did: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<DidDocument, scp_identity::IdentityError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let found = self
+                .documents
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(did)
+                .cloned();
+            Box::pin(async move {
+                found.ok_or_else(|| scp_identity::IdentityError::DhtNotFound(did.to_owned()))
+            })
         }
     }
 
@@ -1837,8 +2560,8 @@ mod tests {
     // JWT unit tests
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn create_and_verify_jwt_roundtrip() {
+    #[tokio::test]
+    async fn create_and_verify_jwt_roundtrip() {
         let signing_key = SigningKey::generate(&mut OsRng);
         let did = test_did(&signing_key);
         let claims = test_claims(&did);
@@ -1850,14 +2573,14 @@ mod tests {
             .did_docs
             .push((did.clone(), test_did_document(&did, &signing_key)));
 
-        let verified = verify_bridge_jwt(&token, &lookup).unwrap();
+        let verified = verify_bridge_jwt(&token, &lookup).await.unwrap();
         assert_eq!(verified.iss, did);
         assert_eq!(verified.scp_bridge_id, "bridge-test-001");
         assert_eq!(verified.scp_context_id, "ctx-test-001");
     }
 
-    #[test]
-    fn reject_expired_jwt() {
+    #[tokio::test]
+    async fn reject_expired_jwt() {
         let signing_key = SigningKey::generate(&mut OsRng);
         let did = test_did(&signing_key);
         let mut claims = test_claims(&did);
@@ -1872,7 +2595,7 @@ mod tests {
             .did_docs
             .push((did.clone(), test_did_document(&did, &signing_key)));
 
-        let result = verify_bridge_jwt(&token, &lookup);
+        let result = verify_bridge_jwt(&token, &lookup).await;
         assert!(result.is_err());
         assert!(
             result.unwrap_err().contains("expired"),
@@ -1880,8 +2603,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reject_jwt_with_excessive_lifetime() {
+    #[tokio::test]
+    async fn reject_jwt_with_excessive_lifetime() {
         let signing_key = SigningKey::generate(&mut OsRng);
         let did = test_did(&signing_key);
         let mut claims = test_claims(&did);
@@ -1895,7 +2618,7 @@ mod tests {
             .did_docs
             .push((did.clone(), test_did_document(&did, &signing_key)));
 
-        let result = verify_bridge_jwt(&token, &lookup);
+        let result = verify_bridge_jwt(&token, &lookup).await;
         assert!(result.is_err());
         assert!(
             result.unwrap_err().contains("lifetime exceeds maximum"),
@@ -1903,8 +2626,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reject_jwt_with_wrong_key() {
+    #[tokio::test]
+    async fn reject_jwt_with_wrong_key() {
         let signing_key = SigningKey::generate(&mut OsRng);
         let wrong_key = SigningKey::generate(&mut OsRng);
         let did = test_did(&signing_key);
@@ -1918,7 +2641,7 @@ mod tests {
             .did_docs
             .push((did.clone(), test_did_document(&did, &signing_key)));
 
-        let result = verify_bridge_jwt(&token, &lookup);
+        let result = verify_bridge_jwt(&token, &lookup).await;
         assert!(result.is_err());
         assert!(
             result
@@ -1928,8 +2651,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reject_jwt_with_wrong_audience() {
+    #[tokio::test]
+    async fn reject_jwt_with_wrong_audience() {
         let signing_key = SigningKey::generate(&mut OsRng);
         let did = test_did(&signing_key);
         let mut claims = test_claims(&did);
@@ -1942,7 +2665,7 @@ mod tests {
             .did_docs
             .push((did.clone(), test_did_document(&did, &signing_key)));
 
-        let result = verify_bridge_jwt(&token, &lookup);
+        let result = verify_bridge_jwt(&token, &lookup).await;
         assert!(result.is_err());
         assert!(
             result.unwrap_err().contains("audience mismatch"),
@@ -1950,8 +2673,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reject_jwt_with_future_iat() {
+    #[tokio::test]
+    async fn reject_jwt_with_future_iat() {
         let signing_key = SigningKey::generate(&mut OsRng);
         let did = test_did(&signing_key);
         let mut claims = test_claims(&did);
@@ -1966,7 +2689,7 @@ mod tests {
             .did_docs
             .push((did.clone(), test_did_document(&did, &signing_key)));
 
-        let result = verify_bridge_jwt(&token, &lookup);
+        let result = verify_bridge_jwt(&token, &lookup).await;
         assert!(result.is_err());
         assert!(
             result.unwrap_err().contains("issued in the future"),
@@ -1974,22 +2697,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reject_malformed_jwt() {
+    #[tokio::test]
+    async fn reject_malformed_jwt() {
         let lookup = TestBridgeLookup::new("https://node.example.com");
 
         // No segments.
-        assert!(verify_bridge_jwt("not-a-jwt", &lookup).is_err());
+        assert!(verify_bridge_jwt("not-a-jwt", &lookup).await.is_err());
 
         // Only two segments.
-        assert!(verify_bridge_jwt("header.payload", &lookup).is_err());
+        assert!(verify_bridge_jwt("header.payload", &lookup).await.is_err());
 
         // Four segments.
-        assert!(verify_bridge_jwt("a.b.c.d", &lookup).is_err());
+        assert!(verify_bridge_jwt("a.b.c.d", &lookup).await.is_err());
     }
 
-    #[test]
-    fn reject_unsupported_algorithm() {
+    #[tokio::test]
+    async fn reject_unsupported_algorithm() {
         let header = serde_json::json!({"alg": "RS256", "typ": "JWT"});
         let claims = serde_json::json!({"iss": "did:test", "aud": "test", "iat": 0, "exp": 0, "scp_bridge_id": "b", "scp_context_id": "c"});
 
@@ -1999,7 +2722,7 @@ mod tests {
         let token = format!("{header_b64}.{payload_b64}.{fake_sig}");
 
         let lookup = TestBridgeLookup::new("test");
-        let result = verify_bridge_jwt(&token, &lookup);
+        let result = verify_bridge_jwt(&token, &lookup).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unsupported JWT algorithm"));
     }
@@ -2661,7 +3384,24 @@ mod tests {
     fn make_storage_lookup() -> StorageBridgeLookup<InMemoryStorage> {
         let storage = InMemoryStorage::new();
         let repo = Arc::new(ProtocolRepository::new_for_testing(storage));
-        StorageBridgeLookup::new(repo, "https://node.example.com".to_owned())
+        StorageBridgeLookup::new(
+            repo,
+            "https://node.example.com".to_owned(),
+            Arc::new(TestDidResolver::default()),
+        )
+    }
+
+    /// Builds a lookup over `repo` whose resolver a test keeps a handle on, so
+    /// it can publish, retract, and count resolutions.
+    fn storage_lookup_with_resolver(
+        repo: &Arc<ProtocolRepository<InMemoryStorage>>,
+        resolver: &Arc<TestDidResolver>,
+    ) -> StorageBridgeLookup<InMemoryStorage> {
+        StorageBridgeLookup::new(
+            Arc::clone(repo),
+            "https://node.example.com".to_owned(),
+            Arc::clone(resolver) as Arc<dyn BridgeDidResolver>,
+        )
     }
 
     /// Drives one registration through spec 12.2.1 governance approval.
@@ -2770,12 +3510,13 @@ mod tests {
         // pick one, so this id is 64 lowercase hex characters.
         assert_eq!(bridge_id.len(), 64);
         assert!(bridge_id.bytes().all(|b| b.is_ascii_hexdigit()));
-        assert!(lookup.resolve_did_document(&operator_did).is_some());
+        assert!(lookup.resolve_did_document(&operator_did).await.is_some());
         assert_eq!(
             lookup.find_webhook_key("pk-1"),
             Some(WebhookKeyBinding {
                 public_key: [42u8; 32],
                 bridge_id,
+                valid_until: None,
             })
         );
 
@@ -2798,7 +3539,7 @@ mod tests {
         assert!(lookup.find_bridge(&bridge_id).is_some());
         assert!(
             lookup
-                .stored_webhook_key_ids_for_bridge(&bridge_id)
+                .stored_webhook_keys_for_bridge(&bridge_id)
                 .await
                 .unwrap()
                 .is_empty()
@@ -3031,8 +3772,11 @@ mod tests {
     async fn an_unhydrated_cache_cannot_resurrect_a_revoked_bridge() {
         let storage = InMemoryStorage::new();
         let repo = Arc::new(ProtocolRepository::new_for_testing(storage));
-        let first =
-            StorageBridgeLookup::new(Arc::clone(&repo), "https://node.example.com".to_owned());
+        let first = StorageBridgeLookup::new(
+            Arc::clone(&repo),
+            "https://node.example.com".to_owned(),
+            Arc::new(TestDidResolver::default()),
+        );
 
         let signing_key = SigningKey::generate(&mut OsRng);
         let operator_did = test_did(&signing_key);
@@ -3054,8 +3798,11 @@ mod tests {
             .unwrap();
 
         // A second lookup over that same storage, holding an empty cache.
-        let unhydrated =
-            StorageBridgeLookup::new(Arc::clone(&repo), "https://node.example.com".to_owned());
+        let unhydrated = StorageBridgeLookup::new(
+            Arc::clone(&repo),
+            "https://node.example.com".to_owned(),
+            Arc::new(TestDidResolver::default()),
+        );
         assert!(unhydrated.find_bridge(&bridge_id).is_none());
 
         let err = unhydrated
@@ -3077,8 +3824,11 @@ mod tests {
 
         // A third lookup that does hydrate reads a bridge still revoked, with
         // no signing key.
-        let hydrated =
-            StorageBridgeLookup::new(Arc::clone(&repo), "https://node.example.com".to_owned());
+        let hydrated = StorageBridgeLookup::new(
+            Arc::clone(&repo),
+            "https://node.example.com".to_owned(),
+            Arc::new(TestDidResolver::default()),
+        );
         hydrated.load_from_storage().await.unwrap();
         assert_eq!(
             hydrated.find_bridge(&bridge_id).unwrap().status,
@@ -3093,13 +3843,19 @@ mod tests {
     async fn an_unhydrated_cache_cannot_rebind_a_key_identifier() {
         let storage = InMemoryStorage::new();
         let repo = Arc::new(ProtocolRepository::new_for_testing(storage));
-        let first =
-            StorageBridgeLookup::new(Arc::clone(&repo), "https://node.example.com".to_owned());
+        let first = StorageBridgeLookup::new(
+            Arc::clone(&repo),
+            "https://node.example.com".to_owned(),
+            Arc::new(TestDidResolver::default()),
+        );
         let (first_id, _) =
             admit_cooperative_bridge(&first, "bridge-a", "ctx-a", "pk-shared", [1u8; 32]).await;
 
-        let unhydrated =
-            StorageBridgeLookup::new(Arc::clone(&repo), "https://node.example.com".to_owned());
+        let unhydrated = StorageBridgeLookup::new(
+            Arc::clone(&repo),
+            "https://node.example.com".to_owned(),
+            Arc::new(TestDidResolver::default()),
+        );
         let signing_key = SigningKey::generate(&mut OsRng);
         let operator_did = test_did(&signing_key);
         let err = unhydrated
@@ -3120,8 +3876,11 @@ mod tests {
             "expected WebhookKeyIdBoundElsewhere, got {err}"
         );
 
-        let hydrated =
-            StorageBridgeLookup::new(Arc::clone(&repo), "https://node.example.com".to_owned());
+        let hydrated = StorageBridgeLookup::new(
+            Arc::clone(&repo),
+            "https://node.example.com".to_owned(),
+            Arc::new(TestDidResolver::default()),
+        );
         hydrated.load_from_storage().await.unwrap();
         assert_eq!(
             hydrated.find_webhook_key("pk-shared").unwrap().bridge_id,
@@ -3176,6 +3935,497 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------------
+    // Platform key rotation (spec §12.10.2 step 5)
+    // -------------------------------------------------------------------
+
+    /// Admits one cooperative bridge in the rotation-test context and returns
+    /// its id.
+    async fn admit_rotatable_bridge(
+        lookup: &StorageBridgeLookup<InMemoryStorage>,
+        seed: &str,
+        key_id: &str,
+        key: [u8; 32],
+    ) -> String {
+        let (bridge_id, _) = admit_cooperative_bridge(lookup, seed, "ctx-rot", key_id, key).await;
+        bridge_id
+    }
+
+    #[tokio::test]
+    async fn re_admission_under_a_fresh_key_identifier_is_refused() {
+        let lookup = make_storage_lookup();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let operator_did = test_did(&signing_key);
+        let document = test_did_document(&operator_did, &signing_key);
+        lookup
+            .admit_registration(
+                approved_registration("b-1", &operator_did, "ctx-1", Some(("pk-1", [1u8; 32]))),
+                document.clone(),
+            )
+            .await
+            .unwrap();
+
+        let err = lookup
+            .admit_registration(
+                approved_registration("b-1", &operator_did, "ctx-1", Some(("pk-2", [2u8; 32]))),
+                document,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                BridgeAdmissionError::PlatformKeyIdentifierChanged { .. }
+            ),
+            "expected PlatformKeyIdentifierChanged, got {err}"
+        );
+        // The refusal is what keeps this bridge from holding two live keys.
+        assert!(lookup.find_webhook_key("pk-2").is_none());
+        assert_eq!(
+            lookup.find_webhook_key("pk-1").unwrap().public_key,
+            [1u8; 32]
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_registers_a_new_identifier_and_dates_the_outgoing_one() {
+        let lookup = make_storage_lookup();
+        let bridge_id = admit_rotatable_bridge(&lookup, "b-rot", "pk-1", [1u8; 32]).await;
+
+        lookup
+            .rotate_platform_key(&bridge_id, "pk-2", [2u8; 32])
+            .await
+            .unwrap();
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let incoming = lookup.find_webhook_key("pk-2").unwrap();
+        assert_eq!(incoming.public_key, [2u8; 32]);
+        assert_eq!(incoming.bridge_id, bridge_id);
+        assert_eq!(
+            incoming.valid_until, None,
+            "the identifier a rotation installs is the bridge's current one"
+        );
+
+        let outgoing = lookup.find_webhook_key("pk-1").unwrap();
+        let deadline = outgoing
+            .valid_until
+            .expect("the outgoing identifier is dated");
+        assert!(
+            deadline > now && deadline <= now + PLATFORM_KEY_ROTATION_WINDOW_SECS,
+            "spec 12.10.2 step 5 caps the dual-accept window at 24 hours, got {deadline} at {now}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_refuses_an_identifier_this_bridge_already_holds() {
+        let lookup = make_storage_lookup();
+        let bridge_id = admit_rotatable_bridge(&lookup, "b-same", "pk-1", [1u8; 32]).await;
+
+        let err = lookup
+            .rotate_platform_key(&bridge_id, "pk-1", [2u8; 32])
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, BridgeAdmissionError::PlatformKeyIdentifierInUse { .. }),
+            "expected PlatformKeyIdentifierInUse, got {err}"
+        );
+        assert_eq!(
+            lookup.find_webhook_key("pk-1").unwrap().public_key,
+            [1u8; 32]
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_refuses_an_identifier_another_bridge_holds() {
+        let lookup = make_storage_lookup();
+        let first = admit_rotatable_bridge(&lookup, "b-a", "pk-a", [1u8; 32]).await;
+        let _second = admit_rotatable_bridge(&lookup, "b-b", "pk-b", [2u8; 32]).await;
+
+        let err = lookup
+            .rotate_platform_key(&first, "pk-b", [3u8; 32])
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, BridgeAdmissionError::PlatformKeyIdentifierInUse { .. }),
+            "expected PlatformKeyIdentifierInUse, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_refuses_a_revoked_bridge() {
+        let lookup = make_storage_lookup();
+        let bridge_id = admit_rotatable_bridge(&lookup, "b-rev", "pk-1", [1u8; 32]).await;
+        lookup
+            .set_bridge_status(&bridge_id, BridgeStatus::Revoked)
+            .await
+            .unwrap();
+
+        let err = lookup
+            .rotate_platform_key(&bridge_id, "pk-2", [2u8; 32])
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, BridgeAdmissionError::BridgeRevoked { .. }),
+            "expected BridgeRevoked, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_refuses_a_bridge_that_registers_no_platform_key() {
+        let lookup = make_storage_lookup();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let operator_did = test_did(&signing_key);
+        let approved = approved_registration("b-relay", &operator_did, "ctx-relay", None);
+        let bridge_id = approved.connector().bridge_id.clone();
+        lookup
+            .admit_registration(approved, test_did_document(&operator_did, &signing_key))
+            .await
+            .unwrap();
+
+        let err = lookup
+            .rotate_platform_key(&bridge_id, "pk-1", [1u8; 32])
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, BridgeAdmissionError::BridgeNotCooperative { .. }),
+            "expected BridgeNotCooperative, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_signature_under_a_closed_identifier_is_refused() {
+        let lookup = make_storage_lookup();
+        let bridge_id = admit_rotatable_bridge(&lookup, "b-closed", "pk-1", [1u8; 32]).await;
+        lookup
+            .rotate_platform_key(&bridge_id, "pk-2", [2u8; 32])
+            .await
+            .unwrap();
+
+        // The rotation dated `pk-1`. Move that deadline into the past, which is
+        // what 24 hours of wall clock does, and put a real platform key behind
+        // the identifier so nothing but the deadline decides the answer.
+        assert!(
+            lookup
+                .find_webhook_key("pk-1")
+                .unwrap()
+                .valid_until
+                .is_some()
+        );
+        let platform_key = SigningKey::generate(&mut OsRng);
+        lookup
+            .store_webhook_key_binding(
+                "pk-1",
+                WebhookKeyBinding {
+                    public_key: platform_key.verifying_key().to_bytes(),
+                    bridge_id: bridge_id.clone(),
+                    valid_until: Some(1),
+                },
+            )
+            .await
+            .unwrap();
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let body = b"{}";
+        let timestamp = now.to_string();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"pk-1");
+        payload.push(0x00);
+        payload.extend_from_slice(timestamp.as_bytes());
+        payload.push(0x00);
+        payload.extend_from_slice(body);
+        let signature = {
+            use ed25519_dalek::Signer;
+            URL_SAFE_NO_PAD.encode(platform_key.sign(&payload).to_bytes())
+        };
+
+        let err = verify_webhook_signature(
+            &signature,
+            "pk-1",
+            Some(&timestamp),
+            body,
+            &lookup as &dyn BridgeLookup,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.contains("retired by a rotation"),
+            "a signature under a closed identifier must be refused, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_signature_inside_the_rotation_window_still_verifies() {
+        let lookup = make_storage_lookup();
+        let bridge_id = admit_rotatable_bridge(&lookup, "b-window", "pk-1", [1u8; 32]).await;
+
+        let platform_key = SigningKey::generate(&mut OsRng);
+        lookup
+            .store_webhook_key_binding(
+                "pk-1",
+                WebhookKeyBinding {
+                    public_key: platform_key.verifying_key().to_bytes(),
+                    bridge_id: bridge_id.clone(),
+                    valid_until: None,
+                },
+            )
+            .await
+            .unwrap();
+        lookup
+            .rotate_platform_key(&bridge_id, "pk-2", [2u8; 32])
+            .await
+            .unwrap();
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let body = b"{}";
+        let timestamp = now.to_string();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"pk-1");
+        payload.push(0x00);
+        payload.extend_from_slice(timestamp.as_bytes());
+        payload.push(0x00);
+        payload.extend_from_slice(body);
+        let signature = {
+            use ed25519_dalek::Signer;
+            URL_SAFE_NO_PAD.encode(platform_key.sign(&payload).to_bytes())
+        };
+
+        let binding = verify_webhook_signature(
+            &signature,
+            "pk-1",
+            Some(&timestamp),
+            body,
+            &lookup as &dyn BridgeLookup,
+        )
+        .unwrap();
+
+        assert_eq!(binding.bridge_id, bridge_id);
+    }
+
+    #[tokio::test]
+    async fn loading_from_storage_deletes_an_identifier_whose_window_closed() {
+        let storage = InMemoryStorage::new();
+        let repo = Arc::new(ProtocolRepository::new_for_testing(storage));
+        let resolver = Arc::new(TestDidResolver::default());
+        let lookup = storage_lookup_with_resolver(&repo, &resolver);
+        let bridge_id = admit_rotatable_bridge(&lookup, "b-sweep", "pk-1", [1u8; 32]).await;
+        lookup
+            .rotate_platform_key(&bridge_id, "pk-2", [2u8; 32])
+            .await
+            .unwrap();
+        let outgoing = lookup.find_webhook_key("pk-1").unwrap();
+        lookup
+            .store_webhook_key_binding(
+                "pk-1",
+                WebhookKeyBinding {
+                    valid_until: Some(1),
+                    ..outgoing
+                },
+            )
+            .await
+            .unwrap();
+
+        let restarted = storage_lookup_with_resolver(&repo, &resolver);
+        restarted.load_from_storage().await.unwrap();
+
+        assert!(
+            restarted.find_webhook_key("pk-1").is_none(),
+            "spec 12.10.2 step 5 deletes an outgoing identifier at rotation close"
+        );
+        assert!(restarted.find_webhook_key("pk-2").is_some());
+    }
+
+    // -------------------------------------------------------------------
+    // Operator DID document freshness (spec §12.10.2)
+    // -------------------------------------------------------------------
+
+    /// Seeds the cache with `document` stamped `DID_DOCUMENT_TTL_SECS + 1`
+    /// seconds ago, which is what an admission-time record becomes once its
+    /// window passes.
+    async fn age_cached_document(
+        lookup: &StorageBridgeLookup<InMemoryStorage>,
+        document: DidDocument,
+    ) {
+        let stale_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_sub(DID_DOCUMENT_TTL_SECS + 1);
+        lookup
+            .register_did_document(document, stale_at)
+            .await
+            .unwrap();
+    }
+
+    /// Builds a lookup over fresh storage together with the resolver it reads.
+    fn lookup_and_resolver() -> (
+        Arc<ProtocolRepository<InMemoryStorage>>,
+        Arc<TestDidResolver>,
+        StorageBridgeLookup<InMemoryStorage>,
+    ) {
+        let repo = Arc::new(ProtocolRepository::new_for_testing(InMemoryStorage::new()));
+        let resolver = Arc::new(TestDidResolver::default());
+        let lookup = storage_lookup_with_resolver(&repo, &resolver);
+        (repo, resolver, lookup)
+    }
+
+    #[tokio::test]
+    async fn a_stale_cached_document_is_resolved_again_before_it_decides_a_token() {
+        let (_repo, resolver, lookup) = lookup_and_resolver();
+        let (_bridge_id, operator_did) =
+            admit_cooperative_bridge(&lookup, "b-ttl", "ctx-ttl", "pk-1", [1_u8; 32]).await;
+
+        // The cached copy names the key this operator has since retired.
+        let retired_key = SigningKey::generate(&mut OsRng);
+        let stale = test_did_document(&operator_did, &retired_key);
+        age_cached_document(&lookup, stale.clone()).await;
+
+        // The DHT carries the document this operator republished after the
+        // rotation, naming a different key.
+        let rotated_key = SigningKey::generate(&mut OsRng);
+        let republished = test_did_document(&operator_did, &rotated_key);
+        resolver.publish(republished.clone());
+        assert_eq!(resolver.call_count(), 0);
+
+        let found = lookup
+            .resolve_did_document(&operator_did)
+            .await
+            .expect("a published document resolves");
+
+        assert_eq!(found.id, operator_did);
+        assert_eq!(
+            found.verification_method[0].public_key_multibase,
+            republished.verification_method[0].public_key_multibase,
+            "the document that decides a token must be the one the DHT carries"
+        );
+        assert_ne!(
+            found.verification_method[0].public_key_multibase,
+            stale.verification_method[0].public_key_multibase,
+            "the retired key must stop deciding tokens"
+        );
+        assert_eq!(
+            resolver.call_count(),
+            1,
+            "a document past its TTL must be resolved again"
+        );
+
+        // The refreshed document carries a current timestamp, so a second call
+        // answers from the cache.
+        lookup.resolve_did_document(&operator_did).await;
+        assert_eq!(resolver.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_retracted_operator_document_stops_authorizing_once_the_ttl_passes() {
+        let (_repo, resolver, lookup) = lookup_and_resolver();
+        let (_bridge_id, operator_did) =
+            admit_cooperative_bridge(&lookup, "b-gone", "ctx-gone", "pk-1", [1_u8; 32]).await;
+        age_cached_document(
+            &lookup,
+            test_did_document(&operator_did, &SigningKey::generate(&mut OsRng)),
+        )
+        .await;
+
+        // The operator's DID resolves to nothing — a revoked or unpublished
+        // document. The stale copy must not stand in for it.
+        resolver.retract(&operator_did);
+
+        assert!(
+            lookup.resolve_did_document(&operator_did).await.is_none(),
+            "an admission-time snapshot must not authorize a token past its TTL"
+        );
+        assert_eq!(
+            resolver.call_count(),
+            1,
+            "the refusal must follow a failed resolution, not a skipped one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_cached_document_answers_without_a_resolution() {
+        let (_repo, resolver, lookup) = lookup_and_resolver();
+        let (_bridge_id, operator_did) =
+            admit_cooperative_bridge(&lookup, "b-fresh", "ctx-fresh", "pk-1", [1_u8; 32]).await;
+
+        assert!(lookup.resolve_did_document(&operator_did).await.is_some());
+        assert_eq!(resolver.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_resolution_naming_a_different_did_is_refused() {
+        let (_repo, resolver, lookup) = lookup_and_resolver();
+        let (_bridge_id, operator_did) =
+            admit_cooperative_bridge(&lookup, "b-mismatch", "ctx-mismatch", "pk-1", [1_u8; 32])
+                .await;
+        age_cached_document(
+            &lookup,
+            test_did_document(&operator_did, &SigningKey::generate(&mut OsRng)),
+        )
+        .await;
+
+        // The resolver answers this operator's DID with a document naming a
+        // second DID, which would install one operator's keys under another
+        // operator's name.
+        let other_key = SigningKey::generate(&mut OsRng);
+        let other_did = test_did(&other_key);
+        resolver.answer(&operator_did, test_did_document(&other_did, &other_key));
+
+        assert!(lookup.resolve_did_document(&operator_did).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_did_no_admitted_bridge_names_is_never_resolved() {
+        let (_repo, resolver, lookup) = lookup_and_resolver();
+        let stranger_key = SigningKey::generate(&mut OsRng);
+        let stranger_did = test_did(&stranger_key);
+        resolver.publish(test_did_document(&stranger_did, &stranger_key));
+
+        assert!(lookup.resolve_did_document(&stranger_did).await.is_none());
+        assert_eq!(
+            resolver.call_count(),
+            0,
+            "a bearer token names its own iss, so an unadmitted DID must reach no DHT lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_request_inside_the_retry_interval_starts_no_second_resolution() {
+        let (_repo, resolver, lookup) = lookup_and_resolver();
+        let (_bridge_id, operator_did) =
+            admit_cooperative_bridge(&lookup, "b-retry", "ctx-retry", "pk-1", [1_u8; 32]).await;
+        age_cached_document(
+            &lookup,
+            test_did_document(&operator_did, &SigningKey::generate(&mut OsRng)),
+        )
+        .await;
+        resolver.retract(&operator_did);
+
+        assert!(lookup.resolve_did_document(&operator_did).await.is_none());
+        assert_eq!(resolver.call_count(), 1);
+
+        // A caller's request rate must not become this node's DHT rate.
+        assert!(lookup.resolve_did_document(&operator_did).await.is_none());
+        assert_eq!(
+            resolver.call_count(),
+            1,
+            "a second request inside DID_RESOLUTION_RETRY_SECS must reuse the first attempt"
+        );
+    }
+
     #[tokio::test]
     async fn setting_status_on_an_unknown_bridge_is_rejected() {
         let lookup = make_storage_lookup();
@@ -3198,13 +4448,25 @@ mod tests {
         let did = test_did(&signing_key);
         let doc = test_did_document(&did, &signing_key);
 
-        lookup.register_did_document(doc.clone()).await.unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        lookup
+            .register_did_document(doc.clone(), now)
+            .await
+            .unwrap();
 
-        let found = lookup.resolve_did_document(&did);
+        let found = lookup.resolve_did_document(&did).await;
         assert!(found.is_some());
         assert_eq!(found.unwrap().id, did);
 
-        assert!(lookup.resolve_did_document("did:dht:nonexistent").is_none());
+        assert!(
+            lookup
+                .resolve_did_document("did:dht:nonexistent")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -3251,8 +4513,11 @@ mod tests {
         let storage = InMemoryStorage::new();
         let repo = Arc::new(ProtocolRepository::new_for_testing(storage));
 
-        let lookup1 =
-            StorageBridgeLookup::new(Arc::clone(&repo), "https://node.example.com".to_owned());
+        let lookup1 = StorageBridgeLookup::new(
+            Arc::clone(&repo),
+            "https://node.example.com".to_owned(),
+            Arc::new(TestDidResolver::default()),
+        );
         let signing_key = SigningKey::generate(&mut OsRng);
         let did = test_did(&signing_key);
         let approved =
@@ -3264,17 +4529,24 @@ mod tests {
             .unwrap();
 
         // Create a fresh instance that shares the same storage and load.
-        let lookup2 =
-            StorageBridgeLookup::new(Arc::clone(&repo), "https://node.example.com".to_owned());
+        let lookup2 = StorageBridgeLookup::new(
+            Arc::clone(&repo),
+            "https://node.example.com".to_owned(),
+            Arc::new(TestDidResolver::default()),
+        );
         lookup2.load_from_storage().await.unwrap();
 
         assert!(lookup2.find_bridge(&rt_bridge_id).is_some());
-        assert!(lookup2.resolve_did_document(&did).is_some());
+        // The loaded document carries the second admission fetched it, so it
+        // is inside its TTL and `lookup2`'s resolver — which publishes nothing
+        // — is never reached.
+        assert!(lookup2.resolve_did_document(&did).await.is_some());
         assert_eq!(
             lookup2.find_webhook_key("wh-key-rt"),
             Some(WebhookKeyBinding {
                 public_key: [99u8; 32],
                 bridge_id: rt_bridge_id,
+                valid_until: None,
             })
         );
     }
@@ -3306,7 +4578,7 @@ mod tests {
         };
 
         let token = create_bridge_jwt(&claims, &signing_key).unwrap();
-        let verified = verify_bridge_jwt(&token, &lookup).unwrap();
+        let verified = verify_bridge_jwt(&token, &lookup).await.unwrap();
         assert_eq!(verified.iss, did);
         assert_eq!(verified.scp_bridge_id, jwt_bridge_id);
     }

@@ -111,6 +111,35 @@ impl BridgeAdmissionRecord {
     }
 }
 
+/// One `UpdateBridgePlatformKey` governance action, as an operator hands it to
+/// a node.
+///
+/// Spec §12.10.2 step 5 defines that action and its three fields. A platform
+/// publishes a new webhook signing key under an identifier that differs from
+/// the one its current key sits under, a bridge node accepts a signature under
+/// either identifier for 24 hours, and at rotation close it deletes the
+/// outgoing identifier. This record carries that action across the same process
+/// boundary [`BridgeAdmissionRecord`] carries an approved registration across,
+/// and a node applies it through
+/// `ApplicationNode::rotate_bridge_platform_keys`.
+///
+/// Rotation is what retires a leaked platform key: §12.2.1 makes `Revoked`
+/// terminal, so revoking a bridge is not a remedy an operator can undo, and
+/// admission refuses to change key material.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlatformKeyRotationRecord {
+    /// The bridge whose platform key this action rotates.
+    pub bridge_id: String,
+
+    /// The identifier the incoming key sits under. Spec §12.10.2 step 5
+    /// requires it to differ from an identifier this bridge's current key sits
+    /// under.
+    pub new_platform_key_id: String,
+
+    /// The platform's incoming Ed25519 webhook signing key.
+    pub new_platform_key: [u8; 32],
+}
+
 /// Reads a JSON array of admission records from `path`.
 ///
 /// # Errors
@@ -120,6 +149,25 @@ impl BridgeAdmissionRecord {
 pub fn load_admission_records(
     path: &Path,
 ) -> Result<Vec<BridgeAdmissionRecord>, AdmissionRecordError> {
+    load_json_array(path)
+}
+
+/// Reads a JSON array of platform key rotation records from `path`.
+///
+/// # Errors
+///
+/// Returns [`AdmissionRecordError::Read`] when the file cannot be read and
+/// [`AdmissionRecordError::Parse`] when it does not parse.
+pub fn load_rotation_records(
+    path: &Path,
+) -> Result<Vec<PlatformKeyRotationRecord>, AdmissionRecordError> {
+    load_json_array(path)
+}
+
+/// Reads `path` and deserializes it as a JSON array of `T`.
+fn load_json_array<T: serde::de::DeserializeOwned>(
+    path: &Path,
+) -> Result<Vec<T>, AdmissionRecordError> {
     let text = std::fs::read_to_string(path).map_err(|source| AdmissionRecordError::Read {
         path: path.display().to_string(),
         source,
@@ -238,6 +286,51 @@ mod tests {
     #[test]
     fn a_missing_file_reports_a_read_failure() {
         let err = load_admission_records(Path::new("/nonexistent/bridges.json")).unwrap_err();
+
+        assert!(
+            matches!(err, AdmissionRecordError::Read { .. }),
+            "expected Read, got {err}"
+        );
+    }
+
+    #[test]
+    fn a_rotation_record_round_trips_through_json() {
+        let rotation = PlatformKeyRotationRecord {
+            bridge_id: "bridge-1".to_owned(),
+            new_platform_key_id: "pk-2".to_owned(),
+            new_platform_key: [7_u8; 32],
+        };
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            serde_json::to_string(&vec![rotation.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_rotation_records(file.path()).unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].bridge_id, rotation.bridge_id);
+        assert_eq!(loaded[0].new_platform_key_id, "pk-2");
+        assert_eq!(loaded[0].new_platform_key, [7_u8; 32]);
+    }
+
+    #[test]
+    fn a_rotation_file_that_does_not_parse_reports_a_parse_failure() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "{ not an array }").unwrap();
+
+        let err = load_rotation_records(file.path()).unwrap_err();
+
+        assert!(
+            matches!(err, AdmissionRecordError::Parse { .. }),
+            "expected Parse, got {err}"
+        );
+    }
+
+    #[test]
+    fn a_missing_rotation_file_reports_a_read_failure() {
+        let err = load_rotation_records(Path::new("/nonexistent/rotations.json")).unwrap_err();
 
         assert!(
             matches!(err, AdmissionRecordError::Read { .. }),

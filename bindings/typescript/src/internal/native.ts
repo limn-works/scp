@@ -1290,6 +1290,13 @@ export function createNativeBridge(scp: SCP): Bridge {
       description: string | undefined,
       operatorContact: string | undefined,
     ) {
+      // NAPI Vec<u8> maps to number[] in JS, not Uint8Array. `bridge_register`
+      // declares `platform_key: Option<Vec<u8>>`, and napi-rs validates that
+      // parameter with `napi_is_array`, which reports false for a typed array,
+      // so a Uint8Array passed straight through throws `InvalidArg` before the
+      // Rust function runs.
+      const platformKeyArray =
+        platformKey === undefined ? undefined : (Array.from(platformKey) as unknown as number[]);
       // napi-rs #[napi(object)] returns camelCase keys; Bridge interface expects snake_case.
       const raw = (
         addon.bridgeRegister as (
@@ -1299,7 +1306,7 @@ export function createNativeBridge(scp: SCP): Bridge {
           p: string,
           m: BridgeMode,
           webhookUrl?: string,
-          platformKey?: Uint8Array,
+          platformKey?: number[],
           platformKeyId?: string,
           maxShadows?: number,
           displayName?: string,
@@ -1320,7 +1327,7 @@ export function createNativeBridge(scp: SCP): Bridge {
         platform,
         mode,
         webhookUrl,
-        platformKey,
+        platformKeyArray,
         platformKeyId,
         maxShadows,
         displayName,
