@@ -135,13 +135,21 @@ async fn test_agent_binding_full_flow() {
     // Step 2: Attach custody attestation
     // -----------------------------------------------------------------------
 
-    let attestation = ScpKeyCustodyAttestation {
-        active_key_custody: KeyCustodyModel::HardwareBiometric,
-        agent_key_custody: Some(KeyCustodyModel::Software),
-        platform: Platform::Ios,
-        platform_attestation: None,
-        created_at: 1_700_000_000,
-    };
+    let attestation = ScpKeyCustodyAttestation::new(
+        KeyCustodyModel::HardwareBiometric,
+        Some(KeyCustodyModel::Software),
+        Platform::Ios,
+        None,
+        1_700_000_000,
+    );
+
+    // §27.4.4 clause 2: the declaration names a hardware model and carries no
+    // verified platform proof, so every consumer reads `Software`.
+    assert_eq!(
+        attestation.active_custody_model(),
+        KeyCustodyModel::Software,
+        "an unproven hardware declaration must read as software"
+    );
 
     doc.set_custody_attestation(&attestation)
         .expect("setting custody attestation must succeed");
@@ -724,19 +732,22 @@ fn test_did_document_without_agent_key() {
 /// Custody attestation without agent key custody field.
 #[test]
 fn test_custody_attestation_without_agent() {
-    let attestation = ScpKeyCustodyAttestation {
-        active_key_custody: KeyCustodyModel::Software,
-        agent_key_custody: None,
-        platform: Platform::Desktop,
-        platform_attestation: None,
-        created_at: 1_700_000_000,
-    };
+    let attestation = ScpKeyCustodyAttestation::new(
+        KeyCustodyModel::Software,
+        None,
+        Platform::Desktop,
+        None,
+        1_700_000_000,
+    );
 
     // Verify JSON round-trip.
     let json = serde_json::to_string(&attestation).expect("serialize attestation");
     let deserialized: ScpKeyCustodyAttestation =
         serde_json::from_str(&json).expect("deserialize attestation");
-    assert_eq!(deserialized.active_key_custody, KeyCustodyModel::Software);
-    assert!(deserialized.agent_key_custody.is_none());
+    assert_eq!(
+        deserialized.active_custody_model(),
+        KeyCustodyModel::Software
+    );
+    assert!(deserialized.agent_custody_model().is_none());
     assert_eq!(deserialized.platform, Platform::Desktop);
 }

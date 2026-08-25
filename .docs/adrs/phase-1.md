@@ -1299,7 +1299,7 @@ DidDocument.verification_method = [
 
 3. **Verifier validation.** Network-level enforcement: all conformant verifiers reject Category A actions (DID document modifications) signed by `#agent`. Non-conformant SDKs can produce these signatures, but they cannot propagate through the network. The attempt is both rejected and logged as a custody violation.
 
-4. **Custody attestation.** At identity creation, the DID document includes a `ScpKeyCustodyAttestation` service entry declaring key custody model (`hardware-biometric` vs `software`) with optional platform attestation proof (Apple App Attest / Android Key Attestation). Unambiguous violations (Category A attempts with `#agent`, attestation mismatches with hardware proof) are permanently logged as `ScpCustodyViolationAttestation` records. DID owners can publish counter-attestations for reputation restoration. Absence of attestation is itself a signal.
+4. **Custody attestation.** At identity creation, the DID document includes a `ScpKeyCustodyAttestation` service entry declaring key custody model (`hardware-biometric`, `hardware-pin`, or `software`), and the entry may carry a platform attestation proof (Apple App Attest / Android Key Attestation). §27.4.4 of the attestations spec states what a consumer reads off that declaration; this layer states no reading rule of its own, and the Amendment (2026-08-25) at the end of this ADR records the human ruling §27.4.4 states. Unambiguous violations (Category A attempts with `#agent`, attestation mismatches with hardware proof) are permanently logged as `ScpCustodyViolationAttestation` records. DID owners can publish counter-attestations for reputation restoration. Absence of attestation is itself a signal.
 
 5. **Behavioral signals.** Soft trust signal only — feeds into trust function (§7.1), NOT logged as violations. Timing patterns, usage anomalies, and interaction patterns provide supplementary context for trust evaluation. Explicitly excluded from violation records due to false positive risk.
 
@@ -1387,3 +1387,15 @@ Agent key compromise (most common case — agent runtime is less secure than dev
 18. `CounterAttestation` type for reputation restoration.
 19. All FFI bridges (PyO3, NAPI, UniFFI) expose agent key creation, rotation, and status.
 20. Integration test: create identity with agent key → mint scoped UCAN → join MLS group with agent credential → send message → verify at recipient → rotate agent key → verify credential update.
+
+### Amendment (2026-08-25): an unproven hardware custody declaration reads as software
+
+Alec ruled, verbatim: "either the platform proof is attached and verified, or the custody model reads as software no matter what string was written."
+
+The ruling governs Enforcement Stack layer 4 above, which had called the platform attestation proof optional. The ruling binds because Alec made it, not because of which file records it. §27.4.4 of the attestations spec (`.docs/specs/27-attestations.md`) states it in four clauses and §27.3.4 of the same spec restates it beside the record's construction; open question OQ-38 of that spec asks a human which file finally holds F4's normative text, and the ruling travels with those sections wherever that answer sends them. Layer 4 above now cites those clauses and states no reading rule of its own, so this ADR and the spec cannot drift apart on the rule's wording.
+
+What the clauses settle for this ADR: a `ScpKeyCustodyAttestation` entry declaring `hardware-biometric` or `hardware-pin` for a key raises no consumer's reading of that key's custody above `software` unless the consumer verifies an accompanying platform attestation proof and that verification returns a pass. In every case that pass does not cover, the consumer reads `software`. A declaration of `software` needs no proof.
+
+No SCP implementation verifies a `ScpKeyCustodyAttestation` platform proof today, so every hardware declaration published today reads as `software`. What such a verification would check, and what its pass would establish, are open questions OQ-2, OQ-29, and OQ-51 of the attestations spec.
+
+Layer 4's remaining sentences stand unchanged. This amendment decides what a written hardware declaration is worth; it decides nothing about a DID document that carries no custody entry, and "Absence of attestation is itself a signal" keeps its meaning.

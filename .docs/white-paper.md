@@ -349,7 +349,7 @@ Three permission categories govern what each key can do:
 - **Category B** (user-configurable): Operational actions — messaging, outlet invocation, governance votes. SDK defaults to human-only; the human can delegate subsets to the agent via UCAN.
 - **Category C** (context-configurable): Context governance can further restrict which key types are accepted for specific actions.
 
-The enforcement stack has five layers: custody separation (hardware vs. software keys) → SDK defaults (conservative) → verifier validation (signing key checks) → custody attestation (DID document service entry declaring key custody model) → behavioral signals (participation history by key type).
+The enforcement stack has five layers: custody separation (hardware vs. software keys) → SDK defaults (conservative) → verifier validation (signing key checks) → custody attestation (a DID document service entry declaring a key custody model, which a reader treats as software custody unless the reader verifies an accompanying platform attestation proof) → behavioral signals (participation history by key type).
 
 ### 4.5 Identity Attestations
 
