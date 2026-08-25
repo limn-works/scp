@@ -602,13 +602,13 @@
       "gate": "gate-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "pending",
       "files": [
         "crates/scp-core/src/identity/mod.rs",
         "crates/scp-core/src/identity/dht.rs",
         "crates/scp-core/src/identity/document.rs"
       ],
-      "description": "Implement did:dht as scp-core/identity/. The identity module handles DID creation, verification, and DID document management. did:dht uses the BitTorrent Mainline DHT for resolution. The DID string is the z-base-32 encoding of the Ed25519 public key, making it self-certifying. The module abstracts the DID method behind a DidMethod trait so a contingency did:web fallback could be swapped in without changing calling code.",
+      "description": "Implement did:dht as scp-core/identity/. The identity module handles DID creation, verification, and DID document management. did:dht uses the BitTorrent Mainline DHT for resolution. The DID string is the z-base-32 encoding of the Ed25519 public key, making it self-certifying. The module abstracts the DID method behind a DidMethod trait so a contingency did:web fallback could be swapped in without changing calling code. §18.2.2A of the addressability spec now gives each layer its own encoding: the relay layer carries the full W3C document as RFC 8785 canonical JSON, and Mainline carries the did:dht DNS packet holding the bootstrap core (§18.2.2C). This story previously built one W3C JSON-LD document and serialized it with serde_json::to_string_pretty, which DidDocument::to_json still calls. The tree carries neither the canonical-JSON serializer nor the DNS-packet encoder, so the two-encoding amendment to §3.10.5 and ADR-003 returned this status to pending. Everything else this story delivered remains in the tree and needs no rebuild: the DidMethod trait with its create and verify methods, the DidDht struct that implements it, and the ScpIdentity struct.",
       "acceptanceCriteria": [
         "create_identity(key_custody) -> Identity generates three keypairs via key_custody: Identity Key (Ed25519, derives DID string, highest-security custody), Active Signing Key (Ed25519, used for MLS/envelopes/UCANs, rotatable), Pre-Rotation Key (Ed25519, cold/offline custody, generates pre-rotation commitment SHA-256(pre_rotation_key.public))",
         "create_identity derives did:dht identifier: did:dht: + z-base-32 encoding of Identity Key's public key",
@@ -717,7 +717,7 @@
         "cacheStrategy": "Resolution cache — TTL-based, 24h active / 7d inactive refresh, BEP44 sequence number comparison for staleness",
         "stalenessIndicator": "When resolve_did returns a cached result not refreshed within expected republish window (2 hours + 30 minute grace), result includes staleness indicator. Callers SHOULD treat stale results as valid but degraded. Critical operations (UCAN validation, MLS credential verification) SHOULD attempt fresh DHT resolution before rejecting stale result."
       },
-      "result": "Implemented DID publish/resolve with BEP44 signing, DhtClient trait abstraction, InMemoryDhtClient for testing, DidCache with TTL-based staleness detection (24h active/7d inactive), RepublishManager with exponential backoff. 40 new tests."
+      "result": "Implemented DID publish/resolve with BEP44 signing, DhtClient trait abstraction, InMemoryDhtClient for testing, DidCache with TTL-based staleness detection (24h active/7d inactive), RepublishManager with exponential backoff. 40 new tests. Superseded in part: that work published the full JSON document to Mainline as the single encoding, which §3.10.5 no longer permits."
     },
     {
       "id": "SCP-008",
@@ -725,12 +725,12 @@
       "gate": "gate-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "pending",
       "files": [
         "crates/scp-core/src/identity/dht.rs",
         "crates/scp-core/src/identity/document.rs"
       ],
-      "description": "Implement the three-layer key rotation architecture for did:dht. Layer 1 (rotate_active_key) is the common case — rotates the Active Signing Key while preserving the DID string. Layer 2 (migrate_identity) is rare planned migration to a new DID. Layer 3 (verify_migration) verifies migration proofs. did:dht's Identity Key is non-rotatable (DID string bound to initial public key), so SCP separates Identity Key from Active Signing Key.",
+      "description": "Implement the three-layer key rotation architecture for did:dht. Layer 1 (rotate_active_key) is the common case — rotates the Active Signing Key while preserving the DID string. Layer 2 (migrate_identity) is rare planned migration to a new DID. Layer 3 (verify_migration) verifies migration proofs. did:dht's Identity Key is non-rotatable (DID string bound to initial public key), so SCP separates Identity Key from Active Signing Key. §3.10.5 of the identity spec now requires every DID document create or update to reach both layers, each in its own encoding under its own signature and its own sequence number, so rotate_active_key and migrate_identity must publish to SCP relays as well as to Mainline. Both functions publish only through publish_document, which writes the full JSON document to Mainline alone, and RepublishManager::with_relay_publisher is called only from that crate's own test module, so no production path reaches a relay. The two-encoding amendment to §3.10.5 and ADR-003 returned this status to pending. verify_migration and the proof structs this story delivered are unaffected and need no rebuild.",
       "acceptanceCriteria": [
         "rotate_active_key(identity, key_custody) -> Identity generates new Ed25519 keypair as new Active Signing Key",
         "rotate_active_key updates DID document: adds new key as verification method, moves authentication and assertionMethod references to new key, retains old key as #retired-{sequence}",
@@ -781,7 +781,7 @@
         "postRotationRequirements": "After rotation, the caller MUST issue MLS Update proposals in all active contexts (PCS, spec §9.7.3) and revoke/reissue UCAN tokens signed by the old active key.",
         "threeLayerSummary": "Layer 1 (rotate_active_key): common case, DID string unchanged. Layer 2 (migrate_identity): rare planned migration, DID string changes. Layer 3 (verify_migration): verification of migration proofs."
       },
-      "result": "Three-layer key rotation: rotate_active_key, migrate_identity, verify_migration. 28 new tests. All passing."
+      "result": "Three-layer key rotation: rotate_active_key, migrate_identity, verify_migration. 28 new tests. All passing. Superseded in part: that work published one encoding to Mainline alone, which §3.10.5 no longer permits, so the relay-layer publish that rotate_active_key and migrate_identity now owe is unbuilt."
     },
     {
       "id": "SCP-009",
