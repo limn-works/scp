@@ -409,6 +409,10 @@ The `allow_unencrypted_storage` feature flag in `scp-core` exposes `ProtocolRepo
 
 Production code (FFI bridges, application nodes, SDK wrappers) must NOT enable this feature. If a production backend does not natively encrypt, wrap it in `EncryptingAdapter` instead.
 
+`scripts/check-shipped-feature-graph.sh` enforces that prohibition mechanically. It resolves each shipped artifact's complete SCP-crate feature set with dev-dependencies excluded, and fails when that set contains any feature its allowlist omits. That allowlist omits `scp-core/allow_unencrypted_storage`, `scp-node/allow_unencrypted_storage`, and `scp-runtime/allow_unencrypted_storage`, and that gate's `assert_allowlist_has_no_nullifier` fixture fails when an edit adds one of those three names back.
+
+Per-package resolution alone does not settle a shipped binary's contents, because cargo's resolver 2 unifies normal-dependency features per invocation rather than per package. A command that builds several workspace members at once resolves a union no per-package check inspects. `crates/scp-testing` carries `testing` and `allow_unencrypted_storage` on normal dependency edges, so a workspace-wide `cargo build` once compiled `ProtocolRepository::new_for_testing` into every FFI bridge cdylib. Two mechanisms close that path: root `Cargo.toml` omits `crates/scp-testing` from `default-members`, and the gate resolves a bare `cargo build` at that root as a sixth artifact, so a member that unifies a nullifier into its siblings fails. A shipped artifact therefore compiles no `ProtocolRepository::new_for_testing` at all, because a `cfg` that admits it is off.
+
 The `Storage` trait operates on opaque bytes. Platform-specific encryption happens below:
 
 | Platform | Mechanism | Notes |

@@ -9,20 +9,24 @@
 # scp-relay binaries), the COMPLETE resolved feature set of the SCP
 # workspace crates is a SUBSET of a single explicit permitted-production allowlist
 # (one superset list covering all five artifacts) permitting durability-only +
-# real-backend features — with one disclosed confidentiality-nullifier residue
-# (the three `scp-*/allow_unencrypted_storage` entries, tracked for removal in
-# Track B / #2292; full statement in ADR-062 §Status). Any resolved SCP-crate
-# feature that is NOT on the allowlist — named or novel, present or future —
-# FAILS the gate. The gate's TARGET soundness invariant — shipped-graph
+# real-backend features and ZERO nullifier features. Any resolved SCP-crate
+# feature that is NOT on this allowlist — named or novel, present or future —
+# FAILS this gate. This gate's soundness invariant — shipped-graph
 # feature-absence ≡ nullifier-type absence — holds for every `testing`-gated
 # nullifier double (`InMemoryKeyCustody` / `InMemoryDeviceAttestation` /
-# `InMemoryPreRotationCustody` / `InMemoryDhtClient` and the `did:key` test
+# `InMemoryPreRotationCustody` / `InMemoryDhtClient` and a `did:key` test
 # method, each gated behind a `testing` feature of scp-platform / scp-dht /
-# scp-did / scp-core / scp-protocol / scp-runtime / scp-mls or the `scp-testing`
-# crate, none of which the whitelist admits — so an absent gating feature means
-# the nullifier cannot be compiled in), but is NOT YET fully achieved while the
-# disclosed `allow_unencrypted_storage` residue remains on the allowlist
-# (see ADR-062 §Status / #2292).
+# scp-did / scp-core / scp-protocol / scp-runtime / scp-mls or behind an
+# `scp-testing` crate, none of which this whitelist admits — so an absent gating
+# feature means a nullifier cannot be compiled in), and it holds equally for
+# `allow_unencrypted_storage`, which gates
+# `ProtocolRepository::new_for_testing` (a constructor accepting any `Storage`,
+# unsealing an `EncryptedStorage` bound that `ProtocolRepository::new` requires).
+# Three `scp-*/allow_unencrypted_storage` rows sat on this allowlist until four
+# shipped FFI-bridge `scp-node` dependency edges that resolved them were removed;
+# `NULLIFIER_CONTROL_FEATURES` now names all three, so an
+# `assert_allowlist_has_no_nullifier` fixture rejects any edit that puts them
+# back.
 #
 # WHY A CLOSED ⊆-WHITELIST, NOT A DENYLIST
 # ----------------------------------------
@@ -54,17 +58,23 @@ cd "$REPO_ROOT"
 # Single permitted-production allowlist (EXPLICIT — the whitelist).
 #
 # Durability-only (SCP-CAPSEL-8010/8011) + real-backend features. ZERO nullifier
-# features is the design mandate (ADR-062 §Decision 6; PR #2132); the one
-# disclosed `allow_unencrypted_storage` residue (the three `scp-*/...` entries
-# below) is single-sourced in ADR-062 §Status / #2292 — see there for the full
-# classification. The `assert_allowlist_has_no_nullifier` self-test enforces that
-# no NULLIFIER_CONTROL_FEATURES entry is added, so a future edit cannot quietly
-# add a *new* nullifier exception.
+# features is a design mandate (ADR-062 §Decision 6; PR #2132), and this list now
+# carries zero — no exceptions, no disclosed residue. An
+# `assert_allowlist_has_no_nullifier` self-test enforces that no
+# NULLIFIER_CONTROL_FEATURES entry is added, so a future edit cannot quietly add
+# a nullifier exception.
 #
 # `scp-platform/in-memory-push` is an intentionally-permitted, currently-unused
 # durability-only entry: no shipped artifact resolves it today, but a superset
 # allowlist may carry permitted-but-unresolved rows (it is durability-only, not a
 # nullifier, so its presence widens nothing that matters).
+#
+# `scp-platform/filesystem` was such a row until three FFI bridges stopped
+# depending on it: `start_node_local` no longer opens a plaintext
+# `FilesystemStorage` under its data directory, so no shipped artifact resolves
+# that feature. Its row is dropped rather than kept, because keeping it would let
+# a future dependency edge pull plaintext key-per-file storage back into a
+# shipped graph with no gate failure to announce it.
 #
 # Five artifacts are gated: the three shipped FFI bridges (built
 # `--no-default-features --features server`) plus the scp-node and scp-relay
@@ -76,8 +86,8 @@ cd "$REPO_ROOT"
 # this allowlist is the hand-maintained set of what is PERMITTED.
 # ---------------------------------------------------------------------------
 PERMITTED_ALLOWLIST="$(cat <<'EOF'
+scp-client/default
 scp-clock/default
-scp-core/allow_unencrypted_storage
 scp-core/default
 scp-crypto/default
 scp-dht/default
@@ -92,19 +102,16 @@ scp-identity/production-dht
 scp-mcp/default
 scp-media/default
 scp-mls/default
-scp-node/allow_unencrypted_storage
 scp-node/default
 scp-platform/default
 scp-platform/encrypting
 scp-platform/file
-scp-platform/filesystem
 scp-platform/in-memory-push
 scp-platform/in-memory-storage
 scp-platform/software_platform
 scp-platform/sqlite
 scp-protocol/default
 scp-relay-client/default
-scp-runtime/allow_unencrypted_storage
 scp-runtime/default
 scp-transport/default
 scp-transport/postgres-blob
@@ -129,11 +136,21 @@ EOF
 #
 # DRIFT CAVEAT: each entry's build-invocation string above MUST be kept in
 # lockstep with the actual shipped build config — the Dockerfile
-# `cargo build --release -p scp-relay -p scp-node` and the
-# `.github/workflows/release.yml` `cargo publish` steps. This gate checks the
-# feature config NAMED HERE, not whatever those workflows actually build; if the
-# two drift apart, coverage silently narrows (an artifact would be gated in a
-# config it no longer ships).
+# `cargo build --release -p scp-relay -p scp-node`, a
+# `.github/workflows/release.yml` `cargo publish` step, `maturin`'s
+# `--manifest-path crates/scp-ffi/Cargo.toml` wheel build (which keeps default
+# features and adds `extension-module`, a pyo3-only feature that changes no
+# SCP-crate edge, so it resolves an `scp-ffi` set named below), and a
+# `.github/workflows/build-matrix.yml` "Build shipped bridge artifacts" step,
+# which builds one package per invocation into `target-shipped` so its uploaded
+# cdylibs resolve those same per-package sets these entries name. This gate
+# checks a feature config NAMED HERE, not whatever those workflows actually
+# build; when those two drift apart, coverage silently narrows (an artifact
+# would be gated in a config it no longer ships). One drift class is covered
+# mechanically rather than
+# by this caveat: a `default-members` check in `run_gate` resolves a bare
+# `cargo build` at this root, so a member that unifies a nullifier into its
+# siblings fails whether or not anyone updates this comment.
 #
 # uniffi-bindgen (the third workspace `[[bin]]`, in `crates/scp-ffi/uniffi`) is
 # deliberately NOT a separate ARTIFACTS entry: it is a build-time code-generation
@@ -160,7 +177,18 @@ NULLIFIER_CONTROL_FEATURES=(
   "scp-protocol/testing"
   "scp-runtime/testing"
   "scp-mls/testing"
+  "scp-client/testing"
+  "scp-client-wasm/testing"
   "scp-testing"
+  # `allow_unencrypted_storage` gates `ProtocolRepository::new_for_testing`,
+  # which takes any `Storage` where `ProtocolRepository::new` demands a sealed
+  # `EncryptedStorage` bound, so this feature unseals encryption at rest — a
+  # confidentiality nullifier, not a durability-only capability (spec §17.17.2).
+  # Each of three crates re-exports one gate down one dependency chain
+  # (scp-core → scp-runtime; scp-node → scp-core), so all three names appear.
+  "scp-core/allow_unencrypted_storage"
+  "scp-node/allow_unencrypted_storage"
+  "scp-runtime/allow_unencrypted_storage"
 )
 
 # ---------------------------------------------------------------------------
@@ -258,6 +286,61 @@ resolution_is_nonempty() {
 }
 
 # ---------------------------------------------------------------------------
+# resolve_default_members_features
+#   Emit a COMPLETE resolved SCP-crate feature set for a bare `cargo build` at
+#   this workspace root — no `-p`, so cargo resolves `[workspace] default-members`
+#   and unifies normal-dependency features across every package on that list.
+#
+#   WHY THIS EXISTS SEPARATELY FROM resolve_scp_features
+#   ---------------------------------------------------
+#   Every per-artifact entry above models `cargo build -p <package>`. Resolver 2
+#   unifies normal-dependency features per INVOCATION, not per package, so a
+#   command that builds several members at once resolves a UNION none of those
+#   per-package checks sees. `.github/workflows/build-matrix.yml` runs exactly
+#   such a bare `cargo build --release --target <triple>` and uploads each FFI
+#   bridge cdylib it produces, and `.github/workflows/release.yml`
+#   Authenticode-signs those DLLs — so a member carrying a test-harness feature
+#   on a normal dependency edge would ship a nullifier through a signed binary
+#   while all five per-artifact checks stayed green.
+#
+#   `crates/scp-testing` is such a member: its `helpers.rs` names in-memory
+#   doubles at lib level, so `scp-core/testing`, `scp-platform/testing`,
+#   `scp-dht/testing`, and `allow_unencrypted_storage` sit on its NORMAL edges.
+#   Root `Cargo.toml` therefore omits it from `default-members`, and this check
+#   is what keeps that omission true.
+# ---------------------------------------------------------------------------
+resolve_default_members_features() {
+  local raw rc
+  raw="$(cargo tree -e features,no-dev 2>&1)"; rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    { echo "cargo tree failed for a bare default-members resolution:"
+      printf '%s\n' "$raw"; } >&2
+    return 1
+  fi
+  printf '%s\n' "$raw" \
+    | grep -oE 'scp-[a-z0-9-]+ feature "[^"]+"' \
+    | sed -E 's/ feature "/\//; s/"$//' \
+    | sort -u
+}
+
+# resolve_default_members_testing_crate
+#   Emit "scp-testing" iff a bare default-members build pulls that crate. Mirrors
+#   resolve_scp_testing_crate, which probes CRATE-NODE presence rather than
+#   feature edges, and catches a `scp-testing` pulled with no enabled features.
+resolve_default_members_testing_crate() {
+  local raw rc
+  raw="$(cargo tree -e no-dev 2>&1)"; rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    { echo "cargo tree (scp-testing probe) failed for a bare default-members resolution:"
+      printf '%s\n' "$raw"; } >&2
+    return 1
+  fi
+  if printf '%s\n' "$raw" | grep -qE '(^|[^a-z-])scp-testing v'; then
+    echo "scp-testing"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Real gate.
 # ---------------------------------------------------------------------------
 run_gate() {
@@ -305,10 +388,43 @@ run_gate() {
       echo "   These are test-harness / nullifier features that must NOT reach a"
       echo "   shipped artifact. A shipped build carries only durability-only +"
       echo "   real-backend features (ADR-062 §Decision 6; ZERO-nullifier mandate,"
-      echo "   modulo the disclosed \`allow_unencrypted_storage\` residue — §Status / #2292)."
+      echo "   zero nullifier exceptions)."
       failures=$((failures + 1))
     fi
   done
+
+  # A bare workspace build — one `.github/workflows/build-matrix.yml` runs
+  # and uploads bridge cdylibs from. Resolver 2 unifies normal-dependency
+  # features across every default member, so this union can carry a nullifier no
+  # per-artifact check above would see.
+  echo ">> default-members  (bare \`cargo build\` at this workspace root)"
+  local dm_resolved dm_offenders dm_testing
+  if ! dm_resolved="$(resolve_default_members_features)" \
+      || ! resolution_is_nonempty "$dm_resolved"; then
+    echo "   FAIL — resolved SCP-crate feature set is EMPTY (cargo resolution"
+    echo "          failed). A default-members build legitimately resolves a"
+    echo "          NON-EMPTY set; refusing to treat an empty resolution as"
+    echo "          'empty ⊆ allowlist' PASS."
+    failures=$((failures + 1))
+  elif ! dm_testing="$(resolve_default_members_testing_crate)"; then
+    echo "   FAIL — scp-testing presence probe failed (cargo resolution error);"
+    echo "          refusing to read a probe failure as 'no nullifier crate present'."
+    failures=$((failures + 1))
+  else
+    [[ -n "$dm_testing" ]] && dm_resolved="$(printf '%s\n%s' "$dm_resolved" "$dm_testing")"
+    if dm_offenders="$(check_subset "$dm_resolved" "$PERMITTED_ALLOWLIST")"; then
+      echo "   OK — resolved SCP-crate feature set ⊆ permitted-production allowlist"
+    else
+      echo "   FAIL — a bare workspace build resolves features NOT on a"
+      echo "   permitted-production allowlist:"
+      printf '%s\n' "$dm_offenders" | sed 's/^/       ✗ /'
+      echo "   Resolver 2 unified them from a default member's NORMAL dependency"
+      echo "   edge. Move that edge to [dev-dependencies], or drop that member"
+      echo "   from \`default-members\` in a root Cargo.toml — do NOT add that"
+      echo "   feature to this allowlist."
+      failures=$((failures + 1))
+    fi
+  fi
   return "$failures"
 }
 
@@ -328,7 +444,7 @@ expect() { # <label> <expected: PASS|FAIL> <actual-rc>
 }
 
 assert_allowlist_has_no_nullifier() {
-  echo ">> fixture: allowlist carries ZERO enumerated control-nullifier features — no NULLIFIER_CONTROL_FEATURES entry (custody/attestation/DHT/did:key/test-harness double) appears (AC7); disclosed allow_unencrypted_storage residue tracked in §Status / #2292"
+  echo ">> fixture: allowlist carries ZERO enumerated control-nullifier features — no NULLIFIER_CONTROL_FEATURES entry (custody/attestation/DHT/did:key/test-harness double, or an allow_unencrypted_storage encryption-at-rest unseal) appears (AC7)"
   local nf
   for nf in "${NULLIFIER_CONTROL_FEATURES[@]}"; do
     if printf '%s\n' "$PERMITTED_ALLOWLIST" | grep -qxF "$nf"; then
@@ -336,7 +452,7 @@ assert_allowlist_has_no_nullifier() {
       fixture_failures=$((fixture_failures + 1))
     fi
   done
-  echo "   ok   — no custody/attestation/DHT/did:key/test-harness nullifier control-feature appears on the allowlist"
+  echo "   ok   — no custody/attestation/DHT/did:key/test-harness/encryption-at-rest-unseal nullifier control-feature appears on this allowlist"
 }
 
 run_fixtures() {
@@ -363,15 +479,20 @@ run_fixtures() {
   check_subset "$PERMITTED_ALLOWLIST" "$trimmed" >/dev/null 2>&1; rc=$?
   expect "(b) allowlist omitting a resolved feature is REJECTED" "FAIL" "$rc"
 
-  # (AC8 soundness) A synthetic consumer whose graph carries a `testing` nullifier
-  #     feature (e.g. a mis-wired bridge, or a future consumer that fails to keep
-  #     the nullifier behind dev-deps) → REJECTED, because no `testing` feature is
-  #     on the durability-only + real-backend allowlist. This is the gate's TARGET
-  #     feature-absence ≡ nullifier-absence invariant — fully held for the testing
-  #     nullifiers, with the disclosed `allow_unencrypted_storage` residue the one
-  #     outstanding gap (§Status / #2292).
+  # (AC8 soundness) A synthetic consumer whose graph carries a nullifier feature
+  #     (e.g. a mis-wired bridge, or a future consumer that fails to keep a
+  #     nullifier behind dev-deps) → REJECTED, because a durability-only +
+  #     real-backend allowlist admits no `testing` feature and no
+  #     `allow_unencrypted_storage` feature. That is this gate's
+  #     feature-absence ≡ nullifier-absence invariant, and it now holds for an
+  #     encryption-at-rest unseal as well as for testing doubles: a shipped
+  #     artifact that resolved `scp-runtime/allow_unencrypted_storage` would
+  #     compile `ProtocolRepository::new_for_testing`, and this fixture proves
+  #     that a ⊆ check rejects such a resolved set.
   local nf leaked
-  for nf in "scp-platform/testing" "scp-dht/testing" "scp-did/testing" "scp-testing"; do
+  for nf in "scp-platform/testing" "scp-dht/testing" "scp-did/testing" "scp-testing" \
+            "scp-core/allow_unencrypted_storage" "scp-node/allow_unencrypted_storage" \
+            "scp-runtime/allow_unencrypted_storage"; do
     leaked="$(printf '%s\n%s' "$PERMITTED_ALLOWLIST" "$nf")"
     check_subset "$leaked" "$PERMITTED_ALLOWLIST" >/dev/null 2>&1; rc=$?
     expect "(soundness) leaked nullifier feature '$nf' is REJECTED" "FAIL" "$rc"
@@ -411,7 +532,7 @@ main() {
   echo
   if run_gate; then
     echo
-    echo "G1 PASSED: every shipped artifact's SCP-crate feature set ⊆ the permitted-production allowlist (durability-only + real-backend, plus the disclosed \`allow_unencrypted_storage\` residue — §Status / #2292)."
+    echo "G1 PASSED: every shipped artifact's SCP-crate feature set ⊆ this permitted-production allowlist (durability-only + real-backend, zero nullifier exceptions)."
     exit 0
   fi
   echo

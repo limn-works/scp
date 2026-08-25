@@ -1490,12 +1490,26 @@ impl<S: Storage> ApplicationNode<S> {
 /// Pkarr client, or [`DhtMode::Disabled`](crate::DhtMode::Disabled) via
 /// `host_site` for a non-publishing node.
 #[cfg(any(test, feature = "testing"))]
-impl ApplicationNode<scp_platform::in_memory::InMemoryStorage> {
+impl
+    ApplicationNode<
+        Arc<
+            scp_platform::encrypting_adapter::EncryptingAdapter<
+                scp_platform::in_memory::InMemoryStorage,
+            >,
+        >,
+    >
+{
     /// Creates an `ApplicationNode` with sensible development defaults.
     ///
     /// Auto-wires:
     /// - [`InMemoryKeyCustody`](scp_platform::testing::InMemoryKeyCustody)
-    /// - [`InMemoryStorage`](scp_platform::in_memory::InMemoryStorage)
+    /// - [`InMemoryStorage`](scp_platform::in_memory::InMemoryStorage) wrapped in
+    ///   [`EncryptingAdapter`](scp_platform::encrypting_adapter::EncryptingAdapter)
+    ///   under a fresh `OsRng` AES-256-GCM key, so this constructor satisfies a
+    ///   production [`Node::start`](crate::Node::start) `EncryptedStorage` bound
+    ///   (spec §17.5 canonical usage pattern). An `Arc` around that adapter
+    ///   matches a handle shape a bridge instance holds, so an FFI caller places
+    ///   a `dev` node and a caller-supplied-storage node in one enum variant.
     /// - [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) (no real DHT network)
     /// - [`SelfSignedTlsProvider`] (self-signed TLS certificate for `localhost`)
     /// - Relay bound to `127.0.0.1:<port>`
@@ -1525,8 +1539,10 @@ impl ApplicationNode<scp_platform::in_memory::InMemoryStorage> {
         use scp_dht::InMemoryDhtClient;
         use scp_identity::DidCache;
         use scp_identity::dht::DidDht;
+        use scp_platform::encrypting_adapter::EncryptingAdapter;
         use scp_platform::in_memory::InMemoryStorage;
         use scp_platform::testing::InMemoryKeyCustody;
+        use zeroize::Zeroizing;
 
         type DevDidDht = DidDht<InMemoryDhtClient, SystemClock>;
 
@@ -1544,7 +1560,16 @@ impl ApplicationNode<scp_platform::in_memory::InMemoryStorage> {
         // byte-identical self-signed provider for the `Domain` reach. `Domain`
         // is a publishing reach, so M2 requires `DhtMode::Production`
         // (advisory in P1 — the in-memory DHT client publishes nothing).
-        Node::start_for_testing(NodeConfig {
+        //
+        // Storage goes through a production `Node::start` front door: an
+        // ephemeral `InMemoryStorage` is wrapped in `EncryptingAdapter` under a
+        // fresh `OsRng` AES-256-GCM key, which satisfies a sealed
+        // `EncryptedStorage` bound (spec §17.5). `dev` is a *DHT/custody*
+        // test-harness affordance, not a storage-encryption one — it has no
+        // reason to reach for `start_for_testing`.
+        let mut storage_key = Zeroizing::new([0u8; 32]);
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *storage_key);
+        Node::start(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], port))),
             dht: DhtMode::Production,
             ..NodeConfig::defaults(
@@ -1555,7 +1580,7 @@ impl ApplicationNode<scp_platform::in_memory::InMemoryStorage> {
                     custody,
                     did_method,
                 },
-                InMemoryStorage::new(),
+                Arc::new(EncryptingAdapter::new(InMemoryStorage::new(), storage_key)),
                 // Durability-only blob arm, selected explicitly — `dev()` is a
                 // documented dev/prototyping affordance (SCP-CAPINJECT-010).
                 BlobStorageBackend::in_memory(),

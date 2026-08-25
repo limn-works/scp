@@ -3,6 +3,10 @@
 
 # Rust
 target/
+# `.github/workflows/build-matrix.yml` builds each uploaded bridge binary here,
+# one package per invocation, so no `cargo test` step overwrites an artifact a
+# release job then Authenticode-signs.
+target-shipped/
 rust_out
 
 # Python
