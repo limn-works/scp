@@ -41,7 +41,7 @@ use scp_protocol::envelope::inner::{
 };
 use scp_protocol::trust::{
     ActionCategory, CounterAttestation, CustodyViolationType, ScpCustodyViolationAttestation,
-    classify_action, enforce_category_a,
+    VerifiedCounterAttestation, VerifiedCustodyViolation, classify_action, enforce_category_a,
 };
 use scp_runtime::crypto::ucan::mint::{MintParams, mint_ucan};
 use scp_runtime::envelope::inner::sign::create_inner_envelope;
@@ -392,20 +392,43 @@ async fn test_agent_binding_full_flow() {
     // Step 8: Counter-attestation for reputation restoration
     // -----------------------------------------------------------------------
 
-    let counter = CounterAttestation {
-        subject_did: DID(did.clone()),
-        violation_reference: "sha256:abc123def456".to_owned(),
-        explanation: "Agent key was compromised; key has been rotated.".to_owned(),
-        timestamp: 1_700_001_000,
-        signature: active_sk
+    // Spec section §9.5.2 derives `violation_reference` from a contested
+    // record, so build that record and let `referencing` compute a reference
+    // rather than inventing an identifier no verifier can recompute.
+    let contested = ScpCustodyViolationAttestation::new(
+        DID(did.clone()),
+        1_700_000_500,
+        CustodyViolationType::CategoryAViolation {
+            action: "did_document_update".to_owned(),
+            signer_key_id: SigningKeyId::Agent,
+            signature_evidence: vec![9, 9, 9, 9],
+        },
+        vec![8, 8, 8, 8],
+        DID("did:dht:z6MkVerifier".to_owned()),
+    )
+    .expect("a well-formed violation record must build");
+
+    let counter = CounterAttestation::referencing(
+        &contested,
+        "Agent key was compromised; key has been rotated.".to_owned(),
+        1_700_001_000,
+        active_sk
             .sign(b"counter-attestation-payload")
             .to_bytes()
             .to_vec(),
-    };
+    )
+    .expect("a counter-attestation with well-formed fields must build");
 
+    assert_eq!(
+        counter.violation_reference,
+        contested
+            .signing_hash()
+            .expect("a violation record must produce a signing hash"),
+        "a counter-claim's reference equals a contested record's signing hash"
+    );
     assert!(
-        counter.validate().is_ok(),
-        "counter-attestation with valid fields must pass validation"
+        counter.validate_field_shape().is_ok(),
+        "counter-attestation with well-formed fields must pass a shape check"
     );
 }
 
@@ -598,35 +621,54 @@ fn test_custody_violation_attestation_construction() {
     }
 }
 
-/// `CounterAttestation` validation rejects empty fields.
+/// `CounterAttestation` shape checking rejects empty fields, and a 32-byte
+/// `violation_reference` removes an empty-reference case a free-form string
+/// used to admit.
 #[test]
 fn test_counter_attestation_validation() {
     let (_, sk) = test_keypair();
     let sig = sk.sign(b"test").to_bytes().to_vec();
 
-    // Valid counter-attestation.
-    let valid = CounterAttestation {
-        subject_did: DID("did:dht:z6MkTest".to_owned()),
-        violation_reference: "sha256:abc".to_owned(),
-        explanation: "Key compromised and rotated.".to_owned(),
-        timestamp: 1_700_000_000,
-        signature: sig,
-    };
-    assert!(valid.validate().is_ok());
+    let contested = ScpCustodyViolationAttestation::new(
+        DID("did:dht:z6MkTest".to_owned()),
+        1_699_999_000,
+        CustodyViolationType::CategoryAViolation {
+            action: "did_document_update".to_owned(),
+            signer_key_id: SigningKeyId::Agent,
+            signature_evidence: vec![4, 4, 4, 4],
+        },
+        vec![3, 3, 3, 3],
+        DID("did:dht:z6MkVerifier".to_owned()),
+    )
+    .expect("a well-formed violation record must build");
 
-    // Empty violation_reference must fail.
-    let empty_ref = CounterAttestation {
-        violation_reference: String::new(),
-        ..valid.clone()
-    };
-    assert!(empty_ref.validate().is_err());
+    // Well-formed counter-attestation.
+    let valid = CounterAttestation::referencing(
+        &contested,
+        "Key compromised and rotated.".to_owned(),
+        1_700_000_000,
+        sig.clone(),
+    )
+    .expect("well-formed fields must build");
+    assert!(valid.validate_field_shape().is_ok());
 
-    // Empty explanation must fail.
-    let empty_expl = CounterAttestation {
-        explanation: String::new(),
-        ..valid
-    };
-    assert!(empty_expl.validate().is_err());
+    // An empty explanation must fail.
+    assert!(
+        CounterAttestation::referencing(&contested, String::new(), 1_700_000_000, sig).is_err(),
+        "an empty explanation must be rejected"
+    );
+
+    // An empty signature must fail.
+    assert!(
+        CounterAttestation::referencing(
+            &contested,
+            "Key compromised and rotated.".to_owned(),
+            1_700_000_000,
+            Vec::new(),
+        )
+        .is_err(),
+        "an empty signature must be rejected"
+    );
 }
 
 /// `SigningKeyId` serialization round-trip (JSON).
@@ -697,4 +739,243 @@ fn test_custody_attestation_without_agent() {
     assert_eq!(deserialized.active_key_custody, KeyCustodyModel::Software);
     assert!(deserialized.agent_key_custody.is_none());
     assert_eq!(deserialized.platform, Platform::Desktop);
+}
+
+// ---------------------------------------------------------------------------
+// Custody-violation records verified against a DID document (§9.5.2, §25.25)
+// ---------------------------------------------------------------------------
+
+/// Builds a DID document carrying `#0`, `#active`, and `#agent`, and returns it
+/// with the `#active` and `#agent` signing keys.
+fn did_document_with_active_and_agent() -> (
+    String,
+    DidDocument,
+    ed25519_dalek::SigningKey,
+    ed25519_dalek::SigningKey,
+) {
+    use sha2::{Digest, Sha256};
+
+    let (identity_vk, _identity_sk) = test_keypair();
+    let (active_vk, active_sk) = test_keypair();
+    let (agent_vk, agent_sk) = test_keypair();
+    let did = did_from_pubkey(&identity_vk);
+    let (next_vk, _) = test_keypair();
+    let pre_rotation_commitment: [u8; 32] = Sha256::digest(next_vk.as_bytes()).into();
+
+    let doc = DidDocument::new_with_agent_key(
+        &did,
+        identity_vk.as_bytes(),
+        active_vk.as_bytes(),
+        &pre_rotation_commitment,
+        Some(agent_vk.as_bytes()),
+    );
+
+    (did, doc, active_sk, agent_sk)
+}
+
+/// Reads the raw Ed25519 public key of `fragment` out of `doc`.
+fn public_key_from_document(doc: &DidDocument, fragment: &str) -> Vec<u8> {
+    let vm = doc
+        .verification_method_by_fragment(fragment)
+        .unwrap_or_else(|| panic!("DID document must carry #{fragment}"));
+    decode_multibase_key(&vm.public_key_multibase)
+}
+
+/// A verifier signs a violation record, and a reader that resolves that
+/// verifier's DID document accepts the record under the key the document
+/// publishes.
+///
+/// ADR-039 enforcement-stack layer 4 makes this record a permanent accusation
+/// one verifier writes about a subject, so a reader must be able to establish
+/// which verifier wrote it. Spec section §9.5.2 of
+/// `.docs/specs/09-security-model.md` fixes the seven-field preimage this
+/// signature covers.
+#[test]
+fn violation_signature_verifies_under_the_verifier_did_document_key() {
+    let (subject_did, _subject_doc, _subject_active, subject_agent) =
+        did_document_with_active_and_agent();
+    let (verifier_did, verifier_doc, verifier_active, _verifier_agent) =
+        did_document_with_active_and_agent();
+
+    let offending_signature = subject_agent
+        .sign(b"did_document_update")
+        .to_bytes()
+        .to_vec();
+    let mut record = ScpCustodyViolationAttestation {
+        subject_did: DID(subject_did),
+        timestamp: 1_700_000_000,
+        violation: CustodyViolationType::CategoryAViolation {
+            action: "did_document_update".to_owned(),
+            signer_key_id: SigningKeyId::Agent,
+            signature_evidence: offending_signature,
+        },
+        verifier_signature: vec![0u8; 64],
+        verifier_did: DID(verifier_did),
+    };
+    record.verifier_signature = verifier_active
+        .sign(&record.signing_hash().expect("a record must hash"))
+        .to_bytes()
+        .to_vec();
+
+    let published_key = public_key_from_document(&verifier_doc, "active");
+    let verified = VerifiedCustodyViolation::verify(record.clone(), &published_key)
+        .expect("a record signs under the key its verifier's DID document publishes");
+    assert_eq!(verified.record(), &record);
+
+    // The same document's #agent key is a different key, so it rejects.
+    let agent_key = public_key_from_document(&verifier_doc, "agent");
+    assert!(
+        VerifiedCustodyViolation::verify(record.clone(), &agent_key).is_err(),
+        "a key the record's signer did not hold must reject the record"
+    );
+
+    // An unrelated verifier's published key rejects.
+    let (_, other_doc, _, _) = did_document_with_active_and_agent();
+    assert!(
+        VerifiedCustodyViolation::verify(record, &public_key_from_document(&other_doc, "active"))
+            .is_err(),
+        "another DID document's key must reject the record"
+    );
+}
+
+/// A record carrying no signature is rejected before any key is consulted, and
+/// a record whose signature covers different bytes is rejected under the key
+/// that produced that signature.
+#[test]
+fn unsigned_and_retargeted_violation_records_are_rejected() {
+    let (verifier_did, verifier_doc, verifier_active, _verifier_agent) =
+        did_document_with_active_and_agent();
+    let published_key = public_key_from_document(&verifier_doc, "active");
+
+    let template = ScpCustodyViolationAttestation {
+        subject_did: DID("did:dht:z6MkCustodySubject".to_owned()),
+        timestamp: 1_700_000_000,
+        violation: CustodyViolationType::CategoryAViolation {
+            action: "did_document_update".to_owned(),
+            signer_key_id: SigningKeyId::Agent,
+            signature_evidence: vec![0xAB; 64],
+        },
+        verifier_signature: vec![0u8; 64],
+        verifier_did: DID(verifier_did),
+    };
+
+    // Unsigned: an empty signature is rejected.
+    let unsigned = ScpCustodyViolationAttestation {
+        verifier_signature: Vec::new(),
+        ..template.clone()
+    };
+    assert!(
+        VerifiedCustodyViolation::verify(unsigned, &published_key).is_err(),
+        "a record carrying no signature must be rejected"
+    );
+
+    // Signed, then retargeted: the signature covers the original bytes, and the
+    // stored record now names a different action, so the hash moves.
+    let mut signed = template;
+    signed.verifier_signature = verifier_active
+        .sign(&signed.signing_hash().expect("a record must hash"))
+        .to_bytes()
+        .to_vec();
+    assert!(
+        VerifiedCustodyViolation::verify(signed.clone(), &published_key).is_ok(),
+        "the unaltered record verifies"
+    );
+
+    let retargeted = ScpCustodyViolationAttestation {
+        violation: CustodyViolationType::CategoryAViolation {
+            action: "verification_method_add".to_owned(),
+            signer_key_id: SigningKeyId::Agent,
+            signature_evidence: vec![0xAB; 64],
+        },
+        ..signed
+    };
+    assert!(
+        VerifiedCustodyViolation::verify(retargeted, &published_key).is_err(),
+        "a signature that covers different bytes must be rejected"
+    );
+}
+
+/// A subject's counter-attestation verifies under the `#active` key its DID
+/// document publishes, fails under the `#agent` key of that same document, and
+/// answers only the violation record it references.
+///
+/// ADR-039 acceptance criterion 18 assigns this signature to `#active`. The
+/// record carries no `signing_key_id`, so a verifier enforces that assignment by
+/// resolving `#active` and checking against that key alone.
+#[test]
+fn counter_attestation_verifies_under_active_and_rejects_agent() {
+    let (subject_did, subject_doc, subject_active, _subject_agent) =
+        did_document_with_active_and_agent();
+    let (_, verifier_doc, verifier_active, _) = did_document_with_active_and_agent();
+
+    let mut contested = ScpCustodyViolationAttestation {
+        subject_did: DID(subject_did),
+        timestamp: 1_700_000_000,
+        violation: CustodyViolationType::CategoryAViolation {
+            action: "did_document_update".to_owned(),
+            signer_key_id: SigningKeyId::Agent,
+            signature_evidence: vec![0xAB; 64],
+        },
+        verifier_signature: vec![0u8; 64],
+        verifier_did: DID("did:dht:z6MkCustodyVerifier".to_owned()),
+    };
+    contested.verifier_signature = verifier_active
+        .sign(&contested.signing_hash().expect("a record must hash"))
+        .to_bytes()
+        .to_vec();
+    let verified_violation = VerifiedCustodyViolation::verify(
+        contested.clone(),
+        &public_key_from_document(&verifier_doc, "active"),
+    )
+    .expect("the contested record verifies under its verifier's published key");
+
+    let mut counter = CounterAttestation::referencing(
+        &contested,
+        "agent key compromised; rotated and republished".to_owned(),
+        1_700_003_600,
+        vec![0u8; 64],
+    )
+    .expect("a counter-claim with well-formed fields must build");
+    counter.signature = subject_active
+        .sign(&counter.signing_hash().expect("a counter-claim must hash"))
+        .to_bytes()
+        .to_vec();
+
+    let verified_counter = VerifiedCounterAttestation::verify(
+        counter.clone(),
+        &public_key_from_document(&subject_doc, "active"),
+    )
+    .expect("a counter-claim verifies under the #active key its DID document publishes");
+
+    assert!(
+        VerifiedCounterAttestation::verify(
+            counter,
+            &public_key_from_document(&subject_doc, "agent")
+        )
+        .is_err(),
+        "the subject's #agent key must reject a counter-claim ADR-039 assigns to #active"
+    );
+
+    verified_counter
+        .answers(&verified_violation)
+        .expect("a counter-claim answers the record it references");
+
+    // A second violation record, differing only in timestamp, hashes elsewhere,
+    // so this counter-claim does not answer it.
+    let mut other = ScpCustodyViolationAttestation {
+        timestamp: 1_700_000_001,
+        verifier_signature: vec![0u8; 64],
+        ..contested
+    };
+    other.verifier_signature = verifier_active
+        .sign(&other.signing_hash().expect("a record must hash"))
+        .to_bytes()
+        .to_vec();
+    let verified_other =
+        VerifiedCustodyViolation::verify(other, &public_key_from_document(&verifier_doc, "active"))
+            .expect("the second record verifies under the same published key");
+    assert!(
+        verified_counter.answers(&verified_other).is_err(),
+        "a counter-claim must not answer a record it does not reference"
+    );
 }

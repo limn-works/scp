@@ -613,8 +613,9 @@ async fn custody_violation_attestation() {
     assert_eq!(attestation.violation_kind(), "CategoryAViolation");
     assert_eq!(attestation.verifier_did, did("did:dht:z6MkVerifier"));
 
-    // Validation should pass.
-    assert!(attestation.validate().is_ok());
+    // Field shapes should pass. This check establishes nothing about who
+    // signed; `VerifiedCustodyViolation::verify` answers that.
+    assert!(attestation.validate_field_shape().is_ok());
 
     // Empty evidence should fail.
     let bad_violation = CustodyViolationType::CategoryAViolation {
@@ -681,9 +682,24 @@ async fn counter_attestation() {
     let sk = sk_for(30);
     let sig = sk.sign(b"counter-claim-data");
 
-    let counter = CounterAttestation::new(
+    // A counter-claim names a violation record by a 32-byte reference spec
+    // section §9.5.2 derives, so build a record first and let `referencing`
+    // compute that reference rather than inventing an identifier.
+    let violation = ScpCustodyViolationAttestation::new(
         did("did:dht:z6MkSubject"),
-        "violation-ref-001".to_owned(),
+        1000,
+        CustodyViolationType::CategoryAViolation {
+            action: "did_document_update".to_owned(),
+            signer_key_id: SigningKeyId::Agent,
+            signature_evidence: vec![1, 2, 3, 4],
+        },
+        vec![5, 6, 7, 8],
+        did("did:dht:z6MkVerifier"),
+    )
+    .unwrap();
+
+    let counter = CounterAttestation::referencing(
+        &violation,
         "Key was compromised and rotated".to_owned(),
         2000,
         sig.to_bytes().to_vec(),
@@ -691,44 +707,26 @@ async fn counter_attestation() {
     .unwrap();
 
     assert_eq!(counter.subject_did, did("did:dht:z6MkSubject"));
-    assert_eq!(counter.violation_reference, "violation-ref-001");
+    assert_eq!(
+        counter.violation_reference,
+        violation.signing_hash().unwrap(),
+        "a counter-claim's reference equals a contested record's signing hash"
+    );
     assert_eq!(counter.explanation, "Key was compromised and rotated");
     assert_eq!(counter.timestamp, 2000);
     assert!(!counter.signature.is_empty());
-    assert!(counter.validate().is_ok());
+    assert!(counter.validate_field_shape().is_ok());
 
-    // Empty fields should fail.
+    // An empty explanation and an empty signature each fail.
     assert!(
-        CounterAttestation::new(
-            did("did:dht:z6MkSubject"),
-            String::new(),
-            "explanation".to_owned(),
-            2000,
-            vec![1],
-        )
-        .is_err()
+        CounterAttestation::referencing(&violation, String::new(), 2000, vec![1]).is_err(),
+        "an empty explanation must be rejected"
     );
 
     assert!(
-        CounterAttestation::new(
-            did("did:dht:z6MkSubject"),
-            "ref".to_owned(),
-            String::new(),
-            2000,
-            vec![1],
-        )
-        .is_err()
-    );
-
-    assert!(
-        CounterAttestation::new(
-            did("did:dht:z6MkSubject"),
-            "ref".to_owned(),
-            "explanation".to_owned(),
-            2000,
-            vec![],
-        )
-        .is_err()
+        CounterAttestation::referencing(&violation, "explanation".to_owned(), 2000, vec![])
+            .is_err(),
+        "an empty signature must be rejected"
     );
 }
 
