@@ -4168,12 +4168,12 @@
       "gate": "gate-4",
       "priority": "P1",
       "severity": "critical",
-      "status": "done",
+      "status": "pending",
       "files": [
         "crates/scp-core/discovery/mod.rs",
         "crates/scp-core/discovery/did_capabilities.rs"
       ],
-      "description": "Implement `scp-core/discovery/` module root with all discovery types and DID document capability resolution. DID documents contain a SCPCapabilities service entry that lists an agent's capabilities — resolvable by anyone who knows the DID. Any agent can publish capabilities in their DID document — zero setup, zero registration, zero dependency on contexts with discovery outlets.",
+      "description": "Implement `scp-core/discovery/` module root with all discovery types and DID document capability resolution. DID documents contain a SCPCapabilities service entry that lists an agent's capabilities — resolvable by anyone who knows the DID. Any agent can publish capabilities in their DID document — zero setup, zero registration, zero dependency on contexts with discovery outlets. §18.2.2C of the addressability spec puts the `SCPCapabilities` service entry on the relay layer alone, so this story's `resolve_capabilities` criterion now requires relay-layer resolution and an unresolved report where only the Mainline bootstrap core answers. The shipped function does neither half: `resolve_capabilities` (`crates/scp-runtime/src/discovery/did_capabilities.rs:80`) calls `DidDht::resolve` (`:87`), which reads Mainline, and `extract_capabilities` (`:99`) returns `DiscoveryError::NoCapabilitiesService` (`:111`) when the resolved document carries no entry, which reports the capabilities absent. The `ResolvedDidDocument` two-variant enum an unresolved report reads is unbuilt, because `crates/scp-identity/src/resolver.rs:69` still declares the document-plus-metadata struct (§3.10.12 records the replacement as owed), so the two-encoding amendment to §3.10.5 and ADR-003 returned this status to pending. Everything else this story delivered remains in the tree and needs no rebuild: the `CapabilityEntry`, `DiscoveryQuery`, `DiscoveryResult`, `DiscoveryResultEntry` and `RegistrationEntry` types, the `DiscoveryError` enum, and the `SCPCapabilities` service-endpoint parser.",
       "acceptanceCriteria": [
         "CapabilityEntry struct defined with fields: did (DID), capabilities (Vec<String>), service_endpoints (Vec<String>), resolved_at (u64)",
         "DiscoveryQuery struct defined with fields: capability_filter (Option<Vec<String>>), keywords (Option<Vec<String>>), min_history (Option<Duration>)",
@@ -4195,12 +4195,21 @@
       ],
       "blockedBy": [
         "SCP-006",
-        "SCP-018"
+        "SCP-018",
+        "SCP-241"
       ],
       "sources": [
         {
           "file": ".docs/adrs/phase-4.md",
           "section": "## ADR-020: Outlet-Interface Discovery"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.2.2C The Mainline Bootstrap Core"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.10 DidResolver Trait"
         }
       ],
       "details": {
