@@ -491,19 +491,36 @@ async fn create_shadow_handler(
     let shadow_id = derive_shadow_id(bridge_id, &body.platform_user_id);
 
     let mut registries = bridge_state.registries.write().await;
+    // `delete_shadow_handler` retires a shadow by adding its identifier here
+    // and leaves the registry record in place, so every read below filters
+    // this set out. `status_handler` takes these two locks in this order.
+    let mut deleted = bridge_state.deleted_shadows.write().await;
 
     // Ensure a registry exists for this context.
     let registry = registries
         .entry(context_id.to_owned())
         .or_insert_with(|| ShadowRegistry::new(context_id.to_owned()));
 
+    let retirement_key = (
+        context_id.to_owned(),
+        bridge_id.to_owned(),
+        shadow_id.clone(),
+    );
+
     // Idempotency: if a shadow this bridge owns already carries this ID,
     // return 200.
+    //
+    // A shadow this bridge retired returns here too, and this call un-retires
+    // it, because a platform user who departs and returns derives the same
+    // identifier from the same `platform_user_id`. Answering 200 while leaving
+    // the retirement in place would hand a caller a record that
+    // `status_handler` omits and `emit_message_handler` answers 404 for.
     if let Some(existing) = registry
         .shadows()
         .iter()
         .find(|s| s.shadow_id == shadow_id && s.bridge_id == bridge_id)
     {
+        deleted.remove(&retirement_key);
         return (
             StatusCode::OK,
             Json(CreateShadowResponse {
@@ -523,10 +540,22 @@ async fn create_shadow_handler(
     // check reads the limit governance approved for the calling bridge and
     // counts that bridge's own shadows against it; the registry's own limit
     // stays as a second, context-wide bound.
+    //
+    // A retired shadow is not one this bridge manages — `status_handler`
+    // leaves it out of the roster it reports — so counting it would spend a
+    // governance-granted slot on a shadow no endpoint acts on, and a bridge
+    // that creates and retires would exhaust its limit permanently.
     let owned_shadows = registry
         .shadows()
         .iter()
-        .filter(|shadow| shadow.bridge_id == bridge_id)
+        .filter(|shadow| {
+            shadow.bridge_id == bridge_id
+                && !deleted.contains(&(
+                    context_id.to_owned(),
+                    bridge_id.to_owned(),
+                    shadow.shadow_id.clone(),
+                ))
+        })
         .count();
     if owned_shadows >= auth_ctx.bridge.max_shadows as usize {
         return (
@@ -541,6 +570,7 @@ async fn create_shadow_handler(
         )
             .into_response();
     }
+    drop(deleted);
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1157,8 +1187,12 @@ async fn webhook_handler(
 /// `BridgeAuthContext` as a request extension (injected by the bridge
 /// auth middleware layer applied by the caller).
 pub fn bridge_router(state: Arc<BridgeState>) -> Router {
+    // `Router::layer` wraps whichever routes a router already holds and adds
+    // nothing to a route registered after it, so this call follows all five
+    // `route` calls. Applying it to `Router::new()` leaves axum's own 2 MiB
+    // default governing every bridge route, and the doc comment on
+    // `MAX_BRIDGE_BODY_BYTES` then describes a bound no request ever meets.
     Router::new()
-        .layer(axum::extract::DefaultBodyLimit::max(MAX_BRIDGE_BODY_BYTES))
         .route("/v1/scp/bridge/shadow", post(create_shadow_handler))
         .route(
             "/v1/scp/bridge/shadow/{shadow_id}",
@@ -1167,6 +1201,7 @@ pub fn bridge_router(state: Arc<BridgeState>) -> Router {
         .route("/v1/scp/bridge/attest", post(attest_handler))
         .route("/v1/scp/bridge/message", post(emit_message_handler))
         .route("/v1/scp/bridge/status", get(status_handler))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BRIDGE_BODY_BYTES))
         .with_state(state)
 }
 
@@ -1178,9 +1213,10 @@ pub fn bridge_router(state: Arc<BridgeState>) -> Router {
 /// `bridge_auth_middleware_dyn` to the webhook route would reject all
 /// legitimate platform webhook callbacks with 401.
 pub fn bridge_webhook_router(state: Arc<BridgeState>) -> Router {
+    // The layer follows the route for the reason `bridge_router` states.
     Router::new()
-        .layer(axum::extract::DefaultBodyLimit::max(MAX_BRIDGE_BODY_BYTES))
         .route("/v1/scp/bridge/webhook", post(webhook_handler))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BRIDGE_BODY_BYTES))
         .with_state(state)
 }
 
@@ -1287,6 +1323,214 @@ mod tests {
     /// context.
     fn test_app(state: Arc<BridgeState>) -> Router {
         test_app_for(state, "bridge-test-001", "ctx-test-001")
+    }
+
+    /// Builds the production [`bridge_router`] with the auth extension the
+    /// middleware installs, so a test drives the routes an operator reaches
+    /// rather than a hand-assembled copy of them.
+    fn production_bridge_app(state: Arc<BridgeState>) -> Router {
+        bridge_router(state).layer(axum::Extension(test_auth_ctx()))
+    }
+
+    /// Builds the production [`bridge_webhook_router`] with the webhook auth
+    /// extension, for the reason [`production_bridge_app`] exists.
+    fn production_webhook_app(state: Arc<BridgeState>) -> Router {
+        let webhook_ctx = crate::bridge_auth::WebhookAuthContext {
+            bridge: test_auth_ctx().bridge,
+        };
+        bridge_webhook_router(state).layer(axum::Extension(webhook_ctx))
+    }
+
+    /// Builds a request carrying `len` bytes of JSON string content.
+    fn request_of_body_len(uri: &str, len: usize) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(vec![b'x'; len]))
+            .expect("test")
+    }
+
+    // -----------------------------------------------------------------------
+    // Request body limit (spec §12.10.4)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_body_over_the_bridge_limit_is_refused_before_a_handler_runs() {
+        let state = Arc::new(BridgeState::new());
+        let app = production_bridge_app(state);
+
+        let req = request_of_body_len("/v1/scp/bridge/shadow", MAX_BRIDGE_BODY_BYTES + 1);
+
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a body one byte over MAX_BRIDGE_BODY_BYTES must not reach a handler"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_bridge_limit_is_refused_on_the_message_route() {
+        let state = Arc::new(BridgeState::new());
+        let app = production_bridge_app(state);
+
+        let req = request_of_body_len("/v1/scp/bridge/message", MAX_BRIDGE_BODY_BYTES + 1);
+
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_bridge_limit_is_refused_on_the_webhook_route() {
+        let state = Arc::new(BridgeState::new());
+        let app = production_webhook_app(state);
+
+        let req = request_of_body_len("/v1/scp/bridge/webhook", MAX_BRIDGE_BODY_BYTES + 1);
+
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn a_body_at_the_bridge_limit_reaches_the_handler() {
+        let state = Arc::new(BridgeState::new());
+        let app = production_bridge_app(state);
+
+        let req = request_of_body_len("/v1/scp/bridge/shadow", MAX_BRIDGE_BODY_BYTES);
+
+        let resp = app.oneshot(req).await.expect("test");
+        // The body is not valid JSON, so axum's own `Json` extractor rejects
+        // it. The assertion here is that the limit did not reject it first,
+        // which is what distinguishes a correctly-placed layer from one that
+        // rejects everything.
+        assert_ne!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // -----------------------------------------------------------------------
+    // Governance-configured shadow limit (spec §12.2.1)
+    // -----------------------------------------------------------------------
+
+    /// Builds the default test router with `max_shadows` set to `limit`.
+    fn test_app_with_shadow_limit(state: Arc<BridgeState>, limit: u32) -> Router {
+        let mut auth_ctx = test_auth_ctx();
+        auth_ctx.bridge.max_shadows = limit;
+        let webhook_ctx = crate::bridge_auth::WebhookAuthContext {
+            bridge: auth_ctx.bridge.clone(),
+        };
+        let authed = Router::new()
+            .route("/v1/scp/bridge/shadow", post(create_shadow_handler))
+            .route(
+                "/v1/scp/bridge/shadow/{shadow_id}",
+                delete(delete_shadow_handler),
+            )
+            .route("/v1/scp/bridge/message", post(emit_message_handler))
+            .route("/v1/scp/bridge/status", get(status_handler))
+            .layer(axum::Extension(auth_ctx))
+            .with_state(Arc::clone(&state));
+        let webhook = Router::new()
+            .route("/v1/scp/bridge/webhook", post(webhook_handler))
+            .layer(axum::Extension(webhook_ctx))
+            .with_state(state);
+        authed.merge(webhook)
+    }
+
+    fn create_shadow_request_for(platform_user_id: &str) -> Request<Body> {
+        create_request(serde_json::json!({
+            "platform_handle": format!("@{platform_user_id}"),
+            "platform_user_id": platform_user_id,
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_retired_shadow_stops_counting_against_the_governance_limit() {
+        let state = Arc::new(BridgeState::new());
+
+        let resp = test_app_with_shadow_limit(Arc::clone(&state), 1)
+            .oneshot(create_shadow_request_for("user-one"))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = test_app_with_shadow_limit(Arc::clone(&state), 1)
+            .oneshot(delete_shadow_request("shadow:bridge-test-001:user-one"))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // The bridge manages zero shadows now, so its one governance-granted
+        // slot is free.
+        let resp = test_app_with_shadow_limit(Arc::clone(&state), 1)
+            .oneshot(create_shadow_request_for("user-two"))
+            .await
+            .expect("test");
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a retired shadow must not hold a governance-granted slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_shadow_still_exhausts_the_governance_limit() {
+        let state = Arc::new(BridgeState::new());
+
+        let resp = test_app_with_shadow_limit(Arc::clone(&state), 1)
+            .oneshot(create_shadow_request_for("user-one"))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = test_app_with_shadow_limit(Arc::clone(&state), 1)
+            .oneshot(create_shadow_request_for("user-two"))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response_json(resp).await["code"], "BRIDGE_FORBIDDEN");
+    }
+
+    #[tokio::test]
+    async fn re_creating_a_retired_shadow_returns_it_to_the_roster() {
+        let state = Arc::new(BridgeState::new());
+        let shadow_id = "shadow:bridge-test-001:user-one";
+
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(create_shadow_request_for("user-one"))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(delete_shadow_request(shadow_id))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(status_request())
+            .await
+            .expect("test");
+        assert_eq!(response_json(resp).await["shadow_count"], 0);
+
+        // Re-creating the same platform user derives the same identifier, and
+        // the 200 this returns must name a shadow the other endpoints see.
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(create_shadow_request_for("user-one"))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(response_json(resp).await["shadow_id"], shadow_id);
+
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(status_request())
+            .await
+            .expect("test");
+        let json = response_json(resp).await;
+        assert_eq!(
+            json["shadow_count"], 1,
+            "a re-created shadow must appear in the roster the status endpoint reports"
+        );
+        assert_eq!(json["shadows"][0]["shadow_id"], shadow_id);
     }
 
     fn create_request(body: serde_json::Value) -> Request<Body> {

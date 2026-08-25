@@ -888,6 +888,58 @@ fn dht_gateways_from_env() -> Vec<String> {
     )
 }
 
+/// Applies the two operator-supplied bridge governance files this node reads at
+/// startup, and exits the process when it refuses either one.
+///
+/// `SCP_NODE_BRIDGE_REGISTRATIONS` carries `RegisterBridge` approvals (spec
+/// §12.10.6 step 1) and `SCP_NODE_BRIDGE_KEY_ROTATIONS` carries
+/// `UpdateBridgePlatformKey` actions (§12.10.2 step 5). Admission runs first,
+/// because a rotation names a bridge admission installed. An operator who sets
+/// neither variable gets a node serving `/v1/scp/bridge/*` against an empty
+/// registry, which answers `BRIDGE_NOT_AUTHORIZED` (401) to every request.
+///
+/// A record this node refuses leaves a bridge unreachable, or leaves a key an
+/// operator meant to retire still signing webhook requests, and serving on
+/// would hide either from that operator until a platform reported it. This
+/// exits instead.
+async fn apply_bridge_governance_files<S: EncryptedStorage + 'static>(
+    node: &scp_node::ApplicationNode<S>,
+) {
+    if let Ok(path) = env::var("SCP_NODE_BRIDGE_REGISTRATIONS") {
+        match node
+            .admit_bridge_registrations(std::path::Path::new(&path))
+            .await
+        {
+            Ok(count) => tracing::info!(
+                count,
+                path = %path,
+                "admitted bridge registrations from an operator-supplied file"
+            ),
+            Err(e) => {
+                tracing::error!(error = %e, path = %path, "bridge registration admission failed");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Ok(path) = env::var("SCP_NODE_BRIDGE_KEY_ROTATIONS") {
+        match node
+            .rotate_bridge_platform_keys(std::path::Path::new(&path))
+            .await
+        {
+            Ok(count) => tracing::info!(
+                count,
+                path = %path,
+                "applied bridge platform key rotations from an operator-supplied file"
+            ),
+            Err(e) => {
+                tracing::error!(error = %e, path = %path, "bridge platform key rotation failed");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
 /// Shared implementation for `run_full_node`, parameterized over DID method
 /// and storage type.
 ///
@@ -1008,33 +1060,7 @@ async fn run_node_with<
         }
     };
 
-    // Spec §12.10.6 step 1: admit whatever bridge registrations this operator
-    // approved, before serving any bridge endpoint. Without this call a node
-    // holds no registration, so every `/v1/scp/bridge/*` request answers
-    // `BRIDGE_NOT_AUTHORIZED` (401) and every per-bridge scope rule behind that
-    // 401 never runs. An operator who bridges nothing sets no path and this
-    // node serves those endpoints against an empty registry, which is the same
-    // honest 401.
-    if let Ok(path) = env::var("SCP_NODE_BRIDGE_REGISTRATIONS") {
-        match node
-            .admit_bridge_registrations(std::path::Path::new(&path))
-            .await
-        {
-            Ok(count) => tracing::info!(
-                count,
-                path = %path,
-                "admitted bridge registrations from an operator-supplied file"
-            ),
-            Err(e) => {
-                // A registration an operator meant to admit and a node refused
-                // leaves that bridge unreachable, and serving on regardless
-                // would hide that from an operator until a platform reported a
-                // 401. Fail the node instead.
-                tracing::error!(error = %e, path = %path, "bridge registration admission failed");
-                std::process::exit(1);
-            }
-        }
-    }
+    apply_bridge_governance_files(&node).await;
 
     // The BEP44 sequence counter was bootstrapped inside the builder ahead of
     // the startup publish (SCP-RELAYRES-004), so `Node::start` above already

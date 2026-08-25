@@ -564,3 +564,136 @@ async fn a_malformed_platform_key_id_is_rejected() {
 
     node.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// Platform key rotation reaches a live request path (spec §12.10.2 step 5)
+// ---------------------------------------------------------------------------
+
+/// A rotation an operator writes to the file `SCP_NODE_BRIDGE_KEY_ROTATIONS`
+/// names installs the incoming key on a live request path, and the outgoing key
+/// keeps working for the 24-hour window §12.10.2 step 5 defines.
+///
+/// This exercises the shipped entry point rather than the store method:
+/// `ApplicationNode::rotate_bridge_platform_keys` is what `main` calls at
+/// startup, and a rotation reachable only from a test would leave a shipped
+/// node with no way to retire a leaked platform key short of revoking the
+/// bridge, which §12.2.1 makes terminal.
+#[tokio::test]
+async fn a_rotation_applied_from_an_operator_file_installs_the_incoming_key() {
+    let node = ApplicationNode::dev(0).await.unwrap();
+    let operator = Operator::generate();
+    let outgoing = SigningKey::from_bytes(&rand_seed());
+    let incoming = SigningKey::from_bytes(&rand_seed());
+
+    let approval = approved(
+        "bridge-rot",
+        &operator.did,
+        "ctx-rot",
+        Some(("pk-old", *outgoing.verifying_key().as_bytes())),
+    );
+    let bridge_id = approval.connector().bridge_id.clone();
+    node.register_bridge(approval, operator.document.clone())
+        .await
+        .unwrap();
+
+    // Before the rotation the incoming key names no registered identifier.
+    let before = bridge_app(&node)
+        .oneshot(signed_webhook(&incoming, "pk-new", "pk-new"))
+        .await
+        .unwrap();
+    assert_eq!(before.status(), StatusCode::UNAUTHORIZED);
+
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        file.path(),
+        serde_json::to_string(&serde_json::json!([{
+            "bridge_id": bridge_id,
+            "new_platform_key_id": "pk-new",
+            "new_platform_key": incoming.verifying_key().as_bytes(),
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let rotated = node.rotate_bridge_platform_keys(file.path()).await.unwrap();
+    assert_eq!(rotated, 1);
+
+    let after = bridge_app(&node)
+        .oneshot(signed_webhook(&incoming, "pk-new", "pk-new"))
+        .await
+        .unwrap();
+    assert_eq!(
+        after.status(),
+        StatusCode::OK,
+        "the incoming key must authenticate after a rotation"
+    );
+
+    // §12.10.2 step 5 accepts either identifier during the window, so the
+    // outgoing key still works right after the rotation.
+    let outgoing_still_works = bridge_app(&node)
+        .oneshot(signed_webhook(&outgoing, "pk-old", "pk-old"))
+        .await
+        .unwrap();
+    assert_eq!(outgoing_still_works.status(), StatusCode::OK);
+
+    // Re-running the same file, which is what a restart does, changes nothing.
+    let replayed = node.rotate_bridge_platform_keys(file.path()).await.unwrap();
+    assert_eq!(replayed, 1);
+    let after_replay = bridge_app(&node)
+        .oneshot(signed_webhook(&incoming, "pk-new", "pk-new"))
+        .await
+        .unwrap();
+    assert_eq!(after_replay.status(), StatusCode::OK);
+
+    node.shutdown();
+}
+
+/// A second admission naming a fresh `platform_key_id` for a bridge that
+/// already holds one is refused, so admission never leaves two live webhook
+/// keys behind (spec §12.10.6 step 1, §12.10.2 step 5).
+#[tokio::test]
+async fn re_admitting_a_bridge_under_a_fresh_key_identifier_is_refused() {
+    let node = ApplicationNode::dev(0).await.unwrap();
+    let operator = Operator::generate();
+    let first = SigningKey::from_bytes(&rand_seed());
+    let second = SigningKey::from_bytes(&rand_seed());
+
+    node.register_bridge(
+        approved(
+            "bridge-two-keys",
+            &operator.did,
+            "ctx-two-keys",
+            Some(("pk-1", *first.verifying_key().as_bytes())),
+        ),
+        operator.document.clone(),
+    )
+    .await
+    .unwrap();
+
+    let err = node
+        .register_bridge(
+            approved(
+                "bridge-two-keys",
+                &operator.did,
+                "ctx-two-keys",
+                Some(("pk-2", *second.verifying_key().as_bytes())),
+            ),
+            operator.document.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("already holds platform key identifier"),
+        "expected a refusal naming the stored identifier, got: {err}"
+    );
+
+    // The second key authenticates nothing.
+    let resp = bridge_app(&node)
+        .oneshot(signed_webhook(&second, "pk-2", "pk-2"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    node.shutdown();
+}

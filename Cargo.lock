@@ -5476,6 +5476,7 @@ name = "scp-node"
 version = "0.1.0-beta.2"
 dependencies = [
  "arc-swap",
+ "async-trait",
  "axum",
  "base64",
  "bs58",

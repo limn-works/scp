@@ -663,6 +663,78 @@ impl<S: Storage> ApplicationNode<S> {
             .map_err(bridge_admission_to_node_error)
     }
 
+    /// Rotates a cooperative bridge's platform webhook key onto a fresh
+    /// identifier.
+    ///
+    /// Spec §12.10.2 step 5 defines the `UpdateBridgePlatformKey` governance
+    /// action this performs. `new_key_id` must differ from every identifier
+    /// this bridge already holds. This node then accepts a webhook signature
+    /// under either identifier for 24 hours, and after that window an outgoing
+    /// identifier authenticates nothing — which is what retires a leaked
+    /// platform key without revoking the bridge, since §12.2.1 makes `Revoked`
+    /// terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::InvalidConfig`] when no record names `bridge_id`,
+    /// when that record is revoked, when its mode is not `Cooperative`, when
+    /// any bridge already stores `new_key_id`, or when the system clock reports
+    /// a time before the Unix epoch. Returns [`NodeError::Storage`] when a
+    /// storage read or write fails.
+    pub async fn rotate_bridge_platform_key(
+        &self,
+        bridge_id: &str,
+        new_key_id: &str,
+        new_platform_key: [u8; 32],
+    ) -> Result<(), NodeError> {
+        self.bridge_registry
+            .rotate_platform_key(bridge_id, new_key_id, new_platform_key)
+            .await
+            .map_err(bridge_admission_to_node_error)
+    }
+
+    /// Applies every `UpdateBridgePlatformKey` action an operator wrote to
+    /// `path`, and returns how many rotations this call performed.
+    ///
+    /// This is what the `scp-node` binary calls at startup when
+    /// `SCP_NODE_BRIDGE_KEY_ROTATIONS` names a file, after it admits whatever
+    /// `SCP_NODE_BRIDGE_REGISTRATIONS` names — a rotation names a bridge
+    /// admission already installed. Re-running a rotation an earlier start
+    /// already performed changes nothing, so an operator leaves the file in
+    /// place across restarts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::InvalidConfig`] when the file cannot be read or
+    /// parsed, and whatever
+    /// [`rotate_bridge_platform_key`](Self::rotate_bridge_platform_key)
+    /// returns for a record a node refuses. Nothing after a failure is applied,
+    /// so an operator fixes a record and reruns.
+    pub async fn rotate_bridge_platform_keys(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<usize, NodeError> {
+        let records = crate::bridge_admission::load_rotation_records(path)
+            .map_err(|e| NodeError::InvalidConfig(e.to_string()))?;
+
+        let mut rotated = 0_usize;
+        for record in records {
+            self.rotate_bridge_platform_key(
+                &record.bridge_id,
+                &record.new_platform_key_id,
+                record.new_platform_key,
+            )
+            .await?;
+            tracing::info!(
+                bridge_id = %record.bridge_id,
+                key_id = %record.new_platform_key_id,
+                "applied a bridge platform key rotation"
+            );
+            rotated += 1;
+        }
+        Ok(rotated)
+    }
+
     /// Returns this node's bridge registration store behind
     /// [`BridgeLookup`](bridge_auth::BridgeLookup).
     ///
@@ -3392,9 +3464,15 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
 
     // Build the production bridge auth lookup, hydrating from storage.
     // The audience URL is the HTTPS base URL for this node (spec 12.10.2).
+    let audience = format!("https://{domain}");
+    // §12.10.2 verifies a bearer token against the operator's DID document, and
+    // this node resolves that document rather than trusting a copy an operator
+    // handed it at admission time, so a rotated or revoked signing key stops
+    // authenticating within one TTL.
     let bridge_lookup = Arc::new(bridge_auth::StorageBridgeLookup::new(
         Arc::clone(&storage),
-        format!("https://{domain}"),
+        audience,
+        Arc::new(bridge_auth::DidMethodResolver::new(Arc::clone(&did_method))),
     ));
     // A node that cannot read its own bridge registry must not start serving
     // bridge endpoints. Starting with an empty cache over populated storage
@@ -3776,9 +3854,12 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
     // an operator had already minted against the old value. The domain builder
     // makes the same distinction visible: there the audience is
     // `https://<domain>`, which is not the relay URL at all.
+    //
+    // The resolver is here for the reason `build_domain_inner` states.
     let bridge_lookup = Arc::new(bridge_auth::StorageBridgeLookup::new(
         Arc::clone(&storage),
         live_state.get().relay_url,
+        Arc::new(bridge_auth::DidMethodResolver::new(Arc::clone(&did_method))),
     ));
     // A node that cannot read its own bridge registry must not start serving
     // bridge endpoints. Starting with an empty cache over populated storage
