@@ -7,10 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - 2026-08-16
 
-### Five fail-open fixes, and what they change for a caller
+### Six fail-open fixes, and what they change for a caller
 
 Each item below removes a path where a capability reported success without
-delivering what that success claims. Four of them change a caller-visible
+delivering what that success claims. Five of them change a caller-visible
 contract, so each names what a caller does differently.
 
 **Custody selection is required, with no in-memory default.** TypeScript
@@ -48,6 +48,26 @@ by version**: it carries neither value, so neither its passphrase nor its
 integrity is checkable. Creation now uses an exclusive create, so two processes
 racing on one path no longer overwrite each other's keys.
 
+Two further defects in that same key file are closed. Every bridge opens one
+`$HOME/.scp/keys.bin` and constructs a fresh `FileKeyCustody` for each identity
+creation, so the writers that contend for that file are two custody objects
+rather than two tasks inside one. `append_entry` and `destroy_key` now hold an
+exclusive advisory lock across their whole read-modify-write, which excludes a
+second process and a second object in this process alike; the per-object mutex
+they held before excluded neither, so two concurrent creations each appended at
+one index and the later write replaced the earlier — **one generated private key
+never reached disk while both callers read success, and both handles then named
+the surviving entry**. Each entry's ciphertext now binds `key_type ‖
+entry_index` as AES-256-GCM associated data, and every read path compares an
+entry's stored `key_type` byte against the type its handle names before
+decrypting. Without those two rules, a handle whose entry the file had since
+refilled decrypted an X25519 static secret, and `SigningKey::from_bytes`, which
+accepts any 32 bytes, turned that secret into an Ed25519 signing key that
+returned a signature. **A handle that names an entry the file has refilled now
+reports an error instead of signing.** `destroy_key` re-encrypts every entry it
+moves down one index, because that index is part of what an entry's ciphertext
+commits to.
+
 **A relay names its blob storage backend.**
 `scp_transport::startup::storage_from_env` substituted `sqlite` when
 `SCP_RELAY_STORAGE_BACKEND` was unset and called `std::process::exit(1)` on
@@ -60,6 +80,15 @@ those errors into exit code 1 at its own boundary. **An operator sets
 still selects an in-memory blob backend and reads no env var. `health_check`
 returns a verdict instead of exiting, and `shutdown_signal` waits on ctrl_c
 alone when a kernel refuses a SIGTERM handler.
+
+**`identityCreateWithAgentKey("file")` creates an identity on Node.** The
+napi-rs bridge admits `"file"` at its validation boundary and serves it on
+`identity_create`, and `identity_create_with_agent_key` carried no `"file"`
+arm, so that call fell to a catch-all that returned `SCP-IDENT-1005` with text
+telling the caller they had found a bug in the bridge layer. **That method now
+opens the same encrypted key file `identityCreate("file")` opens**, which is
+what the `PyO3` bridge already did by routing both creators through one
+`parse_custody`.
 
 **Three in-memory or always-succeeds implementations left public API.**
 `InMemoryFfiTrustStore`, `InMemoryViolationStore`, and `NoOpRevocationChecker`

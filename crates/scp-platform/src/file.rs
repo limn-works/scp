@@ -35,6 +35,44 @@
 //! ciphertext is the 32-byte private key encrypted under AES-256-GCM;
 //! the tag (16 bytes) is appended by the AEAD.
 //!
+//! # Per-entry binding
+//!
+//! `FileKeyCustody::encrypt_key` passes `key_type ‖ entry_index` as
+//! AES-256-GCM associated data, and `FileKeyCustody::decrypt_entry` compares
+//! the stored `key_type` byte against the key type its caller's handle names
+//! before it decrypts anything. §17.8 of
+//! `.docs/specs/17-persistence-and-storage.md`, under "Per-entry binding",
+//! requires both.
+//!
+//! Neither the file HMAC nor a handle map supplies what those two rules
+//! supply. A handle map records a key type and an entry index in memory, and a
+//! second custody object over the same file rewrites that file under the same
+//! passphrase, so the first object's map outlives the entry it names while the
+//! file it now reads still carries a valid HMAC. [`SigningKey::from_bytes`]
+//! accepts any 32 bytes, so without the stored-byte comparison a stale
+//! Ed25519 handle turns an X25519 static secret into an Ed25519 signing key
+//! and returns a signature. Without the associated data, a writer who swaps
+//! two entry blocks and re-seals the HMAC hands each block a position its
+//! ciphertext never committed to.
+//!
+//! `destroy_key` moves every entry after a removed one down by one index, so
+//! it decrypts each moved entry and re-encrypts it under its new index. An
+//! entry that keeps its index keeps its ciphertext.
+//!
+//! # One writer at a time
+//!
+//! `append_entry` and `destroy_key` each read this file, change it, and write
+//! it back. Both hold an exclusive advisory lock on a `.lock` sibling of the
+//! key file across that whole sequence, which §17.8 of
+//! `.docs/specs/17-persistence-and-storage.md` requires under "One writer at a
+//! time". Every bridge opens `$HOME/.scp/keys.bin`
+//! (`scp_ffi_common::custody_file`), and each identity creation constructs a
+//! fresh `FileKeyCustody` over that one path, so the contending writers are
+//! two custody objects rather than two tasks inside one object. `flock`
+//! excludes a second process and a second object in this process alike; the
+//! `file_write_lock` mutex below excludes two tasks that share one object
+//! without a syscall.
+//!
 //! # Passphrase commitment and file HMAC
 //!
 //! One Argon2id derivation over a caller's passphrase and a stored salt
@@ -196,6 +234,15 @@ impl StoredKeyType {
         }
     }
 
+    /// Returns the public [`KeyType`] this stored type names, so an error a
+    /// caller reads names the same two values the trait's own signatures use.
+    const fn to_key_type(self) -> KeyType {
+        match self {
+            Self::Ed25519 => KeyType::Ed25519,
+            Self::X25519 => KeyType::X25519,
+        }
+    }
+
     fn from_byte(b: u8) -> Result<Self, PlatformError> {
         match b {
             KEY_TYPE_ED25519 => Ok(Self::Ed25519),
@@ -205,6 +252,105 @@ impl StoredKeyType {
             ))),
         }
     }
+}
+
+/// Builds the AES-256-GCM associated data that binds one entry's ciphertext to
+/// its key type and to its position in the file: `key_type ‖ entry_index`, with
+/// the index written as a little-endian `u64`.
+///
+/// A fixed 9-byte width makes the encoding unambiguous, so no two
+/// (`key_type`, `entry_index`) pairs produce the same associated data. §17.8 of
+/// `.docs/specs/17-persistence-and-storage.md` defines this encoding under
+/// "Per-entry binding".
+fn entry_aad(key_type: StoredKeyType, entry_index: usize) -> [u8; 1 + 8] {
+    let mut aad = [0u8; 1 + 8];
+    aad[0] = key_type.to_byte();
+    aad[1..].copy_from_slice(&(entry_index as u64).to_le_bytes());
+    aad
+}
+
+/// Returns the path of the lock file that serializes writes to `path`:
+/// `path` with `.lock` appended.
+///
+/// The lock lives beside the key file rather than on the key file itself,
+/// because every write path replaces the key file through `rename`. A lock
+/// taken on the key file's inode would stop excluding a writer that opened the
+/// path after that rename, since the two writers would then hold locks on two
+/// different inodes. `atomic_write` names its temporary file
+/// `{file_name}.{32 hex digits}.tmp`, so no temporary file ever collides with
+/// this name.
+fn lock_file_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Holds an exclusive advisory lock on one key file's lock sibling until this
+/// value drops.
+///
+/// `fs2` maps this onto `flock` on Unix and `LockFileEx` on Windows. Both
+/// exclude a second process and a second open file description inside this
+/// process, which is what makes two `FileKeyCustody` objects over one path
+/// serialize.
+struct KeyFileWriteLock {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+impl Drop for KeyFileWriteLock {
+    fn drop(&mut self) {
+        if let Err(e) = fs2::FileExt::unlock(&self.file) {
+            tracing::warn!(
+                path = %self.path.display(),
+                error = %e,
+                "FileKeyCustody could not release its key-file lock explicitly; closing the \
+                 file releases it"
+            );
+        }
+    }
+}
+
+/// Takes the exclusive advisory lock that guards a read-modify-write of the key
+/// file at `key_path`, creating the lock file when it does not exist.
+///
+/// This call blocks until whichever writer holds that lock releases it, because
+/// two identity creations on one machine must both succeed rather than one of
+/// them reporting contention. Every holder does bounded work under this lock —
+/// one file read, one AEAD operation per entry it writes, and one atomic write
+/// — and awaits nothing while it holds the lock, so no holder waits on a caller
+/// of this function. A holder that crashes releases the lock, because an
+/// operating system drops every advisory lock a dead process held.
+///
+/// # Errors
+///
+/// Returns [`PlatformError::CustodyError`] when the lock file cannot be opened
+/// and when the lock cannot be taken.
+fn lock_key_file_for_write(key_path: &Path) -> Result<KeyFileWriteLock, PlatformError> {
+    let path = lock_file_path(key_path);
+
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+
+    let file = options.open(&path).map_err(|e| {
+        PlatformError::CustodyError(format!(
+            "failed to open key-file lock at {}: {e}",
+            path.display()
+        ))
+    })?;
+
+    fs2::FileExt::lock_exclusive(&file).map_err(|e| {
+        PlatformError::CustodyError(format!(
+            "failed to take the key-file lock at {}: {e}",
+            path.display()
+        ))
+    })?;
+
+    Ok(KeyFileWriteLock { file, path })
 }
 
 /// Maps handle IDs to their key type and position in the file's entry list.
@@ -575,6 +721,11 @@ pub struct FileKeyCustody {
     pseudonym_keys: Mutex<HashMap<u64, SigningKey>>,
     /// Serializes file read-modify-write operations to prevent data races
     /// when multiple tasks call `append_entry` concurrently.
+    ///
+    /// This mutex covers two tasks that share one `FileKeyCustody` value and
+    /// nothing else. Two values over one path hold two mutexes, which is why
+    /// every read-modify-write also takes the cross-process advisory lock that
+    /// `lock_key_file_for_write` returns.
     file_write_lock: StdMutex<()>,
 }
 
@@ -761,10 +912,24 @@ impl FileKeyCustody {
         })
     }
 
-    /// Encrypts a 32-byte private key using AES-256-GCM with a fresh nonce.
+    /// Encrypts a 32-byte private key using AES-256-GCM with a fresh nonce,
+    /// binding `key_type` and `entry_index` as associated data.
+    ///
+    /// A caller writes the returned ciphertext at `entry_index` and writes
+    /// `key_type`'s byte in front of it, so [`Self::decrypt_entry`] rebuilds the
+    /// same associated data from what it reads. Writing the ciphertext at any
+    /// other index, or in front of any other type byte, makes the AEAD reject
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::CustodyError`] when AES-256-GCM rejects this
+    /// custody object's wrapping key or the plaintext.
     fn encrypt_key(
         &self,
         plaintext: &[u8; KEY_LEN],
+        key_type: StoredKeyType,
+        entry_index: usize,
     ) -> Result<([u8; NONCE_LEN], Vec<u8>), PlatformError> {
         let cipher = Aes256Gcm::new_from_slice(self.derived_key.as_ref())
             .map_err(|e| PlatformError::CustodyError(format!("cipher init failed: {e}")))?;
@@ -773,14 +938,22 @@ impl FileKeyCustody {
         rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
 
+        let aad = entry_aad(key_type, entry_index);
         let ciphertext = cipher
-            .encrypt(nonce, plaintext.as_ref())
+            .encrypt(
+                nonce,
+                aes_gcm::aead::Payload {
+                    msg: plaintext.as_ref(),
+                    aad: &aad,
+                },
+            )
             .map_err(|e| PlatformError::CustodyError(format!("encryption failed: {e}")))?;
 
         Ok((nonce_bytes, ciphertext))
     }
 
-    /// Decrypts a key entry from the file at the given entry index.
+    /// Decrypts the key entry at `entry_index`, after checking that the entry's
+    /// stored `key_type` byte names `expected_key_type`.
     ///
     /// Checks `entry_index` against `data` before it slices. A caller reaches
     /// an out-of-range index whenever the handle map outlives the entry it
@@ -791,14 +964,27 @@ impl FileKeyCustody {
     /// authentication cannot prevent it because authentication reads the bytes
     /// the slice already produced.
     ///
+    /// The same desync reaches an index the file does hold, where the entry
+    /// sitting there carries the other key type. `expected_key_type` is what a
+    /// caller's handle map recorded, and `data[offset]` is what the file says
+    /// now. Comparing those two before decrypting is what stops
+    /// [`SigningKey::from_bytes`] from turning an X25519 static secret into an
+    /// Ed25519 signing key, which it does without complaint for any 32 bytes.
+    /// The associated data this function rebuilds — `key_type ‖ entry_index`,
+    /// per §17.8 of `.docs/specs/17-persistence-and-storage.md` — then makes
+    /// AES-256-GCM reject a ciphertext that a writer moved to another index or
+    /// placed behind another type byte.
+    ///
     /// # Errors
     ///
     /// Returns [`PlatformError::CustodyError`] when `entry_index` names an
-    /// entry outside `data`, and when AES-256-GCM rejects the entry.
+    /// entry outside `data`, when the stored `key_type` byte names a type other
+    /// than `expected_key_type`, and when AES-256-GCM rejects the entry.
     fn decrypt_entry(
         &self,
         data: &[u8],
         entry_index: usize,
+        expected_key_type: StoredKeyType,
     ) -> Result<Zeroizing<[u8; KEY_LEN]>, PlatformError> {
         let out_of_range = || {
             PlatformError::CustodyError(format!(
@@ -814,12 +1000,24 @@ impl FileKeyCustody {
             .checked_mul(ENTRY_SIZE)
             .and_then(|entries_len| HEADER_SIZE.checked_add(entries_len))
             .ok_or_else(out_of_range)?;
-        // Skip key_type byte (1 byte).
         let nonce_start = offset + 1;
         let ct_start = nonce_start + NONCE_LEN;
         let ct_end = ct_start + KEY_LEN + TAG_LEN;
         if ct_end > data.len() {
             return Err(out_of_range());
+        }
+
+        // Compare the type this file records against the type this caller's
+        // handle names, before any decryption runs.
+        let stored_key_type = StoredKeyType::from_byte(data[offset])?;
+        if stored_key_type != expected_key_type {
+            return Err(PlatformError::CustodyError(format!(
+                "key entry {entry_index} holds a {:?} key, and the handle naming it expects a \
+                 {:?} key: this key file changed after that handle was minted — restore the \
+                 key file this handle was minted against",
+                stored_key_type.to_key_type(),
+                expected_key_type.to_key_type()
+            )));
         }
 
         let nonce = Nonce::from_slice(&data[nonce_start..ct_start]);
@@ -828,10 +1026,20 @@ impl FileKeyCustody {
         let cipher = Aes256Gcm::new_from_slice(self.derived_key.as_ref())
             .map_err(|e| PlatformError::CustodyError(format!("cipher init failed: {e}")))?;
 
-        let plaintext =
-            Zeroizing::new(cipher.decrypt(nonce, ciphertext_and_tag).map_err(|_| {
-                PlatformError::CustodyError("decryption failed (wrong passphrase?)".into())
-            })?);
+        let aad = entry_aad(stored_key_type, entry_index);
+        let plaintext = Zeroizing::new(
+            cipher
+                .decrypt(
+                    nonce,
+                    aes_gcm::aead::Payload {
+                        msg: ciphertext_and_tag,
+                        aad: &aad,
+                    },
+                )
+                .map_err(|_| {
+                    PlatformError::CustodyError("decryption failed (wrong passphrase?)".into())
+                })?,
+        );
 
         let mut key_bytes = Zeroizing::new([0u8; KEY_LEN]);
         if plaintext.len() != KEY_LEN {
@@ -872,6 +1080,20 @@ impl FileKeyCustody {
     /// Appends an encrypted key entry to the file and updates the entry count.
     ///
     /// Uses write-to-tmp + rename for crash-safe atomic writes (#1470).
+    ///
+    /// Holds the cross-process advisory lock from the read below through the
+    /// write at the end, which §17.8 of
+    /// `.docs/specs/17-persistence-and-storage.md` requires under "One writer at
+    /// a time". Without it, two custody objects over one key file each read one
+    /// entry count, each append at that count, and the later `atomic_write`
+    /// replaces the earlier one, so one generated private key never reaches
+    /// disk while both callers read success.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::CustodyError`] when the advisory lock cannot be
+    /// taken, when [`Self::read_file`] rejects the file, when AES-256-GCM
+    /// rejects the key, and when the write fails.
     fn append_entry(
         &self,
         key_type: StoredKeyType,
@@ -881,6 +1103,7 @@ impl FileKeyCustody {
             .file_write_lock
             .lock()
             .map_err(|_| PlatformError::CustodyError("file write lock poisoned".into()))?;
+        let _file_lock = lock_key_file_for_write(&self.path)?;
         let mut data = self.read_file()?;
 
         // Read current entry count.
@@ -892,8 +1115,9 @@ impl FileKeyCustody {
 
         let new_index = current_count as usize;
 
-        // Encrypt the key.
-        let (nonce, ciphertext) = self.encrypt_key(private_key)?;
+        // Encrypt the key, binding it to the type byte and the index it is
+        // about to occupy.
+        let (nonce, ciphertext) = self.encrypt_key(private_key, key_type, new_index)?;
 
         // Build the entry: key_type + nonce + ciphertext+tag.
         data.push(key_type.to_byte());
@@ -944,7 +1168,7 @@ impl FileKeyCustody {
         }
         let data = self.read_file()?;
         drop(map);
-        let key_bytes = self.decrypt_entry(&data, entry_index)?;
+        let key_bytes = self.decrypt_entry(&data, entry_index, StoredKeyType::Ed25519)?;
         let signing_key = SigningKey::from_bytes(&key_bytes);
         Ok((key_bytes, signing_key))
     }
@@ -1055,7 +1279,7 @@ impl KeyCustody for FileKeyCustody {
                 .ok_or(PlatformError::KeyNotFound)?;
             let data = self.read_file()?;
             drop(map);
-            let key_bytes = self.decrypt_entry(&data, entry_index)?;
+            let key_bytes = self.decrypt_entry(&data, entry_index, key_type)?;
 
             match key_type {
                 StoredKeyType::Ed25519 => {
@@ -1111,6 +1335,12 @@ impl KeyCustody for FileKeyCustody {
                 .file_write_lock
                 .lock()
                 .map_err(|_| PlatformError::CustodyError("file write lock poisoned".into()))?;
+            // Hold the cross-process advisory lock from this read through the
+            // write below, so a second custody object over the same path cannot
+            // append between them and lose its own entry to this rewrite
+            // (§17.8 of `.docs/specs/17-persistence-and-storage.md`, "One
+            // writer at a time").
+            let _file_lock = lock_key_file_for_write(&self.path)?;
 
             let data = self.read_file()?;
 
@@ -1147,13 +1377,34 @@ impl KeyCustody for FileKeyCustody {
             // Write updated entry count.
             new_data.extend_from_slice(&new_count.to_le_bytes());
 
-            // Copy all entries except the removed one.
+            // Copy every entry except the removed one. An entry that keeps its
+            // index keeps its ciphertext. An entry that moves down one index
+            // gets decrypted and re-encrypted, because
+            // `FileKeyCustody::encrypt_key` binds an entry's index as
+            // associated data, so a moved ciphertext would otherwise fail every
+            // later decrypt (§17.8 of
+            // `.docs/specs/17-persistence-and-storage.md`, "Per-entry
+            // binding"). This loop holds no handle for the entries it moves, so
+            // it reads each entry's type from the file and hands that same type
+            // to `decrypt_entry`, whose AEAD check then decides whether that
+            // byte and that ciphertext belong together.
             for i in 0..current_count as usize {
                 if i == removed_index {
                     continue;
                 }
                 let entry_offset = HEADER_SIZE + i * ENTRY_SIZE;
-                new_data.extend_from_slice(&data[entry_offset..entry_offset + ENTRY_SIZE]);
+                if i < removed_index {
+                    new_data.extend_from_slice(&data[entry_offset..entry_offset + ENTRY_SIZE]);
+                    continue;
+                }
+
+                let moved_index = i - 1;
+                let stored_type = StoredKeyType::from_byte(data[entry_offset])?;
+                let key_bytes = self.decrypt_entry(&data, i, stored_type)?;
+                let (nonce, ciphertext) = self.encrypt_key(&key_bytes, stored_type, moved_index)?;
+                new_data.push(stored_type.to_byte());
+                new_data.extend_from_slice(&nonce);
+                new_data.extend_from_slice(&ciphertext);
             }
 
             // Re-authenticate this whole file: this rewrite dropped an entry
@@ -1208,7 +1459,7 @@ impl KeyCustody for FileKeyCustody {
 
             let data = self.read_file()?;
             drop(map);
-            let key_bytes = self.decrypt_entry(&data, entry_index)?;
+            let key_bytes = self.decrypt_entry(&data, entry_index, StoredKeyType::X25519)?;
 
             let secret = StaticSecret::from(*key_bytes);
             let peer_key = X25519PublicKey::from(peer);
@@ -1354,12 +1605,14 @@ impl KeyCustody for FileKeyCustody {
                 // doesn't match"; treating it as the latter would
                 // permit a corrupted file to silently re-grow with
                 // duplicate entries on every retry.
-                let existing_bytes = self.decrypt_entry(&data, *idx).map_err(|e| {
-                    PlatformError::CustodyError(format!(
-                        "import dedup scan: failed to decrypt entry {idx} \
-                         (handle {id}) — file may be corrupted: {e}"
-                    ))
-                })?;
+                let existing_bytes = self
+                    .decrypt_entry(&data, *idx, StoredKeyType::Ed25519)
+                    .map_err(|e| {
+                        PlatformError::CustodyError(format!(
+                            "import dedup scan: failed to decrypt entry {idx} \
+                                 (handle {id}) — file may be corrupted: {e}"
+                        ))
+                    })?;
                 let existing = SigningKey::from_bytes(&existing_bytes);
                 if existing.verifying_key().to_bytes() == target_pub {
                     return Ok(KeyHandle::new(*id));
@@ -2280,5 +2533,415 @@ mod tests {
                 "handle {id} has stale entry_index {idx} ≥ on-disk count {count}"
             );
         }
+    }
+    // -----------------------------------------------------------------------
+    // Two custody objects over one key file (§17.8 of
+    // `.docs/specs/17-persistence-and-storage.md`, "One writer at a time").
+    // -----------------------------------------------------------------------
+
+    /// Eight `FileKeyCustody` objects over one path each generate one key at
+    /// once, and the file ends up holding all eight distinct keys.
+    ///
+    /// This is the end state the advisory lock exists to produce: eight
+    /// appends, eight surviving entries, eight distinct keys, and eight handles
+    /// that each read back their own. It does not decide whether
+    /// `append_entry` takes that lock, because the interleaving it would
+    /// otherwise hit is a few syscalls wide and does not reproduce on every
+    /// run. `append_entry_waits_for_a_lock_another_writer_holds` is the
+    /// assertion that fails when the lock leaves `append_entry`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn eight_custody_objects_over_one_file_keep_all_eight_keys() {
+        use std::sync::Arc;
+
+        const WRITERS: usize = 8;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+
+        // Construct the file once, so no constructor races another constructor
+        // and every object below opens the same existing header.
+        drop(FileKeyCustody::new(&path, "pw").unwrap());
+
+        let mut tasks = Vec::with_capacity(WRITERS);
+        for _ in 0..WRITERS {
+            let custody = Arc::new(FileKeyCustody::new(&path, "pw").unwrap());
+            tasks.push(tokio::spawn(async move {
+                let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+                let public = custody.public_key(&handle).await.unwrap();
+                public.as_bytes().to_vec()
+            }));
+        }
+
+        let mut public_keys = Vec::with_capacity(WRITERS);
+        for task in tasks {
+            public_keys.push(task.await.unwrap());
+        }
+
+        let bytes = std::fs::read(&path).unwrap();
+        let on_disk_count =
+            u32::from_le_bytes(bytes[ENTRY_COUNT_OFFSET..HEADER_SIZE].try_into().unwrap()) as usize;
+        assert_eq!(
+            on_disk_count, WRITERS,
+            "every generated key must reach disk: {on_disk_count} of {WRITERS} entries survived"
+        );
+        assert_eq!(
+            bytes.len(),
+            HEADER_SIZE + WRITERS * ENTRY_SIZE,
+            "the file length must match the entry count it declares"
+        );
+
+        public_keys.sort_unstable();
+        public_keys.dedup();
+        assert_eq!(
+            public_keys.len(),
+            WRITERS,
+            "each caller must hold its own key, not a key another caller wrote"
+        );
+
+        // Reopening reads all eight entries back, which proves each entry
+        // decrypts under the index it sits at.
+        let reopened = FileKeyCustody::new(&path, "pw").unwrap();
+        let mut reread = Vec::with_capacity(WRITERS);
+        for id in 1..=WRITERS as u64 {
+            let public = reopened.public_key(&KeyHandle::new(id)).await.unwrap();
+            reread.push(public.as_bytes().to_vec());
+        }
+        reread.sort_unstable();
+        assert_eq!(
+            public_keys, reread,
+            "reopening must recover the same eight keys"
+        );
+    }
+
+    /// A second custody object over one key file appends without discarding the
+    /// entry a first object wrote, and both objects' handles keep working.
+    #[tokio::test]
+    async fn a_second_custody_object_appends_without_dropping_the_first_key() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+
+        let first = FileKeyCustody::new(&path, "pw").unwrap();
+        let first_handle = first.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let first_public = first.public_key(&first_handle).await.unwrap();
+
+        let second = FileKeyCustody::new(&path, "pw").unwrap();
+        let second_handle = second.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let second_public = second.public_key(&second_handle).await.unwrap();
+
+        assert_ne!(
+            first_public.as_bytes(),
+            second_public.as_bytes(),
+            "two objects must hold two keys, not one key twice"
+        );
+        assert_eq!(
+            first.public_key(&first_handle).await.unwrap().as_bytes(),
+            first_public.as_bytes(),
+            "the first object's key must survive the second object's append"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-entry binding (§17.8 of
+    // `.docs/specs/17-persistence-and-storage.md`, "Per-entry binding").
+    // -----------------------------------------------------------------------
+
+    /// A handle that names an entry the file has since refilled with the other
+    /// key type reports an error instead of signing.
+    ///
+    /// Object `a` records (Ed25519, entry 0) and (X25519, entry 1). Object `b`
+    /// destroys entry 0, which moves the X25519 secret to entry 0 and re-seals
+    /// a valid file HMAC under the same passphrase. Object `a`'s map still says
+    /// entry 0 holds an Ed25519 key. `SigningKey::from_bytes` accepts any 32
+    /// bytes, so without the stored-`key_type` comparison in `decrypt_entry`
+    /// this `sign` call returns an Ed25519 signature computed from an X25519
+    /// static secret.
+    #[tokio::test]
+    async fn a_handle_over_a_refilled_entry_fails_instead_of_signing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+
+        let a = FileKeyCustody::new(&path, "pw").unwrap();
+        let ed = a.generate_keypair(KeyType::Ed25519).await.unwrap();
+        a.generate_keypair(KeyType::X25519).await.unwrap();
+
+        // `b` loads the same two entries and mints handles 1 and 2 for them, so
+        // handle 1 names entry 0.
+        let b = FileKeyCustody::new(&path, "pw").unwrap();
+        b.destroy_key(&KeyHandle::new(1)).await.unwrap();
+
+        let sign_error = a
+            .sign(&ed, b"payload")
+            .await
+            .expect_err("signing an entry that now holds an X25519 secret must fail");
+        match sign_error {
+            PlatformError::CustodyError(msg) => assert!(
+                msg.contains("X25519") && msg.contains("Ed25519"),
+                "the error must name both the stored type and the expected type: {msg}"
+            ),
+            other => panic!("expected CustodyError, got {other:?}"),
+        }
+
+        let public_key_error = a
+            .public_key(&ed)
+            .await
+            .expect_err("reading a public key from a refilled entry must fail");
+        assert!(matches!(public_key_error, PlatformError::CustodyError(_)));
+    }
+
+    /// A writer who swaps two entry blocks and re-seals the file HMAC under the
+    /// passphrase-derived MAC key produces entries the AEAD rejects.
+    ///
+    /// The file HMAC cannot catch this swap, because the writer recomputes it —
+    /// which is exactly what every legitimate `append_entry` and `destroy_key`
+    /// does. The associated data `encrypt_key` binds catches it: each
+    /// ciphertext committed to the index it was written at. Removing the
+    /// `Payload` from `encrypt_key` and `decrypt_entry` makes this `sign` call
+    /// return a signature under the other entry's key.
+    #[tokio::test]
+    async fn an_entry_moved_to_another_index_fails_its_aead_check() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+
+        let custody = FileKeyCustody::new(&path, "pw").unwrap();
+        let first = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let second = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let first_public = custody.public_key(&first).await.unwrap();
+        let second_public = custody.public_key(&second).await.unwrap();
+
+        let mut data = custody.read_file().unwrap();
+        let first_start = HEADER_SIZE;
+        let second_start = HEADER_SIZE + ENTRY_SIZE;
+        let first_entry = data[first_start..first_start + ENTRY_SIZE].to_vec();
+        let second_entry = data[second_start..second_start + ENTRY_SIZE].to_vec();
+        data[first_start..first_start + ENTRY_SIZE].copy_from_slice(&second_entry);
+        data[second_start..second_start + ENTRY_SIZE].copy_from_slice(&first_entry);
+        seal_file_mac(&custody.mac_key, &mut data).unwrap();
+        atomic_write(&path, &data).unwrap();
+
+        // The file now passes `verify_file`, so only the per-entry binding is
+        // left to reject it.
+        assert!(
+            custody.read_file().is_ok(),
+            "a re-sealed file must pass its HMAC check, which is what makes this test \
+             exercise the AEAD binding rather than the HMAC"
+        );
+
+        let error = custody
+            .sign(&first, b"payload")
+            .await
+            .expect_err("an entry moved to another index must not decrypt");
+        match error {
+            PlatformError::CustodyError(msg) => assert!(
+                msg.contains("decryption failed"),
+                "the AEAD must reject a relocated ciphertext: {msg}"
+            ),
+            other => panic!("expected CustodyError, got {other:?}"),
+        }
+
+        assert_ne!(
+            first_public.as_bytes(),
+            second_public.as_bytes(),
+            "this test needs two distinct keys for the swap to be observable"
+        );
+    }
+
+    /// `destroy_key` re-encrypts every entry it moves, so the handles naming
+    /// those entries keep working.
+    ///
+    /// `encrypt_key` binds an entry's index, so an entry copied verbatim into a
+    /// lower index would fail every later decrypt. Deleting the re-encryption
+    /// branch from `destroy_key` makes the third handle's `sign` call fail here.
+    #[tokio::test]
+    async fn destroy_key_reencrypts_the_entries_it_moves() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+
+        let custody = FileKeyCustody::new(&path, "pw").unwrap();
+        let first = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let victim = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let third = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let fourth = custody.generate_keypair(KeyType::X25519).await.unwrap();
+
+        let first_public = custody.public_key(&first).await.unwrap();
+        let third_public = custody.public_key(&third).await.unwrap();
+        let fourth_public = custody.public_key(&fourth).await.unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        custody.destroy_key(&victim).await.unwrap();
+
+        assert_eq!(
+            custody.public_key(&first).await.unwrap().as_bytes(),
+            first_public.as_bytes(),
+            "an entry that kept its index must keep its key"
+        );
+        assert_eq!(
+            custody.public_key(&third).await.unwrap().as_bytes(),
+            third_public.as_bytes(),
+            "an entry that moved down one index must still decrypt to the same key"
+        );
+        assert_eq!(
+            custody.public_key(&fourth).await.unwrap().as_bytes(),
+            fourth_public.as_bytes(),
+            "a moved X25519 entry must still decrypt to the same key"
+        );
+        custody
+            .sign(&third, b"payload")
+            .await
+            .expect("a moved Ed25519 entry must still sign");
+        let peer = [7u8; 32];
+        custody
+            .dh_agree(&fourth, &peer)
+            .await
+            .expect("a moved X25519 entry must still agree");
+
+        // The moved entries carry fresh ciphertext, which is what makes them
+        // decryptable at their new indices.
+        let after = std::fs::read(&path).unwrap();
+        let moved_third = HEADER_SIZE + ENTRY_SIZE;
+        assert_ne!(
+            &after[moved_third..moved_third + ENTRY_SIZE],
+            &before[HEADER_SIZE + 2 * ENTRY_SIZE..HEADER_SIZE + 3 * ENTRY_SIZE],
+            "a moved entry must be re-encrypted under its new index, not copied"
+        );
+        // The entry that did not move keeps its bytes.
+        assert_eq!(
+            &after[HEADER_SIZE..HEADER_SIZE + ENTRY_SIZE],
+            &before[HEADER_SIZE..HEADER_SIZE + ENTRY_SIZE],
+            "an entry that kept its index must keep its bytes"
+        );
+    }
+
+    /// `entry_aad` gives every (`key_type`, `entry_index`) pair its own 9-byte
+    /// encoding, so no two entries share associated data.
+    #[test]
+    fn entry_aad_separates_every_type_and_index_pair() {
+        let mut seen = std::collections::HashSet::new();
+        for key_type in [StoredKeyType::Ed25519, StoredKeyType::X25519] {
+            for index in 0..64usize {
+                assert!(
+                    seen.insert(entry_aad(key_type, index)),
+                    "associated data repeated for {key_type:?} at index {index}"
+                );
+            }
+        }
+        assert_eq!(seen.len(), 128);
+    }
+
+    /// The lock file sits beside the key file and carries the key file's name
+    /// with `.lock` appended, so `atomic_write`'s `{name}.{32 hex}.tmp`
+    /// temporary never collides with it.
+    #[test]
+    fn the_lock_file_sits_beside_the_key_file() {
+        let path = Path::new("/tmp/scp-lock-name-test/keys.bin");
+        assert_eq!(
+            lock_file_path(path),
+            PathBuf::from("/tmp/scp-lock-name-test/keys.bin.lock")
+        );
+    }
+    /// A second caller of `lock_key_file_for_write` waits while a first holds
+    /// that lock.
+    ///
+    /// Two `FileKeyCustody` objects hold two `file_write_lock` mutexes, so this
+    /// advisory lock is the only thing that makes them take turns. Replacing
+    /// `fs2::FileExt::lock_exclusive` with a call that returns immediately makes
+    /// the second thread set its flag inside the wait below, which fails this
+    /// assertion.
+    #[test]
+    fn a_second_writer_waits_for_the_key_file_lock() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+
+        let held = lock_key_file_for_write(&path).unwrap();
+
+        let acquired = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&acquired);
+        let waiter_path = path;
+        let waiter = std::thread::spawn(move || {
+            let _second = lock_key_file_for_write(&waiter_path).unwrap();
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !acquired.load(Ordering::SeqCst),
+            "a second writer must wait while a first holds the key-file lock"
+        );
+
+        drop(held);
+        waiter.join().unwrap();
+        assert!(
+            acquired.load(Ordering::SeqCst),
+            "releasing the lock must let the waiting writer through"
+        );
+    }
+
+    /// `append_entry` waits for the key-file lock rather than reading and
+    /// writing beside whoever holds it.
+    ///
+    /// The test takes that lock directly, then starts one `generate_keypair`
+    /// and checks that it has not finished 300 ms later. Deleting the
+    /// `lock_key_file_for_write` call from `append_entry` lets that call finish
+    /// in milliseconds, which fails this assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn append_entry_waits_for_a_lock_another_writer_holds() {
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+        let custody = Arc::new(FileKeyCustody::new(&path, "pw").unwrap());
+
+        let held = lock_key_file_for_write(&path).unwrap();
+
+        let appending = Arc::clone(&custody);
+        let task = tokio::spawn(async move { appending.generate_keypair(KeyType::Ed25519).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !task.is_finished(),
+            "generate_keypair must wait for the key-file lock another writer holds"
+        );
+
+        drop(held);
+        let handle = task.await.unwrap().unwrap();
+        custody
+            .public_key(&handle)
+            .await
+            .expect("the key written after the lock was released must read back");
+    }
+
+    /// `destroy_key` waits for the key-file lock the same way `append_entry`
+    /// does, so its rewrite never replaces an entry another writer appended
+    /// between its own read and its own write.
+    ///
+    /// Deleting the `lock_key_file_for_write` call from `destroy_key` lets the
+    /// call below finish while this test holds that lock, which fails this
+    /// assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn destroy_key_waits_for_a_lock_another_writer_holds() {
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+        let custody = Arc::new(FileKeyCustody::new(&path, "pw").unwrap());
+        let victim = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+
+        let held = lock_key_file_for_write(&path).unwrap();
+
+        let destroying = Arc::clone(&custody);
+        let task = tokio::spawn(async move { destroying.destroy_key(&victim).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !task.is_finished(),
+            "destroy_key must wait for the key-file lock another writer holds"
+        );
+
+        drop(held);
+        task.await
+            .unwrap()
+            .expect("destroy_key must succeed once the lock is free");
     }
 }

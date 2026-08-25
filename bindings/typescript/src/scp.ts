@@ -763,12 +763,15 @@ export class SCP {
    * Create a DID whose key material lives in a custody backend a caller
    * names.
    *
-   * @param custody Custody backend: `"in_memory"` (development — plaintext keys
-   *   in process memory), `"platform"`, or `"software"`. Naming a backend is
-   *   required, and this parameter has no default: persistence spec §17.17.1
-   *   (`SCP-CAPSEL-8000`) forbids an omit-the-field form that selects a
-   *   backend for a caller, and §17:658 classifies `InMemoryKeyCustody` as a
-   *   security nullifier. Kotlin and Swift require this same argument.
+   * @param custody Custody backend: `"file"` (this process holds its own keys
+   *   in `$HOME/.scp/keys.bin` under `SCP_KEY_PASSPHRASE`), `"platform"` or
+   *   `"software"` (an injected `KeyCustodyProvider`), or `"in_memory"`
+   *   (development — plaintext keys in process memory, on a build carrying a
+   *   testing feature). Naming a backend is required, and this parameter has
+   *   no default: persistence spec §17.17.1 (`SCP-CAPSEL-8000`) forbids an
+   *   omit-the-field form that selects a backend for a caller, and §17:658
+   *   classifies `InMemoryKeyCustody` as a security nullifier. Kotlin and
+   *   Swift require this same argument.
    * @throws {IdentityError} If `custody` is missing or empty — code
    *   `SCP-IDENT-1060`.
    */
@@ -787,9 +790,10 @@ export class SCP {
    * Create a DID that carries an agent key, in a custody backend a caller
    * names.
    *
-   * @param custody Custody backend: `"in_memory"` (development — plaintext keys
-   *   in process memory), `"platform"`, or `"software"`. Required, with no
-   *   default; {@link SCP.identityCreate} states why.
+   * @param custody Custody backend: `"file"`, `"platform"`, `"software"`, or
+   *   `"in_memory"` — the same four names {@link SCP.identityCreate} takes,
+   *   documented there. Required, with no default; {@link SCP.identityCreate}
+   *   states why.
    * @throws {IdentityError} If `custody` is missing or empty — code
    *   `SCP-IDENT-1060`.
    */
