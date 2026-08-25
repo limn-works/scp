@@ -1046,3 +1046,37 @@ class TestGovernanceActionResultFromBridge:
 
         with pytest.raises(UnknownGovernanceOutcomeError):
             GovernanceActionResult.from_bridge("")
+
+
+class TestMemberRoleFromBridge:
+    """``MemberRole.from_bridge`` names every built-in role.
+
+    ``RESERVED_ROLE_NAMES`` in ``crates/scp-protocol/src/context/roles.rs``
+    forbids a custom role from taking any of the six built-in names, so a name
+    among them that parses to :attr:`MemberRole.CUSTOM` reports a
+    protocol-defined role as one a context's governance defined. ``author``
+    carries ``messages:write`` and the outlet capabilities, and ``subscriber``
+    is what a broadcast subscribe assigns, so a caller that cannot tell those
+    two apart cannot tell a writer from a reader. Deleting either member makes
+    ``test_every_built_in_role_name_parses_to_its_own_member`` fail.
+    """
+
+    def test_every_built_in_role_name_parses_to_its_own_member(self) -> None:
+        from scp_sdk.types import MemberRole
+
+        assert MemberRole.from_bridge("admin") is MemberRole.ADMIN
+        assert MemberRole.from_bridge("moderator") is MemberRole.MODERATOR
+        assert MemberRole.from_bridge("member") is MemberRole.MEMBER
+        assert MemberRole.from_bridge("observer") is MemberRole.OBSERVER
+        assert MemberRole.from_bridge("author") is MemberRole.AUTHOR
+        assert MemberRole.from_bridge("subscriber") is MemberRole.SUBSCRIBER
+
+    def test_governance_defined_role_name_parses_to_custom(self) -> None:
+        from scp_sdk.types import MemberRole
+
+        assert MemberRole.from_bridge("night-shift-reviewer") is MemberRole.CUSTOM
+
+    def test_quotes_and_whitespace_are_stripped(self) -> None:
+        from scp_sdk.types import MemberRole
+
+        assert MemberRole.from_bridge('  "subscriber"  ') is MemberRole.SUBSCRIBER

@@ -194,7 +194,7 @@ function parseGovernanceActionResult(raw: string): GovernanceActionResult {
  * compile time. A JavaScript caller — or TypeScript that defeats its own types
  * through `any` or a type-suppression directive — still reaches these methods
  * with `undefined`, so this guard gives that caller a documented
- * `SCP-IDENT-1060` instead of a napi conversion failure. That code reports an
+ * `SCP-IDENT-1061` instead of a napi conversion failure. That code reports an
  * absent selection; `SCP-VALID-7005` reports a custody name no build
  * recognizes, and `SCP-IDENT-1003` / `SCP-IDENT-1008` report a named backend a
  * build cannot serve. A storage-selection guard in this `SCP` constructor pairs
@@ -208,7 +208,7 @@ function requireCustodySelection(custody: unknown): void {
         'pass "platform" or "software" and wire a KeyCustodyProvider through ' +
         'SCP.identityCreateWithCustody, or pass "in_memory" on a build carrying ' +
         "a testing feature. There is no default custody backend.",
-      "SCP-IDENT-1060",
+      "SCP-IDENT-1061",
     );
   }
 }
@@ -773,7 +773,7 @@ export class SCP {
    *   classifies `InMemoryKeyCustody` as a security nullifier. Kotlin and
    *   Swift require this same argument.
    * @throws {IdentityError} If `custody` is missing or empty — code
-   *   `SCP-IDENT-1060`.
+   *   `SCP-IDENT-1061`.
    */
   async identityCreate(custody: string): Promise<Identity> {
     requireCustodySelection(custody);
@@ -795,7 +795,7 @@ export class SCP {
    *   documented there. Required, with no default; {@link SCP.identityCreate}
    *   states why.
    * @throws {IdentityError} If `custody` is missing or empty — code
-   *   `SCP-IDENT-1060`.
+   *   `SCP-IDENT-1061`.
    */
   async identityCreateWithAgentKey(custody: string): Promise<Identity> {
     requireCustodySelection(custody);

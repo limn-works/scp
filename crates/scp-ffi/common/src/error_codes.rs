@@ -290,6 +290,19 @@ pub const IDENT_1058: &str = "SCP-IDENT-1058";
 /// (Option A) is out of scope (Discussion #1553).
 pub const IDENT_1059: &str = "SCP-IDENT-1059";
 
+/// A caller reached a broadcast operation without naming an identity handle.
+///
+/// The Kotlin SDK's `CoroutineBridge.resolveIdentityHandle` raises this string
+/// when a caller passes no `identityHandle` and set no
+/// `BroadcastBridgeOps.defaultIdentityHandle`
+/// (`bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/bridge/CoroutineBridge.kt`),
+/// and `CoroutineBridgeTest` pins it. That literal lives in a language SDK, and
+/// Phase 2 of `scripts/check-error-codes.sh` reads only the four FFI bridge
+/// source directories, so no gate would have caught a second meaning minted
+/// against this number. It is recorded here so a later author reads it as
+/// taken.
+pub const IDENT_1060: &str = "SCP-IDENT-1060";
+
 /// A caller reached an identity-creation method without naming a key custody
 /// backend.
 ///
@@ -300,10 +313,10 @@ pub const IDENT_1059: &str = "SCP-IDENT-1059";
 /// require that argument does so; this code is what its runtime guard reports
 /// when a caller defeats those types (JavaScript, `any`, a type-suppression
 /// directive) and arrives with no selection. It reports an absent selection
-/// only — an unrecognized custody name is `VALID_7005`, and a named backend
-/// this build cannot serve is `IDENT_1003` or `IDENT_1008`. This is a custody
-/// analogue of `STORAGE_8000`.
-pub const IDENT_1060: &str = "SCP-IDENT-1060";
+/// only — an unrecognized custody name is `VALID_7005`, a named backend this
+/// build cannot serve is `IDENT_1003` or `IDENT_1008`, and an absent identity
+/// handle is `IDENT_1060`. This is a custody analogue of `STORAGE_8000`.
+pub const IDENT_1061: &str = "SCP-IDENT-1061";
 
 // -------------------------------------------------------------------------
 // Context (SCP-CTX- 2000--2999)

@@ -44,7 +44,10 @@ public enum GovernanceActionResult: String, Sendable {
 
 /// Role assigned to a member within a context (spec section 5.5).
 ///
-/// Mirrors `scp_core::context::roles::Role`.
+/// The six cases before ``custom`` carry the six built-in role names
+/// `scp_core::context::roles` reserves: `RESERVED_ROLE_NAMES` forbids a custom
+/// role from taking any of them, so a member holding one of those names holds
+/// the protocol-defined role of that name.
 public enum MemberRole: String, Sendable {
     /// Context administrator with full governance capabilities.
     case admin = "Admin"
@@ -54,16 +57,21 @@ public enum MemberRole: String, Sendable {
     case member = "Member"
     /// Read-only observer with no write capabilities.
     case observer = "Observer"
+    /// Broadcast-context writer: message writes plus outlet query and call.
+    case author = "Author"
+    /// Broadcast-context reader, which a subscribe assigns.
+    case subscriber = "Subscriber"
     /// Custom role defined by context governance.
     case custom = "Custom"
 
     /// Parse a bridge-layer role name into a ``MemberRole``.
     ///
     /// Every bridge reports an assigned role's name
-    /// (`RoleAssignment.role_name`). A name no case carries is a role a
-    /// context's governance defined, which ``custom`` is exactly what this
-    /// protocol calls — so that answer states what a governance engine
-    /// reported rather than substituting a protocol-defined role for it.
+    /// (`RoleAssignment.role_name`), and every built-in name has a case above.
+    /// A name no case carries is therefore a role a context's governance
+    /// defined, which ``custom`` is exactly what this protocol calls — so that
+    /// answer states what a governance engine reported rather than
+    /// substituting a protocol-defined role for it.
     public static func fromBridge(_ raw: String) -> MemberRole {
         let normalised = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             .trimmingCharacters(in: CharacterSet(charactersIn: "\""))

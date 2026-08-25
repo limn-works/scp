@@ -448,9 +448,20 @@ function encodeConsequenceCapability(capability: ConsequenceCapability): unknown
 /**
  * Role assigned to a member within a context (spec section 5.5).
  *
- * Mirrors `scp_core::context::roles::Role`.
+ * The six members before `"Custom"` carry the six built-in role names
+ * `scp_core::context::roles` reserves: `RESERVED_ROLE_NAMES` forbids a custom
+ * role from taking any of them, so a member holding one of those names holds
+ * the protocol-defined role of that name. `"Custom"` names every role a
+ * context's governance defined.
  */
-export type MemberRole = "Admin" | "Moderator" | "Member" | "Observer" | "Custom";
+export type MemberRole =
+  | "Admin"
+  | "Moderator"
+  | "Member"
+  | "Observer"
+  | "Author"
+  | "Subscriber"
+  | "Custom";
 
 // ---------------------------------------------------------------------------
 // Broadcast

@@ -76,17 +76,23 @@
 //!
 //! # One writer at a time
 //!
-//! `append_entry` and `destroy_key` each read this file, change it, and write
-//! it back. Both hold an exclusive advisory lock on a `.lock` sibling of the
-//! key file across that whole sequence, which §17.8 of
-//! `.docs/specs/17-persistence-and-storage.md` requires under "One writer at a
-//! time". Every bridge opens `$HOME/.scp/keys.bin`
-//! (`scp_ffi_common::custody_file`), and each identity creation constructs a
-//! fresh `FileKeyCustody` over that one path, so the contending writers are
-//! two custody objects rather than two tasks inside one object. `flock`
-//! excludes a second process and a second object in this process alike; the
-//! `file_write_lock` mutex below excludes two tasks that share one object
-//! without a syscall.
+//! `append_entry`, `destroy_key`, and `import_ed25519_signing_key` each read
+//! this file, change it, and write it back. All three hold an exclusive
+//! advisory lock on a `.lock` sibling of the key file across that whole
+//! sequence, which §17.8 of `.docs/specs/17-persistence-and-storage.md`
+//! requires under "One writer at a time". Every bridge opens
+//! `$HOME/.scp/keys.bin` (`scp_ffi_common::custody_file`), and each identity
+//! creation constructs a fresh `FileKeyCustody` over that one path, so the
+//! contending writers are two custody objects rather than two tasks inside one
+//! object. `flock` excludes a second process and a second object in this
+//! process alike; the `file_write_lock` mutex below excludes two tasks that
+//! share one object without a syscall.
+//!
+//! Key import reads before it writes: its dedup scan decides whether the file
+//! already holds a seed, so that scan runs under the lock that guards the
+//! append it decides. Neither lock is reentrant, so import cannot reach
+//! `append_entry`, which takes them both again; it takes them itself and
+//! appends through `append_entry_holding_the_write_locks`.
 //!
 //! # Passphrase commitment and file HMAC
 //!
@@ -1165,12 +1171,12 @@ impl FileKeyCustody {
         Ok(data)
     }
 
-    /// Appends an encrypted key entry to the file and updates the entry count.
+    /// Appends an encrypted key entry to the file and updates the entry count,
+    /// for a caller that holds neither write lock.
     ///
-    /// Uses write-to-tmp + rename for crash-safe atomic writes (#1470).
-    ///
-    /// Holds the cross-process advisory lock from the read below through the
-    /// write at the end, which §17.8 of
+    /// Takes both locks and hands the read-modify-write to
+    /// [`Self::append_entry_holding_the_write_locks`], so the cross-process
+    /// advisory lock spans that whole sequence — what §17.8 of
     /// `.docs/specs/17-persistence-and-storage.md` requires under "One writer at
     /// a time". Without it, two custody objects over one key file each read one
     /// entry count, each append at that count, and the later `atomic_write`
@@ -1192,6 +1198,32 @@ impl FileKeyCustody {
             .lock()
             .map_err(|_| PlatformError::CustodyError("file write lock poisoned".into()))?;
         let _file_lock = lock_key_file_for_write(&self.path)?;
+        self.append_entry_holding_the_write_locks(key_type, private_key)
+    }
+
+    /// Appends an encrypted key entry to the file and updates the entry count,
+    /// for a caller that already holds both write locks.
+    ///
+    /// Uses write-to-tmp + rename for crash-safe atomic writes (#1470).
+    ///
+    /// `import_ed25519_signing_key` reads the file, scans every Ed25519 entry
+    /// for the key it is about to store, and appends when that scan matches
+    /// nothing. §17.8 of `.docs/specs/17-persistence-and-storage.md` requires
+    /// one advisory lock across that whole read-modify-write, and neither lock
+    /// is reentrant — `file_write_lock` is a plain mutex, and a second
+    /// `lock_key_file_for_write` in this process opens a second file
+    /// description whose `flock` blocks on the first one — so that caller takes
+    /// both locks once, before its read, and calls this function to write.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::CustodyError`] when [`Self::read_file`] rejects
+    /// the file, when AES-256-GCM rejects the key, and when the write fails.
+    fn append_entry_holding_the_write_locks(
+        &self,
+        key_type: StoredKeyType,
+        private_key: &[u8; KEY_LEN],
+    ) -> Result<EntryId, PlatformError> {
         let mut data = self.read_file()?;
 
         // Read current entry count.
@@ -1683,15 +1715,36 @@ impl KeyCustody for FileKeyCustody {
             // here (that method re-acquires `handle_map` and would
             // deadlock). Instead, read the file once and decrypt
             // candidate Ed25519 entries directly via `decrypt_entry`.
-            // `append_entry` takes the separate `file_write_lock`,
-            // never `handle_map`, so there is no inversion.
             //
             // The scan walks the file's entries rather than this object's
             // handle map, because a second custody object over the same path
             // writes entries this object minted no handle for. A scan over the
             // map would miss those entries and append a second copy of a key
             // the file already holds.
+            //
+            // Both write locks are taken here, before that read, and held
+            // through the append below, because this scan and that append are
+            // one read-modify-write of the key file: §17.8 of
+            // `.docs/specs/17-persistence-and-storage.md` requires an
+            // exclusive advisory lock across it, and states that an in-process
+            // mutex does not satisfy that requirement. `handle_map` excludes
+            // only two tasks that share this object, so without the advisory
+            // lock two custody objects over one path — the arrangement every
+            // bridge produces, since each identity creation constructs a fresh
+            // object over `$HOME/.scp/keys.bin` — each scan a file that holds
+            // no matching entry, each append, and the file ends up holding two
+            // entries wrapping one private key. `destroy_key` then removes the
+            // one entry its handle names and leaves the other on disk.
+            //
+            // Lock order matches `destroy_key`: `handle_map`, then
+            // `file_write_lock`, then the advisory lock. Nothing below awaits,
+            // so no lock here is held across a suspension point.
             let mut map = self.handle_map.lock().await;
+            let _lock = self
+                .file_write_lock
+                .lock()
+                .map_err(|_| PlatformError::CustodyError("file write lock poisoned".into()))?;
+            let _file_lock = lock_key_file_for_write(&self.path)?;
 
             let data = self.read_file()?;
             let entry_count = data.len().saturating_sub(HEADER_SIZE) / ENTRY_SIZE;
@@ -1742,10 +1795,12 @@ impl KeyCustody for FileKeyCustody {
             // Persist the seed bytes via the same encrypted append-only
             // log used by `generate_keypair`. After this call the bytes
             // are encrypted-at-rest under the same passphrase-derived key.
-            // `append_entry` takes only `file_write_lock` — safe to call
-            // while holding `handle_map`.
+            // Both write locks are already held above and neither is
+            // reentrant, so this call takes the variant that writes under
+            // locks its caller holds.
             let key_bytes = Zeroizing::new(**seed);
-            let entry_id = self.append_entry(StoredKeyType::Ed25519, &key_bytes)?;
+            let entry_id =
+                self.append_entry_holding_the_write_locks(StoredKeyType::Ed25519, &key_bytes)?;
 
             let handle = self.next_handle();
             map.entries
@@ -2563,6 +2618,113 @@ mod tests {
         assert_eq!(
             count, 1,
             "concurrent dedup must not append a parallel encrypted entry"
+        );
+    }
+
+    /// Appends one Ed25519 entry to `custody`'s key file without taking either
+    /// write lock, which is what lets a test stand in for a second custody
+    /// object mid-write while that test holds the advisory lock itself. Every
+    /// custody write path would block on that lock instead. Mirrors what
+    /// `append_entry_holding_the_write_locks` writes, byte for byte.
+    fn append_ed25519_entry_bypassing_the_locks(
+        custody: &FileKeyCustody,
+        seed: &Zeroizing<[u8; KEY_LEN]>,
+    ) {
+        let mut data = std::fs::read(&custody.path).unwrap();
+        verify_file(&data, &custody.mac_key).unwrap();
+
+        let current_count =
+            u32::from_le_bytes(data[ENTRY_COUNT_OFFSET..HEADER_SIZE].try_into().unwrap());
+        let entry_id = generate_unique_entry_id(&data).unwrap();
+        let (nonce, ciphertext) = custody
+            .encrypt_key(seed, StoredKeyType::Ed25519, &entry_id)
+            .unwrap();
+
+        data.push(StoredKeyType::Ed25519.to_byte());
+        data.extend_from_slice(&entry_id);
+        data.extend_from_slice(&nonce);
+        data.extend_from_slice(&ciphertext);
+        data[ENTRY_COUNT_OFFSET..HEADER_SIZE].copy_from_slice(&(current_count + 1).to_le_bytes());
+
+        seal_file_mac(&custody.mac_key, &mut data).unwrap();
+        atomic_write(&custody.path, &data).unwrap();
+    }
+
+    /// `import_ed25519_signing_key` reads the key file under the same advisory
+    /// lock it writes under, so a key another writer stored while this import
+    /// waited is a key this import finds rather than a key it stores a second
+    /// time.
+    ///
+    /// §17.8 of `.docs/specs/17-persistence-and-storage.md` requires that lock
+    /// "from the read that starts a read-modify-write of a key file through the
+    /// write that ends that sequence", and states that an in-process mutex does
+    /// not satisfy it. Key import is such a sequence: its dedup scan reads the
+    /// file, and its append writes the file.
+    ///
+    /// This test holds the advisory lock while the import runs, which is what a
+    /// second custody object over one `$HOME/.scp/keys.bin` holds mid-write —
+    /// the arrangement every bridge produces, because each identity creation
+    /// constructs a fresh `FileKeyCustody` over that one path. It then stores
+    /// the very seed the import is about to store, and releases the lock.
+    ///
+    /// Reading before taking the lock instead makes the import scan an empty
+    /// file, miss, wait, and append: the file ends up holding two entries
+    /// wrapping one private key, and `destroy_key` on either handle leaves the
+    /// other entry — that private key, still encrypted — on disk. Moving the
+    /// two lock acquisitions in `import_ed25519_signing_key` below its
+    /// `read_file` call turns the entry-count assertion below red.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn import_scans_the_key_file_under_the_advisory_lock() {
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+
+        let importer = Arc::new(FileKeyCustody::new(&path, "pw").unwrap());
+        let other_writer = FileKeyCustody::new(&path, "pw").unwrap();
+
+        let seed = Zeroizing::new([7u8; KEY_LEN]);
+        let expected_public = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+
+        // Stand in for a second custody object that is mid-write: hold the
+        // advisory lock this import has to wait on.
+        let held = lock_key_file_for_write(&path).unwrap();
+
+        let import_custody = Arc::clone(&importer);
+        let import_seed = seed.clone();
+        let import = tokio::spawn(async move {
+            import_custody
+                .import_ed25519_signing_key(&import_seed)
+                .await
+                .unwrap()
+        });
+
+        // Long enough for the spawned import to reach whichever point it blocks
+        // at, on any runner.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !import.is_finished(),
+            "an import must wait for the advisory lock rather than write beside its holder"
+        );
+
+        // What that second custody object writes before it releases the lock.
+        append_ed25519_entry_bypassing_the_locks(&other_writer, &seed);
+        drop(held);
+
+        let handle = import.await.unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let count = u32::from_le_bytes(bytes[ENTRY_COUNT_OFFSET..HEADER_SIZE].try_into().unwrap());
+        assert_eq!(
+            count, 1,
+            "an import that scanned the file under the lock must find the entry another writer \
+             stored, rather than append a second entry wrapping the same private key"
+        );
+
+        assert_eq!(
+            importer.public_key(&handle).await.unwrap().as_bytes(),
+            expected_public,
+            "the handle an import returned must name the key it was asked to store"
         );
     }
 

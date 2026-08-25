@@ -5513,6 +5513,62 @@ mod identity_remove_validation_tests {
 mod file_custody_agent_key_tests {
     use super::*;
 
+    /// Filter that selects [`every_admitted_custody_name_reaches_an_arm_inner`]
+    /// and nothing else, and the line its child prints so its parent can tell
+    /// "the inner test passed" from "the filter matched nothing".
+    const INNER_TEST_FILTER: &str = "every_admitted_custody_name_reaches_an_arm_inner";
+    const INNER_TEST_SENTINEL: &str = "[file-custody-agent-key] every admitted name reached an arm";
+
+    /// Runs [`every_admitted_custody_name_reaches_an_arm_inner`] in a child
+    /// process that carries a temporary `HOME` and a `SCP_KEY_PASSPHRASE`.
+    ///
+    /// The `"file"` arm reads both variables through
+    /// `scp_ffi_common::custody_file`, and `HOME` has to name a temporary
+    /// directory so that arm writes its key file there rather than into
+    /// whichever `$HOME/.scp` the machine running this test owns. Setting them
+    /// with `std::env::set_var` is what this test must not do: CI drives this
+    /// lane with `cargo test -p scp-ffi-napi --features server`, libtest runs a
+    /// binary's tests as threads of one process, and `server.rs` calls
+    /// `std::env::temp_dir()` — a `getenv` — in two of its tests. glibc's
+    /// `setenv` reallocates `environ` and frees the old array, so a concurrent
+    /// `getenv` reads freed memory. `Command::env` writes the child's
+    /// environment and leaves this process's environment untouched, so no
+    /// sibling test races it and nothing has to be restored afterwards.
+    ///
+    /// A child that matched no test exits 0, so this asserts on what the child
+    /// printed as well as on its status: renaming the inner test without
+    /// renaming the filter leaves both assertions red rather than passing
+    /// vacuously.
+    #[test]
+    fn every_admitted_custody_name_reaches_an_arm() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let exe = std::env::current_exe().expect("this test binary's own path");
+
+        let output = std::process::Command::new(exe)
+            .args([
+                INNER_TEST_FILTER,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("HOME", tmp.path())
+            .env("SCP_KEY_PASSPHRASE", "agent-key-file-custody-test")
+            .output()
+            .expect("re-running this test binary for the inner test");
+
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "the inner test failed in its child process.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains(INNER_TEST_SENTINEL),
+            "the child ran no inner test — {INNER_TEST_FILTER:?} matched nothing.\nstdout:\n\
+             {stdout}\nstderr:\n{stderr}"
+        );
+    }
+
     /// Every custody name `validate_custody_type` admits reaches an arm of
     /// `identity_create_with_agent_key`, and `"file"` reaches the same
     /// fail-closed pre-rotation error `identity_create` reaches.
@@ -5521,24 +5577,13 @@ mod file_custody_agent_key_tests {
     /// that name into the catch-all, which returns `SCP-IDENT-1005` and fails
     /// both assertions below.
     ///
-    /// This is the only test in this crate that writes `HOME` or
-    /// `SCP_KEY_PASSPHRASE`. `cargo test` runs a crate's tests as threads of
-    /// one process, so a second env-writing test here would race this one; the
-    /// four names are checked in one test for that reason. `HOME` points at a
-    /// temporary directory so the `"file"` arm creates its key file there
-    /// rather than in whichever `$HOME/.scp` the machine running this test
-    /// owns.
+    /// Ignored so libtest skips it on a normal run:
+    /// [`every_admitted_custody_name_reaches_an_arm`] runs it, in a child
+    /// process whose `HOME` and `SCP_KEY_PASSPHRASE` that parent sets on the
+    /// child alone.
     #[test]
-    fn every_admitted_custody_name_reaches_an_arm() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        // SAFETY: no other test in this crate reads or writes these two
-        // variables, and no other thread in this process reads the environment
-        // while this call runs.
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("SCP_KEY_PASSPHRASE", "agent-key-file-custody-test");
-        }
-
+    #[ignore = "run in a child process by every_admitted_custody_name_reaches_an_arm"]
+    fn every_admitted_custody_name_reaches_an_arm_inner() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -5574,5 +5619,9 @@ mod file_custody_agent_key_tests {
                 );
             }
         }
+
+        // Read by the parent process, which cannot otherwise tell a passing
+        // inner test from a filter that matched nothing.
+        println!("{INNER_TEST_SENTINEL}");
     }
 }

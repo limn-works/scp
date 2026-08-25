@@ -22,8 +22,10 @@ Persistence spec §17.8 classifies `InMemoryKeyCustody` as a security
 nullifier, and `SCP-CAPSEL-8000` (§17.17.1) forbids a form that selects a
 backend for a caller, whichever backend it picks. **A caller now names a
 custody backend on every call.** TypeScript also rejects a missing selection at
-runtime with `SCP-IDENT-1060`, which a JavaScript caller reaches without a type
-check.
+runtime with `SCP-IDENT-1061`, which a JavaScript caller reaches without a type
+check. (`SCP-IDENT-1060` was already in service: Kotlin's `CoroutineBridge`
+raises it for a broadcast call that names no identity handle, and the shared
+registry now records that meaning against that number.)
 
 **An unknown governance outcome fails closed.** Python's
 `GovernanceActionResult.from_bridge` returned `EXECUTED` for a string it did not
@@ -51,13 +53,18 @@ racing on one path no longer overwrite each other's keys.
 Two further defects in that same key file are closed. Every bridge opens one
 `$HOME/.scp/keys.bin` and constructs a fresh `FileKeyCustody` for each identity
 creation, so the writers that contend for that file are two custody objects
-rather than two tasks inside one. `append_entry` and `destroy_key` now hold an
-exclusive advisory lock across their whole read-modify-write, which excludes a
-second process and a second object in this process alike; the per-object mutex
-they held before excluded neither, so two concurrent creations each appended at
-one index and the later write replaced the earlier — **one generated private key
-never reached disk while both callers read success, and both handles then named
-the surviving entry**. Each entry now carries a 16-byte `entry_id` that custody
+rather than two tasks inside one. `append_entry`, `destroy_key`, and
+`import_ed25519_signing_key` now hold an exclusive advisory lock across their
+whole read-modify-write, which excludes a second process and a second object in
+this process alike; the per-object mutex they held before excluded neither, so
+two concurrent creations each appended at one index and the later write replaced
+the earlier — **one generated private key never reached disk while both callers
+read success, and both handles then named the surviving entry**. Key import
+reads before it writes: its dedup scan decides whether the file already holds a
+seed, so that scan runs under the same lock as the append it decides. Two key
+rotations racing on one machine used to leave two encrypted entries wrapping one
+private key, and `destroy_key` on either handle then reported success while
+leaving that key on disk under the other entry. Each entry now carries a 16-byte `entry_id` that custody
 draws once and no later write changes; a handle records that identifier, every
 read finds its entry by comparing identifiers, and each entry's ciphertext binds
 `key_type | entry_id` as AES-256-GCM associated data. Every read path also
@@ -100,6 +107,21 @@ telling the caller they had found a bug in the bridge layer. **That method now
 opens the same encrypted key file `identityCreate("file")` opens**, which is
 what the `PyO3` bridge already did by routing both creators through one
 `parse_custody`.
+
+**Two protocol-defined roles stopped reading as governance-defined ones.**
+`member_role` on the `PyO3` and `UniFFI` bridges now reports
+`RoleAssignment.role_name`, which is one of the six names
+`crates/scp-protocol/src/context/roles.rs` reserves. Python's `MemberRole`,
+Swift's `MemberRole`, and TypeScript's `MemberRole` carried five of those six, so
+a member holding `author` or `subscriber` resolved to `Custom` — the answer each
+SDK documents as "a role a context's governance defined", which
+`RESERVED_ROLE_NAMES` forbids either name from being. **All three now carry
+`Author` and `Subscriber`**, so a broadcast app tells a writing author from a
+read-only subscriber. TypeScript's bridge wrapper capitalized a first letter and
+asserted the result into `MemberRole`, which put values outside that union into
+a typed field — `"Author"` before this union carried it, and `"My-role"` for any
+governance-defined role — so a `switch` over `MemberRole` matched no case. It
+now parses a name the way Swift and Python do.
 
 **Three in-memory or always-succeeds implementations left public API.**
 `InMemoryFfiTrustStore`, `InMemoryViolationStore`, and `NoOpRevocationChecker`

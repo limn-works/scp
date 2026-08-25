@@ -53,7 +53,7 @@ describe("custody selection is required", () => {
         (caught: unknown) => caught,
       );
       expect(err).toBeInstanceOf(IdentityError);
-      expect((err as IdentityError).code).toBe("SCP-IDENT-1060");
+      expect((err as IdentityError).code).toBe("SCP-IDENT-1061");
       expect((err as IdentityError).message).toContain("custody selection is required");
     }
   });
@@ -65,7 +65,25 @@ describe("custody selection is required", () => {
       (caught: unknown) => caught,
     );
     expect(err).toBeInstanceOf(IdentityError);
-    expect((err as IdentityError).code).toBe("SCP-IDENT-1060");
+    expect((err as IdentityError).code).toBe("SCP-IDENT-1061");
+  });
+
+  it("carries a code no other condition already raises", async () => {
+    // `SCP-IDENT-1060` was in service before this guard existed: Kotlin's
+    // `CoroutineBridge.resolveIdentityHandle` raises it when a broadcast call
+    // names no identity handle, and `CoroutineBridgeTest` asserts it. One code
+    // naming two conditions sends an operator whose handler keys on the string
+    // to the wrong remedy, so this guard carries `SCP-IDENT-1061`, which
+    // `crates/scp-ffi/common/src/error_codes.rs` allocates to it. Phase 2 of
+    // `scripts/check-error-codes.sh` reads only the four FFI bridge source
+    // directories, so it sees neither literal.
+    const { scp } = mountMockScp();
+    const err = await scp.identityCreate("").then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
+    expect((err as IdentityError).code).not.toBe("SCP-IDENT-1060");
+    expect((err as IdentityError).code).toBe("SCP-IDENT-1061");
   });
 
   it("passes a named custody backend through to a bridge", async () => {

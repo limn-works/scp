@@ -185,7 +185,10 @@ class ProvenanceQuality(enum.Enum):
 class MemberRole(enum.Enum):
     """Role assigned to a member within a context (spec section 5.5).
 
-    Mirrors ``scp_core::context::roles::Role``.
+    The six members before :attr:`CUSTOM` carry the six built-in role names
+    ``scp_core::context::roles`` reserves: ``RESERVED_ROLE_NAMES`` forbids a
+    custom role from taking any of them, so a member holding one of those names
+    holds the protocol-defined role of that name.
     """
 
     #: Context administrator with full governance capabilities.
@@ -196,6 +199,10 @@ class MemberRole(enum.Enum):
     MEMBER = "Member"
     #: Read-only observer with no write capabilities.
     OBSERVER = "Observer"
+    #: Broadcast-context writer: message writes plus outlet query and call.
+    AUTHOR = "Author"
+    #: Broadcast-context reader, which a subscribe assigns.
+    SUBSCRIBER = "Subscriber"
     #: Custom role defined by context governance.
     CUSTOM = "Custom"
 
@@ -204,10 +211,11 @@ class MemberRole(enum.Enum):
         """Parse a bridge-layer role name into a :class:`MemberRole`.
 
         Every bridge reports an assigned role's name (``RoleAssignment.role_name``),
-        matched here without regard to case. A name no member carries is a
-        role a context's governance defined, which :attr:`CUSTOM` is exactly
-        what this protocol calls — so that answer states what a governance
-        engine reported rather than substituting a protocol-defined role for it.
+        matched here without regard to case, and every built-in name has a
+        member above. A name no member carries is therefore a role a context's
+        governance defined, which :attr:`CUSTOM` is exactly what this protocol
+        calls — so that answer states what a governance engine reported rather
+        than substituting a protocol-defined role for it.
         """
         normalised = raw.strip().strip('"')
         for member in cls:
