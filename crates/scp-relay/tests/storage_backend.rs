@@ -242,7 +242,17 @@ fn explicit_sqlite_backend_opens_sqlite() {
     });
 
     // Wait for the relay to initialize by polling for the DB file.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    //
+    // This deadline bounds how long a poll waits; an assertion below still
+    // requires that a relay created its database, so a longer wait weakens
+    // nothing. 10 seconds failed this test once during a `cargo nextest run
+    // --workspace` pass over 11019 tests, where a debug-profile relay binary
+    // competed for CPU with every other test binary and reached 10.062s
+    // without writing its file. A rerun of that same commit passed, and this
+    // test passes on its own in 1.4s, so 10 seconds measured machine load
+    // rather than relay behavior. 45 leaves headroom under that load and still
+    // fails within one test-run budget when a relay genuinely never starts.
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
     let mut db_created = false;
     while std::time::Instant::now() < deadline {
         if db_path.exists() {

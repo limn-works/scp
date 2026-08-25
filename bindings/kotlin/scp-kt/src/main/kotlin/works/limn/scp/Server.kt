@@ -18,6 +18,30 @@ import works.limn.scp.bridge.CoroutineBridge
  *
  * All methods are blocking JNA calls into Rust and must be dispatched
  * on [kotlinx.coroutines.Dispatchers.IO].
+ *
+ * ## This interface has no production implementer, and that is deliberate
+ *
+ * No production class implements [ServerBindings]. The only implementer is
+ * `StubServerBindings` in the test source set. Because no production Kotlin
+ * code reaches these operations, all ten `Server` operations in
+ * `.docs/standards/sdk-capability-matrix.json` carry `"kotlin": false` with a
+ * matching `exemptions.kotlin` reason.
+ *
+ * [ServerBindings] and [ServerBridge] stay in scp-kt because Alec ruled on
+ * 2026-08-17: "let's keep kotlin false but not forever. we can add impls
+ * later." Do not delete either type, and do not read either type as a working
+ * capability.
+ *
+ * scp-kt is a plain JVM library, so a relay IS implementable here: a relay is
+ * an inbound listener (`TcpListener::bind`,
+ * `crates/scp-transport/src/native/server.rs:446`), and a JVM server binds
+ * ports. The separate Android module scp-kt-android depends on scp-kt, and
+ * Android is not a relay or node environment: a phone sits behind carrier
+ * CGNAT with no routable address, and Doze plus Android's
+ * background-execution limits kill a persistent listener.
+ *
+ * Whoever implements [ServerBindings] flips those ten matrix cells back to
+ * `true` and removes their exemptions.
  */
 interface ServerBindings {
     /**
@@ -36,7 +60,7 @@ interface ServerBindings {
     fun relayStartLocal(dataDir: String): String
 
     /**
-     * Starts a full application node with in-memory storage.
+     * Starts a full application node with encrypted in-memory storage.
      *
      * @param identityDid DID string of a pre-existing identity, or null to generate a fresh identity.
      * @return JSON-encoded node handle with `relayUrl`, `relayPort`, and `did` fields.
@@ -44,7 +68,7 @@ interface ServerBindings {
     fun nodeStartInMemory(identityDid: String? = null): String
 
     /**
-     * Starts a full application node with file-backed storage.
+     * Starts a full application node on this instance's own storage backend.
      *
      * @param dataDir Directory for persistent storage.
      * @param identityDid DID string of a pre-existing identity, or null to generate a fresh identity.
@@ -427,14 +451,16 @@ class Node internal constructor(
 
     companion object {
         /**
-         * Starts a full application node with in-memory storage.
+         * Starts a full application node with encrypted in-memory storage.
          *
          * When [identityDid] is provided, the node uses the pre-existing
          * identity instead of generating a fresh one. This enables identity
          * portability -- the same DID persists across node restarts.
          *
-         * Auto-wires in-memory key custody, in-memory storage, in-memory DHT
-         * client, self-signed TLS, and a relay on an OS-assigned port.
+         * Auto-wires encrypted in-memory storage (ephemeral), self-signed TLS,
+         * and a relay on an OS-assigned port. A build carrying a test-harness
+         * feature also auto-wires in-memory key custody and an in-memory DHT
+         * client; a shipped build fails closed instead when `identity` is absent.
          *
          * @param bridge The [ServerBridge] providing FFI access.
          * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.
@@ -446,7 +472,7 @@ class Node internal constructor(
         ): Node = bridge.startNodeInMemory(identityDid)
 
         /**
-         * Starts a full application node with file-backed storage.
+         * Starts a full application node on this instance's own storage backend.
          *
          * When [identityDid] is provided, the node uses the pre-existing
          * identity. When `null`, the node creates or reloads a persistent
@@ -476,6 +502,20 @@ class Node internal constructor(
  * All operations delegate through the coroutine bridge to UniFFI-generated
  * Rust functions. Provides relay and application node startup/shutdown as
  * suspend functions with proper dispatcher assignment.
+ *
+ * ## Every method here runs against a [ServerBindings] that only tests supply
+ *
+ * [ServerBridge] delegates to [ServerBindings], and no production class
+ * implements [ServerBindings] — see the note on that interface for the full
+ * state. All ten `Server` operations in
+ * `.docs/standards/sdk-capability-matrix.json` therefore carry
+ * `"kotlin": false` with a matching `exemptions.kotlin` reason.
+ *
+ * [ServerBridge] stays in scp-kt because Alec ruled on 2026-08-17: "let's keep
+ * kotlin false but not forever. we can add impls later." Do not delete this
+ * class, and do not read it as a working capability. A JVM implementation of
+ * [ServerBindings] makes every method here live, and whoever writes it flips
+ * those ten matrix cells back to `true` and removes their exemptions.
  */
 class ServerBridge internal constructor(
     private val bindings: ServerBindings,
@@ -517,7 +557,7 @@ class ServerBridge internal constructor(
         }
 
     /**
-     * Starts a full application node with in-memory storage.
+     * Starts a full application node with encrypted in-memory storage.
      *
      * When [identityDid] is provided, the node uses the pre-existing
      * identity instead of generating a fresh one.
@@ -539,7 +579,7 @@ class ServerBridge internal constructor(
         }
 
     /**
-     * Starts a full application node with file-backed storage.
+     * Starts a full application node on this instance's own storage backend.
      *
      * @param dataDir Directory for persistent storage.
      * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.

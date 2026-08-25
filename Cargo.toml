@@ -29,6 +29,53 @@ members = [
     "crates/scp-ffi/napi-test-stubs",
 ]
 
+# Every member except `crates/scp-testing`, which a bare `cargo build` at this
+# root must not compile.
+#
+# `scp-testing` is a `publish = false` test harness whose `helpers.rs` names
+# `InMemoryDhtClient` and `TestDidDht` at lib level, so its `scp-core`,
+# `scp-identity`, `scp-platform`, `scp-dht`, and `scp-node` edges carry
+# `testing` / `allow_unencrypted_storage` as NORMAL dependencies rather than
+# dev-dependencies. Resolver 2 unifies normal-dependency features across every
+# package one invocation builds, so a workspace-wide `cargo build` compiles
+# `InMemoryKeyCustody`, `InMemoryDhtClient`, `InMemoryPreRotationCustody`, and
+# `ProtocolRepository::new_for_testing` into each FFI bridge cdylib — binaries
+# `.github/workflows/build-matrix.yml` uploads and
+# `.github/workflows/release.yml` Authenticode-signs. Excluding one member here
+# removes that unification path, and
+# `scripts/check-shipped-feature-graph.sh` asserts a default-members build
+# resolves nothing outside its permitted-production allowlist.
+#
+# A test run still covers `scp-testing`: CI passes `--workspace` explicitly,
+# which overrides this list.
+default-members = [
+    "crates/scp-clock",
+    "crates/scp-crypto",
+    "crates/scp-did",
+    "crates/scp-dht",
+    "crates/scp-platform",
+    "crates/scp-identity",
+    "crates/scp-event-log",
+    "crates/scp-protocol",
+    "crates/scp-relay-client",
+    "crates/scp-mls",
+    "crates/scp-client",
+    "crates/scp-client-wasm",
+    "crates/scp-relay-mock",
+    "crates/scp-runtime",
+    "crates/scp-core",
+    "crates/scp-transport",
+    "crates/scp-mcp",
+    "crates/scp-media",
+    "crates/scp-node",
+    "crates/scp-relay",
+    "crates/scp-ffi",
+    "crates/scp-ffi/common",
+    "crates/scp-ffi/uniffi",
+    "crates/scp-ffi/napi",
+    "crates/scp-ffi/napi-test-stubs",
+]
+
 [workspace.package]
 edition = "2024"
 repository = "https://github.com/limn/scp"
@@ -114,6 +161,44 @@ cargo_common_metadata = "allow"
 # proptest macro expansion creates large internal runner arrays on the stack;
 # clippy cannot point to the source location so a crate-level allow is needed.
 large_stack_arrays = "allow"
+# `clippy::unused_async_trait_impl` (added in clippy 1.98.0) reports an `async fn`
+# whose body contains no `.await`, inside an impl block.
+#
+# THE CRITERION for allowing it: this lint decides nothing that `clippy::unused_async`
+# does not already decide, except on a trait impl, and on a trait impl the author of
+# the impl does not control whether the future exists. `clippy::unused_async` stays
+# enabled below, so the question "should this function be async at all" still has to
+# be answered wherever the author of the function can answer it.
+#
+# The evidence behind that criterion, per kind of site the lint reaches:
+#
+#  - An inherent impl. `clippy::unused_async` reports the same function, so allowing
+#    the second name drops no detection. It does not follow that every such function
+#    carries an individual justification: three of the allows naming
+#    `clippy::unused_async` are `#![allow(..)]` inner attributes covering a whole file or
+#    module rather than one function.
+#  - A trait impl. `clippy::unused_async` skips these deliberately. The trait declares
+#    the method as future-returning, so the impl can only re-spell
+#    `async fn f(..) -> T` as `fn f(..) -> impl Future<Output = T> + Send
+#    { async move { .. } }`, which desugars to the identical future. Clippy's own
+#    suggested form is not that re-spelling: it wraps the body's values in
+#    `std::future::ready`, which runs the body at call time instead of at poll time
+#    and so moves when a side effect such as a map insert happens.
+#
+# THE CASE THAT LOOKS LIKE AN EXCEPTION, AND IS NOT: a trait this workspace owns whose
+# methods no impl awaits. `HandleQuerier` (crates/scp-runtime/src/discovery/addressing.rs)
+# and `ContextQuerier` (crates/scp-runtime/src/discovery/search.rs) are the two, and
+# de-asyncing either would be the wrong edit. Both declare methods that perform network
+# I/O — `lookup_domain_handle` fetches `.well-known/scp`, `query_context` queries a remote
+# context's `agent_search` outlet. No impl awaits because the implementations that would
+# do that I/O do not exist yet: `ContextQuerier`'s only impl is a test double, and
+# `LocalHandleQuerier` returns an empty vector from two methods it cannot perform.
+# Removing `async` would write the missing backend's absence into the signature and make
+# adding it a breaking change.
+#
+# `clippy::unused_async` is NOT allowed here — an async function with no await still
+# has to justify itself at every inherent-impl and free-function site.
+unused_async_trait_impl = "allow"
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"

@@ -115,13 +115,13 @@ pub const IDENT_1016: &str = "SCP-IDENT-1016";
 /// Operation requires retained signing custody, which this identity/handle
 /// lacks.
 ///
-/// Surfaced by operations that must sign with the creator/identity key (UCAN
-/// mint, UCAN delegate, event-log checkpoint, broadcast publish) when the
-/// identity was loaded externally with no retained custody, or the
-/// custody/handle is sign-only without the needed key material. Distinct from
-/// `IDENT_1001` (identity not registered). (UCAN delegate surfaces this on
-/// `UniFFI` only; the registry-based NAPI/PyO3 delegate paths surface
-/// `IDENT_1001` instead — see sdk-common.md.)
+/// Surfaced by operations that must sign with a creator/identity key (UCAN
+/// mint, event-log checkpoint, broadcast publish) when an identity was loaded
+/// externally with no retained custody, or when a custody/handle is sign-only
+/// without needed key material. Distinct from `IDENT_1001` (identity not
+/// registered). UCAN delegate surfaces `IDENT_1001` on every bridge, because
+/// `PyO3`, NAPI, and `UniFFI` all read a delegator's key from their identity
+/// registry — see sdk-common.md.
 pub const IDENT_1017: &str = "SCP-IDENT-1017";
 /// Recovery ownership rejection.
 ///

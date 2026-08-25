@@ -99,7 +99,10 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"
 scp-dht = { path = "../scp-dht", features = ["testing"] }
 scp-mls = { path = "../scp-mls", features = ["testing"] }
 scp-protocol = { path = "../scp-protocol", features = ["testing"] }
-scp-platform = { path = "../scp-platform", features = ["testing", "encrypting"] }
+# `filesystem` backs ADR-052 §AC-9 `EncryptedStorage` seal doctests on
+# `ProtocolRepository::new`: `FilesystemStorage` is a plaintext backend that a
+# `compile_fail,E0277` assertion proves cannot reach a production constructor.
+scp-platform = { path = "../scp-platform", features = ["testing", "encrypting", "filesystem"] }
 scp-event-log = { path = "../scp-event-log", features = ["testing"] }
 openmls_basic_credential = { workspace = true, features = ["test-utils"] }
 proptest = "1"

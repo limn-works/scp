@@ -30,14 +30,34 @@ jobs:
   changes:
     needs: check-draft
     runs-on: ubuntu-latest
+    # `rust-toolchain.toml` selects the compiler for every lane below, not only the Rust
+    # one: `python-test` runs `maturin develop`, `typescript-check` runs
+    # `cargo build -p scp-ffi-napi`, the two wasm jobs run `wasm-pack build`, `kotlin-test`
+    # runs `cargo build -p scp-ffi-uniffi`, and `swift-build-test` runs
+    # `build-xcframework.sh`. Every job those outputs guard is written
+    # `if: needs.changes.outputs.<lane> == 'true'`, and the `ci` job that aggregates every
+    # other job's result counts a skipped job as a pass, so a lane the pin does not reach
+    # lets a version bump merge with nothing compiling on the new compiler.
+    #
+    # `.cargo/config.toml` reaches every one of those lanes for the same reason: cargo
+    # reads a `.cargo/config.toml` out of every ancestor of the directory a cargo command
+    # runs in, so the rustflags it sets apply to each of those compiles.
+    #
+    # The `toolchain` filter below holds both files, and every output ORs that filter in,
+    # so this workflow names each of them once. `scripts/check-toolchain-wiring.sh` reads
+    # these output names out of this file and fails when one of them drops the OR, so a
+    # lane added later is covered without editing that gate.
     outputs:
-      rust: ${{ steps.filter.outputs.rust }}
-      python: ${{ steps.filter.outputs.python }}
-      typescript: ${{ steps.filter.outputs.typescript }}
-      typescript-wasm: ${{ steps.filter.outputs.typescript-wasm }}
-      scaffold-typescript-web: ${{ steps.filter.outputs.scaffold-typescript-web }}
-      kotlin: ${{ steps.filter.outputs.kotlin }}
-      swift: ${{ steps.filter.outputs.swift }}
+      rust: ${{ steps.filter.outputs.rust == 'true' || steps.filter.outputs.toolchain == 'true' }}
+      python: ${{ steps.filter.outputs.python == 'true' || steps.filter.outputs.toolchain == 'true' }}
+      typescript: ${{ steps.filter.outputs.typescript == 'true' || steps.filter.outputs.toolchain == 'true' }}
+      typescript-wasm: ${{ steps.filter.outputs.typescript-wasm == 'true' || steps.filter.outputs.toolchain == 'true' }}
+      scaffold-typescript-web: ${{ steps.filter.outputs.scaffold-typescript-web == 'true' || steps.filter.outputs.toolchain == 'true' }}
+      kotlin: ${{ steps.filter.outputs.kotlin == 'true' || steps.filter.outputs.toolchain == 'true' }}
+      swift: ${{ steps.filter.outputs.swift == 'true' || steps.filter.outputs.toolchain == 'true' }}
+      # `fuzz-build` is the one job the stable pin does not decide: it runs `cargo check`
+      # with `working-directory: fuzz`, where rustup resolves `fuzz/rust-toolchain.toml`
+      # instead, and the `fuzz` filter's `fuzz/**` entry already covers that file.
       fuzz: ${{ steps.filter.outputs.fuzz }}
     steps:
       - uses: actions/checkout@v5
@@ -45,11 +65,40 @@ jobs:
         id: filter
         with:
           filters: |
+            # The files that decide how every lane compiles, rather than what any one lane
+            # compiles. The `outputs:` block above ORs this filter into every other lane,
+            # so no other filter repeats an entry listed here.
+            toolchain:
+              - 'rust-toolchain.toml'
+              # Cargo reads `.cargo/config.toml` out of every ancestor directory of the
+              # one a cargo command runs in, so this file reaches every cargo invocation
+              # in this workspace and every `wasm-pack build` under it. Its
+              # `[target.wasm32-unknown-unknown]` stanza sets the rustflag that selects
+              # getrandom's wasm backend, and `typescript-wasm-check` and
+              # `scaffold-typescript-web-check` fail to link without it. A `[build]`
+              # stanza added there would change what every other lane compiles.
+              - '.cargo/**'
             rust:
               - 'crates/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'deny.toml'
+              # The `docker-image` job builds from these two and is guarded by this
+              # filter, so a change to either has to reach it.
+              - 'Dockerfile'
+              - '.dockerignore'
+              # `rust-clippy` reads `.clippy.toml` and `rust-fmt` reads `rustfmt.toml`,
+              # and this filter guards both. A pull request that lowers a threshold in
+              # either file and changes nothing else would otherwise skip the job that
+              # reads it, and the next branch to rebase would find the check red.
+              - '.clippy.toml'
+              - 'rustfmt.toml'
+              # `scripts/check-toolchain-wiring.sh` enumerates every root-level file in
+              # the git tree, and every cargo configuration file the tree holds at any
+              # depth, and fails when one is listed neither here nor in the `toolchain`
+              # filter, unless that gate declares that no job reads it while it compiles.
+              # A file added at the repository root later, or a `.cargo/config.toml`
+              # added under any directory, fails that gate until someone classifies it.
             python:
               - 'bindings/python/**'
               - 'crates/scp-ffi/src/**'
@@ -134,9 +183,9 @@ jobs:
   # SCP-crate feature set (dev-deps EXCLUDED) is a subset of an explicit
   # durability-only + real-backend allowlist — so NO
   # in-memory nullifier (custody / attestation / pre-rotation / DHT / did:key)
-  # feature can reach a production binary. Closed ⊆-whitelist; ZERO nullifier
-  # features is the gate's design mandate/target, with one disclosed
-  # allow_unencrypted_storage residue — see ADR-062 §Status / #2292.
+  # feature, and no allow_unencrypted_storage feature (which unseals
+  # ProtocolRepository::new_for_testing), can reach a production binary. Closed
+  # ⊆-whitelist carrying ZERO nullifier exceptions — see ADR-062 §Decision 6.
   # The fixture harness (a/b/c + soundness + allowlist hygiene) runs
   # first and must pass before the real workspace gate. NEVER add a resolved
   # nullifier feature to the allowlist to make this pass — fix the dependency edge.
@@ -303,6 +352,27 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: bash scripts/check-handle-affinity.sh
+
+  # ── Toolchain wiring ───────────────────────────────────────────────
+  # `rust-toolchain.toml` is the one place this repository names a Rust version, so
+  # nothing can disagree with it. Two things a derivation cannot establish: that every
+  # container build copies the pin into its image, since the base tag no longer names a
+  # compiler; and which CI jobs a change to a pin has to reach, since every Rust job is
+  # guarded by a paths filter and the `ci` aggregator counts a skipped job as a pass.
+  toolchain-wiring:
+    needs: check-draft
+    name: enforcement / toolchain wiring
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # The mise check parses `.mise.toml` with `tomllib`, which the Python standard
+      # library has held since 3.11, and it fails when no interpreter on PATH imports it.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: bash scripts/check-toolchain-wiring.sh
+      - name: Run toolchain-wiring cases
+        run: bash scripts/tests/toolchain-wiring/run-tests.sh
 
   # ── Mutable shared process-global enforcement (ADR-048, #1549 Phase 4) ──
   # Forward-prevention gates that forbid the DEFAULT_BRIDGE_INSTANCE pattern
@@ -717,6 +787,42 @@ jobs:
       - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@v2
 
+  # ── Container image ─────────────────────────────────────────────────
+  # Builds the `Dockerfile` that ships `scp-relay` and `scp-node`, and that
+  # `templates/personal-relay/README.md` tells a self-hosting operator to run. Nothing
+  # built this image until this job existed, so it sat on `FROM rust:1.85-slim` —
+  # thirteen minor versions behind the pin — while every other file read the current
+  # one, and its `.dockerignore` excluded the `*.md` files twelve crates pull in with
+  # `#![doc = include_str!("../README.md")]`. Both defects compile fine and break only
+  # at `docker build`.
+  #
+  # The build reaches the release compile of both binaries, so it is the slowest job
+  # here; the gha cache keeps a re-run that changes no dependency to the final stage.
+  docker-image:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    name: Docker / relay and node image
+    runs-on: ubuntu-latest
+    steps:
+      # The builder stage measures about 6 GB — 2 GB of it the pin's cross-compilation
+      # targets — before the buildx cache blobs. `rust-clippy` here and all three jobs in
+      # `fuzz.yml` already reclaim this space.
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          # Read the cache everywhere; write it only from a push to `main`. A cache
+          # written on a pull-request ref is readable only by that pull request, and it
+          # would evict entries from the 10 GB budget the ~18 `Swatinem/rust-cache` steps
+          # in this workflow share. `ignore-error` so a cache-service failure cannot fail
+          # the build check: this job answers whether the image builds.
+          cache-from: type=gha,scope=docker-image
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=docker-image,ignore-error=true' || '' }}
+
   # ── Python ──────────────────────────────────────────────────────────
   python-lint:
     needs: changes
@@ -957,6 +1063,16 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - run: ./gradlew :scp-kt:runKtlintCheckOverMainSourceSet
       - run: ./gradlew :scp-kt:detekt
+      # `generateUniffiBindings` writes into `src/main/kotlin`, so Gradle fails
+      # any task that reads that root and carries no ordering edge to it. Gradle
+      # reports the failure only when both tasks land in one build and the
+      # reader executes, and no job ran `sourcesJar` or `dokkaHtml` beside the
+      # generator — so both shipped without an edge, and the release workflow's
+      # publish-maven step would have aborted at `sourcesJar`. This gate reads
+      # the edges out of Gradle's task model, so it fails on a missing edge
+      # whatever the caller asked to build. It compiles no Rust, which is why it
+      # belongs in this job rather than in `kotlin-test`.
+      - run: ./gradlew :scp-kt:checkUniffiBindingsOrdering
 
   kotlin-test:
     needs: changes
@@ -998,7 +1114,13 @@ jobs:
         run: |
           # Set JNA library path to find the compiled Rust cdylib
           export LD_LIBRARY_PATH="${GITHUB_WORKSPACE}/target/debug${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          ./gradlew testDebugUnitTest
+          # Name both test tasks explicitly. `:scp-kt` is a kotlin-jvm module
+          # and declares `test`; only the Android library module declares
+          # `testDebugUnitTest`. Running the bare name `testDebugUnitTest`
+          # therefore ran the Android unit tests alone and skipped every
+          # `:scp-kt` test — including the real-FFI suites that exercise the
+          # compiled cdylib this job builds two steps above.
+          ./gradlew :scp-kt:test :scp-kt-android:testDebugUnitTest
 
   # ── Swift ──────────────────────────────────────────────────────────
   swift-lint:
@@ -1054,20 +1176,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      # Pin nightly to the last known-good date for the fuzz crate.
-      # Nightlies after 2026-05-03 tightened pub(crate) re-export rules
-      # (E0365) and break openmls 0.8.1's
-      # `pub use crate::ciphersuite::signature::*` at prelude.rs:16.
-      # Unpin once openmls publishes a fix or we upgrade to a version
-      # that re-exports under the new compiler rules.
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2026-05-03
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "fuzz -> target"
+      # This step names no channel. rustup applies the toolchain file of the directory a
+      # command runs in, so running `cargo check` from `fuzz/` resolves
+      # `fuzz/rust-toolchain.toml` and installs the nightly it names — the same
+      # invocation `fuzz/README.md` documents. That file records why the channel is a
+      # dated nightly and what unpins it.
       - name: Check fuzz crate compiles
-        run: cargo +nightly-2026-05-03 check --manifest-path fuzz/Cargo.toml
+        working-directory: fuzz
+        run: cargo check
 
   # ── Bridge parity (ADR-046) ────────────────────────────────────────
   # Cross-bridge runtime parity harness: drives PyO3 (in-process) and
@@ -1309,11 +1428,16 @@ jobs:
       - bridge-globals
       - fallback-registry
       - handle-affinity
+      - pyi-generated
+      - construction-pattern
+      - block-in-place
       - no-panic-abort
       - handler-no-panic
       - saga-gating-granularity
       - deleted-primitives
       - bridge-instance-lifecycle
+      - toolchain-wiring
+      - docker-image
       - no-mutable-globals-rust
       - no-mutable-globals-python
       - no-mutable-globals-ts
@@ -1357,11 +1481,16 @@ jobs:
             "${{ needs.bridge-globals.result }}" \
             "${{ needs.fallback-registry.result }}" \
             "${{ needs.handle-affinity.result }}" \
+            "${{ needs.pyi-generated.result }}" \
+            "${{ needs.construction-pattern.result }}" \
+            "${{ needs.block-in-place.result }}" \
             "${{ needs.no-panic-abort.result }}" \
             "${{ needs.handler-no-panic.result }}" \
             "${{ needs.saga-gating-granularity.result }}" \
             "${{ needs.deleted-primitives.result }}" \
             "${{ needs.bridge-instance-lifecycle.result }}" \
+            "${{ needs.toolchain-wiring.result }}" \
+            "${{ needs.docker-image.result }}" \
             "${{ needs.no-mutable-globals-rust.result }}" \
             "${{ needs.no-mutable-globals-python.result }}" \
             "${{ needs.no-mutable-globals-ts.result }}" \

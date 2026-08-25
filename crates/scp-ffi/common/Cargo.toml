@@ -51,15 +51,31 @@ testing = [
 custody = ["dep:scp-platform", "scp-platform?/file"]
 # Shared relay/node startup code for FFI bridges that need to spawn servers.
 # Requires scp-transport (relay), scp-node (application node), scp-platform, and
-# tokio. Storage uses the durability-only in-memory-storage feature of
-# scp-platform (ADR-062 Slice 0). This feature does NOT enable
+# tokio. `start_node_local` opens no protocol store: it receives a caller's
+# already-selected `EncryptedStorage` handle and reaches `Node::start`, so it
+# needs no `scp-platform/filesystem` edge — plaintext `FilesystemStorage`, which
+# `start_node_local` once constructed, has no consumer in this crate.
+# `scp-platform/in-memory-storage` remains for `start_node_in_memory`
+# (ADR-062 Slice 0, durability-only), and `scp-platform/encrypting` + `dep:rand`
+# back an `EncryptingAdapter` wrap that `start_node_in_memory` puts around that
+# ephemeral store, which satisfies a sealed `EncryptedStorage` bound that a
+# production `Node::start` requires (spec §17.5). `encrypting` is already
+# unconditional on this crate's `scp-platform` edge; it is restated here so a
+# `server` feature stays self-contained. This feature does NOT enable
 # scp-platform's `testing` feature: since ADR-062 Slice 6 (SCP-CAPINJECT-006)
-# server.rs's `Explicit`-identity phantoms are typed to the production
-# `FileKeyCustody` (not the `InMemoryKeyCustody` nullifier), and the dev-relay
+# server.rs's `Explicit`-identity phantoms are typed to a production
+# `FileKeyCustody` (not to an `InMemoryKeyCustody` nullifier), and a dev-relay
 # auto-generate path FAILS CLOSED (`ServerError::AutoGenerateUnavailable`) on a
 # shipped build instead of running a nullifier-backed node. No test-harness
 # platform edge is present, transitively or otherwise — G1 proves it.
-server = ["dep:scp-transport", "dep:scp-node", "dep:scp-platform", "scp-platform/in-memory-storage", "scp-platform/filesystem", "scp-platform/file", "dep:scp-identity", "dep:tokio", "dep:tokio-util", "dep:tracing", "dep:thiserror"]
+# `resolvers` is listed because `server.rs` names `scp_core::context::supervisor::Supervisor`
+# (in `wire_and_supervise_context_events`) and `crate::bridge_instance::CoreFields`
+# (in `register_node`), and both live behind `resolvers`. That edge held before
+# this line existed only because `resolvers` is a default feature; declaring it
+# makes `--no-default-features --features server` compile rather than fail on a
+# missing `scp-core` dep. It resolves no new feature anywhere, because every
+# crate enabling `server` already enables `resolvers`.
+server = ["resolvers", "dep:scp-transport", "dep:scp-node", "dep:scp-platform", "scp-platform/in-memory-storage", "scp-platform/file", "scp-platform/encrypting", "dep:scp-identity", "dep:rand", "dep:tokio", "dep:tokio-util", "dep:tracing", "dep:thiserror"]
 
 [dependencies]
 scp-core = { path = "../../scp-core", optional = true }
@@ -75,7 +91,12 @@ scp-identity = { path = "../../scp-identity", optional = true }
 # feature lists — the crate is always present, never feature-gated optional.
 scp-dht = { path = "../../scp-dht", features = ["production-dht"] }
 scp-transport = { path = "../../scp-transport", features = ["redb-blob"], optional = true }
-scp-node = { path = "../../scp-node", features = ["allow_unencrypted_storage"], optional = true }
+# Default features only. `start_node_in_memory` wraps its ephemeral store in
+# `EncryptingAdapter` and `start_node_local` receives a caller's already-encrypted
+# handle, so both reach a production `Node::start` and its sealed
+# `EncryptedStorage` bound. `scripts/check-shipped-feature-graph.sh` rejects any
+# feature added here that its allowlist omits (ADR-062 §Decision 6).
+scp-node = { path = "../../scp-node", optional = true }
 scp-platform = { path = "../../scp-platform", features = ["encrypting", "sqlite", "in-memory-storage"], optional = true }
 async-trait = { workspace = true, optional = true }
 dashmap = { workspace = true }

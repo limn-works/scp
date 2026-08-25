@@ -1,0 +1,75 @@
+# The one place this repository names a Rust version. Every other consumer derives
+# the version from this file, so no two of them can disagree.
+#
+# WHO READS IT.
+#   - `cargo` and `rustup` read it natively for any command run inside this directory,
+#     and rustup installs the channel, components, and targets below on first use.
+#     `.mise.toml` names no Rust version and installs no Rust toolchain, so no
+#     `RUSTUP_TOOLCHAIN` comes between rustup and this file; the comment at the top of
+#     that file records why, which is that `fuzz/` resolves a different compiler and one
+#     exported variable cannot serve both directories.
+#   - `Dockerfile` copies this file into the builder image before any cargo command,
+#     so rustup inside the container resolves the same compiler. The image tag names
+#     a Debian release and no Rust version.
+#   - `templates/personal-relay/README.md` documents a container build that copies the
+#     repository root, this file included, for the same reason the root `Dockerfile` does.
+#
+# WHAT SELECTS THE COMPILER IN CI. The workflow steps that read
+# `dtolnay/rust-toolchain@stable` select no version: that action never reads a toolchain
+# file (its `action.yml` performs no filesystem read of the checkout), so each step
+# installs rustup's `stable` and runs `rustup default stable`. rustup then applies this
+# file as a directory override, which beats `rustup default`, so every cargo command in
+# a CI job compiles on the channel below. Each step costs one redundant toolchain
+# install and installs its `targets:` inputs into a toolchain cargo does not use. Deleting
+# those steps, and moving each job's targets to a `rustup target add`, would remove that
+# redundancy; it is not done here because most of them live in `build-matrix.yml` and
+# `release.yml`, which run only on a release tag, so a pull request produces no signal on
+# the change.
+#
+# WHY THE PIN EXISTS. Until 2026-08-22 this repository had no toolchain file, and every
+# workflow step installed `dtolnay/rust-toolchain@stable`, which resolves to whichever
+# stable Rust was published most recently. Rust 1.98.0 shipped on 2026-08-20; its clippy
+# added `chunks_exact_to_as_chunks` and `unused_async_trait_impl`. The `Rust / clippy`
+# required check started failing on every branch the next morning, and a local run of the
+# identical command on 1.97.1 reported nothing, so nobody could reproduce the failure that
+# was blocking the merge queue. CLAUDE.md requires running CI locally before pushing; that
+# requirement only means something when the local compiler and the CI compiler are the
+# same compiler. See `.docs/lessons/pin-the-rust-toolchain-or-ci-drifts-from-local.md`.
+#
+# HOW TO RAISE IT. Edit `channel` below and run the CI clippy command from the
+# "Orchestrator verification protocol" section of CLAUDE.md; rustup downloads the new
+# toolchain the first time a cargo command runs here. Fix everything the new release
+# reports in that same pull request. Nothing else names a version, so nothing else has to
+# move. Never lower the pin to make a new lint disappear.
+#
+# `targets` lists every target some CI job cross-compiles for:
+#   - wasm32-unknown-unknown ......... browser SDK (ci.yml wasm jobs)
+#   - {aarch64,x86_64}-apple-darwin .. macOS binaries and the Swift SPM mirror
+#   - aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios .. Swift SDK
+#   - {aarch64,armv7,x86_64,i686}-linux-android* .. Kotlin SDK
+#   - {x86_64,aarch64}-unknown-linux-gnu, x86_64-pc-windows-msvc .. release
+#     build matrix
+# rustup installs every one of them when it installs this toolchain.
+#
+# `fuzz/` is a standalone crate outside the workspace and needs nightly, which stable
+# cannot supply. `fuzz/rust-toolchain.toml` names that nightly, and it is the only other
+# file in this repository that names a Rust version; `.github/workflows/fuzz.yml` and the
+# fuzz check in `.github/workflows/ci.yml` read the channel out of it at run time.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]
+targets = [
+    "wasm32-unknown-unknown",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-apple-ios",
+    "aarch64-apple-ios-sim",
+    "x86_64-apple-ios",
+    "aarch64-linux-android",
+    "armv7-linux-androideabi",
+    "x86_64-linux-android",
+    "i686-linux-android",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]

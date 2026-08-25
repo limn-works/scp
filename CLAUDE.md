@@ -142,6 +142,10 @@ bridge_ratchet_baseline.json, ratchet/once-lock-count.json,
 check-shipped-feature-graph.sh (ADR-062 §Decision 6 G1 — the shipped-artifact
 feature-graph ⊆-allowlist prove-absence gate; the allowlist permits durability-only
 features only, ZERO nullifier exceptions),
+check-toolchain-wiring.sh (every container build asserts which compiler it resolved;
+the changes job of every paths-filtered workflow routes a pin change to every lane that
+compiles on it, and ci.yml routes every root-level file and every cargo configuration
+file to a lane or declares it unread; .mise.toml names no Rust version source),
 pretooluse-enforcement-files.sh,
 CLAUDE.md (enforcement sections).
 When a check fails, fix the code that the check rejected. You may modify an enforcement file for exactly two reasons:
@@ -182,13 +186,17 @@ Caulfield asked a model to characterize the director Chris Columbus and got "war
 
 All tools via [mise](https://mise.jdx.dev/) (see `.mise.toml`). **Never use npm or npx** — bun only for JS/TS. System `python3` is Xcode 3.9 — **do not use it**; use `python3.12`.
 
+**`rust-toolchain.toml` is the one place this repository names a Rust version.** Every other consumer derives the version from that file, so no two files can disagree: `cargo` and `rustup` read it natively, and rustup installs the channel, components, and targets it names on first use; `Dockerfile` and the container recipe in `templates/personal-relay/README.md` copy the file into the image before any cargo command, and their base tags name a Debian release and no Rust version. `fuzz/rust-toolchain.toml` names the nightly the standalone fuzz crate needs; run every fuzz command from inside `fuzz/` and rustup applies that file, so no command names the channel, and `.github/workflows/fuzz.yml` — whose commands run from the repository root — reads the channel out of the file in one job. To raise either version: edit `channel`, run the CI clippy command from the Orchestrator verification protocol below, and fix everything the new release reports in that same pull request. Never lower the pin to make a new lint disappear.
+
+**mise installs every tool except Rust, and `.mise.toml` names no Rust version.** mise exports one `RUSTUP_TOOLCHAIN` for the whole repository, and that variable overrides a toolchain file entirely, so it cannot give `fuzz/` a nightly while the workspace compiles on stable. rustup resolves both, per directory, and README.md lists rustup among the prerequisites. A `RUSTUP_TOOLCHAIN` exported into your shell from anywhere still overrides both files, so `scripts/hooks/pre-commit` compares `rustc --version` against the pin before it runs cargo, and `fuzz/build.rs` fails the fuzz build when that crate resolves a compiler its own file does not name. `scripts/check-toolchain-wiring.sh` checks the three properties a derivation cannot supply: that every container build carries the ASSERT-PINNED-RUSTC block, which makes the build compare the compiler it resolved against the copied-in pin, since the base tag no longer names a compiler; that the `dorny/paths-filter` wiring of every workflow that guards a job with one — `.github/workflows/ci.yml` and `.github/workflows/docs.yml` today — routes a pin change to every lane that compiles on it, and that `ci.yml` routes every root-level file and every cargo configuration file to a lane or declares that no compile reads it, since the `ci` aggregator job counts a skipped job as a pass; and that `.mise.toml`, parsed as TOML rather than matched line by line, gives its `tools` table no `rust` key and registers no `rust` idiomatic version file. See `.docs/lessons/pin-the-rust-toolchain-or-ci-drifts-from-local.md`, which records the merge-queue outage that a floating `@stable` caused.
+
 | Language | Location | Package Manager | Lint | Format | Test | Build |
 |----------|----------|----------------|------|--------|------|-------|
 | **Rust** | `crates/` | cargo (workspace) | `cargo clippy --workspace --all-targets` | `cargo fmt --all` | `cargo test --workspace` (needs `DYLD_LIBRARY_PATH` below) | `cargo build --workspace` |
 | **Python** | `bindings/python/` | pip + maturin | `python3.12 -m ruff check .` | `python3.12 -m ruff format .` | `python3.12 -m pytest tests/ -v` | `maturin develop --release` |
 | **TypeScript** | `bindings/typescript/` | **bun** (not npm) | `bun run lint` (biome) | `bun run format` (biome) | `bun test` | `bun run build` (tsup) |
 | **Kotlin** | `bindings/kotlin/` | Gradle 8.x | `./gradlew detekt` | — | `./gradlew test` | `./gradlew assembleRelease` |
-| **Fuzzing** | `fuzz/` (standalone, not workspace) | cargo-fuzz (**nightly only**) | — | — | `cargo +nightly fuzz run <target> --fuzz-dir fuzz` | `cargo +nightly check --manifest-path fuzz/Cargo.toml` |
+| **Fuzzing** | `fuzz/` (standalone, not workspace) | cargo-fuzz (**nightly only**) | — | — | `cd fuzz && cargo fuzz run <target>` | `cd fuzz && cargo check` |
 
 **Language-specific gotchas:**
 
@@ -196,7 +204,7 @@ All tools via [mise](https://mise.jdx.dev/) (see `.mise.toml`). **Never use npm 
 - **Kotlin:** JDK 17 (zulu), Gradle 8.x, Kotlin 2.x — all via mise. Run `eval "$(mise env)"` first.
 - **TypeScript:** `bun run check` runs `tsc --noEmit` for type checking. Biome handles both lint and format.
 - **PRD validation:** `python3.12 scripts/validate-prd.py` — run before committing PRD changes.
-- **Fuzzing:** `fuzz/` is a standalone crate — never add it to root `Cargo.toml` members. All commands require `+nightly`. List targets: `cargo +nightly fuzz list --fuzz-dir fuzz`. See ADR-045, the fuzzing infrastructure decision, and `fuzz/README.md`.
+- **Fuzzing:** `fuzz/` is a standalone crate — never add it to root `Cargo.toml` members. Run every fuzz command from inside `fuzz/`: rustup applies the toolchain file of the directory a command runs in, and `fuzz/rust-toolchain.toml` names the nightly cargo-fuzz needs, so no command names a version. A command run from the repository root resolves the stable pin instead, and cargo-fuzz refuses to run on it. List targets: `cd fuzz && cargo fuzz list`. See ADR-045, the fuzzing infrastructure decision, and `fuzz/README.md`.
 
 ### Git
 
@@ -207,7 +215,10 @@ All tools via [mise](https://mise.jdx.dev/) (see `.mise.toml`). **Never use npm 
 - Always open a PR when work is complete and double-zero reviewed — do not wait to be asked (see the Change protocol). Opening the PR is part of finishing the work, not a separate step that requires permission.
 - Clean, linear history
 - Unexpected changes: back off, read, understand before acting. Never discard without understanding first
-- No stashing/branch switching unless 100% confident. No destructive git ops unless told to or integrated upstream
+- **NEVER run `git stash`** — no form, no reason, no exception. Not as a real step, not as inert filler, not chained behind a `;` in a compound command. There is no "confident enough" threshold that unlocks it
+- **NEVER run `git checkout <ref> -- <path>`.** To read another revision's version of a file, use `git show <rev>:<path>`. To actually restore one, do it deliberately — show the current content first, confirm the overwrite is intended, and only then write
+- Both bans are unconditional because both failures are SILENT: the working tree looks clean afterwards, so the destroyed work is either discovered hours later or misread as a genuine code finding when a grep returns baseline content
+- No branch switching unless 100% confident. No destructive git ops unless told to or integrated upstream
 
 ## Agents
 

@@ -43,6 +43,7 @@ import uniffi.scp.CeilingPolicy
 import uniffi.scp.ContextMode
 import uniffi.scp.ContextParams
 import uniffi.scp.GovernanceModel
+import uniffi.scp.InviteMemberOutcome
 import uniffi.scp.MemoryScope
 import uniffi.scp.ScpException
 import uniffi.scp.SealedInvitation
@@ -82,11 +83,10 @@ class JoinFromWelcomeTest {
         private const val MISSING_KEY_MATERIAL_CODE = "SCP-IDENT-1054"
 
         /**
-         * Context error raised when the invitee's #active key cannot be
-         * resolved from its DID document during HPKE sealing — the UniFFI
-         * bridge does not publish locally-created DID docs to a resolver.
+         * Length in bytes of an RFC 9180 HPKE encapsulated key under DHKEM
+         * X25519-HKDF-SHA256 — the KEM the sealed invitation uses.
          */
-        private const val UNRESOLVABLE_INVITEE_CODE = "SCP-CTX-2001"
+        private const val HPKE_ENCAPSULATED_KEY_BYTES = 32
 
         /** A syntactically-valid 64-hex context id (ADR-056). */
         private const val HEX_CONTEXT_ID =
@@ -195,7 +195,7 @@ class JoinFromWelcomeTest {
     // ── inviteMember — real UniFFI bridge ─────────────────────────────────
 
     @Test
-    fun `inviteMember reaches the real HPKE sealing and is authorized past the capability gate`() {
+    fun `inviteMember seals a real bundle for a reserved invitee KeyPackage`() {
         assumeTrue(nativeAvailable, skipReason)
         runBlocking {
             val scp = SCP(StorageConfig.InMemory)
@@ -207,8 +207,7 @@ class JoinFromWelcomeTest {
                 // governance:propose (the only capability the invite gate
                 // enforces) — so the invite is AUTHORIZED by the actor's
                 // capability-checked governance gate (a missing capability would
-                // reject earlier with a Permission error, not the sealing-stage
-                // error we assert below).
+                // reject earlier with a Permission error).
                 val ctx = scp.contextCreate(creator, makeInviteParams())
 
                 // The invitee reserves a single-use KeyPackage (declares the
@@ -216,21 +215,7 @@ class JoinFromWelcomeTest {
                 // to the creator out of band.
                 val reservation = scp.reserveKeyPackage(invitee)
 
-                // The fully-sealed happy path (InviteMemberOutcome.Sealed) is
-                // NOT reachable from the UniFFI SDK alone: the creator seals the
-                // bundle to the invitee's #active key (Ed25519 -> X25519), which
-                // must be RESOLVED from the invitee's DID document. Unlike the
-                // PyO3 / napi reference bridges, the UniFFI bridge's
-                // identity_create does NOT publish the minted DID document to a
-                // resolver-visible store (the resolver is per-Scp and never
-                // learns locally-created identities). So a locally-created
-                // invitee is unresolvable and the invite fails INSIDE the
-                // runtime at the HPKE sealing step — AFTER the capability gate
-                // authorized it. This reachable-error proves the wrapper
-                // forwards correctly and the invite path is wired end-to-end
-                // through the real runtime; the fully-sealed outcome is proven
-                // by the PyO3 / napi reference suites (which publish DID docs).
-                try {
+                val outcome =
                     scp.inviteMember(
                         identity = creator,
                         contextId = ctx.contextId(),
@@ -238,25 +223,38 @@ class JoinFromWelcomeTest {
                         inviteeKeyPackage = reservation.keyPackagePublic,
                         relayUrls = emptyList(),
                     )
-                    fail(
-                        "expected inviteMember to fail at #active-key resolution " +
-                            "for the unresolvable invitee (UniFFI no-publish limitation)",
-                    )
-                } catch (e: ScpException.Context) {
-                    assertEquals(
-                        UNRESOLVABLE_INVITEE_CODE,
-                        e.code,
-                        "expected SCP-CTX-2001 at the invitee #active-key resolution seam",
-                    )
-                    // Message must name the invitee #active-key resolution — the
-                    // sealing-stage failure, isolating it from any earlier
-                    // capability-gate rejection (a Permission error).
-                    val msg = e.message ?: ""
-                    assertTrue(
-                        msg.contains("#active") && msg.contains("invitee"),
-                        "expected an invitee #active-key resolution failure, got: $msg",
-                    )
-                }
+
+                // The outcome carries a SealedInvitation `bundle` whose fields
+                // are exactly the `contextJoinFromWelcome` `sealed` parameter
+                // shape, so the caller re-boxes nothing. Mirrors the PyO3
+                // reference assertions in
+                // `bindings/python/tests/test_join_from_welcome.py`
+                // (`test_invite_member_seals_for_single_admin_context`). The
+                // two-party JOIN is proven at the runtime layer
+                // (`spawn_from_welcome_tests`): one instance cannot self-join
+                // its own context, because first-writer-wins rejects a second
+                // actor for the same context id.
+                val sealed = (outcome as InviteMemberOutcome.Sealed).bundle
+                assertEquals(
+                    ctx.contextId(),
+                    sealed.contextId,
+                    "the sealed bundle must name the context the invite was issued for",
+                )
+                assertEquals(
+                    creator.did(),
+                    sealed.creatorDid,
+                    "the sealed bundle must name the inviting creator's DID",
+                )
+                // RFC 9180 HPKE encapsulated key is exactly 32 bytes.
+                assertEquals(
+                    HPKE_ENCAPSULATED_KEY_BYTES,
+                    sealed.enc.size,
+                    "the HPKE encapsulated key must be 32 bytes (RFC 9180 DHKEM X25519)",
+                )
+                assertTrue(
+                    sealed.ciphertext.isNotEmpty(),
+                    "the sealed Welcome ciphertext must be non-empty",
+                )
             } finally {
                 scp.shutdown(shutdownBridge(), 1.seconds)
             }

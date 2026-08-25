@@ -6,4 +6,3 @@ bindings/
 node_modules/
 .github/
 scripts/
-*.md
