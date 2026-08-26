@@ -163,8 +163,8 @@ pub struct KeyDestructionAttestation {
 ///
 /// A value of this type reaches a consumer only as the output of
 /// [`PublishableKeyDestructionAttestation::verified_method`], which applies the
-/// clauses of §27.4.6 in `.docs/specs/27-attestations.md`. Those clauses record
-/// a human ruling of 2026-08-25: a record declaring
+/// clauses of §27.4.6 in `.docs/specs/27-attestations.md`. Those clauses state a
+/// human ruling of 2026-08-25, which that section quotes: a record declaring
 /// [`DestructionMethod::HardwareBacked`] reads as
 /// [`DestructionMethod::SoftwareOnly`] unless a platform attestation proof
 /// accompanies it and a verification of that proof returns a pass. §9.15 of the
@@ -1133,12 +1133,12 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod destruction_reading_rule_tests {
-    //! §27.4.6 of `.docs/specs/27-attestations.md` records a human ruling of
-    //! 2026-08-25: a key-destruction attestation declaring a hardware-backed
-    //! method reads as software-backed unless a verified platform attestation
-    //! proof accompanies it. No verification exists, and the signing preimage
-    //! leaves the proof outside the signed bytes, so every hardware declaration
-    //! reads as `SoftwareOnly`.
+    //! §27.4.6 of `.docs/specs/27-attestations.md` quotes a human ruling of
+    //! 2026-08-25 and states it in four clauses: a hardware-backed declaration
+    //! reads as software-backed unless a verified platform attestation proof
+    //! accompanies it. No verification exists, and the signing preimage leaves
+    //! the proof outside the signed bytes, so every hardware declaration reads
+    //! as `SoftwareOnly`.
 
     use super::{DestructionMethod, PlatformAttestation, PublishableKeyDestructionAttestation};
 
