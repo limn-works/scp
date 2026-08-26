@@ -55,6 +55,7 @@ import { IdentityAttestation, RevocationStatus } from "../src/identity";
 import { SCP } from "../src/scp";
 import type { Relay } from "../src/server";
 import type { ConsequenceRule as ConsequenceRuleTypeAlias, OutletDefinition } from "../src/types";
+import { GOVERNANCE_ACTION_RESULTS } from "../src/types";
 import { createMockNativeScp, mountMockScp } from "./mock-bridge";
 
 /**
@@ -1725,6 +1726,48 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       expect(Array.isArray(list)).toBe(true);
       // Fresh context has no pending proposals.
       expect((list as unknown[]).length).toBe(0);
+    });
+
+    it("scp.contextGovernancePropose names a payload-carrying execution_result", async () => {
+      // A single_admin proposal auto-approves and auto-executes, so a caller of
+      // such a context never reaches contextExecuteGovernanceAction and reads
+      // which action ran out of execution_result. GOVERNANCE_ACTION_RESULTS
+      // stores Rust variant names, so that field must carry one.
+      //
+      // SuspendCapability resolves to GovernanceActionResult::MemberSuspended,
+      // which wraps a SuspendMemberResult payload. The napi bridge rendered
+      // execution_result with format!("{r:?}") until
+      // scp_ffi_common::governance_result::governance_propose_response existed,
+      // and that rendering returned `MemberSuspended(SuspendMemberResult {
+      // did: DID("did:dht:…"), capabilities: [MessagesWrite] })` — a string
+      // absent from GOVERNANCE_ACTION_RESULTS.
+      const admin = await scp.identityCreate("in_memory");
+      const ctx = await scp.contextCreate(
+        admin,
+        JSON.stringify({
+          // `governance:propose` lets the creator-admin propose; `member:ban`
+          // is the ceiling capability the suspend execution requires.
+          ceiling: ["messages:read", "messages:write", "governance:propose", "member:ban"],
+          governance: "single_admin",
+        }),
+      );
+      // The creator is a member, which the suspend execution requires of its
+      // target.
+      const proposeResult = await scp.contextGovernancePropose(
+        ctx._rawHandle,
+        JSON.stringify({
+          SuspendCapability: { did: admin.did, capabilities: ["MessagesWrite"] },
+        }),
+        admin.did,
+      );
+      const parsed = JSON.parse(proposeResult) as {
+        status: string;
+        execution_result: string | null;
+      };
+      expect(parsed.status).toBe("Approved");
+      expect(parsed.execution_result).toBe("MemberSuspended");
+      const known: readonly string[] = GOVERNANCE_ACTION_RESULTS;
+      expect(known.includes(parsed.execution_result ?? "")).toBe(true);
     });
   });
 

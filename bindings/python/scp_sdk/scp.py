@@ -1788,7 +1788,14 @@ class SCP:
         return await asyncio.to_thread(self._native.governance_list_proposals, handle)
 
     async def governance_propose(self, handle: Any, identity_did: str, action_json: str) -> Any:
-        """Delegate to ``_scp_core.SCP.governance_propose``."""
+        """Delegate to ``_scp_core.SCP.governance_propose``.
+
+        Returns a JSON string carrying ``proposal_id``, ``status``, and
+        ``execution_result``. ``execution_result`` holds the value of one
+        :class:`~scp_sdk.governance.GovernanceActionResult` member when a
+        ``single_admin`` proposal auto-approved and auto-executed, and is
+        ``null`` while a multi-admin proposal awaits votes.
+        """
 
         try:
             return await asyncio.to_thread(

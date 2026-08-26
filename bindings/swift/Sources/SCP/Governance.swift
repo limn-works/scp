@@ -356,7 +356,11 @@ public extension Context {
     ///   - actionJson: JSON-serialized ``GovernanceAction``.
     ///   - proposerDid: DID of the proposer.
     ///   - proposeFn: Bridge function override for testing.
-    /// - Returns: JSON string with `proposal_id`, `status`, and `execution_result`.
+    /// - Returns: JSON string with `proposal_id`, `status`, and
+    ///   `execution_result`. `execution_result` carries the raw value of one
+    ///   ``GovernanceActionResult`` case when a `SingleAdmin` proposal
+    ///   auto-executed, and is `null` while a multi-admin proposal awaits
+    ///   votes.
     /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not
     ///   active or the proposal fails.
     func proposeGovernanceAction(

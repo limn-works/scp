@@ -1344,3 +1344,84 @@ async fn context_import_rejects_tampered_signature_with_2093() {
         other => panic!("expected ScpError::Context with SCP-CTX-2093, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Governance — the name a propose response carries
+// ---------------------------------------------------------------------------
+
+/// A `SingleAdmin` context auto-approves and auto-executes a proposal, so a
+/// caller of such a context never reaches `governance_execute` and reads which
+/// action ran out of the `execution_result` field `governance_propose`
+/// returns. Swift's `GovernanceActionResult` and Kotlin's enum store Rust
+/// variant names, so that field must carry one.
+///
+/// `SuspendCapability` resolves to `GovernanceActionResult::MemberSuspended`,
+/// which wraps a `SuspendMemberResult` payload. This bridge rendered
+/// `execution_result` with `format!("{r:?}")` until
+/// `scp_ffi_common::governance_result::governance_propose_response` existed,
+/// and that rendering handed a caller
+/// `MemberSuspended(SuspendMemberResult { did: DID("did:dht:…"),
+/// capabilities: [MessagesWrite] })` — a string no SDK enum names.
+#[tokio::test]
+async fn governance_propose_names_a_payload_carrying_execution_result() {
+    let scp = Scp::new_in_memory_for_test();
+    let admin = scp
+        .identity_create("in_memory".to_owned(), None)
+        .await
+        .expect("identity_create");
+
+    // `governance:propose` lets the creator-admin propose; `member:ban` is the
+    // ceiling capability `execute_suspend_member` requires.
+    let params = ContextParams {
+        mode: ContextMode::Encrypted,
+        ceiling: vec![
+            "governance:propose".to_owned(),
+            "member:ban".to_owned(),
+            "messages:read".to_owned(),
+            "messages:write".to_owned(),
+        ],
+        ceiling_policy: CeilingPolicy::Immutable,
+        governance: GovernanceModel::SingleAdmin,
+        memory_scope: MemoryScope::Ephemeral,
+        ttl_seconds: 3600,
+        promotable: false,
+        min_protocol_version: 0,
+        max_chain_depth: None,
+        max_nesting_depth: None,
+        session_cap: None,
+        economic_policy: None,
+        consequence_rules_json: None,
+        consequence_config_json: None,
+    };
+    let handle = scp
+        .context_create(admin.clone(), params)
+        .await
+        .expect("context_create");
+
+    // The creator is a member, which `execute_suspend_member` requires of its
+    // target.
+    let action_json = serde_json::json!({
+        "SuspendCapability": {
+            "did": admin.did(),
+            "capabilities": ["MessagesWrite"],
+        }
+    })
+    .to_string();
+    let response = scp
+        .governance_propose(handle, admin.did(), action_json)
+        .await
+        .expect("SuspendCapability must auto-execute under SingleAdmin");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&response).expect("governance_propose must return JSON");
+    assert_eq!(
+        parsed["status"].as_str(),
+        Some("Approved"),
+        "a single-admin proposal auto-approves; got {response}"
+    );
+    assert_eq!(
+        parsed["execution_result"].as_str(),
+        Some("MemberSuspended"),
+        "a propose response must name its outcome, not dump its payload; got {response}"
+    );
+}

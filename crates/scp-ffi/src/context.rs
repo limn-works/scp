@@ -4076,7 +4076,13 @@ impl crate::scp::PyScp {
     /// # Returns
     ///
     /// JSON string with `{ "proposal_id": hex, "status": string,
-    /// "execution_result": string | null }`.
+    /// "execution_result": string | null }`. `execution_result` names one
+    /// variant of `GovernanceActionResult` — the same name
+    /// [`governance_execute`](crate::scp::PyScp::governance_execute) returns
+    /// for that action — and is `null` while a multi-admin proposal awaits
+    /// votes. `status` renders
+    /// `ProposalStatus`, whose `Rejected` and `Invalidated` forms carry the
+    /// reason a proposal did not pass.
     ///
     /// # Errors
     ///
@@ -4136,14 +4142,16 @@ impl crate::scp::PyScp {
                 );
             }
 
-            let result_str = outcome.execution_result.as_ref().map(|r| format!("{r:?}"));
-
-            let response = serde_json::json!({
-                "proposal_id": hex::encode(outcome.proposal.proposal_id),
-                "status": format!("{:?}", outcome.status),
-                "execution_result": result_str,
-            });
-            Ok(response.to_string())
+            // One shared builder names the outcome for all three bridges, so a
+            // `single_admin` auto-execution reports the same string
+            // `governance_execute` reports (`scp_ffi_common::governance_result`).
+            Ok(
+                scp_ffi_common::governance_result::governance_propose_response(
+                    &outcome.proposal.proposal_id,
+                    &outcome.status,
+                    outcome.execution_result.as_ref(),
+                ),
+            )
         })
     }
 

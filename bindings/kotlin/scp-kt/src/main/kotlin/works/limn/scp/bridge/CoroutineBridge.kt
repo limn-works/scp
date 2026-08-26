@@ -410,7 +410,10 @@ interface GovernanceBindings {
      * @param proposerDid DID of the member submitting the proposal.
      * @param actionJson JSON-serialized governance action to propose.
      * @return JSON string with `proposal_id`, `status`, and
-     *   `execution_result` (if auto-approved).
+     *   `execution_result`. `execution_result` carries the same action-result
+     *   name [governanceExecute] returns (e.g., `"MemberAdded"`,
+     *   `"RoleChanged"`) when a `SingleAdmin` proposal auto-executed, and is
+     *   `null` while a multi-admin proposal awaits votes.
      * @throws BridgeException if the proposer lacks permission or
      *   the action JSON is malformed.
      */
@@ -2185,7 +2188,11 @@ class GovernanceBridgeOps internal constructor(
      * @param contextHandle Handle from context create.
      * @param proposerDid DID of the proposer.
      * @param actionJson JSON-serialized governance action.
-     * @return JSON string with `proposal_id`, `status`, and `execution_result`.
+     * @return JSON string with `proposal_id`, `status`, and
+     *   `execution_result`. `execution_result` carries the same action-result
+     *   name [execute] returns (e.g., `"MemberAdded"`, `"RoleChanged"`) when a
+     *   `SingleAdmin` proposal auto-executed, and is `null` while a
+     *   multi-admin proposal awaits votes.
      */
     suspend fun propose(
         contextHandle: Long,

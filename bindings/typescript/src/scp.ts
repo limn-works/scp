@@ -2175,6 +2175,15 @@ export class SCP {
     return parseGovernanceActionResult(raw);
   }
 
+  /**
+   * Submits a governance action for voting.
+   *
+   * @returns A JSON string carrying `proposal_id`, `status`, and
+   *   `execution_result`. `execution_result` holds one entry of
+   *   {@link GOVERNANCE_ACTION_RESULTS} when a `single_admin` proposal
+   *   auto-approved and auto-executed, and `null` while a multi-admin
+   *   proposal awaits votes.
+   */
   async contextGovernancePropose(
     handle: unknown,
     actionJson: string,

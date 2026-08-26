@@ -40,6 +40,21 @@ their enums lacked — `MigrationProposed`, `MigrationCancelled`,
 mapping, which replaces a napi-rs `format!("{result:?}")` whose
 payload-carrying variants rendered as a Rust debug dump.
 
+`governance_propose` returns that same enum in its `execution_result` field,
+and all three bridges rendered that field with `format!("{r:?}")` too. A
+`single_admin` context auto-approves and auto-executes a proposal, so a caller
+of that context never reaches `governance_execute` and learns which action ran
+out of `execution_result`. A `SuspendCapability` proposal returned
+`MemberSuspended(SuspendMemberResult { did: DID("did:dht:zri6…"),
+capabilities: [MessagesWrite] })`, and Python's `GovernanceActionResult`,
+Swift's enum, and TypeScript's `GOVERNANCE_ACTION_RESULTS` all reject that
+string. **All three bridges now build that whole JSON body through one shared
+function** (`scp_ffi_common::governance_result::governance_propose_response`),
+so `execution_result` carries the name `governance_execute` carries for the
+same action. `status` keeps its `Debug` rendering, because
+`ProposalStatus::Rejected` and `ProposalStatus::Invalidated` each carry the
+reason a proposal did not pass and no SDK declares an enum over status names.
+
 **`FileKeyCustody` rejects a wrong passphrase at construction.**
 `FileKeyCustody::new` used to return custody built from any passphrase, and
 every later `sign` failed. Key-file format version `0x02` adds a passphrase

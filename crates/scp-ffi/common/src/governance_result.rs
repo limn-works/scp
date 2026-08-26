@@ -13,7 +13,13 @@
 //! arm, so adding a variant to [`GovernanceActionResult`] stops this crate from
 //! compiling until someone names it. A wildcard arm here would instead ship a
 //! new outcome under an old name.
+//!
+//! `governance_propose` returns that same enum in a JSON field, and all three
+//! bridges rendered that field with `format!("{r:?}")` after `governance_execute`
+//! stopped doing so. [`governance_propose_response`] builds that whole JSON
+//! body, so both entry points hand a caller one name for one outcome.
 
+use scp_core::context::governance::{ProposalId, ProposalStatus};
 use scp_core::context::state::GovernanceActionResult;
 
 /// Returns whichever name a caller reads for `result`.
@@ -55,9 +61,53 @@ pub const fn governance_action_result_name(result: &GovernanceActionResult) -> &
     }
 }
 
+/// Builds the JSON body every bridge answers `governance_propose` with.
+///
+/// `PyO3`, napi-rs, and `UniFFI` each answer `governance_propose` with
+/// `{proposal_id, status, execution_result}`, and each used to build that
+/// object itself. All three rendered `execution_result` as
+/// `format!("{r:?}")`, so a payload-carrying variant reached a caller as a
+/// Rust debug dump — `MemberAdded { welcome_bytes: [..], commit_bytes: [..] }`
+/// — that no SDK enum names. A `single_admin` context auto-approves and
+/// auto-executes a proposal, which makes `execution_result` the field that
+/// caller reads, so the debug dump was what an `AddMember` proposal returned.
+/// Routing all three bridges through this one function gives
+/// `execution_result` the same name [`governance_action_result_name`] gives
+/// `governance_execute`.
+///
+/// `status` keeps its `Debug` rendering. `ProposalStatus::Rejected` and
+/// `ProposalStatus::Invalidated` each carry the reason a proposal did not
+/// pass, no SDK declares an enum over those names, and dropping the payload
+/// would delete the reason. Every bridge rendered `status` identically before
+/// this function existed, so moving that rendering here changes no answer.
+///
+/// # Arguments
+///
+/// * `proposal_id` -- Identifier of the proposal the engine created.
+/// * `status` -- Lifecycle status the proposal holds after creation.
+/// * `execution_result` -- What the action did, `Some` when a single-admin
+///   proposal auto-executed and `None` while a multi-admin proposal awaits
+///   votes.
+#[must_use]
+pub fn governance_propose_response(
+    proposal_id: &ProposalId,
+    status: &ProposalStatus,
+    execution_result: Option<&GovernanceActionResult>,
+) -> String {
+    serde_json::json!({
+        "proposal_id": hex::encode(proposal_id),
+        "status": format!("{status:?}"),
+        "execution_result": execution_result.map(governance_action_result_name),
+    })
+    .to_string()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use scp_core::context::governance::RejectionReason;
+    use scp_core::context::membership::RedactedBytes;
+
     use super::*;
 
     /// Each name a bridge hands a caller is exactly its Rust variant name, so
@@ -75,6 +125,76 @@ mod tests {
         assert_eq!(
             governance_action_result_name(&GovernanceActionResult::Executed),
             "Executed"
+        );
+    }
+
+    /// A `single_admin` context auto-approves and auto-executes an
+    /// `AddMember` proposal, so `governance_propose` is where a caller reads
+    /// `MemberAdded`. Every bridge rendered that variant with
+    /// `format!("{r:?}")` until [`governance_propose_response`] existed, which
+    /// handed a caller `MemberAdded { welcome_bytes: [3 bytes, REDACTED],
+    /// commit_bytes: [2 bytes, REDACTED] }` — a string Python's
+    /// `GovernanceActionResult`, Swift's enum, and TypeScript's
+    /// `GOVERNANCE_ACTION_RESULTS` all reject.
+    #[test]
+    fn propose_response_names_a_payload_carrying_outcome() {
+        let response = governance_propose_response(
+            &[0xAB; 32],
+            &ProposalStatus::Approved,
+            Some(&GovernanceActionResult::MemberAdded {
+                welcome_bytes: RedactedBytes(vec![1, 2, 3]),
+                commit_bytes: RedactedBytes(vec![4, 5]),
+            }),
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&response).expect("the response must be JSON");
+        assert_eq!(
+            parsed["execution_result"].as_str(),
+            Some("MemberAdded"),
+            "a propose response must name its outcome; got {response}"
+        );
+        assert_eq!(parsed["status"].as_str(), Some("Approved"));
+        assert_eq!(
+            parsed["proposal_id"].as_str(),
+            Some("ab".repeat(32).as_str())
+        );
+    }
+
+    /// A multi-admin proposal awaits votes, so a caller reads a JSON `null`
+    /// rather than a name. An SDK reads that difference to decide whether a
+    /// governance action already ran.
+    #[test]
+    fn propose_response_reports_a_pending_proposal_as_null() {
+        let response = governance_propose_response(&[0; 32], &ProposalStatus::Pending, None);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&response).expect("the response must be JSON");
+        assert!(
+            parsed["execution_result"].is_null(),
+            "a pending proposal executed nothing; got {response}"
+        );
+        assert_eq!(parsed["status"].as_str(), Some("Pending"));
+    }
+
+    /// `ProposalStatus::Rejected` and `ProposalStatus::Invalidated` each carry
+    /// the reason a proposal did not pass, and no SDK declares an enum over
+    /// status names, so `status` keeps the `Debug` rendering every bridge
+    /// already produced. This holds that rendering fixed, because dropping the
+    /// payload would delete the reason a caller reads.
+    #[test]
+    fn propose_response_keeps_the_reason_a_rejection_carries() {
+        let response = governance_propose_response(
+            &[0; 32],
+            &ProposalStatus::Rejected {
+                reason: RejectionReason::ApprovalImpossible,
+            },
+            None,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&response).expect("the response must be JSON");
+        assert_eq!(
+            parsed["status"].as_str(),
+            Some("Rejected { reason: ApprovalImpossible }"),
+            "a rejected proposal must still report why; got {response}"
         );
     }
 
