@@ -41,7 +41,7 @@ The parameter holds `Vec<Capability>` — the type `crates/scp-protocol/src/cont
 Four candidate vocabularies exist and three of them cannot express what a context needs to say:
 
 - **`ActionCategory`** (`crates/scp-protocol/src/trust/custody_violation.rs:84`) carries two variants and classifies by the `{resource}` segment of a capability URI alone, so it cannot separate `governance:vote` from `governance:propose`. It also has no `CategoryC` variant and takes none: §4.9.3 states that Category C partitions nothing and is a second axis.
-- **A role name** bundles a capability set, so a context that gated one capability would have to define a role per gated combination, and §5.5.1 of the contexts spec fixes four built-in roles.
+- **A role name** names a capability bundle that a context assigns to a member (§5.5), and a member holds one role, so a role says which capabilities a member has and cannot say which of them need a gesture. Expressing the gate through roles would need one role per gated subset of the member's capabilities, and §5.5.1 already assigns the four built-in roles by function rather than by custody.
 - **A boolean** contradicts Alec's ruling that authenticating every action "is not going to fly."
 - **`Capability`** is the vocabulary the ceiling holds, a role grants, a UCAN attests, and §5.3.1's "Gated by" column ties governance actions to. `Capability::new` is the single canonical parser, which §5.3.1.1 names as the mechanism that closes the ceiling grammar by construction, so a `Vec<Capability>` inherits that closure and admits no spelling the ceiling would reject.
 
