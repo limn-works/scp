@@ -17185,11 +17185,19 @@ impl Scp {
                         dht.initialize_sequence(&old_did)
                             .await
                             .map_err(ScpError::from)?;
+                        // The ADR-003 §4b forwarding-maintenance task is already running. This
+                        // bridge deliberately does not retain its handle: the task stops itself
+                        // after MIGRATION_REPUBLISH_DURATION_SECS (90 days), and cancelling it
+                        // early would stop the OLD DID resolving to the new one for every
+                        // third-party resolver that has not yet followed `alsoKnownAs` — which
+                        // is the outcome ADR-003 §4b exists to prevent. No SDK operation
+                        // cancels it, so no bridge export carries the handle.
                         let scp_identity::MigrationOutcome {
                             new_identity,
                             new_document,
                             rotation_event,
                             new_pre_rotation_handle,
+                            migration_republish: _migration_republish,
                         } = dht
                             .migrate_identity(
                                 &old_identity,
@@ -17293,11 +17301,19 @@ impl Scp {
                         dht.initialize_sequence(&old_did)
                             .await
                             .map_err(ScpError::from)?;
+                        // The ADR-003 §4b forwarding-maintenance task is already running. This
+                        // bridge deliberately does not retain its handle: the task stops itself
+                        // after MIGRATION_REPUBLISH_DURATION_SECS (90 days), and cancelling it
+                        // early would stop the OLD DID resolving to the new one for every
+                        // third-party resolver that has not yet followed `alsoKnownAs` — which
+                        // is the outcome ADR-003 §4b exists to prevent. No SDK operation
+                        // cancels it, so no bridge export carries the handle.
                         let scp_identity::MigrationOutcome {
                             new_identity,
                             new_document,
                             rotation_event,
                             new_pre_rotation_handle,
+                            migration_republish: _migration_republish,
                         } = dht
                             .migrate_identity(
                                 &old_identity,

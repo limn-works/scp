@@ -753,6 +753,21 @@ async fn relay_republish_loop<R: RelayPublisher>(
 /// Default interval for migration republishing: 1 hour (in seconds).
 pub const MIGRATION_REPUBLISH_INTERVAL_SECS: u64 = 60 * 60;
 
+/// Default lifetime of a migration republish task: 90 days (in seconds).
+///
+/// ADR-003 §4b (`.docs/adrs/phase-1.md`) states that `migrate_identity`
+/// "Starts a background republish task for the old DID document (forwarding
+/// record maintenance, recommended 90 days)." This constant is that 90 days.
+///
+/// The bound is what makes the task finite. A migration redirect exists so a
+/// resolver holding the OLD DID can discover the new one; after 90 days of
+/// forwarding, every such resolver has had ample opportunity to follow
+/// `alsoKnownAs`, and continuing to re-put the old record only keeps a
+/// superseded identity alive on the DHT. Without the bound the loop runs until
+/// the process exits, which is a task leak per migration — the loop holds an
+/// `Arc<D>` and a `RepublishEntry` and nothing ever frees them.
+pub const MIGRATION_REPUBLISH_DURATION_SECS: u64 = 90 * 24 * 60 * 60;
+
 /// Periodically republishes an old DID document with an `alsoKnownAs` redirect
 /// to the new DID after identity migration.
 ///
@@ -760,19 +775,45 @@ pub const MIGRATION_REPUBLISH_INTERVAL_SECS: u64 = 60 * 60;
 /// republished with a redirect so that resolvers looking up the old DID can
 /// discover the new one. This struct manages that background task.
 ///
+/// # Lifetime
+///
+/// The task stops on its own after [`MIGRATION_REPUBLISH_DURATION_SECS`]
+/// (90 days, ADR-003 §4b) — or after the duration
+/// [`with_interval_and_duration`](Self::with_interval_and_duration) names.
+/// A caller that wants to stop it earlier calls
+/// [`MigrationHandle::cancel`] on the returned handle.
+///
 /// # Cancellation
 ///
-/// The returned [`MigrationHandle`] can be used to cancel the background task.
-/// The task also stops if the handle is dropped.
+/// A caller stops the background task early by calling
+/// [`MigrationHandle::cancel`] on the returned handle. Dropping the handle
+/// does NOT stop the task: [`MigrationHandle`] holds a
+/// [`tokio::task::AbortHandle`], which releases the permission to abort when
+/// it drops and leaves the spawned task running (tokio 1.50.0,
+/// `src/runtime/task/abort.rs`: "Dropping an `AbortHandle` releases the
+/// permission to terminate the task --- it does *not* abort the task").
+/// Aborting on drop would defeat ADR-003 §4b: a caller that ignores the
+/// returned handle would publish the redirect once and never again, so the
+/// old DID would stop resolving as soon as its DHT record expired. The
+/// 90-day bound, not the handle's drop, is what makes the task finite.
 pub struct MigrationRepublisher<D: DhtClient> {
     dht_client: Arc<D>,
     interval_secs: u64,
+    duration_secs: u64,
 }
 
 /// Handle to a running migration republish task.
 ///
-/// Dropping the handle or calling [`cancel`](Self::cancel) stops the
-/// background republish task.
+/// [`cancel`](Self::cancel) stops the background republish task early.
+/// Dropping this handle does NOT stop it — the inner
+/// [`tokio::task::AbortHandle`] only releases the permission to abort when it
+/// drops, so the spawned task keeps republishing until it reaches its own
+/// duration bound (see [`MigrationRepublisher`]) or the runtime shuts down.
+///
+/// Cloning the handle yields a second holder of the same abort permission.
+/// [`cancel`](Self::cancel) is idempotent, so two holders cancelling the same
+/// task is well defined.
+#[derive(Debug, Clone)]
 pub struct MigrationHandle {
     abort_handle: tokio::task::AbortHandle,
 }
@@ -791,35 +832,71 @@ impl MigrationHandle {
 }
 
 impl<D: DhtClient + 'static> MigrationRepublisher<D> {
-    /// Creates a new migration republisher with the default interval (1 hour).
+    /// Creates a new migration republisher with the default interval (1 hour)
+    /// and the default 90-day duration (ADR-003 §4b).
     #[must_use]
     pub const fn new(dht_client: Arc<D>) -> Self {
         Self {
             dht_client,
             interval_secs: MIGRATION_REPUBLISH_INTERVAL_SECS,
+            duration_secs: MIGRATION_REPUBLISH_DURATION_SECS,
         }
     }
 
-    /// Creates a new migration republisher with a custom interval.
+    /// Creates a new migration republisher with a custom interval and the
+    /// default 90-day duration (ADR-003 §4b).
     #[must_use]
     pub const fn with_interval(dht_client: Arc<D>, interval_secs: u64) -> Self {
         Self {
             dht_client,
             interval_secs,
+            duration_secs: MIGRATION_REPUBLISH_DURATION_SECS,
         }
+    }
+
+    /// Creates a new migration republisher with a custom interval and a custom
+    /// duration.
+    ///
+    /// `duration_secs` bounds the total lifetime of the spawned task. A value
+    /// of `0` still performs the first publish and then stops, because the
+    /// loop publishes before it checks the deadline.
+    #[must_use]
+    pub const fn with_interval_and_duration(
+        dht_client: Arc<D>,
+        interval_secs: u64,
+        duration_secs: u64,
+    ) -> Self {
+        Self {
+            dht_client,
+            interval_secs,
+            duration_secs,
+        }
+    }
+
+    /// Returns the total lifetime, in seconds, of the tasks this republisher
+    /// starts.
+    #[must_use]
+    pub const fn duration_secs(&self) -> u64 {
+        self.duration_secs
     }
 
     /// Starts the migration republish background task.
     ///
     /// The task immediately republishes the old DID document with the redirect,
-    /// then repeats at the configured interval. Returns a [`MigrationHandle`]
-    /// that can cancel the task.
+    /// then repeats at the configured interval until the configured duration
+    /// elapses. Returns a [`MigrationHandle`] that cancels the task early.
     #[must_use]
     pub fn start(&self, entry: RepublishEntry) -> MigrationHandle {
         let dht_client = Arc::clone(&self.dht_client);
         let interval_secs = self.interval_secs;
+        let duration_secs = self.duration_secs;
 
-        let join_handle = tokio::spawn(migration_republish_loop(dht_client, entry, interval_secs));
+        let join_handle = tokio::spawn(migration_republish_loop(
+            dht_client,
+            entry,
+            interval_secs,
+            duration_secs,
+        ));
 
         MigrationHandle {
             abort_handle: join_handle.abort_handle(),
@@ -827,16 +904,32 @@ impl<D: DhtClient + 'static> MigrationRepublisher<D> {
     }
 }
 
-/// Background loop that periodically republishes a migration redirect.
+/// Background loop that periodically republishes a migration redirect, then
+/// stops.
+///
+/// The loop publishes the entry, then sleeps `interval_secs`, and repeats until
+/// `duration_secs` have elapsed since it started (ADR-003 §4b, "forwarding
+/// record maintenance, recommended 90 days"). The deadline is measured on
+/// [`tokio::time::Instant`], so a paused-clock test advances it
+/// deterministically.
+///
+/// A failed publish is logged and retried on the same exponential backoff
+/// [`dht_republish_loop`] uses, never swallowed. The redirect is what keeps the
+/// OLD DID resolving to the new one, so an operator whose forwarding record is
+/// lapsing has to be able to see it lapse.
 async fn migration_republish_loop<D: DhtClient>(
     dht_client: Arc<D>,
     entry: RepublishEntry,
     interval_secs: u64,
+    duration_secs: u64,
 ) {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(duration_secs);
+    let mut consecutive_failures: u32 = 0;
+
     loop {
         // Attempt to publish the old DID document (which should already contain
         // the alsoKnownAs redirect to the new DID).
-        let _ = dht_client
+        let result = dht_client
             .publish(
                 &entry.public_key,
                 &entry.signature,
@@ -845,8 +938,43 @@ async fn migration_republish_loop<D: DhtClient>(
             )
             .await;
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
+        let wait_secs = match result {
+            Ok(()) => {
+                consecutive_failures = 0;
+                interval_secs
+            }
+            Err(e) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                tracing::warn!(
+                    did = %entry.did,
+                    error = %e,
+                    consecutive_failures,
+                    "migration redirect republish failed — the old DID's alsoKnownAs \
+                     redirect may lapse from the DHT; retrying with backoff (ADR-003 §4b)"
+                );
+                backoff_secs(consecutive_failures.saturating_sub(1))
+            }
+        };
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+
+        // Never sleep past the deadline: a caller that names a duration shorter
+        // than one interval gets one publish and a prompt stop, not a full
+        // interval of idling.
+        let sleep_for = tokio::time::Duration::from_secs(wait_secs)
+            .min(deadline.saturating_duration_since(now));
+        tokio::time::sleep(sleep_for).await;
     }
+
+    tracing::info!(
+        did = %entry.did,
+        duration_secs,
+        "migration republish task reached its forwarding-maintenance bound and stopped; \
+         the old DID document will stop being refreshed on the DHT (ADR-003 §4b)"
+    );
 }
 
 #[cfg(test)]
@@ -1224,6 +1352,234 @@ mod tests {
         assert!(record.is_some(), "first publish should happen immediately");
 
         handle.cancel();
+    }
+
+    #[tokio::test]
+    async fn migration_republisher_defaults_to_the_adr003_ninety_day_bound() {
+        let dht = Arc::new(InMemoryDhtClient::new());
+        let republisher = MigrationRepublisher::new(dht);
+        assert_eq!(
+            republisher.duration_secs(),
+            MIGRATION_REPUBLISH_DURATION_SECS,
+            "the default migration republisher must carry the 90-day forwarding \
+             bound ADR-003 §4b names"
+        );
+        assert_eq!(
+            MIGRATION_REPUBLISH_DURATION_SECS,
+            90 * 24 * 60 * 60,
+            "MIGRATION_REPUBLISH_DURATION_SECS must be 90 days in seconds"
+        );
+
+        // `with_interval` keeps the same bound — only the interval changes.
+        let dht2 = Arc::new(InMemoryDhtClient::new());
+        assert_eq!(
+            MigrationRepublisher::with_interval(dht2, 42).duration_secs(),
+            MIGRATION_REPUBLISH_DURATION_SECS
+        );
+    }
+
+    /// Counts every `publish` call and forwards to an in-memory DHT.
+    ///
+    /// `InMemoryDhtClient` treats a re-put at the same BEP44 sequence as an
+    /// idempotent no-op, so the stored record alone cannot distinguish one
+    /// publish from two thousand. The counter is the only signal that the
+    /// forwarding loop kept re-putting the redirect.
+    #[derive(Default)]
+    struct CountingDhtClient {
+        publishes: std::sync::atomic::AtomicU32,
+        inner: InMemoryDhtClient,
+    }
+
+    impl CountingDhtClient {
+        fn new() -> Self {
+            Self {
+                publishes: std::sync::atomic::AtomicU32::new(0),
+                inner: InMemoryDhtClient::new(),
+            }
+        }
+
+        fn count(&self) -> u32 {
+            self.publishes.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    impl scp_dht::DhtClient for CountingDhtClient {
+        fn publish(
+            &self,
+            public_key: &[u8; 32],
+            signature: &[u8; 64],
+            value: &[u8],
+            seq: u64,
+        ) -> impl Future<Output = Result<(), scp_dht::DhtError>> + Send {
+            let pk = *public_key;
+            let sig = *signature;
+            let val = value.to_vec();
+            async move {
+                self.publishes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.inner.publish(&pk, &sig, &val, seq).await
+            }
+        }
+
+        fn resolve(
+            &self,
+            public_key: &[u8; 32],
+        ) -> impl Future<Output = Result<Option<scp_dht::DhtRecord>, scp_dht::DhtError>> + Send
+        {
+            let pk = *public_key;
+            async move { self.inner.resolve(&pk).await }
+        }
+    }
+
+    /// The forwarding task republishes on its interval and then STOPS at its
+    /// duration bound — it does not run for the life of the process
+    /// (ADR-003 §4b, "recommended 90 days").
+    ///
+    /// The clock is paused, so tokio advances time only when every task is
+    /// idle; the test's own `sleep` is what lets the loop's 2160 hourly cycles
+    /// run to completion in milliseconds of wall time.
+    #[tokio::test(start_paused = true)]
+    async fn migration_republish_loop_stops_at_its_duration_bound() {
+        let dht = Arc::new(CountingDhtClient::new());
+        let republisher = MigrationRepublisher::with_interval_and_duration(
+            Arc::clone(&dht),
+            MIGRATION_REPUBLISH_INTERVAL_SECS,
+            MIGRATION_REPUBLISH_DURATION_SECS,
+        );
+
+        let handle = republisher.start(make_migration_entry());
+        assert!(handle.is_active());
+
+        // Halfway through the bound the task is still republishing.
+        tokio::time::sleep(tokio::time::Duration::from_secs(
+            MIGRATION_REPUBLISH_DURATION_SECS / 2,
+        ))
+        .await;
+        assert!(
+            handle.is_active(),
+            "the forwarding task must still run 45 days into a 90-day bound"
+        );
+        let halfway = dht.count();
+        assert!(
+            halfway > 1000,
+            "an hourly loop must have published far more than once after 45 days; got {halfway}"
+        );
+
+        // Past the bound it has stopped on its own, with no cancel call.
+        tokio::time::sleep(tokio::time::Duration::from_secs(
+            MIGRATION_REPUBLISH_DURATION_SECS / 2 + 7200,
+        ))
+        .await;
+        assert!(
+            !handle.is_active(),
+            "the forwarding task must stop at its 90-day bound without being cancelled"
+        );
+
+        let final_count = dht.count();
+        assert!(
+            final_count > halfway,
+            "the task must keep republishing between the halfway point and the bound"
+        );
+
+        // And it publishes nothing more afterwards.
+        tokio::time::sleep(tokio::time::Duration::from_secs(
+            MIGRATION_REPUBLISH_DURATION_SECS,
+        ))
+        .await;
+        assert_eq!(
+            dht.count(),
+            final_count,
+            "a stopped forwarding task must publish nothing further"
+        );
+    }
+
+    /// A duration shorter than one interval yields exactly one publish and a
+    /// prompt stop, rather than one publish followed by a full interval of
+    /// idling.
+    #[tokio::test(start_paused = true)]
+    async fn migration_republish_loop_honors_a_sub_interval_duration() {
+        let dht = Arc::new(CountingDhtClient::new());
+        let republisher =
+            MigrationRepublisher::with_interval_and_duration(Arc::clone(&dht), 3600, 60);
+
+        let handle = republisher.start(make_migration_entry());
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(120)).await;
+
+        assert!(
+            !handle.is_active(),
+            "a 60-second bound must stop the task well inside one 3600-second interval"
+        );
+        assert_eq!(
+            dht.count(),
+            2,
+            "a 60-second bound at a 3600-second interval publishes once immediately \
+             and once at the deadline"
+        );
+    }
+
+    /// A DHT that rejects every publish, so the forwarding loop's failure arm
+    /// runs.
+    #[derive(Default)]
+    struct AlwaysFailDhtClient {
+        attempts: std::sync::atomic::AtomicU32,
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    impl scp_dht::DhtClient for AlwaysFailDhtClient {
+        fn publish(
+            &self,
+            _public_key: &[u8; 32],
+            _signature: &[u8; 64],
+            _value: &[u8],
+            _seq: u64,
+        ) -> impl Future<Output = Result<(), scp_dht::DhtError>> + Send {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                Err(scp_dht::DhtError::DhtPublishFailed(
+                    "simulated DHT rejection".to_owned(),
+                ))
+            }
+        }
+
+        fn resolve(
+            &self,
+            _public_key: &[u8; 32],
+        ) -> impl Future<Output = Result<Option<scp_dht::DhtRecord>, scp_dht::DhtError>> + Send
+        {
+            async move { Ok(None) }
+        }
+    }
+
+    /// A failing publish is retried on backoff rather than swallowed, and the
+    /// duration bound still stops the task.
+    #[tokio::test(start_paused = true)]
+    async fn migration_republish_loop_retries_failures_and_still_stops() {
+        let dht = Arc::new(AlwaysFailDhtClient::default());
+        let republisher = MigrationRepublisher::with_interval_and_duration(
+            Arc::clone(&dht),
+            MIGRATION_REPUBLISH_INTERVAL_SECS,
+            // Two hours: long enough for several 30s-to-30min backoff retries,
+            // short enough to keep the assertion legible.
+            2 * 60 * 60,
+        );
+
+        let handle = republisher.start(make_migration_entry());
+
+        tokio::time::sleep(tokio::time::Duration::from_mins(2 * 60 + 1)).await;
+
+        let attempts = dht.attempts.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            attempts >= 5,
+            "a failing publish must retry on the 30s/1m/2m/4m/8m backoff inside two \
+             hours, not wait a full hour between attempts; got {attempts}"
+        );
+        assert!(
+            !handle.is_active(),
+            "the duration bound must stop the task even while every publish fails"
+        );
     }
 
     #[tokio::test]

@@ -32,6 +32,7 @@ use sha2::{Digest, Sha256};
 use scp_platform::traits::{KeyCustody, KeyType, PreRotationCustody, PreRotationKeyHandle};
 
 use super::cache::{DidCache, DidResolutionResult, Staleness};
+use super::republish::{MigrationHandle, MigrationRepublisher, RepublishEntry};
 use super::{DidMethod, IdentityError, ScpIdentity};
 use scp_clock::{Clock, SystemClock};
 use scp_dht::DhtClient;
@@ -423,6 +424,25 @@ pub enum MigrationResumePhase {
     RepublishOldAlsoKnownAs,
 }
 
+/// The BEP44 record a single DID-document publish put on the DHT.
+///
+/// [`DidDht::publish_document_returning_record`] returns this so a caller that
+/// must keep the published record alive — the ADR-003 §4b migration forwarding
+/// task — can re-put the exact bytes that were signed, under the same sequence
+/// number, without holding the signing key.
+#[derive(Debug, Clone)]
+struct PublishedDidRecord {
+    /// The 32-byte Ed25519 public key the record is stored under (the DID's
+    /// `#0` key).
+    public_key: [u8; 32],
+    /// The serialized DID document bytes that were signed and put.
+    value: Vec<u8>,
+    /// The 64-byte Ed25519 BEP44 signature over `(value, seq)`.
+    signature: [u8; 64],
+    /// The BEP44 sequence number the record was put under.
+    seq: u64,
+}
+
 /// Outcome returned by a successful [`DidDht::migrate_identity`] /
 /// [`DidDht::resume_migration_publish`] call.
 ///
@@ -458,6 +478,19 @@ pub struct MigrationOutcome {
     /// (spec §9.7.4.1 item 6 "post-rotation key cycling"). Caller
     /// persists this for the next migration cycle.
     pub new_pre_rotation_handle: PreRotationKeyHandle,
+    /// Handle to the running forwarding-maintenance task that keeps the OLD
+    /// DID document — the one carrying `alsoKnownAs: [new_did]` — resolvable
+    /// on the DHT (ADR-003 §4b, "forwarding record maintenance, recommended
+    /// 90 days").
+    ///
+    /// The task is already running when this outcome is returned. It stops on
+    /// its own after
+    /// [`MIGRATION_REPUBLISH_DURATION_SECS`](crate::republish::MIGRATION_REPUBLISH_DURATION_SECS).
+    /// A caller that wants it to stop sooner calls
+    /// [`MigrationHandle::cancel`]. Dropping this outcome does NOT stop the
+    /// task, which is deliberate: a caller that ignores the field still gets
+    /// the 90 days of forwarding ADR-003 §4b requires.
+    pub migration_republish: MigrationHandle,
 }
 
 /// Recovery handle for [`DidDht::migrate_identity`] DHT-publish failures.
@@ -832,6 +865,32 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         identity: &ScpIdentity,
         document: &DidDocument,
     ) -> Result<(), IdentityError> {
+        self.publish_document_returning_record(identity, document)
+            .await
+            .map(|_record| ())
+    }
+
+    /// Publishes a DID document to the DHT and returns the BEP44 record that
+    /// was put.
+    ///
+    /// [`publish_document`](Self::publish_document) is the same operation with
+    /// the record discarded. The migration path needs the record: ADR-003 §4b
+    /// requires a background task that keeps re-putting the OLD document, and
+    /// a re-put needs the exact `(public_key, value, signature, seq)` this
+    /// publish signed. Re-deriving them would mean re-signing under a `#0` that
+    /// migration has already moved on from, so the record travels from the
+    /// publish to the republish task instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::DhtPublishFailed`] if the DHT publish fails,
+    /// or [`IdentityError::DocumentSerializationError`] if the document cannot
+    /// be serialized to JSON.
+    async fn publish_document_returning_record(
+        &self,
+        identity: &ScpIdentity,
+        document: &DidDocument,
+    ) -> Result<PublishedDidRecord, IdentityError> {
         let sign_fn = self.sign_fn.as_ref().ok_or_else(|| {
             IdentityError::DhtPublishFailed(
                 "no signing function configured; use DidDht::with_client_and_signer".to_owned(),
@@ -872,7 +931,12 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             store.store(&identity.did, seq).await?;
         }
 
-        Ok(())
+        Ok(PublishedDidRecord {
+            public_key,
+            value: value.to_vec(),
+            signature,
+            seq,
+        })
     }
 
     /// Publishes a DID document to the DHT with optional relay URLs.
@@ -1453,7 +1517,10 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         pre_rotation_custody: &impl PreRotationCustody,
         key_custody: &impl KeyCustody,
         rotated_at: u64,
-    ) -> Result<MigrationOutcome, IdentityError> {
+    ) -> Result<MigrationOutcome, IdentityError>
+    where
+        D: 'static,
+    {
         // Step 0: Pre-flight `import_ed25519_signing_key` capability on
         // the operational custody. Step 6 below imports the OLD
         // pre-rotation private bytes (returned by step 5's
@@ -1652,7 +1719,10 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         &self,
         state: MigrationPartialState,
         key_custody: &impl KeyCustody,
-    ) -> Result<MigrationOutcome, IdentityError> {
+    ) -> Result<MigrationOutcome, IdentityError>
+    where
+        D: 'static,
+    {
         let MigrationPartialState {
             phase,
             new_identity,
@@ -1695,30 +1765,78 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         // Step 8: republish OLD with `alsoKnownAs` + retire OLD operational
         // VMs (spec §9.12). On failure, surface a partial state at the
         // step-8-only phase — the caller's next resume runs only step 8.
-        if let Err(source) = self
+        let redirect_record = match self
             .publish_old_doc_with_also_known_as(&old_identity, &old_document, &new_identity.did)
             .await
         {
-            return Err(IdentityError::MigrationPublishFailed {
-                phase: MigrationResumePhase::RepublishOldAlsoKnownAs,
-                partial: Box::new(MigrationPartialState {
+            Ok(record) => record,
+            Err(source) => {
+                return Err(IdentityError::MigrationPublishFailed {
                     phase: MigrationResumePhase::RepublishOldAlsoKnownAs,
-                    new_identity,
-                    new_document,
-                    rotation_event,
-                    new_pre_rotation_handle,
-                    old_identity,
-                    old_document,
-                }),
-                source: Box::new(source),
-            });
-        }
+                    partial: Box::new(MigrationPartialState {
+                        phase: MigrationResumePhase::RepublishOldAlsoKnownAs,
+                        new_identity,
+                        new_document,
+                        rotation_event,
+                        new_pre_rotation_handle,
+                        old_identity,
+                        old_document,
+                    }),
+                    source: Box::new(source),
+                });
+            }
+        };
+
+        // Step 9: start the forwarding-maintenance task for the OLD DID
+        // document (ADR-003 §4b). Step 8 put the redirect on the DHT once;
+        // Mainline DHT records expire, so without this task the OLD DID stops
+        // resolving — and every resolver still holding it loses the
+        // `alsoKnownAs` pointer to the new one. The task re-puts exactly the
+        // record step 8 signed, so it needs no key material and cannot fail
+        // for want of a signer.
+        let migration_republish =
+            self.start_migration_republishing(&old_identity.did, &redirect_record);
 
         Ok(MigrationOutcome {
             new_identity,
             new_document,
             rotation_event,
             new_pre_rotation_handle,
+            migration_republish,
+        })
+    }
+
+    /// Starts the ADR-003 §4b forwarding-maintenance task for a migrated-away
+    /// DID.
+    ///
+    /// `redirect_record` is the BEP44 record step 8 put on the DHT: the OLD
+    /// document with `alsoKnownAs` set to the new DID, already signed under the
+    /// OLD `#0`. The task re-puts that record every
+    /// [`MIGRATION_REPUBLISH_INTERVAL_SECS`](crate::republish::MIGRATION_REPUBLISH_INTERVAL_SECS)
+    /// for
+    /// [`MIGRATION_REPUBLISH_DURATION_SECS`](crate::republish::MIGRATION_REPUBLISH_DURATION_SECS),
+    /// then stops.
+    ///
+    /// Starting the task cannot fail. `MigrationRepublisher::start` calls
+    /// `tokio::spawn`, and every caller of this function is already running on
+    /// a tokio runtime (it is reached only from an `async fn` that the caller
+    /// awaited), so there is no failure mode to report and no error to
+    /// swallow.
+    fn start_migration_republishing(
+        &self,
+        old_did: &str,
+        redirect_record: &PublishedDidRecord,
+    ) -> MigrationHandle
+    where
+        D: 'static,
+    {
+        let republisher = MigrationRepublisher::new(Arc::clone(&self.dht_client));
+        republisher.start(RepublishEntry {
+            did: old_did.to_owned(),
+            public_key: redirect_record.public_key,
+            document_bytes: redirect_record.value.clone(),
+            signature: redirect_record.signature,
+            sequence: redirect_record.seq,
         })
     }
 
@@ -1738,11 +1856,16 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         old_identity: &ScpIdentity,
         old_document: &DidDocument,
         new_did: &str,
-    ) -> Result<(), IdentityError> {
+    ) -> Result<PublishedDidRecord, IdentityError> {
         let mut updated_old_doc = old_document.clone();
         updated_old_doc.set_also_known_as(new_did);
         updated_old_doc.retire_operational_keys_for_migration();
-        self.publish_document(old_identity, &updated_old_doc).await
+        // The record travels back to `run_migration_publish_chain`, which hands
+        // it to the ADR-003 §4b forwarding-maintenance task. That task re-puts
+        // these exact bytes under this exact sequence number, so the record is
+        // returned rather than discarded.
+        self.publish_document_returning_record(old_identity, &updated_old_doc)
+            .await
     }
 
     /// Finish a [`Self::migrate_identity`] call that returned
@@ -1824,7 +1947,10 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         &self,
         state: MigrationPartialState,
         key_custody: &impl KeyCustody,
-    ) -> Result<MigrationOutcome, IdentityError> {
+    ) -> Result<MigrationOutcome, IdentityError>
+    where
+        D: 'static,
+    {
         // Pre-flight custody substrate check. `resume_migration_publish`
         // re-uses the original `migrate_identity`'s key handles — handles
         // are numeric ids into a specific custody substrate (file
@@ -3662,6 +3788,7 @@ mod tests {
             new_document: _new_doc,
             rotation_event: _event,
             new_pre_rotation_handle: _new_pre_rotation_handle,
+            migration_republish: _migration_republish,
         } = dht
             .migrate_identity(
                 &identity,
@@ -3700,6 +3827,7 @@ mod tests {
             new_document: _new_doc,
             rotation_event: _event,
             new_pre_rotation_handle: _new_pre_rotation_handle,
+            migration_republish: _migration_republish,
         } = dht
             .migrate_identity(
                 &identity,
@@ -3732,6 +3860,7 @@ mod tests {
             new_document: _new_doc,
             rotation_event: _event,
             new_pre_rotation_handle: _new_pre_rotation_handle,
+            migration_republish: _migration_republish,
         } = dht
             .migrate_identity(
                 &identity,
@@ -3783,6 +3912,7 @@ mod tests {
             new_document: _new_doc,
             rotation_event: _event,
             new_pre_rotation_handle: _new_pre_rotation_handle,
+            migration_republish: _migration_republish,
         } = dht
             .migrate_identity(
                 &identity,
@@ -3867,6 +3997,7 @@ mod tests {
             new_document: _new_doc,
             rotation_event: event,
             new_pre_rotation_handle: _new_pre_rotation_handle,
+            migration_republish: _migration_republish,
         } = dht
             .migrate_identity(
                 &identity,
@@ -3920,6 +4051,7 @@ mod tests {
             new_document: _new_doc,
             rotation_event: event,
             new_pre_rotation_handle: _new_pre_rotation_handle,
+            migration_republish: _migration_republish,
         } = dht
             .migrate_identity(
                 &identity,
@@ -3956,6 +4088,7 @@ mod tests {
             new_document: new_doc,
             rotation_event: _event,
             new_pre_rotation_handle: _new_pre_rotation_handle,
+            migration_republish: _migration_republish,
         } = dht
             .migrate_identity(
                 &identity,
@@ -3989,6 +4122,7 @@ mod tests {
             new_document: _new_doc,
             rotation_event: _event,
             new_pre_rotation_handle: _new_pre_rotation_handle,
+            migration_republish: _migration_republish,
         } = dht
             .migrate_identity(
                 &identity,
@@ -4030,6 +4164,7 @@ mod tests {
             new_document: _new_doc,
             rotation_event: event,
             new_pre_rotation_handle: _new_pre_rotation_handle,
+            migration_republish: _migration_republish,
         } = dht
             .migrate_identity(
                 &identity,
@@ -4079,6 +4214,7 @@ mod tests {
             new_document: _new_doc,
             rotation_event: event,
             new_pre_rotation_handle: _new_pre_rotation_handle,
+            migration_republish: _migration_republish,
         } = dht
             .migrate_identity(
                 &identity,
@@ -4127,6 +4263,7 @@ mod tests {
             new_document: _new_doc,
             rotation_event: event,
             new_pre_rotation_handle: _new_pre_rotation_handle,
+            migration_republish: _migration_republish,
         } = dht
             .migrate_identity(
                 &identity,
@@ -4174,6 +4311,7 @@ mod tests {
             new_document: _new_doc,
             rotation_event: event,
             new_pre_rotation_handle: _new_pre_rotation_handle,
+            migration_republish: _migration_republish,
         } = dht
             .migrate_identity(
                 &identity,
@@ -4236,6 +4374,7 @@ mod tests {
             new_document: _new_doc,
             rotation_event: event,
             new_pre_rotation_handle: _new_pre_rotation_handle,
+            migration_republish: _migration_republish,
         } = dht
             .migrate_identity(
                 &identity,
@@ -4286,6 +4425,7 @@ mod tests {
             new_document: _new_doc,
             rotation_event: event,
             new_pre_rotation_handle: _new_pre_rotation_handle,
+            migration_republish: _migration_republish,
         } = dht
             .migrate_identity(
                 &identity,
@@ -4342,6 +4482,7 @@ mod tests {
             new_document: _new_doc,
             rotation_event: event,
             new_pre_rotation_handle: _new_pre_rotation_handle,
+            migration_republish: _migration_republish,
         } = dht
             .migrate_identity(
                 &identity,
@@ -4448,6 +4589,7 @@ mod tests {
             new_document: _new_doc_a,
             rotation_event: event,
             new_pre_rotation_handle: _new_pre_rotation_handle_a,
+            migration_republish: _migration_republish,
         } = dht
             .migrate_identity(
                 &identity_a,
@@ -4524,6 +4666,7 @@ mod tests {
             new_document: _new_doc,
             rotation_event: event,
             new_pre_rotation_handle: _new_pre_rotation_handle,
+            migration_republish: _migration_republish,
         } = dht
             .migrate_identity(
                 &identity,
@@ -4594,6 +4737,7 @@ mod tests {
             new_document: _new_doc,
             rotation_event: event,
             new_pre_rotation_handle: _new_pre_rotation_handle,
+            migration_republish: _migration_republish,
         } = dht
             .migrate_identity(
                 &identity,
@@ -4674,6 +4818,7 @@ mod tests {
             new_document: _new_doc,
             rotation_event: event,
             new_pre_rotation_handle: _new_pre_rotation_handle,
+            migration_republish: _migration_republish,
         } = dht
             .migrate_identity(
                 &identity,
@@ -4741,6 +4886,7 @@ mod tests {
             new_document: _new_doc,
             rotation_event: event,
             new_pre_rotation_handle: _new_pre_rotation_handle,
+            migration_republish: _migration_republish,
         } = dht
             .migrate_identity(
                 &identity,
@@ -4842,6 +4988,7 @@ mod tests {
             new_document: _new_doc,
             rotation_event: event,
             new_pre_rotation_handle: _new_pre_rotation_handle,
+            migration_republish: _migration_republish,
         } = dht
             .migrate_identity(
                 &identity,
@@ -4897,6 +5044,7 @@ mod tests {
             new_document: _new_doc,
             rotation_event: event,
             new_pre_rotation_handle: _new_pre_rotation_handle,
+            migration_republish: _migration_republish,
         } = dht
             .migrate_identity(
                 &identity,
@@ -4957,6 +5105,7 @@ mod tests {
             new_document: _new_doc,
             rotation_event: event,
             new_pre_rotation_handle: _new_pre_rotation_handle,
+            migration_republish: _migration_republish,
         } = dht
             .migrate_identity(
                 &identity,
@@ -5962,6 +6111,7 @@ mod tests {
             new_document: new_doc,
             rotation_event: _event,
             new_pre_rotation_handle: _new_pre_rotation_handle,
+            migration_republish: _migration_republish,
         } = dht
             .migrate_identity(
                 &identity,
@@ -6071,6 +6221,7 @@ mod tests {
             new_document: _new_doc,
             rotation_event: _event,
             new_pre_rotation_handle: _new_handle,
+            migration_republish,
         } = dht
             .migrate_identity(
                 &identity,
@@ -6082,6 +6233,13 @@ mod tests {
             )
             .await
             .unwrap();
+
+        // Stop the ADR-003 §4b forwarding task before the snapshot below, so
+        // the exact-count assertion measures the two migration publishes and
+        // nothing else. `#[tokio::test]` runs a current-thread runtime and no
+        // await point separates the `tokio::spawn` inside `migrate_identity`
+        // from this line, so the task is cancelled before its first poll.
+        migration_republish.cancel();
 
         let after = recorder.snapshot().await;
         let migration_publishes = &after[pre_migration_publishes..];
@@ -6098,6 +6256,100 @@ mod tests {
             migration_publishes[1], identity.did,
             "step 8 (publish old doc with alsoKnownAs) MUST occur after step 7; recorded order: {migration_publishes:?}"
         );
+    }
+
+    /// `migrate_identity` MUST leave a running forwarding-maintenance task
+    /// that keeps re-putting the OLD DID document — the one carrying
+    /// `alsoKnownAs: [new_did]` — on the DHT (ADR-003 §4b, "Starts a
+    /// background republish task for the old DID document (forwarding record
+    /// maintenance, recommended 90 days)").
+    ///
+    /// Mainline DHT records expire. A single step-8 publish therefore keeps the
+    /// redirect resolvable only until that record lapses, after which every
+    /// resolver still holding the OLD DID loses the pointer to the new one.
+    /// This test asserts the running task, its repeated publishes, and its
+    /// termination at the 90-day bound.
+    #[tokio::test(start_paused = true)]
+    async fn migrate_identity_starts_bounded_forwarding_republishing_for_old_did() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let recorder = Arc::new(PublishOrderRecorder::new());
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = Arc::new(DidCache::with_clock(clock));
+        let sign_fn =
+            DidDht::<PublishOrderRecorder, Arc<TestClock>>::make_sign_fn(Arc::clone(&custody));
+        let dht: DidDht<PublishOrderRecorder, Arc<TestClock>> =
+            DidDht::with_client_and_signer(Arc::clone(&recorder), cache, sign_fn);
+
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let old_did = identity.did.clone();
+        let old_public_key = extract_public_key(&old_did).unwrap();
+
+        let outcome = dht
+            .migrate_identity(
+                &identity,
+                &document,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
+                &*custody,
+                1_700_000_000u64,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            outcome.migration_republish.is_active(),
+            "migrate_identity must return a RUNNING forwarding task (ADR-003 §4b)"
+        );
+
+        // The record the task keeps alive is the OLD document carrying the
+        // redirect, not the pre-migration document.
+        let stored = recorder.resolve(&old_public_key).await.unwrap().unwrap();
+        let redirect_doc = DidDocument::from_json(&String::from_utf8(stored.value).unwrap())
+            .expect("the OLD DID's stored record must be a DID document");
+        assert_eq!(
+            redirect_doc.also_known_as,
+            vec![outcome.new_identity.did.clone()],
+            "the republished OLD document must point at the new DID"
+        );
+
+        let publishes_after_migration = recorder.snapshot().await.len();
+
+        // Three hours of a one-hour cycle: the task must have re-put the OLD
+        // record, and every one of those publishes must be for the OLD DID.
+        tokio::time::sleep(tokio::time::Duration::from_mins(3 * 60 + 1)).await;
+        let after_three_hours = recorder.snapshot().await;
+        let forwarding = &after_three_hours[publishes_after_migration..];
+        assert!(
+            forwarding.len() >= 3,
+            "an hourly forwarding cycle must publish at least three times in three hours; got {}",
+            forwarding.len()
+        );
+        assert!(
+            forwarding.iter().all(|did| *did == old_did),
+            "every forwarding publish must target the OLD DID; got {forwarding:?}"
+        );
+
+        // And the task stops itself at the ADR-003 §4b bound rather than
+        // running for the life of the process.
+        tokio::time::sleep(tokio::time::Duration::from_secs(
+            scp_dht_migration_bound_secs(),
+        ))
+        .await;
+        assert!(
+            !outcome.migration_republish.is_active(),
+            "the forwarding task must stop at its 90-day bound (ADR-003 §4b)"
+        );
+    }
+
+    /// The 90-day forwarding bound, read from the constant the republish module
+    /// defines so this test cannot drift from it.
+    fn scp_dht_migration_bound_secs() -> u64 {
+        crate::republish::MIGRATION_REPUBLISH_DURATION_SECS
     }
 
     /// `migrate_identity` MUST destroy the old `#active` operational key
@@ -7105,6 +7357,7 @@ mod tests {
             new_document: resumed_doc,
             rotation_event: resumed_event,
             new_pre_rotation_handle: resumed_handle,
+            migration_republish: _migration_republish,
         } = dht
             .resume_migration_publish(partial, &*custody)
             .await
@@ -7320,6 +7573,7 @@ mod tests {
             new_document: resumed_doc,
             rotation_event: resumed_event,
             new_pre_rotation_handle: resumed_handle,
+            migration_republish: _migration_republish,
         } = dht
             .resume_migration_publish(partial, &*custody)
             .await

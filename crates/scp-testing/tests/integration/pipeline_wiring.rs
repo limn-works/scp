@@ -134,6 +134,22 @@ const COMMON_BROADCAST_SRC: &str =
 const BRIDGE_INSTANCE_SRC: &str =
     include_str!("../../../../crates/scp-ffi/common/src/bridge_instance.rs");
 
+// Identity DID-method source — owns `run_migration_publish_chain`, the body
+// that both `migrate_identity` and `resume_migration_publish` funnel through.
+// The `migrate_identity_starts_bounded_migration_republishing` assertion below
+// pins the ADR-003 §4b step-9 wiring: a completed migration MUST leave a
+// running forwarding-maintenance task for the OLD DID document, so a refactor
+// cannot silently return to the pre-fix state where `migrate_identity` ran
+// steps 0 through 8 and spawned nothing.
+const IDENTITY_DHT_SRC: &str = include_str!("../../../../crates/scp-identity/src/dht.rs");
+
+// Identity republish source — owns `migration_republish_loop`, the ADR-003 §4b
+// forwarding loop. Pinned by
+// `migration_republish_loop_is_bounded_by_a_deadline` so the loop cannot
+// regress to the unbounded `loop { publish; sleep }` it had before.
+const IDENTITY_REPUBLISH_SRC: &str =
+    include_str!("../../../../crates/scp-identity/src/republish.rs");
+
 // Transport layer sources for Batch 3 assertions
 const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/native/adapter.rs");
 
@@ -3631,6 +3647,90 @@ fn no_stale_ignores() {
     }
 
     assert!(stale.is_empty(), "Stale ignores:\n  {}", stale.join("\n  "));
+}
+
+// ---------------------------------------------------------------------------
+// ADR-003 §4b — migration forwarding-record maintenance
+// ---------------------------------------------------------------------------
+
+/// ADR-003 §4b (`.docs/adrs/phase-1.md`) requires that `migrate_identity`
+/// "Starts a background republish task for the old DID document (forwarding
+/// record maintenance, recommended 90 days)."
+///
+/// `run_migration_publish_chain` is the body both `migrate_identity` and
+/// `resume_migration_publish` funnel through, so pinning step 9 there covers
+/// both entry points. Each assertion below pins a call with its real argument:
+/// `start_migration_republishing` receives the record step 8 published, and
+/// that helper reaches `MigrationRepublisher::start` with a real
+/// `RepublishEntry`. Naming a symbol without calling it does not satisfy any of
+/// them.
+#[test]
+fn migrate_identity_starts_bounded_migration_republishing() {
+    assert!(
+        fn_body_contains(
+            IDENTITY_DHT_SRC,
+            "run_migration_publish_chain",
+            "self.start_migration_republishing(&old_identity.did, &redirect_record)"
+        ),
+        "run_migration_publish_chain must start the ADR-003 §4b forwarding task \
+         with the record step 8 published for the OLD DID"
+    );
+    assert!(
+        fn_body_contains(
+            IDENTITY_DHT_SRC,
+            "start_migration_republishing",
+            "MigrationRepublisher::new(Arc::clone(&self.dht_client))"
+        ),
+        "start_migration_republishing must build a MigrationRepublisher over the \
+         DidDht's own DHT client"
+    );
+    assert!(
+        fn_body_contains(
+            IDENTITY_DHT_SRC,
+            "start_migration_republishing",
+            "republisher.start(RepublishEntry {"
+        ),
+        "start_migration_republishing must spawn the task with a real RepublishEntry, \
+         not merely name the type"
+    );
+    assert!(
+        fn_body_contains(
+            IDENTITY_DHT_SRC,
+            "publish_old_doc_with_also_known_as",
+            "self.publish_document_returning_record(old_identity, &updated_old_doc)"
+        ),
+        "step 8 must return the BEP44 record it published so the forwarding task \
+         re-puts the bytes that were actually signed"
+    );
+}
+
+/// The ADR-003 §4b forwarding loop MUST terminate at its duration bound. An
+/// unbounded loop is one leaked task per migration: it holds the DHT client and
+/// the entry forever, and it keeps a superseded identity alive on the DHT long
+/// after every resolver has had the chance to follow `alsoKnownAs`.
+#[test]
+fn migration_republish_loop_is_bounded_by_a_deadline() {
+    assert!(
+        fn_body_contains(
+            IDENTITY_REPUBLISH_SRC,
+            "migration_republish_loop",
+            "deadline"
+        ),
+        "migration_republish_loop must compute a deadline from its duration"
+    );
+    assert!(
+        fn_body_contains(IDENTITY_REPUBLISH_SRC, "migration_republish_loop", "break"),
+        "migration_republish_loop must leave its loop once the deadline passes"
+    );
+    assert!(
+        IDENTITY_REPUBLISH_SRC
+            .contains("pub const MIGRATION_REPUBLISH_DURATION_SECS: u64 = 90 * 24 * 60 * 60;"),
+        "the forwarding bound must be the 90 days ADR-003 §4b recommends"
+    );
+    assert!(
+        fn_body_contains(IDENTITY_REPUBLISH_SRC, "start", "migration_republish_loop("),
+        "MigrationRepublisher::start must spawn migration_republish_loop"
+    );
 }
 
 /// Verifies that CLAUDE.md contains the required enforcement sections.
