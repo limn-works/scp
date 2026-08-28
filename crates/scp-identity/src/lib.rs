@@ -50,7 +50,15 @@ pub use dht::{
 };
 pub use relay_querier::RealMultiRelayQuerier;
 pub use republish::RepublishManager;
-pub use resolution::{InMemoryRelayQuerier, RelayQuerier, RelayQueryRecord, did_routing_id};
+// The three DID→`routing_id` derivations are re-exported SYMMETRICALLY: they
+// are one family (`did_routing_id` ∘ key ∘ frame, see `resolution`), and
+// root-exporting only some of them would push consumers back to module paths
+// for the rest — the drift that let a production site re-inline the
+// composition.
+pub use resolution::{
+    InMemoryRelayQuerier, RelayQuerier, RelayQueryRecord, did_key_routing_id,
+    did_record_routing_id, did_routing_id,
+};
 pub use resolver::{
     DidResolver, DualLayerHealingPublisher, DualLayerResolver, HealingPublisher, MultiRelayQuerier,
     NoOpHealer, NoOpRelayQuerier, ResolutionSource, ResolvedDidDocument, StaleLayer,
@@ -232,6 +240,28 @@ pub enum IdentityError {
     /// Publishing a DID document to an SCP relay failed.
     #[error("relay publish failed: {0}")]
     RelayPublishFailed(String),
+
+    /// A relay PUBLISH was attempted while NO relay is bound at all.
+    ///
+    /// Distinct from [`RelayPublishFailed`](Self::RelayPublishFailed): no relay
+    /// rejected the record, there was simply nowhere to send it. That is a
+    /// configuration state no retry can heal, so the republish loop reports it
+    /// on the transition and then rate-limits, instead of alarming every cycle
+    /// for the life of a node that has no relay client wired.
+    #[error("relay publish failed: no relay bound")]
+    NoRelayBound,
+
+    /// A BEP44 record could not be wrapped into a `DidRecordV1` relay frame
+    /// (§9.10.12) — the document bytes are empty or exceed the maximum frame
+    /// `value` length.
+    ///
+    /// Distinct from [`RelayPublishFailed`](Self::RelayPublishFailed) because
+    /// framing happens BEFORE any layer is contacted: nothing was published, and
+    /// nothing about a relay went wrong. Collapsing the two would misattribute a
+    /// local well-formedness fault to a remote layer, sending operators to look
+    /// at relay health for a bug in their own document.
+    #[error("DID-record framing failed: {0}")]
+    DidRecordFramingFailed(String),
 
     /// Querying an SCP relay for a DID document failed.
     #[error("relay query failed: {0}")]
@@ -421,8 +451,23 @@ impl From<scp_did::DidError> for IdentityError {
 
 /// Abstract trait for DID method implementations.
 ///
-/// Enables swapping between `did:dht` (primary) and `did:web` (contingency
-/// fallback) without changing calling code. See ADR-003 acceptance criterion 6.
+/// # This trait names `did:dht` concepts, and ADR-003 acceptance criterion 6 wants it not to
+///
+/// ADR-003 acceptance criterion 6 in `.docs/adrs/phase-1.md` describes this
+/// trait as "enabling did:web fallback swap without changing calling code".
+/// Three of its members contradict that today, so a `DidWeb` cannot implement it
+/// as written:
+///
+/// - [`publish`](Self::publish) returns a [`republish::RepublishEntry`], a BEP44
+///   `(public_key, seq, signature, value)` record whose
+///   [`did()`](republish::RepublishEntry::did) derives a `did:dht` string.
+/// - [`initialize_sequence`](Self::initialize_sequence) is defined in terms of a
+///   monotonic BEP44 sequence.
+/// - [`Dht`](Self::Dht) names a [`DhtClient`](scp_dht::DhtClient).
+///
+/// Retiring criterion 6 or splitting the `did:dht` members onto a subtrait is an
+/// open decision for a human; nothing here decides it. Read this section as the
+/// current state of the trait rather than as an argument for either answer.
 ///
 /// # Implementors
 ///
@@ -433,6 +478,28 @@ impl From<scp_did::DidError> for IdentityError {
 /// All methods are async because production implementations may involve
 /// network I/O (DHT publish/resolve) or hardware security module access.
 pub trait DidMethod: Send + Sync {
+    /// The DHT client this method signs records onto, and the same client that
+    /// keeps those records resolvable.
+    ///
+    /// Publishing a DID document signs `(public_key, seq, signature, value)`
+    /// once. Mainline DHT records expire, so §3.10.5 step 4 of the identity spec
+    /// schedules a keep-alive that re-puts those exact bytes under that exact
+    /// sequence, and
+    /// [`RepublishManager`] — the type §3.10.5 names
+    /// for the job — takes a [`DhtClient`](scp_dht::DhtClient). This associated
+    /// type is where a node that holds only a `DidMethod` obtains one.
+    ///
+    /// Binding the keep-alive client to the method that signs is the whole point:
+    /// a node that took the client as a second, free parameter could pair a
+    /// record signed by one method with a client that puts it somewhere else.
+    type Dht: scp_dht::DhtClient + 'static;
+
+    /// A shared handle on [`Dht`](Self::Dht).
+    ///
+    /// Returned by value because every caller clones the `Arc` anyway: the
+    /// keep-alive task outlives the borrow.
+    fn dht_client(&self) -> std::sync::Arc<Self::Dht>;
+
     /// Creates a new identity with three Ed25519 keypairs.
     ///
     /// Generates the Identity Key and Active Signing Key in the operational
@@ -465,18 +532,70 @@ pub trait DidMethod: Send + Sync {
     /// See ADR-003 acceptance criterion 5.
     fn verify(&self, did_string: &str, public_key: &[u8]) -> bool;
 
-    /// Publishes a DID document to the underlying DID infrastructure.
+    /// Publishes a DID document to the underlying DID infrastructure and
+    /// returns the **signed BEP44 record it just produced**.
     ///
     /// For `did:dht`, this publishes to the Mainline DHT as a BEP44 signed
     /// mutable item. See ADR-003 acceptance criterion 2.
     ///
-    /// **Note:** This method is defined in the trait for completeness but is
-    /// implemented in story SCP-007, not SCP-006.
+    /// # The signed record is an output of signing, never a read-back
+    ///
+    /// Signing already computes `(public_key, seq, signature, value)`;
+    /// returning it means every downstream consumer — the relay layer
+    /// (§3.10.5), the republish cycle (§3.10.5 step 4) — receives the
+    /// byte-identical triple the publisher signed. Discarding it forced callers
+    /// to reconstruct the triple by resolving the record back off the network,
+    /// which (a) makes a node's own republishing depend on a remote read
+    /// succeeding, (b) pins whatever a responder returns with no check against
+    /// the locally-known sequence, and (c) freezes at the first read so an
+    /// in-lifetime rotation is never re-seeded. The record is returned so that
+    /// re-derivation is unnecessary and, structurally, not a thing a caller can
+    /// be tempted into.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IdentityError`] if signing or the underlying publish fails.
+    /// An implementation that cannot publish MUST return a typed error — never
+    /// a fabricated record.
     fn publish(
         &self,
         identity: &ScpIdentity,
         document: &DidDocument,
-    ) -> impl Future<Output = Result<(), IdentityError>> + Send;
+    ) -> impl Future<Output = Result<republish::RepublishEntry, IdentityError>> + Send;
+
+    /// Bootstraps this method's monotonic publish sequence counter to the
+    /// highest value known across its persistent store and the live network
+    /// record, so the NEXT [`publish`](Self::publish) supersedes rather than
+    /// collides with an existing record.
+    ///
+    /// Must be called BEFORE the first publish of a process's lifetime (e.g. a
+    /// node's startup publish): a fresh counter starts at 0 and would otherwise
+    /// publish at `seq = 1`, which on a restart-within-TTL lands *beneath* a
+    /// live `seq = N` record — the real DHT rejects the lower-seq write while the
+    /// old (possibly superseded) document stays authoritative. See
+    /// `build_domain_inner` / `build_no_domain_inner` in `scp-node`, which call
+    /// this inside the builder ahead of the startup publish.
+    ///
+    /// The default is a no-op success: a DID method with no monotonic-sequence
+    /// semantics (nothing to bootstrap) legitimately has nothing to initialize.
+    /// `did:dht` overrides it to recover its BEP44 sequence from the store and/or
+    /// a DHT resolve. A resolve failure there is fail-closed (propagated): the
+    /// caller must not publish at an unknown sequence.
+    ///
+    /// **Implementors:** any method with monotonic BEP44-style sequence
+    /// semantics MUST override this to bootstrap its counter to
+    /// `max(persisted, live)` before the first publish. Inheriting the no-op
+    /// default reintroduces the restart-within-TTL collision this method exists
+    /// to prevent: a fresh counter republishes at `seq = 1` beneath a live
+    /// `seq = N` record, and the network rejects the lower-seq write (fail-open —
+    /// the stale document stays authoritative). The default is correct ONLY for
+    /// methods with no monotonic-sequence semantics at all.
+    fn initialize_sequence(
+        &self,
+        _did: &str,
+    ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+        async { Ok(()) }
+    }
 
     /// Resolves a DID string to its DID document via the underlying infrastructure.
     ///

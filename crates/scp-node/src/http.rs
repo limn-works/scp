@@ -23,7 +23,6 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use zeroize::Zeroizing;
 
-use scp_did::DidDocument;
 use scp_platform::traits::Storage;
 use scp_transport::native::server::RelayConfig as TransportRelayConfig;
 use scp_transport::native::storage::BlobStorageBackend;
@@ -63,8 +62,15 @@ pub struct BroadcastContext {
 pub struct NodeState {
     /// The operator's DID string.
     pub(crate) did: String,
-    /// The relay URL (e.g., `wss://example.com/scp/v1`).
-    pub(crate) relay_url: String,
+    /// The node's live published state: the DID document it stands behind, the
+    /// relay URL it is reachable at, and the signed record it last published.
+    ///
+    /// The node's slot, NOT a build-time copy — it is shared with the tier
+    /// re-evaluation task, so neither the **public, unauthenticated**
+    /// `.well-known/scp` discovery document (spec section 18.3) nor the dev-API
+    /// identity endpoint can read state the node has moved off. See
+    /// [`LiveSlot`](crate::LiveSlot).
+    pub(crate) live_state: crate::LiveSlot<crate::NodePublishedState>,
     /// Registered broadcast contexts, keyed by lowercase hex context ID.
     /// Modified via [`ApplicationNode::register_broadcast_context`].
     pub(crate) broadcast_contexts: RwLock<HashMap<String, BroadcastContext>>,
@@ -164,11 +170,6 @@ pub struct NodeState {
     ///
     /// See spec section 18.6.3 (auto-renewal).
     pub(crate) cert_resolver: Option<Arc<crate::tls::CertResolver>>,
-    /// The operator's DID document, populated at build time.
-    ///
-    /// Used by the dev API identity endpoint to return the full document
-    /// (spec section 18.10.3).
-    pub(crate) did_document: DidDocument,
     /// Shared connection tracker from the relay server.
     ///
     /// Tracks active connections per IP address across all transports.
@@ -1169,7 +1170,19 @@ mod tests {
     fn test_state(cors_origins: Option<Vec<String>>) -> Arc<NodeState> {
         Arc::new(NodeState {
             did: "did:dht:cors_test".to_owned(),
-            relay_url: "wss://localhost/scp/v1".to_owned(),
+            live_state: crate::LiveSlot::new(crate::NodePublishedState {
+                relay_url: "wss://localhost/scp/v1".to_owned(),
+                record: None,
+                document: scp_did::DidDocument {
+                    context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+                    id: "did:dht:cors_test".to_owned(),
+                    verification_method: vec![],
+                    authentication: vec![],
+                    assertion_method: vec![],
+                    also_known_as: vec![],
+                    service: vec![],
+                },
+            }),
             broadcast_contexts: RwLock::new(HashMap::new()),
             relay_addr: "127.0.0.1:9000".parse::<SocketAddr>().unwrap(),
             bridge_secret: Zeroizing::new([0u8; 32]),
@@ -1190,15 +1203,6 @@ mod tests {
             ),
             tls_config: None,
             cert_resolver: None,
-            did_document: scp_did::DidDocument {
-                context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
-                id: "did:dht:cors_test".to_owned(),
-                verification_method: vec![],
-                authentication: vec![],
-                assertion_method: vec![],
-                also_known_as: vec![],
-                service: vec![],
-            },
             connection_tracker: scp_transport::relay::rate_limit::new_connection_tracker(),
             subscription_registry: scp_transport::relay::subscription::new_registry(),
             acme_challenges: None,
@@ -1365,7 +1369,19 @@ mod vhost_tests {
     ) -> Arc<NodeState> {
         Arc::new(NodeState {
             did: "did:dht:vhost_test".to_owned(),
-            relay_url: "wss://localhost/scp/v1".to_owned(),
+            live_state: crate::LiveSlot::new(crate::NodePublishedState {
+                relay_url: "wss://localhost/scp/v1".to_owned(),
+                record: None,
+                document: scp_did::DidDocument {
+                    context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+                    id: "did:dht:vhost_test".to_owned(),
+                    verification_method: vec![],
+                    authentication: vec![],
+                    assertion_method: vec![],
+                    also_known_as: vec![],
+                    service: vec![],
+                },
+            }),
             broadcast_contexts: RwLock::new(HashMap::new()),
             relay_addr: "127.0.0.1:9000".parse::<SocketAddr>().unwrap(),
             bridge_secret: Zeroizing::new([0u8; 32]),
@@ -1386,15 +1402,6 @@ mod vhost_tests {
             ),
             tls_config: None,
             cert_resolver: None,
-            did_document: scp_did::DidDocument {
-                context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
-                id: "did:dht:vhost_test".to_owned(),
-                verification_method: vec![],
-                authentication: vec![],
-                assertion_method: vec![],
-                also_known_as: vec![],
-                service: vec![],
-            },
             connection_tracker: scp_transport::relay::rate_limit::new_connection_tracker(),
             subscription_registry: scp_transport::relay::subscription::new_registry(),
             acme_challenges: None,

@@ -278,9 +278,12 @@ pub struct NapiNodeHandle {
 impl NapiNodeHandle {
     /// Returns the WebSocket URL clients should connect to for this node's
     /// relay (e.g., `ws://127.0.0.1:12345/scp/v1`).
+    ///
+    /// Read live per call from the node's relay-URL slot, so it reflects a NAT
+    /// tier change that re-pointed the node's endpoint.
     #[napi(getter)]
     pub fn relay_url(&self) -> String {
-        self.inner.relay_url().to_owned()
+        self.inner.relay_url()
     }
 
     /// Returns the port the node's relay is listening on.
