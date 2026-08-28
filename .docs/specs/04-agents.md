@@ -6,7 +6,7 @@ Humans and their bound agents are the only actors in the system. Every action on
 
 ## 4.2 Binding
 
-Every agent is bound to its human through the DID document itself — the agent's signing key is a verification method (`#agent`) on the human's DID. Binding is structural, not an external proof: the DID document is the single source of truth for which key is the human's (`#active`) and which is the agent's (`#agent`). The binding is verifiable by any participant who resolves the DID.
+Every agent is bound to its human through the DID document itself — the agent's signing key is a verification method (`#agent`) on the human's DID. Binding is structural, not an external proof: the DID document is the single source of truth for which key is the human's (`#active`) and which is the agent's (`#agent`). The binding is verifiable by any participant who resolves the DID. §3.9 of the identity spec governs both keys: §3.9.3 covers `#active` and §3.9.4 covers `#agent`.
 
 - **Personal agents:** Bound to a single human. The common case. The human's DID document contains at most one `#agent` verification method.
 - **Institutional agents:** Bound to multiple humans through shared governance (multi-sig, elected operators, organizational hierarchy). Structurally identical to personal agents; the difference is in who holds the keys and how revocation/control works. Institutions get one agent per context, the same as individuals — one seat per institution per table.

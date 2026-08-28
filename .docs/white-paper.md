@@ -262,13 +262,13 @@ Key custody is invisible to users. Keys are stored in platform-specific secure s
 
 ### 4.2 Multi-Key Verification Method Architecture
 
-Standard DID methods use a single keypair for everything — signing, authenticating, operating. This conflates distinct security concerns. SCP defines multiple verification methods per DID document, each serving a specific purpose:
+Standard DID methods use a single keypair for everything — signing, authenticating, operating. This conflates distinct security concerns. SCP defines multiple verification methods per DID document, each serving a specific purpose. §3.9 of the identity specification governs the four keys; the summary below states no rule of its own:
 
-**Identity Key (`#0`).** The Ed25519 key encoded in the DID string. Hardware-backed. The long-lived root of trust. Used exclusively for BEP44 signing and DID document modifications. Never used for day-to-day protocol operations.
+**Identity Key (`#0`).** The Ed25519 key encoded in the DID string. The long-lived root of trust. Used exclusively for BEP44 signing and DID document modifications. Never used for day-to-day protocol operations. Each platform holds it in the strongest custody that platform offers for an Ed25519 key.
 
-**Human Signing Key (`#active`).** The human's operational key for protocol actions — signing inner envelopes, MLS operations, capability delegation. Hardware-backed. Rotatable without changing the DID. Published in the DID document, authorized by the Identity Key.
+**Human Signing Key (`#active`).** The human's operational key for protocol actions — signing inner envelopes, MLS operations, capability delegation. Rotatable without changing the DID. Published in the DID document, authorized by the Identity Key. The participant chooses its custody, and platform secure storage is the expectation.
 
-**Pre-Rotation Key.** A commitment to the next Human Signing Key. The hash of the pre-rotation key is published in the DID document before it is needed. This enables safe key rotation even under compromise: the pre-rotation commitment was made before the compromise occurred, so an attacker who steals the current signing key cannot forge a valid rotation — they would need the pre-rotation private key, which was generated separately.
+**Pre-Rotation Key.** A commitment to the next Identity Key. The hash of the pre-rotation key is published in the DID document before it is needed, and identity migration installs the revealed key as the new `#0`. This enables safe recovery even under compromise: the pre-rotation commitment was made before the compromise occurred, so an attacker who steals the current Identity Key cannot forge a valid migration — they would need the pre-rotation private key, which is generated separately and stored apart from operational custody.
 
 **Agent Signing Key (`#agent`).** Optional. A software-held Ed25519 key for the human's autonomous agent. Published in the DID document, authorized by the human via a self-delegation UCAN (`iss == aud`, same DID, with `fct.scp_key_scope: "#agent"`). Independently rotatable and revocable without affecting the human's keys.
 
@@ -282,9 +282,9 @@ This separation provides three security improvements over single-key DID methods
 flowchart TB
     subgraph did["DID Document (did:dht:z6Mk...)"]
         direction TB
-        id["#0 Identity Key\n(Ed25519, hardware-backed)\nCategory A: DID doc modifications only"]
-        active["#active Human Signing Key\n(Ed25519, hardware-backed)\nCategory B: protocol operations"]
-        prerot["Pre-Rotation Key\n(hash commitment to next #active)"]
+        id["#0 Identity Key\n(Ed25519, strongest custody the platform offers)\nCategory A: DID doc modifications only"]
+        active["#active Human Signing Key\n(Ed25519, participant-chosen custody)\nCategory B: protocol operations"]
+        prerot["Pre-Rotation Key\n(hash commitment to next #0)"]
         agent["#agent Agent Signing Key\n(Ed25519, software-held)\nCategory B: delegated via UCAN"]
     end
 
@@ -345,7 +345,7 @@ The one-per-context constraint emerged from analysis of what happens without it.
 
 Three permission categories govern what each key can do:
 
-- **Category A** (`#0` only): DID document modifications, key rotation. Human-exclusive, never delegable to the agent key. Structurally impossible for agents because the identity key is hardware-backed.
+- **Category A** (`#0` only): DID document modifications, key rotation. Human-exclusive, never delegable to the agent key. The agent runtime cannot reach the identity key, because custody separation places the two keys in different substrates.
 - **Category B** (user-configurable): Operational actions — messaging, outlet invocation, governance votes. SDK defaults to human-only; the human can delegate subsets to the agent via UCAN.
 - **Category C** (context-configurable): Context governance can further restrict which key types are accepted for specific actions.
 

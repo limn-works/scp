@@ -88,7 +88,7 @@
       "acceptanceCriteria": [
         "ADR-039 exists in .docs/adrs/phase-1.md with Status: Accepted",
         "ADR-039 Extends: ADR-003 (DID Creation)",
-        "Decision section defines three verification methods: #0 (Identity Key, Ed25519, hardware-backed), #active (Human Signing Key, Ed25519), #agent (Agent Signing Key, Ed25519, optional, rotatable)",
+        "Decision section defines three verification methods: #0 (Identity Key, Ed25519, strongest custody the platform offers), #active (Human Signing Key, Ed25519), #agent (Agent Signing Key, Ed25519, optional, rotatable)",
         "Permission Model section defines Category A (#0 only: DID doc mods), Category B (user-configurable operational actions), Category C (context-configurable restrictions)",
         "Enforcement Stack section defines 5 layers: custody separation, SDK defaults, verifier validation, custody attestation, behavioral signals",
         "MLS Impact section adds signing_key_id to ScpCredential",
@@ -143,10 +143,10 @@
       "files": [
         ".docs/specs/03-identity.md"
       ],
-      "description": "Update §3 (Identity) to integrate the shared-DID model from ADR-039. §3.1 (Root of Identity) must document that a DID has three verification methods: #0 (identity), #active (human signing), #agent (agent signing, optional). §3.2 (Key Custody) must document custody separation between hardware-backed #active and software-based #agent. §3.9 (Key Lifecycle) must document agent key generation, rotation via #0, and removal. Add new subsection for agent key management operations: add_agent_key(), remove_agent_key(), rotate_agent_key(). Document the structural constraint: exactly one #agent VM per DID document; verifiers reject documents with multiple #agent VMs.",
+      "description": "Update §3 (Identity) to integrate the shared-DID model from ADR-039. §3.1 (Root of Identity) must document that a DID has three verification methods: #0 (identity), #active (human signing), #agent (agent signing, optional). §3.2 (Key Custody) must document custody separation between hardware-backed #active and software-based #agent. §3.9 (Multi-Key Architecture and Key Lifecycle) must document agent key generation, rotation via #0, and removal. Add new subsection for agent key management operations: add_agent_key(), remove_agent_key(), rotate_agent_key(). Document the structural constraint: exactly one #agent VM per DID document; verifiers reject documents with multiple #agent VMs.",
       "acceptanceCriteria": [
         "§3.1 documents three verification methods: #0 (Identity Key), #active (Human Signing Key), #agent (Agent Signing Key, optional)",
-        "§3.2 documents custody separation: #active in hardware (SE/AKS), #agent in software keychain",
+        "§3.9.3 and §3.9.4 document custody: the participant chooses #active's custody with platform secure storage as the expectation, and #agent sits in a software keystore",
         "§3.9 documents agent key lifecycle: generation at identity creation or later, rotation signed by #0, removal signed by #0",
         "New subsection documents add_agent_key(), remove_agent_key(), rotate_agent_key() operations",
         "Structural constraint documented: exactly one #agent VM per DID document, verifiers reject multiple",
@@ -178,7 +178,7 @@
         },
         {
           "file": ".docs/specs/03-identity.md",
-          "section": "## 3.9 Key Lifecycle"
+          "section": "## 3.9 Multi-Key Architecture and Key Lifecycle"
         }
       ],
       "details": {}
@@ -538,7 +538,7 @@
         },
         {
           "file": ".docs/specs/03-identity.md",
-          "section": "## 3.9 Key Lifecycle"
+          "section": "## 3.9 Multi-Key Architecture and Key Lifecycle"
         }
       ],
       "details": {}

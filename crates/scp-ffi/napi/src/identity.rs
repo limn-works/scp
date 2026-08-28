@@ -575,7 +575,7 @@ impl NapiIdentity {
     ///   crypto state).
     /// - `SCP-IDENT-1001`: Key generation or DHT publishing failed.
     ///
-    /// See §3.9 Key Lifecycle, ADR-003 DID Creation.
+    /// See §3.9 Multi-Key Architecture and Key Lifecycle, ADR-003 DID Creation.
     #[napi]
     #[allow(clippy::unused_async)] // napi requires async for Promise return type
     pub async fn rotate_key(&self) -> napi::Result<Self> {

@@ -613,13 +613,16 @@ pub enum PreRotationCustodyError {
 /// boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PreRotationCustodyKind {
-    /// Shipped-but-degraded default backend: in-process registry. Satisfies
-    /// the §9.7.4.1 §3 type-level isolation requirement (separate custody
+    /// Test-harness-only backend: in-process registry. Satisfies the
+    /// §9.7.4.1 §3 type-level isolation requirement (separate custody
     /// object, distinct handle type) but does NOT satisfy the substrate
     /// isolation requirement — the pre-rotation key co-resides in the same
-    /// process memory as operational keys. Used as the default in production
-    /// FFI/SDK paths until passkey-PRF / hardware-token / Shamir backends
-    /// are wired in as a follow-up workstream.
+    /// process memory as operational keys. ADR-062 §Decision 6 severed it
+    /// from every shipped build: the module exporting
+    /// `InMemoryPreRotationCustody` is gated behind `feature = "testing"`,
+    /// and identity creation on a shipped build fails closed rather than
+    /// reaching this arm. Passkey-PRF / hardware-token / Shamir backends
+    /// remain unbuilt (RFC #2130).
     InMemory,
     /// FIDO2/U2F hardware security key. Highest security per §9.7.4.1 §4.
     HardwareSecurityKey,
@@ -727,10 +730,13 @@ pub enum PreRotationCustodyKind {
 /// backup). Modeling UX inside the trait would force concrete
 /// flows that don't generalize.
 ///
-/// Today's shipped backend ([`InMemoryPreRotationCustody`](super::testing::InMemoryPreRotationCustody))
-/// is process-memory only — it satisfies the trait's type-level
-/// isolation but not §9.7.4.1 §3 substrate isolation. Production
-/// backends are a separate workstream.
+/// No production backend implements this trait today. The one implementation
+/// that exists, [`InMemoryPreRotationCustody`](super::testing::InMemoryPreRotationCustody),
+/// is process-memory only — it satisfies the trait's type-level isolation but
+/// not §9.7.4.1 §3 substrate isolation — and ADR-062 §Decision 6 gates it to
+/// the test harness, so a shipped build carries no backend and identity
+/// creation fails closed. Production backends are a separate workstream
+/// (RFC #2130).
 ///
 /// # Concurrency
 ///

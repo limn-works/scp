@@ -1258,7 +1258,7 @@ DidDocument.verification_method = [
 ]
 ```
 
-**Trust chain:** `#0` (root of trust) authorizes `#active` and `#agent` via DID document publication. Adding/removing `#agent` is a DID document update signed by `#0`.
+**Trust chain:** `#0` (root of trust) authorizes `#active` and `#agent` via DID document publication. Adding/removing `#agent` is a DID document update signed by `#0`. §3.9 of the identity spec consolidates the four keys this ADR introduces — `#0`, `#active`, `#agent`, and the pre-rotation key — and states, for each one, what it signs, where its key material lives, who chooses that, how it rotates, and how it appears in the DID document. Where this ADR and §3.9 disagree, §3.9 states the rule and §3.9.8 records the disagreement.
 
 **Key properties:**
 

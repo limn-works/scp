@@ -769,7 +769,7 @@ Each replaceable trait imposes invariants that every implementation must uphold.
 - Adapters map transport-specific semantics (WebSocket, Nostr relay, libp2p, etc.) onto this uniform interface.
 
 **`DidMethod`** (scp-core/identity) — `Send + Sync`, async methods.
-- `create` generates three Ed25519 keypairs (identity, active signing, pre-rotation) via the provided `KeyCustody`. Returns `ScpIdentity` + `DidDocument`.
+- `create` generates the identity and active signing keypairs, and an optional agent signing keypair, via the provided `KeyCustody`, and the pre-rotation keypair via a separate `PreRotationCustody` substrate (§9.7.4.1 item 3 forbids the operational provider from holding it). Returns `ScpIdentity` + `DidDocument`. §3.9 of the identity spec governs the four keys.
 - `verify` is a local, synchronous self-certification check (z-base-32 decode + public key comparison).
 - `publish` and `resolve` perform network I/O against the underlying DID infrastructure.
 - `rotate` generates a new active signing key, updates the DID document, and publishes. The DID string does not change.
