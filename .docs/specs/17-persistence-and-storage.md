@@ -669,6 +669,14 @@ Key custody is a provider capability governed by the general capability-selectio
 | Python/Node/Server | Software keys in SQLCipher-encrypted SQLite | Ed25519, X25519 | No hardware key store on typical servers |
 | Testing | `InMemoryKeyCustody` | Ed25519, X25519 | Already defined (ADR-006) |
 
+§3.2.2 of the identity spec, the custody vocabulary, states which value a caller names to
+reach a row of this table: `encrypted_file` names the `FileKeyCustody` key store the next
+subsection parameterizes, and `os_keystore` names the operating-system row for the
+platform the caller runs on, which SCP reaches through the platform key-custody callback
+an SDK consumer supplies. This table states where a key sits; it states no value a caller
+passes, and the words `platform`, `software`, `file`, and `hardware` name no custody
+value.
+
 ### FileKeyCustody Argon2id Parameters
 
 The software-key custody backend for non-HSM platforms (`FileKeyCustody`, the universal fallback used by the Python/Node/Server row above) derives an AES-256 wrapping key from a passphrase using Argon2id. Its parameters are the canonical Argon2id parameterization for the codebase and MUST be:

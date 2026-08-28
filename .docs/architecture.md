@@ -908,11 +908,16 @@ The Python SDK is the most critical binding. The agent ecosystem is Python. If t
 
 **The 20-line agent:**
 
+§3.2.2 of the identity spec, the custody vocabulary, states the two values every SDK
+snippet in this section passes: `encrypted_file` selects the on-disk key store SCP
+implements, and `os_keystore` selects the operating system's own key store through the
+platform key-custody callback the SDK consumer supplies.
+
 ```python
 import scp
 
 # Create or load identity
-identity = await scp.Identity.create(custody="platform")
+identity = await scp.Identity.create(custody="os_keystore")
 
 # Create a context
 ctx = await scp.Context.create(
@@ -982,7 +987,7 @@ PyO3 handles the Rust↔Python boundary: async (tokio↔asyncio), error conversi
 import { SCP } from '@limn-works/scp-ts';
 
 // Node.js / Deno
-const identity = await SCP.Identity.create({ custody: 'platform' });
+const identity = await SCP.Identity.create({ custody: 'os_keystore' });
 const ctx = await SCP.Context.create({
   creator: identity,
   ceiling: ['messaging'],
@@ -1003,7 +1008,7 @@ TypeScript uses napi-rs for in-process use on Node.js/Bun (Rust → native addon
 ```swift
 import SCP
 
-let identity = try await SCP.Identity.create(custody: .secureEnclave)
+let identity = try await SCP.Identity.create(custody: "os_keystore")
 
 let quest = try await SCP.Context.create(
     creator: identity,

@@ -131,13 +131,15 @@ class Identity:
 custody is a security-relevant choice, and the agent-first API design tenet in
 CLAUDE.md forbids an SDK picking one on a caller's behalf.
 
-The PyO3 bridge builds a key store from two custody strings. `"file"` writes an
-`$HOME/.scp/keys.bin` key file that `FileKeyCustody` encrypts with Argon2id and
-AES-256-GCM under `$SCP_KEY_PASSPHRASE`. `"in_memory"` compiles under the bridge's
-`testing` feature, so a shipped build returns `SCP-IDENT-1008`. The bridge returns
-`SCP-IDENT-1003` for `"platform"`, because a caller reaches Apple Keychain or Android
-Keystore by passing a `KeyCustodyProvider` to `SCP.identity_create_with_custody`, never
-by naming a custody string.
+§3.2.2 of the identity spec, the custody vocabulary, states the two values this string
+carries. `"encrypted_file"` selects the on-disk key store SCP implements, which derives
+an AES-256 key from `$SCP_KEY_PASSPHRASE` with Argon2id and encrypts each key entry
+under AES-256-GCM. `"os_keystore"` selects the operating system's own key store, which
+SCP reaches through the platform key-custody callback the SDK consumer supplies; a
+bridge holding no such callback returns a typed error rather than falling back to
+another store. A shipped build answers every other string with a typed error, and
+answers the test-harness string `"in_memory"` with `SCP-IDENT-1008`. The words
+`platform`, `software`, `file`, and `hardware` name no custody value.
 
 ### Opaque types
 

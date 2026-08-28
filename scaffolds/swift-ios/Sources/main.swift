@@ -1,9 +1,10 @@
 /// Minimal SCP iOS app scaffold.
 ///
 /// Creates a DID identity with the in-memory key store, opens an encrypted
-/// context, and sends a message. No custody string reaches the Keychain: the
-/// UniFFI bridge answers "platform" with SCP-IDENT-1003, so Keychain-held keys
-/// need a KeyCustodyProvider injected through identityCreateWithCustody.
+/// context, and sends a message. Section 3.2.2 of the identity spec, the custody
+/// vocabulary, names two values a shipped caller passes: "encrypted_file" for
+/// the on-disk key store SCP implements, and "os_keystore" for the Keychain,
+/// which needs a KeyCustodyProvider injected through identityCreateWithCustody.
 /// Replace mock values with real relay URLs for production.
 
 import Foundation

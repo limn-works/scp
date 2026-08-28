@@ -220,11 +220,14 @@ class Identity private constructor(private val handle: IdentityHandle) {
 ```
 
 `create` takes the custody string as a required argument and offers no default, because
-no custody string names a key store a shipped build reaches. The UniFFI bridge builds a
-key store from `"in_memory"` only, and compiles that one under its `testing` feature, so a
-shipped build returns `SCP-IDENT-1008` for it and returns `SCP-IDENT-1003` for
-`"platform"` and for `"software"`. A caller reaches Android Keystore by passing a
-`KeyCustodyProvider` to `identityCreateWithCustody` instead.
+key custody is a security-relevant choice and the agent-first API design tenet in
+CLAUDE.md forbids an SDK picking one on a caller's behalf. §3.2.2 of the identity spec,
+the custody vocabulary, states the two values this string carries: `"encrypted_file"`
+selects the on-disk key store SCP implements, and `"os_keystore"` selects Android
+Keystore through the platform key-custody callback the SDK consumer supplies. A shipped
+build answers every other string with a typed error, and answers the test-harness string
+`"in_memory"` with `SCP-IDENT-1008`. The words `platform`, `software`, `file`, and
+`hardware` name no custody value.
 
 ## Resource Management
 

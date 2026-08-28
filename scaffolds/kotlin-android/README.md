@@ -1,8 +1,10 @@
 # SCP Kotlin Android Scaffold
 
-Minimal Android app using the SCP Kotlin SDK with the in-memory key store. No
-custody string reaches Android Keystore: the UniFFI bridge answers `"platform"`
-with `SCP-IDENT-1003`.
+Minimal Android app using the SCP Kotlin SDK with the in-memory key store. A caller
+reaches Android Keystore by naming `"os_keystore"` and supplying a
+`KeyCustodyProvider`; §3.2.2 of the identity spec, the custody vocabulary, states that
+value and states that a bridge holding no such provider returns a typed error rather
+than falling back to another store.
 
 ## Prerequisites
 

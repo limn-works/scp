@@ -194,7 +194,7 @@ The two workstreams touched the same bridge surfaces from opposite ends: §7 mov
 
 **Identity construction — `verifying_key_hex` field.** The `Identity` struct in every bridge gains a `verifying_key_hex: Option<String>` field (hex-encoded Ed25519 verifying-key bytes for the identity key, VM `#0` — the DID-deriving key, not `#active`). Exposing the identity key gives byte-exact parity across all three bridges under a deterministic `seed`. Populated at every constructor site across PyO3 (`PyIdentity::new` / `PyIdentity::from_document` factory methods, 8+ sites), NAPI (`NapiIdentityInner` literal, 13 sites), and UniFFI (`Identity { ... }` literal, 7 sites). Populated via `custody.public_key(&identity.identity_key).await.ok().map(|pk| hex::encode(pk.as_bytes()))` — an ADR-046 stability contract, not an exposed API at the SDK layer (read via `identity.verifying_key()`).
 
-**Identity creation — `testing_seed: Option<Vec<u8>>` parameter.** `Scp::identity_create(custody, testing_seed)` on every bridge accepts an optional 32-byte deterministic RNG seed. When `Some(bytes)`, `InMemoryKeyCustody::from_seed_bytes(bytes)` replaces the default `OsRng`-backed `InMemoryKeyCustody::new()`, making subsequent `generate_keypair` calls produce byte-identical Ed25519 keys across bridges. Rejected with `SCP-VALID-7007` for length ≠ 32 bytes and with `SCP-VALID-7009` for non-`in_memory` custody (Platform/Software paths reject the parameter — seeded determinism is only meaningful for in-process testing custody).
+**Identity creation — `testing_seed: Option<Vec<u8>>` parameter.** `Scp::identity_create(custody, testing_seed)` on every bridge accepts an optional 32-byte deterministic RNG seed. When `Some(bytes)`, `InMemoryKeyCustody::from_seed_bytes(bytes)` replaces the default `OsRng`-backed `InMemoryKeyCustody::new()`, making subsequent `generate_keypair` calls produce byte-identical Ed25519 keys across bridges. Rejected with `SCP-VALID-7007` for length ≠ 32 bytes and with `SCP-VALID-7009` for non-`in_memory` custody, because seeded determinism is only meaningful for in-process testing custody. When this paragraph was written the bridges named `Platform` and `Software` custody variants; §3.2.2 of the identity spec, the custody vocabulary, has since retired both words, and the note at the end of this ADR states what a bridge does now.
 
 Swift / Kotlin SDK wrappers expose `testingSeed: Data? = nil` / `testingSeed: ByteArray? = null` defaults so production callers retain the single-argument call shape. The name makes intent explicit at the call site: `scp.identityCreate(custody: "in_memory", testingSeed: seedBytes)` reads as a testing affordance rather than a production knob.
 
@@ -223,18 +223,17 @@ The registry currently has no live entries. The three bridges share the real eng
 
 > **The `testing_seed` rejection this ADR records no longer holds.** The paragraph
 > above states that a seed is "Rejected ... with `SCP-VALID-7009` for non-`in_memory`
-> custody (Platform/Software paths reject the parameter)". Story SCP-294 in
-> `.docs/prds/http-features.json` made every bridge judge the custody name before the
-> seed, so a seed paired with a refused custody string now reports that string's own
-> code: `SCP-IDENT-1003` for `"platform"` on all three bridges and for `"software"`
-> on the NAPI and UniFFI bridges, `SCP-IDENT-1008` for `"in_memory"` in a build
-> without the `testing` feature, and `SCP-VALID-7005` for any other string.
-> `SCP-VALID-7009` survives on the PyO3 bridge alone, for the one pairing that
-> reaches a key store that bridge builds: `"file"` custody with a seed. The
-> `CustodyMethod::Platform` and `CustodyMethod::Software` variants the paragraph names
-> are deleted. The length check, `SCP-VALID-7007` for a seed that is not 32 bytes, is
-> unchanged. This ADR's decision is untouched; a story does not rewrite one, so the
-> paragraph stands as written and this note records what the bridges now do.
+> custody". Every bridge now judges the custody name before the seed, so a seed paired
+> with a custody string the bridge refuses reports that string's own typed error
+> rather than `SCP-VALID-7009`. §3.2.2 of the identity spec, the custody vocabulary,
+> states which strings a bridge refuses: every string other than `"encrypted_file"`
+> and `"os_keystore"` draws a typed error, and the test-harness string `"in_memory"`
+> draws `SCP-IDENT-1008` in a build without the `testing` feature. `SCP-VALID-7009`
+> survives for one pairing that reaches a key store a bridge builds: `"encrypted_file"`
+> custody with a seed. The `CustodyMethod::Platform` and `CustodyMethod::Software`
+> variants the paragraph names are deleted, and §3.2.2 of the identity spec retired
+> both words, so do not pass either. The length check, `SCP-VALID-7007` for a seed
+> that is not 32 bytes, is unchanged.
 
 ## Consequences
 

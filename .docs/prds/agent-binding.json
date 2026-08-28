@@ -1004,6 +1004,10 @@
         },
         {
           "file": ".docs/specs/03-identity.md",
+          "section": "### 3.2.2 The Custody Vocabulary"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
           "section": "## 3.5 Identity Attestations"
         },
         {

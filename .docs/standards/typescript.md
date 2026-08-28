@@ -105,6 +105,12 @@ describe("Identity", () => {
 });
 ```
 
+The snippet above passes `in_memory`, which §3.2.2 of the identity spec, the custody
+vocabulary, classifies as a test-harness string rather than a value a shipped caller
+names. A test reaches it only in a build carrying the bridge's `testing` feature; a
+shipped build rejects it with `SCP-IDENT-1008` and takes `encrypted_file` or
+`os_keystore` instead.
+
 ### Test naming
 
 Format: `{action} {condition or expected result}` in natural English.

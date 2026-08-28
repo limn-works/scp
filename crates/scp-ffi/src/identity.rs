@@ -59,7 +59,6 @@ use scp_identity::{DidCache, DidDht, DidMethod, DualLayerResolver, NoOpRelayQuer
 // value directly (production migration is unreachable — ADR-062 §Decision 6).
 #[cfg(feature = "testing")]
 use scp_identity::ScpIdentity;
-use scp_platform::file::FileKeyCustody;
 #[cfg(feature = "testing")]
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, Storage};
@@ -380,9 +379,10 @@ where
 pub struct PyIdentity {
     /// The DID string (e.g., `"did:dht:z6Mk..."`).
     did: String,
-    /// The custody type used to create this identity: `"in_memory"`, `"file"`,
-    /// or `"callback"` when the caller injected a `KeyCustodyProvider` through
-    /// `identity_create_with_custody`.
+    /// The custody value this identity was created under:
+    /// `"encrypted_file"`, `"os_keystore"`, or the test-harness
+    /// `"in_memory"`. §3.2.2 of `.docs/specs/03-identity.md` states the
+    /// vocabulary.
     custody: String,
     /// Whether this identity has an agent signing key (`#agent` VM).
     has_agent_key: bool,
@@ -686,46 +686,172 @@ impl PyDIDDocument {
 }
 
 // ---------------------------------------------------------------------------
-// Custody parsing helper
+// The custody factory
 // ---------------------------------------------------------------------------
 
-/// Parses a custody type string and returns an [`FfiKeyCustody`] instance.
+/// Builds the key custody backend a caller's custody value names.
 ///
-/// Supported custody types:
+/// §3.2.2 of the identity spec, the custody vocabulary, gives a caller two
+/// values: `"encrypted_file"` selects the on-disk key store SCP implements, and
+/// `"os_keystore"` selects the operating system's own key store, which this
+/// bridge reaches through the `KeyCustodyProvider` a Python caller supplies.
+/// This function is the one place on this bridge that maps either value onto a
+/// backend, so `identity_create`, `identity_create_with_agent_key`, and
+/// `identity_create_with_custody` all reach the same decision.
 ///
-/// - `"in_memory"` — Test-only in-memory custody. Keys are lost on process
-///   exit. Only available when compiled with `cfg(feature = "testing")`.
-/// - `"file"` — Encrypted file-backed custody ([`FileKeyCustody`]) using
-///   Argon2id + AES-256-GCM. This is the production default for desktop/server
-///   platforms. Mobile platforms (iOS/Android) should use their native
-///   `KeyCustodyProvider` callback interface via `UniFFI` instead.
-/// - `"platform"` — Rejected. No bridge builds an OS-keystore custody from a
-///   custody string: a caller reaches Keychain, Android Keystore, or any other
-///   platform-native store by passing a `KeyCustodyProvider` to
-///   `identity_create_with_custody`, never by naming it here. The NAPI
-///   and `UniFFI` bridges reject the same string with the same code, so one
-///   custody name carries one meaning across all three bridges.
+/// A shipped build additionally answers `"in_memory"`, the test-harness string,
+/// with `SCP-IDENT-1008`; a build carrying the `testing` cargo feature builds
+/// the in-memory backend for it. §3.2.2 states that the string is a test
+/// affordance and not a value of the vocabulary.
 ///
-/// The `"file"` path creates a [`FileKeyCustody`] at a default location
-/// (`$HOME/.scp/keys.bin`) with a passphrase from the `SCP_KEY_PASSPHRASE`
-/// environment variable. If the variable is not set, an error is returned.
+/// # Arguments
+///
+/// * `py` — the GIL token `PyKeyCustodyProvider::new` validates the provider
+///   under.
+/// * `custody` — the custody value, one of the two §3.2.2 names.
+/// * `provider` — the Python `KeyCustodyProvider` object that holds the key,
+///   supplied only alongside `"os_keystore"`.
 ///
 /// # Errors
 ///
-/// Returns [`ScpPyError::ValidationError`] if:
-/// - The custody string is not recognized.
-/// - `"file"` is requested but `SCP_KEY_PASSPHRASE` is not set.
+/// Returns [`ScpPyError::IdentityError`] carrying:
+/// - `SCP-IDENT-1003` when a caller names `"os_keystore"` and supplies no
+///   provider. §3.2.2 states the rule this applies: the bridge returns a typed
+///   error and falls back to neither `encrypted_file` nor an in-memory store.
+/// - `SCP-IDENT-1008` when a caller names `"in_memory"` on a build that carries
+///   no `testing` feature.
+/// - `SCP-IDENT-1005` when a caller supplies a provider alongside a value other
+///   than `"os_keystore"`. No public entry point forms that pair, so the error
+///   reports a bridge-layer bug.
+/// - A `FileKeyCustody` initialization failure (a rejected passphrase, an
+///   unreadable key file).
 ///
-/// Returns [`ScpPyError::IdentityError`] if:
-/// - `"in_memory"` is requested but the `testing` feature is not enabled
-///   (`SCP-IDENT-1008`).
-/// - `"platform"` is requested (`SCP-IDENT-1003`) — see above.
-/// - [`FileKeyCustody`] initialization fails (I/O error, corrupt key file).
+/// Returns [`ScpPyError::ValidationError`] carrying:
+/// - `SCP-VALID-7005` for every string outside the vocabulary, which includes
+///   the five this bridge and its two siblings once parsed: `platform`,
+///   `software`, `file`, `platform_managed`, and `hardware`.
+/// - `SCP-VALID-7005` when the supplied provider exposes no complete
+///   `KeyCustodyProvider` protocol.
+/// - An unset `SCP_KEY_PASSPHRASE` under `"encrypted_file"`.
 ///
-/// See issue #323, ADR-006, and story SCP-294, the custody-naming and
-/// identity-parameter normalization story.
-fn parse_custody(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
-    parse_custody_with_seed(custody, None)
+/// See ADR-006, the platform abstraction, and story SCP-294, the
+/// custody-naming and identity-parameter normalization story.
+fn build_key_custody(
+    py: Python<'_>,
+    custody: &str,
+    provider: Option<Py<PyAny>>,
+) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
+    if provider.is_some() && custody != "os_keystore" {
+        return Err(ScpPyError::identity_with_code(
+            "internal: a KeyCustodyProvider was supplied alongside a custody value \
+             other than \"os_keystore\" — this is a bug in the bridge layer",
+            scp_ffi_common::error_codes::IDENT_1005,
+        ));
+    }
+
+    match custody {
+        // `FileKeyCustody` derives an AES-256 key from a passphrase with
+        // Argon2id and encrypts each key entry under AES-256-GCM
+        // (`scp-platform/src/file.rs`). It reports `CustodyType::Software` for
+        // every key it holds. All three bridges open the same store at the same
+        // path through `scp_ffi_common::key_file::open_default_key_file`, so
+        // they cannot drift on the path, the environment variable, or the
+        // message text.
+        "encrypted_file" => {
+            let file_kc = scp_ffi_common::key_file::open_default_key_file().map_err(|e| {
+                use scp_ffi_common::key_file::KeyFileError;
+                match e {
+                    KeyFileError::MissingPassphrase | KeyFileError::DirectoryCreate(_) => {
+                        ScpPyError::validation(e.to_string())
+                    }
+                    KeyFileError::Open(_) => ScpPyError::identity(e.to_string()),
+                }
+            })?;
+
+            Ok((
+                Arc::new(FfiKeyCustody::File(file_kc)),
+                "encrypted_file".to_owned(),
+            ))
+        }
+        // The operating system's own key store sits on the far side of the
+        // `KeyCustodyProvider` callback, so this arm needs the provider a
+        // caller passed to `identity_create_with_custody`.
+        "os_keystore" => {
+            match provider {
+                Some(obj) => {
+                    let provider_shim = crate::custody::PyKeyCustodyProvider::new(py, obj)
+                        .map_err(|e| ScpPyError::ValidationError {
+                            message: format!("invalid KeyCustodyProvider: {e}"),
+                            code: scp_ffi_common::error_codes::VALID_7005.to_owned(),
+                        })?;
+                    Ok((
+                        Arc::new(FfiKeyCustody::Callback(
+                            crate::custody::PyCallbackKeyCustody::new(provider_shim),
+                        )),
+                        "os_keystore".to_owned(),
+                    ))
+                }
+                // FAIL CLOSED. §3.2.2 of the identity spec states that this bridge
+                // returns a typed error here, falls back to neither
+                // `encrypted_file` nor an in-memory store, and cites the
+                // no-dev-stand-in tenet of `CLAUDE.md` as the rule it applies.
+                None => Err(ScpPyError::identity_with_code(
+                    "custody type \"os_keystore\" reaches the operating system's key store \
+                 through a KeyCustodyProvider, and identity_create supplies none — call \
+                 identity_create_with_custody() and pass a provider backed by the Apple \
+                 Keychain or the Android Keystore. For the encrypted key file SCP \
+                 implements, pass \"encrypted_file\". Both of those calls return \
+                 SCP-IDENT-1059 on a shipped build today, because no pre-rotation custody \
+                 backend is wired yet, so no shipped build creates an identity.",
+                    scp_ffi_common::error_codes::IDENT_1003,
+                )),
+            }
+        }
+        #[cfg(feature = "testing")]
+        "in_memory" => {
+            let kc = Arc::new(FfiKeyCustody::InMemory(InMemoryKeyCustody::new()));
+            Ok((kc, custody.to_owned()))
+        }
+        #[cfg(not(feature = "testing"))]
+        "in_memory" => Err(ScpPyError::identity_with_code(
+            "in_memory custody is not available in this build -- use \"encrypted_file\" \
+             custody for an encrypted key file, or identity_create_with_custody() to \
+             inject a platform-native KeyCustodyProvider for \"os_keystore\". Both of \
+             those calls return SCP-IDENT-1059 on a shipped build today, because no \
+             pre-rotation custody backend is wired yet, so no shipped build creates an \
+             identity.",
+            scp_ffi_common::error_codes::IDENT_1008,
+        )),
+        // Align with NAPI + UniFFI: a string outside the vocabulary returns
+        // `SCP-VALID-7005` ("invalid field value") rather than `SCP-VALID-7001`
+        // (reserved for basic malformed-input failures). See #1549 round-2
+        // api-design review.
+        other => Err(ScpPyError::ValidationError {
+            message: format!(
+                "unknown custody type: {other:?} — §3.2.2 of the identity spec gives a \
+                 caller two values, \"encrypted_file\" and \"os_keystore\". The strings \
+                 \"platform\", \"software\", \"file\", \"platform_managed\", and \
+                 \"hardware\" name no custody backend. Reach the operating system's key \
+                 store by passing a KeyCustodyProvider to identity_create_with_custody(). \
+                 That call returns SCP-IDENT-1059 on a shipped build today, because no \
+                 pre-rotation custody backend is wired yet, so no shipped build creates \
+                 an identity."
+            ),
+            code: scp_ffi_common::error_codes::VALID_7005.to_owned(),
+        }),
+    }
+}
+
+/// Builds the key custody backend for a caller who supplied no provider.
+///
+/// `identity_create_with_agent_key` takes a custody value and no provider, so a
+/// caller who names `"os_keystore"` there reads the fail-closed
+/// `SCP-IDENT-1003` [`build_key_custody`] returns for a missing provider.
+fn parse_custody(
+    py: Python<'_>,
+    custody: &str,
+) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
+    build_key_custody(py, custody, None)
 }
 
 /// Variant of [`parse_custody`] that optionally accepts a 32-byte
@@ -735,12 +861,13 @@ fn parse_custody(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), ScpPyErr
 /// `generate_keypair` call deterministic.
 ///
 /// Seeded determinism is only meaningful for the in-process testing custody,
-/// so a non-`None` seed paired with `"file"` is a validation error
+/// so a non-`None` seed paired with `"encrypted_file"` is a validation error
 /// (`SCP-VALID-7009`). The custody name is judged first, so a seed paired with
-/// `"platform"` reports that string's own `SCP-IDENT-1003`, and a seed paired
-/// with an unrecognised string reports `SCP-VALID-7005`.
+/// `"os_keystore"` reports that value's own `SCP-IDENT-1003`, and a seed paired
+/// with a string outside the vocabulary reports `SCP-VALID-7005`.
 #[cfg(feature = "testing")]
 fn parse_custody_with_seed(
+    py: Python<'_>,
     custody: &str,
     testing_seed: Option<zeroize::Zeroizing<[u8; 32]>>,
 ) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
@@ -759,37 +886,38 @@ fn parse_custody_with_seed(
                 });
             Ok((Arc::new(FfiKeyCustody::InMemory(kc)), custody.to_owned()))
         }
-        // This arm names `"file"` rather than matching every remaining string,
-        // so the custody name is judged BEFORE the seed pairing. A caller who
-        // passes `"platform"` together with a seed then reads `SCP-IDENT-1003`,
-        // the custody error, exactly as they do with no seed. A bare
-        // `_ if testing_seed.is_some()` arm reported the seed problem instead
-        // and hid the unusable custody name behind it.
+        // This arm names `"encrypted_file"` rather than matching every
+        // remaining string, so the custody name is judged BEFORE the seed
+        // pairing. A caller who passes `"os_keystore"` together with a seed
+        // then reads `SCP-IDENT-1003`, the custody error, exactly as they do
+        // with no seed. A bare `_ if testing_seed.is_some()` arm reported the
+        // seed problem instead and hid the unusable custody name behind it.
         //
         // That ordering holds in THIS build only. The
         // `#[cfg(not(feature = "testing"))]` sibling below takes the same
         // `testing_seed` parameter — it is present in every build — and
         // rejects any `Some` with `SCP-VALID-7008` before it reads the custody
         // name, because the feature that would consume a seed is not compiled.
-        // So a shipped PyO3 build answers `("platform", seed)` with
+        // So a shipped PyO3 build answers `("os_keystore", seed)` with
         // `SCP-VALID-7008` while the NAPI and UniFFI bridges answer
         // `SCP-IDENT-1003`. The seed is a parity-harness affordance (ADR-046)
         // that no shipped caller supplies, so the divergence is confined to an
         // argument production never passes.
         //
-        // `"file"` is the one custody string this bridge accepts besides
-        // `"in_memory"`, so this enumeration is closed against
-        // `parse_custody_inner`'s accepted set rather than open-ended.
-        "file" if testing_seed.is_some() => Err(ScpPyError::ValidationError {
+        // `"encrypted_file"` is the one custody value this bridge builds a
+        // backend for without a provider, so this enumeration is closed
+        // against `build_key_custody`'s accepted set rather than open-ended.
+        "encrypted_file" if testing_seed.is_some() => Err(ScpPyError::ValidationError {
             message: "`testing_seed` parameter is only valid for custody=\"in_memory\"".to_owned(),
             code: scp_ffi_common::error_codes::VALID_7009.to_owned(),
         }),
-        other => parse_custody_inner(other),
+        other => build_key_custody(py, other, None),
     }
 }
 
 #[cfg(not(feature = "testing"))]
 fn parse_custody_with_seed(
+    py: Python<'_>,
     custody: &str,
     testing_seed: Option<zeroize::Zeroizing<[u8; 32]>>,
 ) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
@@ -799,98 +927,18 @@ fn parse_custody_with_seed(
             code: scp_ffi_common::error_codes::VALID_7008.to_owned(),
         });
     }
-    parse_custody_inner(custody)
-}
-
-fn parse_custody_inner(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
-    match custody {
-        #[cfg(feature = "testing")]
-        "in_memory" => {
-            let kc = Arc::new(FfiKeyCustody::InMemory(InMemoryKeyCustody::new()));
-            Ok((kc, custody.to_owned()))
-        }
-        #[cfg(not(feature = "testing"))]
-        "in_memory" => Err(ScpPyError::identity_with_code(
-            "in_memory custody is not available in this build -- use \"file\" custody \
-             for an encrypted key file, or identity_create_with_custody() to inject a \
-             platform-native KeyCustodyProvider. Both of those calls return \
-             SCP-IDENT-1059 on a shipped build today, because no pre-rotation custody \
-             backend is wired yet, so no shipped build creates an identity.",
-            scp_ffi_common::error_codes::IDENT_1008,
-        )),
-        // `"platform"` reaches no platform-native key store on any bridge, so
-        // it fails closed here rather than resolving to a file on disk. A
-        // caller reaches Keychain / Android Keystore by injecting a
-        // `KeyCustodyProvider` through `identity_create_with_custody`. The NAPI
-        // bridge (`napi/src/scp.rs`) and the UniFFI bridge
-        // (`uniffi/src/bridge.rs`) already reject the string with this same
-        // code; this arm makes the third bridge agree with them.
-        "platform" => Err(ScpPyError::identity_with_code(
-            "custody type \"platform\" requires a wired platform KeyCustodyProvider — \
-             use identity_create_with_custody() to inject Keychain (Apple) or Android \
-             Keystore backed custody. For an encrypted key file on disk, pass \"file\". \
-             Both of those calls return SCP-IDENT-1059 on a shipped build today, because \
-             no pre-rotation custody backend is wired yet, so no shipped build creates \
-             an identity.",
-            scp_ffi_common::error_codes::IDENT_1003,
-        )),
-        // `FileKeyCustody` encrypts the key file with Argon2id + AES-256-GCM
-        // and reports `CustodyType::Software` for every key it holds
-        // (`scp-platform/src/file.rs`).
-        "file" => {
-            let passphrase =
-                zeroize::Zeroizing::new(std::env::var("SCP_KEY_PASSPHRASE").map_err(|_| {
-                    ScpPyError::validation(
-                        "file custody requires the SCP_KEY_PASSPHRASE environment \
-                         variable to be set — this passphrase protects the encrypted key file",
-                    )
-                })?);
-
-            let key_dir = dirs_home().join(".scp");
-            std::fs::create_dir_all(&key_dir).map_err(|e| {
-                ScpPyError::validation(format!(
-                    "failed to create key directory {}: {e}",
-                    key_dir.display()
-                ))
-            })?;
-
-            let key_path = key_dir.join("keys.bin");
-            let file_kc = FileKeyCustody::new(&key_path, &passphrase).map_err(|e| {
-                ScpPyError::identity(format!(
-                    "failed to initialize file-backed key custody at {}: {e}",
-                    key_path.display()
-                ))
-            })?;
-
-            Ok((Arc::new(FfiKeyCustody::File(file_kc)), "file".to_owned()))
-        }
-        // Align with NAPI + UniFFI: unknown custody strings return the
-        // generic "unrecognised value" code `SCP-VALID-7005` rather than
-        // `SCP-VALID-7001` (reserved for basic malformed-input failures).
-        // See #1549 round-2 api-design review.
-        other => Err(ScpPyError::ValidationError {
-            message: format!(
-                "unknown custody type: {other:?} — expected \"in_memory\" or \"file\". \
-                 Platform-native key stores are reached by injecting a KeyCustodyProvider \
-                 through identity_create_with_custody(), not by naming a custody string. \
-                 That call returns SCP-IDENT-1059 on a shipped build today, because no \
-                 pre-rotation custody backend is wired yet, so no shipped build creates \
-                 an identity."
-            ),
-            code: scp_ffi_common::error_codes::VALID_7005.to_owned(),
-        }),
-    }
+    build_key_custody(py, custody, None)
 }
 
 /// Builds the message for a DID that storage holds while the
 /// runtime registry holds no crypto state for it.
 ///
-/// The message names `"file"` custody, which is the one custody string
-/// [`parse_custody_inner`] turns into a key store that outlives the process.
-/// It names no custody string this bridge rejects: `parse_custody_inner`
-/// answers `"platform"` with `SCP-IDENT-1003`, so an earlier version of this
-/// message, which told the caller to pass that string, sent them from one
-/// closed door to another.
+/// The message names `"encrypted_file"` custody, which is the one custody
+/// value [`build_key_custody`] turns into a key store that outlives the
+/// process without a caller-supplied provider. It names no custody string this
+/// bridge rejects: `build_key_custody` answers `"platform"` with
+/// `SCP-VALID-7005`, so an earlier version of this message, which told the
+/// caller to pass that string, sent them from one closed door to another.
 ///
 /// It also states what `identity_create` itself returns on a shipped build.
 /// Section 9.7.4.1 of the security model makes every identity commit a
@@ -902,20 +950,12 @@ fn identity_load_no_live_state_message(did: &str) -> String {
     format!(
         "identity '{did}' was found in storage but has no live \
          crypto state in the runtime registry. If using in-memory custody, key \
-         material does not persist across process boundaries. Pass \"file\" \
-         custody to identity_create for a key file that survives a process \
-         restart -- this bridge rejects the \"platform\" custody string with \
-         SCP-IDENT-1003. On a shipped build identity_create itself returns \
+         material does not persist across process boundaries. Pass \
+         \"encrypted_file\" custody to identity_create for a key file that survives \
+         a process restart -- this bridge rejects the \"platform\" custody string \
+         with SCP-VALID-7005. On a shipped build identity_create itself returns \
          SCP-IDENT-1059, because no pre-rotation custody backend is wired yet."
     )
-}
-
-/// Returns the user's home directory.
-///
-/// Falls back to the current directory if `$HOME` is not set (unlikely on
-/// any supported platform).
-fn dirs_home() -> std::path::PathBuf {
-    std::env::var("HOME").map_or_else(|_| std::path::PathBuf::from("."), std::path::PathBuf::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -1129,11 +1169,14 @@ impl crate::scp::PyScp {
     ///
     /// # Arguments
     ///
-    /// * `custody` — The custody type: `"in_memory"` (testing builds only) or
-    ///   `"file"` (an Argon2id + AES-256-GCM key file at `$HOME/.scp/keys.bin`).
-    ///   `"platform"` names an OS keystore that no custody string reaches, so it
-    ///   returns `SCP-IDENT-1003`; inject a `KeyCustodyProvider` through
-    ///   `identity_create_with_custody` to reach Keychain or Android Keystore.
+    /// * `custody` — one of the two values §3.2.2 of the identity spec gives a
+    ///   caller. `"encrypted_file"` selects an Argon2id + AES-256-GCM key file
+    ///   at `$HOME/.scp/keys.bin`. `"os_keystore"` selects the operating
+    ///   system's own key store, which this method reaches through no
+    ///   provider, so it returns `SCP-IDENT-1003`; call
+    ///   `identity_create_with_custody` and pass a `KeyCustodyProvider` backed
+    ///   by Keychain or Android Keystore instead. A build carrying the
+    ///   `testing` cargo feature also accepts `"in_memory"`.
     ///
     /// # Returns
     ///
@@ -1164,7 +1207,7 @@ impl crate::scp::PyScp {
         // `None` or exactly 32 bytes long. Keeping seed-length validation
         // on the FFI boundary means the runtime never sees malformed
         // bytes. Mismatched length is `SCP-VALID-7007` (format error);
-        // a seed paired with `"file"` custody is `SCP-VALID-7009`, raised by
+        // a seed paired with `"encrypted_file"` custody is `SCP-VALID-7009`, raised by
         // `parse_custody_with_seed` below, which judges the custody name
         // first so every other pairing reports that name's own code.
         // Wrap in `Zeroizing` immediately on the FFI boundary so the
@@ -1193,7 +1236,7 @@ impl crate::scp::PyScp {
             })
             .transpose()?
             .map(zeroize::Zeroizing::new);
-        let (key_custody, custody_str) = parse_custody_with_seed(custody, testing_seed_array)?;
+        let (key_custody, custody_str) = parse_custody_with_seed(py, custody, testing_seed_array)?;
         let rt = crate::runtime()?;
 
         // Ensure the production DID resolver is initialized on this bridge
@@ -1304,11 +1347,14 @@ impl crate::scp::PyScp {
     ///
     /// # Arguments
     ///
-    /// * `custody` — The custody type: `"in_memory"` (testing builds only) or
-    ///   `"file"` (an Argon2id + AES-256-GCM key file at `$HOME/.scp/keys.bin`).
-    ///   `"platform"` names an OS keystore that no custody string reaches, so it
-    ///   returns `SCP-IDENT-1003`; inject a `KeyCustodyProvider` through
-    ///   `identity_create_with_custody` to reach Keychain or Android Keystore.
+    /// * `custody` — one of the two values §3.2.2 of the identity spec gives a
+    ///   caller. `"encrypted_file"` selects an Argon2id + AES-256-GCM key file
+    ///   at `$HOME/.scp/keys.bin`. `"os_keystore"` selects the operating
+    ///   system's own key store, which this method reaches through no
+    ///   provider, so it returns `SCP-IDENT-1003`; call
+    ///   `identity_create_with_custody` and pass a `KeyCustodyProvider` backed
+    ///   by Keychain or Android Keystore instead. A build carrying the
+    ///   `testing` cargo feature also accepts `"in_memory"`.
     ///
     /// # Returns
     ///
@@ -1326,7 +1372,7 @@ impl crate::scp::PyScp {
         custody: &str,
     ) -> PyResult<PyIdentity> {
         let bi_arc = Arc::clone(&self.inner);
-        let (key_custody, custody_str) = parse_custody(custody)?;
+        let (key_custody, custody_str) = parse_custody(py, custody)?;
         let rt = crate::runtime()?;
 
         // Ensure the production DID resolver is initialized on this bridge
@@ -1439,9 +1485,11 @@ impl crate::scp::PyScp {
     ///
     /// # Returns
     ///
-    /// A [`PyIdentity`] whose `custody` is reported as `"callback"`. The
-    /// `did:dht:` value is derived from the provider-generated identity key
-    /// and `verifying_key()` is populated from the provider's public key.
+    /// A [`PyIdentity`] whose `custody` is reported as `"os_keystore"`, the
+    /// value §3.2.2 of the identity spec gives the operating system's own key
+    /// store. The `did:dht:` value is derived from the provider-generated
+    /// identity key and `verifying_key()` is populated from the provider's
+    /// public key.
     ///
     /// # Errors
     ///
@@ -1457,22 +1505,14 @@ impl crate::scp::PyScp {
     ) -> PyResult<PyIdentity> {
         let bi_arc = Arc::clone(&self.inner);
 
-        // Validate the provider exposes the required protocol methods BEFORE
-        // releasing the GIL. A malformed provider fails fast here with a
-        // typed ValidationError instead of deep inside the async DID-creation
-        // flow. Construction binds the (validated) Python object into the
-        // GIL-independent shim.
-        let provider_shim =
-            crate::custody::PyKeyCustodyProvider::new(py, provider).map_err(|e| {
-                ScpPyError::ValidationError {
-                    message: format!("invalid KeyCustodyProvider: {e}"),
-                    code: scp_ffi_common::error_codes::VALID_7005.to_owned(),
-                }
-            })?;
-        let key_custody = Arc::new(FfiKeyCustody::Callback(
-            crate::custody::PyCallbackKeyCustody::new(provider_shim),
-        ));
-        let custody_str = "callback".to_owned();
+        // One factory decides what every custody value on this bridge reaches,
+        // so this method names `"os_keystore"` and hands the provider to
+        // `build_key_custody` rather than constructing the callback custody
+        // itself. The factory validates the provider under the GIL held here,
+        // BEFORE `py.allow_threads` releases it, so a malformed provider fails
+        // fast with a typed `ValidationError` instead of deep inside the async
+        // DID-creation flow.
+        let (key_custody, custody_str) = build_key_custody(py, "os_keystore", Some(provider))?;
         let rt = crate::runtime()?;
 
         // Ensure the production DID resolver is initialized on this bridge
@@ -2116,6 +2156,70 @@ impl crate::scp::PyScp {
         validate::validate_did(did)?;
         crate::runtime::remove_identity(&self.inner, did);
         Ok(())
+    }
+
+    /// Returns the custody value a DID document publishes for this identity's
+    /// `#active` signing key, and `None` when the backend holding that key
+    /// reports a pair the published vocabulary states no value for.
+    ///
+    /// §3.2.2 of the identity spec separates two vocabularies. A caller
+    /// selecting custody names a backend, which is what `custody` on
+    /// `identity_create` carries. A DID document publishes whether the key can
+    /// leave its store and which factor unlocks it, which is what this method
+    /// returns: `"non-extractable-biometric"`, `"non-extractable-pin"`, or
+    /// `"extractable-passphrase"`.
+    ///
+    /// The value is derived, never declared. This method reads it off the
+    /// running backend — the encrypted key file answers for itself, and a
+    /// caller-injected `KeyCustodyProvider` answers through its
+    /// `key_is_extractable` and `unlock_factor` methods — so a participant
+    /// cannot publish a custody they do not run.
+    ///
+    /// # Arguments
+    ///
+    /// * `did` — the DID whose `#active` key custody to read.
+    ///
+    /// # Returns
+    ///
+    /// The published custody value, or `None` when the backend reports a pair
+    /// §3.2.2 states no value for. ADR-039's Enforcement Stack layer 4 gives
+    /// that absence a meaning, "Absence of attestation is itself a signal".
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if `did` is malformed. Raises `IdentityError`
+    /// if the DID has no retained state on this instance, or if the injected
+    /// provider raises while answering either question.
+    #[pyo3(name = "identity_published_custody")]
+    pub fn identity_published_custody(
+        &self,
+        py: Python<'_>,
+        did: &str,
+    ) -> PyResult<Option<String>> {
+        validate::validate_did(did)?;
+        let bi_arc = Arc::clone(&self.inner);
+        let rt = crate::runtime()?;
+
+        let (custody, active_key) = crate::runtime::with_identity(&bi_arc, did, |entry| {
+            Ok((
+                Arc::clone(&entry.custody),
+                entry.identity.active_signing_key,
+            ))
+        })?;
+
+        py.allow_threads(|| {
+            let substrate = rt
+                .block_on(custody.custody_substrate(&active_key))
+                .map_err(|e| {
+                    ScpPyError::identity(format!(
+                        "failed to read the published custody value for '{did}': {e}"
+                    ))
+                })?;
+            Ok(
+                scp_ffi_common::custody_substrate::published_custody_wire_value(&substrate)
+                    .map(str::to_owned),
+            )
+        })
     }
 
     /// Removes a DID from this instance's SCP-side identity registry if
@@ -2844,7 +2948,7 @@ pub fn register_identity(m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 #[cfg(all(test, feature = "testing"))]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use std::sync::Once;
@@ -2862,82 +2966,111 @@ mod tests {
         crate::scp::PyScp::new_in_memory_for_test()
     }
 
-    /// The custody-string vocabulary this bridge accepts, pinned against the
-    /// concrete custody each string reaches. This comment introduces the
-    /// custody-string tests that follow it as well as this one.
+    /// The custody vocabulary this bridge accepts, pinned against the concrete
+    /// custody each value reaches. This comment introduces the custody tests
+    /// that follow it as well as this one.
     ///
-    /// These tests drive the `"in_memory"` arm of `parse_custody_inner` and
+    /// These tests drive the `"in_memory"` arm of [`build_key_custody`] and
     /// every arm that rejects a string. No test in this module drives the
-    /// `"file"` arm. That arm reads `SCP_KEY_PASSPHRASE` and, when the
-    /// developer running the suite exports it, calls `std::fs::create_dir_all`
-    /// on `$HOME/.scp` and writes `keys.bin` into that directory, so a test
-    /// that called it would write to the home directory of whoever runs
-    /// `cargo test -p scp-ffi`. A test cannot avoid that write by clearing
-    /// `SCP_KEY_PASSPHRASE` or by pointing `HOME` at a temporary directory,
-    /// because both variables belong to the process and every other test in
-    /// this binary reads them concurrently. The `"file"` arm therefore carries
-    /// no coverage here.
+    /// `"encrypted_file"` arm. That arm reads `SCP_KEY_PASSPHRASE` and, when
+    /// the developer running the suite exports it, calls
+    /// `std::fs::create_dir_all` on `$HOME/.scp` and writes `keys.bin` into
+    /// that directory, so a test that called it would write to the home
+    /// directory of whoever runs `cargo test -p scp-ffi`. A test cannot avoid
+    /// that write by clearing `SCP_KEY_PASSPHRASE` or by pointing `HOME` at a
+    /// temporary directory, because both variables belong to the process and
+    /// every other test in this binary reads them concurrently. The
+    /// `"encrypted_file"` arm therefore carries no coverage here.
     #[test]
     fn parse_custody_accepts_in_memory() {
-        let parsed = parse_custody("in_memory");
-        assert!(
-            matches!(&parsed, Ok((custody, label))
-                if label == "in_memory" && matches!(**custody, FfiKeyCustody::InMemory(_))),
-            "in_memory must build an InMemoryKeyCustody labelled in_memory"
-        );
+        Python::with_gil(|py| {
+            let parsed = parse_custody(py, "in_memory");
+            assert!(
+                matches!(&parsed, Ok((custody, label))
+                    if label == "in_memory" && matches!(**custody, FfiKeyCustody::InMemory(_))),
+                "in_memory must build an InMemoryKeyCustody labelled in_memory"
+            );
+        });
     }
 
-    /// `"platform"` names an OS keystore, and no bridge builds one from a
-    /// custody string — a caller reaches Keychain or Android Keystore by
-    /// injecting a `KeyCustodyProvider` through `identity_create_with_custody`.
-    /// It therefore fails closed with `SCP-IDENT-1003`, the code the NAPI and
-    /// `UniFFI` bridges already return for this string.
-    ///
-    /// Before story SCP-294, the custody-naming story, this string built a
-    /// `FileKeyCustody` at `$HOME/.scp/keys.bin`, so a caller who asked for
-    /// platform-native custody silently received an encrypted file instead.
+    /// `"os_keystore"` names the operating system's own key store, which sits
+    /// behind a `KeyCustodyProvider` callback. `identity_create` supplies no
+    /// provider, so the value fails closed with `SCP-IDENT-1003` rather than
+    /// falling back to `encrypted_file` or to an in-memory store. §3.2.2 of the
+    /// identity spec states that rule and cites the no-dev-stand-in tenet of
+    /// `CLAUDE.md` as the rule it applies.
     #[test]
-    fn parse_custody_rejects_platform_with_ident_1003() {
-        let code = match parse_custody("platform") {
-            Err(ScpPyError::IdentityError { code, .. }) => code,
-            _ => String::from("<platform did not fail closed as an IdentityError>"),
-        };
-        assert_eq!(code, scp_ffi_common::error_codes::IDENT_1003);
+    fn os_keystore_without_a_provider_fails_closed_with_ident_1003() {
+        Python::with_gil(|py| {
+            let (code, message) = match parse_custody(py, "os_keystore") {
+                Err(ScpPyError::IdentityError { code, message }) => (code, message),
+                Err(other) => panic!("os_keystore must fail closed as IdentityError: {other:?}"),
+                Ok(_) => panic!("os_keystore without a provider must not build a custody"),
+            };
+            assert_eq!(code, scp_ffi_common::error_codes::IDENT_1003);
+            assert!(
+                message.contains("identity_create_with_custody"),
+                "the message must name the entry point that takes a provider, got: {message}"
+            );
+        });
     }
 
-    /// An unrecognised custody string carries `SCP-VALID-7005`, matching the
+    /// Every string §3.2.2 of the identity spec retired carries
+    /// `SCP-VALID-7005`, the code the NAPI and `UniFFI` bridges return for a
+    /// string outside the vocabulary.
+    ///
+    /// `platform` and `software` once parsed into custody backends or into
+    /// their own rejections on one bridge or another, `file` was this bridge's
+    /// own spelling of the encrypted key file, and `platform_managed` and
+    /// `hardware` were custody-migration targets. §3.2.2 replaced all five with
+    /// `encrypted_file` and `os_keystore`, and divergence D13 of §3.2.2.1
+    /// records what the three SDKs said before that change.
+    #[test]
+    fn every_retired_custody_string_carries_valid_7005() {
+        Python::with_gil(|py| {
+            for retired in [
+                "platform",
+                "software",
+                "file",
+                "platform_managed",
+                "hardware",
+            ] {
+                let code = match parse_custody(py, retired) {
+                    Err(ScpPyError::ValidationError { code, .. }) => code,
+                    Err(other) => {
+                        panic!("{retired:?} must be a ValidationError, got: {other:?}")
+                    }
+                    Ok(_) => panic!("{retired:?} must not build a custody"),
+                };
+                assert_eq!(
+                    code,
+                    scp_ffi_common::error_codes::VALID_7005,
+                    "{retired:?} must carry SCP-VALID-7005"
+                );
+            }
+        });
+    }
+
+    /// A string outside the vocabulary carries `SCP-VALID-7005`, matching the
     /// NAPI and `UniFFI` bridges.
     #[test]
     fn parse_custody_rejects_unknown_with_valid_7005() {
-        let code = match parse_custody("keychain") {
-            Err(ScpPyError::ValidationError { code, .. }) => code,
-            _ => String::from("<unknown custody was not a ValidationError>"),
-        };
-        assert_eq!(code, scp_ffi_common::error_codes::VALID_7005);
+        Python::with_gil(|py| {
+            let code = match parse_custody(py, "keychain") {
+                Err(ScpPyError::ValidationError { code, .. }) => code,
+                _ => String::from("<unknown custody was not a ValidationError>"),
+            };
+            assert_eq!(code, scp_ffi_common::error_codes::VALID_7005);
+        });
     }
 
-    /// `"software"` is the name the NAPI and `UniFFI` bridges carry for custody
-    /// they do not host. This bridge spells its software custody `"file"`, so
-    /// the string is unrecognised here. Section 3.2 of the identity spec owns
-    /// the custody options and decides whether the bridges keep two spellings;
-    /// this test pins today's behaviour so a change to it is deliberate.
-    #[test]
-    fn parse_custody_rejects_software_as_unknown() {
-        let code = match parse_custody("software") {
-            Err(ScpPyError::ValidationError { code, .. }) => code,
-            _ => String::from("<software was not a ValidationError>"),
-        };
-        assert_eq!(code, scp_ffi_common::error_codes::VALID_7005);
-    }
-
-    /// The no-live-state message points the caller at a custody string this
+    /// The no-live-state message points the caller at a custody value this
     /// bridge accepts, and it states what `identity_create` returns today.
     ///
     /// The message once told the caller to pass the platform custody string as
     /// the `custody=` argument for cross-process identity persistence, while
-    /// `parse_custody_inner` in this same file answered that string with
-    /// `SCP-IDENT-1003`, so one file gave the caller two contradictory
-    /// instructions.
+    /// the custody factory in this same file rejected that string, so one file
+    /// gave the caller two contradictory instructions.
     #[test]
     fn identity_load_message_names_a_custody_string_this_bridge_accepts() {
         let message = identity_load_no_live_state_message("did:dht:z6MkTest");
@@ -2947,8 +3080,8 @@ mod tests {
             "the message must name the DID it rejected, got: {message}"
         );
         assert!(
-            message.contains("\"file\" custody"),
-            "the message must name the custody string that persists, got: {message}"
+            message.contains("\"encrypted_file\" custody"),
+            "the message must name the custody value that persists, got: {message}"
         );
         // Composed from parts so this assertion holds the forbidden text
         // without this file carrying it as one literal.
@@ -2956,10 +3089,10 @@ mod tests {
         assert!(
             !message.contains(&rejected_instruction),
             "the message must not instruct the caller to pass a string \
-             parse_custody_inner rejects, got: {message}"
+             build_key_custody rejects, got: {message}"
         );
         assert!(
-            message.contains(scp_ffi_common::error_codes::IDENT_1003),
+            message.contains(scp_ffi_common::error_codes::VALID_7005),
             "the message must say what \"platform\" returns, got: {message}"
         );
         assert!(
@@ -2968,18 +3101,18 @@ mod tests {
              build, got: {message}"
         );
 
-        // These assertions read the message and never hand the `"file"` string
-        // to `parse_custody_inner`, so they do not confirm that the parser
-        // accepts the string the message recommends. That call creates
-        // `$HOME/.scp` and writes `keys.bin` into it whenever the developer
-        // running the suite exports `SCP_KEY_PASSPHRASE`. A reader who changes
-        // the `"file"` arm has to re-read this message by hand, because no
-        // assertion here compares the two.
+        // These assertions read the message and never hand the
+        // `"encrypted_file"` value to `build_key_custody`, so they do not
+        // confirm that the factory accepts the value the message recommends.
+        // That call creates `$HOME/.scp` and writes `keys.bin` into it whenever
+        // the developer running the suite exports `SCP_KEY_PASSPHRASE`. A
+        // reader who changes the `"encrypted_file"` arm has to re-read this
+        // message by hand, because no assertion here compares the two.
     }
 
-    /// Every custody-string rejection names `identity_create_with_custody` as
-    /// the injection entry point, and every one of them also states that the
-    /// entry point returns `SCP-IDENT-1059` on a shipped build.
+    /// Every custody rejection names `identity_create_with_custody` as the
+    /// injection entry point, and every one of them also states that the entry
+    /// point returns `SCP-IDENT-1059` on a shipped build.
     ///
     /// `identity_create_with_custody` reaches
     /// `crate::identity::no_pre_rotation_backend` on a `#[cfg(not(feature =
@@ -2990,24 +3123,26 @@ mod tests {
     /// injection and prove-absent dev backends, records that state.
     #[test]
     fn custody_rejection_messages_name_the_pre_rotation_gap() {
-        for custody in ["platform", "keychain", "software"] {
-            let message = match parse_custody(custody) {
-                Err(
-                    ScpPyError::IdentityError { message, .. }
-                    | ScpPyError::ValidationError { message, .. },
-                ) => message,
-                _ => String::from("<custody string did not fail closed>"),
-            };
-            assert!(
-                message.contains("identity_create_with_custody"),
-                "{custody:?} message must name the injection entry point, got: {message}"
-            );
-            assert!(
-                message.contains("SCP-IDENT-1059"),
-                "{custody:?} message must state what that entry point returns on a \
-                 shipped build, got: {message}"
-            );
-        }
+        Python::with_gil(|py| {
+            for custody in ["os_keystore", "platform", "keychain", "software"] {
+                let message = match parse_custody(py, custody) {
+                    Err(
+                        ScpPyError::IdentityError { message, .. }
+                        | ScpPyError::ValidationError { message, .. },
+                    ) => message,
+                    _ => String::from("<custody string did not fail closed>"),
+                };
+                assert!(
+                    message.contains("identity_create_with_custody"),
+                    "{custody:?} message must name the injection entry point, got: {message}"
+                );
+                assert!(
+                    message.contains("SCP-IDENT-1059"),
+                    "{custody:?} message must state what that entry point returns on a \
+                     shipped build, got: {message}"
+                );
+            }
+        });
     }
 
     /// The custody name is judged before the `testing_seed` pairing, so a
@@ -3016,33 +3151,135 @@ mod tests {
     ///
     /// `parse_custody_with_seed` previously guarded its `SCP-VALID-7009` arm
     /// with a bare `_ if testing_seed.is_some()`, which caught every string
-    /// that was not `"in_memory"` — including `"platform"` — and reported the
-    /// seed problem while hiding the unusable custody name behind it.
+    /// that was not `"in_memory"` and reported the seed problem while hiding
+    /// the unusable custody name behind it.
     #[test]
     fn seed_pairing_is_judged_after_the_custody_name() {
-        let seed = zeroize::Zeroizing::new([7u8; 32]);
+        Python::with_gil(|py| {
+            let seed = zeroize::Zeroizing::new([7u8; 32]);
 
-        // `"platform"` names no key store, so its own code wins over the seed.
-        let platform_code = match parse_custody_with_seed("platform", Some(seed.clone())) {
-            Err(ScpPyError::IdentityError { code, .. }) => code,
-            _ => String::from("<platform with a seed did not report the custody error>"),
-        };
-        assert_eq!(platform_code, scp_ffi_common::error_codes::IDENT_1003);
+            // `"os_keystore"` reaches no key store without a provider, so its
+            // own code wins over the seed.
+            let os_keystore_code =
+                match parse_custody_with_seed(py, "os_keystore", Some(seed.clone())) {
+                    Err(ScpPyError::IdentityError { code, .. }) => code,
+                    _ => String::from("<os_keystore with a seed did not report the custody error>"),
+                };
+            assert_eq!(os_keystore_code, scp_ffi_common::error_codes::IDENT_1003);
 
-        // An unrecognised name likewise wins over the seed.
-        let unknown_code = match parse_custody_with_seed("keychain", Some(seed.clone())) {
-            Err(ScpPyError::ValidationError { code, .. }) => code,
-            _ => String::from("<unknown custody with a seed did not report the custody error>"),
-        };
-        assert_eq!(unknown_code, scp_ffi_common::error_codes::VALID_7005);
+            // A string outside the vocabulary likewise wins over the seed.
+            let unknown_code = match parse_custody_with_seed(py, "keychain", Some(seed.clone())) {
+                Err(ScpPyError::ValidationError { code, .. }) => code,
+                _ => String::from("<unknown custody with a seed did not report the custody error>"),
+            };
+            assert_eq!(unknown_code, scp_ffi_common::error_codes::VALID_7005);
 
-        // `"file"` IS a key store this bridge builds, so here the seed pairing
-        // is the real defect and `SCP-VALID-7009` is the right answer.
-        let file_code = match parse_custody_with_seed("file", Some(seed)) {
-            Err(ScpPyError::ValidationError { code, .. }) => code,
-            _ => String::from("<file with a seed did not report the seed error>"),
-        };
-        assert_eq!(file_code, scp_ffi_common::error_codes::VALID_7009);
+            // `"encrypted_file"` IS a key store this bridge builds, so here the
+            // seed pairing is the real defect and `SCP-VALID-7009` is the right
+            // answer. The guarded arm returns before the factory runs, so this
+            // call writes nothing to `$HOME`.
+            let file_code = match parse_custody_with_seed(py, "encrypted_file", Some(seed)) {
+                Err(ScpPyError::ValidationError { code, .. }) => code,
+                _ => String::from("<encrypted_file with a seed did not report the seed error>"),
+            };
+            assert_eq!(file_code, scp_ffi_common::error_codes::VALID_7009);
+        });
+    }
+
+    /// `identity_create` itself rejects every string §3.2.2 of the identity
+    /// spec retired, so the rejection covers the path a caller takes rather
+    /// than only the factory that path delegates to.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn identity_create_rejects_every_retired_custody_string() {
+        setup();
+
+        Python::with_gil(|py| {
+            let scp = default_scp();
+            for retired in [
+                "platform",
+                "software",
+                "file",
+                "platform_managed",
+                "hardware",
+            ] {
+                let err = scp
+                    .identity_create(py, retired, None)
+                    .expect_err("a retired custody string must be rejected");
+                assert!(
+                    err.to_string()
+                        .contains(scp_ffi_common::error_codes::VALID_7005),
+                    "{retired:?} must carry SCP-VALID-7005, got: {err}"
+                );
+            }
+        });
+    }
+
+    /// `identity_create` supplies no `KeyCustodyProvider`, so `"os_keystore"`
+    /// fails closed with `SCP-IDENT-1003` at the entry point and builds neither
+    /// the encrypted key file nor an in-memory store.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn identity_create_fails_closed_on_os_keystore() {
+        setup();
+
+        Python::with_gil(|py| {
+            let scp = default_scp();
+            let err = scp
+                .identity_create(py, "os_keystore", None)
+                .expect_err("os_keystore without a provider must fail closed");
+            assert!(
+                err.to_string()
+                    .contains(scp_ffi_common::error_codes::IDENT_1003),
+                "os_keystore must carry SCP-IDENT-1003, got: {err}"
+            );
+        });
+    }
+
+    /// `identity_published_custody` reads the published custody value off the
+    /// running backend rather than off a string a caller wrote.
+    ///
+    /// The in-memory test backend reports an extractable key and no gate, which
+    /// §3.2.2 of the identity spec pairs with no published value, so the method
+    /// returns `None`. ADR-039's Enforcement Stack layer 4 gives that absence a
+    /// meaning: "Absence of attestation is itself a signal".
+    #[test]
+    #[cfg(feature = "testing")]
+    fn identity_published_custody_reads_the_backend() {
+        setup();
+
+        Python::with_gil(|py| {
+            let scp = default_scp();
+            let identity = scp
+                .identity_create(py, "in_memory", None)
+                .expect("identity_create failed");
+            let published = scp
+                .identity_published_custody(py, identity.did())
+                .expect("published custody read");
+            assert_eq!(
+                published, None,
+                "the in-memory backend states a pair §3.2.2 publishes no value for"
+            );
+        });
+    }
+
+    /// `identity_published_custody` fails closed for a DID this instance holds
+    /// no custody for, rather than reporting a value it cannot read.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn identity_published_custody_fails_closed_without_retained_custody() {
+        setup();
+
+        Python::with_gil(|py| {
+            let scp = default_scp();
+            let err = scp
+                .identity_published_custody(py, "did:dht:z6MkNotRegistered")
+                .expect_err("an unregistered DID must fail closed");
+            assert!(
+                err.to_string().contains("SCP-IDENT-1001"),
+                "expected the registry-miss code, got: {err}"
+            );
+        });
     }
 
     /// Verifies that `PyScp::identity_migrate` succeeds end-to-end.
@@ -3116,7 +3353,7 @@ mod tests {
 /// `#[cfg(not(feature = "testing"))]` guards get an assertion of their own.
 ///
 /// The `testing`-gated module above cannot reach them: under that feature
-/// `parse_custody_inner` builds an `InMemoryKeyCustody` for `"in_memory"` and
+/// [`build_key_custody`] builds an `InMemoryKeyCustody` for `"in_memory"` and
 /// returns `Ok`, so the rejection arm is not compiled there.
 #[cfg(all(test, not(feature = "testing")))]
 mod prod_custody_message_tests {
@@ -3127,33 +3364,78 @@ mod prod_custody_message_tests {
     ///
     /// `identity_create_with_custody` reaches
     /// [`no_pre_rotation_backend`] on this build, and so does
-    /// `identity_create` with `"file"` custody, so a message that names either
-    /// one without naming `SCP-IDENT-1059` sends the reader to a second closed
-    /// door with nothing explaining it.
+    /// `identity_create` with `"encrypted_file"` custody, so a message that
+    /// names either one without naming `SCP-IDENT-1059` sends the reader to a
+    /// second closed door with nothing explaining it.
     #[test]
     fn in_memory_rejection_states_what_the_alternatives_return() {
-        let (code, message) = match parse_custody_inner("in_memory") {
-            Err(ScpPyError::IdentityError { code, message }) => (code, message),
-            _ => (
-                String::from("<in_memory was not an IdentityError>"),
-                String::new(),
-            ),
-        };
+        Python::with_gil(|py| {
+            let (code, message) = match parse_custody(py, "in_memory") {
+                Err(ScpPyError::IdentityError { code, message }) => (code, message),
+                _ => (
+                    String::from("<in_memory was not an IdentityError>"),
+                    String::new(),
+                ),
+            };
 
-        assert_eq!(code, scp_ffi_common::error_codes::IDENT_1008);
-        assert!(
-            message.contains("identity_create_with_custody()"),
-            "the message must name the injection entry point, got: {message}"
-        );
-        assert!(
-            message.contains("\"file\" custody"),
-            "the message must name the other custody string this bridge builds, \
-             got: {message}"
-        );
-        assert!(
-            message.contains(scp_ffi_common::error_codes::IDENT_1059),
-            "the message must state what those two calls return on a shipped \
-             build, got: {message}"
-        );
+            assert_eq!(code, scp_ffi_common::error_codes::IDENT_1008);
+            assert!(
+                message.contains("identity_create_with_custody()"),
+                "the message must name the injection entry point, got: {message}"
+            );
+            assert!(
+                message.contains("\"encrypted_file\" custody"),
+                "the message must name the other custody value this bridge builds, \
+                 got: {message}"
+            );
+            assert!(
+                message.contains(scp_ffi_common::error_codes::IDENT_1059),
+                "the message must state what those two calls return on a shipped \
+                 build, got: {message}"
+            );
+        });
+    }
+
+    /// Every string §3.2.2 of the identity spec retired carries
+    /// `SCP-VALID-7005` on a shipped wheel too, so the vocabulary a wheel
+    /// enforces is the vocabulary a `testing` build enforces.
+    #[test]
+    fn every_retired_custody_string_carries_valid_7005_on_a_shipped_build() {
+        Python::with_gil(|py| {
+            for retired in [
+                "platform",
+                "software",
+                "file",
+                "platform_managed",
+                "hardware",
+            ] {
+                let code = match parse_custody(py, retired) {
+                    Err(ScpPyError::ValidationError { code, .. }) => code,
+                    Err(other) => {
+                        panic!("{retired:?} must be a ValidationError, got: {other:?}")
+                    }
+                    Ok(_) => panic!("{retired:?} must not build a custody"),
+                };
+                assert_eq!(
+                    code,
+                    scp_ffi_common::error_codes::VALID_7005,
+                    "{retired:?} must carry SCP-VALID-7005"
+                );
+            }
+        });
+    }
+
+    /// `"os_keystore"` with no provider fails closed with `SCP-IDENT-1003` on a
+    /// shipped wheel, reaching neither `encrypted_file` nor an in-memory store.
+    #[test]
+    fn os_keystore_without_a_provider_fails_closed_on_a_shipped_build() {
+        Python::with_gil(|py| {
+            let code = match parse_custody(py, "os_keystore") {
+                Err(ScpPyError::IdentityError { code, .. }) => code,
+                Err(other) => panic!("os_keystore must fail closed as IdentityError: {other:?}"),
+                Ok(_) => panic!("os_keystore without a provider must not build a custody"),
+            };
+            assert_eq!(code, scp_ffi_common::error_codes::IDENT_1003);
+        });
     }
 }

@@ -24,7 +24,7 @@ bun run start
 
 ## Next Steps
 
-- Replace the `Identity.create({ custody: "in_memory" })` call with `scp.identityCreateWithCustody(provider)`, passing your own `KeyCustodyProvider` over an OS keystore — that call throws `SCP-IDENT-1059` on a released addon, because no pre-rotation custody backend is wired yet
+- Replace the `Identity.create({ custody: "in_memory" })` call with `"encrypted_file"` for the on-disk key store SCP implements, or with `"os_keystore"` plus your own `KeyCustodyProvider` for the operating system's key store. §3.2.2 of the identity spec, the custody vocabulary, states those two values. Either call throws `SCP-IDENT-1059` on a released addon, because no pre-rotation custody backend is wired yet
 - Add tool registration with `defineToolDefinition()`
 - Connect to a relay with `Transport.connect()` for real networking
 - See `docs/examples/typescript/` for more detailed examples

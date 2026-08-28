@@ -32,12 +32,17 @@ testing = [
     "scp-dht/testing",
     "scp-node?/testing",
 ]
-# Shared callback-custody byte/string parsing helpers (custody_parse module).
-# Requires only scp-platform for the typed return values (KeyHandle,
-# PseudonymKeypair, PublicKey, PlatformError). Deliberately NOT folded into
-# `resolvers`: these are pure byte/string ops far lighter than the resolver
-# stack.
-custody = ["dep:scp-platform"]
+# Shared callback-custody byte/string parsing helpers (custody_parse module)
+# plus the encrypted key file every bridge opens for the custody value
+# `encrypted_file` (key_file module). Requires scp-platform for the typed return
+# values (KeyHandle, PseudonymKeypair, PublicKey, PlatformError) and for
+# `FileKeyCustody`, which `scp-platform/file` compiles. `file` is a
+# durability-only feature — the store derives an AES-256 key from a passphrase
+# with Argon2id and encrypts each key entry under AES-256-GCM — and the
+# allowlist of `scripts/check-shipped-feature-graph.sh` already carries it
+# (ADR-062 §Decision 6). Deliberately NOT folded into `resolvers`: the parsing
+# helpers are pure byte/string ops far lighter than the resolver stack.
+custody = ["dep:scp-platform", "scp-platform?/file"]
 # Shared relay/node startup code for FFI bridges that need to spawn servers.
 # Requires scp-transport (relay), scp-node (application node), scp-platform, and
 # tokio. `start_node_local` opens no protocol store: it receives a caller's

@@ -13,15 +13,23 @@
 //!
 //! - `InMemory` — test/dev in-memory custody (feature-gated), wrapped in
 //!   [`OpaqueInMemoryKeyCustody`] for redacted `Debug`.
+//! - `File` — the encrypted key file §3.2.2 of the identity spec names
+//!   `encrypted_file` (Argon2id + AES-256-GCM), which `identityCreate` builds.
 //! - `Callback` — caller-provided custody backed by JS callbacks
-//!   ([`NapiCallbackKeyCustody`]), used by `identityCreateWithCustody`.
+//!   ([`NapiCallbackKeyCustody`]), which `identityCreateWithCustody` builds for
+//!   the value §3.2.2 names `os_keystore`.
 
 use std::fmt;
 
 use napi::bindgen_prelude::Function;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
+use scp_ffi_common::custody_substrate::ReportedCustodySubstrate;
+use scp_ffi_common::error_codes as codes;
 use scp_platform::error::PlatformError;
+use scp_platform::file::FileKeyCustody;
+
+use crate::error::ScpNapiError;
 use scp_platform::traits::{
     CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
     Signature,
@@ -82,8 +90,21 @@ pub struct NapiKeyCustodyProvider {
     #[napi(ts_type = "(keyId: string) => Uint8Array")]
     pub export_signing_key_bytes: Function<'static, String, Vec<u8>>,
     /// `(keyId: string) => string` — `"hardware"` / `"software"` / `"in_memory"`.
+    /// Names the storage location, which `scp_platform::CustodyType` consumes.
     #[napi(ts_type = "(keyId: string) => string")]
     pub custody_type: Function<'static, String, String>,
+    /// `(keyId: string) => boolean` — whether the private key can leave the
+    /// store this provider holds it in. One of the two facts a DID document
+    /// publishes about custody (§3.2.2 of the identity spec).
+    #[napi(ts_type = "(keyId: string) => boolean")]
+    pub key_is_extractable: Function<'static, String, bool>,
+    /// `(keyId: string) => string` — which factor unlocks the key: one of
+    /// `"biometric"`, `"pin"`, `"passphrase"`, `"caller_supplied_key"`, or
+    /// `"unprotected"`. The other fact a DID document publishes about custody
+    /// (§3.2.2 of the identity spec). A string outside that set publishes no
+    /// custody value.
+    #[napi(ts_type = "(keyId: string) => string")]
+    pub unlock_factor: Function<'static, String, String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -117,6 +138,8 @@ struct CallbackTsfns {
     >,
     export_signing_key_bytes: ThreadsafeFunction<String, Vec<u8>, String, napi::Status, false>,
     custody_type: ThreadsafeFunction<String, String, String, napi::Status, false>,
+    key_is_extractable: ThreadsafeFunction<String, bool, String, napi::Status, false>,
+    unlock_factor: ThreadsafeFunction<String, String, String, napi::Status, false>,
 }
 
 /// Concrete [`KeyCustody`] adapter delegating to JS callbacks. The
@@ -192,6 +215,16 @@ impl NapiCallbackKeyCustody {
                     .build_threadsafe_function()
                     .weak::<false>()
                     .build()?,
+                key_is_extractable: provider
+                    .key_is_extractable
+                    .build_threadsafe_function()
+                    .weak::<false>()
+                    .build()?,
+                unlock_factor: provider
+                    .unlock_factor
+                    .build_threadsafe_function()
+                    .weak::<false>()
+                    .build()?,
             },
         })
     }
@@ -223,6 +256,45 @@ impl NapiCallbackKeyCustody {
             &bytes,
         )?);
         Ok(ed25519_dalek::SigningKey::from_bytes(&arr))
+    }
+
+    /// Asks the JS provider the two questions a published custody value
+    /// answers, and returns the answers as a
+    /// [`CustodySubstrate`](scp_did::attestation::CustodySubstrate).
+    ///
+    /// §3.2.2 of the identity spec states that a DID document publishes
+    /// whether the key can leave its store and which factor unlocks it, and
+    /// that `ScpKeyCustodyAttestation::derive` reads both off the backend. The
+    /// JS provider is the only party that knows either fact about a key it
+    /// holds, so this method dispatches both questions to the event loop and
+    /// awaits the answers. `KeyCustody::custody_type` cannot do the same,
+    /// because that trait method is synchronous and a threadsafe-function
+    /// dispatch returns no value to a tokio worker thread synchronously.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::CustodyError`] if either callback throws or
+    /// returns a value napi-rs cannot read as a `boolean` or a `string`.
+    pub async fn custody_substrate(
+        &self,
+        handle: &KeyHandle,
+    ) -> Result<ReportedCustodySubstrate, PlatformError> {
+        let key_is_extractable = self
+            .tsfns
+            .key_is_extractable
+            .call_async(handle.id().to_string())
+            .await
+            .map_err(|e| Self::map_call_err("key_is_extractable", &e))?;
+        let unlock_factor = self
+            .tsfns
+            .unlock_factor
+            .call_async(handle.id().to_string())
+            .await
+            .map_err(|e| Self::map_call_err("unlock_factor", &e))?;
+        Ok(ReportedCustodySubstrate::new(
+            key_is_extractable,
+            &unlock_factor,
+        ))
     }
 }
 
@@ -403,11 +475,17 @@ impl KeyCustody for NapiCallbackKeyCustody {
 /// Enum dispatch wrapper for the [`KeyCustody`] implementations the napi-rs
 /// bridge uses. Since [`KeyCustody`] is not object-safe (RPITIT), this enum
 /// wraps the concrete types and delegates each method to the active variant.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum NapiKeyCustody {
     /// Test/dev in-memory custody (feature-gated), wrapped for redacted Debug.
     #[cfg(feature = "testing")]
     InMemory(OpaqueInMemoryKeyCustody),
-    /// Caller-provided custody backed by JS callbacks.
+    /// The encrypted key file §3.2.2 of the identity spec names
+    /// `encrypted_file`: Argon2id derives an AES-256 key from the caller's
+    /// passphrase, and each key entry is encrypted under AES-256-GCM.
+    File(FileKeyCustody),
+    /// Caller-provided custody backed by JS callbacks. §3.2.2 of the identity
+    /// spec names the value that selects it `os_keystore`.
     Callback(NapiCallbackKeyCustody),
 }
 
@@ -416,25 +494,30 @@ impl fmt::Debug for NapiKeyCustody {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(_) => f.write_str("NapiKeyCustody::InMemory([redacted])"),
+            Self::File(_) => f.write_str("NapiKeyCustody::File([encrypted])"),
             Self::Callback(_) => f.write_str("NapiKeyCustody::Callback([js])"),
         }
     }
 }
 
 impl NapiKeyCustody {
-    /// Returns the custody-type label for handle reporting (`"in_memory"` for
-    /// the in-memory test backend, `"callback"` for caller-provided callback
-    /// custody).
+    /// Returns the custody value this bridge reports for the active backend:
+    /// `"encrypted_file"`, `"os_keystore"`, or the test-harness `"in_memory"`.
     ///
-    /// This is a cheap, sync variant discriminator — distinct from the async
+    /// §3.2.2 of the identity spec gives a caller the first two values, and the
+    /// `PyO3` and `UniFFI` bridges report the same string for the same backend,
+    /// so one name carries one meaning across all three bridges.
+    ///
+    /// This is a cheap, sync variant discriminator — distinct from the
     /// [`KeyCustody::custody_type`] trait method, which reports the
     /// per-key-handle [`CustodyType`] (hardware/software/in-memory) the
-    /// underlying provider declares.
+    /// underlying backend declares.
     pub(crate) const fn custody_type_label(&self) -> &'static str {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(_) => "in_memory",
-            Self::Callback(_) => "callback",
+            Self::File(_) => "encrypted_file",
+            Self::Callback(_) => "os_keystore",
         }
     }
 
@@ -454,7 +537,37 @@ impl NapiKeyCustody {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.export_ed25519_signing_key(handle).await,
+            Self::File(kc) => kc.export_ed25519_signing_key(handle).await,
             Self::Callback(kc) => kc.export_ed25519_signing_key(handle).await,
+        }
+    }
+
+    /// Reads the two facts a DID document publishes about the backend holding
+    /// `handle`: whether the private key can leave its store, and which factor
+    /// unlocks it (§3.2.2 of the identity spec).
+    ///
+    /// `FileKeyCustody` and `InMemoryKeyCustody` implement
+    /// [`CustodySubstrate`](scp_did::attestation::CustodySubstrate) about
+    /// themselves, so those two arms copy the answers. The callback arm asks
+    /// the injected JS provider, which is the only party that knows what the
+    /// operating system's key store does with the key.
+    ///
+    /// `ScpKeyCustodyAttestation::derive` takes one substrate per key, so this
+    /// method takes one handle rather than describing the whole backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::CustodyError`] when a JS callback throws or
+    /// returns a value napi-rs cannot read.
+    pub(crate) async fn custody_substrate(
+        &self,
+        handle: &KeyHandle,
+    ) -> Result<ReportedCustodySubstrate, PlatformError> {
+        match self {
+            #[cfg(feature = "testing")]
+            Self::InMemory(kc) => Ok(ReportedCustodySubstrate::from_substrate(&kc.0)),
+            Self::File(kc) => Ok(ReportedCustodySubstrate::from_substrate(kc)),
+            Self::Callback(kc) => kc.custody_substrate(handle).await,
         }
     }
 }
@@ -464,6 +577,7 @@ impl KeyCustody for NapiKeyCustody {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.generate_keypair(key_type).await,
+            Self::File(kc) => kc.generate_keypair(key_type).await,
             Self::Callback(kc) => kc.generate_keypair(key_type).await,
         }
     }
@@ -472,6 +586,7 @@ impl KeyCustody for NapiKeyCustody {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.sign(key, data).await,
+            Self::File(kc) => kc.sign(key, data).await,
             Self::Callback(kc) => kc.sign(key, data).await,
         }
     }
@@ -480,6 +595,7 @@ impl KeyCustody for NapiKeyCustody {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.public_key(key).await,
+            Self::File(kc) => kc.public_key(key).await,
             Self::Callback(kc) => kc.public_key(key).await,
         }
     }
@@ -488,6 +604,7 @@ impl KeyCustody for NapiKeyCustody {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.destroy_key(key).await,
+            Self::File(kc) => kc.destroy_key(key).await,
             Self::Callback(kc) => kc.destroy_key(key).await,
         }
     }
@@ -500,6 +617,7 @@ impl KeyCustody for NapiKeyCustody {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.dh_agree(key, peer_public).await,
+            Self::File(kc) => kc.dh_agree(key, peer_public).await,
             Self::Callback(kc) => kc.dh_agree(key, peer_public).await,
         }
     }
@@ -512,6 +630,7 @@ impl KeyCustody for NapiKeyCustody {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.derive_pseudonym(key, context_id).await,
+            Self::File(kc) => kc.derive_pseudonym(key, context_id).await,
             Self::Callback(kc) => kc.derive_pseudonym(key, context_id).await,
         }
     }
@@ -526,6 +645,10 @@ impl KeyCustody for NapiKeyCustody {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => {
                 kc.0.derive_rotatable_pseudonym(key, context_id, pseudonym_epoch)
+                    .await
+            }
+            Self::File(kc) => {
+                kc.derive_rotatable_pseudonym(key, context_id, pseudonym_epoch)
                     .await
             }
             Self::Callback(kc) => {
@@ -546,6 +669,10 @@ impl KeyCustody for NapiKeyCustody {
                 kc.0.ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
                     .await
             }
+            Self::File(kc) => {
+                kc.ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
+                    .await
+            }
             Self::Callback(kc) => {
                 kc.ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
                     .await
@@ -557,6 +684,7 @@ impl KeyCustody for NapiKeyCustody {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.custody_type(key),
+            Self::File(kc) => kc.custody_type(key),
             Self::Callback(kc) => kc.custody_type(key),
         }
     }
@@ -567,6 +695,7 @@ impl KeyCustody for NapiKeyCustody {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.generate_ephemeral_ed25519_seed().await,
+            Self::File(kc) => kc.generate_ephemeral_ed25519_seed().await,
             Self::Callback(kc) => kc.generate_ephemeral_ed25519_seed().await,
         }
     }
@@ -578,8 +707,205 @@ impl KeyCustody for NapiKeyCustody {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.import_ed25519_signing_key(seed).await,
+            Self::File(kc) => kc.import_ed25519_signing_key(seed).await,
             Self::Callback(kc) => kc.import_ed25519_signing_key(seed).await,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The custody factory
+// ---------------------------------------------------------------------------
+
+/// Builds the key custody backend a caller's custody value names.
+///
+/// §3.2.2 of the identity spec, the custody vocabulary, gives a caller two
+/// values: `"encrypted_file"` selects the on-disk key store SCP implements, and
+/// `"os_keystore"` selects the operating system's own key store, which this
+/// bridge reaches through the `KeyCustodyProvider` a JavaScript caller
+/// supplies. This function is the one place on this bridge that maps either
+/// value onto a backend, so `identityCreate`, `identityCreateWithAgentKey`, and
+/// `identityCreateWithCustody` all reach the same decision.
+///
+/// A shipped build additionally answers `"in_memory"`, the test-harness string,
+/// with `SCP-IDENT-1008`; a build carrying the `testing` cargo feature builds
+/// the in-memory backend for it, seeded from `testing_seed` when the caller
+/// supplied one (ADR-046 cross-bridge parity). §3.2.2 states that the string is
+/// a test affordance and not a value of the vocabulary.
+///
+/// # Arguments
+///
+/// * `custody` — the custody value, one of the two §3.2.2 names.
+/// * `provider` — the JavaScript `KeyCustodyProvider` record that holds the
+///   key, supplied only alongside `"os_keystore"`. The caller MUST promote it
+///   on the JavaScript thread, which is where this function runs for that
+///   value, because the record's `Function` fields are not `Send`.
+/// * `testing_seed` — the 32-byte deterministic RNG seed, valid only alongside
+///   `"in_memory"`.
+///
+/// # Errors
+///
+/// Returns [`ScpNapiError::Identity`] carrying:
+/// - `SCP-IDENT-1003` when a caller names `"os_keystore"` and supplies no
+///   provider. §3.2.2 states the rule this applies: the bridge returns a typed
+///   error and falls back to neither `encrypted_file` nor an in-memory store.
+/// - `SCP-IDENT-1008` when a caller names `"in_memory"` on a build that carries
+///   no `testing` feature.
+/// - `SCP-IDENT-1005` when a caller supplies a provider alongside a value other
+///   than `"os_keystore"`. No public entry point forms that pair, so the error
+///   reports a bridge-layer bug.
+/// - An opening failure from the encrypted key file.
+///
+/// Returns [`ScpNapiError::Validation`] carrying:
+/// - `SCP-VALID-7005` for every string outside the vocabulary, and for a
+///   JavaScript provider napi-rs cannot promote to threadsafe functions.
+/// - `SCP-VALID-7008` for a `testing_seed` on a build carrying no `testing`
+///   feature, and `SCP-VALID-7009` for a `testing_seed` paired with
+///   `"encrypted_file"`.
+/// - An unset `SCP_KEY_PASSPHRASE` under `"encrypted_file"`.
+pub(crate) fn build_key_custody(
+    custody: &str,
+    provider: Option<NapiKeyCustodyProvider>,
+    testing_seed: Option<zeroize::Zeroizing<[u8; 32]>>,
+) -> Result<(std::sync::Arc<NapiKeyCustody>, String), ScpNapiError> {
+    if provider.is_some() && custody != "os_keystore" {
+        return Err(ScpNapiError::Identity {
+            message: "internal: a KeyCustodyProvider was supplied alongside a custody value \
+                      other than \"os_keystore\" — this is a bug in the bridge layer"
+                .to_owned(),
+            code: codes::IDENT_1005.to_owned(),
+        });
+    }
+
+    // The custody name is judged before the seed pairing, so a caller who
+    // passes an unusable custody name together with a seed reads the custody
+    // error rather than the seed error. `"in_memory"` consumes the seed below;
+    // `"encrypted_file"` is the one other value this bridge builds a backend
+    // for, so this guard is closed against the accepted set rather than
+    // open-ended. Mirrors the `PyO3` bridge's `parse_custody_with_seed`.
+    if custody == "encrypted_file" && testing_seed.is_some() {
+        return Err(ScpNapiError::Validation {
+            message: "`testingSeed` parameter is only valid for custody=\"in_memory\"".to_owned(),
+            code: codes::VALID_7009.to_owned(),
+        });
+    }
+
+    match custody {
+        // `FileKeyCustody` derives an AES-256 key from a passphrase with
+        // Argon2id and encrypts each key entry under AES-256-GCM
+        // (`scp-platform/src/file.rs`). All three bridges open the same store
+        // at the same path through
+        // `scp_ffi_common::key_file::open_default_key_file`, so they cannot
+        // drift on the path, the environment variable, or the message text.
+        "encrypted_file" => {
+            let file_kc = scp_ffi_common::key_file::open_default_key_file().map_err(|e| {
+                use scp_ffi_common::key_file::KeyFileError;
+                match e {
+                    KeyFileError::MissingPassphrase | KeyFileError::DirectoryCreate(_) => {
+                        ScpNapiError::Validation {
+                            message: e.to_string(),
+                            code: codes::VALID_7005.to_owned(),
+                        }
+                    }
+                    KeyFileError::Open(_) => ScpNapiError::Identity {
+                        message: e.to_string(),
+                        code: codes::IDENT_1001.to_owned(),
+                    },
+                }
+            })?;
+            Ok((
+                std::sync::Arc::new(NapiKeyCustody::File(file_kc)),
+                "encrypted_file".to_owned(),
+            ))
+        }
+        // The operating system's own key store sits on the far side of the JS
+        // callbacks, so this arm needs the provider a caller passed to
+        // `identityCreateWithCustody`.
+        "os_keystore" => match provider {
+            Some(record) => {
+                let callback = NapiCallbackKeyCustody::from_provider(record).map_err(|e| {
+                    ScpNapiError::Validation {
+                        message: format!("invalid KeyCustodyProvider: {e}"),
+                        code: codes::VALID_7005.to_owned(),
+                    }
+                })?;
+                Ok((
+                    std::sync::Arc::new(NapiKeyCustody::Callback(callback)),
+                    "os_keystore".to_owned(),
+                ))
+            }
+            // FAIL CLOSED. §3.2.2 of the identity spec states that this bridge
+            // returns a typed error here, falls back to neither
+            // `encrypted_file` nor an in-memory store, and cites the
+            // no-dev-stand-in tenet of `CLAUDE.md` as the rule it applies.
+            None => Err(ScpNapiError::Identity {
+                message: "custody type \"os_keystore\" reaches the operating system's key \
+                          store through a KeyCustodyProvider, and identityCreate supplies \
+                          none — call identityCreateWithCustody() and pass a provider backed \
+                          by the Apple Keychain or the Android Keystore. For the encrypted \
+                          key file SCP implements, pass \"encrypted_file\". Both of those \
+                          calls return SCP-IDENT-1059 on a shipped build today, because no \
+                          pre-rotation custody backend is wired yet, so no shipped build \
+                          creates an identity."
+                    .to_owned(),
+                code: codes::IDENT_1003.to_owned(),
+            }),
+        },
+        #[cfg(feature = "testing")]
+        "in_memory" => {
+            use scp_platform::testing::InMemoryKeyCustody;
+
+            // Deref through `Zeroizing<[u8; 32]>` so the wrapper drops (and
+            // wipes) at the end of this scope. The inner `[u8; 32]` is consumed
+            // by value by `from_seed_bytes` (one unavoidable Copy) and then
+            // discarded inside `StdRng::from_seed`.
+            let in_memory = testing_seed
+                .as_ref()
+                .map_or_else(InMemoryKeyCustody::new, |seed| {
+                    InMemoryKeyCustody::from_seed_bytes(**seed)
+                });
+            Ok((
+                std::sync::Arc::new(NapiKeyCustody::InMemory(OpaqueInMemoryKeyCustody(
+                    in_memory,
+                ))),
+                "in_memory".to_owned(),
+            ))
+        }
+        #[cfg(not(feature = "testing"))]
+        "in_memory" => {
+            // A `testingSeed` is a parity-harness affordance gated on the
+            // `testing` feature, so surface it as SCP-VALID-7008 ("testing-only
+            // feature requires feature flag") ahead of the generic
+            // custody-unavailable error. Mirrors the `PyO3` bridge's
+            // `#[cfg(not(feature = "testing"))] parse_custody_with_seed`.
+            if testing_seed.is_some() {
+                return Err(ScpNapiError::Validation {
+                    message: "`testingSeed` parameter requires the testing feature".to_owned(),
+                    code: codes::VALID_7008.to_owned(),
+                });
+            }
+            Err(ScpNapiError::Identity {
+                message: "in_memory custody is not available in this build -- use \
+                          \"encrypted_file\" custody for an encrypted key file, or \
+                          identityCreateWithCustody() to inject a platform-native \
+                          KeyCustodyProvider for \"os_keystore\". Both of those calls return \
+                          SCP-IDENT-1059 on a shipped build today, because no pre-rotation \
+                          custody backend is wired yet, so no shipped build creates an \
+                          identity."
+                    .to_owned(),
+                code: codes::IDENT_1008.to_owned(),
+            })
+        }
+        // `validate_custody_type` rejects every string outside the vocabulary
+        // before any caller reaches this function, so this arm reports a
+        // bridge-layer bug rather than a caller's mistake.
+        other => Err(ScpNapiError::Identity {
+            code: codes::IDENT_1005.to_owned(),
+            message: format!(
+                "internal: unexpected custody type {other:?} passed validate_custody_type — \
+                 this is a bug in the bridge layer"
+            ),
+        }),
     }
 }
 

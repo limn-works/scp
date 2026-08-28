@@ -324,17 +324,16 @@ WebRTC library integration is platform-specific (webrtc-rs for native, browser W
 
 ## ADR-025: Apple Platform Adapter
 
-> **The custody string `"platform"` no longer selects this adapter.** Every FFI
-> bridge answers that string with `SCP-IDENT-1003` and builds no key store, because
-> no custody string reaches an OS keystore on any bridge. A caller reaches one by
-> passing a `KeyCustodyProvider` to `identity_create_with_custody`. This ADR's
-> decision — that platform-native custody arrives through an injected adapter —
-> stands; only the selector this ADR names for it does not, and the
-> `SCP.create(custody:)` factory those examples call was never built. Story SCP-294
-> in `.docs/prds/http-features.json` made the bridges agree and left this ADR's text
-> as written, because a story does not rewrite an ADR's decision. Whether that
-> decision is superseded, and what replaces the examples below, is this ADR's
-> question to answer.
+> **The custody string that selects this adapter is `"os_keystore"`, not
+> `"platform"`.** §3.2.2 of the identity spec, the custody vocabulary, states the two
+> values a caller names — `"encrypted_file"` and `"os_keystore"` — and states that
+> `"platform"` names no custody value, because two published specifications give that
+> word two different meanings in key handling. `"os_keystore"` selects the operating
+> system's own key store, which SCP reaches through the platform key-custody callback
+> an SDK consumer supplies, so this ADR's decision — that platform-native custody
+> arrives through an injected adapter — stands. The examples below name
+> `"os_keystore"` where they named `"platform"` before §3.2.2 of the identity spec
+> landed. The `SCP.create(custody:)` factory those examples call was never built.
 
 **Status:** Decided
 
@@ -413,7 +412,7 @@ When biometric gating is active, the protection class changes from `kSecAttrAcce
 If the device has no biometric hardware (e.g., older iPads, Mac mini), `.biometryCurrentSet` falls back to device passcode authentication. The key is still gated, but by passcode rather than biometric. This is standard iOS/macOS behavior -- no special handling is needed.
 
 **`custodyType` reporting:**
-`custodyType()` returns `"software"` for `.none` and `"software_biometric"` for `.required`. This allows the protocol engine and remote participants to understand the custody level without exposing implementation details.
+`custodyType()` returns `"software"` for `.none` and `"software_biometric"` for `.required`. These two strings are the substrate report, not the custody vocabulary a caller passes: §3.2.2 of the identity spec states that vocabulary, and its open question OQ-12 asks which published value a participant running Keychain behind a biometric gate publishes, because the three published values state no pair that matches `"software_biometric"`.
 
 **Industry comparison:**
 
@@ -512,7 +511,7 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
 - **ADR-006 (Platform Abstraction):** Defines the `KeyCustody`, `DeviceAttestation`, `Push`, and `Storage` trait signatures. The Apple adapter implements these.
 - **ADR-021 (UniFFI Bridge):** Defines the callback interfaces (`KeyCustodyProvider`, `StorageProvider`, `PushProvider`) in `scp.udl`. The Apple adapter implements these callback interfaces in Swift. The adapter is injected into the Rust engine via UniFFI's callback interface binding.
 - **Phase 1-2 Rust core:** The Apple adapter is called from `scp-core` through the UniFFI bridge. Phase 1-2 must be implemented before the adapter can be exercised in integration tests.
-- **ADR-026 (Swift SDK):** The Swift SDK initializes the Apple adapter and injects it into `SCP.init()`. The adapter is not directly visible to SDK consumers — it is the default platform implementation selected when `custody: "platform"` is specified.
+- **ADR-026 (Swift SDK):** The Swift SDK initializes the Apple adapter and injects it into `SCP.init()`. The adapter is not directly visible to SDK consumers — a caller selects it by naming `custody: "os_keystore"`, the value §3.2.2 of the identity spec, the custody vocabulary, gives to the operating system's own key store.
 
 ### Acceptance Criteria
 
@@ -573,7 +572,7 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
    }
    ```
 
-   - `ApplePlatformAdapter.make()` is called by `SCP.init()` when `custody: "platform"` is specified (ADR-026).
+   - `ApplePlatformAdapter.make()` is called by `SCP.init()` when `custody: "os_keystore"` is specified (ADR-026).
    - All four providers are initialized before the Rust engine starts. If any provider fails to initialize (e.g., Keychain inaccessible at boot), `make()` returns a descriptive `PlatformError`.
 
 7. **Conformance test suite:**
@@ -740,11 +739,16 @@ public actor SCP {
     }
 
     /// Create an SCP instance with the specified custody method.
-    /// On Apple platforms, `custody: .platform` uses Keychain-backed key storage.
-    /// `custody: .inMemory` uses software keys (testing only).
-    public static func create(custody: CustodyMethod = .platform) async throws -> SCP {
+    /// Section 3.2.2 of the identity spec, the custody vocabulary, states the
+    /// two values `custody` carries. On Apple platforms `.osKeystore` puts the
+    /// keys in the Keychain, which holds SCP's Ed25519 keys in software because
+    /// the Secure Enclave supports only P-256. `.encryptedFile` puts them in
+    /// the on-disk key store SCP implements. The parameter carries no default,
+    /// because key custody is a security-relevant choice an SDK does not make
+    /// for a caller.
+    public static func create(custody: CustodyMethod) async throws -> SCP {
         let adapter: ApplePlatformAdapter?
-        if custody == .platform {
+        if custody == .osKeystore {
             adapter = try ApplePlatformAdapter.make()
         } else {
             adapter = nil
@@ -1096,7 +1100,7 @@ private func makeMessageStream(handle: ContextHandle) -> AsyncStream<Message> {
 ### Dependencies
 
 - **ADR-021 (UniFFI Bridge):** The Swift SDK wraps the UniFFI-generated `ScpBindings.swift` and `ScpFFI.xcframework`. Every SDK public method calls exactly one UniFFI bridge function. The bridge defines the flat function surface (`identity_create`, `context_create`, etc.), opaque object handles (`IdentityHandle`, `ContextHandle`), value records (`ScpMessage`, `ContextParams`), the `ScpError` enum, and the `MessageListener` callback interface.
-- **ADR-025 (Apple Platform Adapter):** The `ApplePlatformAdapter` (implemented in ADR-025) is instantiated by `SCP.create(custody: .platform)` and injected into the Rust engine via UniFFI callback interfaces (`KeyCustodyProvider`, `StorageProvider`, `PushProvider`, `DeviceAttestationProvider`). The Swift SDK depends on the `Platform/` files being present in `Sources/SCP/Platform/`.
+- **ADR-025 (Apple Platform Adapter):** The `ApplePlatformAdapter` (implemented in ADR-025) is instantiated by `SCP.create(custody: .osKeystore)` and injected into the Rust engine via UniFFI callback interfaces (`KeyCustodyProvider`, `StorageProvider`, `PushProvider`, `DeviceAttestationProvider`). The Swift SDK depends on the `Platform/` files being present in `Sources/SCP/Platform/`.
 - **ADR-006 (Platform Abstraction):** Platform trait definitions (`KeyCustody`, `PushProvider`, `Storage`, `DeviceAttestationProvider`) shape the UniFFI callback interface contracts that the Swift SDK implements.
 - **ADR-013 (PyO3 Bridge) / ADR-014 (Python SDK):** The ergonomics layer pattern — flat FFI bridge → idiomatic language wrapper — is established here and applied to Swift. Swift SDK mirrors the structural choices (no logic in the wrapper layer, delegation only) and the type category decisions (opaque handles for crypto state, value types for data).
 - **ADR-022 (TypeScript SDK):** Parallel patterns: `AsyncStream<Message>` (Swift) mirrors `AsyncIterable<Message>` (TypeScript); `deinit` + `close()` (Swift) mirrors `Symbol.asyncDispose` (TypeScript). Conformance test suite is shared.
@@ -1114,17 +1118,23 @@ private func makeMessageStream(handle: ContextHandle) -> AsyncStream<Message> {
    All three commands exit 0 with zero warnings at `SWIFT_STRICT_CONCURRENCY=complete`.
 
 2. **`SCP.create()` factory:**
-   - `await SCP.create(custody: .platform)` returns an `SCP` actor with a valid `identity.did` starting with `"did:dht:"`.
-   - `await SCP.create(custody: .inMemory)` returns an `SCP` actor with a software-backed identity (for testing).
-   - `SCP.create()` calls `ApplePlatformAdapter.make()` when `custody == .platform` and injects all four providers.
+
+   §3.2.2 of the identity spec, the custody vocabulary, gives the custody type the two
+   values below and spells no member for the test-harness string `in_memory`, so a test
+   that needs the in-memory key store passes that string to the bridge rather than to
+   this factory.
+
+   - `await SCP.create(custody: .osKeystore)` returns an `SCP` actor with a valid `identity.did` starting with `"did:dht:"`.
+   - `await SCP.create(custody: .encryptedFile)` returns an `SCP` actor whose keys sit in the on-disk key store SCP implements.
+   - `SCP.create()` calls `ApplePlatformAdapter.make()` when `custody == .osKeystore` and injects all four providers.
 
 3. **`SCPIdentity` operations:**
 
    ```swift
-   let scp = try await SCP.create(custody: .inMemory)
+   let scp = try await SCP.create(custody: .encryptedFile)
    let identity = scp.identity
    #expect(await identity.did.hasPrefix("did:dht:"))
-   #expect(await identity.custodyType == "in_memory")
+   #expect(await identity.custodyType == "encrypted_file")
 
    let doc = try await identity.resolve(did: await identity.did)
    #expect(!doc.verificationMethods.isEmpty)

@@ -79,7 +79,13 @@ rmp-serde = { workspace = true }
 # `EncryptingAdapter` in `build_event_log_provider` (#1447 / #484). The
 # `testing` crate-feature above adds `scp-platform/testing` for
 # dev/test/desktop builds only (ADR-062 §Decision 6).
-scp-platform = { path = "../../scp-platform", features = ["software_platform", "encrypting", "sqlite"] }
+# `file` compiles `FileKeyCustody`, the encrypted key store §3.2.2 of the
+# identity spec names `encrypted_file`. It is a durability-only feature — the
+# store derives an AES-256 key from a passphrase with Argon2id and encrypts each
+# key entry under AES-256-GCM — and the allowlist of
+# `scripts/check-shipped-feature-graph.sh` already carries it (ADR-062
+# §Decision 6).
+scp-platform = { path = "../../scp-platform", features = ["software_platform", "file", "encrypting", "sqlite"] }
 scp-mcp = { path = "../../scp-mcp" }
 scp-transport = { path = "../../scp-transport" }
 ed25519-dalek = { workspace = true }

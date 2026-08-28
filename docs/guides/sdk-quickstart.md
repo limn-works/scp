@@ -157,18 +157,23 @@ severs from production. A shipped build therefore returns the
 typed `SCP-IDENT-1059` error rather than minting the test double. ADR-062,
 capability injection and prove-absent dev backends, records that state as
 accepted and holds the real backend out of its own scope. §Platform-native key
-custody below says which call returns which code on which bridge.
+custody below separates that gap from the custody-string gap.
 
-The bridges build a key store from two custody strings and reject every other
-one. `"file"` builds an encrypted key file and works on the PyO3 bridge only.
-`"in_memory"` compiles under each bridge's `testing` feature, so a released
-build rejects it with `SCP-IDENT-1008`. `"platform"` and `"software"` name no
-key store the bridges build: all three bridges reject `"platform"` with
-`SCP-IDENT-1003`, and the NAPI and UniFFI bridges reject `"software"` with the
-same code. To put keys in Apple Keychain or in Android Keystore, pass a
-`KeyCustodyProvider` to `identity_create_with_custody` (see §Platform-native
-key custody below), which returns `SCP-IDENT-1059` on a shipped build for the
-separate reason stated above.
+A caller names a custody backend with one of two values, and §3.2.2 of the identity
+spec, the custody vocabulary, states both. `encrypted_file` selects the on-disk key
+store SCP implements, which derives an AES-256 key from a passphrase with Argon2id and
+encrypts each key entry under AES-256-GCM. `os_keystore` selects the operating system's
+own key store, which SCP reaches through a platform key-custody callback the SDK
+consumer supplies; §Platform-native key custody below describes the entry point that
+takes that callback. §3.2.2 of the identity spec states that a shipped build answers
+every other string with a typed error, and that a bridge holding no platform callback
+answers `os_keystore` with a typed error rather than falling back to `encrypted_file` or
+to an in-memory store. A build compiled with a bridge's `testing` feature additionally
+accepts the raw string `in_memory`, which reaches a test-only key store; §3.2.2 of the
+identity spec states that a shipped build rejects that string with `SCP-IDENT-1008`.
+
+The words `platform`, `software`, `file`, and `hardware` name no custody value. A caller
+who passes one of them reads a typed error instead of reaching a key store.
 
 ### Rust
 
@@ -201,13 +206,13 @@ println!("DID: {}", identity.did);
 ```python
 import asyncio
 from scp_sdk import SCP
-from scp_sdk.types import CustodyType
 
 async def main():
     with SCP(storage={"type": "in_memory"}) as scp:
-        # Encrypts $HOME/.scp/keys.bin under $SCP_KEY_PASSPHRASE (Argon2id + AES-256-GCM).
+        # encrypted_file derives an AES-256 key from $SCP_KEY_PASSPHRASE with
+        # Argon2id and encrypts each key entry under AES-256-GCM.
         # A shipped bridge raises SCP-IDENT-1059 here; this needs a `testing` build.
-        identity = await scp.identity_create(CustodyType.FILE)
+        identity = await scp.identity_create("encrypted_file")
         print(f"DID: {identity.did}")
 
 asyncio.run(main())
@@ -287,18 +292,16 @@ is the only entry point that takes an injected provider. It is not a working
 create path today: on a shipped build it returns `SCP-IDENT-1059`, and
 `crates/scp-ffi/src/identity.rs`, `crates/scp-ffi/uniffi/src/bridge.rs`, and
 `crates/scp-ffi/napi/src/scp.rs` each return that code before minting anything.
-The PyO3 bridge returns the same code from `identity_create` with `"file"`
-custody. The NAPI and UniFFI bridges reject every custody string one step
-earlier -- `SCP-IDENT-1008` for `"in_memory"`, `SCP-IDENT-1003` for
-`"platform"` and `"software"`, `SCP-VALID-7005` for anything else -- so
-`identity_create` on those two bridges never reaches the pre-rotation step at
-all.
+A bridge that rejects the custody string never reaches the pre-rotation step, so a
+caller who names a string outside the vocabulary reads the custody error rather than
+`SCP-IDENT-1059`. §3.2.2 of the identity spec states which strings a shipped build
+rejects: every string other than `encrypted_file` and `os_keystore` draws a typed error,
+and the test-harness string `in_memory` draws `SCP-IDENT-1008`.
 
-Two separate gaps produce those codes, and closing one does not close the
-other. `SCP-IDENT-1003` and `SCP-IDENT-1008` say that the custody string names
-no key store the bridge builds. `SCP-IDENT-1059` says that no pre-rotation
-custody backend exists for any create path to use. Wiring a platform provider
-clears the first gap; a real pre-rotation backend clears the second.
+Two separate gaps produce those errors, and closing one does not close the other. A
+custody error says that the string names no backend the bridge builds. `SCP-IDENT-1059`
+says that no pre-rotation custody backend exists for any create path to use. Wiring a
+platform provider clears the first gap; a real pre-rotation backend clears the second.
 
 ---
 
@@ -333,7 +336,7 @@ println!("Context ID: {}", handle.context_id());
 ### Python
 
 ```python
-from scp_sdk import Capability, Context, CustodyType, MemoryScope
+from scp_sdk import Capability, Context, MemoryScope
 
 ctx = await Context.create(
     creator=identity,

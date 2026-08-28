@@ -337,49 +337,62 @@ and are documented with their own features.
 
 ### Custody strings and their cross-bridge contract
 
-`identity_create` takes a custody string naming the key store that holds the new
-identity's private keys. The three bridges do not host the same key stores, so one
-string does not reach the same backend everywhere. This table is the contract; each
-SDK's custody type cites it rather than restating it.
+`identity_create` takes a custody string naming the backend that holds the new
+identity's private keys. §3.2.2 of the identity spec, the custody vocabulary, decides
+which values that string carries, and this section restates nothing that section
+decides.
 
-| String | `PyO3` | NAPI | `UniFFI` |
-|---|---|---|---|
-| `in_memory` | `InMemoryKeyCustody` under the bridge's `testing` feature; `SCP-IDENT-1008` in a shipped build | same | same |
-| `file` | `FileKeyCustody`, an Argon2id and AES-256-GCM key file at `$HOME/.scp/keys.bin`, requiring `SCP_KEY_PASSPHRASE` | `SCP-VALID-7005` | `SCP-VALID-7005` |
-| `platform` | `SCP-IDENT-1003` | `SCP-IDENT-1003` | `SCP-IDENT-1003` |
-| `software` | `SCP-VALID-7005` | `SCP-IDENT-1003` | `SCP-IDENT-1003` |
-| any other string | `SCP-VALID-7005` | `SCP-VALID-7005` | `SCP-VALID-7005` |
+| Value | Backend it selects |
+|---|---|
+| `encrypted_file` | The on-disk key store SCP implements, which derives an AES-256 key from a passphrase with Argon2id and encrypts each key entry under AES-256-GCM |
+| `os_keystore` | The operating system's own key store, which SCP reaches through the platform key-custody callback an SDK consumer supplies |
+
+The vocabulary holds no third value. §3.2.2 of the identity spec states that a shipped
+build answers every other string with a typed error. A build compiled with a bridge's
+`testing` cargo feature additionally accepts the raw string `in_memory`, which reaches a
+test-only in-memory key store; §3.2.2 of the identity spec states that a shipped build
+rejects that string with the typed code `SCP-IDENT-1008`, and that no SDK custody type
+spells it.
+
+**The words `platform`, `software`, `file`, and `hardware` name no custody value.** An
+SCP build from before this vocabulary landed accepted `file` for the encrypted key file
+and carried `platform` and `software` in its SDK custody types. A caller who passes any
+of those four strings to a current build reads a typed error instead of reaching a key
+store. §3.2.2 of the identity spec states why the first two cannot name a backend: two
+published specifications give `platform` two different meanings in key handling, and
+`software` states a property a backend lacks rather than naming a store.
+
+**`os_keystore` states which store holds the key, and states nothing about hardware
+isolation.** On Apple platforms the operating system's key store holds SCP's keys in
+software. `bindings/swift/Sources/SCP/Platform/AppleKeyCustody.swift:217`–`:221` states
+the reason: "Apple's Secure Enclave only supports P-256 (NIST P-256 / secp256r1) key
+operations. SCP uses Ed25519 for signing and X25519 for key agreement; neither is
+supported by the Secure Enclave. All SCP identity keys on Apple platforms are therefore
+software-backed via Keychain."
+
+**A bridge that cannot reach a real platform key store fails closed.** When a caller
+names `os_keystore` and the bridge holds no platform key-custody callback, the bridge
+returns a typed error. It does not fall back to `encrypted_file`, and it does not fall
+back to an in-memory store. §3.2.2 of the identity spec states that rule.
 
 **Custody is a required argument on every SDK, and no SDK carries a default.** Key
-custody is a security-relevant choice, and the agent-first API design tenet forbids an
-SDK making it for a caller. The Swift and Kotlin entry points take their `CustodyType`
-rather than a bare string, so a caller cannot pass a value the type already rejects.
+custody is a security-relevant choice, and the agent-first API design tenet of
+`CLAUDE.md` forbids an SDK making it for a caller. The Swift and Kotlin entry points
+take a custody type rather than a bare string, so a caller cannot pass a value the type
+already rejects.
 
-**No custody string reaches a platform-native key store on any bridge.** A caller
-reaches Apple Keychain or Android Keystore by passing a `KeyCustodyProvider` to
-`identity_create_with_custody`. `scp_platform::CustodyType` names the substrates a key
-can occupy — `InMemory`, `Hardware`, `Software` — and carries no `Platform` variant,
-and every shipped custody implementation reports one of `hardware`, `software`,
-`software_biometric`, or `in_memory` through `KeyCustody::custody_type`.
+**The substrate report is a separate vocabulary, and no caller passes one of its
+values.** `scp_platform::CustodyType` (`crates/scp-platform/src/traits.rs:223`–`:232`)
+names where a key already sits — `InMemory`, `Hardware`, and `Software` — and
+`KeyCustody::custody_type` returns one of those three. A caller selects a backend with
+the two values in the table above, never with these three, and §3.2.2 of the identity
+spec governs neither this report nor the values a DID document publishes.
 
-`"file"` and `"software"` name one substrate under two spellings: `FileKeyCustody`
-reports `CustodyType::Software` for every key it holds. Only a Cargo feature separates
-the bridges — `crates/scp-ffi/Cargo.toml` resolves `scp-platform` with the `file`
-feature and the NAPI and `UniFFI` manifests do not. Section 3.2 of the identity spec,
-key custody, owns the custody options a participant chooses among and names no option
-string today; which spelling survives is its question to answer.
-
-**Reading a custody type back.** `Identity::custody_type()` returns `"in_memory"`,
-`"callback"`, or `"external"` on the NAPI and `UniFFI` bridges. The `PyO3` bridge
-returns `"in_memory"`, `"file"`, or `"callback"`, and never `"external"`, because its
-`parse_custody_inner` hands back the label the identity was created under. `"callback"`
-names an identity created through `identity_create_with_custody`; the bridge cannot
-observe which substrate the injected provider uses, so that value names the injection
-rather than the key store, and no SDK custody type spells it.
-
-`scp_sdk.Identity.custody_type` parses the `PyO3` value back into `CustodyType` and
-succeeds for `"in_memory"` and `"file"`, returning the raw string for `"callback"`. The
-Swift, Kotlin, and TypeScript SDKs surface the string and parse nothing.
+**Reading a custody type back.** `Identity::custody_type()` hands back the label the
+identity was created under, and hands back `"callback"` for an identity created through
+`identity_create_with_custody`. `"callback"` names the injection rather than the key
+store, because the bridge cannot observe which substrate the injected provider uses, and
+no SDK custody type spells it.
 
 **One further gap, independent of custody.** Every create path on every bridge returns
 `SCP-IDENT-1059` in a shipped build, because no production `PreRotationCustody` backend

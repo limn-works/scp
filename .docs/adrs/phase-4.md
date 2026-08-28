@@ -686,7 +686,7 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
    async fn identity_resolve(did: String) -> Result<DIDDocument, ScpError> { ... }
    ```
 
-   - `identity_create(custody) -> Identity` — creates a new DID identity with up to four keypairs (Identity Key, Active Signing Key, Pre-Rotation Key, and optionally Agent Signing Key per ADR-039). `custody` is a string: `"platform"`, `"in_memory"`.
+   - `identity_create(custody) -> Identity` — creates a new DID identity with up to four keypairs (Identity Key, Active Signing Key, Pre-Rotation Key, and optionally Agent Signing Key per ADR-039). `custody` is a string, and §3.2.2 of the identity spec, the custody vocabulary, states the two values it carries: `"encrypted_file"` and `"os_keystore"`.
    - `identity_load(did) -> Identity` — loads an existing identity from storage.
    - `identity_resolve(did) -> DIDDocument` — resolves a DID to its document. The returned `DIDDocument` includes all verification methods: `#0`, `#active`, and optionally `#agent` (ADR-039).
    - `Identity` is an opaque object interface exposing: `did() -> String`, `custody_type() -> String`, `rotateActiveKey() -> Identity`, `rotateAgentKey() -> Identity` (ADR-039 — separate rotation for `#active` and `#agent` keys).
@@ -826,7 +826,11 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
         [Throws=ScpError]
         bytes derive_pseudonym(string key_id, bytes context_id);
 
-        // Returns "hardware", "software", or "in_memory". Sync, no I/O.
+        // Returns the substrate the provider holds this key in: "hardware",
+        // "software", or "in_memory". This is the substrate report, not the
+        // custody vocabulary a caller passes to identity_create; §3.2.2 of the
+        // identity spec states that vocabulary and governs neither of these
+        // three words. Sync, no I/O.
         string custody_type(string key_id);
     };
 
@@ -1063,9 +1067,12 @@ export class Identity {
     this.custodyType = custodyType;
   }
 
-  static async create(options: { custody?: "platform" | "in_memory" } = {}): Promise<Identity> {
+  // custody carries no default: §3.2.2 of the identity spec, the custody
+  // vocabulary, names "encrypted_file" and "os_keystore", and key custody is a
+  // security-relevant choice an SDK does not make for a caller.
+  static async create(options: { custody: "encrypted_file" | "os_keystore" }): Promise<Identity> {
     const bridge = await getBridge();
-    const handle = await bridge.identityCreate(options.custody ?? "platform");
+    const handle = await bridge.identityCreate(options.custody);
     return new Identity(handle.did(), handle.custodyType(), handle);
   }
 
@@ -1250,10 +1257,16 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
    - `getBridge()` returns the same initialized bridge instance on repeated calls (no re-initialization).
 
 2. **Identity API:**
+
+   §3.2.2 of the identity spec, the custody vocabulary, gives the SDK type the two values
+   below and spells no member for the test-harness string `in_memory`, so a test that
+   needs the in-memory key store passes that string to the bridge rather than to
+   `Identity.create`.
+
    ```typescript
-   const identity = await Identity.create({ custody: "in_memory" });
+   const identity = await Identity.create({ custody: "encrypted_file" });
    expect(identity.did).toMatch(/^did:dht:/);
-   expect(identity.custodyType).toBe("in_memory");
+   expect(identity.custodyType).toBe("encrypted_file");
 
    const loaded = await Identity.load(identity.did);
    expect(loaded.did).toBe(identity.did);
@@ -1262,7 +1275,7 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
    expect(doc.did).toBe(identity.did);
    expect(doc.verificationMethods.length).toBeGreaterThan(0);
    ```
-   - `Identity.create({ custody: "in_memory" })` returns an `Identity` with a `did:dht:` DID.
+   - `Identity.create({ custody: "encrypted_file" })` returns an `Identity` with a `did:dht:` DID.
    - `Identity.load(did)` rehydrates an existing identity from storage.
    - `Identity.resolve(did)` returns a `DIDDocument` with at least two verification methods (`#0`, `#active`), and optionally `#agent` if agent delegation is configured (ADR-039).
    - `Identity.rotateActiveKey()` returns a new `Identity` with a rotated `#active` key.

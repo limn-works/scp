@@ -157,6 +157,12 @@ Tests are defined as JSON fixtures:
 }
 ```
 
+The fixture above names `in_memory`, which §3.2.2 of the identity spec, the custody
+vocabulary, classifies as a test-harness string rather than a value of that vocabulary:
+a fixture passes it as a raw string to a bridge built with the `testing` feature, and a
+shipped build rejects it with `SCP-IDENT-1008`. A fixture that exercises a shipped
+backend names `encrypted_file` or `os_keystore` instead.
+
 Each SDK implements a conformance test runner that:
 1. Loads JSON fixtures from `tests/conformance/`
 2. Maps `operation` strings to SDK function calls (e.g., `"identity_create"` → `Identity.create()`)

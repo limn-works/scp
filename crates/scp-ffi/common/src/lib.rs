@@ -82,6 +82,18 @@ pub fn html_escape_event_string(s: &str) -> String {
 #[cfg(feature = "custody")]
 pub mod custody_parse;
 
+// The encrypted key file every bridge opens for the custody value
+// `encrypted_file` (§3.2.2 of the identity spec). Needs `scp-platform/file`,
+// which the `custody` feature pulls in.
+#[cfg(feature = "custody")]
+pub mod key_file;
+
+// The two facts a published custody value states (§3.2.2 of the identity
+// spec), carried across the callback boundary from a platform
+// `KeyCustodyProvider`. Needs only `scp-did`, which this crate depends on
+// unconditionally, so no feature gates it.
+pub mod custody_substrate;
+
 // Shared attestation construction pipeline for all FFI bridges.
 // Requires scp-core + scp-identity (behind `resolvers` feature).
 #[cfg(feature = "resolvers")]

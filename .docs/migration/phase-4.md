@@ -46,6 +46,11 @@ instance is gone (PR 4). Post-PR-5 the per-domain namespace classes
 operations are **methods on `SCP`** (see [ADR-048 §7](../adrs/ADR-048-scp-multi-instance.md#7-per-sdk-idiomatic-shape--language-constraints-stay-local)).
 Callers construct an `SCP` at process start and invoke it directly.
 
+Every snippet below passes `in_memory`, which §3.2.2 of the identity spec, the custody
+vocabulary, classifies as a test-harness string rather than a value a shipped caller
+names. That section states the two values a shipped caller does name: `encrypted_file`
+and `os_keystore`.
+
 ```python
 # Before Phase 4
 from scp_sdk import Identity, Context
