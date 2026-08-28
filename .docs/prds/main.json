@@ -2616,7 +2616,7 @@
       ],
       "description": "Implement the Python SDK `Identity` class as a pure Python wrapper over the `_scp_core` bridge. Async-first — all network operations are `async def` methods using asyncio. Synchronous convenience wrappers provided for simple scripts and REPL usage via a dedicated background event loop. Implement `run_sync()` helper that is safe in ALL contexts: plain scripts, Jupyter notebooks, inside async functions, inside other frameworks' event loops.",
       "acceptanceCriteria": [
-        "`Identity.create()` is the entry point. The custody parameter defaults to `CustodyType.FILE`. This criterion originally named a default of `\"platform\"`; SCP-294 in `.docs/prds/http-features.json` made the PyO3 bridge return `SCP-IDENT-1003` for that string, and ADR-048 moved this operation onto `SCP.identity_create`.",
+        "`Identity.create()` is the entry point. The custody parameter is required and carries no default. This criterion originally named a default of `\"platform\"`; SCP-294 in `.docs/prds/http-features.json` made the PyO3 bridge return `SCP-IDENT-1003` for that string, and ADR-048 moved this operation onto `SCP.identity_create`.",
         "All `Identity` instances expose `.did` (string), `.custody_type` (string).",
         "Sync wrappers (`create_sync`, `load_sync`) use `run_sync()` with a dedicated background event loop.",
         "`run_sync` is safe in ALL contexts: plain scripts, Jupyter notebooks, inside async functions, inside other frameworks' event loops. It never calls `asyncio.run()` (which fails inside running loops) and never calls `block_on` (which panics inside tokio).",
@@ -2628,9 +2628,9 @@
       "actionItems": [
         "Create `bindings/python/scp_sdk/sync.py` with `_get_sync_loop()` and `run_sync()` helper using a dedicated background asyncio event loop in a daemon thread with `threading.Lock` for thread safety.",
         "Create `bindings/python/scp_sdk/identity.py` with `Identity` class.",
-        "Implement `@classmethod async def create(cls, custody=CustodyType.FILE) -> Identity` delegating to `_scp_core.py_identity_create`. This action item originally named a default of `\"platform\"`, which the bridge now rejects with `SCP-IDENT-1003` (SCP-294).",
+        "Implement `@classmethod async def create(cls, custody: CustodyType) -> Identity` delegating to `_scp_core.py_identity_create`. This action item originally named a default of `\"platform\"`, which the bridge now rejects with `SCP-IDENT-1003`; SCP-294 also removed the default outright, because an SDK does not choose key custody for a caller.",
         "Implement `@classmethod async def load(cls, did) -> Identity` delegating to `_scp_core.py_identity_load`.",
-        "Implement `@classmethod def create_sync(cls, custody=CustodyType.FILE) -> Identity` using `run_sync(cls.create(custody))`. This action item originally named a default of `\"platform\"`, which the bridge now rejects with `SCP-IDENT-1003` (SCP-294).",
+        "Implement `@classmethod def create_sync(cls, custody: CustodyType) -> Identity` using `run_sync(cls.create(custody))`. This action item originally named a default of `\"platform\"`, which the bridge now rejects with `SCP-IDENT-1003`; SCP-294 also removed the default outright, because an SDK does not choose key custody for a caller.",
         "Implement `async def rotate_key(self) -> Identity` delegating to `_scp_core.py_identity_rotate_key`.",
         "Implement `async def resolve(self, did) -> DIDDocument` delegating to `_scp_core.py_identity_resolve`.",
         "Expose `.did` and `.custody_type` as properties."

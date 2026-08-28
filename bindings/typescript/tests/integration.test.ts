@@ -357,15 +357,21 @@ describe("SCP forwarder dispatch (mountMockScp)", () => {
     expect(call?.args).toEqual(["in_memory"]);
   });
 
-  it("identityCreate defaults custody to 'in_memory' when omitted", async () => {
+  it("identityCreate names no custody when the caller omits one", async () => {
+    // `identityCreate` declares `custody` as a required parameter, so `tsc
+    // --noEmit` rejects the call below and `@ts-expect-error` records that
+    // rejection. The assertion then shows what the SDK forwards when a
+    // JavaScript caller evades the type: `undefined`, not a custody string the
+    // SDK chose for them.
     const { scp, native } = mountMockScp();
     native.__stub("identityCreate", () =>
-      Promise.resolve({ did: "did:dht:z6MkDefault", custodyType: "in_memory" }),
+      Promise.resolve({ did: "did:dht:z6MkNoDefault", custodyType: "in_memory" }),
     );
 
+    // @ts-expect-error identityCreate requires a custody argument.
     await scp.identityCreate();
 
-    expect(native.__lastCall("identityCreate")?.args).toEqual(["in_memory"]);
+    expect(native.__lastCall("identityCreate")?.args).toEqual([undefined]);
   });
 
   it("CustodyType carries every string the bridge names and no other", async () => {

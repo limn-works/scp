@@ -826,7 +826,7 @@ class SCP internal constructor(
      * ```kotlin
      * // Step 1 (joiner): reserve a single-use KeyPackage under the joiner's
      * // own locally-custodied identity.
-     * val joiner = scp.identityCreate(custody = "in_memory")
+     * val joiner = scp.identityCreate(custody = CustodyType.IN_MEMORY)
      * val reservation = scp.reserveKeyPackage(joiner)
      *
      * // Hand reservation.keyPackagePublic to the creator out of band. The
@@ -1255,17 +1255,24 @@ class SCP internal constructor(
     /**
      * Forwards to [NativeScp.identityCreate] on [inner].
      *
+     * [custody] carries no default, so the caller names the key store that
+     * holds this identity's keys and this SDK names none for them. Which key
+     * store holds a private key decides who can reach that key, so a default
+     * would pick a security-relevant answer the caller never stated. This
+     * method sends [CustodyType.rawValue] to the UniFFI bridge, so the
+     * compiler rejects a custody string the bridge does not name.
+     *
      * [testingSeed] is a testing-only parameter for the ADR-046
      * cross-bridge parity harness; pass `null` from production callers
      * (in-memory custody uses OS RNG when [testingSeed] is `null`). A
-     * non-`null` [testingSeed] is only valid for `custody == "in_memory"`.
-     * The UniFFI bridge judges the custody name before the seed, so every
-     * other custody string reports that name's own code — `SCP-IDENT-1003`
-     * for `"platform"` and `"software"`, `SCP-VALID-7005` for anything
-     * else — and this bridge emits no `SCP-VALID-7009`.
+     * non-`null` [testingSeed] is only valid for
+     * `custody == CustodyType.IN_MEMORY`. The UniFFI bridge judges the custody
+     * name before the seed, so every other custody name reports that name's
+     * own code — `SCP-IDENT-1003` for [CustodyType.PLATFORM] and
+     * [CustodyType.SOFTWARE] — and this bridge emits no `SCP-VALID-7009`.
      */
-    suspend fun identityCreate(custody: String, testingSeed: ByteArray? = null): Identity =
-        inner.identityCreate(custody = custody, testingSeed = testingSeed)
+    suspend fun identityCreate(custody: CustodyType, testingSeed: ByteArray? = null): Identity =
+        inner.identityCreate(custody = custody.rawValue, testingSeed = testingSeed)
 
     /** Forwards to [NativeScp.identityCreateLinkAttestation] on [inner]. */
     @Suppress("LongParameterList")
@@ -1286,10 +1293,19 @@ class SCP internal constructor(
             platformId = platformId,
         )
 
-    /** Forwards to [NativeScp.identityCreateWithAgentKey] on [inner]. */
-    suspend fun identityCreateWithAgentKey(custody: String): Identity =
+    /**
+     * Forwards to [NativeScp.identityCreateWithAgentKey] on [inner].
+     *
+     * [custody] carries no default, so the caller names the key store that
+     * holds this identity's keys and this SDK names none for them. Which key
+     * store holds a private key decides who can reach that key, so a default
+     * would pick a security-relevant answer the caller never stated. This
+     * method sends [CustodyType.rawValue] to the UniFFI bridge, so the
+     * compiler rejects a custody string the bridge does not name.
+     */
+    suspend fun identityCreateWithAgentKey(custody: CustodyType): Identity =
         inner.identityCreateWithAgentKey(
-            custody = custody,
+            custody = custody.rawValue,
         )
 
     /** Forwards to [NativeScp.identityCreateWithCustody] on [inner]. */

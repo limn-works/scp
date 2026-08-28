@@ -350,6 +350,11 @@ SDK's custody type cites it rather than restating it.
 | `software` | `SCP-VALID-7005` | `SCP-IDENT-1003` | `SCP-IDENT-1003` |
 | any other string | `SCP-VALID-7005` | `SCP-VALID-7005` | `SCP-VALID-7005` |
 
+**Custody is a required argument on every SDK, and no SDK carries a default.** Key
+custody is a security-relevant choice, and the agent-first API design tenet forbids an
+SDK making it for a caller. The Swift and Kotlin entry points take their `CustodyType`
+rather than a bare string, so a caller cannot pass a value the type already rejects.
+
 **No custody string reaches a platform-native key store on any bridge.** A caller
 reaches Apple Keychain or Android Keystore by passing a `KeyCustodyProvider` to
 `identity_create_with_custody`. `scp_platform::CustodyType` names the substrates a key

@@ -49,7 +49,9 @@ asyncio.run(main())
 
 ## Key custody
 
-`identity_create` takes a custody string, and a shipped PyO3 build accepts one
+`identity_create` takes a `CustodyType` or the string it spells, and carries no
+default, so a caller names the key store and this SDK names none for them. A
+shipped PyO3 build accepts one
 of them: `CustodyType.FILE` (`"file"`) builds a `FileKeyCustody` that derives
 the file key with Argon2id and encrypts `$HOME/.scp/keys.bin` with AES-256-GCM.
 `CustodyType.IN_MEMORY` (`"in_memory"`) compiles only under the bridge's

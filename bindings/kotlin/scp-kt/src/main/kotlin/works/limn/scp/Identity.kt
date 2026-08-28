@@ -240,27 +240,22 @@ class IdentityAdvancedBridge internal constructor(
     /**
      * Creates a new identity with an agent signing key (ADR-039).
      *
+     * [custody] carries no default, so the caller names the key store that
+     * holds this identity's keys and this bridge names none for them. Which
+     * key store holds a private key decides who can reach that key, so a
+     * default would pick a security-relevant answer the caller never stated.
+     * This method sends [CustodyType.rawValue] to the UniFFI bridge, so the
+     * compiler rejects a custody string the bridge does not name. The bridge
+     * builds a key store for [CustodyType.IN_MEMORY] alone, and it answers
+     * [CustodyType.PLATFORM] and [CustodyType.SOFTWARE] with
+     * `SCP-IDENT-1003`; inject a `KeyCustodyProvider` through
+     * `identityCreateWithCustody` to reach Android Keystore.
+     *
      * @param custody Key custody method.
      * @return Opaque identity handle with agent key.
      */
     suspend fun createWithAgentKey(custody: CustodyType): Long =
         bridge.ffiCall { bindings.identityCreateWithAgentKey(custody.rawValue) }
-
-    /**
-     * Creates a new identity with an agent signing key (ADR-039).
-     *
-     * Overload accepting a raw string for backward compatibility.
-     *
-     * @param custody The custody string the UniFFI bridge accepts, which is
-     *   `"in_memory"` and no other. The bridge answers `"platform"` and
-     *   `"software"` with `SCP-IDENT-1003` because neither string reaches a
-     *   platform key store; inject a `KeyCustodyProvider` through
-     *   `identityCreateWithCustody` to reach Android Keystore. Every other
-     *   string draws `SCP-VALID-7005`.
-     * @return Opaque identity handle with agent key.
-     */
-    suspend fun createWithAgentKey(custody: String = "in_memory"): Long =
-        bridge.ffiCall { bindings.identityCreateWithAgentKey(custody) }
 
     /**
      * Adds an agent signing key to an existing identity (ADR-039).

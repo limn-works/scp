@@ -721,20 +721,33 @@ class SCP:
             )
         return await asyncio.to_thread(self._native.identity_attest_device, identity_did)
 
-    async def identity_create(self, custody: CustodyType | str = CustodyType.FILE) -> Any:
-        """Delegate to ``_scp_core.SCP.identity_create`` (returns :class:`Identity`)."""
+    async def identity_create(self, custody: CustodyType | str) -> Any:
+        """Delegate to ``_scp_core.SCP.identity_create`` (returns :class:`Identity`).
+
+        ``custody`` carries no default, so the caller names the key store that
+        holds this identity's keys and this SDK names none for them. Which key
+        store holds a private key decides who can reach that key, so a default
+        would pick a security-relevant answer the caller never stated. Read
+        :class:`~scp_sdk.types.CustodyType` for what each custody string
+        reaches on the PyO3 bridge.
+        """
         from scp_sdk.identity import Identity
 
         custody_str = custody.value if isinstance(custody, CustodyType) else custody
         raw = await asyncio.to_thread(self._native.identity_create, custody_str)
         return Identity(raw)
 
-    async def identity_create_with_agent_key(
-        self, custody: CustodyType | str = CustodyType.FILE
-    ) -> Any:
+    async def identity_create_with_agent_key(self, custody: CustodyType | str) -> Any:
         """Delegate to ``_scp_core.SCP.identity_create_with_agent_key``.
 
         Returns an :class:`Identity` wrapper.
+
+        ``custody`` carries no default, so the caller names the key store that
+        holds this identity's keys and this SDK names none for them. Which key
+        store holds a private key decides who can reach that key, so a default
+        would pick a security-relevant answer the caller never stated. Read
+        :class:`~scp_sdk.types.CustodyType` for what each custody string
+        reaches on the PyO3 bridge.
         """
         from scp_sdk.identity import Identity
 

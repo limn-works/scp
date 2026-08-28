@@ -122,10 +122,14 @@ from scp_sdk._scp_core import py_identity_create
 
 class Identity:
     @classmethod
-    async def create(cls, custody: str = "file") -> Identity:
+    async def create(cls, custody: str) -> Identity:
         raw = await py_identity_create(custody)
         return cls(raw)
 ```
+
+`create` takes the custody string as a required argument and offers no default. Key
+custody is a security-relevant choice, and the agent-first API design tenet in
+CLAUDE.md forbids an SDK picking one on a caller's behalf.
 
 The PyO3 bridge builds a key store from two custody strings. `"file"` writes an
 `$HOME/.scp/keys.bin` key file that `FileKeyCustody` encrypts with Argon2id and

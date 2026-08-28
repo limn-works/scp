@@ -103,7 +103,7 @@ class CustodyCallErrorCodeTest {
         runBlocking {
             val thrown =
                 assertFailsWith<ScpException.Identity> {
-                    scp.identityCreate(custody = "platform")
+                    scp.identityCreate(custody = CustodyType.PLATFORM)
                 }
             assertEquals(
                 PLATFORM_CUSTODY_REQUIRED_CODE,
@@ -119,7 +119,7 @@ class CustodyCallErrorCodeTest {
         runBlocking {
             val thrown =
                 assertFailsWith<ScpException.Identity> {
-                    scp.identityCreate(custody = "software")
+                    scp.identityCreate(custody = CustodyType.SOFTWARE)
                 }
             assertEquals(PLATFORM_CUSTODY_REQUIRED_CODE, thrown.code)
         }
@@ -130,18 +130,23 @@ class CustodyCallErrorCodeTest {
         runBlocking {
             val thrown =
                 assertFailsWith<ScpException.Identity> {
-                    scp.identityCreateWithAgentKey(custody = "platform")
+                    scp.identityCreateWithAgentKey(custody = CustodyType.PLATFORM)
                 }
             assertEquals(PLATFORM_CUSTODY_REQUIRED_CODE, thrown.code)
         }
     }
 
+    // `SCP.identityCreate` takes a `CustodyType`, so no caller of the SDK can
+    // name a custody string the enum does not carry. This test reaches past
+    // that signature to the UniFFI `Scp` object `SCP` holds in `inner`, because
+    // the bridge still screens every string it receives and this test pins the
+    // code it answers an unrecognized one with.
     @Test
     fun `identityCreate answers an unrecognized custody string with SCP-VALID-7005`() {
         runBlocking {
             val thrown =
                 assertFailsWith<ScpException.Validation> {
-                    scp.identityCreate(custody = "magic")
+                    scp.inner.identityCreate(custody = "magic", testingSeed = null)
                 }
             assertEquals(UNRECOGNIZED_CUSTODY_CODE, thrown.code)
         }
@@ -150,7 +155,7 @@ class CustodyCallErrorCodeTest {
     @Test
     fun `identityCreate accepts the one custody string of the three the bridge parses`() {
         runBlocking {
-            val identity = scp.identityCreate(custody = CustodyType.IN_MEMORY.rawValue)
+            val identity = scp.identityCreate(custody = CustodyType.IN_MEMORY)
             assertEquals(
                 true,
                 identity.did().startsWith("did:dht:"),

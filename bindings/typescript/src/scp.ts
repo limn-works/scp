@@ -717,8 +717,13 @@ export class SCP {
    * passes `"platform"` or `"software"`.
    * @throws A `ValidationError` carrying `SCP-VALID-7005` when the caller
    * passes a string {@link CustodyType} does not carry.
+   *
+   * `custody` carries no default, so the caller names the key store that holds
+   * this identity's keys and this SDK names none for them. Which key store
+   * holds a private key decides who can reach that key, so a default would
+   * pick a security-relevant answer the caller never stated.
    */
-  async identityCreate(custody: CustodyType = "in_memory"): Promise<Identity> {
+  async identityCreate(custody: CustodyType): Promise<Identity> {
     try {
       const raw = await (this.#native.identityCreate as (c: string) => Promise<unknown>)(custody);
       const { Identity: IdentityCls } = await import("./identity");
@@ -737,8 +742,13 @@ export class SCP {
    * {@link SCP.identityCreate} matches, so it builds the same key store for
    * `"in_memory"` and answers every other custody string with the code
    * {@link SCP.identityCreate} answers it with.
+   *
+   * `custody` carries no default, so the caller names the key store that holds
+   * this identity's keys and this SDK names none for them. Which key store
+   * holds a private key decides who can reach that key, so a default would
+   * pick a security-relevant answer the caller never stated.
    */
-  async identityCreateWithAgentKey(custody: CustodyType = "in_memory"): Promise<Identity> {
+  async identityCreateWithAgentKey(custody: CustodyType): Promise<Identity> {
     try {
       const raw = await (
         this.#native.identityCreateWithAgentKey as (c: string) => Promise<unknown>

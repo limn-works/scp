@@ -66,9 +66,10 @@ try await scp.contextClose(handle: ctx, identity: identity)
 
 ## Key custody
 
-`identityCreate` takes a custody string, and the UniFFI bridge builds a key
-store from one string only: `"in_memory"`, which it compiles under its `testing`
-feature. A released XCFramework throws `ScpError.Identity` carrying
+`identityCreate` takes a `CustodyType` and carries no default, so a caller names
+the key store and this SDK names none for them. Each member spells a custody
+string the UniFFI bridge matches, and that bridge builds a key store from one of
+them only: `"in_memory"`, which it compiles under its `testing` feature. A released XCFramework throws `ScpError.Identity` carrying
 `SCP-IDENT-1008` for `"in_memory"`, it throws `ScpError.Identity` carrying
 `SCP-IDENT-1003` for `"platform"` and for `"software"`, and it throws
 `ScpError.Validation` carrying `SCP-VALID-7005` for any other string. No custody

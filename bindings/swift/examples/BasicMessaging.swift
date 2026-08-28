@@ -15,8 +15,8 @@ struct BasicMessaging {
         defer { Task { try? await scp.shutdown(timeout: 5) } }
 
         // Create two identities via the SDK wrapper function.
-        let alice = try await scp.identityCreate(custody: "in_memory")
-        let bob = try await scp.identityCreate(custody: "in_memory")
+        let alice = try await scp.identityCreate(custody: .inMemory)
+        let bob = try await scp.identityCreate(custody: .inMemory)
         print("Alice DID: \(alice.did())")
         print("Bob DID: \(bob.did())")
 

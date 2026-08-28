@@ -253,7 +253,7 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
            ...
    ```
 
-   - `Identity.create()` is the entry point. The custody parameter defaults to `"file"`, which is the only custody string a shipped PyO3 build accepts. To store keys in Apple Keychain or in Android Keystore, inject a `KeyCustodyProvider` through `identity_create_with_custody` instead.
+   - `Identity.create()` is the entry point. The custody parameter is required and carries no default, because key custody is a security-relevant choice an SDK does not make for a caller. `"file"` is the only custody string a shipped PyO3 build accepts. To store keys in Apple Keychain or in Android Keystore, inject a `KeyCustodyProvider` through `identity_create_with_custody` instead.
    - All `Identity` instances expose `.did` (string), `.custody_type` (string).
    - Sync wrappers (`create_sync`, `load_sync`) use `asyncio.run()`.
 

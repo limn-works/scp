@@ -731,17 +731,24 @@ public extension SCP {
 
     /// Forwards to ``Scp/identityCreate`` on ``inner``.
     ///
+    /// `custody` carries no default, so the caller names the key store that
+    /// holds this identity's keys and this SDK names none for them. Which key
+    /// store holds a private key decides who can reach that key, so a default
+    /// would pick a security-relevant answer the caller never stated. This
+    /// method sends ``CustodyType/rawValue`` to the UniFFI bridge, so the
+    /// compiler rejects a custody string the bridge does not name.
+    ///
     /// `testingSeed` is a testing-only parameter for the ADR-046
     /// cross-bridge parity harness; pass `nil` from production callers
     /// (the `testing` in-memory path uses OS RNG when
     /// `testingSeed` is `nil`). A non-`nil` `testingSeed` is only valid
-    /// for `custody == "in_memory"`. The UniFFI bridge judges the custody
-    /// name before the seed, so every other custody string reports that
-    /// name's own code — `SCP-IDENT-1003` for `"platform"` and
-    /// `"software"`, `SCP-VALID-7005` for anything else — and this bridge
-    /// emits no `SCP-VALID-7009`.
-    func identityCreate(custody: String, testingSeed: Data? = nil) async throws -> Identity {
-        try await inner.identityCreate(custody: custody, testingSeed: testingSeed)
+    /// for `custody == .inMemory`. The UniFFI bridge judges the custody
+    /// name before the seed, so every other custody name reports that
+    /// name's own code — `SCP-IDENT-1003` for ``CustodyType/platform`` and
+    /// ``CustodyType/software`` — and this bridge emits no
+    /// `SCP-VALID-7009`.
+    func identityCreate(custody: CustodyType, testingSeed: Data? = nil) async throws -> Identity {
+        try await inner.identityCreate(custody: custody.rawValue, testingSeed: testingSeed)
     }
 
     /// Forwards to ``Scp/identityCreateLinkAttestation`` on ``inner``.
@@ -750,8 +757,15 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/identityCreateWithAgentKey`` on ``inner``.
-    func identityCreateWithAgentKey(custody: String) async throws -> Identity {
-        try await inner.identityCreateWithAgentKey(custody: custody)
+    ///
+    /// `custody` carries no default, so the caller names the key store that
+    /// holds this identity's keys and this SDK names none for them. Which key
+    /// store holds a private key decides who can reach that key, so a default
+    /// would pick a security-relevant answer the caller never stated. This
+    /// method sends ``CustodyType/rawValue`` to the UniFFI bridge, so the
+    /// compiler rejects a custody string the bridge does not name.
+    func identityCreateWithAgentKey(custody: CustodyType) async throws -> Identity {
+        try await inner.identityCreateWithAgentKey(custody: custody.rawValue)
     }
 
     /// Forwards to ``Scp/identityCreateWithCustody`` on ``inner``.

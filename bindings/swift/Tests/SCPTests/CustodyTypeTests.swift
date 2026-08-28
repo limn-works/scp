@@ -22,6 +22,13 @@ import XCTest
 /// UniFFI cdylib through the real `SCP` class, so each one exercises the
 /// rejection path rather than constructing an `ScpError` by hand.
 ///
+/// `SCP.identityCreate` takes a `CustodyType`, so no caller of the SDK can
+/// name a custody string the enum does not carry.
+/// `testUnrecognizedCustodyStringDrawsValidationCode` reaches past that
+/// signature to the UniFFI `Scp` object `SCP` holds in `inner`, because the
+/// bridge still screens every string it receives and this test pins the code
+/// it answers an unrecognized one with.
+///
 /// ## Provenance
 ///
 /// - Spec section 3.2 (Key Custody)
@@ -92,7 +99,7 @@ final class CustodyTypeTests: XCTestCase {
 
     /// The one case that reaches a key store mints a real `did:dht` identity.
     func testInMemoryCustodyStringCreatesAnIdentity() async throws {
-        let identity = try await scp.identityCreate(custody: CustodyType.inMemory.rawValue)
+        let identity = try await scp.identityCreate(custody: .inMemory)
         XCTAssertTrue(identity.did().hasPrefix("did:dht:"), "the accepted custody string must mint a did:dht identity")
     }
 
@@ -102,14 +109,14 @@ final class CustodyTypeTests: XCTestCase {
     /// `SCP-IDENT-1003`.
     func testPlatformCustodyStringFailsClosed() async {
         await assertIdentityCode(Self.custodyProviderRequiredCode) {
-            try await self.scp.identityCreate(custody: CustodyType.platform.rawValue)
+            try await self.scp.identityCreate(custody: .platform)
         }
     }
 
     /// `software` fails closed for the same reason and with the same code.
     func testSoftwareCustodyStringFailsClosed() async {
         await assertIdentityCode(Self.custodyProviderRequiredCode) {
-            try await self.scp.identityCreate(custody: CustodyType.software.rawValue)
+            try await self.scp.identityCreate(custody: .software)
         }
     }
 
@@ -117,15 +124,18 @@ final class CustodyTypeTests: XCTestCase {
     /// path falls back to a different key store.
     func testCreateWithAgentKeyRejectsPlatformCustodyString() async {
         await assertIdentityCode(Self.custodyProviderRequiredCode) {
-            try await self.scp.identityCreateWithAgentKey(custody: CustodyType.platform.rawValue)
+            try await self.scp.identityCreateWithAgentKey(custody: .platform)
         }
     }
 
     /// A custody string the enum does not carry draws the validation code, not
     /// the identity code, so the two rejections stay distinguishable.
+    ///
+    /// `SCP.identityCreate` takes a `CustodyType`, so this test sends `"magic"`
+    /// to the UniFFI `Scp` object directly.
     func testUnrecognizedCustodyStringDrawsValidationCode() async {
         do {
-            _ = try await scp.identityCreate(custody: "magic")
+            _ = try await scp.inner.identityCreate(custody: "magic", testingSeed: nil)
             XCTFail("expected ScpError.Validation(\(Self.unrecognizedCustodyCode)) to be thrown")
         } catch let ScpError.Validation(_, code) {
             XCTAssertEqual(code, Self.unrecognizedCustodyCode, "unexpected validation code")

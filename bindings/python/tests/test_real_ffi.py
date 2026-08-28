@@ -239,6 +239,21 @@ class TestIdentity:
             await scp.identity_create("magic")
         assert str(excinfo.value).startswith("[SCP-VALID-7005]")
 
+    async def test_create_requires_a_custody_argument(self, scp: SCP):
+        """Omitting custody raises ``TypeError``; the SDK names no key store.
+
+        Which key store holds a private key decides who can reach that key, so
+        the agent-first API design tenet in CLAUDE.md forbids this SDK choosing
+        one for a caller. ``identity_create`` carried ``CustodyType.FILE`` as a
+        default until SCP-294 removed it, and that default wrote
+        ``$HOME/.scp/keys.bin`` for a caller who named no key store at all.
+        """
+        with pytest.raises(TypeError):
+            await scp.identity_create()
+
+        with pytest.raises(TypeError):
+            await scp.identity_create_with_agent_key()
+
     async def test_create_rejects_platform_custody_with_typed_code(self, scp: SCP):
         """``"platform"`` fails closed instead of building a key file.
 
