@@ -107,7 +107,7 @@ enum class CustodyType(val rawValue: String) {
      * AES-256-GCM (`crates/scp-platform/src/file.rs`).
      *
      * The bridge reads the passphrase from the `SCP_KEY_PASSPHRASE` environment
-     * variable and answers an unset variable with `SCP-VALID-7001`.
+     * variable and answers an unset variable with `SCP-VALID-7005`.
      */
     ENCRYPTED_FILE("encrypted_file"),
 

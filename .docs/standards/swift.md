@@ -117,7 +117,7 @@ import Testing
 
 @Test
 func createIdentityReturnsValidDid() async throws {
-    let identity = try await Identity.create(custody: "in_memory")
+    let identity = try await Identity.create(custody: .encryptedFile)
     #expect(identity.did.hasPrefix("did:dht:"))
 }
 

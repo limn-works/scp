@@ -32,7 +32,7 @@ For a full Android app, import into Android Studio and add the SCP SDK as a depe
 ## Next Steps
 
 - Load the native library with `System.loadLibrary("scp_ffi_uniffi")`
-- Replace the `bridge.identity.create(CustodyType.IN_MEMORY)` call with `identityCreateWithCustody(provider)` on a `works.limn.scp.SCP` instance, passing your own `uniffi.scp.KeyCustodyProvider` over Android Keystore — that call returns `SCP-IDENT-1059` on a released build, because no pre-rotation custody backend is wired yet
+- Replace the `bridge.identity.create(CustodyType.ENCRYPTED_FILE)` call with `identityCreateWithCustody(provider)` on a `works.limn.scp.SCP` instance, passing your own `uniffi.scp.KeyCustodyProvider` over Android Keystore — that call returns `SCP-IDENT-1059` on a released build, because no pre-rotation custody backend is wired yet
 - Add relay connectivity for real transport
 - Integrate with Android lifecycle (ViewModel, coroutine scopes)
 - See `docs/examples/kotlin/` for more detailed examples

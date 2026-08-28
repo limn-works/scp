@@ -146,7 +146,7 @@ from scp_sdk import Identity, Context
 
 @pytest.fixture
 async def alice():
-    return await Identity.create(custody="in_memory")
+    return await Identity.create(custody=CustodyType.ENCRYPTED_FILE)
 
 @pytest.fixture
 async def context(alice):
@@ -161,7 +161,7 @@ async def context(alice):
 
 ```python
 async def test_identity_create_returns_valid_did():
-    identity = await Identity.create(custody="in_memory")
+    identity = await Identity.create(custody=CustodyType.ENCRYPTED_FILE)
     assert identity.did.startswith("did:dht:")
 
 async def test_context_send_requires_active_state():

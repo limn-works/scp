@@ -385,8 +385,9 @@ already rejects.
 values.** `scp_platform::CustodyType` (`crates/scp-platform/src/traits.rs:223`–`:232`)
 names where a key already sits — `InMemory`, `Hardware`, and `Software` — and
 `KeyCustody::custody_type` returns one of those three. A caller selects a backend with
-the two values in the table above, never with these three, and §3.2.2 of the identity
-spec governs neither this report nor the values a DID document publishes.
+the two values in the table above, never with these three. §3.2.2 of the identity
+spec does not govern this report, which names a storage location; it does state the
+values a DID document publishes, which name extractability and an unlock factor.
 
 **Reading a custody type back.** `Identity::custody_type()` hands back the label the
 identity was created under, and hands back `"callback"` for an identity created through

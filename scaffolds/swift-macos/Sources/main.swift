@@ -15,7 +15,7 @@ struct SCPmacOSApp {
         // 1. Create a DID identity. This in-memory key store loses every key
         //    on process exit, and a released build rejects it with
         //    SCP-IDENT-1008.
-        let identity = try await createIdentity(custody: CustodyType.inMemory.rawValue)
+        let identity = try await createIdentity(custody: CustodyType.encryptedFile.rawValue)
         print("Created identity: \(identity.did())")
 
         // 2. Create an encrypted context via the UniFFI bridge.

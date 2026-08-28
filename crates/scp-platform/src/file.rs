@@ -443,6 +443,19 @@ impl FileKeyCustody {
         let ct_start = nonce_start + NONCE_LEN;
         let ct_end = ct_start + KEY_LEN + TAG_LEN;
 
+        // A handle map records an entry index, and the file behind it can hold
+        // fewer entries than that index names: `destroy_key` compacts the file,
+        // and a second `FileKeyCustody` over the same path writes the file this
+        // one read. Slicing without this check panics, and that panic unwinds
+        // across the PyO3, napi, and UniFFI boundaries.
+        if data.len() < ct_end {
+            return Err(PlatformError::CustodyError(format!(
+                "key file holds no entry at index {entry_index}: the file is {} bytes \
+                 and that entry ends at {ct_end}",
+                data.len()
+            )));
+        }
+
         let nonce = Nonce::from_slice(&data[nonce_start..ct_start]);
         let ciphertext_and_tag = &data[ct_start..ct_end];
 

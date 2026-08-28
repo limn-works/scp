@@ -10207,7 +10207,7 @@ impl Scp {
             let registry = identity_custody_registry(&self.inner);
             let entry = registry.get(&did).ok_or_else(|| ScpError::Identity {
                 msg: format!(
-                    "identity '{did}' has no retained custody on this SCP instance —                      the published custody value is read off the running backend"
+                    "identity '{did}' has no retained custody on this SCP instance — the published custody value is read off the running backend"
                 ),
                 code: codes::IDENT_1017.to_owned(),
             })?;

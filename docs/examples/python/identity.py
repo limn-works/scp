@@ -24,7 +24,7 @@ async def main() -> None:
     #    spec, the custody vocabulary, states those two values. Neither call
     #    creates an identity on a released wheel: both return SCP-IDENT-1059,
     #    because no pre-rotation custody backend is wired yet.
-    identity = await Identity.create(custody=CustodyType.IN_MEMORY)
+    identity = await Identity.create(custody=CustodyType.ENCRYPTED_FILE)
 
     print(f"DID: {identity.did}")
     print(f"Custody type: {identity.custody_type}")
@@ -46,7 +46,7 @@ async def main() -> None:
     # 3. Create an identity with an agent signing key (ADR-039).
     #    Agent keys enable human+agent shared DID patterns.
     agent_identity = await Identity.create_with_agent_key(
-        custody=CustodyType.IN_MEMORY,
+        custody=CustodyType.ENCRYPTED_FILE,
     )
     print(f"Agent identity DID: {agent_identity.did}")
     print()

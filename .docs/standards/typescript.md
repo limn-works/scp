@@ -94,7 +94,7 @@ import { Identity } from "../src/index.js";
 
 describe("Identity", () => {
   it("creates identity with valid DID", async () => {
-    const identity = await Identity.create({ custody: "in_memory" });
+    const identity = await Identity.create({ custody: "encrypted_file" });
     expect(identity.did).toMatch(/^did:dht:/);
   });
 

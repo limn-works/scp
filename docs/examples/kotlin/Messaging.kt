@@ -25,8 +25,8 @@ import works.limn.scp.bridge.CoroutineBridge
 
 fun messagingExample(bridge: CoroutineBridge) = runBlocking {
     // 1. Create two identities.
-    val aliceHandle = bridge.identity.create(CustodyType.IN_MEMORY)
-    val bobHandle = bridge.identity.create(CustodyType.IN_MEMORY)
+    val aliceHandle = bridge.identity.create(CustodyType.ENCRYPTED_FILE)
+    val bobHandle = bridge.identity.create(CustodyType.ENCRYPTED_FILE)
     println("Alice handle: $aliceHandle")
     println("Bob handle:   $bobHandle")
 

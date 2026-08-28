@@ -59,14 +59,16 @@ which requires the `testing` feature of `scp-platform`. `crates/scp-ffi/uniffi/C
 now names that edge in two places and neither one reaches a shipped build: the
 crate's own `testing` feature adds `scp-platform/testing`, and `[dev-dependencies]`
 adds it for the test binaries. The regular `[dependencies]` entry names
-`software_platform`, `encrypting`, and `sqlite`, and no `testing`, so a shipped
+`software_platform`, `file`, `encrypting`, and `sqlite`, and no `testing`, so a shipped
 build returns `SCP-IDENT-1008` for `"in_memory"` instead of creating an identity.
 `scripts/check-shipped-feature-graph.sh` fails the build when a shipped artifact's
 resolved feature set contains `scp-platform/testing`.
 
-The `"platform"` and `"software"` custody strings return `ScpError::Identity`
-carrying `SCP-IDENT-1003`. That error is the permanent behaviour, not a waiting
-state: `identity_create_with_custody` is exported on all three bridges, and
+The `"platform"` and `"software"` custody strings name no custody value, so they
+return `ScpError::Validation` carrying `SCP-VALID-7005`, the code every string
+outside the vocabulary returns; `SCP-IDENT-1003` is what `"os_keystore"` returns
+when the bridge holds no `KeyCustodyProvider`. §3.2.2 of `.docs/specs/03-identity.md`
+states the vocabulary. That behaviour is permanent, not a waiting state: `identity_create_with_custody` is exported on all three bridges, and
 passing a `KeyCustodyProvider` to it is the only path to Apple Keychain or Android
 Keystore. No custody string reaches either key store on any bridge.
 

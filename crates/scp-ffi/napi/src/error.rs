@@ -678,7 +678,7 @@ pub(crate) fn validate_custody_type(custody: &str) -> Result<&str, ScpNapiError>
         // unrecognized enum string is a wrong-value error, not the
         // malformed/wrong-shape byte input that VALID_7007 is reserved for
         // (api-design J2, M1). The PyO3 bridge's `build_key_custody` and the
-        // UniFFI bridge's `parse_custody_method` emit VALID_7005 for this same
+        // UniFFI bridge's `build_key_custody` emit VALID_7005 for this same
         // condition, so a caller who switches on the code string reads one
         // value across all three bridges.
         other => Err(ScpNapiError::Validation {

@@ -40,7 +40,7 @@ public nonisolated enum CustodyType: String, Sendable, CaseIterable {
     ///
     /// The bridge reads the passphrase from the `SCP_KEY_PASSPHRASE`
     /// environment variable and answers an unset variable with
-    /// `SCP-VALID-7001`.
+    /// `SCP-VALID-7005`.
     case encryptedFile = "encrypted_file"
     /// Selects the operating system's own key store, which SCP reaches through
     /// the platform key-custody callback an SDK consumer supplies.

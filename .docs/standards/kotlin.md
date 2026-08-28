@@ -38,7 +38,7 @@ All I/O operations are `suspend` functions. Streaming uses `Flow<T>`. Blocking F
 class IdentityTest {
     @Test
     fun `create identity returns valid DID`() = runTest {
-        val identity = Identity.create(custody = "in_memory")
+        val identity = Identity.create(custody = CustodyType.ENCRYPTED_FILE)
         assertTrue(identity.did.startsWith("did:dht:"))
     }
 

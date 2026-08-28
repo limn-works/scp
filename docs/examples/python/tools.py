@@ -28,7 +28,7 @@ from scp_sdk.ucan import mint
 
 async def main() -> None:
     # 1. Create an identity for the tool operator.
-    operator = await Identity.create(custody=CustodyType.IN_MEMORY)
+    operator = await Identity.create(custody=CustodyType.ENCRYPTED_FILE)
     print(f"Operator DID: {operator.did}")
 
     # 2. Create a context with tool capabilities.

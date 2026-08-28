@@ -37,7 +37,7 @@ fun main() = runBlocking {
     //
     // // 1. Create identity. This in-memory key store loses every key on
     // //    process exit, and a released build rejects it with SCP-IDENT-1008.
-    // val identityHandle = bridge.identity.create(CustodyType.IN_MEMORY)
+    // val identityHandle = bridge.identity.create(CustodyType.ENCRYPTED_FILE)
     //
     // // 2. Create an encrypted context
     // val paramsJson = """

@@ -23,7 +23,7 @@ import works.limn.scp.bridge.CoroutineBridge
 
 fun contextExample(bridge: CoroutineBridge) = runBlocking {
     // 1. Create the identity that will own the context.
-    val aliceHandle = bridge.identity.create(CustodyType.IN_MEMORY)
+    val aliceHandle = bridge.identity.create(CustodyType.ENCRYPTED_FILE)
     println("Alice identity handle: $aliceHandle")
 
     // 2. Define context parameters as JSON.
@@ -62,7 +62,7 @@ fun contextExample(bridge: CoroutineBridge) = runBlocking {
     println("  Members: $members")
 
     // 6. Bob joins the context.
-    val bobHandle = bridge.identity.create(CustodyType.IN_MEMORY)
+    val bobHandle = bridge.identity.create(CustodyType.ENCRYPTED_FILE)
     val bobContextHandle = bridge.context.join(bobHandle, "context-id")
     println()
     println("Bob joined the context, handle: $bobContextHandle")
