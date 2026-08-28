@@ -1,6 +1,6 @@
 {
   "project": "scp",
-  "description": "Shared-DID human-agent identity model: human and agent share one DID with three verification methods (#0 identity key, #active human signing key, #agent agent signing key). Mechanical enforcement of one-agent-per-context, structural accountability, protocol-native action provenance. Permission model: Category A (DID doc mods, #0 only), Category B (operational actions, user-configurable), Category C (context-configurable). Five-layer enforcement stack: custody separation, SDK defaults, verifier validation, custody attestation, behavioral signals. ADR-039.",
+  "description": "Shared-DID human-agent identity model: human and agent share one DID with three verification methods (#0 identity key, #active human signing key, #agent agent signing key). Mechanical enforcement of one-agent-per-context, structural accountability, protocol-native action provenance. Permission model: Category A (DID doc mods, #0 only), Category B (operational actions, user-configurable), Category C (context-configurable). ADR-063 adds a fifth Category C mechanism, user_authentication_required. Five-layer enforcement stack: custody separation, SDK defaults, verifier validation, custody attestation, behavioral signals. ADR-039.",
   "gates": [
     {
       "id": "gate-design-artifacts",
@@ -98,7 +98,9 @@
         "SCP-AB-031",
         "SCP-AB-032",
         "SCP-AB-033",
-        "SCP-AB-036"
+        "SCP-AB-036",
+        "SCP-AB-037",
+        "SCP-AB-038"
       ]
     },
     {
@@ -1714,28 +1716,33 @@
       "status": "pending",
       "files": [
         "crates/scp-protocol/src/context/metadata.rs",
-        "crates/scp-runtime/src/context/governance_helpers.rs"
+        "crates/scp-runtime/src/context/governance_helpers.rs",
+        ".docs/specs/09-security-model.md"
       ],
-      "description": "§5.7 lists agent policy — agent_keys_allowed, agent_rate_limit, and agent_cosign_required — among the structural fields a prospective member reads before joining, and §5.9 states that the context's governance sets and changes them through the same propose/approve path it uses for any other parameter. A change to any of the three ContextParams fields is a metadata change subject to metadata:edit; a change to an agent-restricted role assignment is subject to role:assign.",
+      "description": "§5.7 lists agent policy — agent_keys_allowed, agent_rate_limit, agent_cosign_required, and user_authentication_required — among the structural fields a prospective member reads before joining, and §5.9 states that the context's governance sets and changes them through the same propose/approve path it uses for any other parameter. A change to any of the four ContextParams fields is a metadata change subject to metadata:edit; a change to an agent-restricted role assignment is subject to role:assign. §9.18.B of the security spec is the configurable-parameter registry the four fields need rows in, and this story adds those rows with the projection. user_authentication_required carries the whole legibility guarantee for a member on macOS, Linux, or Windows, because §9.3 of the security spec records that those platforms have no App Attest or Play Integrity equivalent, so a member on one of them reads the capability list before joining and learns which capabilities they will never exercise in this context.",
       "acceptanceCriteria": [
-        "The structural metadata a prospective member reads before joining includes agent_keys_allowed, agent_rate_limit, and agent_cosign_required",
-        "The three fields are visible whatever the context's MetadataVisibilityPolicy holds",
-        "A governance proposal that changes any of the three fields requires the metadata:edit capability",
+        "The structural metadata a prospective member reads before joining includes agent_keys_allowed, agent_rate_limit, agent_cosign_required, and user_authentication_required",
+        "The four fields are visible whatever the context's MetadataVisibilityPolicy holds",
+        "A governance proposal that changes any of the four fields requires the metadata:edit capability",
         "A governance proposal that changes an agent-restricted role assignment requires the role:assign capability",
         "Executing an approved change updates the context's structural metadata and the change is visible to every member without a re-join",
         "A test asserts a member without metadata:edit cannot change agent_keys_allowed",
-        "A test reads the three fields from a context the reader has not joined"
+        "A test asserts a member without metadata:edit cannot change user_authentication_required",
+        "A test reads the four fields from a context the reader has not joined",
+        "The 9.18.B Configurable Parameters table of .docs/specs/09-security-model.md carries one row per field for all four fields, each naming its ContextParams path, its default, and its spec reference"
       ],
       "actionItems": [
-        "Add the three fields to the structural metadata projection",
+        "Add the four fields to the structural metadata projection",
         "Gate the parameter change on metadata:edit and the role change on role:assign",
-        "Add the pre-join read test and the unauthorized-change test"
+        "Add four rows to the 9.18.B Configurable Parameters table",
+        "Add the pre-join read test and the two unauthorized-change tests"
       ],
       "blockedBy": [
         "SCP-AB-028",
         "SCP-AB-029",
         "SCP-AB-030",
-        "SCP-AB-031"
+        "SCP-AB-031",
+        "SCP-AB-037"
       ],
       "sources": [
         {
@@ -1749,6 +1756,10 @@
         {
           "file": ".docs/specs/05-contexts.md",
           "section": "## 5.9 Governance"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.18.B Configurable Parameters"
         }
       ],
       "details": {}
@@ -1765,18 +1776,17 @@
         "crates/scp-ffi/napi/src/context.rs",
         "crates/scp-ffi/uniffi/src/context.rs"
       ],
-      "description": "Export the Category C context parameters across the PyO3, napi-rs and UniFFI bridges. This story stops at the bridge boundary; the SDK wrappers and the capability-matrix rows are SCP-AB-036.",
+      "description": "Export the four Category C context parameters across the PyO3, napi-rs and UniFFI bridges. This story stops at the bridge boundary; the SDK wrappers and the capability-matrix rows are SCP-AB-036.",
       "acceptanceCriteria": [
-        "The context-creation parameters of the PyO3, napi-rs, and UniFFI bridges each carry agent_keys_allowed, agent_rate_limit, and agent_cosign_required with the same argument names",
-        "The structural-metadata read of all three bridges returns the three fields",
-        "bindings/python, bindings/typescript, bindings/swift, and bindings/kotlin each expose the three fields on their context-creation parameters and on their metadata read",
-        "python3.12 scripts/check-sdk-coverage.py exits zero",
-        "scripts/check-bridge-symmetry.sh exits zero"
+        "The context-creation parameters of the PyO3, napi-rs, and UniFFI bridges each carry agent_keys_allowed, agent_rate_limit, agent_cosign_required, and user_authentication_required with the same argument names",
+        "The structural-metadata read of all three bridges returns the four fields",
+        "scripts/check-bridge-symmetry.sh exits zero",
+        "scripts/check-cross-layer.sh exits zero"
       ],
       "actionItems": [
-        "Add the the Category C context parameters export to crates/scp-ffi/src",
-        "Add the the Category C context parameters export to crates/scp-ffi/napi/src",
-        "Add the the Category C context parameters export to crates/scp-ffi/uniffi/src"
+        "Add the four Category C context parameters to crates/scp-ffi/src",
+        "Add the four Category C context parameters to crates/scp-ffi/napi/src",
+        "Add the four Category C context parameters to crates/scp-ffi/uniffi/src"
       ],
       "blockedBy": [
         "SCP-AB-032"
@@ -1807,18 +1817,17 @@
         "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Scp.kt",
         ".docs/standards/sdk-capability-matrix.json"
       ],
-      "description": "Wrap the the Category C context parameters bridge exports in the Python, TypeScript, Swift and Kotlin SDKs, and add the capability-matrix rows. Depends on SCP-AB-033 for the exports it wraps.",
+      "description": "Wrap the four Category C context-parameter bridge exports in the Python, TypeScript, Swift and Kotlin SDKs, and add the capability-matrix rows. Depends on SCP-AB-033 for the exports it wraps.",
       "acceptanceCriteria": [
-        "Each of the four SDKs exposes the Category C context parameters with the per-SDK idiom its own standard names",
-        "The capability matrix carries a row per SDK for the Category C context parameters, and python3.12 scripts/check-sdk-coverage.py passes"
+        "Each of the four SDKs exposes agent_keys_allowed, agent_rate_limit, agent_cosign_required, and user_authentication_required on its context-creation parameters and on its structural-metadata read, with the per-SDK idiom its own standard names",
+        "The capability matrix carries a row per SDK for the Category C context parameters, and python3.12 scripts/check-sdk-coverage.py exits zero"
       ],
       "actionItems": [
         "Add the the Category C context parameters wrapper to each of the four SDKs",
         "Add the capability-matrix rows"
       ],
       "blockedBy": [
-        "SCP-AB-032",
-        "SCP-AB-036"
+        "SCP-AB-033"
       ],
       "sources": [
         {
@@ -1872,6 +1881,106 @@
         {
           "file": ".docs/specs/04-agents.md",
           "section": "## 4.9 Agent Permission Model"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-037",
+      "title": "Add user_authentication_required to ContextParams",
+      "gate": "gate-permission-category-c",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/context/params.rs"
+      ],
+      "description": "§4.9.3 defines user_authentication_required as the list of capabilities a member may exercise only when the verification method that signed the action holds a key the platform releases to a signer who has just passed a device-local authentication gesture, on ContextParams, default empty. ADR-063 §Decision 2 states why the parameter holds Vec<Capability> rather than a boolean, a role name, or an ActionCategory: Capability is the vocabulary the ceiling holds, a role grants, and §5.3.1 enumerates, and Capability::new is the canonical parser that closes the ceiling grammar by construction. This story adds the field and its ceiling validation only. The verifier is SCP-AB-038 and the metadata projection is SCP-AB-032. ADR-063 carries four open questions that a human answers before a context may set the field; the tracking issue named in blockedByIssues carries them.",
+      "acceptanceCriteria": [
+        "ContextParams carries a field user_authentication_required: Vec<Capability>",
+        "The Default impl of ContextParams yields an empty vector for user_authentication_required",
+        "The field carries #[serde(default)] so an older serialized ContextParams deserializes with an empty vector",
+        "Every entry of user_authentication_required is validated against the context's ceiling at context creation, and an entry outside the ceiling is rejected with the same error the ceiling validation already returns for an out-of-ceiling role capability",
+        "A test constructs a ContextParams with user_authentication_required containing governance:vote inside the ceiling and asserts creation succeeds",
+        "A test constructs a ContextParams with user_authentication_required containing a capability outside the ceiling and asserts creation is rejected",
+        "A test round-trips a ContextParams carrying a non-empty user_authentication_required through serde and asserts field equality",
+        "A test deserializes a ContextParams JSON document that omits user_authentication_required and asserts the field is an empty vector"
+      ],
+      "actionItems": [
+        "Add user_authentication_required: Vec<Capability> to ContextParams with #[serde(default)]",
+        "Add the empty vector to the Default impl",
+        "Extend the creation-time ceiling validation to the new field",
+        "Add the four tests named in the acceptance criteria"
+      ],
+      "blockedBy": [],
+      "blockedByIssues": [
+        2417
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/04-agents.md",
+          "section": "### 4.9.3 Category C — context-configurable"
+        },
+        {
+          "file": ".docs/adrs/ADR-063-context-declared-user-authentication-gate.md",
+          "section": "## Decision"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.3 Capability Ceiling"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-038",
+      "title": "Reject an action on a user-authentication-gated capability that carries no verified custody attestation",
+      "gate": "gate-permission-category-c",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/envelope/inner/mod.rs",
+        "crates/scp-protocol/src/trust/custody_violation.rs",
+        "crates/scp-ffi/common/src/error_codes.rs"
+      ],
+      "description": "§4.9.3 states the four cases a verifier distinguishes when a context declares user_authentication_required. The verifier resolves the signer's DID document, reads the ScpKeyCustodyAttestation service entry, and reads the custody model that entry declares for the verification method the artifact's signing_key_id names. No shipped artifact produces that attestation on a production path and no shipped code verifies its platform_attestation, so this story delivers the fail-closed verifier §4.9.3 requires: an action on a listed capability is rejected with a typed error, and no code path treats a self-declared KeyCustodyModel::HardwareBiometric as satisfying the requirement. ADR-063 §Decision 5 states why: reading the self-declared enum as satisfied would accept a caller-asserted value as a security guarantee, which is the shape evaluate_sybil_resistance already exhibits and the no-dev-stand-ins tenet of CLAUDE.md forbids. Issue #2171 tracks the production device-attestation backend whose arrival lets case 4 of §4.9.3 return an admission.",
+      "acceptanceCriteria": [
+        "A verification function takes the context's user_authentication_required list, the artifact's invoked capability, and the artifact's signing_key_id, and returns a typed result",
+        "The function returns Ok when the invoked capability is absent from the list, whatever the signing_key_id holds and whatever the DID document carries",
+        "The function returns Err when the invoked capability is present and signing_key_id is Agent, and the error names the invoked capability",
+        "The function returns Err when the invoked capability is present, signing_key_id is Active, and the resolved DID document carries no ScpKeyCustodyAttestation service entry",
+        "The function returns Err when the invoked capability is present, signing_key_id is Active, and the custody attestation declares a KeyCustodyModel other than HardwareBiometric for the named verification method",
+        "The function returns Err when the invoked capability is present, signing_key_id is Active, the custody attestation declares HardwareBiometric, and platform_attestation is None",
+        "The function returns Err when the invoked capability is present, signing_key_id is Active, the custody attestation declares HardwareBiometric, and platform_attestation is Some but no production verifier for it exists, and the error names SCP-IDENT-1016 as the reason no verdict is available",
+        "A distinct error variant exists for each of the five reject cases, so a caller can tell them apart without parsing a message string",
+        "No branch of the function returns Ok on the strength of a KeyCustodyModel value alone, and a test asserts that a ScpKeyCustodyAttestation carrying HardwareBiometric with platform_attestation None is rejected",
+        "A test exercises governance:vote with user_authentication_required containing governance:vote and asserts each of the one accept and five reject cases above",
+        "A test asserts that an artifact whose invoked capability is messages:write, in a context whose user_authentication_required holds only governance:vote, is admitted with no DID document resolution"
+      ],
+      "actionItems": [
+        "Add the verification function and its typed error enum",
+        "Add the error code constant to crates/scp-ffi/common/src/error_codes.rs",
+        "Add the accept and reject tests named in the acceptance criteria"
+      ],
+      "blockedBy": [
+        "SCP-AB-037"
+      ],
+      "blockedByIssues": [
+        2417
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/04-agents.md",
+          "section": "### 4.9.3 Category C — context-configurable"
+        },
+        {
+          "file": ".docs/adrs/ADR-063-context-declared-user-authentication-gate.md",
+          "section": "## Decision"
+        },
+        {
+          "file": ".docs/specs/27-attestations.md",
+          "section": "### 27.3.4 F4 — Key-custody attestation: no domain separator, no construction"
         }
       ],
       "details": {}
