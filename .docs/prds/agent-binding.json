@@ -236,7 +236,7 @@
         "§4.2 states binding is via #agent verification method on the human's DID",
         "§4.3 states one-agent-per-context is mechanically enforced by DID document structure (one #agent VM max)",
         "§4.5 states human-agent pair shares one DID, agent accountability is structural not inferential",
-        "§4.7 documents Category C context restrictions: agent_keys_allowed, agent-specific roles, agent_rate_limit, agent_cosign_required",
+        "§4.7 states that a context restricts an agent through four Category C mechanisms and routes a reader to §4.9.3 for their shapes, rather than enumerating them",
         "§4.8 documents fleet operation under shared-DID model: one agent per DID, multiple DIDs for fleet (full Sybil cost each)",
         "No references to separate agent DIDs or UCAN-delegation-based binding remain in §4"
       ],
@@ -1712,6 +1712,7 @@
       "severity": "major",
       "status": "pending",
       "files": [
+        "crates/scp-protocol/src/context/governance/mod.rs",
         "crates/scp-protocol/src/context/metadata.rs",
         "crates/scp-runtime/src/context/governance_helpers.rs"
       ],
@@ -1719,6 +1720,7 @@
       "acceptanceCriteria": [
         "The structural metadata a prospective member reads before joining includes agent_keys_allowed, agent_rate_limit, and agent_cosign_required",
         "The three fields are visible whatever the context's MetadataVisibilityPolicy holds",
+        "A GovernanceAction variant changes the three Category C ContextParams fields, and executing it is gated on the metadata:edit capability",
         "A governance proposal that changes any of the three fields requires the metadata:edit capability",
         "A governance proposal that changes an agent-restricted role assignment requires the role:assign capability",
         "Executing an approved change updates the context's structural metadata and the change is visible to every member without a re-join",
@@ -1727,6 +1729,7 @@
       ],
       "actionItems": [
         "Add the three fields to the structural metadata projection",
+        "Add the GovernanceAction variant that changes the three fields",
         "Gate the parameter change on metadata:edit and the role change on role:assign",
         "Add the pre-join read test and the unauthorized-change test"
       ],
