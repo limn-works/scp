@@ -20,6 +20,7 @@ pub(crate) mod error;
 pub mod http;
 pub mod projection;
 mod published_state;
+mod republish;
 pub mod self_host;
 pub mod tls;
 pub mod webhook;
@@ -339,6 +340,21 @@ pub struct ApplicationNode<S: Storage> {
     /// Set by [`serve_background`](Self::serve_background) after successful bind.
     /// Wrapped in `Arc` so the spawned background task can clear it on exit.
     serving_addr: Arc<tokio::sync::Mutex<Option<SocketAddr>>>,
+    /// The node's self-DID republish cycle (ADR-003 §2, §3.10.5 step 4).
+    ///
+    /// Not an `Option`: every node has exactly one, because only a builder can
+    /// construct an `ApplicationNode` and both builders fill this field. A
+    /// Mainline DHT record that nothing re-puts expires, so a node without a
+    /// cycle is a node whose DID document stops resolving. The cycle is dormant
+    /// (zero arms) while the node has published nothing — which is the permanent
+    /// state of a [`DhtMode::Disabled`] node — and it seeds itself the moment the
+    /// node publishes. See [`republish`].
+    ///
+    /// `Arc<dyn RepublishCycle>` erases the DHT client type the builder's
+    /// `DidMethod` supplies, which `ApplicationNode<S>` does not carry.
+    /// [`shutdown`](Self::shutdown) stops it; dropping the node without calling
+    /// `shutdown` reaches the cycle's own `Drop` backstop.
+    republish: Arc<dyn republish::RepublishCycle>,
 }
 
 impl<S: Storage + std::fmt::Debug> std::fmt::Debug for ApplicationNode<S> {
@@ -378,20 +394,12 @@ impl<S: Storage> ApplicationNode<S> {
     /// off the network.
     ///
     /// This is a **snapshot**: a NAT tier change re-publishes the document with a
-    /// new sequence, after which this returns the newer record. A long-lived
-    /// consumer (the self-host republish cycle) subscribes to the node's live
-    /// state slot instead (crate-private, so no intra-doc link).
+    /// new sequence, after which this returns the newer record. The node's own
+    /// republish cycle takes a live view of the slot instead of a snapshot, so
+    /// it follows every re-publish (see the crate-private `republish` module).
     #[must_use]
     pub fn published_did_record(&self) -> Option<scp_identity::republish::RepublishEntry> {
         self.state.live_state.get().record
-    }
-
-    /// A live view of this node's published-state slot, yielding every
-    /// subsequent publish (§3.10.5). See [`LiveSlot`].
-    pub(crate) fn subscribe_published_state(
-        &self,
-    ) -> tokio::sync::watch::Receiver<NodePublishedState> {
-        self.state.live_state.subscribe()
     }
 
     /// Returns a reference to the relay handle.
@@ -588,6 +596,19 @@ impl<S: Storage> ApplicationNode<S> {
         if let Some(ref handle) = self.tier_reeval {
             handle.stop_and_wait();
         }
+        // Both republish arms stop here. An arm that outlived shutdown would
+        // keep re-putting this node's address on the DHT for the life of the
+        // process — the §10.12.1 disclosure past shutdown.
+        self.republish.stop_and_wait();
+    }
+
+    /// How many republish arms this node is running, per layer.
+    ///
+    /// Crate-internal: the counts exist so the node's own tests can assert that
+    /// exactly one cycle runs and that it covers both layers (§3.10.6).
+    #[cfg(test)]
+    pub(crate) async fn active_republish_arms(&self) -> republish::ActiveArms {
+        self.republish.active_arms().await
     }
 
     /// Returns a clone of the node's graceful-shutdown cancellation token.
@@ -3081,6 +3102,42 @@ pub(crate) fn resolve_nat(
     })
 }
 
+/// Starts the node's self-DID republish cycle and erases its DHT client type.
+///
+/// ADR-003 §2 of `.docs/adrs/phase-1.md`: republishing "starts when an identity
+/// is loaded". Both builders call this, so every `Node::start` path reaches it —
+/// `build_domain_inner` on the `Reach::Domain` TLS-success arm, and
+/// [`build_no_domain_inner`] on `Reach::NatTraversal`, `Reach::Tunnel`,
+/// `Reach::Local`, and the `Reach::Domain` TLS-failure fall-through.
+///
+/// Both layers run. The DHT keep-alive is the only thing stopping this node's
+/// BEP44 record from expiring off Mainline, and the relay arm fails closed while
+/// no relay is bound and self-heals the instant one is; §3.10.6 forbids turning
+/// either off without a deliberate opt-out, and an unbound relay is not one.
+///
+/// The cycle reads a LIVE VIEW of the slot [`seed_from_startup_publish`] just
+/// built, never a snapshot: a NAT tier change re-publishes the document with a
+/// new `(value, signature, seq)`, and both arms follow it rather than going on
+/// asserting a superseded sequence. While `record` is `None` the cycle sits
+/// dormant at zero arms — the permanent state of a [`DhtMode::Disabled`] node,
+/// which publishes nothing.
+///
+/// The DHT client comes from the node's own [`DidMethod`], so the client that
+/// keeps the record alive is the client that signed the publish.
+async fn start_node_republish_cycle<D: DidMethod + 'static>(
+    did_method: &Arc<D>,
+    live_state: &LiveSlot<NodePublishedState>,
+) -> Arc<dyn republish::RepublishCycle> {
+    Arc::new(
+        republish::start_self_did_republishing(
+            did_method.dht_client(),
+            Arc::new(scp_transport::native::TransportRelayPublisher::new()),
+            live_state.subscribe(),
+        )
+        .await,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Shared domain build logic (extracted for clippy::too_many_lines)
 // ---------------------------------------------------------------------------
@@ -3194,6 +3251,10 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
         tracing::warn!(error = %e, "failed to load bridge auth cache from storage — starting with empty cache");
     }
 
+    // Start this node's self-DID republish cycle (ADR-003 §2). Below every
+    // fallible step in this builder, so no `?` leaves arms to tear down.
+    let republish = start_node_republish_cycle(&did_method, &live_state).await;
+
     let state = Arc::new(http::NodeState {
         did: identity.did.clone(),
         live_state: live_state.clone(),
@@ -3249,6 +3310,7 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
         serving: Arc::new(AtomicBool::new(false)),
         rate_limit_cleanup_spawned: Arc::new(AtomicBool::new(false)),
         serving_addr: Arc::new(tokio::sync::Mutex::new(None)),
+        republish,
     })
 }
 
@@ -3521,6 +3583,10 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
         "application node started (no-domain mode, §10.12.8)"
     );
 
+    // Start this node's self-DID republish cycle (ADR-003 §2). Below every
+    // fallible step in this builder, so no `?` leaves arms to tear down.
+    let republish = start_node_republish_cycle(&did_method, &live_state).await;
+
     let (tier_event_tx, tier_event_rx) = tokio::sync::mpsc::channel(16);
     let bg_identity = identity.clone();
     // No tier to re-evaluate when the probe was skipped: the node is reached via
@@ -3616,6 +3682,7 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
         serving: Arc::new(AtomicBool::new(false)),
         rate_limit_cleanup_spawned: Arc::new(AtomicBool::new(false)),
         serving_addr: Arc::new(tokio::sync::Mutex::new(None)),
+        republish,
     })
 }
 
@@ -3735,6 +3802,15 @@ impl KeyCustody for NoOpCustody {
 pub struct NoOpDidMethod;
 
 impl DidMethod for NoOpDidMethod {
+    /// Every other method here returns an error, so the keep-alive client is the
+    /// one that refuses to publish rather than one that would report a false
+    /// success: `DisabledDhtClient::publish` returns `DhtError::Disabled`.
+    type Dht = scp_dht::DisabledDhtClient;
+
+    fn dht_client(&self) -> Arc<scp_dht::DisabledDhtClient> {
+        Arc::new(scp_dht::DisabledDhtClient)
+    }
+
     fn create(
         &self,
         _key_custody: &impl KeyCustody,
@@ -4083,6 +4159,16 @@ mod tests {
         }
 
         impl DidMethod for CountingDidMethod {
+            /// These doubles observe what the builders publish; none of them
+            /// keeps a record alive, so the keep-alive client is the fail-closed
+            /// `DisabledDhtClient` rather than one that would report a false
+            /// publish success.
+            type Dht = scp_dht::DisabledDhtClient;
+
+            fn dht_client(&self) -> Arc<scp_dht::DisabledDhtClient> {
+                Arc::new(scp_dht::DisabledDhtClient)
+            }
+
             fn create(
                 &self,
                 key_custody: &impl KeyCustody,
@@ -4220,6 +4306,16 @@ mod tests {
         }
 
         impl DidMethod for RelayCheckDidMethod {
+            /// These doubles observe what the builders publish; none of them
+            /// keeps a record alive, so the keep-alive client is the fail-closed
+            /// `DisabledDhtClient` rather than one that would report a false
+            /// publish success.
+            type Dht = scp_dht::DisabledDhtClient;
+
+            fn dht_client(&self) -> Arc<scp_dht::DisabledDhtClient> {
+                Arc::new(scp_dht::DisabledDhtClient)
+            }
+
             fn create(
                 &self,
                 key_custody: &impl KeyCustody,
@@ -4482,6 +4578,16 @@ mod tests {
     }
 
     impl DidMethod for FailingPublishDidMethod {
+        /// These doubles observe what the builders publish; none of them
+        /// keeps a record alive, so the keep-alive client is the fail-closed
+        /// `DisabledDhtClient` rather than one that would report a false
+        /// publish success.
+        type Dht = scp_dht::DisabledDhtClient;
+
+        fn dht_client(&self) -> Arc<scp_dht::DisabledDhtClient> {
+            Arc::new(scp_dht::DisabledDhtClient)
+        }
+
         fn create(
             &self,
             key_custody: &impl KeyCustody,
@@ -5054,6 +5160,16 @@ mod tests {
         }
 
         impl DidMethod for CountingDidMethod {
+            /// These doubles observe what the builders publish; none of them
+            /// keeps a record alive, so the keep-alive client is the fail-closed
+            /// `DisabledDhtClient` rather than one that would report a false
+            /// publish success.
+            type Dht = scp_dht::DisabledDhtClient;
+
+            fn dht_client(&self) -> Arc<scp_dht::DisabledDhtClient> {
+                Arc::new(scp_dht::DisabledDhtClient)
+            }
+
             fn create(
                 &self,
                 key_custody: &impl KeyCustody,

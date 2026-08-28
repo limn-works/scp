@@ -384,6 +384,15 @@ mod tests {
     // Mock only implements resolve(); other DidMethod methods are intentionally
     // unimplemented as they are not exercised by well_known tests.
     impl DidMethod for MockDidMethod {
+        /// The tests here exercise `resolve` only, and never publish, so the
+        /// keep-alive client is the fail-closed `DisabledDhtClient` rather than
+        /// a client that would report a false publish success.
+        type Dht = scp_dht::DisabledDhtClient;
+
+        fn dht_client(&self) -> Arc<scp_dht::DisabledDhtClient> {
+            Arc::new(scp_dht::DisabledDhtClient)
+        }
+
         fn create(
             &self,
             _key_custody: &impl KeyCustody,

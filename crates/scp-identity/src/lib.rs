@@ -451,8 +451,23 @@ impl From<scp_did::DidError> for IdentityError {
 
 /// Abstract trait for DID method implementations.
 ///
-/// Enables swapping between `did:dht` (primary) and `did:web` (contingency
-/// fallback) without changing calling code. See ADR-003 acceptance criterion 6.
+/// # This trait names `did:dht` concepts, and ADR-003 acceptance criterion 6 wants it not to
+///
+/// ADR-003 acceptance criterion 6 in `.docs/adrs/phase-1.md` describes this
+/// trait as "enabling did:web fallback swap without changing calling code".
+/// Three of its members contradict that today, so a `DidWeb` cannot implement it
+/// as written:
+///
+/// - [`publish`](Self::publish) returns a [`republish::RepublishEntry`], a BEP44
+///   `(public_key, seq, signature, value)` record whose
+///   [`did()`](republish::RepublishEntry::did) derives a `did:dht` string.
+/// - [`initialize_sequence`](Self::initialize_sequence) is defined in terms of a
+///   monotonic BEP44 sequence.
+/// - [`Dht`](Self::Dht) names a [`DhtClient`](scp_dht::DhtClient).
+///
+/// Retiring criterion 6 or splitting the `did:dht` members onto a subtrait is an
+/// open decision for a human; nothing here decides it. Read this section as the
+/// current state of the trait rather than as an argument for either answer.
 ///
 /// # Implementors
 ///
@@ -463,6 +478,28 @@ impl From<scp_did::DidError> for IdentityError {
 /// All methods are async because production implementations may involve
 /// network I/O (DHT publish/resolve) or hardware security module access.
 pub trait DidMethod: Send + Sync {
+    /// The DHT client this method signs records onto, and the same client that
+    /// keeps those records resolvable.
+    ///
+    /// Publishing a DID document signs `(public_key, seq, signature, value)`
+    /// once. Mainline DHT records expire, so §3.10.5 step 4 of the identity spec
+    /// schedules a keep-alive that re-puts those exact bytes under that exact
+    /// sequence, and
+    /// [`RepublishManager`](republish::RepublishManager) — the type §3.10.5 names
+    /// for the job — takes a [`DhtClient`](scp_dht::DhtClient). This associated
+    /// type is where a node that holds only a `DidMethod` obtains one.
+    ///
+    /// Binding the keep-alive client to the method that signs is the whole point:
+    /// a node that took the client as a second, free parameter could pair a
+    /// record signed by one method with a client that puts it somewhere else.
+    type Dht: scp_dht::DhtClient + 'static;
+
+    /// A shared handle on [`Dht`](Self::Dht).
+    ///
+    /// Returned by value because every caller clones the `Arc` anyway: the
+    /// keep-alive task outlives the borrow.
+    fn dht_client(&self) -> std::sync::Arc<Self::Dht>;
+
     /// Creates a new identity with three Ed25519 keypairs.
     ///
     /// Generates the Identity Key and Active Signing Key in the operational

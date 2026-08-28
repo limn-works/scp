@@ -181,11 +181,23 @@ pub struct PublishAuthorization(());
 ///
 /// Object-safe where the full [`DidMethod`] trait is not (it returns
 /// `impl Future`), so the tier re-evaluation background task (SCP-243) can hold
-/// it without a generic parameter. Every path that publishes this node's DID
-/// document — startup ([`seed_from_startup_publish`]) and tier change
+/// it without a generic parameter. Every path that SIGNS a new DID document for
+/// this node — startup ([`seed_from_startup_publish`]) and tier change
 /// ([`apply_tier_change`]) alike — goes through this one method, so the configured
 /// [`DhtMode`] gate is honored by construction: a `DhtMode::Disabled` node
-/// discloses nothing on *any* publish.
+/// signs and discloses nothing on *any* publish.
+///
+/// # The keep-alive re-put reaches the DHT without this seam
+///
+/// The node's republish cycle (see the crate-private `republish` module) re-puts
+/// an already-signed record through the DHT client directly, holding no
+/// [`PublishAuthorization`] and reading no [`DhtMode`]. The mode gate still
+/// covers it, but transitively rather than by construction: the cycle publishes
+/// only what the live slot's `record` field holds, that field is written only by
+/// the two paths above, and a `DhtMode::Disabled` node leaves it `None`, which
+/// keeps the cycle dormant at zero arms. A future writer that seeds `record`
+/// without going through this seam would break that chain, which is why
+/// `LiveSlot::modify` is visible only inside this module.
 ///
 /// The [`PublishAuthorization`] parameter is what confines the CALL to this
 /// module. The trait itself stays crate-visible so test doubles can implement it,

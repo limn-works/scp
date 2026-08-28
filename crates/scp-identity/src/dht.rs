@@ -704,12 +704,6 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         })
     }
 
-    /// Returns a reference to the DHT client.
-    #[must_use]
-    pub const fn dht_client(&self) -> &Arc<D> {
-        &self.dht_client
-    }
-
     /// Returns a reference to the DID cache.
     #[must_use]
     pub const fn cache(&self) -> &Arc<DidCache<C>> {
@@ -2041,6 +2035,15 @@ pub fn verify_self_certification(
 // must return a future rather than use `async fn` directly.
 #[allow(clippy::manual_async_fn)]
 impl<D: DhtClient + 'static, C: Clock + 'static> DidMethod for DidDht<D, C> {
+    /// The client this `DidDht` was constructed over. The keep-alive re-puts
+    /// through the same client that performed the signed publish, so a record
+    /// and the client that refreshes it cannot come from two different places.
+    type Dht = D;
+
+    fn dht_client(&self) -> Arc<D> {
+        Arc::clone(&self.dht_client)
+    }
+
     fn create(
         &self,
         key_custody: &impl KeyCustody,
