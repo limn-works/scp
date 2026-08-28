@@ -606,7 +606,12 @@ impl<S: Storage> ApplicationNode<S> {
     ///
     /// Crate-internal: the counts exist so the node's own tests can assert that
     /// exactly one cycle runs and that it covers both layers (§3.10.6).
-    #[cfg(test)]
+    ///
+    /// The `testing` feature gates this method for the same reason it gates the
+    /// `ActiveArms` counts it returns: every test that calls it starts its node
+    /// in the `Memory` variant of `DhtMode`, which compiles only under that
+    /// feature.
+    #[cfg(all(test, feature = "testing"))]
     pub(crate) async fn active_republish_arms(&self) -> republish::ActiveArms {
         self.republish.active_arms().await
     }
@@ -4737,6 +4742,7 @@ mod tests {
     ///
     /// The returned record is checked against the node's DID-derived key, so a
     /// fabricated or mismatched record cannot pass.
+    #[cfg(feature = "testing")]
     #[tokio::test]
     async fn publishing_node_carries_its_own_signed_record() {
         let custody = Arc::new(InMemoryKeyCustody::new());
@@ -4798,6 +4804,7 @@ mod tests {
     /// pre-fix code — which bootstrapped the counter only AFTER `Node::start`
     /// (or self-host build) had already published — this fails: a fresh
     /// `AtomicU64::new(0)` published `seq = 1` beneath the live `seq = N`.
+    #[cfg(feature = "testing")]
     #[tokio::test]
     async fn restart_startup_publish_supersedes_live_record_not_seq_1() {
         use scp_platform::testing::InMemoryPreRotationCustody;

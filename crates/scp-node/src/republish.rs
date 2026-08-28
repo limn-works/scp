@@ -38,9 +38,9 @@
 //! confines them to the crate — `pub(crate)` here would be the redundant
 //! spelling of the same thing.)
 
-#[cfg(test)]
+#[cfg(all(test, feature = "testing"))]
 use std::future::Future;
-#[cfg(test)]
+#[cfg(all(test, feature = "testing"))]
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -369,11 +369,13 @@ impl<D: DhtClient + 'static> Drop for SelfDidRepublishing<D> {
 /// and both are `0` while it has published nothing — the honest dormant state a
 /// [`DhtMode::Disabled`](crate::DhtMode) node sits in permanently.
 ///
-/// Compiled for the test build alone: the counts exist so this crate can assert
-/// that a node built through the plain path runs exactly one cycle over both
-/// layers. Shipped code has no reader for them, and an unread accessor is dead
-/// weight on the node's surface.
-#[cfg(test)]
+/// Compiled for the test build that enables the `testing` feature: the three
+/// tests that read these counts start their node in the `Memory` variant of
+/// `DhtMode`, and that variant compiles only under `testing`. The counts exist
+/// so this crate can assert that a node built through the plain path runs
+/// exactly one cycle over both layers. Shipped code has no reader for them, and
+/// an unread accessor is dead weight on the node's surface.
+#[cfg(all(test, feature = "testing"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActiveArms {
     /// Running DHT keep-alive tasks (the 2-hour cycle, §3.10.2).
@@ -394,7 +396,8 @@ pub struct ActiveArms {
 /// Object safety is why neither method returns `impl Future`: `stop_and_wait` is
 /// synchronous (it bridges to the async stop the way `TierReEvalHandle` does),
 /// and `active_arms` returns a boxed future. `active_arms` carries
-/// `#[cfg(test)]`, so a doc build compiles no link target for it.
+/// `#[cfg(all(test, feature = "testing"))]`, so a doc build compiles no link
+/// target for it.
 pub trait RepublishCycle: Send + Sync {
     /// Aborts the re-seed observer, then stops both arms.
     ///
@@ -413,7 +416,7 @@ pub trait RepublishCycle: Send + Sync {
     fn stop_and_wait(&self);
 
     /// How many arms are running right now. See `ActiveArms`.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "testing"))]
     fn active_arms(&self) -> Pin<Box<dyn Future<Output = ActiveArms> + Send + '_>>;
 }
 
@@ -461,7 +464,7 @@ impl<D: DhtClient + 'static> RepublishCycle for SelfDidRepublishing<D> {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "testing"))]
     fn active_arms(&self) -> Pin<Box<dyn Future<Output = ActiveArms> + Send + '_>> {
         Box::pin(async move {
             ActiveArms {
@@ -586,13 +589,16 @@ async fn reseed_republish_arms<D: DhtClient + 'static>(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "testing")]
     use crate::DhtMode;
 
     use std::pin::Pin;
     use std::time::Duration;
 
+    #[cfg(feature = "testing")]
     use scp_clock::SystemClock;
     use scp_dht::InMemoryDhtClient;
+    #[cfg(feature = "testing")]
     use scp_identity::{DidCache, DidDht};
 
     /// The signed BEP44 record a node's own publish produces — the SHAPE the
@@ -1085,15 +1091,20 @@ mod tests {
     // `apply_tier_change` — and assert the RUNNING arms follow it.
     // -----------------------------------------------------------------------
 
+    #[cfg(feature = "testing")]
     use crate::{
         LiveSlot, NodePublishedState, NodePublisher, apply_tier_change, seed_from_startup_publish,
     };
+    #[cfg(feature = "testing")]
     use scp_did::DidDocument;
+    #[cfg(feature = "testing")]
     use scp_identity::{DidMethod as _, ScpIdentity};
+    #[cfg(feature = "testing")]
     use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};
 
     /// The concrete signing `DidDht` used by the re-seed tests: a real BEP44
     /// signer over an in-memory DHT, with the real monotonic sequence counter.
+    #[cfg(feature = "testing")]
     type SigningDidDht = DidDht<InMemoryDhtClient, SystemClock>;
 
     /// A real identity + relay-carrying DID document + the signing method that
@@ -1102,6 +1113,7 @@ mod tests {
     /// Nothing here is synthesized: the records these tests compare are produced
     /// by the same `DidDht::publish_document` signing pass production uses, so a
     /// re-seed that carried the wrong bytes could not pass.
+    #[cfg(feature = "testing")]
     async fn signing_identity() -> (Arc<SigningDidDht>, ScpIdentity, DidDocument, String) {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let sign_fn = SigningDidDht::make_sign_fn(Arc::clone(&custody));
@@ -1120,6 +1132,7 @@ mod tests {
     }
 
     /// The node's publish seam over `did_method`, in a publishing `DhtMode`.
+    #[cfg(feature = "testing")]
     fn publish_seam(did_method: &Arc<SigningDidDht>) -> NodePublisher {
         NodePublisher::new(Arc::clone(did_method), DhtMode::Memory)
     }
@@ -1128,6 +1141,7 @@ mod tests {
     /// document, address and signed record, together — produced by the SAME
     /// `seed_from_startup_publish` seam the production builders use, so the publish
     /// and the slot seed are one indivisible step here too.
+    #[cfg(feature = "testing")]
     async fn published_slot(
         publisher: &NodePublisher,
         identity: &ScpIdentity,
@@ -1141,6 +1155,7 @@ mod tests {
 
     /// Drives ONE real tier change through the real writer, alternating the
     /// relay endpoint so every call genuinely re-publishes at a new sequence.
+    #[cfg(feature = "testing")]
     async fn republish_via_tier_change(
         live_state: &LiveSlot<NodePublishedState>,
         publisher: &NodePublisher,
@@ -1209,6 +1224,7 @@ mod tests {
     /// the *current* record stops being kept alive and expires) and the relay arm
     /// kept pushing the superseded frame (rejected by a validating relay, then
     /// miscounted as a publish failure).
+    #[cfg(feature = "testing")]
     #[tokio::test(start_paused = true)]
     async fn tier_change_reseeds_the_running_republish_arms() {
         let (did_method, identity, document, relay_url) = signing_identity().await;
@@ -1302,6 +1318,7 @@ mod tests {
     /// Waits for each arm rather than assuming a fixed number of task hops, and
     /// compares full bytes rather than only the sequence — a stale arm republishing
     /// the previous document would otherwise pass on a coincidental sequence match.
+    #[cfg(feature = "testing")]
     async fn assert_arms_assert_record(
         keep_alive_dht: &InMemoryDhtClient,
         adapter: &RecordingRelayAdapter,
@@ -1364,6 +1381,7 @@ mod tests {
     /// Re-seeding replaces the arms 1:1: N re-seeds leave exactly one DHT arm and
     /// one relay arm, no leaked tokio tasks, and exactly ONE publish per interval
     /// (N leaked arms would produce N).
+    #[cfg(feature = "testing")]
     #[tokio::test(start_paused = true)]
     async fn reseeding_neither_leaks_nor_double_spawns_tasks() {
         const RESEEDS: u32 = 5;
@@ -1460,6 +1478,7 @@ mod tests {
     /// on W1 — detaching two arms that keep republishing this node's DID document
     /// (a §10.12.1 address disclosure) for the life of the process. The other
     /// re-seed tests are current-thread and cannot observe this.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stop_is_a_barrier_even_against_an_in_flight_reseed() {
         let (did_method, identity, document, relay_url) = signing_identity().await;
@@ -1499,6 +1518,7 @@ mod tests {
     /// A re-seed that lands while an arm is MID-PUBLISH is safe: the in-flight
     /// tick is replaced, not duplicated, and the stale record it was asserting
     /// never completes.
+    #[cfg(feature = "testing")]
     #[tokio::test(start_paused = true)]
     async fn reseed_racing_an_in_flight_tick_replaces_it_safely() {
         let (did_method, identity, document, relay_url) = signing_identity().await;
@@ -1560,11 +1580,13 @@ mod tests {
 
     /// Records every `publish` as `(public_key, seq)` so a test can count arm
     /// ticks and check which record each tick asserted.
+    #[cfg(feature = "testing")]
     #[derive(Default)]
     struct CountingDhtClient {
         publishes: std::sync::Mutex<Vec<([u8; 32], u64)>>,
     }
 
+    #[cfg(feature = "testing")]
     impl CountingDhtClient {
         fn count(&self) -> usize {
             self.publishes.lock().expect("publishes lock").len()
@@ -1575,6 +1597,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "testing")]
     impl scp_dht::DhtClient for CountingDhtClient {
         fn publish(
             &self,
@@ -1602,6 +1625,7 @@ mod tests {
 
     /// A DHT client whose `publish` parks until [`release`](Self::release), so a
     /// test can hold an arm mid-tick and re-seed underneath it.
+    #[cfg(feature = "testing")]
     #[derive(Default)]
     struct GatedDhtClient {
         started: std::sync::Mutex<Vec<u64>>,
@@ -1610,6 +1634,7 @@ mod tests {
         open: std::sync::atomic::AtomicBool,
     }
 
+    #[cfg(feature = "testing")]
     impl GatedDhtClient {
         fn started(&self) -> Vec<u64> {
             self.started.lock().expect("started lock").clone()
@@ -1625,6 +1650,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "testing")]
     impl scp_dht::DhtClient for GatedDhtClient {
         fn publish(
             &self,
@@ -1687,6 +1713,7 @@ mod tests {
     /// `Reach::Local` skips the NAT probe (no network), and `DhtMode::Memory`
     /// is a publishing mode, so the builder performs the real startup publish
     /// and seeds the live slot from it.
+    #[cfg(feature = "testing")]
     async fn start_plain_node(
         dht: &Arc<CountingDhtClient>,
     ) -> crate::ApplicationNode<scp_platform::in_memory::InMemoryStorage> {
@@ -1726,6 +1753,7 @@ mod tests {
     /// performs no republish of its own, so a document that only the startup
     /// publish ever wrote stops resolving once its record lapses — and every
     /// identity behind that document stops resolving with it.
+    #[cfg(feature = "testing")]
     #[tokio::test]
     async fn a_node_started_through_the_plain_path_keeps_its_did_record_alive() {
         let dht = Arc::new(CountingDhtClient::default());
@@ -1776,6 +1804,7 @@ mod tests {
     /// Counted rather than asserted structurally: a paused clock advanced by one
     /// full DHT keep-alive interval must produce exactly ONE further put. Two
     /// cycles would produce two, and the assertion names that number.
+    #[cfg(feature = "testing")]
     #[tokio::test(start_paused = true)]
     async fn a_node_runs_exactly_one_republish_cycle() {
         use scp_identity::republish::REPUBLISH_INTERVAL_SECS;
@@ -1820,6 +1849,7 @@ mod tests {
     ///
     /// The node is built inside a multi-thread runtime and `shutdown()` is then
     /// called from a `std::thread` that is not one of its workers.
+    #[cfg(feature = "testing")]
     #[test]
     fn shutdown_from_a_thread_outside_the_runtime_stops_both_arms() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1873,6 +1903,7 @@ mod tests {
     /// `shutdown()` stops the arms. An arm that outlived shutdown would keep
     /// asserting this node's address on the DHT for the life of the process
     /// (§10.12.1).
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread")]
     async fn shutdown_stops_both_republish_arms() {
         let dht = Arc::new(CountingDhtClient::default());
