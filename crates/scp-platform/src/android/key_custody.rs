@@ -26,5 +26,18 @@
 //! latency penalty incompatible with SCP's frequent signing operations.
 //!
 //! See ADR-027 in `.docs/adrs/phase-6.md` for the full design rationale.
+//!
+//! # No `CustodySubstrate` implementation lives here
+//!
+//! This module declares no Rust type, so there is nothing here for
+//! `scp_did::attestation::CustodySubstrate` to describe. The Kotlin adapter
+//! crosses the FFI boundary as a `UniFFI` callback, and the Rust side receives
+//! it as `CallbackKeyCustody` in `crates/scp-ffi/uniffi/src/bridge.rs`. That
+//! callback interface carries one custody question today — `custody_type`,
+//! which returns a `CustodyType` string — and asks the adapter neither whether
+//! the key can leave the Android Keystore nor which factor unlocks it. An
+//! Android identity therefore publishes no `ScpKeyCustodyAttestation` until
+//! that interface asks the adapter those two questions across all three
+//! bridges.
 
 pub use crate::traits::{CustodyType, KeyCustody, KeyHandle, KeyType};

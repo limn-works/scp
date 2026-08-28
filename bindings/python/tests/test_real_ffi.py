@@ -264,7 +264,7 @@ class TestIdentity:
         # The FFI uses a NotConfiguredMigrationBackend that returns an error
         # on step 1 (key generation). Verify the SDK wrapper propagates this.
         with pytest.raises(Exception, match="custody migration"):
-            await scp.identity_execute_custody_migration(identity.did, "hardware", [])
+            await scp.identity_execute_custody_migration(identity.did, "os_keystore", [])
 
     async def test_execute_custody_migration_invalid_target(self, scp: SCP):
         identity = await scp.identity_create(CustodyType.IN_MEMORY)

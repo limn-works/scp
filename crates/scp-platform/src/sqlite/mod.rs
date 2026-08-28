@@ -42,6 +42,26 @@ const DB_FILE_NAME: &str = "scp.db";
 /// would be a bootstrap deadlock (spec §17.6 "Salt Persistence").
 const SALT_FILE_NAME: &str = "scp.salt";
 
+/// How the caller supplied the `SQLCipher` key that opens a database.
+///
+/// [`SqliteStorage::new`] and [`SqliteStorage::with_passphrase`] both end up
+/// passing raw key bytes to `PRAGMA key`, so the opened connection no longer
+/// records which of the two the caller went through. This enum records it,
+/// because the factor a holder presents to unlock a private key stored in the
+/// database is the factor that unlocks the database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqliteKeyProvisioning {
+    /// The caller passed raw key bytes to [`SqliteStorage::new`]. Whatever
+    /// protects those bytes lives outside this crate, so this adapter cannot
+    /// name the factor a holder presents.
+    CallerSuppliedKey,
+
+    /// The caller passed a passphrase to [`SqliteStorage::with_passphrase`],
+    /// and Argon2id derived the `SQLCipher` key from it, so a holder presents
+    /// that passphrase.
+    Passphrase,
+}
+
 /// `SQLite`-backed storage adapter with `SQLCipher` encryption.
 ///
 /// Uses a single `WITHOUT ROWID` table with a clustered index on the
@@ -55,6 +75,13 @@ const SALT_FILE_NAME: &str = "scp.salt";
 ///
 /// See spec section 17.6.
 pub struct SqliteStorage {
+    // How the caller supplied the `SQLCipher` key this database was opened
+    // with. [`SqliteKeyCustody`](key_custody::SqliteKeyCustody) reads this to
+    // answer `CustodySubstrate::unlock_factor`: the factor that unlocks a
+    // private key stored in this database is the factor that unlocks the
+    // database, and only the constructor that opened it knows which factor
+    // that was.
+    key_provisioning: SqliteKeyProvisioning,
     // Uses `std::sync::Mutex` deliberately rather than `tokio::sync::Mutex`.
     // All rusqlite operations are sub-millisecond (single-row KV on WAL-mode
     // SQLite with no network I/O), so blocking the async runtime for that
@@ -111,6 +138,19 @@ impl SqliteStorage {
     /// created, or the advisory file lock is already held by another
     /// `SqliteStorage` instance (same process or other).
     pub fn new(dir: &Path, key: &[u8]) -> Result<Self, PlatformError> {
+        Self::open_with_key(dir, key, SqliteKeyProvisioning::CallerSuppliedKey)
+    }
+
+    /// Opens the database and records which constructor supplied the key.
+    ///
+    /// [`SqliteStorage::new`] and [`SqliteStorage::with_passphrase`] both route
+    /// here, and each passes the `key_provisioning` value that names how its
+    /// own caller supplied the key.
+    fn open_with_key(
+        dir: &Path,
+        key: &[u8],
+        key_provisioning: SqliteKeyProvisioning,
+    ) -> Result<Self, PlatformError> {
         std::fs::create_dir_all(dir)
             .map_err(|e| PlatformError::StorageError(format!("failed to create directory: {e}")))?;
 
@@ -183,9 +223,17 @@ impl SqliteStorage {
         .map_err(|e| PlatformError::StorageError(format!("failed to create schema: {e}")))?;
 
         Ok(Self {
+            key_provisioning,
             conn: Mutex::new(conn),
             lock_file: Mutex::new(Some(lock_file)),
         })
+    }
+
+    /// Returns how the caller supplied the `SQLCipher` key that opened this
+    /// database.
+    #[must_use]
+    pub const fn key_provisioning(&self) -> SqliteKeyProvisioning {
+        self.key_provisioning
     }
 
     /// Opens or creates an encrypted `SQLite` database at `{dir}/scp.db`,
@@ -206,9 +254,10 @@ impl SqliteStorage {
     ///   an error and does NOT regenerate the salt — a fresh salt would derive
     ///   a different key and permanently brick the existing database.
     /// - A salt file of the wrong length (not 16 bytes) is a terminal error.
-    /// - A wrong passphrase is rejected by `SQLCipher` on the first query inside
-    ///   [`SqliteStorage::new`]; that error is propagated. The system never
-    ///   silently creates or opens a fresh, empty database.
+    /// - A wrong passphrase is rejected by `SQLCipher` on the first query in the
+    ///   shared open path this constructor and [`SqliteStorage::new`] both
+    ///   route through; that error is propagated. The system never silently
+    ///   creates or opens a fresh, empty database.
     ///
     /// The passphrase bytes are borrowed and never copied here; the derived
     /// key is held in [`Zeroizing`](zeroize::Zeroizing) memory and dropped at
@@ -244,9 +293,9 @@ impl SqliteStorage {
 
         // Delegate to the shared SQLCipher path. A wrong passphrase produces a
         // different derived key; SQLCipher rejects it on the first query inside
-        // `new`, and that error propagates here (fail closed) — `new` never
-        // silently creates a fresh DB on key rejection.
-        Self::new(dir, key.as_ref())
+        // `open_with_key`, and that error propagates here (fail closed) —
+        // `open_with_key` never silently creates a fresh DB on key rejection.
+        Self::open_with_key(dir, key.as_ref(), SqliteKeyProvisioning::Passphrase)
         // `key` (Zeroizing) is dropped here; SQLCipher retains its own derived
         // key internally for the connection lifetime.
     }

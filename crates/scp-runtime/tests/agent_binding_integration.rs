@@ -31,7 +31,9 @@
 
 use ed25519_dalek::Signer;
 
-use scp_did::attestation::{KeyCustodyModel, Platform, ScpKeyCustodyAttestation};
+use scp_did::attestation::{
+    CustodySubstrate, KeyCustodyModel, Platform, ScpKeyCustodyAttestation, UnlockFactor,
+};
 use scp_did::{DID, DidDocument, SigningKeyId};
 use scp_mls::credential::ScpCredential;
 use scp_platform::testing::InMemoryKeyCustody;
@@ -49,6 +51,34 @@ use scp_runtime::envelope::inner::sign::create_inner_envelope;
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// A custody backend that reports whatever this test file tells it to report.
+struct FakeSubstrate {
+    key_is_extractable: bool,
+    unlock_factor: UnlockFactor,
+}
+
+impl CustodySubstrate for FakeSubstrate {
+    fn key_is_extractable(&self) -> bool {
+        self.key_is_extractable
+    }
+
+    fn unlock_factor(&self) -> UnlockFactor {
+        self.unlock_factor
+    }
+}
+
+/// A backend whose key cannot leave its store and that a biometric unlocks.
+const NON_EXTRACTABLE_BIOMETRIC: FakeSubstrate = FakeSubstrate {
+    key_is_extractable: false,
+    unlock_factor: UnlockFactor::Biometric,
+};
+
+/// A backend whose key can leave its store and that a passphrase unlocks.
+const EXTRACTABLE_PASSPHRASE: FakeSubstrate = FakeSubstrate {
+    key_is_extractable: true,
+    unlock_factor: UnlockFactor::Passphrase,
+};
 
 /// Creates an Ed25519 keypair and returns (`verifying_key`, `signing_key`).
 fn test_keypair() -> (ed25519_dalek::VerifyingKey, ed25519_dalek::SigningKey) {
@@ -135,13 +165,14 @@ async fn test_agent_binding_full_flow() {
     // Step 2: Attach custody attestation
     // -----------------------------------------------------------------------
 
-    let attestation = ScpKeyCustodyAttestation {
-        active_key_custody: KeyCustodyModel::HardwareBiometric,
-        agent_key_custody: Some(KeyCustodyModel::Software),
-        platform: Platform::Ios,
-        platform_attestation: None,
-        created_at: 1_700_000_000,
-    };
+    let attestation = ScpKeyCustodyAttestation::derive(
+        &NON_EXTRACTABLE_BIOMETRIC,
+        Some(&EXTRACTABLE_PASSPHRASE),
+        Platform::Ios,
+        None,
+        1_700_000_000,
+    )
+    .expect("both substrates report a pair the published vocabulary states");
 
     doc.set_custody_attestation(&attestation)
         .expect("setting custody attestation must succeed");
@@ -682,19 +713,23 @@ fn test_did_document_without_agent_key() {
 /// Custody attestation without agent key custody field.
 #[test]
 fn test_custody_attestation_without_agent() {
-    let attestation = ScpKeyCustodyAttestation {
-        active_key_custody: KeyCustodyModel::Software,
-        agent_key_custody: None,
-        platform: Platform::Desktop,
-        platform_attestation: None,
-        created_at: 1_700_000_000,
-    };
+    let attestation = ScpKeyCustodyAttestation::derive(
+        &EXTRACTABLE_PASSPHRASE,
+        None,
+        Platform::Desktop,
+        None,
+        1_700_000_000,
+    )
+    .expect("the substrate reports a pair the published vocabulary states");
 
     // Verify JSON round-trip.
     let json = serde_json::to_string(&attestation).expect("serialize attestation");
     let deserialized: ScpKeyCustodyAttestation =
         serde_json::from_str(&json).expect("deserialize attestation");
-    assert_eq!(deserialized.active_key_custody, KeyCustodyModel::Software);
-    assert!(deserialized.agent_key_custody.is_none());
-    assert_eq!(deserialized.platform, Platform::Desktop);
+    assert_eq!(
+        deserialized.active_key_custody(),
+        KeyCustodyModel::ExtractablePassphrase
+    );
+    assert!(deserialized.agent_key_custody().is_none());
+    assert_eq!(deserialized.platform(), Platform::Desktop);
 }

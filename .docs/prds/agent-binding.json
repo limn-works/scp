@@ -971,10 +971,10 @@
         "crates/scp-identity/src/document.rs",
         "crates/scp-identity/src/attestation.rs"
       ],
-      "description": "Implement ScpKeyCustodyAttestation per ADR-039 acceptance criterion 16 and Enforcement Stack layer 4. At identity creation, the DID document includes a service entry declaring key custody model. The attestation declares: custody_model (hardware-biometric, hardware-pin, software), platform (ios, android, desktop, browser), platform_attestation (optional platform-specific proof — Apple App Attest token or Android Key Attestation certificate chain). Absence of attestation is itself a signal (feeds into trust evaluation per §7.1). Create attestation.rs module in scp-identity. Add ScpKeyCustodyAttestation as a DID document service entry type. The attestation is signed by #0.",
+      "description": "Implement ScpKeyCustodyAttestation per ADR-039 acceptance criterion 16 and Enforcement Stack layer 4. At identity creation, the DID document includes a service entry declaring key custody model. The attestation declares: custody_model (non-extractable-biometric, non-extractable-pin, extractable-passphrase), platform (ios, android, desktop, browser), platform_attestation (optional platform-specific proof — Apple App Attest token or Android Key Attestation certificate chain). Absence of attestation is itself a signal (feeds into trust evaluation per §7.1). Create attestation.rs module in scp-identity. Add ScpKeyCustodyAttestation as a DID document service entry type. The attestation is signed by #0.",
       "acceptanceCriteria": [
         "ScpKeyCustodyAttestation struct with fields: custody_model, platform, platform_attestation (optional), timestamp",
-        "CustodyModel enum: HardwareBiometric, HardwarePin, Software",
+        "CustodyModel enum: NonExtractableBiometric, NonExtractablePin, ExtractablePassphrase",
         "Platform enum: Ios, Android, Desktop, Browser",
         "Attestation published as DID document service entry with type 'ScpKeyCustodyAttestation'",
         "Attestation signed by #0 (Identity Key)",

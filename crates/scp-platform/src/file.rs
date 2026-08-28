@@ -59,6 +59,8 @@ use tokio::sync::Mutex;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
+use scp_did::attestation::{CustodySubstrate, UnlockFactor};
+
 use crate::error::PlatformError;
 use crate::traits::{
     CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
@@ -976,6 +978,23 @@ impl KeyCustody for FileKeyCustody {
     }
 }
 
+impl CustodySubstrate for FileKeyCustody {
+    /// Returns `true`: this backend writes each private key into a file the
+    /// process can read, and every signing operation decrypts the key into
+    /// process memory, so the key leaves the store.
+    fn key_is_extractable(&self) -> bool {
+        true
+    }
+
+    /// Returns [`UnlockFactor::Passphrase`]: Argon2id derives this backend's
+    /// AES-256-GCM key from the passphrase the caller supplied to
+    /// [`FileKeyCustody::new`], so a holder presents that passphrase to reach
+    /// any key in the file.
+    fn unlock_factor(&self) -> UnlockFactor {
+        UnlockFactor::Passphrase
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1250,6 +1269,44 @@ mod tests {
         let custody = make_custody(&dir, "pw");
         let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         assert_eq!(custody.custody_type(&handle), CustodyType::Software);
+    }
+
+    #[test]
+    fn substrate_reports_an_extractable_key_a_passphrase_unlocks() {
+        let dir = TempDir::new().unwrap();
+        let custody = make_custody(&dir, "pw");
+
+        assert!(custody.key_is_extractable());
+        assert_eq!(custody.unlock_factor(), UnlockFactor::Passphrase);
+    }
+
+    /// A participant running an encrypted key file publishes the extractable
+    /// value, so that participant cannot publish a non-extractable claim.
+    #[test]
+    fn derived_published_custody_is_extractable_passphrase() {
+        use scp_did::attestation::{KeyCustodyModel, Platform, ScpKeyCustodyAttestation};
+
+        let dir = TempDir::new().unwrap();
+        let custody = make_custody(&dir, "pw");
+
+        assert_eq!(
+            KeyCustodyModel::from_substrate(&custody).unwrap(),
+            KeyCustodyModel::ExtractablePassphrase
+        );
+
+        let attestation = ScpKeyCustodyAttestation::derive(
+            &custody,
+            None,
+            Platform::Desktop,
+            None,
+            1_700_000_000,
+        )
+        .unwrap();
+
+        assert_eq!(
+            attestation.active_key_custody(),
+            KeyCustodyModel::ExtractablePassphrase
+        );
     }
 
     #[tokio::test]

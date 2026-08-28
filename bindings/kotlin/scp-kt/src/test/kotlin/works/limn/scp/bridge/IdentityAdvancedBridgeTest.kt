@@ -377,7 +377,7 @@ class IdentityAdvancedBridgeTest {
         @Test
         fun `executeCustodyMigration with empty contextIds`() =
             runTest(testDispatcher) {
-                advancedBridge.executeCustodyMigration("did:dht:z6MkTest", "software")
+                advancedBridge.executeCustodyMigration("did:dht:z6MkTest", "encrypted_file")
                 assertEquals(emptyList(), stubAdvanced.lastContextIds)
             }
 
@@ -387,14 +387,14 @@ class IdentityAdvancedBridgeTest {
                 stubAdvanced.executeCustodyMigrationError =
                     BridgeException("backend not configured", "SCP-IDENT-1025")
                 assertFailsWith<BridgeException> {
-                    advancedBridge.executeCustodyMigration("did:dht:z6MkFail", "hardware")
+                    advancedBridge.executeCustodyMigration("did:dht:z6MkFail", "os_keystore")
                 }
             }
 
         @Test
         fun `executeCustodyMigration supports all target types`() =
             runTest(testDispatcher) {
-                for (target in listOf("platform_managed", "hardware", "software", "in_memory")) {
+                for (target in listOf("encrypted_file", "os_keystore")) {
                     advancedBridge.executeCustodyMigration("did:dht:z6MkTest", target)
                     assertEquals(target, stubAdvanced.lastTarget)
                 }

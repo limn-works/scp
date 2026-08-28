@@ -3256,3 +3256,42 @@ fn outlet_stream_pure_wrappers_roundtrip() {
         );
     });
 }
+
+// ============================================================================
+// Custody migration — request-side custody vocabulary (spec §3.2.1)
+// ============================================================================
+
+/// The request-side custody vocabulary names `encrypted_file` and
+/// `os_keystore`. Every other string — including the four this bridge parsed
+/// before the vocabulary changed — is rejected with the bridge's identity
+/// error, and the message names the two the caller may pass.
+#[test]
+fn custody_migration_rejects_retired_targets() {
+    setup();
+    Python::with_gil(|py| {
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let did = published_identity_did(py, &scp);
+
+        for retired in [
+            "in_memory",
+            "platform",
+            "software",
+            "hardware",
+            "platform_managed",
+        ] {
+            let err = scp
+                .identity_execute_custody_migration(py, &did, retired, Vec::new())
+                .expect_err("a retired custody target must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("invalid custody migration target"),
+                "expected invalid-target message for '{retired}', got: {msg}"
+            );
+            assert!(
+                msg.contains("'encrypted_file' or 'os_keystore'"),
+                "the message must name the two targets a caller may pass, got: {msg}"
+            );
+        }
+    });
+}

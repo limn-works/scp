@@ -2172,6 +2172,46 @@ mod tests {
 
     // --- Custody attestation DID document integration tests (SCP-AB-018) ---
 
+    /// A custody backend that reports whatever the test tells it to report.
+    struct FakeSubstrate {
+        key_is_extractable: bool,
+        unlock_factor: crate::attestation::UnlockFactor,
+    }
+
+    impl crate::attestation::CustodySubstrate for FakeSubstrate {
+        fn key_is_extractable(&self) -> bool {
+            self.key_is_extractable
+        }
+
+        fn unlock_factor(&self) -> crate::attestation::UnlockFactor {
+            self.unlock_factor
+        }
+    }
+
+    /// A backend whose key cannot leave its store and that a biometric unlocks.
+    const fn non_extractable_biometric() -> FakeSubstrate {
+        FakeSubstrate {
+            key_is_extractable: false,
+            unlock_factor: crate::attestation::UnlockFactor::Biometric,
+        }
+    }
+
+    /// A backend whose key cannot leave its store and that a PIN unlocks.
+    const fn non_extractable_pin() -> FakeSubstrate {
+        FakeSubstrate {
+            key_is_extractable: false,
+            unlock_factor: crate::attestation::UnlockFactor::Pin,
+        }
+    }
+
+    /// A backend whose key can leave its store and that a passphrase unlocks.
+    const fn extractable_passphrase() -> FakeSubstrate {
+        FakeSubstrate {
+            key_is_extractable: true,
+            unlock_factor: crate::attestation::UnlockFactor::Passphrase,
+        }
+    }
+
     #[test]
     fn did_document_without_attestation_returns_none() {
         let did = "did:dht:zNoAttestation";
@@ -2186,18 +2226,19 @@ mod tests {
 
     #[test]
     fn did_document_set_and_get_custody_attestation() {
-        use crate::attestation::{KeyCustodyModel, Platform, ScpKeyCustodyAttestation};
+        use crate::attestation::{Platform, ScpKeyCustodyAttestation};
 
         let did = "did:dht:zWithAttestation";
         let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
 
-        let attestation = ScpKeyCustodyAttestation {
-            active_key_custody: KeyCustodyModel::HardwareBiometric,
-            agent_key_custody: Some(KeyCustodyModel::Software),
-            platform: Platform::Ios,
-            platform_attestation: None,
-            created_at: 1_700_000_000,
-        };
+        let attestation = ScpKeyCustodyAttestation::derive(
+            &non_extractable_biometric(),
+            Some(&extractable_passphrase()),
+            Platform::Ios,
+            None,
+            1_700_000_000,
+        )
+        .unwrap();
 
         doc.set_custody_attestation(&attestation).unwrap();
 
@@ -2207,27 +2248,29 @@ mod tests {
 
     #[test]
     fn did_document_set_custody_attestation_replaces_existing() {
-        use crate::attestation::{KeyCustodyModel, Platform, ScpKeyCustodyAttestation};
+        use crate::attestation::{Platform, ScpKeyCustodyAttestation};
 
         let did = "did:dht:zReplaceAttestation";
         let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
 
-        let first = ScpKeyCustodyAttestation {
-            active_key_custody: KeyCustodyModel::Software,
-            agent_key_custody: None,
-            platform: Platform::Desktop,
-            platform_attestation: None,
-            created_at: 1_700_000_000,
-        };
+        let first = ScpKeyCustodyAttestation::derive(
+            &extractable_passphrase(),
+            None,
+            Platform::Desktop,
+            None,
+            1_700_000_000,
+        )
+        .unwrap();
         doc.set_custody_attestation(&first).unwrap();
 
-        let second = ScpKeyCustodyAttestation {
-            active_key_custody: KeyCustodyModel::HardwareBiometric,
-            agent_key_custody: Some(KeyCustodyModel::HardwarePin),
-            platform: Platform::Ios,
-            platform_attestation: None,
-            created_at: 1_700_000_001,
-        };
+        let second = ScpKeyCustodyAttestation::derive(
+            &non_extractable_biometric(),
+            Some(&non_extractable_pin()),
+            Platform::Ios,
+            None,
+            1_700_000_001,
+        )
+        .unwrap();
         doc.set_custody_attestation(&second).unwrap();
 
         let attestation_count = doc
@@ -2246,20 +2289,21 @@ mod tests {
 
     #[test]
     fn did_document_custody_attestation_preserves_other_services() {
-        use crate::attestation::{KeyCustodyModel, Platform, ScpKeyCustodyAttestation};
+        use crate::attestation::{Platform, ScpKeyCustodyAttestation};
 
         let did = "did:dht:zPreserveServices";
         let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
         doc.add_relay_service("wss://relay.example.com/scp/v1")
             .unwrap();
 
-        let attestation = ScpKeyCustodyAttestation {
-            active_key_custody: KeyCustodyModel::HardwareBiometric,
-            agent_key_custody: None,
-            platform: Platform::Ios,
-            platform_attestation: None,
-            created_at: 1_700_000_000,
-        };
+        let attestation = ScpKeyCustodyAttestation::derive(
+            &non_extractable_biometric(),
+            None,
+            Platform::Ios,
+            None,
+            1_700_000_000,
+        )
+        .unwrap();
         doc.set_custody_attestation(&attestation).unwrap();
 
         // Should have: PreRotationCommitment + SCPRelay + ScpKeyCustodyAttestation.
@@ -2272,23 +2316,23 @@ mod tests {
     #[test]
     fn did_document_custody_attestation_survives_json_roundtrip() {
         use crate::attestation::{
-            AttestationPlatform, KeyCustodyModel, Platform, PlatformAttestation,
-            ScpKeyCustodyAttestation,
+            AttestationPlatform, Platform, PlatformAttestation, ScpKeyCustodyAttestation,
         };
 
         let did = "did:dht:zJsonRoundtrip";
         let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
 
-        let attestation = ScpKeyCustodyAttestation {
-            active_key_custody: KeyCustodyModel::HardwareBiometric,
-            agent_key_custody: Some(KeyCustodyModel::Software),
-            platform: Platform::Ios,
-            platform_attestation: Some(PlatformAttestation {
+        let attestation = ScpKeyCustodyAttestation::derive(
+            &non_extractable_biometric(),
+            Some(&extractable_passphrase()),
+            Platform::Ios,
+            Some(PlatformAttestation {
                 platform: AttestationPlatform::AppleAppAttest,
                 proof: vec![0xCA, 0xFE, 0xBA, 0xBE],
             }),
-            created_at: 1_700_000_000,
-        };
+            1_700_000_000,
+        )
+        .unwrap();
         doc.set_custody_attestation(&attestation).unwrap();
 
         let json = doc.to_json().unwrap();

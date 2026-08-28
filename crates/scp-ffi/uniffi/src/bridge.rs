@@ -17605,14 +17605,12 @@ impl Scp {
         let did_val = DID::from(did.as_str());
 
         let migration_target = match target.as_str() {
-            "platform_managed" => CustodyMigrationTarget::PlatformManaged,
-            "hardware" => CustodyMigrationTarget::Hardware,
-            "software" => CustodyMigrationTarget::Software,
-            "in_memory" => CustodyMigrationTarget::InMemory,
+            "encrypted_file" => CustodyMigrationTarget::EncryptedFile,
+            "os_keystore" => CustodyMigrationTarget::OsKeystore,
             other => {
                 return Err(ScpError::Identity {
                     msg: format!(
-                        "invalid custody migration target: {other}; expected 'platform_managed', 'hardware', 'software', or 'in_memory'"
+                        "invalid custody migration target: {other}; expected 'encrypted_file' or 'os_keystore'"
                     ),
                     code: codes::IDENT_1024.to_owned(),
                 });
@@ -19278,6 +19276,46 @@ mod tests {
                 );
             }
             other => panic!("expected ScpError::Identity, got: {other:?}"),
+        }
+    }
+
+    /// The request-side custody vocabulary names `encrypted_file` and
+    /// `os_keystore`. Every other string — including the four this bridge
+    /// parsed before the vocabulary changed — is rejected with the bridge's
+    /// invalid-target code, `SCP-IDENT-1024`.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn custody_migration_rejects_retired_targets() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+
+        for retired in [
+            "in_memory",
+            "platform",
+            "software",
+            "hardware",
+            "platform_managed",
+        ] {
+            let err = scp
+                .identity_execute_custody_migration(identity.did(), retired.to_owned(), Vec::new())
+                .expect_err("a retired custody target must be rejected");
+            match err {
+                ScpError::Identity { msg, code } => {
+                    assert_eq!(
+                        code,
+                        codes::IDENT_1024,
+                        "expected invalid-target code SCP-IDENT-1024 for '{retired}', got: {msg}"
+                    );
+                    assert!(
+                        msg.contains("invalid custody migration target"),
+                        "expected invalid-target message for '{retired}', got: {msg}"
+                    );
+                }
+                other => panic!("expected ScpError::Identity, got: {other:?}"),
+            }
         }
     }
 

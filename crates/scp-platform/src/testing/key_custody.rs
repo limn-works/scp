@@ -13,6 +13,8 @@ use tokio::sync::Mutex;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
+use scp_did::attestation::{CustodySubstrate, UnlockFactor};
+
 use crate::error::PlatformError;
 use crate::traits::{
     CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
@@ -510,6 +512,23 @@ impl KeyCustody for InMemoryKeyCustody {
     }
 }
 
+impl CustodySubstrate for InMemoryKeyCustody {
+    /// Returns `true`: this backend holds every private key in a process-memory
+    /// `HashMap`, so the key leaves the store on any read of that map.
+    fn key_is_extractable(&self) -> bool {
+        true
+    }
+
+    /// Returns [`UnlockFactor::Unprotected`]: nothing gates access to the
+    /// `HashMap` this backend keeps its keys in, so a holder presents nothing.
+    /// Paired with an extractable key, that answer maps onto no published
+    /// custody value, so this test-only backend cannot mint a custody claim a
+    /// DID document publishes.
+    fn unlock_factor(&self) -> UnlockFactor {
+        UnlockFactor::Unprotected
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -716,6 +735,35 @@ mod tests {
         let custody = InMemoryKeyCustody::new();
         let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         assert_eq!(custody.custody_type(&handle), CustodyType::InMemory);
+    }
+
+    /// The test-only custody reports an extractable key that nothing gates, and
+    /// the published vocabulary states no value for that pair, so this backend
+    /// cannot mint a custody claim a DID document publishes.
+    #[test]
+    fn substrate_publishes_no_custody_value() {
+        use scp_did::attestation::{KeyCustodyModel, Platform, ScpKeyCustodyAttestation};
+
+        let custody = InMemoryKeyCustody::new();
+
+        assert!(custody.key_is_extractable());
+        assert_eq!(custody.unlock_factor(), UnlockFactor::Unprotected);
+
+        let err = KeyCustodyModel::from_substrate(&custody).unwrap_err();
+        assert_eq!(err.unlock_factor, UnlockFactor::Unprotected);
+        assert!(err.key_is_extractable);
+
+        assert!(
+            ScpKeyCustodyAttestation::derive(
+                &custody,
+                None,
+                Platform::Desktop,
+                None,
+                1_700_000_000,
+            )
+            .is_err(),
+            "the in-memory custody must not derive a published custody value"
+        );
     }
 
     #[tokio::test]

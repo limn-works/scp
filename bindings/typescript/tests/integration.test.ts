@@ -823,8 +823,9 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.identityExecuteCustodyMigration rejects an unknown target", async () => {
-      // Target must be one of the documented custody kinds (hardware,
-      // platform, software, etc.). Synchronous surface — the bridge
+      // Target must be one of the two custody backends the request-side
+      // vocabulary names ("encrypted_file", "os_keystore"). Synchronous
+      // surface — the bridge
       // validates before any async work. Use a real identity that this
       // SCP owns so the DID-ownership gate lets us reach the target
       // validation branch (post per-test isolation).
@@ -866,7 +867,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       // the orchestrator then fails with SCP-IDENT-1025 inside the
       // backend. This assertion exercises that the async path runs.
       const identity = await scp.identityCreate("in_memory");
-      expect(() => scp.identityExecuteCustodyMigration(identity.did, "software", [])).toThrow(
+      expect(() => scp.identityExecuteCustodyMigration(identity.did, "encrypted_file", [])).toThrow(
         /SCP-IDENT-1025|not configured/i,
       );
     });

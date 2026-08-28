@@ -393,7 +393,7 @@ class IdentityAdvancedBridge internal constructor(
      * Runs the 5-step migration protocol from spec section 3.2.1.
      *
      * @param did The DID string to migrate.
-     * @param target Target custody type: "platform_managed", "hardware", "software", or "in_memory".
+     * @param target The custody backend to migrate into: "encrypted_file" or "os_keystore".
      * @param contextIds Context IDs where this DID is a member.
      * @return JSON string with the migration result.
      */

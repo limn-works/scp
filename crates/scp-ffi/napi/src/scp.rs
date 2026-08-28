@@ -1272,14 +1272,12 @@ impl Scp {
         let did_val = DID::from(did.as_str());
 
         let migration_target = match target.as_str() {
-            "platform_managed" => CustodyMigrationTarget::PlatformManaged,
-            "hardware" => CustodyMigrationTarget::Hardware,
-            "software" => CustodyMigrationTarget::Software,
-            "in_memory" => CustodyMigrationTarget::InMemory,
+            "encrypted_file" => CustodyMigrationTarget::EncryptedFile,
+            "os_keystore" => CustodyMigrationTarget::OsKeystore,
             other => {
                 return Err(NapiError::from(ScpNapiError::Identity {
                     message: format!(
-                        "invalid custody migration target: {other}; expected 'platform_managed', 'hardware', 'software', or 'in_memory'"
+                        "invalid custody migration target: {other}; expected 'encrypted_file' or 'os_keystore'"
                     ),
                     code: codes::IDENT_1024.to_owned(),
                 }));
@@ -5003,6 +5001,36 @@ mod concurrency_cap_tests {
             msg.contains("not configured"),
             "expected 'not configured' in fail-closed message, got: {msg}"
         );
+    }
+
+    /// The request-side custody vocabulary names `encrypted_file` and
+    /// `os_keystore`. Every other string — including the four this bridge
+    /// parsed before the vocabulary changed — is rejected with the bridge's
+    /// invalid-target code, `SCP-IDENT-1024`.
+    #[test]
+    fn custody_migration_rejects_retired_targets() {
+        let (scp, did) = build_scp_with_identity();
+
+        for retired in [
+            "in_memory",
+            "platform",
+            "software",
+            "hardware",
+            "platform_managed",
+        ] {
+            let err = scp
+                .identity_execute_custody_migration(did.clone(), retired.to_owned(), Vec::new())
+                .expect_err("a retired custody target must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("SCP-IDENT-1024"),
+                "expected invalid-target code SCP-IDENT-1024 for '{retired}', got: {msg}"
+            );
+            assert!(
+                msg.contains("invalid custody migration target"),
+                "expected invalid-target message for '{retired}', got: {msg}"
+            );
+        }
     }
 
     /// Recovery rejects an unrecognized compromise tier with the dedicated

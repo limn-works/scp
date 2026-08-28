@@ -2619,14 +2619,15 @@ impl crate::scp::PyScp {
     /// Executes the custody migration protocol for the given DID.
     ///
     /// This method creates a `CustodyMigrationOrchestrator` and runs the
-    /// 5-step migration protocol using an FFI backend that succeeds for all
-    /// operations by default.
+    /// 5-step migration protocol against a backend that returns an error from
+    /// every step, so a caller who supplies no real backend through the SDK
+    /// layer receives a typed failure rather than a fabricated success.
     ///
     /// # Arguments
     ///
     /// * `did` — The DID string to migrate.
-    /// * `target` — Target custody type: `"platform_managed"`, `"hardware"`,
-    ///   `"software"`, or `"in_memory"`.
+    /// * `target` — The custody backend to migrate into: `"encrypted_file"` or
+    ///   `"os_keystore"`.
     /// * `context_ids` — List of context IDs where the DID is a member.
     ///
     /// # Returns
@@ -2661,13 +2662,11 @@ impl crate::scp::PyScp {
             let did_val = DID::from(did_owned.as_str());
 
             let migration_target = match target_owned.as_str() {
-                "platform_managed" => CustodyMigrationTarget::PlatformManaged,
-                "hardware" => CustodyMigrationTarget::Hardware,
-                "software" => CustodyMigrationTarget::Software,
-                "in_memory" => CustodyMigrationTarget::InMemory,
+                "encrypted_file" => CustodyMigrationTarget::EncryptedFile,
+                "os_keystore" => CustodyMigrationTarget::OsKeystore,
                 other => {
                     return Err(ScpPyError::identity(format!(
-                        "invalid custody migration target: {other}; expected 'platform_managed', 'hardware', 'software', or 'in_memory'"
+                        "invalid custody migration target: {other}; expected 'encrypted_file' or 'os_keystore'"
                     )));
                 }
             };

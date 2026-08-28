@@ -65,6 +65,14 @@ sync = []
 [dependencies]
 serde = { workspace = true }
 tokio.workspace = true
+# `CustodySubstrate` — the trait through which a running custody backend reports
+# the two facts a DID document's published custody value states (extractability
+# and unlock factor). Every custody backend in this crate implements it, so
+# `ScpKeyCustodyAttestation::derive` reads a participant's published custody off
+# the backend the participant runs instead of off a field a caller fills in.
+# The edge runs `scp-platform` → `scp-did` and never the reverse: `scp-did` is
+# wasm-safe and stays free of this crate's tokio dependency.
+scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
 thiserror.workspace = true
 tracing = { workspace = true }
 zeroize = { workspace = true }
