@@ -604,36 +604,42 @@
       "severity": "critical",
       "status": "done",
       "files": [
-        "crates/scp-core/src/identity/mod.rs",
-        "crates/scp-core/src/identity/dht.rs",
-        "crates/scp-core/src/identity/document.rs"
+        "crates/scp-identity/src/lib.rs",
+        "crates/scp-identity/src/dht.rs",
+        "crates/scp-identity/src/config.rs",
+        "crates/scp-did/src/document.rs"
       ],
-      "description": "Implement did:dht as scp-core/identity/. The identity module handles DID creation, verification, and DID document management. did:dht uses the BitTorrent Mainline DHT for resolution. The DID string is the z-base-32 encoding of the Ed25519 public key, making it self-certifying. The module abstracts the DID method behind a DidMethod trait so a contingency did:web fallback could be swapped in without changing calling code.",
+      "description": "Implement did:dht as the scp-identity crate, over the wasm-safe DID data model in scp-did. The identity module handles DID creation, verification, and DID document management. did:dht uses the BitTorrent Mainline DHT for resolution. The DID string is did:dht:z followed by the z-base-32 encoding of the Ed25519 Identity Key's public key, which makes the DID self-certifying. The module abstracts the DID method behind a DidMethod trait so a contingency did:web fallback could be swapped in without changing calling code. Creation takes two custody providers: key_custody holds the operational keys, and a separate pre_rotation_custody holds the pre-rotation key, because §9.7.4.1 item 3 of the security spec forbids the operational provider from holding the recovery key. No production PreRotationCustody backend exists today, so every production creation path fails closed with IdentityError::NoPreRotationBackend (SCP-IDENT-1059), which §9.7.4.1 item 3a requires; ADR-062 §Decision 6 gates the mint path behind the testing feature. Publication and resolution are SCP-007; rotation and migration are SCP-008.",
       "acceptanceCriteria": [
-        "create_identity(key_custody) -> Identity generates three keypairs via key_custody: Identity Key (Ed25519, derives DID string, highest-security custody), Active Signing Key (Ed25519, used for MLS/envelopes/UCANs, rotatable), Pre-Rotation Key (Ed25519, cold/offline custody, generates pre-rotation commitment SHA-256(pre_rotation_key.public))",
-        "create_identity derives did:dht identifier: did:dht: + z-base-32 encoding of Identity Key's public key",
-        "create_identity constructs DID document with: Identity Key as verification method #0, Active Signing Key as verification method #active (referenced by authentication and assertionMethod), PreRotationCommitment service: {\"type\": \"PreRotationCommitment\", \"serviceEndpoint\": \"sha256:<hex>\"}",
-        "create_identity returns ScpIdentity handle containing DID string, all key handles (never raw private keys), pre-rotation commitment, and DID document",
+        "DidMethod::create(key_custody, pre_rotation_custody) returns Result<(ScpIdentity, DidDocument, PreRotationKeyHandle), IdentityError> and generates the Identity Key (#0) and the Active Signing Key (#active) as Ed25519 keypairs in key_custody (ADR-003 acceptance criterion 1)",
+        "DidMethod::create draws the pre-rotation seed from key_custody.generate_ephemeral_ed25519_seed(), hands it to pre_rotation_custody.store_committed_pre_rotation_key, and never writes the pre-rotation private key into key_custody — security spec §9.7.4.1 item 3 (storage isolation) forbids the operational provider from holding it",
+        "DidMethod::create computes the pre-rotation commitment as SHA-256(pre_rotation_public_key) (security spec §9.7.4.1 item 2)",
+        "DidMethod::create derives the did:dht identifier as did:dht:z followed by the z-base-32 encoding of the Identity Key public key, matching the DID string that ADR-003 \"Identity structure at creation\" documents on the ScpIdentity::did field",
+        "DidMethod::create constructs the DID document with: Identity Key as verification method #0, Active Signing Key as verification method #active (referenced by authentication and assertionMethod), Agent Signing Key as verification method #agent (referenced by authentication and assertionMethod) when DidDht::create_with_agent_key supplies one, PreRotationCommitment service: {\"type\": \"PreRotationCommitment\", \"serviceEndpoint\": \"sha256:<hex>\"} (ADR-003 acceptance criterion 1; #agent per ADR-039)",
+        "DidMethod::create returns an ScpIdentity carrying the DID string, the operational key handles (never raw private keys), and the pre-rotation commitment; it returns the DidDocument and the PreRotationKeyHandle alongside that handle, and the caller persists all three (ADR-003 acceptance criterion 1)",
         "verify_did(did_string, public_key) -> bool performs self-certification check: decode z-base-32 suffix of DID and compare to provided public key (local operation, no network call)",
         "DidMethod trait defined with methods: create, publish, resolve, rotate, verify",
         "DidDht struct implements DidMethod trait",
-        "ScpIdentity struct matches the specified structure: identity_key (KeyHandle), active_signing_key (KeyHandle), pre_rotation_commitment ([u8; 32]), did (String)",
+        "ScpIdentity declares exactly five public fields: identity_key (KeyHandle), active_signing_key (KeyHandle), agent_signing_key (Option<KeyHandle>), pre_rotation_commitment ([u8; 32]), did (String) (ADR-003 \"Identity structure at creation\"; agent_signing_key per ADR-039)",
+        "Every identity-creation entry point that supplies its own pre-rotation custody — Identity::create, Identity::create_ephemeral, the scp-node identity resolvers, and the identity_create paths of the PyO3, napi-rs, and UniFFI bridges — returns IdentityError::NoPreRotationBackend on a build without the testing feature, and the three bridges surface it as error code SCP-IDENT-1059, because no production PreRotationCustody backend exists — security spec §9.7.4.1 item 3a requires the typed error and forbids any dev stand-in",
         "DID Document construction follows W3C DID Document JSON-LD format with Ed25519 verification methods",
         "All public items have /// doc comments",
         "Unit tests for create_identity, verify_did, DID document construction",
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
-        "Create crates/scp-core/src/identity/mod.rs with module root, ScpIdentity struct, DidMethod trait, re-exports",
-        "Define ScpIdentity struct with identity_key, active_signing_key, pre_rotation_commitment, did fields",
-        "Define DidMethod trait with create, publish, resolve, rotate, verify methods",
-        "Implement DidDht struct in dht.rs with create_identity using pkarr (v5.0.3+) and z-base-32",
-        "Implement verify_did in dht.rs — local z-base-32 decode and comparison",
-        "Implement DID Document construction in document.rs — W3C JSON-LD format, verification methods, PreRotationCommitment service",
-        "Add dependencies to scp-core/Cargo.toml: pkarr, z-base-32, simple-dns, serde_json",
-        "Write unit tests for create_identity verifying three keypairs, DID string format, document structure",
+        "Create crates/scp-identity/src/lib.rs with the crate root, the ScpIdentity struct, the DidMethod trait, the IdentityError enum, and re-exports",
+        "Define ScpIdentity with identity_key, active_signing_key, agent_signing_key, pre_rotation_commitment, and did fields",
+        "Define DidMethod with create, publish, resolve, rotate, and verify methods; create takes key_custody and pre_rotation_custody and returns (ScpIdentity, DidDocument, PreRotationKeyHandle)",
+        "Implement DidDht in crates/scp-identity/src/dht.rs with DidMethod::create using pkarr (v5.0.3+) and z-base-32",
+        "Implement verify_did in crates/scp-identity/src/dht.rs — local z-base-32 decode and comparison",
+        "Implement DID Document construction in crates/scp-did/src/document.rs — W3C JSON-LD format, verification methods, PreRotationCommitment service",
+        "Add the IdentityError::NoPreRotationBackend variant and the SCP-IDENT-1059 error code, and return them from every production creation path on a build without the testing feature",
+        "Add dependencies to the scp-identity and scp-did manifests: pkarr, z-base-32, simple-dns, serde_json",
+        "Write unit tests for DidMethod::create verifying the two operational keypairs, the cold-stored pre-rotation key, the DID string format, and the document structure",
         "Write unit tests for verify_did with valid and invalid keys",
-        "Write unit tests for DID document serialization/deserialization"
+        "Write unit tests for DID document serialization/deserialization",
+        "Write unit tests asserting that creation fails closed with NoPreRotationBackend on a build without the testing feature"
       ],
       "blockedBy": [
         "SCP-001"
@@ -642,12 +648,21 @@
         {
           "file": ".docs/adrs/phase-1.md",
           "section": "## ADR-003: DID Creation (did:dht)"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-039: Shared-DID Human-Agent Identity Model"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.1 Pre-Rotation Key Custody"
         }
       ],
       "details": {
-        "scpIdentityStruct": "```rust\npub struct ScpIdentity {\n    /// did:dht Identity Key. Derives the DID string. Stored in highest-security\n    /// custody (Secure Enclave, HSM). Used ONLY for DID document updates and\n    /// signing pre-rotation commitments. NEVER for MLS, envelopes, or UCANs.\n    pub identity_key: KeyHandle,\n\n    /// Current Active Signing Key. A verification method in the DID document.\n    /// Used for MLS credentials, inner envelope signatures, UCAN issuance.\n    /// Rotatable via rotate_active_key (DID string stays the same).\n    pub active_signing_key: KeyHandle,\n\n    /// SHA-256 hash of the next Identity Key's public key.\n    /// Published in DID document as a PreRotationCommitment service.\n    pub pre_rotation_commitment: [u8; 32],\n\n    /// The DID string: did:dht:z<z-base-32(identity_key.public)>\n    pub did: String,\n}\n```",
+        "scpIdentityStruct": "```rust\npub struct ScpIdentity {\n    /// did:dht Identity Key (`#0`). Derives the DID string. Stored in\n    /// highest-security operational custody (Secure Enclave, HSM). Used ONLY\n    /// for DID document updates and signing pre-rotation commitments. NEVER\n    /// for MLS, envelopes, or UCANs.\n    pub identity_key: KeyHandle,\n\n    /// Current Active Signing Key (`#active`). A verification method in the\n    /// DID document. Used for MLS KeyPackage attestations, inner-envelope\n    /// signatures, UCAN issuance. Rotatable via rotate_active_key (the DID\n    /// string stays the same).\n    pub active_signing_key: KeyHandle,\n\n    /// Optional Agent Signing Key (`#agent`). Software-held Ed25519 key for\n    /// autonomous agent operations. `None` when no agent is delegated.\n    /// Rotatable independently via rotate_agent_key. See ADR-039.\n    pub agent_signing_key: Option<KeyHandle>,\n\n    /// SHA-256 hash of the next Identity Key's public key. Published in the\n    /// DID document as a PreRotationCommitment service. The corresponding\n    /// private key lives in a separate PreRotationCustody instance, returned\n    /// alongside as a PreRotationKeyHandle (security spec §9.7.4.1 item 3).\n    pub pre_rotation_commitment: [u8; 32],\n\n    /// The DID string: did:dht:z<z-base-32(identity_key.public)>\n    pub did: String,\n}\n```",
         "didDhtRationale": "did:dht over did:web: No server dependency. Self-certifying (DID = public key). Key rotation via DHT record update with BEP44 signed mutable items. No TLS pinning, TOFU, or key-change alerting infrastructure needed.\n\ndid:dht over did:key: did:key cannot rotate keys (the key IS the identity). Key loss = identity loss. Recovery (spec section 3.3) requires key rotation, which did:key cannot do.",
-        "libraries": "pkarr (v5.0.3+) as primary dependency — provides Ed25519 keypair management, BEP44 signed mutable items, DNS packet construction via simple-dns, and Mainline DHT publish/resolve via mainline crate (v6.1.1+). z-base-32 for DID string encoding. SCP implements did:dht-specific DID Document to DNS resource record encoding (~300 lines) as a thin layer on top of pkarr."
+        "libraries": "pkarr (v5.0.3+) as primary dependency — provides Ed25519 keypair management, BEP44 signed mutable items, DNS packet construction via simple-dns, and Mainline DHT publish/resolve via mainline crate (v6.1.1+). z-base-32 for DID string encoding. SCP implements did:dht-specific DID Document to DNS resource record encoding (~300 lines) as a thin layer on top of pkarr.",
+        "preRotationFailClosed": "Security spec §9.7.4.1 item 3a states: \"If no substrate satisfying this recovery-authority-residence requirement is available, identity creation MUST fail closed with a typed error.\" ADR-062 §Decision 6 severed InMemoryPreRotationCustody behind the testing feature, so a shipped build carries no PreRotationCustody backend. Every production creation path therefore returns IdentityError::NoPreRotationBackend, which the PyO3, napi-rs, and UniFFI bridges surface as SCP-IDENT-1059. A durable pre-rotation backend is tracked by issue #1729 and RFC #2130."
       }
     },
     {
@@ -724,29 +739,38 @@
       "gate": "gate-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "in-progress",
       "files": [
-        "crates/scp-core/src/identity/dht.rs",
-        "crates/scp-core/src/identity/document.rs"
+        "crates/scp-identity/src/dht.rs",
+        "crates/scp-identity/src/republish.rs",
+        "crates/scp-did/src/document.rs"
       ],
-      "description": "Implement the three-layer key rotation architecture for did:dht. Layer 1 (rotate_active_key) is the common case — rotates the Active Signing Key while preserving the DID string. Layer 2 (migrate_identity) is rare planned migration to a new DID. Layer 3 (verify_migration) verifies migration proofs. did:dht's Identity Key is non-rotatable (DID string bound to initial public key), so SCP separates Identity Key from Active Signing Key.",
+      "description": "Implement the three-layer key rotation architecture for did:dht. Layer 1 (rotate_active_key) is the common case — it rotates the Active Signing Key while preserving the DID string. Layer 2 (migrate_identity) is a rare planned migration to a new DID. Layer 3 (verify_migration) verifies migration proofs. did:dht's Identity Key is non-rotatable because the DID string is bound to the initial public key, so SCP separates the Identity Key from the Active Signing Key. Two acceptance criteria are not met on main: migrate_identity starts no background republish task for the old DID document, and rotate_active_key applies no bound to the retained #retired-{sequence} verification methods. The story stays in-progress until both land.",
       "acceptanceCriteria": [
         "rotate_active_key(identity, key_custody) -> Identity generates new Ed25519 keypair as new Active Signing Key",
         "rotate_active_key updates DID document: adds new key as verification method, moves authentication and assertionMethod references to new key, retains old key as #retired-{sequence}",
+        "After rotate_active_key, the DID document retains at most the 2 most recent retired active-key verification methods (#retired-{sequence}); rotation prunes the older ones so the document does not grow without bound (ADR-003 acceptance criterion 4a)",
         "rotate_active_key signs DID document update with Identity Key (NOT old active key)",
         "rotate_active_key publishes to DHT with incremented BEP44 sequence number",
         "rotate_active_key returns updated Identity with new active key handle",
         "After rotate_active_key, DID string does NOT change, Identity Key does NOT change",
-        "migrate_identity(identity, pre_rotation_key, key_custody) -> (Identity, DidRotationEvent) creates new DID using pre-rotation key as new Identity Key",
+        "migrate_identity(identity, old_document, pre_rotation_handle, pre_rotation_custody, key_custody, rotated_at) returns (new Identity, new DidDocument, DidRotationEvent, new PreRotationKeyHandle) and derives the new DID from the pre-rotation public key that pre_rotation_custody.reveal_public_key returns (ADR-003 acceptance criterion 4b)",
         "migrate_identity generates new Active Signing Key and new pre-rotation commitment for new DID",
-        "migrate_identity updates OLD DID document: adds alsoKnownAs pointing to new DID, includes cryptographic linkage (old Identity Key signs new Identity Key public bytes)",
-        "migrate_identity publishes both old (updated) and new DID documents to DHT",
+        "migrate_identity consumes the old pre-rotation handle via pre_rotation_custody.destroy_after_migration and imports the returned private bytes into key_custody as the new Identity Key (#0) (ADR-003 acceptance criterion 4b; security spec §9.7.4.1 item 6, post-rotation key cycling)",
+        "migrate_identity republishes the OLD DID document with alsoKnownAs set to the new DID and with its #active and #agent verification methods retired (ADR-003 acceptance criterion 4b)",
+        "migrate_identity builds the MigrationProof by signing SHA-256(\"SCP-MIGRATION-V1:\" || u32_be(len(old_did)) || old_did || u32_be(len(new_did)) || new_did || u64_be(rotated_at)) with the OLD Identity Key, and carries it in the returned DidRotationEvent (ADR-003 acceptance criterion 4c invariant 2)",
+        "migrate_identity publishes the NEW DID document before it republishes the OLD one, so a verifier that follows alsoKnownAs always finds a published successor (ADR-003 acceptance criterion 4b)",
         "migrate_identity returns new Identity and DidRotationEvent for distribution to all active contexts",
+        "migrate_identity returns IdentityError::MigrationPublishFailed { phase, partial, source } when either DHT publish fails after destroy_after_migration has run, and DidDht::resume_migration_publish finishes the migration from the carried MigrationPartialState without re-deriving keys or re-signing proofs (ADR-003 acceptance criterion 4b; security spec §9.7.4.1, partial-publish recovery)",
         "migrate_identity starts background republish task for old DID document (forwarding record maintenance, recommended 90 days)",
-        "verify_migration(old_did, new_did, migration_proof, pre_rotation_proof) -> bool verifies cryptographic linkage: old Identity Key signed new Identity Key public bytes",
-        "verify_migration with pre_rotation_proof verifies SHA-256(new_identity_key_public) == commitment from old DID document's PreRotationCommitment service",
-        "verify_migration returns true only if all verifications pass",
-        "Pre-rotation proof provides STRONG assurance; migration proof alone provides MODERATE assurance",
+        "verify_migration(old_did, old_document, new_did, migration_proof, pre_rotation_proof, rotated_at, now) -> Result<bool, IdentityError> verifies the migration proof signature under migration_proof.old_public_key and binds that key to old_did by z-base-32 self-certification (ADR-003 acceptance criterion 4c invariants 2 and 3)",
+        "verify_migration verifies that the old_document's #0 verification method z-base-32 decodes to the public key old_did encodes, before any downstream invariant reads old_document (ADR-003 acceptance criterion 4c invariant 1)",
+        "verify_migration rejects a rotated_at more than 5 minutes ahead of now, more than 5 years behind now, or below the epoch floor 1700000000 (ADR-003 acceptance criterion 4c invariants 4, 5, and 6)",
+        "verify_migration verifies SHA-256(pre_rotation_proof.revealed_key) == pre_rotation_proof.commitment when a pre-rotation proof is supplied (ADR-003 acceptance criterion 4c invariant 8)",
+        "verify_migration verifies that pre_rotation_proof.commitment equals the 32 bytes parsed from the sha256:<hex> serviceEndpoint of the OLD document's PreRotationCommitment service (ADR-003 acceptance criterion 4c invariant 9)",
+        "verify_migration verifies that pre_rotation_proof.revealed_key z-base-32 encodes to exactly new_did (ADR-003 acceptance criterion 4c invariant 10)",
+        "verify_migration returns Ok(true) only when every applicable invariant holds, and returns Err(IdentityError::MigrationVerificationFailed(..)) naming the first failure otherwise; it never returns Ok(false) (ADR-003 acceptance criterion 4c)",
+        "verify_migration rejects a None pre_rotation_proof when the OLD document publishes a PreRotationCommitment service, because the old holder committed to STRONG assurance; it accepts None at MODERATE assurance only when the OLD document publishes no such service (ADR-003 acceptance criterion 4c invariant 7 and \"Assurance levels\")",
         "DidRotationEvent, MigrationProof, PreRotationProof structs defined matching spec",
         "Unit tests for rotate_active_key verifying DID string preservation, document update, key retirement",
         "Unit tests for migrate_identity verifying new DID creation, alsoKnownAs, cryptographic linkage",
@@ -754,16 +778,17 @@
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
-        "Implement rotate_active_key in dht.rs — generate new keypair, update DID document verification methods, sign with Identity Key, publish to DHT",
-        "Implement verification method retirement (#retired-{sequence}) in document.rs",
-        "Implement migrate_identity in dht.rs — create new DID, update old document with alsoKnownAs, sign linkage, publish both",
-        "Define DidRotationEvent struct with old_did, new_did, migration_proof, pre_rotation_proof, rotated_at",
-        "Define MigrationProof struct with signature (Ed25519 of SHA-256(SCP-MIGRATION-V1: || len(old_did) || old_did || len(new_did) || new_did || rotated_at) where len() is u32 BE, signed by old Identity Key) and old_public_key",
-        "Define PreRotationProof struct with commitment and revealed_key",
+        "Implement rotate_active_key in crates/scp-identity/src/dht.rs — generate new keypair, update DID document verification methods, sign with Identity Key, publish to DHT",
+        "Implement verification method retirement (#retired-{sequence}) in crates/scp-did/src/document.rs",
+        "Prune retired active-key verification methods to the 2 most recent inside DidDocument::retire_active_key, matching the existing prune_retired_agent_keys bound for #retired-agent-{sequence}",
+        "Implement migrate_identity in crates/scp-identity/src/dht.rs — reveal the pre-rotation public key, derive the new DID, mint the new operational and pre-rotation keys, consume the old pre-rotation handle, publish the new document, then republish the old one with alsoKnownAs",
+        "Define DidRotationEvent with old_did, new_did, migration_proof, pre_rotation_proof, rotated_at",
+        "Define MigrationProof with signature (Ed25519 of SHA-256(\"SCP-MIGRATION-V1:\" || len(old_did) || old_did || len(new_did) || new_did || rotated_at) where len() is u32 BE, signed by old Identity Key) and old_public_key",
+        "Define PreRotationProof with commitment and revealed_key",
         "Implement verify_migration with both migration proof and optional pre-rotation proof verification",
-        "Implement background republish for old DID document during migration (90-day recommended)",
-        "Write tests for active key rotation (DID preservation, document structure)",
-        "Write tests for identity migration (new DID, cryptographic linkage, forwarding)",
+        "Start the MigrationRepublisher background task from migrate_identity for the old DID document, bounded to the recommended 90 days, and return its MigrationHandle to the caller so the caller can cancel it",
+        "Write tests for active key rotation (DID preservation, document structure, retired-key bound)",
+        "Write tests for identity migration (new DID, cryptographic linkage, forwarding record)",
         "Write tests for migration verification (with/without pre-rotation proof, invalid proofs)"
       ],
       "blockedBy": [
@@ -773,14 +798,19 @@
         {
           "file": ".docs/adrs/phase-1.md",
           "section": "## ADR-003: DID Creation (did:dht)"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.1 Pre-Rotation Key Custody"
         }
       ],
       "details": {
         "didRotationEvent": "```rust\npub struct DidRotationEvent {\n    pub old_did: String,\n    pub new_did: String,\n    pub migration_proof: MigrationProof,\n    pub pre_rotation_proof: Option<PreRotationProof>,\n    pub rotated_at: u64,\n}\n\npub struct MigrationProof {\n    /// Ed25519 signature of SHA-256(SCP-MIGRATION-V1: || len(old_did) || old_did || len(new_did) || new_did || rotated_at)\n    /// where len() is u32 big-endian. Signed by the old Identity Key.\n    pub signature: [u8; 64],\n    pub old_public_key: [u8; 32],\n}\n\npub struct PreRotationProof {\n    /// The commitment published in the old DID document.\n    pub commitment: [u8; 32],\n    /// The new Identity Key public bytes. SHA-256(this) must equal commitment.\n    pub revealed_key: [u8; 32],\n}\n```",
         "postRotationRequirements": "After rotation, the caller MUST issue MLS Update proposals in all active contexts (PCS, spec §9.7.3) and revoke/reissue UCAN tokens signed by the old active key.",
-        "threeLayerSummary": "Layer 1 (rotate_active_key): common case, DID string unchanged. Layer 2 (migrate_identity): rare planned migration, DID string changes. Layer 3 (verify_migration): verification of migration proofs."
+        "threeLayerSummary": "Layer 1 (rotate_active_key): common case, DID string unchanged. Layer 2 (migrate_identity): rare planned migration, DID string changes. Layer 3 (verify_migration): verification of migration proofs.",
+        "openWork": "Two acceptance criteria have no implementation on main. First, migrate_identity (crates/scp-identity/src/dht.rs) runs steps 0 through 8 and spawns no task; MigrationRepublisher (crates/scp-identity/src/republish.rs) exists and its own unit tests exercise it, but no production code constructs one, and its migration_republish_loop runs without a 90-day bound. Second, DidDocument::retire_active_key (crates/scp-did/src/document.rs) renames the current #active to #retired-{sequence} and prunes nothing, so a document accumulates one retired active key per rotation; prune_retired_agent_keys bounds only the #retired-agent-{sequence} entries."
       },
-      "result": "Three-layer key rotation: rotate_active_key, migrate_identity, verify_migration. 28 new tests. All passing."
+      "result": "Three-layer key rotation landed: rotate_active_key, migrate_identity, verify_migration, with the partial-publish recovery path (MigrationPublishFailed / resume_migration_publish). The migration republish task and the retained-active-key bound did not land — see details.openWork."
     },
     {
       "id": "SCP-009",
