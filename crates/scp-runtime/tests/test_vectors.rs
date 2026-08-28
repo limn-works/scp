@@ -1293,7 +1293,8 @@ fn domain_separators_are_all_unique() {
         "SCP-EVENT-V1:",
         "SCP-CHECKPOINT-V1:",
         "SCP-MIGRATION-V1:",
-        "SCP-KEY-DESTRUCTION-V1:",
+        "SCP-KEY-DESTRUCTION-V2:",
+        "SCP-DESTRUCTION-PROOF-V1:",
         "SCP-CHUNK-MSG-ID-V1:",
         "SCP-PRIVATE-LOG-V1:",
         "SCP-BROADCAST-ENVELOPE-V1:",
@@ -1314,6 +1315,32 @@ fn domain_separators_are_all_unique() {
         "SCP-EPOCH-ADVANCE-V1:",
         "SCP-KEY-REQUEST-V1:",
         "SCP-DID-AUTH-V1:",
+        // §9.18.2 of the security spec registers these; the list above omitted
+        // them, so the prefix-freeness assertion below covered a subset of the
+        // registry rather than all of it. §9.18.2 has 48 rows carrying 49
+        // separator strings, because one row carries both `"standing:"` and
+        // `"standing-"`. The list below covers the 47 strings on the other 47
+        // rows and leaves that row out, because §9.18.2 marks its two strings as
+        // context-id construction prefixes rather than §9.5.1
+        // signature-preimage separators.
+        "SCP-ABSENT-AGENT-KEY",
+        "SCP-EXPORT-ENTRY:",
+        "SCP-HANDLE-OUTLET-V1:",
+        "SCP-INVITATION-BUNDLE-V1:",
+        "SCP-JOIN-RESPONSE-V1:",
+        "SCP-KEYPACKAGE-ATTESTATION-V1:",
+        "SCP-OUTLET-CANCEL-V1:",
+        "SCP-OUTLET-CAVEAT-BIND-V1:",
+        "SCP-OUTLET-CHUNK-SIG-V1:",
+        "SCP-OUTLET-CHUNK-V1:",
+        "SCP-OUTLET-CREDIT-V1:",
+        "SCP-PARTICIPATION-PROFILE-V1:",
+        "SCP-PUSH-DEREGISTER-V1:",
+        "SCP-PUSH-REGISTER-V1:",
+        "SCP-RECEIPT-V1:",
+        "SCP-XCTX-DIVERGENCE-V1:",
+        "SCP-XCTX-RECEIPT-V1:",
+        "SCP-XCTX-STREAM-RECEIPT-V1:",
     ];
 
     // HKDF/HMAC domain labels — used as info strings, salts, or trailing labels

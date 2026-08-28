@@ -38,6 +38,9 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::{ContextError, ContextMode, MemoryScope};
+use crate::crypto::canonical::{
+    CanonicalError, CanonicalField, canonical_hash, canonical_hash_bytes,
+};
 
 // ---------------------------------------------------------------------------
 // Type aliases (per-module pattern used throughout scp-core)
@@ -172,15 +175,45 @@ pub struct KeyDestructionAttestation {
 /// verified, never the method a record declared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DestructionMethod {
-    /// Key destruction is backed by a hardware security module (Secure
-    /// Enclave, Android Keystore). The hardware claims the key is gone.
-    HardwareBacked,
     /// Key destruction is software-only (`memset(0)` on key material in
     /// memory). Memory dumps, swap files, or crash logs may have retained
     /// the key.
+    ///
+    /// Declared first so that this variant's ordinal, `0`, equals the
+    /// discriminator §9.5.2 of the security spec assigns it. A binding author
+    /// who reaches for an ordinal, a `rawValue`, or a compact enum
+    /// serialization reads the same byte the preimage carries.
     SoftwareOnly,
+    /// Key destruction is backed by a hardware security module (Secure
+    /// Enclave, Android Keystore). The hardware claims the key is gone.
+    HardwareBacked,
 }
 
+impl DestructionMethod {
+    /// The one-byte discriminator this variant contributes to the
+    /// key-destruction signing preimage.
+    ///
+    /// §9.5.2 of the security spec assigns the encoding in its
+    /// `KeyDestructionAttestation` row: `0x00` for
+    /// [`DestructionMethod::SoftwareOnly`] and `0x01` for
+    /// [`DestructionMethod::HardwareBacked`]. The values follow this enum's
+    /// declaration order, as `InnerEnvelope.message_type` does, so an
+    /// implementation that reaches for a variant ordinal reads the same byte.
+    #[must_use]
+    pub const fn discriminator(self) -> u8 {
+        match self {
+            Self::SoftwareOnly => 0x00,
+            Self::HardwareBacked => 0x01,
+        }
+    }
+}
+
+/// Renders the variant name for a human reader.
+///
+/// The signing preimage does not use this output. §9.5.2 of the security spec
+/// encodes `method` as the one-byte [`DestructionMethod::discriminator`], and
+/// `"SCP-KEY-DESTRUCTION-V1:"` — which wrote this `Display` output behind a
+/// 4-byte length prefix — no longer exists.
 impl std::fmt::Display for DestructionMethod {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -193,6 +226,111 @@ impl std::fmt::Display for DestructionMethod {
 // ---------------------------------------------------------------------------
 // PlatformAttestation (§9.15)
 // ---------------------------------------------------------------------------
+
+/// The DID verification-method fragment that signed a key-destruction
+/// attestation.
+///
+/// §9.5.2 of the security spec binds this value in field 6 of the preimage, so
+/// a verifier reads the intended verification method out of the signed bytes.
+///
+/// The two variants are the union of what the security spec's two incompatible
+/// sentences admit. §9.15 permits `#0` or `#active`; §9.7.4 states that `#0` is
+/// "Used ONLY for DID document updates and signing pre-rotation commitments,"
+/// which excludes `#0` here. §27.4.6 of `.docs/specs/27-attestations.md`
+/// records the pair as contradiction C35 and open question OQ-53. This type
+/// admits everything either sentence admits, so it decides neither, and it
+/// admits nothing beyond them. It also excludes `#agent`, which §9.15 excludes.
+/// Open question OQ-53 records that §9.15 is the only artifact stating that
+/// exclusion: ADR-039's Category A names four actions the agent key must not
+/// sign and a destruction attestation is not one of them, and its
+/// key-properties table gives `#agent` "Yes (within permission scope)" for
+/// operational actions.
+///
+/// Wire-serializes as `"#0"` / `"#active"`, the values §9.15 of the security
+/// spec states and field 6 of the §9.5.2 preimage carries. The `Serialize` and
+/// `Deserialize` implementations route through [`DestructionSignerKeyId::as_fragment`]
+/// and [`DestructionSignerKeyId::from_fragment`] rather than deriving, so the
+/// wire alphabet and the preimage alphabet are the same one, as
+/// `scp_did::SigningKeyId` does for `InnerEnvelope` and `KeyPackageAttestation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DestructionSignerKeyId {
+    /// The Identity Key, `#0`.
+    Identity,
+    /// The Active Signing Key, `#active`.
+    Active,
+}
+
+impl DestructionSignerKeyId {
+    /// The DID document fragment reference this variant names.
+    ///
+    /// Field 6 of the §9.5.2 preimage carries the UTF-8 bytes of this string
+    /// behind a 4-byte big-endian length prefix.
+    #[must_use]
+    pub const fn as_fragment(self) -> &'static str {
+        match self {
+            Self::Identity => "#0",
+            Self::Active => "#active",
+        }
+    }
+
+    /// Parses a DID document fragment reference into a variant.
+    ///
+    /// Returns `None` for every fragment outside the permitted pair, `#agent`
+    /// included. This is the single canonical string-to-enum decoder, so the
+    /// permitted set stays closed in one place.
+    #[must_use]
+    pub fn from_fragment(fragment: &str) -> Option<Self> {
+        match fragment {
+            "#0" => Some(Self::Identity),
+            "#active" => Some(Self::Active),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for DestructionSignerKeyId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_fragment())
+    }
+}
+
+impl Serialize for DestructionSignerKeyId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_fragment())
+    }
+}
+
+impl<'de> Deserialize<'de> for DestructionSignerKeyId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let fragment = String::deserialize(deserializer)?;
+        Self::from_fragment(&fragment).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "signing_key_id must be \"#0\" or \"#active\", got {fragment:?}"
+            ))
+        })
+    }
+}
+
+/// Domain separator for the key-destruction signing preimage.
+///
+/// §9.18.2 of the security spec registers it, and §9.5.2 of that spec states
+/// the field order it prefixes. The `V2` suffix replaces
+/// `"SCP-KEY-DESTRUCTION-V1:"`, whose preimage covered neither
+/// `platform_attestation` nor `signing_key_id`, encoded `method` as a
+/// length-prefixed variant name, and carried no SHA-256. §9.5.1 of the security
+/// spec requires the increment: "Changing any field's encoding, adding a field,
+/// or removing a field requires incrementing the version."
+pub const KEY_DESTRUCTION_DOMAIN: &str = "SCP-KEY-DESTRUCTION-V2:";
+
+/// Domain separator for the hash of a [`PlatformAttestation`] proof body.
+///
+/// §9.18.2 of the security spec registers it. The key-destruction preimage
+/// carries the proof as this 32-byte hash, which lets an absent proof take
+/// §9.5.1's `SHA-256(0x00)` sentinel at the same width. §9.5.1 states why the
+/// present case hashes domain-separated bytes: "The sentinel is
+/// distinguishable from any real hash because `SHA-256(0x00)` is not a valid
+/// hash of structured data with a domain separator."
+pub const DESTRUCTION_PROOF_DOMAIN: &str = "SCP-DESTRUCTION-PROOF-V1:";
 
 /// Platform-provided attestation for key destruction, if available.
 ///
@@ -208,17 +346,46 @@ pub struct PlatformAttestation {
     pub platform: String,
 }
 
+impl PlatformAttestation {
+    /// The 32-byte hash this proof contributes to the key-destruction signing
+    /// preimage (§9.5.2 of the security spec, field 4).
+    ///
+    /// `SHA-256("SCP-DESTRUCTION-PROOF-V1:" || BE32(len(attestation_data)) ||
+    /// attestation_data || BE32(len(platform)) || platform)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CanonicalError::FieldTooLarge`] when `attestation_data` or
+    /// `platform` exceeds `u32::MAX` bytes, which no length prefix can encode.
+    pub fn proof_hash(&self) -> Result<[u8; 32], CanonicalError> {
+        canonical_hash(
+            DESTRUCTION_PROOF_DOMAIN,
+            &[
+                CanonicalField::VarBytes(&self.attestation_data),
+                CanonicalField::VarBytes(self.platform.as_bytes()),
+            ],
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PublishableKeyDestructionAttestation (§9.15)
 // ---------------------------------------------------------------------------
 
 /// Publishable key destruction attestation per spec §9.15.
 ///
-/// Published to relays after context key destruction. Signed by the
-/// member's Identity Key (`#0`) or Active Signing Key (`#active`) — NOT
-/// the Agent Signing Key (`#agent`, ADR-039). The signature remains
-/// verifiable after context keys are destroyed because it is bound to the
-/// identity key, not the context key material.
+/// Published to relays after context key destruction. The signature remains
+/// verifiable after context keys are destroyed because it is bound to an
+/// identity key, not to the context key material.
+///
+/// Which verification method may sign is unsettled. §9.15 of the security spec
+/// permits `#0` (Identity Key) or `#active` (Active Signing Key) and excludes
+/// `#agent` (ADR-039); §9.7.4 of the same spec states that `#0` is "Used ONLY
+/// for DID document updates and signing pre-rotation commitments," which a
+/// destruction attestation is not. §27.4.6 of
+/// `.docs/specs/27-attestations.md` records the pair as contradiction C35 and
+/// open question OQ-53. [`Self::signing_key_id`] binds whichever fragment
+/// signed, so a verifier enforces whichever rule a human settles.
 ///
 /// Trust levels, per §9.15 of the security spec, which rates the method a
 /// consumer verified and never the method this record declared:
@@ -248,19 +415,46 @@ pub struct PublishableKeyDestructionAttestation {
     /// pass (§27.4.6 of `.docs/specs/27-attestations.md`, clause 1). No SCP
     /// implementation verifies this proof today, and open questions OQ-2 and
     /// OQ-29 of that spec own the verification procedure and what a pass would
-    /// establish. [`Self::signing_payload`] does not cover this field, which is
-    /// contradiction C34 of the same spec and open question OQ-8.
+    /// establish.
+    ///
+    /// [`Self::signing_preimage`] covers this field as
+    /// [`PlatformAttestation::proof_hash`], so a holder who strips it or swaps
+    /// a different proof in invalidates the signature. §9.5.2 of the security
+    /// spec states the encoding, and §9.5.1's `SHA-256(0x00)` sentinel encodes
+    /// the absent case.
     pub platform_attestation: Option<PlatformAttestation>,
     /// The destruction method the publisher declared.
     ///
     /// This is a declaration, not a finding. Read it through
-    /// [`Self::verified_method`], which applies the §27.4.6 clauses. The field
-    /// is crate-private so that no consumer can read the declared value in
-    /// place of the method those clauses produce.
+    /// [`Self::verified_method`], which applies the §27.4.6 clauses.
+    ///
+    /// The field is crate-private, which closes the typed Rust read path and
+    /// closes no other. The struct derives `Serialize` and `Debug`, so the
+    /// declaration reaches any consumer that formats or serializes the record,
+    /// and `the_declaration_still_round_trips_on_the_wire` pins that on
+    /// purpose: a republished record carries the publisher's declaration
+    /// unchanged. Clause 4 of §27.4.6 addresses that consumer too.
     pub(crate) method: DestructionMethod,
-    /// Ed25519 signature over the attestation payload, signed by `#0`
-    /// (Identity Key) or `#active` (Active Signing Key). NOT `#agent`
-    /// per ADR-039 — agents cannot sign destruction attestations.
+    /// The DID verification-method fragment that produced `signature`.
+    ///
+    /// §9.5.2 of the security spec places this field in the signing preimage,
+    /// so a verifier reads the intended key out of the signed bytes rather than
+    /// out of the transport that carried them. A verifier resolves the fragment
+    /// against `member_did` above, which the same preimage binds.
+    ///
+    /// [`DestructionSignerKeyId`] admits the union of what §9.15 and §9.7.4 of
+    /// the security spec each admit, so the type decides neither arm of
+    /// contradiction C35. It also rejects `#agent`, which §9.15 excludes and
+    /// which open question OQ-53 records as resting on §9.15 alone.
+    pub signing_key_id: DestructionSignerKeyId,
+    /// Ed25519 signature over the 32-byte [`Self::canonical_hash`] output.
+    ///
+    /// §9.15 of the security spec states one rule for which key signs, and
+    /// §9.7.4 of the same spec states another; §27.4.6 of
+    /// `.docs/specs/27-attestations.md` records the pair as contradiction C35
+    /// and open question OQ-53. Whichever rule a human settles,
+    /// `signing_key_id` above binds the fragment that actually signed, so a
+    /// verifier can enforce it.
     ///
     /// Stored as `Vec<u8>` (always 64 bytes) because `[u8; 64]` does not
     /// implement `Serialize`/`Deserialize` in serde without additional
@@ -281,6 +475,7 @@ impl PublishableKeyDestructionAttestation {
         destroyed_at: u64,
         platform_attestation: Option<PlatformAttestation>,
         method: DestructionMethod,
+        signing_key_id: DestructionSignerKeyId,
         signature: Vec<u8>,
     ) -> Self {
         Self {
@@ -289,6 +484,7 @@ impl PublishableKeyDestructionAttestation {
             destroyed_at,
             platform_attestation,
             method,
+            signing_key_id,
             signature,
         }
     }
@@ -301,15 +497,18 @@ impl PublishableKeyDestructionAttestation {
     /// [`DestructionMethod::SoftwareOnly`] unless a verification of the
     /// accompanying `platform_attestation` returns a pass.
     ///
-    /// Two answers stand between a declaration and a hardware reading, and this
-    /// function fails closed to [`DestructionMethod::SoftwareOnly`] until both
-    /// land. No SCP implementation verifies a `platform_attestation`, and no
-    /// artifact states the checks such a verification would run — open
-    /// questions OQ-2 and OQ-29. [`Self::signing_payload`] also leaves the proof
-    /// outside the signed bytes, so a holder detaches it from the signature that
-    /// binds `method`, and a verification of a detached proof establishes
-    /// nothing about the declaration beside it — contradiction C34 and open
-    /// question OQ-8, which a human decides.
+    /// This function fails closed to [`DestructionMethod::SoftwareOnly`] for
+    /// every declared value. No SCP implementation verifies a
+    /// `platform_attestation`, and no artifact states the checks such a
+    /// verification would run — open questions OQ-2 and OQ-29.
+    ///
+    /// [`Self::signing_preimage`] covers the proof, so a holder cannot swap the
+    /// proof a signer chose for a different one. Which platform event that
+    /// proof reports, and whether it reports one about this member, this
+    /// context, and this key material, are the three properties §27.4.6 of
+    /// `.docs/specs/27-attestations.md` derives and open question OQ-2 owns.
+    /// The signed scope binds which proof a signer chose; it does not make that
+    /// proof report a destruction.
     #[must_use]
     pub const fn verified_method(&self) -> DestructionMethod {
         // Both declared variants map to `SoftwareOnly` today. The match names
@@ -329,37 +528,82 @@ impl PublishableKeyDestructionAttestation {
         self.signature.len() == 64
     }
 
-    /// Returns the signing payload for this attestation.
+    /// The six canonical fields of the signing preimage, in the order §9.5.2 of
+    /// the security spec assigns them.
     ///
-    /// The payload is length-prefixed to prevent field-boundary ambiguity:
+    /// `proof_hash` carries [`PlatformAttestation::proof_hash`] when the record
+    /// holds a proof, and `None` when it does not. The caller computes it and
+    /// lends it, because [`CanonicalField::Fixed32`] borrows the array.
+    fn canonical_fields<'a>(&'a self, proof_hash: Option<&'a [u8; 32]>) -> [CanonicalField<'a>; 6] {
+        [
+            CanonicalField::VarBytes(self.context_id.as_bytes()),
+            CanonicalField::VarBytes(self.member_did.as_bytes()),
+            CanonicalField::U64(self.destroyed_at),
+            proof_hash.map_or(CanonicalField::Absent, CanonicalField::Fixed32),
+            CanonicalField::U8(self.method.discriminator()),
+            CanonicalField::VarBytes(self.signing_key_id.as_fragment().as_bytes()),
+        ]
+    }
+
+    /// Hashes the accompanying proof, or returns `None` when the record carries
+    /// none.
+    fn proof_hash(&self) -> Result<Option<[u8; 32]>, CanonicalError> {
+        self.platform_attestation
+            .as_ref()
+            .map(PlatformAttestation::proof_hash)
+            .transpose()
+    }
+
+    /// Returns the §9.5.1 canonical preimage — the bytes the hash covers.
+    ///
+    /// §9.5.2 of the security spec states the field order and every encoding:
+    ///
     /// ```text
-    /// "SCP-KEY-DESTRUCTION-V1:"
+    /// "SCP-KEY-DESTRUCTION-V2:"
     ///   || len(context_id) (4 bytes BE) || context_id
     ///   || len(member_did) (4 bytes BE) || member_did
     ///   || destroyed_at (8 bytes BE)
-    ///   || len(method) (4 bytes BE) || method
+    ///   || platform_attestation (32 bytes: proof_hash, or SHA-256(0x00))
+    ///   || method (1 byte: 0x00 SoftwareOnly, 0x01 HardwareBacked)
+    ///   || len(signing_key_id) (4 bytes BE) || signing_key_id
     /// ```
-    #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
-    pub fn signing_payload(&self) -> Vec<u8> {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(b"SCP-KEY-DESTRUCTION-V1:");
+    ///
+    /// The order matches this struct's declaration order and §9.15's record
+    /// listing, so a binding author transcribing either produces the same
+    /// bytes.
+    ///
+    /// A signer signs [`Self::canonical_hash`], not these bytes. This method
+    /// exists so a conformance test can compare the preimage against the
+    /// known-answer vectors in §25.25 of `.docs/specs/25-test-vectors.md`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CanonicalError::FieldTooLarge`] when a variable-length field
+    /// exceeds `u32::MAX` bytes, which no length prefix can encode.
+    pub fn signing_preimage(&self) -> Result<Vec<u8>, CanonicalError> {
+        let proof_hash = self.proof_hash()?;
+        canonical_hash_bytes(
+            KEY_DESTRUCTION_DOMAIN.as_bytes(),
+            &self.canonical_fields(proof_hash.as_ref()),
+        )
+    }
 
-        let ctx_bytes = self.context_id.as_bytes();
-        payload.extend_from_slice(&(ctx_bytes.len() as u32).to_be_bytes());
-        payload.extend_from_slice(ctx_bytes);
-
-        let did_bytes = self.member_did.as_bytes();
-        payload.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
-        payload.extend_from_slice(did_bytes);
-
-        payload.extend_from_slice(&self.destroyed_at.to_be_bytes());
-
-        let method_str = self.method.to_string();
-        let method_bytes = method_str.as_bytes();
-        payload.extend_from_slice(&(method_bytes.len() as u32).to_be_bytes());
-        payload.extend_from_slice(method_bytes);
-        payload
+    /// Returns the 32-byte SHA-256 hash an Ed25519 signature over this record
+    /// covers.
+    ///
+    /// §9.5.1 of the security spec states the construction for every signed
+    /// structure: `SHA-256(domain_separator || field_1 || ... || field_N)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CanonicalError::FieldTooLarge`] when a variable-length field
+    /// exceeds `u32::MAX` bytes, which no length prefix can encode.
+    pub fn canonical_hash(&self) -> Result<[u8; 32], CanonicalError> {
+        let proof_hash = self.proof_hash()?;
+        canonical_hash(
+            KEY_DESTRUCTION_DOMAIN,
+            &self.canonical_fields(proof_hash.as_ref()),
+        )
     }
 }
 
@@ -1015,6 +1259,7 @@ mod tests {
                 platform: "android-keystore".to_owned(),
             }),
             method: DestructionMethod::HardwareBacked,
+            signing_key_id: DestructionSignerKeyId::Active,
             signature: vec![0xAA; 64],
         };
         let json = serde_json::to_string(&attestation).unwrap();
@@ -1031,6 +1276,7 @@ mod tests {
             destroyed_at: 1_700_000_000,
             platform_attestation: None,
             method: DestructionMethod::SoftwareOnly,
+            signing_key_id: DestructionSignerKeyId::Active,
             signature: vec![0x00; 64],
         };
         assert!(attestation.has_valid_signature_length());
@@ -1044,25 +1290,53 @@ mod tests {
             destroyed_at: 1_700_000_000,
             platform_attestation: None,
             method: DestructionMethod::SoftwareOnly,
+            signing_key_id: DestructionSignerKeyId::Active,
             signature: vec![0x00; 32], // Wrong length
         };
         assert!(!attestation.has_valid_signature_length());
     }
 
     #[test]
-    fn publishable_attestation_signing_payload_deterministic() {
+    fn publishable_attestation_signing_preimage_deterministic() {
         let attestation = PublishableKeyDestructionAttestation {
             context_id: "ctx-1".to_owned(),
             member_did: "did:dht:alice".to_owned(),
             destroyed_at: 1_700_000_000,
             platform_attestation: None,
             method: DestructionMethod::SoftwareOnly,
+            signing_key_id: DestructionSignerKeyId::Active,
             signature: vec![0x00; 64],
         };
-        let payload1 = attestation.signing_payload();
-        let payload2 = attestation.signing_payload();
-        assert_eq!(payload1, payload2);
-        assert!(!payload1.is_empty());
+        let preimage1 = attestation.signing_preimage().unwrap();
+        let preimage2 = attestation.signing_preimage().unwrap();
+        assert_eq!(preimage1, preimage2);
+        // 23-byte domain + (4 + 5) context_id + (4 + 13) member_did
+        // + 8 destroyed_at + 32 proof sentinel + 1 method + (4 + 7) key id.
+        assert_eq!(preimage1.len(), 101);
+    }
+
+    #[test]
+    fn publishable_attestation_canonical_hash_covers_the_preimage() {
+        use sha2::{Digest, Sha256};
+        let attestation = PublishableKeyDestructionAttestation {
+            context_id: "ctx-1".to_owned(),
+            member_did: "did:dht:alice".to_owned(),
+            destroyed_at: 1_700_000_000,
+            platform_attestation: None,
+            method: DestructionMethod::SoftwareOnly,
+            signing_key_id: DestructionSignerKeyId::Active,
+            signature: vec![0x00; 64],
+        };
+        let expected: [u8; 32] = Sha256::digest(attestation.signing_preimage().unwrap()).into();
+        assert_eq!(attestation.canonical_hash().unwrap(), expected);
+    }
+
+    #[test]
+    fn destruction_method_discriminators_match_the_spec_row() {
+        // §9.5.2 of the security spec assigns 0x00 to the lower-confidence
+        // variant, so a zero-filled byte decodes to the weaker claim.
+        assert_eq!(DestructionMethod::SoftwareOnly.discriminator(), 0x00);
+        assert_eq!(DestructionMethod::HardwareBacked.discriminator(), 0x01);
     }
 
     #[test]
@@ -1073,6 +1347,7 @@ mod tests {
             destroyed_at: 1_700_000_000,
             platform_attestation: None,
             method: DestructionMethod::SoftwareOnly,
+            signing_key_id: DestructionSignerKeyId::Active,
             signature: vec![0xFF; 64],
         };
         assert!(attestation.platform_attestation.is_none());
@@ -1136,11 +1411,17 @@ mod destruction_reading_rule_tests {
     //! §27.4.6 of `.docs/specs/27-attestations.md` quotes a human ruling of
     //! 2026-08-25 and states it in four clauses: a hardware-backed declaration
     //! reads as software-backed unless a verified platform attestation proof
-    //! accompanies it. No verification exists, and the signing preimage leaves
-    //! the proof outside the signed bytes, so every hardware declaration reads
-    //! as `SoftwareOnly`.
+    //! accompanies it. No verification of such a proof exists in any SCP
+    //! implementation, so every hardware declaration reads as `SoftwareOnly`.
+    //!
+    //! The tests below also pin what the signed scope does: §9.5.2 of the
+    //! security spec carries `platform_attestation` in the preimage, so
+    //! stripping the proof or substituting another one breaks the signature.
 
-    use super::{DestructionMethod, PlatformAttestation, PublishableKeyDestructionAttestation};
+    use super::{
+        DestructionMethod, DestructionSignerKeyId, PlatformAttestation,
+        PublishableKeyDestructionAttestation,
+    };
 
     fn attestation(
         method: DestructionMethod,
@@ -1152,6 +1433,7 @@ mod destruction_reading_rule_tests {
             1_700_000_000,
             proof,
             method,
+            DestructionSignerKeyId::Active,
             vec![0xAA; 64],
         )
     }
@@ -1181,23 +1463,101 @@ mod destruction_reading_rule_tests {
     }
 
     #[test]
-    fn the_signing_payload_still_covers_the_declared_method_and_not_the_proof() {
-        // Contradiction C34: the signature binds the declaration and leaves the
-        // proof detachable. This test pins the shipped scope so that a change to
-        // it is a deliberate answer to open question OQ-8, not a side effect.
+    fn stripping_the_proof_changes_the_signed_bytes() {
+        // Contradiction C34 said the signature bound the declaration and left
+        // the proof detachable. §9.5.2 of the security spec now places
+        // `platform_attestation` in the preimage, so a holder who strips it
+        // changes the hash a signature covers and that signature no longer
+        // verifies. The predecessor of this test asserted the two preimages
+        // equal, and it fails against this body.
         let proof = PlatformAttestation {
             attestation_data: vec![0xCD; 8],
             platform: "android-keystore".to_owned(),
         };
         let with_proof = attestation(DestructionMethod::HardwareBacked, Some(proof));
         let without_proof = attestation(DestructionMethod::HardwareBacked, None);
-        assert_eq!(
-            with_proof.signing_payload(),
-            without_proof.signing_payload()
+        assert_ne!(
+            with_proof.signing_preimage().unwrap(),
+            without_proof.signing_preimage().unwrap()
+        );
+        assert_ne!(
+            with_proof.canonical_hash().unwrap(),
+            without_proof.canonical_hash().unwrap()
+        );
+    }
+
+    #[test]
+    fn swapping_in_a_different_proof_changes_the_signed_bytes() {
+        let apple = PlatformAttestation {
+            attestation_data: vec![0xCD; 8],
+            platform: "apple-secure-enclave".to_owned(),
+        };
+        let android = PlatformAttestation {
+            attestation_data: vec![0xCD; 8],
+            platform: "android-keystore".to_owned(),
+        };
+        let signed = attestation(DestructionMethod::HardwareBacked, Some(apple));
+        let swapped = attestation(DestructionMethod::HardwareBacked, Some(android));
+        assert_ne!(
+            signed.canonical_hash().unwrap(),
+            swapped.canonical_hash().unwrap()
         );
 
+        // The same platform with different proof bytes is a different record too.
+        let mutated_bytes = PlatformAttestation {
+            attestation_data: vec![0xCE; 8],
+            platform: "apple-secure-enclave".to_owned(),
+        };
+        let mutated = attestation(DestructionMethod::HardwareBacked, Some(mutated_bytes));
+        assert_ne!(
+            signed.canonical_hash().unwrap(),
+            mutated.canonical_hash().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_stripped_proof_fails_ed25519_verification() {
+        use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+
+        let proof = PlatformAttestation {
+            attestation_data: vec![0xCD; 8],
+            platform: "apple-secure-enclave".to_owned(),
+        };
+        let signer = SigningKey::from_bytes(&[0x11; 32]);
+        let verifier: VerifyingKey = signer.verifying_key();
+
+        let mut record = attestation(DestructionMethod::HardwareBacked, Some(proof));
+        let signature = signer.sign(&record.canonical_hash().unwrap());
+        record.signature = signature.to_bytes().to_vec();
+        verifier
+            .verify(&record.canonical_hash().unwrap(), &signature)
+            .expect("the record the signer signed must verify");
+
+        // A holder strips the proof and presents the same signature.
+        record.platform_attestation = None;
+        assert!(
+            verifier
+                .verify(&record.canonical_hash().unwrap(), &signature)
+                .is_err(),
+            "a stripped proof must invalidate the signature"
+        );
+    }
+
+    #[test]
+    fn the_signed_bytes_bind_the_declared_method_and_the_signing_key_id() {
+        let hardware = attestation(DestructionMethod::HardwareBacked, None);
         let software = attestation(DestructionMethod::SoftwareOnly, None);
-        assert_ne!(without_proof.signing_payload(), software.signing_payload());
+        assert_ne!(
+            hardware.canonical_hash().unwrap(),
+            software.canonical_hash().unwrap()
+        );
+
+        let mut other_key = attestation(DestructionMethod::SoftwareOnly, None);
+        other_key.signing_key_id = DestructionSignerKeyId::Identity;
+        assert_ne!(
+            software.canonical_hash().unwrap(),
+            other_key.canonical_hash().unwrap()
+        );
     }
 
     #[test]
@@ -1211,5 +1571,222 @@ mod destruction_reading_rule_tests {
         let back: PublishableKeyDestructionAttestation = serde_json::from_str(&json).unwrap();
         assert_eq!(back, a);
         assert_eq!(back.verified_method(), DestructionMethod::SoftwareOnly);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod destruction_test_vectors {
+    //! §25.25 of `.docs/specs/25-test-vectors.md` pins Vector 38 and Vector 39,
+    //! the two known-answer vectors for the key-destruction signing preimage.
+    //! Vector 38 carries no platform attestation proof and Vector 39 carries
+    //! one, so the pair pins both arms of §9.5.1's optional-field rule. Two
+    //! conforming implementations that disagree on a byte fail here.
+
+    use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
+
+    use super::{
+        DESTRUCTION_PROOF_DOMAIN, DestructionMethod, DestructionSignerKeyId,
+        KEY_DESTRUCTION_DOMAIN, PlatformAttestation, PublishableKeyDestructionAttestation,
+    };
+
+    /// The §25.2 reference Ed25519 seed — RFC 8032 §7.1 Test Vector 1.
+    const REF_SEED: [u8; 32] = [
+        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
+        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
+        0x7f, 0x60,
+    ];
+
+    /// The §25.2 reference Ed25519 public key.
+    const REF_PUBLIC: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+
+    const CONTEXT_ID: &str = "ctx-destroy-vector";
+    const MEMBER_DID: &str = "did:dht:z6MkDestroyer";
+    const DESTROYED_AT: u64 = 1_700_000_000;
+    const SIGNING_KEY_ID: DestructionSignerKeyId = DestructionSignerKeyId::Active;
+
+    fn record(
+        method: DestructionMethod,
+        proof: Option<PlatformAttestation>,
+    ) -> PublishableKeyDestructionAttestation {
+        PublishableKeyDestructionAttestation::new(
+            CONTEXT_ID.to_owned(),
+            MEMBER_DID.to_owned(),
+            DESTROYED_AT,
+            proof,
+            method,
+            SIGNING_KEY_ID,
+            vec![0x00; 64],
+        )
+    }
+
+    /// The Vector 39 proof: eight bytes of attestation data from an Apple
+    /// Secure Enclave.
+    fn vector_39_proof() -> PlatformAttestation {
+        PlatformAttestation {
+            attestation_data: vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+            platform: "apple-secure-enclave".to_owned(),
+        }
+    }
+
+    fn signed(record: &PublishableKeyDestructionAttestation) -> [u8; 64] {
+        SigningKey::from_bytes(&REF_SEED)
+            .sign(&record.canonical_hash().unwrap())
+            .to_bytes()
+    }
+
+    #[test]
+    fn the_reference_key_reproduces_the_spec_public_key() {
+        // §25.2 states that an implementation failing this check has a broken
+        // Ed25519 and must not proceed with interoperability testing.
+        let public = SigningKey::from_bytes(&REF_SEED).verifying_key();
+        assert_eq!(hex::encode(public.as_bytes()), REF_PUBLIC);
+    }
+
+    #[test]
+    fn the_signing_key_id_serializes_as_the_fragment_the_spec_states() {
+        // §9.15 of the security spec states the value domain as `"#0" | "#active"`,
+        // and field 6 of the §9.5.2 preimage carries those same bytes. A derived
+        // `Serialize` would emit the variant name instead, so the wire alphabet and
+        // the preimage alphabet would differ.
+        let json = serde_json::to_string(&DestructionSignerKeyId::Active).unwrap();
+        assert_eq!(json, "\"#active\"");
+        let json = serde_json::to_string(&DestructionSignerKeyId::Identity).unwrap();
+        assert_eq!(json, "\"#0\"");
+
+        let back: DestructionSignerKeyId = serde_json::from_str("\"#0\"").unwrap();
+        assert_eq!(back, DestructionSignerKeyId::Identity);
+
+        // Everything outside the permitted set is rejected on the wire, including
+        // the variant names a derived implementation would have accepted.
+        for rejected in ["#agent", "", "Active", "Identity", "#ACTIVE", "active"] {
+            let encoded = serde_json::to_string(rejected).unwrap();
+            assert!(
+                serde_json::from_str::<DestructionSignerKeyId>(&encoded).is_err(),
+                "{rejected:?} must not deserialize"
+            );
+        }
+    }
+
+    #[test]
+    fn field_six_carries_the_identity_fragment_as_two_bytes() {
+        // No known-answer vector pins the `#0` arm, because §25.25 uses `"#active"`
+        // in both vectors — the one fragment both sides of contradiction C35 admit.
+        // This test pins the other arm's bytes.
+        let mut attestation = record(DestructionMethod::SoftwareOnly, None);
+        attestation.signing_key_id = DestructionSignerKeyId::Identity;
+        let preimage = attestation.signing_preimage().unwrap();
+        // 122 bytes minus the 5-byte difference between "#active" and "#0".
+        assert_eq!(preimage.len(), 117);
+        // BE32(2) || "#0" == 00000002 2330
+        assert!(hex::encode(&preimage).ends_with("000000022330"));
+    }
+
+    #[test]
+    fn the_domain_separators_match_the_registry_rows() {
+        // §9.18.2 of the security spec registers both strings.
+        assert_eq!(KEY_DESTRUCTION_DOMAIN, "SCP-KEY-DESTRUCTION-V2:");
+        assert_eq!(DESTRUCTION_PROOF_DOMAIN, "SCP-DESTRUCTION-PROOF-V1:");
+    }
+
+    #[test]
+    fn vector_38_pins_the_preimage_hash_and_signature_with_no_proof() {
+        let attestation = record(DestructionMethod::SoftwareOnly, None);
+
+        let preimage = attestation.signing_preimage().unwrap();
+        assert_eq!(preimage.len(), 122);
+        assert_eq!(
+            hex::encode(&preimage),
+            concat!(
+                "5343502d4b45592d4445535452554354494f4e2d56323a",
+                "000000126374782d64657374726f792d766563746f72",
+                "000000156469643a6468743a7a364d6b44657374726f796572",
+                "000000006553f100",
+                "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+                "00",
+                "0000000723616374697665",
+            )
+        );
+
+        let hash = attestation.canonical_hash().unwrap();
+        assert_eq!(
+            hex::encode(hash),
+            "8a140aac6b15748b96cef6cfb1942bc0b1b68ecbc505ac8de487452ba18ba7c4"
+        );
+
+        let signature = signed(&attestation);
+        assert_eq!(
+            hex::encode(signature),
+            concat!(
+                "63df30675677a88898ce9e6ddd95de1df080efb03b21c58a7de4886ccdbd53b7",
+                "e216826ffa797a124fbfe8fc81262fd06e3b45e5edb2ec4526475fcb829f6c0d",
+            )
+        );
+
+        SigningKey::from_bytes(&REF_SEED)
+            .verifying_key()
+            .verify(&hash, &Signature::from_bytes(&signature))
+            .expect("Vector 38 signature must verify under the reference key");
+    }
+
+    #[test]
+    fn vector_39_pins_the_preimage_hash_and_signature_with_a_proof() {
+        let proof = vector_39_proof();
+        assert_eq!(
+            hex::encode(proof.proof_hash().unwrap()),
+            "743ccc956ebe5f89a1ba4c0c8a6caae5361c7c7e6e7c78d31821e139ed16096e"
+        );
+
+        let attestation = record(DestructionMethod::HardwareBacked, Some(proof));
+
+        let preimage = attestation.signing_preimage().unwrap();
+        assert_eq!(preimage.len(), 122);
+        assert_eq!(
+            hex::encode(&preimage),
+            concat!(
+                "5343502d4b45592d4445535452554354494f4e2d56323a",
+                "000000126374782d64657374726f792d766563746f72",
+                "000000156469643a6468743a7a364d6b44657374726f796572",
+                "000000006553f100",
+                "743ccc956ebe5f89a1ba4c0c8a6caae5361c7c7e6e7c78d31821e139ed16096e",
+                "01",
+                "0000000723616374697665",
+            )
+        );
+
+        let hash = attestation.canonical_hash().unwrap();
+        assert_eq!(
+            hex::encode(hash),
+            "6a6a896cd7c711b6cbfaab276e7de891bc9fdb5bb9ce1826b288fa3e69e9ccb1"
+        );
+
+        let signature = signed(&attestation);
+        assert_eq!(
+            hex::encode(signature),
+            concat!(
+                "6b7c14cd04ab2b757fd2e37f70637879ddc4af55b4c19f54f653f2b7dbe4bf42",
+                "81d44646053f53b5b100c2d2e572ac31a0a7ae58f491baebcf57a41743ae960b",
+            )
+        );
+
+        SigningKey::from_bytes(&REF_SEED)
+            .verifying_key()
+            .verify(&hash, &Signature::from_bytes(&signature))
+            .expect("Vector 39 signature must verify under the reference key");
+    }
+
+    #[test]
+    fn the_vector_39_signature_rejects_the_vector_38_record() {
+        // The two vectors differ in the method byte and in the proof field, so
+        // neither signature covers the other record.
+        let with_proof = record(DestructionMethod::HardwareBacked, Some(vector_39_proof()));
+        let without_proof = record(DestructionMethod::SoftwareOnly, None);
+        let signature = Signature::from_bytes(&signed(&with_proof));
+        assert!(
+            SigningKey::from_bytes(&REF_SEED)
+                .verifying_key()
+                .verify(&without_proof.canonical_hash().unwrap(), &signature)
+                .is_err()
+        );
     }
 }
