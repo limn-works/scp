@@ -485,7 +485,7 @@ pub trait DidMethod: Send + Sync {
     /// once. Mainline DHT records expire, so §3.10.5 step 4 of the identity spec
     /// schedules a keep-alive that re-puts those exact bytes under that exact
     /// sequence, and
-    /// [`RepublishManager`](republish::RepublishManager) — the type §3.10.5 names
+    /// [`RepublishManager`] — the type §3.10.5 names
     /// for the job — takes a [`DhtClient`](scp_dht::DhtClient). This associated
     /// type is where a node that holds only a `DidMethod` obtains one.
     ///

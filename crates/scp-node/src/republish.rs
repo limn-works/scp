@@ -213,7 +213,7 @@ pub struct SelfDidRepublishing<D: DhtClient + 'static> {
     /// for the life of the process — the §10.12.1 disclosure past shutdown.
     runtime: tokio::runtime::Handle,
     /// The re-seed observer. Aborted AND JOINED before the manager is stopped —
-    /// see [`stop`](Self::stop).
+    /// see [`join_then_stop_all`].
     ///
     /// `Option` so every teardown path can take the handle by value: [`Drop`]
     /// must move it into the task it spawns, because the join is the barrier and
@@ -222,8 +222,8 @@ pub struct SelfDidRepublishing<D: DhtClient + 'static> {
     /// [`Arc`] and stops it through a shared `&self`, exactly as
     /// `TierReEvalHandle` holds its completion receiver.
     reseed_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Set by [`stop`](Self::stop) so the [`Drop`] backstop stays out of the way
-    /// on the deterministic teardown path.
+    /// Set by every teardown path so the [`Drop`] backstop stays out of the way
+    /// once the arms are already accounted for.
     stopped: std::sync::atomic::AtomicBool,
 }
 
@@ -311,7 +311,8 @@ impl<D: DhtClient + 'static> SelfDidRepublishing<D> {
 }
 
 impl<D: DhtClient + 'static> Drop for SelfDidRepublishing<D> {
-    /// Backstop for every path that never reaches [`stop`](Self::stop).
+    /// Backstop for every path that never reaches
+    /// [`stop_and_wait`](RepublishCycle::stop_and_wait).
     ///
     /// [`stop_and_wait`](RepublishCycle::stop_and_wait) runs from exactly one
     /// line, `ApplicationNode::shutdown`. A node that is DROPPED without one —
@@ -417,9 +418,9 @@ pub trait RepublishCycle: Send + Sync {
 }
 
 impl<D: DhtClient + 'static> RepublishCycle for SelfDidRepublishing<D> {
-    /// Bridges the synchronous `shutdown(&self)` surface to [`stop`](Self::stop),
-    /// which must `await` the observer join that is the barrier against a
-    /// re-seed outrunning `stop_all`.
+    /// Bridges the synchronous `shutdown(&self)` surface to
+    /// [`join_then_stop_all`], which must `await` the observer join that is the
+    /// barrier against a re-seed outrunning `stop_all`.
     ///
     /// The observer abort needs no runtime, so it runs first and on every path:
     /// once it has happened, nothing can start a further arm, whatever the
