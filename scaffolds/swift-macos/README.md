@@ -1,6 +1,8 @@
 # SCP Swift macOS Scaffold
 
-Minimal macOS app using the SCP Swift SDK with Keychain key custody.
+Minimal macOS app using the SCP Swift SDK with the in-memory key store. No custody
+string reaches the Keychain: the UniFFI bridge answers `"platform"` with
+`SCP-IDENT-1003`.
 
 ## Prerequisites
 
@@ -18,7 +20,7 @@ swift run
 
 ## What This Does
 
-1. Creates a `did:dht` identity with Keychain key custody
+1. Creates a `did:dht` identity with the in-memory key store
 2. Opens an encrypted context with messaging capabilities
 3. Sends a message
 4. Cleans up by leaving the context

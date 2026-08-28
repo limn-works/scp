@@ -150,7 +150,7 @@ public struct Identity: Sendable {
 
     private let handle: IdentityHandle
 
-    public static func create(custody: String = "platform") async throws -> Identity {
+    public static func create(custody: String) async throws -> Identity {
         let handle = try await ScpBindings.identityCreate(custody: custody)
         return Identity(did: handle.did(), custodyType: handle.custodyType(), handle: handle)
     }
@@ -160,6 +160,13 @@ public struct Identity: Sendable {
     public func rotateKey() async throws -> Identity { ... }
 }
 ```
+
+`create` takes the custody string as a required argument and offers no default, because
+no custody string names a key store a shipped build reaches. The UniFFI bridge builds a
+key store from `"in_memory"` only, and compiles that one under its `testing` feature, so a
+shipped build returns `SCP-IDENT-1008` for it and returns `SCP-IDENT-1003` for
+`"platform"` and for `"software"`. A caller reaches Keychain or Android Keystore by
+passing a `KeyCustodyProvider` to `identityCreateWithCustody` instead.
 
 ### Error types
 

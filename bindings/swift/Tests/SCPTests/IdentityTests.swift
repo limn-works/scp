@@ -28,7 +28,7 @@ final class IdentityTests: XCTestCase {
     /// Removing an existing identity drops it from the registry; a follow-up
     /// `identityRemoveIfPresent` then reports the DID is gone.
     func testRemoveExistingIdentity() async throws {
-        let identity = try await scp.identityCreate(custody: "in_memory")
+        let identity = try await scp.identityCreate(custody: .inMemory)
         let did = identity.did()
 
         try scp.identityRemove(did: did)
@@ -41,7 +41,7 @@ final class IdentityTests: XCTestCase {
     /// `identityRemoveIfPresent` returns `true` for a present DID, then
     /// `false` on the second call once the identity has been removed.
     func testRemoveIfPresentTrueThenFalse() async throws {
-        let identity = try await scp.identityCreate(custody: "in_memory")
+        let identity = try await scp.identityCreate(custody: .inMemory)
         let did = identity.did()
 
         XCTAssertTrue(

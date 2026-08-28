@@ -121,7 +121,7 @@ The `NativeBindings` interface is a flat-function abstraction (Long handles, JSO
 | `TransportManager` (opaque object with `status()`, `is_connected()`) | `class TransportManager` |
 | `UcanToken` (opaque object with `token_data()`, `token_id()`, etc.) | `class UcanToken` |
 | `identity_create(custody: String)` | `suspend fun identityCreate(custody: String): Identity` |
-| `identity_create_platform(provider: KeyCustodyProvider)` | `suspend fun identityCreatePlatform(...)` |
+| `identity_create_with_custody(provider: KeyCustodyProvider)` | `suspend fun identityCreateWithCustody(...)` |
 | `context_create(identity, params)` | `suspend fun contextCreate(identity: Identity, params: ContextParams): ContextHandle` |
 | `ScpError` (enum with 7 variants) | `sealed class ScpException` |
 | `ContextParams`, `Message`, `DIDDocument`, etc. (records) | `data class` |

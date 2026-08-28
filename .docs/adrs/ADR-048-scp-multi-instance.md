@@ -221,6 +221,21 @@ The registry is intentionally narrow: it lists operations where the *behavior* d
 
 The registry currently has no live entries. The three bridges share the real engine, so identity rotation, link-attestation signing, and signed checkpoints all run the one native code path — there is no per-bridge semantic divergence to register. (Historically this section recorded `identity_rotate_key`, `identity_create_link_attestation`, and `event_log_checkpoint`/`event_log_checkpoint_by_did` divergences against a separate WASM bridge that re-implemented the protocol; that bridge was removed by ADR-055, so those entries no longer apply.)
 
+> **The `testing_seed` rejection this ADR records no longer holds.** The paragraph
+> above states that a seed is "Rejected ... with `SCP-VALID-7009` for non-`in_memory`
+> custody (Platform/Software paths reject the parameter)". Story SCP-294 in
+> `.docs/prds/http-features.json` made every bridge judge the custody name before the
+> seed, so a seed paired with a refused custody string now reports that string's own
+> code: `SCP-IDENT-1003` for `"platform"` on all three bridges and for `"software"`
+> on the NAPI and UniFFI bridges, `SCP-IDENT-1008` for `"in_memory"` in a build
+> without the `testing` feature, and `SCP-VALID-7005` for any other string.
+> `SCP-VALID-7009` survives on the PyO3 bridge alone, for the one pairing that
+> reaches a key store that bridge builds: `"file"` custody with a seed. The
+> `CustodyMethod::Platform` and `CustodyMethod::Software` variants the paragraph names
+> are deleted. The length check, `SCP-VALID-7007` for a seed that is not 32 bytes, is
+> unchanged. This ADR's decision is untouched; a story does not rewrite one, so the
+> paragraph stands as written and this note records what the bridges now do.
+
 ## Consequences
 
 - **Tests parallel-safe on every bridge.** Per-test `SCP` fixtures eliminate `BRIDGE_LIFECYCLE_SERIAL`, per-test `beforeAll` in NAPI, and the module-scope poisoning on every SDK. pytest-xdist, Gradle parallel tests, and XCTest concurrency all work.

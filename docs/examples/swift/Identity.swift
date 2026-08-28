@@ -17,7 +17,12 @@ import SCP
 struct IdentityExample {
     static func main() async throws {
         // 1. Create a new identity with in-memory key custody.
-        //    In production on iOS/macOS, use "platform" for Keychain storage.
+        //    In production, inject a KeyCustodyProvider through
+        //    scp.identityCreateWithCustody to hold the keys in the Keychain.
+        //    No custody string reaches it: the bridge answers "platform"
+        //    with SCP-IDENT-1003. That call returns SCP-IDENT-1059 on a
+        //    released framework, because no pre-rotation custody backend
+        //    is wired yet.
         let identity = try await createIdentity(custody: "in_memory")
 
         print("DID: \(identity.did())")

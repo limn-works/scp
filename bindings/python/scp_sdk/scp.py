@@ -721,20 +721,33 @@ class SCP:
             )
         return await asyncio.to_thread(self._native.identity_attest_device, identity_did)
 
-    async def identity_create(self, custody: CustodyType | str = CustodyType.FILE) -> Any:
-        """Delegate to ``_scp_core.SCP.identity_create`` (returns :class:`Identity`)."""
+    async def identity_create(self, custody: CustodyType | str) -> Any:
+        """Delegate to ``_scp_core.SCP.identity_create`` (returns :class:`Identity`).
+
+        ``custody`` carries no default, so the caller names the key store that
+        holds this identity's keys and this SDK names none for them. Which key
+        store holds a private key decides who can reach that key, so a default
+        would pick a security-relevant answer the caller never stated. Read
+        :class:`~scp_sdk.types.CustodyType` for what each custody string
+        reaches on the PyO3 bridge.
+        """
         from scp_sdk.identity import Identity
 
         custody_str = custody.value if isinstance(custody, CustodyType) else custody
         raw = await asyncio.to_thread(self._native.identity_create, custody_str)
         return Identity(raw)
 
-    async def identity_create_with_agent_key(
-        self, custody: CustodyType | str = CustodyType.FILE
-    ) -> Any:
+    async def identity_create_with_agent_key(self, custody: CustodyType | str) -> Any:
         """Delegate to ``_scp_core.SCP.identity_create_with_agent_key``.
 
         Returns an :class:`Identity` wrapper.
+
+        ``custody`` carries no default, so the caller names the key store that
+        holds this identity's keys and this SDK names none for them. Which key
+        store holds a private key decides who can reach that key, so a default
+        would pick a security-relevant answer the caller never stated. Read
+        :class:`~scp_sdk.types.CustodyType` for what each custody string
+        reaches on the PyO3 bridge.
         """
         from scp_sdk.identity import Identity
 
@@ -755,11 +768,25 @@ class SCP:
         provider's (potentially blocking) keystore operations do not stall the
         asyncio event loop.
 
+        On a shipped build this method raises ``IdentityError`` with code
+        ``SCP-IDENT-1059`` after it checks the provider's method set and
+        before it generates any key. Section 9.7.4.1 of the security model,
+        pre-rotation key custody, makes every identity commit a pre-rotation
+        commitment when it is created, and no production
+        ``PreRotationCustody`` backend is wired, so the bridge fails closed
+        rather than minting the test-harness
+        ``InMemoryPreRotationCustody`` (ADR-062, capability injection and
+        prove-absent dev backends, §Decision 6). Injecting a provider and
+        wiring that backend are two separate gaps: this method is where a real
+        platform backend lands, and closing it does not close the pre-rotation
+        one.
+
         :param provider: A :class:`KeyCustodyProvider` implementation.
         :returns: An :class:`Identity` wrapper.
-        :raises ScpError: if the provider is missing required methods
-            (``ValidationError``) or key/DID creation fails inside the
-            provider (``IdentityError``).
+        :raises ScpError: ``IdentityError`` carrying ``SCP-IDENT-1059`` on a
+            shipped build; ``ValidationError`` if the provider is missing
+            required methods; ``IdentityError`` if key/DID creation fails
+            inside the provider.
         """
         from scp_sdk.identity import Identity
 

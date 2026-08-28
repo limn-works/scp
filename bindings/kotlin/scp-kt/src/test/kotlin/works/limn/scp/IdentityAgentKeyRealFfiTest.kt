@@ -98,14 +98,14 @@ class IdentityAgentKeyRealFfiTest {
             cpuDispatcher = Dispatchers.Default,
         )
 
-    private suspend fun freshIdentity(): Identity = scp.identityCreate(custody = "in_memory")
+    private suspend fun freshIdentity(): Identity = scp.identityCreate(custody = CustodyType.IN_MEMORY)
 
     // ── Identity/create_with_agent_key ────────────────────────────
 
     @Test
     fun `identityCreateWithAgentKey mints an identity that already carries an agent key`() {
         runBlocking {
-            val identity = scp.identityCreateWithAgentKey(custody = "in_memory")
+            val identity = scp.identityCreateWithAgentKey(custody = CustodyType.IN_MEMORY)
 
             assertTrue(
                 identity.hasAgentKey(),
@@ -146,7 +146,7 @@ class IdentityAgentKeyRealFfiTest {
     @Test
     fun `identityRotateAgentKey replaces the agent public key and keeps the DID`() {
         runBlocking {
-            val withAgentKey = scp.identityCreateWithAgentKey(custody = "in_memory")
+            val withAgentKey = scp.identityCreateWithAgentKey(custody = CustodyType.IN_MEMORY)
             val originalAgentKey = assertNotNull(withAgentKey.getAgentPublicKey())
 
             val rotated = scp.identityRotateAgentKey(withAgentKey)
@@ -169,7 +169,7 @@ class IdentityAgentKeyRealFfiTest {
     @Test
     fun `identityRemoveAgentKey drops the agent key from an identity that has one`() {
         runBlocking {
-            val withAgentKey = scp.identityCreateWithAgentKey(custody = "in_memory")
+            val withAgentKey = scp.identityCreateWithAgentKey(custody = CustodyType.IN_MEMORY)
             assertTrue(withAgentKey.hasAgentKey())
 
             val removed = scp.identityRemoveAgentKey(withAgentKey)

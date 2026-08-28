@@ -283,3 +283,6 @@ Notes:
 ### RESIDUAL low-sev: BUN_TEST=0 and BUN_TEST=false OPEN seam (length>0 only). Moot post-bundle (seam unreachable). Suggest falsey-value guard.
 ### FINDING gate soundness: check-sdk-coverage.py accepts a TYPE name as proof of runtime capability
 - _extract_typescript_symbols folds interface/type_alias names into same set as runtime fns. _to_pascal(op) then matches a type. PROVEN: Governance/member_role matches `MemberRole` type not SCP.contextMemberRole; MCP/connect_client matches `McpClient` interface (alias also lists DELETED connectMcp; real impl mcpClientConnectStdio/Sse). Gate stays GREEN after deleting all runtime impls if same-named type survives. 2/184 TS ops affected. Softer re-intro of the suffix-match gap the PR claims closed. NOTE: file now in enforcement allowlist (CLAUDE.md) — report, don't self-edit.
+
+## PR reviews
+- [SCP-294 custody naming — bridges fail closed; 4 upstream docs still say custody="platform" reaches an OS keystore](pr-scp294-custody-name-one-thing.md)

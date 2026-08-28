@@ -632,30 +632,131 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 4);
     }
 
+    /// `"in_memory"` is the one custody string this bridge parses into a
+    /// `CustodyMethod`, and the `testing` feature decides whether it parses.
+    /// That feature compiles the `InMemoryKeyCustody` nullifier; a shipped
+    /// build severs it, so the parser declines the string with
+    /// `SCP-IDENT-1008` (ADR-062 §Decision 6).
     #[test]
-    fn parse_custody_method_accepts_known_values() {
+    fn parse_custody_method_admits_in_memory_per_compiled_feature() {
         use crate::bridge::parse_custody_method;
 
-        assert!(matches!(
-            parse_custody_method("in_memory"),
-            Ok(bridge::CustodyMethod::InMemory)
-        ));
-        assert!(matches!(
-            parse_custody_method("platform"),
-            Ok(bridge::CustodyMethod::Platform)
-        ));
-        assert!(matches!(
-            parse_custody_method("software"),
-            Ok(bridge::CustodyMethod::Software)
-        ));
+        let result = parse_custody_method("in_memory");
+
+        #[cfg(feature = "testing")]
+        match result {
+            Ok(bridge::CustodyMethod::InMemory) => {}
+            other => panic!("expected Ok(CustodyMethod::InMemory), got: {other:?}"),
+        }
+
+        #[cfg(not(feature = "testing"))]
+        match result {
+            Err(ScpError::Identity { code, msg }) => {
+                assert_eq!(code, "SCP-IDENT-1008");
+                assert!(
+                    msg.contains("identity_create_with_custody()"),
+                    "message must name the injection entry point, got: {msg}"
+                );
+                // That entry point reaches `no_pre_rotation_backend` on this
+                // build, so the message states what it returns rather than
+                // sending the reader to a second closed door.
+                assert!(
+                    msg.contains("SCP-IDENT-1059"),
+                    "message must state what that entry point returns on a \
+                     shipped build, got: {msg}"
+                );
+            }
+            other => panic!("expected SCP-IDENT-1008 for in_memory, got: {other:?}"),
+        }
     }
 
+    /// `"platform"` names no custody backend inside this bridge, so the parser
+    /// rejects it with `SCP-IDENT-1003` and names
+    /// `identity_create_with_custody()` as the way to inject one. Before this
+    /// bridge deleted the `CustodyMethod::Platform` variant, the string parsed
+    /// into that variant and `identity_create_with_custody` stamped the same
+    /// variant onto a callback-custody handle, so `Identity::custody_type`
+    /// answered `"platform"` for an opaque injected provider while the `PyO3`
+    /// and napi bridges answered `"callback"` for that same provider.
     #[test]
-    fn parse_custody_method_rejects_unknown_value() {
+    fn parse_custody_method_rejects_platform_with_ident_1003() {
         use crate::bridge::parse_custody_method;
 
-        let result = parse_custody_method("unknown");
-        assert!(matches!(result, Err(ScpError::Validation { .. })));
+        match parse_custody_method("platform") {
+            Err(ScpError::Identity { code, msg }) => {
+                assert_eq!(code, "SCP-IDENT-1003");
+                assert!(
+                    msg.contains("identity_create_with_custody()"),
+                    "message must name the injection entry point, got: {msg}"
+                );
+            }
+            other => panic!("expected SCP-IDENT-1003 for platform, got: {other:?}"),
+        }
+    }
+
+    /// `"software"` names no custody backend inside this bridge either, and
+    /// takes the same `SCP-IDENT-1003` rejection as `"platform"`.
+    #[test]
+    fn parse_custody_method_rejects_software_with_ident_1003() {
+        use crate::bridge::parse_custody_method;
+
+        match parse_custody_method("software") {
+            Err(ScpError::Identity { code, msg }) => {
+                assert_eq!(code, "SCP-IDENT-1003");
+                assert!(
+                    msg.contains("identity_create_with_custody()"),
+                    "message must name the injection entry point, got: {msg}"
+                );
+            }
+            other => panic!("expected SCP-IDENT-1003 for software, got: {other:?}"),
+        }
+    }
+
+    /// Every custody-string rejection that names `identity_create_with_custody`
+    /// also states that the call returns `SCP-IDENT-1059` on a shipped build.
+    ///
+    /// `Scp::identity_create_with_custody` reaches `no_pre_rotation_backend` on
+    /// a `#[cfg(not(feature = "testing"))]` build, so a message that names the
+    /// entry point without naming that code sends the reader to a second closed
+    /// door with nothing explaining it. Section 9.7.4.1 of the security model
+    /// requires the pre-rotation commitment that has no production backend;
+    /// ADR-062, capability injection and prove-absent dev backends, records
+    /// that state.
+    #[test]
+    fn custody_rejection_messages_name_the_pre_rotation_gap() {
+        use crate::bridge::parse_custody_method;
+
+        for custody in ["platform", "software", "unknown"] {
+            let msg = match parse_custody_method(custody) {
+                Err(ScpError::Identity { msg, .. } | ScpError::Validation { msg, .. }) => msg,
+                other => panic!("expected a rejection for {custody:?}, got: {other:?}"),
+            };
+            assert!(
+                msg.contains("identity_create_with_custody()"),
+                "{custody:?} message must name the injection entry point, got: {msg}"
+            );
+            assert!(
+                msg.contains("SCP-IDENT-1059"),
+                "{custody:?} message must state what that entry point returns on a \
+                 shipped build, got: {msg}"
+            );
+        }
+    }
+
+    /// A string the parser does not recognize is a wrong-value error, which
+    /// `SCP-VALID-7005` names. This assertion pins the code string, because a
+    /// test that checks only the `ScpError::Validation` variant passes while
+    /// the code underneath it drifts.
+    #[test]
+    fn parse_custody_method_rejects_unknown_value_with_valid_7005() {
+        use crate::bridge::parse_custody_method;
+
+        match parse_custody_method("unknown") {
+            Err(ScpError::Validation { code, .. }) => {
+                assert_eq!(code, "SCP-VALID-7005");
+            }
+            other => panic!("expected SCP-VALID-7005 for unknown, got: {other:?}"),
+        }
     }
 
     #[test]

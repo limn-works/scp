@@ -376,8 +376,10 @@ impl Scp {
     /// is backed by a deterministic RNG so subsequent `generate_keypair`
     /// calls produce byte-identical Ed25519 keys across bridges — the
     /// basis of the cross-bridge parity test (ADR-046). `testing_seed` is
-    /// only valid for `"in_memory"` custody; other custody types reject
-    /// it with `SCP-VALID-7009`.
+    /// only valid for `"in_memory"` custody. This bridge judges the custody
+    /// name before the seed, so `"platform"` and `"software"` report their
+    /// own `SCP-IDENT-1003` and every other string reports
+    /// `SCP-VALID-7005`; no input reaches `SCP-VALID-7009` here.
     #[napi(js_name = "identityCreate")]
     // napi-rs requires `async` for the Promise return type. Without the
     // in-memory-custody backend the only `.await` (the `"in_memory"` arm) is
@@ -397,8 +399,9 @@ impl Scp {
         // Validate the optional 32-byte `testing_seed` at the FFI boundary
         // so we fail early rather than panicking in
         // `InMemoryKeyCustody::from_seed_bytes`. A length mismatch is
-        // `SCP-VALID-7007`; a seed paired with a non-InMemory custody
-        // surfaces later as `SCP-VALID-7009`. The seed bytes feed
+        // `SCP-VALID-7007`; a seed paired with any other custody name
+        // surfaces later as that name's own code, because the custody match
+        // below judges the name before the seed. The seed bytes feed
         // `Ed25519 SigningKey::from_bytes` inside the custody's RNG, so
         // we wrap the narrowed `[u8; 32]` in `Zeroizing` immediately to
         // wipe them when dropped rather than leaving them on the stack.
@@ -511,32 +514,37 @@ impl Scp {
                     }));
                 }
                 Err(ScpNapiError::Identity {
-                    message: "in_memory custody is not available in this build -- use \
-                              \"software\" or \"platform\" custody for production key storage"
+                    message: "in_memory custody is not available in this build -- this bridge \
+                              builds no key store from any other custody string either, so \
+                              inject a KeyCustodyProvider through identityCreateWithCustody() \
+                              for production key storage. That call returns SCP-IDENT-1059 \
+                              today, because no pre-rotation custody backend is wired yet, so \
+                              no shipped build creates an identity."
                         .to_owned(),
                     code: codes::IDENT_1008.to_owned(),
                 }
                 .into())
             }
-            "platform" | "software" => {
-                if testing_seed_bytes.is_some() {
-                    return Err(NapiError::from(ScpNapiError::Validation {
-                        message: "`testing_seed` parameter is only valid for custody=\"in_memory\""
-                            .to_owned(),
-                        code: codes::VALID_7009.to_owned(),
-                    }));
-                }
-                Err(ScpNapiError::Identity {
-                    message: format!(
-                        "custody type {custody:?} requires a wired platform \
+            // The custody name is judged before the seed pairing, so a caller
+            // who passes an unusable custody name together with a seed reads
+            // the custody error rather than the seed error. Both other bridges
+            // report `SCP-IDENT-1003` for this pair: the UniFFI bridge's
+            // `parse_custody_method` rejects the string before any seed is
+            // read, and the PyO3 bridge's `parse_custody_with_seed` guards its
+            // `SCP-VALID-7009` arm on `"file"` for the same reason.
+            "platform" | "software" => Err(ScpNapiError::Identity {
+                message: format!(
+                    "custody type {custody:?} requires a wired platform \
                          KeyCustodyProvider — use the KeyCustodyProvider callback \
                          interface to inject Secure Enclave (iOS) or Android \
-                         Keystore (Android) backed custody"
-                    ),
-                    code: codes::IDENT_1003.to_owned(),
-                }
-                .into())
+                         Keystore (Android) backed custody. identityCreateWithCustody \
+                         returns SCP-IDENT-1059 on a shipped build today, because no \
+                         pre-rotation custody backend is wired yet, so no shipped build \
+                         creates an identity."
+                ),
+                code: codes::IDENT_1003.to_owned(),
             }
+            .into()),
             _ => Err(ScpNapiError::Identity {
                 code: codes::IDENT_1005.to_owned(),
                 message: format!(
@@ -626,8 +634,12 @@ impl Scp {
             }
             #[cfg(not(feature = "testing"))]
             "in_memory" => Err(ScpNapiError::Identity {
-                message: "in_memory custody is not available in this build -- use \
-                          \"software\" or \"platform\" custody for production key storage"
+                message: "in_memory custody is not available in this build -- this bridge \
+                          builds no key store from any other custody string either, so inject \
+                          a KeyCustodyProvider through identityCreateWithCustody() and then \
+                          add an agent key for production key storage. That call returns \
+                          SCP-IDENT-1059 today, because no pre-rotation custody backend is \
+                          wired yet, so no shipped build creates an identity."
                     .to_owned(),
                 code: codes::IDENT_1008.to_owned(),
             }
@@ -637,7 +649,10 @@ impl Scp {
                     "custody type {custody:?} requires a wired platform \
                      KeyCustodyProvider — use the KeyCustodyProvider callback \
                      interface to inject Secure Enclave (iOS) or Android \
-                     Keystore (Android) backed custody"
+                     Keystore (Android) backed custody. identityCreateWithCustody \
+                     returns SCP-IDENT-1059 on a shipped build today, because no \
+                     pre-rotation custody backend is wired yet, so no shipped build \
+                     creates an identity."
                 ),
                 code: codes::IDENT_1003.to_owned(),
             }

@@ -1,7 +1,9 @@
 /// Minimal SCP macOS app scaffold.
 ///
-/// Creates a DID identity with platform custody, opens an encrypted context,
-/// and sends a message.
+/// Creates a DID identity with the in-memory key store, opens an encrypted
+/// context, and sends a message. No custody string reaches the Keychain: the
+/// UniFFI bridge answers "platform" with SCP-IDENT-1003, so Keychain-held keys
+/// need a KeyCustodyProvider injected through identityCreateWithCustody.
 
 import Foundation
 import SCP
@@ -9,8 +11,10 @@ import SCP
 @main
 struct SCPmacOSApp {
     static func main() async throws {
-        // 1. Create a DID identity with platform (Keychain) custody.
-        let identity = try await createIdentity(custody: CustodyType.platform.rawValue)
+        // 1. Create a DID identity. This in-memory key store loses every key
+        //    on process exit, and a released build rejects it with
+        //    SCP-IDENT-1008.
+        let identity = try await createIdentity(custody: CustodyType.inMemory.rawValue)
         print("Created identity: \(identity.did())")
 
         // 2. Create an encrypted context via the UniFFI bridge.
