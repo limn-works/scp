@@ -285,4 +285,4 @@ Notes:
 - _extract_typescript_symbols folds interface/type_alias names into same set as runtime fns. _to_pascal(op) then matches a type. PROVEN: Governance/member_role matches `MemberRole` type not SCP.contextMemberRole; MCP/connect_client matches `McpClient` interface (alias also lists DELETED connectMcp; real impl mcpClientConnectStdio/Sse). Gate stays GREEN after deleting all runtime impls if same-named type survives. 2/184 TS ops affected. Softer re-intro of the suffix-match gap the PR claims closed. NOTE: file now in enforcement allowlist (CLAUDE.md) — report, don't self-edit.
 
 ## PR reviews
-- [SCP-294 custody naming — IDENT-1059 severs every create path; false guarantee relocated](pr-scp294-custody-name-one-thing.md)
+- [SCP-294 custody naming — bridges fail closed; 4 upstream docs still say custody="platform" reaches an OS keystore](pr-scp294-custody-name-one-thing.md)

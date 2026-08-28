@@ -1,9 +1,8 @@
 # SCP Swift macOS Scaffold
 
-Minimal macOS app using the SCP Swift SDK. It creates its identity with the
-in-memory key store, because no custody string reaches the Keychain — the
-bridge answers `"platform"` with `SCP-IDENT-1003`. Hold keys in the Keychain
-by injecting a `KeyCustodyProvider` through `identityCreateWithCustody`.
+Minimal macOS app using the SCP Swift SDK with the in-memory key store. No custody
+string reaches the Keychain: the UniFFI bridge answers `"platform"` with
+`SCP-IDENT-1003`.
 
 ## Prerequisites
 

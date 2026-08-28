@@ -336,7 +336,7 @@ fn rotation_publish_client(
 /// [`KeyCustody`] implementation, over the **per-instance shared** DHT client.
 ///
 /// Generic over the custody backend so it works for both production callback
-/// custody ([`UniffiKeyCustody::Callback`], Secure Enclave / Android Keystore)
+/// custody ([`UniffiKeyCustody::Callback`], Apple Keychain / Android Keystore)
 /// and — in `testing` builds — the in-memory dev custody
 /// ([`OpaqueInMemoryKeyCustody`] and [`UniffiKeyCustody::InMemory`]). Private
 /// key material never crosses the FFI boundary (ADR-006): the closure only
@@ -642,7 +642,7 @@ fn resolve_identity_custody(identity: &Identity) -> Option<Arc<UniffiKeyCustody>
 ///
 /// Resolution order mirrors [`resolve_identity_custody`] (and the handle's own
 /// `resolve_uniffi_signing_key` / `sign_export_snapshot_via_custody`): the
-/// `ContextHandle`'s production callback custody (Secure Enclave / Android
+/// `ContextHandle`'s production callback custody (Apple Keychain / Android
 /// Keystore) first, then — only in `testing` builds — the
 /// retained in-memory custody. Returns `None` for an externally-loaded handle
 /// that retains no custody (all custody fields `None`), so the caller fails
@@ -930,7 +930,7 @@ impl CallbackKeyCustody {
 // (`scpid_sign`, `identity_create_link_attestation`,
 // `identity_remove*`) can re-derive public keys and re-sign without the caller
 // re-passing an `Identity` handle. Production identities are
-// callback-custody-backed (Secure Enclave / Android Keystore via the injected
+// callback-custody-backed (Apple Keychain / Android Keystore via the injected
 // `KeyCustodyProvider`); only dev/desktop builds with `testing`
 // use `InMemoryKeyCustody`.
 //
@@ -960,8 +960,10 @@ pub(crate) enum UniffiKeyCustody {
     #[cfg(feature = "testing")]
     InMemory(Arc<OpaqueInMemoryKeyCustody>),
     /// Production callback custody backed by the injected
-    /// [`KeyCustodyProvider`](crate::KeyCustodyProvider) (Secure Enclave /
-    /// Android Keystore). Private key material stays in the platform TEE.
+    /// [`KeyCustodyProvider`](crate::KeyCustodyProvider) (Apple Keychain /
+    /// Android Keystore). The provider holds the private key on its own side
+    /// of the callback boundary and returns signatures, so no private key
+    /// byte crosses into this bridge.
     Callback(Arc<CallbackKeyCustody>),
 }
 
@@ -1706,9 +1708,17 @@ impl From<serde_json::Error> for ScpError {
 // See ADR-021 acceptance criterion 11.
 // ---------------------------------------------------------------------------
 
-/// The custody method used to protect an identity's private key.
+/// Which key-material path this bridge took for one identity.
 ///
-/// See ADR-006 (Platform Abstraction) and `scp_platform::CustodyType`.
+/// The enum reports a bridge path, not a storage substrate.
+/// `parse_custody_method` returns `InMemory` for the one custody string this
+/// bridge parses, `identity_create_with_custody` returns `Callback` for an
+/// identity bound to a caller-injected `KeyCustodyProvider`, and
+/// `identity_load` returns `External` for an identity that carries a DID
+/// string and no key material. A provider reports the substrate holding its
+/// keys through `KeyCustody::custody_type`, which returns
+/// `scp_platform::CustodyType`; that enum names `InMemory`, `Hardware`, and
+/// `Software`, and this enum names none of the three.
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum CustodyMethod {
     /// Key material stored in memory only (testing / in-process).
@@ -4179,7 +4189,7 @@ async fn identity_create_link_attestation_impl(
             code: codes::IDENT_1040.to_owned(),
         })?;
     // Resolve the retained custody to a `UniffiKeyCustody` enum: production
-    // identities are callback-custody-backed (Secure Enclave / Android
+    // identities are callback-custody-backed (Apple Keychain / Android
     // Keystore), while dev/desktop `testing` builds may also
     // carry in-memory custody. Fails closed when neither is present (an
     // externally-loaded DID-string-only handle cannot self-sign an attestation).
@@ -6727,14 +6737,14 @@ pub(crate) fn parse_custody_method(custody: &str) -> Result<CustodyMethod, ScpEr
         // Both strings once parsed into their own `CustodyMethod` variants, and
         // every create path then rejected those variants, so the rejection now
         // happens here at the boundary and the two variants are gone. A caller
-        // that wants Keychain / Secure Enclave / Android Keystore custody
-        // injects a provider, which reports its own substrate.
+        // that wants Apple Keychain or Android Keystore custody injects a
+        // provider, which reports its own substrate.
         "platform" | "software" => Err(ScpError::Identity {
             msg: format!(
                 "custody type {custody:?} reaches no key custody backend in this bridge — \
                  use identity_create_with_custody() to inject a KeyCustodyProvider backed \
-                 by the iOS Keychain / Secure Enclave or the Android Keystore. That call \
-                 returns SCP-IDENT-1059 on a shipped build today, because no pre-rotation \
+                 by the Apple Keychain or the Android Keystore. That call returns \
+                 SCP-IDENT-1059 on a shipped build today, because no pre-rotation \
                  custody backend is wired yet, so no shipped build creates an identity."
             ),
             code: codes::IDENT_1003.to_owned(),
@@ -8963,7 +8973,7 @@ pub(crate) fn scpid_sign_impl(
     };
 
     // Resolve the retained custody: production identities sign through the
-    // injected callback custody (Secure Enclave / Android Keystore); dev/desktop
+    // injected callback custody (Apple Keychain / Android Keystore); dev/desktop
     // `testing` builds may also carry in-memory custody. Fails
     // closed for externally-loaded DID-string-only handles, which have no key
     // material to sign with.
@@ -23571,12 +23581,12 @@ mod tests {
     // identity custody registry to the `UniffiKeyCustody` enum un-gated
     // `scpid_sign`, `identity_create_link_attestation`, and `identity_remove*`
     // so they ship in the released Swift/Kotlin SDKs and route over callback
-    // (Secure Enclave / Android Keystore) custody. Before the fix these ops
+    // (Apple Keychain / Android Keystore) custody. Before the fix these ops
     // were `#[cfg(testing)]`-gated and silently absent.
     // -----------------------------------------------------------------------
 
     /// A full `KeyCustodyProvider` backed by real Ed25519 keys with a
-    /// multi-key store, modelling a platform custody (e.g. Secure Enclave). It
+    /// multi-key store, modelling a platform custody (e.g. Apple Keychain). It
     /// supports every required protocol method so `identity_create_with_custody`
     /// (which runs `DidDht::create`) and `scpid_sign` (which signs + exposes the
     /// public key) both work. Signatures are real, so a signed SCPID response
@@ -23946,7 +23956,7 @@ mod tests {
     }
 
     /// Direct, end-to-end proof of the `rotate_key` fix mechanism over callback
-    /// (Secure Enclave / Android Keystore) custody.
+    /// (Apple Keychain / Android Keystore) custody.
     ///
     /// `Identity::rotate_key`'s callback branch built `DidDht::new()`
     /// (`sign_fn`: None) and called `dht.rotate(...)`, which delegates to
@@ -24029,7 +24039,7 @@ mod tests {
     }
 
     /// Smoke test for the public bridge op `Identity::rotate_key` over callback
-    /// (Secure Enclave / Android Keystore) custody. It drives the REAL op end to
+    /// (Apple Keychain / Android Keystore) custody. It drives the REAL op end to
     /// end and confirms it dispatches through `dht.rotate` and reaches the
     /// resolve stage without panicking or erroring earlier.
     ///
@@ -24041,7 +24051,7 @@ mod tests {
     /// therefore cannot return `Ok` here regardless of the signer fix — full
     /// round-trip integration is a cross-process / relay-backed E2E concern.
     ///
-    /// `rotate_key` over callback (Secure Enclave / Android Keystore) custody
+    /// `rotate_key` over callback (Apple Keychain / Android Keystore) custody
     /// now round-trips end-to-end (ADR-062 §Decision 1): `identity_create_with_custody`
     /// publishes the freshly minted document into the per-instance SHARED DHT
     /// client, and `rotate_key` reads/re-publishes through that SAME client
@@ -24130,7 +24140,7 @@ mod tests {
         );
     }
 
-    /// `identity_migrate` over callback (Secure Enclave / Android Keystore)
+    /// `identity_migrate` over callback (Apple Keychain / Android Keystore)
     /// custody. The migrate callback branch's `DidDht::new()` -> `make_dht_with_signer(cc)`
     /// fix is correct and necessary, but it is NOT independently observable: a
     /// successful migrate over callback custody is architecturally unsupported
@@ -24198,7 +24208,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Builds a `ContextHandle` carrying a real-Ed25519 [`ProdLikeCustody`]
-    /// (modelling Secure Enclave / Android Keystore) and a freshly generated
+    /// (modelling Apple Keychain / Android Keystore) and a freshly generated
     /// `#active` signing-key handle that lives in that custody's store — exactly
     /// the shape `context_create` produces for a platform-custody identity. The
     /// returned tuple yields the verifying key so signatures can be checked.

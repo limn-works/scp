@@ -767,14 +767,15 @@ fn parse_custody_with_seed(
         // and hid the unusable custody name behind it.
         //
         // That ordering holds in THIS build only. The
-        // `#[cfg(not(feature = "testing"))]` sibling above rejects any seed
-        // with `SCP-VALID-7008` before it reads the custody name, because the
-        // parameter itself does not exist in a shipped build, so a shipped
-        // PyO3 build answers `("platform", seed)` with `SCP-VALID-7008` while
-        // the NAPI and UniFFI bridges answer `SCP-IDENT-1003`. The seed is a
-        // parity-harness affordance (ADR-046), and no shipped caller supplies
-        // one, so the divergence is confined to a parameter production never
-        // passes.
+        // `#[cfg(not(feature = "testing"))]` sibling below takes the same
+        // `testing_seed` parameter — it is present in every build — and
+        // rejects any `Some` with `SCP-VALID-7008` before it reads the custody
+        // name, because the feature that would consume a seed is not compiled.
+        // So a shipped PyO3 build answers `("platform", seed)` with
+        // `SCP-VALID-7008` while the NAPI and UniFFI bridges answer
+        // `SCP-IDENT-1003`. The seed is a parity-harness affordance (ADR-046)
+        // that no shipped caller supplies, so the divergence is confined to an
+        // argument production never passes.
         //
         // `"file"` is the one custody string this bridge accepts besides
         // `"in_memory"`, so this enumeration is closed against
@@ -881,7 +882,7 @@ fn parse_custody_inner(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), Sc
     }
 }
 
-/// Builds the `SCP-IDENT-1010` message for a DID that storage holds while the
+/// Builds the message for a DID that storage holds while the
 /// runtime registry holds no crypto state for it.
 ///
 /// The message names `"file"` custody, which is the one custody string
@@ -899,7 +900,7 @@ fn parse_custody_inner(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), Sc
 /// prove-absent dev backends, §Decision 6).
 fn identity_load_no_live_state_message(did: &str) -> String {
     format!(
-        "SCP-IDENT-1010: identity '{did}' was found in storage but has no live \
+        "identity '{did}' was found in storage but has no live \
          crypto state in the runtime registry. If using in-memory custody, key \
          material does not persist across process boundaries. Pass \"file\" \
          custody to identity_create for a key file that survives a process \
@@ -1582,7 +1583,7 @@ impl crate::scp::PyScp {
     /// `PyScp::identity_create`), it will be in the registry and this method
     /// succeeds. If the identity was created in a different process with
     /// in-memory custody, the key material is lost and this method returns
-    /// `SCP-IDENT-1010`. File-backed custody persists across restarts if the
+    /// `SCP-IDENT-1001`. File-backed custody persists across restarts if the
     /// same passphrase is provided.
     ///
     /// # Arguments
@@ -1603,7 +1604,7 @@ impl crate::scp::PyScp {
     /// - The DID is not found in storage.
     /// - The stored state is malformed.
     /// - The identity has no live crypto state in the registry
-    ///   (`SCP-IDENT-1010`). This happens when loading an identity created
+    ///   (`SCP-IDENT-1001`). This happens when loading an identity created
     ///   in a different process with in-memory custody (which does not
     ///   persist key material). File-backed custody survives restarts.
     ///
@@ -2646,7 +2647,7 @@ impl crate::scp::PyScp {
         // recovery is restricted to identities THIS SCP instance hosts in its
         // identity registry (populated by `identity_create*` / migrate, never by
         // `identity_load`, which only reads the registry and fails
-        // `SCP-IDENT-1010` if the DID is absent).
+        // `SCP-IDENT-1001` if the DID is absent).
         // A DID this instance does not own is rejected here — before any
         // recovery bookkeeping — so a realm-local caller cannot drive recovery
         // against arbitrary DIDs. `SCP-IDENT-1020` matches NAPI/UniFFI.
@@ -2863,12 +2864,20 @@ mod tests {
     }
 
     /// The custody-string vocabulary this bridge accepts, pinned against the
-    /// concrete custody each string reaches.
+    /// concrete custody each string reaches. This comment introduces the
+    /// custody-string tests that follow it as well as this one.
     ///
-    /// The `"file"` arm reads `SCP_KEY_PASSPHRASE` and writes under `$HOME`,
-    /// so these tests drive the arms that decide the vocabulary — the accepted
-    /// string set, and the code each rejected string carries — without doing
-    /// either.
+    /// These tests drive the `"in_memory"` arm of `parse_custody_inner` and
+    /// every arm that rejects a string. No test in this module drives the
+    /// `"file"` arm. That arm reads `SCP_KEY_PASSPHRASE` and, when the
+    /// developer running the suite exports it, calls `std::fs::create_dir_all`
+    /// on `$HOME/.scp` and writes `keys.bin` into that directory, so a test
+    /// that called it would write to the home directory of whoever runs
+    /// `cargo test -p scp-ffi`. A test cannot avoid that write by clearing
+    /// `SCP_KEY_PASSPHRASE` or by pointing `HOME` at a temporary directory,
+    /// because both variables belong to the process and every other test in
+    /// this binary reads them concurrently. The `"file"` arm therefore carries
+    /// no coverage here.
     #[test]
     fn parse_custody_accepts_in_memory() {
         let parsed = parse_custody("in_memory");
@@ -2922,7 +2931,7 @@ mod tests {
         assert_eq!(code, scp_ffi_common::error_codes::VALID_7005);
     }
 
-    /// The `SCP-IDENT-1010` message points the caller at a custody string this
+    /// The no-live-state message points the caller at a custody string this
     /// bridge accepts, and it states what `identity_create` returns today.
     ///
     /// The message once told the caller to pass the platform custody string as
@@ -2960,25 +2969,13 @@ mod tests {
              build, got: {message}"
         );
 
-        // `parse_custody_inner` builds a key store from the string the message
-        // recommends, so the recommendation is checked against the parser
-        // rather than against a copy of its accepted set. `"file"` either
-        // builds a `FileKeyCustody` or fails on the unset
-        // `$SCP_KEY_PASSPHRASE`; it never takes the `SCP-IDENT-1003`
-        // rejection that `"platform"` takes.
-        let file_code = match parse_custody_inner("file") {
-            Ok(_) => String::new(),
-            Err(
-                ScpPyError::ValidationError { code, .. } | ScpPyError::IdentityError { code, .. },
-            ) => code,
-            Err(_) => String::from("<file was rejected by an unexpected error variant>"),
-        };
-        assert_ne!(
-            file_code,
-            scp_ffi_common::error_codes::IDENT_1003,
-            "the message recommends \"file\", so parse_custody_inner must not reject \
-             it the way it rejects \"platform\""
-        );
+        // These assertions read the message and never hand the `"file"` string
+        // to `parse_custody_inner`, so they do not confirm that the parser
+        // accepts the string the message recommends. That call creates
+        // `$HOME/.scp` and writes `keys.bin` into it whenever the developer
+        // running the suite exports `SCP_KEY_PASSPHRASE`. A reader who changes
+        // the `"file"` arm has to re-read this message by hand, because no
+        // assertion here compares the two.
     }
 
     /// Every custody-string rejection names `identity_create_with_custody` as

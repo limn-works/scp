@@ -248,6 +248,10 @@ public final class Identity implements AutoCloseable {
         });
     }
 
+    public static CompletableFuture<Identity> create() {
+        return create("platform");
+    }
+
     @Override
     public void close() {
         if (handle != null) {
@@ -257,13 +261,6 @@ public final class Identity implements AutoCloseable {
     }
 }
 ```
-
-`create` takes the custody string as a required argument and offers no zero-argument
-overload, because no custody string names a key store a shipped build reaches.
-`scp_identity_create` returns `SCP-IDENT-1003` for `"platform"` and for `"software"`, and
-it returns `SCP-IDENT-1008` for `"in_memory"` unless the loaded library carries the
-bridge's `testing` feature. A caller reaches an OS keystore by passing a
-`KeyCustodyProvider` to `scp_identity_create_with_custody` instead.
 
 ### Context class
 

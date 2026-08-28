@@ -26,7 +26,9 @@ let scp = try SCP(storage: .inMemory)
 // `KeyCustodyProvider` — see "Key custody" below for what it must implement.
 // On a released XCFramework this call throws SCP-IDENT-1059 — read "No shipped
 // build creates an identity yet" below before you run it.
-let keychain: KeyCustodyProvider = MyKeychainCustody()
+// Supply your own type conforming to KeyCustodyProvider; this package
+// ships none that conforms — see "Key custody" below.
+let keychain: KeyCustodyProvider = YourKeychainCustody()
 let identity = try await scp.identityCreateWithCustody(provider: keychain)
 print("DID: \(identity.did())")
 
@@ -67,9 +69,10 @@ try await scp.contextClose(handle: ctx, identity: identity)
 `identityCreate` takes a custody string, and the UniFFI bridge builds a key
 store from one string only: `"in_memory"`, which it compiles under its `testing`
 feature. A released XCFramework throws `ScpError.Identity` carrying
-`SCP-IDENT-1008` for `"in_memory"`, and it throws `ScpError.Identity` carrying
-`SCP-IDENT-1003` for `"platform"` and for `"software"`. No custody string
-reaches Keychain or Secure Enclave.
+`SCP-IDENT-1008` for `"in_memory"`, it throws `ScpError.Identity` carrying
+`SCP-IDENT-1003` for `"platform"` and for `"software"`, and it throws
+`ScpError.Validation` carrying `SCP-VALID-7005` for any other string. No custody
+string reaches Keychain or Secure Enclave.
 
 Production key storage runs through
 `scp.identityCreateWithCustody(provider:)` instead, which takes a value
@@ -79,27 +82,29 @@ every cryptographic operation back to the provider's callbacks (ADR-006, the
 platform abstraction).
 
 This package ships `AppleKeyCustody`, which stores Ed25519 and X25519 key
-material in the Keychain, takes an optional access group and a biometric
-policy, and reports `"software"` or `"software_biometric"` from `custodyType`
-— the Secure Enclave generates P-256 keys and SCP signs with Ed25519. It
-carries the method set `KeyCustodyProvider` declares, but it does not declare
-conformance to that protocol: `Sources/SCP/Platform/AppleKeyCustody.swift`
-declares `public final class AppleKeyCustody: Sendable` and adds its methods in
-a plain `public extension AppleKeyCustody`, so no declaration names the
-protocol. Passing it to `identityCreateWithCustody` therefore does not compile
-today, and a caller writes their own conforming type until that conformance
-lands.
+material in the Keychain and reports `"software"` or `"software_biometric"`
+from `custodyType` — the Secure Enclave generates P-256 keys and SCP signs with
+Ed25519. You cannot pass it to `identityCreateWithCustody`, and adding
+`: KeyCustodyProvider` to it does not make you able to.
+`Sources/SCP/Platform/AppleKeyCustody.swift` declares `public final class
+AppleKeyCustody: Sendable`, and eight of the nine methods it defines differ
+from the protocol's by argument label, by return type, or by both: the protocol
+declares `getPublicKey(keyId:)` where the class defines `publicKey(_:)`, and it
+declares `destroyKey(keyId:)` returning `Void` where the class defines
+`destroyKey(_:)` returning `DestructionAttestation`. Only
+`generateKeypair(keyType:)` matches. Write your own conforming type until an
+adapter lands.
 
 ## No shipped build creates an identity yet
 
 `identityCreateWithCustody(provider:)` throws `ScpError.Identity` carrying
 `SCP-IDENT-1059` on every released XCFramework. `identityCreate` stops one step
-earlier, with the `SCP-IDENT-1008` and `SCP-IDENT-1003` codes described above,
-because the bridge rejects every custody string before it reaches the
-pre-rotation step. Section 9.7.4.1 of the security model, pre-rotation key
-custody, makes every identity commit a pre-rotation commitment when it is
-created. That commitment needs a `PreRotationCustody` backend, and the only
-implementation is the test-harness `InMemoryPreRotationCustody`, which the
+earlier, with the three codes described above, because the bridge rejects every
+custody string before it reaches the pre-rotation step. Section 9.7.4.1 of the
+security model, pre-rotation key custody, makes every identity commit a
+pre-rotation commitment when it is created. That commitment needs a
+`PreRotationCustody` backend, and the only implementation is the test-harness
+`InMemoryPreRotationCustody`, which the
 bridge's `testing` feature severs from production, so
 `crates/scp-ffi/uniffi/src/bridge.rs` returns the typed error rather than
 minting the test double. ADR-062, capability injection and prove-absent dev

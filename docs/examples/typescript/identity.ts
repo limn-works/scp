@@ -15,8 +15,11 @@ import { Identity } from "@limn-works/scp-ts";
 
 async function main(): Promise<void> {
   // 1. Create a new identity with in-memory key custody.
-  //    In production, use "platform" for secure key storage
-  //    (Keychain on iOS/macOS, Keystore on Android).
+  //    In production, inject a KeyCustodyProvider through
+  //    scp.identityCreateWithCustody to hold the keys in an OS keystore.
+  //    No custody string reaches one: the bridge answers "platform" with
+  //    SCP-IDENT-1003. That call returns SCP-IDENT-1059 on a released
+  //    addon, because no pre-rotation custody backend is wired yet.
   const alice = await Identity.create({ custody: "in_memory" });
 
   console.log(`DID: ${alice.did}`);

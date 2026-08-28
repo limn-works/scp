@@ -49,9 +49,9 @@ asyncio.run(main())
 
 ## Key custody
 
-`identity_create` takes a custody string, and the PyO3 bridge accepts two of
-them. `CustodyType.FILE` (`"file"`) builds a `FileKeyCustody` that derives the
-file key with Argon2id and encrypts `$HOME/.scp/keys.bin` with AES-256-GCM.
+`identity_create` takes a custody string, and a shipped PyO3 build accepts one
+of them: `CustodyType.FILE` (`"file"`) builds a `FileKeyCustody` that derives
+the file key with Argon2id and encrypts `$HOME/.scp/keys.bin` with AES-256-GCM.
 `CustodyType.IN_MEMORY` (`"in_memory"`) compiles only under the bridge's
 `testing` feature, so a shipped build raises `IdentityError` with code
 `SCP-IDENT-1008`. Every other string, `"platform"` and `"software"` included,

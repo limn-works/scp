@@ -73,10 +73,11 @@ suspend fun main(keystore: KeyCustodyProvider) {
 
 `identityCreate` takes a custody string, and the UniFFI bridge builds a key
 store from one string only: `"in_memory"`, which it compiles under its `testing`
-feature. A released build throws `ScpError.Identity` carrying `SCP-IDENT-1008`
-for `"in_memory"`, and it throws `ScpError.Identity` carrying `SCP-IDENT-1003`
-for `"platform"` and for `"software"`. No custody string reaches Android
-Keystore.
+feature. A released build throws `ScpException.Identity` carrying
+`SCP-IDENT-1008` for `"in_memory"`, it throws `ScpException.Identity` carrying
+`SCP-IDENT-1003` for `"platform"` and for `"software"`, and it throws
+`ScpException.Validation` carrying `SCP-VALID-7005` for any other string. No
+custody string reaches Android Keystore.
 
 Production key storage runs through `scp.identityCreateWithCustody(provider)`
 instead. The private key material never crosses into the native core, because
@@ -84,25 +85,29 @@ the core delegates every cryptographic operation back to your callbacks
 (ADR-006, the platform abstraction).
 
 Implement `uniffi.scp.KeyCustodyProvider` yourself over Android Keystore and
-pass it in. The `scp-kt-android` module ships `AndroidKeyCustody`, which stores
-Ed25519 and X25519 key material in Android Keystore, but it implements
-`works.limn.scp.android.platform.KeyCustodyProvider` — a different interface
-from the `uniffi.scp.KeyCustodyProvider` this method takes, declaring
+pass it in. The `scp-kt-android` module ships `AndroidKeyCustody`, but it
+implements `works.limn.scp.android.platform.KeyCustodyProvider` — a different
+interface from the `uniffi.scp.KeyCustodyProvider` this method takes, declaring
 `publicKey(KeyHandle)` where the UniFFI interface declares
 `getPublicKey(String)`. No adapter converts between the two, so
-`AndroidKeyCustody` cannot be passed here until one lands.
+`AndroidKeyCustody` cannot be passed here until one lands. That class does not
+put every key in Android Keystore either: it holds Ed25519 keys in Keystore
+only on API 33 and above, it generates software Ed25519 keys through Bouncy
+Castle on API 26 to 32 and persists their seeds in `EncryptedSharedPreferences`,
+and it manages every X25519 key in software, because Android Keystore supports
+X25519 key agreement at no API level.
 
 ## No shipped build creates an identity yet
 
-`identityCreateWithCustody` throws `ScpError.Identity` carrying
+`identityCreateWithCustody` throws `ScpException.Identity` carrying
 `SCP-IDENT-1059` on every released build. `identityCreate` stops one step
-earlier, with the `SCP-IDENT-1008` and `SCP-IDENT-1003` codes described above,
-because the bridge rejects every custody string before it reaches the
-pre-rotation step. Section 9.7.4.1 of the security model, pre-rotation key
-custody, makes every identity commit a pre-rotation commitment when it is
-created. That commitment needs a `PreRotationCustody` backend, and the only
-implementation is the test-harness `InMemoryPreRotationCustody`, which the
-bridge's `testing` feature severs from production, so
+earlier, with the three codes described above, because the bridge rejects every
+custody string before it reaches the pre-rotation step. Section 9.7.4.1 of the
+security model, pre-rotation key custody, makes every identity commit a
+pre-rotation commitment when it is created. That commitment needs a
+`PreRotationCustody` backend, and the only implementation is the test-harness
+`InMemoryPreRotationCustody`, which the bridge's `testing` feature severs from
+production, so
 `crates/scp-ffi/uniffi/src/bridge.rs` returns the typed error rather than
 minting the test double. ADR-062, capability injection and prove-absent dev
 backends, records that state as accepted in its §Decision 6 and holds the real

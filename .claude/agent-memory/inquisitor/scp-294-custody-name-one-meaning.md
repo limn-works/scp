@@ -1,42 +1,52 @@
 ---
 name: scp-294-custody-name-one-meaning
-description: SCP-294 custody-string fail-closed change — severing the PyO3 "platform"→file substitution was compelled; deleting the SDK CustodyType members decided OQ-9, which §3.2 of the identity spec owns and an unmerged PR routed to a human.
+description: SCP-294 custody-string fail-closed change — the "platform" refusal is compelled, but the permanence doctrine written alongside it contradicts ADR-025/026/027/028, and the injection path it points every caller at does not compile on Swift or Kotlin.
 metadata:
   type: project
 ---
 
-Branch `fix/scp-294-custody-name-means-one-thing` (base `5e7e5b4e67`). Verdict: **UNSOUND in part** —
-keep the bridge half, reverse the SDK-enum and ADR half.
+Branch `fix/scp-294-custody-name-means-one-thing`, head `56c6a0e880`, base `5e7e5b4e67`.
+Second pass, after the human restored `platform`/`software` in the four SDK enums and reserved
+the `"file"`-vs-`"software"` spelling to open question OQ-9 and to §3.2 of the identity spec.
 
-**Two questions, one owner, two opposite handlings in one change.** §3.2 of `.docs/specs/03-identity.md`
-(lines 9–19) names four custody *sources* in prose and no option string at all. Open question OQ-9, added
-by pull request #2411 on branch `spec/one-section-governs-the-four-identity-keys` (commit `00d784f1ef`,
-OPEN), assigns the custody-option vocabulary to §3.2 "with the three SDK enums following it". The change
-withheld the `"file"`-vs-`"software"` spelling from decision and pinned it in a test (correct), and
-decided the `"platform"` half by deleting `CustodyType.platform`/`.software` from the Swift, Kotlin, and
-TypeScript SDKs and rewriting ADR-025/026/027/028's factory APIs (wrong — §3.2 owns it).
+**Settled, do not relitigate:** restoring the SDK enum members was right; the spelling question
+belongs to the human and to §3.2.
 
-**Compelled independently of §3.2 (keep):** severing PyO3's `"platform"` → `FileKeyCustody` silent
-substitution, and giving `"platform"` the same `SCP-IDENT-1003` on all three bridges. The fail-closed
-builder tenet is upstream of §3.2.
+**Compelled and correct (keep):** PyO3's `"platform"` → `FileKeyCustody` substitution is severed,
+and all three bridges answer the string with `SCP-IDENT-1003`. Naming a platform-native store and
+receiving an encrypted file is a false guarantee about key location; the fail-closed builder tenet
+decides it upstream of §3.2. `CustodyMethod::Platform`/`Software` deletion is also right — the
+variants stamped an opaque injected provider with a substrate claim, and `Identity::custody_type()`
+now answers `"callback"`, which the PyO3 and napi bridges already answered.
 
-**Root cause the change perpetuated instead of naming:** `crates/scp-ffi/Cargo.toml:80` resolves
-`scp-platform` with the `file` feature; `napi/Cargo.toml:86` and `uniffi/Cargo.toml:82` do not. Nobody
-decided that. `"file"` therefore reaches a real encrypted-file custody on one bridge and nothing on two,
-and the shipped TypeScript SDK is left with **no** production identity-creation path (its
-`KeyCustodyProvider` ships as an interface with no implementation).
+**The doctrine is not compelled and contradicts four Accepted ADRs.** The change wrote
+"never by naming it here" (`crates/scp-ffi/src/identity.rs` `parse_custody` rustdoc), "That error is
+the permanent behaviour, not a waiting state" (`.docs/lessons/uniffi-handle-count-shutdown-ordering.md`),
+"No custody string selects it" (`bindings/kotlin/scp-kt-android/.../PlatformAdapter.kt:3`), and
+"in every build" (`bindings/swift/Tests/SCPTests/CustodyTypeTests.swift:10`). Against:
+`.docs/adrs/phase-6.md:411` — "The Kotlin SDK's `SCP.create()` factory calls
+`AndroidPlatformAdapter.make(context)` when `custody = "platform"`" — and `.docs/adrs/phase-5.md:733`,
+`public static func create(custody: CustodyMethod = .platform)`. Those ADRs make the custody string
+the SDK-level selector for the injection; the change says no custody string selects it. Neither ADR
+was amended, and the `SCP.create(custody:)` factory they describe was never built.
 
-**Human ruling that constrains any future answer** (§3.9.3 of the PR-#2411 spec, quoted verbatim):
-Alec, 2026-08-25 — "active generally would not go in hardware but it's an option. it would go behind a
-passkey or something. so platform would be the expectation." And: "LET PEOPLE CHOOSE. LIKE IS ALREADY
-FUCKING WRITTEN INTO THE GODDAMN PROTOCOL." Do not re-derive the custody vocabulary without it.
+**The advertised alternative does not compile on the two named platforms.** The change's own READMEs
+say it: `AppleKeyCustody` carries the `KeyCustodyProvider` method set but declares no conformance
+(`bindings/swift/Sources/SCP/Platform/AppleKeyCustody.swift:240` is `public final class
+AppleKeyCustody: Sendable`), and `AndroidKeyCustody` implements
+`works.limn.scp.android.platform.KeyCustodyProvider`, a different interface from
+`uniffi.scp.KeyCustodyProvider`, with no adapter. Both are documented as "until that conformance
+lands" / "until one lands".
 
-**Nine live custody vocabularies** (the change reduced none): `scp_platform::CustodyType`
-(`crates/scp-platform/src/traits.rs:223`); the `KeyCustodyProvider` callback strings
-`hardware|software|software_biometric`; `scp_did::KeyCustodyModel`
-(`crates/scp-did/src/attestation.rs:86`); UniFFI `CustodyMethod`; the three bridge create-string sets;
-the four SDK `CustodyType` enums; `works.limn.scp.android.platform.CustodyType`; §3.2.1's
-`target_custody_type` enum; §3.2's four prose options.
+**Root cause still unnamed:** `crates/scp-ffi/Cargo.toml:80` resolves `scp-platform` with the `file`
+feature; `napi/Cargo.toml:86` and `uniffi/Cargo.toml:82` do not. Nobody decided that, and it is the
+sole reason `"file"` exists on one bridge and `"software"` on two — which is the spelling question
+OQ-9 holds.
 
-See [[scp-out-046-streaming-saga-seal-fsm]] for the contrasting case where an architecture-forced split
-was SOUND and should not be re-litigated.
+**Human ruling that constrains any future answer** (§3.9.3 of the PR-#2411 spec, verbatim):
+Alec, 2026-08-25 — "active generally would not go in hardware but it's an option. it would go behind
+a passkey or something. so platform would be the expectation." And: "LET PEOPLE CHOOSE. LIKE IS
+ALREADY FUCKING WRITTEN INTO THE GODDAMN PROTOCOL."
+
+See [[scp-out-046-streaming-saga-seal-fsm]] for the contrasting case where an architecture-forced
+split was SOUND and should not be re-litigated.

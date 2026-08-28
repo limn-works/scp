@@ -244,9 +244,10 @@ class TestIdentity:
 
         No custody string reaches Apple Keychain or Android Keystore, so the
         bridge answers ``"platform"`` with ``SCP-IDENT-1003`` and builds no key
-        store. Before SCP-294, "Fix Python custody naming and normalize
-        identity parameter across SDKs", the string built a ``FileKeyCustody``,
-        so the SDK named one substrate and delivered another.
+        store. Before SCP-294, "Fail closed on the custody strings the bridges
+        reject, and normalize the identity parameter across SDKs", the string
+        built a ``FileKeyCustody``, so the SDK named one substrate and
+        delivered another.
         """
         with pytest.raises(_scp_core.IdentityError) as excinfo:
             await scp.identity_create("platform")

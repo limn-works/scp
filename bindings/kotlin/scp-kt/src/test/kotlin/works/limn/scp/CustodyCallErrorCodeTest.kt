@@ -1,24 +1,29 @@
-// CustodyCallErrorCodeTest.kt — real-FFI proof that a custody string the
-// Kotlin `CustodyType` enum does not offer fails closed at the bridge.
+// CustodyCallErrorCodeTest.kt — real-FFI proof that the custody strings the
+// bridge refuses fail closed, and that the one string it accepts creates an
+// identity.
 //
-// `SmokeTest` pins the SDK half: `CustodyType` carries one entry, `IN_MEMORY`,
-// and `fromRawValue` returns null for "platform" and for "software". That test
-// alone cannot show what the bridge does with a string a JavaScript-style
-// caller passes anyway, so this suite calls `SCP.identityCreate` against the
-// compiled UniFFI cdylib with each rejected string and reads the typed code
-// off the thrown `ScpException`.
+// `SmokeTest` pins the SDK half: `CustodyType` carries three entries —
+// `IN_MEMORY`, `PLATFORM`, and `SOFTWARE` — and `fromRawValue` maps each
+// entry's raw string back to it. That the enum spells each refused string does
+// not show what the bridge answers when a caller passes one, so this suite
+// calls `SCP.identityCreate` against the compiled UniFFI cdylib with each
+// refused string and reads the typed code off the thrown `ScpException`.
 //
 // The property under test: `SCP-IDENT-1003` reaches the caller and no identity
 // is created. A bridge that instead built a key file would name Android
-// Keystore and deliver something else, which is the failure SCP-294, "Fix
-// Python custody naming and normalize identity parameter across SDKs", closes.
+// Keystore and deliver something else, which is the failure SCP-294, "Fail
+// closed on the custody strings the bridges reject, and normalize the identity
+// parameter across SDKs", closes.
 //
 // Every test method uses a BLOCK body, not an `= runBlocking { ... }`
 // expression body, for the reason `IdentityAgentKeyRealFfiTest` records: JUnit
 // 5 refuses to execute a `@Test` method that returns a value, so an
 // expression-bodied test can compile, report no failure, and never run.
 //
-// Provenance: spec §3.2 (Key Custody), ADR-006 (platform abstraction), and the
+// Provenance: section 3.2, Key Custody, of the identity spec
+// (`.docs/specs/03-identity.md`), which names four custody sources in prose and
+// no custody string; ADR-006, the platform abstraction, which defines the
+// `KeyCustody` trait that `identityCreateWithCustody` injects; and the
 // `"platform" | "software"` arm of `parse_custody_method` in
 // `crates/scp-ffi/uniffi/src/bridge.rs`, which raises SCP-IDENT-1003 before any
 // key store is built.
@@ -143,7 +148,7 @@ class CustodyCallErrorCodeTest {
     }
 
     @Test
-    fun `identityCreate accepts the one custody string CustodyType offers`() {
+    fun `identityCreate accepts the one custody string of the three the bridge parses`() {
         runBlocking {
             val identity = scp.identityCreate(custody = CustodyType.IN_MEMORY.rawValue)
             assertEquals(

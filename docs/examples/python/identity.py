@@ -21,6 +21,8 @@ async def main() -> None:
     #    In production, use CustodyType.FILE for an encrypted key file, or
     #    SCP.identity_create_with_custody(provider) to hold the keys in a
     #    platform-native key store. No custody string reaches such a store.
+    #    Neither call creates an identity on a released wheel: both return
+    #    SCP-IDENT-1059, because no pre-rotation custody backend is wired yet.
     identity = await Identity.create(custody=CustodyType.IN_MEMORY)
 
     print(f"DID: {identity.did}")

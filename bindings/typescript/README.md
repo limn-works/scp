@@ -45,10 +45,11 @@ await scp.shutdown(5);
 ## Key custody
 
 The NAPI bridge builds no key store from a custody string except the in-memory
-one, and it compiles that one only under its `testing` feature. `identityCreate`
-therefore accepts `"in_memory"` and nothing else: a released addon throws an
-`IdentityError` carrying `SCP-IDENT-1008` for `"in_memory"`, and it throws an
-`IdentityError` carrying `SCP-IDENT-1003` for `"platform"` and for `"software"`.
+one, and it compiles that one only under its `testing` feature. A released addon
+therefore rejects every custody string: it throws an `IdentityError` carrying
+`SCP-IDENT-1008` for `"in_memory"`, it throws an `IdentityError` carrying
+`SCP-IDENT-1003` for `"platform"` and for `"software"`, and it throws a
+`ValidationError` carrying `SCP-VALID-7005` for any other string.
 
 Production key storage runs through `scp.identityCreateWithCustody(provider)`
 instead. Implement the `KeyCustodyProvider` interface over the key store you
@@ -62,12 +63,12 @@ only entry point that takes an injected provider.
 
 `identityCreateWithCustody` throws an `IdentityError` carrying `SCP-IDENT-1059`
 on every released addon. `identityCreate` stops one step earlier, with the
-`SCP-IDENT-1008` and `SCP-IDENT-1003` codes described above, because the addon
-rejects every custody string before it reaches the pre-rotation step. Section
-9.7.4.1 of the security model, pre-rotation key custody, makes every identity
-commit a pre-rotation commitment when it is created. That commitment needs a
-`PreRotationCustody` backend, and the only implementation is the test-harness
-`InMemoryPreRotationCustody`, which the bridge's `testing` feature severs from
+three codes described above, because the addon rejects every custody string
+before it reaches the pre-rotation step. Section 9.7.4.1 of the security model,
+pre-rotation key custody, makes every identity commit a pre-rotation commitment
+when it is created. That commitment needs a `PreRotationCustody` backend, and
+the only implementation is the test-harness `InMemoryPreRotationCustody`, which
+the bridge's `testing` feature severs from
 production, so `crates/scp-ffi/napi/src/scp.rs` returns the typed error rather
 than minting the test double. ADR-062, capability injection and prove-absent
 dev backends, records that state as accepted in its §Decision 6 and holds the

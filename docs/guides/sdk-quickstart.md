@@ -147,17 +147,28 @@ dependencies {
 
 Every SCP participant starts by creating a cryptographic identity -- a DID (Decentralized Identifier) backed by Ed25519 keys. The identity is the root of trust for all protocol operations.
 
-**No shipped build creates an identity yet.** Every snippet in this section
-needs a bridge compiled with its `testing` feature. Section 9.7.4.1 of the
-security model, pre-rotation key custody, makes every identity commit a
-pre-rotation commitment when it is
-created. That commitment needs a `PreRotationCustody` backend, and the only
-implementation is the test-harness `InMemoryPreRotationCustody`, which the
-`testing` feature severs from production. A shipped build therefore returns the
+**No shipped build creates an identity yet.** Every SDK snippet below --
+Python, TypeScript, Swift, Kotlin -- needs a bridge compiled with its `testing`
+feature. Section 9.7.4.1 of the security model, pre-rotation key custody, makes
+every identity commit a pre-rotation commitment when it is created. That
+commitment needs a `PreRotationCustody` backend, and the only implementation is
+the test-harness `InMemoryPreRotationCustody`, which the `testing` feature
+severs from production. A shipped build therefore returns the
 typed `SCP-IDENT-1059` error rather than minting the test double. ADR-062,
 capability injection and prove-absent dev backends, records that state as
 accepted and holds the real backend out of its own scope. §Platform-native key
 custody below says which call returns which code on which bridge.
+
+The bridges build a key store from two custody strings and reject every other
+one. `"file"` builds an encrypted key file and works on the PyO3 bridge only.
+`"in_memory"` compiles under each bridge's `testing` feature, so a released
+build rejects it with `SCP-IDENT-1008`. `"platform"` and `"software"` name no
+key store the bridges build: all three bridges reject `"platform"` with
+`SCP-IDENT-1003`, and the NAPI and UniFFI bridges reject `"software"` with the
+same code. To put keys in Apple Keychain or in Android Keystore, pass a
+`KeyCustodyProvider` to `identity_create_with_custody` (see §Platform-native
+key custody below), which returns `SCP-IDENT-1059` on a shipped build for the
+separate reason stated above.
 
 ### Rust
 
@@ -184,17 +195,6 @@ let identity = ScpIdentity {
 };
 println!("DID: {}", identity.did);
 ```
-
-The bridges build a key store from two custody strings and reject every other
-one. `"file"` builds an encrypted key file and works on the PyO3 bridge only.
-`"in_memory"` compiles under each bridge's `testing` feature, so a released
-build rejects it with `SCP-IDENT-1008`. `"platform"` and `"software"` name no
-key store the bridges build: all three bridges reject `"platform"` with
-`SCP-IDENT-1003`, and the NAPI and UniFFI bridges reject `"software"` with the
-same code. To put keys in Apple Keychain or in Android Keystore, pass a
-`KeyCustodyProvider` to `identity_create_with_custody` (see §Platform-native
-key custody below), which returns `SCP-IDENT-1059` on a shipped build for the
-separate reason stated above.
 
 ### Python
 
@@ -237,7 +237,9 @@ import SCP
 let scp = try SCP(storage: .inMemory)
 // The UniFFI bridge builds no production key store from a custody string, so
 // supply your own type conforming to KeyCustodyProvider.
-let keychain: KeyCustodyProvider = MyKeychainCustody()
+// Supply your own type conforming to KeyCustodyProvider; this package
+// ships none that conforms — see "Key custody" below.
+let keychain: KeyCustodyProvider = YourKeychainCustody()
 // A released XCFramework throws SCP-IDENT-1059 here; this needs a `testing` build.
 let identity = try await scp.identityCreateWithCustody(provider: keychain)
 print("DID: \(identity.did())")
@@ -269,15 +271,16 @@ key material never crosses into the native core (ADR-006, the platform
 abstraction).
 
 Neither mobile SDK ships a provider you can pass in today. The Swift package's
-`AppleKeyCustody` carries the method set `KeyCustodyProvider` declares and
-stores key material in the Keychain, but
+`AppleKeyCustody` stores key material in the Keychain, but
 `bindings/swift/Sources/SCP/Platform/AppleKeyCustody.swift` declares
-`public final class AppleKeyCustody: Sendable` and names no protocol, so it
-does not satisfy the parameter. The Kotlin `AndroidKeyCustody` implements
+`public final class AppleKeyCustody: Sendable`, names no protocol, and defines
+eight of its nine methods with an argument label or a return type that differs
+from the protocol's, so adding `: KeyCustodyProvider` to it does not compile.
+The Kotlin `AndroidKeyCustody` implements
 `works.limn.scp.android.platform.KeyCustodyProvider`, a different interface
 from the `uniffi.scp.KeyCustodyProvider` the bridge takes, and no adapter
-converts between them. Until each SDK declares that conformance, a caller
-writes the provider themselves.
+converts between them. Write the provider yourself until an adapter lands on
+each platform.
 
 `identity_create_with_custody` is where a real platform backend lands, and it
 is the only entry point that takes an injected provider. It is not a working
@@ -286,8 +289,10 @@ create path today: on a shipped build it returns `SCP-IDENT-1059`, and
 `crates/scp-ffi/napi/src/scp.rs` each return that code before minting anything.
 The PyO3 bridge returns the same code from `identity_create` with `"file"`
 custody. The NAPI and UniFFI bridges reject every custody string one step
-earlier, with `SCP-IDENT-1008` or `SCP-IDENT-1003`, so `identity_create` on
-those two bridges never reaches the pre-rotation step at all.
+earlier -- `SCP-IDENT-1008` for `"in_memory"`, `SCP-IDENT-1003` for
+`"platform"` and `"software"`, `SCP-VALID-7005` for anything else -- so
+`identity_create` on those two bridges never reaches the pre-rotation step at
+all.
 
 Two separate gaps produce those codes, and closing one does not close the
 other. `SCP-IDENT-1003` and `SCP-IDENT-1008` say that the custody string names

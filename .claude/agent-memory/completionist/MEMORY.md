@@ -25,7 +25,8 @@ artifact diverged) so future passes trace faster.
   `scp-client-wasm::WasmScpClient`; `resubscribe_all` was not (inter-layer gap). Also: type
   renames (Socket→RelaySink) leave stray doc refs; native reciprocal-announce is a legit
   recorded follow-up.
-- [SCP-294 custody name means one thing](scp294_custody_name_one_meaning.md) — deleting a
-  UniFFI-exported enum variant leaves the CHECKED-IN Swift `ScpBindings.swift` stale while
-  the untracked generated Kotlin file self-heals; live error messages, scaffold sources,
-  and stub-backed conformance tests keep naming the rejected string.
+- [SCP-294 custody name means one thing](scp294_custody_name_one_meaning.md) — two rounds,
+  disjoint gaps. An author's exclusion list under-scopes itself: grep `phase-1.md`
+  through `phase-6.md` by name rather than trusting line numbers. A new test file's own
+  header can describe an earlier iteration of the change, and a story's `actionItems` can
+  contradict its own `acceptanceCriteria` after a mid-flight redesign.

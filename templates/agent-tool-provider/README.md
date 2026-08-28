@@ -216,7 +216,7 @@ Test vectors are optional but recommended -- they document expected behavior and
 
 ## Next Steps
 
-- Replace `"in_memory"` custody with `"file"` for production key storage, and export `SCP_KEY_PASSPHRASE` — the PyO3 bridge encrypts `$HOME/.scp/keys.bin` under that passphrase. For an OS keystore, pass a `KeyCustodyProvider` to `scp.identity_create_with_custody()` instead; the bridge rejects the custody string `"platform"` with `SCP-IDENT-1003`
+- Replace `"in_memory"` custody with `"file"` and export `SCP_KEY_PASSPHRASE` — the PyO3 bridge encrypts `$HOME/.scp/keys.bin` under that passphrase. For an OS keystore, pass a `KeyCustodyProvider` to `scp.identity_create_with_custody()` instead; the bridge rejects the custody string `"platform"` with `SCP-IDENT-1003`. Neither call creates an identity on a released wheel: both return `SCP-IDENT-1059`, because no pre-rotation custody backend is wired yet
 - Connect to a relay with `connect_relay()` for networked transport
 - Use `session_create()`/`session_invoke()` for multi-turn tool workflows
 - Add a second participant and use `delegate()` to issue scoped UCAN tokens
