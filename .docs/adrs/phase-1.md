@@ -1291,7 +1291,6 @@ DidDocument.verification_method = [
 - Agent-specific roles with restricted capabilities
 - `agent_rate_limit` — rate limiting for agent actions
 - `agent_cosign_required` — agent actions require human co-signature
-- A fifth mechanism is under design and this list does not yet carry it: `user_authentication_required`, which would name the capabilities a context requires a member to exercise under a signing key its platform gates behind a device-local authentication gesture. ADR-063, the context-declared user-authentication gate, states what it settles and what a human decides first, and its status is Proposed. No spec section declares a field for it.
 
 ### Enforcement Stack (5 Layers)
 
