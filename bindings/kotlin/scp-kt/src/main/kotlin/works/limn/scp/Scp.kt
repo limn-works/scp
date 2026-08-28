@@ -1258,8 +1258,11 @@ class SCP internal constructor(
      * [testingSeed] is a testing-only parameter for the ADR-046
      * cross-bridge parity harness; pass `null` from production callers
      * (in-memory custody uses OS RNG when [testingSeed] is `null`). A
-     * non-`null` [testingSeed] is only valid for `custody == "in_memory"`;
-     * other custody types reject it with `SCP-VALID-7009`.
+     * non-`null` [testingSeed] is only valid for `custody == "in_memory"`.
+     * The UniFFI bridge judges the custody name before the seed, so every
+     * other custody string reports that name's own code — `SCP-IDENT-1003`
+     * for `"platform"` and `"software"`, `SCP-VALID-7005` for anything
+     * else — and this bridge emits no `SCP-VALID-7009`.
      */
     suspend fun identityCreate(custody: String, testingSeed: ByteArray? = null): Identity =
         inner.identityCreate(custody = custody, testingSeed = testingSeed)

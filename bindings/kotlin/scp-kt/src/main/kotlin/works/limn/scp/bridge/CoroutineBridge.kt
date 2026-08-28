@@ -124,13 +124,16 @@ interface IdentityBindings {
      * Generates a new `did:dht` identity backed by the given custody type.
      * The returned handle retains key material for the identity's lifetime.
      *
-     * @param custody Key custody method: `"in_memory"` (dev/test only, feature-gated),
-     *   `"platform"` (Secure Enclave / Android Keystore), or `"software"`.
+     * @param custody Key custody method. The bridge builds a key store for
+     *   `"in_memory"` (dev/test only, feature-gated) and for no other string.
+     *   Reach Secure Enclave or Android Keystore by injecting a
+     *   `KeyCustodyProvider` through `identityCreateWithCustody`, not by
+     *   naming a custody string.
      * @return Opaque identity handle for use in subsequent operations.
      * @throws BridgeException with `SCP-IDENT-1008` if `"in_memory"` is requested
-     *   but the `testing` feature is not enabled, or with
-     *   `SCP-IDENT-1003` if `"platform"`/`"software"` is requested without a
-     *   wired `KeyCustodyProvider`.
+     *   but the `testing` feature is not enabled, with `SCP-IDENT-1003` for
+     *   `"platform"` or `"software"`, which reach no key store on any bridge,
+     *   and with `SCP-VALID-7005` for every other string.
      */
     fun identityCreate(custody: String): Long
 
@@ -1515,7 +1518,12 @@ class IdentityBridge internal constructor(
      *
      * Overload accepting a raw string for backward compatibility.
      *
-     * @param custody Key custody method: "platform", "in_memory", or "software".
+     * @param custody The custody string the UniFFI bridge accepts, which is
+     *   `"in_memory"` and no other. The bridge answers `"platform"` and
+     *   `"software"` with `SCP-IDENT-1003` because neither string reaches a
+     *   platform key store; inject a `KeyCustodyProvider` through
+     *   `identityCreateWithCustody` to reach Android Keystore. Every other
+     *   string draws `SCP-VALID-7005`.
      * @return Opaque identity handle for use in subsequent operations.
      */
     suspend fun create(custody: String): Long = bridge.ffiCall { bindings.identityCreate(custody) }

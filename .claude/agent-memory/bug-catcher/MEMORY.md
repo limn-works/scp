@@ -214,3 +214,4 @@ Notes:
   no consumers. rotationEventJson getter surfaces NAPI migrate() Some(json) end-to-end.
   Gate PASS (0 err, 1 coverage-exempt), gate self-tests 4/4, TS check clean, 62 TS
   tests pass, Python parity tests sound. NO BUGS.
+- [SCP-294 custody-name review](scp294_custody_name_one_thing.md) — "platform" fails closed on 3 bridges; verified-sound list + 6 open findings (stale IDENT-1010 message, untested seed arm).

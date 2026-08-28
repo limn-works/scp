@@ -15,29 +15,70 @@ bun add @limn-works/scp-ts
 ## Quick Start
 
 ```typescript
-import { Identity, Context } from "@limn-works/scp-ts";
+import { SCP } from "@limn-works/scp-ts";
+import type { KeyCustodyProvider } from "@limn-works/scp-ts";
 
-// Create a cryptographic identity (DID)
-const identity = await Identity.create({ custody: "platform" });
+// Storage selection is required — there is no default (spec §17.6).
+const scp = new SCP({ storage: { type: "in_memory" } });
+
+// Create a cryptographic identity (DID). `keychain` is your own
+// KeyCustodyProvider over the OS keystore — see "Key custody" below. On a
+// released addon this call throws SCP-IDENT-1059 — read "No shipped build
+// creates an identity yet" below before you run it.
+declare const keychain: KeyCustodyProvider;
+const identity = await scp.identityCreateWithCustody(keychain);
 console.log(`DID: ${identity.did}`);
 
 // Create an encrypted context
-const ctx = await Context.create(identity, {
-  ceiling: ["msg:send", "msg:receive"],
-  ttl: 3600,
-});
+const ctx = await scp.contextCreate(
+  identity,
+  JSON.stringify({ ceiling: ["msg:send", "msg:receive"], ttl: 3600 }),
+);
 
 // Send a message (MLS-encrypted, signed, provenance-tagged)
-await ctx.send(new TextEncoder().encode("Hello from SCP"));
+await scp.contextSend(ctx, identity.did, new TextEncoder().encode("Hello from SCP"));
 
-// Receive messages
-for await (const msg of ctx.receive()) {
-  console.log(`${msg.senderDid}: ${msg.content}`);
-  break;
-}
-
-await ctx.close();
+await scp.contextClose(ctx, identity.did);
+await scp.shutdown(5);
 ```
+
+## Key custody
+
+The NAPI bridge builds no key store from a custody string except the in-memory
+one, and it compiles that one only under its `testing` feature. `identityCreate`
+therefore accepts `"in_memory"` and nothing else: a released addon throws an
+`IdentityError` carrying `SCP-IDENT-1008` for `"in_memory"`, and it throws an
+`IdentityError` carrying `SCP-IDENT-1003` for `"platform"` and for `"software"`.
+
+Production key storage runs through `scp.identityCreateWithCustody(provider)`
+instead. Implement the `KeyCustodyProvider` interface over the key store you
+want — an OS keychain, a hardware token, an HSM wrapper — and the private key
+material never crosses into the native core, because the core delegates every
+cryptographic operation back to your callbacks (ADR-006, the platform
+abstraction). That method is where a real platform backend lands, and it is the
+only entry point that takes an injected provider.
+
+## No shipped build creates an identity yet
+
+`identityCreateWithCustody` throws an `IdentityError` carrying
+`SCP-IDENT-1059` on every released addon. `identityCreate` stops one step
+earlier, with the `SCP-IDENT-1008` and `SCP-IDENT-1003` codes described above,
+because the addon rejects every custody string before it reaches the
+pre-rotation step. Spec section 9.7.4.1 makes every identity commit a
+pre-rotation commitment when it is created, that commitment needs a `PreRotationCustody` backend, and the only
+implementation is the test-harness `InMemoryPreRotationCustody`, which the
+bridge's `testing` feature severs from production. The bridge returns the typed
+`SCP-IDENT-1059` error rather than minting the test double
+(`crates/scp-ffi/napi/src/scp.rs`, ADR-062, capability injection and
+prove-absent dev backends, §Decision 6). The Quick Start above therefore runs
+against an addon built with the `testing` feature.
+
+Two separate gaps produce these two codes, and closing one does not close the
+other. `SCP-IDENT-1003` and `SCP-IDENT-1008` say that the custody string you
+passed names no key store this bridge builds. `SCP-IDENT-1059` says that no
+pre-rotation custody backend exists for any create path to use. A wired
+platform provider clears the first; a real pre-rotation backend clears the
+second.
 
 ## Runtime Support
 

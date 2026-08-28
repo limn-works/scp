@@ -784,10 +784,12 @@ public func FfiConverterTypeContextHandle_lower(_ value: ContextHandle) -> Unsaf
  * - **In-memory custody** (dev/desktop): retained `InMemoryKeyCustody`
  * with key material in heap memory. Only available when the
  * `testing` feature is enabled.
- * - **Platform/Software custody** (production mobile): retained
- * `CallbackKeyCustody` adapter wrapping the injected
- * [`KeyCustodyProvider`](crate::KeyCustodyProvider) callback. Private
- * key material stays in the platform TEE (Secure Enclave / Keystore).
+ * - **Callback custody** (production): retained `CallbackKeyCustody`
+ * adapter wrapping the injected
+ * [`KeyCustodyProvider`](crate::KeyCustodyProvider) callback. Private key
+ * material never crosses the callback boundary, and the bridge does not
+ * learn which substrate stores it — the provider reports that itself
+ * through `KeyCustodyProvider::custody_type`.
  *
  * Generated as `class Identity` in both Swift and Kotlin.
  *
@@ -816,7 +818,10 @@ public protocol IdentityProtocol: AnyObject, Sendable {
     /**
      * Returns the custody method string for this identity.
      *
-     * One of: `"in_memory"`, `"platform"`, `"software"`, `"external"`.
+     * One of: `"in_memory"`, `"callback"`, `"external"`. `"callback"` names an
+     * identity whose key material a caller-injected `KeyCustodyProvider`
+     * holds; the `PyO3` and napi bridges report the same string for the same
+     * custody, so one name carries one meaning across all three bridges.
      */
     func custodyType()  -> String
     
@@ -946,10 +951,12 @@ public protocol IdentityProtocol: AnyObject, Sendable {
  * - **In-memory custody** (dev/desktop): retained `InMemoryKeyCustody`
  * with key material in heap memory. Only available when the
  * `testing` feature is enabled.
- * - **Platform/Software custody** (production mobile): retained
- * `CallbackKeyCustody` adapter wrapping the injected
- * [`KeyCustodyProvider`](crate::KeyCustodyProvider) callback. Private
- * key material stays in the platform TEE (Secure Enclave / Keystore).
+ * - **Callback custody** (production): retained `CallbackKeyCustody`
+ * adapter wrapping the injected
+ * [`KeyCustodyProvider`](crate::KeyCustodyProvider) callback. Private key
+ * material never crosses the callback boundary, and the bridge does not
+ * learn which substrate stores it — the provider reports that itself
+ * through `KeyCustodyProvider::custody_type`.
  *
  * Generated as `class Identity` in both Swift and Kotlin.
  *
@@ -1043,7 +1050,10 @@ open func addAgentKey()async throws  -> Identity  {
     /**
      * Returns the custody method string for this identity.
      *
-     * One of: `"in_memory"`, `"platform"`, `"software"`, `"external"`.
+     * One of: `"in_memory"`, `"callback"`, `"external"`. `"callback"` names an
+     * identity whose key material a caller-injected `KeyCustodyProvider`
+     * holds; the `PyO3` and napi bridges report the same string for the same
+     * custody, so one name carries one meaning across all three bridges.
      */
 open func custodyType() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
@@ -2608,8 +2618,8 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * is backed by a deterministic RNG so subsequent `generate_keypair`
      * calls produce byte-identical Ed25519 keys across bridges — the
      * basis of the cross-bridge parity test (ADR-046). `testing_seed`
-     * is only valid for `"in_memory"` custody; other custody types
-     * reject it with `SCP-VALID-7009`.
+     * is only valid for `"in_memory"` custody, and `parse_custody_method`
+     * rejects every other custody string before this method reads the seed.
      */
     func identityCreate(custody: String, testingSeed: Data?) async throws  -> Identity
     
@@ -2656,9 +2666,18 @@ public protocol ScpProtocol: AnyObject, Sendable {
     /**
      * Per-instance equivalent of the free-function `identity_execute_recovery`.
      *
-     * Pure orchestration — takes no handles. Routes through `&self.inner`
-     * only to preserve API uniformity; the underlying recovery backend is
-     * a local stub pending SDK-layer wiring.
+     * # Fails closed (#2240)
+     *
+     * The §9.12 recovery WIRE (a real `RecoveryBackend` plus step-1 key
+     * rotation) is not yet built (custody / DID-method operations tracked as
+     * #2240 Part B, pending human sign-off). Until it is wired via the SDK
+     * layer this method **fails closed** with a typed `SCP-IDENT-1022` error
+     * ("recovery backend not configured — provide a real backend via SDK
+     * layer") — it NEVER returns a fabricated success (the former inline
+     * always-`Ok` backend returned `key_rotation_completed: true` while doing
+     * nothing, a nullifier forbidden by the builder tenets). Mirrors the
+     * sibling [`Self::identity_execute_custody_migration`] fail-closed
+     * behaviour.
      */
     func identityExecuteRecovery(did: String, tier: String, contextIds: [String]) throws  -> String
     
@@ -2874,6 +2893,27 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * is not per-instance; the opaque handle string is globally unique).
      */
     func mcpServerStop(handle: String) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `media_activate_session`.
+     *
+     * Transitions the session from `Initiating` to `Active` and appends a
+     * `MediaSessionStarted` leaf to the context event log (ADR-024 AC 8).
+     * The event log append is best-effort: if the context is not registered
+     * in the UCAN state registry a warning is emitted but the session state
+     * transition still succeeds.
+     */
+    func mediaActivateSession(sessionJson: String) throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `media_end_session`.
+     *
+     * Ends the session and appends a `MediaSessionEnded` leaf to the context
+     * event log (ADR-024 AC 8). The event log append is best-effort: if the
+     * context is not registered a warning is emitted but the session teardown
+     * still succeeds.
+     */
+    func mediaEndSession(sessionJson: String, timestamp: UInt64) throws  -> String
     
     /**
      * Per-instance equivalent of the free-function `migration_state`.
@@ -3154,6 +3194,65 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Returns `ScpError::Validation` if a byte argument is malformed.
      */
     func outletStreamVerifyChunkSignature(chunkBytes: Data, operatorPk: Data, contextId: String, outletId: String, caveatsBinding: Data) async throws  -> Bool
+    
+    /**
+     * Opens a §5.4.5 / §6.2.4 CROSS-CONTEXT streaming outlet invocation as a
+     * saga (SCP-OUT-047), returning the durable `saga_id` PROMPTLY (the
+     * Commit-transition — NOT a block-until-terminal; the seal pumps
+     * off-mailbox). Drive the stream via `outletStreamingSagaPollNext` with the
+     * returned `saga_id`.
+     *
+     * The invocation UCAN is validated ONCE at open via the full 11-step
+     * ADR-016 pipeline against the TARGET context B (`target_handle`).
+     * `caller_did` is bound to this bridge instance's channel-authenticated
+     * principal (§6.2.4) and must be a member of `source_handle`'s context — a
+     * mismatch returns `ScpError::SagaAborted` (SCP-SAGA-13050) BEFORE the saga
+     * runs, so the receiver is never handed out.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::SagaAborted` (SCP-SAGA-13050) if the caller-principal
+     * binding fails; `ScpError::Permission` if authorization fails; a saga
+     * terminal error (`SagaAborted` / `SagaNeedsRepair` / `SagaBusy`) if the
+     * Prepare/Commit-transition is rejected; `ScpError::Validation` if an
+     * id/DID/outlet-id is malformed or `asserted_nonce_hex` is not 16 bytes.
+     */
+    func outletStreamingSagaOpen(sourceHandle: ContextHandle, targetHandle: ContextHandle, callerDid: String, outletRegistrationId: String, inputJson: String, assertedNonceHex: String, timestampMs: UInt64, chainDepth: UInt8, ucanToken: String, proofTokens: [String]?, ucanProofId: String?, timeoutMs: UInt32?, estimatedChunkCount: UInt32?) async throws  -> String
+    
+    /**
+     * Drains one chunk from a live cross-context streaming saga, awaiting until
+     * a chunk arrives or the stream closes. Returns the JSON-serialized
+     * `OutletStreamChunk` bytes (A's plaintext operator-signed frame), or `None`
+     * at the terminal (which evicts the saga stream).
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Context` for an unknown/evicted `saga_id` (a DISTINCT
+     * error, NEVER `None`) or if chunk serialization fails.
+     */
+    func outletStreamingSagaPollNext(sagaId: String) async throws  -> Data?
+    
+    /**
+     * Key-bearing in-session reconnect/repair truncated-close for a cross-context
+     * streaming saga (SCP-OUT-046 #136 AC7): seals the durable prefix with the
+     * TARGET context's Active Signing Key (resolved per-call from custody) and
+     * resolves the saga `Committed` WITHOUT re-opening the stream or re-invoking
+     * the executor. Recovers a seal that stalled / went `NeedsRepair` while THIS
+     * bridge process is still alive; the saga registry is per-instance and
+     * in-memory, so it does NOT survive a process/node restart (cross-restart
+     * recovery is a separate durable-journal operator path, §17.16).
+     * `caller_did` must be an identity hosted by this bridge instance (§6.2.4
+     * channel-auth) AND the invoker pinned at open (CRITICAL #1 — recovery is
+     * money-moving). On success the saga registry entry is evicted.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Context` if `caller_did` is not hosted by this instance
+     * or the `saga_id` is unknown; `ScpError::Permission` with `SCP-PERM-3001`
+     * if `caller_did` is hosted but is not the pinned invoker; a saga terminal
+     * error (`SagaNeedsRepair`) if the seal cannot complete.
+     */
+    func outletStreamingSagaRecoverTruncatedClose(sagaId: String, callerDid: String) async throws 
     
     /**
      * Per-instance equivalent of the free-function `outlet_verify`.
@@ -3488,6 +3587,10 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * Signs each delegation with `delegator_did`'s own key, read from this
+     * instance's identity custody registry. A `delegator_did` that this
+     * instance has not registered returns `SCP-IDENT-1001`.
      */
     func ucanDelegate(handle: ContextHandle, delegatorDid: String, delegateeDid: String, parentToken: String, capabilities: [String]) async throws  -> UcanToken
     
@@ -5273,8 +5376,8 @@ open func identityAttestDevice(identity: Identity)async throws  -> String  {
      * is backed by a deterministic RNG so subsequent `generate_keypair`
      * calls produce byte-identical Ed25519 keys across bridges — the
      * basis of the cross-bridge parity test (ADR-046). `testing_seed`
-     * is only valid for `"in_memory"` custody; other custody types
-     * reject it with `SCP-VALID-7009`.
+     * is only valid for `"in_memory"` custody, and `parse_custody_method`
+     * rejects every other custody string before this method reads the seed.
      */
 open func identityCreate(custody: String, testingSeed: Data?)async throws  -> Identity  {
     return
@@ -5389,9 +5492,18 @@ open func identityExecuteCustodyMigration(did: String, target: String, contextId
     /**
      * Per-instance equivalent of the free-function `identity_execute_recovery`.
      *
-     * Pure orchestration — takes no handles. Routes through `&self.inner`
-     * only to preserve API uniformity; the underlying recovery backend is
-     * a local stub pending SDK-layer wiring.
+     * # Fails closed (#2240)
+     *
+     * The §9.12 recovery WIRE (a real `RecoveryBackend` plus step-1 key
+     * rotation) is not yet built (custody / DID-method operations tracked as
+     * #2240 Part B, pending human sign-off). Until it is wired via the SDK
+     * layer this method **fails closed** with a typed `SCP-IDENT-1022` error
+     * ("recovery backend not configured — provide a real backend via SDK
+     * layer") — it NEVER returns a fabricated success (the former inline
+     * always-`Ok` backend returned `key_rotation_completed: true` while doing
+     * nothing, a nullifier forbidden by the builder tenets). Mirrors the
+     * sibling [`Self::identity_execute_custody_migration`] fail-closed
+     * behaviour.
      */
 open func identityExecuteRecovery(did: String, tier: String, contextIds: [String])throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
@@ -5827,6 +5939,40 @@ open func mcpServerStop(handle: String)async throws   {
             liftFunc: { $0 },
             errorHandler: FfiConverterTypeScpError_lift
         )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `media_activate_session`.
+     *
+     * Transitions the session from `Initiating` to `Active` and appends a
+     * `MediaSessionStarted` leaf to the context event log (ADR-024 AC 8).
+     * The event log append is best-effort: if the context is not registered
+     * in the UCAN state registry a warning is emitted but the session state
+     * transition still succeeds.
+     */
+open func mediaActivateSession(sessionJson: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_media_activate_session(self.uniffiClonePointer(),
+        FfiConverterString.lower(sessionJson),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `media_end_session`.
+     *
+     * Ends the session and appends a `MediaSessionEnded` leaf to the context
+     * event log (ADR-024 AC 8). The event log append is best-effort: if the
+     * context is not registered a warning is emitted but the session teardown
+     * still succeeds.
+     */
+open func mediaEndSession(sessionJson: String, timestamp: UInt64)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_media_end_session(self.uniffiClonePointer(),
+        FfiConverterString.lower(sessionJson),
+        FfiConverterUInt64.lower(timestamp),$0
+    )
+})
 }
     
     /**
@@ -6405,6 +6551,110 @@ open func outletStreamVerifyChunkSignature(chunkBytes: Data, operatorPk: Data, c
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
             liftFunc: FfiConverterBool.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Opens a §5.4.5 / §6.2.4 CROSS-CONTEXT streaming outlet invocation as a
+     * saga (SCP-OUT-047), returning the durable `saga_id` PROMPTLY (the
+     * Commit-transition — NOT a block-until-terminal; the seal pumps
+     * off-mailbox). Drive the stream via `outletStreamingSagaPollNext` with the
+     * returned `saga_id`.
+     *
+     * The invocation UCAN is validated ONCE at open via the full 11-step
+     * ADR-016 pipeline against the TARGET context B (`target_handle`).
+     * `caller_did` is bound to this bridge instance's channel-authenticated
+     * principal (§6.2.4) and must be a member of `source_handle`'s context — a
+     * mismatch returns `ScpError::SagaAborted` (SCP-SAGA-13050) BEFORE the saga
+     * runs, so the receiver is never handed out.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::SagaAborted` (SCP-SAGA-13050) if the caller-principal
+     * binding fails; `ScpError::Permission` if authorization fails; a saga
+     * terminal error (`SagaAborted` / `SagaNeedsRepair` / `SagaBusy`) if the
+     * Prepare/Commit-transition is rejected; `ScpError::Validation` if an
+     * id/DID/outlet-id is malformed or `asserted_nonce_hex` is not 16 bytes.
+     */
+open func outletStreamingSagaOpen(sourceHandle: ContextHandle, targetHandle: ContextHandle, callerDid: String, outletRegistrationId: String, inputJson: String, assertedNonceHex: String, timestampMs: UInt64, chainDepth: UInt8, ucanToken: String, proofTokens: [String]?, ucanProofId: String?, timeoutMs: UInt32?, estimatedChunkCount: UInt32?)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_outlet_streaming_saga_open(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(sourceHandle),FfiConverterTypeContextHandle_lower(targetHandle),FfiConverterString.lower(callerDid),FfiConverterString.lower(outletRegistrationId),FfiConverterString.lower(inputJson),FfiConverterString.lower(assertedNonceHex),FfiConverterUInt64.lower(timestampMs),FfiConverterUInt8.lower(chainDepth),FfiConverterString.lower(ucanToken),FfiConverterOptionSequenceString.lower(proofTokens),FfiConverterOptionString.lower(ucanProofId),FfiConverterOptionUInt32.lower(timeoutMs),FfiConverterOptionUInt32.lower(estimatedChunkCount)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Drains one chunk from a live cross-context streaming saga, awaiting until
+     * a chunk arrives or the stream closes. Returns the JSON-serialized
+     * `OutletStreamChunk` bytes (A's plaintext operator-signed frame), or `None`
+     * at the terminal (which evicts the saga stream).
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Context` for an unknown/evicted `saga_id` (a DISTINCT
+     * error, NEVER `None`) or if chunk serialization fails.
+     */
+open func outletStreamingSagaPollNext(sagaId: String)async throws  -> Data?  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_outlet_streaming_saga_poll_next(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(sagaId)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionData.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Key-bearing in-session reconnect/repair truncated-close for a cross-context
+     * streaming saga (SCP-OUT-046 #136 AC7): seals the durable prefix with the
+     * TARGET context's Active Signing Key (resolved per-call from custody) and
+     * resolves the saga `Committed` WITHOUT re-opening the stream or re-invoking
+     * the executor. Recovers a seal that stalled / went `NeedsRepair` while THIS
+     * bridge process is still alive; the saga registry is per-instance and
+     * in-memory, so it does NOT survive a process/node restart (cross-restart
+     * recovery is a separate durable-journal operator path, §17.16).
+     * `caller_did` must be an identity hosted by this bridge instance (§6.2.4
+     * channel-auth) AND the invoker pinned at open (CRITICAL #1 — recovery is
+     * money-moving). On success the saga registry entry is evicted.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Context` if `caller_did` is not hosted by this instance
+     * or the `saga_id` is unknown; `ScpError::Permission` with `SCP-PERM-3001`
+     * if `caller_did` is hosted but is not the pinned invoker; a saga terminal
+     * error (`SagaNeedsRepair`) if the seal cannot complete.
+     */
+open func outletStreamingSagaRecoverTruncatedClose(sagaId: String, callerDid: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_outlet_streaming_saga_recover_truncated_close(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(sagaId),FfiConverterString.lower(callerDid)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
             errorHandler: FfiConverterTypeScpError_lift
         )
 }
@@ -7110,6 +7360,10 @@ open func trustVerifyResponse(challengeJson: String, responseJson: String)throws
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * Signs each delegation with `delegator_did`'s own key, read from this
+     * instance's identity custody registry. A `delegator_did` that this
+     * instance has not registered returns `SCP-IDENT-1001`.
      */
 open func ucanDelegate(handle: ContextHandle, delegatorDid: String, delegateeDid: String, parentToken: String, capabilities: [String])async throws  -> UcanToken  {
     return
@@ -12929,14 +13183,15 @@ public enum CustodyMethod {
      */
     case inMemory
     /**
-     * Key material protected by hardware security module
-     * (Secure Enclave on iOS, Android Keystore on Android).
+     * Key material held by the caller-injected `KeyCustodyProvider` that
+     * `Scp::identity_create_with_custody` binds to the identity.
+     *
+     * The variant names the injection, not the substrate. The bridge never
+     * sees what stores the key, so the provider reports its own substrate
+     * through `KeyCustody::custody_type`, which `CallbackKeyCustody` forwards
+     * to `KeyCustodyProvider::custody_type`.
      */
-    case platform
-    /**
-     * Key material in software-managed encrypted storage (not HSM-backed).
-     */
-    case software
+    case callback
     /**
      * Identity loaded by DID string without local key material.
      *
@@ -12963,11 +13218,9 @@ public struct FfiConverterTypeCustodyMethod: FfiConverterRustBuffer {
         
         case 1: return .inMemory
         
-        case 2: return .platform
+        case 2: return .callback
         
-        case 3: return .software
-        
-        case 4: return .external
+        case 3: return .external
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -12981,16 +13234,12 @@ public struct FfiConverterTypeCustodyMethod: FfiConverterRustBuffer {
             writeInt(&buf, Int32(1))
         
         
-        case .platform:
+        case .callback:
             writeInt(&buf, Int32(2))
         
         
-        case .software:
-            writeInt(&buf, Int32(3))
-        
-        
         case .external:
-            writeInt(&buf, Int32(4))
+            writeInt(&buf, Int32(3))
         
         }
     }
@@ -16626,8 +16875,11 @@ public func evaluateProvenanceQuality(sourceContext: String?, sourceType: String
 /**
  * Resolves a DID to its document.
  *
- * DID resolution uses a fresh `DidDht::new()` and reads zero per-instance
- * state — it is a pure helper per ADR-048 §1.
+ * DID resolution builds the production DHT client fail-closed (via
+ * [`build_ffi_dht_client`]) and reads zero per-instance state — it is a pure
+ * helper per ADR-048 §1. The in-memory arm is reachable only under `testing`;
+ * a shipped build always resolves against the real Mainline Pkarr client
+ * (ADR-062 §Decision 1).
  */
 public func identityResolve(did: String)async throws  -> DidDocument  {
     return
@@ -17209,7 +17461,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_evaluate_provenance_quality() != 60373) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_identity_resolve() != 39653) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_identity_resolve() != 22292) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_identity_verify_device_attestation() != 44196) {
@@ -17323,7 +17575,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_add_agent_key() != 23309) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_identity_custody_type() != 7777) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_identity_custody_type() != 59443) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_did() != 6016) {
@@ -17344,7 +17596,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_rotate_key() != 21897) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_identity_rotation_event_json() != 64760) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_identity_rotation_event_json() != 23136) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_verifying_key() != 19807) {
@@ -17476,10 +17728,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_unsubscribe() != 16701) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_configure_local_transport() != 48267) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_configure_local_transport() != 46239) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_configure_relay_transport() != 42668) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_configure_relay_transport() != 46916) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_close() != 41503) {
@@ -17614,7 +17866,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_attest_device() != 36607) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create() != 25630) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create() != 38162) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create_link_attestation() != 29874) {
@@ -17629,7 +17881,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_execute_custody_migration() != 23068) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_execute_recovery() != 41947) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_execute_recovery() != 12015) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_link_attestations() != 36734) {
@@ -17692,6 +17944,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_server_stop() != 46867) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_media_activate_session() != 3062) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_media_end_session() != 31083) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_migration_state() != 34622) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -17750,6 +18008,15 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_stream_verify_chunk_signature() != 15888) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_streaming_saga_open() != 5447) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_streaming_saga_poll_next() != 45714) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_streaming_saga_recover_truncated_close() != 47469) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_verify() != 31142) {
@@ -17860,7 +18127,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_response() != 16753) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_delegate() != 51192) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_delegate() != 59265) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_evaluate() != 33478) {

@@ -2186,5 +2186,45 @@ mod prod_fail_closed_tests {
             "shipped `software` identity_create must fail closed (SCP-IDENT-1003, \
              requires callback custody), got: {msg}"
         );
+        // The message sends the reader to the callback provider, and
+        // `identity_create_with_custody` returns `SCP-IDENT-1059` on a shipped
+        // build, so the message states that too. Without it the reader follows
+        // this text to a second closed door with nothing explaining it.
+        assert!(
+            msg.contains(scp_ffi_common::error_codes::IDENT_1059),
+            "the message must state what the callback path returns on a shipped \
+             build (SCP-IDENT-1059), got: {msg}"
+        );
+    }
+
+    /// `"in_memory"` takes the severed-nullifier rejection (`SCP-IDENT-1008`),
+    /// and that message carries the same two statements: it names
+    /// `identityCreateWithCustody` and it says what that call returns on a
+    /// shipped build.
+    #[test]
+    fn in_memory_rejection_states_what_the_callback_path_returns() {
+        let scp = Scp::new_in_memory_for_test();
+        let result = crate::runtime().block_on(scp.identity_create("in_memory".to_owned(), None));
+        let msg = match result {
+            Ok(_) => panic!(
+                "shipped identity_create must FAIL CLOSED on in_memory custody — the \
+                 InMemoryKeyCustody nullifier is severed from this build"
+            ),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            msg.contains(scp_ffi_common::error_codes::IDENT_1008),
+            "shipped `in_memory` identity_create must fail closed (SCP-IDENT-1008), \
+             got: {msg}"
+        );
+        assert!(
+            msg.contains("identityCreateWithCustody()"),
+            "the message must name the injection entry point, got: {msg}"
+        );
+        assert!(
+            msg.contains(scp_ffi_common::error_codes::IDENT_1059),
+            "the message must state what that entry point returns on a shipped \
+             build (SCP-IDENT-1059), got: {msg}"
+        );
     }
 }

@@ -34,8 +34,11 @@ fun main() = runBlocking {
     //
     // val bridge = CoroutineBridge(nativeBindings)
     //
-    // // 1. Create identity with Keystore custody
-    // val identityHandle = bridge.identity.create(CustodyType.PLATFORM)
+    // // 1. Create identity. No custody string reaches Android Keystore, so
+    // //    inject a KeyCustodyProvider through SCP.identityCreateWithCustody
+    // //    for Keystore-held keys; CustodyType.IN_MEMORY loses every key on
+    // //    process exit and a shipped build rejects it with SCP-IDENT-1008.
+    // val identityHandle = bridge.identity.create(CustodyType.IN_MEMORY)
     //
     // // 2. Create an encrypted context
     // val paramsJson = """

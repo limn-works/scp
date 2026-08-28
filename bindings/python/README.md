@@ -14,33 +14,77 @@ pip install scp-python
 
 ```python
 import asyncio
-from scp_sdk import Identity, Context
+from scp_sdk import SCP
+from scp_sdk.types import CustodyType
 
 
 async def main():
-    # Create a cryptographic identity (DID)
-    identity = await Identity.create(custody="platform")
-    print(f"DID: {identity.did}")
+    with SCP(storage={"type": "in_memory"}) as scp:
+        # Create a cryptographic identity (DID). CustodyType.FILE writes an
+        # encrypted key file to $HOME/.scp/keys.bin; export SCP_KEY_PASSPHRASE
+        # before this call or the bridge raises ValidationError. On a shipped
+        # build this call raises SCP-IDENT-1059 -- read "No shipped build
+        # creates an identity yet" below before you run it.
+        identity = await scp.identity_create(CustodyType.FILE)
+        print(f"DID: {identity.did}")
 
-    # Create an encrypted context
-    ctx = await Context.create(
-        identity=identity,
-        params={"ceiling": ["msg:send", "msg:receive"], "ttl": 3600},
-    )
+        # Create an encrypted context
+        ctx = await scp.context_create(
+            identity.did,
+            {"ceiling": ["msg:send", "msg:receive"], "ttl": 3600},
+        )
 
-    # Send a message (MLS-encrypted, signed, provenance-tagged)
-    await ctx.send(b"Hello from SCP")
+        # Send a message (MLS-encrypted, signed, provenance-tagged)
+        await scp.context_send(ctx._raw_handle, identity.did, b"Hello from SCP")
 
-    # Receive messages
-    async for msg in ctx.receive():
+        # Receive a message
+        msg = await scp.context_receive(ctx._raw_handle)
         print(f"{msg.sender_did}: {msg.content}")
-        break
 
-    await ctx.close()
+        await scp.context_close(ctx._raw_handle, identity.did)
 
 
 asyncio.run(main())
 ```
+
+## Key custody
+
+`identity_create` takes a custody string, and the PyO3 bridge accepts two of
+them. `CustodyType.FILE` (`"file"`) builds a `FileKeyCustody` that derives the
+file key with Argon2id and encrypts `$HOME/.scp/keys.bin` with AES-256-GCM.
+`CustodyType.IN_MEMORY` (`"in_memory"`) compiles only under the bridge's
+`testing` feature, so a shipped build raises `IdentityError` with code
+`SCP-IDENT-1008`. Every other string, `"platform"` and `"software"` included,
+raises an error: `"platform"` raises `IdentityError` with code `SCP-IDENT-1003`,
+and an unrecognised string raises `ValidationError` with code `SCP-VALID-7005`.
+
+No custody string reaches Apple Keychain or Android Keystore. To store keys in
+a platform-native key store, implement `scp_sdk.scp.KeyCustodyProvider` over that
+key store and pass it to `scp.identity_create_with_custody(provider)`. That
+method is where a real platform backend lands, and it is the only entry point
+that takes an injected provider.
+
+## No shipped build creates an identity yet
+
+`identity_create_with_custody` raises `IdentityError` with code
+`SCP-IDENT-1059` on every shipped build, and so does
+`identity_create(CustodyType.FILE)` once `SCP_KEY_PASSPHRASE` is set. Spec
+section 9.7.4.1 makes every identity
+commit a pre-rotation commitment when it is created, that commitment needs a
+`PreRotationCustody` backend, and the only implementation is the test-harness
+`InMemoryPreRotationCustody`, which the bridge's `testing` feature severs from
+production. The bridge returns the typed `SCP-IDENT-1059` error rather than
+minting the test double
+(`crates/scp-ffi/src/identity.rs`, ADR-062, capability injection and
+prove-absent dev backends, §Decision 6). Every code example above therefore
+runs against a build that enables the `testing` feature.
+
+Two separate gaps produce these two codes, and closing one does not close the
+other. `SCP-IDENT-1003` and `SCP-IDENT-1008` say that the custody string you
+passed names no key store this bridge builds. `SCP-IDENT-1059` says that no
+pre-rotation custody backend exists for any create path to use. A wired
+platform provider clears the first; a real pre-rotation backend clears the
+second.
 
 ## Requirements
 

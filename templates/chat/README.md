@@ -54,5 +54,5 @@ Without a relay, the template demonstrates the SDK API patterns locally -- each 
 - **Capabilities**: add `OUTLET_CALL_ALL`, `GOVERNANCE_PROPOSE`, etc. to the ceiling for richer contexts.
 - **Memory scope**: change `"ephemeral"` to `"full"` to retain chat history after the context closes.
 - **Governance**: pass `governance="threshold"` for multi-admin contexts that require voting.
-- **Custody**: replace `"in_memory"` with `"platform"` for production key storage.
+- **Custody**: replace `"in_memory"` with `"file"` for production key storage, and export `SCP_KEY_PASSPHRASE` — the PyO3 bridge encrypts `$HOME/.scp/keys.bin` under that passphrase. For an OS keystore, pass a `KeyCustodyProvider` to `scp.identity_create_with_custody()` instead; the bridge rejects the custody string `"platform"` with `SCP-IDENT-1003`.
 - **Relay**: wire up `Transport.connect` / `TransportConfig` to connect both participants through the same relay.

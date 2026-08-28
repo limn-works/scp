@@ -173,9 +173,94 @@ class TestIdentity:
         assert len(identity.did) > 20
         assert identity.custody_type == CustodyType.IN_MEMORY
 
+    async def test_custody_type_offers_exactly_the_strings_the_bridge_matches(self):
+        """Every :class:`CustodyType` member names a string the bridge matches.
+
+        ``parse_custody_inner`` in ``crates/scp-ffi/src/identity.rs`` builds a
+        key store for ``"in_memory"`` and for ``"file"``, and names
+        ``"platform"`` in its own arm so it fails closed with
+        ``SCP-IDENT-1003`` rather than falling through to the unrecognised-string
+        arm. Those three strings are the enum's members, so a member added
+        without a matching arm — or an arm added without a member — breaks here.
+
+        ``PLATFORM`` reaches no key store, and that is the point: it lets a
+        caller name platform-native custody and read a typed refusal, instead of
+        silently receiving an encrypted key file the way it did before SCP-294.
+        """
+        assert {member.value for member in CustodyType} == {
+            "file",
+            "in_memory",
+            "platform",
+        }
+
+    async def test_file_custody_creates_an_identity_in_an_encrypted_key_file(
+        self, scp: SCP, tmp_path, monkeypatch
+    ):
+        """:attr:`CustodyType.FILE` reaches ``FileKeyCustody`` and mints a DID.
+
+        The bridge builds the key file under ``$HOME/.scp/keys.bin``, so point
+        ``HOME`` at a temporary directory and assert the file appears. Without
+        this the accepted set is asserted but never exercised, and a ``"file"``
+        arm that stopped building a key store would still pass.
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("SCP_KEY_PASSPHRASE", "test-passphrase-for-file-custody")
+
+        identity = await scp.identity_create(CustodyType.FILE)
+
+        assert identity.did.startswith("did:dht:")
+        assert identity.custody_type == CustodyType.FILE
+        assert (tmp_path / ".scp" / "keys.bin").is_file()
+
+    async def test_file_custody_without_a_passphrase_draws_the_validation_code(
+        self, scp: SCP, tmp_path, monkeypatch
+    ):
+        """``"file"`` custody fails closed when ``SCP_KEY_PASSPHRASE`` is unset.
+
+        The passphrase protects the key file, so the bridge refuses to build an
+        unprotected one and raises ``SCP-VALID-7001`` instead.
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("SCP_KEY_PASSPHRASE", raising=False)
+
+        with pytest.raises(_scp_core.ValidationError) as excinfo:
+            await scp.identity_create(CustodyType.FILE)
+        assert str(excinfo.value).startswith("[SCP-VALID-7001]")
+
     async def test_create_rejects_unknown_custody(self, scp: SCP):
-        with pytest.raises(Exception):
+        """An unrecognized custody string draws ``SCP-VALID-7005``.
+
+        ``identity_create`` raises the PyO3 bridge's own exception class, whose
+        message carries the code in a leading ``[SCP-CAT-NNNN]`` bracket. Pin
+        both the class and the code so a renumbering or a reclassification
+        fails here.
+        """
+        with pytest.raises(_scp_core.ValidationError) as excinfo:
             await scp.identity_create("magic")
+        assert str(excinfo.value).startswith("[SCP-VALID-7005]")
+
+    async def test_create_rejects_platform_custody_with_typed_code(self, scp: SCP):
+        """``"platform"`` fails closed instead of building a key file.
+
+        No custody string reaches Apple Keychain or Android Keystore, so the
+        bridge answers ``"platform"`` with ``SCP-IDENT-1003`` and builds no key
+        store. Before SCP-294, "Fix Python custody naming and normalize
+        identity parameter across SDKs", the string built a ``FileKeyCustody``,
+        so the SDK named one substrate and delivered another.
+        """
+        with pytest.raises(_scp_core.IdentityError) as excinfo:
+            await scp.identity_create("platform")
+        assert str(excinfo.value).startswith("[SCP-IDENT-1003]")
+
+    async def test_create_with_agent_key_rejects_platform_custody(self, scp: SCP):
+        """``identity_create_with_agent_key`` rejects ``"platform"`` too.
+
+        Both creation paths call ``parse_custody_inner``, so both report the
+        same code and neither one falls back to a key file.
+        """
+        with pytest.raises(_scp_core.IdentityError) as excinfo:
+            await scp.identity_create_with_agent_key("platform")
+        assert str(excinfo.value).startswith("[SCP-IDENT-1003]")
 
     async def test_multiple_identities_distinct(self, scp: SCP):
         a = await scp.identity_create(CustodyType.IN_MEMORY)

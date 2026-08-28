@@ -29,7 +29,7 @@ the platform code and dependencies it needs:
 | Feature | Provides |
 |---------|----------|
 | `software_platform` | In-process `Ed25519` / `X25519` crypto primitives (no HSM) |
-| `testing` | In-memory custody / attestation adapters for tests (implies `software_platform`, ADR-006) |
+| `testing` | In-memory custody / attestation adapters for tests (implies `software_platform`, `in-memory-storage`, and `in-memory-push`, ADR-006). No shipped artifact resolves this feature — `scripts/check-shipped-feature-graph.sh` fails the build when one does |
 | `sqlite` | `SQLCipher`-encrypted `Storage` with raw-key or `Argon2id`-passphrase key material (spec §17.6) |
 | `apple` | Apple `SQLCipher` storage adapter (key supplied from the Keychain) |
 | `file` | Encrypted file-backed key custody (`Argon2id` + `AES-256-GCM`) |

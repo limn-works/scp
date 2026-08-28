@@ -164,7 +164,7 @@ public sealed class Identity : IAsyncDisposable
     public string Did => NativeLib.GetDid(_handle);
     public string CustodyType => NativeLib.GetCustodyType(_handle);
 
-    public static async Task<Identity> CreateAsync(string custody = "platform")
+    public static async Task<Identity> CreateAsync(string custody)
     {
         // Task.Run offloads blocking FFI to thread pool. If FFI throughput becomes
         // a bottleneck, consider a dedicated thread or async FFI callbacks.
@@ -182,6 +182,13 @@ public sealed class Identity : IAsyncDisposable
     }
 }
 ```
+
+`CreateAsync` takes the custody string as a required argument and offers no default,
+because no custody string names a key store a shipped build reaches. `scp_identity_create`
+returns `SCP-IDENT-1003` for `"platform"` and for `"software"`, and it returns
+`SCP-IDENT-1008` for `"in_memory"` unless the loaded library carries the bridge's `testing`
+feature. A caller reaches an OS keystore by passing a `KeyCustodyProvider` to
+`scp_identity_create_with_custody` instead.
 
 ### Context
 

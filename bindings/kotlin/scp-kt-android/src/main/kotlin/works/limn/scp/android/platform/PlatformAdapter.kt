@@ -1,8 +1,10 @@
 // PlatformAdapter.kt — Android platform adapter factory (ADR-027)
 //
 // Assembles all four Android platform providers (KeyCustody, DeviceAttestation,
-// PushProvider, Storage) into a single adapter object. Called by the Kotlin SDK's
-// SCP.create() when custody = "platform".
+// PushProvider, Storage) into a single adapter object. No custody string selects
+// it: the UniFFI bridge answers "platform" with SCP-IDENT-1003, and a caller
+// reaches Android Keystore by injecting a KeyCustodyProvider through
+// SCP.identityCreateWithCustody.
 //
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer).
 

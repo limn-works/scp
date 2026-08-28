@@ -24,7 +24,7 @@ bun run start
 
 ## Next Steps
 
-- Replace `"in_memory"` custody with `"platform"` for production
+- Replace the `identityCreate("in_memory")` call with `scp.identityCreateWithCustody(provider)` for production, passing your own `KeyCustodyProvider` over an OS keystore — the NAPI bridge rejects the custody strings `"platform"` and `"software"` with `SCP-IDENT-1003`
 - Add tool registration with `defineToolDefinition()`
 - Connect to a relay with `Transport.connect()` for real networking
 - See `docs/examples/typescript/` for more detailed examples

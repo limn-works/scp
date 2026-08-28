@@ -9,8 +9,12 @@ import SCP
 @main
 struct SCPmacOSApp {
     static func main() async throws {
-        // 1. Create a DID identity with platform (Keychain) custody.
-        let identity = try await createIdentity(custody: CustodyType.platform.rawValue)
+        // 1. Create a DID identity. No custody string reaches the Keychain —
+        //    the bridge answers "platform" with SCP-IDENT-1003 — so hold keys
+        //    in the Keychain by injecting a KeyCustodyProvider through
+        //    identityCreateWithCustody instead. This in-memory store loses
+        //    every key on process exit.
+        let identity = try await createIdentity(custody: CustodyType.inMemory.rawValue)
         print("Created identity: \(identity.did())")
 
         // 2. Create an encrypted context via the UniFFI bridge.

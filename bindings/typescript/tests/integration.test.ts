@@ -51,6 +51,7 @@ import {
   UcanPermissionError,
   ValidationError,
 } from "../src/errors";
+import type { CustodyType } from "../src/identity";
 import { IdentityAttestation, RevocationStatus } from "../src/identity";
 import { SCP } from "../src/scp";
 import type { Relay } from "../src/server";
@@ -365,6 +366,36 @@ describe("SCP forwarder dispatch (mountMockScp)", () => {
     await scp.identityCreate();
 
     expect(native.__lastCall("identityCreate")?.args).toEqual(["in_memory"]);
+  });
+
+  it("CustodyType carries every string the bridge names and no other", async () => {
+    // `CustodyType` is a compile-time union with no runtime value to read, so
+    // pin it with two assignments that `tsc --noEmit` checks. `widening` fails
+    // to compile if the union ever loses a member of `named`; `narrowing`
+    // fails if the union ever gains a member `named` does not list. Together
+    // they pin the union to exactly the three strings
+    // `validate_custody_type` in `crates/scp-ffi/napi/src/error.rs` admits.
+    const named = ["platform", "in_memory", "software"] as const;
+    type Named = (typeof named)[number];
+    const widening: CustodyType[] = [...named];
+    const narrowing: Named = "in_memory" as CustodyType;
+    expect(widening).toEqual(["platform", "in_memory", "software"]);
+    expect(narrowing).toBe("in_memory");
+
+    // Then call `identityCreate` with each pinned member, so the array is not
+    // a list of strings the SDK never sees. The mock records the forwarded
+    // argument, which must be the member verbatim. The mock answers every
+    // string; the real bridge answers "platform" and "software" with
+    // SCP-IDENT-1003, which the real-NAPI suite below asserts.
+    const { scp, native } = mountMockScp();
+    for (const custody of named) {
+      native.__stub("identityCreate", () =>
+        Promise.resolve({ did: `did:dht:z6Mk${custody}`, custodyType: custody }),
+      );
+      const identity = await scp.identityCreate(custody);
+      expect(identity.custodyType).toBe(custody);
+      expect(native.__lastCall("identityCreate")?.args).toEqual([custody]);
+    }
   });
 
   it("contextSend forwards handle, did, payload array, and null spending ucan by default", async () => {
@@ -771,6 +802,52 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       const a = await scp.identityCreate("in_memory");
       const b = await scp.identityCreate("in_memory");
       expect(a.did).not.toBe(b.did);
+    });
+
+    // `CustodyType` carries "platform" and "software", and the bridge builds
+    // no key store for either one. Each test below passes the string the type
+    // permits and reads the code the bridge answers with, because a fallback
+    // to a weaker key store would name one substrate and hand the caller
+    // another.
+    for (const rejected of ["platform", "software"] as const satisfies readonly CustodyType[]) {
+      it(`identityCreate rejects "${rejected}" with SCP-IDENT-1003`, async () => {
+        let threw = false;
+        try {
+          await scp.identityCreate(rejected);
+        } catch (err) {
+          threw = true;
+          expect(err).toBeInstanceOf(IdentityError);
+          expect((err as IdentityError).code).toBe("SCP-IDENT-1003");
+        }
+        expect(threw).toBe(true);
+      });
+
+      it(`identityCreateWithAgentKey rejects "${rejected}" with SCP-IDENT-1003`, async () => {
+        let threw = false;
+        try {
+          await scp.identityCreateWithAgentKey(rejected);
+        } catch (err) {
+          threw = true;
+          expect(err).toBeInstanceOf(IdentityError);
+          expect((err as IdentityError).code).toBe("SCP-IDENT-1003");
+        }
+        expect(threw).toBe(true);
+      });
+    }
+
+    // "magic" is a string `CustodyType` does not carry, so the cast
+    // reproduces what a JavaScript caller passes at runtime, where no type
+    // checker intervenes.
+    it("identityCreate rejects a custody string the type does not carry with SCP-VALID-7005", async () => {
+      let threw = false;
+      try {
+        await scp.identityCreate("magic" as unknown as CustodyType);
+      } catch (err) {
+        threw = true;
+        expect(err).toBeInstanceOf(ValidationError);
+        expect((err as ValidationError).code).toBe("SCP-VALID-7005");
+      }
+      expect(threw).toBe(true);
     });
 
     it("scp.identityLoad round-trips a previously created DID", async () => {

@@ -39,9 +39,14 @@ interface IdentityAdvancedBindings {
      * Combines identity creation with immediate agent key generation
      * in a single operation.
      *
-     * @param custody Key custody method: "in_memory", "platform", or "software".
+     * @param custody Key custody method. The bridge builds a key store for
+     *   `"in_memory"` and for no other string. Reach Android Keystore by
+     *   injecting a `KeyCustodyProvider` through `identityCreateWithCustody`,
+     *   not by naming a custody string.
      * @return Opaque identity handle with agent key.
-     * @throws BridgeException if custody method is unsupported or creation fails.
+     * @throws BridgeException with `SCP-IDENT-1003` for `"platform"` or
+     *   `"software"`, which reach no key store on any bridge, and with
+     *   `SCP-VALID-7005` for every other unrecognized string.
      */
     fun identityCreateWithAgentKey(custody: String): Long
 
@@ -246,7 +251,12 @@ class IdentityAdvancedBridge internal constructor(
      *
      * Overload accepting a raw string for backward compatibility.
      *
-     * @param custody Key custody method: "in_memory", "platform", or "software".
+     * @param custody The custody string the UniFFI bridge accepts, which is
+     *   `"in_memory"` and no other. The bridge answers `"platform"` and
+     *   `"software"` with `SCP-IDENT-1003` because neither string reaches a
+     *   platform key store; inject a `KeyCustodyProvider` through
+     *   `identityCreateWithCustody` to reach Android Keystore. Every other
+     *   string draws `SCP-VALID-7005`.
      * @return Opaque identity handle with agent key.
      */
     suspend fun createWithAgentKey(custody: String = "in_memory"): Long =

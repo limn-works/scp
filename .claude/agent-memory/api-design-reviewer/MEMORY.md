@@ -45,3 +45,4 @@
 - Good: Storage trait is minimal (6 methods), conformance macros excellent DX, sanitize_key_component applied consistently, Migratable trait + StoredValue envelope is sound migration design, zeroize-on-write for key material, TypeScript StorageInterface 1:1 match with Rust
 - Pattern: thin trait (Storage 6 methods) + thick coordinator (ProtocolRepository 50+ methods) is the right layering. Conformance macros (storage_conformance!, blob_store_conformance!) validate adapter implementations with one-liner invocation
 - Convention established: `store_X/load_X/delete_X/list_X` naming across all 8 ProtocolRepository domain modules
+- [Custody selection surface (SCP-294)](custody_selection_surface_scp294.md) — per-bridge custody-string matrix, IDENT-1003/1008 doc drift, Swift/Kotlin no-shipped-provider dead end

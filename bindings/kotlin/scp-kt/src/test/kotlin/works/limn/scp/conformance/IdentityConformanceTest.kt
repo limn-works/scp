@@ -62,8 +62,19 @@ class IdentityConformanceTest {
                 assertEquals("in_memory", stubBindings.identityCreateCustody)
             }
 
+        // This test asserted `custody_type == "platform"` until SCP-294, the
+        // custody-naming story. No bridge returns that string any more: the
+        // UniFFI bridge answers the custody string `"platform"` with
+        // `SCP-IDENT-1003`, and `CustodyMethod` carries no `Platform` variant
+        // for `Identity.custody_type` to render. The assertion survived only
+        // because the dispatcher runs against `ConformanceStubBindings`, which
+        // echoes whatever custody string it receives.
+        //
+        // What the stub CAN prove is that the dispatcher forwards the string
+        // unaltered rather than rewriting it. The rejection itself is covered
+        // against the compiled cdylib by `CustodyCallErrorCodeTest`.
         @Test
-        fun `identity_create with platform custody returns handle`() =
+        fun `identity_create forwards an unhandled custody string unaltered`() =
             runTest(testDispatcher) {
                 stubBindings.identityCreateResult = 1L
                 val result =
@@ -72,7 +83,7 @@ class IdentityConformanceTest {
                         mapOf("custody" to "platform"),
                     )
                 assertEquals("1", result["handle"])
-                assertEquals("platform", result["custody_type"])
+                assertEquals("platform", stubBindings.identityCreateCustody)
             }
 
         @Test

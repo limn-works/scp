@@ -6,10 +6,13 @@ Contains dataclasses and enums used across multiple SDK modules:
 ``CeilingPolicy``, ``PromotionPolicy``, ``MemoryScope``,
 ``SourceType``, ``DiscoveryMethod``, and ``ProvenanceQuality``.
 
-All types mirror their Rust counterparts in ``scp-core`` and carry full
-PEP 484 type annotations.  See ``.docs/adrs/phase-3.md`` ADR-014 for
-the wrapper design and ``.docs/standards/python.md`` for coding
-conventions.
+Every type here carries full PEP 484 type annotations.  Most mirror a
+Rust counterpart in ``scp-core``; :class:`CustodyType` instead lists the
+custody strings that ``parse_custody_inner`` in
+``crates/scp-ffi/src/identity.rs`` matches by name, and its own docstring
+says which Rust type it does not mirror.  See ``.docs/adrs/phase-3.md``
+ADR-014 for the wrapper design and ``.docs/standards/python.md`` for
+coding conventions.
 """
 
 from __future__ import annotations
@@ -23,30 +26,58 @@ from dataclasses import dataclass, field
 
 
 class CustodyType(enum.Enum):
-    """Key custody method for identity key management (spec section 3.2).
+    """The custody string :meth:`scp_sdk.SCP.identity_create` sends to the
+    PyO3 bridge (spec section 3.2).
 
-    Determines where cryptographic keys are stored and managed.
-    Mirrors ``scp_core::identity::CustodyType``.
+    Each member's value is a custody string that ``parse_custody_inner``
+    in ``crates/scp-ffi/src/identity.rs`` matches by name.  Two members name
+    a key store the bridge can build, and :attr:`PLATFORM` names none, so
+    read the member's own docstring before you pass it.  A string this enum
+    does not carry draws ``scp_sdk._scp_core.ValidationError`` carrying code
+    ``SCP-VALID-7005``.
 
-    The bridge layer accepts both ``"file"`` and ``"platform"`` for
-    file-backed custody (:attr:`FILE` and :attr:`PLATFORM` respectively).
-    ``"platform"`` is a backward-compatible alias — both resolve to
-    ``FileKeyCustody`` (Argon2id + AES-256-GCM encrypted key file at
-    ``$HOME/.scp/keys.bin``).  Prefer :attr:`FILE` for new code.
+    This enum does not mirror ``scp_platform::CustodyType`` in
+    ``crates/scp-platform/src/traits.rs``.  That Rust enum reports where a
+    key already lives, and it names three places: ``InMemory``,
+    ``Hardware``, and ``Software``.  This enum instead names the custody
+    string the caller passes.
 
-    See SCP-294a.
+    A platform-native key store — Apple Keychain, Android Keystore — holds
+    keys only when the caller passes a
+    :class:`scp_sdk.scp.KeyCustodyProvider` to
+    :meth:`scp_sdk.SCP.identity_create_with_custody`.  No custody string
+    reaches such a key store on any of the three bridges.
+
+    Section 3.2 of the identity spec, "Key Custody", names four custody
+    sources in prose and names no custody string, so no artifact yet fixes
+    which strings this enum carries.
+
+    See the custody-string and identity-parameter story SCP-294 in
+    ``.docs/prds/http-features.json``.
     """
 
-    #: Encrypted file-backed key custody (Argon2id + AES-256-GCM).
-    #: Canonical name for what was previously called ``"platform"``.
-    #: Requires the ``SCP_KEY_PASSPHRASE`` environment variable.
+    #: An encrypted key file at ``$HOME/.scp/keys.bin``.  The bridge builds
+    #: ``FileKeyCustody``, which derives the file key with Argon2id and
+    #: encrypts the file with AES-256-GCM.  The bridge reads the passphrase
+    #: from the ``SCP_KEY_PASSPHRASE`` environment variable and raises
+    #: ``scp_sdk._scp_core.ValidationError`` carrying code
+    #: ``SCP-VALID-7001`` when that variable is unset.
     FILE = "file"
-    #: Backward-compatible alias for :attr:`FILE`.  Both resolve to
-    #: ``FileKeyCustody`` in the bridge layer.  Prefer :attr:`FILE`
-    #: for new code.
+    #: A custody string the bridge names and refuses.  ``parse_custody_inner``
+    #: raises ``scp_sdk._scp_core.IdentityError`` carrying code
+    #: ``SCP-IDENT-1003`` for this string and builds no key store, because no
+    #: custody string reaches Apple Keychain or Android Keystore on any
+    #: bridge.  Pass a :class:`scp_sdk.scp.KeyCustodyProvider` to
+    #: :meth:`scp_sdk.SCP.identity_create_with_custody` to reach either key
+    #: store.  Until the custody-string story SCP-294 deleted the alias, this
+    #: string built a ``FileKeyCustody``, so the SDK named one substrate and
+    #: handed the caller another.
     PLATFORM = "platform"
-    #: Ephemeral in-memory key store, suitable for testing or short-lived
-    #: agents.  Keys are lost on process exit.
+    #: An in-memory key store that loses every key when the process exits.
+    #: The bridge builds ``InMemoryKeyCustody`` for this string only in a
+    #: build carrying the bridge's ``testing`` feature; a shipped build
+    #: raises ``scp_sdk._scp_core.IdentityError`` carrying code
+    #: ``SCP-IDENT-1008`` instead of substituting a weaker key store.
     IN_MEMORY = "in_memory"
 
 
