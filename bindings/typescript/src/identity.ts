@@ -66,7 +66,31 @@ export interface IdentityLinkAttestation {
 // CustodyType
 // ---------------------------------------------------------------------------
 
-/** Supported custody methods for identity key management. */
+/**
+ * The custody string a caller passes to {@link SCP.identityCreate}.
+ *
+ * `validate_custody_type` in `crates/scp-ffi/napi/src/error.rs` admits
+ * `"in_memory"`, `"platform"`, and `"software"`, and rejects every other
+ * string with `SCP-VALID-7005`. The match in `crates/scp-ffi/napi/src/scp.rs`
+ * then decides what each admitted string reaches:
+ *
+ * - `"in_memory"` builds `InMemoryKeyCustody` in a build carrying the NAPI
+ *   bridge's `testing` feature. A shipped build answers the string with
+ *   `SCP-IDENT-1008` rather than substituting a weaker key store.
+ * - `"platform"` reaches no key store. Every bridge answers it with
+ *   `SCP-IDENT-1003`, because no custody string reaches Apple Keychain or
+ *   Android Keystore. A caller reaches either key store by passing a
+ *   `KeyCustodyProvider` to {@link SCP.identityCreateWithCustody}.
+ * - `"software"` reaches no key store either: the NAPI bridge and the UniFFI
+ *   bridge both answer it with `SCP-IDENT-1003`. The PyO3 bridge spells its
+ *   software-managed custody `"file"` instead, and that string builds
+ *   `FileKeyCustody`, an encrypted key file that reports
+ *   `CustodyType::Software` from `crates/scp-platform/src/traits.rs`. The two
+ *   spellings name that one substrate. Section 3.2 of the identity spec,
+ *   "Key Custody", owns which spelling survives, and it names four custody
+ *   sources in prose and no custody string today, so this type carries
+ *   `"software"` and decides nothing about that question.
+ */
 export type CustodyType = "platform" | "in_memory" | "software";
 
 // ---------------------------------------------------------------------------

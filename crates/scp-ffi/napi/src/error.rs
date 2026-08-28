@@ -664,12 +664,17 @@ pub(crate) fn validate_custody_type(custody: &str) -> Result<&str, ScpNapiError>
         // VALID_7005 ("invalid field value") matches the semantic: an
         // unrecognized enum string is a wrong-value error, not the
         // malformed/wrong-shape byte input that VALID_7007 is reserved for
-        // (api-design J2, M1). PyO3's `parse_custody_inner` emits the
-        // same class of error (VALID_7001 via `ScpPyError::validation`),
-        // both distinct from the narrower 7007.
+        // (api-design J2, M1). The PyO3 bridge's `parse_custody_inner` and the
+        // UniFFI bridge's `parse_custody_method` emit VALID_7005 for this same
+        // condition, so a caller who switches on the code string reads one
+        // value across all three bridges.
         other => Err(ScpNapiError::Validation {
             message: format!(
-                "unknown custody type: {other:?} — expected \"in_memory\", \"platform\", or \"software\""
+                "unknown custody type: {other:?} — this bridge recognises \"in_memory\", \
+                 \"platform\", and \"software\". Only \"in_memory\" builds a custody, and only \
+                 in a build carrying the testing feature; \"platform\" and \"software\" name no \
+                 backend this bridge hosts and return SCP-IDENT-1003. Reach a platform-native \
+                 key store by injecting a KeyCustodyProvider through identityCreateWithCustody()."
             ),
             code: codes::VALID_7005.to_owned(),
         }),

@@ -39,9 +39,14 @@ interface IdentityAdvancedBindings {
      * Combines identity creation with immediate agent key generation
      * in a single operation.
      *
-     * @param custody Key custody method: "in_memory", "platform", or "software".
+     * @param custody Key custody method. The bridge builds a key store for
+     *   `"in_memory"` and for no other string. Reach Android Keystore by
+     *   injecting a `KeyCustodyProvider` through `identityCreateWithCustody`,
+     *   not by naming a custody string.
      * @return Opaque identity handle with agent key.
-     * @throws BridgeException if custody method is unsupported or creation fails.
+     * @throws BridgeException with `SCP-IDENT-1003` for `"platform"` or
+     *   `"software"`, which reach no key store on any bridge, and with
+     *   `SCP-VALID-7005` for every other unrecognized string.
      */
     fun identityCreateWithAgentKey(custody: String): Long
 
@@ -235,22 +240,22 @@ class IdentityAdvancedBridge internal constructor(
     /**
      * Creates a new identity with an agent signing key (ADR-039).
      *
+     * [custody] carries no default, so the caller names the key store that
+     * holds this identity's keys and this bridge names none for them. Which
+     * key store holds a private key decides who can reach that key, so a
+     * default would pick a security-relevant answer the caller never stated.
+     * This method sends [CustodyType.rawValue] to the UniFFI bridge, so the
+     * compiler rejects a custody string the bridge does not name. The bridge
+     * builds a key store for [CustodyType.IN_MEMORY] alone, and it answers
+     * [CustodyType.PLATFORM] and [CustodyType.SOFTWARE] with
+     * `SCP-IDENT-1003`; inject a `KeyCustodyProvider` through
+     * `identityCreateWithCustody` to reach Android Keystore.
+     *
      * @param custody Key custody method.
      * @return Opaque identity handle with agent key.
      */
     suspend fun createWithAgentKey(custody: CustodyType): Long =
         bridge.ffiCall { bindings.identityCreateWithAgentKey(custody.rawValue) }
-
-    /**
-     * Creates a new identity with an agent signing key (ADR-039).
-     *
-     * Overload accepting a raw string for backward compatibility.
-     *
-     * @param custody Key custody method: "in_memory", "platform", or "software".
-     * @return Opaque identity handle with agent key.
-     */
-    suspend fun createWithAgentKey(custody: String = "in_memory"): Long =
-        bridge.ffiCall { bindings.identityCreateWithAgentKey(custody) }
 
     /**
      * Adds an agent signing key to an existing identity (ADR-039).

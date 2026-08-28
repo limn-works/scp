@@ -324,6 +324,18 @@ WebRTC library integration is platform-specific (webrtc-rs for native, browser W
 
 ## ADR-025: Apple Platform Adapter
 
+> **The custody string `"platform"` no longer selects this adapter.** Every FFI
+> bridge answers that string with `SCP-IDENT-1003` and builds no key store, because
+> no custody string reaches an OS keystore on any bridge. A caller reaches one by
+> passing a `KeyCustodyProvider` to `identity_create_with_custody`. This ADR's
+> decision — that platform-native custody arrives through an injected adapter —
+> stands; only the selector this ADR names for it does not, and the
+> `SCP.create(custody:)` factory those examples call was never built. Story SCP-294
+> in `.docs/prds/http-features.json` made the bridges agree and left this ADR's text
+> as written, because a story does not rewrite an ADR's decision. Whether that
+> decision is superseded, and what replaces the examples below, is this ADR's
+> question to answer.
+
 **Status:** Decided
 
 ### Context

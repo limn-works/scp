@@ -92,7 +92,7 @@ Implement the FFI bridge in `crates/scp-ffi/src/` using PyO3 and maturin. The br
    }
    ```
 
-   - `py_identity_create(custody) -> PyIdentity` — creates a new DID identity. `custody` is a string: `"platform"`, `"in_memory"`.
+   - `py_identity_create(custody) -> PyIdentity` — creates a new DID identity. `custody` is a string: `"file"` (an `$HOME/.scp/keys.bin` key file that `FileKeyCustody` encrypts with Argon2id and AES-256-GCM under `$SCP_KEY_PASSPHRASE`) or `"in_memory"` (compiled under the bridge's `testing` feature; a shipped build returns `SCP-IDENT-1008`). The bridge builds no key store from `"platform"` and returns `SCP-IDENT-1003` for it, because a platform-native key store is reached by injecting a `KeyCustodyProvider` through `SCP.identity_create_with_custody`, never by naming a custody string.
    - `py_identity_load(did) -> PyIdentity` — loads an existing identity from storage.
    - `py_identity_resolve(did) -> PyDIDDocument` — resolves a DID to its document.
    - `py_identity_rotate_active_key(identity) -> PyIdentity` — rotates the identity's Active Signing Key (`#active`).
@@ -230,7 +230,7 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
        custody_type: str
 
        @classmethod
-       async def create(cls, custody: str = "platform") -> "Identity":
+       async def create(cls, custody: str = "file") -> "Identity":
            """Create a new SCP identity with the specified key custody method."""
            ...
 
@@ -240,7 +240,7 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
            ...
 
        @classmethod
-       def create_sync(cls, custody: str = "platform") -> "Identity":
+       def create_sync(cls, custody: str = "file") -> "Identity":
            """Synchronous convenience wrapper for create()."""
            return asyncio.run(cls.create(custody))
 
@@ -253,7 +253,7 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
            ...
    ```
 
-   - `Identity.create()` is the entry point. Custody parameter defaults to `"platform"`.
+   - `Identity.create()` is the entry point. The custody parameter is required and carries no default, because key custody is a security-relevant choice an SDK does not make for a caller. `"file"` is the only custody string a shipped PyO3 build accepts. To store keys in Apple Keychain or in Android Keystore, inject a `KeyCustodyProvider` through `identity_create_with_custody` instead.
    - All `Identity` instances expose `.did` (string), `.custody_type` (string).
    - Sync wrappers (`create_sync`, `load_sync`) use `asyncio.run()`.
 

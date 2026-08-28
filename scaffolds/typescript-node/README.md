@@ -24,7 +24,7 @@ bun run start
 
 ## Next Steps
 
-- Replace `"in_memory"` custody with `"platform"` for production
+- Replace the `Identity.create({ custody: "in_memory" })` call with `scp.identityCreateWithCustody(provider)`, passing your own `KeyCustodyProvider` over an OS keystore — that call throws `SCP-IDENT-1059` on a released addon, because no pre-rotation custody backend is wired yet
 - Add tool registration with `defineToolDefinition()`
 - Connect to a relay with `Transport.connect()` for real networking
 - See `docs/examples/typescript/` for more detailed examples

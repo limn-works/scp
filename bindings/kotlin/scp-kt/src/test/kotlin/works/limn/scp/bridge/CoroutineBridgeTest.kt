@@ -26,6 +26,7 @@ import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
+import works.limn.scp.CustodyType
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
@@ -61,7 +62,7 @@ class CoroutineBridgeTest {
         fun `identityCreate dispatches on IO and returns handle`() =
             runTest(ioDispatcher) {
                 stubBindings.identityCreateResult = 42L
-                val result = bridge.identity.create("in_memory")
+                val result = bridge.identity.create(CustodyType.IN_MEMORY)
                 assertEquals(42L, result)
                 assertTrue(stubBindings.identityCreateCalled)
                 assertEquals("in_memory", stubBindings.lastCustody)
@@ -505,7 +506,7 @@ class CoroutineBridgeTest {
 
                 assertFailsWith<CancellationException> {
                     kotlinx.coroutines.withContext(job) {
-                        bridge.identity.create("in_memory")
+                        bridge.identity.create(CustodyType.IN_MEMORY)
                     }
                 }
             }
@@ -820,7 +821,7 @@ class CoroutineBridgeTest {
 
                 val exception =
                     assertFailsWith<BridgeException> {
-                        bridge.identity.create("in_memory")
+                        bridge.identity.create(CustodyType.IN_MEMORY)
                     }
 
                 assertEquals("SCP-IDENT-1001", exception.code)

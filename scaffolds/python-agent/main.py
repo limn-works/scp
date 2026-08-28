@@ -6,7 +6,12 @@ Usage:
     pip install -e ../../bindings/python
     python main.py
 
-Replace in_memory custody with platform custody for production use.
+For production, pass CustodyType.FILE for an encrypted key file, or call
+SCP.identity_create_with_custody(provider) to hold the keys in a
+platform-native key store. The bridge answers "platform" with SCP-IDENT-1003,
+because no custody string reaches such a store. Neither call creates an identity
+on a released wheel: both return SCP-IDENT-1059, because no pre-rotation custody
+backend is wired yet.
 """
 
 import asyncio

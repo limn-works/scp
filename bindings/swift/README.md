@@ -19,30 +19,106 @@ dependencies: [
 ```swift
 import SCP
 
-// Create a cryptographic identity (DID)
-let identity = try await Identity.create(custody: "platform")
-print("DID: \(identity.did)")
+// Storage selection is required — there is no default (spec §17.6).
+let scp = try SCP(storage: .inMemory)
+
+// Create a cryptographic identity (DID). Supply your own type conforming to
+// `KeyCustodyProvider` — see "Key custody" below for what it must implement.
+// On a released XCFramework this call throws SCP-IDENT-1059 — read "No shipped
+// build creates an identity yet" below before you run it.
+// Supply your own type conforming to KeyCustodyProvider; this package
+// ships none that conforms — see "Key custody" below.
+let keychain: KeyCustodyProvider = YourKeychainCustody()
+let identity = try await scp.identityCreateWithCustody(provider: keychain)
+print("DID: \(identity.did())")
 
 // Create an encrypted context
-let ctx = try await Context.create(
+let ctx = try await scp.contextCreate(
     identity: identity,
     params: ContextParams(
+        mode: .encrypted,
         ceiling: ["msg:send", "msg:receive"],
-        ttl: 3600
+        ceilingPolicy: .immutable,
+        governance: .singleAdmin,
+        memoryScope: .ephemeral,
+        ttlSeconds: 3600,
+        promotable: false,
+        minProtocolVersion: 0,
+        maxChainDepth: nil,
+        maxNestingDepth: nil,
+        sessionCap: nil,
+        economicPolicy: nil,
+        consequenceRulesJson: nil,
+        consequenceConfigJson: nil
     )
 )
 
 // Send a message (MLS-encrypted, signed, provenance-tagged)
-try await ctx.send(Data("Hello from SCP".utf8))
+try await scp.contextSend(
+    handle: ctx,
+    identity: identity,
+    payload: Data("Hello from SCP".utf8),
+    spendingUcanJwt: nil
+)
 
-// Receive messages
-for await msg in ctx.messages {
-    print("\(msg.senderDid): \(String(data: msg.content, encoding: .utf8)!)")
-    break
-}
-
-try await ctx.close()
+try await scp.contextClose(handle: ctx, identity: identity)
 ```
+
+## Key custody
+
+`identityCreate` takes a `CustodyType` and carries no default, so a caller names
+the key store and this SDK names none for them. Each member spells a custody
+string the UniFFI bridge matches, and that bridge builds a key store from one of
+them only: `"in_memory"`, which it compiles under its `testing` feature. A released XCFramework throws `ScpError.Identity` carrying
+`SCP-IDENT-1008` for `"in_memory"`, it throws `ScpError.Identity` carrying
+`SCP-IDENT-1003` for `"platform"` and for `"software"`, and it throws
+`ScpError.Validation` carrying `SCP-VALID-7005` for any other string. No custody
+string reaches Keychain or Secure Enclave.
+
+Production key storage runs through
+`scp.identityCreateWithCustody(provider:)` instead, which takes a value
+conforming to the UniFFI-generated `KeyCustodyProvider` protocol. The private
+key material never crosses into the native core, because the core delegates
+every cryptographic operation back to the provider's callbacks (ADR-006, the
+platform abstraction).
+
+This package ships `AppleKeyCustody`, which stores Ed25519 and X25519 key
+material in the Keychain and reports `"software"` or `"software_biometric"`
+from `custodyType` — the Secure Enclave generates P-256 keys and SCP signs with
+Ed25519. You cannot pass it to `identityCreateWithCustody`, and adding
+`: KeyCustodyProvider` to it does not make you able to.
+`Sources/SCP/Platform/AppleKeyCustody.swift` declares `public final class
+AppleKeyCustody: Sendable`, and eight of the nine methods it defines differ
+from the protocol's by argument label, by return type, or by both: the protocol
+declares `getPublicKey(keyId:)` where the class defines `publicKey(_:)`, and it
+declares `destroyKey(keyId:)` returning `Void` where the class defines
+`destroyKey(_:)` returning `DestructionAttestation`. Only
+`generateKeypair(keyType:)` matches. Write your own conforming type until an
+adapter lands.
+
+## No shipped build creates an identity yet
+
+`identityCreateWithCustody(provider:)` throws `ScpError.Identity` carrying
+`SCP-IDENT-1059` on every released XCFramework. `identityCreate` stops one step
+earlier, with the three codes described above, because the bridge rejects every
+custody string before it reaches the pre-rotation step. Section 9.7.4.1 of the
+security model, pre-rotation key custody, makes every identity commit a
+pre-rotation commitment when it is created. That commitment needs a
+`PreRotationCustody` backend, and the only implementation is the test-harness
+`InMemoryPreRotationCustody`, which the
+bridge's `testing` feature severs from production, so
+`crates/scp-ffi/uniffi/src/bridge.rs` returns the typed error rather than
+minting the test double. ADR-062, capability injection and prove-absent dev
+backends, records that state as accepted in its §Decision 6 and holds the real
+backend out of its own scope. The Quick Start above therefore runs against a
+framework built with the `testing` feature.
+
+Two separate gaps produce those codes, and closing one does not close the
+other. `SCP-IDENT-1003` and `SCP-IDENT-1008` say that the custody string you
+passed names no key store this bridge builds. `SCP-IDENT-1059` says that no
+pre-rotation custody backend exists for any create path to use. A wired
+platform provider clears the first gap; a real pre-rotation backend clears the
+second.
 
 ## Platform Support
 

@@ -259,7 +259,13 @@ async def run_agent(*, enable_mcp: bool = False, mcp_transport: str = "stdio") -
             context's tools to external MCP-compatible models.
         mcp_transport: MCP transport mode (``"stdio"`` or ``"sse"``).
     """
-    # 1. Create identity with in-memory custody (swap to "platform" for prod).
+    # 1. Create identity with in-memory custody. For production, pass
+    #    CustodyType.FILE for an encrypted key file, or call
+    #    scp.identity_create_with_custody(provider) to hold the keys in a
+    #    platform-native key store. The bridge answers "platform" with
+    #    SCP-IDENT-1003, because no custody string reaches such a store.
+    #    Neither call creates an identity on a released wheel: both return
+    #    SCP-IDENT-1059, because no pre-rotation custody backend is wired yet.
     identity = await Identity.create(custody="in_memory")
     logger.info("Created identity: %s", identity.did)
 

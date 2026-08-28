@@ -122,10 +122,22 @@ from scp_sdk._scp_core import py_identity_create
 
 class Identity:
     @classmethod
-    async def create(cls, custody: str = "platform") -> Identity:
+    async def create(cls, custody: str) -> Identity:
         raw = await py_identity_create(custody)
         return cls(raw)
 ```
+
+`create` takes the custody string as a required argument and offers no default. Key
+custody is a security-relevant choice, and the agent-first API design tenet in
+CLAUDE.md forbids an SDK picking one on a caller's behalf.
+
+The PyO3 bridge builds a key store from two custody strings. `"file"` writes an
+`$HOME/.scp/keys.bin` key file that `FileKeyCustody` encrypts with Argon2id and
+AES-256-GCM under `$SCP_KEY_PASSPHRASE`. `"in_memory"` compiles under the bridge's
+`testing` feature, so a shipped build returns `SCP-IDENT-1008`. The bridge returns
+`SCP-IDENT-1003` for `"platform"`, because a caller reaches Apple Keychain or Android
+Keystore by passing a `KeyCustodyProvider` to `SCP.identity_create_with_custody`, never
+by naming a custody string.
 
 ### Opaque types
 

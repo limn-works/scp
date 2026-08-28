@@ -17,14 +17,6 @@ import works.limn.scp.bridge.BridgeException
 import uniffi.scp.OutletKind
 
 /**
- * Key custody method for identity key management (spec section 3.2).
- *
- * Determines where cryptographic keys are stored and managed. The
- * [rawValue] property returns the string expected by the FFI bridge.
- *
- * @property rawValue Wire-format string passed to the FFI bridge.
- */
-/**
  * Canonical protocol capability strings and parameterised constructors.
  *
  * These are the SDK-facing colon-separated forms accepted by `Capability::new`
@@ -79,21 +71,61 @@ object Capability {
     fun outletCall(outletId: String): String = "outlet:call:$outletId"
 }
 
+/**
+ * The custody string a caller passes to
+ * [works.limn.scp.bridge.IdentityBridge.create] (spec §3.2).
+ *
+ * `parse_custody_method` in `crates/scp-ffi/uniffi/src/bridge.rs` decides what
+ * each entry's [rawValue] reaches. It builds a key store for `"in_memory"`
+ * alone, answers `"platform"` and `"software"` with `SCP-IDENT-1003`, and
+ * answers every string this enum does not carry with `SCP-VALID-7005`.
+ *
+ * - [IN_MEMORY] builds `InMemoryKeyCustody` in a build carrying the UniFFI
+ *   bridge's `testing` feature. A shipped build answers the string with
+ *   `SCP-IDENT-1008` rather than substituting a weaker key store.
+ * - [PLATFORM] reaches no key store. No custody string reaches Android
+ *   Keystore or Apple Keychain on any bridge; a caller reaches either key
+ *   store by injecting a `KeyCustodyProvider` through
+ *   `identityCreateWithCustody`.
+ * - [SOFTWARE] reaches no key store on this bridge or on the NAPI bridge,
+ *   which both answer it with `SCP-IDENT-1003`. The PyO3 bridge spells its
+ *   software-managed custody `"file"` instead, and that string builds
+ *   `FileKeyCustody`, an encrypted key file that reports
+ *   `CustodyType::Software` from `crates/scp-platform/src/traits.rs`. The two
+ *   spellings name that one substrate. Spec §3.2, Key Custody, owns which
+ *   spelling survives, and it names four custody sources in prose and no
+ *   custody string today, so this enum carries [SOFTWARE] and decides nothing
+ *   about that question.
+ *
+ * `works.limn.scp.android.platform.CustodyType` in the `scp-kt-android` module is a
+ * different enum: it reports where an Android key already lives, and this enum
+ * names the custody string the caller passes.
+ *
+ * See the custody-string and identity-parameter story SCP-294 in
+ * `.docs/prds/http-features.json`.
+ *
+ * @property rawValue Wire-format string passed to the FFI bridge.
+ */
 enum class CustodyType(val rawValue: String) {
     /**
-     * Platform-native secure storage (Keychain on macOS/iOS, Keystore
-     * on Android, credential manager on Windows/Linux). Default.
-     */
-    PLATFORM("platform"),
-
-    /**
-     * Ephemeral in-memory key store, suitable for testing or
-     * short-lived agents. Keys are lost on process exit.
+     * An in-memory key store that loses every key when the process exits.
+     *
+     * The UniFFI bridge compiles this key store under its `testing` feature
+     * only, so a shipped build answers this string with `SCP-IDENT-1008`
+     * instead of substituting a weaker key store.
      */
     IN_MEMORY("in_memory"),
 
     /**
-     * Software-backed file-based key store with passphrase protection.
+     * A custody string the bridge names and refuses with `SCP-IDENT-1003`,
+     * because no custody string reaches a platform-native key store.
+     */
+    PLATFORM("platform"),
+
+    /**
+     * A custody string the UniFFI bridge and the NAPI bridge both refuse with
+     * `SCP-IDENT-1003`. The PyO3 bridge reaches its software-managed key file
+     * through `"file"`, a spelling this enum does not carry.
      */
     SOFTWARE("software"),
     ;

@@ -19,7 +19,9 @@ import works.limn.scp.bridge.CoroutineBridge
 
 fun identityExample(bridge: CoroutineBridge) = runBlocking {
     // 1. Create a new identity with in-memory key custody.
-    //    In production on Android, use CustodyType.PLATFORM for Keystore.
+    //    In production on Android, inject a KeyCustodyProvider through
+    //    SCP.identityCreateWithCustody to hold the keys in Android Keystore.
+    //    No custody string reaches Keystore.
     //    All FFI calls are dispatched on Dispatchers.IO via the bridge.
     val identityHandle = bridge.identity.create(CustodyType.IN_MEMORY)
     println("Identity handle: $identityHandle")

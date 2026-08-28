@@ -41,7 +41,7 @@ import type { BridgeCredential } from "./bridge";
 import type { Context } from "./context";
 import type { PaymentReceiptVerificationResult } from "./economy";
 import { ContextError, mapBridgeError, mapSagaError, ValidationError } from "./errors";
-import type { Identity } from "./identity";
+import type { CustodyType, Identity } from "./identity";
 import { type BridgeContextHandle, getBridge, toCapabilityValidation } from "./internal/bridge";
 import { loadNativeAddon, type NativeAddon as RawNativeAddon } from "./internal/native";
 import { assertTestEnvironment } from "./internal/test-guard";
@@ -700,7 +700,30 @@ export class SCP {
   // Domain: Identity
   // ───────────────────────────────────────────────────────────────────────
 
-  async identityCreate(custody: string = "in_memory"): Promise<Identity> {
+  /**
+   * Create a DID whose keys live in a key store the NAPI bridge builds.
+   *
+   * The bridge builds a key store for `"in_memory"` alone. It answers the
+   * other two strings {@link CustodyType} carries, `"platform"` and
+   * `"software"`, with `SCP-IDENT-1003` and builds nothing, so read
+   * {@link CustodyType} for what each string reaches. To put keys in Apple
+   * Keychain or in Android Keystore, call
+   * {@link SCP.identityCreateWithCustody} with a `KeyCustodyProvider` instead.
+   *
+   * @throws An `IdentityError` carrying `SCP-IDENT-1008` when the caller
+   * passes `"in_memory"` to an addon built without the bridge's `testing`
+   * feature, which is the only build that compiles the in-memory key store.
+   * @throws An `IdentityError` carrying `SCP-IDENT-1003` when the caller
+   * passes `"platform"` or `"software"`.
+   * @throws A `ValidationError` carrying `SCP-VALID-7005` when the caller
+   * passes a string {@link CustodyType} does not carry.
+   *
+   * `custody` carries no default, so the caller names the key store that holds
+   * this identity's keys and this SDK names none for them. Which key store
+   * holds a private key decides who can reach that key, so a default would
+   * pick a security-relevant answer the caller never stated.
+   */
+  async identityCreate(custody: CustodyType): Promise<Identity> {
     try {
       const raw = await (this.#native.identityCreate as (c: string) => Promise<unknown>)(custody);
       const { Identity: IdentityCls } = await import("./identity");
@@ -710,7 +733,22 @@ export class SCP {
     }
   }
 
-  async identityCreateWithAgentKey(custody: string = "in_memory"): Promise<Identity> {
+  /**
+   * Create a DID that carries an `#agent` signing key (ADR-039, the shared-DID
+   * agent binding), with its keys in a key store the NAPI bridge builds.
+   *
+   * This method screens `custody` through `validate_custody_type` and then
+   * matches it against arms that spell the same outcomes
+   * {@link SCP.identityCreate} matches, so it builds the same key store for
+   * `"in_memory"` and answers every other custody string with the code
+   * {@link SCP.identityCreate} answers it with.
+   *
+   * `custody` carries no default, so the caller names the key store that holds
+   * this identity's keys and this SDK names none for them. Which key store
+   * holds a private key decides who can reach that key, so a default would
+   * pick a security-relevant answer the caller never stated.
+   */
+  async identityCreateWithAgentKey(custody: CustodyType): Promise<Identity> {
     try {
       const raw = await (
         this.#native.identityCreateWithAgentKey as (c: string) => Promise<unknown>

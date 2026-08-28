@@ -202,7 +202,7 @@ class Identity private constructor(private val handle: IdentityHandle) {
     val custodyType: String get() = handle.custodyType()
 
     companion object {
-        suspend fun create(custody: String = "platform"): Identity =
+        suspend fun create(custody: String): Identity =
             withContext(Dispatchers.IO) {
                 Identity(NativeLib.identityCreate(custody))
             }
@@ -218,6 +218,13 @@ class Identity private constructor(private val handle: IdentityHandle) {
     }
 }
 ```
+
+`create` takes the custody string as a required argument and offers no default, because
+no custody string names a key store a shipped build reaches. The UniFFI bridge builds a
+key store from `"in_memory"` only, and compiles that one under its `testing` feature, so a
+shipped build returns `SCP-IDENT-1008` for it and returns `SCP-IDENT-1003` for
+`"platform"` and for `"software"`. A caller reaches Android Keystore by passing a
+`KeyCustodyProvider` to `identityCreateWithCustody` instead.
 
 ## Resource Management
 

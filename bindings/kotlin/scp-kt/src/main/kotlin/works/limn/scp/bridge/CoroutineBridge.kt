@@ -124,13 +124,16 @@ interface IdentityBindings {
      * Generates a new `did:dht` identity backed by the given custody type.
      * The returned handle retains key material for the identity's lifetime.
      *
-     * @param custody Key custody method: `"in_memory"` (dev/test only, feature-gated),
-     *   `"platform"` (Secure Enclave / Android Keystore), or `"software"`.
+     * @param custody Key custody method. The bridge builds a key store for
+     *   `"in_memory"` (dev/test only, feature-gated) and for no other string.
+     *   Reach Secure Enclave or Android Keystore by injecting a
+     *   `KeyCustodyProvider` through `identityCreateWithCustody`, not by
+     *   naming a custody string.
      * @return Opaque identity handle for use in subsequent operations.
      * @throws BridgeException with `SCP-IDENT-1008` if `"in_memory"` is requested
-     *   but the `testing` feature is not enabled, or with
-     *   `SCP-IDENT-1003` if `"platform"`/`"software"` is requested without a
-     *   wired `KeyCustodyProvider`.
+     *   but the `testing` feature is not enabled, with `SCP-IDENT-1003` for
+     *   `"platform"` or `"software"`, which reach no key store on any bridge,
+     *   and with `SCP-VALID-7005` for every other string.
      */
     fun identityCreate(custody: String): Long
 
@@ -1504,21 +1507,24 @@ class IdentityBridge internal constructor(
     /**
      * Create a new identity with the specified custody method.
      *
+     * [custody] carries no default, so the caller names the key store that
+     * holds this identity's keys and this bridge names none for them. Which
+     * key store holds a private key decides who can reach that key, so a
+     * default would pick a security-relevant answer the caller never stated.
+     * This method sends [works.limn.scp.CustodyType.rawValue] to the UniFFI
+     * bridge, so the compiler rejects a custody string the bridge does not
+     * name. The bridge builds a key store for
+     * [works.limn.scp.CustodyType.IN_MEMORY] alone, and it answers
+     * [works.limn.scp.CustodyType.PLATFORM] and
+     * [works.limn.scp.CustodyType.SOFTWARE] with `SCP-IDENT-1003`; inject a
+     * `KeyCustodyProvider` through `identityCreateWithCustody` to reach
+     * Android Keystore.
+     *
      * @param custody Key custody method.
      * @return Opaque identity handle for use in subsequent operations.
      */
     suspend fun create(custody: works.limn.scp.CustodyType): Long =
         bridge.ffiCall { bindings.identityCreate(custody.rawValue) }
-
-    /**
-     * Create a new identity with the specified custody method.
-     *
-     * Overload accepting a raw string for backward compatibility.
-     *
-     * @param custody Key custody method: "platform", "in_memory", or "software".
-     * @return Opaque identity handle for use in subsequent operations.
-     */
-    suspend fun create(custody: String): Long = bridge.ffiCall { bindings.identityCreate(custody) }
 
     /**
      * Load an existing identity from storage by DID.

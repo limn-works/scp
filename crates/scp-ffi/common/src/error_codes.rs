@@ -56,6 +56,16 @@ pub const IDENT_1001: &str = "SCP-IDENT-1001";
 /// Identity not found.
 pub const IDENT_1002: &str = "SCP-IDENT-1002";
 /// Identity already exists.
+///
+/// Also the code every bridge returns when a caller names a custody string
+/// that reaches no key custody backend on that bridge — `"platform"` on all
+/// three, and `"software"` on the NAPI and `UniFFI` bridges. A caller reaches a
+/// platform-native key store by injecting a `KeyCustodyProvider` through
+/// `identity_create_with_custody`, never by naming a custody string. That
+/// second purpose predates story SCP-294, the custody-naming story, on the
+/// NAPI and `UniFFI` bridges; SCP-294 brought the `PyO3` bridge onto it and
+/// recorded the purpose here, because this file is the registry a reviewer
+/// checks drift against and it named only the first purpose.
 pub const IDENT_1003: &str = "SCP-IDENT-1003";
 /// Identity key generation failed.
 pub const IDENT_1004: &str = "SCP-IDENT-1004";
@@ -66,6 +76,14 @@ pub const IDENT_1006: &str = "SCP-IDENT-1006";
 /// Identity migration failed.
 pub const IDENT_1007: &str = "SCP-IDENT-1007";
 /// Identity load failed.
+///
+/// Also the code every bridge returns when a caller names `"in_memory"`
+/// custody in a build that does not carry the bridge's `testing` feature. That
+/// feature compiles `InMemoryKeyCustody`, and a shipped build severs it
+/// (ADR-062, capability injection and prove-absent dev backends), so the
+/// bridge declines the string rather than substituting a weaker key store. The
+/// NAPI bridge additionally returns this code when an identity carries no
+/// agent key to rotate.
 pub const IDENT_1008: &str = "SCP-IDENT-1008";
 /// Identity storage error.
 pub const IDENT_1009: &str = "SCP-IDENT-1009";
