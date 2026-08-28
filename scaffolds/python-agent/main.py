@@ -21,8 +21,8 @@ from scp_sdk import Capability, Context, Identity
 
 
 async def main() -> None:
-    # 1. Create a DID identity with in-memory key custody.
-    identity = await Identity.create(custody="in_memory")
+    # 1. Create a DID identity with encrypted-key-file custody.
+    identity = await Identity.create(custody="encrypted_file")
     print(f"Created identity: {identity.did}")
 
     # 2. Create an encrypted context with messaging capabilities.

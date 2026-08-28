@@ -14,14 +14,14 @@
 import { Identity } from "@limn-works/scp-ts";
 
 async function main(): Promise<void> {
-  // 1. Create a new identity with in-memory key custody.
+  // 1. Create a new identity with the encrypted key file SCP implements.
   //    In production, pass "encrypted_file" for the on-disk key store SCP
   //    implements, or "os_keystore" together with a KeyCustodyProvider to
   //    hold the keys in the operating system's key store. Section 3.2.2 of
   //    the identity spec, the custody vocabulary, states those two values.
   //    Either call returns SCP-IDENT-1059 on a released addon, because no
   //    pre-rotation custody backend is wired yet.
-  const alice = await Identity.create({ custody: "in_memory" });
+  const alice = await Identity.create({ custody: "encrypted_file" });
 
   console.log(`DID: ${alice.did}`);
   console.log(`Custody type: ${alice.custodyType}`);
@@ -43,7 +43,7 @@ async function main(): Promise<void> {
   // 3. Create an identity with an agent signing key (ADR-039).
   //    Agent keys enable human+agent shared DID patterns.
   const agentIdentity = await Identity.createWithAgentKey({
-    custody: "in_memory",
+    custody: "encrypted_file",
   });
   console.log(`Agent identity DID: ${agentIdentity.did}`);
   console.log();

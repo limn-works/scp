@@ -11,8 +11,8 @@
 import { Context, Identity } from "@limn-works/scp-ts";
 
 async function main(): Promise<void> {
-  // 1. Create a DID identity with in-memory key custody.
-  const identity = await Identity.create({ custody: "in_memory" });
+  // 1. Create a DID identity with encrypted-key-file custody.
+  const identity = await Identity.create({ custody: "encrypted_file" });
   console.log(`Created identity: ${identity.did}`);
 
   // 2. Create an encrypted context with messaging capabilities.

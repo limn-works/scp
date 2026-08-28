@@ -1,6 +1,6 @@
 # SCP Kotlin Android Scaffold
 
-Minimal Android app using the SCP Kotlin SDK with the in-memory key store. A caller
+Minimal Android app using the SCP Kotlin SDK with the encrypted key file SCP implements. A caller
 reaches Android Keystore by naming `"os_keystore"` and supplying a
 `KeyCustodyProvider`; §3.2.2 of the identity spec, the custody vocabulary, states that
 value and states that a bridge holding no such provider returns a typed error rather

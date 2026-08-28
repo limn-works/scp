@@ -18,7 +18,7 @@ import works.limn.scp.CustodyType
 import works.limn.scp.bridge.CoroutineBridge
 
 fun identityExample(bridge: CoroutineBridge) = runBlocking {
-    // 1. Create a new identity with in-memory key custody.
+    // 1. Create a new identity with the encrypted key file SCP implements.
     //    In production, pass "encrypted_file" for the on-disk key store SCP
     //    implements, or "os_keystore" together with a KeyCustodyProvider to
     //    hold the keys in Android Keystore. Section 3.2.2 of the identity

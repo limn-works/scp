@@ -1,6 +1,6 @@
 /// Minimal SCP macOS app scaffold.
 ///
-/// Creates a DID identity with the in-memory key store, opens an encrypted
+/// Creates a DID identity with the encrypted key file SCP implements, opens an encrypted
 /// context, and sends a message. Section 3.2.2 of the identity spec, the custody
 /// vocabulary, names two values a shipped caller passes: "encrypted_file" for
 /// the on-disk key store SCP implements, and "os_keystore" for the Keychain,
@@ -12,7 +12,7 @@ import SCP
 @main
 struct SCPmacOSApp {
     static func main() async throws {
-        // 1. Create a DID identity. This in-memory key store loses every key
+        // 1. Create a DID identity. This encrypted key file keeps every key
         //    on process exit, and a released build rejects it with
         //    SCP-IDENT-1008.
         let identity = try await createIdentity(custody: CustodyType.encryptedFile.rawValue)

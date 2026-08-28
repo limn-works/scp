@@ -21,7 +21,7 @@ import type { ContextParams, ToolDefinition } from "@limn-works/scp-ts";
 
 async function main(): Promise<void> {
   // 1. Create an identity for the tool operator.
-  const operator = await Identity.create({ custody: "in_memory" });
+  const operator = await Identity.create({ custody: "encrypted_file" });
   console.log(`Operator DID: ${operator.did}`);
 
   // 2. Create a context with tool capabilities.

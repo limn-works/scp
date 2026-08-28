@@ -17,7 +17,7 @@ from scp_sdk import Identity, CustodyType
 
 
 async def main() -> None:
-    # 1. Create a new identity with in-memory key custody.
+    # 1. Create a new identity with the encrypted key file SCP implements.
     #    In production, pass "encrypted_file" for the on-disk key store SCP
     #    implements, or "os_keystore" together with a KeyCustodyProvider for
     #    the operating system's own key store. Section 3.2.2 of the identity
