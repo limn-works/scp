@@ -1233,6 +1233,7 @@ This test proves: identity works, encryption works, the envelope format works, s
 **Date:** March 4, 2026
 **Status:** Decided
 **Extends:** ADR-003 (DID Creation)
+**Amended by ADR-063 (2026-08-28):** Category C carries a fifth mechanism, `user_authentication_required`, the context-declared user-authentication gate (`.docs/adrs/ADR-063-context-declared-user-authentication-gate.md`). That ADR's status is Proposed, and its open question 7 asks which of two statements in this ADR governs the Backing value of `#active` — the key-properties table below, which reads "Software", or Enforcement Stack layer 1, which reads "in hardware (Secure Enclave / Android Keystore) with session-based biometric unlock".
 
 ### Context
 
@@ -1290,6 +1291,7 @@ DidDocument.verification_method = [
 - Agent-specific roles with restricted capabilities
 - `agent_rate_limit` — rate limiting for agent actions
 - `agent_cosign_required` — agent actions require human co-signature
+- `user_authentication_required` — named capabilities require a signing key whose platform gates it behind a device-local authentication gesture (ADR-063, Proposed; §4.9.3 of `.docs/specs/04-agents.md` states what a verifier does, which today is a rejection). This mechanism differs from the four above in whose key it binds: it rejects an `#agent` signature and then constrains which `#active` signatures pass, so it reaches past the "restrictions on agent actions" this section's opening sentence states. ADR-063's open question 6 asks a human whether Category C covers it.
 
 ### Enforcement Stack (5 Layers)
 
