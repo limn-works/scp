@@ -149,6 +149,14 @@
           "notes": "SDK wrapper + FFI surface exist on all four bindings (this column is a name-existence check). Like execute_recovery, the surface FAILS CLOSED: no production custody-migration backend is wired, so every bridge drives a NotConfiguredMigrationBackend whose first step returns Err — surfaced as a typed 'custody migration backend not configured — provide a real backend via SDK layer' error instead of fabricating a migration. The real backend (platform/hardware/software custody key generation + DID-document rotation) is tracked separately and needs human design sign-off. This is the fail-closed precedent execute_recovery mirrors."
         },
         {
+          "name": "published_custody",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Returns the custody value a DID document publishes for an identity's #active signing key: non-extractable-biometric, non-extractable-pin, extractable-passphrase, or nothing. \u00a73.2.2 of the identity spec, 'The Custody Vocabulary', separates the two vocabularies this row sits between: Identity/create names a backend (encrypted_file or os_keystore), and this operation reads what a stranger learns from the DID document, which is whether the key can leave its store and which factor unlocks it. The bridge derives the value from the running backend rather than from any argument, so a participant cannot publish a custody they do not run; an injected KeyCustodyProvider answers through its key_is_extractable and unlock_factor callbacks, and the encrypted key file answers for itself. Absent value is a protocol state, not a gap: \u00a73.2.2 states that a backend reporting a pair the published vocabulary states no value for 'publishes no custody attestation at all', and ADR-039's Enforcement Stack layer 4 gives that absence a meaning, 'Absence of attestation is itself a signal'. All three bridges export it (PyO3 identity_published_custody, NAPI identityPublishedCustody, UniFFI identity_published_custody) and all four SDKs wrap it. One fail-path divergence: PyO3 and NAPI answer a DID the instance retains no custody for with SCP-IDENT-1001, the registry-miss code with_identity raises, while UniFFI answers the same miss with SCP-IDENT-1017."
+        },
+        {
           "name": "create_attestation",
           "python": true,
           "typescript": true,

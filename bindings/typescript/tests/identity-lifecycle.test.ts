@@ -28,6 +28,7 @@ import { Identity } from "../src/identity";
 import type { Bridge, BridgeIdentityHandle } from "../src/internal/bridge";
 import { __setBridgeForTests } from "../src/internal/bridge";
 import { SCP } from "../src/scp";
+import { createInMemoryIdentity } from "./harness-custody";
 import { mountMockScp } from "./mock-bridge";
 
 const LIFECYCLE_METHODS = [
@@ -173,7 +174,7 @@ try {
   if (typeof (probe as unknown as Record<string, unknown>).identityRotateKey !== "function") {
     skipReason = "SCP missing identityRotateKey — rebuild with the parity changes";
   } else {
-    await probe.identityCreate("in_memory");
+    await createInMemoryIdentity(probe);
     napiAvailable = true;
   }
   await probe.shutdown(1).catch(() => {});
@@ -190,7 +191,7 @@ if (!napiAvailable) {
     test("rotateKey returns an Identity with the same DID", async () => {
       const scp = new SCP({ storage: { type: "in_memory" } });
       try {
-        const identity = await scp.identityCreate("in_memory");
+        const identity = await createInMemoryIdentity(scp);
         const rotated = await scp.identityRotateKey(identity);
         expect(rotated).toBeInstanceOf(Identity);
         expect(rotated.did).toBe(identity.did);
@@ -202,7 +203,7 @@ if (!napiAvailable) {
     test("agent-key lifecycle: add, rotate, remove round-trips", async () => {
       const scp = new SCP({ storage: { type: "in_memory" } });
       try {
-        const identity = await scp.identityCreate("in_memory");
+        const identity = await createInMemoryIdentity(scp);
         const withAgent = await scp.identityAddAgentKey(identity);
         expect(withAgent.did).toBe(identity.did);
         const rotated = await scp.identityRotateAgentKey(withAgent);
@@ -218,7 +219,7 @@ if (!napiAvailable) {
     test("migrate returns an Identity with a NEW DID (spec §9.12)", async () => {
       const scp = new SCP({ storage: { type: "in_memory" } });
       try {
-        const identity = await scp.identityCreate("in_memory");
+        const identity = await createInMemoryIdentity(scp);
         const migrated = await scp.identityMigrate(identity);
         expect(migrated).toBeInstanceOf(Identity);
         // Migration creates a new DID — it does NOT preserve the old one.
@@ -236,7 +237,7 @@ if (!napiAvailable) {
       const scp = new SCP({ storage: { type: "in_memory" } });
       try {
         // Start with an identity that has an #agent key.
-        const identity = await scp.identityAddAgentKey(await scp.identityCreate("in_memory"));
+        const identity = await scp.identityAddAgentKey(await createInMemoryIdentity(scp));
         const migrated = await scp.identityMigrate(identity);
         expect(migrated).toBeInstanceOf(Identity);
         // Migration MUST have dropped the #agent key from the new DID document

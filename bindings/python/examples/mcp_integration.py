@@ -14,7 +14,7 @@ from scp_sdk.types import Capability, CustodyType, MemoryScope
 
 async def main() -> None:
     with SCP(storage={"type": "in_memory"}) as scp:
-        identity = await scp.identity_create(CustodyType.IN_MEMORY)
+        identity = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
 
         # Create a context with outlet capabilities.
         ctx = await scp.context_create(

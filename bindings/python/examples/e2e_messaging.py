@@ -23,8 +23,8 @@ async def main() -> None:
         await scp.transport_connect(relay.relay_url)
 
         # 2. Create two identities
-        alice = await scp.identity_create(CustodyType.IN_MEMORY)
-        bob = await scp.identity_create(CustodyType.IN_MEMORY)
+        alice = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
+        bob = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
         print(f"Alice DID: {alice.did}")
         print(f"Bob DID:   {bob.did}")
 

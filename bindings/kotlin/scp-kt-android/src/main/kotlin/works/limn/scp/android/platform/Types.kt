@@ -336,6 +336,39 @@ interface KeyCustodyProvider {
      *   and cannot be exported (TEE keys are non-extractable).
      */
     fun exportSigningKeyBytes(keyHandle: KeyHandle): ByteArray
+
+    /**
+     * Report whether the private key [keyHandle] names can leave the store this
+     * provider holds it in.
+     *
+     * One of the two facts a DID document publishes about custody (§3.2.2 of
+     * the identity spec). [KeyHandle.custodyType] reports where the key lives,
+     * which is a different question: a TEE-backed key lives in hardware AND
+     * cannot leave it, while a Bouncy Castle key lives in software AND can.
+     *
+     * @param keyHandle Handle to any key type.
+     * @return `true` when the key can leave the store.
+     * @throws ScpException with code `SCP-CRYPTO-4001` if key not found. A
+     *   bridge that reads a throw here publishes no custody value for the key.
+     */
+    fun keyIsExtractable(keyHandle: KeyHandle): Boolean
+
+    /**
+     * Report which factor unlocks the key [keyHandle] names: one of
+     * `"biometric"`, `"pin"`, `"passphrase"`, `"caller_supplied_key"`, or
+     * `"unprotected"`.
+     *
+     * The other fact a DID document publishes about custody (§3.2.2 of the
+     * identity spec). The bridge publishes a custody value only for a pair
+     * §3.2.2 states one for, so a value outside the two non-extractable
+     * pairings and the extractable-passphrase pairing publishes nothing rather
+     * than a guess.
+     *
+     * @param keyHandle Handle to any key type.
+     * @return One of the five factor strings.
+     * @throws ScpException with code `SCP-CRYPTO-4001` if key not found.
+     */
+    fun unlockFactor(keyHandle: KeyHandle): String
 }
 
 /**

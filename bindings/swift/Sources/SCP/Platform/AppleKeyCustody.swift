@@ -1023,4 +1023,68 @@ public extension AppleKeyCustody {
         case .required: "software_biometric"
         }
     }
+
+    // MARK: Published custody
+
+    /// Reports whether the private key `keyId` names can leave the Keychain.
+    ///
+    /// This adapter answers `true` for every key it holds, because
+    /// ``exportSigningKeyBytes(_:)`` reads the raw 32 private-key bytes out of
+    /// the Keychain item and returns a copy of them to the caller. That is
+    /// true under both ``BiometricPolicy`` cases: `.required` gates the read
+    /// behind Face ID or Touch ID, and a gated read still hands the bytes to
+    /// the caller.
+    ///
+    /// The Secure Enclave, which holds a key non-extractably, generates P-256
+    /// keys only, and SCP signs with Ed25519, so no SCP key reaches it. See
+    /// the "Secure Enclave note" section above.
+    ///
+    /// - Parameter keyId: The UUID handle returned by
+    ///   ``generateKeypair(keyType:)``. Reading the attribute needs no key
+    ///   material, so this call raises no biometric prompt.
+    /// - Returns: `true`.
+    /// - Throws: ``PlatformError/keyNotFound(_:)`` when the Keychain holds no
+    ///   item for `keyId`. A bridge that reads a throw here publishes no
+    ///   custody value for the key.
+    nonisolated func keyIsExtractable(_ keyId: String) throws -> Bool {
+        _ = try fetchMetadata(for: keyId)
+        return true
+    }
+
+    /// Reports which factor unlocks the key `keyId` names.
+    ///
+    /// Under ``BiometricPolicy/required`` this adapter answers `"biometric"`:
+    /// ``storePrivateKeyBytes(_:for:keyType:publicKeyBytes:)`` creates the
+    /// item with a `SecAccessControl` carrying `.biometryCurrentSet`, so Face
+    /// ID or Touch ID authenticates before the Keychain releases key material.
+    ///
+    /// Under ``BiometricPolicy/none`` this adapter answers
+    /// `"caller_supplied_key"`, and that answer names no factor this adapter
+    /// verified. The item then carries
+    /// `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` and no access
+    /// control, and no artifact states which factor that protection class
+    /// means: the device passcode, which would make the answer
+    /// `"passphrase"`, or nothing at all, which would make it
+    /// `"unprotected"`. Those two answers publish different values —
+    /// `"passphrase"` publishes `extractable-passphrase` and `"unprotected"`
+    /// publishes nothing — so the adapter reports neither while the question
+    /// is open. `"caller_supplied_key"` publishes nothing, which section 3.2.2
+    /// of the identity spec states is what a backend reporting a pair the
+    /// published vocabulary states no value for does. Alec decides which of
+    /// the two the adapter answers; until then this value publishes no claim
+    /// rather than the wrong one.
+    ///
+    /// - Parameter keyId: The UUID handle returned by
+    ///   ``generateKeypair(keyType:)``. Reading the attribute needs no key
+    ///   material, so this call raises no biometric prompt.
+    /// - Returns: `"biometric"` or `"caller_supplied_key"`.
+    /// - Throws: ``PlatformError/keyNotFound(_:)`` when the Keychain holds no
+    ///   item for `keyId`.
+    nonisolated func unlockFactor(_ keyId: String) throws -> String {
+        _ = try fetchMetadata(for: keyId)
+        switch biometricPolicy {
+        case .required: return "biometric"
+        case .none: return "caller_supplied_key"
+        }
+    }
 }

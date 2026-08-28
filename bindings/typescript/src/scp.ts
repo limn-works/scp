@@ -12,7 +12,7 @@
  *
  * // Storage selection is required — there is no default (spec §17.6).
  * const scp = new SCP({ storage: { type: "in_memory" } }); // dev/test storage
- * const identity = await scp.identityCreate("in_memory");
+ * const identity = await scp.identityCreate("encrypted_file");
  * await scp.resume();                    // async — reconnects transport
  * await scp.shutdown(5);                 // graceful shutdown
  * ```
@@ -21,7 +21,7 @@
  * bridge operation has a corresponding instance method on `SCP`. The
  * process-wide default-instance façade and free-function shorthands were
  * deleted — callers construct an explicit `new SCP()` and invoke methods
- * directly (e.g. `scp.identityCreate("in_memory")`).
+ * directly (e.g. `scp.identityCreate("encrypted_file")`).
  *
  * NOTE: `SCP` requires a Node.js or Bun runtime with the native addon.
  * Browser clients run the full protocol in-tab (keys on-device) via the
@@ -516,8 +516,35 @@ export interface KeyCustodyProvider {
    * vote signing via {@link SCP.identityCreateWithCustody}) surface a hard error.
    */
   exportSigningKeyBytes(keyId: string): Uint8Array;
-  /** Return `"hardware"`, `"software"`, or `"in_memory"`. */
+  /**
+   * Return `"hardware"`, `"software"`, or `"in_memory"`.
+   *
+   * The three values name a storage location, which
+   * `scp_platform::CustodyType` consumes. What a DID document publishes about
+   * custody is a different pair of questions, and {@link keyIsExtractable}
+   * and {@link unlockFactor} answer those.
+   */
   custodyType(keyId: string): string;
+  /**
+   * Return whether the private key `keyId` names can leave this store.
+   *
+   * One of the two facts a DID document publishes about custody (section
+   * 3.2.2 of the identity spec). Throw when this provider cannot read the
+   * attribute; the bridge then publishes no custody value for the key.
+   */
+  keyIsExtractable(keyId: string): boolean;
+  /**
+   * Return which factor unlocks the key `keyId` names: one of `"biometric"`,
+   * `"pin"`, `"passphrase"`, `"caller_supplied_key"`, or `"unprotected"`.
+   *
+   * The other fact a DID document publishes about custody (section 3.2.2 of
+   * the identity spec). The bridge publishes a custody value only for a pair
+   * section 3.2.2 states one for, so a value outside the two non-extractable
+   * pairings and the extractable-passphrase pairing publishes nothing rather
+   * than a guess. Throw when this provider cannot read the attribute at all;
+   * the bridge then publishes no custody value for the key.
+   */
+  unlockFactor(keyId: string): string;
 }
 
 // ---------------------------------------------------------------------------
@@ -701,22 +728,23 @@ export class SCP {
   // ───────────────────────────────────────────────────────────────────────
 
   /**
-   * Create a DID whose keys live in a key store the NAPI bridge builds.
+   * Create a DID whose keys live in the custody backend `custody` names.
    *
-   * The bridge builds a key store for `"in_memory"` alone. It answers the
-   * other two strings {@link CustodyType} carries, `"platform"` and
-   * `"software"`, with `SCP-IDENT-1003` and builds nothing, so read
-   * {@link CustodyType} for what each string reaches. To put keys in Apple
-   * Keychain or in Android Keystore, call
-   * {@link SCP.identityCreateWithCustody} with a `KeyCustodyProvider` instead.
+   * The bridge builds a key store for `"encrypted_file"`. It answers
+   * `"os_keystore"` with `SCP-IDENT-1003`, because this method supplies no
+   * platform key-custody callback and falls back to neither the encrypted key
+   * file nor an in-memory store; call {@link SCP.identityCreateWithCustody}
+   * with a `KeyCustodyProvider` to reach the operating system's key store.
    *
-   * @throws An `IdentityError` carrying `SCP-IDENT-1008` when the caller
-   * passes `"in_memory"` to an addon built without the bridge's `testing`
-   * feature, which is the only build that compiles the in-memory key store.
    * @throws An `IdentityError` carrying `SCP-IDENT-1003` when the caller
-   * passes `"platform"` or `"software"`.
+   * passes `"os_keystore"`.
+   * @throws An `IdentityError` carrying `SCP-IDENT-1008` when the caller
+   * passes the raw string `"in_memory"` to an addon built without the
+   * bridge's `testing` feature, which is the only build that compiles the
+   * in-memory key store.
    * @throws A `ValidationError` carrying `SCP-VALID-7005` when the caller
-   * passes a string {@link CustodyType} does not carry.
+   * passes any other string, `"platform"`, `"software"`, `"file"`,
+   * `"platform_managed"`, and `"hardware"` included.
    *
    * `custody` carries no default, so the caller names the key store that holds
    * this identity's keys and this SDK names none for them. Which key store
@@ -735,12 +763,12 @@ export class SCP {
 
   /**
    * Create a DID that carries an `#agent` signing key (ADR-039, the shared-DID
-   * agent binding), with its keys in a key store the NAPI bridge builds.
+   * agent binding), with its keys in the custody backend `custody` names.
    *
    * This method screens `custody` through `validate_custody_type` and then
    * matches it against arms that spell the same outcomes
    * {@link SCP.identityCreate} matches, so it builds the same key store for
-   * `"in_memory"` and answers every other custody string with the code
+   * `"encrypted_file"` and answers every other custody value with the code
    * {@link SCP.identityCreate} answers it with.
    *
    * `custody` carries no default, so the caller names the key store that holds
@@ -776,10 +804,11 @@ export class SCP {
    */
   async identityCreateWithCustody(provider: KeyCustodyProvider): Promise<Identity> {
     // Validate provider completeness up front. The byte-converting adapter
-    // below always supplies all nine closures, so a provider missing a method
-    // would otherwise surface only later as a cryptic native "oneshot canceled"
-    // failure. Checking here makes the returned promise reject early with a
-    // clear, actionable error. Mirrors the nine methods on KeyCustodyProvider.
+    // below always supplies all eleven closures, so a provider missing a
+    // method would otherwise surface only later as a cryptic native "oneshot
+    // canceled" failure. Checking here makes the returned promise reject early
+    // with a clear, actionable error. Mirrors the eleven methods on
+    // KeyCustodyProvider.
     const REQUIRED = [
       "generateKeypair",
       "sign",
@@ -790,6 +819,8 @@ export class SCP {
       "deriveRotatablePseudonym",
       "exportSigningKeyBytes",
       "custodyType",
+      "keyIsExtractable",
+      "unlockFactor",
     ] as const;
     for (const method of REQUIRED) {
       if (typeof (provider as unknown as Record<string, unknown>)[method] !== "function") {
@@ -848,6 +879,10 @@ export class SCP {
         }
       },
       custodyType: (keyId: string): string => provider.custodyType(keyId),
+      // The two published-custody reads carry no byte payload and take a
+      // single positional argument, so each one passes straight through.
+      keyIsExtractable: (keyId: string): boolean => provider.keyIsExtractable(keyId),
+      unlockFactor: (keyId: string): string => provider.unlockFactor(keyId),
     };
     try {
       const raw = await (
@@ -985,6 +1020,42 @@ export class SCP {
   async identityResolve(did: string): Promise<unknown> {
     try {
       return await (this.#native.identityResolve as (d: string) => Promise<unknown>)(did);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
+  }
+
+  /**
+   * Return the custody value a DID document publishes for `did`.
+   *
+   * Section 3.2.2 of the identity spec, "The Custody Vocabulary", separates
+   * two vocabularies. A caller selecting custody names a backend, which is
+   * what {@link CustodyType} carries. A DID document publishes whether the key
+   * can leave its store and which factor unlocks it, which is what this method
+   * returns: `"non-extractable-biometric"`, `"non-extractable-pin"`, or
+   * `"extractable-passphrase"`.
+   *
+   * Returns `null` when the backend holding the `#active` key reports a pair
+   * the published vocabulary states no value for. ADR-039's Enforcement Stack
+   * layer 4 gives that absence a meaning, "Absence of attestation is itself a
+   * signal".
+   *
+   * The bridge derives the value from the running backend, so a participant
+   * cannot publish a custody they do not run. A caller-injected
+   * {@link KeyCustodyProvider} answers through its
+   * {@link KeyCustodyProvider.keyIsExtractable} and
+   * {@link KeyCustodyProvider.unlockFactor} methods.
+   *
+   * @throws A `ValidationError` when `did` is not a syntactically valid DID.
+   * @throws An `IdentityError` carrying `SCP-IDENT-1017` when this instance
+   * retains no custody for `did`, or when the injected provider throws while
+   * answering either question.
+   */
+  async identityPublishedCustody(did: string): Promise<string | null> {
+    try {
+      return await (this.#native.identityPublishedCustody as (d: string) => Promise<string | null>)(
+        did,
+      );
     } catch (err) {
       throw mapBridgeError(err);
     }

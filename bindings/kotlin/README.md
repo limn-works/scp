@@ -72,18 +72,30 @@ suspend fun main(keystore: KeyCustodyProvider) {
 ## Key custody
 
 `identityCreate` takes a `CustodyType` and carries no default, so a caller names
-the key store and this SDK names none for them. Each member spells a custody
-string the UniFFI bridge matches, and that bridge builds a key store from one of
-them only: `"in_memory"`, which it compiles under its `testing` feature. A released build throws `ScpException.Identity` carrying
-`SCP-IDENT-1008` for `"in_memory"`, it throws `ScpException.Identity` carrying
-`SCP-IDENT-1003` for `"platform"` and for `"software"`, and it throws
-`ScpException.Validation` carrying `SCP-VALID-7005` for any other string. No
-custody string reaches Android Keystore.
+the key store and this SDK names none for them. §3.2.2 of the identity spec,
+"The Custody Vocabulary", states the two values `CustodyType` carries.
+`ENCRYPTED_FILE` (`"encrypted_file"`) selects the on-disk key store SCP
+implements, which derives the file key with Argon2id and encrypts
+`$HOME/.scp/keys.bin` with AES-256-GCM. `OS_KEYSTORE` (`"os_keystore"`) selects
+the operating system's own key store, which SCP reaches through the platform
+key-custody callback you supply. Every other string throws
+`ScpException.Validation` carrying `SCP-VALID-7005`, and that includes
+`"platform"`, `"software"`, `"file"`, `"platform_managed"`, and `"hardware"`.
 
-Production key storage runs through `scp.identityCreateWithCustody(provider)`
-instead. The private key material never crosses into the native core, because
-the core delegates every cryptographic operation back to your callbacks
-(ADR-006, the platform abstraction).
+`scp.identityCreate(custody = CustodyType.OS_KEYSTORE)` throws
+`ScpException.Identity` carrying `SCP-IDENT-1003`, because that call supplies no
+provider and the bridge falls back to neither the encrypted key file nor an
+in-memory store. Reaching Android Keystore runs through
+`scp.identityCreateWithCustody(provider)` instead. The private key material
+never crosses into the native core, because the core delegates every
+cryptographic operation back to your callbacks (ADR-006, the platform
+abstraction).
+
+A build carrying the bridge's `testing` cargo feature additionally accepts the
+raw string `"in_memory"`, which reaches the test-only in-memory key store. No
+`CustodyType` entry spells it, a test that needs it passes the raw string to the
+UniFFI `Scp` object, and a released build throws `ScpException.Identity`
+carrying `SCP-IDENT-1008`.
 
 Implement `uniffi.scp.KeyCustodyProvider` yourself over Android Keystore and
 pass it in. The `scp-kt-android` module ships `AndroidKeyCustody`, but it
@@ -98,12 +110,38 @@ Castle on API 26 to 32 and persists their seeds in `EncryptedSharedPreferences`,
 and it manages every X25519 key in software, because Android Keystore supports
 X25519 key agreement at no API level.
 
+## What a DID document publishes about custody
+
+`scp.identityPublishedCustody(did)` returns what a stranger reading that DID
+document learns about custody, which §3.2.2 states is whether the key can leave
+its store and which factor unlocks it: `"non-extractable-biometric"`,
+`"non-extractable-pin"`, or `"extractable-passphrase"`. It returns `null` when
+the backend holding the `#active` key reports a pair the published vocabulary
+states no value for.
+
+The bridge derives the value from the running backend, so a participant cannot
+publish a custody they do not run. `KeyCustodyProvider.keyIsExtractable` and
+`KeyCustodyProvider.unlockFactor` answer the two questions for an injected
+provider.
+
+`AndroidKeyCustody` answers both questions on its own interface, which
+`identityCreateWithCustody` cannot reach until an adapter lands (see "Key
+custody" above). It answers `false` to the first for a TEE-backed key, whose
+private bytes `exportSigningKeyBytes` refuses to release, and `true` for a
+Bouncy Castle key, whose 32-byte seed it copies out. It answers `"unprotected"`
+to the second for both, because `KeystoreKeyOps.generateEd25519` builds its
+`KeyGenParameterSpec` with `setUserAuthenticationRequired(false)` and the
+`EncryptedSharedPreferences` master key comes from `MasterKeys.AES256_GCM_SPEC`,
+which requires no user authentication either. §3.2.2 states no published value
+for either pair, so a participant on this adapter publishes no custody
+attestation.
+
 ## No shipped build creates an identity yet
 
 `identityCreateWithCustody` throws `ScpException.Identity` carrying
-`SCP-IDENT-1059` on every released build. `identityCreate` stops one step
-earlier, with the three codes described above, because the bridge rejects every
-custody string before it reaches the pre-rotation step. Section 9.7.4.1 of the
+`SCP-IDENT-1059` on every released build, and
+`identityCreate(custody = CustodyType.ENCRYPTED_FILE)` throws it too once
+`SCP_KEY_PASSPHRASE` is set. Section 9.7.4.1 of the
 security model, pre-rotation key custody, makes every identity commit a
 pre-rotation commitment when it is created. That commitment needs a
 `PreRotationCustody` backend, and the only implementation is the test-harness
@@ -116,8 +154,8 @@ backend out of its own scope. The Quick Start above therefore runs against a
 build that enables the `testing` feature.
 
 Two separate gaps produce those codes, and closing one does not close the
-other. `SCP-IDENT-1003` and `SCP-IDENT-1008` say that the custody string you
-passed names no key store this bridge builds. `SCP-IDENT-1059` says that no
+other. `SCP-IDENT-1003`, `SCP-IDENT-1008`, and `SCP-VALID-7005` say that the
+custody value you passed names no key store this bridge builds. `SCP-IDENT-1059` says that no
 pre-rotation custody backend exists for any create path to use. A wired
 platform provider clears the first gap; a real pre-rotation backend clears the
 second.

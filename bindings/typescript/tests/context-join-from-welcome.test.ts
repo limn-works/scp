@@ -42,6 +42,7 @@ import { Context } from "../src/context";
 import { ContextError, IdentityError } from "../src/errors";
 import { SCP } from "../src/scp";
 import type { SealedInvitation } from "../src/types";
+import { createInMemoryIdentity } from "./harness-custody";
 import { mountMockScp } from "./mock-bridge";
 
 // ---------------------------------------------------------------------------
@@ -269,7 +270,7 @@ if (!scpAvailable) {
     test("reserves a real KeyPackage under a locally-custodied identity", async () => {
       const scp = new SCP({ storage: { type: "in_memory" } });
       try {
-        const joiner = await scp.identityCreate("in_memory");
+        const joiner = await createInMemoryIdentity(scp);
 
         const reservation = await scp.reserveKeyPackage(joiner.did);
 
@@ -288,7 +289,7 @@ if (!scpAvailable) {
     test("each reservation consumes a distinct KeyPackage (fresh public bytes)", async () => {
       const scp = new SCP({ storage: { type: "in_memory" } });
       try {
-        const joiner = await scp.identityCreate("in_memory");
+        const joiner = await createInMemoryIdentity(scp);
         const a = await scp.reserveKeyPackage(joiner.did);
         const b = await scp.reserveKeyPackage(joiner.did);
         // Single-use KeyPackages: two reservations are not the same public bytes.
@@ -317,8 +318,8 @@ if (!scpAvailable) {
     test("SingleAdmin unilateral invite returns a real sealed bundle for a reserved invitee KeyPackage", async () => {
       const scp = new SCP({ storage: { type: "in_memory" } });
       try {
-        const creator = await scp.identityCreate("in_memory");
-        const invitee = await scp.identityCreate("in_memory");
+        const creator = await createInMemoryIdentity(scp);
+        const invitee = await createInMemoryIdentity(scp);
 
         // Encrypted SingleAdmin context: the creator can invite unilaterally.
         // The invite is routed through the actor's governance gate, which checks
@@ -382,8 +383,8 @@ if (!scpAvailable) {
     test("rejects inviting under a non-custodied creator DID", async () => {
       const scp = new SCP({ storage: { type: "in_memory" } });
       try {
-        const creator = await scp.identityCreate("in_memory");
-        const invitee = await scp.identityCreate("in_memory");
+        const creator = await createInMemoryIdentity(scp);
+        const invitee = await createInMemoryIdentity(scp);
         const ctx = await scp.contextCreate(
           creator,
           JSON.stringify({
@@ -417,8 +418,8 @@ if (!scpAvailable) {
     test("join reaches the real bundle open: a garbage sealed bundle is rejected after arg marshaling", async () => {
       const scp = new SCP({ storage: { type: "in_memory" } });
       try {
-        const joiner = await scp.identityCreate("in_memory");
-        const creator = await scp.identityCreate("in_memory");
+        const joiner = await createInMemoryIdentity(scp);
+        const creator = await createInMemoryIdentity(scp);
 
         // A real reservation id from the pool — parses cleanly at the bridge.
         const reservation = await scp.reserveKeyPackage(joiner.did);
@@ -444,8 +445,8 @@ if (!scpAvailable) {
     test("join rejects a malformed (non-32-byte) enc at the boundary", async () => {
       const scp = new SCP({ storage: { type: "in_memory" } });
       try {
-        const joiner = await scp.identityCreate("in_memory");
-        const creator = await scp.identityCreate("in_memory");
+        const joiner = await createInMemoryIdentity(scp);
+        const creator = await createInMemoryIdentity(scp);
         const reservation = await scp.reserveKeyPackage(joiner.did);
 
         // enc length gate is fail-closed: a 3-byte enc is rejected up front.

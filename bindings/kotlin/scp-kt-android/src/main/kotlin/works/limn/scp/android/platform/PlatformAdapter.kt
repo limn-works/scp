@@ -1,10 +1,12 @@
 // PlatformAdapter.kt — Android platform adapter factory (ADR-027)
 //
 // Assembles all four Android platform providers (KeyCustody, DeviceAttestation,
-// PushProvider, Storage) into a single adapter object. No custody string selects
-// it: the UniFFI bridge answers "platform" with SCP-IDENT-1003, and a caller
-// reaches Android Keystore by injecting a KeyCustodyProvider through
-// SCP.identityCreateWithCustody.
+// PushProvider, Storage) into a single adapter object. §3.2.2 of the identity
+// spec names "os_keystore" as the value that selects the operating system's own
+// key store, and the bridge reaches that store only through an injected
+// KeyCustodyProvider: SCP.identityCreate answers "os_keystore" with
+// SCP-IDENT-1003 because it supplies none, so a caller reaches Android Keystore
+// by passing a provider to SCP.identityCreateWithCustody.
 //
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer).
 

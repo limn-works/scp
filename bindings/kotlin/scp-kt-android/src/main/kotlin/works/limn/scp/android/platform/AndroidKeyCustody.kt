@@ -157,6 +157,14 @@ class AndroidKeyCustody internal constructor(
      */
     private val softwareKeyOps = SoftwareKeyOps(softwareKeys, softwareKeyTypes, encryptedPrefs)
 
+    /**
+     * Delegate for Android Keystore (TEE) key operations.
+     *
+     * Holds no state of its own: every operation resolves the Keystore alias from the
+     * key id, so the delegate and [AndroidKeyCustody] reach the same TEE entries.
+     */
+    private val keystoreKeyOps = KeystoreKeyOps()
+
     init {
         softwareKeyOps.restorePersistedEd25519Keys()
     }
@@ -181,7 +189,7 @@ class AndroidKeyCustody internal constructor(
         val keyId = UUID.randomUUID().toString()
         return when {
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && keyType == KeyType.ED25519 -> {
-                generateKeystoreEd25519(keyId)
+                keystoreKeyOps.generateEd25519(keyId)
             }
             keyType == KeyType.ED25519 -> {
                 softwareKeyOps.generateEd25519(keyId)
@@ -211,7 +219,7 @@ class AndroidKeyCustody internal constructor(
      */
     override fun sign(keyHandle: KeyHandle, data: ByteArray): ByteArray {
         return if (keyHandle.custodyType == CustodyType.HARDWARE) {
-            signWithKeystore(keyHandle, data)
+            keystoreKeyOps.sign(keyHandle, data)
         } else {
             softwareKeyOps.sign(keyHandle, data)
         }
@@ -232,7 +240,7 @@ class AndroidKeyCustody internal constructor(
      */
     override fun publicKey(keyHandle: KeyHandle): ByteArray {
         return if (keyHandle.custodyType == CustodyType.HARDWARE) {
-            publicKeyFromKeystore(keyHandle)
+            keystoreKeyOps.publicKey(keyHandle)
         } else {
             softwareKeyOps.publicKey(keyHandle)
         }
@@ -256,7 +264,7 @@ class AndroidKeyCustody internal constructor(
      */
     override fun destroyKey(keyHandle: KeyHandle): DestructionAttestation {
         return if (keyHandle.custodyType == CustodyType.HARDWARE) {
-            destroyKeystoreKey(keyHandle)
+            keystoreKeyOps.destroy(keyHandle)
         } else {
             softwareKeyOps.destroy(keyHandle)
         }
@@ -483,7 +491,7 @@ class AndroidKeyCustody internal constructor(
 
         if (keyHandle.custodyType == CustodyType.HARDWARE) {
             // TEE path: sign the salt message deterministically, hash the result.
-            val signatureBytes = signWithKeystore(keyHandle, salt)
+            val signatureBytes = keystoreKeyOps.sign(keyHandle, salt)
             val digest = java.security.MessageDigest.getInstance("SHA-256")
             return digest.digest(signatureBytes)
         }
@@ -572,9 +580,102 @@ class AndroidKeyCustody internal constructor(
         return result
     }
 
-    // -----------------------------------------------------------------------
-    // Private: Keystore Ed25519 operations (API 33+)
-    // -----------------------------------------------------------------------
+    /**
+     * Reports whether the private key [keyHandle] names can leave the store
+     * this adapter holds it in.
+     *
+     * A [CustodyType.HARDWARE] key answers `false`:
+     * [KeystoreKeyOps.generateEd25519] generates it inside the TEE, and
+     * [exportSigningKeyBytes] throws
+     * `SCP-CRYPTO-4005` for it because the TEE releases no private bytes.
+     *
+     * A [CustodyType.SOFTWARE] key answers `true`: Bouncy Castle holds it in
+     * [softwareKeys], and [exportSigningKeyBytes] returns a copy of its 32-byte
+     * seed.
+     *
+     * One of the two facts a DID document publishes about custody (§3.2.2 of
+     * the identity spec).
+     *
+     * The hardware answer reads [KeyHandle.custodyType] and does not consult
+     * Android Keystore, because every TEE key this adapter generates is
+     * non-extractable and [exportSigningKeyBytes] refuses the same handle
+     * whether or not the alias still exists. The software answer does consult
+     * [softwareKeys], because that map is where a software key's
+     * extractability lives.
+     *
+     * @param keyHandle Handle returned by [generateKeypair] or
+     *   [derivePseudonym].
+     * @return `false` for a TEE-backed key, `true` for a Bouncy Castle key.
+     * @throws ScpException with code `SCP-CRYPTO-4001` if this adapter holds no
+     *   software key for [keyHandle] and the handle does not name a TEE key.
+     */
+    override fun keyIsExtractable(keyHandle: KeyHandle): Boolean {
+        if (keyHandle.custodyType == CustodyType.HARDWARE) {
+            return false
+        }
+        if (!softwareKeys.containsKey(keyHandle.id)) {
+            throw ScpException(
+                "Key not found: ${keyHandle.id}",
+                "SCP-CRYPTO-4001",
+            )
+        }
+        return true
+    }
+
+    /**
+     * Reports which factor unlocks the key [keyHandle] names.
+     *
+     * This adapter answers `"unprotected"` for every key it holds, because no
+     * user factor gates either store it writes to.
+     * [KeystoreKeyOps.generateEd25519] builds its `KeyGenParameterSpec` with
+     * `setUserAuthenticationRequired(false)`, so the TEE signs without a
+     * biometric reading, a PIN, or a passcode. The Bouncy Castle seeds live in
+     * [encryptedPrefs], whose production constructor derives the master key
+     * from `MasterKeys.AES256_GCM_SPEC`, a spec that requires no user
+     * authentication either.
+     *
+     * §3.2.2 of the identity spec states that a backend reporting a pair the
+     * published vocabulary states no value for "publishes no custody
+     * attestation at all", and neither (non-extractable, unprotected) nor
+     * (extractable, unprotected) is a pair that vocabulary states.
+     *
+     * @param keyHandle Handle returned by [generateKeypair] or
+     *   [derivePseudonym].
+     * @return `"unprotected"`.
+     * @throws ScpException with code `SCP-CRYPTO-4001` if this adapter holds no
+     *   software key for [keyHandle] and the handle does not name a TEE key.
+     */
+    override fun unlockFactor(keyHandle: KeyHandle): String {
+        if (keyHandle.custodyType != CustodyType.HARDWARE &&
+            !softwareKeys.containsKey(keyHandle.id)
+        ) {
+            throw ScpException(
+                "Key not found: ${keyHandle.id}",
+                "SCP-CRYPTO-4001",
+            )
+        }
+        return "unprotected"
+    }
+
+    companion object {
+        /** Filename for the EncryptedSharedPreferences storing software Ed25519 keys. */
+        internal const val PREFS_FILENAME = "scp_key_custody"
+    }
+}
+
+/**
+ * Android Keystore (TEE) key operations for [AndroidKeyCustody].
+ *
+ * Manages Ed25519 keys the Trusted Execution Environment holds, which Android
+ * Keystore supports from API 33 onward. The private key is generated inside the TEE
+ * and never leaves it, so every operation here dispatches into the TEE rather than
+ * touching key bytes.
+ *
+ * Extracted from [AndroidKeyCustody] alongside [SoftwareKeyOps], for the same reason:
+ * it keeps the parent class focused on routing between hardware and software custody
+ * while respecting function count limits.
+ */
+internal class KeystoreKeyOps {
 
     /**
      * Generates a TEE-backed Ed25519 keypair using Android Keystore.
@@ -591,7 +692,7 @@ class AndroidKeyCustody internal constructor(
      * to sign messages during relay connections and message processing without user
      * interaction.
      */
-    private fun generateKeystoreEd25519(keyId: String): KeyHandle {
+    fun generateEd25519(keyId: String): KeyHandle {
         val keystoreAlias = "scp.key.$keyId"
         val spec = KeyGenParameterSpec.Builder(
             keystoreAlias,
@@ -613,7 +714,7 @@ class AndroidKeyCustody internal constructor(
      * The signing operation happens entirely inside the TEE — the private key bytes
      * never leave hardware.
      */
-    private fun signWithKeystore(keyHandle: KeyHandle, data: ByteArray): ByteArray {
+    fun sign(keyHandle: KeyHandle, data: ByteArray): ByteArray {
         val keystoreAlias = "scp.key.${keyHandle.id}"
         val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         val entry = keyStore.getEntry(keystoreAlias, null) as? KeyStore.PrivateKeyEntry
@@ -634,7 +735,7 @@ class AndroidKeyCustody internal constructor(
      * For Ed25519, the raw 32-byte key is the last 32 bytes of the encoded form
      * (the first 12 bytes are the ASN.1 header: SEQUENCE + OID for Ed25519).
      */
-    private fun publicKeyFromKeystore(keyHandle: KeyHandle): ByteArray {
+    fun publicKey(keyHandle: KeyHandle): ByteArray {
         val keystoreAlias = "scp.key.${keyHandle.id}"
         val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         val entry = keyStore.getEntry(keystoreAlias, null) as? KeyStore.PrivateKeyEntry
@@ -662,7 +763,7 @@ class AndroidKeyCustody internal constructor(
      * Returns [DestructionMethod.HARDWARE] because the key material resided in the TEE
      * and was destroyed by the hardware security module.
      */
-    private fun destroyKeystoreKey(keyHandle: KeyHandle): DestructionAttestation {
+    fun destroy(keyHandle: KeyHandle): DestructionAttestation {
         val keystoreAlias = "scp.key.${keyHandle.id}"
         val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
 
@@ -693,11 +794,11 @@ class AndroidKeyCustody internal constructor(
         /** Raw Ed25519 public key size in bytes. */
         private const val RAW_ED25519_KEY_SIZE = 32
 
-        /** X.509 SubjectPublicKeyInfo encoding size for Ed25519 (RFC 8410 §3): 12-byte ASN.1 header + 32-byte key. */
+        /**
+         * X.509 SubjectPublicKeyInfo encoding size for Ed25519 (RFC 8410 §3):
+         * 12-byte ASN.1 header + 32-byte key.
+         */
         private const val X509_ED25519_SPKI_SIZE = 44
-
-        /** Filename for the EncryptedSharedPreferences storing software Ed25519 keys. */
-        internal const val PREFS_FILENAME = "scp_key_custody"
     }
 }
 

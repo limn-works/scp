@@ -124,16 +124,19 @@ interface IdentityBindings {
      * Generates a new `did:dht` identity backed by the given custody type.
      * The returned handle retains key material for the identity's lifetime.
      *
-     * @param custody Key custody method. The bridge builds a key store for
-     *   `"in_memory"` (dev/test only, feature-gated) and for no other string.
-     *   Reach Secure Enclave or Android Keystore by injecting a
-     *   `KeyCustodyProvider` through `identityCreateWithCustody`, not by
-     *   naming a custody string.
+     * @param custody Key custody method. §3.2.2 of the identity spec, "The
+     *   Custody Vocabulary", states two values: `"encrypted_file"` selects the
+     *   on-disk key store SCP implements, and `"os_keystore"` selects the
+     *   operating system's own key store, which SCP reaches through a
+     *   `KeyCustodyProvider` an SDK consumer injects through
+     *   `identityCreateWithCustody`.
      * @return Opaque identity handle for use in subsequent operations.
-     * @throws BridgeException with `SCP-IDENT-1008` if `"in_memory"` is requested
-     *   but the `testing` feature is not enabled, with `SCP-IDENT-1003` for
-     *   `"platform"` or `"software"`, which reach no key store on any bridge,
-     *   and with `SCP-VALID-7005` for every other string.
+     * @throws BridgeException with `SCP-IDENT-1003` for `"os_keystore"` when
+     *   the caller supplied no provider, with `SCP-IDENT-1008` for the raw
+     *   test-harness string `"in_memory"` on a build without the bridge's
+     *   `testing` cargo feature, and with `SCP-VALID-7005` for every other
+     *   string, `"platform"`, `"software"`, `"file"`, `"platform_managed"`,
+     *   and `"hardware"` included.
      */
     fun identityCreate(custody: String): Long
 
@@ -1512,13 +1515,12 @@ class IdentityBridge internal constructor(
      * key store holds a private key decides who can reach that key, so a
      * default would pick a security-relevant answer the caller never stated.
      * This method sends [works.limn.scp.CustodyType.rawValue] to the UniFFI
-     * bridge, so the compiler rejects a custody string the bridge does not
-     * name. The bridge builds a key store for
-     * [works.limn.scp.CustodyType.IN_MEMORY] alone, and it answers
-     * [works.limn.scp.CustodyType.PLATFORM] and
-     * [works.limn.scp.CustodyType.SOFTWARE] with `SCP-IDENT-1003`; inject a
-     * `KeyCustodyProvider` through `identityCreateWithCustody` to reach
-     * Android Keystore.
+     * bridge, so the compiler rejects a custody value the vocabulary does not
+     * state. The bridge builds a key store for
+     * [works.limn.scp.CustodyType.ENCRYPTED_FILE], and it answers
+     * [works.limn.scp.CustodyType.OS_KEYSTORE] with `SCP-IDENT-1003` because
+     * this path supplies no provider; inject a `KeyCustodyProvider` through
+     * `identityCreateWithCustody` to reach Android Keystore.
      *
      * @param custody Key custody method.
      * @return Opaque identity handle for use in subsequent operations.

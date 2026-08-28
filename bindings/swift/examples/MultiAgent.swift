@@ -66,9 +66,9 @@ struct MultiAgent {
         let scp = try SCP(storage: .inMemory)
         defer { Task { try? await scp.shutdown(timeout: 5) } }
 
-        let coordinator = try await scp.identityCreate(custody: .inMemory)
-        let agentA = try await scp.identityCreate(custody: .inMemory)
-        let agentB = try await scp.identityCreate(custody: .inMemory)
+        let coordinator = try await scp.identityCreate(custody: .encryptedFile)
+        let agentA = try await scp.identityCreate(custody: .encryptedFile)
+        let agentB = try await scp.identityCreate(custody: .encryptedFile)
 
         let params = ContextParams(
             mode: .encrypted,

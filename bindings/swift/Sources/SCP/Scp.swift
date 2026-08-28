@@ -736,19 +736,53 @@ public extension SCP {
     /// store holds a private key decides who can reach that key, so a default
     /// would pick a security-relevant answer the caller never stated. This
     /// method sends ``CustodyType/rawValue`` to the UniFFI bridge, so the
-    /// compiler rejects a custody string the bridge does not name.
+    /// compiler rejects a custody value the vocabulary does not state.
     ///
     /// `testingSeed` is a testing-only parameter for the ADR-046
-    /// cross-bridge parity harness; pass `nil` from production callers
-    /// (the `testing` in-memory path uses OS RNG when
-    /// `testingSeed` is `nil`). A non-`nil` `testingSeed` is only valid
-    /// for `custody == .inMemory`. The UniFFI bridge judges the custody
-    /// name before the seed, so every other custody name reports that
-    /// name's own code — `SCP-IDENT-1003` for ``CustodyType/platform`` and
-    /// ``CustodyType/software`` — and this bridge emits no
-    /// `SCP-VALID-7009`.
+    /// cross-bridge parity harness; pass `nil` from production callers. A
+    /// non-`nil` `testingSeed` is only valid alongside the raw test-harness
+    /// custody string `"in_memory"`, which ``CustodyType`` does not spell, so
+    /// a caller reaching this method with a ``CustodyType`` passes `nil`. The
+    /// UniFFI bridge judges the custody value before the seed, so
+    /// ``CustodyType/osKeystore`` reports its own `SCP-IDENT-1003` and this
+    /// bridge emits no `SCP-VALID-7009`.
+    ///
+    /// A test that needs the in-memory key store calls
+    /// ``Scp/identityCreate(custody:testingSeed:)`` on ``inner`` with the raw
+    /// string, which is what section 3.2.2 of the identity spec states a test
+    /// does: "a test that needs it passes the raw string to the bridge".
     func identityCreate(custody: CustodyType, testingSeed: Data? = nil) async throws -> Identity {
         try await inner.identityCreate(custody: custody.rawValue, testingSeed: testingSeed)
+    }
+
+    /// Returns the custody value a DID document publishes for `did`.
+    ///
+    /// Section 3.2.2 of the identity spec, "The Custody Vocabulary", separates
+    /// two vocabularies. A caller selecting custody names a backend, which is
+    /// what ``CustodyType`` carries. A DID document publishes whether the key
+    /// can leave its store and which factor unlocks it, which is what this
+    /// method returns: `"non-extractable-biometric"`,
+    /// `"non-extractable-pin"`, or `"extractable-passphrase"`.
+    ///
+    /// Returns `nil` when the backend holding the `#active` key reports a pair
+    /// the published vocabulary states no value for. ADR-039's Enforcement
+    /// Stack layer 4 gives that absence a meaning, "Absence of attestation is
+    /// itself a signal".
+    ///
+    /// The bridge derives the value from the running backend, so a participant
+    /// cannot publish a custody they do not run. A `KeyCustodyProvider` passed
+    /// to ``identityCreateWithCustody(provider:)`` answers both questions
+    /// through its `keyIsExtractable` and `unlockFactor` methods.
+    /// ``AppleKeyCustody`` answers the same two questions with its own method
+    /// signatures, which that method cannot reach until an adapter lands — the
+    /// Swift README's "Key custody" section states why.
+    ///
+    /// - Throws: ``ScpError`` when `did` is not a syntactically valid DID, and
+    ///   ``ScpError`` carrying `SCP-IDENT-1017` when this instance retains no
+    ///   custody for `did` or the injected provider throws while answering
+    ///   either question.
+    func identityPublishedCustody(did: String) async throws -> String? {
+        try await inner.identityPublishedCustody(did: did)
     }
 
     /// Forwards to ``Scp/identityCreateLinkAttestation`` on ``inner``.
@@ -763,7 +797,7 @@ public extension SCP {
     /// store holds a private key decides who can reach that key, so a default
     /// would pick a security-relevant answer the caller never stated. This
     /// method sends ``CustodyType/rawValue`` to the UniFFI bridge, so the
-    /// compiler rejects a custody string the bridge does not name.
+    /// compiler rejects a custody value the vocabulary does not state.
     func identityCreateWithAgentKey(custody: CustodyType) async throws -> Identity {
         try await inner.identityCreateWithAgentKey(custody: custody.rawValue)
     }

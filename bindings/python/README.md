@@ -20,12 +20,12 @@ from scp_sdk.types import CustodyType
 
 async def main():
     with SCP(storage={"type": "in_memory"}) as scp:
-        # Create a cryptographic identity (DID). CustodyType.FILE writes an
+        # Create a cryptographic identity (DID). CustodyType.ENCRYPTED_FILE writes an
         # encrypted key file to $HOME/.scp/keys.bin; export SCP_KEY_PASSPHRASE
         # before this call or the bridge raises ValidationError. On a shipped
         # build this call raises SCP-IDENT-1059 -- read "No shipped build
         # creates an identity yet" below before you run it.
-        identity = await scp.identity_create(CustodyType.FILE)
+        identity = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
         print(f"DID: {identity.did}")
 
         # Create an encrypted context
@@ -50,26 +50,47 @@ asyncio.run(main())
 ## Key custody
 
 `identity_create` takes a `CustodyType` or the string it spells, and carries no
-default, so a caller names the key store and this SDK names none for them. A
-shipped PyO3 build accepts one
-of them: `CustodyType.FILE` (`"file"`) builds a `FileKeyCustody` that derives
-the file key with Argon2id and encrypts `$HOME/.scp/keys.bin` with AES-256-GCM.
-`CustodyType.IN_MEMORY` (`"in_memory"`) compiles only under the bridge's
-`testing` feature, so a shipped build raises `IdentityError` with code
-`SCP-IDENT-1008`. Every other string, `"platform"` and `"software"` included,
-raises an error: `"platform"` raises `IdentityError` with code `SCP-IDENT-1003`,
-and an unrecognised string raises `ValidationError` with code `SCP-VALID-7005`.
+default, so a caller names the key store and this SDK names none for them.
+Section 3.2.2 of the identity spec, "The Custody Vocabulary", states the two
+values `CustodyType` carries. `CustodyType.ENCRYPTED_FILE` (`"encrypted_file"`)
+selects the on-disk key store SCP implements, which derives the file key with
+Argon2id and encrypts `$HOME/.scp/keys.bin` with AES-256-GCM.
+`CustodyType.OS_KEYSTORE` (`"os_keystore"`) selects the operating system's own
+key store, which SCP reaches through the platform key-custody callback you
+supply. Every other string raises `ValidationError` with code
+`SCP-VALID-7005`, and that includes `"platform"`, `"software"`, `"file"`,
+`"platform_managed"`, and `"hardware"`.
 
-No custody string reaches Apple Keychain or Android Keystore. To store keys in
-a platform-native key store, implement `scp_sdk.scp.KeyCustodyProvider` over that
-key store and pass it to `scp.identity_create_with_custody(provider)`. That
-method is where a real platform backend lands, and it is the only entry point
-that takes an injected provider.
+`identity_create(CustodyType.OS_KEYSTORE)` raises `IdentityError` with code
+`SCP-IDENT-1003`, because that call supplies no provider and the bridge falls
+back to neither the encrypted key file nor an in-memory store. To store keys in
+a platform-native key store, implement `scp_sdk.scp.KeyCustodyProvider` over
+that key store and pass it to `scp.identity_create_with_custody(provider)`.
+That method is where a real platform backend lands, and it is the only entry
+point that takes an injected provider.
+
+A build carrying the bridge's `testing` cargo feature additionally accepts the
+raw string `"in_memory"`, which reaches the test-only in-memory key store. No
+`CustodyType` member spells it, a test that needs it passes the raw string, and
+a shipped build raises `IdentityError` with code `SCP-IDENT-1008`.
+
+## What a DID document publishes about custody
+
+`scp.identity_published_custody(did)` returns what a stranger reading that
+DID document learns about custody, which section 3.2.2 states is whether the
+key can leave its store and which factor unlocks it:
+`"non-extractable-biometric"`, `"non-extractable-pin"`, or
+`"extractable-passphrase"`. It returns `None` when the backend holding the
+`#active` key reports a pair the published vocabulary states no value for.
+The bridge derives the value from the running backend, so a participant cannot
+publish a custody they do not run: `KeyCustodyProvider.key_is_extractable` and
+`KeyCustodyProvider.unlock_factor` answer the two questions for an injected
+provider, and the encrypted key file answers them for itself.
 
 ## No shipped build creates an identity yet
 
 `identity_create_with_custody` raises `IdentityError` with code
-`SCP-IDENT-1059` on every shipped build, and `identity_create(CustodyType.FILE)`
+`SCP-IDENT-1059` on every shipped build, and `identity_create(CustodyType.ENCRYPTED_FILE)`
 raises it too once `SCP_KEY_PASSPHRASE` is set. Section 9.7.4.1 of the security
 model, pre-rotation key custody, makes every identity commit a pre-rotation
 commitment when it is created. That commitment needs a `PreRotationCustody`
@@ -82,8 +103,8 @@ real backend out of its own scope. Every code example above therefore runs
 against a wheel built with the `testing` feature.
 
 Two separate gaps produce those codes, and closing one does not close the
-other. `SCP-IDENT-1003` and `SCP-IDENT-1008` say that the custody string you
-passed names no key store this bridge builds. `SCP-IDENT-1059` says that no
+other. `SCP-IDENT-1003`, `SCP-IDENT-1008`, and `SCP-VALID-7005` say that the
+custody value you passed names no key store this bridge builds. `SCP-IDENT-1059` says that no
 pre-rotation custody backend exists for any create path to use. A wired
 platform provider clears the first gap; a real pre-rotation backend clears the
 second.

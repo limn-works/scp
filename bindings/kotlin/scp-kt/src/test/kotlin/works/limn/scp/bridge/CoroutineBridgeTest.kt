@@ -62,10 +62,10 @@ class CoroutineBridgeTest {
         fun `identityCreate dispatches on IO and returns handle`() =
             runTest(ioDispatcher) {
                 stubBindings.identityCreateResult = 42L
-                val result = bridge.identity.create(CustodyType.IN_MEMORY)
+                val result = bridge.identity.create(CustodyType.ENCRYPTED_FILE)
                 assertEquals(42L, result)
                 assertTrue(stubBindings.identityCreateCalled)
-                assertEquals("in_memory", stubBindings.lastCustody)
+                assertEquals("encrypted_file", stubBindings.lastCustody)
             }
 
         @Test
@@ -506,7 +506,7 @@ class CoroutineBridgeTest {
 
                 assertFailsWith<CancellationException> {
                     kotlinx.coroutines.withContext(job) {
-                        bridge.identity.create(CustodyType.IN_MEMORY)
+                        bridge.identity.create(CustodyType.ENCRYPTED_FILE)
                     }
                 }
             }
@@ -821,7 +821,7 @@ class CoroutineBridgeTest {
 
                 val exception =
                     assertFailsWith<BridgeException> {
-                        bridge.identity.create(CustodyType.IN_MEMORY)
+                        bridge.identity.create(CustodyType.ENCRYPTED_FILE)
                     }
 
                 assertEquals("SCP-IDENT-1001", exception.code)

@@ -556,6 +556,57 @@
             #expect(custodyBio.custodyType("any-handle") == "software_biometric")
         }
 
+        // MARK: - The two facts a DID document publishes about custody
+
+        /// Every key this adapter holds can leave the Keychain, because
+        /// `exportSigningKeyBytes` reads the raw private-key bytes and returns a
+        /// copy of them. The Secure Enclave, which holds a key
+        /// non-extractably, generates P-256 keys only, and SCP signs with
+        /// Ed25519.
+        @Test("keyIsExtractable reports true under BiometricPolicy.none")
+        func keyIsExtractableUnderNoBiometricPolicy() async throws {
+            let custodyNone = AppleKeyCustody(accessGroup: nil, biometricPolicy: .none)
+            let handle = try await custodyNone.generateKeypair(keyType: "ed25519")
+            #expect(try custodyNone.keyIsExtractable(handle))
+            try await custodyNone.destroyKey(handle)
+        }
+
+        /// `keyIsExtractable` reads Keychain attributes only, so an unknown
+        /// handle throws rather than reporting a value the adapter cannot read.
+        @Test("keyIsExtractable throws for a handle the Keychain does not hold")
+        func keyIsExtractableThrowsForUnknownHandle() throws {
+            let custodyNone = AppleKeyCustody(accessGroup: nil, biometricPolicy: .none)
+            #expect(throws: PlatformError.self) {
+                _ = try custodyNone.keyIsExtractable("scp.test.handle-that-does-not-exist")
+            }
+        }
+
+        /// Under `BiometricPolicy.none` the Keychain item carries
+        /// `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` and no access
+        /// control. No artifact states which factor that protection class
+        /// means — the device passcode (`"passphrase"`) or nothing at all
+        /// (`"unprotected"`) — and the two publish different values, so the
+        /// adapter answers `"caller_supplied_key"`, which publishes nothing,
+        /// while the question is open.
+        @Test("unlockFactor reports caller_supplied_key under BiometricPolicy.none")
+        func unlockFactorUnderNoBiometricPolicy() async throws {
+            let custodyNone = AppleKeyCustody(accessGroup: nil, biometricPolicy: .none)
+            let handle = try await custodyNone.generateKeypair(keyType: "ed25519")
+            #expect(try custodyNone.unlockFactor(handle) == "caller_supplied_key")
+            try await custodyNone.destroyKey(handle)
+        }
+
+        /// `unlockFactor` reads Keychain attributes only, so an unknown handle
+        /// throws rather than reporting the instance's policy for a key the
+        /// adapter does not hold.
+        @Test("unlockFactor throws for a handle the Keychain does not hold")
+        func unlockFactorThrowsForUnknownHandle() throws {
+            let custodyBio = AppleKeyCustody(accessGroup: nil, biometricPolicy: .required)
+            #expect(throws: PlatformError.self) {
+                _ = try custodyBio.unlockFactor("scp.test.handle-that-does-not-exist")
+            }
+        }
+
         // MARK: - BiometricPolicy.required creates biometric-gated keys
 
         /// Whether the Keychain supports biometric-protected items in this
@@ -624,6 +675,27 @@
             }
 
             // Cleanup
+            try await custodyBio.destroyKey(handle)
+        }
+
+        /// Under `BiometricPolicy.required` the adapter names the factor:
+        /// `storePrivateKeyBytes` creates the item with a `SecAccessControl`
+        /// carrying `.biometryCurrentSet`, so Face ID or Touch ID authenticates
+        /// before the Keychain releases key material. The key still leaves the
+        /// store once that authentication succeeds, so `keyIsExtractable`
+        /// answers `true` here too, and section 3.2.2 of the identity spec
+        /// states no published value for that pair.
+        @Test(
+            "BiometricPolicy.required reports an extractable key behind a biometric factor",
+            .enabled(if: biometricKeychainAvailable, "Requires Keychain biometric entitlements")
+        )
+        func biometricRequiredReportsBiometricUnlockFactor() async throws {
+            let custodyBio = AppleKeyCustody(accessGroup: nil, biometricPolicy: .required)
+            let handle = try await custodyBio.generateKeypair(keyType: "ed25519")
+
+            #expect(try custodyBio.unlockFactor(handle) == "biometric")
+            #expect(try custodyBio.keyIsExtractable(handle))
+
             try await custodyBio.destroyKey(handle)
         }
 

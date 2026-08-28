@@ -816,12 +816,15 @@ public protocol IdentityProtocol: AnyObject, Sendable {
     func addAgentKey() async throws  -> Identity
     
     /**
-     * Returns the custody method string for this identity.
+     * Returns the custody value this identity's key material sits under.
      *
-     * One of: `"in_memory"`, `"callback"`, `"external"`. `"callback"` names an
-     * identity whose key material a caller-injected `KeyCustodyProvider`
-     * holds; the `PyO3` and napi bridges report the same string for the same
-     * custody, so one name carries one meaning across all three bridges.
+     * One of: `"encrypted_file"`, `"os_keystore"`, `"in_memory"`, and
+     * `"external"`. §3.2.2 of the identity spec gives a caller the first two;
+     * `"in_memory"` names the test-harness backend that spec calls a test
+     * affordance rather than a value of the vocabulary, and `"external"` names
+     * a handle `identity_load` produced from a DID string with no key
+     * material. The `PyO3` and napi bridges report the same string for the
+     * same backend, so one name carries one meaning across all three bridges.
      */
     func custodyType()  -> String
     
@@ -1048,12 +1051,15 @@ open func addAgentKey()async throws  -> Identity  {
 }
     
     /**
-     * Returns the custody method string for this identity.
+     * Returns the custody value this identity's key material sits under.
      *
-     * One of: `"in_memory"`, `"callback"`, `"external"`. `"callback"` names an
-     * identity whose key material a caller-injected `KeyCustodyProvider`
-     * holds; the `PyO3` and napi bridges report the same string for the same
-     * custody, so one name carries one meaning across all three bridges.
+     * One of: `"encrypted_file"`, `"os_keystore"`, `"in_memory"`, and
+     * `"external"`. §3.2.2 of the identity spec gives a caller the first two;
+     * `"in_memory"` names the test-harness backend that spec calls a test
+     * affordance rather than a value of the vocabulary, and `"external"` names
+     * a handle `identity_load` produced from a DID string with no key
+     * material. The `PyO3` and napi bridges report the same string for the
+     * same backend, so one name carries one meaning across all three bridges.
      */
 open func custodyType() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
@@ -2614,12 +2620,21 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * initialization, handle `instance_id` stamping) is scoped to this
      * `SCP`.
      *
+     * `custody` is one of the two values §3.2.2 of the identity spec gives a
+     * caller. `"encrypted_file"` selects an Argon2id + AES-256-GCM key file at
+     * `$HOME/.scp/keys.bin`. `"os_keystore"` selects the operating system's
+     * own key store, which this method reaches through no provider, so it
+     * returns `SCP-IDENT-1003`; call `identity_create_with_custody` and pass a
+     * `KeyCustodyProvider` backed by the Apple Keychain or the Android
+     * Keystore instead.
+     *
      * When `testing_seed` is supplied (32 bytes), the in-memory custody
      * is backed by a deterministic RNG so subsequent `generate_keypair`
      * calls produce byte-identical Ed25519 keys across bridges — the
      * basis of the cross-bridge parity test (ADR-046). `testing_seed`
-     * is only valid for `"in_memory"` custody, and `parse_custody_method`
-     * rejects every other custody string before this method reads the seed.
+     * is only valid for `"in_memory"` custody, which a build carrying the
+     * `testing` cargo feature accepts, and `build_key_custody` judges the
+     * custody name before it reads the seed.
      */
     func identityCreate(custody: String, testingSeed: Data?) async throws  -> Identity
     
@@ -2642,6 +2657,12 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Creates a new SCP identity with an agent signing key. Routes through
      * `&*self.inner` so the returned `Identity`'s `instance_id` is stamped
      * against this `SCP`.
+     *
+     * It takes the same two custody values `identity_create` takes, and
+     * `"os_keystore"` fails closed with `SCP-IDENT-1003` for the same reason:
+     * this method supplies no `KeyCustodyProvider`. Call
+     * `identity_create_with_custody`, then `add_agent_key`, to give an
+     * injected-custody identity an agent key.
      */
     func identityCreateWithAgentKey(custody: String) async throws  -> Identity
     
@@ -2653,6 +2674,11 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * [`KeyCustodyProvider`](crate::KeyCustodyProvider). Routes through
      * `&*self.inner` — the handle's `instance_id` is stamped against this
      * `SCP` so cross-instance misuse is rejected.
+     *
+     * The identity this method creates reports the custody value
+     * `"os_keystore"`, which §3.2.2 of the identity spec gives the operating
+     * system's own key store, and the `PyO3` and napi bridges report the same
+     * string for the same backend.
      *
      * See SCP-214 acceptance criteria 2-3.
      */
@@ -2708,6 +2734,37 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * `SCP`'s.
      */
     func identityMigrate(identity: Identity) async throws  -> Identity
+    
+    /**
+     * Returns the custody value a DID document publishes for this identity's
+     * `#active` signing key, and `None` when the backend holding that key
+     * reports a pair the published vocabulary states no value for.
+     *
+     * §3.2.2 of the identity spec separates two vocabularies. A caller
+     * selecting custody names a backend, which is what `custody` on
+     * `identity_create` carries. A DID document publishes whether the key can
+     * leave its store and which factor unlocks it, which is what this method
+     * returns: `"non-extractable-biometric"`, `"non-extractable-pin"`, or
+     * `"extractable-passphrase"`.
+     *
+     * The value is derived, never declared. This method reads it off the
+     * running backend — the encrypted key file answers for itself, and a
+     * caller-injected `KeyCustodyProvider` answers through its
+     * `key_is_extractable` and `unlock_factor` methods — so a participant
+     * cannot publish a custody they do not run.
+     *
+     * Returns `None` when the backend reports a pair §3.2.2 states no value
+     * for. ADR-039's Enforcement Stack layer 4 gives that absence a meaning,
+     * "Absence of attestation is itself a signal".
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Validation` when `did` is not a syntactically valid
+     * DID, and `ScpError::Identity` when the DID has no retained state on this
+     * instance or the injected provider returns an error while answering
+     * either question.
+     */
+    func identityPublishedCustody(did: String) async throws  -> String?
     
     /**
      * Removes a DID from this instance's SCP-side identity registry.
@@ -5372,12 +5429,21 @@ open func identityAttestDevice(identity: Identity)async throws  -> String  {
      * initialization, handle `instance_id` stamping) is scoped to this
      * `SCP`.
      *
+     * `custody` is one of the two values §3.2.2 of the identity spec gives a
+     * caller. `"encrypted_file"` selects an Argon2id + AES-256-GCM key file at
+     * `$HOME/.scp/keys.bin`. `"os_keystore"` selects the operating system's
+     * own key store, which this method reaches through no provider, so it
+     * returns `SCP-IDENT-1003`; call `identity_create_with_custody` and pass a
+     * `KeyCustodyProvider` backed by the Apple Keychain or the Android
+     * Keystore instead.
+     *
      * When `testing_seed` is supplied (32 bytes), the in-memory custody
      * is backed by a deterministic RNG so subsequent `generate_keypair`
      * calls produce byte-identical Ed25519 keys across bridges — the
      * basis of the cross-bridge parity test (ADR-046). `testing_seed`
-     * is only valid for `"in_memory"` custody, and `parse_custody_method`
-     * rejects every other custody string before this method reads the seed.
+     * is only valid for `"in_memory"` custody, which a build carrying the
+     * `testing` cargo feature accepts, and `build_key_custody` judges the
+     * custody name before it reads the seed.
      */
 open func identityCreate(custody: String, testingSeed: Data?)async throws  -> Identity  {
     return
@@ -5430,6 +5496,12 @@ open func identityCreateLinkAttestation(identity: Identity, platform: String, ha
      * Creates a new SCP identity with an agent signing key. Routes through
      * `&*self.inner` so the returned `Identity`'s `instance_id` is stamped
      * against this `SCP`.
+     *
+     * It takes the same two custody values `identity_create` takes, and
+     * `"os_keystore"` fails closed with `SCP-IDENT-1003` for the same reason:
+     * this method supplies no `KeyCustodyProvider`. Call
+     * `identity_create_with_custody`, then `add_agent_key`, to give an
+     * injected-custody identity an agent key.
      */
 open func identityCreateWithAgentKey(custody: String)async throws  -> Identity  {
     return
@@ -5456,6 +5528,11 @@ open func identityCreateWithAgentKey(custody: String)async throws  -> Identity  
      * [`KeyCustodyProvider`](crate::KeyCustodyProvider). Routes through
      * `&*self.inner` — the handle's `instance_id` is stamped against this
      * `SCP` so cross-instance misuse is rejected.
+     *
+     * The identity this method creates reports the custody value
+     * `"os_keystore"`, which §3.2.2 of the identity spec gives the operating
+     * system's own key store, and the `PyO3` and napi bridges report the same
+     * string for the same backend.
      *
      * See SCP-214 acceptance criteria 2-3.
      */
@@ -5575,6 +5652,52 @@ open func identityMigrate(identity: Identity)async throws  -> Identity  {
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
             liftFunc: FfiConverterTypeIdentity_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Returns the custody value a DID document publishes for this identity's
+     * `#active` signing key, and `None` when the backend holding that key
+     * reports a pair the published vocabulary states no value for.
+     *
+     * §3.2.2 of the identity spec separates two vocabularies. A caller
+     * selecting custody names a backend, which is what `custody` on
+     * `identity_create` carries. A DID document publishes whether the key can
+     * leave its store and which factor unlocks it, which is what this method
+     * returns: `"non-extractable-biometric"`, `"non-extractable-pin"`, or
+     * `"extractable-passphrase"`.
+     *
+     * The value is derived, never declared. This method reads it off the
+     * running backend — the encrypted key file answers for itself, and a
+     * caller-injected `KeyCustodyProvider` answers through its
+     * `key_is_extractable` and `unlock_factor` methods — so a participant
+     * cannot publish a custody they do not run.
+     *
+     * Returns `None` when the backend reports a pair §3.2.2 states no value
+     * for. ADR-039's Enforcement Stack layer 4 gives that absence a meaning,
+     * "Absence of attestation is itself a signal".
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Validation` when `did` is not a syntactically valid
+     * DID, and `ScpError::Identity` when the DID has no retained state on this
+     * instance or the injected provider returns an error while answering
+     * either question.
+     */
+open func identityPublishedCustody(did: String)async throws  -> String?  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_identity_published_custody(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(did)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionString.lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
 }
@@ -13171,9 +13294,21 @@ extension ContextState: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
- * The custody method used to protect an identity's private key.
+ * Which key-material path this bridge took for one identity.
  *
- * See ADR-006 (Platform Abstraction) and `scp_platform::CustodyType`.
+ * The enum reports a bridge path, not a storage substrate.
+ * `build_key_custody` returns `EncryptedFile` for the custody value
+ * `"encrypted_file"` and `InMemory` for the test-harness string `"in_memory"`,
+ * `identity_create_with_custody` returns `Callback` for an identity bound to a
+ * caller-injected `KeyCustodyProvider`, and `identity_load` returns `External`
+ * for an identity that carries a DID string and no key material. A provider
+ * reports the substrate holding its keys through `KeyCustody::custody_type`,
+ * which returns `scp_platform::CustodyType`; that enum names `InMemory`,
+ * `Hardware`, and `Software`, and this enum names none of the three.
+ *
+ * [`Identity::custody_type`] maps each variant onto the custody value §3.2.2
+ * of the identity spec states, so a Swift or Kotlin caller reading that string
+ * reads the same value the `PyO3` and napi bridges report.
  */
 
 public enum CustodyMethod {
@@ -13183,8 +13318,15 @@ public enum CustodyMethod {
      */
     case inMemory
     /**
+     * Key material held in the encrypted key file §3.2.2 of the identity spec
+     * names `encrypted_file`: Argon2id derives an AES-256 key from the
+     * caller's passphrase, and each key entry is encrypted under AES-256-GCM.
+     */
+    case encryptedFile
+    /**
      * Key material held by the caller-injected `KeyCustodyProvider` that
-     * `Scp::identity_create_with_custody` binds to the identity.
+     * `Scp::identity_create_with_custody` binds to the identity. §3.2.2 of the
+     * identity spec names the value that selects it `os_keystore`.
      *
      * The variant names the injection, not the substrate. The bridge never
      * sees what stores the key, so the provider reports its own substrate
@@ -13218,9 +13360,11 @@ public struct FfiConverterTypeCustodyMethod: FfiConverterRustBuffer {
         
         case 1: return .inMemory
         
-        case 2: return .callback
+        case 2: return .encryptedFile
         
-        case 3: return .external
+        case 3: return .callback
+        
+        case 4: return .external
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -13234,12 +13378,16 @@ public struct FfiConverterTypeCustodyMethod: FfiConverterRustBuffer {
             writeInt(&buf, Int32(1))
         
         
-        case .callback:
+        case .encryptedFile:
             writeInt(&buf, Int32(2))
         
         
-        case .external:
+        case .callback:
             writeInt(&buf, Int32(3))
+        
+        
+        case .external:
+            writeInt(&buf, Int32(4))
         
         }
     }
@@ -14694,8 +14842,47 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
     /**
      * Return the custody type for `key_id`: `"hardware"`, `"software"`, or
      * `"in_memory"`. Stays sync — no I/O required.
+     *
+     * The three values name a storage location, which
+     * `scp_platform::CustodyType` consumes. What a DID document publishes
+     * about custody is a different pair of questions, and
+     * [`Self::key_is_extractable`] and [`Self::unlock_factor`] answer those.
      */
     func custodyType(keyId: String)  -> String
+    
+    /**
+     * Return whether the private key `key_id` names can leave the store this
+     * provider holds it in.
+     *
+     * One of the two facts a DID document publishes about custody (§3.2.2 of
+     * the identity spec). Stays sync: an Apple adapter reads
+     * `kSecAttrIsExtractable` through `SecItemCopyMatching`, and an Android
+     * adapter reads `KeyInfo`, both of which are synchronous platform calls.
+     *
+     * # Errors
+     *
+     * Returns `ScpError` when the provider cannot read the attribute, for
+     * example when `key_id` names no key it holds. A bridge that reads an
+     * error publishes no custody value for that key.
+     */
+    func keyIsExtractable(keyId: String) throws  -> Bool
+    
+    /**
+     * Return which factor unlocks the key `key_id` names: one of
+     * `"biometric"`, `"pin"`, `"passphrase"`, `"caller_supplied_key"`, or
+     * `"unprotected"`.
+     *
+     * The other fact a DID document publishes about custody (§3.2.2 of the
+     * identity spec). A string outside that set publishes no custody value
+     * rather than a guess, so an adapter that cannot name the factor is free
+     * to say so.
+     *
+     * # Errors
+     *
+     * Returns `ScpError` when the provider cannot read the attribute. A
+     * bridge that reads an error publishes no custody value for that key.
+     */
+    func unlockFactor(keyId: String) throws  -> String
     
 }
 
@@ -15083,6 +15270,56 @@ fileprivate struct UniffiCallbackInterfaceKeyCustodyProvider {
                 callStatus: uniffiCallStatus,
                 makeCall: makeCall,
                 writeReturn: writeReturn
+            )
+        },
+        keyIsExtractable: { (
+            uniffiHandle: UInt64,
+            keyId: RustBuffer,
+            uniffiOutReturn: UnsafeMutablePointer<Int8>,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> Bool in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceKeyCustodyProvider.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try uniffiObj.keyIsExtractable(
+                     keyId: try FfiConverterString.lift(keyId)
+                )
+            }
+
+            
+            let writeReturn = { uniffiOutReturn.pointee = FfiConverterBool.lower($0) }
+            uniffiTraitInterfaceCallWithError(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn,
+                lowerError: FfiConverterTypeScpError_lower
+            )
+        },
+        unlockFactor: { (
+            uniffiHandle: UInt64,
+            keyId: RustBuffer,
+            uniffiOutReturn: UnsafeMutablePointer<RustBuffer>,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> String in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceKeyCustodyProvider.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try uniffiObj.unlockFactor(
+                     keyId: try FfiConverterString.lift(keyId)
+                )
+            }
+
+            
+            let writeReturn = { uniffiOutReturn.pointee = FfiConverterString.lower($0) }
+            uniffiTraitInterfaceCallWithError(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn,
+                lowerError: FfiConverterTypeScpError_lower
             )
         },
         uniffiFree: { (uniffiHandle: UInt64) -> () in
@@ -17575,7 +17812,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_add_agent_key() != 23309) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_identity_custody_type() != 59443) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_identity_custody_type() != 55767) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_did() != 6016) {
@@ -17866,16 +18103,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_attest_device() != 36607) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create() != 38162) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create() != 29634) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create_link_attestation() != 29874) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create_with_agent_key() != 20413) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create_with_agent_key() != 3695) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create_with_custody() != 35310) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create_with_custody() != 7661) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_execute_custody_migration() != 23068) {
@@ -17891,6 +18128,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_migrate() != 35072) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_published_custody() != 4074) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_remove() != 20795) {
@@ -18214,7 +18454,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_export_signing_key_bytes() != 55617) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_custody_type() != 30807) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_custody_type() != 20683) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_key_is_extractable() != 14541) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_unlock_factor() != 55874) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_messagelistener_on_message() != 11557) {

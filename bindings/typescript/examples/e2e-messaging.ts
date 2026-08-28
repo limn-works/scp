@@ -24,8 +24,8 @@ async function main(): Promise<void> {
     console.log(`Relay listening at ${relay.relayUrl}`);
 
     // 2. Create two identities.
-    const alice = await scp.identityCreate("in_memory");
-    const bob = await scp.identityCreate("in_memory");
+    const alice = await scp.identityCreate("encrypted_file");
+    const bob = await scp.identityCreate("encrypted_file");
     console.log(`Alice DID: ${alice.did}`);
     console.log(`Bob DID:   ${bob.did}`);
 

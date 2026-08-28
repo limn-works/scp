@@ -147,21 +147,26 @@ Tests are defined as JSON fixtures:
 {
   "test_id": "identity-create-001",
   "category": "identity",
-  "description": "Create identity with in-memory custody",
+  "description": "Create identity with an encrypted key file",
   "operation": "identity_create",
-  "input": { "custody": "in_memory" },
+  "input": { "custody": "encrypted_file" },
   "expected": {
     "did_prefix": "did:dht:",
-    "custody_type": "in_memory"
+    "custody_type": "encrypted_file"
   }
 }
 ```
 
-The fixture above names `in_memory`, which §3.2.2 of the identity spec, the custody
-vocabulary, classifies as a test-harness string rather than a value of that vocabulary:
-a fixture passes it as a raw string to a bridge built with the `testing` feature, and a
-shipped build rejects it with `SCP-IDENT-1008`. A fixture that exercises a shipped
-backend names `encrypted_file` or `os_keystore` instead.
+A fixture names `encrypted_file` or `os_keystore`, the two values §3.2.2 of the identity
+spec, the custody vocabulary, states. A runner converts the fixture's raw string into its
+SDK's custody type, which spells those two values and no others, so a fixture naming
+anything else — a retired spelling, or the test-harness string `in_memory` — gets reported
+by the runner and never reaches the bridge. A test that needs the in-memory key store
+passes that string straight to the bridge instead of going through a fixture.
+
+A fixture that names no custody at all gets none chosen for it: the runner reports the
+omission. Key custody decides who can reach a private key, and the agent-first API design
+tenet of `CLAUDE.md` forbids an SDK making that choice for a caller.
 
 Each SDK implements a conformance test runner that:
 1. Loads JSON fixtures from `tests/conformance/`

@@ -16,7 +16,7 @@ import { SCP, defineOutletDefinition } from "../src/index";
 async function main(): Promise<void> {
   const scp = new SCP({ storage: { type: "in_memory" } });
   try {
-    const identity = await scp.identityCreate("in_memory");
+    const identity = await scp.identityCreate("encrypted_file");
 
     // Create a context with outlet capabilities.
     const ctx = await scp.contextCreate(

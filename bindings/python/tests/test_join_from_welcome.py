@@ -35,6 +35,8 @@ from scp_sdk.scp import (
     SealedInvitation,
 )
 
+from .harness_custody import create_in_memory_identity
+
 # ---------------------------------------------------------------------------
 # Helpers — minimal bridge mocks (mirrors tests/test_context.py)
 # ---------------------------------------------------------------------------
@@ -319,9 +321,8 @@ class TestJoinerHandshakeRealFfi:
     """Joiner handshake through the real PyO3 bridge."""
 
     async def test_reserve_key_package_returns_reservation_and_public_bytes(self, scp) -> None:
-        from scp_sdk.types import CustodyType
 
-        identity = await scp.identity_create(CustodyType.IN_MEMORY)
+        identity = await create_in_memory_identity(scp)
 
         reservation_id, key_package_public = await scp.reserve_key_package(identity.did)
 
@@ -364,9 +365,8 @@ class TestInviteMemberRealFfi:
         # A custodied inviter + a real context so the supervisor is attached and
         # signing-key resolution succeeds; then the live-context lookup for a
         # DIFFERENT (non-existent) context fails.
-        from scp_sdk.types import CustodyType
 
-        creator = await scp.identity_create(CustodyType.IN_MEMORY)
+        creator = await create_in_memory_identity(scp)
         await scp.context_create(creator.did, {"mode": "encrypted", "governance": "single_admin"})
 
         unknown_ctx = "d" * 64
@@ -397,9 +397,8 @@ class TestInviteMemberRealFfi:
         # invitee's reserved KeyPackage declares the 0xFF02 context-binding
         # capability (§5.13.3, valn0502; fixed in 9fe3b4c9b), so the MLS add
         # succeeds instead of failing the group-context-extension round-trip.
-        from scp_sdk.types import CustodyType
 
-        creator = await scp.identity_create(CustodyType.IN_MEMORY)
+        creator = await create_in_memory_identity(scp)
         # The invite is routed through the actor's governance gate, which checks
         # the proposer's `governance:propose` capability before auto-executing —
         # that is the ONLY capability enforced for the invite. A normally-created
@@ -423,7 +422,7 @@ class TestInviteMemberRealFfi:
             },
         )
 
-        invitee = await scp.identity_create(CustodyType.IN_MEMORY)
+        invitee = await create_in_memory_identity(scp)
         reservation_id, invitee_kp = await scp.reserve_key_package(invitee.did)
         assert reservation_id
         assert len(invitee_kp) > 0

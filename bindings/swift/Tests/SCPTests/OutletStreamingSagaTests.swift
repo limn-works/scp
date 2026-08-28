@@ -210,7 +210,7 @@ final class OutletStreamingSagaTests: XCTestCase {
     /// asserted in the Rust/integration tests.
     func testRecoverForwardsToBridgeAndSurfacesTypedError() async throws {
         let scp = try SCP(storage: .inMemory)
-        let identity = try await scp.identityCreate(custody: .inMemory)
+        let identity = try await scp.identityCreateInTestHarnessCustody()
         let params = ContextParams(
             mode: .encrypted,
             ceiling: ["messages:read", "messages:write", "outlet:call:*", "outlet:register", "context:close"],

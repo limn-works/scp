@@ -24,6 +24,7 @@ import {
 import { defineOutletDefinition } from "../src/outlets";
 import type { SCP } from "../src/scp";
 import type { SagaResult } from "../src/types";
+import { createInMemoryIdentity } from "./harness-custody";
 import { type MockNativeScp, mountMockScp } from "./mock-bridge";
 
 // ---------------------------------------------------------------------------
@@ -248,7 +249,7 @@ describe("scp.outletInvokeCrossContext", () => {
   });
 
   it("invokes an outlet across contexts and returns result", async () => {
-    const identity = await scp.identityCreate("in_memory");
+    const identity = await createInMemoryIdentity(scp);
     const sourceHandle = await scp.contextCreate(identity, "{}");
     const targetHandle = await scp.contextCreate(identity, "{}");
 
@@ -276,7 +277,7 @@ describe("scp.outletInvokeCrossContext", () => {
   });
 
   it("rejects chainDepth > 255 (u8 range per ADR-043)", async () => {
-    const identity = await scp.identityCreate("in_memory");
+    const identity = await createInMemoryIdentity(scp);
     const sourceHandle = await scp.contextCreate(identity, "{}");
     const targetHandle = await scp.contextCreate(identity, "{}");
 
@@ -294,7 +295,7 @@ describe("scp.outletInvokeCrossContext", () => {
   });
 
   it("accepts chainDepth at u8 max (255)", async () => {
-    const identity = await scp.identityCreate("in_memory");
+    const identity = await createInMemoryIdentity(scp);
     const sourceHandle = await scp.contextCreate(identity, "{}");
     const targetHandle = await scp.contextCreate(identity, "{}");
 
@@ -321,7 +322,7 @@ describe("scp.outletInvokeCrossContext", () => {
   });
 
   it("rejects negative chainDepth", async () => {
-    const identity = await scp.identityCreate("in_memory");
+    const identity = await createInMemoryIdentity(scp);
     const sourceHandle = await scp.contextCreate(identity, "{}");
     const targetHandle = await scp.contextCreate(identity, "{}");
 
@@ -339,7 +340,7 @@ describe("scp.outletInvokeCrossContext", () => {
   });
 
   it("rejects non-integer chainDepth", async () => {
-    const identity = await scp.identityCreate("in_memory");
+    const identity = await createInMemoryIdentity(scp);
     const sourceHandle = await scp.contextCreate(identity, "{}");
     const targetHandle = await scp.contextCreate(identity, "{}");
 
@@ -357,7 +358,7 @@ describe("scp.outletInvokeCrossContext", () => {
   });
 
   it("surfaces SCP-OUTLET-6010 when source context is not active", async () => {
-    const identity = await scp.identityCreate("in_memory");
+    const identity = await createInMemoryIdentity(scp);
     const sourceHandle = await scp.contextCreate(identity, "{}");
     const targetHandle = await scp.contextCreate(identity, "{}");
 
@@ -377,7 +378,7 @@ describe("scp.outletInvokeCrossContext", () => {
   });
 
   it("surfaces SCP-OUTLET-6011 when target context is not active", async () => {
-    const identity = await scp.identityCreate("in_memory");
+    const identity = await createInMemoryIdentity(scp);
     const sourceHandle = await scp.contextCreate(identity, "{}");
     const targetHandle = await scp.contextCreate(identity, "{}");
 
@@ -421,7 +422,7 @@ describe("scp.outletInvokeCrossContextSaga", () => {
 
   /** Creates source + target context handles and returns the dispatch args. */
   async function handles(): Promise<{ did: string; source: unknown; target: unknown }> {
-    const identity = await scp.identityCreate("in_memory");
+    const identity = await createInMemoryIdentity(scp);
     const sourceHandle = await scp.contextCreate(identity, "{}");
     const targetHandle = await scp.contextCreate(identity, "{}");
     return { did: identity.did, source: sourceHandle._rawHandle, target: targetHandle._rawHandle };
@@ -645,7 +646,7 @@ describe("scp.outletSessionCreate", () => {
   });
 
   it("creates a session and returns a session ID", async () => {
-    const identity = await scp.identityCreate("in_memory");
+    const identity = await createInMemoryIdentity(scp);
     const handle = await scp.contextCreate(identity, "{}");
     const outletId = await scp.outletRegister(handle._rawHandle, {
       name: "stateful-outlet",
@@ -662,7 +663,7 @@ describe("scp.outletSessionCreate", () => {
   });
 
   it("creates a session with TTL", async () => {
-    const identity = await scp.identityCreate("in_memory");
+    const identity = await createInMemoryIdentity(scp);
     const handle = await scp.contextCreate(identity, "{}");
     const outletId = await scp.outletRegister(handle._rawHandle, {
       name: "ttl-outlet",
@@ -683,7 +684,7 @@ describe("scp.outletSessionCreate", () => {
   });
 
   it("rejects negative ttlSeconds", async () => {
-    const identity = await scp.identityCreate("in_memory");
+    const identity = await createInMemoryIdentity(scp);
     const handle = await scp.contextCreate(identity, "{}");
 
     await expect(
@@ -692,7 +693,7 @@ describe("scp.outletSessionCreate", () => {
   });
 
   it("rejects non-integer ttlSeconds", async () => {
-    const identity = await scp.identityCreate("in_memory");
+    const identity = await createInMemoryIdentity(scp);
     const handle = await scp.contextCreate(identity, "{}");
 
     await expect(
@@ -717,7 +718,7 @@ describe("scp.outletSessionInvoke", () => {
   });
 
   it("invokes an outlet within a session and returns result with call-count provenance", async () => {
-    const identity = await scp.identityCreate("in_memory");
+    const identity = await createInMemoryIdentity(scp);
     const handle = await scp.contextCreate(identity, "{}");
     const outletId = await scp.outletRegister(handle._rawHandle, {
       name: "session-outlet",
@@ -749,7 +750,7 @@ describe("scp.outletSessionInvoke", () => {
   });
 
   it("increments call count across invocations", async () => {
-    const identity = await scp.identityCreate("in_memory");
+    const identity = await createInMemoryIdentity(scp);
     const handle = await scp.contextCreate(identity, "{}");
     const outletId = await scp.outletRegister(handle._rawHandle, {
       name: "counter-outlet",
@@ -791,7 +792,7 @@ describe("scp.outletSessionClose", () => {
   });
 
   it("closes a session successfully", async () => {
-    const identity = await scp.identityCreate("in_memory");
+    const identity = await createInMemoryIdentity(scp);
     const handle = await scp.contextCreate(identity, "{}");
     const outletId = await scp.outletRegister(handle._rawHandle, {
       name: "closable-outlet",
@@ -811,7 +812,7 @@ describe("scp.outletSessionClose", () => {
   });
 
   it("rejects closing a non-existent session", async () => {
-    const identity = await scp.identityCreate("in_memory");
+    const identity = await createInMemoryIdentity(scp);
     const handle = await scp.contextCreate(identity, "{}");
 
     await expect(scp.outletSessionClose(handle._rawHandle, "nonexistent-session")).rejects.toThrow(

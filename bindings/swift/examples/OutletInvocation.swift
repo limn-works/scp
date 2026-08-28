@@ -12,7 +12,7 @@ struct OutletInvocation {
         let scp = try SCP(storage: .inMemory)
         defer { Task { try? await scp.shutdown(timeout: 5) } }
 
-        let identity = try await scp.identityCreate(custody: .inMemory)
+        let identity = try await scp.identityCreate(custody: .encryptedFile)
 
         let weatherOutlet = OutletDefinition(
             name: "weather",

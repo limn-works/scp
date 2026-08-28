@@ -27,7 +27,7 @@ async def main() -> None:
         await scp.transport_connect(relay.relay_url)
 
         # 2. Create admin identity.
-        admin = await scp.identity_create(CustodyType.IN_MEMORY)
+        admin = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
         print(f"Admin DID: {admin.did}")
 
         # 3. Create a context with governance enabled.
@@ -50,7 +50,7 @@ async def main() -> None:
 
         try:
             # 4. Create a second identity and have them join.
-            member = await scp.identity_create(CustodyType.IN_MEMORY)
+            member = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
             await scp.context_join(ctx._raw_handle, member.did)
             print(f"Member {member.did} joined")
 

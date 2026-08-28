@@ -157,6 +157,19 @@ class CanonicalKeychain implements KeyCustodyProvider {
   custodyType(_keyId: string): string {
     return "software";
   }
+
+  // This fixture keeps every seed in a process-memory map and hands it back
+  // through `exportSigningKeyBytes`, so the key leaves the store, and nothing
+  // gates that map. Section 3.2.2 of the identity spec states that a backend
+  // reporting a pair the published vocabulary states no value for "publishes
+  // no custody attestation at all".
+  keyIsExtractable(_keyId: string): boolean {
+    return true;
+  }
+
+  unlockFactor(_keyId: string): string {
+    return "unprotected";
+  }
 }
 
 // Extract the 32-byte public key from the `publicKey(32) || keyIdUtf8` blob the

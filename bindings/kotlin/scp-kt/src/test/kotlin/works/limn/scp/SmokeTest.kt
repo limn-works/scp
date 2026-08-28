@@ -6,43 +6,41 @@ import kotlin.test.assertNull
 
 class SmokeTest {
     @Test
-    fun `CustodyType carries every custody string the bridge names`() {
+    fun `CustodyType carries the two values the vocabulary states`() {
         // Exercises real SDK code with no native dependency: the typed
         // CustodyType enum's wire-format mapping and its fromRawValue parser.
         //
-        // `parse_custody_method` in `crates/scp-ffi/uniffi/src/bridge.rs` names
-        // "in_memory", "platform", and "software" in its match arms and
-        // answers every other string with SCP-VALID-7005. Pin the whole set
-        // rather than one entry, so an entry added without a matching arm
-        // there fails here.
+        // §3.2.2 of the identity spec, "The Custody Vocabulary", states that a
+        // caller "names exactly one of two custody values" and that "The
+        // vocabulary holds no third value". Pin the whole set rather than one
+        // entry, so an entry added without a matching arm in
+        // `build_key_custody` fails here.
         assertEquals(
-            listOf("in_memory", "platform", "software"),
+            listOf("encrypted_file", "os_keystore"),
             CustodyType.entries.map { it.rawValue },
         )
-        assertEquals("in_memory", CustodyType.IN_MEMORY.rawValue)
-        assertEquals("platform", CustodyType.PLATFORM.rawValue)
-        assertEquals("software", CustodyType.SOFTWARE.rawValue)
-        assertEquals(CustodyType.IN_MEMORY, CustodyType.fromRawValue("in_memory"))
-        assertEquals(CustodyType.PLATFORM, CustodyType.fromRawValue("platform"))
-        assertEquals(CustodyType.SOFTWARE, CustodyType.fromRawValue("software"))
+        assertEquals("encrypted_file", CustodyType.ENCRYPTED_FILE.rawValue)
+        assertEquals("os_keystore", CustodyType.OS_KEYSTORE.rawValue)
+        assertEquals(CustodyType.ENCRYPTED_FILE, CustodyType.fromRawValue("encrypted_file"))
+        assertEquals(CustodyType.OS_KEYSTORE, CustodyType.fromRawValue("os_keystore"))
         assertNull(CustodyType.fromRawValue("not-a-custody-type"))
     }
 
     @Test
-    fun `CustodyType spells each refused custody string the way the bridge spells it`() {
-        // The bridge builds a key store for "in_memory" alone, and answers
-        // "platform" and "software" with SCP-IDENT-1003, because neither
-        // string reaches Android Keystore — a caller reaches it by injecting a
-        // KeyCustodyProvider through identityCreateWithCustody.
+    fun `CustodyType spells no retired custody string and no test-harness string`() {
+        // §3.2.2 names five spellings and states that they "name no custody
+        // backend": the bridge answers each one with SCP-VALID-7005. It states
+        // separately that "in_memory" "is a test-harness affordance and not a
+        // value of this vocabulary" and that "no SDK enum spells it".
         // `CustodyCallErrorCodeTest` calls the bridge and asserts those codes;
-        // this test pins the SDK half, that the enum spells each rejected
-        // string the way the bridge's match arm spells it, so a caller reads
-        // one vocabulary.
-        assertEquals(
-            listOf("platform", "software"),
-            CustodyType.entries
-                .filter { it != CustodyType.IN_MEMORY }
-                .map { it.rawValue },
-        )
+        // this test pins the SDK half, that the enum spells none of them, so a
+        // caller cannot name one through a typed API.
+        val absent = listOf("platform", "software", "file", "platform_managed", "hardware", "in_memory")
+        for (spelling in absent) {
+            assertNull(
+                CustodyType.fromRawValue(spelling),
+                "CustodyType must not spell $spelling",
+            )
+        }
     }
 }

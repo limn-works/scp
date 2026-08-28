@@ -145,7 +145,7 @@ class JoinFromWelcomeTest {
         runBlocking {
             val scp = SCP(StorageConfig.InMemory)
             try {
-                val joiner = scp.identityCreate(custody = CustodyType.IN_MEMORY)
+                val joiner = scp.identityCreateInTestHarnessCustody()
 
                 val reservation = scp.reserveKeyPackage(joiner)
 
@@ -173,7 +173,7 @@ class JoinFromWelcomeTest {
                 // Reloading a created identity yields a DID-only handle with no
                 // retained key material — reserve must fail closed (the same
                 // trust model as contextCreate).
-                val custodied = scp.identityCreate(custody = CustodyType.IN_MEMORY)
+                val custodied = scp.identityCreateInTestHarnessCustody()
                 val loaded = scp.identityLoad(custodied.did())
 
                 try {
@@ -200,8 +200,8 @@ class JoinFromWelcomeTest {
         runBlocking {
             val scp = SCP(StorageConfig.InMemory)
             try {
-                val creator = scp.identityCreate(custody = CustodyType.IN_MEMORY)
-                val invitee = scp.identityCreate(custody = CustodyType.IN_MEMORY)
+                val creator = scp.identityCreateInTestHarnessCustody()
+                val invitee = scp.identityCreateInTestHarnessCustody()
 
                 // Encrypted SingleAdmin context whose admin holds
                 // governance:propose (the only capability the invite gate
@@ -267,8 +267,8 @@ class JoinFromWelcomeTest {
         runBlocking {
             val scp = SCP(StorageConfig.InMemory)
             try {
-                val creator = scp.identityCreate(custody = CustodyType.IN_MEMORY)
-                val invitee = scp.identityCreate(custody = CustodyType.IN_MEMORY)
+                val creator = scp.identityCreateInTestHarnessCustody()
+                val invitee = scp.identityCreateInTestHarnessCustody()
                 val ctx = scp.contextCreate(creator, makeInviteParams())
                 val reservation = scp.reserveKeyPackage(invitee)
 
@@ -314,7 +314,7 @@ class JoinFromWelcomeTest {
                 // reservation id and the sealed bundle's bytes are never
                 // reached. contextId / creatorDid are valid so the join gets
                 // past boundary validation to the custody seam.
-                val custodied = scp.identityCreate(custody = CustodyType.IN_MEMORY)
+                val custodied = scp.identityCreateInTestHarnessCustody()
                 val loaded = scp.identityLoad(custodied.did())
 
                 val sealed =

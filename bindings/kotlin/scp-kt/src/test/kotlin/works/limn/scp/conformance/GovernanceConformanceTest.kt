@@ -134,7 +134,7 @@ class GovernanceConformanceTest {
                 val result =
                     dispatcher.dispatch(
                         "identity_create",
-                        mapOf("custody" to "in_memory"),
+                        mapOf("custody" to "encrypted_file"),
                     )
                 assertEquals("SCP-IDENT-1001", result["error"])
             }

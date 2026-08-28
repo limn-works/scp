@@ -14,8 +14,8 @@ async function main(): Promise<void> {
   const scp = new SCP({ storage: { type: "in_memory" } });
   try {
     // Create two identities (in_memory custody for examples).
-    const alice = await scp.identityCreate("in_memory");
-    const bob = await scp.identityCreate("in_memory");
+    const alice = await scp.identityCreate("encrypted_file");
+    const bob = await scp.identityCreate("encrypted_file");
     console.log(`Alice DID: ${alice.did}`);
     console.log(`Bob DID: ${bob.did}`);
 

@@ -6,56 +6,50 @@ import Foundation
 
 // MARK: - CustodyType
 
-/// The custody string a caller passes to `identityCreate` (spec section 3.2).
+/// The custody backend a caller names to `identityCreate` (section 3.2.2 of
+/// the identity spec).
 ///
-/// `parse_custody_method` in `crates/scp-ffi/uniffi/src/bridge.rs` decides what
-/// each case's `rawValue` reaches. It builds a key store for `"in_memory"`
-/// alone, answers `"platform"` and `"software"` with `SCP-IDENT-1003`, and
-/// answers every string this enum does not carry with `SCP-VALID-7005`.
+/// Section 3.2.2, "The Custody Vocabulary", states two values a caller names
+/// when it selects a custody backend, and states that "The vocabulary holds no
+/// third value, and a shipped build answers every other string with a typed
+/// error." Each case below carries one of those two values.
 ///
-/// - `inMemory` builds `InMemoryKeyCustody` in a build carrying the UniFFI
-///   bridge's `testing` feature. A shipped build answers the string with
-///   `SCP-IDENT-1008` rather than substituting a weaker key store.
-/// - `platform` reaches no key store. No custody string reaches Apple Keychain
-///   or Android Keystore on any bridge; a caller reaches either key store by
-///   injecting a `KeyCustodyProvider` through `identityCreateWithCustody`.
-/// - `software` reaches no key store on this bridge or on the NAPI bridge,
-///   which both answer it with `SCP-IDENT-1003`. The PyO3 bridge spells its
-///   software-managed custody `"file"` instead, and that string builds
-///   `FileKeyCustody`, an encrypted key file that reports
-///   `CustodyType.Software` from `crates/scp-platform/src/traits.rs`. The two
-///   spellings name that one substrate. Spec section 3.2, Key Custody, owns
-///   which spelling survives, and it names four custody sources in prose and
-///   no custody string today, so this enum carries `software` and decides
-///   nothing about that question.
+/// `build_key_custody` in `crates/scp-ffi/uniffi/src/bridge.rs` answers
+/// every other string with `SCP-VALID-7005`, and that includes `"platform"`,
+/// `"software"`, `"file"`, `"platform_managed"`, and `"hardware"`.
 ///
-/// The Swift SDK's own `AppleKeyCustody` provider reports
-/// `CustodyType.Software` from `crates/scp-platform/src/traits.rs` for every
-/// key it holds, because the Secure Enclave generates P-256 keys and SCP signs
-/// with Ed25519.
+/// A build carrying the UniFFI bridge's `testing` cargo feature additionally
+/// accepts the raw string `"in_memory"`, which reaches the test-only in-memory
+/// key store. Section 3.2.2 states that the string is a test-harness
+/// affordance and not a value of this vocabulary, so this enum does not spell
+/// it: a test that needs it passes the raw string to the bridge, and a shipped
+/// build answers it with `SCP-IDENT-1008`.
 ///
 /// This type is a pure Swift convenience type. It does not conflict with any
 /// UniFFI-generated type.
 ///
 /// ## Provenance
 ///
-/// - Spec section 3.2 (Key Custody)
+/// - Section 3.2.2 of the identity spec, "The Custody Vocabulary"
 /// - The custody-string and identity-parameter story SCP-294 in
 ///   `.docs/prds/http-features.json`
 public nonisolated enum CustodyType: String, Sendable, CaseIterable {
-    /// An in-memory key store that loses every key when the process exits.
+    /// Selects the on-disk key store SCP implements, which derives an AES-256
+    /// key from a passphrase with Argon2id and encrypts each key entry under
+    /// AES-256-GCM (`crates/scp-platform/src/file.rs`).
     ///
-    /// The UniFFI bridge compiles this key store under its `testing` feature
-    /// only, so a shipped build answers this string with `SCP-IDENT-1008`
-    /// instead of substituting a weaker key store.
-    case inMemory = "in_memory"
-    /// A custody string the bridge names and refuses with `SCP-IDENT-1003`,
-    /// because no custody string reaches a platform-native key store.
-    case platform
-    /// A custody string the UniFFI bridge and the NAPI bridge both refuse with
-    /// `SCP-IDENT-1003`. The PyO3 bridge reaches its software-managed key file
-    /// through `"file"`, a spelling this enum does not carry.
-    case software
+    /// The bridge reads the passphrase from the `SCP_KEY_PASSPHRASE`
+    /// environment variable and answers an unset variable with
+    /// `SCP-VALID-7001`.
+    case encryptedFile = "encrypted_file"
+    /// Selects the operating system's own key store, which SCP reaches through
+    /// the platform key-custody callback an SDK consumer supplies.
+    ///
+    /// `identityCreate` supplies none, so it answers this value with
+    /// `SCP-IDENT-1003` and falls back to neither the encrypted key file nor
+    /// an in-memory store. Pass a `KeyCustodyProvider` to
+    /// `identityCreateWithCustody` to reach the store.
+    case osKeystore = "os_keystore"
 }
 
 // MARK: - BridgeMode

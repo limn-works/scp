@@ -56,6 +56,7 @@ import { IdentityAttestation, RevocationStatus } from "../src/identity";
 import { SCP } from "../src/scp";
 import type { Relay } from "../src/server";
 import type { ConsequenceRule as ConsequenceRuleTypeAlias, OutletDefinition } from "../src/types";
+import { createInMemoryIdentity, createInMemoryIdentityWithAgentKey } from "./harness-custody";
 import { createMockNativeScp, mountMockScp } from "./mock-bridge";
 
 /**
@@ -345,7 +346,7 @@ describe("SCP forwarder dispatch (mountMockScp)", () => {
     const fakeHandle = { did: "did:dht:z6MkForwardTest", custodyType: "in_memory" };
     native.__stub("identityCreate", () => Promise.resolve(fakeHandle));
 
-    const identity = await scp.identityCreate("in_memory");
+    const identity = await createInMemoryIdentity(scp);
 
     expect(identity.did).toBe(fakeHandle.did);
     expect(identity.custodyType).toBe(fakeHandle.custodyType);
@@ -374,25 +375,30 @@ describe("SCP forwarder dispatch (mountMockScp)", () => {
     expect(native.__lastCall("identityCreate")?.args).toEqual([undefined]);
   });
 
-  it("CustodyType carries every string the bridge names and no other", async () => {
+  it("CustodyType carries the two values the vocabulary states and no other", async () => {
     // `CustodyType` is a compile-time union with no runtime value to read, so
     // pin it with two assignments that `tsc --noEmit` checks. `widening` fails
     // to compile if the union ever loses a member of `named`; `narrowing`
     // fails if the union ever gains a member `named` does not list. Together
-    // they pin the union to exactly the three strings
-    // `validate_custody_type` in `crates/scp-ffi/napi/src/error.rs` admits.
-    const named = ["platform", "in_memory", "software"] as const;
+    // they pin the union to exactly the two values section 3.2.2 of the
+    // identity spec, "The Custody Vocabulary", states.
+    //
+    // `"in_memory"` is absent by design: section 3.2.2 states that the string
+    // is a test-harness affordance, that "no SDK enum spells it", and that "a
+    // test that needs it passes the raw string to the bridge", which is what
+    // `createInMemoryIdentity` in `tests/harness-custody.ts` does.
+    const named = ["encrypted_file", "os_keystore"] as const;
     type Named = (typeof named)[number];
     const widening: CustodyType[] = [...named];
-    const narrowing: Named = "in_memory" as CustodyType;
-    expect(widening).toEqual(["platform", "in_memory", "software"]);
-    expect(narrowing).toBe("in_memory");
+    const narrowing: Named = "encrypted_file" as CustodyType;
+    expect(widening).toEqual(["encrypted_file", "os_keystore"]);
+    expect(narrowing).toBe("encrypted_file");
 
     // Then call `identityCreate` with each pinned member, so the array is not
     // a list of strings the SDK never sees. The mock records the forwarded
     // argument, which must be the member verbatim. The mock answers every
-    // string; the real bridge answers "platform" and "software" with
-    // SCP-IDENT-1003, which the real-NAPI suite below asserts.
+    // string; the real bridge answers "os_keystore" with SCP-IDENT-1003,
+    // which the real-NAPI suite below asserts.
     const { scp, native } = mountMockScp();
     for (const custody of named) {
       native.__stub("identityCreate", () =>
@@ -460,7 +466,7 @@ describe("SCP forwarder dispatch (mountMockScp)", () => {
       Promise.resolve({ did: "did:dht:z6MkCreator", custodyType: "in_memory" }),
     );
 
-    const identity = await scp.identityCreate("in_memory");
+    const identity = await createInMemoryIdentity(scp);
     const paramsJson = JSON.stringify({ ceiling: ["messages:read"] });
     const ctx = await scp.contextCreate(identity, paramsJson);
 
@@ -764,7 +770,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     // in `tests/real-napi.test.ts`.
     scp = new SCP({ storage: { type: "in_memory" } });
     relay = await scp.relayStartInMemory();
-    const bootstrap = await scp.identityCreate("in_memory");
+    const bootstrap = await createInMemoryIdentity(scp);
     await scp.configureRelayTransport(relay.relayUrl, bootstrap.did);
     // Establish the second relay adapter used by contextSubscribe.
     await scp.transportConnect(relay.relayUrl);
@@ -798,24 +804,24 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 
   describe("Identity lifecycle (real NAPI)", () => {
     it("scp.identityCreate returns a did:dht DID and in_memory custody", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       expect(identity.did).toMatch(/^did:dht:/);
       expect(identity.custodyType).toBe("in_memory");
       expect(identity._rawHandle).toBeDefined();
     });
 
     it("two fresh identities have distinct DIDs", async () => {
-      const a = await scp.identityCreate("in_memory");
-      const b = await scp.identityCreate("in_memory");
+      const a = await createInMemoryIdentity(scp);
+      const b = await createInMemoryIdentity(scp);
       expect(a.did).not.toBe(b.did);
     });
 
-    // `CustodyType` carries "platform" and "software", and the bridge builds
-    // no key store for either one. Each test below passes the string the type
-    // permits and reads the code the bridge answers with, because a fallback
-    // to a weaker key store would name one substrate and hand the caller
-    // another.
-    for (const rejected of ["platform", "software"] as const satisfies readonly CustodyType[]) {
+    // `CustodyType` carries "os_keystore", and `identityCreate` supplies no
+    // platform key-custody callback, so the bridge builds no key store for it.
+    // Each test below passes the value the type permits and reads the code the
+    // bridge answers with, because a fallback to a weaker key store would name
+    // one substrate and hand the caller another.
+    for (const rejected of ["os_keystore"] as const satisfies readonly CustodyType[]) {
       it(`identityCreate rejects "${rejected}" with SCP-IDENT-1003`, async () => {
         let threw = false;
         try {
@@ -856,15 +862,70 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       expect(threw).toBe(true);
     });
 
+    // Section 3.2.2 of the identity spec names these five and states that they
+    // "name no custody backend". Two of them, "platform" and "file", each
+    // built a key store in this bridge's history, so the SDK named one
+    // substrate and delivered another. `CustodyType` spells none of them, so
+    // each test reaches the bridge through the SDK method with a cast, which
+    // is what a JavaScript caller passing the old spelling reaches at runtime.
+    for (const retired of [
+      "platform",
+      "software",
+      "file",
+      "platform_managed",
+      "hardware",
+    ] as const) {
+      it(`identityCreate rejects the retired string "${retired}" with SCP-VALID-7005`, async () => {
+        let threw = false;
+        try {
+          await scp.identityCreate(retired as unknown as CustodyType);
+        } catch (err) {
+          threw = true;
+          expect(err).toBeInstanceOf(ValidationError);
+          expect((err as ValidationError).code).toBe("SCP-VALID-7005");
+        }
+        expect(threw).toBe(true);
+      });
+    }
+
+    it("identityPublishedCustody reads the running backend, not the caller's choice", async () => {
+      // Section 3.2.2 states that the published value "is derived, never
+      // declared". The in-memory key store holds every private key in a
+      // process-memory map that nothing gates, which is a pair the published
+      // vocabulary states no value for, so the bridge publishes nothing.
+      // ADR-039's Enforcement Stack layer 4 gives that absence a meaning,
+      // "Absence of attestation is itself a signal".
+      const identity = await createInMemoryIdentity(scp);
+      expect(await scp.identityPublishedCustody(identity.did)).toBeNull();
+    });
+
+    it("identityPublishedCustody fails closed for a DID this instance does not retain", async () => {
+      // The published value comes off the running backend, so an instance
+      // holding no backend for a DID reports a typed error rather than a value
+      // it reconstructed from the DID string. The NAPI bridge answers the
+      // registry miss with the code `with_identity` raises, `SCP-IDENT-1001`,
+      // which is the code the PyO3 bridge raises for the same miss; the UniFFI
+      // bridge raises `SCP-IDENT-1017` there instead.
+      let threw = false;
+      try {
+        await scp.identityPublishedCustody("did:dht:z6MkNotRegistered");
+      } catch (err) {
+        threw = true;
+        expect(err).toBeInstanceOf(IdentityError);
+        expect((err as IdentityError).code).toBe("SCP-IDENT-1001");
+      }
+      expect(threw).toBe(true);
+    });
+
     it("scp.identityLoad round-trips a previously created DID", async () => {
-      const created = await scp.identityCreate("in_memory");
+      const created = await createInMemoryIdentity(scp);
       const loaded = await scp.identityLoad(created.did);
       expect(loaded.did).toBe(created.did);
       expect(loaded.custodyType).toBe("in_memory");
     });
 
     it("scp.identityResolve returns a DID document with verification methods", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       // Typed as unknown — the resolver returns a raw JSON object whose
       // shape we only need to spot-check here.
       const doc = (await scp.identityResolve(identity.did)) as {
@@ -881,7 +942,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("agent-key variant flags hasAgentKey=true on the resolved document", async () => {
-      const identity = await scp.identityCreateWithAgentKey("in_memory");
+      const identity = await createInMemoryIdentityWithAgentKey(scp);
       const doc = (await scp.identityResolve(identity.did)) as {
         hasAgentKey?: boolean;
         agentPublicKey?: string;
@@ -891,7 +952,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.identityAttestDevice + verify round-trips a valid token", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const token = await scp.identityAttestDevice(identity.did);
       expect(typeof token).toBe("string");
       expect(token.length).toBeGreaterThan(0);
@@ -900,7 +961,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.identityVerifyDeviceAttestation returns false on a forged token", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const ok = await scp.identityVerifyDeviceAttestation(identity.did, "YWJjZGVm");
       expect(ok).toBe(false);
     });
@@ -912,7 +973,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       // validates before any async work. Use a real identity that this
       // SCP owns so the DID-ownership gate lets us reach the target
       // validation branch (post per-test isolation).
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       expect(() => scp.identityExecuteCustodyMigration(identity.did, "nonexistent", [])).toThrow(
         /invalid|unsupported|nonexistent/,
       );
@@ -928,7 +989,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       // identity_key). An unknown tier fails at the validation branch
       // before any async work is driven. Use a real identity so the
       // DID-ownership gate lets us reach the tier validation branch.
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       expect(() => scp.identityExecuteRecovery(identity.did, "nonexistent-tier", [])).toThrow();
     });
 
@@ -937,7 +998,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       // Part B, pending human sign-off). Passing the ownership + tier gates,
       // the bridge fails closed with SCP-IDENT-1022 instead of fabricating a
       // success. Mirrors the custody-migration NotConfigured assertion below.
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       expect(() => scp.identityExecuteRecovery(identity.did, "agent", [])).toThrow(
         /SCP-IDENT-1022|not configured/i,
       );
@@ -949,7 +1010,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       // Crossing the tokio barrier now succeeds (Phase 4 PR 5 fix);
       // the orchestrator then fails with SCP-IDENT-1025 inside the
       // backend. This assertion exercises that the async path runs.
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       expect(() => scp.identityExecuteCustodyMigration(identity.did, "encrypted_file", [])).toThrow(
         /SCP-IDENT-1025|not configured/i,
       );
@@ -969,7 +1030,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.identityCreateLinkAttestation + list + hydrate round-trips a signed attestation", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       // The 5th arg is the proof *method* — one of the spec-defined
       // verification methods (oauth / signed_post / dns_record /
       // challenge_response). `scp_ffi_common::validate` rejects
@@ -1019,7 +1080,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.identityRemoveLinkAttestation removes a previously-added attestation", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const attestationJson = await scp.identityCreateLinkAttestation(
         identity.did,
         "github.com",
@@ -1037,7 +1098,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.identityCreateLinkAttestation rejects an unsupported proof method", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       let attestErr: unknown;
       try {
         await scp.identityCreateLinkAttestation(
@@ -1057,7 +1118,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.identityVerifyLinkAttestation accepts a freshly-minted attestation", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const attestationJson = await scp.identityCreateLinkAttestation(
         identity.did,
         "github.com",
@@ -1098,7 +1159,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 
   describe("Context lifecycle (real NAPI)", () => {
     it("scp.contextCreate returns a Context wrapper with a non-empty contextId", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
@@ -1110,8 +1171,8 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.contextJoin lets a second identity enter the group", async () => {
-      const creator = await scp.identityCreate("in_memory");
-      const joiner = await scp.identityCreate("in_memory");
+      const creator = await createInMemoryIdentity(scp);
+      const joiner = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         creator,
         JSON.stringify({ ceiling: ["messages:read", "role:assign"] }),
@@ -1121,7 +1182,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.contextSend publishes through the relay without error", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
@@ -1131,8 +1192,8 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.contextLeave succeeds for a joined non-creator", async () => {
-      const admin = await scp.identityCreate("in_memory");
-      const member = await scp.identityCreate("in_memory");
+      const admin = await createInMemoryIdentity(scp);
+      const member = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         admin,
         JSON.stringify({
@@ -1147,7 +1208,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.contextClose by the admin transitions the context out of Active", async () => {
-      const admin = await scp.identityCreate("in_memory");
+      const admin = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         admin,
         JSON.stringify({
@@ -1167,22 +1228,22 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.contextIsMember returns true for the creator, false for an outsider", async () => {
-      const identity = await scp.identityCreate("in_memory");
-      const outsider = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
+      const outsider = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(identity, JSON.stringify({ ceiling: ["messages:read"] }));
       expect(await scp.contextIsMember(ctx._rawHandle, identity.did)).toBe(true);
       expect(await scp.contextIsMember(ctx._rawHandle, outsider.did)).toBe(false);
     });
 
     it("scp.contextMemberDids lists the creator DID", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(identity, JSON.stringify({ ceiling: ["messages:read"] }));
       const dids = await scp.contextMemberDids(ctx._rawHandle);
       expect(dids).toContain(identity.did);
     });
 
     it("scp.contextMemberRole returns the creator's admin role (single_admin governance)", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read"], governance: "single_admin" }),
@@ -1197,7 +1258,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.contextCreate rejects an unknown governance model (SCP-GOV error)", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       let govErr: unknown;
       try {
         await scp.contextCreate(
@@ -1215,7 +1276,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("Broadcast-mode contextCreate produces a usable handle", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         identity,
         JSON.stringify({
@@ -1231,7 +1292,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.contextSend fails after the context is closed", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read", "messages:write", "context:close"] }),
@@ -1247,8 +1308,8 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("non-admin closing a single_admin context is rejected", async () => {
-      const admin = await scp.identityCreate("in_memory");
-      const member = await scp.identityCreate("in_memory");
+      const admin = await createInMemoryIdentity(scp);
+      const member = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         admin,
         JSON.stringify({
@@ -1278,8 +1339,8 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 
   describe("UCAN flow (real NAPI)", () => {
     it("scp.ucanMint returns a token with the requested capability URI", async () => {
-      const admin = await scp.identityCreate("in_memory");
-      const member = await scp.identityCreate("in_memory");
+      const admin = await createInMemoryIdentity(scp);
+      const member = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
       const raw = (await scp.ucanMint(ctx._rawHandle, member.did, ["messages:read"])) as {
         encoded: string;
@@ -1292,8 +1353,8 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.ucanValidate accepts a minted token for its granted capability", async () => {
-      const admin = await scp.identityCreate("in_memory");
-      const member = await scp.identityCreate("in_memory");
+      const admin = await createInMemoryIdentity(scp);
+      const member = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
       const token = (await scp.ucanMint(ctx._rawHandle, member.did, ["messages:read"])) as {
         encoded: string;
@@ -1306,8 +1367,8 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.ucanValidate rejects a capability that was not granted", async () => {
-      const admin = await scp.identityCreate("in_memory");
-      const member = await scp.identityCreate("in_memory");
+      const admin = await createInMemoryIdentity(scp);
+      const member = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
       const token = (await scp.ucanMint(ctx._rawHandle, member.did, ["messages:read"])) as {
         encoded: string;
@@ -1322,8 +1383,8 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.ucanValidate rejects a token a second time (ADR-016 step 9 nonce replay)", async () => {
-      const admin = await scp.identityCreate("in_memory");
-      const member = await scp.identityCreate("in_memory");
+      const admin = await createInMemoryIdentity(scp);
+      const member = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
       const token = (await scp.ucanMint(ctx._rawHandle, member.did, ["messages:read"])) as {
         encoded: string;
@@ -1343,8 +1404,8 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.ucanRevoke causes subsequent validation to fail", async () => {
-      const admin = await scp.identityCreate("in_memory");
-      const member = await scp.identityCreate("in_memory");
+      const admin = await createInMemoryIdentity(scp);
+      const member = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
       const token = (await scp.ucanMint(ctx._rawHandle, member.did, ["messages:read"])) as {
         encoded: string;
@@ -1362,9 +1423,9 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.ucanDelegate scopes a minted token down to a subset audience", async () => {
-      const admin = await scp.identityCreate("in_memory");
-      const member = await scp.identityCreate("in_memory");
-      const delegate = await scp.identityCreate("in_memory");
+      const admin = await createInMemoryIdentity(scp);
+      const member = await createInMemoryIdentity(scp);
+      const delegate = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         admin,
         JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
@@ -1385,9 +1446,9 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.ucanDelegate rejects when delegator is not the parent audience (ceiling enforcement)", async () => {
-      const admin = await scp.identityCreate("in_memory");
-      const member = await scp.identityCreate("in_memory");
-      const other = await scp.identityCreate("in_memory");
+      const admin = await createInMemoryIdentity(scp);
+      const member = await createInMemoryIdentity(scp);
+      const other = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
       const token = (await scp.ucanMint(ctx._rawHandle, member.did, ["messages:read"])) as {
         encoded: string;
@@ -1445,7 +1506,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     }
 
     it("scp.outletRegister returns an outlet ID", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["outlet:register"] }),
@@ -1463,8 +1524,8 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.outletInvoke executes a registered outlet with a valid UCAN", async () => {
-      const admin = await scp.identityCreate("in_memory");
-      const member = await scp.identityCreate("in_memory");
+      const admin = await createInMemoryIdentity(scp);
+      const member = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         admin,
         JSON.stringify({ ceiling: ["outlet:register", "outlet:call:*"] }),
@@ -1490,8 +1551,8 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.outletInvoke fails without a UCAN for the matching capability", async () => {
-      const admin = await scp.identityCreate("in_memory");
-      const outsider = await scp.identityCreate("in_memory");
+      const admin = await createInMemoryIdentity(scp);
+      const outsider = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         admin,
         JSON.stringify({ ceiling: ["outlet:register", "outlet:call:*"] }),
@@ -1514,7 +1575,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.outletVerify returns a verification summary", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["outlet:register"] }),
@@ -1553,7 +1614,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       identity: Awaited<ReturnType<SCP["identityCreate"]>>;
       ctx: Awaited<ReturnType<SCP["contextCreate"]>>;
     }> {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         identity,
         JSON.stringify({
@@ -1567,7 +1628,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 
     it("scp.broadcastSubscribe adds a subscriber", async () => {
       const { ctx } = await makeBroadcast();
-      const subscriber = await scp.identityCreate("in_memory");
+      const subscriber = await createInMemoryIdentity(scp);
       await scp.broadcastSubscribe(ctx._rawHandle, subscriber.did);
       expect(await scp.contextIsBroadcastSubscriber(ctx._rawHandle, subscriber.did)).toBe(true);
       expect(await scp.contextBroadcastSubscriberCount(ctx._rawHandle)).toBe(1);
@@ -1575,7 +1636,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 
     it("scp.broadcastUnsubscribe removes a subscriber", async () => {
       const { ctx } = await makeBroadcast();
-      const subscriber = await scp.identityCreate("in_memory");
+      const subscriber = await createInMemoryIdentity(scp);
       await scp.broadcastSubscribe(ctx._rawHandle, subscriber.did);
       await scp.broadcastUnsubscribe(ctx._rawHandle, subscriber.did);
       expect(await scp.contextIsBroadcastSubscriber(ctx._rawHandle, subscriber.did)).toBe(false);
@@ -1584,7 +1645,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 
     it("scp.broadcastUnsubscribe with rotateKeys=true succeeds", async () => {
       const { ctx } = await makeBroadcast();
-      const subscriber = await scp.identityCreate("in_memory");
+      const subscriber = await createInMemoryIdentity(scp);
       await scp.broadcastSubscribe(ctx._rawHandle, subscriber.did);
       // The Rust path emits a BroadcastKeyRotated event when rotateKeys=true.
       // We only assert the call path doesn't throw — content of the event
@@ -1603,7 +1664,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 
     it("scp.broadcastBlockSubscriber keeps the DID in the roster per §5.14.8", async () => {
       const { ctx, identity } = await makeBroadcast();
-      const subscriber = await scp.identityCreate("in_memory");
+      const subscriber = await createInMemoryIdentity(scp);
       await scp.broadcastSubscribe(ctx._rawHandle, subscriber.did);
       await scp.broadcastBlockSubscriber(ctx._rawHandle, subscriber.did, identity.did);
       // Per §5.14.8, per-author blocking does NOT remove from the
@@ -1613,7 +1674,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 
     it("scp.broadcastUnblockSubscriber returns the subscriber to unblocked state", async () => {
       const { ctx, identity } = await makeBroadcast();
-      const subscriber = await scp.identityCreate("in_memory");
+      const subscriber = await createInMemoryIdentity(scp);
       await scp.broadcastSubscribe(ctx._rawHandle, subscriber.did);
       await scp.broadcastBlockSubscriber(ctx._rawHandle, subscriber.did, identity.did);
       await scp.broadcastUnblockSubscriber(ctx._rawHandle, subscriber.did, identity.did);
@@ -1623,7 +1684,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 
     it("scp.broadcastHandleKeyRequest grants and scp.broadcastOpenKey opens the key", async () => {
       const { ctx, identity } = await makeBroadcast();
-      const subscriber = await scp.identityCreate("in_memory");
+      const subscriber = await createInMemoryIdentity(scp);
       await scp.broadcastSubscribe(ctx._rawHandle, subscriber.did);
       const { secret, publicKey } = generateX25519KeyPair();
       const sealedJson = await scp.broadcastHandleKeyRequest(
@@ -1642,7 +1703,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 
     it("scp.broadcastHandleKeyRequest returns null for a non-subscriber", async () => {
       const { ctx, identity } = await makeBroadcast();
-      const stranger = await scp.identityCreate("in_memory");
+      const stranger = await createInMemoryIdentity(scp);
       const { publicKey } = generateX25519KeyPair();
       const decision = await scp.broadcastHandleKeyRequest(
         ctx._rawHandle,
@@ -1661,7 +1722,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.contextBroadcastSubscriberCount returns null for an encrypted context", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(identity, JSON.stringify({ ceiling: ["messages:read"] }));
       // Encrypted mode (the default) — subscriber count is a broadcast-only
       // notion. The bridge returns null to indicate inapplicability.
@@ -1714,8 +1775,8 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 
   describe("Governance (real NAPI)", () => {
     it("scp.contextExecuteGovernanceAction changes a member's role", async () => {
-      const admin = await scp.identityCreate("in_memory");
-      const member = await scp.identityCreate("in_memory");
+      const admin = await createInMemoryIdentity(scp);
+      const member = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         admin,
         JSON.stringify({
@@ -1750,8 +1811,8 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.contextExecuteGovernanceAction removes a member", async () => {
-      const admin = await scp.identityCreate("in_memory");
-      const member = await scp.identityCreate("in_memory");
+      const admin = await createInMemoryIdentity(scp);
+      const member = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         admin,
         JSON.stringify({
@@ -1779,7 +1840,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.contextExecuteGovernanceAction rejects invalid JSON", async () => {
-      const admin = await scp.identityCreate("in_memory");
+      const admin = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         admin,
         JSON.stringify({ ceiling: ["messages:read"], governance: "single_admin" }),
@@ -1794,7 +1855,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.contextGovernanceListProposals returns a JSON array (initially empty)", async () => {
-      const admin = await scp.identityCreate("in_memory");
+      const admin = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         admin,
         JSON.stringify({ ceiling: ["messages:read"], governance: "single_admin" }),
@@ -1813,7 +1874,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 
   describe("Event log (real NAPI)", () => {
     it("scp.eventLogQuery returns at least one event after create", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(identity, JSON.stringify({ ceiling: ["messages:read"] }));
       const events = await scp.eventLogQuery(ctx._rawHandle);
       expect(events.length).toBeGreaterThanOrEqual(1);
@@ -1825,8 +1886,8 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("a MessageSent send surfaces on the ContextEvent buffer but is excluded from the durable log", async () => {
-      const identity = await scp.identityCreate("in_memory");
-      const bob = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
+      const bob = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         identity,
         JSON.stringify({
@@ -1863,7 +1924,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.eventLogVerify confirms an inclusion proof against leaf 0 (snake_case key)", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(identity, JSON.stringify({ ceiling: ["messages:read"] }));
       // Rust serde expects snake_case on the claim JSON. The SCP surface
       // does not transform the argument, so the caller must pass
@@ -1877,7 +1938,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.eventLogCheckpoint returns a merkleRoot + event count", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(identity, JSON.stringify({ ceiling: ["messages:read"] }));
       // At the raw NAPI surface, the checkpoint struct keys use napi
       // camelCase directly (`merkleRoot`). The Bridge wrapper in
@@ -1896,7 +1957,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.eventLogCheckpointByDid accepts a DID string and returns the same shape", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(identity, JSON.stringify({ ceiling: ["messages:read"] }));
       const checkpoint = scp.eventLogCheckpointByDid(ctx._rawHandle, identity.did, 0) as {
         merkleRoot: string;
@@ -1907,7 +1968,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.contextDrainEvents returns events and is idempotent on a second call", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(identity, JSON.stringify({ ceiling: ["messages:read"] }));
       const first = await scp.contextDrainEvents(ctx._rawHandle);
       expect(Array.isArray(first)).toBe(true);
@@ -1922,7 +1983,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 
   describe("TTL operations (real NAPI)", () => {
     it("scp.contextHandleTtlExpiry is callable on a TTL context", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 3600 }),
@@ -1933,7 +1994,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.contextProposeTtlExtension returns a boolean (unanimous with one member)", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 3600 }),
@@ -1943,7 +2004,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.contextResetTtlTimer completes without error", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 3600 }),
@@ -1958,7 +2019,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 
   describe("Context export/import (real NAPI)", () => {
     it("scp.contextExport returns a non-empty Uint8Array", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read"], memoryScope: "ephemeral" }),
@@ -1969,7 +2030,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("export -> close -> import round-trips the context ID", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         identity,
         JSON.stringify({
@@ -1986,7 +2047,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.contextImport rejects malformed data", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       let importMalformedErr: unknown;
       try {
         await scp.contextImport(new Uint8Array([0, 1, 2, 3]), identity.did);
@@ -2007,7 +2068,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       // changes must go through governance (propose SetEconomicPolicy
       // action). Direct mutation is rejected. This is a protocol-level
       // guarantee; the test pins the fail-closed path.
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(identity, JSON.stringify({ ceiling: ["messages:read"] }));
       const policy = JSON.stringify({
         locked: false,
@@ -2022,7 +2083,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.contextGetEconomicPolicy returns null when none is set", async () => {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(identity, JSON.stringify({ ceiling: ["messages:read"] }));
       expect(scp.contextGetEconomicPolicy(ctx._rawHandle)).toBeNull();
     });
@@ -2080,7 +2141,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     it("SCP-PERM-3030 is raised when a handle crosses SCP instances", async () => {
       const other = new SCP({ storage: { type: "in_memory" } });
       try {
-        const identity = await scp.identityCreate("in_memory");
+        const identity = await createInMemoryIdentity(scp);
         // `identity` belongs to `scp`. Feeding it to `other.contextCreate`
         // must be rejected BEFORE any capability or state work runs.
         let threw = false;
@@ -2102,7 +2163,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     it("contextSend with a handle minted by another SCP is rejected", async () => {
       const other = new SCP({ storage: { type: "in_memory" } });
       try {
-        const ours = await scp.identityCreate("in_memory");
+        const ours = await createInMemoryIdentity(scp);
         const ourCtx = await scp.contextCreate(
           ours,
           JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
@@ -2132,8 +2193,8 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 
   describe("End-to-end scenarios (real NAPI)", () => {
     it("E2E context lifecycle: create -> join -> send -> query -> leave -> close", async () => {
-      const alice = await scp.identityCreate("in_memory");
-      const bob = await scp.identityCreate("in_memory");
+      const alice = await createInMemoryIdentity(scp);
+      const bob = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         alice,
         JSON.stringify({
@@ -2168,8 +2229,8 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("E2E UCAN lifecycle: mint -> validate -> revoke -> validation fails", async () => {
-      const admin = await scp.identityCreate("in_memory");
-      const member = await scp.identityCreate("in_memory");
+      const admin = await createInMemoryIdentity(scp);
+      const member = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         admin,
         JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
@@ -2191,8 +2252,8 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("E2E broadcast lifecycle: create -> subscribe -> publish -> unsubscribe", async () => {
-      const author = await scp.identityCreate("in_memory");
-      const subscriber = await scp.identityCreate("in_memory");
+      const author = await createInMemoryIdentity(scp);
+      const subscriber = await createInMemoryIdentity(scp);
       const ctx = await scp.contextCreate(
         author,
         JSON.stringify({
@@ -2238,8 +2299,8 @@ describeStorageNapi("SCP storage integration (real NAPI)", () => {
     const a = new SCP({ storage: { type: "in_memory" } });
     const b = new SCP({ storage: { type: "in_memory" } });
     try {
-      const idA = await a.identityCreate("in_memory");
-      const idB = await b.identityCreate("in_memory");
+      const idA = await createInMemoryIdentity(a);
+      const idB = await createInMemoryIdentity(b);
       // Two fresh SCPs mint distinct identities.
       expect(idA.did).not.toBe(idB.did);
       // Isolation is over KEY MATERIAL / storage, not public documents. Ephemeral
@@ -2268,7 +2329,7 @@ describeStorageNapi("SCP storage integration (real NAPI)", () => {
       const first = new SCP({ storage: { type: "sqlite", path: dir, key } });
       let createdDid: string;
       try {
-        const identity = await first.identityCreate("in_memory");
+        const identity = await createInMemoryIdentity(first);
         createdDid = identity.did;
         expect(createdDid).toMatch(/^did:dht:/);
       } finally {
@@ -2302,7 +2363,7 @@ describeStorageNapi("SCP storage integration (real NAPI)", () => {
       // First open with the correct key — creates the encrypted DB.
       const first = new SCP({ storage: { type: "sqlite", path: dir, key: goodKey } });
       try {
-        await first.identityCreate("in_memory");
+        await createInMemoryIdentity(first);
       } finally {
         await first.shutdown(1);
       }
@@ -2337,7 +2398,7 @@ describeStorageNapi("SCP storage integration (real NAPI)", () => {
       // resume() must resolve (post-#1678 async semantics).
       await fresh.resume();
       // An identityCreate after resume must still work.
-      const id = await fresh.identityCreate("in_memory");
+      const id = await createInMemoryIdentity(fresh);
       expect(id.did).toMatch(/^did:dht:/);
     } finally {
       await fresh.shutdown(1);
