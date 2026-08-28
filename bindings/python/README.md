@@ -67,23 +67,23 @@ that takes an injected provider.
 ## No shipped build creates an identity yet
 
 `identity_create_with_custody` raises `IdentityError` with code
-`SCP-IDENT-1059` on every shipped build, and so does
-`identity_create(CustodyType.FILE)` once `SCP_KEY_PASSPHRASE` is set. Spec
-section 9.7.4.1 makes every identity
-commit a pre-rotation commitment when it is created, that commitment needs a
-`PreRotationCustody` backend, and the only implementation is the test-harness
+`SCP-IDENT-1059` on every shipped build, and `identity_create(CustodyType.FILE)`
+raises it too once `SCP_KEY_PASSPHRASE` is set. Section 9.7.4.1 of the security
+model, pre-rotation key custody, makes every identity commit a pre-rotation
+commitment when it is created. That commitment needs a `PreRotationCustody`
+backend, and the only implementation is the test-harness
 `InMemoryPreRotationCustody`, which the bridge's `testing` feature severs from
-production. The bridge returns the typed `SCP-IDENT-1059` error rather than
-minting the test double
-(`crates/scp-ffi/src/identity.rs`, ADR-062, capability injection and
-prove-absent dev backends, §Decision 6). Every code example above therefore
-runs against a build that enables the `testing` feature.
+production, so `crates/scp-ffi/src/identity.rs` returns the typed error rather
+than minting the test double. ADR-062, capability injection and prove-absent
+dev backends, records that state as accepted in its §Decision 6 and holds the
+real backend out of its own scope. Every code example above therefore runs
+against a wheel built with the `testing` feature.
 
-Two separate gaps produce these two codes, and closing one does not close the
+Two separate gaps produce those codes, and closing one does not close the
 other. `SCP-IDENT-1003` and `SCP-IDENT-1008` say that the custody string you
 passed names no key store this bridge builds. `SCP-IDENT-1059` says that no
 pre-rotation custody backend exists for any create path to use. A wired
-platform provider clears the first; a real pre-rotation backend clears the
+platform provider clears the first gap; a real pre-rotation backend clears the
 second.
 
 ## Requirements

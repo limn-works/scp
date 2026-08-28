@@ -149,8 +149,9 @@ Every SCP participant starts by creating a cryptographic identity -- a DID (Dece
 
 **No shipped build creates an identity yet.** Every snippet in this section
 needs a bridge compiled with its `testing` feature. Section 9.7.4.1 of the
-security model makes every identity commit a pre-rotation commitment when it is
-created, that commitment needs a `PreRotationCustody` backend, and the only
+security model, pre-rotation key custody, makes every identity commit a
+pre-rotation commitment when it is
+created. That commitment needs a `PreRotationCustody` backend, and the only
 implementation is the test-harness `InMemoryPreRotationCustody`, which the
 `testing` feature severs from production. A shipped build therefore returns the
 typed `SCP-IDENT-1059` error rather than minting the test double. ADR-062,
@@ -288,11 +289,11 @@ custody. The NAPI and UniFFI bridges reject every custody string one step
 earlier, with `SCP-IDENT-1008` or `SCP-IDENT-1003`, so `identity_create` on
 those two bridges never reaches the pre-rotation step at all.
 
-Two separate gaps produce these codes, and closing one does not close the
+Two separate gaps produce those codes, and closing one does not close the
 other. `SCP-IDENT-1003` and `SCP-IDENT-1008` say that the custody string names
 no key store the bridge builds. `SCP-IDENT-1059` says that no pre-rotation
 custody backend exists for any create path to use. Wiring a platform provider
-clears the first; a real pre-rotation backend clears the second.
+clears the first gap; a real pre-rotation backend clears the second.
 
 ---
 

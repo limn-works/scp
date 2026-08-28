@@ -98,20 +98,22 @@ from the `uniffi.scp.KeyCustodyProvider` this method takes, declaring
 `SCP-IDENT-1059` on every released build. `identityCreate` stops one step
 earlier, with the `SCP-IDENT-1008` and `SCP-IDENT-1003` codes described above,
 because the bridge rejects every custody string before it reaches the
-pre-rotation step. Spec section 9.7.4.1 makes every identity commit a
-pre-rotation commitment when it is created, that commitment needs a `PreRotationCustody` backend, and the only
+pre-rotation step. Section 9.7.4.1 of the security model, pre-rotation key
+custody, makes every identity commit a pre-rotation commitment when it is
+created. That commitment needs a `PreRotationCustody` backend, and the only
 implementation is the test-harness `InMemoryPreRotationCustody`, which the
-bridge's `testing` feature severs from production. The bridge returns the typed
-`SCP-IDENT-1059` error rather than minting the test double
-(`crates/scp-ffi/uniffi/src/bridge.rs`, ADR-062, capability injection and
-prove-absent dev backends, §Decision 6). The Quick Start above therefore runs
-against a build that enables the `testing` feature.
+bridge's `testing` feature severs from production, so
+`crates/scp-ffi/uniffi/src/bridge.rs` returns the typed error rather than
+minting the test double. ADR-062, capability injection and prove-absent dev
+backends, records that state as accepted in its §Decision 6 and holds the real
+backend out of its own scope. The Quick Start above therefore runs against a
+build that enables the `testing` feature.
 
-Two separate gaps produce these two codes, and closing one does not close the
+Two separate gaps produce those codes, and closing one does not close the
 other. `SCP-IDENT-1003` and `SCP-IDENT-1008` say that the custody string you
 passed names no key store this bridge builds. `SCP-IDENT-1059` says that no
 pre-rotation custody backend exists for any create path to use. A wired
-platform provider clears the first; a real pre-rotation backend clears the
+platform provider clears the first gap; a real pre-rotation backend clears the
 second.
 
 ## Requirements

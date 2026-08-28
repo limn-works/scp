@@ -29,7 +29,7 @@ class SmokeTest {
     }
 
     @Test
-    fun `CustodyType offers one entry that reaches a key store`() {
+    fun `CustodyType spells each refused custody string the way the bridge spells it`() {
         // The bridge builds a key store for "in_memory" alone, and answers
         // "platform" and "software" with SCP-IDENT-1003, because neither
         // string reaches Android Keystore — a caller reaches it by injecting a
