@@ -19,6 +19,8 @@ pub mod dns_provider;
 pub(crate) mod error;
 pub mod http;
 pub mod projection;
+mod published_state;
+mod republish;
 pub mod self_host;
 pub mod tls;
 pub mod webhook;
@@ -40,6 +42,17 @@ use scp_transport::native::storage::{BlobStorage as _, BlobStorageBackend};
 use sha2::Digest;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
+
+pub(crate) use published_state::{
+    LiveSlot, NodePublishedState, NodePublisher, apply_tier_change, seed_from_startup_publish,
+};
+// The publish seam's trait and its call-authorization token are needed only by
+// test doubles (which implement `DidPublisher`) and the `NodePublisher::from_dyn`
+// test constructor. Production never names them — it goes through `NodePublisher`
+// and `seed_from_startup_publish` / `apply_tier_change` — so gate the re-export to
+// `cfg(test)` to keep the non-test build free of an unused import.
+#[cfg(test)]
+pub(crate) use published_state::{DidPublisher, PublishAuthorization};
 
 pub use http::BroadcastContext;
 pub use projection::{
@@ -219,11 +232,23 @@ impl RelayHandle {
 pub struct IdentityHandle {
     /// The SCP identity containing key handles and DID string.
     identity: ScpIdentity,
-    /// The published DID document.
-    document: DidDocument,
+    /// The node's live published-state slot, never an independent copy. See
+    /// [`LiveSlot`].
+    live_state: LiveSlot<NodePublishedState>,
 }
 
 impl IdentityHandle {
+    /// Binds an identity to the node's live published-state slot.
+    pub(crate) const fn new(
+        identity: ScpIdentity,
+        live_state: LiveSlot<NodePublishedState>,
+    ) -> Self {
+        Self {
+            identity,
+            live_state,
+        }
+    }
+
     /// Returns a reference to the underlying [`ScpIdentity`].
     #[must_use]
     pub const fn identity(&self) -> &ScpIdentity {
@@ -236,10 +261,15 @@ impl IdentityHandle {
         &self.identity.did
     }
 
-    /// Returns a reference to the published [`DidDocument`].
+    /// Returns the [`DidDocument`] the node currently stands behind.
+    ///
+    /// By value rather than by reference precisely because it can change: a
+    /// `&DidDocument` would either pin the document for the borrow's lifetime or
+    /// hand back a build-time copy. (No intra-doc link: the slot type is
+    /// crate-private, like the `NodeState` field it lives on.)
     #[must_use]
-    pub const fn document(&self) -> &DidDocument {
-        &self.document
+    pub fn document(&self) -> DidDocument {
+        self.live_state.get().document
     }
 }
 
@@ -280,6 +310,20 @@ pub struct ApplicationNode<S: Storage> {
     /// `None` in domain mode with successful TLS (Tier 4 doesn't need NAT re-eval).
     tier_reeval: Option<TierReEvalHandle>,
     /// Channel for tier change events (§10.12.1, SCP-243).
+    ///
+    /// A bounded `mpsc` whose sender uses `try_send` (see `apply_tier_change`),
+    /// so it drops the NEWEST event on a full queue rather than the oldest —
+    /// technically the wrong end for a latest-value "where am I now" stream, for
+    /// which `tokio::sync::watch` would be the semantically-correct primitive.
+    /// It is kept as `mpsc` deliberately: no production consumer drains this
+    /// stream (the authoritative surfaces — `.well-known/scp`, the DID document,
+    /// `relay_url()` — never depend on it), so the drop-newest gap is
+    /// inconsequential, and the `try_send` is what keeps the tier task from
+    /// wedging on a full queue in the first place (see `apply_tier_change`). A
+    /// `watch` swap would wrap the variant-only `NatTierChange` in `Option` for
+    /// an initial value and rewrite the send block plus every test, buying
+    /// nothing while no consumer exists. Revisit the primitive if a real
+    /// draining consumer is ever added.
     tier_change_rx: Option<tokio::sync::mpsc::Receiver<NatTierChange>>,
     /// HTTP/3 configuration for the QUIC-based HTTP/3 endpoint (spec §10.15.1).
     /// `None` if HTTP/3 is not configured. Only available with the `http3` feature.
@@ -296,6 +340,21 @@ pub struct ApplicationNode<S: Storage> {
     /// Set by [`serve_background`](Self::serve_background) after successful bind.
     /// Wrapped in `Arc` so the spawned background task can clear it on exit.
     serving_addr: Arc<tokio::sync::Mutex<Option<SocketAddr>>>,
+    /// The node's self-DID republish cycle (ADR-003 §2, §3.10.5 step 4).
+    ///
+    /// Not an `Option`: every node has exactly one, because only a builder can
+    /// construct an `ApplicationNode` and both builders fill this field. A
+    /// Mainline DHT record that nothing re-puts expires, so a node without a
+    /// cycle is a node whose DID document stops resolving. The cycle is dormant
+    /// (zero arms) while the node has published nothing — which is the permanent
+    /// state of a [`DhtMode::Disabled`] node — and it seeds itself the moment the
+    /// node publishes. See [`republish`].
+    ///
+    /// `Arc<dyn RepublishCycle>` erases the DHT client type the builder's
+    /// `DidMethod` supplies, which `ApplicationNode<S>` does not carry.
+    /// [`shutdown`](Self::shutdown) stops it; dropping the node without calling
+    /// `shutdown` reaches the cycle's own `Drop` backstop.
+    republish: Arc<dyn republish::RepublishCycle>,
 }
 
 impl<S: Storage + std::fmt::Debug> std::fmt::Debug for ApplicationNode<S> {
@@ -323,6 +382,26 @@ impl<S: Storage> ApplicationNode<S> {
         self.domain.as_deref()
     }
 
+    /// The signed BEP44 DID record this node has most recently published
+    /// (§3.10.5).
+    ///
+    /// `None` when the node has published nothing — the `DhtMode::Disabled`
+    /// fail-safe default. That absence is protocol-supported and detectable;
+    /// callers MUST NOT synthesize a record in its place.
+    ///
+    /// The value is the output of this node's own signing pass, so a caller never
+    /// has to reconstruct the `(value, signature, seq)` triple by reading it back
+    /// off the network.
+    ///
+    /// This is a **snapshot**: a NAT tier change re-publishes the document with a
+    /// new sequence, after which this returns the newer record. The node's own
+    /// republish cycle takes a live view of the slot instead of a snapshot, so
+    /// it follows every re-publish (see the crate-private `republish` module).
+    #[must_use]
+    pub fn published_did_record(&self) -> Option<scp_identity::republish::RepublishEntry> {
+        self.state.live_state.get().record
+    }
+
     /// Returns a reference to the relay handle.
     #[must_use]
     pub const fn relay(&self) -> &RelayHandle {
@@ -341,13 +420,20 @@ impl<S: Storage> ApplicationNode<S> {
         &self.storage
     }
 
-    /// Returns the relay URL published in the DID document.
+    /// Returns the relay URL the node is currently reachable at — the one it
+    /// publishes in its DID document and serves from `.well-known/scp`.
     ///
     /// For domain mode: `wss://<domain>/scp/v1` (spec section 18.5.2).
-    /// For no-domain mode: the relay URL is stored in the node state.
+    /// For no-domain mode: the address of the current reachability tier, which a
+    /// NAT tier change (§10.12.1) advances.
+    ///
+    /// Returned by value rather than as `&str` precisely because it can change:
+    /// this reads the node's live state slot per call, and a borrow cannot escape
+    /// that slot. (No intra-doc link: the slot type is crate-private, like the
+    /// `NodeState` field it lives on.)
     #[must_use]
-    pub fn relay_url(&self) -> &str {
-        &self.state.relay_url
+    pub fn relay_url(&self) -> String {
+        self.state.live_state.get().relay_url
     }
 
     /// Returns a clonable handle to this node's outbound webhook dispatcher.
@@ -510,6 +596,24 @@ impl<S: Storage> ApplicationNode<S> {
         if let Some(ref handle) = self.tier_reeval {
             handle.stop_and_wait();
         }
+        // Both republish arms stop here. An arm that outlived shutdown would
+        // keep re-putting this node's address on the DHT for the life of the
+        // process — the §10.12.1 disclosure past shutdown.
+        self.republish.stop_and_wait();
+    }
+
+    /// How many republish arms this node is running, per layer.
+    ///
+    /// Crate-internal: the counts exist so the node's own tests can assert that
+    /// exactly one cycle runs and that it covers both layers (§3.10.6).
+    ///
+    /// The `testing` feature gates this method for the same reason it gates the
+    /// `ActiveArms` counts it returns: every test that calls it starts its node
+    /// in the `Memory` variant of `DhtMode`, which compiles only under that
+    /// feature.
+    #[cfg(all(test, feature = "testing"))]
+    pub(crate) async fn active_republish_arms(&self) -> republish::ActiveArms {
+        self.republish.active_arms().await
     }
 
     /// Returns a clone of the node's graceful-shutdown cancellation token.
@@ -2080,41 +2184,12 @@ impl TlsProvider for SelfSignedTlsProvider {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DidPublisher — object-safe trait for DID document publishing (SCP-243)
-// ---------------------------------------------------------------------------
-
-/// Object-safe trait for publishing DID documents.
-///
-/// The full [`DidMethod`] trait is not object-safe because it uses `impl Future`
-/// in return types. This trait wraps just the `publish` method with a boxed
-/// future, enabling the tier re-evaluation background task (SCP-243) to
-/// republish the DID document on tier changes without requiring generic
-/// parameters.
-pub(crate) trait DidPublisher: Send + Sync {
-    /// Publishes a DID document to the underlying DID infrastructure.
-    fn publish<'a>(
-        &'a self,
-        identity: &'a ScpIdentity,
-        document: &'a DidDocument,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), IdentityError>> + Send + 'a>>;
-}
-
-/// Blanket implementation wrapping any [`DidMethod`] into a [`DidPublisher`].
-struct DidMethodPublisher<D: DidMethod> {
-    inner: Arc<D>,
-}
-
-impl<D: DidMethod + 'static> DidPublisher for DidMethodPublisher<D> {
-    fn publish<'a>(
-        &'a self,
-        identity: &'a ScpIdentity,
-        document: &'a DidDocument,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), IdentityError>> + Send + 'a>>
-    {
-        Box::pin(self.inner.publish(identity, document))
-    }
-}
+// The node's DID-document publish seam — the `DidPublisher` trait, its production
+// impl `NodeDidPublisher`, the opaque `NodePublisher` handle, and
+// `seed_from_startup_publish` — lives in the private `published_state` module,
+// beside the live slot it writes and `apply_tier_change`. Keeping the seam and
+// the slot in one module is what makes `publish` uncallable without also seeding
+// the slot (SCP-RELAYRES-004 AC-6). See `published_state`.
 
 // ---------------------------------------------------------------------------
 // Tier re-evaluation (§10.12.1, SCP-243)
@@ -2402,7 +2477,7 @@ async fn run_mapping_renewal_loop(
 
 /// Spawns the NAT port-mapping renewal loop, tied to `cancel` for shutdown.
 ///
-/// Hold the returned [`JoinHandle`] for the node's lifetime. On shutdown, trigger
+/// Hold the returned [`JoinHandle`](tokio::task::JoinHandle) for the node's lifetime. On shutdown, trigger
 /// `cancel` and `await` the handle so the renewal loop fully stops *before* the
 /// mapping is released — renewal must never race the teardown `remove()`.
 ///
@@ -2419,49 +2494,6 @@ pub fn spawn_self_host_mapping_renewal(
     tokio::spawn(run_mapping_renewal_loop(mappers, port, cancel))
 }
 
-/// Handles a detected tier change: updates the DID document, republishes it,
-/// and emits the event only after successful publish. Returns the new URL and
-/// document on success.
-async fn apply_tier_change(
-    current_url: &str,
-    new_relay_url: &str,
-    trigger_reason: &str,
-    current_doc: &DidDocument,
-    publisher: &dyn DidPublisher,
-    identity: &ScpIdentity,
-    event_tx: Option<&tokio::sync::mpsc::Sender<NatTierChange>>,
-) -> Option<(String, DidDocument)> {
-    let mut updated_doc = current_doc.clone();
-    for svc in &mut updated_doc.service {
-        if svc.service_type == "SCPRelay" && svc.service_endpoint == current_url {
-            new_relay_url.clone_into(&mut svc.service_endpoint);
-        }
-    }
-    match publisher.publish(identity, &updated_doc).await {
-        Ok(()) => {
-            // Emit the tier-change event only after the DID document has been
-            // successfully published. This ensures consumers see events that
-            // correspond to actual state changes in the DHT.
-            if let Some(tx) = event_tx {
-                let _ = tx
-                    .send(NatTierChange::TierChanged {
-                        previous_relay_url: current_url.to_owned(),
-                        new_relay_url: new_relay_url.to_owned(),
-                        reason: trigger_reason.to_owned(),
-                    })
-                    .await;
-            }
-            tracing::info!(new_url = %new_relay_url, did = %identity.did,
-                "DID document republished with new relay URL");
-            Some((new_relay_url.to_owned(), updated_doc))
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "DID document republish failed after tier change");
-            None
-        }
-    }
-}
-
 /// Spawns the periodic tier re-evaluation background task (§10.12.1, SCP-243).
 ///
 /// The task uses `tokio::select!` to wait for either:
@@ -2471,15 +2503,19 @@ async fn apply_tier_change(
 /// On each trigger, it calls `NatStrategy::select_tier()` and compares the
 /// result to the current tier. If the tier changed, it updates the DID
 /// document and republishes it, logging at INFO level.
+///
+/// `live_state` is the node's shared state slot, not a copy: this task is its
+/// only writer, and it keeps no document and no URL of its own — not even the
+/// "current" address it compares against, which it reads back out of the slot.
+/// See [`LiveSlot`].
 #[allow(clippy::too_many_arguments)]
 fn spawn_tier_reevaluation(
     nat_strategy: Arc<dyn NatStrategy>,
     network_detector: Option<Arc<dyn NetworkChangeDetector>>,
-    publisher: Arc<dyn DidPublisher>,
+    publisher: NodePublisher,
     identity: ScpIdentity,
-    document: DidDocument,
+    live_state: LiveSlot<NodePublishedState>,
     relay_port: u16,
-    current_relay_url: String,
     event_tx: Option<tokio::sync::mpsc::Sender<NatTierChange>>,
     reevaluation_interval: Duration,
 ) -> TierReEvalHandle {
@@ -2496,8 +2532,6 @@ fn spawn_tier_reevaluation(
         // Held for the lifetime of the task future; dropped with it. The `move`
         // closure captures it even though it is never read.
         let _done_tx = done_tx;
-        let mut current_url = current_relay_url;
-        let mut current_doc = document;
         loop {
             let trigger_reason = tokio::select! {
                 () = tokio::time::sleep(reevaluation_interval) => {
@@ -2533,29 +2567,35 @@ fn spawn_tier_reevaluation(
                 }
             };
             let new_relay_url = tier_to_relay_url(&new_tier);
-            if new_relay_url == current_url {
-                tracing::debug!(relay_url = %current_url, "tier re-evaluation: no change");
+            // A re-publish is owed while EITHER the address the node advertises
+            // or the endpoint its DID document carries still names somewhere
+            // else. Both are checked because they are gated differently: the
+            // address advances on every detected change while the document
+            // advances only on a successful publish, so a failed publish must
+            // keep being retried after the address has already moved. See
+            // `NodePublishedState`.
+            let current = live_state.get();
+            if current.relay_url == new_relay_url
+                && published_state::document_relay_url(&current.document).as_deref()
+                    == Some(new_relay_url.as_str())
+            {
+                tracing::debug!(relay_url = %new_relay_url, "tier re-evaluation: no change");
                 continue;
             }
             tracing::info!(
-                previous_url = %current_url, new_url = %new_relay_url,
+                previous_url = %current.relay_url, new_url = %new_relay_url,
                 tier = ?new_tier, reason = trigger_reason,
                 "reachability tier changed, updating DID document (§10.12.1)"
             );
-            if let Some((url, doc)) = apply_tier_change(
-                &current_url,
+            apply_tier_change(
+                &live_state,
                 &new_relay_url,
                 trigger_reason,
-                &current_doc,
-                &*publisher,
+                &publisher,
                 &identity,
                 event_tx.as_ref(),
             )
-            .await
-            {
-                current_url = url;
-                current_doc = doc;
-            }
+            .await;
         }
     });
     TierReEvalHandle {
@@ -3067,6 +3107,42 @@ pub(crate) fn resolve_nat(
     })
 }
 
+/// Starts the node's self-DID republish cycle and erases its DHT client type.
+///
+/// ADR-003 §2 of `.docs/adrs/phase-1.md`: republishing "starts when an identity
+/// is loaded". Both builders call this, so every `Node::start` path reaches it —
+/// `build_domain_inner` on the `Reach::Domain` TLS-success arm, and
+/// [`build_no_domain_inner`] on `Reach::NatTraversal`, `Reach::Tunnel`,
+/// `Reach::Local`, and the `Reach::Domain` TLS-failure fall-through.
+///
+/// Both layers run. The DHT keep-alive is the only thing stopping this node's
+/// BEP44 record from expiring off Mainline, and the relay arm fails closed while
+/// no relay is bound and self-heals the instant one is; §3.10.6 forbids turning
+/// either off without a deliberate opt-out, and an unbound relay is not one.
+///
+/// The cycle reads a LIVE VIEW of the slot [`seed_from_startup_publish`] just
+/// built, never a snapshot: a NAT tier change re-publishes the document with a
+/// new `(value, signature, seq)`, and both arms follow it rather than going on
+/// asserting a superseded sequence. While `record` is `None` the cycle sits
+/// dormant at zero arms — the permanent state of a [`DhtMode::Disabled`] node,
+/// which publishes nothing.
+///
+/// The DHT client comes from the node's own [`DidMethod`], so the client that
+/// keeps the record alive is the client that signed the publish.
+async fn start_node_republish_cycle<D: DidMethod + 'static>(
+    did_method: &Arc<D>,
+    live_state: &LiveSlot<NodePublishedState>,
+) -> Arc<dyn republish::RepublishCycle> {
+    Arc::new(
+        republish::start_self_did_republishing(
+            did_method.dht_client(),
+            Arc::new(scp_transport::native::TransportRelayPublisher::new()),
+            live_state.subscribe(),
+        )
+        .await,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Shared domain build logic (extracted for clippy::too_many_lines)
 // ---------------------------------------------------------------------------
@@ -3113,7 +3189,27 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     // (and the test-only `Memory`) publish FATALLY, exactly as this path did
     // before. `Domain + Disabled` is never rejected: erroring on the fail-safe
     // direction would itself violate M2.
-    publish_did_document_for_mode(dht_mode, did_method.as_ref(), &identity, &document).await?;
+    //
+    // Published AND seeded through the node's single publish seam as ONE step:
+    // `seed_from_startup_publish` performs the publish and builds the live slot
+    // that carries the published document and record together, so a startup
+    // publish that does not seed the slot is not expressible (SCP-RELAYRES-004
+    // AC-6 — the seam's `publish` is uncallable outside `published_state`). The
+    // seam is the same one the no-domain builder and the tier-change task use, so
+    // the configured `DhtMode` gate is honored identically: `Disabled` publishes
+    // nothing (still a start), `Production` / test-only `Memory` publish FATALLY.
+    //
+    // Domain mode spawns NO tier re-evaluation (`tier_reeval: None`), so nothing
+    // writes the slot after construction — it is still a `LiveSlot` so both modes
+    // read the same live type and a future update site cannot leave a reader
+    // behind. See `LiveSlot`.
+    //
+    // FIRST bootstrap the publish-sequence counter (Production / Memory) so a
+    // restart's startup publish supersedes the live record instead of colliding
+    // at `seq = 1` (SCP-RELAYRES-004). This MUST precede `seed_from_startup_publish`.
+    initialize_sequence_for_mode(dht_mode, did_method.as_ref(), &identity).await?;
+    let publisher = NodePublisher::new(Arc::clone(&did_method), dht_mode);
+    let live_state = seed_from_startup_publish(&publisher, &identity, document, &relay_url).await?;
 
     // Build the rustls ServerConfig from the provisioned certificate.
     // Uses the reloadable config so that ACME renewal can hot-swap certs
@@ -3152,18 +3248,21 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
 
     // Build the production bridge auth lookup, hydrating from storage.
     // The audience URL is the HTTPS base URL for this node (spec 12.10.2).
-    let audience = format!("https://{domain}");
     let bridge_lookup = Arc::new(bridge_auth::StorageBridgeLookup::new(
         Arc::clone(&storage),
-        audience,
+        format!("https://{domain}"),
     ));
     if let Err(e) = bridge_lookup.load_from_storage().await {
         tracing::warn!(error = %e, "failed to load bridge auth cache from storage — starting with empty cache");
     }
 
+    // Start this node's self-DID republish cycle (ADR-003 §2). Below every
+    // fallible step in this builder, so no `?` leaves arms to tear down.
+    let republish = start_node_republish_cycle(&did_method, &live_state).await;
+
     let state = Arc::new(http::NodeState {
         did: identity.did.clone(),
-        relay_url,
+        live_state: live_state.clone(),
         broadcast_contexts: tokio::sync::RwLock::new(HashMap::new()),
         relay_addr: bound_addr,
         bridge_secret,
@@ -3182,7 +3281,6 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
         projection_ucan_cache: std::sync::RwLock::new(projection::ProjectionUcanCache::new()),
         tls_config: Some(Arc::new(tls_server_config)),
         cert_resolver: Some(cert_resolver),
-        did_document: document.clone(),
         connection_tracker,
         subscription_registry,
         acme_challenges,
@@ -3207,7 +3305,7 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
             bound_addr,
             shutdown_handle,
         },
-        identity: IdentityHandle { identity, document },
+        identity: IdentityHandle::new(identity, live_state),
         storage,
         state,
         tier_reeval: None,
@@ -3217,6 +3315,7 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
         serving: Arc::new(AtomicBool::new(false)),
         rate_limit_cleanup_spawned: Arc::new(AtomicBool::new(false)),
         serving_addr: Arc::new(tokio::sync::Mutex::new(None)),
+        republish,
     })
 }
 
@@ -3225,26 +3324,76 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
 // Reach::Domain ACME-failure fallthrough in config.rs's build engine)
 // ---------------------------------------------------------------------------
 
-/// Appends an `SCPRelay` service entry to the DID document for `relay_url`.
+/// Installs the node's OWN `SCPRelay` service entry for `relay_url` at the
+/// preferred position — first among the document's `SCPRelay` entries (§18.2.3).
 ///
-/// The service id is suffixed with the next sequential index so multiple relays
-/// can coexist on one document (`<did>#scp-relay-<n>`).
+/// # Why it inserts rather than appends
+///
+/// [`repoint_relay_service`](crate::published_state) keys the tier-change rewrite
+/// on POSITION: the first `SCPRelay` entry is the subject's preferred relay and
+/// the only one this node's own reachability owns. Nothing used to *establish*
+/// that position — this function appended, and so does
+/// [`DidDocument::add_relay_service`](scp_did::DidDocument::add_relay_service).
+/// The node's entry therefore landed first only when the incoming document
+/// happened to carry no relay entry at all.
+///
+/// It does not always. `IdentitySource::Explicit` is public API and hands the
+/// caller's document through verbatim, so a caller supplying a document that
+/// already names a relay pushed the node's own entry to position 1. Then the
+/// first tier tick found `document_relay_url` (position 0 — the CALLER's relay)
+/// disagreeing with the address the node advertises, ran a tier change that had
+/// not happened, rewrote the caller's preferred relay to the node's address, and
+/// left the node's own entry at position 1 naming the pre-change URL forever —
+/// never the `find` target again. Inserting at the preferred position makes the
+/// premise the rewriter relies on true by construction instead of asserted.
+///
+/// Additional relay entries keep their relative order after it, and their ids are
+/// left alone (see the comment on the insert). The node's own entry is suffixed
+/// with the next free sequential index so multiple relays can coexist
+/// (`<did>#scp-relay-<n>`).
 fn push_relay_service(document: &mut DidDocument, relay_url: &str) {
-    let relay_count = document
+    let insert_at = document
+        .service
+        .iter()
+        .position(|s| s.service_type == "SCPRelay")
+        .unwrap_or(document.service.len());
+    // The id is derived from the count of relay entries ALREADY present, not by
+    // renumbering the whole set. A caller-supplied document reaches this function
+    // verbatim through `IdentitySource::Explicit`, and its service ids are
+    // resolvable URIs that third parties may already reference; silently
+    // rewriting `did:x#my-primary-relay` to `did:x#scp-relay-2` would dangle
+    // them. The node names only the entry it owns.
+    let existing_relays = document
         .service
         .iter()
         .filter(|s| s.service_type == "SCPRelay")
         .count();
-    document.service.push(scp_did::Service {
-        id: format!("{}#scp-relay-{}", document.id, relay_count + 1),
-        service_type: "SCPRelay".to_owned(),
-        service_endpoint: relay_url.to_owned(),
-    });
+    document.service.insert(
+        insert_at,
+        scp_did::Service {
+            id: format!("{}#scp-relay-{}", document.id, existing_relays + 1),
+            service_type: "SCPRelay".to_owned(),
+            service_endpoint: relay_url.to_owned(),
+        },
+    );
 }
 
-/// Publishes a node's DID document on the no-domain build path, discriminating
-/// on the configured [`DhtMode`] so the two semantically-opposite outcomes are
-/// never conflated.
+/// Publishes a node's DID document, discriminating on the configured
+/// [`DhtMode`] so the two semantically-opposite outcomes are never conflated.
+///
+/// The `DhtMode` gate itself. Its ONLY caller is the node's publish seam
+/// (`NodeDidPublisher::publish`, in `published_state`), so every publish this
+/// node performs — startup and NAT tier change alike — honors the mode.
+///
+/// It takes a [`PublishAuthorization`] by value, whose sole constructor is
+/// private to `published_state`. So even though it is `pub(crate)`, it is
+/// **uncallable outside the publish seam by construction, not by convention**:
+/// a would-be in-crate caller that reached the [`DidMethod`] around this gate —
+/// publishing a `DhtMode::Disabled` node's address, or publishing WITHOUT
+/// seeding the live slot (the served≠published divergence AC-6 forbids) — cannot
+/// mint the token, so it does not compile. This completes AC-6's structural
+/// guarantee for the real DHT/relay publish itself, matching the guard on
+/// [`DidPublisher::publish`].
 ///
 /// The asymmetry is deliberate and honest:
 ///
@@ -3271,12 +3420,22 @@ fn push_relay_service(document: &mut DidDocument, relay_url: &str) {
 /// `D`'s client would error on publish (e.g.
 /// [`DisabledDhtClient`](scp_dht::DisabledDhtClient), ADR-062 §Decision 1), no
 /// publish is attempted, so a `Disabled` node always starts.
-async fn publish_did_document_for_mode<D: DidMethod + 'static>(
+///
+/// # Return value: the signed record, or an honest absence
+///
+/// Returns `Some(entry)` carrying the BEP44 `(public_key, seq, signature,
+/// value)` this publish signed, and `None` for `DhtMode::Disabled` — where the
+/// absence is the literal truth that nothing was published, not a lookup miss.
+/// The record becomes part of the node's [`NodePublishedState`], from which the
+/// self-host republish cycle reads it directly, so the triple is never
+/// reconstructed by resolving the node's own record back off the network.
+pub(crate) async fn publish_did_document_for_mode<D: DidMethod + 'static>(
+    _auth: published_state::PublishAuthorization,
     dht_mode: DhtMode,
     did_method: &D,
     identity: &ScpIdentity,
     document: &DidDocument,
-) -> Result<(), NodeError> {
+) -> Result<Option<scp_identity::republish::RepublishEntry>, NodeError> {
     match dht_mode {
         DhtMode::Disabled => {
             tracing::info!(
@@ -3284,7 +3443,7 @@ async fn publish_did_document_for_mode<D: DidMethod + 'static>(
                 "DhtMode::Disabled — node is intentionally not DHT-published \
                  (not discoverable by design; no address disclosed)"
             );
-            Ok(())
+            Ok(None)
         }
         // Production publishes to the global Mainline DHT; Memory (test-harness-
         // only) publishes to its in-memory client. Both treat a publish failure
@@ -3295,9 +3454,54 @@ async fn publish_did_document_for_mode<D: DidMethod + 'static>(
         DhtMode::Memory => did_method
             .publish(identity, document)
             .await
+            .map(Some)
             .map_err(NodeError::from),
         DhtMode::Production => did_method
             .publish(identity, document)
+            .await
+            .map(Some)
+            .map_err(NodeError::from),
+    }
+}
+
+/// Bootstraps the DID method's monotonic publish-sequence counter ahead of the
+/// node's STARTUP publish — for the modes that actually publish.
+///
+/// Mirrors [`publish_did_document_for_mode`]'s gate exactly, and must run BEFORE
+/// [`seed_from_startup_publish`] in the builders:
+///
+/// - [`DhtMode::Disabled`] publishes nothing, so there is no sequence to
+///   bootstrap — a no-op success (and it never touches the disabled DHT arm).
+/// - [`DhtMode::Production`] (and the test-only [`DhtMode::Memory`]) publish, so
+///   the counter MUST be raised to `max(persisted store, live DHT seq)` here.
+///   A fresh [`DidDht`](scp_identity::dht::DidDht) counter starts at
+///   `AtomicU64::new(0)`, so the first publish does `fetch_add(1)` → `seq = 1`.
+///   On a **restart within the record TTL** that `seq = 1` lands *beneath* the
+///   live `seq = N` record the previous run published: the real DHT rejects the
+///   lower-seq write (a fatal startup-publish failure) or, worse, the node pins
+///   itself at `seq = 1` and its DID document dies at the live record's TTL.
+///   Bootstrapping the counter here makes the startup publish emit `seq = N + 1`,
+///   correctly superseding the prior record (SCP-RELAYRES-004).
+///
+/// A failure is **FATAL**, exactly as a startup publish failure is:
+/// [`DidMethod::initialize_sequence`] is fail-closed on a DHT resolve error
+/// (proceeding at an unknown sequence would republish beneath the live record
+/// while the OLD — possibly superseded — document stays authoritative), so the
+/// node must not go on to publish.
+async fn initialize_sequence_for_mode<D: DidMethod + 'static>(
+    dht_mode: DhtMode,
+    did_method: &D,
+    identity: &ScpIdentity,
+) -> Result<(), NodeError> {
+    match dht_mode {
+        DhtMode::Disabled => Ok(()),
+        #[cfg(feature = "testing")]
+        DhtMode::Memory => did_method
+            .initialize_sequence(&identity.did)
+            .await
+            .map_err(NodeError::from),
+        DhtMode::Production => did_method
+            .initialize_sequence(&identity.did)
             .await
             .map_err(NodeError::from),
     }
@@ -3350,12 +3554,30 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
 
     push_relay_service(&mut document, &relay_url);
 
-    // 4. Publish the DID document per the configured DhtMode: skipped for
-    //    `Disabled` (fail-safe, not discoverable by design), FATAL on failure for
-    //    a publishing node (`Production` / test-only `Memory`) so a genuine
-    //    startup publish failure fails the node closed rather than advertising a
-    //    false discoverability guarantee.
-    publish_did_document_for_mode(dht_mode, did_method.as_ref(), &identity, &document).await?;
+    // 4. Publish the DID document through the node's SINGLE publish seam AND seed
+    //    the live slot in ONE step. `seed_from_startup_publish` performs the
+    //    publish and constructs the slot carrying the published document and
+    //    record together, so a startup publish that does not seed the slot is not
+    //    expressible (SCP-RELAYRES-004 AC-6 — the seam's `publish` is uncallable
+    //    outside `published_state`). The seam applies the configured DhtMode gate
+    //    — skipped for `Disabled` (fail-safe, not discoverable by design), FATAL
+    //    on failure for a publishing node (`Production` / test-only `Memory`) so a
+    //    genuine startup publish failure fails the node closed rather than
+    //    advertising a false discoverability guarantee. The SAME publisher handle
+    //    drives the tier-change re-publish below.
+    //
+    //    Consuming the plain `document` here is deliberate: past this line there
+    //    is no copy of it left in scope to hand out, so the tier task, `NodeState`
+    //    and the `IdentityHandle` can only receive clones of the slot. See
+    //    `LiveSlot`.
+    //
+    //    FIRST bootstrap the publish-sequence counter (Production / Memory) so the
+    //    startup publish supersedes any live record a prior run left within its
+    //    TTL, instead of colliding at `seq = 1` (SCP-RELAYRES-004). This MUST
+    //    precede `seed_from_startup_publish` — the publish is inside it.
+    initialize_sequence_for_mode(dht_mode, did_method.as_ref(), &identity).await?;
+    let publisher = NodePublisher::new(Arc::clone(&did_method), dht_mode);
+    let live_state = seed_from_startup_publish(&publisher, &identity, document, &relay_url).await?;
 
     tracing::info!(
         tier = ?tier,
@@ -3366,9 +3588,10 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
         "application node started (no-domain mode, §10.12.8)"
     );
 
-    let publisher: Arc<dyn DidPublisher> = Arc::new(DidMethodPublisher {
-        inner: Arc::clone(&did_method),
-    });
+    // Start this node's self-DID republish cycle (ADR-003 §2). Below every
+    // fallible step in this builder, so no `?` leaves arms to tear down.
+    let republish = start_node_republish_cycle(&did_method, &live_state).await;
+
     let (tier_event_tx, tier_event_rx) = tokio::sync::mpsc::channel(16);
     let bg_identity = identity.clone();
     // No tier to re-evaluate when the probe was skipped: the node is reached via
@@ -3381,18 +3604,25 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
             network_detector,
             publisher,
             bg_identity,
-            document.clone(),
+            live_state.clone(),
             http_bind_addr.port(),
-            relay_url.clone(),
             Some(tier_event_tx),
             TIER_REEVALUATION_INTERVAL,
         ))
     };
 
-    // Bridge auth lookup — audience is relay URL in no-domain mode (spec 12.10.2).
+    // Bridge auth lookup — audience is the relay URL in no-domain mode (spec
+    // 12.10.2). Deliberately a SNAPSHOT, not a clone of the slot: the audience is
+    // this node's stable JWT-validation identity, not its reachability address.
+    // `load_from_storage` persists it once (`bridge/config/audience`) and never
+    // overwrites it, so it is already pinned across restarts — and making it
+    // follow a NAT tier change would silently invalidate every bridge credential
+    // an operator had already minted against the old value. The domain builder
+    // makes the same distinction visible: there the audience is
+    // `https://<domain>`, which is not the relay URL at all.
     let bridge_lookup = Arc::new(bridge_auth::StorageBridgeLookup::new(
         Arc::clone(&storage),
-        relay_url.clone(),
+        live_state.get().relay_url,
     ));
     if let Err(e) = bridge_lookup.load_from_storage().await {
         tracing::warn!(error = %e, "failed to load bridge auth cache from storage — starting with empty cache");
@@ -3400,7 +3630,7 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
 
     let state = Arc::new(http::NodeState {
         did: identity.did.clone(),
-        relay_url,
+        live_state: live_state.clone(),
         broadcast_contexts: tokio::sync::RwLock::new(HashMap::new()),
         relay_addr: bound_addr,
         bridge_secret,
@@ -3419,7 +3649,6 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
         projection_ucan_cache: std::sync::RwLock::new(projection::ProjectionUcanCache::new()),
         tls_config: None,
         cert_resolver: None,
-        did_document: document.clone(),
         connection_tracker,
         subscription_registry,
         acme_challenges: None,
@@ -3445,7 +3674,7 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
             bound_addr,
             shutdown_handle,
         },
-        identity: IdentityHandle { identity, document },
+        identity: IdentityHandle::new(identity, live_state),
         storage,
         state,
         // `None` for both when the NAT probe was skipped: there is no
@@ -3458,6 +3687,7 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
         serving: Arc::new(AtomicBool::new(false)),
         rate_limit_cleanup_spawned: Arc::new(AtomicBool::new(false)),
         serving_addr: Arc::new(tokio::sync::Mutex::new(None)),
+        republish,
     })
 }
 
@@ -3577,6 +3807,15 @@ impl KeyCustody for NoOpCustody {
 pub struct NoOpDidMethod;
 
 impl DidMethod for NoOpDidMethod {
+    /// Every other method here returns an error, so the keep-alive client is the
+    /// one that refuses to publish rather than one that would report a false
+    /// success: `DisabledDhtClient::publish` returns `DhtError::Disabled`.
+    type Dht = scp_dht::DisabledDhtClient;
+
+    fn dht_client(&self) -> Arc<scp_dht::DisabledDhtClient> {
+        Arc::new(scp_dht::DisabledDhtClient)
+    }
+
     fn create(
         &self,
         _key_custody: &impl KeyCustody,
@@ -3600,7 +3839,10 @@ impl DidMethod for NoOpDidMethod {
         &self,
         _identity: &ScpIdentity,
         _document: &DidDocument,
-    ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send {
+    ) -> impl std::future::Future<
+        Output = Result<scp_identity::republish::RepublishEntry, IdentityError>,
+    > + Send {
+        // Fails closed with a typed error — never a fabricated signed record.
         std::future::ready(Err(IdentityError::DhtPublishFailed(
             "NoOpDidMethod: not configured".to_owned(),
         )))
@@ -3922,6 +4164,16 @@ mod tests {
         }
 
         impl DidMethod for CountingDidMethod {
+            /// These doubles observe what the builders publish; none of them
+            /// keeps a record alive, so the keep-alive client is the fail-closed
+            /// `DisabledDhtClient` rather than one that would report a false
+            /// publish success.
+            type Dht = scp_dht::DisabledDhtClient;
+
+            fn dht_client(&self) -> Arc<scp_dht::DisabledDhtClient> {
+                Arc::new(scp_dht::DisabledDhtClient)
+            }
+
             fn create(
                 &self,
                 key_custody: &impl KeyCustody,
@@ -3943,7 +4195,9 @@ mod tests {
                 &self,
                 identity: &ScpIdentity,
                 document: &DidDocument,
-            ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send {
+            ) -> impl std::future::Future<
+                Output = Result<scp_identity::republish::RepublishEntry, IdentityError>,
+            > + Send {
                 self.publish_count.fetch_add(1, Ordering::SeqCst);
                 self.inner.publish(identity, document)
             }
@@ -4057,6 +4311,16 @@ mod tests {
         }
 
         impl DidMethod for RelayCheckDidMethod {
+            /// These doubles observe what the builders publish; none of them
+            /// keeps a record alive, so the keep-alive client is the fail-closed
+            /// `DisabledDhtClient` rather than one that would report a false
+            /// publish success.
+            type Dht = scp_dht::DisabledDhtClient;
+
+            fn dht_client(&self) -> Arc<scp_dht::DisabledDhtClient> {
+                Arc::new(scp_dht::DisabledDhtClient)
+            }
+
             fn create(
                 &self,
                 key_custody: &impl KeyCustody,
@@ -4078,7 +4342,9 @@ mod tests {
                 &self,
                 identity: &ScpIdentity,
                 document: &DidDocument,
-            ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send {
+            ) -> impl std::future::Future<
+                Output = Result<scp_identity::republish::RepublishEntry, IdentityError>,
+            > + Send {
                 // Probe the relay bind address to see if it's listening.
                 let addr = self.bind_addr;
                 let flag = Arc::clone(&self.relay_was_listening_at_publish);
@@ -4317,6 +4583,16 @@ mod tests {
     }
 
     impl DidMethod for FailingPublishDidMethod {
+        /// These doubles observe what the builders publish; none of them
+        /// keeps a record alive, so the keep-alive client is the fail-closed
+        /// `DisabledDhtClient` rather than one that would report a false
+        /// publish success.
+        type Dht = scp_dht::DisabledDhtClient;
+
+        fn dht_client(&self) -> Arc<scp_dht::DisabledDhtClient> {
+            Arc::new(scp_dht::DisabledDhtClient)
+        }
+
         fn create(
             &self,
             key_custody: &impl KeyCustody,
@@ -4338,7 +4614,9 @@ mod tests {
             &self,
             _identity: &ScpIdentity,
             _document: &DidDocument,
-        ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send {
+        ) -> impl std::future::Future<
+            Output = Result<scp_identity::republish::RepublishEntry, IdentityError>,
+        > + Send {
             self.publish_attempts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             std::future::ready(Err(IdentityError::DhtPublishFailed(
@@ -4449,6 +4727,178 @@ mod tests {
             0,
             "relay should be bound to a real port"
         );
+        // B2: the absence is HONEST — the node published nothing, so it carries
+        // no signed record. Nothing is fabricated in its place, and the
+        // downstream republish cycle reads exactly this to stay dormant.
+        assert!(
+            node.published_did_record().is_none(),
+            "a Disabled node published nothing, so it holds no signed record"
+        );
+    }
+
+    /// B2: a node that DOES publish carries the signed BEP44 record its own
+    /// publish produced — so nothing downstream has to reconstruct the
+    /// `(value, signature, seq)` triple by reading it back off the network.
+    ///
+    /// The returned record is checked against the node's DID-derived key, so a
+    /// fabricated or mismatched record cannot pass.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn publishing_node_carries_its_own_signed_record() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let did_method = Arc::new(make_test_dht(&custody));
+        // A resolvable NAT tier so the build reaches the publish step.
+        let tier = ReachabilityTier::Stun {
+            external_addr: SocketAddr::from(([198, 51, 100, 9], 32893)),
+        };
+        let config = NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht: DhtMode::Memory,
+            nat: NatSlot::Custom(Arc::new(MockNatStrategy { tier })),
+            ..NodeConfig::defaults(
+                Reach::NatTraversal,
+                IdentitySource::Generate {
+                    custody,
+                    did_method,
+                },
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
+        };
+
+        let node = Node::start_for_testing(config)
+            .await
+            .expect("a publishing node starts");
+
+        let record = node
+            .published_did_record()
+            .expect("a publishing node carries the record it signed");
+
+        // The record is genuinely this node's: its key derives the node's DID,
+        // and its (value, seq) BEP44-verify under that key.
+        assert_eq!(
+            record.did(),
+            node.identity().did(),
+            "the record's key derives THIS node's DID"
+        );
+        scp_dht::verify_bep44_signature(
+            &record.public_key,
+            &record.signature,
+            &record.document_bytes,
+            record.sequence,
+        )
+        .expect("the carried record BEP44-verifies against the node's own key");
+        assert!(
+            record.sequence >= 1,
+            "a published record carries the sequence its publish assigned"
+        );
+    }
+
+    /// SCP-RELAYRES-004: a node RESTART within the record TTL must SUPERSEDE the
+    /// live `seq = N` record its prior run published, not collide beneath it at
+    /// `seq = 1`.
+    ///
+    /// The builder now bootstraps the publish-sequence counter
+    /// (`initialize_sequence_for_mode`) BEFORE the startup publish, so the
+    /// restart's `seed_from_startup_publish` emits `seq = N + 1`. Against the
+    /// pre-fix code — which bootstrapped the counter only AFTER `Node::start`
+    /// (or self-host build) had already published — this fails: a fresh
+    /// `AtomicU64::new(0)` published `seq = 1` beneath the live `seq = N`.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn restart_startup_publish_supersedes_live_record_not_seq_1() {
+        use scp_platform::testing::InMemoryPreRotationCustody;
+
+        // The live record the prior run leaves behind sits at seq = N.
+        const N: u64 = 5;
+
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let cache = Arc::new(DidCache::new());
+        // ONE shared in-memory DHT client stands in for the live Mainline record
+        // that survives a restart within TTL: both the "prior run" and the
+        // "restart" DID methods publish into / resolve from it.
+        let shared_dht = Arc::new(InMemoryDhtClient::new());
+
+        // Create the node's identity ONCE; the restart reuses it verbatim via
+        // `IdentitySource::Explicit` (a restart keeps the same DID).
+        let prior_method = Arc::new(DidDht::with_client_and_signer(
+            Arc::clone(&shared_dht),
+            Arc::clone(&cache),
+            TestDidDht::make_sign_fn(Arc::clone(&custody)),
+        ));
+        let pre_rotation = InMemoryPreRotationCustody::new();
+        let (identity, document, _handle) = prior_method
+            .create(&*custody, &pre_rotation)
+            .await
+            .expect("identity creation succeeds");
+
+        // Simulate the prior run: drive the shared live record up to seq = N.
+        let mut last_seq = 0;
+        for _ in 0..N {
+            last_seq = prior_method
+                .publish(&identity, &document)
+                .await
+                .expect("prior-run publish succeeds")
+                .sequence;
+        }
+        assert_eq!(last_seq, N, "prior run left the live record at seq = N");
+
+        // RESTART: a FRESH DID method over the SAME shared DHT client — its
+        // sequence counter starts at `AtomicU64::new(0)`, exactly as a restarted
+        // process's would.
+        let restart_method = Arc::new(DidDht::with_client_and_signer(
+            Arc::clone(&shared_dht),
+            Arc::clone(&cache),
+            TestDidDht::make_sign_fn(Arc::clone(&custody)),
+        ));
+
+        let tier = ReachabilityTier::Stun {
+            external_addr: SocketAddr::from(([198, 51, 100, 9], 32893)),
+        };
+        let config: NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> = NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht: DhtMode::Memory,
+            nat: NatSlot::Custom(Arc::new(MockNatStrategy { tier })),
+            ..NodeConfig::defaults(
+                Reach::NatTraversal,
+                IdentitySource::Explicit(Box::new(ExplicitIdentity {
+                    identity: identity.clone(),
+                    document: document.clone(),
+                    did_method: restart_method,
+                })),
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
+        };
+
+        let node = Node::start_for_testing(config)
+            .await
+            .expect("the restarted node starts");
+
+        let record = node
+            .published_did_record()
+            .expect("the restarted node carries the record it signed");
+
+        // The fix: the startup publish superseded the live record at seq = N + 1.
+        // Without `initialize_sequence` in the builder the fresh counter would
+        // have published seq = 1, colliding beneath the live seq = N record.
+        assert_eq!(
+            record.sequence,
+            N + 1,
+            "restart must supersede the live record at seq = N+1, not collide at seq = 1"
+        );
+        assert_eq!(
+            record.did(),
+            node.identity().did(),
+            "the record's key derives THIS (restarted) node's DID"
+        );
+        scp_dht::verify_bep44_signature(
+            &record.public_key,
+            &record.signature,
+            &record.document_bytes,
+            record.sequence,
+        )
+        .expect("the superseding record BEP44-verifies against the node's own key");
     }
 
     // -----------------------------------------------------------------------
@@ -4717,6 +5167,16 @@ mod tests {
         }
 
         impl DidMethod for CountingDidMethod {
+            /// These doubles observe what the builders publish; none of them
+            /// keeps a record alive, so the keep-alive client is the fail-closed
+            /// `DisabledDhtClient` rather than one that would report a false
+            /// publish success.
+            type Dht = scp_dht::DisabledDhtClient;
+
+            fn dht_client(&self) -> Arc<scp_dht::DisabledDhtClient> {
+                Arc::new(scp_dht::DisabledDhtClient)
+            }
+
             fn create(
                 &self,
                 key_custody: &impl KeyCustody,
@@ -4738,7 +5198,9 @@ mod tests {
                 &self,
                 identity: &ScpIdentity,
                 document: &DidDocument,
-            ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send {
+            ) -> impl std::future::Future<
+                Output = Result<scp_identity::republish::RepublishEntry, IdentityError>,
+            > + Send {
                 self.publish_count.fetch_add(1, Ordering::SeqCst);
                 self.inner.publish(identity, document)
             }
@@ -5426,7 +5888,9 @@ mod tests {
         }
     }
 
-    /// Mock `DidPublisher` that records publish calls.
+    /// Mock `DidPublisher` that records publish calls and models the real seam's
+    /// monotonically-increasing BEP44 sequence, so a test can tell the record
+    /// produced by the Nth publish apart from the previous one.
     struct RecordingPublisher {
         publish_count: std::sync::atomic::AtomicU32,
     }
@@ -5446,14 +5910,33 @@ mod tests {
     impl DidPublisher for RecordingPublisher {
         fn publish<'a>(
             &'a self,
+            _auth: PublishAuthorization,
             _identity: &'a ScpIdentity,
-            _document: &'a DidDocument,
+            document: &'a DidDocument,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<(), IdentityError>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<
+                        Output = Result<Option<scp_identity::republish::RepublishEntry>, NodeError>,
+                    > + Send
+                    + 'a,
+            >,
         > {
-            self.publish_count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Box::pin(async { Ok(()) })
+            let sequence = u64::from(
+                self.publish_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            ) + 1;
+            let document_bytes = document
+                .to_json()
+                .expect("test document serializes")
+                .into_bytes();
+            Box::pin(async move {
+                Ok(Some(scp_identity::republish::RepublishEntry {
+                    public_key: [7u8; 32],
+                    document_bytes,
+                    signature: [0u8; 64],
+                    sequence,
+                }))
+            })
         }
     }
 
@@ -5509,11 +5992,14 @@ mod tests {
         let handle = spawn_tier_reevaluation(
             Arc::clone(&strategy) as Arc<dyn NatStrategy>,
             None,
-            Arc::clone(&publisher) as Arc<dyn DidPublisher>,
+            NodePublisher::from_dyn(Arc::clone(&publisher) as Arc<dyn DidPublisher>),
             identity,
-            document,
+            LiveSlot::new(NodePublishedState {
+                document,
+                relay_url: "ws://198.51.100.7:32891/scp/v1".to_owned(),
+                record: None,
+            }),
             32891,
-            "ws://198.51.100.7:32891/scp/v1".to_owned(),
             Some(event_tx),
             TEST_REEVALUATION_INTERVAL,
         );
@@ -5597,11 +6083,14 @@ mod tests {
         let handle = spawn_tier_reevaluation(
             Arc::clone(&strategy) as Arc<dyn NatStrategy>,
             Some(detector as Arc<dyn NetworkChangeDetector>),
-            Arc::clone(&publisher) as Arc<dyn DidPublisher>,
+            NodePublisher::from_dyn(Arc::clone(&publisher) as Arc<dyn DidPublisher>),
             identity,
-            document,
+            LiveSlot::new(NodePublishedState {
+                document,
+                relay_url: "ws://198.51.100.7:32891/scp/v1".to_owned(),
+                record: None,
+            }),
             32891,
-            "ws://198.51.100.7:32891/scp/v1".to_owned(),
             Some(event_tx),
             // Use a long interval so the periodic timer does NOT fire first.
             Duration::from_hours(1),
@@ -5685,11 +6174,14 @@ mod tests {
         let handle = spawn_tier_reevaluation(
             Arc::clone(&strategy) as Arc<dyn NatStrategy>,
             None,
-            Arc::clone(&publisher) as Arc<dyn DidPublisher>,
+            NodePublisher::from_dyn(Arc::clone(&publisher) as Arc<dyn DidPublisher>),
             identity,
-            document,
+            LiveSlot::new(NodePublishedState {
+                document,
+                relay_url: "ws://198.51.100.7:32891/scp/v1".to_owned(),
+                record: None,
+            }),
             32891,
-            "ws://198.51.100.7:32891/scp/v1".to_owned(),
             Some(event_tx),
             TEST_REEVALUATION_INTERVAL,
         );
@@ -5783,11 +6275,14 @@ mod tests {
         let handle = spawn_tier_reevaluation(
             strategy as Arc<dyn NatStrategy>,
             None,
-            Arc::clone(&publisher) as Arc<dyn DidPublisher>,
+            NodePublisher::from_dyn(Arc::clone(&publisher) as Arc<dyn DidPublisher>),
             identity,
-            document,
+            LiveSlot::new(NodePublishedState {
+                document,
+                relay_url: format!("ws://{addr}/scp/v1"),
+                record: None,
+            }),
             addr.port(),
-            format!("ws://{addr}/scp/v1"),
             Some(event_tx),
             TEST_REEVALUATION_INTERVAL,
         );
@@ -5851,6 +6346,563 @@ mod tests {
         );
 
         node.shutdown();
+    }
+
+    // -----------------------------------------------------------------------
+    // The node's published state is a LIVE slot, not a build-time snapshot
+    // (SCP-243 §10.12.1 / SCP-RELAYRES-004). See `NodePublishedState`.
+    //
+    // `apply_tier_change` re-points the node's relay endpoint on a NAT tier
+    // change. These tests drive a REAL tier change on a REAL node — real
+    // builder, real tier re-evaluation task, real publish seam — and assert
+    // against the real handler RESPONSE BODIES and public accessors, never a
+    // field: the token-gated `GET /scp/dev/v1/identity` document, the public
+    // `IdentityHandle::document`, the PUBLIC UNAUTHENTICATED
+    // `GET /.well-known/scp` top-level `relay` field and invite-URI `relay=`
+    // parameters, and `ApplicationNode::relay_url`. Every one must advance, and
+    // — the actual invariant — they must all AGREE.
+    // -----------------------------------------------------------------------
+
+    /// The pre-tier-change relay endpoint these tests start at.
+    const TIER_CHANGE_OLD_URL: &str = "ws://198.51.100.7:32891/scp/v1";
+    /// The post-tier-change relay endpoint these tests expect to be served.
+    const TIER_CHANGE_NEW_URL: &str = "ws://203.0.113.42:8443/scp/v1";
+    /// The context ID registered so the discovery document actually contains
+    /// `scp://context/…?relay=` URIs to check.
+    const WELL_KNOWN_TEST_CONTEXT: &str = "beefcafe";
+
+    /// Builds a no-domain `NodeConfig` whose NAT probe walks a STUN tier then a
+    /// `UPnP` tier (`TIER_CHANGE_OLD_URL` then `TIER_CHANGE_NEW_URL`), and whose
+    /// network-change detector is driven by the returned sender.
+    ///
+    /// The build path calls `select_tier` exactly once, so the first tier is the
+    /// node's startup tier and the sender triggers the re-evaluation that reaches
+    /// the second — a real tier change, without waiting out the 30-minute
+    /// production timer or reaching into the task.
+    fn tier_change_config(
+        dht: DhtMode,
+    ) -> (
+        NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage>,
+        tokio::sync::mpsc::Sender<()>,
+    ) {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let did_method = Arc::new(make_test_dht(&custody));
+        let (net_change_tx, net_change_rx) = tokio::sync::mpsc::channel(16);
+        let config = NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht,
+            nat: NatSlot::Custom(Arc::new(SequenceNatStrategy::new(vec![
+                ReachabilityTier::Stun {
+                    external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
+                },
+                ReachabilityTier::Upnp {
+                    external_addr: SocketAddr::from(([203, 0, 113, 42], 8443)),
+                },
+            ]))),
+            network_detector: Some(Arc::new(
+                scp_transport::nat::ChannelNetworkChangeDetector::new(net_change_rx),
+            )),
+            ..NodeConfig::defaults(
+                Reach::NatTraversal,
+                IdentitySource::Generate {
+                    custody,
+                    did_method,
+                },
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
+        };
+        (config, net_change_tx)
+    }
+
+    /// Every relay endpoint the node exposes, read back through the REAL
+    /// surfaces a caller uses:
+    /// `(dev-API document, IdentityHandle document, .well-known top-level relay,
+    /// .well-known invite-URI relays, ApplicationNode::relay_url)`.
+    async fn advertised_relay_surfaces<S: scp_platform::traits::Storage>(
+        node: &ApplicationNode<S>,
+    ) -> (Vec<String>, Vec<String>, String, Vec<String>, String) {
+        use axum::response::IntoResponse as _;
+
+        let state = &node.state;
+        let identity_response =
+            crate::dev_api::identity_handler(axum::extract::State(Arc::clone(state)))
+                .await
+                .into_response();
+        let identity_body = axum::body::to_bytes(identity_response.into_body(), usize::MAX)
+            .await
+            .expect("the dev API identity body is readable");
+        let identity_json: serde_json::Value =
+            serde_json::from_slice(&identity_body).expect("the dev API identity response is JSON");
+        let dev_api_document: DidDocument =
+            serde_json::from_value(identity_json["document"].clone())
+                .expect("the dev API serves a full DID document, not the DID-string fallback");
+
+        let well_known_response =
+            crate::well_known::well_known_handler(axum::extract::State(Arc::clone(state)))
+                .await
+                .into_response();
+        let well_known_body = axum::body::to_bytes(well_known_response.into_body(), usize::MAX)
+            .await
+            .expect("the .well-known/scp body is readable");
+        let well_known: scp_core::well_known::WellKnownScp =
+            serde_json::from_slice(&well_known_body).expect("the .well-known/scp response is JSON");
+
+        let uri_relays = well_known
+            .contexts
+            .unwrap_or_default()
+            .into_iter()
+            .map(|ctx| {
+                let uri = ctx
+                    .uri
+                    .expect("a broadcast context advertises an invite URI");
+                let query = uri
+                    .split_once('?')
+                    .expect("the invite URI carries a query string")
+                    .1;
+                let encoded = query
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("relay="))
+                    .expect("the invite URI carries a relay= parameter");
+                percent_encoding::percent_decode_str(encoded)
+                    .decode_utf8()
+                    .expect("the relay= parameter is UTF-8")
+                    .into_owned()
+            })
+            .collect();
+
+        (
+            dev_api_document.relay_service_urls(),
+            node.identity().document().relay_service_urls(),
+            well_known.relay,
+            uri_relays,
+            node.relay_url(),
+        )
+    }
+
+    /// Asserts every advertised surface names `expected`, and therefore agrees
+    /// with every other. Nothing else pins the surfaces to EACH OTHER, which is
+    /// the invariant the single slot exists to hold.
+    async fn assert_all_surfaces_advertise<S: scp_platform::traits::Storage>(
+        node: &ApplicationNode<S>,
+        expected: &str,
+        when: &str,
+    ) {
+        let (dev_api, handle, well_known_relay, uri_relays, accessor) =
+            advertised_relay_surfaces(node).await;
+        let expected_one = vec![expected.to_owned()];
+        assert_eq!(dev_api, expected_one, "dev-API document, {when}");
+        assert_eq!(handle, expected_one, "IdentityHandle::document, {when}");
+        assert_eq!(
+            well_known_relay, expected,
+            "the PUBLIC .well-known/scp top-level relay, {when}"
+        );
+        assert_eq!(
+            uri_relays, expected_one,
+            "the PUBLIC .well-known/scp invite-URI relay= parameters, {when}"
+        );
+        assert_eq!(accessor, expected, "ApplicationNode::relay_url, {when}");
+    }
+
+    /// Drives the node through one real tier change and returns once it has been
+    /// applied.
+    ///
+    /// The tier task writes the slot BEFORE emitting `TierChanged`, so awaiting
+    /// the event is a happens-before edge for the update — no polling, no sleep.
+    async fn drive_tier_change<S: scp_platform::traits::Storage>(
+        node: &mut ApplicationNode<S>,
+        net_change_tx: &tokio::sync::mpsc::Sender<()>,
+    ) {
+        net_change_tx
+            .send(())
+            .await
+            .expect("the network-change detector is listening");
+        let event = tokio::time::timeout(
+            TEST_EVENT_TIMEOUT,
+            node.tier_change_rx()
+                .expect("a no-domain node streams tier changes")
+                .recv(),
+        )
+        .await
+        .expect("timed out waiting for the tier change")
+        .expect("the tier-change channel closed unexpectedly");
+        match event {
+            NatTierChange::TierChanged {
+                previous_relay_url,
+                new_relay_url,
+                ..
+            } => {
+                assert_eq!(previous_relay_url, TIER_CHANGE_OLD_URL);
+                assert_eq!(new_relay_url, TIER_CHANGE_NEW_URL);
+            }
+            other => panic!("expected TierChanged, got {other:?}"),
+        }
+    }
+
+    /// THE regression: a NAT tier change re-signs and re-publishes the node's DID
+    /// document with a NEW relay endpoint, and EVERY surface that reports the
+    /// node's address must report THAT one — the token-gated dev API, the public
+    /// identity handle, the public unauthenticated discovery document (top-level
+    /// field and invite URIs alike) and the public accessor.
+    ///
+    /// Against the pre-fix code this fails on every surface: each held its own
+    /// build-time copy, so the dev API served a document naming a dead relay and
+    /// `.well-known/scp` handed every peer an address the node had moved off.
+    #[tokio::test]
+    async fn tier_change_advances_every_advertised_surface_in_agreement() {
+        let (config, net_change_tx) = tier_change_config(DhtMode::Production);
+        let mut node = Node::start_for_testing(config)
+            .await
+            .expect("the no-domain node starts");
+        node.register_broadcast_context(WELL_KNOWN_TEST_CONTEXT.to_owned(), None)
+            .await
+            .expect("a broadcast context registers");
+
+        assert_all_surfaces_advertise(&node, TIER_CHANGE_OLD_URL, "at startup").await;
+        let published_before = node
+            .published_did_record()
+            .expect("a publishing node signs a record at startup");
+
+        drive_tier_change(&mut node, &net_change_tx).await;
+
+        // The re-publish genuinely happened: a new signed record at a higher
+        // BEP44 sequence. Without this the surface assertions could pass on a
+        // change that was never published.
+        let published_after = node
+            .published_did_record()
+            .expect("the tier change re-published");
+        assert!(
+            published_after.sequence > published_before.sequence,
+            "the tier-change re-publish assigns a HIGHER sequence ({} -> {})",
+            published_before.sequence,
+            published_after.sequence
+        );
+        assert!(
+            String::from_utf8_lossy(&published_after.document_bytes).contains(TIER_CHANGE_NEW_URL),
+            "the re-published record carries the NEW relay endpoint"
+        );
+
+        assert_all_surfaces_advertise(&node, TIER_CHANGE_NEW_URL, "after the tier change").await;
+
+        node.shutdown();
+    }
+
+    /// The `DhtMode::Disabled` case: the node publishes NOTHING — its record is
+    /// `None` before and after — and every surface must STILL advance, because
+    /// its reachability genuinely changed.
+    ///
+    /// This is why the state is its own slot rather than a projection of the
+    /// published record: keying it off the record would leave a
+    /// not-discoverable-by-design node advertising the build-time endpoint
+    /// forever, or force a synthesized record to paper over it.
+    #[tokio::test]
+    async fn tier_change_advances_every_surface_on_a_node_that_publishes_nothing() {
+        let (config, net_change_tx) = tier_change_config(DhtMode::Disabled);
+        let mut node = Node::start_for_testing(config)
+            .await
+            .expect("a DhtMode::Disabled node starts without publishing");
+        node.register_broadcast_context(WELL_KNOWN_TEST_CONTEXT.to_owned(), None)
+            .await
+            .expect("a broadcast context registers");
+
+        assert!(
+            node.published_did_record().is_none(),
+            "DhtMode::Disabled publishes nothing — the honest absent state"
+        );
+        assert_all_surfaces_advertise(&node, TIER_CHANGE_OLD_URL, "at startup").await;
+
+        drive_tier_change(&mut node, &net_change_tx).await;
+
+        assert!(
+            node.published_did_record().is_none(),
+            "the tier change must not make a non-publishing node publish"
+        );
+        assert_all_surfaces_advertise(
+            &node,
+            TIER_CHANGE_NEW_URL,
+            "after a tier change that published nothing",
+        )
+        .await;
+
+        node.shutdown();
+    }
+
+    // -----------------------------------------------------------------------
+    // `apply_tier_change` unit tests over the slot directly: the two gates, and
+    // the document rewrite's unconditional postcondition.
+    // -----------------------------------------------------------------------
+
+    /// A `DidPublisher` that records what it was handed and can be made to fail.
+    struct ScriptedPublisher {
+        fail: bool,
+        seen: std::sync::Mutex<Vec<DidDocument>>,
+    }
+
+    impl ScriptedPublisher {
+        fn new(fail: bool) -> Self {
+            Self {
+                fail,
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl DidPublisher for ScriptedPublisher {
+        fn publish<'a>(
+            &'a self,
+            _auth: PublishAuthorization,
+            _identity: &'a ScpIdentity,
+            document: &'a DidDocument,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<Option<scp_identity::republish::RepublishEntry>, NodeError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            self.seen
+                .lock()
+                .expect("scripted publisher lock")
+                .push(document.clone());
+            let fail = self.fail;
+            Box::pin(async move {
+                if fail {
+                    Err(NodeError::Identity(IdentityError::DhtPublishFailed(
+                        "scripted failure".to_owned(),
+                    )))
+                } else {
+                    Ok(None)
+                }
+            })
+        }
+    }
+
+    fn slot_test_identity() -> ScpIdentity {
+        ScpIdentity {
+            identity_key: scp_platform::KeyHandle::new(1),
+            active_signing_key: scp_platform::KeyHandle::new(2),
+            agent_signing_key: None,
+            pre_rotation_commitment: [0u8; 32],
+            did: "did:dht:slottest".to_owned(),
+        }
+    }
+
+    fn slot_test_document(relay_endpoints: &[&str]) -> DidDocument {
+        DidDocument {
+            context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+            id: "did:dht:slottest".to_owned(),
+            verification_method: vec![],
+            authentication: vec![],
+            assertion_method: vec![],
+            also_known_as: vec![],
+            service: relay_endpoints
+                .iter()
+                .enumerate()
+                .map(|(i, endpoint)| scp_did::Service {
+                    id: format!("did:dht:slottest#scp-relay-{}", i + 1),
+                    service_type: "SCPRelay".to_owned(),
+                    service_endpoint: (*endpoint).to_owned(),
+                })
+                .collect(),
+        }
+    }
+
+    /// The node's own entry lands FIRST even when the caller's document already
+    /// names a relay — the position premise `repoint_relay_service` keys on.
+    ///
+    /// `IdentitySource::Explicit` hands a caller-supplied document through
+    /// verbatim. While `push_relay_service` appended, the node's own entry landed
+    /// at position 1 behind the caller's, so `document_relay_url` (position 0)
+    /// reported the CALLER's relay while the slot reported the node's. The first
+    /// tier tick then saw them disagree, ran a tier change that had not happened,
+    /// rewrote the caller's preferred relay, and stranded the node's own entry at
+    /// position 1 naming a URL nothing would ever re-point again.
+    #[test]
+    fn the_nodes_own_relay_entry_is_installed_at_the_preferred_position() {
+        const CALLER_RELAY: &str = "wss://caller.example.com/scp/v1";
+        let mut document = slot_test_document(&[CALLER_RELAY]);
+
+        push_relay_service(&mut document, TIER_CHANGE_NEW_URL);
+
+        assert_eq!(
+            document.relay_service_urls(),
+            vec![TIER_CHANGE_NEW_URL.to_owned(), CALLER_RELAY.to_owned()],
+            "the node's own relay is the subject's preferred relay (§18.2.3) and \
+             must be first; the caller's additional relay keeps its order after it"
+        );
+        assert_eq!(
+            published_state::document_relay_url(&document).as_deref(),
+            Some(TIER_CHANGE_NEW_URL),
+            "so the tier loop's skip condition compares against the node's own \
+             endpoint rather than the caller's"
+        );
+        // The caller's service id is untouched. A DID service `id` is a
+        // resolvable URI a third party may already reference, so the node names
+        // only the entry it owns rather than renumbering the whole set.
+        let ids: Vec<&str> = document
+            .service
+            .iter()
+            .filter(|s| s.service_type == "SCPRelay")
+            .map(|s| s.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "did:dht:slottest#scp-relay-2",
+                "did:dht:slottest#scp-relay-1"
+            ],
+            "the node takes the next free index and leaves the caller's id alone"
+        );
+        assert_eq!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            ids.len(),
+            "service ids must stay unique within the document"
+        );
+    }
+
+    /// A document with NO `SCPRelay` entry still ends up naming the address the
+    /// node advertises. The predecessor rewrote only entries matching the current
+    /// URL while the address advanced regardless, so a document with no match
+    /// diverged from the advertised address permanently.
+    #[tokio::test]
+    async fn tier_change_appends_a_relay_service_when_the_document_carries_none() {
+        let live_state = LiveSlot::new(NodePublishedState {
+            document: slot_test_document(&[]),
+            relay_url: TIER_CHANGE_OLD_URL.to_owned(),
+            record: None,
+        });
+        let publisher = Arc::new(ScriptedPublisher::new(false));
+
+        apply_tier_change(
+            &live_state,
+            TIER_CHANGE_NEW_URL,
+            "test",
+            &NodePublisher::from_dyn(Arc::clone(&publisher) as Arc<dyn DidPublisher>),
+            &slot_test_identity(),
+            None,
+        )
+        .await;
+
+        let state = live_state.get();
+        assert_eq!(state.relay_url, TIER_CHANGE_NEW_URL);
+        assert_eq!(
+            state.document.relay_service_urls(),
+            vec![TIER_CHANGE_NEW_URL.to_owned()],
+            "no matching entry to re-point → the document gains one, rather than \
+             silently disagreeing with the address the node advertises"
+        );
+        assert_eq!(
+            publisher.seen.lock().expect("lock")[0].relay_service_urls(),
+            vec![TIER_CHANGE_NEW_URL.to_owned()],
+            "and the document that was PUBLISHED already carried it"
+        );
+    }
+
+    /// A tier change re-points only the preferred (first) `SCPRelay` entry
+    /// (§18.2.3) — the one this node's own reachability owns. Additional relays
+    /// are other ways to reach the subject and a NAT tier change does not move
+    /// them.
+    #[tokio::test]
+    async fn tier_change_repoints_only_the_preferred_relay_entry() {
+        const OTHER_RELAY: &str = "wss://other.example.com/scp/v1";
+        let live_state = LiveSlot::new(NodePublishedState {
+            document: slot_test_document(&[TIER_CHANGE_OLD_URL, OTHER_RELAY]),
+            relay_url: TIER_CHANGE_OLD_URL.to_owned(),
+            record: None,
+        });
+
+        apply_tier_change(
+            &live_state,
+            TIER_CHANGE_NEW_URL,
+            "test",
+            &NodePublisher::from_dyn(
+                Arc::new(ScriptedPublisher::new(false)) as Arc<dyn DidPublisher>
+            ),
+            &slot_test_identity(),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            live_state.get().document.relay_service_urls(),
+            vec![TIER_CHANGE_NEW_URL.to_owned(), OTHER_RELAY.to_owned()],
+        );
+    }
+
+    /// A FAILED re-publish still advances the address the node reports — the
+    /// external address has already moved, so the old one is dead either way and
+    /// `.well-known/scp` must not keep handing it to peers — while leaving the
+    /// document at what was actually published. The next re-evaluation therefore
+    /// still owes a re-publish, which the tier loop detects by comparing the
+    /// DOCUMENT's endpoint rather than the address.
+    #[tokio::test]
+    async fn a_failed_republish_advances_the_address_but_not_the_document() {
+        let live_state = LiveSlot::new(NodePublishedState {
+            document: slot_test_document(&[TIER_CHANGE_OLD_URL]),
+            relay_url: TIER_CHANGE_OLD_URL.to_owned(),
+            record: None,
+        });
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
+
+        apply_tier_change(
+            &live_state,
+            TIER_CHANGE_NEW_URL,
+            "test",
+            &NodePublisher::from_dyn(
+                Arc::new(ScriptedPublisher::new(true)) as Arc<dyn DidPublisher>
+            ),
+            &slot_test_identity(),
+            Some(&event_tx),
+        )
+        .await;
+
+        let state = live_state.get();
+        assert_eq!(
+            state.relay_url, TIER_CHANGE_NEW_URL,
+            "the node reports where it actually is"
+        );
+        assert_eq!(
+            state.document.relay_service_urls(),
+            vec![TIER_CHANGE_OLD_URL.to_owned()],
+            "the document is published state: it may only name what was published"
+        );
+        assert!(
+            matches!(event_rx.try_recv(), Ok(NatTierChange::TierChanged { .. })),
+            "the reachability change is real, so the event fires even though the \
+             re-publish did not land"
+        );
+
+        // A re-publish is still OWED: the loop's skip condition must see it.
+        assert_ne!(
+            published_state::document_relay_url(&state.document).as_deref(),
+            Some(TIER_CHANGE_NEW_URL),
+        );
+
+        // The retry succeeds and converges both, and does NOT re-announce an
+        // address that did not move.
+        apply_tier_change(
+            &live_state,
+            TIER_CHANGE_NEW_URL,
+            "retry",
+            &NodePublisher::from_dyn(
+                Arc::new(ScriptedPublisher::new(false)) as Arc<dyn DidPublisher>
+            ),
+            &slot_test_identity(),
+            Some(&event_tx),
+        )
+        .await;
+        let state = live_state.get();
+        assert_eq!(state.relay_url, TIER_CHANGE_NEW_URL);
+        assert_eq!(
+            state.document.relay_service_urls(),
+            vec![TIER_CHANGE_NEW_URL.to_owned()],
+            "the retry re-points the SAME entry rather than appending a duplicate"
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "the address did not move on the retry, so no second TierChanged"
+        );
     }
 
     // -----------------------------------------------------------------------

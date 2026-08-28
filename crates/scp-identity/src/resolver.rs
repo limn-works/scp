@@ -37,10 +37,11 @@ use crate::IdentityError;
 use crate::cache::DidCache;
 use crate::dht::extract_public_key;
 use crate::republish::RelayPublisher;
-use crate::resolution::{did_routing_id, verify_relay_record};
+use crate::resolution::verify_relay_record;
 use scp_clock::{Clock, SystemClock};
 use scp_dht::{DhtClient, DhtRecord};
 use scp_did::{DidDocument, decode_multibase_key};
+use scp_protocol::envelope::did_record::DidRecordV1;
 
 // ---------------------------------------------------------------------------
 // Core types (§3.10.10)
@@ -180,14 +181,25 @@ pub enum StaleLayer {
 pub trait HealingPublisher: Send + Sync {
     /// Republishes the fresher document to the stale layer.
     ///
+    /// # Why a `&DidRecordV1` and not four loose fields
+    ///
+    /// The fresher record's `(public_key, seq, signature, value)` is one
+    /// indivisible BEP44 unit: a signature only verifies against the exact
+    /// `(value, seq)` it was made over, and only under the key the DID binds to.
+    /// Passing them as four positional parameters let a caller reorder or mix
+    /// them silently, and made "the public key" a second, independently-supplied
+    /// answer to a question the record already answers. `DidRecordV1` can only
+    /// be built through the validating [`DidRecordV1::try_new`], so both layers
+    /// receive one already-well-formed unit (see
+    /// [`RelayPublisher`] for the same
+    /// discipline on the publish path).
+    ///
     /// # Arguments
     ///
-    /// * `did` — The DID string whose document diverged across layers.
+    /// * `did` — The DID string whose document diverged across layers. Used for
+    ///   log correlation; the authoritative key is `record.public_key()`.
     /// * `stale_layer` — Which layer had the stale document.
-    /// * `document_bytes` — The BEP44-signed DID document bytes (fresher copy).
-    /// * `signature` — The Ed25519 signature for the BEP44 record.
-    /// * `seq` — The sequence number of the fresher document.
-    /// * `public_key` — The 32-byte Ed25519 public key from the DID.
+    /// * `record` — The fresher signed record to republish.
     ///
     /// # Errors
     ///
@@ -197,10 +209,7 @@ pub trait HealingPublisher: Send + Sync {
         &self,
         did: &str,
         stale_layer: &StaleLayer,
-        document_bytes: &[u8],
-        signature: &[u8; 64],
-        seq: u64,
-        public_key: &[u8; 32],
+        record: &DidRecordV1,
     ) -> impl Future<Output = Result<(), IdentityError>> + Send;
 }
 
@@ -266,10 +275,7 @@ impl HealingPublisher for NoOpHealer {
         &self,
         _did: &str,
         _stale_layer: &StaleLayer,
-        _document_bytes: &[u8],
-        _signature: &[u8; 64],
-        _seq: u64,
-        _public_key: &[u8; 32],
+        _record: &DidRecordV1,
     ) -> impl Future<Output = Result<(), IdentityError>> + Send {
         async { Ok(()) }
     }
@@ -327,18 +333,19 @@ impl<D: DhtClient + 'static, R: RelayPublisher + 'static> HealingPublisher
         &self,
         did: &str,
         stale_layer: &StaleLayer,
-        document_bytes: &[u8],
-        signature: &[u8; 64],
-        seq: u64,
-        public_key: &[u8; 32],
+        record: &DidRecordV1,
     ) -> impl Future<Output = Result<(), IdentityError>> + Send {
         let dht_client = Arc::clone(&self.dht_client);
         let relay_publisher = Arc::clone(&self.relay_publisher);
         let stale_layer = stale_layer.clone();
-        let document_bytes = document_bytes.to_vec();
-        let signature = *signature;
-        let public_key = *public_key;
         let did = did.to_owned();
+        // The record arrives already framed and validated, so both arms read
+        // the SAME `(public_key, seq, signature, value)` unit.
+        let public_key = *record.public_key();
+        let signature = *record.signature();
+        let seq = record.seq();
+        let document_bytes = record.value().to_vec();
+        let record = record.clone();
 
         async move {
             match stale_layer {
@@ -352,14 +359,16 @@ impl<D: DhtClient + 'static, R: RelayPublisher + 'static> HealingPublisher
                         .map_err(IdentityError::from)
                 }
                 StaleLayer::Relay { relay_urls: _ } => {
-                    // Publish the fresher document to relays via the relay
-                    // publisher. The relay publisher distributes to the
-                    // identity's own relays + bootstrap relays (§18.5.1).
-                    let routing_id = did_routing_id(&did);
+                    // Healing publishes the SAME self-certifying frame the
+                    // republish loop does. The publisher distributes it to the
+                    // identity's own relays + bootstrap relays (§18.5.1) and
+                    // derives the routing_id from the frame's own key; the heal
+                    // arm never passes one.
                     debug!(did = %did, seq, "healing: republishing to relay");
                     relay_publisher
-                        .publish(&routing_id, DID_DOCUMENT_BLOB_TTL_SECS, &document_bytes)
+                        .publish(DID_DOCUMENT_BLOB_TTL_SECS, &record)
                         .await
+                        .map(|_| ())
                 }
             }
         }
@@ -609,11 +618,37 @@ fn maybe_trigger_healing<H: HealingPublisher + 'static>(
     };
 
     let did_owned = did.to_owned();
-    let pk = *public_key;
     let stale = healing.stale_layer;
-    let raw_value = healing.raw_value;
-    let raw_sig = healing.raw_signature;
     let fresher_seq = healing.fresher_seq;
+
+    // Frame ONCE, here, before either layer is touched. A framing failure means
+    // NOTHING was published to either layer, so it is reported as a framing
+    // error — never as a relay/DHT publish failure, which would misattribute a
+    // local well-formedness bug to a remote layer.
+    let record = match DidRecordV1::try_new(
+        *public_key,
+        fresher_seq,
+        healing.raw_signature,
+        healing.raw_value,
+    )
+    .map_err(|e| {
+        IdentityError::DidRecordFramingFailed(format!(
+            "healing: fresher DID document cannot be wrapped into a DID-record \
+             frame (§9.10.12): {e}"
+        ))
+    }) {
+        Ok(record) => record,
+        Err(e) => {
+            warn!(
+                did = %did_owned,
+                stale_layer = ?stale,
+                error = %e,
+                "protocol-level healing skipped — nothing was published to either \
+                 layer (best-effort, §3.10.7)"
+            );
+            return;
+        }
+    };
 
     info!(
         did = %did_owned,
@@ -623,10 +658,7 @@ fn maybe_trigger_healing<H: HealingPublisher + 'static>(
     );
 
     let handle = tokio::spawn(async move {
-        if let Err(e) = healer
-            .heal(&did_owned, &stale, &raw_value, &raw_sig, fresher_seq, &pk)
-            .await
-        {
+        if let Err(e) = healer.heal(&did_owned, &stale, &record).await {
             warn!(
                 did = %did_owned,
                 stale_layer = ?stale,
@@ -1605,12 +1637,16 @@ mod tests {
             &self,
             did: &str,
             stale_layer: &StaleLayer,
-            document_bytes: &[u8],
-            signature: &[u8; 64],
-            seq: u64,
-            public_key: &[u8; 32],
+            record: &DidRecordV1,
         ) -> impl Future<Output = Result<(), IdentityError>> + Send {
             let stale_layer = stale_layer.clone();
+            let did = did.to_owned();
+            // Unpack the frame back into loose fields so existing assertions
+            // keep checking the SAME bytes reached the healer.
+            let document_bytes = record.value().to_vec();
+            let signature = *record.signature();
+            let seq = record.seq();
+            let public_key = *record.public_key();
             async move {
                 let fail = *self.should_fail.lock().await;
                 if fail {
@@ -1620,12 +1656,12 @@ mod tests {
                 }
                 let mut heals = self.heals.lock().await;
                 heals.push(RecordedHeal {
-                    did: did.to_owned(),
+                    did,
                     stale_layer,
-                    document_bytes: document_bytes.to_vec(),
-                    signature: *signature,
+                    document_bytes,
+                    signature,
                     seq,
-                    public_key: *public_key,
+                    public_key,
                 });
                 drop(heals);
                 Ok(())
@@ -1647,6 +1683,56 @@ mod tests {
             vec!["wss://bootstrap.example.com/scp/v1".to_owned()],
             healer,
         )
+    }
+
+    /// AC (heal-arm frames correctly): the production `DualLayerHealingPublisher`
+    /// Relay arm publishes a DID-record FRAME (§9.10.12), never bare document
+    /// bytes. Drive `heal` directly with a `StaleLayer::Relay` and assert the
+    /// `InMemoryRelayPublisher` recorded a blob that decodes to the same
+    /// `(public_key, signature, seq, value)` (with `value` == `document_bytes`).
+    #[tokio::test]
+    async fn healing_relay_arm_publishes_did_record_frame() {
+        use crate::republish::InMemoryRelayPublisher;
+        use scp_dht::InMemoryDhtClient;
+
+        let dht = Arc::new(InMemoryDhtClient::new());
+        let relay_pub = Arc::new(InMemoryRelayPublisher::new());
+        let healer = DualLayerHealingPublisher::new(Arc::clone(&dht), Arc::clone(&relay_pub));
+
+        // Consistent identity: DID derived from the public key, so the
+        // frame-key-derived routing_id equals did_routing_id(did).
+        let public_key = [0x11; 32];
+        let did = crate::did_from_ed25519_public_key(&public_key);
+        let signature = [0x22; 64];
+        let document_bytes = b"fresher signed DID document".to_vec();
+        let seq = 7u64;
+
+        let record = DidRecordV1::try_new(public_key, seq, signature, document_bytes.clone())
+            .expect("frame invariants hold");
+        healer
+            .heal(
+                &did,
+                &StaleLayer::Relay {
+                    relay_urls: vec!["wss://relay1.example.com/scp/v1".to_owned()],
+                },
+                &record,
+            )
+            .await
+            .expect("relay heal succeeds");
+
+        let publishes = relay_pub.recorded_publishes().await;
+        assert_eq!(publishes.len(), 1, "exactly one relay heal PUBLISH");
+        assert_eq!(
+            publishes[0].routing_id,
+            did_routing_id(&did),
+            "healed record is published at the frame-key-derived DID routing_id"
+        );
+        let frame = DidRecordV1::decode(&publishes[0].blob)
+            .expect("healed relay blob must be a DID-record frame, not bare bytes");
+        assert_eq!(frame.public_key(), &public_key);
+        assert_eq!(frame.signature(), &signature);
+        assert_eq!(frame.seq(), seq);
+        assert_eq!(frame.value(), &document_bytes[..]);
     }
 
     #[tokio::test]

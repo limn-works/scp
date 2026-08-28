@@ -35,13 +35,13 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 use scp_clock::SystemClock;
-use scp_dht::{DisabledDhtClient, PkarrDhtClient};
+use scp_dht::{DhtClient, DisabledDhtClient, PkarrDhtClient};
 // `InMemoryDhtClient` backs the test-harness-only `build_memory_did_method`
 // (`DhtMode::Memory`); it is a §17.17.3 nullifier, gated out of shipped builds.
 #[cfg(any(test, feature = "testing"))]
 use scp_dht::InMemoryDhtClient;
 use scp_identity::dht::SequenceStore;
-use scp_identity::{DidCache, DidDht, IdentityError};
+use scp_identity::{DidCache, DidDht, DidMethod as _, IdentityError};
 use scp_platform::KeyCustody;
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_platform::traits::Storage;
@@ -820,15 +820,6 @@ pub(crate) const SELF_HOST_HOSTNAME: &str = "selfhost.scp.local";
 /// mapping is attempted, so there is nothing to release).
 type OptionalPortMapper = Option<Arc<dyn scp_transport::nat::PortMapper>>;
 
-/// Boxed callback for BEP44 sequence initialization.
-///
-/// Invoked with the node's DID string after `build()` completes, before any
-/// publish operation, to recover the BEP44 sequence number from the persistent
-/// store and/or DHT.
-pub type SeqInitFn = Box<
-    dyn FnOnce(String) -> Pin<Box<dyn Future<Output = Result<(), IdentityError>> + Send>> + Send,
->;
-
 /// Reports the live site details to the caller once the site is deployed and
 /// the public listener is about to open.
 ///
@@ -1339,16 +1330,16 @@ where
                  DID resolution composes the relay layer around the off DHT arm (the fail-safe \
                  default; set DhtMode::Production to host publicly)"
             );
-            let (did_method, seq_init) = build_disabled_did_method(cache);
+            let did_method = build_disabled_did_method(cache);
             let key_resolver = build_shared_cache_key_resolver(
-                Arc::clone(did_method.dht_client()),
+                did_method.dht_client(),
                 Arc::clone(did_method.cache()),
                 handle,
             );
             // `sequence_store` is unused for a non-publishing node; drop it
             // explicitly so the move is intentional, not an oversight.
             drop(sequence_store);
-            serve_hosted_site(common, did_method, key_resolver, seq_init, shutdown).await
+            serve_hosted_site(common, did_method, key_resolver, shutdown).await
         }
         // Gated `feature = "testing"` ONLY (ADR-062 A5) to match the
         // `DhtMode::Memory` variant's single activation path.
@@ -1358,14 +1349,14 @@ where
                 "using InMemoryDhtClient — DID document will NOT be published to the network \
                  (test-harness-only; DhtMode::Disabled is the shipped no-publish value)"
             );
-            let (did_method, seq_init) =
+            let did_method =
                 build_memory_did_method(Arc::clone(&common.custody), cache, sequence_store);
             let key_resolver = build_shared_cache_key_resolver(
-                Arc::clone(did_method.dht_client()),
+                did_method.dht_client(),
                 Arc::clone(did_method.cache()),
                 handle,
             );
-            serve_hosted_site(common, did_method, key_resolver, seq_init, shutdown).await
+            serve_hosted_site(common, did_method, key_resolver, shutdown).await
         }
         DhtMode::Production => {
             tracing::warn!(
@@ -1373,18 +1364,18 @@ where
                  to the global Mainline DHT (an IP-to-identity disclosure). Use DhtMode::Disabled \
                  to keep the DID document local."
             );
-            let (did_method, seq_init) = build_production_did_method(
+            let did_method = build_production_did_method(
                 Arc::clone(&common.custody),
                 cache,
                 sequence_store,
                 dht_gateways,
             )?;
             let key_resolver = build_shared_cache_key_resolver(
-                Arc::clone(did_method.dht_client()),
+                did_method.dht_client(),
                 Arc::clone(did_method.cache()),
                 handle,
             );
-            serve_hosted_site(common, did_method, key_resolver, seq_init, shutdown).await
+            serve_hosted_site(common, did_method, key_resolver, shutdown).await
         }
     }
 }
@@ -1399,9 +1390,14 @@ where
 /// [`resolve`](scp_identity::resolver::DidResolver::resolve) is the authoritative
 /// anti-rollback guard, and operating on the node's shared cache keeps the
 /// participant's view consistent with the node's. The relay layer is a
-/// [`NoOpRelayQuerier`](scp_identity::resolver::NoOpRelayQuerier): the node's own
-/// loopback relay is a protocol-unaware blob pipe (§10.4), not a DID-document
-/// QUERY source, so DID resolution flows through the DHT layer (and cache).
+/// [`NoOpRelayQuerier`](scp_identity::resolver::NoOpRelayQuerier) for one honest
+/// reason: no relay-client bind exists yet, so there is no relay to QUERY. That
+/// wiring is SCP-RELAYRES-006. It is emphatically NOT because the node's own
+/// loopback relay is unsuitable — it ships `DidRecordValidation::Enabled` by
+/// default and per §3.10.2/§3.10.4 IS a DID-document QUERY source; §10.4's
+/// "protocol-unaware" design goal is scoped to encrypted payload blobs. Until
+/// SCP-RELAYRES-006, the relay-client bind, lands, DID resolution here flows
+/// through the DHT layer (and cache) alone.
 fn build_shared_cache_key_resolver<D: scp_dht::DhtClient + 'static>(
     dht_client: Arc<D>,
     cache: Arc<DidCache>,
@@ -1452,15 +1448,14 @@ struct ServeHostedSite {
 // sequenced with its own error/teardown handling, so it reads as one flat body
 // rather than fragmenting into helpers that would obscure the ordering.
 #[allow(clippy::too_many_lines)]
-async fn serve_hosted_site<D, F>(
+async fn serve_hosted_site<DC, F>(
     common: ServeHostedSite,
-    did_method: Arc<D>,
+    did_method: Arc<DidDht<DC, SystemClock>>,
     key_resolver: scp_core::context::governance::KeyResolver,
-    seq_init: SeqInitFn,
     shutdown: F,
 ) -> Result<(), HostSiteError>
 where
-    D: scp_identity::DidMethod + 'static,
+    DC: DhtClient + 'static,
     F: Future<Output = ()> + Send + 'static,
 {
     let ServeHostedSite {
@@ -1494,10 +1489,19 @@ where
     )
     .await?;
 
+    // The BEP44 sequence counter was bootstrapped inside the builder ahead of
+    // the startup publish (SCP-RELAYRES-004): `build_host_site_node` →
+    // `build_no_domain_inner` calls `initialize_sequence_for_mode` before
+    // `seed_from_startup_publish`, so the node above already published at the
+    // correct next sequence. No post-build seq step here.
     let node_did = node.identity().did().to_owned();
-    if let Err(e) = seq_init(node_did.clone()).await {
-        tracing::error!(error = %e, "failed to initialize BEP44 sequence — publishing may fail");
-    }
+
+    // -- Self-DID republishing needs no wiring here. `build_no_domain_inner`
+    //    started the cycle inside the builder above, over the DHT client this
+    //    node's own `DidMethod` publishes through, seeded from the node's
+    //    published-record slot (see `crate::republish`). `node.shutdown()`, at
+    //    the end of `run_refresh_and_serve_until_shutdown`, stops it; dropping
+    //    the node without shutting it down hits the cycle's `Drop` backstop. --
 
     let context_id = self_host_context_id(&node_did);
 
@@ -1606,7 +1610,8 @@ async fn open_self_host_public_surface<S>(
 where
     S: scp_platform::EncryptedStorage + 'static,
 {
-    let tls_config = match build_self_host_tls_config(node.relay_url(), http_addr.ip(), plaintext) {
+    let tls_config = match build_self_host_tls_config(&node.relay_url(), http_addr.ip(), plaintext)
+    {
         Ok(c) => c,
         Err(e) => {
             release_self_host_mappings(upnp_mapper.clone(), natpmp_mapper.clone(), port).await;
@@ -1938,14 +1943,6 @@ impl<S: Storage + 'static> SequenceStore for StorageSequenceStore<S> {
 // DID method construction (shared)
 // ---------------------------------------------------------------------------
 
-/// Creates a BEP44 sequence-initialization callback for a `DidDht` method.
-#[must_use]
-pub fn make_seq_init<D: scp_dht::DhtClient + 'static>(
-    did_method: Arc<DidDht<D, SystemClock>>,
-) -> SeqInitFn {
-    Box::new(move |did| Box::pin(async move { did_method.initialize_sequence(&did).await }))
-}
-
 /// Builds the **test-harness-only** in-memory DID method (`DhtMode::Memory`).
 ///
 /// The returned method signs with `custody` and persists its BEP44 sequence in
@@ -1960,17 +1957,15 @@ pub fn build_memory_did_method(
     custody: Arc<SqliteKeyCustody>,
     cache: Arc<DidCache>,
     sequence_store: Arc<dyn SequenceStore>,
-) -> (Arc<DidDht<InMemoryDhtClient, SystemClock>>, SeqInitFn) {
+) -> Arc<DidDht<InMemoryDhtClient, SystemClock>> {
     let dht_client = Arc::new(InMemoryDhtClient::new());
     let sign_fn = DidDht::<InMemoryDhtClient, SystemClock>::make_sign_fn(custody);
-    let did_method = Arc::new(DidDht::with_client_signer_and_store(
+    Arc::new(DidDht::with_client_signer_and_store(
         dht_client,
         cache,
         sign_fn,
         sequence_store,
-    ));
-    let seq_init = make_seq_init(Arc::clone(&did_method));
-    (did_method, seq_init)
+    ))
 }
 
 /// Builds the DHT-layer-off DID method (`DhtMode::Disabled` — the shipped
@@ -1980,18 +1975,17 @@ pub fn build_memory_did_method(
 /// disclosed) and resolve contributes an honest `Ok(None)` — never a fabricated
 /// or in-memory answer (ADR-062 §Decision 1, A2). The method shares the node's
 /// [`DidCache`] with the co-located resolver but carries no signer (it never
-/// publishes). DID resolution still runs: the [`DualLayerResolver`] composes the
+/// publishes). DID resolution still runs: the
+/// [`DualLayerResolver`](scp_identity::DualLayerResolver) composes the
 /// relay layer around the off DHT arm.
 #[must_use]
 pub fn build_disabled_did_method(
     cache: Arc<DidCache>,
-) -> (Arc<DidDht<DisabledDhtClient, SystemClock>>, SeqInitFn) {
-    let did_method = Arc::new(DidDht::with_client_and_cache(
+) -> Arc<DidDht<DisabledDhtClient, SystemClock>> {
+    Arc::new(DidDht::with_client_and_cache(
         Arc::new(DisabledDhtClient),
         cache,
-    ));
-    let seq_init = make_seq_init(Arc::clone(&did_method));
-    (did_method, seq_init)
+    ))
 }
 
 /// Builds the production pkarr DID method (publishes DID docs to the DHT).
@@ -2008,17 +2002,15 @@ pub fn build_production_did_method(
     cache: Arc<DidCache>,
     sequence_store: Arc<dyn SequenceStore>,
     dht_gateways: &[String],
-) -> Result<(Arc<DidDht<PkarrDhtClient, SystemClock>>, SeqInitFn), HostSiteError> {
+) -> Result<Arc<DidDht<PkarrDhtClient, SystemClock>>, HostSiteError> {
     let dht_client = build_pkarr_client(dht_gateways)?;
     let sign_fn = DidDht::<PkarrDhtClient, SystemClock>::make_sign_fn(custody);
-    let did_method = Arc::new(DidDht::with_client_signer_and_store(
+    Ok(Arc::new(DidDht::with_client_signer_and_store(
         dht_client,
         cache,
         sign_fn,
         sequence_store,
-    ));
-    let seq_init = make_seq_init(Arc::clone(&did_method));
-    Ok((did_method, seq_init))
+    )))
 }
 
 /// Builds a [`PkarrDhtClient`] over the Mainline DHT plus the supplied HTTP

@@ -704,12 +704,6 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         })
     }
 
-    /// Returns a reference to the DHT client.
-    #[must_use]
-    pub const fn dht_client(&self) -> &Arc<D> {
-        &self.dht_client
-    }
-
     /// Returns a reference to the DID cache.
     #[must_use]
     pub const fn cache(&self) -> &Arc<DidCache<C>> {
@@ -817,10 +811,16 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         Ok(())
     }
 
-    /// Publishes a DID document to the DHT with the given signing function.
+    /// Publishes a DID document to the DHT with the given signing function and
+    /// returns the signed BEP44 record it produced.
     ///
     /// This is the internal publish implementation used by both
     /// `DidMethod::publish` and the `RepublishManager`.
+    ///
+    /// The returned [`RepublishEntry`](crate::republish::RepublishEntry) is the
+    /// `(public_key, seq, signature, value)` computed by THIS signing pass — see
+    /// [`DidMethod::publish`] for why it is an output
+    /// rather than something a caller reconstructs from a read-back.
     ///
     /// # Errors
     ///
@@ -831,7 +831,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         &self,
         identity: &ScpIdentity,
         document: &DidDocument,
-    ) -> Result<(), IdentityError> {
+    ) -> Result<crate::republish::RepublishEntry, IdentityError> {
         let sign_fn = self.sign_fn.as_ref().ok_or_else(|| {
             IdentityError::DhtPublishFailed(
                 "no signing function configured; use DidDht::with_client_and_signer".to_owned(),
@@ -862,17 +862,37 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         // Extract the public key from the DID.
         let public_key = extract_public_key(&identity.did)?;
 
+        // Persist the sequence BEFORE the network write, not after.
+        // Write-ahead is the only ordering that keeps the caller's view and the
+        // network's from diverging in the direction that matters:
+        //
+        // - store-then-publish: a failed store returns `Err` with NOTHING
+        //   published, and a failed publish merely burns a sequence number
+        //   (monotone, so the next publish still supersedes).
+        // - publish-then-store (the predecessor): a failed store returned `Err`
+        //   with the record ALREADY live at `seq`. The publish seam files the
+        //   record only on `Ok`, so the republish arms kept re-asserting
+        //   `seq - 1`, which BEP44 nodes and validating relays both reject as
+        //   non-superseding — the CURRENT record stopped being kept alive and
+        //   expired at TTL. It also lost the durable record of `seq`, so a
+        //   restart could reuse it for different bytes.
+        if let Some(store) = &self.sequence_store {
+            store.store(&identity.did, seq).await?;
+        }
+
         // Publish to DHT.
         self.dht_client
             .publish(&public_key, &signature, value, seq)
             .await?;
 
-        // Persist the sequence number after successful publish (issue #327).
-        if let Some(store) = &self.sequence_store {
-            store.store(&identity.did, seq).await?;
-        }
-
-        Ok(())
+        // Hand back the record this pass signed, so no caller has to re-derive
+        // it from a network read-back (see `DidMethod::publish`).
+        Ok(crate::republish::RepublishEntry {
+            public_key,
+            document_bytes: value.to_vec(),
+            signature,
+            sequence: seq,
+        })
     }
 
     /// Publishes a DID document to the DHT with optional relay URLs.
@@ -1742,7 +1762,13 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         let mut updated_old_doc = old_document.clone();
         updated_old_doc.set_also_known_as(new_did);
         updated_old_doc.retire_operational_keys_for_migration();
-        self.publish_document(old_identity, &updated_old_doc).await
+        // The migration redirect's signed record is not needed here: the caller
+        // is wrapping publish failure into a `MigrationPartialState`, and the
+        // OLD DID's republish cycle is torn down by migration, not restarted.
+        // Discarded explicitly so the drop is a decision, not an oversight.
+        self.publish_document(old_identity, &updated_old_doc)
+            .await
+            .map(|_signed_record| ())
     }
 
     /// Finish a [`Self::migrate_identity`] call that returned
@@ -2009,6 +2035,15 @@ pub fn verify_self_certification(
 // must return a future rather than use `async fn` directly.
 #[allow(clippy::manual_async_fn)]
 impl<D: DhtClient + 'static, C: Clock + 'static> DidMethod for DidDht<D, C> {
+    /// The client this `DidDht` was constructed over. The keep-alive re-puts
+    /// through the same client that performed the signed publish, so a record
+    /// and the client that refreshes it cannot come from two different places.
+    type Dht = D;
+
+    fn dht_client(&self) -> Arc<D> {
+        Arc::clone(&self.dht_client)
+    }
+
     fn create(
         &self,
         key_custody: &impl KeyCustody,
@@ -2124,9 +2159,20 @@ impl<D: DhtClient + 'static, C: Clock + 'static> DidMethod for DidDht<D, C> {
         &self,
         identity: &ScpIdentity,
         document: &DidDocument,
-    ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+    ) -> impl Future<Output = Result<crate::republish::RepublishEntry, IdentityError>> + Send {
         // Delegate to the internal method that uses the stored signing function.
         self.publish_document(identity, document)
+    }
+
+    fn initialize_sequence(
+        &self,
+        did: &str,
+    ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+        // Delegate to the inherent method of the SAME name. The explicit
+        // associated-function path selects the inherent `Self::initialize_sequence`
+        // (inherent items take priority over trait items in path resolution), so
+        // this is a delegation, not a self-recursive call into this trait method.
+        Self::initialize_sequence(self, did)
     }
 
     fn resolve(
@@ -6292,6 +6338,70 @@ mod tests {
 
         let stored = store.load(&identity.did).await.unwrap();
         assert_eq!(stored, Some(2));
+    }
+
+    /// A `SequenceStore` whose `store` always fails.
+    struct FailingSequenceStore;
+
+    impl SequenceStore for FailingSequenceStore {
+        fn load(
+            &self,
+            _did: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, IdentityError>> + Send + '_>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn store(
+            &self,
+            _did: &str,
+            _seq: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<(), IdentityError>> + Send + '_>> {
+            Box::pin(async {
+                Err(IdentityError::DhtPublishFailed(
+                    "sequence store is unwritable (test)".to_owned(),
+                ))
+            })
+        }
+    }
+
+    /// A failed sequence-store write must leave NOTHING on the network.
+    ///
+    /// Against the publish-then-store predecessor this fails: the record was
+    /// already live at `seq` when the store error propagated, so the caller saw
+    /// `Err` and filed nothing — leaving the republish arms asserting `seq - 1`,
+    /// which BEP44 nodes and validating relays both reject as non-superseding.
+    /// The current record then stopped being kept alive and expired at TTL. The
+    /// store write is now ahead of the network write, so the caller's view can
+    /// never be behind it.
+    #[tokio::test]
+    async fn a_failed_sequence_store_write_publishes_nothing() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht_client = Arc::new(InMemoryDhtClient::new());
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let sign_fn =
+            DidDht::<InMemoryDhtClient, Arc<TestClock>>::make_sign_fn(Arc::clone(&custody));
+        let dht = DidDht::with_client_signer_and_store(
+            Arc::clone(&dht_client),
+            Arc::new(DidCache::with_clock(clock)),
+            sign_fn,
+            Arc::new(FailingSequenceStore),
+        );
+
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
+
+        let result = dht.publish_document(&identity, &document).await;
+        assert!(result.is_err(), "an unwritable sequence store fails closed");
+
+        let public_key = extract_public_key(&identity.did).unwrap();
+        assert!(
+            dht_client.resolve(&public_key).await.unwrap().is_none(),
+            "nothing may be on the network that the caller was not handed: a \
+             record live at a sequence the caller never learned strands the \
+             republish arms one sequence behind, forever"
+        );
     }
 
     #[tokio::test]

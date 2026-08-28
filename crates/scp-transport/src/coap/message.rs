@@ -15,6 +15,7 @@
 use coap_lite::{CoapOption, MessageClass, MessageType, Packet, RequestType, ResponseType};
 
 use crate::error::TransportError;
+use scp_relay_client::sanitize_relay_text;
 
 /// URI prefix for all SCP CoAP resources (section 10.16.2 point 1).
 pub const SCP_COAP_URI_PREFIX: &str = "scp";
@@ -374,7 +375,9 @@ impl CoapResponseParser {
             code
         } else {
             let msg = String::from_utf8_lossy(&packet.payload);
-            format!("{code}: {msg}")
+            // The payload is server-supplied diagnostic text; render it inert
+            // before it reaches a log or a `TransportError`.
+            format!("{code}: {}", sanitize_relay_text(&msg))
         }
     }
 

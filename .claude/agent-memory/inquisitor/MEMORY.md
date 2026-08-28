@@ -8,6 +8,7 @@ found — so future passes can spot expired premises and compounding drift faste
 - [SCP-OUT-046 streaming-saga seal FSM](scp-out-046-streaming-saga-seal-fsm.md) — SOUND; custody split is architecture-forced (ADR-049 no-autonomous-key), consistent w/ unary keyless recovery. Do not re-litigate.
 - [ADR-057 reciprocal-announce mesh](adr057-reciprocal-announce-mesh.md) — SOUND online-quiescent only; epoch/sender-key race + offline residual leave permanent gaps w/ NO recovery; offline drift vs T4 (T4 names+pulls, mesh doesn't); test harness can't exercise the race (pump panics on error).
 - [SCP-294 custody-name fail-closed](scp-294-custody-name-one-meaning.md) — UNSOUND in part: bridge fail-close is compelled; deleting SDK CustodyType members decided OQ-9, which §3.2 owns. Root cause: `file` Cargo feature on 1 of 3 bridges.
+- [SCP-RELAYRES-004 relay WRITE path](scp-relayres-004-relay-write-path.md) — trait/frame SOUND; self-host wiring UNSOUND. "No relay client exists" is FALSE (live adapter at self_host.rs:620, before the check); §3.10.6 MUST-warning suppressed; #482 pointer phantom; entry sourced by network round-trip.
 
 ## Operating reminders
 - The code is evidence, not the defendant. Cite code to prove a claim about a *decision*;
