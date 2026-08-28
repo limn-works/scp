@@ -1109,3 +1109,107 @@ cargo test -p scp-testing --test conformance \
 ```
 
 The regenerator is `#[ignore]` by default so the default `cargo test` run does not write to disk. Fixture drift (live code changes that should but do not invalidate the JSON) is caught by `CONF-046`, which compares the on-disk file byte-for-byte to the generator's current output.
+
+## 25.25 Key Destruction Attestation Signing Vectors (§9.15, §9.5.2)
+
+Domain: `"SCP-KEY-DESTRUCTION-V2:"`. Proof-body domain: `"SCP-DESTRUCTION-PROOF-V1:"`.
+
+The `KeyDestructionAttestation` row in §9.5.2 gives six fields, and field 4 carries `platformAttestation` as a 32-byte hash in both arms of §9.5.1's optional-field rule. Vector 38 exercises the absent arm, where field 4 is the `SHA-256(0x00)` sentinel. Vector 39 exercises the present arm, where field 4 is the hash of the proof body. The two vectors share `contextId`, `memberDid`, `destroyedAt`, and `signingKeyId`, so the bytes that differ between them are field 4, the proof hash, and field 5, the method discriminator.
+
+Both vectors set `signingKeyId` to `"#active"`. §9.15 permits `#0` or `#active` and §9.7.4 permits only DID-document updates and pre-rotation commitments for `#0`; `"#active"` is the one fragment both sentences admit, so these vectors decide nothing about contradiction C35 of §27.4.6 in the attestations spec.
+
+The Ed25519 signature is computed over the 32-byte canonical hash with the reference key (§25.2). Ed25519 is deterministic (RFC 8032), so a reference implementation reproduces these exact signature bytes on every run. Verify with Ed25519-verify(reference_public_key, hash, signature) per §25.17 step 5. The Rust reference implementation asserts both vectors in `crates/scp-protocol/src/context/memory_scope.rs`, module `destruction_test_vectors`, rather than in either generator §25.18 names.
+
+### Vector 38: Key Destruction Attestation — no platform attestation proof
+
+```
+Input:
+  signing key:           reference Ed25519 key (§25.2, seed 0x9d61b1…7f60)
+  context_id:            "ctx-destroy-vector"                    (18 bytes)
+  member_did:            "did:dht:z6MkDestroyer"                 (21 bytes)
+  destroyed_at:          1700000000
+  platform_attestation:  absent
+  method:                SoftwareOnly                            (discriminator 0x00)
+  signing_key_id:        "#active"                               (7 bytes)
+
+Canonical hash input (per §9.5.1 / §9.5.2 KeyDestructionAttestation):
+  "SCP-KEY-DESTRUCTION-V2:"                        (23 bytes, no length prefix)
+  || BE32(18) || "ctx-destroy-vector"              (4 + 18 = 22 bytes — context_id)
+  || BE32(21) || "did:dht:z6MkDestroyer"           (4 + 21 = 25 bytes — member_did)
+  || BE64(1700000000)                              (8 bytes — destroyed_at)
+  || SHA-256(0x00)                                 (32 bytes — absent-proof sentinel)
+  || 0x00                                          (1 byte — method discriminator)
+  || BE32(7)  || "#active"                         (4 + 7 = 11 bytes — signing_key_id)
+
+Total preimage: 23 + 22 + 25 + 8 + 32 + 1 + 11 = 122 bytes
+
+Preimage (hex, 122 bytes):
+  5343502d4b45592d4445535452554354494f4e2d56323a
+  000000126374782d64657374726f792d766563746f72
+  000000156469643a6468743a7a364d6b44657374726f796572
+  000000006553f100
+  6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d
+  00
+  0000000723616374697665
+
+Canonical hash SHA-256(preimage) (32 bytes):
+  8a140aac6b15748b96cef6cfb1942bc0b1b68ecbc505ac8de487452ba18ba7c4
+
+Ed25519 signature over the 32-byte hash, reference key (64 bytes):
+  63df30675677a88898ce9e6ddd95de1df080efb03b21c58a7de4886ccdbd53b7
+  e216826ffa797a124fbfe8fc81262fd06e3b45e5edb2ec4526475fcb829f6c0d
+```
+
+### Vector 39: Key Destruction Attestation — platform attestation proof present
+
+```
+Input:
+  signing key:           reference Ed25519 key (§25.2, seed 0x9d61b1…7f60)
+  context_id:            "ctx-destroy-vector"                    (18 bytes)
+  member_did:            "did:dht:z6MkDestroyer"                 (21 bytes)
+  destroyed_at:          1700000000
+  platform_attestation:
+      attestation_data:  0x0102030405060708                      (8 bytes)
+      platform:          "apple-secure-enclave"                  (20 bytes)
+  method:                HardwareBacked                          (discriminator 0x01)
+  signing_key_id:        "#active"                               (7 bytes)
+
+Proof-body hash input (field 4, present arm):
+  "SCP-DESTRUCTION-PROOF-V1:"                      (25 bytes, no length prefix)
+  || BE32(8)  || 0x0102030405060708                (4 + 8 = 12 bytes — attestation_data)
+  || BE32(20) || "apple-secure-enclave"            (4 + 20 = 24 bytes — platform)
+
+Total proof body: 25 + 12 + 24 = 61 bytes
+
+Proof-body hash SHA-256 (32 bytes):
+  743ccc956ebe5f89a1ba4c0c8a6caae5361c7c7e6e7c78d31821e139ed16096e
+
+Canonical hash input (per §9.5.1 / §9.5.2 KeyDestructionAttestation):
+  "SCP-KEY-DESTRUCTION-V2:"                        (23 bytes, no length prefix)
+  || BE32(18) || "ctx-destroy-vector"              (4 + 18 = 22 bytes — context_id)
+  || BE32(21) || "did:dht:z6MkDestroyer"           (4 + 21 = 25 bytes — member_did)
+  || BE64(1700000000)                              (8 bytes — destroyed_at)
+  || proof-body hash                               (32 bytes — present-proof arm)
+  || 0x01                                          (1 byte — method discriminator)
+  || BE32(7)  || "#active"                         (4 + 7 = 11 bytes — signing_key_id)
+
+Total preimage: 23 + 22 + 25 + 8 + 32 + 1 + 11 = 122 bytes
+
+Preimage (hex, 122 bytes):
+  5343502d4b45592d4445535452554354494f4e2d56323a
+  000000126374782d64657374726f792d766563746f72
+  000000156469643a6468743a7a364d6b44657374726f796572
+  000000006553f100
+  743ccc956ebe5f89a1ba4c0c8a6caae5361c7c7e6e7c78d31821e139ed16096e
+  01
+  0000000723616374697665
+
+Canonical hash SHA-256(preimage) (32 bytes):
+  6a6a896cd7c711b6cbfaab276e7de891bc9fdb5bb9ce1826b288fa3e69e9ccb1
+
+Ed25519 signature over the 32-byte hash, reference key (64 bytes):
+  6b7c14cd04ab2b757fd2e37f70637879ddc4af55b4c19f54f653f2b7dbe4bf42
+  81d44646053f53b5b100c2d2e572ac31a0a7ae58f491baebcf57a41743ae960b
+```
+
+An implementation that leaves `platformAttestation` out of its preimage builds 90 bytes rather than 122 and fails both vectors' published hashes, so the vectors catch the omission on their own. What Vector 39 additionally gives an implementer is the differential check: take the Vector 39 record, drop its `platformAttestation`, recompute, and confirm that the hash moves and Vector 39's signature stops verifying. That is the property field 4 exists to supply — a holder cannot present the signed declaration beside a proof the signer did not choose.

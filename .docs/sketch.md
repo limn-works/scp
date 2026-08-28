@@ -1879,15 +1879,18 @@ SCP.Security.destroyContextKeys(
   memberDID: DID,
   destroyedAt: DateTime,
   platformAttestation: PlatformAttestation? {
-    platform: .secureEnclave | .androidKeystore | .tpm,
-    keyHandleInvalid: Bool,            // hardware confirms key handle is gone
-    attestationBlob: Data
+    attestationData: Data,             // opaque, platform-specific
+    platform: String                   // UTF-8, e.g. "apple-secure-enclave"
   },
   method: .hardwareBacked | .softwareOnly,
-  trustLevel: .high                    // hardware-attested destruction, platform proof verified
-            | .moderate                // software-only deletion, or a hardwareBacked method with no verified proof
-            | .none,                   // no attestation available
-  signature: Ed25519Signature          // signed by identity key, NOT the destroyed key
+  signingKeyId: "#0" | "#active",      // the DID verification-method fragment that signed; §9.5.2 binds it in the preimage
+  // NOTE: PlatformAttestation carries exactly the two fields §9.15 of the security spec
+  // gives it, and §9.5.2 field 4 hashes exactly those two. The record carries no
+  // trustLevel and no keyHandleInvalid: both would be declarations sitting outside the
+  // six-field preimage, where a holder edits them without breaking the signature, and
+  // §27.4.6's clauses make the trust level what a consumer computes from a verification
+  // rather than what a publisher declares. verifyDestruction below returns the level.
+  signature: Ed25519Signature          // signed by a key that survives the destruction, NOT the destroyed key
 }
 
 // Verify a destruction attestation from another member

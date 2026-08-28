@@ -579,7 +579,7 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
 9. **Key destruction verification (§9.15):**
    - `destroyKey` verifies deletion before returning.
    - `DestructionAttestation.method` is always `.softwareOnly` for Keychain-backed keys.
-   - The attestation is signed by the identity key (not the destroyed key) per §9.15 protocol step 3.
+   - This adapter's `DestructionAttestation` carries a `method` and a `confirmed` flag and no signature; §27.4.6 of the attestations spec records it as a local observation the device makes about itself rather than a claim a second party reads. The signed, publishable record §9.15 of the security spec specifies is a different type, `PublishableKeyDestructionAttestation`, whose signature step 4 of §9.15's protocol covers. Which verification method signs that one is unsettled: §9.15 permits `#0` or `#active`, §9.7.4 of the same spec reserves `#0` for DID document updates and pre-rotation commitments, and §27.4.6 records the pair as contradiction C35 and open question OQ-53.
 
 10. **Conditional compilation:**
     - All Apple platform APIs are gated behind `#if os(iOS) || os(macOS)`.
