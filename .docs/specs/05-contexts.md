@@ -900,6 +900,7 @@ Content access actions go through the context's governance model (propose/vote/e
 | `threshold_signers` | 64 per context | Signers participate in quorum; >64 is operationally impractical |
 | `suspended_capabilities[did]` | No artificial cap | Naturally bounded by ceiling cardinality — at most one entry per capability per member |
 | `read_exclusion_list` | No artificial cap | Naturally bounded by membership count — cannot exclude non-members from CEK wrapping |
+| `user_authentication_required` | No artificial cap | Naturally bounded by ceiling cardinality — §4.9.3 requires every entry to name a ceiling capability and rejects an entry outside it at creation, so the list holds at most one entry per ceiling capability |
 
 Both `suspended_capabilities[did]` and the removed DID's `read_exclusion_list` entry are dropped when the member is removed from the context (§5.6.1 — member removal is a clean teardown), so neither retains entries for non-members.
 
