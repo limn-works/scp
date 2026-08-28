@@ -57,15 +57,29 @@ impl std::error::Error for KeyFileError {}
 /// # Errors
 ///
 /// Returns [`KeyFileError::MissingPassphrase`] when the environment variable
-/// is unset, [`KeyFileError::DirectoryCreate`] when creating `$HOME/.scp`
-/// fails, and [`KeyFileError::Open`] when the store rejects the passphrase or
-/// the file is unreadable.
+/// is unset or holds an empty string, [`KeyFileError::DirectoryCreate`] when
+/// creating `$HOME/.scp` fails or `$HOME` is unset, and [`KeyFileError::Open`]
+/// when the file is unreadable.
+///
+/// It does NOT report a wrong passphrase. `FileKeyCustody::new` derives the
+/// wrapping key and reads the entry headers without decrypting an entry, so a
+/// wrong passphrase opens the store and surfaces at the first signing
+/// operation. Open question OQ-16 of `.docs/specs/03-identity.md` owns that.
 pub fn open_default_key_file() -> Result<FileKeyCustody, KeyFileError> {
+    // An exported-but-empty variable reads as `Ok("")`, and Argon2id accepts a
+    // zero-length password, so an empty value would derive a wrapping key that
+    // anyone holding the file can recompute — the salt sits in its header in
+    // the clear. The no-dev-stand-in tenet of `CLAUDE.md` puts a capability
+    // that cannot be provided honestly on the failing side, so an empty
+    // passphrase reads as no passphrase.
     let passphrase = zeroize::Zeroizing::new(
-        std::env::var(KEY_PASSPHRASE_ENV).map_err(|_| KeyFileError::MissingPassphrase)?,
+        std::env::var(KEY_PASSPHRASE_ENV)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .ok_or(KeyFileError::MissingPassphrase)?,
     );
 
-    let key_dir = home_dir().join(".scp");
+    let key_dir = home_dir()?.join(".scp");
     std::fs::create_dir_all(&key_dir).map_err(|e| {
         KeyFileError::DirectoryCreate(format!(
             "failed to create key directory {}: {e}",
@@ -82,10 +96,27 @@ pub fn open_default_key_file() -> Result<FileKeyCustody, KeyFileError> {
     })
 }
 
-/// Returns the user's home directory, and the current directory when `$HOME`
-/// is unset.
-fn home_dir() -> std::path::PathBuf {
-    std::env::var("HOME").map_or_else(|_| std::path::PathBuf::from("."), std::path::PathBuf::from)
+/// Returns the user's home directory.
+///
+/// # Errors
+///
+/// Returns [`KeyFileError::DirectoryCreate`] when `$HOME` is unset. This read
+/// the current directory in that case, which put the key store at
+/// `./.scp/keys.bin` under whatever directory the process happened to start
+/// in — a daemon, a container entrypoint, and a scheduled job each run with
+/// `$HOME` unset. `FileKeyCustody::new` creates a store when the path holds no
+/// file, so a restart from a second directory produced a second empty key
+/// store and reported success. Failing here states the condition instead.
+fn home_dir() -> Result<std::path::PathBuf, KeyFileError> {
+    std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .map_err(|_| {
+            KeyFileError::DirectoryCreate(
+                "HOME is unset, so this process names no key directory. Set HOME, \
+                 or reach a key store through a KeyCustodyProvider."
+                    .to_owned(),
+            )
+        })
 }
 
 #[cfg(test)]

@@ -565,7 +565,14 @@ mod tests {
         }
         Python::with_gil(|py| {
             let scp = PyScp::new_in_memory_for_test();
-            let msg = match scp.identity_create(py, "file", None) {
+            // `encrypted_file` is a value §3.2.2 of the identity spec states, so
+            // this call reaches custody construction and then the pre-rotation
+            // commitment step. It read `"file"` until the custody vocabulary
+            // changed, and the string-vocabulary arm then rejected that string
+            // before any custody was built — while quoting `SCP-IDENT-1059` in
+            // its message, so the assertion below passed without the
+            // pre-rotation gate running at all.
+            let msg = match scp.identity_create(py, "encrypted_file", None) {
                 Ok(_) => panic!(
                     "shipped identity_create must FAIL CLOSED — the in-memory \
                      pre-rotation nullifier must not be minted on a production path"

@@ -47,3 +47,4 @@
 - Pattern: thin trait (Storage 6 methods) + thick coordinator (ProtocolRepository 50+ methods) is the right layering. Conformance macros (storage_conformance!, blob_store_conformance!) validate adapter implementations with one-liner invocation
 - Convention established: `store_X/load_X/delete_X/list_X` naming across all 8 ProtocolRepository domain modules
 - [Custody selection surface (SCP-294)](custody_selection_surface_scp294.md) — per-bridge custody-string matrix, IDENT-1003/1008 doc drift, Swift/Kotlin no-shipped-provider dead end
+- [Custody vocabulary PR #2415](custody_vocabulary_pr2415.md) — two-value vocab meets identical-shape; identity_published_custody misnamed (local registry, not DID doc); unlock_factor typo == shipped adapters' real answer; derive Result has zero readers

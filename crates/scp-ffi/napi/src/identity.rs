@@ -2170,10 +2170,14 @@ mod prod_fail_closed_tests {
     #[test]
     fn identity_create_fails_closed_without_pre_rotation_backend() {
         let scp = Scp::new_in_memory_for_test();
-        // `software` is a real production custody kind; on a shipped build it
-        // fails closed (it requires the callback `KeyCustodyProvider`) rather than
-        // minting an identity — so no nullifier-backed identity is ever produced.
-        let result = crate::runtime().block_on(scp.identity_create("software".to_owned(), None));
+        // `os_keystore` is a value §3.2.2 of the identity spec states, and on a
+        // shipped build with no injected `KeyCustodyProvider` it fails closed
+        // with `SCP-IDENT-1003` rather than minting an identity, so no
+        // nullifier-backed identity is ever produced. This read `"software"`
+        // until the custody vocabulary changed, and that string now leaves
+        // `validate_custody_type` with `SCP-VALID-7005`, so the
+        // `SCP-IDENT-1003` assertion below could not have held.
+        let result = crate::runtime().block_on(scp.identity_create("os_keystore".to_owned(), None));
         let msg = match result {
             Ok(_) => panic!(
                 "shipped identity_create must FAIL CLOSED — no identity may be minted \
@@ -2183,7 +2187,7 @@ mod prod_fail_closed_tests {
         };
         assert!(
             msg.contains(scp_ffi_common::error_codes::IDENT_1003),
-            "shipped `software` identity_create must fail closed (SCP-IDENT-1003, \
+            "shipped `os_keystore` identity_create must fail closed (SCP-IDENT-1003, \
              requires callback custody), got: {msg}"
         );
         // The message sends the reader to the callback provider, and

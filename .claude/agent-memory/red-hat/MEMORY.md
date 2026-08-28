@@ -118,3 +118,14 @@ See [pr_sdk_coverage_fail_closed_parity.md](pr_sdk_coverage_fail_closed_parity.m
 - **RED-906 (MEDIUM)**: UniFFI identity custody NOT in BridgeInstance (separate OnceLock). Weaker cleanup vs PyO3/NAPI.
 - **RED-907 (MEDIUM)**: Post-shutdown re-registration possible. register_identity() has no is_shutdown() check.
 - Fix priority: (1) bridge_instance() should reject post-shutdown with Err, (2) clear storage_provider/protocol_repository, (3) UniFFI identity into BridgeInstance.
+
+## PR #2415 `spec/custody-vocabulary-names-the-backend` (2026-08-28)
+See [pr2415_custody_vocabulary.md](pr2415_custody_vocabulary.md) for full chains.
+- **Reachability gate**: shipped builds create NO identity (`SCP-IDENT-1059`, no pre-rotation backend). Whole custody surface inert in prod; live only on `testing` builds, which is what the Swift README tells developers to run.
+- **RED-1201 (HIGH, proven)**: `derive` gives zero adversarial guarantee on `os_keystore` — the substrate is the consumer's own callback. In-repo working exploit: `SignOnlyKeychain` (bindings/typescript/tests/identity-create-with-custody.test.ts:182) keeps seeds in a JS Map and publishes `non-extractable-biometric`.
+- **RED-1202**: `ScpKeyCustodyAttestation::derive` / `set_custody_attestation` have ZERO non-test callers; `KeyCustodyModel` has zero production consumers. Nothing publishes, nothing reads.
+- **RED-1203**: `.docs/specs/03-identity.md:175` cites §27.4.4 as stating the reader-side downgrade rule "in four clauses"; §27.4.4 states "There is no verifier". Dangling citation for the one control that would defang a lying attestation.
+- **RED-1204**: `open_default_key_file` — empty `SCP_KEY_PASSPHRASE` accepted; `$HOME` unset ⇒ key file lands in CWD (`key_file.rs:88`); wrong passphrase succeeds at open, fails at first decrypt.
+- **RED-1205**: missing-passphrase code PyO3 `VALID_7001` vs NAPI/UniFFI `VALID_7005`; Swift+Kotlin SDK docs state 7001 for a UniFFI bridge. Key-file open: `IDENT_1001` vs UniFFI `IDENT_1002`. `identity_published_custody` provider-throw: NAPI `IDENT_1001` vs UniFFI `IDENT_1017`; TS doc says 1017.
+- **RED-1206**: No shipped adapter can publish a value — Apple always `extractable`, Android always `unprotected`. `AppleKeyCustody` does not conform to the UniFFI `KeyCustodyProvider` protocol (10/11 signatures differ).
+- **Lesson**: "derived, never declared" is a type-safety property, not a trust property. When the substrate is a foreign callback, deriving moves the lie one frame outward. Always grep for non-test callers of the publish function before scoring a chain.
