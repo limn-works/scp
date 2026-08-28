@@ -1,6 +1,6 @@
 {
   "project": "scp",
-  "description": "Shared-DID human-agent identity model: human and agent share one DID with three verification methods (#0 identity key, #active human signing key, #agent agent signing key). Mechanical enforcement of one-agent-per-context, structural accountability, protocol-native action provenance. Permission model: Category A (DID doc mods, #0 only), Category B (operational actions, user-configurable), Category C (context-configurable). ADR-063 adds a fifth Category C mechanism, user_authentication_required. Five-layer enforcement stack: custody separation, SDK defaults, verifier validation, custody attestation, behavioral signals. ADR-039.",
+  "description": "Shared-DID human-agent identity model: human and agent share one DID with three verification methods (#0 identity key, #active human signing key, #agent agent signing key). Mechanical enforcement of one-agent-per-context, structural accountability, protocol-native action provenance. Permission model: Category A (DID doc mods, #0 only), Category B (operational actions, user-configurable), Category C (context-configurable). ADR-063 proposes a fifth Category C mechanism, user_authentication_required, and declares no field for it; issue #2417 carries the eight questions that decide whether it ships. Five-layer enforcement stack: custody separation, SDK defaults, verifier validation, custody attestation, behavioral signals. ADR-039.",
   "gates": [
     {
       "id": "gate-design-artifacts",
@@ -98,8 +98,7 @@
         "SCP-AB-031",
         "SCP-AB-032",
         "SCP-AB-033",
-        "SCP-AB-036",
-        "SCP-AB-037"
+        "SCP-AB-036"
       ]
     },
     {
@@ -237,7 +236,7 @@
         "§4.2 states binding is via #agent verification method on the human's DID",
         "§4.3 states one-agent-per-context is mechanically enforced by DID document structure (one #agent VM max)",
         "§4.5 states human-agent pair shares one DID, agent accountability is structural not inferential",
-        "§4.7 documents Category C context restrictions: agent_keys_allowed, agent-specific roles, agent_rate_limit, agent_cosign_required, and user_authentication_required (ADR-063)",
+        "§4.7 documents Category C context restrictions: agent_keys_allowed, agent-specific roles, agent_rate_limit, agent_cosign_required",
         "§4.8 documents fleet operation under shared-DID model: one agent per DID, multiple DIDs for fleet (full Sybil cost each)",
         "No references to separate agent DIDs or UCAN-delegation-based binding remain in §4"
       ],
@@ -1875,66 +1874,6 @@
         {
           "file": ".docs/specs/04-agents.md",
           "section": "## 4.9 Agent Permission Model"
-        }
-      ],
-      "details": {}
-    },
-    {
-      "id": "SCP-AB-037",
-      "title": "Add user_authentication_required to ContextParams and reject every listed capability",
-      "gate": "gate-permission-category-c",
-      "priority": "P0",
-      "severity": "critical",
-      "status": "pending",
-      "files": [
-        "crates/scp-protocol/src/context/params.rs",
-        "crates/scp-protocol/src/context/invitation_bundle.rs",
-        "crates/scp-ffi/common/src/error_codes.rs"
-      ],
-      "description": "§4.9.3 defines user_authentication_required as the list of capabilities a context requires a member to exercise under a signing key whose platform gates it behind a device-local authentication gesture, on ContextParams, default empty. §4.9.3 states no admission rule and ADR-063 §Decision 5 states why: four things a verifier would need are undecided, and a rule written before those answers admits the wrong artifacts. So this story adds the field, its creation-time ceiling validation, and a verifier that rejects every listed capability with a typed error. It adds no admission path. ADR-063 §Decision 2 states why the granularity is one entry per capability, and states that the entry's own type is a bare Capability only if a human answers open questions 2 and 3 in the negative — issue #2417 records the answers, and this story does not start before it closes. Adding a ContextParams field folds into the genesis_params_hash the invitation bundle signs, so the story regenerates that KAT the way three prior field additions did.",
-      "acceptanceCriteria": [
-        "ContextParams carries a field named user_authentication_required whose element type matches the resolution issue #2417 records for open questions 2 and 3, and which is a bare Capability when both answers are negative",
-        "The Default impl of ContextParams yields an empty collection for user_authentication_required",
-        "Every entry of user_authentication_required is validated against the context's ceiling at context creation, and an entry outside the ceiling is rejected with the same error the ceiling validation already returns for an out-of-ceiling role capability",
-        "Membership of the list is decided by the same wildcard-aware matching CapabilityCeiling::contains applies, so an OutletCallAll entry gates an OutletCall(id) invocation",
-        "A verification function rejects an action whose invoked capability appears in user_authentication_required, whatever the signer's DID document declares, and returns a typed error carrying a new error-code constant",
-        "The verification function admits an action whose invoked capability is absent from user_authentication_required, and resolves no DID document on that path",
-        "No branch of the verification function reads a KeyCustodyModel value or a PlatformAttestation, and a test asserts that a DID document declaring HardwareBiometric with a verifying platform_attestation is still rejected",
-        "A test constructs a ContextParams whose user_authentication_required holds governance:vote inside the ceiling and asserts creation succeeds",
-        "A test constructs a ContextParams whose user_authentication_required holds a capability outside the ceiling and asserts creation is rejected",
-        "A test asserts that an OutletCallAll entry gates an OutletCall(id) invocation and that an OutletQuery(id) invocation is unaffected",
-        "A test round-trips a ContextParams carrying a non-empty user_authentication_required through serde and asserts field equality",
-        "The invitation-bundle genesis_params_hash known-answer test is regenerated and its comment records this field addition alongside the three prior ones"
-      ],
-      "actionItems": [
-        "Read issue #2417 for the resolution of open questions 2 and 3, and take the entry type from it",
-        "Add user_authentication_required to ContextParams with an empty default",
-        "Extend the creation-time ceiling validation to the new field",
-        "Add the wildcard-aware membership test using CapabilityCeiling::contains semantics",
-        "Add the fail-closed verification function and its error-code constant",
-        "Regenerate the invitation-bundle genesis_params_hash known-answer test",
-        "Add the tests named in the acceptance criteria"
-      ],
-      "blockedBy": [],
-      "blockedByIssues": [
-        2417
-      ],
-      "sources": [
-        {
-          "file": ".docs/specs/04-agents.md",
-          "section": "### 4.9.3 Category C — context-configurable"
-        },
-        {
-          "file": ".docs/adrs/ADR-063-context-declared-user-authentication-gate.md",
-          "section": "## Decision"
-        },
-        {
-          "file": ".docs/specs/05-contexts.md",
-          "section": "## 5.3 Capability Ceiling"
-        },
-        {
-          "file": ".docs/specs/09-security-model.md",
-          "section": "### 9.18.B Configurable Parameters"
         }
       ],
       "details": {}

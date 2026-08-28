@@ -25,3 +25,6 @@ artifact diverged) so future passes trace faster.
   `scp-client-wasm::WasmScpClient`; `resubscribe_all` was not (inter-layer gap). Also: type
   renames (Socket→RelaySink) leave stray doc refs; native reciprocal-announce is a legit
   recorded follow-up.
+- [ADR-063 user-authentication gate revision](adr063_user_auth_gate_revision.md) — one parameter
+  named in six artifacts; rewriting one sentence leaves its twins. Carries the verified line
+  numbers and the absence claims already proven.
