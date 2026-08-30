@@ -92,7 +92,7 @@ skipped. In `.github/workflows/ci.yml` the pin decides seven lanes, not one:
 
 | Lane | The jobs it guards whose behaviour the pin decides |
 |--------|----------------------------------------------------|
-| `rust` | `rust-fmt`, `rust-clippy`, `rust-test`, `rust-test-napi-production`, `rust-build-pyo3-production`, `rust-build-uniffi-production`, `rust-doc`, `rust-deny`, and `docker-image` |
+| `rust` | `rust-fmt`, `rust-clippy`, `rust-test`, `rust-test-napi-production`, `rust-test-pyo3-production`, `rust-build-uniffi-production`, `rust-doc`, `rust-deny`, and `docker-image` |
 | `python` | `python-test` runs `maturin develop --release` |
 | `typescript` | `typescript-check` runs `cargo build -p scp-ffi-napi --release` |
 | `typescript-wasm` | `typescript-wasm-check` runs `wasm-pack build` from the repository root |

@@ -703,14 +703,22 @@ jobs:
   # re-gate a production identity/SCPID/custody op behind the test-only
   # `testing` feature — making it vanish from the production lib —
   # and the regression would go unnoticed until release. This is the per-PR guard
-  # against that over-gating regression class. Build-only (lib + bins): the pyo3
-  # test suite assumes in-memory custody and does not compile in prod config, so
-  # a full prod-config test lane is a separate follow-up. The lib build still
-  # catches the bug class — a production op gated out of the lib won't compile.
-  rust-build-pyo3-production:
+  # against that over-gating regression class.
+  #
+  # This lane ran `cargo build` until the custody-vocabulary change, on the
+  # reading that "the pyo3 test suite assumes in-memory custody and does not
+  # compile in prod config". It does compile: `cargo test -p scp-ffi --features
+  # server` runs 428 tests and passes. Building alone left three fail-closed
+  # proofs compiled in no CI configuration at all —
+  # `identity::prod_custody_message_tests` is `#[cfg(all(test, not(feature =
+  # "testing")))]`, so the workspace nextest lane compiles it out and a build
+  # lane compiles no test code. The napi twin already runs its tests here, which
+  # is why its identically-gated `prod_pre_rotation_gate_tests` executes.
+  # ci.yml is not an enforcement file; this widens what the lane covers.
+  rust-test-pyo3-production:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    name: Rust / build (pyo3 production config)
+    name: Rust / test (pyo3 production config)
     runs-on: ubuntu-latest
     steps:
       - name: Free disk space
@@ -723,12 +731,20 @@ jobs:
         with:
           python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
-      - name: Build pyo3 bridge in production config (no in-memory custody)
+      - name: Test pyo3 bridge in production config (no in-memory custody)
         run: |
           # pyo3 links libpython, so LD_LIBRARY_PATH must point at LIBDIR.
           export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           # Default features = production: `server` on, no `testing`.
-          cargo build -p scp-ffi --features server
+          # `cargo test` builds the lib and the bins, so this still catches a
+          # production op gated out of the lib, and it also compiles and runs
+          # the `#[cfg(all(test, not(feature = "testing")))]` modules that the
+          # workspace nextest lane compiles out — among them
+          # `identity::prod_custody_message_tests`, which asserts that a shipped
+          # wheel declines "in_memory" with SCP-IDENT-1008, declines
+          # "os_keystore" without a provider with SCP-IDENT-1003, and carries
+          # SCP-VALID-7005 on every retired custody spelling.
+          cargo test -p scp-ffi --features server
 
   # Builds the uniffi bridge (`scp-ffi-uniffi`) in its PRODUCTION configuration:
   # default features (`server` on) but WITHOUT `testing`. Same
@@ -1448,7 +1464,7 @@ jobs:
       - rust-clippy
       - rust-test
       - rust-test-napi-production
-      - rust-build-pyo3-production
+      - rust-test-pyo3-production
       - rust-build-uniffi-production
       - rust-doc
       - rust-deny
@@ -1501,7 +1517,7 @@ jobs:
             "${{ needs.rust-clippy.result }}" \
             "${{ needs.rust-test.result }}" \
             "${{ needs.rust-test-napi-production.result }}" \
-            "${{ needs.rust-build-pyo3-production.result }}" \
+            "${{ needs.rust-test-pyo3-production.result }}" \
             "${{ needs.rust-build-uniffi-production.result }}" \
             "${{ needs.rust-doc.result }}" \
             "${{ needs.rust-deny.result }}" \
