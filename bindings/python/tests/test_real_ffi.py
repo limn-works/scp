@@ -35,7 +35,7 @@ except (ImportError, AttributeError):
     )
 
 from scp_sdk import SCP
-from scp_sdk.errors import ValidationError
+from scp_sdk.errors import IdentityError, ValidationError
 from scp_sdk.types import CustodyType
 
 from .harness_custody import (
@@ -260,10 +260,23 @@ class TestIdentity:
         holding no backend for a DID reports a typed error rather than a value
         it reconstructed from the DID string. ``with_identity`` raises the
         registry-miss code, and all three bridges spell it ``SCP-IDENT-1001``.
+
+        Two calls, two layers.
+        :meth:`~scp_sdk.SCP.identity_published_custody` routes every bridge
+        exception through ``_coded_bridge_error``, so it raises
+        :class:`scp_sdk.errors.IdentityError`, which is the class its own
+        docstring names. The bridge call under it raises
+        ``_scp_core.IdentityError``, which is the class the other two bridges
+        are pinned against. Both carry the same code in a leading
+        ``[SCP-CAT-NNNN]`` bracket.
         """
-        with pytest.raises(_scp_core.IdentityError) as excinfo:
+        with pytest.raises(IdentityError) as sdk_err:
             await scp.identity_published_custody("did:dht:z6MkNotRegistered")
-        assert str(excinfo.value).startswith("[SCP-IDENT-1001]")
+        assert str(sdk_err.value).startswith("[SCP-IDENT-1001]")
+
+        with pytest.raises(_scp_core.IdentityError) as bridge_err:
+            scp._native.identity_published_custody("did:dht:z6MkNotRegistered")
+        assert str(bridge_err.value).startswith("[SCP-IDENT-1001]")
 
     async def test_create_rejects_unknown_custody(self, scp: SCP):
         """An unrecognized custody string draws ``SCP-VALID-7005``.
