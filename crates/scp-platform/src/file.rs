@@ -316,9 +316,11 @@ fn sync_parent_dir(dir: &Path) {
 /// key file at a time. Each write of the file runs under an advisory exclusive
 /// lock over the sidecar `<path>.lock`, so the writes serialize instead of
 /// overwriting each other: `append_entry` and `destroy_key` each hold it across
-/// their whole read-modify-write, and [`FileKeyCustody::new`] holds it across
-/// the existence test and the file creation that follows. The private
-/// `lock_for_write` states what those races cost when the lock is absent.
+/// their whole read-modify-write, `import_ed25519_signing_key` holds it across
+/// its content-dedup scan and the append or the map insert that scan decides
+/// on, and [`FileKeyCustody::new`] holds it across the existence test and the
+/// file creation that follows. The private `lock_for_write` states what those
+/// races cost when the lock is absent.
 ///
 /// See GitHub issue #391 and ADR-006.
 pub struct FileKeyCustody {
@@ -460,7 +462,11 @@ impl FileKeyCustody {
     ///
     /// Every write of the key file runs under this lock. `append_entry` and
     /// `destroy_key` each read the whole file, change one entry, and write the
-    /// whole file back. [`FileKeyCustody::new`] takes the same lock around the
+    /// whole file back. `import_ed25519_signing_key` reads the whole file,
+    /// decides from it whether the store already holds the seed, and then
+    /// either appends the seed or records the entry the scan matched, so it
+    /// takes the lock across the scan and that decision together.
+    /// [`FileKeyCustody::new`] takes the same lock around the
     /// existence test and the `create_new` that follows it, so two instances
     /// cannot each write a header carrying its own salt.
     ///
@@ -794,9 +800,29 @@ impl FileKeyCustody {
             .map_err(|_| PlatformError::CustodyError("file write lock poisoned".into()))?;
         // Cross-instance and cross-process exclusion. `file_write_lock` above
         // covers this instance's own tasks; this covers every other holder of
-        // the same path. The read below and the write at the end of this
-        // function are one read-modify-write, so both run under it.
+        // the same path. The read `append_entry_locked` opens with and the
+        // write it ends with are one read-modify-write, so both run under it.
         let _file_lock = self.lock_for_write()?;
+        self.append_entry_locked(key_type, private_key)
+    }
+
+    /// Appends an encrypted key entry, and requires the caller to hold both
+    /// write locks already.
+    ///
+    /// The caller MUST hold `file_write_lock` and the advisory lock
+    /// [`FileKeyCustody::lock_for_write`] returns, and MUST keep both until
+    /// this function returns. [`FileKeyCustody::append_entry`] takes both and
+    /// calls this. `import_ed25519_signing_key` takes both across a wider span,
+    /// because its content-dedup scan reads the same file, and this append must
+    /// not follow a read that another writer has already invalidated. Neither
+    /// lock nests: `file_write_lock` is a [`std::sync::Mutex`], and `flock`
+    /// releases the whole lock on the first unlock, so a caller that already
+    /// holds both calls this function rather than `append_entry`.
+    fn append_entry_locked(
+        &self,
+        key_type: StoredKeyType,
+        private_key: &[u8; KEY_LEN],
+    ) -> Result<[u8; NONCE_LEN], PlatformError> {
         let mut data = self.read_file()?;
 
         // Read current entry count. `entry_count` also checks that the file
@@ -919,9 +945,10 @@ impl KeyCustody for FileKeyCustody {
 
             // Hold `handle_map` across the entire append-and-insert
             // path so a concurrent `destroy_key` on this instance cannot
-            // interleave with the insert. `append_entry` takes only
-            // `file_write_lock`, never `handle_map`, so there is no
-            // lock-ordering inversion. Mirrors the pattern in
+            // interleave with the insert. `append_entry` takes
+            // `file_write_lock` and then the advisory lock, and never
+            // `handle_map`, so this call takes the three locks in the order
+            // every other path takes them. Mirrors the pattern in
             // `import_ed25519_signing_key`.
             let mut map = self.handle_map.lock().await;
             let entry_nonce = self.append_entry(stored_type, &key_bytes)?;
@@ -1257,9 +1284,25 @@ impl KeyCustody for FileKeyCustody {
             // here (that method re-acquires `handle_map` and would
             // deadlock). Instead, read the file once and decrypt
             // candidate Ed25519 entries directly via `decrypt_entry`.
-            // `append_entry` takes the separate `file_write_lock`,
-            // never `handle_map`, so there is no inversion.
             let mut map = self.handle_map.lock().await;
+
+            // Take both write locks around the scan, the map insert, and the
+            // append below, in the order every other path takes them:
+            // `handle_map`, then `file_write_lock`, then the advisory lock.
+            // `handle_map` covers this instance's own tasks and nothing else,
+            // so a scan under it alone reads a snapshot another instance may
+            // append to or rewrite before this task decides. Two instances
+            // importing one seed would then both miss the entry and both
+            // append it, and `destroy_key` removes the one entry its handle's
+            // nonce names, which leaves the second encrypted copy of that
+            // private key on disk. An instance that destroyed the matched
+            // entry between the scan and the map insert would likewise leave
+            // this task holding a handle no entry answers to.
+            let _lock = self
+                .file_write_lock
+                .lock()
+                .map_err(|_| PlatformError::CustodyError("file write lock poisoned".into()))?;
+            let _file_lock = self.lock_for_write()?;
 
             // Scan the file rather than this instance's map. Another
             // `FileKeyCustody` over the same path may have appended this seed
@@ -1317,10 +1360,11 @@ impl KeyCustody for FileKeyCustody {
             // Persist the seed bytes via the same encrypted append-only
             // log used by `generate_keypair`. After this call the bytes
             // are encrypted-at-rest under the same passphrase-derived key.
-            // `append_entry` takes only `file_write_lock` — safe to call
-            // while holding `handle_map`.
+            // This calls `append_entry_locked` rather than `append_entry`,
+            // because this function already holds both write locks and neither
+            // one nests.
             let key_bytes = Zeroizing::new(**seed);
-            let entry_nonce = self.append_entry(StoredKeyType::Ed25519, &key_bytes)?;
+            let entry_nonce = self.append_entry_locked(StoredKeyType::Ed25519, &key_bytes)?;
 
             let handle = self.next_handle();
             map.entries
@@ -2527,6 +2571,144 @@ mod tests {
         assert_eq!(
             second.public_key(&second_handle).await.unwrap().as_bytes(),
             expected.as_slice()
+        );
+    }
+
+    /// An import whose content-dedup scan matches an entry already in the file
+    /// cannot run that scan while another instance holds the key file's write
+    /// lock.
+    ///
+    /// This is the deterministic proof that the scan runs under the advisory
+    /// lock rather than beside it. The import below appends nothing, because
+    /// the seed is already stored, so the only lock it can wait on is the one
+    /// the scan itself takes. An import that scanned outside the lock would
+    /// read the file, match the stored entry, and return in well under a
+    /// millisecond while the holder still held the lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_import_matching_a_stored_entry_waits_for_the_lock() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+        let seed = Zeroizing::new([11u8; 32]);
+
+        let writer = FileKeyCustody::new(&path, "import-lock-passphrase").unwrap();
+        writer.import_ed25519_signing_key(&seed).await.unwrap();
+        assert_eq!(entry_count(&path), 1);
+
+        let holder = FileKeyCustody::new(&path, "import-lock-passphrase").unwrap();
+        let importer =
+            std::sync::Arc::new(FileKeyCustody::new(&path, "import-lock-passphrase").unwrap());
+
+        let guard = holder.lock_for_write().unwrap();
+
+        let importing = {
+            let importer = std::sync::Arc::clone(&importer);
+            let seed = seed.clone();
+            tokio::spawn(async move { importer.import_ed25519_signing_key(&seed).await })
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(
+            !importing.is_finished(),
+            "an import must not read the key file while another instance holds its write lock"
+        );
+
+        drop(guard);
+
+        let handle = tokio::time::timeout(std::time::Duration::from_secs(10), importing)
+            .await
+            .expect("the import must complete once the lock is released")
+            .expect("the spawned task must not panic")
+            .expect("the import must succeed");
+        assert_eq!(
+            entry_count(&path),
+            1,
+            "an import that matched a stored entry must append nothing"
+        );
+        let expected = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        assert_eq!(
+            importer.public_key(&handle).await.unwrap().as_bytes(),
+            expected.as_slice(),
+            "the returned handle must name the stored entry"
+        );
+    }
+
+    /// Two instances importing one seed at the same moment write one entry
+    /// between them, so `destroy_key` on either handle removes the only
+    /// encrypted copy of that private key.
+    ///
+    /// A third instance holds the write lock until both imports have started,
+    /// which puts both of them at their content-dedup scan at once. Scanning
+    /// outside the lock, both read a file that lacks the seed and both append
+    /// it, and the file then holds two entries encrypting one private key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_instances_importing_one_seed_at_once_append_one_entry() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+        let seed = Zeroizing::new([12u8; 32]);
+
+        let holder = FileKeyCustody::new(&path, "import-race-passphrase").unwrap();
+        let first =
+            std::sync::Arc::new(FileKeyCustody::new(&path, "import-race-passphrase").unwrap());
+        let second =
+            std::sync::Arc::new(FileKeyCustody::new(&path, "import-race-passphrase").unwrap());
+
+        let guard = holder.lock_for_write().unwrap();
+
+        let importing_first = {
+            let first = std::sync::Arc::clone(&first);
+            let seed = seed.clone();
+            tokio::spawn(async move { first.import_ed25519_signing_key(&seed).await })
+        };
+        let importing_second = {
+            let second = std::sync::Arc::clone(&second);
+            let seed = seed.clone();
+            tokio::spawn(async move { second.import_ed25519_signing_key(&seed).await })
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert_eq!(
+            entry_count(&path),
+            0,
+            "no entry may reach the file while another instance holds the lock"
+        );
+
+        drop(guard);
+
+        let first_handle = tokio::time::timeout(std::time::Duration::from_secs(10), importing_first)
+            .await
+            .expect("the first import must complete once the lock is released")
+            .expect("the first task must not panic")
+            .expect("the first import must succeed");
+        let second_handle =
+            tokio::time::timeout(std::time::Duration::from_secs(10), importing_second)
+                .await
+                .expect("the second import must complete once the lock is released")
+                .expect("the second task must not panic")
+                .expect("the second import must succeed");
+
+        assert_eq!(
+            entry_count(&path),
+            1,
+            "two concurrent imports of one seed must leave one encrypted copy of it"
+        );
+
+        let expected = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        assert_eq!(
+            first.public_key(&first_handle).await.unwrap().as_bytes(),
+            expected.as_slice()
+        );
+        assert_eq!(
+            second.public_key(&second_handle).await.unwrap().as_bytes(),
+            expected.as_slice()
+        );
+
+        // The one entry is the only copy, so destroying either handle takes the
+        // private key off disk. A second copy would survive this call.
+        first.destroy_key(&first_handle).await.unwrap();
+        assert_eq!(
+            entry_count(&path),
+            0,
+            "destroying the imported key must leave no encrypted copy of it on disk"
         );
     }
 }
