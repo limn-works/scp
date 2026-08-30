@@ -196,13 +196,21 @@ final class CustodyTypeTests: XCTestCase {
         XCTAssertNil(published, "an unstatable pair publishes no custody value")
     }
 
-    /// A DID this instance retains no custody for draws `SCP-IDENT-1017`.
+    /// A DID this instance retains no custody for draws `SCP-IDENT-1001`.
     ///
     /// The published value comes off the running backend, so an instance
     /// holding no backend for a DID reports a typed error rather than a value
     /// it reconstructed from the DID string.
+    ///
+    /// This bridge raised `SCP-IDENT-1017` until the custody-vocabulary
+    /// change. The registry entry for that code reserves it for a handle
+    /// carrying no signing custody and names `SCP-IDENT-1001` for a DID an
+    /// instance never registered
+    /// (`crates/scp-ffi/common/src/error_codes.rs`), which is the condition
+    /// this test exercises, and the `PyO3` and NAPI bridges already raised
+    /// `SCP-IDENT-1001` for it.
     func testPublishedCustodyFailsClosedForAnUnretainedDid() async {
-        await assertIdentityCode("SCP-IDENT-1017") {
+        await assertIdentityCode("SCP-IDENT-1001") {
             try await self.scp.identityPublishedCustody(did: "did:dht:z6MkNotRegistered")
         }
     }
