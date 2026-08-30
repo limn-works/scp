@@ -1,6 +1,6 @@
 # Per-SDK idiom — language constraints stay local
 
-> **ADR-055 (2026-06-29):** the WASM bridge was removed; references below to a fourth WASM/wasm-bindgen bridge are historical. SCP now ships four language SDKs (Python, TypeScript, Swift, Kotlin) over three FFI bridges (PyO3, NAPI, UniFFI); the browser is a remote thin client. The per-SDK-idiom rule below remains evergreen.
+> **ADR-055 (2026-06-29):** the WASM bridge was removed; references below to a fourth WASM/wasm-bindgen bridge are historical. SCP now ships four language SDKs (Python, TypeScript, Swift, Kotlin) over three FFI bridges (PyO3, NAPI, UniFFI). ADR-057 later gave the browser an in-process client over `crates/scp-client-wasm`, which exposes a wasm-bindgen surface rather than a fourth FFI bridge. The per-SDK-idiom rule below remains evergreen.
 
 ## Principle
 

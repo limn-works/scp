@@ -13,7 +13,7 @@ The three FFI bridges expose the same protocol operation under different names b
 
 **Rule:** When registering a new matrix entry, prefer the canonical name that already exists in all three bridges' source. If no shared name exists, file the source-side rename as a follow-up rather than picking an arbitrary canonical and growing the alias set.
 
-> When this lesson was first written there was a fourth `wasm-bindgen` bridge (sharing NAPI's flat free-function shape). ADR-055 removed it — browser clients are now remote thin clients to a server-side `scp-node` — so bridge symmetry is a three-bridge invariant (PyO3, UniFFI, napi-rs). The naming guidance below is unchanged in substance.
+> When this lesson was first written there was a fourth `wasm-bindgen` bridge (sharing NAPI's flat free-function shape). ADR-055 removed it, so bridge symmetry is a three-bridge invariant (PyO3, UniFFI, napi-rs) — the three directories `scripts/check-bridge-symmetry.sh` reads. ADR-057 later gave the browser an in-process client over `crates/scp-client-wasm`, which exposes a wasm-bindgen surface rather than an FFI bridge, so the gate does not read it. The naming guidance below is unchanged in substance.
 
 ## Bridge-symmetry harness has an inverse-coverage blind spot
 
