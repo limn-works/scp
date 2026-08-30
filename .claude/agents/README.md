@@ -14,6 +14,8 @@ When you write or edit an agent definition, satisfy both requirements:
 
 Every agent definition also follows `.docs/standards/concrete-prose.md`, which governs all prose in this repository.
 
+Every review agent also follows "Review the class, not the instance" in the Agents section of `CLAUDE.md`: it searches the sibling sites before it writes a finding and reports every site it found as one finding. That statement in `CLAUDE.md` is the authoritative one, so no agent definition repeats it.
+
 ## Agents
 
 | Agent | Responsibility | File |
