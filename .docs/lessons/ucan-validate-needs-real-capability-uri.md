@@ -50,10 +50,11 @@
 
 ## Where these rules are still broken
 
-ADR-059 landed on two of the three surfaces that evaluate trust. `SCP.evaluateTrust` in
-`bindings/typescript/src/scp.ts` calls `ucanEvaluate` and reads the six booleans, and
+ADR-059 landed on every trust-evaluation surface but one. `SCP.evaluateTrust` in
+`bindings/typescript/src/scp.ts` calls `ucanEvaluate` and reads the six booleans,
 `scp_sdk.trust.evaluate_trust` in `bindings/python/scp_sdk/trust.py` calls
-`ucan_evaluate`. ADR-059 did not land on the module-level `evaluateTrust` that
+`ucan_evaluate`, and `evaluateTrust` in `bindings/swift/Sources/SCP/Trust.swift` calls
+`ucanEvaluate`. ADR-059 did not land on the module-level `evaluateTrust` that
 `bindings/typescript/src/index.ts` re-exports out of `bindings/typescript/src/trust.ts`,
 so a caller who imports that name still runs the superseded path, and that path breaks
 three of the rules above:
