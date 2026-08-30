@@ -1,39 +1,29 @@
 # Test Error-Code Fixtures Must Pass the Same Conformance Gate as Production
 
-**Date:** 2026-07-16
-**Source:** PR #2141 review+fix session — `scripts/check-error-codes.sh`
+**Problem**: `scripts/check-error-codes.sh` scans every `.ts`, `.py`, and `.rs` file in the
+repository, test files included, and excludes no test path. An error code that falls
+outside its category's range, or that uses a prefix the script does not recognize, fails the
+gate wherever it lives. A placeholder invented for a test fixture is indistinguishable to
+the scanner from a real violation, and turns CI red on an otherwise-correct change.
 
-## The Problem
+Two ways a fixture breaks it:
 
-`scripts/check-error-codes.sh` scans **all** `.ts`, `.py`, and `.rs` files in the
-repo — test files included. It has no test-path exclusion. Any error code that is
-out of range or uses a non-canonical prefix fails the gate, regardless of whether
-it lives in production code or a test fixture. Two ways a fixture breaks the gate:
+- **An out-of-range number under a real prefix** — `SCP-GOV-6001`, when the governance range
+  is 11000-11999.
+- **A prefix the script does not recognize** — `SCP-WEIRD-9999`, when the categories are
+  `IDENT`, `CTX`, `PERM`, `CRYPTO`, `TRANS`, `OUTLET`, `VALID`, `STORAGE`, `ATTEST`, `MCP`,
+  `GOV`, `ECON`, and `SAGA`.
 
-- **Out-of-range code for a real prefix** — e.g. `SCP-GOV-6001`, when the GOV range
-  is `11000-11999` (see the script's range table and the `SCP-GOV)` case).
-- **Non-canonical prefix** — e.g. `SCP-WEIRD-9999`, when `SCP-WEIRD` is not one of
-  the recognized categories (`IDENT|CTX|PERM|CRYPTO|TRANS|OUTLET|VALID|STORAGE|ATTEST|MCP|GOV|ECON|SAGA`).
+## Rules
 
-## The Pattern
+- **In a test fixture, use a real in-range code for the category under test, or use the
+  `SCP-UNKNOWN-*` or `SCP-TEST-*` sentinel**, which `scripts/check-error-codes.sh`
+  allowlists for the unmapped or placeholder case.
+- **Never invent a placeholder prefix or an arbitrary number for a test.**
+- **Read a repository-wide gate as repository-wide.** "It is only a test fixture" is not a
+  category the scanner has.
 
-In test fixtures, either:
+## See also
 
-1. Use a **real, in-range** code for the category under test, or
-2. Use the **`SCP-UNKNOWN-*` or `SCP-TEST-*` sentinel** — both are explicitly
-   allowlisted in the script (`SCP-UNKNOWN)  ;; # Sentinel for unmapped bridge
-   errors — allowed` and `SCP-TEST)  ;; # Test-only sentinel — allowed`) for the
-   "unmapped / placeholder error" case.
-
-Never invent a placeholder prefix or an arbitrary number for a test.
-
-## Why This Matters
-
-The gate is a repo-wide invariant, not a production-only one. A "just a test
-fixture" placeholder is indistinguishable to the scanner from a real violation, and
-will turn CI red on an otherwise-correct change.
-
-## Related
-
-- `scripts/check-error-codes.sh` — the gate (do not weaken; it is an enforcement file)
+- `scripts/check-error-codes.sh` — the gate. It is an enforcement file; do not weaken it.
 - `.docs/lessons/python-bridge-error-message-strip-double-bracket.md`

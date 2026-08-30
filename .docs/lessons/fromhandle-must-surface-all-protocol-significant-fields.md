@@ -1,35 +1,32 @@
-# `_fromHandle` Wrappers Must Surface All Protocol-Significant Fields
+# A `_fromHandle` Wrapper Must Surface Every Protocol-Significant Field
 
-**Context**: The NAPI `identityMigrate` returns a handle carrying a `rotationEventJson`
-field — the rotation event the caller MUST distribute to active context members
-(spec §9.12, ADR-003 §4b) so the migrate→distribute flow can complete. The TS SDK re-wrapped
-the handle through `Identity._fromHandle`, a generic constructor that captures only the
-standard identity shape (`did`, `custodyType`).
+**Problem**: a shared `_fromHandle` constructor is written against the common shape of an
+object, so it drops by omission whatever a specific bridge method returns beyond that shape.
+The napi `identityMigrate` returns a handle carrying `rotationEventJson` — the rotation event
+the caller must distribute to active context members, per §9.12 of the security-model spec
+and ADR-003, DID creation. The TypeScript SDK re-wrapped that handle through
+`Identity._fromHandle`, which captures `did` and `custodyType` alone, so the field existed on
+the bridge handle and reached no accessor. The migrate-then-distribute flow was impossible
+from TypeScript, and the operation looked wired because it returned an `Identity`.
 
-**Problem**: `_fromHandle` silently dropped `rotationEventJson`. The field existed on the
-bridge handle but was never copied onto the SDK object, so there was no accessor for it.
-From TypeScript, the migrate→distribute flow was **impossible** — callers could migrate but
-had no way to obtain the rotation event they're required to broadcast. The operation
-*looked* wired (it returned an `Identity`) but was protocol-incomplete.
+The loss is silent: the code compiles, the return type is satisfied, and only reading the
+bridge handle reveals the missing data.
 
-**Root cause**: A shared `_fromHandle` constructor is written against the *common* identity
-shape. When a specific bridge method returns *extra* fields beyond that shape, the generic
-wrapper has no knowledge of them and drops them by omission. The loss is silent: the code
-compiles, the happy-path return type is satisfied, and only a careful read of the bridge
-handle reveals the missing data.
+## Rules
 
-**Rule**: When adding (or wrapping) a bridge method that returns protocol-significant fields
-beyond the standard object shape, audit what the shared `_fromHandle` / `fromHandle`
-constructor captures. If the handle carries extra fields the protocol requires the caller to
-act on, add explicit accessors (or a method-specific result type) that surface them. Do not
-assume the generic wrapper round-trips everything — it round-trips only the fields it was
-written to know about.
+- **When you add or wrap a bridge method that returns protocol-significant fields beyond the
+  standard object shape, audit what the shared constructor captures.** Add explicit
+  accessors, or a result type specific to that method, for every field the protocol requires
+  the caller to act on.
+- **Do not assume a generic wrapper round-trips everything.** It round-trips the fields it
+  was written to know about.
+- **For every field the bridge handle exposes, find the corresponding accessor in the SDK
+  wrapper.** An exposed-but-unwrapped field is a half-done binding under the CLAUDE.md
+  integration checklist.
 
-A useful check: for every field the bridge handle exposes, grep the SDK wrapper for a
-corresponding accessor. An exposed-but-unwrapped field is a half-done binding (see the
-CLAUDE.md Integration checklist — a bridge export without a complete SDK wrapper is half-done).
+## See also
 
-Related: `.docs/lessons/napi-bridge-encoded-field-must-be-set.md`,
-`.docs/lessons/migration-publish-recovery-handle.md`,
-`.docs/lessons/typescript-sdk-bridge-patterns.md`, and
-`.docs/lessons/mock-test-must-not-invert-real-bridge-behavior.md` (same migrate path).
+- `.docs/lessons/napi-bridge-encoded-field-must-be-set.md`
+- `.docs/lessons/migration-publish-recovery-handle.md`
+- `.docs/lessons/typescript-sdk-bridge-patterns.md`
+- `.docs/lessons/mock-test-must-not-invert-real-bridge-behavior.md` — the same migrate path.

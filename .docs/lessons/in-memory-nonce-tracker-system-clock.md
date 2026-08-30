@@ -1,7 +1,6 @@
 # `InMemoryNonceTracker::check_replay` uses `SystemClock`, not injected clock
 
-**Date:** 2026-04-15
-**Source:** Round 1 review of fuzzing infrastructure plan — HIGH severity finding
+**Source:** review of the fuzzing infrastructure plan, ADR-045, the fuzzing infrastructure decision.
 
 ## The problem
 

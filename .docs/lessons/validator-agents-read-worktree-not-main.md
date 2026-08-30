@@ -1,7 +1,6 @@
 # Validator subagents in worktrees read their working tree, not `origin/main`
 
-**Date:** 2026-04-15
-**Source:** Fuzzing infrastructure review — orchestrator verification protocol
+**Source:** the Orchestrator verification protocol in CLAUDE.md.
 
 ## What happened
 
@@ -33,7 +32,7 @@ For any claim of the form "file X does not exist" or "function Y is not called":
 git show origin/main:path/to/file.rs | grep "function_name"
 
 # Or: fetch the file content from origin/main explicitly
-git show origin/main:.docs/lessons/some-lesson.md
+git show origin/main:.docs/lessons/<name>.md
 ```
 
 The orchestrator verification protocol in `CLAUDE.md` already mandates this for post-merge

@@ -24,4 +24,4 @@ Any time you add a new module that needs to compute Merkle interior node hashes 
 
 ## Discovered
 
-SCP-126 cryptographic review (2026-02-27). The third copy was added in `pruning.rs`.
+The SCP-126 cryptographic review found the third copy, in `pruning.rs`.

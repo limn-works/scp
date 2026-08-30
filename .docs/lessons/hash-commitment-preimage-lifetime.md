@@ -1,7 +1,6 @@
 # Hash-Then-Reveal Commitments Require Preimage Retention From t=commit Through t=reveal
 
-**Date:** 2026-04-27
-**Source:** SCP-1717 — pre-rotation key destroyed at create time, then required at migrate time. Layered on the earlier SCP-214 review (`pre-rotation-key-must-be-stored-at-creation.md`) which predicted this exact failure on 2026-03-01.
+**Source:** the pre-rotation key, destroyed at create time and then required at migrate time. `.docs/lessons/pre-rotation-key-must-be-stored-at-creation.md`, from the SCP-214 review, predicted this failure before it occurred.
 
 ## Rule
 

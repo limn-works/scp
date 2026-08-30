@@ -1,6 +1,5 @@
 # PyO3 Dict Returns Require Key Access, Not Attribute Access
 
-**Date:** 2026-02-28
 **Source:** SCP-213 security review of `bindings/python/scp_sdk/mcp.py:687`
 
 ## The Bug
