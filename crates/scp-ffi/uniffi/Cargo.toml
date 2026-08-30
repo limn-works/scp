@@ -125,6 +125,18 @@ name = "e2e_bridge"
 path = "tests/e2e_bridge.rs"
 required-features = ["testing"]
 
+# Drives `Scp::suspend` / `Scp::resume` on an instance built by
+# `Scp::new_in_memory_for_test`, which the lib declares
+# `#[cfg(any(test, feature = "testing"))]`. An integration test links the lib
+# compiled WITHOUT `cfg(test)`, so the constructor exists for this target only
+# when the feature is on. Declaring the requirement lets cargo skip this target
+# in the shipped configuration, which is what lets CI's
+# "Rust / test (uniffi production config)" lane run `cargo test` at all.
+[[test]]
+name = "lifecycle"
+path = "tests/lifecycle.rs"
+required-features = ["testing"]
+
 # SCP-OUT-039 (§5.4.5) — replays the 7 outlet-streaming conformance vectors
 # through the UniFFI bridge's public pure-wrapper exports. Needs
 # `testing` for `Scp::new_in_memory_for_test`.
