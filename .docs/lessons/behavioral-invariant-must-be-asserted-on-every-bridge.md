@@ -1,8 +1,8 @@
 # Cryptographic Invariants Must Be Asserted On Every Bridge, Not Just Named in the Matrix
 
-> **Scope:** ADR-055, which removed the WASM bridge, left three bridges — PyO3, NAPI, and UniFFI — and made the browser a remote thin client. The passages below name a fourth wasm-bindgen bridge, which was the one that re-asserted the invariant. The rule binds the three that remain.
+> **Scope:** ADR-055, which removed the WASM bridge, left three bridges — PyO3, NAPI, and UniFFI. The passages below name a fourth wasm-bindgen bridge, which was the one that re-asserted the invariant. The rule binds the three that remain: the browser surface ADR-057 later added, `crates/scp-client-wasm`, emits no rotation event, so it emits no artifact this rule covers.
 
-**Source:** three native bridges silently emitted invalid pre-rotation proofs, because only the WASM bridge re-asserted the `SHA-256(revealed_key) == commitment` invariant that §3.7 of the identity spec, `03-identity.md`, requires.
+**Source:** three native bridges silently emitted invalid pre-rotation proofs, because only the WASM bridge re-asserted the `SHA-256(revealed_key) == commitment` invariant that Pre-Rotation Key Custody, §9.7.4.1 of the security-model spec `09-security-model.md`, requires.
 
 ## Rule
 
@@ -52,5 +52,5 @@ Add to `CLAUDE.md` Integration checklist as item 6:
 - `.docs/lessons/cross-bridge-canonical-naming.md` — covers name parity (necessary), this lesson covers byte parity (also necessary, complementary).
 - `.docs/lessons/pre-rotation-key-must-be-stored-at-creation.md` — covers the storage half of this specific bug (preimage lifetime). This lesson covers the test-coverage half.
 - ADR-003 §4b (`.docs/adrs/phase-1.md` lines 348-415) — the migrate operation contract.
-- spec §3.7 — the `SHA-256(revealed_key) == commitment` invariant.
+- Pre-Rotation Key Custody, §9.7.4.1 of `.docs/specs/09-security-model.md` — the `SHA-256(revealed_key) == commitment` invariant.
 - `scripts/bridge-aliases.json`, `crates/scp-testing/tests/integration/ffi_conformance.rs` — surface symmetry; do not validate behavioral parity.
