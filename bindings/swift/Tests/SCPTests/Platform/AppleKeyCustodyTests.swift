@@ -719,4 +719,119 @@
         }
     }
 
+    // MARK: - KeyCustodyProvider conformance
+
+    /// ``AppleKeyCustody`` satisfies the generated `KeyCustodyProvider`
+    /// protocol, so `SCP.identityCreateWithCustody(provider:)` reaches it.
+    ///
+    /// The class defines Swift-idiomatic methods — `sign(_:data:)`,
+    /// `publicKey(_:)`, `destroyKey(_:)` returning a `DestructionAttestation` —
+    /// and Swift matches a protocol requirement on its full name including
+    /// argument labels, so those methods satisfy nothing. A conformance
+    /// extension supplies the eleven members the protocol declares. Before it
+    /// existed the class named no protocol at all and `os_keystore` had no
+    /// producer on Apple platforms.
+    ///
+    /// Every test here holds the instance as `any KeyCustodyProvider`, so the
+    /// call has to route through the protocol witness rather than through the
+    /// class's own methods.
+    struct AppleKeyCustodyProviderConformanceTests {
+        private let custody = AppleKeyCustody(accessGroup: nil)
+
+        /// The instance is usable where the SDK asks for a provider, and the
+        /// bytes it returns through the protocol match the bytes its own
+        /// methods return for the same handle.
+        @Test("the provider protocol returns the same public key the class does")
+        func publicKeyMatchesThroughTheProtocol() async throws {
+            let provider: any KeyCustodyProvider = custody
+            let handle = try await provider.generateKeypair(keyType: "ed25519")
+            defer { Task { try? await custody.destroyKey(handle) } }
+
+            let throughProtocol = try await provider.getPublicKey(keyId: handle)
+            let throughClass = try await custody.publicKey(handle)
+            #expect(throughProtocol == throughClass)
+            #expect(throughProtocol.count == 32)
+        }
+
+        /// A signature made through the protocol verifies under the public key
+        /// the protocol reports for the same handle.
+        @Test("a signature made through the provider protocol verifies")
+        func signatureThroughTheProtocolVerifies() async throws {
+            let provider: any KeyCustodyProvider = custody
+            let handle = try await provider.generateKeypair(keyType: "ed25519")
+            defer { Task { try? await custody.destroyKey(handle) } }
+
+            let message = Data("payload".utf8)
+            let signature = try await provider.sign(keyId: handle, message: message)
+            #expect(signature.count == 64)
+
+            let publicKeyBytes = try await provider.getPublicKey(keyId: handle)
+            let publicKey = try Curve25519.Signing.PublicKey(rawRepresentation: publicKeyBytes)
+            #expect(publicKey.isValidSignature(signature, for: message))
+        }
+
+        /// The three synchronous members forward to the class's own answers:
+        /// where the key lives, and the two facts §3.2.2 of the identity spec
+        /// states a published custody value carries.
+        @Test("the provider protocol forwards the storage location and both published facts")
+        func synchronousMembersForward() async throws {
+            let provider: any KeyCustodyProvider = custody
+            let handle = try await provider.generateKeypair(keyType: "ed25519")
+            defer { Task { try? await custody.destroyKey(handle) } }
+
+            #expect(provider.custodyType(keyId: handle) == custody.custodyType(handle))
+            #expect(try provider.keyIsExtractable(keyId: handle) == custody.keyIsExtractable(handle))
+            #expect(try provider.unlockFactor(keyId: handle) == custody.unlockFactor(handle))
+        }
+
+        /// A pseudonym crosses the protocol as
+        /// `[public_key_bytes (32) || key_id_utf8]`, the layout
+        /// `scp_ffi_common::custody_parse::unpack_pseudonym` reads on the Rust
+        /// side, and the handle in the tail names the derived key.
+        @Test("the provider protocol packs a pseudonym into the layout the bridge unpacks")
+        func pseudonymPackingMatchesTheBridgeLayout() async throws {
+            let provider: any KeyCustodyProvider = custody
+            let handle = try await provider.generateKeypair(keyType: "ed25519")
+            defer { Task { try? await custody.destroyKey(handle) } }
+
+            let contextId = Data("context-alpha".utf8)
+            let packed = try await provider.derivePseudonym(keyId: handle, contextId: contextId)
+            #expect(packed.count > 32, "the packed pseudonym carries a key id after the key")
+
+            let packedKey = packed.prefix(32)
+            let packedHandle = try #require(String(bytes: packed.dropFirst(32), encoding: .utf8))
+            let direct = try await custody.derivePseudonym(handle, contextId: contextId)
+            #expect(Data(packedKey) == direct.publicKey)
+            #expect(!packedHandle.isEmpty)
+            #expect(try await provider.getPublicKey(keyId: packedHandle) == Data(packedKey))
+
+            _ = try? await custody.destroyKey(packedHandle)
+            _ = try? await custody.destroyKey(direct.handle)
+
+            let rotatable = try await provider.deriveRotatablePseudonym(
+                keyId: handle,
+                contextId: contextId,
+                pseudonymEpoch: 1
+            )
+            #expect(rotatable.prefix(32) != packedKey, "epoch 1 must not match the static derivation")
+            let rotatableHandle = try #require(String(bytes: rotatable.dropFirst(32), encoding: .utf8))
+            _ = try? await custody.destroyKey(rotatableHandle)
+        }
+
+        /// `destroyKey(keyId:)` drops the `DestructionAttestation` the class
+        /// returns, because the protocol declares no return value, and the key
+        /// is gone afterwards.
+        @Test("destroyKey through the provider protocol removes the key")
+        func destroyThroughTheProtocolRemovesTheKey() async throws {
+            let provider: any KeyCustodyProvider = custody
+            let handle = try await provider.generateKeypair(keyType: "ed25519")
+
+            try await provider.destroyKey(keyId: handle)
+
+            await #expect(throws: (any Error).self) {
+                _ = try await provider.getPublicKey(keyId: handle)
+            }
+        }
+    }
+
 #endif // os(iOS) || os(macOS)

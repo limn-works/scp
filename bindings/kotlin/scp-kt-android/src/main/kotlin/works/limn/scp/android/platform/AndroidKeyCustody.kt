@@ -25,10 +25,13 @@ import android.content.SharedPreferences
 import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
+import android.util.Log
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKeys
+import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.security.GeneralSecurityException
 import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.Signature
@@ -657,9 +660,66 @@ class AndroidKeyCustody internal constructor(
         return "unprotected"
     }
 
+    /**
+     * Rebuilds the [KeyHandle] for the key [keyId] names.
+     *
+     * Every method of [KeyCustodyProvider] takes a [KeyHandle], which pairs an
+     * id with the [CustodyType] naming which of this adapter's two stores holds
+     * the key. The UniFFI callback interface passes the id alone, so
+     * [UniffiKeyCustody] calls this to recover the pair before it forwards.
+     *
+     * The answer comes from the two stores rather than from a map this class
+     * fills as it hands handles out, so a key written by an earlier process run
+     * resolves: [SoftwareKeyOps.restorePersistedEd25519Keys] reloads the
+     * software seeds from [encryptedPrefs] in this class's initializer, and an
+     * Android Keystore alias outlives the process on its own.
+     *
+     * @param keyId The id half of a handle this adapter returned.
+     * @return The handle naming the store that holds [keyId].
+     * @throws ScpException with code `SCP-CRYPTO-4001` when neither store holds
+     *   [keyId].
+     */
+    fun resolveKeyHandle(keyId: String): KeyHandle {
+        if (softwareKeys.containsKey(keyId)) {
+            return KeyHandle(id = keyId, custodyType = CustodyType.SOFTWARE)
+        }
+        if (keystoreHolds(keyId)) {
+            return KeyHandle(id = keyId, custodyType = CustodyType.HARDWARE)
+        }
+        throw ScpException(
+            "Key not found: $keyId",
+            "SCP-CRYPTO-4001",
+        )
+    }
+
+    /**
+     * Reports whether Android Keystore holds [keyId], answering `false` on a
+     * runtime that has no Android Keystore.
+     *
+     * A JVM unit test and an API level below 33 both reach a runtime where
+     * `KeyStore.getInstance("AndroidKeyStore")` throws, and this adapter
+     * generates no TEE key on either, so `false` is the true answer there.
+     * Either way [resolveKeyHandle] then throws `SCP-CRYPTO-4001`, so a
+     * Keystore this method could not read costs a caller a typed
+     * key-not-found error rather than a key.
+     */
+    private fun keystoreHolds(keyId: String): Boolean =
+        try {
+            keystoreKeyOps.containsKey(keyId)
+        } catch (e: GeneralSecurityException) {
+            Log.w(TAG, "Android Keystore did not answer for '$keyId'", e)
+            false
+        } catch (e: IOException) {
+            Log.w(TAG, "Android Keystore did not answer for '$keyId'", e)
+            false
+        }
+
     companion object {
         /** Filename for the EncryptedSharedPreferences storing software Ed25519 keys. */
         internal const val PREFS_FILENAME = "scp_key_custody"
+
+        /** Logcat tag for this adapter. */
+        private const val TAG = "AndroidKeyCustody"
     }
 }
 
@@ -706,6 +766,18 @@ internal class KeystoreKeyOps {
         keyPairGenerator.initialize(spec)
         keyPairGenerator.generateKeyPair()
         return KeyHandle(id = keyId, custodyType = CustodyType.HARDWARE)
+    }
+
+    /**
+     * Reports whether Android Keystore holds an entry for [keyId].
+     *
+     * [AndroidKeyCustody.resolveKeyHandle] calls this to decide whether a bare
+     * key id names a TEE key, and the Keystore alias survives process death, so
+     * the answer covers a key an earlier run generated.
+     */
+    fun containsKey(keyId: String): Boolean {
+        val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        return keyStore.containsAlias("scp.key.$keyId")
     }
 
     /**

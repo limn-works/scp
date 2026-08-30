@@ -1088,3 +1088,127 @@ public extension AppleKeyCustody {
         }
     }
 }
+
+// MARK: - KeyCustodyProvider conformance
+
+/// Satisfies the `KeyCustodyProvider` callback interface the UniFFI bridge
+/// generates, so an app passes ``AppleKeyCustody`` straight to
+/// ``SCP/identityCreateWithCustody(provider:)``.
+///
+/// The methods above use Swift-idiomatic signatures — an unlabelled first
+/// parameter, ``PseudonymResult`` and ``DestructionAttestation`` return types.
+/// The generated protocol declares `keyId:` labels and returns `Data` and
+/// `Void`, and Swift matches a protocol requirement on its full name including
+/// argument labels, so the two sets are different methods. Each member here
+/// forwards to the one above it and converts the return value. Renaming the
+/// methods above instead would break every caller that already holds an
+/// ``AppleKeyCustody`` and calls them directly.
+///
+/// Before this extension the class declared no conformance at all, while the
+/// heading above the methods read "KeyCustodyProvider conformance", so
+/// `scp.identityCreateWithCustody(provider: AppleKeyCustody(...))` did not
+/// compile and `os_keystore` had no producer on Apple platforms.
+///
+/// See ADR-025, the Apple platform adapter, and section 3.2.2 of the identity
+/// spec, the custody vocabulary.
+extension AppleKeyCustody: KeyCustodyProvider {
+    /// Signs `message` with the Ed25519 key `keyId` names.
+    ///
+    /// Forwards to ``AppleKeyCustody/sign(_:data:)``.
+    public func sign(keyId: String, message: Data) async throws -> Data {
+        try await sign(keyId, data: message)
+    }
+
+    /// Returns the 32 public-key bytes for `keyId`.
+    ///
+    /// Forwards to ``AppleKeyCustody/publicKey(_:)``.
+    public func getPublicKey(keyId: String) async throws -> Data {
+        try await publicKey(keyId)
+    }
+
+    /// Deletes the Keychain item `keyId` names.
+    ///
+    /// Forwards to ``AppleKeyCustody/destroyKey(_:)`` and drops the
+    /// ``DestructionAttestation`` it returns, because the callback interface
+    /// declares no return value. A caller that needs the attestation calls
+    /// ``AppleKeyCustody/destroyKey(_:)`` directly.
+    public func destroyKey(keyId: String) async throws {
+        _ = try await destroyKey(keyId)
+    }
+
+    /// Performs X25519 Diffie-Hellman with the key `keyId` names.
+    ///
+    /// Forwards to ``AppleKeyCustody/dhAgree(_:peerPublic:)``.
+    public func dhAgree(keyId: String, peerPublic: Data) async throws -> Data {
+        try await dhAgree(keyId, peerPublic: peerPublic)
+    }
+
+    /// Derives a context-scoped pseudonym keypair for `keyId`.
+    ///
+    /// Forwards to ``AppleKeyCustody/derivePseudonym(_:contextId:)`` and packs
+    /// its ``PseudonymResult`` into the wire form the bridge unpacks.
+    public func derivePseudonym(keyId: String, contextId: Data) async throws -> Data {
+        let result = try await derivePseudonym(keyId, contextId: contextId)
+        return Self.packPseudonym(result)
+    }
+
+    /// Derives an epoch-versioned pseudonym keypair for `keyId`.
+    ///
+    /// Forwards to
+    /// ``AppleKeyCustody/deriveRotatablePseudonym(_:contextId:pseudonymEpoch:)``
+    /// and packs its ``PseudonymResult`` into the wire form the bridge unpacks.
+    public func deriveRotatablePseudonym(
+        keyId: String,
+        contextId: Data,
+        pseudonymEpoch: UInt64
+    ) async throws -> Data {
+        let result = try await deriveRotatablePseudonym(
+            keyId,
+            contextId: contextId,
+            pseudonymEpoch: pseudonymEpoch
+        )
+        return Self.packPseudonym(result)
+    }
+
+    /// Returns the raw 32 Ed25519 private-key bytes for `keyId`.
+    ///
+    /// Forwards to ``AppleKeyCustody/exportSigningKeyBytes(_:)``.
+    public func exportSigningKeyBytes(keyId: String) async throws -> Data {
+        try await exportSigningKeyBytes(keyId)
+    }
+
+    /// Reports where the key `keyId` names lives.
+    ///
+    /// Forwards to ``AppleKeyCustody/custodyType(_:)``.
+    public nonisolated func custodyType(keyId: String) -> String {
+        custodyType(keyId)
+    }
+
+    /// Reports whether the key `keyId` names can leave the Keychain.
+    ///
+    /// Forwards to ``AppleKeyCustody/keyIsExtractable(_:)``.
+    public nonisolated func keyIsExtractable(keyId: String) throws -> Bool {
+        try keyIsExtractable(keyId)
+    }
+
+    /// Reports which factor unlocks the key `keyId` names.
+    ///
+    /// Forwards to ``AppleKeyCustody/unlockFactor(_:)``.
+    public nonisolated func unlockFactor(keyId: String) throws -> String {
+        try unlockFactor(keyId)
+    }
+
+    /// Packs a ``PseudonymResult`` into the byte layout the UniFFI bridge
+    /// unpacks: the 32 public-key bytes followed by the handle's UTF-8 bytes.
+    ///
+    /// `ScpUniffiCallbackKeyCustody::derive_pseudonym` reads exactly that
+    /// layout through `scp_ffi_common::custody_parse::unpack_pseudonym`
+    /// (`crates/scp-ffi/uniffi/src/bridge.rs`), and the generated protocol's
+    /// documentation states it: "Returns a two-element list:
+    /// `[pseudonym_public_key_bytes (32), key_id (string as UTF-8)]`".
+    private nonisolated static func packPseudonym(_ result: PseudonymResult) -> Data {
+        var packed = Data(result.publicKey)
+        packed.append(contentsOf: Array(result.handle.utf8))
+        return packed
+    }
+}
