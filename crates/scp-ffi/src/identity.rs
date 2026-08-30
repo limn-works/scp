@@ -2881,10 +2881,19 @@ impl crate::scp::PyScp {
             let migration_target = match target_owned.as_str() {
                 "encrypted_file" => CustodyMigrationTarget::EncryptedFile,
                 "os_keystore" => CustodyMigrationTarget::OsKeystore,
+                // `SCP-IDENT-1024`, the custody-migration rejection code the
+                // NAPI and `UniFFI` twins raise for this same string.
+                // `ScpPyError::identity` would carry `SCP-IDENT-1001`, which
+                // the registry reserves for a DID this instance never
+                // registered, so a Python caller would read a rejected target
+                // as a missing identity.
                 other => {
-                    return Err(ScpPyError::identity(format!(
-                        "invalid custody migration target: {other}; expected 'encrypted_file' or 'os_keystore'"
-                    )));
+                    return Err(ScpPyError::identity_with_code(
+                        format!(
+                            "invalid custody migration target: {other}; expected 'encrypted_file' or 'os_keystore'"
+                        ),
+                        scp_ffi_common::error_codes::IDENT_1024,
+                    ));
                 }
             };
 

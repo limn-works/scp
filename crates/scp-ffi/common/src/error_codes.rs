@@ -187,8 +187,9 @@ pub const IDENT_1023: &str = "SCP-IDENT-1023";
 ///
 /// `identity_execute_custody_migration` was rejected because either the DID is
 /// not owned by this SCP instance (ownership check, ADR-048 §7) or the
-/// requested migration target was not one of `platform_managed`, `hardware`,
-/// `software`, or `in_memory`.
+/// requested migration target was neither `encrypted_file` nor `os_keystore`.
+/// §3.2.2 of the identity spec names those two backends, and the `PyO3`, NAPI,
+/// and `UniFFI` bridges each raise this code for a target outside that pair.
 pub const IDENT_1024: &str = "SCP-IDENT-1024";
 /// Identity custody error.
 pub const IDENT_1025: &str = "SCP-IDENT-1025";

@@ -430,6 +430,12 @@ class TestIdentity:
         identity = await create_in_memory_identity(scp)
         with pytest.raises(Exception, match="invalid custody migration target"):
             await scp.identity_execute_custody_migration(identity.did, "nonexistent_target", [])
+        # Pin the canonical code (SCP-IDENT-1024), the code the NAPI and
+        # UniFFI bridges raise for a rejected migration target. SCP-IDENT-1001
+        # names a DID this instance never registered, so answering a rejected
+        # target with it sends the caller to the wrong recovery.
+        with pytest.raises(Exception, match="SCP-IDENT-1024"):
+            await scp.identity_execute_custody_migration(identity.did, "nonexistent_target", [])
 
     async def test_execute_recovery_fails_closed(self, scp: SCP):
         # #2240: recovery has no configured backend yet (the §9.12 WIRE is
