@@ -26,13 +26,17 @@
   boundary of a trust layer: an absorbed error becomes a partial or all-false trust verdict,
   and a re-thrown error surfaces a fault. Enumerating what to re-throw and absorbing by
   default puts every unmodeled fault into the "absorb" branch, which turns it into a false
-  verdict.
+  verdict. The absorption surface here holds one member: `evaluate_trust` folds
+  `SCP-CTX-2076`, no recorded participation facts for the subject, into a zeroed behavioral
+  record, and re-throws every other error.
 - **Match the error code to the failure class, not to the convenient catch block.** A
   validation entrypoint has at least two failure classes: the token failed the protocol, and
   the infrastructure failed to evaluate the token. They carry distinct codes because a
   downstream absorber keys on the code to decide between a visible fault and a trust
-  verdict. Collapsing a context-state fault into the protocol-failure code launders the
-  fault into a verdict.
+  verdict. Emit `SCP-CTX-2023` for a context-state fault, so the SDK re-throws it, and
+  `SCP-PERM-3001` only for a real pipeline failure; `SCP-PERM-3030`, handle-affinity misuse,
+  re-throws for the same reason. Collapsing a context-state fault into the protocol-failure
+  code launders the fault into a verdict.
 - **Return typed results across the FFI; never classify a failure by prefix-matching a
   Display message.** A prose classifier couples every SDK to Rust's message text, and the
   safe failure mode — all-false on an unrecognized message — makes a reworded message a
