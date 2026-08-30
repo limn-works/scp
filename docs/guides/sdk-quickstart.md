@@ -206,13 +206,17 @@ println!("DID: {}", identity.did);
 ```python
 import asyncio
 from scp_sdk import SCP
+from scp_sdk.types import CustodyType
 
 async def main():
     with SCP(storage={"type": "in_memory"}) as scp:
-        # encrypted_file derives an AES-256 key from $SCP_KEY_PASSPHRASE with
-        # Argon2id and encrypts each key entry under AES-256-GCM.
+        # CustodyType.ENCRYPTED_FILE derives an AES-256 key from
+        # $SCP_KEY_PASSPHRASE with Argon2id and encrypts each key entry under
+        # AES-256-GCM. identity_create takes the member, not its string:
+        # it sends CustodyType.value to the bridge, so a str argument raises
+        # AttributeError before the bridge sees it.
         # A shipped bridge raises SCP-IDENT-1059 here; this needs a `testing` build.
-        identity = await scp.identity_create("encrypted_file")
+        identity = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
         print(f"DID: {identity.did}")
 
 asyncio.run(main())
