@@ -815,8 +815,14 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/identityExecuteCustodyMigration`` on ``inner``.
-    func identityExecuteCustodyMigration(did: String, target: String, contextIds: [String]) throws -> String {
-        try inner.identityExecuteCustodyMigration(did: did, target: target, contextIds: contextIds)
+    ///
+    /// `target` names the custody backend this DID's keys move into. Section
+    /// 3.2.2 of the identity spec, "The Custody Vocabulary", states the two
+    /// values, and this method sends ``CustodyType/rawValue`` to the UniFFI
+    /// bridge, so the compiler rejects a value the vocabulary does not state.
+    /// The bridge answers every other string with `SCP-IDENT-1024`.
+    func identityExecuteCustodyMigration(did: String, target: CustodyType, contextIds: [String]) throws -> String {
+        try inner.identityExecuteCustodyMigration(did: did, target: target.rawValue, contextIds: contextIds)
     }
 
     /// Forwards to ``Scp/identityExecuteRecovery`` on ``inner``.

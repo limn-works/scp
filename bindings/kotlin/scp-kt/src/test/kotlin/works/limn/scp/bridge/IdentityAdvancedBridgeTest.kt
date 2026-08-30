@@ -364,12 +364,12 @@ class IdentityAdvancedBridgeTest {
                 val result =
                     advancedBridge.executeCustodyMigration(
                         "did:dht:z6MkTest",
-                        "hardware",
+                        CustodyType.OS_KEYSTORE,
                         listOf("ctx-1", "ctx-2"),
                     )
                 assertTrue(stubAdvanced.executeCustodyMigrationCalled)
                 assertEquals("did:dht:z6MkTest", stubAdvanced.lastDid)
-                assertEquals("hardware", stubAdvanced.lastTarget)
+                assertEquals("os_keystore", stubAdvanced.lastTarget)
                 assertEquals(listOf("ctx-1", "ctx-2"), stubAdvanced.lastContextIds)
                 assertTrue(result.contains("key_generated"))
                 assertTrue(result.contains("authorized"))
@@ -378,7 +378,10 @@ class IdentityAdvancedBridgeTest {
         @Test
         fun `executeCustodyMigration with empty contextIds`() =
             runTest(testDispatcher) {
-                advancedBridge.executeCustodyMigration("did:dht:z6MkTest", "encrypted_file")
+                advancedBridge.executeCustodyMigration(
+                    "did:dht:z6MkTest",
+                    CustodyType.ENCRYPTED_FILE,
+                )
                 assertEquals(emptyList(), stubAdvanced.lastContextIds)
             }
 
@@ -388,16 +391,30 @@ class IdentityAdvancedBridgeTest {
                 stubAdvanced.executeCustodyMigrationError =
                     BridgeException("backend not configured", "SCP-IDENT-1025")
                 assertFailsWith<BridgeException> {
-                    advancedBridge.executeCustodyMigration("did:dht:z6MkFail", "os_keystore")
+                    advancedBridge.executeCustodyMigration(
+                        "did:dht:z6MkFail",
+                        CustodyType.OS_KEYSTORE,
+                    )
                 }
             }
 
+        /**
+         * Every [CustodyType] member arrives at the bindings layer as its own
+         * [CustodyType.rawValue], which is the string the UniFFI bridge parses
+         * into a migration target. Iterating [CustodyType.entries] rather than
+         * a hand-written list makes a member added to the vocabulary reach this
+         * assertion without an edit here.
+         *
+         * The parameter takes a [CustodyType], so the compiler now rejects the
+         * five strings section 3.2.2 of the identity spec retired. The sibling
+         * test above passed one of them, "hardware", until this change.
+         */
         @Test
         fun `executeCustodyMigration supports all target types`() =
             runTest(testDispatcher) {
-                for (target in listOf("encrypted_file", "os_keystore")) {
+                for (target in CustodyType.entries) {
                     advancedBridge.executeCustodyMigration("did:dht:z6MkTest", target)
-                    assertEquals(target, stubAdvanced.lastTarget)
+                    assertEquals(target.rawValue, stubAdvanced.lastTarget)
                 }
             }
     }

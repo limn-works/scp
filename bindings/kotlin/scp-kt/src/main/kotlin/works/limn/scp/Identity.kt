@@ -402,18 +402,24 @@ class IdentityAdvancedBridge internal constructor(
      *
      * Runs the 5-step migration protocol from spec section 3.2.1.
      *
+     * [target] names the custody backend this DID's keys move into. Section
+     * 3.2.2 of the identity spec, "The Custody Vocabulary", states the two
+     * values, and this method sends [CustodyType.rawValue] to the UniFFI
+     * bridge, so the compiler rejects a value the vocabulary does not state.
+     * The bridge answers every other string with `SCP-IDENT-1024`.
+     *
      * @param did The DID string to migrate.
-     * @param target The custody backend to migrate into: "encrypted_file" or "os_keystore".
+     * @param target The custody backend to migrate into.
      * @param contextIds Context IDs where this DID is a member.
      * @return JSON string with the migration result.
      */
     suspend fun executeCustodyMigration(
         did: String,
-        target: String,
+        target: CustodyType,
         contextIds: List<String> = emptyList(),
     ): String =
         bridge.ffiCall {
-            bindings.identityExecuteCustodyMigration(did, target, contextIds)
+            bindings.identityExecuteCustodyMigration(did, target.rawValue, contextIds)
         }
 
     // Identity link attestation (§3.5.1)

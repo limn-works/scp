@@ -970,15 +970,18 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 
     it("scp.identityExecuteCustodyMigration rejects an unknown target", async () => {
       // Target must be one of the two custody backends the request-side
-      // vocabulary names ("encrypted_file", "os_keystore"). Synchronous
-      // surface — the bridge
-      // validates before any async work. Use a real identity that this
-      // SCP owns so the DID-ownership gate lets us reach the target
-      // validation branch (post per-test isolation).
+      // vocabulary names ("encrypted_file", "os_keystore"). `SCP`'s own
+      // method takes a `CustodyType`, so the compiler rejects a string
+      // outside the two and this test reaches the bridge's rejection through
+      // the raw NAPI bridge, whose `target` stays a string. Use a real
+      // identity that this SCP owns so the DID-ownership gate lets us reach
+      // the target validation branch (post per-test isolation).
+      const { createNativeBridge } = await import("../src/internal/native.js");
+      const bridge = createNativeBridge(scp);
       const identity = await createInMemoryIdentity(scp);
-      expect(() => scp.identityExecuteCustodyMigration(identity.did, "nonexistent", [])).toThrow(
-        /invalid|unsupported|nonexistent/,
-      );
+      await expect(
+        bridge.identityExecuteCustodyMigration(identity.did, "nonexistent", []),
+      ).rejects.toThrow(/invalid|unsupported|nonexistent/);
     });
 
     // NAPI `identity_execute_recovery` / `identity_execute_custody_migration`
@@ -1012,10 +1015,16 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       // Crossing the tokio barrier now succeeds (Phase 4 PR 5 fix);
       // the orchestrator then fails with SCP-IDENT-1025 inside the
       // backend. This assertion exercises that the async path runs.
+      //
+      // It drives both CustodyType values. That backend runs at step 1, past
+      // the bridge's target parsing, so a value the SDK forwarded in a form
+      // the bridge does not parse would draw SCP-IDENT-1024 instead.
       const identity = await createInMemoryIdentity(scp);
-      expect(() => scp.identityExecuteCustodyMigration(identity.did, "encrypted_file", [])).toThrow(
-        /SCP-IDENT-1025|not configured/i,
-      );
+      for (const target of ["encrypted_file", "os_keystore"] as const) {
+        expect(() => scp.identityExecuteCustodyMigration(identity.did, target, [])).toThrow(
+          /SCP-IDENT-1025|not configured/i,
+        );
+      }
     });
 
     it("identityRotateKey is exposed on the raw NAPI handle", async () => {

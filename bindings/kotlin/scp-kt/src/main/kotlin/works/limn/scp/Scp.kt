@@ -1360,15 +1360,23 @@ class SCP internal constructor(
             provider = provider,
         )
 
-    /** Forwards to [NativeScp.identityExecuteCustodyMigration] on [inner]. */
+    /**
+     * Forwards to [NativeScp.identityExecuteCustodyMigration] on [inner].
+     *
+     * [target] names the custody backend this DID's keys move into. Section
+     * 3.2.2 of the identity spec, "The Custody Vocabulary", states the two
+     * values, and this method sends [CustodyType.rawValue] to the UniFFI
+     * bridge, so the compiler rejects a value the vocabulary does not state.
+     * The bridge answers every other string with `SCP-IDENT-1024`.
+     */
     fun identityExecuteCustodyMigration(
         did: String,
-        target: String,
+        target: CustodyType,
         contextIds: List<String>,
     ): String =
         inner.identityExecuteCustodyMigration(
             did = did,
-            target = target,
+            target = target.rawValue,
             contextIds = contextIds,
         )
 

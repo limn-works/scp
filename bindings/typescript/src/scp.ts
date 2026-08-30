@@ -1192,9 +1192,22 @@ export class SCP {
     }
   }
 
+  /**
+   * Migrate `did`'s keys into the custody backend `target` names, and return
+   * the migration outcome as a JSON string (spec section 3.2.1).
+   *
+   * `target` takes a {@link CustodyType}, the two values section 3.2.2 of the
+   * identity spec states, so the compiler rejects a value the vocabulary does
+   * not state. The bridge answers every other string with `SCP-IDENT-1024`.
+   *
+   * `did` must be hosted by this `SCP` instance. The bridge rejects a DID
+   * absent from its identity registry with `SCP-IDENT-1024`, and it caps
+   * `contextIds` at 1024 entries, over which it returns `SCP-VALID-7120`
+   * before the orchestrator runs.
+   */
   identityExecuteCustodyMigration(
     did: string,
-    target: string,
+    target: CustodyType,
     contextIds: readonly string[],
   ): string {
     try {

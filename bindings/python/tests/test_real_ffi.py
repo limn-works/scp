@@ -420,22 +420,33 @@ class TestIdentity:
         assert is_valid is False
 
     async def test_execute_custody_migration(self, scp: SCP):
+        """Both ``CustodyType`` members reach the NotConfigured backend.
+
+        The FFI uses a ``NotConfiguredMigrationBackend`` that returns an error
+        at step 1, key generation, so this asserts the SDK wrapper propagates
+        it. Step 1 runs past the bridge's target parsing, so a member the SDK
+        forwarded in a form the bridge does not parse would draw
+        ``SCP-IDENT-1024`` instead of the message this test matches.
+        """
         identity = await create_in_memory_identity(scp)
-        # The FFI uses a NotConfiguredMigrationBackend that returns an error
-        # on step 1 (key generation). Verify the SDK wrapper propagates this.
-        with pytest.raises(Exception, match="custody migration"):
-            await scp.identity_execute_custody_migration(identity.did, "os_keystore", [])
+        for member in CustodyType:
+            with pytest.raises(Exception, match="custody migration backend not configured"):
+                await scp.identity_execute_custody_migration(identity.did, member, [])
 
     async def test_execute_custody_migration_invalid_target(self, scp: SCP):
+        """A string outside the vocabulary reaches the bridge only through
+        ``_native``: the SDK method takes a :class:`CustodyType`, so a type
+        checker rejects the string before the call runs.
+        """
         identity = await create_in_memory_identity(scp)
         with pytest.raises(Exception, match="invalid custody migration target"):
-            await scp.identity_execute_custody_migration(identity.did, "nonexistent_target", [])
+            scp._native.identity_execute_custody_migration(identity.did, "nonexistent_target", [])
         # Pin the canonical code (SCP-IDENT-1024), the code the NAPI and
         # UniFFI bridges raise for a rejected migration target. SCP-IDENT-1001
         # names a DID this instance never registered, so answering a rejected
         # target with it sends the caller to the wrong recovery.
         with pytest.raises(Exception, match="SCP-IDENT-1024"):
-            await scp.identity_execute_custody_migration(identity.did, "nonexistent_target", [])
+            scp._native.identity_execute_custody_migration(identity.did, "nonexistent_target", [])
 
     async def test_execute_recovery_fails_closed(self, scp: SCP):
         # #2240: recovery has no configured backend yet (the §9.12 WIRE is

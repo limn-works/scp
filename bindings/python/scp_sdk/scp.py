@@ -832,7 +832,7 @@ class SCP:
         return Identity(raw)
 
     async def identity_execute_custody_migration(
-        self, did: str, target: str, context_ids: list[str]
+        self, did: str, target: CustodyType, context_ids: list[str]
     ) -> dict[str, Any]:
         """Delegate to ``_scp_core.SCP.identity_execute_custody_migration``.
 
@@ -846,6 +846,13 @@ class SCP:
             with ``SCP-IDENT-1024`` (round-3 red-hat fix against
             realm-local callers driving unmetered orchestrator work on
             arbitrary DIDs).
+        :param target: The custody backend this DID's keys move into.
+            Section 3.2.2 of the identity spec, "The Custody Vocabulary",
+            states the two values, and this method sends the member's value
+            to the PyO3 bridge, so a type checker rejects a value the
+            vocabulary does not state. The bridge answers every other string
+            with ``SCP-IDENT-1024``. Read
+            :class:`~scp_sdk.types.CustodyType` for what each value selects.
         :param context_ids: The contexts to migrate. Capped at **1024**
             entries per call; over-cap requests return
             ``SCP-VALID-7120`` before the orchestrator runs. The
@@ -860,7 +867,7 @@ class SCP:
         import json
 
         result_json = await asyncio.to_thread(
-            self._native.identity_execute_custody_migration, did, target, context_ids
+            self._native.identity_execute_custody_migration, did, target.value, context_ids
         )
         return json.loads(result_json) if isinstance(result_json, str) else result_json
 
