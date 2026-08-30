@@ -46,7 +46,7 @@
 
         @Test("generateKeypair returns non-empty handle for Ed25519")
         func generateEd25519Keypair() async throws {
-            let handle = try await custody.generateKeypair(keyType: "ed25519")
+            let handle = try await custody.generateKeypair("ed25519")
             #expect(!handle.isEmpty, "handle should be a non-empty UUID string")
             // Cleanup
             try await custody.destroyKey(handle)
@@ -54,7 +54,7 @@
 
         @Test("generateKeypair returns non-empty handle for X25519")
         func generateX25519Keypair() async throws {
-            let handle = try await custody.generateKeypair(keyType: "x25519")
+            let handle = try await custody.generateKeypair("x25519")
             #expect(!handle.isEmpty, "handle should be a non-empty UUID string")
             // Cleanup
             try await custody.destroyKey(handle)
@@ -63,7 +63,7 @@
         @Test("generateKeypair rejects unknown key type")
         func generateUnknownKeyType() async throws {
             await #expect(throws: PlatformError.self) {
-                _ = try await custody.generateKeypair(keyType: "rsa-4096")
+                _ = try await custody.generateKeypair("rsa-4096")
             }
         }
 
@@ -71,7 +71,7 @@
 
         @Test("sign with Ed25519 key produces 64-byte signature")
         func signEd25519() async throws {
-            let handle = try await custody.generateKeypair(keyType: "ed25519")
+            let handle = try await custody.generateKeypair("ed25519")
             let data = Data("hello world".utf8)
             let signature = try await custody.sign(handle, data: data)
             #expect(signature.count == 64, "Ed25519 signature must be 64 bytes")
@@ -81,7 +81,7 @@
 
         @Test("sign with X25519 key throws wrongKeyType")
         func signX25519Fails() async throws {
-            let handle = try await custody.generateKeypair(keyType: "x25519")
+            let handle = try await custody.generateKeypair("x25519")
             await #expect(throws: PlatformError.self) {
                 _ = try await custody.sign(handle, data: Data("test".utf8))
             }
@@ -91,7 +91,7 @@
 
         @Test("sign with destroyed key throws keyNotFound")
         func signDestroyedKey() async throws {
-            let handle = try await custody.generateKeypair(keyType: "ed25519")
+            let handle = try await custody.generateKeypair("ed25519")
             try await custody.destroyKey(handle)
             await #expect(throws: PlatformError.self) {
                 _ = try await custody.sign(handle, data: Data("test".utf8))
@@ -100,7 +100,7 @@
 
         @Test("Ed25519 signature verifies with CryptoKit")
         func signatureVerifies() async throws {
-            let handle = try await custody.generateKeypair(keyType: "ed25519")
+            let handle = try await custody.generateKeypair("ed25519")
             let message = Data("important message".utf8)
 
             let signature = try await custody.sign(handle, data: message)
@@ -119,7 +119,7 @@
 
         @Test("publicKey returns 32 bytes for Ed25519")
         func publicKeyEd25519() async throws {
-            let handle = try await custody.generateKeypair(keyType: "ed25519")
+            let handle = try await custody.generateKeypair("ed25519")
             let pubKey = try await custody.publicKey(handle)
             #expect(pubKey.count == 32, "Ed25519 public key must be 32 bytes")
             // Cleanup
@@ -128,7 +128,7 @@
 
         @Test("publicKey returns 32 bytes for X25519")
         func publicKeyX25519() async throws {
-            let handle = try await custody.generateKeypair(keyType: "x25519")
+            let handle = try await custody.generateKeypair("x25519")
             let pubKey = try await custody.publicKey(handle)
             #expect(pubKey.count == 32, "X25519 public key must be 32 bytes")
             // Cleanup
@@ -137,7 +137,7 @@
 
         @Test("publicKey with destroyed handle throws keyNotFound")
         func publicKeyDestroyedHandle() async throws {
-            let handle = try await custody.generateKeypair(keyType: "ed25519")
+            let handle = try await custody.generateKeypair("ed25519")
             try await custody.destroyKey(handle)
             await #expect(throws: PlatformError.self) {
                 _ = try await custody.publicKey(handle)
@@ -147,7 +147,7 @@
         @Test("publicKey reads from metadata cache without accessing key material")
         func publicKeyFromMetadataCache() async throws {
             // Generate a key -- the public key should be cached in metadata.
-            let handle = try await custody.generateKeypair(keyType: "ed25519")
+            let handle = try await custody.generateKeypair("ed25519")
 
             // Read the public key via the API.
             let pubKey = try await custody.publicKey(handle)
@@ -180,7 +180,7 @@
 
         @Test("destroyKey returns attestation with softwareOnly method")
         func destroyKeyAttestation() async throws {
-            let handle = try await custody.generateKeypair(keyType: "ed25519")
+            let handle = try await custody.generateKeypair("ed25519")
             let attestation = try await custody.destroyKey(handle)
             #expect(attestation.method == .softwareOnly)
             #expect(attestation.confirmed == true)
@@ -188,7 +188,7 @@
 
         @Test("destroyKey makes subsequent operations fail")
         func destroyKeyMakesOperationsFail() async throws {
-            let handle = try await custody.generateKeypair(keyType: "ed25519")
+            let handle = try await custody.generateKeypair("ed25519")
             try await custody.destroyKey(handle)
 
             // All operations should now fail
@@ -207,8 +207,8 @@
 
         @Test("dhAgree with X25519 keys produces matching shared secrets")
         func dhAgreeProducesMatchingSecrets() async throws {
-            let aliceHandle = try await custody.generateKeypair(keyType: "x25519")
-            let bobHandle = try await custody.generateKeypair(keyType: "x25519")
+            let aliceHandle = try await custody.generateKeypair("x25519")
+            let bobHandle = try await custody.generateKeypair("x25519")
 
             let alicePub = try await custody.publicKey(aliceHandle)
             let bobPub = try await custody.publicKey(bobHandle)
@@ -226,7 +226,7 @@
 
         @Test("dhAgree with Ed25519 key throws wrongKeyType")
         func dhAgreeEd25519Fails() async throws {
-            let handle = try await custody.generateKeypair(keyType: "ed25519")
+            let handle = try await custody.generateKeypair("ed25519")
             let peer = Data(repeating: 0, count: 32)
             await #expect(throws: PlatformError.self) {
                 _ = try await custody.dhAgree(handle, peerPublic: peer)
@@ -239,7 +239,7 @@
 
         @Test("derivePseudonym is deterministic for same inputs")
         func derivePseudonymDeterministic() async throws {
-            let handle = try await custody.generateKeypair(keyType: "ed25519")
+            let handle = try await custody.generateKeypair("ed25519")
             let contextId = Data("test-context".utf8)
 
             let first = try await custody.derivePseudonym(handle, contextId: contextId)
@@ -258,7 +258,7 @@
 
         @Test("derivePseudonym produces different keys for different contexts")
         func derivePseudonymDifferentContexts() async throws {
-            let handle = try await custody.generateKeypair(keyType: "ed25519")
+            let handle = try await custody.generateKeypair("ed25519")
 
             let pseudoA = try await custody.derivePseudonym(handle, contextId: Data("context-a".utf8))
             let pseudoB = try await custody.derivePseudonym(handle, contextId: Data("context-b".utf8))
@@ -276,7 +276,7 @@
 
         @Test("derivePseudonym with X25519 key throws wrongKeyType")
         func derivePseudonymX25519Fails() async throws {
-            let handle = try await custody.generateKeypair(keyType: "x25519")
+            let handle = try await custody.generateKeypair("x25519")
             await #expect(throws: PlatformError.self) {
                 _ = try await custody.derivePseudonym(handle, contextId: Data("ctx".utf8))
             }
@@ -286,7 +286,7 @@
 
         @Test("derived pseudonym handle can sign and verify")
         func derivedPseudonymCanSign() async throws {
-            let identityHandle = try await custody.generateKeypair(keyType: "ed25519")
+            let identityHandle = try await custody.generateKeypair("ed25519")
             let pseudonym = try await custody.derivePseudonym(
                 identityHandle, contextId: Data("context-1".utf8)
             )
@@ -308,7 +308,7 @@
 
         @Test("custodyType returns 'software' for all keys")
         func custodyTypeReturnsSoftware() async throws {
-            let handle = try await custody.generateKeypair(keyType: "ed25519")
+            let handle = try await custody.generateKeypair("ed25519")
             #expect(
                 custody.custodyType(handle) == "software",
                 "Keychain-backed keys report CustodyType::Software"
@@ -321,9 +321,9 @@
 
         @Test("each generateKeypair call returns a unique handle")
         func uniqueHandles() async throws {
-            let handle1 = try await custody.generateKeypair(keyType: "ed25519")
-            let handle2 = try await custody.generateKeypair(keyType: "x25519")
-            let handle3 = try await custody.generateKeypair(keyType: "ed25519")
+            let handle1 = try await custody.generateKeypair("ed25519")
+            let handle2 = try await custody.generateKeypair("x25519")
+            let handle3 = try await custody.generateKeypair("ed25519")
 
             #expect(handle1 != handle2)
             #expect(handle2 != handle3)
@@ -346,7 +346,7 @@
 
         @Test("deriveRotatablePseudonym is deterministic for same inputs")
         func deriveRotatablePseudonymDeterministic() async throws {
-            let handle = try await custody.generateKeypair(keyType: "ed25519")
+            let handle = try await custody.generateKeypair("ed25519")
             let contextId = Data("test-context".utf8)
 
             let first = try await custody.deriveRotatablePseudonym(
@@ -369,7 +369,7 @@
 
         @Test("deriveRotatablePseudonym produces different keys for different epochs")
         func deriveRotatablePseudonymDifferentEpochs() async throws {
-            let handle = try await custody.generateKeypair(keyType: "ed25519")
+            let handle = try await custody.generateKeypair("ed25519")
             let contextId = Data("rotating-context".utf8)
 
             let epoch1 = try await custody.deriveRotatablePseudonym(
@@ -396,7 +396,7 @@
 
         @Test("deriveRotatablePseudonym with X25519 key throws wrongKeyType")
         func deriveRotatablePseudonymX25519Fails() async throws {
-            let handle = try await custody.generateKeypair(keyType: "x25519")
+            let handle = try await custody.generateKeypair("x25519")
             await #expect(throws: PlatformError.self) {
                 _ = try await custody.deriveRotatablePseudonym(
                     handle, contextId: Data("ctx".utf8), pseudonymEpoch: 1
@@ -523,8 +523,8 @@
             let custodyExplicit = AppleKeyCustody(accessGroup: nil, biometricPolicy: .none)
 
             // Both should generate keys identically.
-            let handle1 = try await custodyDefault.generateKeypair(keyType: "ed25519")
-            let handle2 = try await custodyExplicit.generateKeypair(keyType: "ed25519")
+            let handle1 = try await custodyDefault.generateKeypair("ed25519")
+            let handle2 = try await custodyExplicit.generateKeypair("ed25519")
 
             // Both should sign successfully.
             let data = Data("test".utf8)
@@ -544,7 +544,7 @@
         @Test("custodyType returns 'software' for BiometricPolicy.none")
         func custodyTypeNone() async throws {
             let custodyNone = AppleKeyCustody(accessGroup: nil, biometricPolicy: .none)
-            let handle = try await custodyNone.generateKeypair(keyType: "ed25519")
+            let handle = try await custodyNone.generateKeypair("ed25519")
             #expect(custodyNone.custodyType(handle) == "software")
             try await custodyNone.destroyKey(handle)
         }
@@ -566,7 +566,7 @@
         @Test("keyIsExtractable reports true under BiometricPolicy.none")
         func keyIsExtractableUnderNoBiometricPolicy() async throws {
             let custodyNone = AppleKeyCustody(accessGroup: nil, biometricPolicy: .none)
-            let handle = try await custodyNone.generateKeypair(keyType: "ed25519")
+            let handle = try await custodyNone.generateKeypair("ed25519")
             #expect(try custodyNone.keyIsExtractable(handle))
             try await custodyNone.destroyKey(handle)
         }
@@ -591,7 +591,7 @@
         @Test("unlockFactor reports caller_supplied_key under BiometricPolicy.none")
         func unlockFactorUnderNoBiometricPolicy() async throws {
             let custodyNone = AppleKeyCustody(accessGroup: nil, biometricPolicy: .none)
-            let handle = try await custodyNone.generateKeypair(keyType: "ed25519")
+            let handle = try await custodyNone.generateKeypair("ed25519")
             #expect(try custodyNone.unlockFactor(handle) == "caller_supplied_key")
             try await custodyNone.destroyKey(handle)
         }
@@ -649,7 +649,7 @@
         )
         func biometricRequiredStoresWithAccessControl() async throws {
             let custodyBio = AppleKeyCustody(accessGroup: nil, biometricPolicy: .required)
-            let handle = try await custodyBio.generateKeypair(keyType: "ed25519")
+            let handle = try await custodyBio.generateKeypair("ed25519")
 
             // Verify the key exists and has an access control attribute by
             // querying the Keychain for attributes.
@@ -691,7 +691,7 @@
         )
         func biometricRequiredReportsBiometricUnlockFactor() async throws {
             let custodyBio = AppleKeyCustody(accessGroup: nil, biometricPolicy: .required)
-            let handle = try await custodyBio.generateKeypair(keyType: "ed25519")
+            let handle = try await custodyBio.generateKeypair("ed25519")
 
             #expect(try custodyBio.unlockFactor(handle) == "biometric")
             #expect(try custodyBio.keyIsExtractable(handle))
@@ -830,6 +830,82 @@
 
             await #expect(throws: (any Error).self) {
                 _ = try await provider.getPublicKey(keyId: handle)
+            }
+        }
+
+        /// Every throwing member of the conformance raises `ScpError`, the one
+        /// error type the generated vtable lowers.
+        ///
+        /// `FfiConverterTypeScpError_lower` is the `lowerError` the generated
+        /// `KeyCustodyProvider` vtable passes, and the generated `makeCall`
+        /// helper marks any other thrown type `CALL_UNEXPECTED_ERROR`, which
+        /// reaches the Rust side as a bare string with no code. Each member
+        /// forwards to a class method that throws ``PlatformError``, so an
+        /// unconverted member fails here.
+        @Test("every throwing member of the provider protocol raises ScpError")
+        func everyThrowingMemberRaisesScpError() async throws {
+            let provider: any KeyCustodyProvider = custody
+            let missing = "scp.test.handle-that-does-not-exist"
+
+            #expect(throws: ScpError.self) {
+                _ = try provider.keyIsExtractable(keyId: missing)
+            }
+            #expect(throws: ScpError.self) {
+                _ = try provider.unlockFactor(keyId: missing)
+            }
+            await #expect(throws: ScpError.self) {
+                _ = try await provider.getPublicKey(keyId: missing)
+            }
+            await #expect(throws: ScpError.self) {
+                _ = try await provider.sign(keyId: missing, message: Data("payload".utf8))
+            }
+            await #expect(throws: ScpError.self) {
+                _ = try await provider.exportSigningKeyBytes(keyId: missing)
+            }
+            await #expect(throws: ScpError.self) {
+                _ = try await provider.dhAgree(keyId: missing, peerPublic: Data(repeating: 0, count: 32))
+            }
+            await #expect(throws: ScpError.self) {
+                _ = try await provider.derivePseudonym(keyId: missing, contextId: Data("ctx".utf8))
+            }
+            await #expect(throws: ScpError.self) {
+                _ = try await provider.deriveRotatablePseudonym(
+                    keyId: missing,
+                    contextId: Data("ctx".utf8),
+                    pseudonymEpoch: 1
+                )
+            }
+            await #expect(throws: ScpError.self) {
+                try await provider.destroyKey(keyId: missing)
+            }
+            await #expect(throws: ScpError.self) {
+                _ = try await provider.generateKeypair(keyType: "rsa-4096")
+            }
+        }
+
+        /// The converted error carries `SCP-CRYPTO-4001`, the code
+        /// `AndroidKeyCustody` raises for every key custody failure, and the
+        /// class's own method keeps throwing ``PlatformError`` for the callers
+        /// that hold an ``AppleKeyCustody`` directly.
+        @Test("the converted error carries SCP-CRYPTO-4001 and the class still throws PlatformError")
+        func theConvertedErrorCarriesTheAndroidCode() throws {
+            let provider: any KeyCustodyProvider = custody
+            let missing = "scp.test.handle-that-does-not-exist"
+
+            do {
+                _ = try provider.keyIsExtractable(keyId: missing)
+                Issue.record("keyIsExtractable must throw for a handle the Keychain does not hold")
+            } catch let error as ScpError {
+                guard case let .Crypto(msg, code) = error else {
+                    Issue.record("expected ScpError.Crypto, got \(error)")
+                    return
+                }
+                #expect(code == "SCP-CRYPTO-4001")
+                #expect(msg.contains(missing), "the message must name the handle, got: \(msg)")
+            }
+
+            #expect(throws: PlatformError.self) {
+                _ = try custody.keyIsExtractable(missing)
             }
         }
     }
