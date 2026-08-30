@@ -12,7 +12,8 @@ rules come from `scripts/check-toolchain-wiring.sh` and the gate it replaced.
   cannot fail that way. The gate here enumerates every root-level file in the git tree, and
   every cargo configuration file at any depth, and requires each one to be routed by a
   paths filter or declared in a list of files no compile reads. A file added at the root
-  later is unclassified, so the gate fails until someone decides which it is.
+  later belongs to neither list, so the gate fails until someone routes it or declares that
+  no compile reads it.
 - **A constant naming one member is not an enumeration.** The earlier gate opened
   `CI_WORKFLOW=".github/workflows/ci.yml"` and read that file alone, while two workflows in
   this repository guard jobs with a `dorny/paths-filter` step. The second one violated the
@@ -34,9 +35,11 @@ rules come from `scripts/check-toolchain-wiring.sh` and the gate it replaced.
   runbook that pasted a Dockerfile's first line into a fenced block fail a required check,
   and left that author two ways out: paste build-time shell into the prose, or reword the
   sentence so `FROM` no longer opened a line, which also hides a real container build whose
-  author typed a leading space. Reading the path instead discovers a `Dockerfile` that
-  writes `  from rust:slim-bookworm` — indented and lowercase, both of which Docker
-  accepts — and the text search never found that file at all.
+  author typed a leading space. Reading the path also closes a gap the text search had: a
+  `Dockerfile` writing `  from rust:slim-bookworm`, indented and lowercase, which Docker
+  accepts and the search never matched. The case
+  `container-indents-a-lowercase-from` in `scripts/tests/toolchain-wiring/run-tests.sh`
+  holds it.
 - **Keep the tree-wide search as a classification check rather than as the discovery
   rule.** A file that neither path rule covers, and that holds a `FROM` line naming a rust
   image, must appear in a list declaring it as prose that quotes a build. The gate fails on

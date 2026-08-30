@@ -1,7 +1,7 @@
 # Pin the Rust Toolchain Once, and Derive Every Other Consumer From That One File
 
 **Problem**: a workflow step that installs `dtolnay/rust-toolchain@stable` selects whichever
-stable release exists on the morning the job runs. Rust 1.98.0 added
+stable release exists on the morning the job runs. Rust 1.98.0's clippy added
 `chunks_exact_to_as_chunks`, a warn-by-default `style` lint that `clippy::all` carries, so
 the `Rust / clippy` required check started failing on every branch in the merge queue
 against code nobody had touched. Developers still on 1.97.1 ran the identical command,
@@ -14,8 +14,8 @@ run resolve different compilers.
 - **Name the compiler version in exactly one file, and make every other consumer read the
   version out of that file.** A second file that names the version is the defect, and a
   gate asserting that two files agree is a workaround for that defect.
-  `rust-toolchain.toml` is that file here, because `cargo` and `rustup` read it natively
-  and no other file supplies the version to them.
+  `rust-toolchain.toml` is that file here, because `cargo` and `rustup` read it natively,
+  without anything having to tell them where to look.
 - **A new stable release can add a warn-by-default lint that `clippy::all` carries, so
   narrowing the enabled lint groups does not remove the exposure.** Dropping `pedantic`
   from `[workspace.lints.clippy]` would not have prevented this outage.
