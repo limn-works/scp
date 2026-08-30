@@ -762,7 +762,11 @@ impl KeyCustody for NapiKeyCustody {
 /// - `SCP-VALID-7008` for a `testing_seed` on a build carrying no `testing`
 ///   feature, and `SCP-VALID-7009` for a `testing_seed` paired with
 ///   `"encrypted_file"`.
-/// - An unset `SCP_KEY_PASSPHRASE` under `"encrypted_file"`.
+/// - `SCP-VALID-7005` for an unset or empty `SCP_KEY_PASSPHRASE` under
+///   `"encrypted_file"`, and for an unset `HOME` or a `$HOME/.scp` this
+///   process cannot create. `KeyFileError::code` states that code once for
+///   all three bridges, and it answers a key file that will not open with
+///   `SCP-IDENT-1001` on the bridge's identity error instead.
 pub(crate) fn build_key_custody(
     custody: &str,
     provider: Option<NapiKeyCustodyProvider>,

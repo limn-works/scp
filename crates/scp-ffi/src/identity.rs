@@ -732,7 +732,11 @@ impl PyDIDDocument {
 ///   `software`, `file`, `platform_managed`, and `hardware`.
 /// - `SCP-VALID-7005` when the supplied provider exposes no complete
 ///   `KeyCustodyProvider` protocol.
-/// - An unset `SCP_KEY_PASSPHRASE` under `"encrypted_file"`.
+/// - `SCP-VALID-7005` for an unset or empty `SCP_KEY_PASSPHRASE` under
+///   `"encrypted_file"`, and for an unset `HOME` or a `$HOME/.scp` this
+///   process cannot create. `KeyFileError::code` states that code once for
+///   all three bridges, and it answers a key file that will not open with
+///   `SCP-IDENT-1001` on the bridge's identity error instead.
 ///
 /// See ADR-006, the platform abstraction, and story SCP-294, the
 /// custody-naming and identity-parameter normalization story.

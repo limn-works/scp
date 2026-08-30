@@ -6764,7 +6764,11 @@ fn bridge_params_to_core(
 /// - `SCP-VALID-7008` for a `testing_seed` on a build carrying no `testing`
 ///   feature, and `SCP-VALID-7009` for a `testing_seed` paired with
 ///   `"encrypted_file"`.
-/// - An unset `SCP_KEY_PASSPHRASE` under `"encrypted_file"`.
+/// - `SCP-VALID-7005` for an unset or empty `SCP_KEY_PASSPHRASE` under
+///   `"encrypted_file"`, and for an unset `HOME` or a `$HOME/.scp` this
+///   process cannot create. `KeyFileError::code` states that code once for
+///   all three bridges, and it answers a key file that will not open with
+///   `SCP-IDENT-1001` on the bridge's identity error instead.
 pub(crate) fn build_key_custody(
     custody: &str,
     provider: Option<Box<dyn crate::KeyCustodyProvider>>,
@@ -23478,7 +23482,15 @@ mod tests {
     }
 
     /// `identity_published_custody` fails closed for a DID this instance holds
-    /// no custody for, rather than reporting a value it cannot read.
+    /// no custody for, rather than reporting a value it cannot read, and it
+    /// reports the miss with `SCP-IDENT-1001`.
+    ///
+    /// This arm returned `SCP-IDENT-1017` until the custody vocabulary landed.
+    /// The registry entry for `IDENT_1017` reserves that code for a handle
+    /// carrying no signing custody and names `IDENT_1001` for a DID an instance
+    /// never registered (`crates/scp-ffi/common/src/error_codes.rs`), which is
+    /// the condition here, and the `PyO3` and NAPI bridges reach `IDENT_1001`
+    /// for the same miss through `with_identity`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(feature = "testing")]
     async fn identity_published_custody_fails_closed_without_retained_custody() {
@@ -23488,7 +23500,7 @@ mod tests {
             .await
             .expect_err("an unregistered DID must fail closed");
         match err {
-            ScpError::Identity { code, .. } => assert_eq!(code, codes::IDENT_1017),
+            ScpError::Identity { code, .. } => assert_eq!(code, codes::IDENT_1001),
             other => panic!("expected ScpError::Identity, got: {other:?}"),
         }
     }
