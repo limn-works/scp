@@ -1385,6 +1385,15 @@ impl KeyCustody for FileKeyCustody {
                 &key_bytes,
             )?;
 
+            // The read-modify-write of the key file ended with that append, so
+            // release both file locks before the map insert below, which
+            // touches only this instance's own state. Another instance that
+            // destroys this entry next names it by the same nonce, and
+            // `locate_entry` then reports key-not-found for this handle, which
+            // rule 2 of §17.8 of the persistence spec requires.
+            drop(file_lock);
+            drop(write_lock);
+
             let handle = self.next_handle();
             map.entries
                 .insert(handle.id(), (StoredKeyType::Ed25519, entry_nonce));
