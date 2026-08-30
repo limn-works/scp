@@ -1,10 +1,12 @@
 # An "Awaiting Upstream" Advisory Ignore Is a Claim About a Date
 
-**Problem**: `deny.toml` suppressed three rustls-webpki advisories with the justification
-"Awaiting upstream rustls-webpki patch". rustls-webpki had published the patch for all
-three four months before anyone read the file again, and every requirement on that crate in
-this workspace was semver-compatible with the fixed release, so
-`cargo update -p rustls-webpki --precise <fixed>` moved one lockfile entry and nothing else.
+**Problem**: `deny.toml` suppressed RUSTSEC-2026-0098, RUSTSEC-2026-0099, and
+RUSTSEC-2026-0104 — three rustls-webpki advisories — with the justification "Awaiting
+upstream rustls-webpki patch". rustls-webpki had published the patch for all three four
+months before anyone read the file again, and every requirement on that crate in this
+workspace was semver-compatible with the fixed release, so
+`cargo update -p rustls-webpki --precise 0.103.13` moved one lockfile entry and nothing
+else.
 Until then the relay kept linking a version that accepts a URI name constraint it should
 reject, accepts a wildcard-asserting certificate under a permitted DNS-name constraint, and
 panics on a syntactically valid empty `BIT STRING` in a certificate revocation list's
