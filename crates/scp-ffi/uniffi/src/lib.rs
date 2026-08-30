@@ -707,6 +707,35 @@ mod tests {
         }
     }
 
+    /// A DID this instance retains no custody for reads `SCP-IDENT-1001`, the
+    /// code the `PyO3` and NAPI bridges already returned for the same miss.
+    ///
+    /// This bridge returned `SCP-IDENT-1017` until §3.2.2 of the identity spec,
+    /// the custody vocabulary, landed. The registry entry for `IDENT_1017`
+    /// reserves that code for a handle carrying no signing custody and names
+    /// `IDENT_1001` for a DID an instance never registered
+    /// (`crates/scp-ffi/common/src/error_codes.rs`), which is the condition
+    /// here. A consumer branching on the code string took one branch on Swift
+    /// or Kotlin and the other on Node against one written contract.
+    #[test]
+    fn published_custody_reports_a_registry_miss_with_ident_1001() {
+        let scp = scp_test();
+
+        let result = runtime()
+            .block_on(scp.identity_published_custody("did:dht:z6MkNotRegistered".to_owned()));
+
+        match result {
+            Err(ScpError::Identity { code, msg }) => {
+                assert_eq!(
+                    code,
+                    codes::IDENT_1001,
+                    "a registry miss must carry the registry-miss code, got: {msg}"
+                );
+            }
+            other => panic!("expected SCP-IDENT-1001 for an unregistered DID, got: {other:?}"),
+        }
+    }
+
     /// `"os_keystore"` names the operating system's own key store, which sits
     /// behind a `KeyCustodyProvider` callback. `identity_create` supplies no
     /// provider, so the value fails closed with `SCP-IDENT-1003` rather than

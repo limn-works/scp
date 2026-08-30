@@ -97,36 +97,60 @@ raw string `"in_memory"`, which reaches the test-only in-memory key store. No
 UniFFI `Scp` object, and a released build throws `ScpException.Identity`
 carrying `SCP-IDENT-1008`.
 
-Implement `uniffi.scp.KeyCustodyProvider` yourself over Android Keystore and
-pass it in. The `scp-kt-android` module ships `AndroidKeyCustody`, but it
-implements `works.limn.scp.android.platform.KeyCustodyProvider` — a different
-interface from the `uniffi.scp.KeyCustodyProvider` this method takes, declaring
+The `scp-kt-android` module ships `AndroidKeyCustody` over Android Keystore and
+`UniffiKeyCustody`, which presents it as the `uniffi.scp.KeyCustodyProvider`
+this method takes:
+
+```kotlin
+val custody = AndroidKeyCustody(context)
+val identity = scp.identityCreateWithCustody(UniffiKeyCustody(custody))
+```
+
+The two interfaces name the same eleven operations and declare them
+differently — `AndroidKeyCustody` implements
+`works.limn.scp.android.platform.KeyCustodyProvider`, which takes a `KeyHandle`
+where the UniFFI interface takes an id string, and declares
 `publicKey(KeyHandle)` where the UniFFI interface declares
-`getPublicKey(String)`. No adapter converts between the two, so
-`AndroidKeyCustody` cannot be passed here until one lands. That class does not
-put every key in Android Keystore either: it holds Ed25519 keys in Keystore
-only on API 33 and above, it generates software Ed25519 keys through Bouncy
-Castle on API 26 to 32 and persists their seeds in `EncryptedSharedPreferences`,
-and it manages every X25519 key in software, because Android Keystore supports
-X25519 key agreement at no API level.
+`getPublicKey(String)`. `UniffiKeyCustody` converts between them in one place.
 
-## What a DID document publishes about custody
+`AndroidKeyCustody` does not put every key in Android Keystore: it holds Ed25519
+keys in Keystore only on API 33 and above, it generates software Ed25519 keys
+through Bouncy Castle on API 26 to 32 and persists their seeds in
+`EncryptedSharedPreferences`, and it manages every X25519 key in software,
+because Android Keystore supports X25519 key agreement at no API level. To reach
+a different store, implement `uniffi.scp.KeyCustodyProvider` yourself and pass
+it in.
 
-`scp.identityPublishedCustody(did)` returns what a stranger reading that DID
-document learns about custody, which §3.2.2 states is whether the key can leave
-its store and which factor unlocks it: `"non-extractable-biometric"`,
+## The published custody value
+
+`scp.identityPublishedCustody(did)` returns the published-vocabulary custody
+value for that DID's `#active` key, read off the backend running in this
+process. §3.2.2 states that value as whether the key can leave its store and
+which factor unlocks it: `"non-extractable-biometric"`,
 `"non-extractable-pin"`, or `"extractable-passphrase"`. It returns `null` when
 the backend holding the `#active` key reports a pair the published vocabulary
 states no value for.
 
-The bridge derives the value from the running backend, so a participant cannot
-publish a custody they do not run. `KeyCustodyProvider.keyIsExtractable` and
+The bridge derives the value from the running backend, so the value states what
+that backend reported. `KeyCustodyProvider.keyIsExtractable` and
 `KeyCustodyProvider.unlockFactor` answer the two questions for an injected
 provider.
 
+The call reads no DID document. Nothing SCP ships writes a custody attestation
+into one — `ScpKeyCustodyAttestation::derive` and
+`DidDocument::set_custody_attestation` have no caller outside tests — so a
+stranger resolving the DID finds no custody service entry, and this call answers
+only for an identity this instance created. Section 3.2.2.1 of the identity spec
+records that as divergence D18, and its open question OQ-17 asks which component
+writes the entry.
+
+It throws `ScpException.Identity` carrying `SCP-IDENT-1001` for a DID this
+instance retains no custody for, and the same code when the injected provider
+throws while answering either question.
+
 `AndroidKeyCustody` answers both questions on its own interface, which
-`identityCreateWithCustody` cannot reach until an adapter lands (see "Key
-custody" above). It answers `false` to the first for a TEE-backed key, whose
+`UniffiKeyCustody` presents to `identityCreateWithCustody` (see "Key custody"
+above). It answers `false` to the first for a TEE-backed key, whose
 private bytes `exportSigningKeyBytes` refuses to release, and `true` for a
 Bouncy Castle key, whose 32-byte seed it copies out. It answers `"unprotected"`
 to the second for both, because `KeystoreKeyOps.generateEd25519` builds its

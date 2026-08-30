@@ -799,18 +799,15 @@ pub(crate) fn build_key_custody(
         // drift on the path, the environment variable, or the message text.
         "encrypted_file" => {
             let file_kc = scp_ffi_common::key_file::open_default_key_file().map_err(|e| {
-                use scp_ffi_common::key_file::KeyFileError;
-                match e {
-                    KeyFileError::MissingPassphrase | KeyFileError::DirectoryCreate(_) => {
-                        ScpNapiError::Validation {
-                            message: e.to_string(),
-                            code: codes::VALID_7005.to_owned(),
-                        }
-                    }
-                    KeyFileError::Open(_) => ScpNapiError::Identity {
-                        message: e.to_string(),
-                        code: codes::IDENT_1001.to_owned(),
-                    },
+                use scp_ffi_common::key_file::KeyFileErrorCategory;
+                // One condition, one code on all three bridges. `KeyFileError`
+                // states both the code and the category, so this bridge picks
+                // neither and cannot drift from the other two.
+                let code = e.code().to_owned();
+                let message = e.to_string();
+                match e.category() {
+                    KeyFileErrorCategory::Validation => ScpNapiError::Validation { message, code },
+                    KeyFileErrorCategory::Identity => ScpNapiError::Identity { message, code },
                 }
             })?;
             Ok((

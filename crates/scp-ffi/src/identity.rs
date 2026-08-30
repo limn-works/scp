@@ -759,12 +759,19 @@ fn build_key_custody(
         // message text.
         "encrypted_file" => {
             let file_kc = scp_ffi_common::key_file::open_default_key_file().map_err(|e| {
-                use scp_ffi_common::key_file::KeyFileError;
-                match e {
-                    KeyFileError::MissingPassphrase | KeyFileError::DirectoryCreate(_) => {
-                        ScpPyError::validation(e.to_string())
+                use scp_ffi_common::key_file::KeyFileErrorCategory;
+                // One condition, one code on all three bridges. `KeyFileError`
+                // states both the code and the category, so this bridge picks
+                // neither and cannot drift from the other two. It reached these
+                // arms through `ScpPyError::validation`, whose default code is
+                // `SCP-VALID-7001`, which neither other bridge returns here.
+                let code = e.code().to_owned();
+                let message = e.to_string();
+                match e.category() {
+                    KeyFileErrorCategory::Validation => {
+                        ScpPyError::ValidationError { message, code }
                     }
-                    KeyFileError::Open(_) => ScpPyError::identity(e.to_string()),
+                    KeyFileErrorCategory::Identity => ScpPyError::IdentityError { message, code },
                 }
             })?;
 
@@ -2158,22 +2165,33 @@ impl crate::scp::PyScp {
         Ok(())
     }
 
-    /// Returns the custody value a DID document publishes for this identity's
-    /// `#active` signing key, and `None` when the backend holding that key
-    /// reports a pair the published vocabulary states no value for.
+    /// Returns the published-vocabulary custody value for this identity's
+    /// `#active` signing key, read off the backend running in this process, and
+    /// `None` when that backend reports a pair the published vocabulary states
+    /// no value for.
     ///
     /// §3.2.2 of the identity spec separates two vocabularies. A caller
     /// selecting custody names a backend, which is what `custody` on
-    /// `identity_create` carries. A DID document publishes whether the key can
-    /// leave its store and which factor unlocks it, which is what this method
-    /// returns: `"non-extractable-biometric"`, `"non-extractable-pin"`, or
-    /// `"extractable-passphrase"`.
+    /// `identity_create` carries. The published vocabulary states whether the
+    /// key can leave its store and which factor unlocks it, which is what this
+    /// method returns: `"non-extractable-biometric"`,
+    /// `"non-extractable-pin"`, or `"extractable-passphrase"`.
     ///
     /// The value is derived, never declared. This method reads it off the
     /// running backend — the encrypted key file answers for itself, and a
     /// caller-injected `KeyCustodyProvider` answers through its
-    /// `key_is_extractable` and `unlock_factor` methods — so a participant
-    /// cannot publish a custody they do not run.
+    /// `key_is_extractable` and `unlock_factor` methods — so the value states
+    /// what the backend this process runs reported.
+    ///
+    /// Nothing this workspace ships writes that value into a DID document.
+    /// `ScpKeyCustodyAttestation::derive` and
+    /// `DidDocument::set_custody_attestation` have no caller outside tests, so
+    /// a stranger resolving this DID reads no `ScpKeyCustodyAttestation`
+    /// service entry and reads ADR-039's Enforcement Stack layer-4 absence
+    /// signal instead. This method therefore answers for an identity this
+    /// instance created and states what that identity would publish, not what
+    /// any document carries. §3.2.2.1 of the identity spec records the gap as
+    /// divergence D18.
     ///
     /// # Arguments
     ///
@@ -2187,9 +2205,11 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Raises `ValidationError` if `did` is malformed. Raises `IdentityError`
-    /// if the DID has no retained state on this instance, or if the injected
-    /// provider raises while answering either question.
+    /// Raises `ValidationError` if `did` is malformed. Raises
+    /// `IdentityError` carrying `SCP-IDENT-1001` if the DID
+    /// has no retained state on this instance, and the same code if the
+    /// injected provider raises while answering either question. All three
+    /// bridges return `SCP-IDENT-1001` for both conditions.
     #[pyo3(name = "identity_published_custody")]
     pub fn identity_published_custody(
         &self,

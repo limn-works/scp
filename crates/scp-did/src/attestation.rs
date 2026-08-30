@@ -1,21 +1,49 @@
 //! Key custody attestation for DID document service entries (ADR-039 Layer 4).
 //!
-//! At identity creation, the DID document includes a service entry stating two
-//! facts about each verification method's private key: whether the key can
-//! leave the store that holds it, and which factor a holder presents to unlock
-//! it. A stranger reads those two facts to decide how far to trust the
-//! participant.
+//! ADR-039's Enforcement Stack layer 4 states that at identity creation the DID
+//! document includes a service entry stating two facts about each verification
+//! method's private key: whether the key can leave the store that holds it, and
+//! which factor a holder presents to unlock it. A stranger reads those two facts
+//! to decide how far to trust the participant.
+//!
+//! No shipped path writes that entry. [`ScpKeyCustodyAttestation::derive`] and
+//! [`crate::document::DidDocument::set_custody_attestation`] have no caller
+//! outside tests, so a party resolving a DID a shipped SDK created finds no
+//! custody service entry and reads the layer-4 absence signal instead. §3.2.2.1
+//! of the identity spec records that as divergence D18, §27.3.4 of the
+//! attestations spec records it as contradiction C30, and open question OQ-17 of
+//! the identity spec asks which component writes the entry.
 //!
 //! The published value names no storage location. A reader deciding whether to
 //! trust a participant does not act on where the key bytes sit; that reader
 //! acts on whether the key can leave and on what a holder must present to use
 //! it.
 //!
-//! A publisher does not choose the published value.
-//! [`ScpKeyCustodyAttestation::derive`] reads it off the [`CustodySubstrate`]
-//! the publisher runs, so a participant whose key sits in an extractable store
-//! cannot publish a non-extractable claim: the struct exposes no field to write
-//! one into.
+//! [`ScpKeyCustodyAttestation::derive`] takes no custody value. It reads one
+//! off each [`CustodySubstrate`] the caller hands it, so a publisher that
+//! builds an attestation through `derive` names no published value.
+//!
+//! `derive` is not the only path to this struct. Three others build it
+//! without calling `derive`, so the paragraph above states what one
+//! constructor does and states no property of every custody value a reader
+//! meets.
+//!
+//! 1. This struct derives `Deserialize`, and serde's generated implementation
+//!    writes the private fields, so
+//!    [`ScpKeyCustodyAttestation::from_service_entry`] builds an attestation
+//!    out of bytes another participant wrote. A reader parsing a stranger's
+//!    DID document needs the deserializing path.
+//! 2. `DidDocument.service` and the three fields of [`Service`] are public, so
+//!    a caller pushes a custody service entry into a document without calling
+//!    any function of this module.
+//! 3. The `os_keystore` backend answers both facts through the platform
+//!    key-custody callback that an SDK consumer writes, so `derive` reads that
+//!    consumer's self-report for that backend.
+//!
+//! §3.2.2 of the identity spec, which states the custody vocabulary, records
+//! all three paths. §27.4.4 of the attestations spec, which describes the
+//! key-custody attestation record, governs what a consumer concludes from a
+//! published custody value.
 //!
 //! Absence of attestation is a valid state — it is itself a signal ("I cannot
 //! prove my keys are isolated"). The attestation is signed by `#0` (Identity
@@ -50,11 +78,16 @@ const CUSTODY_ATTESTATION_SERVICE_TYPE: &str = "ScpKeyCustodyAttestation";
 /// leave its store and which factor unlocks it. Published as a service entry in
 /// the DID document, signed by `#0` as part of document publication.
 ///
-/// Every field is private, and no method takes a [`KeyCustodyModel`], so a
-/// caller cannot name the published custody value.
 /// [`ScpKeyCustodyAttestation::derive`] computes both custody values from the
 /// [`CustodySubstrate`] implementations that hold the two keys, and the getters
-/// below read them back.
+/// below read them back. No field is public and no named constructor takes a
+/// [`KeyCustodyModel`], so a caller reaching this type through `derive` names
+/// neither published value.
+///
+/// The derived `Deserialize` implementation writes those private fields, and
+/// [`ScpKeyCustodyAttestation::from_service_entry`] calls it, so an attestation
+/// parsed off a DID document carries whatever its publisher serialized. The
+/// module documentation above lists that path and two others.
 ///
 /// See ADR-039 acceptance criterion 16.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,8 +186,13 @@ pub enum UnlockFactor {
 ///
 /// A backend implements this trait about itself.
 /// [`ScpKeyCustodyAttestation::derive`] takes the implementation rather than a
-/// [`KeyCustodyModel`], so a participant publishes the custody the participant
-/// runs and cannot publish a custody the participant does not run.
+/// [`KeyCustodyModel`], so a participant who derives an attestation publishes
+/// what the backend running in that process reported. Two limits bound what a
+/// reader may conclude from a published value. First, a backend reached
+/// through the platform key-custody callback reports what the SDK consumer's
+/// adapter answers, which §3.2.2 of the identity spec records as a
+/// self-report. Second, a publisher that skips `derive` writes the published
+/// value directly, by one of the three paths the module documentation lists.
 pub trait CustodySubstrate {
     /// Whether the private key can leave the store this backend holds it in.
     fn key_is_extractable(&self) -> bool;
@@ -292,9 +330,13 @@ impl ScpKeyCustodyAttestation {
     /// Derives a custody attestation from the custody backends that hold the
     /// two keys.
     ///
-    /// This is the only way to build an attestation. The caller passes the
-    /// backends it runs, and this function reads each published custody value
-    /// off its backend, so the caller never names a custody value.
+    /// This function is the only named constructor in this module, and it
+    /// takes no custody value. The caller passes the backends it runs, and
+    /// this function reads each published custody value off its backend. The
+    /// derived `Deserialize` implementation builds the same struct out of
+    /// bytes, and [`ScpKeyCustodyAttestation::from_service_entry`] calls it, so
+    /// an attestation that arrived over the wire carries whatever its publisher
+    /// serialized.
     ///
     /// # Arguments
     ///
@@ -391,6 +433,14 @@ impl ScpKeyCustodyAttestation {
     }
 
     /// Parses a custody attestation from a DID document service entry.
+    ///
+    /// This function checks the service type and the JSON syntax, and it checks
+    /// nothing about the custody values the bytes state. A publisher writes any
+    /// of the three published values into a service entry, so an attestation
+    /// this function returns records what that publisher serialized rather than
+    /// what that publisher's backend reported. §27.4.4 of the attestations
+    /// spec, which describes the key-custody attestation record, governs what a
+    /// consumer concludes from a parsed value.
     ///
     /// # Arguments
     ///
@@ -1036,6 +1086,79 @@ mod tests {
         // platform_attestation fields when they are None.
         assert!(!service.service_endpoint.contains("agent_key_custody"));
         assert!(!service.service_endpoint.contains("platform_attestation"));
+    }
+
+    // --- What the module documentation claims, and what it does not ---
+    //
+    // The module documentation states that `derive` names no custody value and
+    // that three paths build the same struct without calling `derive`. The two
+    // tests below exercise the first and second of those paths, so an edit that
+    // narrows either path without narrowing the documentation turns one of
+    // these tests red.
+
+    /// A custody service entry whose JSON states `custody`, published by a
+    /// caller who never called [`ScpKeyCustodyAttestation::derive`].
+    fn hand_written_entry(custody: &str, platform: &str) -> Service {
+        Service {
+            id: format!("{}#custody-attestation", test_did()),
+            service_type: CUSTODY_ATTESTATION_SERVICE_TYPE.to_owned(),
+            service_endpoint: format!(
+                r#"{{"active_key_custody":"{custody}","platform":"{platform}","created_at":1700000000}}"#
+            ),
+        }
+    }
+
+    /// Path 1 of the module documentation: the derived `Deserialize`
+    /// implementation writes the private fields, so `from_service_entry`
+    /// returns the custody value the bytes state and checks nothing about it.
+    #[test]
+    fn from_service_entry_carries_whatever_the_publisher_serialized() {
+        let entry = hand_written_entry("non-extractable-biometric", "ios");
+
+        let parsed = ScpKeyCustodyAttestation::from_service_entry(&entry)
+            .expect("a syntactically valid custody entry parses");
+
+        assert_eq!(
+            parsed.active_key_custody(),
+            KeyCustodyModel::NonExtractableBiometric,
+            "a parsed attestation states the value its publisher serialized"
+        );
+        assert_eq!(parsed.platform(), Platform::Ios);
+
+        let reemitted = parsed
+            .to_service_entry(test_did())
+            .expect("a parsed attestation serializes back");
+        assert!(
+            reemitted
+                .service_endpoint
+                .contains("non-extractable-biometric"),
+            "re-emitting must carry the parsed value, got: {}",
+            reemitted.service_endpoint
+        );
+    }
+
+    /// Path 2 of the module documentation: `DidDocument.service` and the three
+    /// fields of `Service` are public, so a caller publishes a custody entry
+    /// without calling `set_custody_attestation` or any other function of this
+    /// module, and `custody_attestation` reads that entry back.
+    #[test]
+    fn a_hand_written_service_entry_reaches_a_did_document() {
+        let mut document =
+            crate::document::DidDocument::new(test_did(), &[7_u8; 32], &[9_u8; 32], &[3_u8; 32]);
+
+        document
+            .service
+            .push(hand_written_entry("non-extractable-pin", "android"));
+
+        let read_back = document
+            .custody_attestation()
+            .expect("the pushed entry parses")
+            .expect("the document carries a custody attestation");
+        assert_eq!(
+            read_back.active_key_custody(),
+            KeyCustodyModel::NonExtractablePin,
+            "a document publishes the value a caller pushed into its service vector"
+        );
     }
 
     // --- Error cases ---

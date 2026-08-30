@@ -389,11 +389,45 @@ the two values in the table above, never with these three. §3.2.2 of the identi
 spec does not govern this report, which names a storage location; it does state the
 values a DID document publishes, which name extractability and an unlock factor.
 
-**Reading a custody type back.** `Identity::custody_type()` hands back the label the
-identity was created under, and hands back `"callback"` for an identity created through
-`identity_create_with_custody`. `"callback"` names the injection rather than the key
-store, because the bridge cannot observe which substrate the injected provider uses, and
-no SDK custody type spells it.
+**Reading a custody type back.** `Identity::custody_type()` hands back the custody
+value the identity was created under, and hands back `"os_keystore"` for an identity
+created through `identity_create_with_custody`. That entry point takes the platform
+key-custody callback, and §3.2.2 of the identity spec gives `os_keystore` to the store
+that callback reaches, so all three bridges stamp the handle with it
+(`crates/scp-ffi/uniffi/src/bridge.rs:2852`; `crates/scp-ffi/src/identity.rs:1522`;
+`crates/scp-ffi/napi/src/scp.rs:644`). The value names the store the callback reaches
+and states nothing about which substrate the injected provider holds the key in.
+§3.2.2 of the identity spec states that limit, and open question OQ-15 of that spec
+asks what makes an `os_keystore` answer checkable.
+
+**Each custody condition carries one code on all three bridges.** A caller who
+switches on the code string reads the same value from Python, from Node, and from
+Swift or Kotlin.
+
+| Condition | Code |
+|-----------|------|
+| `identity_create(custody: "encrypted_file")` with `SCP_KEY_PASSPHRASE` unset or empty, or with `$HOME` unset, or with `$HOME/.scp` uncreatable | `SCP-VALID-7005` |
+| `identity_create(custody: "encrypted_file")` when `$HOME/.scp/keys.bin` will not open | `SCP-IDENT-1001` |
+| `identity_create(custody: "os_keystore")` with no `KeyCustodyProvider` | `SCP-IDENT-1003` |
+| `identity_create` with a custody string outside the vocabulary | `SCP-VALID-7005` |
+| `identity_create(custody: "in_memory")` in a build without the bridge's `testing` feature | `SCP-IDENT-1008` |
+| `identity_published_custody(did)` for a DID this instance retains no custody for | `SCP-IDENT-1001` |
+| `identity_published_custody(did)` when the injected provider fails to answer either question | `SCP-IDENT-1001` |
+
+`SCP-IDENT-1017` is not one of these codes, and the last two rows are where a reader
+might expect it. The registry entry for that code reserves it for a handle carrying no
+signing custody, and names `SCP-IDENT-1001` for a DID an instance never registered
+(`crates/scp-ffi/common/src/error_codes.rs`), which is the condition those two rows
+report.
+
+**`identity_published_custody` reads no DID document.** It reads the two facts off the
+backend running in the calling process and returns the value that backend would publish.
+No shipped path writes a custody attestation into a DID document —
+`ScpKeyCustodyAttestation::derive` and `DidDocument::set_custody_attestation` have no
+caller outside tests — so the operation answers for an identity the calling instance
+created and returns `SCP-IDENT-1001` for every other DID. §3.2.2.1 of the identity spec
+records that as divergence D18 and its open question OQ-17 asks which component writes
+the entry.
 
 **One further gap, independent of custody.** Every create path on every bridge returns
 `SCP-IDENT-1059` in a shipped build, because no production `PreRotationCustody` backend

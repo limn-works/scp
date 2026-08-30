@@ -17,6 +17,7 @@ event log, discovery, and provenance through real FFI.
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -222,14 +223,18 @@ class TestIdentity:
         """``"encrypted_file"`` fails closed when ``SCP_KEY_PASSPHRASE`` is unset.
 
         The passphrase protects the key file, so the bridge refuses to build an
-        unprotected one and raises ``SCP-VALID-7001`` instead.
+        unprotected one and raises ``SCP-VALID-7005`` instead.
+        ``KeyFileError.code`` in ``crates/scp-ffi/common/src/key_file.rs``
+        states that code once for all three bridges, so a caller who branches on
+        it takes the same branch on Python, on Node, and on Swift or Kotlin.
+        This bridge returned ``SCP-VALID-7001`` here until that function landed.
         """
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.delenv("SCP_KEY_PASSPHRASE", raising=False)
 
         with pytest.raises(_scp_core.ValidationError) as excinfo:
             await scp.identity_create(CustodyType.ENCRYPTED_FILE)
-        assert str(excinfo.value).startswith("[SCP-VALID-7001]")
+        assert str(excinfo.value).startswith("[SCP-VALID-7005]")
 
     async def test_published_custody_reads_the_encrypted_file_backend(
         self, scp: SCP, tmp_path, monkeypatch
@@ -254,9 +259,7 @@ class TestIdentity:
         The published value comes off the running backend, so an instance
         holding no backend for a DID reports a typed error rather than a value
         it reconstructed from the DID string. ``with_identity`` raises the
-        registry-miss code, which this bridge and the NAPI bridge both spell
-        ``SCP-IDENT-1001``; the UniFFI bridge spells the same miss
-        ``SCP-IDENT-1017``.
+        registry-miss code, and all three bridges spell it ``SCP-IDENT-1001``.
         """
         with pytest.raises(_scp_core.IdentityError) as excinfo:
             await scp.identity_published_custody("did:dht:z6MkNotRegistered")
@@ -265,13 +268,17 @@ class TestIdentity:
     async def test_create_rejects_unknown_custody(self, scp: SCP):
         """An unrecognized custody string draws ``SCP-VALID-7005``.
 
-        ``identity_create`` raises the PyO3 bridge's own exception class, whose
-        message carries the code in a leading ``[SCP-CAT-NNNN]`` bracket. Pin
-        both the class and the code so a renumbering or a reclassification
-        fails here.
+        ``SCP.identity_create`` takes a :class:`CustodyType`, so no unknown
+        string reaches it: a type checker rejects the call and the SDK sends
+        ``custody.value``. The rejection this pins lives in the bridge, so the
+        test calls the bridge the way section 3.2.2 of the identity spec states
+        a test does — "a test that needs it passes the raw string to the
+        bridge". The bridge raises its own exception class, whose message
+        carries the code in a leading ``[SCP-CAT-NNNN]`` bracket. Pin both the
+        class and the code so a renumbering or a reclassification fails here.
         """
         with pytest.raises(_scp_core.ValidationError) as excinfo:
-            await scp.identity_create("magic")
+            await asyncio.to_thread(scp._native.identity_create, "magic")
         assert str(excinfo.value).startswith("[SCP-VALID-7005]")
 
     async def test_create_requires_a_custody_argument(self, scp: SCP):
@@ -300,10 +307,11 @@ class TestIdentity:
         they "name no custody backend". ``"file"`` and ``"platform"`` each
         built a ``FileKeyCustody`` at some point in this bridge's history, so
         the SDK named one substrate and delivered another; each one now fails
-        closed.
+        closed. No :class:`CustodyType` member spells any of the five, so the
+        call goes to the bridge that rejects them.
         """
         with pytest.raises(_scp_core.ValidationError) as excinfo:
-            await scp.identity_create(retired)
+            await asyncio.to_thread(scp._native.identity_create, retired)
         assert str(excinfo.value).startswith("[SCP-VALID-7005]")
 
     async def test_create_with_agent_key_rejects_retired_custody_strings(self, scp: SCP):
@@ -313,7 +321,7 @@ class TestIdentity:
         code and neither one falls back to a key file.
         """
         with pytest.raises(_scp_core.ValidationError) as excinfo:
-            await scp.identity_create_with_agent_key("platform")
+            await asyncio.to_thread(scp._native.identity_create_with_agent_key, "platform")
         assert str(excinfo.value).startswith("[SCP-VALID-7005]")
 
     async def test_os_keystore_without_a_provider_fails_closed(self, scp: SCP):

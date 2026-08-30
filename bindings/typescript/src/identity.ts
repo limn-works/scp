@@ -78,7 +78,10 @@ export interface IdentityLinkAttestation {
  *   derives an AES-256 key from a passphrase with Argon2id and encrypts each
  *   key entry under AES-256-GCM (`crates/scp-platform/src/file.rs`). The
  *   bridge reads the passphrase from the `SCP_KEY_PASSPHRASE` environment
- *   variable.
+ *   variable and answers an unset variable with `SCP-VALID-7005`.
+ *   `KeyFileError::code` in `crates/scp-ffi/common/src/key_file.rs` states
+ *   that code once for all three bridges, so Python, Node, Swift, and Kotlin
+ *   read the same value for this condition.
  * - `"os_keystore"` selects the operating system's own key store, which SCP
  *   reaches through the platform key-custody callback an SDK consumer
  *   supplies. {@link SCP.identityCreate} supplies none, so it answers this

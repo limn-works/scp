@@ -1376,6 +1376,9 @@ public protocol NodeHandleProtocol: AnyObject, Sendable {
     /**
      * Returns the WebSocket URL clients should connect to for this node's
      * relay (e.g., `ws://127.0.0.1:12345/scp/v1`).
+     *
+     * Read live per call from the node's relay-URL slot, so it reflects a NAT
+     * tier change that re-pointed the node's endpoint.
      */
     func relayUrl()  -> String
     
@@ -1596,6 +1599,9 @@ open func relayPort() -> UInt16  {
     /**
      * Returns the WebSocket URL clients should connect to for this node's
      * relay (e.g., `ws://127.0.0.1:12345/scp/v1`).
+     *
+     * Read live per call from the node's relay-URL slot, so it reflects a NAT
+     * tier change that re-pointed the node's endpoint.
      */
 open func relayUrl() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
@@ -2736,22 +2742,33 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func identityMigrate(identity: Identity) async throws  -> Identity
     
     /**
-     * Returns the custody value a DID document publishes for this identity's
-     * `#active` signing key, and `None` when the backend holding that key
-     * reports a pair the published vocabulary states no value for.
+     * Returns the published-vocabulary custody value for this identity's
+     * `#active` signing key, read off the backend running in this process, and
+     * `None` when that backend reports a pair the published vocabulary states
+     * no value for.
      *
      * §3.2.2 of the identity spec separates two vocabularies. A caller
      * selecting custody names a backend, which is what `custody` on
-     * `identity_create` carries. A DID document publishes whether the key can
-     * leave its store and which factor unlocks it, which is what this method
-     * returns: `"non-extractable-biometric"`, `"non-extractable-pin"`, or
-     * `"extractable-passphrase"`.
+     * `identity_create` carries. The published vocabulary states whether the
+     * key can leave its store and which factor unlocks it, which is what this
+     * method returns: `"non-extractable-biometric"`,
+     * `"non-extractable-pin"`, or `"extractable-passphrase"`.
      *
      * The value is derived, never declared. This method reads it off the
      * running backend — the encrypted key file answers for itself, and a
      * caller-injected `KeyCustodyProvider` answers through its
-     * `key_is_extractable` and `unlock_factor` methods — so a participant
-     * cannot publish a custody they do not run.
+     * `key_is_extractable` and `unlock_factor` methods — so the value states
+     * what the backend this process runs reported.
+     *
+     * Nothing this workspace ships writes that value into a DID document.
+     * `ScpKeyCustodyAttestation::derive` and
+     * `DidDocument::set_custody_attestation` have no caller outside tests, so
+     * a stranger resolving this DID reads no `ScpKeyCustodyAttestation`
+     * service entry and reads ADR-039's Enforcement Stack layer-4 absence
+     * signal instead. This method therefore answers for an identity this
+     * instance created and states what that identity would publish, not what
+     * any document carries. §3.2.2.1 of the identity spec records the gap as
+     * divergence D18.
      *
      * Returns `None` when the backend reports a pair §3.2.2 states no value
      * for. ADR-039's Enforcement Stack layer 4 gives that absence a meaning,
@@ -2760,9 +2777,10 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * # Errors
      *
      * Returns `ScpError::Validation` when `did` is not a syntactically valid
-     * DID, and `ScpError::Identity` when the DID has no retained state on this
-     * instance or the injected provider returns an error while answering
-     * either question.
+     * DID. Returns `ScpError::Identity` carrying `SCP-IDENT-1001` when the DID
+     * has no retained state on this instance, and the same code when the
+     * injected provider returns an error while answering either question. All
+     * three bridges return `SCP-IDENT-1001` for both conditions.
      */
     func identityPublishedCustody(did: String) async throws  -> String?
     
@@ -5657,22 +5675,33 @@ open func identityMigrate(identity: Identity)async throws  -> Identity  {
 }
     
     /**
-     * Returns the custody value a DID document publishes for this identity's
-     * `#active` signing key, and `None` when the backend holding that key
-     * reports a pair the published vocabulary states no value for.
+     * Returns the published-vocabulary custody value for this identity's
+     * `#active` signing key, read off the backend running in this process, and
+     * `None` when that backend reports a pair the published vocabulary states
+     * no value for.
      *
      * §3.2.2 of the identity spec separates two vocabularies. A caller
      * selecting custody names a backend, which is what `custody` on
-     * `identity_create` carries. A DID document publishes whether the key can
-     * leave its store and which factor unlocks it, which is what this method
-     * returns: `"non-extractable-biometric"`, `"non-extractable-pin"`, or
-     * `"extractable-passphrase"`.
+     * `identity_create` carries. The published vocabulary states whether the
+     * key can leave its store and which factor unlocks it, which is what this
+     * method returns: `"non-extractable-biometric"`,
+     * `"non-extractable-pin"`, or `"extractable-passphrase"`.
      *
      * The value is derived, never declared. This method reads it off the
      * running backend — the encrypted key file answers for itself, and a
      * caller-injected `KeyCustodyProvider` answers through its
-     * `key_is_extractable` and `unlock_factor` methods — so a participant
-     * cannot publish a custody they do not run.
+     * `key_is_extractable` and `unlock_factor` methods — so the value states
+     * what the backend this process runs reported.
+     *
+     * Nothing this workspace ships writes that value into a DID document.
+     * `ScpKeyCustodyAttestation::derive` and
+     * `DidDocument::set_custody_attestation` have no caller outside tests, so
+     * a stranger resolving this DID reads no `ScpKeyCustodyAttestation`
+     * service entry and reads ADR-039's Enforcement Stack layer-4 absence
+     * signal instead. This method therefore answers for an identity this
+     * instance created and states what that identity would publish, not what
+     * any document carries. §3.2.2.1 of the identity spec records the gap as
+     * divergence D18.
      *
      * Returns `None` when the backend reports a pair §3.2.2 states no value
      * for. ADR-039's Enforcement Stack layer 4 gives that absence a meaning,
@@ -5681,9 +5710,10 @@ open func identityMigrate(identity: Identity)async throws  -> Identity  {
      * # Errors
      *
      * Returns `ScpError::Validation` when `did` is not a syntactically valid
-     * DID, and `ScpError::Identity` when the DID has no retained state on this
-     * instance or the injected provider returns an error while answering
-     * either question.
+     * DID. Returns `ScpError::Identity` carrying `SCP-IDENT-1001` when the DID
+     * has no retained state on this instance, and the same code when the
+     * injected provider returns an error while answering either question. All
+     * three bridges return `SCP-IDENT-1001` for both conditions.
      */
 open func identityPublishedCustody(did: String)async throws  -> String?  {
     return
@@ -17860,7 +17890,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_relay_port() != 32247) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_relay_url() != 19628) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_relay_url() != 35261) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_rollback_deploy() != 34442) {
@@ -18130,7 +18160,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_migrate() != 35072) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_published_custody() != 4074) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_published_custody() != 28165) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_remove() != 20795) {

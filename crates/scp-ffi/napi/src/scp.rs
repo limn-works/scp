@@ -4398,22 +4398,33 @@ impl Scp {
         Ok(())
     }
 
-    /// Returns the custody value a DID document publishes for this identity's
-    /// `#active` signing key, and `null` when the backend holding that key
-    /// reports a pair the published vocabulary states no value for.
+    /// Returns the published-vocabulary custody value for this identity's
+    /// `#active` signing key, read off the backend running in this process, and
+    /// `null` when that backend reports a pair the published vocabulary states
+    /// no value for.
     ///
     /// §3.2.2 of the identity spec separates two vocabularies. A caller
     /// selecting custody names a backend, which is what `custody` on
-    /// `identityCreate` carries. A DID document publishes whether the key can
-    /// leave its store and which factor unlocks it, which is what this method
-    /// returns: `"non-extractable-biometric"`, `"non-extractable-pin"`, or
-    /// `"extractable-passphrase"`.
+    /// `identityCreate` carries. The published vocabulary states whether the
+    /// key can leave its store and which factor unlocks it, which is what this
+    /// method returns: `"non-extractable-biometric"`,
+    /// `"non-extractable-pin"`, or `"extractable-passphrase"`.
     ///
     /// The value is derived, never declared. This method reads it off the
     /// running backend — the encrypted key file answers for itself, and a
     /// caller-injected `KeyCustodyProvider` answers through its
-    /// `keyIsExtractable` and `unlockFactor` callbacks — so a participant
-    /// cannot publish a custody they do not run.
+    /// `keyIsExtractable` and `unlockFactor` callbacks — so the value states
+    /// what the backend this process runs reported.
+    ///
+    /// Nothing this workspace ships writes that value into a DID document.
+    /// `ScpKeyCustodyAttestation::derive` and
+    /// `DidDocument::set_custody_attestation` have no caller outside tests, so
+    /// a stranger resolving this DID reads no `ScpKeyCustodyAttestation`
+    /// service entry and reads ADR-039's Enforcement Stack layer-4 absence
+    /// signal instead. This method therefore answers for an identity this
+    /// instance created and states what that identity would publish, not what
+    /// any document carries. §3.2.2.1 of the identity spec records the gap as
+    /// divergence D18.
     ///
     /// Returns `null` when the backend reports a pair §3.2.2 states no value
     /// for. ADR-039's Enforcement Stack layer 4 gives that absence a meaning,
@@ -4421,10 +4432,11 @@ impl Scp {
     ///
     /// # Errors
     ///
-    /// Throws a validation error when `did` is not a syntactically valid DID,
-    /// and an identity error when the DID has no retained state on this
-    /// instance or the injected provider throws while answering either
-    /// question.
+    /// Throws a validation error when `did` is not a syntactically valid DID.
+    /// Throws an identity error carrying `SCP-IDENT-1001` when the DID has no
+    /// retained state on this instance, and the same code when the injected
+    /// provider throws while answering either question. All three bridges
+    /// return `SCP-IDENT-1001` for both conditions.
     #[napi(js_name = "identityPublishedCustody")]
     pub async fn identity_published_custody(&self, did: String) -> napi::Result<Option<String>> {
         scp_ffi_common::validate::validate_did(&did)
@@ -5278,6 +5290,82 @@ mod storage_mandatory_tests {
             err.reason.contains(codes::STORAGE_8000),
             "constructor missing-selection error must carry SCP-STORAGE-8000: {}",
             err.reason
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shipped-build (no-`testing`) pre-rotation fail-closed proof — ADR-062
+// §Decision 6 / SCP-CAPINJECT-006 (AC5). Runs in the napi PRODUCTION test lane
+// (`cargo test -p scp-ffi-napi --features server`, CI's "napi tests in
+// production config" step).
+//
+// `"encrypted_file"` is the one custody value this bridge builds a real backend
+// for without an injected provider, so it is the one value whose create path
+// runs past `build_key_custody` and reaches `finish_identity_create`. The
+// `"os_keystore"` and `"in_memory"` proofs in
+// `crate::identity::prod_fail_closed_tests` stop at `build_key_custody`, so
+// without this module the `#[cfg(not(feature = "testing"))]` arm of
+// `finish_identity_create` had no napi test that reaches it.
+// ---------------------------------------------------------------------------
+#[cfg(all(test, not(feature = "testing")))]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod prod_pre_rotation_gate_tests {
+    use super::{Scp, finish_identity_create};
+    use std::sync::Arc;
+
+    /// AC5: with a real `encrypted_file` custody backend in hand, the shipped
+    /// create path returns `SCP-IDENT-1059` and mints no identity.
+    ///
+    /// Every identity commits a pre-rotation commitment at creation (spec
+    /// §9.7.4.1 §3), the only `PreRotationCustody` implementation is the
+    /// test-harness `InMemoryPreRotationCustody` nullifier, and ADR-062
+    /// §Decision 6 severs that nullifier from production. This test drives
+    /// `finish_identity_create` — the body `identityCreate`,
+    /// `identityCreateWithAgentKey`, and `identityCreateWithCustody` all share —
+    /// so deleting or weakening its `#[cfg(not(feature = "testing"))]` arm turns
+    /// this test red.
+    ///
+    /// It builds `FileKeyCustody` at a temporary path rather than exporting
+    /// `HOME` and `SCP_KEY_PASSPHRASE` for `open_default_key_file`: libtest runs
+    /// this binary's tests as threads of one process, so mutating the
+    /// environment here would race every sibling test. The value under test is
+    /// the same backend `build_key_custody("encrypted_file", …)` returns —
+    /// `NapiKeyCustody::File` over an Argon2id + AES-256-GCM key file.
+    #[test]
+    fn encrypted_file_custody_fails_closed_at_the_pre_rotation_gate() {
+        let scp = Scp::new_in_memory_for_test();
+        let key_dir = tempfile::tempdir().expect("tempdir");
+        let file_custody = scp_platform::file::FileKeyCustody::new(
+            &key_dir.path().join("keys.bin"),
+            "encrypted-file-pre-rotation-gate-test",
+        )
+        .expect("the encrypted key file opens under a passphrase");
+        let custody = Arc::new(crate::custody::NapiKeyCustody::File(file_custody));
+        assert_eq!(
+            custody.custody_type_label(),
+            "encrypted_file",
+            "this test must drive the backend `encrypted_file` selects"
+        );
+
+        let result = crate::runtime().block_on(finish_identity_create(
+            &scp.inner,
+            custody,
+            "encrypted_file".to_owned(),
+            false,
+        ));
+
+        let msg = match result {
+            Ok(_) => panic!(
+                "shipped identity creation must FAIL CLOSED — the in-memory \
+                 pre-rotation nullifier must not be minted on a production path"
+            ),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            msg.contains(scp_ffi_common::error_codes::IDENT_1059),
+            "shipped encrypted_file creation must fail closed with SCP-IDENT-1059, \
+             got: {msg}"
         );
     }
 }

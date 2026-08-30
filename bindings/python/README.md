@@ -74,18 +74,32 @@ raw string `"in_memory"`, which reaches the test-only in-memory key store. No
 `CustodyType` member spells it, a test that needs it passes the raw string, and
 a shipped build raises `IdentityError` with code `SCP-IDENT-1008`.
 
-## What a DID document publishes about custody
+## The published custody value
 
-`scp.identity_published_custody(did)` returns what a stranger reading that
-DID document learns about custody, which section 3.2.2 states is whether the
-key can leave its store and which factor unlocks it:
-`"non-extractable-biometric"`, `"non-extractable-pin"`, or
-`"extractable-passphrase"`. It returns `None` when the backend holding the
-`#active` key reports a pair the published vocabulary states no value for.
-The bridge derives the value from the running backend, so a participant cannot
-publish a custody they do not run: `KeyCustodyProvider.key_is_extractable` and
+`scp.identity_published_custody(did)` returns the published-vocabulary custody
+value for that DID's `#active` key, read off the backend running in this
+process. Section 3.2.2 states that value as whether the key can leave its store
+and which factor unlocks it: `"non-extractable-biometric"`,
+`"non-extractable-pin"`, or `"extractable-passphrase"`. It returns `None` when
+the backend holding the `#active` key reports a pair the published vocabulary
+states no value for.
+
+The bridge derives the value from the running backend, so the value states what
+that backend reported: `KeyCustodyProvider.key_is_extractable` and
 `KeyCustodyProvider.unlock_factor` answer the two questions for an injected
 provider, and the encrypted key file answers them for itself.
+
+The call reads no DID document. Nothing SCP ships writes a custody attestation
+into one — `ScpKeyCustodyAttestation::derive` and
+`DidDocument::set_custody_attestation` have no caller outside tests — so a
+stranger resolving the DID finds no custody service entry, and this call answers
+only for an identity this instance created. Section 3.2.2.1 of the identity spec
+records that as divergence D18, and its open question OQ-17 asks which component
+writes the entry.
+
+It raises `IdentityError` with code `SCP-IDENT-1001` for a DID this instance
+retains no custody for, and the same code when the injected provider raises
+while answering either question.
 
 ## No shipped build creates an identity yet
 

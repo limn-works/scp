@@ -241,10 +241,9 @@ import SCP
 
 let scp = try SCP(storage: .inMemory)
 // The UniFFI bridge builds no production key store from a custody string, so
-// supply your own type conforming to KeyCustodyProvider.
-// Supply your own type conforming to KeyCustodyProvider; this package
-// ships none that conforms — see "Key custody" below.
-let keychain: KeyCustodyProvider = YourKeychainCustody()
+// pass a KeyCustodyProvider. This package ships AppleKeyCustody, which stores
+// key material in the Keychain and conforms to that protocol.
+let keychain: KeyCustodyProvider = AppleKeyCustody(accessGroup: nil)
 // A released XCFramework throws SCP-IDENT-1059 here; this needs a `testing` build.
 let identity = try await scp.identityCreateWithCustody(provider: keychain)
 print("DID: \(identity.did())")
@@ -253,16 +252,20 @@ print("DID: \(identity.did())")
 ### Kotlin
 
 ```kotlin
-import uniffi.scp.KeyCustodyProvider
+import android.content.Context
 import uniffi.scp.StorageConfig
 import works.limn.scp.SCP
+import works.limn.scp.android.platform.AndroidKeyCustody
+import works.limn.scp.android.platform.UniffiKeyCustody
 
 // The UniFFI bridge builds no production key store from a custody string, so
-// supply your own KeyCustodyProvider over Android Keystore.
-suspend fun main(keystore: KeyCustodyProvider) {
+// pass a KeyCustodyProvider. The scp-kt-android module ships AndroidKeyCustody
+// over Android Keystore, and UniffiKeyCustody presents it as the interface this
+// call takes.
+suspend fun main(context: Context) {
     val scp = SCP.withStorage(StorageConfig.InMemory)
     // A released build throws SCP-IDENT-1059 here; this needs a `testing` build.
-    val identity = scp.identityCreateWithCustody(keystore)
+    val identity = scp.identityCreateWithCustody(UniffiKeyCustody(AndroidKeyCustody(context)))
     println("DID: ${identity.did()}")
 }
 ```
@@ -275,17 +278,26 @@ every cryptographic operation back to that provider's callbacks, so the private
 key material never crosses into the native core (ADR-006, the platform
 abstraction).
 
-Neither mobile SDK ships a provider you can pass in today. The Swift package's
-`AppleKeyCustody` stores key material in the Keychain, but
-`bindings/swift/Sources/SCP/Platform/AppleKeyCustody.swift` declares
-`public final class AppleKeyCustody: Sendable`, names no protocol, and defines
-eight of its nine methods with an argument label or a return type that differs
-from the protocol's, so adding `: KeyCustodyProvider` to it does not compile.
-The Kotlin `AndroidKeyCustody` implements
-`works.limn.scp.android.platform.KeyCustodyProvider`, a different interface
-from the `uniffi.scp.KeyCustodyProvider` the bridge takes, and no adapter
-converts between them. Write the provider yourself until an adapter lands on
-each platform.
+Both mobile SDKs ship a provider you pass in. The Swift package's
+`AppleKeyCustody` stores key material in the Keychain and conforms to
+`KeyCustodyProvider` through an extension at the end of
+`bindings/swift/Sources/SCP/Platform/AppleKeyCustody.swift`, whose members
+forward to the Swift-idiomatic methods above them — Swift matches a protocol
+requirement on its full name including argument labels, so the class keeps
+`sign(_:data:)` and gains `sign(keyId:message:)`. The Kotlin `AndroidKeyCustody`
+implements `works.limn.scp.android.platform.KeyCustodyProvider`, which takes a
+`KeyHandle` where the bridge's `uniffi.scp.KeyCustodyProvider` takes an id
+string, and `works.limn.scp.android.platform.UniffiKeyCustody` converts between
+the two.
+
+Neither adapter reaches a store that holds a key non-extractably behind a
+biometric reading or a PIN, so neither publishes a non-extractable custody
+value. `AppleKeyCustody` answers that every key it holds can leave the Keychain,
+because the Secure Enclave generates P-256 keys and SCP signs Ed25519.
+`AndroidKeyCustody` answers `"unprotected"` as the unlock factor for every key,
+which §3.2.2 of the identity spec states no published value for. Open questions
+OQ-12 and OQ-13 of that spec ask what the vocabulary should state for those
+pairs.
 
 `identity_create_with_custody` is where a real platform backend lands, and it
 is the only entry point that takes an injected provider. It is not a working

@@ -1279,13 +1279,14 @@ class SCP internal constructor(
         inner.identityCreate(custody = custody.rawValue, testingSeed = testingSeed)
 
     /**
-     * Returns the custody value a DID document publishes for [did].
+     * Returns the published-vocabulary custody value for [did]'s `#active`
+     * signing key, read off the backend running in this process.
      *
      * §3.2.2 of the identity spec, "The Custody Vocabulary", separates two
      * vocabularies. A caller selecting custody names a backend, which is what
-     * [CustodyType] carries. A DID document publishes whether the key can leave
-     * its store and which factor unlocks it, which is what this method returns:
-     * `"non-extractable-biometric"`, `"non-extractable-pin"`, or
+     * [CustodyType] carries. The published vocabulary states whether the key can
+     * leave its store and which factor unlocks it, which is what this method
+     * returns: `"non-extractable-biometric"`, `"non-extractable-pin"`, or
      * `"extractable-passphrase"`.
      *
      * Returns `null` when the backend holding the `#active` key reports a pair
@@ -1293,23 +1294,29 @@ class SCP internal constructor(
      * layer 4 gives that absence a meaning, "Absence of attestation is itself a
      * signal".
      *
-     * The bridge derives the value from the running backend, so a participant
-     * cannot publish a custody they do not run. A `uniffi.scp.KeyCustodyProvider`
-     * passed to [identityCreateWithCustody] answers both questions through its
-     * `keyIsExtractable` and `unlockFactor` methods.
-     * `works.limn.scp.android.platform.AndroidKeyCustody` answers the same two
-     * questions on its own interface, which this method cannot reach until an
-     * adapter between the two interfaces lands — the Kotlin README's "Key
-     * custody" section states why.
+     * The bridge derives the value from the running backend, so the value states
+     * what that backend reported. A `uniffi.scp.KeyCustodyProvider` passed to
+     * [identityCreateWithCustody] answers both questions through its
+     * `keyIsExtractable` and `unlockFactor` methods, and
+     * `works.limn.scp.android.platform.UniffiKeyCustody` wraps
+     * `AndroidKeyCustody` into one.
+     *
+     * This method reads no DID document, and nothing SCP ships writes the value
+     * into one: `ScpKeyCustodyAttestation::derive` and
+     * `DidDocument::set_custody_attestation` have no caller outside tests. A
+     * stranger resolving [did] therefore reads no custody service entry, and
+     * this method answers only for an identity this instance created. §3.2.2.1
+     * of the identity spec records that as divergence D18.
      *
      * @param did The DID whose `#active` key custody to read.
      * @return The published custody value, or `null` when the backend reports a
      *   pair §3.2.2 states no value for.
      * @throws uniffi.scp.ScpException.Validation if [did] is not a
      *   syntactically valid DID.
-     * @throws uniffi.scp.ScpException.Identity if this instance retains no
-     *   custody for [did], or the injected provider throws while answering
-     *   either question.
+     * @throws uniffi.scp.ScpException.Identity carrying `SCP-IDENT-1001` if this
+     *   instance retains no custody for [did], and the same code if the injected
+     *   provider throws while answering either question. All three bridges
+     *   return `SCP-IDENT-1001` for both conditions.
      */
     suspend fun identityPublishedCustody(did: String): String? = inner.identityPublishedCustody(did = did)
 

@@ -10,14 +10,40 @@
 
 use scp_platform::file::FileKeyCustody;
 
+use crate::error_codes as codes;
+
 /// The environment variable that carries the passphrase protecting the
 /// encrypted key file.
 pub const KEY_PASSPHRASE_ENV: &str = "SCP_KEY_PASSPHRASE";
 
+/// Which of a bridge's error categories reports a [`KeyFileError`].
+///
+/// A bridge's error type is its own — `ScpPyError::ValidationError`,
+/// `ScpNapiError::Validation`, `ScpError::Validation` — so each bridge builds
+/// its own value. Which category and which code, though, are one answer for all
+/// three: [`KeyFileError::category`] and [`KeyFileError::code`] state them, so a
+/// caller who switches on the code string reads one value from Python, from
+/// Node, and from Swift or Kotlin. The three bridges each chose their own code
+/// before §3.2.2 of the identity spec, the custody vocabulary, landed: one
+/// missing `SCP_KEY_PASSPHRASE` read `SCP-VALID-7001` on `PyO3` and
+/// `SCP-VALID-7005` on the other two, and one unopenable key file read
+/// `SCP-IDENT-1001` on `PyO3` and NAPI and `SCP-IDENT-1002` on `UniFFI`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyFileErrorCategory {
+    /// The caller supplied something this process cannot use, or left it
+    /// unsupplied. Reported as the bridge's validation error.
+    Validation,
+
+    /// The key store itself would not open. Reported as the bridge's identity
+    /// error.
+    Identity,
+}
+
 /// What stopped a bridge from opening the encrypted key file.
 ///
-/// Each bridge maps these three cases onto its own error type: the first two
-/// onto a validation error, and the third onto an identity error.
+/// Each bridge maps these three cases onto its own error type.
+/// [`KeyFileError::category`] states which of that type's variants carries the
+/// case, and [`KeyFileError::code`] states the code all three bridges return.
 #[derive(Debug)]
 pub enum KeyFileError {
     /// The caller exported no `SCP_KEY_PASSPHRASE`, so no key derives.
@@ -41,6 +67,30 @@ impl std::fmt::Display for KeyFileError {
                  variable to be set — this passphrase protects the encrypted key file"
             ),
             Self::DirectoryCreate(detail) | Self::Open(detail) => f.write_str(detail),
+        }
+    }
+}
+
+impl KeyFileError {
+    /// Returns the error code every bridge returns for this condition.
+    ///
+    /// The match is exhaustive over the variants, so adding a variant makes
+    /// this function fail to compile until the new condition is given a code,
+    /// which is what keeps the three bridges from drifting again.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::MissingPassphrase | Self::DirectoryCreate(_) => codes::VALID_7005,
+            Self::Open(_) => codes::IDENT_1001,
+        }
+    }
+
+    /// Returns the bridge error category that carries this condition.
+    #[must_use]
+    pub const fn category(&self) -> KeyFileErrorCategory {
+        match self {
+            Self::MissingPassphrase | Self::DirectoryCreate(_) => KeyFileErrorCategory::Validation,
+            Self::Open(_) => KeyFileErrorCategory::Identity,
         }
     }
 }
@@ -122,7 +172,7 @@ fn home_dir() -> Result<std::path::PathBuf, KeyFileError> {
 #[cfg(test)]
 #[allow(clippy::panic)]
 mod tests {
-    use super::{KEY_PASSPHRASE_ENV, KeyFileError};
+    use super::{KEY_PASSPHRASE_ENV, KeyFileError, KeyFileErrorCategory, codes};
 
     /// The missing-passphrase message names the environment variable a caller
     /// has to export, so a caller who reads the error knows what to do next.
@@ -133,6 +183,36 @@ mod tests {
             message.contains(KEY_PASSPHRASE_ENV),
             "the message must name the environment variable, got: {message}"
         );
+    }
+
+    /// Each condition carries one code and one category, which is what makes
+    /// the three bridges agree. A bridge that picked its own code was the
+    /// defect: one missing `SCP_KEY_PASSPHRASE` read `SCP-VALID-7001` on `PyO3`
+    /// and `SCP-VALID-7005` on the other two, so an application that branched on
+    /// the code string to prompt an operator took the branch on Node and fell
+    /// through on Python.
+    #[test]
+    fn every_condition_carries_one_code_and_one_category() {
+        for (error, code, category) in [
+            (
+                KeyFileError::MissingPassphrase,
+                codes::VALID_7005,
+                KeyFileErrorCategory::Validation,
+            ),
+            (
+                KeyFileError::DirectoryCreate("d".to_owned()),
+                codes::VALID_7005,
+                KeyFileErrorCategory::Validation,
+            ),
+            (
+                KeyFileError::Open("o".to_owned()),
+                codes::IDENT_1001,
+                KeyFileErrorCategory::Identity,
+            ),
+        ] {
+            assert_eq!(error.code(), code, "wrong code for {error:?}");
+            assert_eq!(error.category(), category, "wrong category for {error:?}");
+        }
     }
 
     /// The two failure cases that carry a detail string print that string

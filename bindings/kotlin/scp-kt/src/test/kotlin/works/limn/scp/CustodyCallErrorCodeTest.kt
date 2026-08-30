@@ -51,7 +51,19 @@ class CustodyCallErrorCodeTest {
     companion object {
         private const val CUSTODY_PROVIDER_REQUIRED_CODE = "SCP-IDENT-1003"
         private const val UNRECOGNIZED_CUSTODY_CODE = "SCP-VALID-7005"
-        private const val REGISTRY_MISS_CODE = "SCP-IDENT-1017"
+
+        /**
+         * The code every bridge raises for a DID it retains no custody for.
+         *
+         * This bridge raised `SCP-IDENT-1017` until the custody-vocabulary
+         * change. The registry entry for that code reserves it for a handle
+         * carrying no signing custody and names `SCP-IDENT-1001` for a DID an
+         * instance never registered
+         * (`crates/scp-ffi/common/src/error_codes.rs`), which is the condition
+         * this suite exercises, and the `PyO3` and NAPI bridges already raised
+         * `SCP-IDENT-1001` for it.
+         */
+        private const val REGISTRY_MISS_CODE = "SCP-IDENT-1001"
 
         /**
          * The five spellings §3.2.2 names and states "name no custody backend".

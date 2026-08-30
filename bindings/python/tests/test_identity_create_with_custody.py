@@ -271,11 +271,12 @@ async def test_published_custody_reads_the_providers_two_answers(scp) -> None:
     """The bridge publishes what the provider answers, not what the caller asked for.
 
     Section 3.2.2 of the identity spec states that the published value "is
-    derived, never declared": ``ScpKeyCustodyAttestation`` "carries no
-    argument, no public field, and no setter through which a caller names that
-    value". A provider reporting a non-extractable key behind a biometric
-    reading therefore publishes ``"non-extractable-biometric"``, and the caller
-    named only ``"os_keystore"``.
+    derived, never declared": ``ScpKeyCustodyAttestation::derive`` "is the only
+    named constructor, and it takes no custody value: it reads one off each
+    custody backend the caller passes it". A provider reporting a
+    non-extractable key behind a biometric reading therefore publishes
+    ``"non-extractable-biometric"``, and the caller named only
+    ``"os_keystore"``.
     """
     identity = await scp.identity_create_with_custody(_FakeBiometricKeychain())
 

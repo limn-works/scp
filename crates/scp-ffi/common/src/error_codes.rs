@@ -52,20 +52,38 @@ pub const IDENT_1000: &str = "SCP-IDENT-1000";
 /// never created on this bridge. For registry-based key resolution this is where
 /// missing signing custody manifests, in contrast to the handle-borne
 /// `IDENT_1017` (see sdk-common.md).
+///
+/// `identity_published_custody` returns it on all three bridges for both of its
+/// failure conditions — a DID the instance retains no custody for, and an
+/// injected `KeyCustodyProvider` that fails to answer either published fact.
+/// The `UniFFI` bridge returned `IDENT_1017` for both until §3.2.2 of the
+/// identity spec, the custody vocabulary, landed; that code names a handle
+/// carrying no signing custody, not a DID this instance never registered.
+///
+/// `build_key_custody` also returns it on all three bridges when the custody
+/// value `encrypted_file` names a key file at `$HOME/.scp/keys.bin` that will
+/// not open. The `UniFFI` bridge returned `IDENT_1002` ("identity not found")
+/// for that condition until the same change.
 pub const IDENT_1001: &str = "SCP-IDENT-1001";
 /// Identity not found.
 pub const IDENT_1002: &str = "SCP-IDENT-1002";
 /// Identity already exists.
 ///
-/// Also the code every bridge returns when a caller names a custody string
-/// that reaches no key custody backend on that bridge — `"platform"` on all
-/// three, and `"software"` on the NAPI and `UniFFI` bridges. A caller reaches a
-/// platform-native key store by injecting a `KeyCustodyProvider` through
-/// `identity_create_with_custody`, never by naming a custody string. That
-/// second purpose predates story SCP-294, the custody-naming story, on the
-/// NAPI and `UniFFI` bridges; SCP-294 brought the `PyO3` bridge onto it and
-/// recorded the purpose here, because this file is the registry a reviewer
-/// checks drift against and it named only the first purpose.
+/// Also the code every bridge returns when a caller names the custody value
+/// `os_keystore` and passes no `KeyCustodyProvider`. §3.2.2 of the identity
+/// spec, the custody vocabulary, gives that value the operating system's own
+/// key store, which SCP reaches only through the platform key-custody callback
+/// an SDK consumer supplies, so `identity_create` and
+/// `identity_create_with_agent_key` — neither of which takes a provider — fail
+/// closed here rather than building the encrypted key file or an in-memory
+/// store.
+///
+/// This entry read that every bridge returned the code for `"platform"`, and
+/// that the NAPI and `UniFFI` bridges returned it for `"software"`. §3.2.2
+/// removed both strings from the vocabulary, and `validate_custody_type` on the
+/// NAPI bridge and `build_key_custody` on the other two now answer every string
+/// outside the vocabulary — `"platform"`, `"software"`, `"file"`,
+/// `"platform_managed"`, and `"hardware"` — with `VALID_7005`.
 pub const IDENT_1003: &str = "SCP-IDENT-1003";
 /// Identity key generation failed.
 pub const IDENT_1004: &str = "SCP-IDENT-1004";
@@ -794,6 +812,14 @@ pub const VALID_7003: &str = "SCP-VALID-7003";
 /// Missing required field.
 pub const VALID_7004: &str = "SCP-VALID-7004";
 /// Invalid field value.
+///
+/// Also the code every bridge returns for a custody string outside the
+/// vocabulary §3.2.2 of the identity spec states, and for the two conditions
+/// that stop the custody value `encrypted_file` from opening its key file: no
+/// `SCP_KEY_PASSPHRASE` in the environment, and a `$HOME/.scp` directory the
+/// process cannot create. The `PyO3` bridge returned `VALID_7001` for those two
+/// until §3.2.2 landed, because it reached them through
+/// `ScpPyError::validation`, whose default code is `VALID_7001`.
 pub const VALID_7005: &str = "SCP-VALID-7005";
 /// Validation type error.
 pub const VALID_7006: &str = "SCP-VALID-7006";

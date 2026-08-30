@@ -904,8 +904,10 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       // holding no backend for a DID reports a typed error rather than a value
       // it reconstructed from the DID string. The NAPI bridge answers the
       // registry miss with the code `with_identity` raises, `SCP-IDENT-1001`,
-      // which is the code the PyO3 bridge raises for the same miss; the UniFFI
-      // bridge raises `SCP-IDENT-1017` there instead.
+      // and the PyO3 and UniFFI bridges raise the same code for the same miss.
+      // The registry entry for `SCP-IDENT-1017` reserves that code for a handle
+      // carrying no signing custody and names `SCP-IDENT-1001` for a DID an
+      // instance never registered.
       let threw = false;
       try {
         await scp.identityPublishedCustody("did:dht:z6MkNotRegistered");

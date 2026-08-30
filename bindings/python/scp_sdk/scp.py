@@ -963,13 +963,16 @@ class SCP:
         return Identity(raw)
 
     async def identity_published_custody(self, did: str) -> str | None:
-        """Return the custody value a DID document publishes for ``did``.
+        """Return the published-vocabulary custody value for ``did``.
+
+        Reads the value off the backend running in this process for that
+        DID's ``#active`` signing key.
 
         Section 3.2.2 of the identity spec, "The Custody Vocabulary",
         separates two vocabularies. A caller selecting custody names a
-        backend, which is what :class:`~scp_sdk.types.CustodyType` carries. A
-        DID document publishes whether the key can leave its store and which
-        factor unlocks it, which is what this method returns:
+        backend, which is what :class:`~scp_sdk.types.CustodyType` carries.
+        The published vocabulary states whether the key can leave its store
+        and which factor unlocks it, which is what this method returns:
         ``"non-extractable-biometric"``, ``"non-extractable-pin"``, or
         ``"extractable-passphrase"``.
 
@@ -978,16 +981,25 @@ class SCP:
         Enforcement Stack layer 4 gives that absence a meaning, "Absence of
         attestation is itself a signal".
 
-        The bridge derives the value from the running backend, so a
-        participant cannot publish a custody they do not run. A
-        caller-injected :class:`KeyCustodyProvider` answers through its
+        The bridge derives the value from the running backend, so the value
+        states what that backend reported. A caller-injected
+        :class:`KeyCustodyProvider` answers through its
         :meth:`~KeyCustodyProvider.key_is_extractable` and
         :meth:`~KeyCustodyProvider.unlock_factor` methods.
 
+        This method reads no DID document, and nothing SCP ships writes the
+        value into one: ``ScpKeyCustodyAttestation::derive`` and
+        ``DidDocument::set_custody_attestation`` have no caller outside tests.
+        A stranger resolving ``did`` therefore reads no custody service entry,
+        and this method answers only for an identity this instance created.
+        Section 3.2.2.1 of the identity spec records that as divergence D18.
+
         Raises :class:`~scp_sdk.errors.ValidationError` when ``did`` is
-        malformed, and :class:`~scp_sdk.errors.IdentityError` when this
-        instance retains no state for ``did`` or the injected provider raises
-        while answering either question.
+        malformed, and :class:`~scp_sdk.errors.IdentityError` carrying
+        ``SCP-IDENT-1001`` when this instance retains no state for ``did``, and
+        the same code when the injected provider raises while answering either
+        question. All three bridges return ``SCP-IDENT-1001`` for both
+        conditions.
         """
 
         try:

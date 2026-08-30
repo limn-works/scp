@@ -95,34 +95,49 @@ string to the UniFFI `Scp` object, and a released XCFramework throws
 This package ships `AppleKeyCustody`, which stores Ed25519 and X25519 key
 material in the Keychain and reports `"software"` or `"software_biometric"`
 from `custodyType` — the Secure Enclave generates P-256 keys and SCP signs with
-Ed25519. You cannot pass it to `identityCreateWithCustody`, and adding
-`: KeyCustodyProvider` to it does not make you able to.
-`Sources/SCP/Platform/AppleKeyCustody.swift` declares `public final class
-AppleKeyCustody: Sendable`, and ten of the eleven methods it defines differ
-from the protocol's by argument label, by return type, or by both: the protocol
-declares `getPublicKey(keyId:)` where the class defines `publicKey(_:)`, and it
-declares `destroyKey(keyId:)` returning `Void` where the class defines
-`destroyKey(_:)` returning `DestructionAttestation`. Only
-`generateKeypair(keyType:)` matches. Write your own conforming type until an
-adapter lands.
+Ed25519. Pass it straight to `identityCreateWithCustody(provider:)`:
 
-## What a DID document publishes about custody
+```swift
+let scp = try SCP(storage: .inMemory)
+let custody = AppleKeyCustody(accessGroup: nil)
+let identity = try await scp.identityCreateWithCustody(provider: custody)
+```
 
-`scp.identityPublishedCustody(did:)` returns what a stranger reading that DID
-document learns about custody, which section 3.2.2 states is whether the key can
-leave its store and which factor unlocks it: `"non-extractable-biometric"`,
+`AppleKeyCustody` keeps its Swift-idiomatic methods — `sign(_:data:)`,
+`publicKey(_:)`, `destroyKey(_:)` returning a `DestructionAttestation` — and a
+conformance extension at the end of
+`Sources/SCP/Platform/AppleKeyCustody.swift` supplies the eleven members the
+generated protocol declares, each forwarding to the method above it. Swift
+matches a protocol requirement on its full name including argument labels, so
+the two sets are different methods and both stay callable.
+
+## The published custody value
+
+`scp.identityPublishedCustody(did:)` returns the published-vocabulary custody
+value for that DID's `#active` key, read off the backend running in this
+process. Section 3.2.2 states that value as whether the key can leave its store
+and which factor unlocks it: `"non-extractable-biometric"`,
 `"non-extractable-pin"`, or `"extractable-passphrase"`. It returns `nil` when
 the backend holding the `#active` key reports a pair the published vocabulary
 states no value for.
 
-The bridge derives the value from the running backend, so a participant cannot
-publish a custody they do not run. `KeyCustodyProvider.keyIsExtractable` and
+The bridge derives the value from the running backend, so the value states what
+that backend reported. `KeyCustodyProvider.keyIsExtractable` and
 `KeyCustodyProvider.unlockFactor` answer the two questions for an injected
 provider.
 
-`AppleKeyCustody` answers both questions with its own method signatures, which
-`identityCreateWithCustody` cannot reach until an adapter lands (see "Key
-custody" above). It answers `true` to the first for every key it holds, because
+The call reads no DID document. Nothing SCP ships writes a custody attestation
+into one — `ScpKeyCustodyAttestation::derive` and
+`DidDocument::set_custody_attestation` have no caller outside tests — so a
+stranger resolving the DID finds no custody service entry, and this call answers
+only for an identity this `SCP` instance created. It throws `ScpError.Identity`
+carrying `SCP-IDENT-1001` for every other DID. Section 3.2.2.1 of the identity
+spec records that as divergence D18, and its open question OQ-17 asks which
+component writes the entry.
+
+`AppleKeyCustody` answers both questions through the conformance extension
+`identityCreateWithCustody` reaches. It answers `true` to the first for every
+key it holds, because
 `exportSigningKeyBytes` reads the raw private-key bytes out of the Keychain item
 and returns a copy of them, and the Secure Enclave — which holds a key
 non-extractably — generates P-256 keys only. It answers `"biometric"` to the

@@ -6802,18 +6802,18 @@ pub(crate) fn build_key_custody(
         // drift on the path, the environment variable, or the message text.
         "encrypted_file" => {
             let file_kc = scp_ffi_common::key_file::open_default_key_file().map_err(|e| {
-                use scp_ffi_common::key_file::KeyFileError;
-                match e {
-                    KeyFileError::MissingPassphrase | KeyFileError::DirectoryCreate(_) => {
-                        ScpError::Validation {
-                            msg: e.to_string(),
-                            code: codes::VALID_7005.to_owned(),
-                        }
-                    }
-                    KeyFileError::Open(_) => ScpError::Identity {
-                        msg: e.to_string(),
-                        code: codes::IDENT_1002.to_owned(),
-                    },
+                use scp_ffi_common::key_file::KeyFileErrorCategory;
+                // One condition, one code on all three bridges. `KeyFileError`
+                // states both the code and the category, so this bridge picks
+                // neither and cannot drift from the other two. This arm returned
+                // `SCP-IDENT-1002` ("identity not found") for a key file that
+                // would not open, which names a different condition and which
+                // neither other bridge returned.
+                let code = e.code().to_owned();
+                let msg = e.to_string();
+                match e.category() {
+                    KeyFileErrorCategory::Validation => ScpError::Validation { msg, code },
+                    KeyFileErrorCategory::Identity => ScpError::Identity { msg, code },
                 }
             })?;
             Ok((
@@ -10170,22 +10170,33 @@ impl Scp {
         Ok(removed)
     }
 
-    /// Returns the custody value a DID document publishes for this identity's
-    /// `#active` signing key, and `None` when the backend holding that key
-    /// reports a pair the published vocabulary states no value for.
+    /// Returns the published-vocabulary custody value for this identity's
+    /// `#active` signing key, read off the backend running in this process, and
+    /// `None` when that backend reports a pair the published vocabulary states
+    /// no value for.
     ///
     /// §3.2.2 of the identity spec separates two vocabularies. A caller
     /// selecting custody names a backend, which is what `custody` on
-    /// `identity_create` carries. A DID document publishes whether the key can
-    /// leave its store and which factor unlocks it, which is what this method
-    /// returns: `"non-extractable-biometric"`, `"non-extractable-pin"`, or
-    /// `"extractable-passphrase"`.
+    /// `identity_create` carries. The published vocabulary states whether the
+    /// key can leave its store and which factor unlocks it, which is what this
+    /// method returns: `"non-extractable-biometric"`,
+    /// `"non-extractable-pin"`, or `"extractable-passphrase"`.
     ///
     /// The value is derived, never declared. This method reads it off the
     /// running backend — the encrypted key file answers for itself, and a
     /// caller-injected `KeyCustodyProvider` answers through its
-    /// `key_is_extractable` and `unlock_factor` methods — so a participant
-    /// cannot publish a custody they do not run.
+    /// `key_is_extractable` and `unlock_factor` methods — so the value states
+    /// what the backend this process runs reported.
+    ///
+    /// Nothing this workspace ships writes that value into a DID document.
+    /// `ScpKeyCustodyAttestation::derive` and
+    /// `DidDocument::set_custody_attestation` have no caller outside tests, so
+    /// a stranger resolving this DID reads no `ScpKeyCustodyAttestation`
+    /// service entry and reads ADR-039's Enforcement Stack layer-4 absence
+    /// signal instead. This method therefore answers for an identity this
+    /// instance created and states what that identity would publish, not what
+    /// any document carries. §3.2.2.1 of the identity spec records the gap as
+    /// divergence D18.
     ///
     /// Returns `None` when the backend reports a pair §3.2.2 states no value
     /// for. ADR-039's Enforcement Stack layer 4 gives that absence a meaning,
@@ -10194,9 +10205,10 @@ impl Scp {
     /// # Errors
     ///
     /// Returns `ScpError::Validation` when `did` is not a syntactically valid
-    /// DID, and `ScpError::Identity` when the DID has no retained state on this
-    /// instance or the injected provider returns an error while answering
-    /// either question.
+    /// DID. Returns `ScpError::Identity` carrying `SCP-IDENT-1001` when the DID
+    /// has no retained state on this instance, and the same code when the
+    /// injected provider returns an error while answering either question. All
+    /// three bridges return `SCP-IDENT-1001` for both conditions.
     pub async fn identity_published_custody(
         &self,
         did: String,
@@ -10205,11 +10217,16 @@ impl Scp {
 
         let (custody, active_key) = {
             let registry = identity_custody_registry(&self.inner);
+            // `SCP-IDENT-1001`, not `SCP-IDENT-1017`. The registry entry for
+            // `IDENT_1017` reserves that code for a handle that carries no
+            // signing custody and names `IDENT_1001` for a DID this instance
+            // never registered, which is the condition here. The `PyO3` and
+            // NAPI twins reach the same code through `with_identity`.
             let entry = registry.get(&did).ok_or_else(|| ScpError::Identity {
                 msg: format!(
                     "identity '{did}' has no retained custody on this SCP instance — the published custody value is read off the running backend"
                 ),
-                code: codes::IDENT_1017.to_owned(),
+                code: codes::IDENT_1001.to_owned(),
             })?;
             let (custody, active_key) = entry.value();
             (Arc::clone(custody), *active_key)
@@ -10221,7 +10238,9 @@ impl Scp {
                 .await
                 .map_err(|e| ScpError::Identity {
                     msg: format!("failed to read the published custody value for '{did}': {e}"),
-                    code: codes::IDENT_1017.to_owned(),
+                    // The NAPI and `PyO3` twins return `SCP-IDENT-1001` for a
+                    // provider that fails to answer, so this arm does too.
+                    code: codes::IDENT_1001.to_owned(),
                 })?;
 
         Ok(

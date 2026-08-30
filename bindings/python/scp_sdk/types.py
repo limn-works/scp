@@ -49,7 +49,8 @@ class CustodyType(enum.Enum):
     #: AES-256-GCM (``crates/scp-platform/src/file.rs``).  The bridge reads the
     #: passphrase from the ``SCP_KEY_PASSPHRASE`` environment variable and
     #: raises ``scp_sdk._scp_core.ValidationError`` carrying code
-    #: ``SCP-VALID-7001`` when that variable is unset.
+    #: ``SCP-VALID-7005`` when that variable is unset or empty.  All three
+    #: bridges answer that condition with the same code.
     ENCRYPTED_FILE = "encrypted_file"
     #: Selects the operating system's own key store, which SCP reaches through
     #: the platform key-custody callback an SDK consumer supplies.  A caller
