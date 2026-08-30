@@ -693,6 +693,22 @@ salt       = per-file 16-byte salt             // generated once, persisted with
 
 These are the same parameters the SQLCipher passphrase key-derivation mode (§17.6) MUST use. A single Argon2id parameterization is REQUIRED across the codebase: both the `FileKeyCustody` passphrase-to-wrapping-key derivation and the SQLCipher passphrase-to-PRAGMA-key derivation MUST draw from one shared parameter source. Implementations MUST NOT define a second, divergent Argon2id parameter set.
 
+### FileKeyCustody Entry Identity
+
+The key file holds one private key per entry, and each entry carries the 12-byte AES-256-GCM nonce that encrypted that key. A handle an implementation hands a caller MUST name the entry by that nonce, and MUST NOT name it by the entry's position in the file.
+
+`FileKeyCustody::destroy_key` rewrites the file without the destroyed entry, so every entry after it moves one position down. A second `FileKeyCustody` over the same path does not observe that rewrite, because each instance builds its handle map when it opens the file and updates only its own map when it writes. A position that instance recorded therefore names a different key after the first instance compacts the file, and the entry now at that position decrypts under the same passphrase-derived AES-256 key, so AES-256-GCM authenticates it and the second instance signs with a key its handle does not name. The three FFI bridges open one `FileKeyCustody` per identity they create, all over `$HOME/.scp/keys.bin`, so two instances over one file is the ordinary arrangement rather than an edge case. The advisory exclusive lock each read-modify-write runs under orders the two writes and does not close this, because the two writes are already ordered.
+
+A nonce does not move: compaction copies each surviving entry byte for byte, so the nonce an instance recorded at open still names the same key after another instance destroys a different one. AES-256-GCM already forbids two entries encrypted under one derived key from sharing a nonce, so this rule depends on a uniqueness property the format already requires and imposes no new one.
+
+Three consequences are NORMATIVE:
+
+1. An implementation MUST reject a key file that carries one nonce on two entries, and MUST report that rejection when it opens the file rather than when it first decrypts an entry.
+2. An implementation MUST report key-not-found for a handle whose nonce no entry in the file carries. That is the state a handle reaches after another instance destroys the key it named.
+3. An implementation MUST read the key-type byte from the entry it located and MUST refuse an operation whose required key type differs from that byte. An implementation MUST NOT decide the key type from a value it recorded when it opened the file, because another instance may have destroyed the entry that value described.
+
+Rule 3 states what the second instance costs when it goes unenforced: an X25519 secret read through a handle its map records as Ed25519 reaches `SigningKey::from_bytes` as an Ed25519 seed, which uses one secret scalar under two signature schemes.
+
 ## 17.9 OpenMLS StorageProvider Bridge
 
 OpenMLS requires a `StorageProvider` trait implementation for persisting MLS group state (tree nodes, key schedules, proposals, etc.). `MlsStorageBridge` wraps `ProtocolRepository` and delegates to the `mls/{context_id}/...` key prefix.
