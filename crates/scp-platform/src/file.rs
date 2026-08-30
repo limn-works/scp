@@ -313,11 +313,12 @@ fn sync_parent_dir(dir: &Path) {
 ///
 /// The three FFI bridges open a `FileKeyCustody` per identity they create, and
 /// every one of them opens `$HOME/.scp/keys.bin`, so several instances hold one
-/// key file at a time. Each read-modify-write of the file — `append_entry` and
-/// `destroy_key` — runs under an advisory exclusive lock over the sidecar
-/// `<path>.lock`, so the writes serialize instead of overwriting each other.
-/// [`FileKeyCustody::lock_for_write`] states what that race costs when the lock
-/// is absent.
+/// key file at a time. Each write of the file runs under an advisory exclusive
+/// lock over the sidecar `<path>.lock`, so the writes serialize instead of
+/// overwriting each other: `append_entry` and `destroy_key` each hold it across
+/// their whole read-modify-write, and [`FileKeyCustody::new`] holds it across
+/// the existence test and the file creation that follows. The private
+/// `lock_for_write` states what those races cost when the lock is absent.
 ///
 /// See GitHub issue #391 and ADR-006.
 pub struct FileKeyCustody {
