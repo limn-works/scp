@@ -541,49 +541,57 @@ mod tests {
     // `config.rs` and scp-node proofs. Gated `#[cfg(not(feature = "testing"))]`.
     // -----------------------------------------------------------------------
 
-    /// AC5: on a shipped build the production `identity_create` path fails closed
-    /// with [`IDENT_1059`](scp_ffi_common::error_codes::IDENT_1059) — it reaches
-    /// the pre-rotation commitment step (after real File custody + real Pkarr DHT
-    /// construction) and returns the typed error rather than minting the
-    /// `InMemoryPreRotationCustody` nullifier. File custody is used because
-    /// `in_memory` custody is itself severed on shipped builds; a temp `HOME` +
-    /// `SCP_KEY_PASSPHRASE` give the File backend a real, isolated key file.
+    /// AC5: on a shipped build the production create path fails closed with
+    /// [`IDENT_1059`](scp_ffi_common::error_codes::IDENT_1059) — it reaches the
+    /// pre-rotation commitment step, holding the real `encrypted_file` custody
+    /// backend, and returns the typed error rather than minting the
+    /// `InMemoryPreRotationCustody` nullifier.
+    ///
+    /// The test drives `crate::identity::finish_identity_create`, the body
+    /// `identity_create` runs once `build_key_custody` has produced the
+    /// backend, so deleting or weakening that function's
+    /// `#[cfg(not(feature = "testing"))]` arm turns this test red.
+    ///
+    /// It builds [`FileKeyCustody`](scp_platform::file::FileKeyCustody) at a
+    /// temporary path rather than exporting `HOME` and `SCP_KEY_PASSPHRASE` for
+    /// `open_default_key_file`: this lane runs `cargo test -p scp-ffi
+    /// --features server`, libtest runs that binary's tests as threads of one
+    /// process, and `std::env::set_var` on one thread races every `getenv` a
+    /// sibling thread makes. The value under test is the same backend
+    /// `build_key_custody("encrypted_file", …)` returns —
+    /// `FfiKeyCustody::File` over an Argon2id + AES-256-GCM key file. The napi
+    /// and `UniFFI` twins build their custody the same way, for the same
+    /// reason.
     #[cfg(not(feature = "testing"))]
     #[test]
     fn identity_create_fails_closed_without_pre_rotation_backend() {
         pyo3::prepare_freethreaded_python();
         crate::init_runtime().expect("runtime init");
-        let tmp = tempfile::tempdir().expect("tempdir");
-        // Isolate the File custody key directory (`$HOME/.scp/keys.bin`) and set
-        // the passphrase it requires. nextest runs each test in its own process,
-        // so these env mutations do not leak into sibling tests.
-        // SAFETY: single-threaded test process (nextest process-per-test); no
-        // other thread reads the environment concurrently.
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("SCP_KEY_PASSPHRASE", "fail-closed-test-passphrase");
-        }
-        Python::with_gil(|py| {
-            let scp = PyScp::new_in_memory_for_test();
-            // `encrypted_file` is a value §3.2.2 of the identity spec states, so
-            // this call reaches custody construction and then the pre-rotation
-            // commitment step. It read `"file"` until the custody vocabulary
-            // changed, and the string-vocabulary arm then rejected that string
-            // before any custody was built — while quoting `SCP-IDENT-1059` in
-            // its message, so the assertion below passed without the
-            // pre-rotation gate running at all.
-            let msg = match scp.identity_create(py, "encrypted_file", None) {
-                Ok(_) => panic!(
-                    "shipped identity_create must FAIL CLOSED — the in-memory \
-                     pre-rotation nullifier must not be minted on a production path"
-                ),
-                Err(err) => err.to_string(),
-            };
-            assert!(
-                msg.contains(scp_ffi_common::error_codes::IDENT_1059),
-                "shipped identity_create must fail closed with SCP-IDENT-1059, got: {msg}"
-            );
-        });
+        let key_dir = tempfile::tempdir().expect("tempdir");
+        let file_kc = scp_platform::file::FileKeyCustody::new(
+            &key_dir.path().join("keys.bin"),
+            "encrypted-file-pre-rotation-gate-test",
+        )
+        .expect("the encrypted key file opens under a passphrase");
+        let custody = std::sync::Arc::new(crate::custody::FfiKeyCustody::File(file_kc));
+
+        let rt = crate::runtime().expect("runtime");
+        let scp = PyScp::new_in_memory_for_test();
+        let msg = match rt.block_on(crate::identity::finish_identity_create(
+            &scp.inner,
+            custody,
+            "encrypted_file".to_owned(),
+        )) {
+            Ok(_) => panic!(
+                "shipped identity creation must FAIL CLOSED — the in-memory \
+                 pre-rotation nullifier must not be minted on a production path"
+            ),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            msg.contains(scp_ffi_common::error_codes::IDENT_1059),
+            "shipped identity creation must fail closed with SCP-IDENT-1059, got: {msg}"
+        );
     }
 
     /// AC3: on a shipped build the device-attestation *verify* op fails closed
