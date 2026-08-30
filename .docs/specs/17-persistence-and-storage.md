@@ -701,11 +701,12 @@ The key file holds one private key per entry, and each entry carries the 12-byte
 
 A nonce does not move: compaction copies each surviving entry byte for byte, so the nonce an instance recorded at open still names the same key after another instance destroys a different one. AES-256-GCM already forbids two entries encrypted under one derived key from sharing a nonce, so this rule depends on a uniqueness property the format already requires and imposes no new one.
 
-Three consequences are NORMATIVE:
+Four consequences are NORMATIVE:
 
 1. An implementation MUST reject a key file that carries one nonce on two entries, and MUST report that rejection when it opens the file rather than when it first decrypts an entry.
 2. An implementation MUST report key-not-found for a handle whose nonce no entry in the file carries. That is the state a handle reaches after another instance destroys the key it named.
 3. An implementation MUST read the key-type byte from the entry it located and MUST refuse an operation whose required key type differs from that byte. An implementation MUST NOT decide the key type from a value it recorded when it opened the file, because another instance may have destroyed the entry that value described.
+4. An implementation that imports a private key MUST read the file, decide whether the file already holds that key, and act on that decision under one hold of the advisory exclusive lock. An implementation that reads the file outside the lock lets a second instance append the same key between the read and the decision, and the file then holds two entries encrypting one private key under two nonces, which rule 1 permits. `destroy_key` removes the one entry its handle's nonce names, so a caller who destroyed the key still leaves an encrypted copy of it on disk and reads success.
 
 Rule 3 states what the second instance costs when it goes unenforced: an X25519 secret read through a handle its map records as Ed25519 reaches `SigningKey::from_bytes` as an Ed25519 seed, which uses one secret scalar under two signature schemes.
 

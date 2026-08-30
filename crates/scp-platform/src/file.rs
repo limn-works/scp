@@ -49,6 +49,12 @@
 //!   own salt. `FileKeyCustody::lock_for_write` states how, and
 //!   `FileKeyCustody::new` takes the same lock around the existence test that
 //!   decides whether to write a header at all.
+//! - An import reads the file, decides whether the file already holds the seed,
+//!   and appends or returns a handle, all under one hold of that lock. Rule 4
+//!   of §17.8 of the persistence spec, "`FileKeyCustody` Entry Identity",
+//!   states the rule: an import that reads outside the lock lets a second
+//!   instance append the same seed in between, and the file then holds two
+//!   entries encrypting one private key, of which `destroy_key` removes one.
 //! - A handle names its entry by that entry's AES-256-GCM nonce, never by the
 //!   entry's position, so one instance compacting the file cannot make another
 //!   instance's handle name a neighbour's key. §17.8 of the persistence spec,
@@ -794,7 +800,7 @@ impl FileKeyCustody {
         key_type: StoredKeyType,
         private_key: &[u8; KEY_LEN],
     ) -> Result<[u8; NONCE_LEN], PlatformError> {
-        let _lock = self
+        let lock = self
             .file_write_lock
             .lock()
             .map_err(|_| PlatformError::CustodyError("file write lock poisoned".into()))?;
@@ -802,24 +808,28 @@ impl FileKeyCustody {
         // covers this instance's own tasks; this covers every other holder of
         // the same path. The read `append_entry_locked` opens with and the
         // write it ends with are one read-modify-write, so both run under it.
-        let _file_lock = self.lock_for_write()?;
-        self.append_entry_locked(key_type, private_key)
+        let file_lock = self.lock_for_write()?;
+        self.append_entry_locked(&lock, &file_lock, key_type, private_key)
     }
 
-    /// Appends an encrypted key entry, and requires the caller to hold both
-    /// write locks already.
+    /// Appends an encrypted key entry, and takes both write-lock guards so the
+    /// compiler checks that the caller holds them.
     ///
-    /// The caller MUST hold `file_write_lock` and the advisory lock
-    /// [`FileKeyCustody::lock_for_write`] returns, and MUST keep both until
-    /// this function returns. [`FileKeyCustody::append_entry`] takes both and
-    /// calls this. `import_ed25519_signing_key` takes both across a wider span,
-    /// because its content-dedup scan reads the same file, and this append must
-    /// not follow a read that another writer has already invalidated. Neither
-    /// lock nests: `file_write_lock` is a [`std::sync::Mutex`], and `flock`
-    /// releases the whole lock on the first unlock, so a caller that already
-    /// holds both calls this function rather than `append_entry`.
+    /// The two guard references carry no data this function reads. They are
+    /// parameters because a borrow of a live guard is the one thing a caller
+    /// cannot produce without holding the lock, so the requirement is checked
+    /// rather than documented. [`FileKeyCustody::append_entry`] takes both
+    /// locks and calls this. `import_ed25519_signing_key` takes both across a
+    /// wider span, because its content-dedup scan reads the same file, and
+    /// this append must not follow a read that another writer has already
+    /// invalidated. Neither lock nests: `file_write_lock` is a
+    /// [`std::sync::Mutex`], and `flock` releases the whole lock on the first
+    /// unlock, so a caller that already holds both calls this function rather
+    /// than `append_entry`.
     fn append_entry_locked(
         &self,
+        _write_lock: &std::sync::MutexGuard<'_, ()>,
+        _file_lock: &KeyFileWriteLock<'_>,
         key_type: StoredKeyType,
         private_key: &[u8; KEY_LEN],
     ) -> Result<[u8; NONCE_LEN], PlatformError> {
@@ -1297,12 +1307,15 @@ impl KeyCustody for FileKeyCustody {
             // nonce names, which leaves the second encrypted copy of that
             // private key on disk. An instance that destroyed the matched
             // entry between the scan and the map insert would likewise leave
-            // this task holding a handle no entry answers to.
-            let _lock = self
+            // this task holding a handle no entry answers to. Rule 4 of §17.8
+            // of the persistence spec, "`FileKeyCustody` Entry Identity",
+            // requires one hold of the advisory lock to cover the read, the
+            // decision, and the write.
+            let write_lock = self
                 .file_write_lock
                 .lock()
                 .map_err(|_| PlatformError::CustodyError("file write lock poisoned".into()))?;
-            let _file_lock = self.lock_for_write()?;
+            let file_lock = self.lock_for_write()?;
 
             // Scan the file rather than this instance's map. Another
             // `FileKeyCustody` over the same path may have appended this seed
@@ -1362,9 +1375,15 @@ impl KeyCustody for FileKeyCustody {
             // are encrypted-at-rest under the same passphrase-derived key.
             // This calls `append_entry_locked` rather than `append_entry`,
             // because this function already holds both write locks and neither
-            // one nests.
+            // one nests. The two guards cross as arguments, so the compiler
+            // checks that they are still alive here.
             let key_bytes = Zeroizing::new(**seed);
-            let entry_nonce = self.append_entry_locked(StoredKeyType::Ed25519, &key_bytes)?;
+            let entry_nonce = self.append_entry_locked(
+                &write_lock,
+                &file_lock,
+                StoredKeyType::Ed25519,
+                &key_bytes,
+            )?;
 
             let handle = self.next_handle();
             map.entries
@@ -2674,11 +2693,12 @@ mod tests {
 
         drop(guard);
 
-        let first_handle = tokio::time::timeout(std::time::Duration::from_secs(10), importing_first)
-            .await
-            .expect("the first import must complete once the lock is released")
-            .expect("the first task must not panic")
-            .expect("the first import must succeed");
+        let first_handle =
+            tokio::time::timeout(std::time::Duration::from_secs(10), importing_first)
+                .await
+                .expect("the first import must complete once the lock is released")
+                .expect("the first task must not panic")
+                .expect("the first import must succeed");
         let second_handle =
             tokio::time::timeout(std::time::Duration::from_secs(10), importing_second)
                 .await
