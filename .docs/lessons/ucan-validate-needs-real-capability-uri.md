@@ -48,10 +48,34 @@
   within the ceiling and whose `att[1]` does not reports `withinCeiling: true` to a caller
   that reads only `att[0]`.
 
+## Where these rules are still broken
+
+ADR-059 landed on two of the three surfaces that evaluate trust. `SCP.evaluateTrust` in
+`bindings/typescript/src/scp.ts` calls `ucanEvaluate` and reads the six booleans, and
+`scp_sdk.trust.evaluate_trust` in `bindings/python/scp_sdk/trust.py` calls
+`ucan_evaluate`. ADR-059 did not land on the module-level `evaluateTrust` that
+`bindings/typescript/src/index.ts` re-exports out of `bindings/typescript/src/trust.ts`,
+so a caller who imports that name still runs the superseded path, and that path breaks
+three of the rules above:
+
+- `validateOneCapUri` catches the bridge error and classifies it by prefix-matching the
+  Rust `Display` message, which the typed-results rule forbids. `REVOCATION_PREFIXES` in
+  the same file holds the one entry that keeps an operational revocation message out of a
+  pipeline verdict — the narrowing the typed path would make structural.
+- `__PASSED_BEFORE` maps each failing stage to the stages it assumes ran first, hardcoding
+  the eleven-step order, which the pipeline-order rule forbids.
+- `evaluateLayer1` sends only the `att[0].with` that `__extractFirstCapabilityUri` returns,
+  which the evaluate-every-capability rule forbids.
+
+Earlier revisions of this lesson recorded `__extractFirstCapabilityUri`,
+`__PASSED_BEFORE`, `REVOCATION_PREFIXES`, and `validateOneCapUri` as deleted. All four
+are live, and a reader who wants to see what these rules forbid reads that file.
+
 ## See also
 
-- `.docs/lessons/typescript-node-only-globals-break-browser.md` — a Node-only decode inside
-  a token-parsing helper broke cross-environment evaluation the same silent way.
+- `.docs/lessons/typescript-node-only-globals-break-browser.md` —
+  `__extractFirstCapabilityUri` in the same `trust.ts` decoded a JWT segment with a
+  Node-only `Buffer` call, which broke cross-environment evaluation the same silent way.
 - `.docs/lessons/delegation-chain-full-validation.md` — every link in a delegation chain
   needs the full pipeline, not just structural checks.
 - `.docs/lessons/sdk-consume-structured-ffi-results-not-error-prose.md` — the typed-result
