@@ -1,6 +1,5 @@
 # Pre-Rotation Key Handle Must Be Stored at Identity Creation
 
-**Date:** 2026-03-01
 **Source:** SCP-214 review of `crates/scp-ffi/src/identity.rs:py_identity_migrate`
 
 ## The Bug

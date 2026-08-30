@@ -1,7 +1,6 @@
 # Hash-Then-Reveal Commitments Require Preimage Retention From t=commit Through t=reveal
 
-**Date:** 2026-04-27
-**Source:** SCP-1717 — pre-rotation key destroyed at create time, then required at migrate time. Layered on the earlier SCP-214 review (`pre-rotation-key-must-be-stored-at-creation.md`) which predicted this exact failure on 2026-03-01.
+**Source:** the pre-rotation key, destroyed at create time and then required at migrate time. `.docs/lessons/pre-rotation-key-must-be-stored-at-creation.md`, from the SCP-214 review, predicted this failure before it occurred.
 
 ## Rule
 
@@ -13,7 +12,7 @@ If the commitment-publishing code path destroys or fails to retain the preimage 
 
 | Commitment | Preimage | Spec location | Lifetime |
 |------------|----------|---------------|----------|
-| `pre_rotation_commitment` (32-byte SHA-256) | Pre-rotation key public bytes | §3.7, §9.7.4.1, ADR-003 §4b | Identity creation → next Layer 2 migration (potentially years) |
+| `pre_rotation_commitment` (32-byte SHA-256) | Pre-rotation key public bytes | §9.7.4.1, ADR-003 §4b | Identity creation → next Layer 2 migration (potentially years) |
 | KeyPackage commitment | KeyPackage init key | RFC 9420 / §9.7.3 | KeyPackage publish → KeyPackage consumption (single-use) |
 | Sender key commitment | Sender key | §9.16.2 | Key distribution → key destruction |
 | MLS leaf commitment | Leaf encryption key | RFC 9420 §7 | Epoch advance → next epoch advance |
@@ -30,7 +29,7 @@ Static review:
 
 ## SCP-1717 specifics
 
-`DidDht::create_new_identity_keys` published `SHA-256(pre_rotation_public)` as the commitment, then called `key_custody.destroy_key(&pre_rotation_key)` per literal spec §9.7.4.1 #5f ("destroy from memory after backup is confirmed"). For `InMemoryKeyCustody`, no backup callback existed — the destroy was unconditional. At migrate time, native bridges generated a fresh keypair, breaking `SHA-256(revealed_key) == commitment` from spec §3.7.
+`DidDht::create_new_identity_keys` published `SHA-256(pre_rotation_public)` as the commitment, then called `key_custody.destroy_key(&pre_rotation_key)` per literal spec §9.7.4.1 #5f ("destroy from memory after backup is confirmed"). For `InMemoryKeyCustody`, no backup callback existed — the destroy was unconditional. At migrate time, native bridges generated a fresh keypair, breaking `SHA-256(revealed_key) == commitment` from spec §9.7.4.1.
 
 Three resolutions were considered:
 

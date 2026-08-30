@@ -1,7 +1,6 @@
 # `serde(rename_all = "lowercase")` vs `"snake_case"` — pick what matches the spec
 
-**Date:** 2026-04-14
-**Source:** PR #1632 follow-up (commit `04e5e10b`) — `HandleRegisterStatus` wire-format drift
+**Source:** `HandleRegisterStatus` wire-format drift
 
 ## The bug
 

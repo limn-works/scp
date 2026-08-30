@@ -1,7 +1,6 @@
 # `#[serde(flatten)]` + `rmpv::Value` buffers the whole message before rejection
 
-**Date:** 2026-04-15
-**Source:** PR #1644 — pre-deserialization size checks (security fix)
+**Source:** pre-deserialization size checks (security fix)
 
 ## What happened
 

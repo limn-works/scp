@@ -1,174 +1,83 @@
-# UCAN Validate Requires a Real Capability URI — Never Pass `"*"`
+# UCAN Validation Requires a Real Capability URI — Never Pass `"*"`
 
-> **Implementation status:** The client-side `att[0].with` extraction,
-> `ucanValidate`-based Layer-1 evaluation, `__extractFirstCapabilityUri`,
-> and the `_REVOCATION_PREFIXES` / `_PASSED_BEFORE` maps described in the
-> Historical sections below were **superseded by ADR-059** (structured
-> `ucan_evaluate` → `CapabilityValidation`). The bridge now returns six
-> booleans directly; no string parsing or client-side URI extraction occurs.
->
-> The **enduring principles** (intrinsic-mode vs authorization, closed
-> allowlist over open denylist, bridge error routing, self-consistency not
-> authorization) remain current and apply to the typed path.
+**Source**: ADR-059, structured capability and trust validation across the FFI
+(`.docs/adrs/phase-2.md`), and spec §7.2.4 of `07-trust-validation-and-capabilities.md`.
 
-## Current approach (ADR-059)
+## Rules
 
-`evaluateTrust` / `evaluate_trust` calls the bridge in **intrinsic mode** —
-no capability URI, nonce probed read-only (not consumed):
+- **Never call `ucanValidate(handle, token, "*")`.** The enforcing path — the one that
+  consumes the nonce and gates an action — requires a fully-qualified
+  `scp:ctx:{contextId}/{resource}:{action}` URI. The bridge rejects a bare `"*"` at
+  URI-parse time, before any cryptographic check runs, so the caller receives an all-false
+  verdict that reads as a legitimate result rather than an error.
+- **Pass the DID of the participant under assessment, and never let it default.** The
+  bridge rejects an empty or absent `presenting_agent_did` / `subject_did`, which is what
+  keeps the audience check from collapsing into `aud == aud`.
+- **A read-only capability evaluation measures self-consistency, not authorization.**
+  Intrinsic mode — `ucan_evaluate` with no challenge capability — answers whether the token
+  parses, carries valid signatures and a valid delegation chain, sits within the context
+  ceiling, and is unexpired and unrevoked, measured against the token's own declared
+  capability set. It skips the invoked-capability grant-match, and it probes the nonce
+  without consuming it, so the evaluated token stays replayable against the enforcing path.
+  A green `CapabilityValidation` is a diagnostic; treating it as "the agent may do X" is a
+  security error. To verify authority for a specific operation, pass the concrete capability
+  URI.
+- **Enumerate what you absorb, and default to propagate.** Error absorption is the security
+  boundary of a trust layer: an absorbed error becomes a partial or all-false trust verdict,
+  and a re-thrown error surfaces a fault. Enumerating what to re-throw and absorbing by
+  default puts every unmodeled fault into the "absorb" branch, which turns it into a false
+  verdict. The absorption surface here holds one member: `evaluate_trust` folds
+  `SCP-CTX-2076`, no recorded participation facts for the subject, into a zeroed behavioral
+  record, and re-throws every other error.
+- **Match the error code to the failure class, not to the convenient catch block.** A
+  validation entrypoint has at least two failure classes: the token failed the protocol, and
+  the infrastructure failed to evaluate the token. They carry distinct codes because a
+  downstream absorber keys on the code to decide between a visible fault and a trust
+  verdict. Emit `SCP-CTX-2023` for a context-state fault, so the SDK re-throws it, and
+  `SCP-PERM-3001` only for a real pipeline failure; `SCP-PERM-3030`, handle-affinity misuse,
+  re-throws for the same reason. Collapsing a context-state fault into the protocol-failure
+  code launders the fault into a verdict.
+- **Return typed results across the FFI; never classify a failure by prefix-matching a
+  Display message.** A prose classifier couples every SDK to Rust's message text, and the
+  safe failure mode — all-false on an unrecognized message — makes a reworded message a
+  silent regression rather than a loud one.
+- **Never infer "every earlier stage passed" from a hardcoded pipeline order.** A classifier
+  that maps a failing stage to a list of stages it assumes ran first reports wrong `true`
+  fields the moment someone reorders the pipeline, and the reorder produces no failing test.
+- **Evaluate every declared capability, not the first one.** A token whose `att[0]` sits
+  within the ceiling and whose `att[1]` does not reports `withinCeiling: true` to a caller
+  that reads only `att[0]`.
 
-```ts
-// trust.ts (TypeScript)
-const result = await scp.ucanEvaluate(handle, token, subjectDid);
-// result: CapabilityValidation { tokensValid, signaturesValid, withinCeiling,
-//                                nonceValid, notRevoked, timeBoundsValid }
-```
+## Where these rules are still broken
 
-```python
-# trust.py (Python)
-result = instance.ucan_evaluate(context_id, token, None, subject_did)
-# CapabilityValidation: .tokens_valid, .signatures_valid, .within_ceiling,
-#                        .nonce_valid, .not_revoked, .time_bounds_valid
-```
+ADR-059 landed on every trust-evaluation surface but one. `SCP.evaluateTrust` in
+`bindings/typescript/src/scp.ts` calls `ucanEvaluate` and reads the six booleans,
+`scp_sdk.trust.evaluate_trust` in `bindings/python/scp_sdk/trust.py` calls
+`ucan_evaluate`, and `evaluateTrust` in `bindings/swift/Sources/SCP/Trust.swift` calls
+`ucanEvaluate`. ADR-059 did not land on the module-level `evaluateTrust` that
+`bindings/typescript/src/index.ts` re-exports out of `bindings/typescript/src/trust.ts`,
+so a caller who imports that name still runs the superseded path, and that path breaks
+three of the rules above:
 
-`presenting_agent_did` / `subject_did` is **required and non-defaulting** —
-the bridge rejects empty/absent, preventing the audience check from becoming
-a tautology (`aud == aud`). Pass the DID of the participant under assessment.
+- `validateOneCapUri` catches the bridge error and classifies it by prefix-matching the
+  Rust `Display` message, which the typed-results rule forbids. `REVOCATION_PREFIXES` in
+  the same file holds the one entry that keeps an operational revocation message out of a
+  pipeline verdict — the narrowing the typed path would make structural.
+- `__PASSED_BEFORE` maps each failing stage to the stages it assumes ran first, hardcoding
+  the eleven-step order, which the pipeline-order rule forbids.
+- `evaluateLayer1` sends only the `att[0].with` that `__extractFirstCapabilityUri` returns,
+  which the evaluate-every-capability rule forbids.
 
-**Never call `ucanValidate(handle, token, "*")`** — the enforcing path
-(which DOES consume the nonce and gate an action) requires a fully-qualified
-`scp:ctx:{contextId}/{resource}:{action}` URI. Bare `"*"` is rejected at
-URI-parse time before any cryptographic check runs, yielding an all-false
-verdict that looks valid rather than crashing.
-
-## Closed allowlist, not open denylist — for error absorption
-
-The absorption logic is the security boundary of Layer 1: an absorbed error
-becomes a (partial or all-false) trust verdict; a re-thrown error surfaces a
-fault. Get the direction wrong and a genuine fault is laundered into a
-plausible-looking verdict.
-
-Under ADR-059, the Layer-1 absorption surface is narrow:
-- The `ucan_evaluate` bridge op returns booleans on success and only throws
-  for *malformed FFI input* (bad handle / token / presenting-agent DID).
-- Layer 2 (`evaluate_trust`) folds `SCP-CTX-2076` (no participation facts
-  yet) into a zeroed behavioral record; every other error re-throws.
-
-**Rule:** for security-adjacent error absorption, enumerate what you absorb
-(closed allowlist) and default to propagate. Never enumerate what you re-throw
-(open denylist) and default to absorb — the default case is where new/unknown
-faults land, and "absorb by default" turns every unmodeled fault into a false
-verdict.
-
-## Bridge error routing: don't route infrastructure faults to an absorbed code
-
-A UCAN validation entrypoint has (at least) two failure classes — *the token
-failed the protocol* vs *the infrastructure failed to evaluate it*. They MUST
-carry distinct error codes, because a downstream absorber keys on the code to
-decide visible-fault vs trust-verdict.
-
-Never collapse an infrastructure fault (e.g. context-state lookup/writeback)
-into the protocol-failure code just because it is convenient — always emit
-`[SCP-CTX-2023]` for context-state faults (so they re-throw) and
-`[SCP-PERM-3001]` only for real pipeline errors.
-
-**Rule:** match the error code to the failure class, not to the convenient
-catch block.
-
-## What Layer 1 measures: self-consistency, NOT authorization
-
-Layer 1 answers "is this token structurally valid, correctly signed, within
-the context ceiling, unexpired, and unrevoked?" — measured against the
-token's own declared capability set. It does **not** answer "does this token
-authorize action X?" The intrinsic-mode `ucan_evaluate` skips the step-6
-grant-match check and probes the nonce without consuming it, so the token
-remains replayable.
-
-Callers that need to verify authority for a specific operation must call
-`scp.ucanValidate(handle, token, uri)` directly with a fully-qualified
-capability URI. Do not treat a green Layer-1 `CapabilityValidation` as an
-authorization decision.
-
-## Historical: the `ucanValidate` + `att[0].with` extraction era (pre-ADR-059)
-
-> **Note:** The following sections describe the old client-side implementation
-> superseded by ADR-059. Preserved for context on the design trap.
-
-### What happened
-
-`evaluateTrust` / `evaluate_trust` was calling `ucanValidate(handle, token, "*")`.
-This compiled and ran silently, but the bridge rejects `"*"` at URI-parse time
-(`UcanError::InvalidCapabilityUri`) — before any cryptographic check runs.
-Layer 1 returned all-false for every token, unconditionally.
-
-### The old fix (now deleted)
-
-The correct pre-ADR-059 approach was to extract the URI from `att[0].with`
-and pass it to `ucanValidate`. ADR-059 replaced this entirely — `ucan_evaluate`
-now receives no capability URI for intrinsic-mode evaluation; the bridge owns
-att enumeration and returns six booleans directly.
-
-### PERM-3001 and VALID-* allowlists
-
-The old Layer-1 absorbed two categories of errors via `validateOneCapUri`
-(TypeScript) / `except` handlers (Python):
-
-- `[SCP-PERM-3001]` — pipeline failures (bad signature, ceiling violation,
-  nonce reuse, etc.), each classified into the failing stage via the
-  `__PASSED_BEFORE` / `_PASSED_BEFORE` map to yield a narrowed
-  `CapabilityValidation`.
-- `[SCP-VALID-*]` — URI boundary validation failures before the pipeline ran
-  (e.g. control characters in `att[0].with`); these produced all-false.
-- Re-throws: `[SCP-PERM-3030]` (handle-affinity misuse), `[SCP-CTX-2023]`
-  (context-state faults), unknown codes.
-
-Under ADR-059, `ucan_evaluate` returns booleans directly — no string
-classification occurs, and the error-absorption surface collapsed to Layer 2's
-single `SCP-CTX-2076` fold.
-
-### `_PASSED_BEFORE` inference (superseded by ADR-059)
-
-The old Layer 1 received one error *message string* when a token failed,
-classified it into a pipeline stage by prefix-matching on Display text, then
-inferred "everything before this stage must have passed" via the
-`__PASSED_BEFORE` / `_PASSED_BEFORE` map. Two hidden assumptions made this
-fragile:
-
-1. **Fixed step ordering.** The map hardcoded the 11-step pipeline sequence.
-   If `validate.rs` reordered steps, the inference silently reported wrong
-   `true` fields.
-2. **Message-string stability.** Reword a message and the classifier dropped
-   to `"unknown"` → all-false, or misclassified into a more-passing category.
-
-ADR-059 replaced this: the safe failure mode (all-false on unknown) meant any
-Rust Display-string change was a silent regression. Typed results from
-`ucan_evaluate` are stable and don't couple SDKs to prose.
-
-### Multi-att limitation (superseded by ADR-059)
-
-The old `evaluateLayer1` validated only the first declared capability URI
-(`att[0].with`). A token with an out-of-ceiling `att[1]` and an in-ceiling
-`att[0]` would produce `withinCeiling: true`. ADR-059's `ucan_evaluate`
-moves att enumeration into the bridge; `withinCeiling` now reflects the
-bridge's full evaluation.
-
-### Revocation prefix narrowing (superseded by ADR-059)
-
-`validate.rs` step 10 emits exactly `UcanError::TokenRevoked` → Display
-`"token revoked: {cid}"`. Two other revocation-related messages exist but
-are operational (admin-side revocation-management failures, never step-10
-validation): `"revocation unauthorized: ..."`, `"revocation failed: ..."`.
-
-The old `_REVOCATION_PREFIXES` / `REVOCATION_PREFIXES` constant had to
-contain exactly one entry (`"token revoked:"`) to avoid misclassifying
-operational messages as pipeline results. Under ADR-059, operational messages
-produce a non-`PERM-3001` error code, which the SDK re-throws rather than
-absorbs — the invariant is now enforced structurally by the typed path.
+Earlier revisions of this lesson recorded `__extractFirstCapabilityUri`,
+`__PASSED_BEFORE`, `REVOCATION_PREFIXES`, and `validateOneCapUri` as deleted. All four
+are live, and a reader who wants to see what these rules forbid reads that file.
 
 ## See also
 
-- `.docs/lessons/typescript-node-only-globals-break-browser.md` — a
-  `Buffer`-based decode inside `__extractFirstCapabilityUri` (now deleted)
-  silently broke cross-environment evaluation; the principle of feature-
-  detecting Node globals still applies to any cross-environment utility code.
-- `.docs/lessons/delegation-chain-full-validation.md` — every link in a
-  delegation chain needs the full pipeline, not just structural checks.
+- `.docs/lessons/typescript-node-only-globals-break-browser.md` —
+  `__extractFirstCapabilityUri` in the same `trust.ts` decoded a JWT segment with a
+  Node-only `Buffer` call, which broke cross-environment evaluation the same silent way.
+- `.docs/lessons/delegation-chain-full-validation.md` — every link in a delegation chain
+  needs the full pipeline, not just structural checks.
+- `.docs/lessons/sdk-consume-structured-ffi-results-not-error-prose.md` — the typed-result
+  rule as it binds every bridge, not only this one.

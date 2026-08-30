@@ -1,6 +1,5 @@
 # FFI Registries Must Be Populated From Production Code Paths
 
-**Date:** 2026-02-28
 **Source:** SCP-213 security review of `crates/scp-ffi/src/mcp.rs`, `runtime.rs`
 
 ## The Bug

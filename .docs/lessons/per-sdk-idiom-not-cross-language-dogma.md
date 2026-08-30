@@ -1,6 +1,6 @@
 # Per-SDK idiom — language constraints stay local
 
-> **ADR-055 (2026-06-29):** the WASM bridge was removed; references below to a fourth WASM/wasm-bindgen bridge are historical. SCP now ships four language SDKs (Python, TypeScript, Swift, Kotlin) over three FFI bridges (PyO3, NAPI, UniFFI); the browser is a remote thin client. The per-SDK-idiom rule below remains evergreen.
+> **ADR-055 (2026-06-29):** the WASM bridge was removed; references below to a fourth WASM/wasm-bindgen bridge are historical. SCP now ships four language SDKs (Python, TypeScript, Swift, Kotlin) over three FFI bridges (PyO3, NAPI, UniFFI). ADR-057 later gave the browser an in-process client over `crates/scp-client-wasm`, which exposes a wasm-bindgen surface rather than a fourth FFI bridge. The per-SDK-idiom rule below remains evergreen.
 
 ## Principle
 
@@ -47,11 +47,11 @@ own semantics, or am I propagating it from elsewhere?" If propagating, stop.
   audit flags an op as "missing in X but present in Y," do not assume Y is
   the reference. Both may be wrong. Read §1 and §7 first, then prescribe.
 
-- **Audit scripts measure code state, not intent.** Code can drift from
-  ADRs. ADR-048 §7 was added 2026-04-25 (commit `efc58ecfd`) with one
-  framing; the per-SDK amendment landed the same week (#1543 batch 3a).
-  Letting an audit script's view of code redefine the architecture
-  reverses the artifact-flow invariant in CLAUDE.md.
+- **Audit scripts measure code state, not intent.** Code drifts from ADRs.
+  §7 of ADR-048, SCP multi-instance, arrived with one framing, and the
+  per-SDK amendment landed days later, so a script reading only the code
+  saw neither. Letting an audit script's view of code redefine the
+  architecture reverses the artifact-flow invariant in CLAUDE.md.
 
 - **Review-agent unanimity is weak evidence when the prompt converges
   agents.** If you ask "should this function be a method or a free fn?",
