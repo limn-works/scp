@@ -24,7 +24,8 @@ suppressed.
 - **Write the justification so a reader can check it.** Name the upstream release that would
   clear the entry, or the reason no release can. "Awaiting upstream" names neither, so
   nothing in the entry tells a later reader how to decide whether it still holds.
-- **Deleting the entry is the fix, and the audit is the enforcement.**
-  `cargo deny check advisories` — which the `rust-deny` job runs, guarded by a filter that
-  lists `deny.toml` and `Cargo.lock` — fails if the lock ever resolves a vulnerable version
-  again, so the entry does not need to stay behind as a reminder.
+- **Deleting the entry is the fix, and the audit is the enforcement.** The `rust-deny` job
+  in `.github/workflows/ci.yml` runs `EmbarkStudios/cargo-deny-action`, whose default check
+  set includes advisories, and the paths filter guarding that job lists `deny.toml` and
+  `Cargo.lock`. The audit fails if the lock ever resolves a vulnerable version again, so the
+  entry does not need to stay behind as a reminder.
