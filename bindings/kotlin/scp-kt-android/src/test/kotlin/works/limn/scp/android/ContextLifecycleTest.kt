@@ -14,15 +14,38 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.test.setMain
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ContextLifecycleTest {
+
+    // `asLifecycleFlow` delegates to `Flow.flowWithLifecycle`, which calls
+    // `Lifecycle.repeatOnLifecycle` and so switches to `Dispatchers.Main.immediate`. A plain
+    // JVM unit test carries no Android main looper, so without this dispatcher every method
+    // below fails inside `MissingMainCoroutineDispatcher` before it collects anything.
+    // Installing a TestDispatcher as Main also hands `runTest` that dispatcher's scheduler,
+    // so `advanceUntilIdle()` drives lifecycle dispatch and flow collection together.
+    private val mainDispatcher = UnconfinedTestDispatcher()
+
+    @BeforeEach
+    fun setUpMainDispatcher() {
+        Dispatchers.setMain(mainDispatcher)
+    }
+
+    @AfterEach
+    fun tearDownMainDispatcher() {
+        Dispatchers.resetMain()
+    }
 
     @Test
     fun `asLifecycleFlow completes when owner reaches DESTROYED`() = runTest {

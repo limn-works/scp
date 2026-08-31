@@ -2,7 +2,7 @@
 
 ## Overview
 
-Pure Kotlin ergonomics layer over UniFFI-generated Rust bindings. Provides idiomatic Kotlin API: `suspend` functions, `Flow<T>` streaming, `AutoCloseable` lifecycle. Zero protocol logic — every SDK method delegates through the coroutine bridge to exactly one UniFFI function (ADR-028 flat delegation pattern).
+Pure Kotlin ergonomics layer over UniFFI-generated Rust bindings. Provides idiomatic Kotlin API: `suspend` functions and `Flow<T>` streaming. Lifecycle teardown suspends rather than implementing `AutoCloseable` — see "Teardown suspends" below. Zero protocol logic — every SDK method delegates through one coroutine bridge to exactly one UniFFI function (ADR-028 flat delegation pattern).
 
 ## Breaking Changes
 
@@ -67,6 +67,19 @@ Two-tier streaming architecture per ADR-028:
 
 ## Gotchas
 
+### Teardown suspends; no SDK type implements `AutoCloseable`
+
+`Relay` and `Node` expose one suspending `shutdown()` each and implement no `AutoCloseable`. An earlier revision implemented it, so that a caller could write `use {}`, with `close()` running `runBlocking(Dispatchers.Default) { shutdown() }`. `shutdown()` routes through `CoroutineBridge.ffiCall`, which suspends on a bridge's injected `ioDispatcher`, so a caller injecting a `StandardTestDispatcher` parked one thread that advances that dispatcher's scheduler and never returned, and an Android caller blocked a main thread. Nothing in this repository ever called that `close()`.
+
+A bounded wait was rejected as a fix: it still blocks a calling thread, and blocking an Android main thread up to a timeout produces an ANR, so it trades a deadlock for an ANR rather than removing a blocking wait. Write `try { … } finally { relay.shutdown() }` inside a coroutine instead.
+
+`SCP` follows the same rule for the same reason, with a further one of its own: `SCP.shutdown(bridge, timeout)` takes a `CoroutineBridge` and a deadline, and a synchronous `close()` could neither obtain that bridge nor honour that deadline.
+
+`ServerTest.no lifecycle-owning type implements AutoCloseable` and `ServerTest.every stop method on a lifecycle-owning type suspends` fail if either shape returns to `Relay`, `Node`, or `SCP`. That second method matches on a `kotlin.coroutines.Continuation` parameter, so a non-suspending stop method fails it under any name.
+
+The rule itself lives upstream, where it governs: ADR-028 in `.docs/adrs/phase-6.md` carries the amendment under its `AutoCloseable` rationale bullet, and `.docs/standards/sdk-common.md` carries it under §"Kotlin: why no `Closeable`". See also `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md`.
+
+
 ### detekt TooManyFunctions (threshold: 30)
 
 The `NativeBindings` interface has 19 methods (one per UniFFI function). It is split into 5 domain sub-interfaces (`IdentityBindings`, `ContextBindings`, `OutletBindings`, `UcanBindings`, `InfraBindings`) with `NativeBindings` as the composite. The test stub `StubNativeBindings` uses `@Suppress("TooManyFunctions")` since it must implement all 19. The file-level threshold is 30 (set in `detekt.yml` per `standards/kotlin.md`).
@@ -102,6 +115,18 @@ Rust callbacks (`onMessage`, `onEvent`) run on non-coroutine threads. You cannot
 ### Streaming: HotStreamFactory methods are suspend — call from a coroutine scope
 
 `HotStreamFactory.contextEvents()` and `incomingMessages()` are `suspend` functions that use `withContext(ioDispatcher)` for FFI calls and a `Mutex` to prevent duplicate subscriptions. They must be called from a coroutine scope (e.g., `lifecycleScope.launch { }`, `viewModelScope.launch { }`). See the Breaking Changes section above for migration details.
+
+### Streaming: a subscribe call and its registry write form one non-cancellable step
+
+`contextEvents` and `incomingMessages` run their FFI subscribe call and their registry write together inside `withContext(NonCancellable + ioDispatcher)`. An earlier revision called `contextSubscribeEvents` inside `withContext(ioDispatcher)` and wrote `activeEventSubscriptions` on a following line. Cancellation arriving during that FFI call surfaces on that `withContext`'s resumption, which skipped that write and left a live Rust subscription that no registry entry named, so neither `stopContextEvents` nor `stopAll` could release it.
+
+`NonCancellable` covers those two statements and no others, so a cancelled caller still observes cancellation — it just leaves a subscription that `stopContextEvents` can still name. Removal paths pair a registry removal with an unsubscribe call in that same shape.
+
+### Streaming: every path that writes a subscription registry takes that registry's mutex
+
+`stopContextEvents` takes `eventMutex` and `stopMessageStream` takes `messageMutex`. `stopAll` takes each mutex once and then calls private removal helpers under it, rather than delegating to those two public methods, because taking one non-reentrant `Mutex` twice on one coroutine deadlocks that coroutine. Removal paths that took no lock let a stop read an empty registry while a subscribe held that mutex, return, and leave a subscription that same subscribe registered a moment later.
+
+A Rust callback thread runs `onComplete` outside any coroutine, so that path cannot take either mutex. `SubscriptionSlot` calls `ConcurrentHashMap.remove(key, value)` instead: a completion callback removes its own `HotStreamState` and never a later subscription that carries one same context handle. `StreamsTest.SubscriptionOwnershipTests` covers cancellation, stop-versus-subscribe interleaving, and that stale-completion case. See `.docs/lessons/kotlin/hot-stream-subscription-ownership.md`, which also records why `rememberScpHotStream` in `scp-kt-android` now requires an injected `ScpHotStreamCoordinator`.
 
 ### UniFFI NativeLib.kt generation configured but requires compiled Rust binary
 

@@ -11,6 +11,7 @@ import works.limn.scp.bridge.CancellationHandle
 import works.limn.scp.bridge.CoroutineBridge
 import works.limn.scp.bridge.MessageCallback
 import works.limn.scp.bridge.NativeBindings
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -22,10 +23,16 @@ import kotlinx.coroutines.test.setMain
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
+import java.util.concurrent.TimeUnit
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
+// Every method runs on its own thread under a wall-clock limit, so a method that parks a
+// thread forever — the SCP-117 `runBlocking` deadlock this suite regressed on — fails the
+// build instead of hanging the CI runner until the job's own limit expires.
+@Timeout(value = 30, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
 @OptIn(ExperimentalCoroutinesApi::class)
 class ScpViewModelTest {
     private lateinit var testDispatcher: TestDispatcher
@@ -51,7 +58,7 @@ class ScpViewModelTest {
 
     @Test
     fun `onCleared calls leave on all tracked contexts`() = runTest(testDispatcher) {
-        val viewModel = TestScpViewModel()
+        val viewModel = TestScpViewModel(testDispatcher)
         val ctx1 = TrackedContext(handle = 1L, identityHandle = 1L, bridge = bridge)
         val ctx2 = TrackedContext(handle = 2L, identityHandle = 2L, bridge = bridge)
 
@@ -71,7 +78,7 @@ class ScpViewModelTest {
     fun `onCleared continues cleanup even if one leave throws`() = runTest(testDispatcher) {
         stubBindings.leaveThrowsForHandle = 1L
 
-        val viewModel = TestScpViewModel()
+        val viewModel = TestScpViewModel(testDispatcher)
         viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = bridge))
         viewModel.trackContext(TrackedContext(handle = 2L, identityHandle = 2L, bridge = bridge))
         advanceUntilIdle()
@@ -83,9 +90,64 @@ class ScpViewModelTest {
         assertTrue(stubBindings.leaveCalledHandles.contains(2L))
     }
 
+    // `.docs/standards/sdk-common.md` §Cleanup error handling requires that a cleanup error be
+    // logged rather than dropped. An earlier revision swallowed every throwable except
+    // CancellationException, so an app author learned nothing when a departure did not land.
+    @Test
+    fun `onCleanupFailure receives every leave failure`() = runTest(testDispatcher) {
+        stubBindings.leaveThrowsForHandle = 1L
+
+        val viewModel = TestScpViewModel(testDispatcher)
+        val ctx1 = TrackedContext(handle = 1L, identityHandle = 1L, bridge = bridge)
+        val ctx2 = TrackedContext(handle = 2L, identityHandle = 2L, bridge = bridge)
+        viewModel.trackContext(ctx1)
+        viewModel.trackContext(ctx2)
+        advanceUntilIdle()
+
+        viewModel.callOnCleared()
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf(ctx1),
+            viewModel.cleanupFailures.map { it.first },
+            "a failing leave must reach onCleanupFailure exactly once, naming its context",
+        )
+        assertTrue(
+            viewModel.cleanupFailures.single().second is ScpLeaveException,
+            "onCleanupFailure must receive whatever leave threw, not a wrapper",
+        )
+        // A reported failure does not stop remaining departures.
+        assertEquals(listOf(1L, 2L), stubBindings.leaveCalledHandles)
+    }
+
+    // A CancellationException reports that this cleanup coroutine was cancelled. Reporting it
+    // through onCleanupFailure would invite an override to swallow its own cancellation.
+    @Test
+    fun `onCleanupFailure never receives a cancellation`() = runTest(testDispatcher) {
+        stubBindings.leaveCancelsForHandle = 1L
+
+        val viewModel = TestScpViewModel(testDispatcher)
+        viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = bridge))
+        viewModel.trackContext(TrackedContext(handle = 2L, identityHandle = 2L, bridge = bridge))
+        advanceUntilIdle()
+
+        viewModel.callOnCleared()
+        advanceUntilIdle()
+
+        assertTrue(
+            viewModel.cleanupFailures.isEmpty(),
+            "a cancellation must propagate, never reach onCleanupFailure",
+        )
+        assertEquals(
+            listOf(1L),
+            stubBindings.leaveCalledHandles,
+            "a cancelled cleanup coroutine stops before a second leave",
+        )
+    }
+
     @Test
     fun `untrackContext prevents leave on cleared`() = runTest(testDispatcher) {
-        val viewModel = TestScpViewModel()
+        val viewModel = TestScpViewModel(testDispatcher)
         val ctx = TrackedContext(handle = 1L, identityHandle = 1L, bridge = bridge)
 
         viewModel.trackContext(ctx)
@@ -101,7 +163,7 @@ class ScpViewModelTest {
 
     @Test
     fun `onCleared with no tracked contexts does not throw`() = runTest(testDispatcher) {
-        val viewModel = TestScpViewModel()
+        val viewModel = TestScpViewModel(testDispatcher)
         viewModel.callOnCleared()
         advanceUntilIdle()
 
@@ -110,34 +172,116 @@ class ScpViewModelTest {
 
     @Test
     fun `trackContext returns the same context for chaining`() = runTest(testDispatcher) {
-        val viewModel = TestScpViewModel()
+        val viewModel = TestScpViewModel(testDispatcher)
         val ctx = TrackedContext(handle = 42L, identityHandle = 1L, bridge = bridge)
         val returned = viewModel.trackContext(ctx)
         assertEquals(ctx, returned)
     }
 
+    // A cancelled cleanup scope would satisfy an "is empty" assertion whether or not
+    // onCleared() cleared its tracked list, so this method asserts on recorded contents at
+    // each step. Delete `activeContexts.clear()` from onCleared() and a second
+    // assertEquals reports [1] against an expected empty list.
     @Test
     fun `onCleared clears the active contexts list`() = runTest(testDispatcher) {
-        val viewModel = TestScpViewModel()
+        val viewModel = TestScpViewModel(testDispatcher)
         viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = bridge))
         advanceUntilIdle()
 
         viewModel.callOnCleared()
         advanceUntilIdle()
 
+        assertEquals(listOf(1L), stubBindings.leaveCalledHandles)
         stubBindings.leaveCalledHandles.clear()
 
         viewModel.callOnCleared()
         advanceUntilIdle()
 
-        assertTrue(stubBindings.leaveCalledHandles.isEmpty(), "Second onCleared should have no contexts")
+        assertEquals(
+            emptyList<Long>(),
+            stubBindings.leaveCalledHandles,
+            "a second onCleared finds an empty tracked list, so it leaves nothing",
+        )
+    }
+
+    // Guards against reintroducing `cleanupJob.invokeOnCompletion { cleanupScope.cancel() }`.
+    // A cancelled cleanup scope drops every later launch without running it, so this
+    // leave would never reach TestNativeBindings.
+    @Test
+    fun `a context tracked after onCleared is still left by a later onCleared`() =
+        runTest(testDispatcher) {
+            val viewModel = TestScpViewModel(testDispatcher)
+            viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = bridge))
+            advanceUntilIdle()
+
+            viewModel.callOnCleared()
+            advanceUntilIdle()
+            assertEquals(listOf(1L), stubBindings.leaveCalledHandles)
+
+            viewModel.trackContext(TrackedContext(handle = 2L, identityHandle = 2L, bridge = bridge))
+            viewModel.callOnCleared()
+            advanceUntilIdle()
+
+            assertEquals(listOf(1L, 2L), stubBindings.leaveCalledHandles)
+        }
+
+    // A Java subclass of ScpViewModel calls `super()`, so a zero-argument JVM constructor is
+    // part of this artifact's published surface. Kotlin emits one because every
+    // primary-constructor parameter carries a default; adding a parameter without a default
+    // removes it and fails this method.
+    @Test
+    fun `ScpViewModel exposes a zero-argument constructor to Java callers`() {
+        val parameterCounts = ScpViewModel::class.java.declaredConstructors
+            .map { it.parameterCount }
+            .toSet()
+        assertTrue(
+            parameterCounts.contains(0),
+            "expected a zero-argument constructor, found arities $parameterCounts",
+        )
+        assertTrue(
+            parameterCounts.contains(1),
+            "expected a one-argument constructor, found arities $parameterCounts",
+        )
+    }
+
+    @Test
+    fun `onCleared returns before the leave calls run`() = runTest(testDispatcher) {
+        val viewModel = TestScpViewModel(testDispatcher)
+        viewModel.trackContext(TrackedContext(handle = 7L, identityHandle = 7L, bridge = bridge))
+        advanceUntilIdle()
+
+        viewModel.callOnCleared()
+
+        // StandardTestDispatcher queues the cleanup coroutine without running it, so an
+        // onCleared that waited for leave could not have reached this line.
+        assertTrue(
+            stubBindings.leaveCalledHandles.isEmpty(),
+            "onCleared returned, and no leave has run yet",
+        )
+
+        advanceUntilIdle()
+
+        assertEquals(listOf(7L), stubBindings.leaveCalledHandles)
     }
 }
 
 /**
  * Concrete [ScpViewModel] subclass for testing. Exposes [onCleared] via [callOnCleared].
+ *
+ * @param cleanupDispatcher The dispatcher [ScpViewModel.onCleared] runs its `leave` calls on.
+ *   Each test passes the same `TestDispatcher` it gave the [CoroutineBridge], so
+ *   `advanceUntilIdle()` runs the cleanup coroutine and the `leave` calls it makes.
  */
-private class TestScpViewModel : ScpViewModel() {
+private class TestScpViewModel(
+    cleanupDispatcher: CoroutineDispatcher,
+) : ScpViewModel(cleanupDispatcher) {
+    /** Every (context, cause) pair that [onCleanupFailure] received, in call order. */
+    val cleanupFailures = mutableListOf<Pair<TrackedContext, Throwable>>()
+
+    override fun onCleanupFailure(context: TrackedContext, cause: Throwable) {
+        cleanupFailures += context to cause
+    }
+
     fun callOnCleared() {
         onCleared()
     }
@@ -151,8 +295,14 @@ private class TestNativeBindings : NativeBindings {
     val leaveCalledHandles = mutableListOf<Long>()
     var leaveThrowsForHandle: Long? = null
 
+    /** Handle whose leave raises a cancellation, standing in for a cancelled cleanup coroutine. */
+    var leaveCancelsForHandle: Long? = null
+
     override fun contextLeave(contextHandle: Long, identityHandle: Long) {
         leaveCalledHandles.add(contextHandle)
+        if (contextHandle == leaveCancelsForHandle) {
+            throw kotlinx.coroutines.CancellationException("cleanup cancelled at handle $contextHandle")
+        }
         if (contextHandle == leaveThrowsForHandle) {
             throw ScpLeaveException("leave failed for handle $contextHandle")
         }

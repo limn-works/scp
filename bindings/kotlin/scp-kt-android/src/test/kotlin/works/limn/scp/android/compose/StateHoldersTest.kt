@@ -7,7 +7,10 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.test.junit4.createComposeRule
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.runTest
@@ -18,6 +21,8 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -160,39 +165,96 @@ class StateHoldersTest {
 
     @Test
     fun `rememberScpHotStream invokes onStop when leaving composition`() {
-        val stopped = AtomicBoolean(false)
+        val stopped = CountDownLatch(1)
         val eventFlow = MutableSharedFlow<String>()
         val showComposable = MutableStateFlow(true)
+        val coordinator = ScpHotStreamCoordinator(newCoordinatorScope())
 
         composeRule.setContent {
             val show by showComposable.collectAsStateCompat()
             if (show) {
                 rememberScpHotStream(
                     key = "test-key",
+                    coordinator = coordinator,
                     start = { eventFlow },
-                    onStop = { stopped.set(true) },
+                    onStop = { stopped.countDown() },
                 )
             }
         }
 
         composeRule.waitForIdle()
-        assertEquals(false, stopped.get())
+        assertEquals(1L, stopped.count)
 
         showComposable.value = false
         composeRule.waitForIdle()
-        Thread.sleep(SETTLE_DELAY_MS)
 
-        assertEquals(true, stopped.get())
+        assertTrue(
+            "onStop did not run within $AWAIT_TIMEOUT_SECONDS seconds of disposal",
+            stopped.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+        )
+    }
+
+    // Guards a shape rememberScpHotStream's onDispose must keep: it launches onStop and
+    // returns. A `runBlocking { onStop() }` parks a composition thread until onStop returns,
+    // so `waitForIdle` below would never return and this method would hit its own timeout
+    // rather than reach an assertion.
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `rememberScpHotStream disposal returns while onStop is still suspended`() {
+        val onStopEntered = CountDownLatch(1)
+        val releaseOnStop = CountDownLatch(1)
+        val onStopReturned = CountDownLatch(1)
+        val eventFlow = MutableSharedFlow<String>()
+        val showComposable = MutableStateFlow(true)
+        val coordinator = ScpHotStreamCoordinator(newCoordinatorScope())
+
+        composeRule.setContent {
+            val show by showComposable.collectAsStateCompat()
+            if (show) {
+                rememberScpHotStream(
+                    key = "blocking-key",
+                    coordinator = coordinator,
+                    start = { eventFlow },
+                    onStop = {
+                        onStopEntered.countDown()
+                        releaseOnStop.await()
+                        onStopReturned.countDown()
+                    },
+                )
+            }
+        }
+
+        composeRule.waitForIdle()
+
+        showComposable.value = false
+        composeRule.waitForIdle()
+
+        assertTrue(
+            "onStop did not start within $AWAIT_TIMEOUT_SECONDS seconds of disposal",
+            onStopEntered.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+        )
+        assertEquals(
+            "disposal returned before onStop returned",
+            1L,
+            onStopReturned.count,
+        )
+
+        releaseOnStop.countDown()
+        assertTrue(
+            "onStop did not return after its latch opened",
+            onStopReturned.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+        )
     }
 
     @Test
     fun `rememberScpHotStream returns the started flow`() {
         val eventFlow = MutableSharedFlow<String>()
         var capturedFlow: kotlinx.coroutines.flow.SharedFlow<String>? = null
+        val coordinator = ScpHotStreamCoordinator(newCoordinatorScope())
 
         composeRule.setContent {
             val flowState by rememberScpHotStream(
                 key = "key",
+                coordinator = coordinator,
                 start = { eventFlow },
                 onStop = {},
             )
@@ -300,6 +362,192 @@ class StateHoldersTest {
 }
 
 /**
+ * Drives one composable out of composition and back in under one same key, and checks which
+ * subscription survives.
+ *
+ * A stale `onStop` that lands after a second mount started removes whatever subscription a
+ * registry holds at that moment. When nothing orders that stop against that start, a collector
+ * holds a [kotlinx.coroutines.flow.SharedFlow] that receives nothing further and reports no
+ * error, which is what navigating away from a screen and back produced before
+ * [ScpHotStreamCoordinator] existed.
+ */
+@OptIn(ExperimentalCoroutinesApi::class)
+@RunWith(RobolectricTestRunner::class)
+@Config(manifest = Config.NONE, sdk = [33])
+class ScpHotStreamRemountTest {
+
+    @get:Rule
+    val composeRule = createComposeRule()
+
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `a re-mount under one same key keeps whichever subscription that re-mount opened`() {
+        val subscriptions = FakeSubscriptionRegistry()
+        val showComposable = MutableStateFlow(true)
+        val coordinator = ScpHotStreamCoordinator(newCoordinatorScope())
+        val eventFlow = MutableSharedFlow<String>()
+        val releaseStop = CountDownLatch(1)
+
+        composeRule.setContent {
+            val show by showComposable.collectAsStateCompat()
+            if (show) {
+                rememberScpHotStream(
+                    key = "shared-key",
+                    coordinator = coordinator,
+                    start = {
+                        subscriptions.subscribe()
+                        eventFlow
+                    },
+                    onStop = {
+                        releaseStop.await()
+                        subscriptions.unsubscribeLive()
+                    },
+                )
+            }
+        }
+
+        composeRule.waitForIdle()
+        awaitCondition("first mount opened no subscription") {
+            subscriptions.subscribeIds() == listOf(1)
+        }
+
+        showComposable.value = false
+        composeRule.waitForIdle()
+
+        showComposable.value = true
+        composeRule.waitForIdle()
+
+        // A second mount has entered composition, and its start lambda has had this long to
+        // run. An unsequenced start reuses subscription 1 within that window, which is what
+        // makes a stop below remove a subscription that this second mount depends on.
+        Thread.sleep(SETTLE_DELAY_MS)
+        releaseStop.countDown()
+
+        awaitCondition("a first mount's onStop unsubscribed nothing") {
+            subscriptions.unsubscribeIds().size == 1
+        }
+        awaitCondition("a second mount opened no subscription") {
+            subscriptions.subscribeIds().size == 2
+        }
+
+        assertEquals(listOf(1, 2), subscriptions.subscribeIds())
+        assertEquals(listOf(1), subscriptions.unsubscribeIds())
+        assertEquals(listOf(2), subscriptions.liveIds())
+    }
+
+    /**
+     * A caller who swaps the coordinator while the key stays the same must get a live
+     * subscription from the new coordinator.
+     *
+     * `rememberScpHotStream` remembered its `CoroutineScope` on `key` alone while its
+     * `DisposableEffect` keyed on `key` AND `coordinator`. A coordinator swap therefore ran
+     * `onDispose` — which cancels that scope — and then relaunched `start` into the SAME
+     * cancelled scope, because `key` had not changed. The launch returned an
+     * already-cancelled Job, `start` never ran, and the returned `State` kept the previous
+     * coordinator's flow: a subscription nobody was serving, reported as a live one.
+     */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `a coordinator swap under one same key opens a subscription on the new coordinator`() {
+        val subscriptions = FakeSubscriptionRegistry()
+        val firstCoordinator = ScpHotStreamCoordinator(newCoordinatorScope())
+        val secondCoordinator = ScpHotStreamCoordinator(newCoordinatorScope())
+        val activeCoordinator = MutableStateFlow(firstCoordinator)
+        val eventFlow = MutableSharedFlow<String>()
+
+        composeRule.setContent {
+            val coordinator by activeCoordinator.collectAsStateCompat()
+            rememberScpHotStream(
+                key = "shared-key",
+                coordinator = coordinator,
+                start = {
+                    subscriptions.subscribe()
+                    eventFlow
+                },
+                onStop = { subscriptions.unsubscribeLive() },
+            )
+        }
+
+        composeRule.waitForIdle()
+        awaitCondition("the first coordinator opened no subscription") {
+            subscriptions.subscribeIds() == listOf(1)
+        }
+
+        activeCoordinator.value = secondCoordinator
+        composeRule.waitForIdle()
+
+        awaitCondition("the swapped-in coordinator opened no subscription") {
+            subscriptions.subscribeIds().size == 2
+        }
+        awaitCondition("the swapped-out coordinator's stop released nothing") {
+            subscriptions.unsubscribeIds() == listOf(1)
+        }
+        assertEquals(listOf(2), subscriptions.liveIds())
+    }
+}
+
+/**
+ * Records subscribe and unsubscribe calls for one key, as
+ * [works.limn.scp.stream.HotStreamFactory] records them for one context handle.
+ *
+ * [subscribe] hands back a live subscription when one exists, and [unsubscribeLive] releases
+ * whichever subscription is live, so this double reproduces what a stale `onStop` does to a
+ * subscription that a later mount is using.
+ */
+private class FakeSubscriptionRegistry {
+    private val lock = Any()
+    private var nextId = 0
+    private var live: Int? = null
+    private val subscribed = mutableListOf<Int>()
+    private val unsubscribed = mutableListOf<Int>()
+
+    fun subscribe(): Int =
+        synchronized(lock) {
+            val existing = live
+            if (existing != null) return existing
+            nextId++
+            live = nextId
+            subscribed += nextId
+            nextId
+        }
+
+    fun unsubscribeLive() {
+        synchronized(lock) {
+            val current = live ?: return
+            unsubscribed += current
+            live = null
+        }
+    }
+
+    fun subscribeIds(): List<Int> = synchronized(lock) { subscribed.toList() }
+
+    fun unsubscribeIds(): List<Int> = synchronized(lock) { unsubscribed.toList() }
+
+    fun liveIds(): List<Int> = synchronized(lock) { listOfNotNull(live) }
+}
+
+/**
+ * Poll [condition] until it holds, and throw an [AssertionError] carrying [message] when
+ * [AWAIT_TIMEOUT_SECONDS] pass without it holding.
+ */
+private fun awaitCondition(
+    message: String,
+    condition: () -> Boolean,
+) {
+    val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(AWAIT_TIMEOUT_SECONDS)
+    while (System.nanoTime() < deadline) {
+        if (condition()) return
+        Thread.sleep(POLL_INTERVAL_MS)
+    }
+    throw AssertionError(message)
+}
+
+/**
+ * Build a scope for one [ScpHotStreamCoordinator]. A production caller owns this scope — a
+ * ViewModel, an Application, or a dependency graph holds it — and composable disposal never
+ * cancels it.
+ */
+private fun newCoordinatorScope(): CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+/**
  * Convenience extension mirroring collectAsState for MutableStateFlow
  * within test composables. Uses the Compose runtime's collectAsState.
  */
@@ -314,3 +562,15 @@ private val kotlinx.coroutines.CoroutineScope.isActive: Boolean
     get() = coroutineContext[kotlinx.coroutines.Job]?.isActive == true
 
 private const val SETTLE_DELAY_MS = 100L
+
+/** Upper bound on how long a test waits for a latch that another thread opens. */
+private const val AWAIT_TIMEOUT_SECONDS = 10L
+
+/** Gap between two reads of a condition that another thread makes true. */
+private const val POLL_INTERVAL_MS = 10L
+
+/**
+ * Wall-clock limit for a method that would hang, rather than fail, if disposal blocked on
+ * onStop again.
+ */
+private const val DISPOSAL_TIMEOUT_MS = 60_000L

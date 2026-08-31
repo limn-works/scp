@@ -2,14 +2,15 @@
 //
 // Wraps server-related UniFFI bridge functions as suspend functions with
 // proper dispatcher assignment per ADR-028. Provides Relay and Node types
-// that expose relay URL, DID, and shutdown operations as AutoCloseable
-// resources with proper lifecycle methods.
+// that expose relay URL, DID, and one suspending `shutdown()` each. Neither
+// type implements AutoCloseable: a synchronous `close()` would have to block a
+// calling thread on a coroutine whose dispatcher neither type controls. See
+// `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md`.
 //
 // Provenance: crates/scp-ffi-common/src/server.rs, crates/scp-ffi/uniffi/src/server.rs
 
 package works.limn.scp
 
-import kotlinx.coroutines.runBlocking
 import works.limn.scp.bridge.BridgeException
 import works.limn.scp.bridge.CoroutineBridge
 
@@ -205,14 +206,26 @@ internal data class NodeInfo(
  * Opaque handle to a running SCP relay server.
  *
  * Created via [Relay.Companion.startInMemory] or [Relay.Companion.startLocal].
- * The relay accepts WebSocket connections at [relayUrl] and can be gracefully
- * stopped via [shutdown] or [close] (for `use` blocks).
+ * A relay accepts WebSocket connections at [relayUrl], and [shutdown] stops it.
  *
- * Implements [AutoCloseable] so it can be used with Kotlin's `use` extension:
+ * [shutdown] is this type's only stop path, and it suspends. An earlier revision
+ * also implemented [AutoCloseable] with `close()` running
+ * `runBlocking(Dispatchers.Default) { shutdown() }`, so that a caller could write
+ * `use {}`. That shape breaks a rule this repository holds — a non-suspend method
+ * must not block its calling thread waiting on a coroutine whose dispatcher it
+ * does not control — because [shutdown] routes through `CoroutineBridge.ffiCall`,
+ * which suspends on a bridge's injected `ioDispatcher`. A caller injecting a
+ * `StandardTestDispatcher` parked one thread that advances that dispatcher's
+ * scheduler and never returned, and an Android caller blocked a main thread. See
+ * `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md`.
+ *
  * ```kotlin
- * Relay.startInMemory().use { relay ->
+ * val relay = Relay.startInMemory(bridge)
+ * try {
  *     println(relay.relayUrl)
- * } // shutdown() called automatically
+ * } finally {
+ *     relay.shutdown()
+ * }
  * ```
  */
 class Relay internal constructor(
@@ -222,7 +235,7 @@ class Relay internal constructor(
     val relayPort: Int,
     private val bridge: ServerBridge,
     internal val handleJson: String,
-) : AutoCloseable {
+) {
     /** `true` if [shutdown] has already been called. */
     @Volatile
     var isShutdown: Boolean = false
@@ -239,19 +252,6 @@ class Relay internal constructor(
         } finally {
             isShutdown = true
         }
-    }
-
-    /**
-     * Synchronous [AutoCloseable] cleanup that delegates to [shutdown].
-     *
-     * Blocks the calling thread until shutdown completes. Prefer [shutdown]
-     * from a coroutine scope; this exists for `use {}` block support.
-     *
-     * Uses [kotlinx.coroutines.Dispatchers.Default] to avoid deadlocking
-     * when called from a thread that already holds the event loop.
-     */
-    override fun close() {
-        runBlocking(kotlinx.coroutines.Dispatchers.Default) { shutdown() }
     }
 
     override fun toString(): String = "Relay(url=$relayUrl, relayPort=$relayPort)"
@@ -283,15 +283,22 @@ class Relay internal constructor(
  * Opaque handle to a running SCP application node.
  *
  * Created via [Node.Companion.startInMemory] or [Node.Companion.startLocal].
- * The node includes a running relay server, a generated DID identity, and
+ * A node includes a running relay server, a generated DID identity, and
  * (optionally) persistent storage.
  *
- * Implements [AutoCloseable] so it can be used with Kotlin's `use` extension:
+ * [shutdown] is this type's only stop path, and it suspends, for a reason
+ * [Relay] states in full: an earlier `close()` ran
+ * `runBlocking(Dispatchers.Default) { shutdown() }`, which blocks a calling
+ * thread on a coroutine whose dispatcher this type does not control.
+ *
  * ```kotlin
- * Node.startInMemory().use { node ->
+ * val node = Node.startInMemory(bridge)
+ * try {
  *     println(node.relayUrl)
  *     println(node.did)
- * } // shutdown() called automatically
+ * } finally {
+ *     node.shutdown()
+ * }
  * ```
  */
 class Node internal constructor(
@@ -303,7 +310,7 @@ class Node internal constructor(
     val did: String,
     private val bridge: ServerBridge,
     internal val handleJson: String,
-) : AutoCloseable {
+) {
     /** `true` if [shutdown] has already been called. */
     @Volatile
     var isShutdown: Boolean = false
@@ -320,19 +327,6 @@ class Node internal constructor(
         } finally {
             isShutdown = true
         }
-    }
-
-    /**
-     * Synchronous [AutoCloseable] cleanup that delegates to [shutdown].
-     *
-     * Blocks the calling thread until shutdown completes. Prefer [shutdown]
-     * from a coroutine scope; this exists for `use {}` block support.
-     *
-     * Uses [kotlinx.coroutines.Dispatchers.Default] to avoid deadlocking
-     * when called from a thread that already holds the event loop.
-     */
-    override fun close() {
-        runBlocking(kotlinx.coroutines.Dispatchers.Default) { shutdown() }
     }
 
     // HTTP server lifecycle

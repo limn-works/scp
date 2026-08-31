@@ -84,7 +84,9 @@ class JoinFromWelcomeTest {
 
         /**
          * Length in bytes of an RFC 9180 HPKE encapsulated key under DHKEM
-         * X25519-HKDF-SHA256 — the KEM the sealed invitation uses.
+         * X25519-HKDF-SHA256 — the KEM the sealed invitation uses. A join
+         * boundary validates `SealedInvitation.enc` against exactly this many
+         * bytes.
          */
         private const val HPKE_ENCAPSULATED_KEY_BYTES = 32
 
@@ -215,6 +217,16 @@ class JoinFromWelcomeTest {
                 // to the creator out of band.
                 val reservation = scp.reserveKeyPackage(invitee)
 
+                // A creator seals its bundle to an invitee's #active key
+                // (Ed25519 -> X25519), resolved from that invitee's DID
+                // document. A locally-created invitee resolves here, so a
+                // fully-sealed outcome is reachable from this UniFFI SDK and
+                // this method asserts it. An earlier revision instead asserted
+                // a SCP-CTX-2001 resolution failure and described a UniFFI
+                // bridge that never publishes a minted DID document to a
+                // resolver-visible store; this file's own header already
+                // described that happy path as reachable, so that expectation
+                // outlived whatever behaviour it described.
                 val outcome =
                     scp.inviteMember(
                         identity = creator,
@@ -251,6 +263,8 @@ class JoinFromWelcomeTest {
                     sealed.enc.size,
                     "the HPKE encapsulated key must be 32 bytes (RFC 9180 DHKEM X25519)",
                 )
+                // `ct = ciphertext || tag`, so real sealing never yields an
+                // empty ciphertext.
                 assertTrue(
                     sealed.ciphertext.isNotEmpty(),
                     "the sealed Welcome ciphertext must be non-empty",

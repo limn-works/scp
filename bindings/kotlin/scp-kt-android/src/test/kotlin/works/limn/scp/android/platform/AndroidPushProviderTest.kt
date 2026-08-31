@@ -13,24 +13,31 @@
 package works.limn.scp.android.platform
 
 import android.content.Context
-import org.junit.jupiter.api.BeforeEach
-import org.junit.jupiter.api.Test
-import org.junit.jupiter.api.assertThrows
+import androidx.test.core.app.ApplicationProvider
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 
+// Robolectric supplies a real application Context on a host JVM. An earlier revision
+// constructed this provider with `(null as Any?) as Context`, which Kotlin compiles into an
+// `Intrinsics` null check that throws NullPointerException on every construction, so all 14
+// methods below failed as soon as this module ran its JUnit 5 classes at all.
+// `isReturnDefaultValues = true` does not rescue that cast: it stubs android.jar methods and
+// leaves Kotlin's own null check in place.
+@RunWith(RobolectricTestRunner::class)
+@Config(manifest = Config.NONE, sdk = [35])
 class AndroidPushProviderTest {
 
     private lateinit var provider: AndroidPushProvider
 
-    @BeforeEach
+    @Before
     fun setUp() {
-        // handleNotification() is a pure function that does not use the Android
-        // Context. An unsafe null cast works at the JVM level for unit tests.
-        // Integration tests on a real device should use an actual Context.
-        provider = AndroidPushProvider(
-            @Suppress("CAST_NEVER_SUCCEEDS")
-            (null as Any?) as Context
-        )
+        val context: Context = ApplicationProvider.getApplicationContext()
+        provider = AndroidPushProvider(context)
     }
 
     // -----------------------------------------------------------------------
@@ -59,7 +66,7 @@ class AndroidPushProviderTest {
     @Test
     fun `empty payload throws ScpException with code SCP-TRANS-5001`() {
         val payload = emptyMap<String, String>()
-        val exception = assertThrows<ScpException> {
+        val exception = assertFailsWith<ScpException> {
             provider.handleNotification(payload)
         }
         assertEquals("SCP-TRANS-5001", exception.code)
@@ -69,7 +76,7 @@ class AndroidPushProviderTest {
     @Test
     fun `payload without scp field throws ScpException with code SCP-TRANS-5001`() {
         val payload = mapOf("other" to "value")
-        val exception = assertThrows<ScpException> {
+        val exception = assertFailsWith<ScpException> {
             provider.handleNotification(payload)
         }
         assertEquals("SCP-TRANS-5001", exception.code)
@@ -79,7 +86,7 @@ class AndroidPushProviderTest {
     fun `payload with wrong key name throws ScpException with code SCP-TRANS-5001`() {
         // Case-sensitive: "SCP" is not "scp"
         val payload = mapOf("SCP" to "1")
-        val exception = assertThrows<ScpException> {
+        val exception = assertFailsWith<ScpException> {
             provider.handleNotification(payload)
         }
         assertEquals("SCP-TRANS-5001", exception.code)
@@ -92,7 +99,7 @@ class AndroidPushProviderTest {
     @Test
     fun `scp field with value 0 throws ScpException with code SCP-TRANS-5002`() {
         val payload = mapOf("scp" to "0")
-        val exception = assertThrows<ScpException> {
+        val exception = assertFailsWith<ScpException> {
             provider.handleNotification(payload)
         }
         assertEquals("SCP-TRANS-5002", exception.code)
@@ -102,7 +109,7 @@ class AndroidPushProviderTest {
     @Test
     fun `scp field with value 2 throws ScpException with code SCP-TRANS-5002`() {
         val payload = mapOf("scp" to "2")
-        val exception = assertThrows<ScpException> {
+        val exception = assertFailsWith<ScpException> {
             provider.handleNotification(payload)
         }
         assertEquals("SCP-TRANS-5002", exception.code)
@@ -111,7 +118,7 @@ class AndroidPushProviderTest {
     @Test
     fun `scp field with empty value throws ScpException with code SCP-TRANS-5002`() {
         val payload = mapOf("scp" to "")
-        val exception = assertThrows<ScpException> {
+        val exception = assertFailsWith<ScpException> {
             provider.handleNotification(payload)
         }
         assertEquals("SCP-TRANS-5002", exception.code)
@@ -120,7 +127,7 @@ class AndroidPushProviderTest {
     @Test
     fun `scp field with arbitrary string throws ScpException with code SCP-TRANS-5002`() {
         val payload = mapOf("scp" to "wake")
-        val exception = assertThrows<ScpException> {
+        val exception = assertFailsWith<ScpException> {
             provider.handleNotification(payload)
         }
         assertEquals("SCP-TRANS-5002", exception.code)
@@ -131,7 +138,7 @@ class AndroidPushProviderTest {
     fun `scp field with whitespace-padded value throws ScpException with code SCP-TRANS-5002`() {
         // "1 " is not "1"
         val payload = mapOf("scp" to " 1")
-        val exception = assertThrows<ScpException> {
+        val exception = assertFailsWith<ScpException> {
             provider.handleNotification(payload)
         }
         assertEquals("SCP-TRANS-5002", exception.code)

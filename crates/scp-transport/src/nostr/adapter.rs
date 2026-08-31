@@ -170,24 +170,28 @@ impl NostrAdapter {
         )
         .await;
 
-        match result {
-            Ok(Ok((ws_stream, _response))) => {
-                debug!(
-                    relay_url = %self.config.relay_url,
-                    "connected to Nostr relay"
-                );
-                *conn_guard = Some(NostrConnection {
-                    ws_stream,
-                    subscriptions: HashMap::new(),
-                    reader_active: false,
-                });
-                Ok(())
+        let ws_stream = match result {
+            Ok(Ok((ws_stream, _response))) => ws_stream,
+            Ok(Err(e)) => {
+                return Err(TransportError::ConnectionFailed(format!(
+                    "Nostr relay WebSocket connection failed: {e}"
+                )));
             }
-            Ok(Err(e)) => Err(TransportError::ConnectionFailed(format!(
-                "Nostr relay WebSocket connection failed: {e}"
-            ))),
-            Err(_) => Err(TransportError::Timeout),
-        }
+            Err(_) => return Err(TransportError::Timeout),
+        };
+
+        debug!(
+            relay_url = %self.config.relay_url,
+            "connected to Nostr relay"
+        );
+        *conn_guard = Some(NostrConnection {
+            ws_stream,
+            subscriptions: HashMap::new(),
+            reader_active: false,
+        });
+        drop(conn_guard);
+
+        Ok(())
     }
 
     /// Generate a unique subscription ID.
@@ -212,6 +216,7 @@ impl NostrAdapter {
             .send(Message::Text(json))
             .await
             .map_err(|e| TransportError::SendFailed(format!("Nostr WebSocket send failed: {e}")))?;
+        drop(conn_guard);
 
         Ok(())
     }
@@ -229,6 +234,12 @@ impl NostrAdapter {
     }
 
     /// Sign an event with BIP-340 Schnorr and return the hex-encoded signature.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::ProtocolError`] when `event.id` does not decode
+    /// to exactly 32 bytes of hex, because BIP-340 signs those 32 bytes as its
+    /// message.
     pub fn sign_event(&self, event: &NostrEvent) -> Result<String, TransportError> {
         let id_bytes = event.id_bytes()?;
         let signature: k256::schnorr::Signature = self.signing_key.sign(&id_bytes);
@@ -274,6 +285,13 @@ impl NostrAdapter {
     }
 
     /// Create a NIP-09 deletion event referencing the given event ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::ProtocolError`] in three cases: a system clock
+    /// that reads earlier than 1970-01-01T00:00:00Z, a failure to serialize
+    /// NIP-01 canonical form to JSON while computing an event ID, or a computed
+    /// event ID that does not decode to exactly 32 bytes of hex while signing.
     pub fn create_deletion_event(&self, event_id: &str) -> Result<NostrEvent, TransportError> {
         let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -317,7 +335,9 @@ impl NostrAdapter {
                     let Some(conn) = conn_guard.as_mut() else {
                         break;
                     };
-                    conn.ws_stream.next().await
+                    let next = conn.ws_stream.next().await;
+                    drop(conn_guard);
+                    next
                 };
 
                 match msg {
@@ -422,7 +442,7 @@ impl NostrAdapter {
     /// Parse an SCP outer envelope from a Nostr event's base64-encoded content.
     ///
     /// Uses [`OuterEnvelope::from_bytes`] which rejects payloads exceeding
-    /// `MAX_ENVELOPE_SIZE` before invoking the MessagePack deserializer,
+    /// `MAX_ENVELOPE_SIZE` before invoking its `MessagePack` deserializer,
     /// preventing allocation bombs from malicious Nostr events.
     fn parse_envelope_from_event(event: &NostrEvent) -> Result<OuterEnvelope, TransportError> {
         let bytes = base64_decode(&event.content).map_err(|e| {
@@ -461,7 +481,7 @@ impl TransportAdapter for NostrAdapter {
                 let conn = conn_guard.as_mut().ok_or(TransportError::NotConnected)?;
 
                 // Read messages until we get an OK for our event.
-                loop {
+                let outcome = loop {
                     match conn.ws_stream.next().await {
                         Some(Ok(Message::Text(text))) => {
                             if let Some(RelayMessage::Ok {
@@ -469,9 +489,9 @@ impl TransportAdapter for NostrAdapter {
                             }) = RelayMessage::from_json(&text)
                             {
                                 if accepted {
-                                    return Ok(());
+                                    break Ok(());
                                 }
-                                return Err(TransportError::SendFailed(format!(
+                                break Err(TransportError::SendFailed(format!(
                                     "Nostr relay rejected event: {message}"
                                 )));
                             }
@@ -481,15 +501,17 @@ impl TransportAdapter for NostrAdapter {
                             // Binary or other message types -- skip.
                         }
                         Some(Err(e)) => {
-                            return Err(TransportError::SendFailed(format!(
+                            break Err(TransportError::SendFailed(format!(
                                 "WebSocket error while waiting for OK: {e}"
                             )));
                         }
                         None => {
-                            return Err(TransportError::NotConnected);
+                            break Err(TransportError::NotConnected);
                         }
                     }
-                }
+                };
+                drop(conn_guard);
+                outcome
             })
             .await;
 
@@ -634,7 +656,7 @@ impl TransportAdapter for NostrAdapter {
                 let mut conn_guard = self.connection.lock().await;
                 let conn = conn_guard.as_mut().ok_or(TransportError::NotConnected)?;
 
-                loop {
+                let outcome = loop {
                     match conn.ws_stream.next().await {
                         Some(Ok(Message::Text(text))) => {
                             match RelayMessage::from_json(&text) {
@@ -653,7 +675,7 @@ impl TransportAdapter for NostrAdapter {
                                     if subscription_id == sub_id =>
                                 {
                                     // End of stored events -- close the query subscription.
-                                    break;
+                                    break Ok(envelopes);
                                 }
                                 _ => {
                                     // Other messages -- continue.
@@ -662,17 +684,18 @@ impl TransportAdapter for NostrAdapter {
                         }
                         Some(Ok(_)) => {}
                         Some(Err(e)) => {
-                            return Err(TransportError::SendFailed(format!(
+                            break Err(TransportError::SendFailed(format!(
                                 "WebSocket error during query: {e}"
                             )));
                         }
                         None => {
-                            return Err(TransportError::NotConnected);
+                            break Err(TransportError::NotConnected);
                         }
                     }
-                }
+                };
+                drop(conn_guard);
 
-                Ok(envelopes)
+                outcome
             })
             .await;
 
@@ -778,6 +801,8 @@ mod tests {
 
     #[test]
     fn schnorr_signature_is_valid() {
+        use k256::schnorr::signature::Verifier;
+
         let config = NostrConfig::new("wss://relay.example.com".to_owned(), test_signing_key());
         let adapter = NostrAdapter::new(config).unwrap();
 
@@ -805,7 +830,6 @@ mod tests {
         assert_ne!(event.sig, "0".repeat(128));
 
         // Verify the signature with the verifying key.
-        use k256::schnorr::signature::Verifier;
         let sig_bytes = hex::decode(&event.sig).unwrap();
         let signature = k256::schnorr::Signature::try_from(sig_bytes.as_slice()).unwrap();
         let id_bytes = event.id_bytes().unwrap();
