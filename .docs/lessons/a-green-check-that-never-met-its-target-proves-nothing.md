@@ -12,6 +12,34 @@ rules separate them.
   not occur there. It now runs in `scripts/hooks/pre-commit`, immediately before that hook
   runs `cargo fmt` and `cargo clippy` under whatever compiler the developer's shell
   resolved. Place a check where its target occurs, and say in the check where that is.
+- **An absence assertion about a write must read the store the write went to.** Acceptance
+  criterion 6 of SCP-304, the Layer-3 attestation summaries story, required a test to call
+  an FFI op twice and to assert that the second call returned no summary carrying any of
+  five rejected attestation ids, "because verify-on-ingest persisted none of those five".
+  The op signature the same story pinned,
+  `attestation_summaries<S: TrustProtocolRepository>(store: S, ...)`, takes the store by
+  value and moves it into `AttestationCache::new`, and no implementation of that trait
+  covered `&T` or `Arc<T>`, so an implementer could only build a second, empty store for
+  the second call. An empty store returns an empty vector, and the assertion then passed
+  whatever the renderer had persisted. Three repairs made the line able to go red.
+  1. The criterion names the construct that keeps one store alive across both calls, an
+     `impl<T: TrustProtocolRepository + ?Sized> TrustProtocolRepository for &T`, which lets
+     the test instantiate `S` as `&InMemoryFfiTrustStore` and read the store afterward.
+  2. The criterion asserts over `store.get_cached_attestations(...)` directly, because the
+     op's own output cannot surface most of the entries the assertion is about: the
+     read-only diagnostic excludes a revoked candidate whatever the store holds, and
+     `get_cached_attestations` keys on `(context_id, subject_did)` while
+     `store_cached_attestation` keys on `entry.attestation.subject`, so a wrongly-persisted
+     entry about another subject lands under a key the read never touches. Reading the
+     store covers all six caller-supplied entries; the second call detects one of them.
+  3. The criterion asserts the surviving entry's `verified_at` and `ttl_secs`, not just the
+     count. `InMemoryFfiTrustStore::store_cached_attestation` replaces the entry that shares
+     an incoming entry's `id`, so a wrongly-persisted entry that collides with a seeded one
+     leaves the count unchanged and swaps a trusted stamp for a caller-supplied one. A
+     count is blind to a replacement; compare the field the write would change.
+
+  Ask of every absence assertion: which write would turn this line red, and does the read
+  this line performs reach that write?
 - **When a design change removes a check's reason, ask separately whether it removed the
   check's target.** A container-discovery check existed because an image tag used to name
   the compiler, so a stale tag was a string a gate could read. Making the tags name a
