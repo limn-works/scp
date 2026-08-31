@@ -335,6 +335,106 @@ and are documented with their own features.
 
 **Cross-bridge note.** PyO3 surfaces the analogous failure as `SCP-IDENT-1001` (registry-based key resolution per ADR-048 §7 — a registered identity always retains custody, so the "registered-but-no-custody" condition cannot arise); NAPI's and UniFFI's UCAN **delegate** paths are registry-based for that same structural reason and surface `SCP-IDENT-1001` as well (see that table above). On all three bridges (PyO3, NAPI, and UniFFI → Swift / Kotlin / TS-via-NAPI), consumers that catch the `IdentityError` category are safe for the missing-custody condition; only code that switches on the exact code string must account for the per-bridge code splits described above.
 
+### Custody strings and their cross-bridge contract
+
+`identity_create` takes a custody string naming the backend that holds the new
+identity's private keys. §3.2.2 of the identity spec, the custody vocabulary, decides
+which values that string carries, and this section restates nothing that section
+decides.
+
+| Value | Backend it selects |
+|---|---|
+| `encrypted_file` | The on-disk key store SCP implements, which derives an AES-256 key from a passphrase with Argon2id and encrypts each key entry under AES-256-GCM |
+| `os_keystore` | The operating system's own key store, which SCP reaches through the platform key-custody callback an SDK consumer supplies |
+
+The vocabulary holds no third value. §3.2.2 of the identity spec states that a shipped
+build answers every other string with a typed error. A build compiled with a bridge's
+`testing` cargo feature additionally accepts the raw string `in_memory`, which reaches a
+test-only in-memory key store; §3.2.2 of the identity spec states that a shipped build
+rejects that string with the typed code `SCP-IDENT-1008`, and that no SDK custody type
+spells it.
+
+**The words `platform`, `software`, `file`, and `hardware` name no custody value.** An
+SCP build from before this vocabulary landed accepted `file` for the encrypted key file
+and carried `platform` and `software` in its SDK custody types. A caller who passes any
+of those four strings to a current build reads a typed error instead of reaching a key
+store. §3.2.2 of the identity spec states why the first two cannot name a backend: two
+published specifications give `platform` two different meanings in key handling, and
+`software` states a property a backend lacks rather than naming a store.
+
+**`os_keystore` states which store holds the key, and states nothing about hardware
+isolation.** On Apple platforms the operating system's key store holds SCP's keys in
+software. `bindings/swift/Sources/SCP/Platform/AppleKeyCustody.swift:217`–`:221` states
+the reason: "Apple's Secure Enclave only supports P-256 (NIST P-256 / secp256r1) key
+operations. SCP uses Ed25519 for signing and X25519 for key agreement; neither is
+supported by the Secure Enclave. All SCP identity keys on Apple platforms are therefore
+software-backed via Keychain."
+
+**A bridge that cannot reach a real platform key store fails closed.** When a caller
+names `os_keystore` and the bridge holds no platform key-custody callback, the bridge
+returns a typed error. It does not fall back to `encrypted_file`, and it does not fall
+back to an in-memory store. §3.2.2 of the identity spec states that rule.
+
+**Custody is a required argument on every SDK, and no SDK carries a default.** Key
+custody is a security-relevant choice, and the agent-first API design tenet of
+`CLAUDE.md` forbids an SDK making it for a caller. The Swift and Kotlin entry points
+take a custody type rather than a bare string, so a caller cannot pass a value the type
+already rejects.
+
+**The substrate report is a separate vocabulary, and no caller passes one of its
+values.** `scp_platform::CustodyType` (`crates/scp-platform/src/traits.rs:223`–`:232`)
+names where a key already sits — `InMemory`, `Hardware`, and `Software` — and
+`KeyCustody::custody_type` returns one of those three. A caller selects a backend with
+the two values in the table above, never with these three. §3.2.2 of the identity
+spec does not govern this report, which names a storage location; it does state the
+values a DID document publishes, which name extractability and an unlock factor.
+
+**Reading a custody type back.** `Identity::custody_type()` hands back the custody
+value the identity was created under, and hands back `"os_keystore"` for an identity
+created through `identity_create_with_custody`. That entry point takes the platform
+key-custody callback, and §3.2.2 of the identity spec gives `os_keystore` to the store
+that callback reaches, so all three bridges stamp the handle with it
+(`crates/scp-ffi/uniffi/src/bridge.rs:2852`; `crates/scp-ffi/src/identity.rs:1522`;
+`crates/scp-ffi/napi/src/scp.rs:644`). The value names the store the callback reaches
+and states nothing about which substrate the injected provider holds the key in.
+§3.2.2 of the identity spec states that limit, and open question OQ-15 of that spec
+asks what makes an `os_keystore` answer checkable.
+
+**Each custody condition carries one code on all three bridges.** A caller who
+switches on the code string reads the same value from Python, from Node, and from
+Swift or Kotlin.
+
+| Condition | Code |
+|-----------|------|
+| `identity_create(custody: "encrypted_file")` with `SCP_KEY_PASSPHRASE` unset or empty, or with `$HOME` unset, or with `$HOME/.scp` uncreatable | `SCP-VALID-7005` |
+| `identity_create(custody: "encrypted_file")` when `$HOME/.scp/keys.bin` will not open | `SCP-IDENT-1001` |
+| `identity_create(custody: "os_keystore")` with no `KeyCustodyProvider` | `SCP-IDENT-1003` |
+| `identity_create` with a custody string outside the vocabulary | `SCP-VALID-7005` |
+| `identity_create(custody: "in_memory")` in a build without the bridge's `testing` feature | `SCP-IDENT-1008` |
+| `identity_published_custody(did)` for a DID this instance retains no custody for | `SCP-IDENT-1001` |
+| `identity_published_custody(did)` when the injected provider fails to answer either question | `SCP-IDENT-1001` |
+
+`SCP-IDENT-1017` is not one of these codes, and the last two rows are where a reader
+might expect it. The registry entry for that code reserves it for a handle carrying no
+signing custody, and names `SCP-IDENT-1001` for a DID an instance never registered
+(`crates/scp-ffi/common/src/error_codes.rs`), which is the condition those two rows
+report.
+
+**`identity_published_custody` reads no DID document.** It reads the two facts off the
+backend running in the calling process and returns the value that backend would publish.
+No shipped path writes a custody attestation into a DID document —
+`ScpKeyCustodyAttestation::derive` and `DidDocument::set_custody_attestation` have no
+caller outside tests — so the operation answers for an identity the calling instance
+created and returns `SCP-IDENT-1001` for every other DID. §3.2.2.1 of the identity spec
+records that as divergence D18 and its open question OQ-17 asks which component writes
+the entry.
+
+**One further gap, independent of custody.** Every create path on every bridge returns
+`SCP-IDENT-1059` in a shipped build, because no production `PreRotationCustody` backend
+is wired (ADR-062, capability injection and prove-absent dev backends). Closing the
+custody gap does not close that one, and closing that one does not close the custody
+gap.
+
 ## Stub and Placeholder Policy
 
 Code that does not fully implement its documented contract (acceptance criterion, ADR spec, or trait method) is a **stub**. Stubs are tolerated during phased implementation but must be traceable to the planning system.

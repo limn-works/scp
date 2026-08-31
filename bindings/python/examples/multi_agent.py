@@ -34,9 +34,9 @@ async def run_agent(scp: SCP, name: str, identity, ctx) -> None:  # type: ignore
 async def main() -> None:
     with SCP(storage={"type": "in_memory"}) as scp:
         # Create identities for coordinator and two agents.
-        coordinator = await scp.identity_create(CustodyType.IN_MEMORY)
-        agent_a = await scp.identity_create(CustodyType.IN_MEMORY)
-        agent_b = await scp.identity_create(CustodyType.IN_MEMORY)
+        coordinator = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
+        agent_a = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
+        agent_b = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
 
         # Coordinator creates the context with broad capabilities.
         ctx = await scp.context_create(

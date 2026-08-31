@@ -1,8 +1,49 @@
 //! Key custody attestation for DID document service entries (ADR-039 Layer 4).
 //!
-//! At identity creation, the DID document includes a service entry declaring
-//! the key custody model for each verification method. This provides a
-//! verifiable signal about how signing keys are stored and protected.
+//! ADR-039's Enforcement Stack layer 4 states that at identity creation the DID
+//! document includes a service entry stating two facts about each verification
+//! method's private key: whether the key can leave the store that holds it, and
+//! which factor a holder presents to unlock it. A stranger reads those two facts
+//! to decide how far to trust the participant.
+//!
+//! No shipped path writes that entry. [`ScpKeyCustodyAttestation::derive`] and
+//! [`crate::document::DidDocument::set_custody_attestation`] have no caller
+//! outside tests, so a party resolving a DID a shipped SDK created finds no
+//! custody service entry and reads the layer-4 absence signal instead. §3.2.2.1
+//! of the identity spec records that as divergence D18, §27.3.4 of the
+//! attestations spec records it as contradiction C30, and open question OQ-17 of
+//! the identity spec asks which component writes the entry.
+//!
+//! The published value names no storage location. A reader deciding whether to
+//! trust a participant does not act on where the key bytes sit; that reader
+//! acts on whether the key can leave and on what a holder must present to use
+//! it.
+//!
+//! [`ScpKeyCustodyAttestation::derive`] takes no custody value. It reads one
+//! off each [`CustodySubstrate`] the caller hands it, so a publisher that
+//! builds an attestation through `derive` names no published value.
+//!
+//! `derive` is not the only path to this struct. Three others build it
+//! without calling `derive`, so the paragraph above states what one
+//! constructor does and states no property of every custody value a reader
+//! meets.
+//!
+//! 1. This struct derives `Deserialize`, and serde's generated implementation
+//!    writes the private fields, so
+//!    [`ScpKeyCustodyAttestation::from_service_entry`] builds an attestation
+//!    out of bytes another participant wrote. A reader parsing a stranger's
+//!    DID document needs the deserializing path.
+//! 2. `DidDocument.service` and the three fields of [`Service`] are public, so
+//!    a caller pushes a custody service entry into a document without calling
+//!    any function of this module.
+//! 3. The `os_keystore` backend answers both facts through the platform
+//!    key-custody callback that an SDK consumer writes, so `derive` reads that
+//!    consumer's self-report for that backend.
+//!
+//! §3.2.2 of the identity spec, which states the custody vocabulary, records
+//! all three paths. §27.4.4 of the attestations spec, which describes the
+//! key-custody attestation record, governs what a consumer concludes from a
+//! published custody value.
 //!
 //! Absence of attestation is a valid state — it is itself a signal ("I cannot
 //! prove my keys are isolated"). The attestation is signed by `#0` (Identity
@@ -17,8 +58,8 @@
 //! # Platform Attestation
 //!
 //! Optional platform-specific proof bytes (Apple App Attest / Android Key
-//! Attestation) can accompany the custody model declaration. These proofs are
-//! opaque to the protocol — verification is platform-specific.
+//! Attestation) can accompany the two published custody values. These proofs
+//! are opaque to the protocol — verification is platform-specific.
 //!
 //! See ADR-039 §Enforcement Stack Layer 4 in `.docs/adrs/phase-1.md`.
 
@@ -31,38 +72,51 @@ use serde::{Deserialize, Serialize};
 /// The service type string for custody attestation entries.
 const CUSTODY_ATTESTATION_SERVICE_TYPE: &str = "ScpKeyCustodyAttestation";
 
-/// Key custody model attestation published in DID document service entries.
+/// Key custody attestation published in DID document service entries.
 ///
-/// Declares how signing keys are stored and protected. Published as a service
-/// entry in the DID document, signed by `#0` as part of document publication.
+/// States, for the `#active` key and for the `#agent` key, whether that key can
+/// leave its store and which factor unlocks it. Published as a service entry in
+/// the DID document, signed by `#0` as part of document publication.
+///
+/// [`ScpKeyCustodyAttestation::derive`] computes both custody values from the
+/// [`CustodySubstrate`] implementations that hold the two keys, and the getters
+/// below read them back. No field is public and no named constructor takes a
+/// [`KeyCustodyModel`], so a caller reaching this type through `derive` names
+/// neither published value.
+///
+/// The derived `Deserialize` implementation writes those private fields, and
+/// [`ScpKeyCustodyAttestation::from_service_entry`] calls it, so an attestation
+/// parsed off a DID document carries whatever its publisher serialized. The
+/// module documentation above lists that path and two others.
 ///
 /// See ADR-039 acceptance criterion 16.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScpKeyCustodyAttestation {
-    /// Custody model for the `#active` key.
-    pub active_key_custody: KeyCustodyModel,
+    /// Published custody value for the `#active` key.
+    active_key_custody: KeyCustodyModel,
 
-    /// Custody model for the `#agent` key. `None` if no agent key exists.
+    /// Published custody value for the `#agent` key. `None` if no agent key
+    /// exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_key_custody: Option<KeyCustodyModel>,
+    agent_key_custody: Option<KeyCustodyModel>,
 
     /// The platform where this identity was created.
-    pub platform: Platform,
+    platform: Platform,
 
     /// Optional platform attestation proof (Apple App Attest / Android Key
     /// Attestation). Opaque to the protocol — verification is platform-specific.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub platform_attestation: Option<PlatformAttestation>,
+    platform_attestation: Option<PlatformAttestation>,
 
     /// Unix timestamp (seconds) when this attestation was created.
-    pub created_at: u64,
+    created_at: u64,
 }
 
 /// The platform where this identity was created.
 ///
 /// Used in custody attestation to indicate the runtime environment, which
-/// affects what key custody models are available (e.g., hardware-biometric
-/// requires iOS or Android).
+/// affects which custody values a participant can publish (e.g., only iOS and
+/// Android ship a store a key cannot leave).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Platform {
@@ -76,28 +130,133 @@ pub enum Platform {
     Browser,
 }
 
-/// How a signing key is stored and protected.
+/// What a DID document publishes about a signing key's custody.
 ///
-/// Ordered from strongest to weakest custody guarantee. The custody model
-/// affects trust evaluation (§7.1) — hardware-biometric provides the strongest
-/// key isolation signal.
+/// Each value states two things and nothing else: whether the private key can
+/// leave the store that holds it, and which factor unlocks it. A reader of a
+/// DID document weighs those two facts in trust evaluation (§7.1); a key that
+/// cannot leave its store constrains an attacker who reaches the device, and a
+/// key that can leave does not.
+///
+/// The three values are the only pairs this vocabulary states.
+/// [`KeyCustodyModel::from_substrate`] maps a [`CustodySubstrate`] onto one of
+/// them and returns [`UnstatableCustody`] for every other pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum KeyCustodyModel {
-    /// Secure Enclave / Android Keystore with biometric unlock.
-    /// Strongest custody: key material never leaves hardware, access requires
-    /// biometric authentication.
-    HardwareBiometric,
+    /// The private key cannot leave its store, and a biometric reading unlocks
+    /// it.
+    NonExtractableBiometric,
 
-    /// Hardware-backed key storage with PIN unlock.
-    /// Key material in hardware but unlock uses knowledge factor (PIN/password)
-    /// rather than biometric.
-    HardwarePin,
+    /// The private key cannot leave its store, and a PIN unlocks it.
+    NonExtractablePin,
 
-    /// Software keychain storage.
-    /// Key material in software — no hardware isolation. Typical for agent keys
-    /// and software-only platforms.
-    Software,
+    /// The private key can leave its store, and a passphrase unlocks it.
+    ExtractablePassphrase,
+}
+
+/// Which factor a holder presents to unlock a private key.
+///
+/// One of the two facts a [`CustodySubstrate`] reports about itself. Three of
+/// these variants name a factor a published [`KeyCustodyModel`] value also
+/// names; the other two name states the published vocabulary does not cover, so
+/// a substrate reporting one of them publishes no custody value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnlockFactor {
+    /// A biometric reading unlocks the key.
+    Biometric,
+
+    /// A PIN unlocks the key.
+    Pin,
+
+    /// A passphrase unlocks the key.
+    Passphrase,
+
+    /// A key the caller supplied unlocks the store, and the backend never
+    /// learns what protects that supplied key, so the backend cannot name the
+    /// factor a holder presents.
+    CallerSuppliedKey,
+
+    /// Nothing unlocks the key, because nothing gates access to it.
+    Unprotected,
+}
+
+/// A running key-custody backend, reporting the two facts a published custody
+/// value states.
+///
+/// A backend implements this trait about itself.
+/// [`ScpKeyCustodyAttestation::derive`] takes the implementation rather than a
+/// [`KeyCustodyModel`], so a participant who derives an attestation publishes
+/// what the backend running in that process reported. Two limits bound what a
+/// reader may conclude from a published value. First, a backend reached
+/// through the platform key-custody callback reports what the SDK consumer's
+/// adapter answers, which §3.2.2 of the identity spec records as a
+/// self-report. Second, a publisher that skips `derive` writes the published
+/// value directly, by one of the three paths the module documentation lists.
+pub trait CustodySubstrate {
+    /// Whether the private key can leave the store this backend holds it in.
+    fn key_is_extractable(&self) -> bool;
+
+    /// Which factor unlocks the key.
+    fn unlock_factor(&self) -> UnlockFactor;
+}
+
+/// A [`CustodySubstrate`] reported a pair that the published custody vocabulary
+/// states no value for.
+///
+/// [`KeyCustodyModel`] states three pairs. A backend that reports any other
+/// pair — an extractable key a biometric unlocks, a store a caller-supplied key
+/// unlocks, a store nothing gates — gets this error, and its publisher
+/// publishes no custody attestation. This module's opening paragraphs name that
+/// absence a valid state, so failing here costs a reader a signal and tells the
+/// reader no falsehood.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnstatableCustody {
+    /// Whether the substrate reported that the private key can leave its store.
+    pub key_is_extractable: bool,
+
+    /// The factor the substrate reported.
+    pub unlock_factor: UnlockFactor,
+}
+
+impl fmt::Display for UnstatableCustody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the published custody vocabulary states no value for a key that {} \
+             and that {:?} unlocks",
+            if self.key_is_extractable {
+                "can leave its store"
+            } else {
+                "cannot leave its store"
+            },
+            self.unlock_factor
+        )
+    }
+}
+
+impl std::error::Error for UnstatableCustody {}
+
+impl KeyCustodyModel {
+    /// Reads the published custody value off a running custody backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnstatableCustody`] when the backend reports a pair the three
+    /// published values do not state.
+    pub fn from_substrate(substrate: &dyn CustodySubstrate) -> Result<Self, UnstatableCustody> {
+        let key_is_extractable = substrate.key_is_extractable();
+        let unlock_factor = substrate.unlock_factor();
+        match (key_is_extractable, unlock_factor) {
+            (false, UnlockFactor::Biometric) => Ok(Self::NonExtractableBiometric),
+            (false, UnlockFactor::Pin) => Ok(Self::NonExtractablePin),
+            (true, UnlockFactor::Passphrase) => Ok(Self::ExtractablePassphrase),
+            _ => Err(UnstatableCustody {
+                key_is_extractable,
+                unlock_factor,
+            }),
+        }
+    }
 }
 
 /// Platform-specific attestation proof.
@@ -168,22 +327,81 @@ mod serde_proof_bytes {
 }
 
 impl ScpKeyCustodyAttestation {
-    /// Create a new custody attestation.
-    #[must_use]
-    pub const fn new(
-        active_key_custody: KeyCustodyModel,
-        agent_key_custody: Option<KeyCustodyModel>,
+    /// Derives a custody attestation from the custody backends that hold the
+    /// two keys.
+    ///
+    /// This function is the only named constructor in this module, and it
+    /// takes no custody value. The caller passes the backends it runs, and
+    /// this function reads each published custody value off its backend. The
+    /// derived `Deserialize` implementation builds the same struct out of
+    /// bytes, and [`ScpKeyCustodyAttestation::from_service_entry`] calls it, so
+    /// an attestation that arrived over the wire carries whatever its publisher
+    /// serialized.
+    ///
+    /// # Arguments
+    ///
+    /// * `active` — the backend holding the `#active` key.
+    /// * `agent` — the backend holding the `#agent` key, or `None` when the
+    ///   identity has no agent key.
+    /// * `platform` — the runtime environment this identity was created on.
+    /// * `platform_attestation` — an optional platform proof, opaque to SCP.
+    /// * `created_at` — Unix timestamp in seconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnstatableCustody`] when either backend reports a pair the
+    /// published vocabulary states no value for. The caller then publishes no
+    /// custody attestation, which this module's opening paragraphs name a valid
+    /// state.
+    pub fn derive(
+        active: &dyn CustodySubstrate,
+        agent: Option<&dyn CustodySubstrate>,
         platform: Platform,
         platform_attestation: Option<PlatformAttestation>,
         created_at: u64,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, UnstatableCustody> {
+        let active_key_custody = KeyCustodyModel::from_substrate(active)?;
+        let agent_key_custody = agent.map(KeyCustodyModel::from_substrate).transpose()?;
+
+        Ok(Self {
             active_key_custody,
             agent_key_custody,
             platform,
             platform_attestation,
             created_at,
-        }
+        })
+    }
+
+    /// Returns the published custody value for the `#active` key.
+    #[must_use]
+    pub const fn active_key_custody(&self) -> KeyCustodyModel {
+        self.active_key_custody
+    }
+
+    /// Returns the published custody value for the `#agent` key, or `None` when
+    /// the attestation carries none.
+    #[must_use]
+    pub const fn agent_key_custody(&self) -> Option<KeyCustodyModel> {
+        self.agent_key_custody
+    }
+
+    /// Returns the platform this identity was created on.
+    #[must_use]
+    pub const fn platform(&self) -> Platform {
+        self.platform
+    }
+
+    /// Returns the platform attestation proof, or `None` when the attestation
+    /// carries none.
+    #[must_use]
+    pub const fn platform_attestation(&self) -> Option<&PlatformAttestation> {
+        self.platform_attestation.as_ref()
+    }
+
+    /// Returns the Unix timestamp in seconds when this attestation was created.
+    #[must_use]
+    pub const fn created_at(&self) -> u64 {
+        self.created_at
     }
 
     /// Creates a DID document service entry for this custody attestation.
@@ -215,6 +433,14 @@ impl ScpKeyCustodyAttestation {
     }
 
     /// Parses a custody attestation from a DID document service entry.
+    ///
+    /// This function checks the service type and the JSON syntax, and it checks
+    /// nothing about the custody values the bytes state. A publisher writes any
+    /// of the three published values into a service entry, so an attestation
+    /// this function returns records what that publisher serialized rather than
+    /// what that publisher's backend reported. §27.4.4 of the attestations
+    /// spec, which describes the key-custody attestation record, governs what a
+    /// consumer concludes from a parsed value.
     ///
     /// # Arguments
     ///
@@ -572,58 +798,212 @@ mod tests {
         "did:dht:zTestCustody"
     }
 
+    /// A custody backend that reports whatever the test tells it to report.
+    struct FakeSubstrate {
+        key_is_extractable: bool,
+        unlock_factor: UnlockFactor,
+    }
+
+    impl CustodySubstrate for FakeSubstrate {
+        fn key_is_extractable(&self) -> bool {
+            self.key_is_extractable
+        }
+
+        fn unlock_factor(&self) -> UnlockFactor {
+            self.unlock_factor
+        }
+    }
+
+    /// A backend whose key cannot leave its store and that a biometric unlocks.
+    const fn non_extractable_biometric() -> FakeSubstrate {
+        FakeSubstrate {
+            key_is_extractable: false,
+            unlock_factor: UnlockFactor::Biometric,
+        }
+    }
+
+    /// A backend whose key cannot leave its store and that a PIN unlocks.
+    const fn non_extractable_pin() -> FakeSubstrate {
+        FakeSubstrate {
+            key_is_extractable: false,
+            unlock_factor: UnlockFactor::Pin,
+        }
+    }
+
+    /// A backend whose key can leave its store and that a passphrase unlocks.
+    const fn extractable_passphrase() -> FakeSubstrate {
+        FakeSubstrate {
+            key_is_extractable: true,
+            unlock_factor: UnlockFactor::Passphrase,
+        }
+    }
+
+    /// Derives an attestation and unwraps it, for the tests whose substrates
+    /// all map onto a published value.
+    fn derive_ok(
+        active: &dyn CustodySubstrate,
+        agent: Option<&dyn CustodySubstrate>,
+        platform: Platform,
+        platform_attestation: Option<PlatformAttestation>,
+    ) -> ScpKeyCustodyAttestation {
+        ScpKeyCustodyAttestation::derive(
+            active,
+            agent,
+            platform,
+            platform_attestation,
+            1_700_000_000,
+        )
+        .unwrap()
+    }
+
     // --- Construction tests ---
 
     #[test]
-    fn attestation_with_hardware_biometric_model() {
-        let attestation = ScpKeyCustodyAttestation {
-            active_key_custody: KeyCustodyModel::HardwareBiometric,
-            agent_key_custody: Some(KeyCustodyModel::Software),
-            platform: Platform::Ios,
-            platform_attestation: None,
-            created_at: 1_700_000_000,
-        };
+    fn attestation_with_non_extractable_biometric_value() {
+        let attestation = derive_ok(
+            &non_extractable_biometric(),
+            Some(&extractable_passphrase()),
+            Platform::Ios,
+            None,
+        );
 
         assert_eq!(
-            attestation.active_key_custody,
-            KeyCustodyModel::HardwareBiometric
+            attestation.active_key_custody(),
+            KeyCustodyModel::NonExtractableBiometric
         );
         assert_eq!(
-            attestation.agent_key_custody,
-            Some(KeyCustodyModel::Software)
+            attestation.agent_key_custody(),
+            Some(KeyCustodyModel::ExtractablePassphrase)
         );
-        assert!(attestation.platform_attestation.is_none());
+        assert!(attestation.platform_attestation().is_none());
     }
 
     #[test]
-    fn attestation_with_software_model() {
-        let attestation = ScpKeyCustodyAttestation {
-            active_key_custody: KeyCustodyModel::Software,
-            agent_key_custody: None,
-            platform: Platform::Desktop,
-            platform_attestation: None,
-            created_at: 1_700_000_000,
-        };
+    fn attestation_with_extractable_passphrase_value() {
+        let attestation = derive_ok(&extractable_passphrase(), None, Platform::Desktop, None);
 
-        assert_eq!(attestation.active_key_custody, KeyCustodyModel::Software);
-        assert!(attestation.agent_key_custody.is_none());
-        assert!(attestation.platform_attestation.is_none());
+        assert_eq!(
+            attestation.active_key_custody(),
+            KeyCustodyModel::ExtractablePassphrase
+        );
+        assert!(attestation.agent_key_custody().is_none());
+        assert!(attestation.platform_attestation().is_none());
     }
 
     #[test]
-    fn attestation_with_hardware_pin_model() {
-        let attestation = ScpKeyCustodyAttestation {
-            active_key_custody: KeyCustodyModel::HardwarePin,
-            agent_key_custody: Some(KeyCustodyModel::HardwarePin),
-            platform: Platform::Android,
-            platform_attestation: None,
-            created_at: 1_700_000_000,
+    fn attestation_with_non_extractable_pin_value() {
+        let attestation = derive_ok(
+            &non_extractable_pin(),
+            Some(&non_extractable_pin()),
+            Platform::Android,
+            None,
+        );
+
+        assert_eq!(
+            attestation.active_key_custody(),
+            KeyCustodyModel::NonExtractablePin
+        );
+        assert_eq!(
+            attestation.agent_key_custody(),
+            Some(KeyCustodyModel::NonExtractablePin)
+        );
+    }
+
+    // --- Derivation tests ---
+
+    #[test]
+    fn from_substrate_maps_the_three_published_pairs() {
+        assert_eq!(
+            KeyCustodyModel::from_substrate(&non_extractable_biometric()).unwrap(),
+            KeyCustodyModel::NonExtractableBiometric
+        );
+        assert_eq!(
+            KeyCustodyModel::from_substrate(&non_extractable_pin()).unwrap(),
+            KeyCustodyModel::NonExtractablePin
+        );
+        assert_eq!(
+            KeyCustodyModel::from_substrate(&extractable_passphrase()).unwrap(),
+            KeyCustodyModel::ExtractablePassphrase
+        );
+    }
+
+    #[test]
+    fn from_substrate_rejects_every_pair_the_vocabulary_does_not_state() {
+        let unstatable = [
+            (true, UnlockFactor::Biometric),
+            (true, UnlockFactor::Pin),
+            (false, UnlockFactor::Passphrase),
+            (true, UnlockFactor::CallerSuppliedKey),
+            (false, UnlockFactor::CallerSuppliedKey),
+            (true, UnlockFactor::Unprotected),
+            (false, UnlockFactor::Unprotected),
+        ];
+
+        for (key_is_extractable, unlock_factor) in unstatable {
+            let substrate = FakeSubstrate {
+                key_is_extractable,
+                unlock_factor,
+            };
+            let err = KeyCustodyModel::from_substrate(&substrate).unwrap_err();
+            assert_eq!(err.key_is_extractable, key_is_extractable);
+            assert_eq!(err.unlock_factor, unlock_factor);
+        }
+    }
+
+    #[test]
+    fn derive_rejects_an_unstatable_active_substrate() {
+        let unprotected = FakeSubstrate {
+            key_is_extractable: true,
+            unlock_factor: UnlockFactor::Unprotected,
         };
 
-        assert_eq!(attestation.active_key_custody, KeyCustodyModel::HardwarePin);
-        assert_eq!(
-            attestation.agent_key_custody,
-            Some(KeyCustodyModel::HardwarePin)
+        let err = ScpKeyCustodyAttestation::derive(
+            &unprotected,
+            None,
+            Platform::Desktop,
+            None,
+            1_700_000_000,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.unlock_factor, UnlockFactor::Unprotected);
+    }
+
+    #[test]
+    fn derive_rejects_an_unstatable_agent_substrate() {
+        let unprotected = FakeSubstrate {
+            key_is_extractable: true,
+            unlock_factor: UnlockFactor::Unprotected,
+        };
+
+        let err = ScpKeyCustodyAttestation::derive(
+            &extractable_passphrase(),
+            Some(&unprotected),
+            Platform::Desktop,
+            None,
+            1_700_000_000,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.unlock_factor, UnlockFactor::Unprotected);
+    }
+
+    #[test]
+    fn unstatable_custody_display_names_both_facts() {
+        let err = KeyCustodyModel::from_substrate(&FakeSubstrate {
+            key_is_extractable: true,
+            unlock_factor: UnlockFactor::Unprotected,
+        })
+        .unwrap_err();
+
+        let text = err.to_string();
+        assert!(
+            text.contains("can leave its store"),
+            "error should name extractability, got: {text}"
+        );
+        assert!(
+            text.contains("Unprotected"),
+            "error should name the factor, got: {text}"
         );
     }
 
@@ -631,13 +1011,12 @@ mod tests {
 
     #[test]
     fn roundtrip_through_service_entry_without_platform_attestation() {
-        let original = ScpKeyCustodyAttestation {
-            active_key_custody: KeyCustodyModel::HardwareBiometric,
-            agent_key_custody: Some(KeyCustodyModel::Software),
-            platform: Platform::Ios,
-            platform_attestation: None,
-            created_at: 1_700_000_000,
-        };
+        let original = derive_ok(
+            &non_extractable_biometric(),
+            Some(&extractable_passphrase()),
+            Platform::Ios,
+            None,
+        );
 
         let service = original.to_service_entry(test_did()).unwrap();
         assert_eq!(service.service_type, "ScpKeyCustodyAttestation");
@@ -650,26 +1029,25 @@ mod tests {
     #[test]
     fn roundtrip_through_service_entry_with_platform_attestation() {
         let proof_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
-        let original = ScpKeyCustodyAttestation {
-            active_key_custody: KeyCustodyModel::HardwareBiometric,
-            agent_key_custody: Some(KeyCustodyModel::Software),
-            platform: Platform::Ios,
-            platform_attestation: Some(PlatformAttestation {
+        let original = derive_ok(
+            &non_extractable_biometric(),
+            Some(&extractable_passphrase()),
+            Platform::Ios,
+            Some(PlatformAttestation {
                 platform: AttestationPlatform::AppleAppAttest,
                 proof: proof_bytes,
             }),
-            created_at: 1_700_000_000,
-        };
+        );
 
         let service = original.to_service_entry(test_did()).unwrap();
         let parsed = ScpKeyCustodyAttestation::from_service_entry(&service).unwrap();
         assert_eq!(original, parsed);
         assert_eq!(
-            parsed.platform_attestation.as_ref().unwrap().proof,
+            parsed.platform_attestation().unwrap().proof,
             [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04]
         );
         assert_eq!(
-            parsed.platform_attestation.as_ref().unwrap().platform,
+            parsed.platform_attestation().unwrap().platform,
             AttestationPlatform::AppleAppAttest
         );
     }
@@ -677,35 +1055,28 @@ mod tests {
     #[test]
     fn roundtrip_with_android_key_attestation() {
         let proof_bytes = vec![0x01; 128]; // Simulated certificate chain
-        let original = ScpKeyCustodyAttestation {
-            active_key_custody: KeyCustodyModel::HardwarePin,
-            agent_key_custody: None,
-            platform: Platform::Android,
-            platform_attestation: Some(PlatformAttestation {
+        let original = derive_ok(
+            &non_extractable_pin(),
+            None,
+            Platform::Android,
+            Some(PlatformAttestation {
                 platform: AttestationPlatform::AndroidKeyAttestation,
                 proof: proof_bytes,
             }),
-            created_at: 1_700_000_000,
-        };
+        );
 
         let service = original.to_service_entry(test_did()).unwrap();
         let parsed = ScpKeyCustodyAttestation::from_service_entry(&service).unwrap();
         assert_eq!(original, parsed);
         assert_eq!(
-            parsed.platform_attestation.as_ref().unwrap().platform,
+            parsed.platform_attestation().unwrap().platform,
             AttestationPlatform::AndroidKeyAttestation
         );
     }
 
     #[test]
-    fn roundtrip_software_only_no_agent_key() {
-        let original = ScpKeyCustodyAttestation {
-            active_key_custody: KeyCustodyModel::Software,
-            agent_key_custody: None,
-            platform: Platform::Browser,
-            platform_attestation: None,
-            created_at: 1_700_000_000,
-        };
+    fn roundtrip_extractable_only_no_agent_key() {
+        let original = derive_ok(&extractable_passphrase(), None, Platform::Browser, None);
 
         let service = original.to_service_entry(test_did()).unwrap();
         let parsed = ScpKeyCustodyAttestation::from_service_entry(&service).unwrap();
@@ -715,6 +1086,79 @@ mod tests {
         // platform_attestation fields when they are None.
         assert!(!service.service_endpoint.contains("agent_key_custody"));
         assert!(!service.service_endpoint.contains("platform_attestation"));
+    }
+
+    // --- What the module documentation claims, and what it does not ---
+    //
+    // The module documentation states that `derive` names no custody value and
+    // that three paths build the same struct without calling `derive`. The two
+    // tests below exercise the first and second of those paths, so an edit that
+    // narrows either path without narrowing the documentation turns one of
+    // these tests red.
+
+    /// A custody service entry whose JSON states `custody`, published by a
+    /// caller who never called [`ScpKeyCustodyAttestation::derive`].
+    fn hand_written_entry(custody: &str, platform: &str) -> Service {
+        Service {
+            id: format!("{}#custody-attestation", test_did()),
+            service_type: CUSTODY_ATTESTATION_SERVICE_TYPE.to_owned(),
+            service_endpoint: format!(
+                r#"{{"active_key_custody":"{custody}","platform":"{platform}","created_at":1700000000}}"#
+            ),
+        }
+    }
+
+    /// Path 1 of the module documentation: the derived `Deserialize`
+    /// implementation writes the private fields, so `from_service_entry`
+    /// returns the custody value the bytes state and checks nothing about it.
+    #[test]
+    fn from_service_entry_carries_whatever_the_publisher_serialized() {
+        let entry = hand_written_entry("non-extractable-biometric", "ios");
+
+        let parsed = ScpKeyCustodyAttestation::from_service_entry(&entry)
+            .expect("a syntactically valid custody entry parses");
+
+        assert_eq!(
+            parsed.active_key_custody(),
+            KeyCustodyModel::NonExtractableBiometric,
+            "a parsed attestation states the value its publisher serialized"
+        );
+        assert_eq!(parsed.platform(), Platform::Ios);
+
+        let reemitted = parsed
+            .to_service_entry(test_did())
+            .expect("a parsed attestation serializes back");
+        assert!(
+            reemitted
+                .service_endpoint
+                .contains("non-extractable-biometric"),
+            "re-emitting must carry the parsed value, got: {}",
+            reemitted.service_endpoint
+        );
+    }
+
+    /// Path 2 of the module documentation: `DidDocument.service` and the three
+    /// fields of `Service` are public, so a caller publishes a custody entry
+    /// without calling `set_custody_attestation` or any other function of this
+    /// module, and `custody_attestation` reads that entry back.
+    #[test]
+    fn a_hand_written_service_entry_reaches_a_did_document() {
+        let mut document =
+            crate::document::DidDocument::new(test_did(), &[7_u8; 32], &[9_u8; 32], &[3_u8; 32]);
+
+        document
+            .service
+            .push(hand_written_entry("non-extractable-pin", "android"));
+
+        let read_back = document
+            .custody_attestation()
+            .expect("the pushed entry parses")
+            .expect("the document carries a custody attestation");
+        assert_eq!(
+            read_back.active_key_custody(),
+            KeyCustodyModel::NonExtractablePin,
+            "a document publishes the value a caller pushed into its service vector"
+        );
     }
 
     // --- Error cases ---
@@ -757,16 +1201,15 @@ mod tests {
 
     #[test]
     fn serde_json_roundtrip() {
-        let attestation = ScpKeyCustodyAttestation {
-            active_key_custody: KeyCustodyModel::HardwareBiometric,
-            agent_key_custody: Some(KeyCustodyModel::Software),
-            platform: Platform::Ios,
-            platform_attestation: Some(PlatformAttestation {
+        let attestation = derive_ok(
+            &non_extractable_biometric(),
+            Some(&extractable_passphrase()),
+            Platform::Ios,
+            Some(PlatformAttestation {
                 platform: AttestationPlatform::AppleAppAttest,
                 proof: vec![1, 2, 3, 4, 5],
             }),
-            created_at: 1_700_000_000,
-        };
+        );
 
         let json = serde_json::to_string(&attestation).unwrap();
         let parsed: ScpKeyCustodyAttestation = serde_json::from_str(&json).unwrap();
@@ -775,25 +1218,36 @@ mod tests {
 
     #[test]
     fn serde_key_custody_model_kebab_case() {
-        // Verify enum variants serialize as kebab-case strings.
-        let hw_bio = serde_json::to_string(&KeyCustodyModel::HardwareBiometric).unwrap();
-        assert_eq!(hw_bio, "\"hardware-biometric\"");
+        // Each published value serializes to the wire form its name states.
+        let biometric = serde_json::to_string(&KeyCustodyModel::NonExtractableBiometric).unwrap();
+        assert_eq!(biometric, "\"non-extractable-biometric\"");
 
-        let hw_pin = serde_json::to_string(&KeyCustodyModel::HardwarePin).unwrap();
-        assert_eq!(hw_pin, "\"hardware-pin\"");
+        let pin = serde_json::to_string(&KeyCustodyModel::NonExtractablePin).unwrap();
+        assert_eq!(pin, "\"non-extractable-pin\"");
 
-        let sw = serde_json::to_string(&KeyCustodyModel::Software).unwrap();
-        assert_eq!(sw, "\"software\"");
+        let passphrase = serde_json::to_string(&KeyCustodyModel::ExtractablePassphrase).unwrap();
+        assert_eq!(passphrase, "\"extractable-passphrase\"");
 
         // Verify round-trip from strings.
-        let parsed: KeyCustodyModel = serde_json::from_str("\"hardware-biometric\"").unwrap();
-        assert_eq!(parsed, KeyCustodyModel::HardwareBiometric);
+        let parsed: KeyCustodyModel =
+            serde_json::from_str("\"non-extractable-biometric\"").unwrap();
+        assert_eq!(parsed, KeyCustodyModel::NonExtractableBiometric);
 
-        let parsed: KeyCustodyModel = serde_json::from_str("\"hardware-pin\"").unwrap();
-        assert_eq!(parsed, KeyCustodyModel::HardwarePin);
+        let parsed: KeyCustodyModel = serde_json::from_str("\"non-extractable-pin\"").unwrap();
+        assert_eq!(parsed, KeyCustodyModel::NonExtractablePin);
 
-        let parsed: KeyCustodyModel = serde_json::from_str("\"software\"").unwrap();
-        assert_eq!(parsed, KeyCustodyModel::Software);
+        let parsed: KeyCustodyModel = serde_json::from_str("\"extractable-passphrase\"").unwrap();
+        assert_eq!(parsed, KeyCustodyModel::ExtractablePassphrase);
+    }
+
+    #[test]
+    fn serde_rejects_the_three_replaced_wire_forms() {
+        for retired in ["\"hardware-biometric\"", "\"hardware-pin\"", "\"software\""] {
+            assert!(
+                serde_json::from_str::<KeyCustodyModel>(retired).is_err(),
+                "the published vocabulary must no longer parse {retired}"
+            );
+        }
     }
 
     #[test]
@@ -885,42 +1339,37 @@ mod tests {
             Platform::Desktop,
             Platform::Browser,
         ] {
-            let attestation = ScpKeyCustodyAttestation {
-                active_key_custody: KeyCustodyModel::Software,
-                agent_key_custody: None,
-                platform,
-                platform_attestation: None,
-                created_at: 1_700_000_000,
-            };
+            let attestation = derive_ok(&extractable_passphrase(), None, platform, None);
 
             let service = attestation.to_service_entry(test_did()).unwrap();
             let parsed = ScpKeyCustodyAttestation::from_service_entry(&service).unwrap();
             assert_eq!(attestation, parsed);
-            assert_eq!(parsed.platform, platform);
+            assert_eq!(parsed.platform(), platform);
         }
     }
 
     #[test]
-    fn new_constructor() {
-        let attestation = ScpKeyCustodyAttestation::new(
-            KeyCustodyModel::HardwareBiometric,
-            Some(KeyCustodyModel::Software),
+    fn derive_fills_every_field() {
+        let attestation = ScpKeyCustodyAttestation::derive(
+            &non_extractable_biometric(),
+            Some(&extractable_passphrase()),
             Platform::Ios,
             None,
             1_700_000_000,
-        );
+        )
+        .unwrap();
 
         assert_eq!(
-            attestation.active_key_custody,
-            KeyCustodyModel::HardwareBiometric
+            attestation.active_key_custody(),
+            KeyCustodyModel::NonExtractableBiometric
         );
         assert_eq!(
-            attestation.agent_key_custody,
-            Some(KeyCustodyModel::Software)
+            attestation.agent_key_custody(),
+            Some(KeyCustodyModel::ExtractablePassphrase)
         );
-        assert_eq!(attestation.platform, Platform::Ios);
-        assert!(attestation.platform_attestation.is_none());
-        assert_eq!(attestation.created_at, 1_700_000_000);
+        assert_eq!(attestation.platform(), Platform::Ios);
+        assert!(attestation.platform_attestation().is_none());
+        assert_eq!(attestation.created_at(), 1_700_000_000);
     }
 
     // ===================================================================

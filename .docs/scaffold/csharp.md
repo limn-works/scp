@@ -164,7 +164,10 @@ public sealed class Identity : IAsyncDisposable
     public string Did => NativeLib.GetDid(_handle);
     public string CustodyType => NativeLib.GetCustodyType(_handle);
 
-    public static async Task<Identity> CreateAsync(string custody = "platform")
+    // custody carries no default: §3.2.2 of the identity spec, the custody
+    // vocabulary, names "encrypted_file" and "os_keystore", and the agent-first
+    // API design tenet forbids an SDK choosing between them for a caller.
+    public static async Task<Identity> CreateAsync(string custody)
     {
         // Task.Run offloads blocking FFI to thread pool. If FFI throughput becomes
         // a bottleneck, consider a dedicated thread or async FFI callbacks.

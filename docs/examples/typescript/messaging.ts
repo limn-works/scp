@@ -17,8 +17,8 @@ import type { ContextParams, Message } from "@limn-works/scp-ts";
 
 async function main(): Promise<void> {
   // 1. Create two identities.
-  const alice = await Identity.create({ custody: "in_memory" });
-  const bob = await Identity.create({ custody: "in_memory" });
+  const alice = await Identity.create({ custody: "encrypted_file" });
+  const bob = await Identity.create({ custody: "encrypted_file" });
   console.log(`Alice: ${alice.did}`);
   console.log(`Bob:   ${bob.did}`);
 

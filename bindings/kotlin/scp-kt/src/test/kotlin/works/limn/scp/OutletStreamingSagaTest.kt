@@ -356,7 +356,7 @@ class StreamingSagaRecoverTest {
             val scp = SCP(StorageConfig.InMemory)
             try {
                 scp.configureLocalTransport(localDid = "did:key:z6MkKotlinStreamingSagaRecoverTest")
-                val identity = scp.identityCreate(custody = "in_memory")
+                val identity = scp.identityCreateInTestHarnessCustody()
                 assertFailsWith<ScpException> {
                     scp.recoverStreamingSagaTruncatedClose(
                         sagaId = "nonexistent-saga-id",

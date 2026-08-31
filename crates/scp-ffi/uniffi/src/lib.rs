@@ -459,7 +459,42 @@ pub trait KeyCustodyProvider: Send + Sync {
 
     /// Return the custody type for `key_id`: `"hardware"`, `"software"`, or
     /// `"in_memory"`. Stays sync — no I/O required.
+    ///
+    /// The three values name a storage location, which
+    /// `scp_platform::CustodyType` consumes. What a DID document publishes
+    /// about custody is a different pair of questions, and
+    /// [`Self::key_is_extractable`] and [`Self::unlock_factor`] answer those.
     fn custody_type(&self, key_id: String) -> String;
+
+    /// Return whether the private key `key_id` names can leave the store this
+    /// provider holds it in.
+    ///
+    /// One of the two facts a DID document publishes about custody (§3.2.2 of
+    /// the identity spec). Stays sync: an Apple adapter reads
+    /// `kSecAttrIsExtractable` through `SecItemCopyMatching`, and an Android
+    /// adapter reads `KeyInfo`, both of which are synchronous platform calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError` when the provider cannot read the attribute, for
+    /// example when `key_id` names no key it holds. A bridge that reads an
+    /// error publishes no custody value for that key.
+    fn key_is_extractable(&self, key_id: String) -> Result<bool, ScpError>;
+
+    /// Return which factor unlocks the key `key_id` names: one of
+    /// `"biometric"`, `"pin"`, `"passphrase"`, `"caller_supplied_key"`, or
+    /// `"unprotected"`.
+    ///
+    /// The other fact a DID document publishes about custody (§3.2.2 of the
+    /// identity spec). A string outside that set publishes no custody value
+    /// rather than a guess, so an adapter that cannot name the factor is free
+    /// to say so.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError` when the provider cannot read the attribute. A
+    /// bridge that reads an error publishes no custody value for that key.
+    fn unlock_factor(&self, key_id: String) -> Result<String, ScpError>;
 }
 
 /// Callback for platform persistent key-value storage.
@@ -632,30 +667,175 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 4);
     }
 
+    /// `"in_memory"` is the test-harness custody string §3.2.2 of the identity
+    /// spec calls a test affordance rather than a value of the vocabulary, and
+    /// the `testing` feature decides whether the factory builds a backend for
+    /// it. That feature compiles the `InMemoryKeyCustody` nullifier; a shipped
+    /// build severs it, so the factory declines the string with
+    /// `SCP-IDENT-1008` (ADR-062 §Decision 6).
     #[test]
-    fn parse_custody_method_accepts_known_values() {
-        use crate::bridge::parse_custody_method;
+    fn build_key_custody_admits_in_memory_per_compiled_feature() {
+        use crate::bridge::build_key_custody;
 
-        assert!(matches!(
-            parse_custody_method("in_memory"),
-            Ok(bridge::CustodyMethod::InMemory)
-        ));
-        assert!(matches!(
-            parse_custody_method("platform"),
-            Ok(bridge::CustodyMethod::Platform)
-        ));
-        assert!(matches!(
-            parse_custody_method("software"),
-            Ok(bridge::CustodyMethod::Software)
-        ));
+        let result = build_key_custody("in_memory", None, None);
+
+        #[cfg(feature = "testing")]
+        match result {
+            Ok((_, bridge::CustodyMethod::InMemory)) => {}
+            Ok((_, other)) => panic!("expected CustodyMethod::InMemory, got: {other:?}"),
+            Err(other) => panic!("expected Ok(CustodyMethod::InMemory), got: {other:?}"),
+        }
+
+        #[cfg(not(feature = "testing"))]
+        match result {
+            Err(ScpError::Identity { code, msg }) => {
+                assert_eq!(code, "SCP-IDENT-1008");
+                assert!(
+                    msg.contains("identity_create_with_custody()"),
+                    "message must name the injection entry point, got: {msg}"
+                );
+                // That entry point reaches `no_pre_rotation_backend` on this
+                // build, so the message states what it returns rather than
+                // sending the reader to a second closed door.
+                assert!(
+                    msg.contains("SCP-IDENT-1059"),
+                    "message must state what that entry point returns on a \
+                     shipped build, got: {msg}"
+                );
+            }
+            other => panic!("expected SCP-IDENT-1008 for in_memory, got: {other:?}"),
+        }
     }
 
+    /// A DID this instance retains no custody for reads `SCP-IDENT-1001`, the
+    /// code the `PyO3` and NAPI bridges already returned for the same miss.
+    ///
+    /// This bridge returned `SCP-IDENT-1017` until §3.2.2 of the identity spec,
+    /// the custody vocabulary, landed. The registry entry for `IDENT_1017`
+    /// reserves that code for a handle carrying no signing custody and names
+    /// `IDENT_1001` for a DID an instance never registered
+    /// (`crates/scp-ffi/common/src/error_codes.rs`), which is the condition
+    /// here. A consumer branching on the code string took one branch on Swift
+    /// or Kotlin and the other on Node against one written contract.
     #[test]
-    fn parse_custody_method_rejects_unknown_value() {
-        use crate::bridge::parse_custody_method;
+    fn published_custody_reports_a_registry_miss_with_ident_1001() {
+        let scp = scp_test();
 
-        let result = parse_custody_method("unknown");
-        assert!(matches!(result, Err(ScpError::Validation { .. })));
+        let result = runtime()
+            .block_on(scp.identity_published_custody("did:dht:z6MkNotRegistered".to_owned()));
+
+        match result {
+            Err(ScpError::Identity { code, msg }) => {
+                assert_eq!(
+                    code,
+                    codes::IDENT_1001,
+                    "a registry miss must carry the registry-miss code, got: {msg}"
+                );
+            }
+            other => panic!("expected SCP-IDENT-1001 for an unregistered DID, got: {other:?}"),
+        }
+    }
+
+    /// `"os_keystore"` names the operating system's own key store, which sits
+    /// behind a `KeyCustodyProvider` callback. `identity_create` supplies no
+    /// provider, so the value fails closed with `SCP-IDENT-1003` rather than
+    /// falling back to `encrypted_file` or to an in-memory store. §3.2.2 of the
+    /// identity spec states that rule and cites the no-dev-stand-in tenet of
+    /// `CLAUDE.md` as the rule it applies.
+    #[test]
+    fn os_keystore_without_a_provider_fails_closed_with_ident_1003() {
+        use crate::bridge::build_key_custody;
+
+        match build_key_custody("os_keystore", None, None) {
+            Err(ScpError::Identity { code, msg }) => {
+                assert_eq!(code, "SCP-IDENT-1003");
+                assert!(
+                    msg.contains("identity_create_with_custody()"),
+                    "message must name the entry point that takes a provider, got: {msg}"
+                );
+            }
+            other => panic!("expected SCP-IDENT-1003 for os_keystore, got: {other:?}"),
+        }
+    }
+
+    /// Every string §3.2.2 of the identity spec retired carries
+    /// `SCP-VALID-7005`, the code the `PyO3` and napi bridges return for a
+    /// string outside the vocabulary.
+    ///
+    /// `platform` and `software` once parsed into custody backends or into
+    /// their own rejections on one bridge or another, `file` was the `PyO3`
+    /// bridge's spelling of the encrypted key file, and `platform_managed` and
+    /// `hardware` were custody-migration targets. §3.2.2 replaced all five with
+    /// `encrypted_file` and `os_keystore`, and divergence D13 of §3.2.2.1
+    /// records what the three SDKs said before that change.
+    #[test]
+    fn every_retired_custody_string_carries_valid_7005() {
+        use crate::bridge::build_key_custody;
+
+        for retired in [
+            "platform",
+            "software",
+            "file",
+            "platform_managed",
+            "hardware",
+        ] {
+            match build_key_custody(retired, None, None) {
+                Err(ScpError::Validation { code, .. }) => {
+                    assert_eq!(
+                        code, "SCP-VALID-7005",
+                        "{retired:?} must carry SCP-VALID-7005"
+                    );
+                }
+                other => panic!("expected SCP-VALID-7005 for {retired:?}, got: {other:?}"),
+            }
+        }
+    }
+
+    /// Every custody rejection that names `identity_create_with_custody` also
+    /// states that the call returns `SCP-IDENT-1059` on a shipped build.
+    ///
+    /// `Scp::identity_create_with_custody` reaches `no_pre_rotation_backend` on
+    /// a `#[cfg(not(feature = "testing"))]` build, so a message that names the
+    /// entry point without naming that code sends the reader to a second closed
+    /// door with nothing explaining it. Section 9.7.4.1 of the security model
+    /// requires the pre-rotation commitment that has no production backend;
+    /// ADR-062, capability injection and prove-absent dev backends, records
+    /// that state.
+    #[test]
+    fn custody_rejection_messages_name_the_pre_rotation_gap() {
+        use crate::bridge::build_key_custody;
+
+        for custody in ["os_keystore", "platform", "software", "unknown"] {
+            let msg = match build_key_custody(custody, None, None) {
+                Err(ScpError::Identity { msg, .. } | ScpError::Validation { msg, .. }) => msg,
+                other => panic!("expected a rejection for {custody:?}, got: {other:?}"),
+            };
+            assert!(
+                msg.contains("identity_create_with_custody()"),
+                "{custody:?} message must name the injection entry point, got: {msg}"
+            );
+            assert!(
+                msg.contains("SCP-IDENT-1059"),
+                "{custody:?} message must state what that entry point returns on a \
+                 shipped build, got: {msg}"
+            );
+        }
+    }
+
+    /// A string outside the vocabulary is a wrong-value error, which
+    /// `SCP-VALID-7005` names. This assertion pins the code string, because a
+    /// test that checks only the `ScpError::Validation` variant passes while
+    /// the code underneath it drifts.
+    #[test]
+    fn build_key_custody_rejects_unknown_value_with_valid_7005() {
+        use crate::bridge::build_key_custody;
+
+        match build_key_custody("unknown", None, None) {
+            Err(ScpError::Validation { code, .. }) => {
+                assert_eq!(code, "SCP-VALID-7005");
+            }
+            other => panic!("expected SCP-VALID-7005 for unknown, got: {other:?}"),
+        }
     }
 
     #[test]

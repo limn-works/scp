@@ -45,24 +45,38 @@ tearing down the library.
 
 ## InMemoryKeyCustody in [dependencies] vs [dev-dependencies]
 
+**ADR-062, capability injection and prove-absent dev backends, reversed the
+guidance this section originally gave.** The original text argued that
+`scp-platform/testing` belongs in the `scp-ffi-uniffi` crate's regular
+`[dependencies]`, so that a desktop or CLI build could create an identity with
+zero configuration. ADR-062 Slice 6 rejected that argument: `InMemoryKeyCustody`
+is a nullifier, so a shipped artifact must not resolve it at all. Read the rest
+of this section as the record of a decision that no longer holds, and follow the
+paragraph below it.
+
 `identity_create("in_memory")` uses `scp_platform::testing::InMemoryKeyCustody`,
-which requires the `testing` feature of `scp-platform`. This feature belongs in
-regular `[dependencies]` (not just `[dev-dependencies]`) for the `scp-ffi-uniffi`
-crate because the in-memory path is a first-class, documented code path for:
+which requires the `testing` feature of `scp-platform`. `crates/scp-ffi/uniffi/Cargo.toml`
+now names that edge in two places and neither one reaches a shipped build: the
+crate's own `testing` feature adds `scp-platform/testing`, and `[dev-dependencies]`
+adds it for the test binaries. The regular `[dependencies]` entry names
+`software_platform`, `file`, `encrypting`, and `sqlite`, and no `testing`, so a shipped
+build returns `SCP-IDENT-1008` for `"in_memory"` instead of creating an identity.
+`scripts/check-shipped-feature-graph.sh` fails the build when a shipped artifact's
+resolved feature set contains `scp-platform/testing`.
 
-- Unit and integration tests
-- CLI tools
-- Desktop (non-mobile) builds
-- Developer onboarding (zero config identity creation)
+The `"platform"` and `"software"` custody strings name no custody value, so they
+return `ScpError::Validation` carrying `SCP-VALID-7005`, the code every string
+outside the vocabulary returns; `SCP-IDENT-1003` is what `"os_keystore"` returns
+when the bridge holds no `KeyCustodyProvider`. §3.2.2 of `.docs/specs/03-identity.md`
+states the vocabulary. That behaviour is permanent, not a waiting state: `identity_create_with_custody` is exported on all three bridges, and
+passing a `KeyCustodyProvider` to it is the only path to Apple Keychain or Android
+Keystore. No custody string reaches either key store on any bridge.
 
-The doc comment on `identity_create` warns that `"in_memory"` stores key material
-in unprotected heap memory and is not safe for production mobile deployments. The
-`"platform"` and `"software"` custody paths return `ScpError::Identity` pointing
-callers to the `KeyCustodyProvider` callback interface until that story is wired.
-
-**Do not move `testing` back to dev-dependencies** to "prevent production use" —
-that prevents all non-mobile use cases too and breaks the conformance tests that
-run in the regular build.
+**Do not move `scp-platform/testing` into the regular `[dependencies]` table** to
+restore zero-configuration identity creation. A shipped build that resolves that
+feature reaches a nullifier on a production path, which the builder tenet "No
+dev/test-only stand-ins in production" forbids and the shipped-feature-graph gate
+rejects.
 
 ## Thread-Safety Doc Comments on Callback Interfaces
 

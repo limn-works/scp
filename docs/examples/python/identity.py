@@ -17,9 +17,14 @@ from scp_sdk import Identity, CustodyType
 
 
 async def main() -> None:
-    # 1. Create a new identity with in-memory key custody.
-    #    In production, use CustodyType.PLATFORM for secure key storage.
-    identity = await Identity.create(custody=CustodyType.IN_MEMORY)
+    # 1. Create a new identity with the encrypted key file SCP implements.
+    #    In production, pass "encrypted_file" for the on-disk key store SCP
+    #    implements, or "os_keystore" together with a KeyCustodyProvider for
+    #    the operating system's own key store. Section 3.2.2 of the identity
+    #    spec, the custody vocabulary, states those two values. Neither call
+    #    creates an identity on a released wheel: both return SCP-IDENT-1059,
+    #    because no pre-rotation custody backend is wired yet.
+    identity = await Identity.create(custody=CustodyType.ENCRYPTED_FILE)
 
     print(f"DID: {identity.did}")
     print(f"Custody type: {identity.custody_type}")
@@ -41,7 +46,7 @@ async def main() -> None:
     # 3. Create an identity with an agent signing key (ADR-039).
     #    Agent keys enable human+agent shared DID patterns.
     agent_identity = await Identity.create_with_agent_key(
-        custody=CustodyType.IN_MEMORY,
+        custody=CustodyType.ENCRYPTED_FILE,
     )
     print(f"Agent identity DID: {agent_identity.did}")
     print()

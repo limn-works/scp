@@ -150,7 +150,7 @@ public struct Identity: Sendable {
 
     private let handle: IdentityHandle
 
-    public static func create(custody: String = "platform") async throws -> Identity {
+    public static func create(custody: String) async throws -> Identity {
         let handle = try await ScpBindings.identityCreate(custody: custody)
         return Identity(did: handle.did(), custodyType: handle.custodyType(), handle: handle)
     }
@@ -160,6 +160,19 @@ public struct Identity: Sendable {
     public func rotateKey() async throws -> Identity { ... }
 }
 ```
+
+`create` takes the custody string as a required argument and offers no default, because
+key custody is a security-relevant choice and the agent-first API design tenet in
+CLAUDE.md forbids an SDK picking one on a caller's behalf. §3.2.2 of the identity spec,
+the custody vocabulary, states the two values this string carries: `"encrypted_file"`
+selects the on-disk key store SCP implements, and `"os_keystore"` selects Keychain
+through the platform key-custody callback the SDK consumer supplies. `"os_keystore"`
+states which store holds the key and states nothing about hardware isolation, because
+the Secure Enclave supports only P-256 while SCP signs Ed25519, so Keychain holds SCP's
+keys in software (`bindings/swift/Sources/SCP/Platform/AppleKeyCustody.swift:217`–`:221`).
+A shipped build answers every other string with a typed error, and answers the
+test-harness string `"in_memory"` with `SCP-IDENT-1008`. The words `platform`,
+`software`, `file`, and `hardware` name no custody value.
 
 ### Error types
 

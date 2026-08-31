@@ -159,6 +159,20 @@ class CryptoKeychain implements KeyCustodyProvider {
   custodyType(_keyId: string): string {
     return "software";
   }
+
+  // This double keeps every seed in `#seeds` and hands it back through
+  // `exportSigningKeyBytes`, so the key leaves the store.
+  keyIsExtractable(_keyId: string): boolean {
+    return true;
+  }
+
+  // Nothing gates `#seeds`: no biometric reading, no PIN, no passphrase.
+  // Section 3.2.2 of the identity spec states that a backend reporting a pair
+  // the published vocabulary states no value for "publishes no custody
+  // attestation at all", and (extractable, unprotected) is such a pair.
+  unlockFactor(_keyId: string): string {
+    return "unprotected";
+  }
 }
 
 // A keychain that signs but REFUSES to export raw key bytes — the shape of a
@@ -168,6 +182,18 @@ class CryptoKeychain implements KeyCustodyProvider {
 class SignOnlyKeychain extends CryptoKeychain {
   override exportSigningKeyBytes(_keyId: string): Uint8Array {
     throw new Error("sign-only custody: raw key export is not permitted");
+  }
+
+  // A store that refuses raw export holds a key that cannot leave it.
+  override keyIsExtractable(_keyId: string): boolean {
+    return false;
+  }
+
+  // This double stands in for an OS keychain that releases key material only
+  // after a biometric reading, which is the pair section 3.2.2 of the identity
+  // spec publishes as `"non-extractable-biometric"`.
+  override unlockFactor(_keyId: string): string {
+    return "biometric";
   }
 }
 
@@ -187,7 +213,7 @@ if (!scpAvailable) {
         const provider = new CryptoKeychain();
         const identity = await scp.identityCreateWithCustody(provider);
         expect(identity.did).toMatch(/^did:dht:/);
-        expect(identity.custodyType).toBe("callback");
+        expect(identity.custodyType).toBe("os_keystore");
       } finally {
         await scp.shutdown(1000).catch(() => {});
       }

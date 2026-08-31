@@ -7,6 +7,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import works.limn.scp.CustodyType
 import works.limn.scp.bridge.BridgeException
 import works.limn.scp.bridge.CoroutineBridge
 
@@ -61,9 +62,24 @@ class ConformanceDispatcher(
 
     private suspend fun dispatchIdentityCreate(input: Map<String, String>): Map<String, String> =
         catchBridge {
-            val custody = input["custody"] ?: "in_memory"
+            // A fixture carries custody as a raw string, and the SDK takes a
+            // `CustodyType`, which spells only the two values §3.2.2 of the
+            // identity spec states. This dispatcher answers two cases itself
+            // rather than forwarding them. A fixture that names no custody
+            // gets none chosen for it, because key custody decides who can
+            // reach a private key and the agent-first API design tenet of
+            // `CLAUDE.md` forbids a default for a choice like that. A fixture
+            // naming a string no member spells — a retired spelling, or the
+            // test-harness string `"in_memory"` — names a value the SDK
+            // rejects at compile time.
+            val raw =
+                input["custody"]
+                    ?: return@catchBridge mapOf("error" to "missing_custody_type")
+            val custody =
+                CustodyType.fromRawValue(raw)
+                    ?: return@catchBridge mapOf("error" to "unknown_custody_type", "detail" to raw)
             val handle = bridge.identity.create(custody)
-            mapOf("handle" to handle.toString(), "custody_type" to custody)
+            mapOf("handle" to handle.toString(), "custody_type" to custody.rawValue)
         }
 
     private suspend fun dispatchIdentityLoad(input: Map<String, String>): Map<String, String> =

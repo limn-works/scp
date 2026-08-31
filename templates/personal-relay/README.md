@@ -43,7 +43,7 @@ SCP_RELAY_ACME_EMAIL=you@example.com \
 ```
 
 On first run, the relay:
-1. Generates Ed25519 keypairs (identity, active signing, pre-rotation)
+1. Generates Ed25519 keypairs — identity and active signing in operational custody, pre-rotation in a separate substrate (§3.9 of the identity spec)
 2. Derives a `did:dht` identifier from the identity key
 3. Provisions a TLS certificate from Let's Encrypt
 4. Starts the relay on `0.0.0.0:443` (configurable)

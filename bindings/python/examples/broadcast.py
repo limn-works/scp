@@ -22,8 +22,8 @@ async def main() -> None:
         await scp.transport_connect(relay.relay_url)
 
         # 2. Create publisher and subscriber identities.
-        publisher = await scp.identity_create(CustodyType.IN_MEMORY)
-        subscriber = await scp.identity_create(CustodyType.IN_MEMORY)
+        publisher = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
+        subscriber = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
         print(f"Publisher DID:  {publisher.did}")
         print(f"Subscriber DID: {subscriber.did}")
 

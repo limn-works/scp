@@ -8257,6 +8257,14 @@ class SignOnlyCustody:
 
     def custody_type(self, key_id):
         return 'hardware'
+
+    def key_is_extractable(self, key_id):
+        # Sign-only custody refuses raw key export, so the key cannot leave the
+        # store this provider holds it in.
+        return False
+
+    def unlock_factor(self, key_id):
+        return 'biometric'
 ";
 
     /// Context export must sign via `KeyCustody::sign`, NOT by exporting the raw

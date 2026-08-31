@@ -27,6 +27,30 @@ napi_status napi_acquire_threadsafe_function(napi_threadsafe_function f) { (void
 napi_status napi_ref_threadsafe_function(napi_env env, napi_threadsafe_function f) { (void)env; (void)f; return 0; }
 napi_status napi_unref_threadsafe_function(napi_env env, napi_threadsafe_function f) { (void)env; (void)f; return 0; }
 napi_status napi_create_threadsafe_function(napi_env env, napi_value func, napi_value res, napi_value name, size_t max_queue, size_t initial_thread, void* ctx, void* finalize_cb, void* finalize_data, void* call_js_cb, napi_threadsafe_function* r) { (void)env; (void)func; (void)res; (void)name; (void)max_queue; (void)initial_thread; (void)ctx; (void)finalize_cb; (void)finalize_data; (void)call_js_cb; if (r) *r = (napi_threadsafe_function)0; return 0; }
+
+/* The value-conversion entry points napi-rs instantiates for a
+   `KeyCustodyProvider` callback that returns a JavaScript `boolean`
+   (`keyIsExtractable`, §3.2.2 of the identity spec). napi-rs reads a boolean
+   through `napi_get_value_bool`, and the surrounding argument marshalling
+   through the remaining calls below. */
+napi_status napi_call_function(napi_env env, napi_value recv, napi_value func, size_t argc, const napi_value* argv, napi_value* r) { (void)env; (void)recv; (void)func; (void)argc; (void)argv; if (r) *r = (napi_value)0; return 0; }
+napi_status napi_coerce_to_object(napi_env env, napi_value v, napi_value* r) { (void)env; (void)v; if (r) *r = (napi_value)0; return 0; }
+napi_status napi_coerce_to_string(napi_env env, napi_value v, napi_value* r) { (void)env; (void)v; if (r) *r = (napi_value)0; return 0; }
+napi_status napi_create_array_with_length(napi_env env, size_t l, napi_value* r) { (void)env; (void)l; if (r) *r = (napi_value)0; return 0; }
+napi_status napi_create_bigint_uint64(napi_env env, uint64_t v, napi_value* r) { (void)env; (void)v; if (r) *r = (napi_value)0; return 0; }
+napi_status napi_create_uint32(napi_env env, uint32_t v, napi_value* r) { (void)env; (void)v; if (r) *r = (napi_value)0; return 0; }
+napi_status napi_fatal_exception(napi_env env, napi_value e) { (void)env; (void)e; return 0; }
+napi_status napi_get_array_length(napi_env env, napi_value v, uint32_t* r) { (void)env; (void)v; if (r) *r = 0; return 0; }
+napi_status napi_get_element(napi_env env, napi_value o, uint32_t i, napi_value* r) { (void)env; (void)o; (void)i; if (r) *r = (napi_value)0; return 0; }
+napi_status napi_get_global(napi_env env, napi_value* r) { (void)env; if (r) *r = (napi_value)0; return 0; }
+napi_status napi_get_named_property(napi_env env, napi_value o, const char* n, napi_value* r) { (void)env; (void)o; (void)n; if (r) *r = (napi_value)0; return 0; }
+napi_status napi_get_undefined(napi_env env, napi_value* r) { (void)env; if (r) *r = (napi_value)0; return 0; }
+napi_status napi_get_value_bool(napi_env env, napi_value v, int* r) { (void)env; (void)v; if (r) *r = 0; return 0; }
+napi_status napi_get_value_string_utf8(napi_env env, napi_value v, char* buf, size_t size, size_t* r) { (void)env; (void)v; (void)buf; (void)size; if (r) *r = 0; return 0; }
+napi_status napi_get_value_uint32(napi_env env, napi_value v, uint32_t* r) { (void)env; (void)v; if (r) *r = 0; return 0; }
+napi_status napi_is_array(napi_env env, napi_value v, int* r) { (void)env; (void)v; if (r) *r = 0; return 0; }
+napi_status napi_set_element(napi_env env, napi_value o, uint32_t i, napi_value v) { (void)env; (void)o; (void)i; (void)v; return 0; }
+napi_status napi_typeof(napi_env env, napi_value v, int32_t* r) { (void)env; (void)v; if (r) *r = 0; return 0; }
 ";
 
 fn main() {

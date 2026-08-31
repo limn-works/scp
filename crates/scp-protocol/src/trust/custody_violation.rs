@@ -176,8 +176,8 @@ pub enum CustodyViolationType {
     /// hardware-backed, but operations are observed that would require
     /// software access to that key material.
     AttestationMismatch {
-        /// What the attestation claimed (e.g., `"hardware-biometric"` custody
-        /// model for `#active` key).
+        /// The custody value the DID document published for the `#active` key
+        /// (e.g., `"non-extractable-biometric"`).
         claimed_custody: String,
         /// What was actually observed that contradicts the claim (e.g.,
         /// `"#active key used without biometric unlock within 50ms of
@@ -999,7 +999,7 @@ mod tests {
     #[test]
     fn attestation_mismatch_valid() {
         let violation = CustodyViolationType::AttestationMismatch {
-            claimed_custody: "hardware-biometric".to_string(),
+            claimed_custody: "non-extractable-biometric".to_string(),
             observed_behavior: "#active key used without biometric unlock".to_string(),
             attestation_evidence: vec![0xCA, 0xFE],
         };
@@ -1025,7 +1025,7 @@ mod tests {
     #[test]
     fn attestation_mismatch_rejects_empty_observed() {
         let violation = CustodyViolationType::AttestationMismatch {
-            claimed_custody: "hardware-biometric".to_string(),
+            claimed_custody: "non-extractable-biometric".to_string(),
             observed_behavior: String::new(),
             attestation_evidence: vec![0x01],
         };
@@ -1041,7 +1041,7 @@ mod tests {
     #[test]
     fn attestation_mismatch_rejects_empty_evidence() {
         let violation = CustodyViolationType::AttestationMismatch {
-            claimed_custody: "hardware-biometric".to_string(),
+            claimed_custody: "non-extractable-biometric".to_string(),
             observed_behavior: "something observed".to_string(),
             attestation_evidence: vec![],
         };
@@ -1068,7 +1068,7 @@ mod tests {
 
     fn sample_attestation_mismatch() -> CustodyViolationType {
         CustodyViolationType::AttestationMismatch {
-            claimed_custody: "hardware-biometric".to_string(),
+            claimed_custody: "non-extractable-biometric".to_string(),
             observed_behavior: "#active key used without biometric unlock within 50ms".to_string(),
             attestation_evidence: vec![0xCA, 0xFE, 0xBA, 0xBE],
         }

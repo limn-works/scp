@@ -17,7 +17,7 @@ import SCP
 struct ToolsExample {
     static func main() async throws {
         // 1. Create an identity for the tool operator.
-        let operator_ = try await createIdentity(custody: "in_memory")
+        let operator_ = try await createIdentity(custody: "encrypted_file")
         print("Operator DID: \(operator_.did())")
 
         // 2. Create a context with tool capabilities.

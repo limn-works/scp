@@ -238,6 +238,14 @@ public final class Identity implements AutoCloseable {
         return NativeLib.getCustodyType(handle);
     }
 
+    /**
+     * Creates an identity in the named custody backend. Section 3.2.2 of the
+     * identity spec, the custody vocabulary, states the two values {@code custody}
+     * carries: {@code "encrypted_file"} selects the on-disk key store SCP
+     * implements, and {@code "os_keystore"} selects the operating system's own key
+     * store through the platform key-custody callback the SDK consumer supplies.
+     * A shipped build answers every other string with a typed error.
+     */
     public static CompletableFuture<Identity> create(String custody) {
         return CompletableFuture.supplyAsync(() -> {
             var ref = new PointerByReference();
@@ -248,9 +256,9 @@ public final class Identity implements AutoCloseable {
         });
     }
 
-    public static CompletableFuture<Identity> create() {
-        return create("platform");
-    }
+    // No no-argument overload: 3.2.2 of the identity spec, the custody
+    // vocabulary, names "encrypted_file" and "os_keystore", and key custody is a
+    // security-relevant choice an SDK does not make for a caller.
 
     @Override
     public void close() {

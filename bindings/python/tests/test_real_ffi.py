@@ -17,6 +17,7 @@ event log, discovery, and provenance through real FFI.
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -34,8 +35,13 @@ except (ImportError, AttributeError):
     )
 
 from scp_sdk import SCP
-from scp_sdk.errors import ValidationError
+from scp_sdk.errors import IdentityError, ValidationError
 from scp_sdk.types import CustodyType
+
+from .harness_custody import (
+    create_in_memory_identity,
+    create_in_memory_identity_with_agent_key,
+)
 
 # ---------------------------------------------------------------------------
 # Session-scoped relay fixture (started once, shut down after all tests)
@@ -168,22 +174,189 @@ class TestIdentity:
     """Identity creation and lifecycle through real FFI."""
 
     async def test_create_in_memory(self, scp: SCP):
-        identity = await scp.identity_create(CustodyType.IN_MEMORY)
+        identity = await create_in_memory_identity(scp)
         assert identity.did.startswith("did:dht:")
         assert len(identity.did) > 20
-        assert identity.custody_type == CustodyType.IN_MEMORY
+        assert identity.custody_type == "in_memory"
+
+    async def test_custody_type_carries_the_two_values_the_vocabulary_states(self):
+        """:class:`CustodyType` carries the two values section 3.2.2 states.
+
+        Section 3.2.2 of the identity spec, "The Custody Vocabulary", states
+        that a caller names one of ``"encrypted_file"`` and ``"os_keystore"``,
+        and that "The vocabulary holds no third value". A member added here
+        without a matching arm in ``build_key_custody`` — or an arm added
+        without a member — breaks this assertion.
+
+        ``"in_memory"`` is absent by design: section 3.2.2 states that the
+        string is a test-harness affordance, that "no SDK enum spells it", and
+        that "a test that needs it passes the raw string to the bridge".
+        """
+        assert {member.value for member in CustodyType} == {
+            "encrypted_file",
+            "os_keystore",
+        }
+
+    async def test_encrypted_file_custody_creates_an_identity_in_a_key_file(
+        self, scp: SCP, tmp_path, monkeypatch
+    ):
+        """:attr:`CustodyType.ENCRYPTED_FILE` reaches ``FileKeyCustody`` and mints a DID.
+
+        The bridge builds the key file under ``$HOME/.scp/keys.bin``, so point
+        ``HOME`` at a temporary directory and assert the file appears. Without
+        this the accepted set is asserted but never exercised, and an
+        ``"encrypted_file"`` arm that stopped building a key store would still
+        pass.
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("SCP_KEY_PASSPHRASE", "test-passphrase-for-file-custody")
+
+        identity = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
+
+        assert identity.did.startswith("did:dht:")
+        assert identity.custody_type == CustodyType.ENCRYPTED_FILE
+        assert (tmp_path / ".scp" / "keys.bin").is_file()
+
+    async def test_encrypted_file_custody_without_a_passphrase_fails_closed(
+        self, scp: SCP, tmp_path, monkeypatch
+    ):
+        """``"encrypted_file"`` fails closed when ``SCP_KEY_PASSPHRASE`` is unset.
+
+        The passphrase protects the key file, so the bridge refuses to build an
+        unprotected one and raises ``SCP-VALID-7005`` instead.
+        ``KeyFileError.code`` in ``crates/scp-ffi/common/src/key_file.rs``
+        states that code once for all three bridges, so a caller who branches on
+        it takes the same branch on Python, on Node, and on Swift or Kotlin.
+        This bridge returned ``SCP-VALID-7001`` here until that function landed.
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("SCP_KEY_PASSPHRASE", raising=False)
+
+        with pytest.raises(_scp_core.ValidationError) as excinfo:
+            await scp.identity_create(CustodyType.ENCRYPTED_FILE)
+        assert str(excinfo.value).startswith("[SCP-VALID-7005]")
+
+    async def test_published_custody_reads_the_encrypted_file_backend(
+        self, scp: SCP, tmp_path, monkeypatch
+    ):
+        """The encrypted key file publishes ``"extractable-passphrase"``.
+
+        Section 3.2.2 states that the published value "is derived, never
+        declared": the bridge reads it off the running backend. The encrypted
+        key file decrypts each key into process memory to sign, so the key
+        leaves the store, and a passphrase decrypts it.
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("SCP_KEY_PASSPHRASE", "test-passphrase-for-file-custody")
+
+        identity = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
+
+        assert await scp.identity_published_custody(identity.did) == "extractable-passphrase"
+
+    async def test_published_custody_fails_closed_for_an_unretained_did(self, scp: SCP):
+        """A DID this instance retains no custody for draws ``SCP-IDENT-1001``.
+
+        The published value comes off the running backend, so an instance
+        holding no backend for a DID reports a typed error rather than a value
+        it reconstructed from the DID string. ``with_identity`` raises the
+        registry-miss code, and all three bridges spell it ``SCP-IDENT-1001``.
+
+        Two calls, two layers.
+        :meth:`~scp_sdk.SCP.identity_published_custody` routes every bridge
+        exception through ``_coded_bridge_error``, so it raises
+        :class:`scp_sdk.errors.IdentityError`, which is the class its own
+        docstring names. The bridge call under it raises
+        ``_scp_core.IdentityError``, which is the class the other two bridges
+        are pinned against. Both carry the same code in a leading
+        ``[SCP-CAT-NNNN]`` bracket.
+        """
+        with pytest.raises(IdentityError) as sdk_err:
+            await scp.identity_published_custody("did:dht:z6MkNotRegistered")
+        assert str(sdk_err.value).startswith("[SCP-IDENT-1001]")
+
+        with pytest.raises(_scp_core.IdentityError) as bridge_err:
+            scp._native.identity_published_custody("did:dht:z6MkNotRegistered")
+        assert str(bridge_err.value).startswith("[SCP-IDENT-1001]")
 
     async def test_create_rejects_unknown_custody(self, scp: SCP):
-        with pytest.raises(Exception):
-            await scp.identity_create("magic")
+        """An unrecognized custody string draws ``SCP-VALID-7005``.
+
+        ``SCP.identity_create`` takes a :class:`CustodyType`, so no unknown
+        string reaches it: a type checker rejects the call and the SDK sends
+        ``custody.value``. The rejection this pins lives in the bridge, so the
+        test calls the bridge the way section 3.2.2 of the identity spec states
+        a test does — "a test that needs it passes the raw string to the
+        bridge". The bridge raises its own exception class, whose message
+        carries the code in a leading ``[SCP-CAT-NNNN]`` bracket. Pin both the
+        class and the code so a renumbering or a reclassification fails here.
+        """
+        with pytest.raises(_scp_core.ValidationError) as excinfo:
+            await asyncio.to_thread(scp._native.identity_create, "magic")
+        assert str(excinfo.value).startswith("[SCP-VALID-7005]")
+
+    async def test_create_requires_a_custody_argument(self, scp: SCP):
+        """Omitting custody raises ``TypeError``; the SDK names no key store.
+
+        Which key store holds a private key decides who can reach that key, so
+        the agent-first API design tenet in CLAUDE.md forbids this SDK choosing
+        one for a caller. ``identity_create`` carried ``CustodyType.ENCRYPTED_FILE`` as a
+        default until SCP-294 removed it, and that default wrote
+        ``$HOME/.scp/keys.bin`` for a caller who named no key store at all.
+        """
+        with pytest.raises(TypeError):
+            await scp.identity_create()
+
+        with pytest.raises(TypeError):
+            await scp.identity_create_with_agent_key()
+
+    @pytest.mark.parametrize(
+        "retired",
+        ["platform", "software", "file", "platform_managed", "hardware"],
+    )
+    async def test_create_rejects_every_retired_custody_string(self, scp: SCP, retired: str):
+        """Each retired spelling draws ``SCP-VALID-7005`` and builds no key store.
+
+        Section 3.2.2 of the identity spec names these five and states that
+        they "name no custody backend". ``"file"`` and ``"platform"`` each
+        built a ``FileKeyCustody`` at some point in this bridge's history, so
+        the SDK named one substrate and delivered another; each one now fails
+        closed. No :class:`CustodyType` member spells any of the five, so the
+        call goes to the bridge that rejects them.
+        """
+        with pytest.raises(_scp_core.ValidationError) as excinfo:
+            await asyncio.to_thread(scp._native.identity_create, retired)
+        assert str(excinfo.value).startswith("[SCP-VALID-7005]")
+
+    async def test_create_with_agent_key_rejects_retired_custody_strings(self, scp: SCP):
+        """``identity_create_with_agent_key`` refuses the retired spellings too.
+
+        Both creation paths call ``build_key_custody``, so both report the same
+        code and neither one falls back to a key file.
+        """
+        with pytest.raises(_scp_core.ValidationError) as excinfo:
+            await asyncio.to_thread(scp._native.identity_create_with_agent_key, "platform")
+        assert str(excinfo.value).startswith("[SCP-VALID-7005]")
+
+    async def test_os_keystore_without_a_provider_fails_closed(self, scp: SCP):
+        """``"os_keystore"`` with no injected provider draws ``SCP-IDENT-1003``.
+
+        Section 3.2.2 states the rule this applies: the bridge returns a typed
+        error, falls back to neither ``encrypted_file`` nor an in-memory store,
+        and cites the no-dev-stand-in tenet of ``CLAUDE.md``. Reaching the
+        operating system's key store takes a ``KeyCustodyProvider`` passed to
+        ``identity_create_with_custody``.
+        """
+        with pytest.raises(_scp_core.IdentityError) as excinfo:
+            await scp.identity_create(CustodyType.OS_KEYSTORE)
+        assert str(excinfo.value).startswith("[SCP-IDENT-1003]")
 
     async def test_multiple_identities_distinct(self, scp: SCP):
-        a = await scp.identity_create(CustodyType.IN_MEMORY)
-        b = await scp.identity_create(CustodyType.IN_MEMORY)
+        a = await create_in_memory_identity(scp)
+        b = await create_in_memory_identity(scp)
         assert a.did != b.did
 
     async def test_agent_key_lifecycle(self, scp: SCP):
-        identity = await scp.identity_create(CustodyType.IN_MEMORY)
+        identity = await create_in_memory_identity(scp)
         assert not identity._raw_handle.has_agent_key
 
         with_agent = await scp.identity_add_agent_key(identity._raw_handle)
@@ -200,7 +373,7 @@ class TestIdentity:
         assert not removed._raw_handle.has_agent_key
 
     async def test_remove_existing_identity(self, scp: SCP):
-        identity = await scp.identity_create(CustodyType.IN_MEMORY)
+        identity = await create_in_memory_identity(scp)
         # The DID is in the registry, so removal succeeds. `identity_remove`
         # returns None (void) and the subsequent if_present probe reports the
         # DID is no longer present.
@@ -209,7 +382,7 @@ class TestIdentity:
         assert await scp.identity_remove_if_present(identity.did) is False
 
     async def test_remove_if_present_true_then_false(self, scp: SCP):
-        identity = await scp.identity_create(CustodyType.IN_MEMORY)
+        identity = await create_in_memory_identity(scp)
         # First removal finds the identity and reports True.
         assert await scp.identity_remove_if_present(identity.did) is True
         # Second removal finds nothing and reports False.
@@ -237,46 +410,63 @@ class TestIdentity:
             await scp.identity_remove_if_present(bad)
 
     async def test_create_with_agent_key(self, scp: SCP):
-        identity = await scp.identity_create_with_agent_key(CustodyType.IN_MEMORY)
+        identity = await create_in_memory_identity_with_agent_key(scp)
         assert identity._raw_handle.has_agent_key
         assert identity._raw_handle.get_agent_public_key() is not None
 
     async def test_attest_device(self, scp: SCP):
-        identity = await scp.identity_create(CustodyType.IN_MEMORY)
+        identity = await create_in_memory_identity(scp)
         token = await scp.identity_attest_device(identity.did)
         assert isinstance(token, str)
         assert len(token) > 0
 
     async def test_verify_device_attestation(self, scp: SCP):
-        identity = await scp.identity_create(CustodyType.IN_MEMORY)
+        identity = await create_in_memory_identity(scp)
         token = await scp.identity_attest_device(identity.did)
         is_valid = await scp.identity_verify_device_attestation(identity.did, token)
         assert is_valid is True
 
     async def test_verify_device_attestation_rejects_invalid(self, scp: SCP):
-        identity = await scp.identity_create(CustodyType.IN_MEMORY)
+        identity = await create_in_memory_identity(scp)
         # An arbitrary base64 string that is not a valid attestation token
         is_valid = await scp.identity_verify_device_attestation(identity.did, "aW52YWxpZA==")
         assert is_valid is False
 
     async def test_execute_custody_migration(self, scp: SCP):
-        identity = await scp.identity_create(CustodyType.IN_MEMORY)
-        # The FFI uses a NotConfiguredMigrationBackend that returns an error
-        # on step 1 (key generation). Verify the SDK wrapper propagates this.
-        with pytest.raises(Exception, match="custody migration"):
-            await scp.identity_execute_custody_migration(identity.did, "hardware", [])
+        """Both ``CustodyType`` members reach the NotConfigured backend.
+
+        The FFI uses a ``NotConfiguredMigrationBackend`` that returns an error
+        at step 1, key generation, so this asserts the SDK wrapper propagates
+        it. Step 1 runs past the bridge's target parsing, so a member the SDK
+        forwarded in a form the bridge does not parse would draw
+        ``SCP-IDENT-1024`` instead of the message this test matches.
+        """
+        identity = await create_in_memory_identity(scp)
+        for member in CustodyType:
+            with pytest.raises(Exception, match="custody migration backend not configured"):
+                await scp.identity_execute_custody_migration(identity.did, member, [])
 
     async def test_execute_custody_migration_invalid_target(self, scp: SCP):
-        identity = await scp.identity_create(CustodyType.IN_MEMORY)
+        """A string outside the vocabulary reaches the bridge only through
+        ``_native``: the SDK method takes a :class:`CustodyType`, so a type
+        checker rejects the string before the call runs.
+        """
+        identity = await create_in_memory_identity(scp)
         with pytest.raises(Exception, match="invalid custody migration target"):
-            await scp.identity_execute_custody_migration(identity.did, "nonexistent_target", [])
+            scp._native.identity_execute_custody_migration(identity.did, "nonexistent_target", [])
+        # Pin the canonical code (SCP-IDENT-1024), the code the NAPI and
+        # UniFFI bridges raise for a rejected migration target. SCP-IDENT-1001
+        # names a DID this instance never registered, so answering a rejected
+        # target with it sends the caller to the wrong recovery.
+        with pytest.raises(Exception, match="SCP-IDENT-1024"):
+            scp._native.identity_execute_custody_migration(identity.did, "nonexistent_target", [])
 
     async def test_execute_recovery_fails_closed(self, scp: SCP):
         # #2240: recovery has no configured backend yet (the §9.12 WIRE is
         # Part B, pending human sign-off), so the surface fails closed with a
         # typed error instead of fabricating a success. Mirrors
         # test_execute_custody_migration.
-        identity = await scp.identity_create(CustodyType.IN_MEMORY)
+        identity = await create_in_memory_identity(scp)
         # Pin the canonical code (SCP-IDENT-1022) so the fail-closed path stays
         # cross-bridge symmetric with NAPI/UniFFI, not just the generic
         # IDENT_1001 bucket (#2240 review).
@@ -284,7 +474,7 @@ class TestIdentity:
             await scp.identity_execute_recovery(identity.did, "agent", [])
 
     async def test_execute_recovery_invalid_tier(self, scp: SCP):
-        identity = await scp.identity_create(CustodyType.IN_MEMORY)
+        identity = await create_in_memory_identity(scp)
         # Invalid-tier rejection carries its own dedicated SCP-IDENT-1021 code on
         # every bridge (parity with NAPI/UniFFI), distinct from the
         # SCP-IDENT-1020 ownership rejection — so a caller can tell "bad tier"
@@ -307,7 +497,7 @@ class TestIdentity:
     async def test_migrate(self, scp: SCP):
         import json
 
-        identity = await scp.identity_create(CustodyType.IN_MEMORY)
+        identity = await create_in_memory_identity(scp)
         try:
             new_identity = await scp.identity_migrate(identity._raw_handle)
             # Migration succeeded — new identity should have a different DID
@@ -337,7 +527,7 @@ class TestContext:
     """Context lifecycle through real FFI."""
 
     async def test_create_returns_active(self, scp: SCP):
-        identity = await scp.identity_create(CustodyType.IN_MEMORY)
+        identity = await create_in_memory_identity(scp)
         handle = scp._native.context_create(
             identity.did,
             {
@@ -350,8 +540,8 @@ class TestContext:
         assert handle.state == "active"
 
     async def test_join_and_leave(self, scp: SCP):
-        alice = await scp.identity_create(CustodyType.IN_MEMORY)
-        bob = await scp.identity_create(CustodyType.IN_MEMORY)
+        alice = await create_in_memory_identity(scp)
+        bob = await create_in_memory_identity(scp)
 
         handle = scp._native.context_create(
             alice.did,
@@ -383,7 +573,7 @@ class TestContext:
         assert not scp._native.context_is_member(handle, bob.did)
 
     async def test_close(self, scp: SCP):
-        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        alice = await create_in_memory_identity(scp)
         handle = scp._native.context_create(
             alice.did,
             {
@@ -397,7 +587,7 @@ class TestContext:
         assert handle.state in ("closed", "closing")
 
     async def test_send_message(self, scp: SCP):
-        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        alice = await create_in_memory_identity(scp)
         handle = scp._native.context_create(
             alice.did,
             {
@@ -418,7 +608,7 @@ class TestContext:
         round-trip), exercising the shared
         ``scp_ffi_common::export_verify::resolve_export_verifying_key`` helper
         before any DID resolver is configured."""
-        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        alice = await create_in_memory_identity(scp)
         handle = scp._native.context_create(
             alice.did,
             {
@@ -453,7 +643,7 @@ class TestContext:
         ceiling, governance config, threshold set, access-key store, ...)
         breaks ``SHA-256(domain || JCS(snapshot))`` and the Ed25519 check fails
         before any state is restored."""
-        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        alice = await create_in_memory_identity(scp)
         handle = scp._native.context_create(
             alice.did,
             {
@@ -483,7 +673,7 @@ class TestContext:
         )
 
     async def test_drain_events(self, scp: SCP):
-        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        alice = await create_in_memory_identity(scp)
         handle = scp._native.context_create(
             alice.did,
             {
@@ -496,7 +686,7 @@ class TestContext:
         assert isinstance(events, list)
 
     async def test_member_role(self, scp: SCP):
-        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        alice = await create_in_memory_identity(scp)
         handle = scp._native.context_create(
             alice.did,
             {
@@ -519,7 +709,7 @@ class TestOutlets:
     """Outlet registration and verification through real FFI."""
 
     async def test_register_and_verify(self, scp: SCP):
-        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        alice = await create_in_memory_identity(scp)
         handle = scp._native.context_create(
             alice.did,
             {
@@ -569,8 +759,8 @@ class TestUcan:
     """UCAN mint and revoke through real FFI."""
 
     async def test_mint_and_revoke(self, scp: SCP):
-        alice = await scp.identity_create(CustodyType.IN_MEMORY)
-        bob = await scp.identity_create(CustodyType.IN_MEMORY)
+        alice = await create_in_memory_identity(scp)
+        bob = await create_in_memory_identity(scp)
         handle = scp._native.context_create(
             alice.did,
             {
@@ -632,7 +822,7 @@ class TestUcan:
         ``TypeError`` at the PyO3 boundary; an empty/whitespace value is trimmed
         and rejected by ``validate_did`` as an invalid DID before token parse.
         """
-        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        alice = await create_in_memory_identity(scp)
         handle = scp._native.context_create(
             alice.did,
             {
@@ -664,8 +854,8 @@ class TestUcan:
         """
         from scp_sdk.trust import evaluate_trust
 
-        alice = await scp.identity_create(CustodyType.IN_MEMORY)
-        bob = await scp.identity_create(CustodyType.IN_MEMORY)
+        alice = await create_in_memory_identity(scp)
+        bob = await create_in_memory_identity(scp)
         handle = scp._native.context_create(
             alice.did,
             {
@@ -724,9 +914,9 @@ class TestUcan:
         """
         from scp_sdk.trust import evaluate_trust
 
-        alice = await scp.identity_create(CustodyType.IN_MEMORY)
-        bob = await scp.identity_create(CustodyType.IN_MEMORY)
-        carol = await scp.identity_create(CustodyType.IN_MEMORY)
+        alice = await create_in_memory_identity(scp)
+        bob = await create_in_memory_identity(scp)
+        carol = await create_in_memory_identity(scp)
         handle = scp._native.context_create(
             alice.did,
             {
@@ -778,8 +968,8 @@ class TestUcan:
         §7.2.4). This pins the PyO3 bridge's coercion so the cross-bridge
         parity test (TS real-napi sibling) and this one cannot diverge.
         """
-        alice = await scp.identity_create(CustodyType.IN_MEMORY)
-        bob = await scp.identity_create(CustodyType.IN_MEMORY)
+        alice = await create_in_memory_identity(scp)
+        bob = await create_in_memory_identity(scp)
         handle = scp._native.context_create(
             alice.did,
             {
@@ -832,8 +1022,8 @@ class TestUcan:
         case (ADR-059 / §7.2.4). TS sibling: the real-napi forged-token coercion
         test.
         """
-        alice = await scp.identity_create(CustodyType.IN_MEMORY)
-        bob = await scp.identity_create(CustodyType.IN_MEMORY)
+        alice = await create_in_memory_identity(scp)
+        bob = await create_in_memory_identity(scp)
         handle = scp._native.context_create(
             alice.did,
             {
@@ -875,7 +1065,7 @@ class TestEventLog:
     """Event log query through real FFI."""
 
     async def test_query(self, scp: SCP):
-        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        alice = await create_in_memory_identity(scp)
         handle = scp._native.context_create(
             alice.did,
             {
@@ -981,7 +1171,7 @@ class TestTrust:
 
     async def test_query_score(self, scp: SCP):
         """trust_query_score should return a score dict or structured result."""
-        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        alice = await create_in_memory_identity(scp)
         handle = scp._native.context_create(
             alice.did,
             {
@@ -1086,8 +1276,8 @@ class TestTrust:
         """
         from scp_sdk.trust import participation_record
 
-        admin = await scp.identity_create(CustodyType.IN_MEMORY)
-        member = await scp.identity_create(CustodyType.IN_MEMORY)
+        admin = await create_in_memory_identity(scp)
+        member = await create_in_memory_identity(scp)
         # The ceiling MUST carry the governance + child-creation capabilities, or
         # the proposer (creator) lacks governance:propose / the child-creation
         # capability and the proposal is permission-denied.
@@ -1185,8 +1375,8 @@ class TestTrust:
         """
         from scp_sdk.trust import evaluate_trust
 
-        admin = await scp.identity_create(CustodyType.IN_MEMORY)
-        member = await scp.identity_create(CustodyType.IN_MEMORY)
+        admin = await create_in_memory_identity(scp)
+        member = await create_in_memory_identity(scp)
         handle = scp._native.context_create(
             admin.did,
             {
@@ -1250,8 +1440,8 @@ class TestBroadcastKeyDistribution:
         subscribed. The deny decision short-circuits before any sealing, so it
         needs no real X25519 wrapping key — ``bytes(32)`` is accepted and the
         wrapper surfaces the deny as ``None`` (not an empty/sealed blob)."""
-        author = await scp.identity_create(CustodyType.IN_MEMORY)
-        stranger = await scp.identity_create(CustodyType.IN_MEMORY)
+        author = await create_in_memory_identity(scp)
+        stranger = await create_in_memory_identity(scp)
         handle = self._broadcast_handle(scp, author.did)
         assert handle.mode == "broadcast"
 
@@ -1293,8 +1483,8 @@ class TestBroadcastKeyDistribution:
         the JSON shape only — a true open round-trip would need the X25519 secret
         matching the all-zero *public* key (which is not the all-zero secret), so
         the full unwrap is left to the TypeScript suite (real WebCrypto X25519)."""
-        author = await scp.identity_create(CustodyType.IN_MEMORY)
-        subscriber = await scp.identity_create(CustodyType.IN_MEMORY)
+        author = await create_in_memory_identity(scp)
+        subscriber = await create_in_memory_identity(scp)
         handle = self._broadcast_handle(scp, author.did)
 
         await scp.broadcast_subscribe(handle, subscriber.did)

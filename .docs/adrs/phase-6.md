@@ -29,6 +29,17 @@ Phase 1-5 ADRs
 
 ## ADR-027: Android Platform Adapter
 
+> **The custody string that selects this adapter is `"os_keystore"`, not
+> `"platform"`.** §3.2.2 of the identity spec, the custody vocabulary, states the two
+> values a caller names — `"encrypted_file"` and `"os_keystore"` — and states that
+> `"platform"` names no custody value, because two published specifications give that
+> word two different meanings in key handling. `"os_keystore"` selects the operating
+> system's own key store, which SCP reaches through the platform key-custody callback
+> an SDK consumer supplies, so this ADR's decision — that platform-native custody
+> arrives through an injected adapter — stands. The examples below name
+> `"os_keystore"` where they named `"platform"` before §3.2.2 of the identity spec
+> landed. The `SCP.create(custody:)` factory those examples call was never built.
+
 **Status:** Decided
 
 ### Context
@@ -47,7 +58,9 @@ Implement the Android platform adapter in Kotlin at `bindings/kotlin/scp-kt-andr
 - **`AndroidDeviceAttestation.kt`** — `DeviceAttestationProvider` implementation using Play Integrity Standard API. Standard (server-side, low-latency) preferred over Classic (offline, high-cost) attestation.
 - **`AndroidPushProvider.kt`** — `PushProvider` implementation using Firebase Cloud Messaging. Opaque data-only payload: `{"data": {"scp": "1"}}`. No context ID, sender DID, or message content in any notification payload.
 - **`AndroidStorage.kt`** — `StorageProvider` implementation using SQLCipher. Database encryption key derived from a 32-byte symmetric key stored in Android Keystore (TEE-backed AES-256). Key ID: `scp.storage.key`.
-- **`PlatformAdapter.kt`** — `AndroidPlatformAdapter` factory. `AndroidPlatformAdapter.make()` constructs and injects all four providers. Called by the Kotlin SDK's `SCP.create()` when `custody = "platform"`.
+- **`PlatformAdapter.kt`** — `AndroidPlatformAdapter` factory. `AndroidPlatformAdapter.make()` constructs and injects all four providers. Called by the Kotlin SDK's `SCP.create()` when `custody = "os_keystore"`.
+
+`CustodyType.HARDWARE` and `CustodyType.SOFTWARE` below name the substrate a `KeyHandle` already sits in. They are the substrate report, not the custody vocabulary a caller passes: §3.2.2 of the identity spec states that vocabulary and governs neither word.
 
 **Minimum API level:** API 26 (Android 8.0) for the SDK. API 33 (Android 13) required for hardware-backed Ed25519. Devices on API 26-32 use a software Bouncy Castle Ed25519 key with `CustodyType.Software`.
 
@@ -376,13 +389,19 @@ object AndroidPlatformAdapter {
 **SDK injection point** (in the Kotlin SDK, `SCP.kt`):
 
 ```kotlin
+// custody carries no default: 3.2.2 of the identity spec, the custody
+// vocabulary, names "encrypted_file" and "os_keystore", and key custody is a
+// security-relevant choice an SDK does not make for a caller.
 suspend fun SCP.Companion.create(
     context: Context,
-    custody: String = "platform",
+    custody: String,
 ): SCP {
+    // "encrypted_file" needs no platform adapter: the bridge builds that key
+    // store itself. "os_keystore" reaches Android Keystore only through the
+    // adapter's key-custody callback, so a null adapter fails closed there.
     val adapter = when (custody) {
-        "platform" -> AndroidPlatformAdapter.make(context)
-        "in_memory" -> InMemoryPlatformAdapter.make()
+        "os_keystore" -> AndroidPlatformAdapter.make(context)
+        "encrypted_file" -> null
         else -> throw ScpException("Unknown custody type: $custody", "SCP-IDENT-1001")
     }
     return SCP(NativeLib.scpCreate(adapter))
@@ -408,7 +427,7 @@ dependencies {
 - **ADR-006 (Platform Abstraction Traits):** `KeyCustody`, `DeviceAttestation`, `Push`, and `Storage` trait signatures implemented here. The UniFFI callback interface names (`KeyCustodyProvider`, `DeviceAttestationProvider`, `PushProvider`, `StorageProvider`) map directly to these traits.
 - **ADR-021 (UniFFI Bridge):** Platform traits are exposed as UniFFI callback interfaces. `AndroidKeyCustody`, `AndroidDeviceAttestation`, `AndroidPushProvider`, and `AndroidStorage` are Kotlin implementations of those callback interfaces, injected from Kotlin into the Rust engine. Five callback interfaces total: `KeyCustodyProvider`, `StorageProvider`, `PushProvider`, `DeviceAttestationProvider`, `MessageListener`.
 - **ADR-025 (Apple Platform Adapter):** Structural reference. Both adapters implement the same four traits via the same UniFFI callback interface pattern. Key difference: Android 13+ achieves hardware-backed Ed25519 (unavailable on Apple due to Secure Enclave P-256 constraint).
-- **ADR-028 (Kotlin SDK):** The Kotlin SDK's `SCP.create()` factory calls `AndroidPlatformAdapter.make(context)` when `custody = "platform"`. The SDK owns the injection point; the platform adapter owns the implementations.
+- **ADR-028 (Kotlin SDK):** The Kotlin SDK's `SCP.create()` factory calls `AndroidPlatformAdapter.make(context)` when `custody = "os_keystore"`. The SDK owns the injection point; the platform adapter owns the implementations.
 
 ### Acceptance Criteria
 
@@ -470,7 +489,7 @@ dependencies {
 12. **`AndroidPlatformAdapter.make(context)`:**
     - Constructs `AndroidKeyCustody`, `AndroidDeviceAttestation`, `AndroidPushProvider`, `AndroidStorage`.
     - Returns assembled adapter. Throws `ScpException` with descriptive message if any provider fails to initialize (e.g., Play Integrity unavailable, FCM not configured).
-    - Called by Kotlin SDK `SCP.create(context, custody = "platform")`.
+    - Called by Kotlin SDK `SCP.create(context, custody = "os_keystore")`.
 
 13. **Conformance test suite:**
     - Same conformance macros as the in-memory adapter (ADR-006): `key_custody_conformance!()`, `device_attestation_conformance!()`, `push_provider_conformance!()`, `storage_conformance!()`.
@@ -656,8 +675,11 @@ tasks.test {
 /**
  * Top-level SCP SDK entry point. Initialize once per identity.
  *
- * @param custody Key custody method: "platform" (Android Keystore / JVM keystore)
- *                or "in_memory" (software keys, testing only).
+ * @param custody Key custody method. Section 3.2.2 of the identity spec, the
+ *                custody vocabulary, states the two values it carries:
+ *                "os_keystore" (Android Keystore, reached through the platform
+ *                key-custody callback) and "encrypted_file" (the on-disk key
+ *                store SCP implements).
  */
 class Scp private constructor(private val identityHandle: IdentityHandle) : AutoCloseable {
 
@@ -666,11 +688,12 @@ class Scp private constructor(private val identityHandle: IdentityHandle) : Auto
     companion object {
         /**
          * Create an SCP instance. Generates a new identity if none exists for this device.
-         * On Android with custody = "platform", injects AndroidPlatformAdapter.
-         * On JVM with custody = "in_memory", uses software keys (testing only).
+         * On Android with custody = "os_keystore", injects AndroidPlatformAdapter.
+         * The parameter carries no default, because key custody is a
+         * security-relevant choice an SDK does not make for a caller.
          */
         suspend fun create(
-            custody: String = "platform",
+            custody: String,
             platformAdapter: PlatformAdapter? = null,
         ): Scp = withContext(Dispatchers.IO) {
             val handle = NativeLib.identityCreate(
@@ -1080,7 +1103,7 @@ dependencies {
 ### Dependencies
 
 - **ADR-021 (UniFFI Bridge):** The Kotlin SDK wraps the UniFFI-generated `NativeLib.kt`. Every SDK public method calls exactly one UniFFI bridge function. The bridge defines the flat function surface (`identityCreate`, `contextCreate`, etc.), opaque object handles (`IdentityHandle`, `ContextHandle`), value records (`ScpMessage`, `ContextParams`), the `ScpError` sealed class, and the `MessageListener` callback interface.
-- **ADR-027 (Android Platform Adapter):** The `AndroidPlatformAdapter` (implemented in ADR-027) is instantiated by `Scp.create(custody = "platform", platformAdapter = AndroidPlatformAdapter.make(context))` and injected into the Rust engine via UniFFI callback interfaces. The Kotlin SDK `Scp.create()` factory accepts a `PlatformAdapter` parameter; ADR-027 provides the Android-specific implementation.
+- **ADR-027 (Android Platform Adapter):** The `AndroidPlatformAdapter` (implemented in ADR-027) is instantiated by `Scp.create(custody = "os_keystore", platformAdapter = AndroidPlatformAdapter.make(context))` and injected into the Rust engine via UniFFI callback interfaces. The Kotlin SDK `Scp.create()` factory accepts a `PlatformAdapter` parameter; ADR-027 provides the Android-specific implementation.
 - **ADR-006 (Platform Abstraction):** Platform trait definitions (`KeyCustody`, `PushProvider`, `Storage`, `DeviceAttestationProvider`) shape the UniFFI callback interface contracts that the Kotlin platform adapter implements.
 - **ADR-026 (Swift SDK):** Parallel reference. Same flat delegation pattern, same "no logic in the wrapper layer" principle, same FFI bridge → idiomatic language wrapper architecture. Key differences: Kotlin uses `suspend` functions and `Flow<Message>` where Swift uses `async/await` and `AsyncStream<Message>`; Kotlin uses `AutoCloseable` + `close()` where Swift uses `deinit` + `close()`; Kotlin uses `@Observable`-equivalent via `StateFlow` where Swift uses `@Observable` macro.
 - **ADR-014 (Python SDK) / ADR-013 (PyO3 Bridge):** The ergonomics layer pattern — flat FFI bridge → idiomatic language wrapper — is established here and applied to Kotlin. Kotlin SDK mirrors the structural choices (no logic in the wrapper layer, delegation only) and the type category decisions (opaque handles for crypto state, data classes for data).
@@ -1098,16 +1121,21 @@ dependencies {
    Both commands exit 0. Zero ktlint violations. Zero detekt findings.
 
 2. **`Scp.create()` factory:**
-   - `Scp.create(custody = "in_memory")` returns an `Scp` instance with `identity.did` starting with `"did:dht:"`.
-   - `Scp.create(custody = "platform", platformAdapter = AndroidPlatformAdapter.make(context))` returns an `Scp` instance with hardware-backed identity on API 33+.
+   §3.2.2 of the identity spec, the custody vocabulary, gives the custody type the two
+   values below and spells no member for the test-harness string `in_memory`, so a test
+   that needs the in-memory key store passes that string to the bridge rather than to
+   this factory.
+
+   - `Scp.create(custody = "encrypted_file")` returns an `Scp` instance with `identity.did` starting with `"did:dht:"`.
+   - `Scp.create(custody = "os_keystore", platformAdapter = AndroidPlatformAdapter.make(context))` returns an `Scp` instance with hardware-backed identity on API 33+.
    - `Scp.create()` with an unknown custody string throws `IdentityException` with code `"SCP-IDENT-1001"`.
 
 3. **`Identity` operations:**
 
    ```kotlin
-   val scp = Scp.create(custody = "in_memory")
+   val scp = Scp.create(custody = "encrypted_file")
    assertTrue(scp.identity.did.startsWith("did:dht:"))
-   assertEquals("in_memory", scp.identity.custodyType)
+   assertEquals("encrypted_file", scp.identity.custodyType)
 
    val doc = scp.identity.resolve(scp.identity.did)
    assertTrue(doc.verificationMethods.isNotEmpty())

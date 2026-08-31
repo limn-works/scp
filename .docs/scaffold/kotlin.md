@@ -202,7 +202,7 @@ class Identity private constructor(private val handle: IdentityHandle) {
     val custodyType: String get() = handle.custodyType()
 
     companion object {
-        suspend fun create(custody: String = "platform"): Identity =
+        suspend fun create(custody: String): Identity =
             withContext(Dispatchers.IO) {
                 Identity(NativeLib.identityCreate(custody))
             }
@@ -218,6 +218,16 @@ class Identity private constructor(private val handle: IdentityHandle) {
     }
 }
 ```
+
+`create` takes the custody string as a required argument and offers no default, because
+key custody is a security-relevant choice and the agent-first API design tenet in
+CLAUDE.md forbids an SDK picking one on a caller's behalf. §3.2.2 of the identity spec,
+the custody vocabulary, states the two values this string carries: `"encrypted_file"`
+selects the on-disk key store SCP implements, and `"os_keystore"` selects Android
+Keystore through the platform key-custody callback the SDK consumer supplies. A shipped
+build answers every other string with a typed error, and answers the test-harness string
+`"in_memory"` with `SCP-IDENT-1008`. The words `platform`, `software`, `file`, and
+`hardware` name no custody value.
 
 ## Resource Management
 

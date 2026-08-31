@@ -1,5 +1,13 @@
 # FFI Platform Adapter Must Be Retained on the Handle Struct
 
+> **Two names this lesson uses that the bridge no longer carries.** The function it calls
+> `identity_create_platform` is `identity_create_with_custody` today; that rename landed
+> before story SCP-294, the custody-naming story, and this note only records it. SCP-294
+> itself replaced the `CustodyMethod::Platform` variant with `CustodyMethod::Callback`,
+> because no custody string reaches a platform-native key store and the variant asserted
+> one for an opaque injected provider. The snippet below carries the current variant name.
+> The rule itself is unchanged.
+
 **Rule**: When an FFI bridge function creates a platform adapter (e.g., `KeyCustodyProviderAdapter`) to
 perform a one-shot operation (DID creation, key generation), that adapter must be stored on the opaque
 handle struct — not dropped at scope exit — if any subsequent operation on that handle needs the same
@@ -36,7 +44,7 @@ let adapter = Arc::new(KeyCustodyProviderAdapter::new(provider));
 let (identity, _document) = dht.create(adapter.as_ref()).await.map_err(ScpError::from)?;
 let handle = Arc::new(Identity {
     did: identity.did.clone(),
-    custody_type: CustodyMethod::Platform,
+    custody_type: CustodyMethod::Callback,
     core_id: Some(identity),
     in_memory_custody: None,
     platform_custody: Some(adapter),  // retained

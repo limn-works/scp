@@ -51,8 +51,11 @@ apple = ["dep:rusqlite", "dep:hex", "dep:fs2"]
 # the per-database salt sidecar (fail-closed on lock contention).
 sqlite = ["dep:rusqlite", "dep:hex", "dep:argon2", "dep:rand", "dep:fs2"]
 # Encrypted file-backed key custody (Argon2id + AES-256-GCM).
-# Universal fallback for non-HSM platforms. See GitHub issue #391.
-file = ["software_platform", "dep:aes-gcm", "dep:argon2"]
+# Universal fallback for non-HSM platforms. `fs2` supplies the advisory
+# exclusive lock `FileKeyCustody` holds over one key file, which stops two
+# instances from each writing entry index N of the same file. See GitHub issue
+# #391.
+file = ["software_platform", "dep:aes-gcm", "dep:argon2", "dep:fs2"]
 # Filesystem storage adapter (spec section 17.6).
 filesystem = []
 # EncryptingAdapter — wraps any Storage backend with AES-256-GCM per-value
@@ -65,6 +68,14 @@ sync = []
 [dependencies]
 serde = { workspace = true }
 tokio.workspace = true
+# `CustodySubstrate` — the trait through which a running custody backend reports
+# the two facts a DID document's published custody value states (extractability
+# and unlock factor). Every custody backend in this crate implements it, so
+# `ScpKeyCustodyAttestation::derive` reads a participant's published custody off
+# the backend the participant runs instead of off a field a caller fills in.
+# The edge runs `scp-platform` → `scp-did` and never the reverse: `scp-did` is
+# wasm-safe and stays free of this crate's tokio dependency.
+scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
 thiserror.workspace = true
 tracing = { workspace = true }
 zeroize = { workspace = true }
@@ -95,10 +106,11 @@ scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2", optional = tru
 # sqlite dependencies, gated behind the `sqlite` feature flag.
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"], optional = true }
 hex = { workspace = true, optional = true }
-# fs2 provides advisory POSIX / Windows file locking — used by SqliteStorage
+# fs2 provides advisory POSIX / Windows file locking. `SqliteStorage` uses it
 # to refuse a second process/instance trying to open the same database
 # directory concurrently (SQLite journal/WAL corruption guard, red-hat
-# RED-1002). Tiny dep (flock/LockFileEx wrappers).
+# RED-1002), and `FileKeyCustody` uses it to refuse a second instance over one
+# encrypted key file. Tiny dep (flock/LockFileEx wrappers).
 fs2 = { version = "0.4", optional = true }
 
 [dev-dependencies]

@@ -19,6 +19,7 @@ import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters
 import org.bouncycastle.crypto.signers.Ed25519Signer
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -141,6 +142,65 @@ class AndroidKeyCustodyTest {
         fun `generateKeypair ED25519 stores key in softwareKeys map`() {
             val handle = custody.generateKeypair(KeyType.ED25519)
             assertTrue(custody.softwareKeys.containsKey(handle.id))
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // The two facts a DID document publishes about custody (§3.2.2)
+    // -------------------------------------------------------------------
+
+    @Nested
+    inner class PublishedCustodyFacts {
+
+        @Test
+        fun `keyIsExtractable reports true for a Bouncy Castle software key`() {
+            // `exportSigningKeyBytes` copies the 32-byte seed out of
+            // `softwareKeys`, so the key leaves the store.
+            val handle = custody.generateKeypair(KeyType.ED25519)
+            assertTrue(custody.keyIsExtractable(handle))
+        }
+
+        @Test
+        fun `keyIsExtractable reports false for a TEE-backed key`() {
+            // JVM unit tests cannot reach Android Keystore, so this test names
+            // the hardware custody type on the handle directly. The adapter
+            // decides from that type, matching `exportSigningKeyBytes`, which
+            // throws `SCP-CRYPTO-4005` for the same handle because the TEE
+            // releases no private bytes.
+            val handle = KeyHandle(id = "tee-key", custodyType = CustodyType.HARDWARE)
+            assertFalse(custody.keyIsExtractable(handle))
+        }
+
+        @Test
+        fun `keyIsExtractable throws for a software handle this adapter does not hold`() {
+            val handle = KeyHandle(id = "nonexistent-key", custodyType = CustodyType.SOFTWARE)
+            val exception = assertThrows<ScpException> { custody.keyIsExtractable(handle) }
+            assertEquals("SCP-CRYPTO-4001", exception.code)
+        }
+
+        @Test
+        fun `unlockFactor reports unprotected for a Bouncy Castle software key`() {
+            // The seeds live in `EncryptedSharedPreferences`, whose production
+            // master key comes from `MasterKeys.AES256_GCM_SPEC` — a spec that
+            // requires no user authentication — so no factor gates the key.
+            val handle = custody.generateKeypair(KeyType.ED25519)
+            assertEquals("unprotected", custody.unlockFactor(handle))
+        }
+
+        @Test
+        fun `unlockFactor reports unprotected for a TEE-backed key`() {
+            // `generateKeystoreEd25519` builds its `KeyGenParameterSpec` with
+            // `setUserAuthenticationRequired(false)`, so the TEE signs without
+            // a biometric reading, a PIN, or a passcode.
+            val handle = KeyHandle(id = "tee-key", custodyType = CustodyType.HARDWARE)
+            assertEquals("unprotected", custody.unlockFactor(handle))
+        }
+
+        @Test
+        fun `unlockFactor throws for a software handle this adapter does not hold`() {
+            val handle = KeyHandle(id = "nonexistent-key", custodyType = CustodyType.SOFTWARE)
+            val exception = assertThrows<ScpException> { custody.unlockFactor(handle) }
+            assertEquals("SCP-CRYPTO-4001", exception.code)
         }
     }
 

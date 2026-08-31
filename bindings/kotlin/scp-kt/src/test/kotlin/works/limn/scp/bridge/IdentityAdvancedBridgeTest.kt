@@ -16,6 +16,7 @@ import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
+import works.limn.scp.CustodyType
 import works.limn.scp.IdentityAdvancedBindings
 import works.limn.scp.IdentityAdvancedBridge
 import kotlin.test.assertEquals
@@ -200,9 +201,9 @@ class IdentityAdvancedBridgeTest {
         @Test
         fun `createWithAgentKey delegates to bindings with custody string`() =
             runTest(testDispatcher) {
-                val result = advancedBridge.createWithAgentKey("in_memory")
+                val result = advancedBridge.createWithAgentKey(CustodyType.ENCRYPTED_FILE)
                 assertTrue(stubAdvanced.createWithAgentKeyCalled)
-                assertEquals("in_memory", stubAdvanced.lastCustody)
+                assertEquals("encrypted_file", stubAdvanced.lastCustody)
                 assertEquals(100L, result)
             }
 
@@ -211,7 +212,7 @@ class IdentityAdvancedBridgeTest {
             runTest(testDispatcher) {
                 stubAdvanced.createWithAgentKeyError = BridgeException("custody not available", "SCP-IDENT-1020")
                 assertFailsWith<BridgeException> {
-                    advancedBridge.createWithAgentKey("platform")
+                    advancedBridge.createWithAgentKey(CustodyType.OS_KEYSTORE)
                 }
             }
     }
@@ -363,12 +364,12 @@ class IdentityAdvancedBridgeTest {
                 val result =
                     advancedBridge.executeCustodyMigration(
                         "did:dht:z6MkTest",
-                        "hardware",
+                        CustodyType.OS_KEYSTORE,
                         listOf("ctx-1", "ctx-2"),
                     )
                 assertTrue(stubAdvanced.executeCustodyMigrationCalled)
                 assertEquals("did:dht:z6MkTest", stubAdvanced.lastDid)
-                assertEquals("hardware", stubAdvanced.lastTarget)
+                assertEquals("os_keystore", stubAdvanced.lastTarget)
                 assertEquals(listOf("ctx-1", "ctx-2"), stubAdvanced.lastContextIds)
                 assertTrue(result.contains("key_generated"))
                 assertTrue(result.contains("authorized"))
@@ -377,7 +378,10 @@ class IdentityAdvancedBridgeTest {
         @Test
         fun `executeCustodyMigration with empty contextIds`() =
             runTest(testDispatcher) {
-                advancedBridge.executeCustodyMigration("did:dht:z6MkTest", "software")
+                advancedBridge.executeCustodyMigration(
+                    "did:dht:z6MkTest",
+                    CustodyType.ENCRYPTED_FILE,
+                )
                 assertEquals(emptyList(), stubAdvanced.lastContextIds)
             }
 
@@ -387,16 +391,30 @@ class IdentityAdvancedBridgeTest {
                 stubAdvanced.executeCustodyMigrationError =
                     BridgeException("backend not configured", "SCP-IDENT-1025")
                 assertFailsWith<BridgeException> {
-                    advancedBridge.executeCustodyMigration("did:dht:z6MkFail", "hardware")
+                    advancedBridge.executeCustodyMigration(
+                        "did:dht:z6MkFail",
+                        CustodyType.OS_KEYSTORE,
+                    )
                 }
             }
 
+        /**
+         * Every [CustodyType] member arrives at the bindings layer as its own
+         * [CustodyType.rawValue], which is the string the UniFFI bridge parses
+         * into a migration target. Iterating [CustodyType.entries] rather than
+         * a hand-written list makes a member added to the vocabulary reach this
+         * assertion without an edit here.
+         *
+         * The parameter takes a [CustodyType], so the compiler now rejects the
+         * five strings section 3.2.2 of the identity spec retired. The sibling
+         * test above passed one of them, "hardware", until this change.
+         */
         @Test
         fun `executeCustodyMigration supports all target types`() =
             runTest(testDispatcher) {
-                for (target in listOf("platform_managed", "hardware", "software", "in_memory")) {
+                for (target in CustodyType.entries) {
                     advancedBridge.executeCustodyMigration("did:dht:z6MkTest", target)
-                    assertEquals(target, stubAdvanced.lastTarget)
+                    assertEquals(target.rawValue, stubAdvanced.lastTarget)
                 }
             }
     }

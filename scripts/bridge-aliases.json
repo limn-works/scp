@@ -58,6 +58,19 @@
       ]
     },
     {
+      "canonical": "identity_published_custody",
+      "category": "identity",
+      "pyo3": [
+        "identity_published_custody"
+      ],
+      "uniffi": [
+        "identity_published_custody"
+      ],
+      "napi": [
+        "identity_published_custody"
+      ]
+    },
+    {
       "canonical": "identity_remove_if_present",
       "category": "identity",
       "pyo3": [

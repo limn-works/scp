@@ -17,6 +17,7 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+use scp_ffi_common::custody_substrate::ReportedCustodySubstrate;
 use scp_platform::error::PlatformError;
 use scp_platform::file::FileKeyCustody;
 #[cfg(feature = "testing")]
@@ -232,7 +233,7 @@ impl PyKeyCustodyProvider {
     /// up-front by [`Self::validate`] so a malformed provider fails fast at
     /// the FFI boundary with a clear `ValidationError` rather than deep
     /// inside an async DID-creation flow.
-    const REQUIRED_METHODS: [&'static str; 9] = [
+    const REQUIRED_METHODS: [&'static str; 11] = [
         "sign",
         "get_public_key",
         "destroy_key",
@@ -242,6 +243,11 @@ impl PyKeyCustodyProvider {
         "derive_rotatable_pseudonym",
         "export_signing_key_bytes",
         "custody_type",
+        // The two facts a DID document publishes about custody (§3.2.2 of the
+        // identity spec). `custody_type` names a storage location, which is a
+        // different question and stays for `scp_platform::CustodyType`.
+        "key_is_extractable",
+        "unlock_factor",
     ];
 
     /// Wraps a Python provider object, validating that it exposes every
@@ -392,6 +398,35 @@ impl FfiKeyCustody {
             Self::Callback(kc) => kc.export_ed25519_signing_key(handle).await,
         }
     }
+
+    /// Reads the two facts a DID document publishes about the backend holding
+    /// `handle`: whether the private key can leave its store, and which factor
+    /// unlocks it (§3.2.2 of the identity spec).
+    ///
+    /// `FileKeyCustody` and `InMemoryKeyCustody` implement
+    /// [`CustodySubstrate`](scp_did::attestation::CustodySubstrate) about
+    /// themselves, so those two arms copy the answers. The callback arm asks
+    /// the injected provider, which is the only party that knows what the
+    /// operating system's key store does with the key.
+    ///
+    /// `ScpKeyCustodyAttestation::derive` takes one substrate per key, so this
+    /// method takes one handle rather than describing the whole backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::CustodyError`] when the injected provider
+    /// raises or returns a value the bridge cannot read.
+    pub async fn custody_substrate(
+        &self,
+        handle: &KeyHandle,
+    ) -> Result<ReportedCustodySubstrate, PlatformError> {
+        match self {
+            #[cfg(feature = "testing")]
+            Self::InMemory(kc) => Ok(ReportedCustodySubstrate::from_substrate(kc)),
+            Self::File(kc) => Ok(ReportedCustodySubstrate::from_substrate(kc)),
+            Self::Callback(kc) => kc.custody_substrate(handle).await,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -420,7 +455,18 @@ impl FfiKeyCustody {
 ///   `"scp-pseudonym-v2"`); the bridge does NOT synthesize the preimage.
 /// - `export_signing_key_bytes(key_id: str) -> bytes` — 32 private seed bytes.
 /// - `custody_type(key_id: str) -> str` — `"hardware"` / `"software"` /
-///   `"in_memory"`.
+///   `"in_memory"`. Names the storage location, which
+///   `scp_platform::CustodyType` consumes.
+/// - `key_is_extractable(key_id: str) -> bool` — whether the private key can
+///   leave the store the provider holds it in.
+/// - `unlock_factor(key_id: str) -> str` — which factor unlocks the key, one
+///   of the strings
+///   [`UNLOCK_FACTOR_WIRE_VALUES`](scp_ffi_common::custody_substrate::UNLOCK_FACTOR_WIRE_VALUES)
+///   lists.
+///
+/// The last two answer what a DID document publishes about custody (§3.2.2 of
+/// the identity spec), which is a different question from where the key is
+/// stored.
 pub struct PyCallbackKeyCustody {
     provider: PyKeyCustodyProvider,
 }
@@ -465,6 +511,38 @@ impl PyCallbackKeyCustody {
             &bytes,
         )?);
         Ok(ed25519_dalek::SigningKey::from_bytes(&arr))
+    }
+
+    /// Asks the provider the two questions a published custody value answers,
+    /// and returns the answers as a
+    /// [`CustodySubstrate`](scp_did::attestation::CustodySubstrate).
+    ///
+    /// §3.2.2 of the identity spec states that a DID document publishes
+    /// whether the key can leave its store and which factor unlocks it, and
+    /// that `ScpKeyCustodyAttestation::derive` reads both off the backend. The
+    /// Python provider is the only party that knows either fact about a key it
+    /// holds, so this method crosses the callback boundary to ask it.
+    ///
+    /// `async` for signature uniformity with the napi and `UniFFI` adapters,
+    /// whose own readers must await a callback dispatch; the `PyO3` path
+    /// re-acquires the GIL synchronously under the hood.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::CustodyError`] if the provider raises, or
+    /// returns a value the bridge cannot read as a `bool` or a `str`.
+    #[allow(clippy::unused_async)]
+    pub async fn custody_substrate(
+        &self,
+        handle: &KeyHandle,
+    ) -> Result<ReportedCustodySubstrate, PlatformError> {
+        let key_id = handle.id().to_string();
+        let key_is_extractable: bool = self.provider.call_str("key_is_extractable", &key_id)?;
+        let unlock_factor: String = self.provider.call_str("unlock_factor", &key_id)?;
+        Ok(ReportedCustodySubstrate::new(
+            key_is_extractable,
+            &unlock_factor,
+        ))
     }
 }
 
@@ -694,6 +772,12 @@ class FakeCustody:
 
     def custody_type(self, key_id):
         return 'software'
+
+    def key_is_extractable(self, key_id):
+        return True
+
+    def unlock_factor(self, key_id):
+        return 'passphrase'
 ";
 
     /// Builds a `FfiKeyCustody::Callback` wrapping a freshly-constructed
@@ -708,6 +792,61 @@ class FakeCustody:
             let provider = PyKeyCustodyProvider::new(py, obj.unbind()).expect("valid provider");
             FfiKeyCustody::Callback(PyCallbackKeyCustody::new(provider))
         })
+    }
+
+    #[tokio::test]
+    async fn ffi_custody_callback_reports_the_two_published_custody_facts() {
+        use scp_did::attestation::{CustodySubstrate, KeyCustodyModel, UnlockFactor};
+
+        let custody = fake_callback_custody();
+        let handle = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("callback generate keypair");
+
+        let substrate = custody
+            .custody_substrate(&handle)
+            .await
+            .expect("the provider answers both questions");
+
+        // The `FakeCustody` provider answers `True` and `'passphrase'`, which
+        // §3.2.2 of the identity spec pairs with the published value
+        // `extractable-passphrase`.
+        assert!(substrate.key_is_extractable());
+        assert_eq!(substrate.unlock_factor(), UnlockFactor::Passphrase);
+        assert_eq!(
+            KeyCustodyModel::from_substrate(&substrate).expect("the pair publishes a value"),
+            KeyCustodyModel::ExtractablePassphrase
+        );
+        assert_eq!(
+            scp_ffi_common::custody_substrate::published_custody_wire_value(&substrate),
+            Some("extractable-passphrase")
+        );
+    }
+
+    /// The encrypted key file answers both questions about itself, so an
+    /// identity under `encrypted_file` publishes a custody value without any
+    /// callback crossing.
+    #[tokio::test]
+    async fn ffi_custody_file_reports_the_two_published_custody_facts() {
+        use scp_did::attestation::{CustodySubstrate, UnlockFactor};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let custody = FfiKeyCustody::File(
+            FileKeyCustody::new(&dir.path().join("keys.bin"), "correct horse battery staple")
+                .expect("file custody opens"),
+        );
+        let handle = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("file generate keypair");
+
+        let substrate = custody
+            .custody_substrate(&handle)
+            .await
+            .expect("the file store answers both questions about itself");
+        assert!(substrate.key_is_extractable());
+        assert_eq!(substrate.unlock_factor(), UnlockFactor::Passphrase);
     }
 
     #[tokio::test]

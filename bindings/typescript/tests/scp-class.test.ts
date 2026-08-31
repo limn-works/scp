@@ -192,6 +192,9 @@ describe.skipIf(!addon)(`SCP class (Phase 4) [${skipReason}]`, () => {
       return; // addon predates per-instance identity/context — covered in Rust
     }
     expect(scpA.instanceId).not.toBe(scpB.instanceId);
+    // `scpA` is the raw addon class, not the SDK `SCP` wrapper, so this call
+    // already reaches the bridge directly with the raw test-harness custody
+    // string section 3.2.2 of the identity spec says a test passes.
     const identity = await scpA.identityCreate("in_memory");
     // contextCreate takes a NapiIdentity handle. Crossing it over to
     // scpB MUST be rejected with SCP-PERM-3030 before any capability

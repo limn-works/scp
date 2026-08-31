@@ -731,14 +731,65 @@ public extension SCP {
 
     /// Forwards to ``Scp/identityCreate`` on ``inner``.
     ///
+    /// `custody` carries no default, so the caller names the key store that
+    /// holds this identity's keys and this SDK names none for them. Which key
+    /// store holds a private key decides who can reach that key, so a default
+    /// would pick a security-relevant answer the caller never stated. This
+    /// method sends ``CustodyType/rawValue`` to the UniFFI bridge, so the
+    /// compiler rejects a custody value the vocabulary does not state.
+    ///
     /// `testingSeed` is a testing-only parameter for the ADR-046
-    /// cross-bridge parity harness; pass `nil` from production callers
-    /// (the `testing` in-memory path uses OS RNG when
-    /// `testingSeed` is `nil`). A non-`nil` `testingSeed` is only valid
-    /// for `custody == "in_memory"`; other custody types reject it with
-    /// `SCP-VALID-7009`.
-    func identityCreate(custody: String, testingSeed: Data? = nil) async throws -> Identity {
-        try await inner.identityCreate(custody: custody, testingSeed: testingSeed)
+    /// cross-bridge parity harness; pass `nil` from production callers. A
+    /// non-`nil` `testingSeed` is only valid alongside the raw test-harness
+    /// custody string `"in_memory"`, which ``CustodyType`` does not spell, so
+    /// a caller reaching this method with a ``CustodyType`` passes `nil`. The
+    /// UniFFI bridge judges the custody value before the seed, so
+    /// ``CustodyType/osKeystore`` reports its own `SCP-IDENT-1003` and this
+    /// bridge emits no `SCP-VALID-7009`.
+    ///
+    /// A test that needs the in-memory key store calls
+    /// ``Scp/identityCreate(custody:testingSeed:)`` on ``inner`` with the raw
+    /// string, which is what section 3.2.2 of the identity spec states a test
+    /// does: "a test that needs it passes the raw string to the bridge".
+    func identityCreate(custody: CustodyType, testingSeed: Data? = nil) async throws -> Identity {
+        try await inner.identityCreate(custody: custody.rawValue, testingSeed: testingSeed)
+    }
+
+    /// Returns the published-vocabulary custody value for `did`'s `#active`
+    /// signing key, read off the backend running in this process.
+    ///
+    /// Section 3.2.2 of the identity spec, "The Custody Vocabulary", separates
+    /// two vocabularies. A caller selecting custody names a backend, which is
+    /// what ``CustodyType`` carries. The published vocabulary states whether
+    /// the key can leave its store and which factor unlocks it, which is what
+    /// this method returns: `"non-extractable-biometric"`,
+    /// `"non-extractable-pin"`, or `"extractable-passphrase"`.
+    ///
+    /// Returns `nil` when the backend holding the `#active` key reports a pair
+    /// the published vocabulary states no value for. ADR-039's Enforcement
+    /// Stack layer 4 gives that absence a meaning, "Absence of attestation is
+    /// itself a signal".
+    ///
+    /// The bridge derives the value from the running backend, so the value
+    /// states what that backend reported. A `KeyCustodyProvider` passed to
+    /// ``identityCreateWithCustody(provider:)`` answers both questions through
+    /// its `keyIsExtractable` and `unlockFactor` methods, and
+    /// ``AppleKeyCustody`` conforms to that protocol.
+    ///
+    /// This method reads no DID document, and nothing SCP ships writes the
+    /// value into one: `ScpKeyCustodyAttestation::derive` and
+    /// `DidDocument::set_custody_attestation` have no caller outside tests. A
+    /// stranger resolving `did` therefore reads no custody service entry, and
+    /// this method answers only for an identity this instance created. Section
+    /// 3.2.2.1 of the identity spec records that as divergence D18.
+    ///
+    /// - Throws: ``ScpError`` when `did` is not a syntactically valid DID, and
+    ///   ``ScpError`` carrying `SCP-IDENT-1001` when this instance retains no
+    ///   custody for `did` or the injected provider throws while answering
+    ///   either question. All three bridges return `SCP-IDENT-1001` for both
+    ///   conditions.
+    func identityPublishedCustody(did: String) async throws -> String? {
+        try await inner.identityPublishedCustody(did: did)
     }
 
     /// Forwards to ``Scp/identityCreateLinkAttestation`` on ``inner``.
@@ -747,8 +798,15 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/identityCreateWithAgentKey`` on ``inner``.
-    func identityCreateWithAgentKey(custody: String) async throws -> Identity {
-        try await inner.identityCreateWithAgentKey(custody: custody)
+    ///
+    /// `custody` carries no default, so the caller names the key store that
+    /// holds this identity's keys and this SDK names none for them. Which key
+    /// store holds a private key decides who can reach that key, so a default
+    /// would pick a security-relevant answer the caller never stated. This
+    /// method sends ``CustodyType/rawValue`` to the UniFFI bridge, so the
+    /// compiler rejects a custody value the vocabulary does not state.
+    func identityCreateWithAgentKey(custody: CustodyType) async throws -> Identity {
+        try await inner.identityCreateWithAgentKey(custody: custody.rawValue)
     }
 
     /// Forwards to ``Scp/identityCreateWithCustody`` on ``inner``.
@@ -757,8 +815,14 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/identityExecuteCustodyMigration`` on ``inner``.
-    func identityExecuteCustodyMigration(did: String, target: String, contextIds: [String]) throws -> String {
-        try inner.identityExecuteCustodyMigration(did: did, target: target, contextIds: contextIds)
+    ///
+    /// `target` names the custody backend this DID's keys move into. Section
+    /// 3.2.2 of the identity spec, "The Custody Vocabulary", states the two
+    /// values, and this method sends ``CustodyType/rawValue`` to the UniFFI
+    /// bridge, so the compiler rejects a value the vocabulary does not state.
+    /// The bridge answers every other string with `SCP-IDENT-1024`.
+    func identityExecuteCustodyMigration(did: String, target: CustodyType, contextIds: [String]) throws -> String {
+        try inner.identityExecuteCustodyMigration(did: did, target: target.rawValue, contextIds: contextIds)
     }
 
     /// Forwards to ``Scp/identityExecuteRecovery`` on ``inner``.

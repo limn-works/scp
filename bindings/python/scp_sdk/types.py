@@ -6,10 +6,12 @@ Contains dataclasses and enums used across multiple SDK modules:
 ``CeilingPolicy``, ``PromotionPolicy``, ``MemoryScope``,
 ``SourceType``, ``DiscoveryMethod``, and ``ProvenanceQuality``.
 
-All types mirror their Rust counterparts in ``scp-core`` and carry full
-PEP 484 type annotations.  See ``.docs/adrs/phase-3.md`` ADR-014 for
-the wrapper design and ``.docs/standards/python.md`` for coding
-conventions.
+Every type here carries full PEP 484 type annotations.  Most mirror a
+Rust counterpart in ``scp-core``; :class:`CustodyType` instead carries the
+two custody values section 3.2.2 of the identity spec, "The Custody
+Vocabulary", states, and its own docstring says which Rust type it does not
+mirror.  See ``.docs/adrs/phase-3.md`` ADR-014 for the wrapper design and
+``.docs/standards/python.md`` for coding conventions.
 """
 
 from __future__ import annotations
@@ -23,31 +25,42 @@ from dataclasses import dataclass, field
 
 
 class CustodyType(enum.Enum):
-    """Key custody method for identity key management (spec section 3.2).
+    """The custody backend :meth:`scp_sdk.SCP.identity_create` names to the
+    PyO3 bridge.
 
-    Determines where cryptographic keys are stored and managed.
-    Mirrors ``scp_core::identity::CustodyType``.
+    Section 3.2.2 of the identity spec, "The Custody Vocabulary", states two
+    values a caller names when it selects a custody backend, and states that
+    "The vocabulary holds no third value, and a shipped build answers every
+    other string with a typed error."  Each member below carries one of those
+    two values, and the member's own documentation names the backend that
+    value selects.
 
-    The bridge layer accepts both ``"file"`` and ``"platform"`` for
-    file-backed custody (:attr:`FILE` and :attr:`PLATFORM` respectively).
-    ``"platform"`` is a backward-compatible alias — both resolve to
-    ``FileKeyCustody`` (Argon2id + AES-256-GCM encrypted key file at
-    ``$HOME/.scp/keys.bin``).  Prefer :attr:`FILE` for new code.
+    ``build_key_custody`` in ``crates/scp-ffi/src/identity.rs`` raises
+    ``scp_sdk._scp_core.ValidationError`` carrying code ``SCP-VALID-7005`` for
+    every string outside the two.
 
-    See SCP-294a.
+    This enum does not mirror ``scp_platform::CustodyType`` in
+    ``crates/scp-platform/src/traits.rs``.  That Rust enum reports where a key
+    already lives.  This enum names the backend the caller selects.
     """
 
-    #: Encrypted file-backed key custody (Argon2id + AES-256-GCM).
-    #: Canonical name for what was previously called ``"platform"``.
-    #: Requires the ``SCP_KEY_PASSPHRASE`` environment variable.
-    FILE = "file"
-    #: Backward-compatible alias for :attr:`FILE`.  Both resolve to
-    #: ``FileKeyCustody`` in the bridge layer.  Prefer :attr:`FILE`
-    #: for new code.
-    PLATFORM = "platform"
-    #: Ephemeral in-memory key store, suitable for testing or short-lived
-    #: agents.  Keys are lost on process exit.
-    IN_MEMORY = "in_memory"
+    #: Selects the on-disk key store SCP implements, which derives an AES-256
+    #: key from a passphrase with Argon2id and encrypts each key entry under
+    #: AES-256-GCM (``crates/scp-platform/src/file.rs``).  The bridge reads the
+    #: passphrase from the ``SCP_KEY_PASSPHRASE`` environment variable and
+    #: raises ``scp_sdk._scp_core.ValidationError`` carrying code
+    #: ``SCP-VALID-7005`` when that variable is unset or empty.  All three
+    #: bridges answer that condition with the same code.
+    ENCRYPTED_FILE = "encrypted_file"
+    #: Selects the operating system's own key store, which SCP reaches through
+    #: the platform key-custody callback an SDK consumer supplies.  A caller
+    #: that names this value without passing a
+    #: :class:`scp_sdk.scp.KeyCustodyProvider` to
+    #: :meth:`scp_sdk.SCP.identity_create_with_custody` draws
+    #: ``scp_sdk._scp_core.IdentityError`` carrying code ``SCP-IDENT-1003``,
+    #: because the bridge holds no callback to reach the store with and does
+    #: not fall back to another backend.
+    OS_KEYSTORE = "os_keystore"
 
 
 class BridgeMode(enum.Enum):

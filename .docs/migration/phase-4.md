@@ -46,6 +46,14 @@ instance is gone (PR 4). Post-PR-5 the per-domain namespace classes
 operations are **methods on `SCP`** (see [ADR-048 §7](../adrs/ADR-048-scp-multi-instance.md#7-per-sdk-idiomatic-shape--language-constraints-stay-local)).
 Callers construct an `SCP` at process start and invoke it directly.
 
+Each snippet below names `encrypted_file` through the SDK's own `CustodyType`, one of the
+two values §3.2.2 of the identity spec, the custody vocabulary, states. The pre-Phase-4
+lines keep the `in_memory` string those calls took, which that section classifies as a
+test-harness string rather than a value a shipped caller names. `scp.identity_create` and
+`scp.identityCreate` take a `CustodyType` and spell no third value, so a test that needs
+the in-memory key store passes the raw string to the bridge handle instead — `scp._native`
+in Python, `createNativeBridge(scp)` in TypeScript.
+
 ```python
 # Before Phase 4
 from scp_sdk import Identity, Context
@@ -54,8 +62,9 @@ ctx = await Context.create(creator=identity, ...)
 
 # After Phase 4 PR 5 — storage selection is required (spec §17.6)
 from scp_sdk import SCP
+from scp_sdk.types import CustodyType
 with SCP(storage={"type": "in_memory"}) as scp:
-    identity = await scp.identity_create("in_memory")
+    identity = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
     ctx = await scp.context_create(identity.did, {...})
 ```
 
@@ -69,7 +78,7 @@ const ctx = await Context.create(identity, { ceiling, memoryScope });
 import { SCP } from "@limn-works/scp-ts";
 const scp = new SCP({ storage: { type: "in_memory" } });
 try {
-  const identity = await scp.identityCreate("in_memory");
+  const identity = await scp.identityCreate("encrypted_file");
   const ctx = await scp.contextCreate(identity.did, {...});
 } finally {
   await scp.shutdown(5);

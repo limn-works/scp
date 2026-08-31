@@ -83,7 +83,13 @@ scp-node = { path = "../../scp-node", optional = true }
 # NOT reachable in production: production pre-rotation create FAILS CLOSED with a
 # typed `IdentityError` (SCP-IDENT-1059) rather than mint `InMemoryPreRotationCustody`.
 # The `testing` crate-feature adds `scp-platform/testing` on top for test builds.
-scp-platform = { path = "../../scp-platform", features = ["software_platform", "in-memory-storage", "encrypting", "sqlite"] }
+# `file` compiles `FileKeyCustody`, the encrypted key store §3.2.2 of the
+# identity spec names `encrypted_file`. It is a durability-only feature — the
+# store derives an AES-256 key from a passphrase with Argon2id and encrypts each
+# key entry under AES-256-GCM — and the allowlist of
+# `scripts/check-shipped-feature-graph.sh` already carries it (ADR-062
+# §Decision 6).
+scp-platform = { path = "../../scp-platform", features = ["software_platform", "file", "in-memory-storage", "encrypting", "sqlite"] }
 scp-mcp = { path = "../../scp-mcp" }
 scp-testing = { path = "../../scp-testing", optional = true }
 scp-transport = { path = "../../scp-transport" }

@@ -1,6 +1,10 @@
 # SCP Swift macOS Scaffold
 
-Minimal macOS app using the SCP Swift SDK with Keychain key custody.
+Minimal macOS app using the SCP Swift SDK with the encrypted key file SCP implements. A caller reaches
+the Keychain by naming `"os_keystore"` and supplying a `KeyCustodyProvider`; §3.2.2 of
+the identity spec, the custody vocabulary, states that value and states that a bridge
+holding no such provider returns a typed error rather than falling back to another
+store.
 
 ## Prerequisites
 
@@ -18,7 +22,7 @@ swift run
 
 ## What This Does
 
-1. Creates a `did:dht` identity with Keychain key custody
+1. Creates a `did:dht` identity with the encrypted key file SCP implements
 2. Opens an encrypted context with messaging capabilities
 3. Sends a message
 4. Cleans up by leaving the context

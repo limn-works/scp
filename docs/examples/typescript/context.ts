@@ -16,7 +16,7 @@ import type { ContextParams } from "@limn-works/scp-ts";
 
 async function main(): Promise<void> {
   // 1. Create the identity that will own the context.
-  const alice = await Identity.create({ custody: "in_memory" });
+  const alice = await Identity.create({ custody: "encrypted_file" });
   console.log(`Alice DID: ${alice.did}`);
 
   // 2. Define context parameters.
@@ -61,7 +61,7 @@ async function main(): Promise<void> {
     console.log("  Message sent successfully.");
 
     // 6. Bob joins the context.
-    const bob = await Identity.create({ custody: "in_memory" });
+    const bob = await Identity.create({ custody: "encrypted_file" });
     await ctx.join(bob);
     console.log();
     console.log(`Bob joined the context.`);

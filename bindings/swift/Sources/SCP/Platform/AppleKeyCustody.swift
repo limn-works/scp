@@ -340,7 +340,7 @@ public final class AppleKeyCustody: Sendable {
     /// Reads the raw 32-byte private key bytes for `handle` from the Keychain.
     ///
     /// - Parameter handle: The opaque UUID handle returned by
-    ///   ``generateKeypair(keyType:)``.
+    ///   ``generateKeypair(_:)``.
     /// - Returns: The raw private key bytes.
     /// - Throws: ``PlatformError/keyNotFound(_:)`` if the item does not exist,
     ///   ``PlatformError/biometricAuthenticationFailed(_:)`` if the user
@@ -498,7 +498,7 @@ public extension AppleKeyCustody {
     ///
     /// See ADR-025 Key custody and ADR-006 `generate_keypair`.
     @concurrent
-    func generateKeypair(keyType: String) async throws -> String {
+    func generateKeypair(_ keyType: String) async throws -> String {
         guard let parsedType = KeyType(rawValue: keyType) else {
             throw PlatformError.custodyError("Unknown key type '\(keyType)'")
         }
@@ -536,7 +536,7 @@ public extension AppleKeyCustody {
     /// call. They are not cached, logged, or returned across the FFI boundary.
     ///
     /// - Parameters:
-    ///   - keyHandle: The UUID handle returned by ``generateKeypair(keyType:)``
+    ///   - keyHandle: The UUID handle returned by ``generateKeypair(_:)``
     ///     for an `"ed25519"` key.
     ///   - data: The bytes to sign.
     /// - Returns: 64-byte Ed25519 signature.
@@ -582,7 +582,7 @@ public extension AppleKeyCustody {
     /// items that predate the metadata cache.
     ///
     /// - Parameter keyHandle: The UUID handle returned by
-    ///   ``generateKeypair(keyType:)`` or ``derivePseudonym(_:contextId:)``.
+    ///   ``generateKeypair(_:)`` or ``derivePseudonym(_:contextId:)``.
     /// - Returns: 32-byte raw public key bytes.
     /// - Throws: ``PlatformError/keyNotFound(_:)`` if the handle is unknown,
     ///   ``PlatformError/keychainError(_:)`` for Keychain failures,
@@ -653,7 +653,7 @@ public extension AppleKeyCustody {
     /// SCP specification.
     ///
     /// - Parameter keyHandle: The UUID handle returned by
-    ///   ``generateKeypair(keyType:)``.
+    ///   ``generateKeypair(_:)``.
     /// - Returns: A ``DestructionAttestation`` confirming software deletion.
     /// - Throws: ``PlatformError/keyNotFound(_:)`` if the handle is already
     ///   absent, ``PlatformError/destructionFailed(_:)`` if the item persists
@@ -702,7 +702,7 @@ public extension AppleKeyCustody {
     /// within this method.
     ///
     /// - Parameters:
-    ///   - keyHandle: The UUID handle returned by ``generateKeypair(keyType:)``
+    ///   - keyHandle: The UUID handle returned by ``generateKeypair(_:)``
     ///     for an `"x25519"` key.
     ///   - peerPublic: The 32-byte X25519 public key of the peer.
     /// - Returns: 32-byte X25519 shared secret.
@@ -978,7 +978,7 @@ public extension AppleKeyCustody {
     /// P-256. See ADR-025 Rationale.
     ///
     /// - Parameter keyId: The UUID handle returned by
-    ///   ``generateKeypair(keyType:)``.
+    ///   ``generateKeypair(_:)``.
     /// - Returns: 32-byte raw Ed25519 private key bytes.
     /// - Throws: ``PlatformError/wrongKeyType(_:)`` if the key is X25519,
     ///   ``PlatformError/keyNotFound(_:)`` if the handle is unknown,
@@ -1022,5 +1022,272 @@ public extension AppleKeyCustody {
         case .none: "software"
         case .required: "software_biometric"
         }
+    }
+
+    // MARK: Published custody
+
+    /// Reports whether the private key `keyId` names can leave the Keychain.
+    ///
+    /// This adapter answers `true` for every key it holds, because
+    /// ``exportSigningKeyBytes(_:)`` reads the raw 32 private-key bytes out of
+    /// the Keychain item and returns a copy of them to the caller. That is
+    /// true under both ``BiometricPolicy`` cases: `.required` gates the read
+    /// behind Face ID or Touch ID, and a gated read still hands the bytes to
+    /// the caller.
+    ///
+    /// The Secure Enclave, which holds a key non-extractably, generates P-256
+    /// keys only, and SCP signs with Ed25519, so no SCP key reaches it. See
+    /// the "Secure Enclave note" section above.
+    ///
+    /// - Parameter keyId: The UUID handle returned by
+    ///   ``generateKeypair(_:)``. Reading the attribute needs no key
+    ///   material, so this call raises no biometric prompt.
+    /// - Returns: `true`.
+    /// - Throws: ``PlatformError/keyNotFound(_:)`` when the Keychain holds no
+    ///   item for `keyId`. A bridge that reads a throw here publishes no
+    ///   custody value for the key.
+    nonisolated func keyIsExtractable(_ keyId: String) throws -> Bool {
+        _ = try fetchMetadata(for: keyId)
+        return true
+    }
+
+    /// Reports which factor unlocks the key `keyId` names.
+    ///
+    /// Under ``BiometricPolicy/required`` this adapter answers `"biometric"`:
+    /// ``storePrivateKeyBytes(_:for:keyType:publicKeyBytes:)`` creates the
+    /// item with a `SecAccessControl` carrying `.biometryCurrentSet`, so Face
+    /// ID or Touch ID authenticates before the Keychain releases key material.
+    ///
+    /// Under ``BiometricPolicy/none`` this adapter answers
+    /// `"caller_supplied_key"`, and that answer names no factor this adapter
+    /// verified. The item then carries
+    /// `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` and no access
+    /// control, and no artifact states which factor that protection class
+    /// means: the device passcode, which would make the answer
+    /// `"passphrase"`, or nothing at all, which would make it
+    /// `"unprotected"`. Those two answers publish different values —
+    /// `"passphrase"` publishes `extractable-passphrase` and `"unprotected"`
+    /// publishes nothing — so the adapter reports neither while the question
+    /// is open. `"caller_supplied_key"` publishes nothing, which section 3.2.2
+    /// of the identity spec states is what a backend reporting a pair the
+    /// published vocabulary states no value for does. Alec decides which of
+    /// the two the adapter answers; until then this value publishes no claim
+    /// rather than the wrong one.
+    ///
+    /// - Parameter keyId: The UUID handle returned by
+    ///   ``generateKeypair(_:)``. Reading the attribute needs no key
+    ///   material, so this call raises no biometric prompt.
+    /// - Returns: `"biometric"` or `"caller_supplied_key"`.
+    /// - Throws: ``PlatformError/keyNotFound(_:)`` when the Keychain holds no
+    ///   item for `keyId`.
+    nonisolated func unlockFactor(_ keyId: String) throws -> String {
+        _ = try fetchMetadata(for: keyId)
+        switch biometricPolicy {
+        case .required: return "biometric"
+        case .none: return "caller_supplied_key"
+        }
+    }
+}
+
+// MARK: - KeyCustodyProvider conformance
+
+/// Satisfies the `KeyCustodyProvider` callback interface the UniFFI bridge
+/// generates, so an app passes ``AppleKeyCustody`` straight to
+/// ``SCP/identityCreateWithCustody(provider:)``.
+///
+/// The methods above use Swift-idiomatic signatures — an unlabelled first
+/// parameter, ``PseudonymResult`` and ``DestructionAttestation`` return types.
+/// The generated protocol declares `keyId:` labels and returns `Data` and
+/// `Void`, and Swift matches a protocol requirement on its full name including
+/// argument labels, so the two sets are different methods. Each member here
+/// forwards to the one above it, converts the return value, and converts the
+/// error through ``asScpError(_:)``, because the generated vtable lowers
+/// `ScpError` alone and marks anything else `CALL_UNEXPECTED_ERROR`. Renaming
+/// the methods above instead would break every caller that already holds an
+/// ``AppleKeyCustody`` and calls them directly. `generateKeypair` is the one
+/// exception: the class declared it as `generateKeypair(keyType:)`, which is
+/// the protocol's own full name, so the class's method satisfied the
+/// requirement directly and threw ``PlatformError`` straight into the vtable.
+/// The class now declares `generateKeypair(_:)`, matching every sibling's
+/// unlabelled first parameter, and the member below converts for it too.
+///
+/// Before this extension the class declared no conformance at all, while the
+/// heading above the methods read "KeyCustodyProvider conformance", so
+/// `scp.identityCreateWithCustody(provider: AppleKeyCustody(...))` did not
+/// compile and `os_keystore` had no producer on Apple platforms.
+///
+/// See ADR-025, the Apple platform adapter, and section 3.2.2 of the identity
+/// spec, the custody vocabulary.
+extension AppleKeyCustody: KeyCustodyProvider {
+    /// Signs `message` with the Ed25519 key `keyId` names.
+    ///
+    /// Forwards to ``AppleKeyCustody/sign(_:data:)``.
+    public func sign(keyId: String, message: Data) async throws -> Data {
+        do {
+            return try await sign(keyId, data: message)
+        } catch {
+            throw Self.asScpError(error)
+        }
+    }
+
+    /// Returns the 32 public-key bytes for `keyId`.
+    ///
+    /// Forwards to ``AppleKeyCustody/publicKey(_:)``.
+    public func getPublicKey(keyId: String) async throws -> Data {
+        do {
+            return try await publicKey(keyId)
+        } catch {
+            throw Self.asScpError(error)
+        }
+    }
+
+    /// Deletes the Keychain item `keyId` names.
+    ///
+    /// Forwards to ``AppleKeyCustody/destroyKey(_:)`` and drops the
+    /// ``DestructionAttestation`` it returns, because the callback interface
+    /// declares no return value. A caller that needs the attestation calls
+    /// ``AppleKeyCustody/destroyKey(_:)`` directly.
+    public func destroyKey(keyId: String) async throws {
+        do {
+            _ = try await destroyKey(keyId)
+        } catch {
+            throw Self.asScpError(error)
+        }
+    }
+
+    /// Generates a keypair and returns the handle that names it.
+    ///
+    /// Forwards to ``AppleKeyCustody/generateKeypair(_:)``.
+    public func generateKeypair(keyType: String) async throws -> String {
+        do {
+            return try await generateKeypair(keyType)
+        } catch {
+            throw Self.asScpError(error)
+        }
+    }
+
+    /// Performs X25519 Diffie-Hellman with the key `keyId` names.
+    ///
+    /// Forwards to ``AppleKeyCustody/dhAgree(_:peerPublic:)``.
+    public func dhAgree(keyId: String, peerPublic: Data) async throws -> Data {
+        do {
+            return try await dhAgree(keyId, peerPublic: peerPublic)
+        } catch {
+            throw Self.asScpError(error)
+        }
+    }
+
+    /// Derives a context-scoped pseudonym keypair for `keyId`.
+    ///
+    /// Forwards to ``AppleKeyCustody/derivePseudonym(_:contextId:)`` and packs
+    /// its ``PseudonymResult`` into the wire form the bridge unpacks.
+    public func derivePseudonym(keyId: String, contextId: Data) async throws -> Data {
+        do {
+            let result = try await derivePseudonym(keyId, contextId: contextId)
+            return Self.packPseudonym(result)
+        } catch {
+            throw Self.asScpError(error)
+        }
+    }
+
+    /// Derives an epoch-versioned pseudonym keypair for `keyId`.
+    ///
+    /// Forwards to
+    /// ``AppleKeyCustody/deriveRotatablePseudonym(_:contextId:pseudonymEpoch:)``
+    /// and packs its ``PseudonymResult`` into the wire form the bridge unpacks.
+    public func deriveRotatablePseudonym(
+        keyId: String,
+        contextId: Data,
+        pseudonymEpoch: UInt64
+    ) async throws -> Data {
+        do {
+            let result = try await deriveRotatablePseudonym(
+                keyId,
+                contextId: contextId,
+                pseudonymEpoch: pseudonymEpoch
+            )
+            return Self.packPseudonym(result)
+        } catch {
+            throw Self.asScpError(error)
+        }
+    }
+
+    /// Returns the raw 32 Ed25519 private-key bytes for `keyId`.
+    ///
+    /// Forwards to ``AppleKeyCustody/exportSigningKeyBytes(_:)``.
+    public func exportSigningKeyBytes(keyId: String) async throws -> Data {
+        do {
+            return try await exportSigningKeyBytes(keyId)
+        } catch {
+            throw Self.asScpError(error)
+        }
+    }
+
+    /// Reports where the key `keyId` names lives.
+    ///
+    /// Forwards to ``AppleKeyCustody/custodyType(_:)``.
+    public nonisolated func custodyType(keyId: String) -> String {
+        custodyType(keyId)
+    }
+
+    /// Reports whether the key `keyId` names can leave the Keychain.
+    ///
+    /// Forwards to ``AppleKeyCustody/keyIsExtractable(_:)``.
+    public nonisolated func keyIsExtractable(keyId: String) throws -> Bool {
+        do {
+            return try keyIsExtractable(keyId)
+        } catch {
+            throw Self.asScpError(error)
+        }
+    }
+
+    /// Reports which factor unlocks the key `keyId` names.
+    ///
+    /// Forwards to ``AppleKeyCustody/unlockFactor(_:)``.
+    public nonisolated func unlockFactor(keyId: String) throws -> String {
+        do {
+            return try unlockFactor(keyId)
+        } catch {
+            throw Self.asScpError(error)
+        }
+    }
+
+    /// Converts an error one of the class's own methods threw into the
+    /// `ScpError` the generated callback interface declares.
+    ///
+    /// The generated vtable lowers `ScpError` and nothing else: it passes
+    /// `FfiConverterTypeScpError_lower` as its `lowerError`, so a thrown value
+    /// of any other type takes the `catch` that sets `CALL_UNEXPECTED_ERROR`
+    /// (`Sources/SCP/Internal/ScpBindings.swift`). The Rust side then receives
+    /// a bare string, and the code a caller branches on is gone. Every member
+    /// above converts before it returns for that reason, and `mapErrors` in
+    /// `bindings/kotlin/scp-kt-android/.../UniffiKeyCustody.kt` converts the
+    /// Android adapter's exception for the same reason.
+    ///
+    /// `SCP-CRYPTO-4001` is the code `AndroidKeyCustody` raises for every key
+    /// custody failure, so a caller reads one code for one condition on both
+    /// platforms. The message is the thrown value's own description, which
+    /// names the Keychain status or the handle and carries no key material.
+    private nonisolated static func asScpError(_ error: any Error) -> ScpError {
+        if let error = error as? ScpError {
+            return error
+        }
+        let message = (error as? any LocalizedError)?.errorDescription
+            ?? String(describing: error)
+        return ScpError.Crypto(msg: message, code: "SCP-CRYPTO-4001")
+    }
+
+    /// Packs a ``PseudonymResult`` into the byte layout the UniFFI bridge
+    /// unpacks: the 32 public-key bytes followed by the handle's UTF-8 bytes.
+    ///
+    /// `ScpUniffiCallbackKeyCustody::derive_pseudonym` reads exactly that
+    /// layout through `scp_ffi_common::custody_parse::unpack_pseudonym`
+    /// (`crates/scp-ffi/uniffi/src/bridge.rs`), and the generated protocol's
+    /// documentation states it: "Returns a two-element list:
+    /// `[pseudonym_public_key_bytes (32), key_id (string as UTF-8)]`".
+    private nonisolated static func packPseudonym(_ result: PseudonymResult) -> Data {
+        var packed = Data(result.publicKey)
+        packed.append(contentsOf: Array(result.handle.utf8))
+        return packed
     }
 }

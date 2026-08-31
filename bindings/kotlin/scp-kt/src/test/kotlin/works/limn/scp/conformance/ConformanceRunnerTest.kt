@@ -62,17 +62,17 @@ class ConformanceRunnerTest {
                     category = "identity",
                     description = "Create identity with in-memory custody",
                     operation = "identity_create",
-                    input = mapOf("custody" to "in_memory"),
+                    input = mapOf("custody" to "encrypted_file"),
                     expected =
                         mapOf(
                             "did_prefix" to "did:dht:",
-                            "custody_type" to "in_memory",
+                            "custody_type" to "encrypted_file",
                         ),
                 )
             assertEquals("identity-create-001", fixture.testId)
             assertEquals("identity", fixture.category)
             assertEquals("identity_create", fixture.operation)
-            assertEquals("in_memory", fixture.input["custody"])
+            assertEquals("encrypted_file", fixture.input["custody"])
             assertEquals("did:dht:", fixture.expected["did_prefix"])
         }
 
@@ -187,7 +187,7 @@ class ConformanceRunnerTest {
         @Test
         fun `dispatcher handles all identity operations`() =
             runTest(testDispatcher) {
-                assertDispatchSucceeds("identity_create", mapOf("custody" to "in_memory"))
+                assertDispatchSucceeds("identity_create", mapOf("custody" to "encrypted_file"))
                 assertDispatchSucceeds("identity_load", mapOf("did" to "did:dht:test"))
                 assertDispatchSucceeds("identity_resolve", mapOf("did" to "did:dht:test"))
             }
@@ -278,8 +278,8 @@ class ConformanceRunnerTest {
                 category = "identity",
                 description = "Create identity",
                 operation = "identity_create",
-                input = mapOf("custody" to "in_memory"),
-                expected = mapOf("custody_type" to "in_memory"),
+                input = mapOf("custody" to "encrypted_file"),
+                expected = mapOf("custody_type" to "encrypted_file"),
             ),
             ConformanceFixture(
                 testId = "roundtrip-context-001",

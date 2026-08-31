@@ -24,6 +24,8 @@ import hashlib
 
 import pytest
 
+from scp_sdk.types import CustodyType
+
 from .pseudonym_recipe import (
     canonical_pseudonym_blob,
     canonical_pseudonym_seed,
@@ -184,6 +186,35 @@ class _FakeKeychain:
     def custody_type(self, key_id: str) -> str:
         return "software"
 
+    def key_is_extractable(self, key_id: str) -> bool:
+        # This double keeps every seed in ``self._seeds`` and hands it back
+        # through ``export_signing_key_bytes``, so the key leaves the store.
+        return True
+
+    def unlock_factor(self, key_id: str) -> str:
+        # Nothing gates ``self._seeds``: no biometric reading, no PIN, no
+        # passphrase. Section 3.2.2 of the identity spec states that a backend
+        # reporting a pair the published vocabulary states no value for
+        # "publishes no custody attestation at all", and (extractable,
+        # unprotected) is such a pair.
+        return "unprotected"
+
+
+class _FakeBiometricKeychain(_FakeKeychain):
+    """A double that answers the two published-custody questions differently.
+
+    Every cryptographic operation behaves exactly as :class:`_FakeKeychain`
+    does. This subclass exists so a test can drive the bridge's mapping from a
+    provider's two answers onto the published value section 3.2.2 states for
+    that pair, which :class:`_FakeKeychain` never produces.
+    """
+
+    def key_is_extractable(self, key_id: str) -> bool:
+        return False
+
+    def unlock_factor(self, key_id: str) -> str:
+        return "biometric"
+
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -203,8 +234,10 @@ async def test_identity_create_with_custody_produces_did(scp) -> None:
     identity = await scp.identity_create_with_custody(provider)
 
     assert identity.did.startswith("did:dht:"), f"unexpected DID: {identity.did}"
-    # Custody is reported as the callback path.
-    assert identity.custody_type == "callback"
+    # Section 3.2.2 of the identity spec gives the operating system's own key
+    # store the value ``"os_keystore"``, and an injected provider is how the
+    # bridge reaches that store.
+    assert identity.custody_type == CustodyType.OS_KEYSTORE
     # The #0 verifying key is snapshotted from the provider's public key.
     # Exposed on the raw bridge handle as `verifying_key` (32 raw bytes =
     # 64 hex chars).
@@ -231,3 +264,34 @@ async def test_identity_create_with_custody_rejects_incomplete_provider(scp) -> 
 
     with pytest.raises(_scp_core.ValidationError, match="missing the required method"):
         await scp.identity_create_with_custody(Incomplete())
+
+
+@pytest.mark.asyncio
+async def test_published_custody_reads_the_providers_two_answers(scp) -> None:
+    """The bridge publishes what the provider answers, not what the caller asked for.
+
+    Section 3.2.2 of the identity spec states that the published value "is
+    derived, never declared": ``ScpKeyCustodyAttestation::derive`` "is the only
+    named constructor, and it takes no custody value: it reads one off each
+    custody backend the caller passes it". A provider reporting a
+    non-extractable key behind a biometric reading therefore publishes
+    ``"non-extractable-biometric"``, and the caller named only
+    ``"os_keystore"``.
+    """
+    identity = await scp.identity_create_with_custody(_FakeBiometricKeychain())
+
+    assert await scp.identity_published_custody(identity.did) == "non-extractable-biometric"
+
+
+@pytest.mark.asyncio
+async def test_published_custody_is_absent_for_a_pair_the_vocabulary_omits(scp) -> None:
+    """A pair the published vocabulary states no value for publishes nothing.
+
+    :class:`_FakeKeychain` reports an extractable key that nothing gates.
+    Section 3.2.2 states that such a backend "publishes no custody attestation
+    at all", and ADR-039's Enforcement Stack layer 4 gives that absence a
+    meaning, "Absence of attestation is itself a signal".
+    """
+    identity = await scp.identity_create_with_custody(_FakeKeychain())
+
+    assert await scp.identity_published_custody(identity.did) is None

@@ -17,7 +17,7 @@ import SCP
 struct ContextExample {
     static func main() async throws {
         // 1. Create the identity that will own the context.
-        let alice = try await createIdentity(custody: "in_memory")
+        let alice = try await createIdentity(custody: "encrypted_file")
         print("Alice DID: \(alice.did())")
 
         // 2. Define context parameters.
@@ -72,7 +72,7 @@ struct ContextExample {
         print("  (Message stream ready for consumption)")
 
         // 6. Bob joins the context.
-        let bob = try await createIdentity(custody: "in_memory")
+        let bob = try await createIdentity(custody: "encrypted_file")
         try await contextJoin(handle: handle, identity: bob)
         print()
         print("Bob joined the context.")

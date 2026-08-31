@@ -79,7 +79,13 @@ rmp-serde = { workspace = true }
 # `EncryptingAdapter` in `build_event_log_provider` (#1447 / #484). The
 # `testing` crate-feature above adds `scp-platform/testing` for
 # dev/test/desktop builds only (ADR-062 §Decision 6).
-scp-platform = { path = "../../scp-platform", features = ["software_platform", "encrypting", "sqlite"] }
+# `file` compiles `FileKeyCustody`, the encrypted key store §3.2.2 of the
+# identity spec names `encrypted_file`. It is a durability-only feature — the
+# store derives an AES-256 key from a passphrase with Argon2id and encrypts each
+# key entry under AES-256-GCM — and the allowlist of
+# `scripts/check-shipped-feature-graph.sh` already carries it (ADR-062
+# §Decision 6).
+scp-platform = { path = "../../scp-platform", features = ["software_platform", "file", "encrypting", "sqlite"] }
 scp-mcp = { path = "../../scp-mcp" }
 scp-transport = { path = "../../scp-transport" }
 ed25519-dalek = { workspace = true }
@@ -117,6 +123,18 @@ syn = { version = "2", features = ["full", "visit", "extra-traits"] }
 [[test]]
 name = "e2e_bridge"
 path = "tests/e2e_bridge.rs"
+required-features = ["testing"]
+
+# Drives `Scp::suspend` / `Scp::resume` on an instance built by
+# `Scp::new_in_memory_for_test`, which the lib declares
+# `#[cfg(any(test, feature = "testing"))]`. An integration test links the lib
+# compiled WITHOUT `cfg(test)`, so the constructor exists for this target only
+# when the feature is on. Declaring the requirement lets cargo skip this target
+# in the shipped configuration, which is what lets CI's
+# "Rust / test (uniffi production config)" lane run `cargo test` at all.
+[[test]]
+name = "lifecycle"
+path = "tests/lifecycle.rs"
 required-features = ["testing"]
 
 # SCP-OUT-039 (§5.4.5) — replays the 7 outlet-streaming conformance vectors

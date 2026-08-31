@@ -23,7 +23,7 @@ async function main(): Promise<void> {
     console.log(`Relay listening at ${relay.relayUrl}`);
 
     // 2. Create admin identity.
-    const admin = await scp.identityCreate("in_memory");
+    const admin = await scp.identityCreate("encrypted_file");
     console.log(`Admin DID: ${admin.did}`);
 
     // 3. Wire the bridge's transport to the relay.
@@ -48,7 +48,7 @@ async function main(): Promise<void> {
     console.log(`Governed context created: ${ctx.contextId}`);
 
     // 5. Create a second identity and have them join.
-    const member = await scp.identityCreate("in_memory");
+    const member = await scp.identityCreate("encrypted_file");
     await scp.contextJoin(ctx._rawHandle, member.did, null);
     console.log(`Member ${member.did} joined`);
 

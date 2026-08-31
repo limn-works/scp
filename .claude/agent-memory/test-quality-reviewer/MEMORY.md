@@ -64,3 +64,4 @@
 - [TS SDK bridge error shape](ts_sdk_bridge_error_shape.md) — trust.ts classifies plain-Error bridge errors by [SCP-PERM] message regex; mapBridgeError is bypassed
 - [TS SDK trust/parity tests](ts-sdk-trust-tests.md) — strict mock-bridge harness (M-1) is gold standard; TS classifier ~46 cases vs Python ~111 (per-prefix gap); tier mapping only in skipped real-NAPI group
 - [Gate self-tests over-determined](gate-selftest-over-determined.md) — validator "fails on bad input → exit 1" tests pass for the wrong reason if input trips multiple error branches; isolate the branch + assert the specific signal, not just exit code
+- [SCP-294 custody vocabulary coverage matrix](custody-vocabulary-scp294.md) — what PR #2415 tests prove, and the 3 bridge/SDK cells nothing covers

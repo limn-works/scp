@@ -39,9 +39,19 @@ interface IdentityAdvancedBindings {
      * Combines identity creation with immediate agent key generation
      * in a single operation.
      *
-     * @param custody Key custody method: "in_memory", "platform", or "software".
+     * @param custody Key custody method. §3.2.2 of the identity spec, "The
+     *   Custody Vocabulary", states two values: `"encrypted_file"` selects the
+     *   on-disk key store SCP implements, and `"os_keystore"` selects the
+     *   operating system's own key store, which SCP reaches through a
+     *   `KeyCustodyProvider` an SDK consumer injects through
+     *   `identityCreateWithCustody`.
      * @return Opaque identity handle with agent key.
-     * @throws BridgeException if custody method is unsupported or creation fails.
+     * @throws BridgeException with `SCP-IDENT-1003` for `"os_keystore"` when
+     *   the caller supplied no provider, with `SCP-IDENT-1008` for the raw
+     *   test-harness string `"in_memory"` on a build without the bridge's
+     *   `testing` cargo feature, and with `SCP-VALID-7005` for every other
+     *   string, `"platform"`, `"software"`, `"file"`, `"platform_managed"`,
+     *   and `"hardware"` included.
      */
     fun identityCreateWithAgentKey(custody: String): Long
 
@@ -235,22 +245,22 @@ class IdentityAdvancedBridge internal constructor(
     /**
      * Creates a new identity with an agent signing key (ADR-039).
      *
+     * [custody] carries no default, so the caller names the key store that
+     * holds this identity's keys and this bridge names none for them. Which
+     * key store holds a private key decides who can reach that key, so a
+     * default would pick a security-relevant answer the caller never stated.
+     * This method sends [CustodyType.rawValue] to the UniFFI bridge, so the
+     * compiler rejects a custody value the vocabulary does not state. The
+     * bridge builds a key store for [CustodyType.ENCRYPTED_FILE], and it
+     * answers [CustodyType.OS_KEYSTORE] with `SCP-IDENT-1003` because this
+     * path supplies no provider; inject a `KeyCustodyProvider` through
+     * `identityCreateWithCustody` to reach Android Keystore.
+     *
      * @param custody Key custody method.
      * @return Opaque identity handle with agent key.
      */
     suspend fun createWithAgentKey(custody: CustodyType): Long =
         bridge.ffiCall { bindings.identityCreateWithAgentKey(custody.rawValue) }
-
-    /**
-     * Creates a new identity with an agent signing key (ADR-039).
-     *
-     * Overload accepting a raw string for backward compatibility.
-     *
-     * @param custody Key custody method: "in_memory", "platform", or "software".
-     * @return Opaque identity handle with agent key.
-     */
-    suspend fun createWithAgentKey(custody: String = "in_memory"): Long =
-        bridge.ffiCall { bindings.identityCreateWithAgentKey(custody) }
 
     /**
      * Adds an agent signing key to an existing identity (ADR-039).
@@ -392,18 +402,24 @@ class IdentityAdvancedBridge internal constructor(
      *
      * Runs the 5-step migration protocol from spec section 3.2.1.
      *
+     * [target] names the custody backend this DID's keys move into. Section
+     * 3.2.2 of the identity spec, "The Custody Vocabulary", states the two
+     * values, and this method sends [CustodyType.rawValue] to the UniFFI
+     * bridge, so the compiler rejects a value the vocabulary does not state.
+     * The bridge answers every other string with `SCP-IDENT-1024`.
+     *
      * @param did The DID string to migrate.
-     * @param target Target custody type: "platform_managed", "hardware", "software", or "in_memory".
+     * @param target The custody backend to migrate into.
      * @param contextIds Context IDs where this DID is a member.
      * @return JSON string with the migration result.
      */
     suspend fun executeCustodyMigration(
         did: String,
-        target: String,
+        target: CustodyType,
         contextIds: List<String> = emptyList(),
     ): String =
         bridge.ffiCall {
-            bindings.identityExecuteCustodyMigration(did, target, contextIds)
+            bindings.identityExecuteCustodyMigration(did, target.rawValue, contextIds)
         }
 
     // Identity link attestation (§3.5.1)

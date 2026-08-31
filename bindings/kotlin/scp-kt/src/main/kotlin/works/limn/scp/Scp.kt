@@ -826,7 +826,7 @@ class SCP internal constructor(
      * ```kotlin
      * // Step 1 (joiner): reserve a single-use KeyPackage under the joiner's
      * // own locally-custodied identity.
-     * val joiner = scp.identityCreate(custody = "in_memory")
+     * val joiner = scp.identityCreate(custody = CustodyType.ENCRYPTED_FILE)
      * val reservation = scp.reserveKeyPackage(joiner)
      *
      * // Hand reservation.keyPackagePublic to the creator out of band. The
@@ -1255,14 +1255,70 @@ class SCP internal constructor(
     /**
      * Forwards to [NativeScp.identityCreate] on [inner].
      *
-     * [testingSeed] is a testing-only parameter for the ADR-046
-     * cross-bridge parity harness; pass `null` from production callers
-     * (in-memory custody uses OS RNG when [testingSeed] is `null`). A
-     * non-`null` [testingSeed] is only valid for `custody == "in_memory"`;
-     * other custody types reject it with `SCP-VALID-7009`.
+     * [custody] carries no default, so the caller names the key store that
+     * holds this identity's keys and this SDK names none for them. Which key
+     * store holds a private key decides who can reach that key, so a default
+     * would pick a security-relevant answer the caller never stated. This
+     * method sends [CustodyType.rawValue] to the UniFFI bridge, so the
+     * compiler rejects a custody value the vocabulary does not state.
+     *
+     * [testingSeed] is a testing-only parameter for the ADR-046 cross-bridge
+     * parity harness; pass `null` from production callers. A non-`null`
+     * [testingSeed] is only valid alongside the raw test-harness custody string
+     * `"in_memory"`, which [CustodyType] does not spell, so a caller reaching
+     * this method with a [CustodyType] passes `null`. The UniFFI bridge judges
+     * the custody value before the seed, so [CustodyType.OS_KEYSTORE] reports
+     * its own `SCP-IDENT-1003` and this bridge emits no `SCP-VALID-7009`.
+     *
+     * A test that needs the in-memory key store calls
+     * [NativeScp.identityCreate] on [inner] with the raw string, which is what
+     * §3.2.2 of the identity spec states a test does: "a test that needs it
+     * passes the raw string to the bridge".
      */
-    suspend fun identityCreate(custody: String, testingSeed: ByteArray? = null): Identity =
-        inner.identityCreate(custody = custody, testingSeed = testingSeed)
+    suspend fun identityCreate(custody: CustodyType, testingSeed: ByteArray? = null): Identity =
+        inner.identityCreate(custody = custody.rawValue, testingSeed = testingSeed)
+
+    /**
+     * Returns the published-vocabulary custody value for [did]'s `#active`
+     * signing key, read off the backend running in this process.
+     *
+     * §3.2.2 of the identity spec, "The Custody Vocabulary", separates two
+     * vocabularies. A caller selecting custody names a backend, which is what
+     * [CustodyType] carries. The published vocabulary states whether the key can
+     * leave its store and which factor unlocks it, which is what this method
+     * returns: `"non-extractable-biometric"`, `"non-extractable-pin"`, or
+     * `"extractable-passphrase"`.
+     *
+     * Returns `null` when the backend holding the `#active` key reports a pair
+     * the published vocabulary states no value for. ADR-039's Enforcement Stack
+     * layer 4 gives that absence a meaning, "Absence of attestation is itself a
+     * signal".
+     *
+     * The bridge derives the value from the running backend, so the value states
+     * what that backend reported. A `uniffi.scp.KeyCustodyProvider` passed to
+     * [identityCreateWithCustody] answers both questions through its
+     * `keyIsExtractable` and `unlockFactor` methods, and
+     * `works.limn.scp.android.platform.UniffiKeyCustody` wraps
+     * `AndroidKeyCustody` into one.
+     *
+     * This method reads no DID document, and nothing SCP ships writes the value
+     * into one: `ScpKeyCustodyAttestation::derive` and
+     * `DidDocument::set_custody_attestation` have no caller outside tests. A
+     * stranger resolving [did] therefore reads no custody service entry, and
+     * this method answers only for an identity this instance created. §3.2.2.1
+     * of the identity spec records that as divergence D18.
+     *
+     * @param did The DID whose `#active` key custody to read.
+     * @return The published custody value, or `null` when the backend reports a
+     *   pair §3.2.2 states no value for.
+     * @throws uniffi.scp.ScpException.Validation if [did] is not a
+     *   syntactically valid DID.
+     * @throws uniffi.scp.ScpException.Identity carrying `SCP-IDENT-1001` if this
+     *   instance retains no custody for [did], and the same code if the injected
+     *   provider throws while answering either question. All three bridges
+     *   return `SCP-IDENT-1001` for both conditions.
+     */
+    suspend fun identityPublishedCustody(did: String): String? = inner.identityPublishedCustody(did = did)
 
     /** Forwards to [NativeScp.identityCreateLinkAttestation] on [inner]. */
     @Suppress("LongParameterList")
@@ -1283,10 +1339,19 @@ class SCP internal constructor(
             platformId = platformId,
         )
 
-    /** Forwards to [NativeScp.identityCreateWithAgentKey] on [inner]. */
-    suspend fun identityCreateWithAgentKey(custody: String): Identity =
+    /**
+     * Forwards to [NativeScp.identityCreateWithAgentKey] on [inner].
+     *
+     * [custody] carries no default, so the caller names the key store that
+     * holds this identity's keys and this SDK names none for them. Which key
+     * store holds a private key decides who can reach that key, so a default
+     * would pick a security-relevant answer the caller never stated. This
+     * method sends [CustodyType.rawValue] to the UniFFI bridge, so the
+     * compiler rejects a custody value the vocabulary does not state.
+     */
+    suspend fun identityCreateWithAgentKey(custody: CustodyType): Identity =
         inner.identityCreateWithAgentKey(
-            custody = custody,
+            custody = custody.rawValue,
         )
 
     /** Forwards to [NativeScp.identityCreateWithCustody] on [inner]. */
@@ -1295,15 +1360,23 @@ class SCP internal constructor(
             provider = provider,
         )
 
-    /** Forwards to [NativeScp.identityExecuteCustodyMigration] on [inner]. */
+    /**
+     * Forwards to [NativeScp.identityExecuteCustodyMigration] on [inner].
+     *
+     * [target] names the custody backend this DID's keys move into. Section
+     * 3.2.2 of the identity spec, "The Custody Vocabulary", states the two
+     * values, and this method sends [CustodyType.rawValue] to the UniFFI
+     * bridge, so the compiler rejects a value the vocabulary does not state.
+     * The bridge answers every other string with `SCP-IDENT-1024`.
+     */
     fun identityExecuteCustodyMigration(
         did: String,
-        target: String,
+        target: CustodyType,
         contextIds: List<String>,
     ): String =
         inner.identityExecuteCustodyMigration(
             did = did,
-            target = target,
+            target = target.rawValue,
             contextIds = contextIds,
         )
 

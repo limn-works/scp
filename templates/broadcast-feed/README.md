@@ -122,3 +122,13 @@ ctx = await Context.create(
     economic_policy='{"per_period": {"amount": "1.00", "currency": "USD", "period_seconds": 2592000}}',
 )
 ```
+
+## Key custody
+
+Every snippet here passes `in_memory`, which §3.2.2 of the identity spec, the custody
+vocabulary, classifies as a test-harness string rather than a value a shipped caller
+names. A shipped build rejects it with `SCP-IDENT-1008`. That section states the two
+values a shipped caller does name: `encrypted_file` selects the on-disk key store SCP
+implements, and `os_keystore` selects the operating system's own key store, which SCP
+reaches through the platform key-custody callback the SDK consumer supplies. The words
+`platform`, `software`, `file`, and `hardware` name no custody value.

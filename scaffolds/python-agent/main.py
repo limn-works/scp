@@ -6,7 +6,13 @@ Usage:
     pip install -e ../../bindings/python
     python main.py
 
-Replace in_memory custody with platform custody for production use.
+For production, pass "encrypted_file" for the on-disk key store SCP implements,
+or "os_keystore" together with a KeyCustodyProvider to hold the keys in the
+operating system's own key store. Section 3.2.2 of the identity spec, the
+custody vocabulary, states those two values and states that a shipped build
+answers every other string with a typed error. Neither call creates an identity
+on a released wheel: both return SCP-IDENT-1059, because no pre-rotation custody
+backend is wired yet.
 """
 
 import asyncio
@@ -15,8 +21,8 @@ from scp_sdk import Capability, Context, Identity
 
 
 async def main() -> None:
-    # 1. Create a DID identity with in-memory key custody.
-    identity = await Identity.create(custody="in_memory")
+    # 1. Create a DID identity with encrypted-key-file custody.
+    identity = await Identity.create(custody="encrypted_file")
     print(f"Created identity: {identity.did}")
 
     # 2. Create an encrypted context with messaging capabilities.

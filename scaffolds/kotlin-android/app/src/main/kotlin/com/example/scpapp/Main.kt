@@ -2,8 +2,9 @@
  * Minimal SCP Android app entry point.
  *
  * Creates a DID identity, opens an encrypted context, and sends a message.
- * Uses in-memory custody for demonstration — replace with Keystore custody
- * for production Android apps.
+ * Uses the encrypted key file: no custody string reaches Android Keystore, so
+ * Keystore-held keys need a KeyCustodyProvider injected through
+ * identityCreateWithCustody on a works.limn.scp.SCP instance.
  */
 package com.example.scpapp
 
@@ -34,8 +35,9 @@ fun main() = runBlocking {
     //
     // val bridge = CoroutineBridge(nativeBindings)
     //
-    // // 1. Create identity with Keystore custody
-    // val identityHandle = bridge.identity.create(CustodyType.PLATFORM)
+    // // 1. Create identity. This encrypted key file keeps every key on
+    // //    process exit, and a released build rejects it with SCP-IDENT-1008.
+    // val identityHandle = bridge.identity.create(CustodyType.ENCRYPTED_FILE)
     //
     // // 2. Create an encrypted context
     // val paramsJson = """

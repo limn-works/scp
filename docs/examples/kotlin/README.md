@@ -82,3 +82,13 @@ Streaming uses two patterns:
 - Kotlin SDK source: `bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/`
 - UniFFI bridge: `crates/scp-ffi/uniffi/`
 - Protocol spec: `.docs/specs/`
+
+## Key custody
+
+Every snippet here passes `encrypted_file`, one of the two values §3.2.2 of the identity
+spec, the custody vocabulary, states. It selects the on-disk key store SCP implements,
+and the bridge reads its passphrase from the `SCP_KEY_PASSPHRASE` environment variable.
+The other value, `os_keystore`, selects the operating system's own key store, which SCP
+reaches through the platform key-custody callback the SDK consumer supplies. The words
+`platform`, `software`, `file`, and `hardware` name no custody value, and `in_memory` is
+a test-harness string a shipped build rejects with `SCP-IDENT-1008`.

@@ -694,6 +694,8 @@ MLS provides PCS through the Update proposal mechanism. After a member sends an 
 
 ### 9.7.4 Key Lifecycle
 
+This section states the lifecycle of every key the protocol uses. §3.9 of the identity spec consolidates the four DID keys — `#0`, `#active`, `#agent`, and the pre-rotation key — and cites this section for their lifecycle.
+
 **Key generation:**
 
 - Identity Key (Ed25519): Generated in hardware security module where available (Secure Enclave, Android Keystore). Private key never exported from the secure element. Used ONLY for DID document updates and signing pre-rotation commitments. The DID string is derived from this key and never changes.

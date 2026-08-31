@@ -14,7 +14,7 @@ First launch. User never sees keys. Device attestation proves real device.
 
 ```
 SCP.Identity.create(
-  custody: .secureEnclave | .passkey | .platform(apple|google) | .selfManaged,
+  custody: "encrypted_file" | "os_keystore",   // the two values 3.2.2 of the identity spec states
   recovery: [.trustedDevice, .socialRecovery, .platformBacked],
   deviceAttestation: DeviceAttestation     // Apple App Attest / Google Play Integrity
 ) → Identity {
@@ -25,6 +25,14 @@ SCP.Identity.create(
   custodyMethod
 }
 ```
+
+§3.2.2 of the identity spec, the custody vocabulary, states the two values `custody`
+carries. `encrypted_file` selects the on-disk key store SCP implements; `os_keystore`
+selects the operating system's own key store through the platform key-custody callback
+the SDK consumer supplies. An earlier draft of this sketch offered a hardware security
+key and a passkey as further options, and open question OQ-10 of the identity spec asks
+whether a participant may put an SCP signing key in either one and which value would
+name that backend.
 
 Device attestation binds one DID to one physical device. Sybil resistance starts here — creating identities costs the price of a device.
 

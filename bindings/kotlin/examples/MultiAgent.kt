@@ -51,9 +51,9 @@ suspend fun runAgent(
 
 fun multiAgentExample(bridge: CoroutineBridge) = runBlocking {
     // Create identities for coordinator and two agents
-    val coordinatorHandle = bridge.identity.create(CustodyType.IN_MEMORY)
-    val agentAHandle = bridge.identity.create(CustodyType.IN_MEMORY)
-    val agentBHandle = bridge.identity.create(CustodyType.IN_MEMORY)
+    val coordinatorHandle = bridge.identity.create(CustodyType.ENCRYPTED_FILE)
+    val agentAHandle = bridge.identity.create(CustodyType.ENCRYPTED_FILE)
+    val agentBHandle = bridge.identity.create(CustodyType.ENCRYPTED_FILE)
     println("Coordinator: $coordinatorHandle")
     println("Agent A: $agentAHandle")
     println("Agent B: $agentBHandle")

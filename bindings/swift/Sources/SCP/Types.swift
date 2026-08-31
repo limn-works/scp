@@ -6,26 +6,50 @@ import Foundation
 
 // MARK: - CustodyType
 
-/// Key custody method for identity key management (spec section 3.2).
+/// The custody backend a caller names to `identityCreate` (section 3.2.2 of
+/// the identity spec).
 ///
-/// Determines where cryptographic keys are stored and managed.
-/// The `rawValue` matches the wire-format string expected by the FFI bridge.
+/// Section 3.2.2, "The Custody Vocabulary", states two values a caller names
+/// when it selects a custody backend, and states that "The vocabulary holds no
+/// third value, and a shipped build answers every other string with a typed
+/// error." Each case below carries one of those two values.
+///
+/// `build_key_custody` in `crates/scp-ffi/uniffi/src/bridge.rs` answers
+/// every other string with `SCP-VALID-7005`, and that includes `"platform"`,
+/// `"software"`, `"file"`, `"platform_managed"`, and `"hardware"`.
+///
+/// A build carrying the UniFFI bridge's `testing` cargo feature additionally
+/// accepts the raw string `"in_memory"`, which reaches the test-only in-memory
+/// key store. Section 3.2.2 states that the string is a test-harness
+/// affordance and not a value of this vocabulary, so this enum does not spell
+/// it: a test that needs it passes the raw string to the bridge, and a shipped
+/// build answers it with `SCP-IDENT-1008`.
 ///
 /// This type is a pure Swift convenience type. It does not conflict with any
 /// UniFFI-generated type.
 ///
 /// ## Provenance
 ///
-/// - Spec section 3.2 (Key Custody)
+/// - Section 3.2.2 of the identity spec, "The Custody Vocabulary"
+/// - The custody-string and identity-parameter story SCP-294 in
+///   `.docs/prds/http-features.json`
 public nonisolated enum CustodyType: String, Sendable, CaseIterable {
-    /// Platform-native secure storage (Keychain on macOS/iOS, Keystore
-    /// on Android, credential manager on Windows/Linux). Default.
-    case platform
-    /// Ephemeral in-memory key store, suitable for testing or short-lived
-    /// agents. Keys are lost on process exit.
-    case inMemory = "in_memory"
-    /// Software-backed file-based key store with passphrase protection.
-    case software
+    /// Selects the on-disk key store SCP implements, which derives an AES-256
+    /// key from a passphrase with Argon2id and encrypts each key entry under
+    /// AES-256-GCM (`crates/scp-platform/src/file.rs`).
+    ///
+    /// The bridge reads the passphrase from the `SCP_KEY_PASSPHRASE`
+    /// environment variable and answers an unset variable with
+    /// `SCP-VALID-7005`.
+    case encryptedFile = "encrypted_file"
+    /// Selects the operating system's own key store, which SCP reaches through
+    /// the platform key-custody callback an SDK consumer supplies.
+    ///
+    /// `identityCreate` supplies none, so it answers this value with
+    /// `SCP-IDENT-1003` and falls back to neither the encrypted key file nor
+    /// an in-memory store. Pass a `KeyCustodyProvider` to
+    /// `identityCreateWithCustody` to reach the store.
+    case osKeystore = "os_keystore"
 }
 
 // MARK: - BridgeMode

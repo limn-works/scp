@@ -29,9 +29,11 @@
 //! # Key custody
 //!
 //! The production custody path is `identityCreateWithCustody(provider)`, which
-//! wires a caller-supplied `KeyCustodyProvider` (keychain/HSM-backed). Identities
-//! created this way report `custodyType == "callback"`, since key material
-//! stays behind the provider and never enters this bridge's heap.
+//! wires a caller-supplied `KeyCustodyProvider` (keychain/HSM-backed). That
+//! provider is the platform key-custody callback, which is what `"os_keystore"`
+//! names in §3.2.2 of the identity spec, so identities created this way report
+//! `custodyType == "os_keystore"`. Key material stays behind the provider and
+//! never enters this bridge's heap.
 //!
 //! `"in_memory"` custody stores key material in heap memory via
 //! `InMemoryKeyCustody`. It is dev/test-only and gated behind the
@@ -407,7 +409,8 @@ fn make_dht_with_signer(
 pub(crate) struct NapiIdentityInner {
     /// The DID string (e.g., `"did:dht:z6Mk..."`).
     pub(crate) did: String,
-    /// The custody type string: `"in_memory"`, `"callback"`, or `"external"`.
+    /// The custody value this handle reports: `"encrypted_file"`,
+    /// `"os_keystore"`, `"in_memory"`, or `"external"`.
     pub(crate) custody_type: String,
     /// Retained `ScpIdentity` for in-memory custody paths.
     ///
@@ -501,9 +504,14 @@ impl NapiIdentity {
         self.inner.did.clone()
     }
 
-    /// Returns the custody type string for this identity.
+    /// Returns the custody value this identity was created under.
     ///
-    /// One of: `"in_memory"`, `"callback"`, `"external"`.
+    /// `"encrypted_file"` and `"os_keystore"` are the two values §3.2.2 of the
+    /// identity spec states a caller names. `"external"` marks an identity
+    /// loaded from a DID string alone, which retains no key material.
+    /// `"in_memory"` marks an identity created under the `in_memory`
+    /// test-harness string, which only a build carrying the `testing` cargo
+    /// feature accepts.
     #[napi(getter, js_name = "custodyType")]
     #[must_use]
     pub fn custody_type(&self) -> String {
@@ -575,7 +583,7 @@ impl NapiIdentity {
     ///   crypto state).
     /// - `SCP-IDENT-1001`: Key generation or DHT publishing failed.
     ///
-    /// See §3.9 Key Lifecycle, ADR-003 DID Creation.
+    /// See §3.9 Multi-Key Architecture and Key Lifecycle, ADR-003 DID Creation.
     #[napi]
     #[allow(clippy::unused_async)] // napi requires async for Promise return type
     pub async fn rotate_key(&self) -> napi::Result<Self> {
@@ -2142,15 +2150,31 @@ mod prod_fail_closed_tests {
     use crate::scp::Scp;
 
     /// AC5 (napi `identity_create` string-custody surface): on a shipped build the
-    /// `identity_create(kind)` string entry point mints no identity — every custody
-    /// kind fails closed *before* any DID creation, so the pre-rotation nullifier is
-    /// unreachable via this surface. Unlike `PyO3` (which exposes a `"file"` custody
-    /// kind that reaches the shared `scp-identity::config::create_inner` lowering and
-    /// returns `SCP-IDENT-1059`), napi's real production key custody is the callback
-    /// `KeyCustodyProvider` (keychain/HSM) reached only via `identity_create_with_custody`,
-    /// not the string API. The string kinds fail closed earlier: `in_memory` is severed
-    /// (`SCP-IDENT-1008`) and `software`/`platform` require the callback provider
-    /// (`SCP-IDENT-1003`). This test pins that string-surface fail-closed on `"software"`.
+    /// `identity_create(kind)` string entry point mints no identity, so the
+    /// pre-rotation nullifier is unreachable through it. This test covers the
+    /// `"os_keystore"` arm, which §3.2.2 of the identity spec gives the operating
+    /// system's own key store. That store sits behind the platform key-custody
+    /// callback, `identity_create` passes no callback, and `build_key_custody`
+    /// therefore returns `SCP-IDENT-1003` before it builds any backend.
+    ///
+    /// Three sibling tests cover the rest of the surface, so no custody value this
+    /// bridge accepts is left unproven:
+    ///
+    /// - `in_memory_rejection_states_what_the_callback_path_returns` (below) covers
+    ///   the severed test-harness string, which returns `SCP-IDENT-1008`.
+    /// - `encrypted_file_custody_fails_closed_at_the_pre_rotation_gate`
+    ///   (`crate::scp::prod_pre_rotation_gate_tests`) covers `"encrypted_file"`,
+    ///   the one value that builds a real backend and then reaches
+    ///   `finish_identity_create`'s `SCP-IDENT-1059` arm. The `PyO3` bridge proves
+    ///   the same arm through `identity_create(py, "encrypted_file", None)`.
+    /// - `identity_create_rejects_every_retired_custody_string`
+    ///   (`crate::scp::identity_remove_validation_tests`) covers every string the
+    ///   custody vocabulary retired, each of which leaves `validate_custody_type`
+    ///   with `SCP-VALID-7005`. `"software"` and `"platform"` are two of them, and
+    ///   this test read `"software"` until that change. That sibling runs in the
+    ///   `testing` lane rather than this one; `validate_custody_type` carries no
+    ///   `cfg` on the arm it exercises, so both builds reject the same strings
+    ///   with the same code.
     ///
     /// The *callback* path's own pre-rotation fail-closed (`SCP-IDENT-1059`) is NOT
     /// exercised here — it takes a napi `Env` + JS `Function`s that cannot be
@@ -2162,18 +2186,22 @@ mod prod_fail_closed_tests {
     /// (`check-shipped-feature-graph.sh`) mechanically proves `InMemoryPreRotationCustody`
     /// is absent from the shipped graph. The shared `create_inner` lowering that the
     /// `PyO3` bridge reaches is separately proven fail-closed by scp-identity's
-    /// `config::tests::ephemeral_create_fails_closed_without_pre_rotation_backend` and
-    /// the `PyO3` `"file"`-custody test.
+    /// `config::tests::ephemeral_create_fails_closed_without_pre_rotation_backend`.
     ///
     /// `identity_create` is `async`; the crate tokio runtime drives it, mirroring the
     /// napi-rs worker's `block_on`.
     #[test]
     fn identity_create_fails_closed_without_pre_rotation_backend() {
         let scp = Scp::new_in_memory_for_test();
-        // `software` is a real production custody kind; on a shipped build it
-        // fails closed (it requires the callback `KeyCustodyProvider`) rather than
-        // minting an identity — so no nullifier-backed identity is ever produced.
-        let result = crate::runtime().block_on(scp.identity_create("software".to_owned(), None));
+        // `os_keystore` is a value §3.2.2 of the identity spec states, and on a
+        // shipped build with no injected `KeyCustodyProvider` it fails closed
+        // with `SCP-IDENT-1003` rather than minting an identity, so no
+        // nullifier-backed identity is ever produced. This read `"software"`
+        // until the custody vocabulary changed, and that string now leaves
+        // `validate_custody_type` with `SCP-VALID-7005` — a different code, and
+        // one raised before any custody is built — so the `SCP-IDENT-1003`
+        // assertion below could not have held on the string it named.
+        let result = crate::runtime().block_on(scp.identity_create("os_keystore".to_owned(), None));
         let msg = match result {
             Ok(_) => panic!(
                 "shipped identity_create must FAIL CLOSED — no identity may be minted \
@@ -2183,8 +2211,48 @@ mod prod_fail_closed_tests {
         };
         assert!(
             msg.contains(scp_ffi_common::error_codes::IDENT_1003),
-            "shipped `software` identity_create must fail closed (SCP-IDENT-1003, \
+            "shipped `os_keystore` identity_create must fail closed (SCP-IDENT-1003, \
              requires callback custody), got: {msg}"
+        );
+        // The message sends the reader to the callback provider, and
+        // `identity_create_with_custody` returns `SCP-IDENT-1059` on a shipped
+        // build, so the message states that too. Without it the reader follows
+        // this text to a second closed door with nothing explaining it.
+        assert!(
+            msg.contains(scp_ffi_common::error_codes::IDENT_1059),
+            "the message must state what the callback path returns on a shipped \
+             build (SCP-IDENT-1059), got: {msg}"
+        );
+    }
+
+    /// `"in_memory"` takes the severed-nullifier rejection (`SCP-IDENT-1008`),
+    /// and that message carries the same two statements: it names
+    /// `identityCreateWithCustody` and it says what that call returns on a
+    /// shipped build.
+    #[test]
+    fn in_memory_rejection_states_what_the_callback_path_returns() {
+        let scp = Scp::new_in_memory_for_test();
+        let result = crate::runtime().block_on(scp.identity_create("in_memory".to_owned(), None));
+        let msg = match result {
+            Ok(_) => panic!(
+                "shipped identity_create must FAIL CLOSED on in_memory custody — the \
+                 InMemoryKeyCustody nullifier is severed from this build"
+            ),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            msg.contains(scp_ffi_common::error_codes::IDENT_1008),
+            "shipped `in_memory` identity_create must fail closed (SCP-IDENT-1008), \
+             got: {msg}"
+        );
+        assert!(
+            msg.contains("identityCreateWithCustody()"),
+            "the message must name the injection entry point, got: {msg}"
+        );
+        assert!(
+            msg.contains(scp_ffi_common::error_codes::IDENT_1059),
+            "the message must state what that entry point returns on a shipped \
+             build (SCP-IDENT-1059), got: {msg}"
         );
     }
 }

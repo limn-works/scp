@@ -17,14 +17,6 @@ import works.limn.scp.bridge.BridgeException
 import uniffi.scp.OutletKind
 
 /**
- * Key custody method for identity key management (spec section 3.2).
- *
- * Determines where cryptographic keys are stored and managed. The
- * [rawValue] property returns the string expected by the FFI bridge.
- *
- * @property rawValue Wire-format string passed to the FFI bridge.
- */
-/**
  * Canonical protocol capability strings and parameterised constructors.
  *
  * These are the SDK-facing colon-separated forms accepted by `Capability::new`
@@ -79,23 +71,56 @@ object Capability {
     fun outletCall(outletId: String): String = "outlet:call:$outletId"
 }
 
+/**
+ * The custody backend a caller names to
+ * [works.limn.scp.bridge.IdentityBridge.create] (§3.2.2 of the identity spec).
+ *
+ * §3.2.2, "The Custody Vocabulary", states two values a caller names when it
+ * selects a custody backend, and states that "The vocabulary holds no third
+ * value, and a shipped build answers every other string with a typed error."
+ * Each entry below carries one of those two values.
+ *
+ * `build_key_custody` in `crates/scp-ffi/uniffi/src/bridge.rs` answers every
+ * other string with `SCP-VALID-7005`, and that includes `"platform"`,
+ * `"software"`, `"file"`, `"platform_managed"`, and `"hardware"`.
+ *
+ * A build carrying the UniFFI bridge's `testing` cargo feature additionally
+ * accepts the raw string `"in_memory"`, which reaches the test-only in-memory
+ * key store. §3.2.2 states that the string is a test-harness affordance and not
+ * a value of this vocabulary, so this enum does not spell it: a test that needs
+ * it passes the raw string to the bridge, and a shipped build answers it with
+ * `SCP-IDENT-1008`.
+ *
+ * `works.limn.scp.android.platform.CustodyType` in the `scp-kt-android` module
+ * is a different enum: it reports where an Android key already lives, and this
+ * enum names the backend the caller selects.
+ *
+ * See the custody-string and identity-parameter story SCP-294 in
+ * `.docs/prds/http-features.json`.
+ *
+ * @property rawValue Wire-format string passed to the FFI bridge.
+ */
 enum class CustodyType(val rawValue: String) {
     /**
-     * Platform-native secure storage (Keychain on macOS/iOS, Keystore
-     * on Android, credential manager on Windows/Linux). Default.
+     * Selects the on-disk key store SCP implements, which derives an AES-256
+     * key from a passphrase with Argon2id and encrypts each key entry under
+     * AES-256-GCM (`crates/scp-platform/src/file.rs`).
+     *
+     * The bridge reads the passphrase from the `SCP_KEY_PASSPHRASE` environment
+     * variable and answers an unset variable with `SCP-VALID-7005`.
      */
-    PLATFORM("platform"),
+    ENCRYPTED_FILE("encrypted_file"),
 
     /**
-     * Ephemeral in-memory key store, suitable for testing or
-     * short-lived agents. Keys are lost on process exit.
+     * Selects the operating system's own key store, which SCP reaches through
+     * the platform key-custody callback an SDK consumer supplies.
+     *
+     * `identityCreate` supplies none, so it answers this value with
+     * `SCP-IDENT-1003` and falls back to neither the encrypted key file nor an
+     * in-memory store. Pass a `uniffi.scp.KeyCustodyProvider` to
+     * `identityCreateWithCustody` to reach the store.
      */
-    IN_MEMORY("in_memory"),
-
-    /**
-     * Software-backed file-based key store with passphrase protection.
-     */
-    SOFTWARE("software"),
+    OS_KEYSTORE("os_keystore"),
     ;
 
     companion object {

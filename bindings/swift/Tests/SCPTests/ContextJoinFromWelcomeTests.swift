@@ -118,7 +118,7 @@ final class ContextJoinFromWelcomeTests: XCTestCase {
     /// A custodied identity reserves a single-use `KeyPackage`; both the opaque
     /// reservation id and the PUBLIC `KeyPackage` bytes come back non-empty.
     func testReserveKeyPackageRoundTrip() async throws {
-        let joiner = try await scp.identityCreate(custody: "in_memory")
+        let joiner = try await scp.identityCreateInTestHarnessCustody()
 
         let reservation = try await scp.reserveKeyPackage(identity: joiner)
 
@@ -129,7 +129,7 @@ final class ContextJoinFromWelcomeTests: XCTestCase {
     /// Each reservation is single-use: two reserves under the SAME identity
     /// yield distinct reservation ids AND distinct public `KeyPackage` bytes.
     func testReserveProducesDistinctSingleUseKeyPackages() async throws {
-        let joiner = try await scp.identityCreate(custody: "in_memory")
+        let joiner = try await scp.identityCreateInTestHarnessCustody()
 
         let first = try await scp.reserveKeyPackage(identity: joiner)
         let second = try await scp.reserveKeyPackage(identity: joiner)
@@ -149,7 +149,7 @@ final class ContextJoinFromWelcomeTests: XCTestCase {
     /// A DID-only (non-custodied) handle cannot reserve — the local-custody gate
     /// fails closed with the canonical `SCP-IDENT-1054` before any pool draw.
     func testReserveRejectsNonCustodiedIdentity() async throws {
-        let created = try await scp.identityCreate(custody: "in_memory")
+        let created = try await scp.identityCreateInTestHarnessCustody()
         let loaded = try await loadNonCustodied(created.did())
 
         await assertIdentityCode(Self.nonCustodiedCode) {
@@ -178,10 +178,10 @@ final class ContextJoinFromWelcomeTests: XCTestCase {
     /// than the ceiling gate, so it also proves the invite ceiling authorized the
     /// operation. The NAPI SDK exercises the full `.sealed` happy path.
     func testInviteMemberReachesSealPathPastAuthorization() async throws {
-        let creator = try await scp.identityCreate(custody: "in_memory")
+        let creator = try await scp.identityCreateInTestHarnessCustody()
         let ctx = try await Context.create(scp: scp, identity: creator, params: makeInviteParams())
 
-        let invitee = try await scp.identityCreate(custody: "in_memory")
+        let invitee = try await scp.identityCreateInTestHarnessCustody()
         let reservation = try await scp.reserveKeyPackage(identity: invitee)
 
         do {
@@ -224,9 +224,9 @@ final class ContextJoinFromWelcomeTests: XCTestCase {
     /// resolves the inviter's `#active` signing key from local custody and fails
     /// closed with `SCP-IDENT-1054` before any context lookup or KeyPackage use.
     func testInviteMemberRejectsNonCustodiedInviter() async throws {
-        let created = try await scp.identityCreate(custody: "in_memory")
+        let created = try await scp.identityCreateInTestHarnessCustody()
         let loaded = try await loadNonCustodied(created.did())
-        let invitee = try await scp.identityCreate(custody: "in_memory")
+        let invitee = try await scp.identityCreateInTestHarnessCustody()
         let reservation = try await scp.reserveKeyPackage(identity: invitee)
 
         await assertIdentityCode(Self.nonCustodiedCode) {
@@ -246,7 +246,7 @@ final class ContextJoinFromWelcomeTests: XCTestCase {
     /// identity, so a non-custodied joiner hard-fails at the derivation seam
     /// (`SCP-IDENT-1054`) BEFORE the single-use `KeyPackage` is consumed.
     func testJoinFromWelcomeRejectsNonCustodiedJoiner() async throws {
-        let created = try await scp.identityCreate(custody: "in_memory")
+        let created = try await scp.identityCreateInTestHarnessCustody()
         let loaded = try await loadNonCustodied(created.did())
 
         await assertIdentityCode(Self.nonCustodiedCode) {
@@ -266,7 +266,7 @@ final class ContextJoinFromWelcomeTests: XCTestCase {
     /// A malformed `sealed.creatorDid` is rejected by the shared `validate_did`
     /// gate with `ScpError.Validation`, before the bundle is opened.
     func testJoinFromWelcomeRejectsMalformedCreatorDid() async throws {
-        let joiner = try await scp.identityCreate(custody: "in_memory")
+        let joiner = try await scp.identityCreateInTestHarnessCustody()
 
         do {
             _ = try await Context.joinFromWelcome(
@@ -292,7 +292,7 @@ final class ContextJoinFromWelcomeTests: XCTestCase {
     /// (`ScpError.Validation`) BEFORE the bundle is opened or the reservation
     /// consumed.
     func testJoinFromWelcomeRejectsNon32ByteEnc() async throws {
-        let joiner = try await scp.identityCreate(custody: "in_memory")
+        let joiner = try await scp.identityCreateInTestHarnessCustody()
         let reservation = try await scp.reserveKeyPackage(identity: joiner)
 
         do {
@@ -318,7 +318,7 @@ final class ContextJoinFromWelcomeTests: XCTestCase {
     /// (garbage) sealed bundle reaches the real HPKE opener and is rejected with
     /// an `ScpError` — the join does not silently succeed.
     func testJoinFromWelcomeRejectsBogusBundle() async throws {
-        let joiner = try await scp.identityCreate(custody: "in_memory")
+        let joiner = try await scp.identityCreateInTestHarnessCustody()
         let reservation = try await scp.reserveKeyPackage(identity: joiner)
 
         do {

@@ -322,7 +322,7 @@ class OutletSagaTest {
             val scp = SCP(StorageConfig.InMemory)
             try {
                 scp.configureLocalTransport(localDid = "did:key:z6MkKotlinSagaForwardTest")
-                val identity = scp.identityCreate(custody = "in_memory")
+                val identity = scp.identityCreateInTestHarnessCustody()
                 val source = scp.contextCreate(identity = identity, params = makeParams())
                 val target = scp.contextCreate(identity = identity, params = makeParams())
                 val outletId =

@@ -216,7 +216,7 @@ Test vectors are optional but recommended -- they document expected behavior and
 
 ## Next Steps
 
-- Replace `"in_memory"` custody with `"platform"` for production key storage
+- Replace `"in_memory"` custody with `"encrypted_file"` and export `SCP_KEY_PASSPHRASE` — that value selects the on-disk key store SCP implements, which derives an AES-256 key from the passphrase with Argon2id. For the operating system's own key store, pass `"os_keystore"` together with a `KeyCustodyProvider`. §3.2.2 of the identity spec, the custody vocabulary, states those two values and states that a shipped build answers every other string with a typed error. Neither call creates an identity on a released wheel: both return `SCP-IDENT-1059`, because no pre-rotation custody backend is wired yet
 - Connect to a relay with `connect_relay()` for networked transport
 - Use `session_create()`/`session_invoke()` for multi-turn tool workflows
 - Add a second participant and use `delegate()` to issue scoped UCAN tokens

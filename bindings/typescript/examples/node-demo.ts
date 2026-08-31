@@ -47,10 +47,10 @@ async function main(): Promise<void> {
     // ---- Step 1: Create identities ----
     step(1, "Create identities (in-memory custody)");
 
-    const alice = await scp.identityCreate("in_memory");
+    const alice = await scp.identityCreate("encrypted_file");
     console.log(`Alice DID: ${alice.did}`);
 
-    const bob = await scp.identityCreate("in_memory");
+    const bob = await scp.identityCreate("encrypted_file");
     console.log(`Bob   DID: ${bob.did}`);
 
     // ---- Step 2: Alice creates an encrypted context ----

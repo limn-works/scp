@@ -655,21 +655,41 @@ impl From<scp_ffi_common::bridge_instance::HandleAffinityError> for ScpNapiError
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Parses a custody type string into a string the bridge can match on.
+/// Rejects every custody value outside the vocabulary §3.2.2 of the identity
+/// spec states, before `build_key_custody` decides what an accepted value
+/// reaches.
 ///
-/// Returns the canonical custody type string or `Err(ScpNapiError::Validation)`.
+/// §3.2.2 gives a caller `"encrypted_file"` and `"os_keystore"`. A build
+/// carrying the `testing` cargo feature additionally accepts `"in_memory"`,
+/// which §3.2.2 names a test-harness affordance rather than a value of the
+/// vocabulary; a shipped build accepts the string here and declines it in
+/// `build_key_custody` with `SCP-IDENT-1008`, so the two builds return
+/// different codes for the string and neither returns a custody.
+///
+/// # Errors
+///
+/// Returns `ScpNapiError::Validation` carrying `SCP-VALID-7005` for every
+/// other string, which includes the five the three bridges once parsed:
+/// `platform`, `software`, `file`, `platform_managed`, and `hardware`.
 pub(crate) fn validate_custody_type(custody: &str) -> Result<&str, ScpNapiError> {
     match custody {
-        "in_memory" | "platform" | "software" => Ok(custody),
+        "encrypted_file" | "os_keystore" | "in_memory" => Ok(custody),
         // VALID_7005 ("invalid field value") matches the semantic: an
         // unrecognized enum string is a wrong-value error, not the
         // malformed/wrong-shape byte input that VALID_7007 is reserved for
-        // (api-design J2, M1). PyO3's `parse_custody_inner` emits the
-        // same class of error (VALID_7001 via `ScpPyError::validation`),
-        // both distinct from the narrower 7007.
+        // (api-design J2, M1). The PyO3 bridge's `build_key_custody` and the
+        // UniFFI bridge's `build_key_custody` emit VALID_7005 for this same
+        // condition, so a caller who switches on the code string reads one
+        // value across all three bridges.
         other => Err(ScpNapiError::Validation {
             message: format!(
-                "unknown custody type: {other:?} — expected \"in_memory\", \"platform\", or \"software\""
+                "unknown custody type: {other:?} — §3.2.2 of the identity spec gives a \
+                 caller two values, \"encrypted_file\" and \"os_keystore\". The strings \
+                 \"platform\", \"software\", \"file\", \"platform_managed\", and \"hardware\" \
+                 name no custody backend. Reach the operating system's key store by \
+                 passing a KeyCustodyProvider to identityCreateWithCustody(). That call \
+                 returns SCP-IDENT-1059 on a shipped build today, because no pre-rotation \
+                 custody backend is wired yet, so no shipped build creates an identity."
             ),
             code: codes::VALID_7005.to_owned(),
         }),

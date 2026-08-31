@@ -18,12 +18,15 @@ import works.limn.scp.CustodyType
 import works.limn.scp.bridge.CoroutineBridge
 
 fun identityExample(bridge: CoroutineBridge) = runBlocking {
-    // 1. Create a new identity with in-memory key custody.
-    //    In production on Android, use CustodyType.PLATFORM for Keystore.
+    // 1. Create a new identity with the encrypted key file SCP implements.
+    //    In production, pass "encrypted_file" for the on-disk key store SCP
+    //    implements, or "os_keystore" together with a KeyCustodyProvider to
+    //    hold the keys in Android Keystore. Section 3.2.2 of the identity
+    //    spec, the custody vocabulary, states those two values.
     //    All FFI calls are dispatched on Dispatchers.IO via the bridge.
-    val identityHandle = bridge.identity.create(CustodyType.IN_MEMORY)
+    val identityHandle = bridge.identity.create(CustodyType.ENCRYPTED_FILE)
     println("Identity handle: $identityHandle")
-    println("Custody type: ${CustodyType.IN_MEMORY.rawValue}")
+    println("Custody type: ${CustodyType.ENCRYPTED_FILE.rawValue}")
     println()
 
     // 2. Resolve the DID to its document.
@@ -52,7 +55,7 @@ fun identityExample(bridge: CoroutineBridge) = runBlocking {
 
     //    Create an identity with an agent signing key for
     //    human+agent shared DID patterns.
-    val agentHandle = advanced.createWithAgentKey(CustodyType.IN_MEMORY)
+    val agentHandle = advanced.createWithAgentKey(CustodyType.ENCRYPTED_FILE)
     println("Agent identity handle: $agentHandle")
 
     // 5. Add an agent key to an existing identity.

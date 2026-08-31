@@ -1,5 +1,8 @@
 # White Hat Agent Memory
 
+## Topic files
+- [PR #2415 custody derived-not-declared](custody-derived-not-declared-2415.md) — serde/`pub service` bypass the "no field to write it in" claim; fail-closed is per-arm convention in 3 factories; no verifier, no detection.
+
 ## TS SDK fail-closed test-seam Review (2026-06-20, branch fix/sdk-coverage-fail-closed-and-parity)
 
 ### Defense architecture (TS bridge-swap hardening)

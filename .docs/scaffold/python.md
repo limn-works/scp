@@ -122,10 +122,24 @@ from scp_sdk._scp_core import py_identity_create
 
 class Identity:
     @classmethod
-    async def create(cls, custody: str = "platform") -> Identity:
+    async def create(cls, custody: str) -> Identity:
         raw = await py_identity_create(custody)
         return cls(raw)
 ```
+
+`create` takes the custody string as a required argument and offers no default. Key
+custody is a security-relevant choice, and the agent-first API design tenet in
+CLAUDE.md forbids an SDK picking one on a caller's behalf.
+
+§3.2.2 of the identity spec, the custody vocabulary, states the two values this string
+carries. `"encrypted_file"` selects the on-disk key store SCP implements, which derives
+an AES-256 key from `$SCP_KEY_PASSPHRASE` with Argon2id and encrypts each key entry
+under AES-256-GCM. `"os_keystore"` selects the operating system's own key store, which
+SCP reaches through the platform key-custody callback the SDK consumer supplies; a
+bridge holding no such callback returns a typed error rather than falling back to
+another store. A shipped build answers every other string with a typed error, and
+answers the test-harness string `"in_memory"` with `SCP-IDENT-1008`. The words
+`platform`, `software`, `file`, and `hardware` name no custody value.
 
 ### Opaque types
 

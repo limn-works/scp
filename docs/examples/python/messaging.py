@@ -19,8 +19,8 @@ from scp_sdk import Capability, Context, ContextMode, CustodyType, Identity
 
 async def main() -> None:
     # 1. Create two identities.
-    alice = await Identity.create(custody=CustodyType.IN_MEMORY)
-    bob = await Identity.create(custody=CustodyType.IN_MEMORY)
+    alice = await Identity.create(custody=CustodyType.ENCRYPTED_FILE)
+    bob = await Identity.create(custody=CustodyType.ENCRYPTED_FILE)
     print(f"Alice: {alice.did}")
     print(f"Bob:   {bob.did}")
 

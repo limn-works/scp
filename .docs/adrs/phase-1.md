@@ -1258,7 +1258,7 @@ DidDocument.verification_method = [
 ]
 ```
 
-**Trust chain:** `#0` (root of trust) authorizes `#active` and `#agent` via DID document publication. Adding/removing `#agent` is a DID document update signed by `#0`.
+**Trust chain:** `#0` (root of trust) authorizes `#active` and `#agent` via DID document publication. Adding/removing `#agent` is a DID document update signed by `#0`. §3.9 of the identity spec consolidates the four keys this ADR introduces — `#0`, `#active`, `#agent`, and the pre-rotation key — and states, for each one, what it signs, where its key material lives, who chooses that, how it rotates, and how it appears in the DID document. Where this ADR and §3.9 disagree, §3.9 states the rule and §3.9.8 records the disagreement.
 
 **Key properties:**
 
@@ -1299,7 +1299,7 @@ DidDocument.verification_method = [
 
 3. **Verifier validation.** Network-level enforcement: all conformant verifiers reject Category A actions (DID document modifications) signed by `#agent`. Non-conformant SDKs can produce these signatures, but they cannot propagate through the network. The attempt is both rejected and logged as a custody violation.
 
-4. **Custody attestation.** At identity creation, the DID document includes a `ScpKeyCustodyAttestation` service entry declaring key custody model (`hardware-biometric` vs `software`) with optional platform attestation proof (Apple App Attest / Android Key Attestation). Unambiguous violations (Category A attempts with `#agent`, attestation mismatches with hardware proof) are permanently logged as `ScpCustodyViolationAttestation` records. DID owners can publish counter-attestations for reputation restoration. Absence of attestation is itself a signal.
+4. **Custody attestation.** At identity creation, the DID document includes a `ScpKeyCustodyAttestation` service entry stating, for each key, whether that key can leave its store and which factor unlocks it (`non-extractable-biometric`, `non-extractable-pin`, or `extractable-passphrase`). §3.2.2 of the identity spec, the custody vocabulary, states those three published values and states that a caller names neither of them, because a caller names a backend instead. The entry carries an optional platform attestation proof (Apple App Attest / Android Key Attestation). `ScpKeyCustodyAttestation::derive` takes no custody value: it reads one off each custody backend the caller passes it, so a publisher who builds the entry through `derive` names neither published value. `derive` is not the only path to the struct, and §3.2.2 of the identity spec lists three others that reach it without calling it, so this states what one constructor does rather than a property of every custody value a reader meets. Unambiguous violations (Category A attempts with `#agent`, attestation mismatches with hardware proof) are permanently logged as `ScpCustodyViolationAttestation` records. DID owners can publish counter-attestations for reputation restoration. Absence of attestation is itself a signal.
 
 5. **Behavioral signals.** Soft trust signal only — feeds into trust function (§7.1), NOT logged as violations. Timing patterns, usage anomalies, and interaction patterns provide supplementary context for trust evaluation. Explicitly excluded from violation records due to false positive risk.
 

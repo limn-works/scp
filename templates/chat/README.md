@@ -54,5 +54,5 @@ Without a relay, the template demonstrates the SDK API patterns locally -- each 
 - **Capabilities**: add `OUTLET_CALL_ALL`, `GOVERNANCE_PROPOSE`, etc. to the ceiling for richer contexts.
 - **Memory scope**: change `"ephemeral"` to `"full"` to retain chat history after the context closes.
 - **Governance**: pass `governance="threshold"` for multi-admin contexts that require voting.
-- **Custody**: replace `"in_memory"` with `"platform"` for production key storage.
+- **Custody**: replace `"in_memory"` with `"encrypted_file"` and export `SCP_KEY_PASSPHRASE` — that value selects the on-disk key store SCP implements, which derives an AES-256 key from the passphrase with Argon2id. For the operating system's own key store, pass `"os_keystore"` together with a `KeyCustodyProvider`. §3.2.2 of the identity spec, the custody vocabulary, states those two values and states that a shipped build answers every other string with a typed error. Neither call creates an identity on a released wheel: both return `SCP-IDENT-1059`, because no pre-rotation custody backend is wired yet.
 - **Relay**: wire up `Transport.connect` / `TransportConfig` to connect both participants through the same relay.

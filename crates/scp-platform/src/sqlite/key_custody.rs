@@ -17,7 +17,9 @@ use tokio::sync::Mutex;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
-use super::SqliteStorage;
+use scp_did::attestation::{CustodySubstrate, UnlockFactor};
+
+use super::{SqliteKeyProvisioning, SqliteStorage};
 use crate::error::PlatformError;
 use crate::traits::{
     CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
@@ -525,6 +527,27 @@ impl KeyCustody for SqliteKeyCustody {
     }
 }
 
+impl CustodySubstrate for SqliteKeyCustody {
+    /// Returns `true`: this backend writes each private key into the database
+    /// as raw bytes and loads every key into process memory at construction,
+    /// so the key leaves the store.
+    fn key_is_extractable(&self) -> bool {
+        true
+    }
+
+    /// Returns the factor that unlocks the database holding the keys, because
+    /// that factor is what a holder presents to reach any key in it. A caller
+    /// who opened the database with raw key bytes gets
+    /// [`UnlockFactor::CallerSuppliedKey`], since whatever protects those bytes
+    /// lives outside this crate.
+    fn unlock_factor(&self) -> UnlockFactor {
+        match self.storage.key_provisioning() {
+            SqliteKeyProvisioning::Passphrase => UnlockFactor::Passphrase,
+            SqliteKeyProvisioning::CallerSuppliedKey => UnlockFactor::CallerSuppliedKey,
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -675,5 +698,39 @@ mod tests {
         let custody = temp_custody(dir.path()).await;
         let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         assert_eq!(custody.custody_type(&handle), CustodyType::Software);
+    }
+
+    /// A caller who opened the database with raw key bytes leaves this backend
+    /// unable to name the factor, so the backend publishes no custody value.
+    #[tokio::test]
+    async fn substrate_over_a_caller_supplied_key_publishes_nothing() {
+        use scp_did::attestation::KeyCustodyModel;
+
+        let dir = tempfile::tempdir().unwrap();
+        let custody = temp_custody(dir.path()).await;
+
+        assert!(custody.key_is_extractable());
+        assert_eq!(custody.unlock_factor(), UnlockFactor::CallerSuppliedKey);
+
+        let err = KeyCustodyModel::from_substrate(&custody).unwrap_err();
+        assert_eq!(err.unlock_factor, UnlockFactor::CallerSuppliedKey);
+    }
+
+    /// A caller who opened the database with a passphrase gets the extractable
+    /// published value, because the passphrase unlocks every key inside it.
+    #[tokio::test]
+    async fn substrate_over_a_passphrase_publishes_extractable_passphrase() {
+        use scp_did::attestation::KeyCustodyModel;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = SqliteStorage::with_passphrase(dir.path(), b"correct horse").unwrap();
+        let custody = SqliteKeyCustody::new(storage).await.unwrap();
+
+        assert!(custody.key_is_extractable());
+        assert_eq!(custody.unlock_factor(), UnlockFactor::Passphrase);
+        assert_eq!(
+            KeyCustodyModel::from_substrate(&custody).unwrap(),
+            KeyCustodyModel::ExtractablePassphrase
+        );
     }
 }

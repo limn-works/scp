@@ -25,7 +25,7 @@ from scp_sdk import (
 
 async def main() -> None:
     # 1. Create the identity that will own the context.
-    alice = await Identity.create(custody=CustodyType.IN_MEMORY)
+    alice = await Identity.create(custody=CustodyType.ENCRYPTED_FILE)
     print(f"Alice DID: {alice.did}")
 
     # 2. Create a context with messaging capabilities.
@@ -66,7 +66,7 @@ async def main() -> None:
         print("  Message sent successfully.")
 
         # 5. Bob joins the context.
-        bob = await Identity.create(custody=CustodyType.IN_MEMORY)
+        bob = await Identity.create(custody=CustodyType.ENCRYPTED_FILE)
         membership = await ctx.join(bob)
         print()
         print(f"Bob joined: {membership.did} as {membership.role}")

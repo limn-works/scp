@@ -41,7 +41,11 @@ except (ImportError, AttributeError):
 
 from scp_sdk import SCP
 from scp_sdk.auth import ScpIdChallenge, ScpIdResponse
-from scp_sdk.types import CustodyType
+
+from .harness_custody import (
+    create_in_memory_identity,
+    create_in_memory_identity_with_agent_key,
+)
 
 
 def _run(coro):  # type: ignore[no-untyped-def]
@@ -104,7 +108,7 @@ class TestScpIdSign:
     """Tests for SCPID challenge signing."""
 
     def test_sign_with_active_key(self, scp: SCP) -> None:
-        identity = _run(scp.identity_create(CustodyType.IN_MEMORY))
+        identity = _run(create_in_memory_identity(scp))
         challenge = _run(scp.scpid_challenge("https://example.com", 120))
 
         response = _run(scp.scpid_sign(identity.did, "#active", challenge.to_json()))
@@ -118,7 +122,7 @@ class TestScpIdSign:
         assert len(response.signature) > 0
 
     def test_sign_with_agent_key(self, scp: SCP) -> None:
-        identity = _run(scp.identity_create_with_agent_key(CustodyType.IN_MEMORY))
+        identity = _run(create_in_memory_identity_with_agent_key(scp))
         challenge = _run(scp.scpid_challenge("https://agent-service.example.com", 60))
 
         response = _run(scp.scpid_sign(identity.did, "#agent", challenge.to_json()))
@@ -126,14 +130,14 @@ class TestScpIdSign:
         assert response.signing_key_id == "#agent"
 
     def test_sign_rejects_invalid_key_id(self, scp: SCP) -> None:
-        identity = _run(scp.identity_create(CustodyType.IN_MEMORY))
+        identity = _run(create_in_memory_identity(scp))
         challenge = _run(scp.scpid_challenge("https://example.com", 60))
 
         with pytest.raises(Exception):
             _run(scp.scpid_sign(identity.did, "#owner", challenge.to_json()))
 
     def test_response_json_roundtrip(self, scp: SCP) -> None:
-        identity = _run(scp.identity_create(CustodyType.IN_MEMORY))
+        identity = _run(create_in_memory_identity(scp))
         challenge = _run(scp.scpid_challenge("https://example.com", 120))
 
         response = _run(scp.scpid_sign(identity.did, "#active", challenge.to_json()))
@@ -164,7 +168,7 @@ class TestScpIdVerify:
     """
 
     def test_verify_succeeds_for_in_memory_identity(self, scp: SCP) -> None:
-        identity = _run(scp.identity_create(CustodyType.IN_MEMORY))
+        identity = _run(create_in_memory_identity(scp))
         challenge = _run(scp.scpid_challenge("https://example.com", 120))
         response = _run(scp.scpid_sign(identity.did, "#active", challenge.to_json()))
 
@@ -188,7 +192,7 @@ class TestScpIdVerify:
         signature verifies, which is only possible if the rotated document
         reached the shared resolver.
         """
-        identity = _run(scp.identity_create(CustodyType.IN_MEMORY))
+        identity = _run(create_in_memory_identity(scp))
 
         # Baseline: pre-rotation active key signs and verifies.
         challenge = _run(scp.scpid_challenge("https://example.com", 120))

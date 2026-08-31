@@ -14,33 +14,114 @@ pip install scp-python
 
 ```python
 import asyncio
-from scp_sdk import Identity, Context
+from scp_sdk import SCP
+from scp_sdk.types import CustodyType
 
 
 async def main():
-    # Create a cryptographic identity (DID)
-    identity = await Identity.create(custody="platform")
-    print(f"DID: {identity.did}")
+    with SCP(storage={"type": "in_memory"}) as scp:
+        # Create a cryptographic identity (DID). CustodyType.ENCRYPTED_FILE writes an
+        # encrypted key file to $HOME/.scp/keys.bin; export SCP_KEY_PASSPHRASE
+        # before this call or the bridge raises ValidationError. On a shipped
+        # build this call raises SCP-IDENT-1059 -- read "No shipped build
+        # creates an identity yet" below before you run it.
+        identity = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
+        print(f"DID: {identity.did}")
 
-    # Create an encrypted context
-    ctx = await Context.create(
-        identity=identity,
-        params={"ceiling": ["msg:send", "msg:receive"], "ttl": 3600},
-    )
+        # Create an encrypted context
+        ctx = await scp.context_create(
+            identity.did,
+            {"ceiling": ["msg:send", "msg:receive"], "ttl": 3600},
+        )
 
-    # Send a message (MLS-encrypted, signed, provenance-tagged)
-    await ctx.send(b"Hello from SCP")
+        # Send a message (MLS-encrypted, signed, provenance-tagged)
+        await scp.context_send(ctx._raw_handle, identity.did, b"Hello from SCP")
 
-    # Receive messages
-    async for msg in ctx.receive():
+        # Receive a message
+        msg = await scp.context_receive(ctx._raw_handle)
         print(f"{msg.sender_did}: {msg.content}")
-        break
 
-    await ctx.close()
+        await scp.context_close(ctx._raw_handle, identity.did)
 
 
 asyncio.run(main())
 ```
+
+## Key custody
+
+`identity_create` takes a `CustodyType` or the string it spells, and carries no
+default, so a caller names the key store and this SDK names none for them.
+Section 3.2.2 of the identity spec, "The Custody Vocabulary", states the two
+values `CustodyType` carries. `CustodyType.ENCRYPTED_FILE` (`"encrypted_file"`)
+selects the on-disk key store SCP implements, which derives the file key with
+Argon2id and encrypts `$HOME/.scp/keys.bin` with AES-256-GCM.
+`CustodyType.OS_KEYSTORE` (`"os_keystore"`) selects the operating system's own
+key store, which SCP reaches through the platform key-custody callback you
+supply. Every other string raises `ValidationError` with code
+`SCP-VALID-7005`, and that includes `"platform"`, `"software"`, `"file"`,
+`"platform_managed"`, and `"hardware"`.
+
+`identity_create(CustodyType.OS_KEYSTORE)` raises `IdentityError` with code
+`SCP-IDENT-1003`, because that call supplies no provider and the bridge falls
+back to neither the encrypted key file nor an in-memory store. To store keys in
+a platform-native key store, implement `scp_sdk.scp.KeyCustodyProvider` over
+that key store and pass it to `scp.identity_create_with_custody(provider)`.
+That method is where a real platform backend lands, and it is the only entry
+point that takes an injected provider.
+
+A build carrying the bridge's `testing` cargo feature additionally accepts the
+raw string `"in_memory"`, which reaches the test-only in-memory key store. No
+`CustodyType` member spells it, a test that needs it passes the raw string, and
+a shipped build raises `IdentityError` with code `SCP-IDENT-1008`.
+
+## The published custody value
+
+`scp.identity_published_custody(did)` returns the published-vocabulary custody
+value for that DID's `#active` key, read off the backend running in this
+process. Section 3.2.2 states that value as whether the key can leave its store
+and which factor unlocks it: `"non-extractable-biometric"`,
+`"non-extractable-pin"`, or `"extractable-passphrase"`. It returns `None` when
+the backend holding the `#active` key reports a pair the published vocabulary
+states no value for.
+
+The bridge derives the value from the running backend, so the value states what
+that backend reported: `KeyCustodyProvider.key_is_extractable` and
+`KeyCustodyProvider.unlock_factor` answer the two questions for an injected
+provider, and the encrypted key file answers them for itself.
+
+The call reads no DID document. Nothing SCP ships writes a custody attestation
+into one — `ScpKeyCustodyAttestation::derive` and
+`DidDocument::set_custody_attestation` have no caller outside tests — so a
+stranger resolving the DID finds no custody service entry, and this call answers
+only for an identity this instance created. Section 3.2.2.1 of the identity spec
+records that as divergence D18, and its open question OQ-17 asks which component
+writes the entry.
+
+It raises `IdentityError` with code `SCP-IDENT-1001` for a DID this instance
+retains no custody for, and the same code when the injected provider raises
+while answering either question.
+
+## No shipped build creates an identity yet
+
+`identity_create_with_custody` raises `IdentityError` with code
+`SCP-IDENT-1059` on every shipped build, and `identity_create(CustodyType.ENCRYPTED_FILE)`
+raises it too once `SCP_KEY_PASSPHRASE` is set. Section 9.7.4.1 of the security
+model, pre-rotation key custody, makes every identity commit a pre-rotation
+commitment when it is created. That commitment needs a `PreRotationCustody`
+backend, and the only implementation is the test-harness
+`InMemoryPreRotationCustody`, which the bridge's `testing` feature severs from
+production, so `crates/scp-ffi/src/identity.rs` returns the typed error rather
+than minting the test double. ADR-062, capability injection and prove-absent
+dev backends, records that state as accepted in its §Decision 6 and holds the
+real backend out of its own scope. Every code example above therefore runs
+against a wheel built with the `testing` feature.
+
+Two separate gaps produce those codes, and closing one does not close the
+other. `SCP-IDENT-1003`, `SCP-IDENT-1008`, and `SCP-VALID-7005` say that the
+custody value you passed names no key store this bridge builds. `SCP-IDENT-1059` says that no
+pre-rotation custody backend exists for any create path to use. A wired
+platform provider clears the first gap; a real pre-rotation backend clears the
+second.
 
 ## Requirements
 

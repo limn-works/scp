@@ -15,29 +15,110 @@ bun add @limn-works/scp-ts
 ## Quick Start
 
 ```typescript
-import { Identity, Context } from "@limn-works/scp-ts";
+import { SCP } from "@limn-works/scp-ts";
+import type { KeyCustodyProvider } from "@limn-works/scp-ts";
 
-// Create a cryptographic identity (DID)
-const identity = await Identity.create({ custody: "platform" });
+// Storage selection is required — there is no default (spec §17.6).
+const scp = new SCP({ storage: { type: "in_memory" } });
+
+// Create a cryptographic identity (DID). `keychain` is your own
+// KeyCustodyProvider over the OS keystore — see "Key custody" below. On a
+// released addon this call throws SCP-IDENT-1059 — read "No shipped build
+// creates an identity yet" below before you run it.
+declare const keychain: KeyCustodyProvider;
+const identity = await scp.identityCreateWithCustody(keychain);
 console.log(`DID: ${identity.did}`);
 
 // Create an encrypted context
-const ctx = await Context.create(identity, {
-  ceiling: ["msg:send", "msg:receive"],
-  ttl: 3600,
-});
+const ctx = await scp.contextCreate(
+  identity,
+  JSON.stringify({ ceiling: ["msg:send", "msg:receive"], ttl: 3600 }),
+);
 
 // Send a message (MLS-encrypted, signed, provenance-tagged)
-await ctx.send(new TextEncoder().encode("Hello from SCP"));
+await scp.contextSend(ctx, identity.did, new TextEncoder().encode("Hello from SCP"));
 
-// Receive messages
-for await (const msg of ctx.receive()) {
-  console.log(`${msg.senderDid}: ${msg.content}`);
-  break;
-}
-
-await ctx.close();
+await scp.contextClose(ctx, identity.did);
+await scp.shutdown(5);
 ```
+
+## Key custody
+
+Section 3.2.2 of the identity spec, "The Custody Vocabulary", states the two
+values `CustodyType` carries. `"encrypted_file"` selects the on-disk key store
+SCP implements, which derives the file key with Argon2id and encrypts
+`$HOME/.scp/keys.bin` with AES-256-GCM; export `SCP_KEY_PASSPHRASE` before the
+call or the addon throws a `ValidationError`. `"os_keystore"` selects the
+operating system's own key store, which SCP reaches through the platform
+key-custody callback you supply. Every other string throws a `ValidationError`
+carrying `SCP-VALID-7005`, and that includes `"platform"`, `"software"`,
+`"file"`, `"platform_managed"`, and `"hardware"`.
+
+`scp.identityCreate("os_keystore")` throws an `IdentityError` carrying
+`SCP-IDENT-1003`, because that call supplies no provider and the bridge falls
+back to neither the encrypted key file nor an in-memory store. Reaching the
+operating system's key store runs through `scp.identityCreateWithCustody(provider)`
+instead. Implement the `KeyCustodyProvider` interface over the key store you
+want — an OS keychain, a hardware token, an HSM wrapper — and the private key
+material never crosses into the native core, because the core delegates every
+cryptographic operation back to your callbacks (ADR-006, the platform
+abstraction). That method is where a real platform backend lands, and it is the
+only entry point that takes an injected provider.
+
+An addon carrying the bridge's `testing` cargo feature additionally accepts the
+raw string `"in_memory"`, which reaches the test-only in-memory key store. No
+`CustodyType` member spells it, a test that needs it passes the raw string to
+the bridge, and a released addon throws an `IdentityError` carrying
+`SCP-IDENT-1008`.
+
+## The published custody value
+
+`scp.identityPublishedCustody(did)` returns the published-vocabulary custody
+value for that DID's `#active` key, read off the backend running in this
+process. Section 3.2.2 states that value as whether the key can leave its store
+and which factor unlocks it: `"non-extractable-biometric"`,
+`"non-extractable-pin"`, or `"extractable-passphrase"`. It returns `null` when
+the backend holding the `#active` key reports a pair the published vocabulary
+states no value for.
+
+The bridge derives the value from the running backend, so the value states what
+that backend reported: `KeyCustodyProvider.keyIsExtractable` and
+`KeyCustodyProvider.unlockFactor` answer the two questions for an injected
+provider, and the encrypted key file answers them for itself.
+
+The call reads no DID document. Nothing SCP ships writes a custody attestation
+into one — `ScpKeyCustodyAttestation::derive` and
+`DidDocument::set_custody_attestation` have no caller outside tests — so a
+stranger resolving the DID finds no custody service entry, and this call answers
+only for an identity this instance created. Section 3.2.2.1 of the identity spec
+records that as divergence D18, and its open question OQ-17 asks which component
+writes the entry.
+
+It throws an `IdentityError` carrying `SCP-IDENT-1001` for a DID this instance
+retains no custody for, and the same code when the injected provider throws
+while answering either question.
+
+## No shipped build creates an identity yet
+
+`identityCreateWithCustody` throws an `IdentityError` carrying `SCP-IDENT-1059`
+on every released addon, and `identityCreate("encrypted_file")` throws it too
+once `SCP_KEY_PASSPHRASE` is set. Section 9.7.4.1 of the security model,
+pre-rotation key custody, makes every identity commit a pre-rotation commitment
+when it is created. That commitment needs a `PreRotationCustody` backend, and
+the only implementation is the test-harness `InMemoryPreRotationCustody`, which
+the bridge's `testing` feature severs from
+production, so `crates/scp-ffi/napi/src/scp.rs` returns the typed error rather
+than minting the test double. ADR-062, capability injection and prove-absent
+dev backends, records that state as accepted in its §Decision 6 and holds the
+real backend out of its own scope. The Quick Start above therefore runs against
+an addon built with the `testing` feature.
+
+Two separate gaps produce those codes, and closing one does not close the
+other. `SCP-IDENT-1003`, `SCP-IDENT-1008`, and `SCP-VALID-7005` say that the
+custody value you passed names no key store this bridge builds. `SCP-IDENT-1059` says that no
+pre-rotation custody backend exists for any create path to use. A wired
+platform provider clears the first gap; a real pre-rotation backend clears the
+second.
 
 ## Runtime Support
 

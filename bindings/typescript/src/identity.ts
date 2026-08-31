@@ -66,8 +66,41 @@ export interface IdentityLinkAttestation {
 // CustodyType
 // ---------------------------------------------------------------------------
 
-/** Supported custody methods for identity key management. */
-export type CustodyType = "platform" | "in_memory" | "software";
+/**
+ * The custody backend a caller names to {@link SCP.identityCreate}.
+ *
+ * Section 3.2.2 of the identity spec, "The Custody Vocabulary", states two
+ * values a caller names when it selects a custody backend, and states that
+ * "The vocabulary holds no third value, and a shipped build answers every
+ * other string with a typed error."
+ *
+ * - `"encrypted_file"` selects the on-disk key store SCP implements, which
+ *   derives an AES-256 key from a passphrase with Argon2id and encrypts each
+ *   key entry under AES-256-GCM (`crates/scp-platform/src/file.rs`). The
+ *   bridge reads the passphrase from the `SCP_KEY_PASSPHRASE` environment
+ *   variable and answers an unset variable with `SCP-VALID-7005`.
+ *   `KeyFileError::code` in `crates/scp-ffi/common/src/key_file.rs` states
+ *   that code once for all three bridges, so Python, Node, Swift, and Kotlin
+ *   read the same value for this condition.
+ * - `"os_keystore"` selects the operating system's own key store, which SCP
+ *   reaches through the platform key-custody callback an SDK consumer
+ *   supplies. {@link SCP.identityCreate} supplies none, so it answers this
+ *   value with `SCP-IDENT-1003` and falls back to neither the encrypted key
+ *   file nor an in-memory store; pass a `KeyCustodyProvider` to
+ *   {@link SCP.identityCreateWithCustody} to reach the store.
+ *
+ * `validate_custody_type` in `crates/scp-ffi/napi/src/error.rs` answers every
+ * other string with `SCP-VALID-7005`, and that includes `"platform"`,
+ * `"software"`, `"file"`, `"platform_managed"`, and `"hardware"`.
+ *
+ * A build carrying the NAPI bridge's `testing` cargo feature additionally
+ * accepts the raw string `"in_memory"`, which reaches the test-only in-memory
+ * key store. Section 3.2.2 states that the string is a test-harness
+ * affordance and not a value of this vocabulary, so this type does not spell
+ * it: a test that needs it passes the raw string to the bridge, and a shipped
+ * build answers it with `SCP-IDENT-1008`.
+ */
+export type CustodyType = "encrypted_file" | "os_keystore";
 
 // ---------------------------------------------------------------------------
 // Identity
@@ -84,7 +117,7 @@ export type CustodyType = "platform" | "in_memory" | "software";
  * wherever the underlying bridge call needs access to key material.
  *
  * ```typescript
- * const identity = await scp.identityCreate("in_memory");
+ * const identity = await scp.identityCreate("encrypted_file");
  * console.log(identity.did); // "did:dht:z6Mk..."
  * await scp.identityRotateKey(identity);
  * ```
@@ -93,7 +126,15 @@ export class Identity {
   /** The DID string for this identity (e.g., `"did:dht:z6Mk..."`). */
   readonly did: string;
 
-  /** The custody type used at identity creation. */
+  /**
+   * The custody backend that holds this identity's keys.
+   *
+   * The bridge reports `"encrypted_file"` or `"os_keystore"`. A build
+   * carrying the NAPI bridge's `testing` cargo feature also reports
+   * `"in_memory"` for an identity a test created through the test-harness
+   * custody string, which is why this field's type is `string` and not
+   * {@link CustodyType}.
+   */
   readonly custodyType: string;
 
   /** @internal Opaque bridge handle — not part of the public API. */

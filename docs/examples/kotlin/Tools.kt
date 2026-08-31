@@ -24,7 +24,7 @@ import works.limn.scp.bridge.CoroutineBridge
 
 fun toolsExample(bridge: CoroutineBridge) = runBlocking {
     // 1. Create an identity for the tool operator.
-    val operatorHandle = bridge.identity.create(CustodyType.IN_MEMORY)
+    val operatorHandle = bridge.identity.create(CustodyType.ENCRYPTED_FILE)
     println("Operator handle: $operatorHandle")
 
     // 2. Create a context with tool capabilities.

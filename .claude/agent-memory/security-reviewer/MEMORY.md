@@ -2,6 +2,9 @@
 
 ## SCP Codebase Security Patterns
 
+### SCP-294 custody "platform" fails closed (56c6a0e880) -- 2026-08-28 -- ZERO BLOCKING
+- See `scp294-custody-platform-fails-closed.md`. All 3 bridges answer "platform" with SCP-IDENT-1003; UniFFI drops CustodyMethod::Platform/Software, stamps Callback (stops asserting an unverifiable HSM substrate). Zeroizing intact; no nullifier reachable; 0600 key file. 2 non-blocking residues: PyO3 shipped (platform+seed) -> VALID-7008 parity gap; 4 messages hardcode "no shipped build creates an identity" with tests pinning the literal.
+
 ### Event-Log Phase-2 Substrate Swap FINAL (16a2cd42b) -- 2026-06-20
 - See `eventlog-phase2-final-16a2cd42b.md`. ONE HIGH: bf9266777 made econ-policy/ceiling effective_at = proposal.created_at (PROPOSER-backdatable) + PERIOD; no clamp; breaks §19 commit-anchored 24h MUST; pre-Phase-2 used applying member's now() -> NEW regression. Rest CLEAN (merkle_root mirror removal neutral-or-stronger; committer-ts signed-bound).
 - FIX RE-VERIFIED (f234988bc) -- see `notification-window-backdating-fix-f234988bc.md`. Canonical import observed_at re-pin to local clock. Bypass CLOSED, no new regression. RESTORE-verbatim correct (self-respawn). WASM gov-leaf b"" parity + dedup contiguous-seq + convergent_consequence_timestamp move all clean. MERGE-GATING CONFIRMED.

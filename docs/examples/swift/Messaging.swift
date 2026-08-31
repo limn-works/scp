@@ -18,8 +18,8 @@ import SCP
 struct MessagingExample {
     static func main() async throws {
         // 1. Create two identities.
-        let alice = try await createIdentity(custody: "in_memory")
-        let bob = try await createIdentity(custody: "in_memory")
+        let alice = try await createIdentity(custody: "encrypted_file")
+        let bob = try await createIdentity(custody: "encrypted_file")
         print("Alice: \(alice.did())")
         print("Bob:   \(bob.did())")
 

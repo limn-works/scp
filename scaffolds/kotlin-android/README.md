@@ -1,6 +1,10 @@
 # SCP Kotlin Android Scaffold
 
-Minimal Android app using the SCP Kotlin SDK with Keystore key custody.
+Minimal Android app using the SCP Kotlin SDK with the encrypted key file SCP implements. A caller
+reaches Android Keystore by naming `"os_keystore"` and supplying a
+`KeyCustodyProvider`; §3.2.2 of the identity spec, the custody vocabulary, states that
+value and states that a bridge holding no such provider returns a typed error rather
+than falling back to another store.
 
 ## Prerequisites
 
@@ -28,7 +32,7 @@ For a full Android app, import into Android Studio and add the SCP SDK as a depe
 ## Next Steps
 
 - Load the native library with `System.loadLibrary("scp_ffi_uniffi")`
-- Replace `CustodyType.IN_MEMORY` with `CustodyType.PLATFORM` for Android Keystore
+- Replace the `bridge.identity.create(CustodyType.ENCRYPTED_FILE)` call with `identityCreateWithCustody(provider)` on a `works.limn.scp.SCP` instance, passing your own `uniffi.scp.KeyCustodyProvider` over Android Keystore — that call returns `SCP-IDENT-1059` on a released build, because no pre-rotation custody backend is wired yet
 - Add relay connectivity for real transport
 - Integrate with Android lifecycle (ViewModel, coroutine scopes)
 - See `docs/examples/kotlin/` for more detailed examples

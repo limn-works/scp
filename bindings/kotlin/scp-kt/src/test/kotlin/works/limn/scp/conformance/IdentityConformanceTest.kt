@@ -14,6 +14,7 @@ import works.limn.scp.bridge.BridgeException
 import works.limn.scp.bridge.CoroutineBridge
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -49,37 +50,75 @@ class IdentityConformanceTest {
     @Nested
     inner class IdentityCreate {
         @Test
-        fun `identity_create with in_memory custody returns handle`() =
+        fun `identity_create with encrypted_file custody returns handle`() =
             runTest(testDispatcher) {
                 stubBindings.identityCreateResult = 42L
                 val result =
                     dispatcher.dispatch(
                         "identity_create",
-                        mapOf("custody" to "in_memory"),
+                        mapOf("custody" to "encrypted_file"),
                     )
                 assertEquals("42", result["handle"])
-                assertEquals("in_memory", result["custody_type"])
-                assertEquals("in_memory", stubBindings.identityCreateCustody)
+                assertEquals("encrypted_file", result["custody_type"])
+                assertEquals("encrypted_file", stubBindings.identityCreateCustody)
             }
 
+        // This test asserted `custody_type == "platform"` until SCP-294, the
+        // custody-naming story, and then that the dispatcher forwarded that
+        // string unaltered. §3.2.2 of the identity spec names `"platform"`
+        // among five spellings that "name no custody backend", and
+        // `CustodyType` spells none of them, so the dispatcher now stops each
+        // one before the bridge call. The rejection at the bridge is covered
+        // against the compiled cdylib by `CustodyCallErrorCodeTest`.
         @Test
-        fun `identity_create with platform custody returns handle`() =
+        fun `identity_create reports a retired custody spelling without calling the bridge`() =
+            runTest(testDispatcher) {
+                stubBindings.identityCreateResult = 1L
+                for (retired in listOf("platform", "software", "file", "platform_managed", "hardware")) {
+                    val result =
+                        dispatcher.dispatch(
+                            "identity_create",
+                            mapOf("custody" to retired),
+                        )
+                    assertEquals("unknown_custody_type", result["error"], "$retired must be reported")
+                    assertEquals(retired, result["detail"])
+                }
+                assertNull(stubBindings.identityCreateCustody)
+            }
+
+        // §3.2.2 states that `"in_memory"` "is a test-harness affordance and
+        // not a value of this vocabulary" and that "no SDK enum spells it", so
+        // a fixture naming it reaches the same report the retired spellings do.
+        // A test that needs the in-memory key store passes the raw string to
+        // the bridge instead — see `TestHarnessCustody`.
+        @Test
+        fun `identity_create reports the test-harness custody string without calling the bridge`() =
             runTest(testDispatcher) {
                 stubBindings.identityCreateResult = 1L
                 val result =
                     dispatcher.dispatch(
                         "identity_create",
-                        mapOf("custody" to "platform"),
+                        mapOf("custody" to "in_memory"),
                     )
-                assertEquals("1", result["handle"])
-                assertEquals("platform", result["custody_type"])
+                assertEquals("unknown_custody_type", result["error"])
+                assertEquals("in_memory", result["detail"])
+                assertNull(stubBindings.identityCreateCustody)
             }
 
+        /**
+         * A fixture that names no custody gets none chosen for it. Key custody
+         * decides who can reach a private key, and the agent-first API design
+         * tenet of `CLAUDE.md` forbids an SDK making that choice for a caller.
+         * This test replaced one asserting that the dispatcher defaulted to
+         * `encrypted_file`.
+         */
         @Test
-        fun `identity_create defaults to in_memory when custody not specified`() =
+        fun `identity_create chooses no custody for a fixture that names none`() =
             runTest(testDispatcher) {
                 val result = dispatcher.dispatch("identity_create", emptyMap())
-                assertEquals("in_memory", result["custody_type"])
+                assertEquals("missing_custody_type", result["error"])
+                assertNull(result["custody_type"])
+                assertNull(result["handle"])
             }
 
         @Test
@@ -90,7 +129,7 @@ class IdentityConformanceTest {
                 val result =
                     dispatcher.dispatch(
                         "identity_create",
-                        mapOf("custody" to "platform"),
+                        mapOf("custody" to "os_keystore"),
                     )
                 assertEquals("SCP-IDENT-1001", result["error"])
             }
@@ -173,8 +212,8 @@ class IdentityConformanceTest {
                         category = "identity",
                         description = "Create identity with in-memory custody",
                         operation = "identity_create",
-                        input = mapOf("custody" to "in_memory"),
-                        expected = mapOf("custody_type" to "in_memory"),
+                        input = mapOf("custody" to "encrypted_file"),
+                        expected = mapOf("custody_type" to "encrypted_file"),
                     )
                 val result = dispatcher.dispatch(fixture.operation, fixture.input)
                 val mismatches = compareResults(result, fixture.expected)
