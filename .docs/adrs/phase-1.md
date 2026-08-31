@@ -254,7 +254,9 @@ The inner signature is included inside the encrypted blob. Relays never see it. 
 
 ## ADR-003: DID Creation (did:dht)
 
-**Status:** Decided
+**Status:** Superseded by ADR-063 (2026-08-30)
+
+ADR-063, inception-derived self-certifying identity over a key-event log, replaces this decision. SCP does not adopt did:dht: the BitTorrent Mainline DHT is removed, the pkarr and BEP44 DNS-record encoding is retired, the `did:dht:z` self-certification bindings are dropped, and the SCP relay network carries identity instead. The identifier derives from an inception event in SCP's own encoding rather than from a z-base-32 did:dht string, an append-only key-event log replaces the mutable highest-sequence DHT record, and root recovery appends a key event that reveals the pre-committed key without renaming the identifier, so the identifier-renaming migration this ADR modeled disappears. did:web, which this ADR named as a contingency fallback, is cut; no did:web code is authorized. The DID string as an interface survives only as an optional, deferred `did:scp` facade. Two rulings below survive into ADR-063: a content signature verifies against a retired key while an attestation verifies against the current key only, and the root verification method `#0` remains a distinct root authority that asserts key status. The body below is retained as the historical record that motivated the supersession; the did:dht creation, publication, resolution, rotation, and migration it describes no longer describe SCP's identity method.
 
 ### Context
 
