@@ -33,22 +33,44 @@
 # rustup's own directory or a file on disk, so proving it installs nothing:
 #
 #   a. `rustup` answers on PATH, so rustup installs and dispatches the compilers here.
-#   b. `rustc` answers on PATH and reads the same bytes as `rustup`, which `cmp` reports.
-#      rustup installs its `rustc` as a link to the `rustup` binary, and mise installs its
-#      `rustc` shim as a link to the `mise` binary beside its `rustup` shim, so in both
-#      installations the two names read one file. A compiler some other installer put on
+#   b. `rustc` answers on PATH, reads the same bytes as `rustup`, and the symlink chain
+#      from the `rustup` on PATH ends on a file named `rustup`. rustup installs its
+#      `rustc` as a link to the `rustup` binary, so under rustup the two names read one
+#      file and that file is rustup, whose whole resolution facts c, d, and e below
+#      enumerate. mise installs its `rustc` and `rustup` shims as links to the `mise`
+#      binary, so under mise the two names also read one file — and that file selects a
+#      toolchain of its own each time a shim runs: it reads mise's configuration files at
+#      that moment and exports `RUSTUP_TOOLCHAIN` into the compiler it executes, which
+#      fact c cannot see because fact c reads this script's environment. An earlier
+#      revision of this fact accepted any one file behind both names, so on a machine
+#      whose mise configuration named a Rust version the script skipped while `rustc`
+#      answered that version, which is falsifier 1 arriving through an environment this
+#      script never reads. The name the chain ends on separates the two dispatchers:
+#      `rustup` proves rustup dispatches, and any other name — `mise`, or a dispatcher
+#      this script has never heard of — leaves the skip unproven, so the script compares.
+#      A compiler some other installer put on
 #      PATH — Homebrew's `rustc` ahead of `~/.cargo/bin` — reads different bytes, answers
 #      without consulting rustup, and downloads nothing, so the script compares against it
 #      instead of skipping. It also compares when `cmp` is absent from PATH, because it
 #      cannot prove this fact without `cmp`.
 #   c. `RUSTUP_TOOLCHAIN` holds nothing. rustup applies that variable in place of the
 #      toolchain file, and falsifier 1 above reports it.
-#   d. `rustup override list` names no directory holding this one. `rustup override set`
-#      selects a toolchain for a directory and its children ahead of the toolchain file,
-#      and installs that toolchain as it sets it, so a checkout under an override resolves
-#      an installed compiler the pin does not name. An earlier revision of this script
-#      exited 0 in that state, which is the fail-open this file exists to remove.
-#   e. `rustup toolchain list` holds no entry for the pinned channel.
+#   d. `rustup override list` exits 0 and names no directory holding this one. `rustup
+#      override set` selects a toolchain for a directory and its children ahead of the
+#      toolchain file, and installs that toolchain as it sets it, so a checkout under an
+#      override resolves an installed compiler the pin does not name. An earlier revision
+#      of this script exited 0 in that state, which is the fail-open this file exists to
+#      remove.
+#   e. `rustup toolchain list` exits 0 and holds no entry for the pinned channel.
+#
+#      Facts d and e each demand exit 0 because a rustup that exits reporting an error
+#      prints nothing on stdout, and an earlier revision read that nothing as an empty
+#      override list and an empty toolchain list, took the skip, and exited 0 on a machine
+#      whose `rustc` exited the same way — mise puts every shimmed command into that state
+#      in a directory whose `.mise.toml` it has not trusted, which is where every fresh
+#      `git worktree add` of this repository starts. A failing command proves neither
+#      fact, so the script compares, and the comparison then reports the compiler's
+#      answer, or reports that no answer was readable and exits 1.
 #
 # When any one of the five fails, running `rustc` reports a version and downloads nothing,
 # so the script runs it. It prints which of the two it did, so a caller never reads a skip
@@ -111,27 +133,56 @@ compare=1
 rustc_path=$(command -v rustc 2>/dev/null || true)
 rustup_path=$(command -v rustup 2>/dev/null || true)
 
-if [[ -z ${RUSTUP_TOOLCHAIN:-} && -n $rustc_path && -n $rustup_path ]] &&
-    command -v cmp >/dev/null 2>&1 && cmp -s "$rustc_path" "$rustup_path"; then
-    # Facts a, b, and c hold, so rustup dispatches the compiler that answers on PATH here,
-    # and rustup reads a toolchain file unless a directory override redirects it.
-    repo_root=$(pwd -P)
-    overridden=0
-    while IFS= read -r listed; do
-        # `rustup override list` prints "<directory><whitespace><toolchain>" for each
-        # override it holds, so dropping the last whitespace-delimited field leaves the
-        # directory, which may itself hold spaces. Every other line the command prints —
-        # "no overrides" when it holds none — leaves something that is not an absolute
-        # path, and the test below reads only absolute paths.
-        override_dir=$(printf '%s' "$listed" | sed -E 's/[[:space:]]+[^[:space:]]+[[:space:]]*$//')
-        [[ $override_dir == /* ]] || continue
-        if [[ $repo_root == "$override_dir" || $repo_root == "$override_dir"/* ]]; then
-            overridden=1
-            break
+# The second half of fact b: the file both names read is rustup itself. The loop follows
+# the symlink chain from the `rustup` on PATH and keeps the name of the file the chain
+# ends on, so a rustup behind a package manager's symlink — Homebrew's
+# `/opt/homebrew/bin/rustup` linking into its Cellar — still proves the fact, and a mise
+# shim resolves to the `mise` binary and does not. A chain that a broken link stops, or
+# one still unresolved after 40 links, proves nothing, so `dispatcher` then keeps the
+# empty value and the script compares.
+dispatcher=""
+if [[ -n $rustup_path ]]; then
+    resolved=$rustup_path
+    hops=0
+    while [[ -L $resolved && $hops -lt 40 ]]; do
+        target=$(readlink "$resolved") || break
+        if [[ $target == /* ]]; then
+            resolved=$target
+        else
+            resolved=$(dirname "$resolved")/$target
         fi
-    done < <(rustup override list 2>/dev/null)
+        hops=$((hops + 1))
+    done
+    [[ -L $resolved ]] || dispatcher=$(basename "$resolved")
+fi
 
-    if [[ $overridden -eq 0 ]]; then
+if [[ -z ${RUSTUP_TOOLCHAIN:-} && -n $rustc_path && -n $rustup_path && $dispatcher == "rustup" ]] &&
+    command -v cmp >/dev/null 2>&1 && cmp -s "$rustc_path" "$rustup_path"; then
+    # Facts a, b, and c hold, so rustup itself dispatches the compiler that answers on
+    # PATH here, and rustup reads a toolchain file unless a directory override redirects
+    # it. Facts d and e below each hold only where their rustup command exits 0, because
+    # the header's fact e paragraph records the skip an earlier revision took on a rustup
+    # that exited 1 printing nothing.
+    repo_root=$(pwd -P)
+    overridden=1
+    if override_list=$(rustup override list 2>/dev/null); then
+        overridden=0
+        while IFS= read -r listed; do
+            # `rustup override list` prints "<directory><whitespace><toolchain>" for each
+            # override it holds, so dropping the last whitespace-delimited field leaves
+            # the directory, which may itself hold spaces. Every other line the command
+            # prints — "no overrides" when it holds none — leaves something that is not
+            # an absolute path, and the test below reads only absolute paths.
+            override_dir=$(printf '%s' "$listed" | sed -E 's/[[:space:]]+[^[:space:]]+[[:space:]]*$//')
+            [[ $override_dir == /* ]] || continue
+            if [[ $repo_root == "$override_dir" || $repo_root == "$override_dir"/* ]]; then
+                overridden=1
+                break
+            fi
+        done <<< "$override_list"
+    fi
+
+    if [[ $overridden -eq 0 ]] && toolchain_list=$(rustup toolchain list 2>/dev/null); then
         compare=0
         while IFS= read -r listed; do
             # `rustup toolchain list` prints "<channel>-<host triple>" and appends
@@ -141,7 +192,7 @@ if [[ -z ${RUSTUP_TOOLCHAIN:-} && -n $rustc_path && -n $rustup_path ]] &&
                 compare=1
                 break
             fi
-        done < <(rustup toolchain list 2>/dev/null)
+        done <<< "$toolchain_list"
     fi
 fi
 

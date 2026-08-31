@@ -46,12 +46,15 @@
 #     than the channel the pin names. It passes, and says so, in the one state where running
 #     the compiler would make rustup install the pin: rustup dispatching the `rustc` on
 #     PATH, no directory override redirecting the repository, and rustup's toolchain list
-#     holding no entry for the channel. Three cases hold that toolchain list empty and put a
-#     disagreeing compiler on PATH anyway — under an override on the repository, under an
-#     override on its parent, and installed by something other than rustup — because each
-#     one is a state an earlier revision of `scripts/check-resolved-rustc.sh` exited 0 on. A
-#     fourth holds the list empty under an override on an unrelated directory whose path
-#     shares a prefix with the repository, which the skip still covers. Check 4 fails closed
+#     holding no entry for the channel. Five cases hold that toolchain list empty, or make
+#     rustup unable to print it, and put a disagreeing compiler on PATH anyway — under an
+#     override on the repository, under an override on its parent, installed by something
+#     other than rustup, dispatched by a mise shim that selects a version at exec time,
+#     and behind a rustup whose subcommands exit 1 printing nothing — because each one is
+#     a state an earlier revision of `scripts/check-resolved-rustc.sh` exited 0 on. One
+#     more holds the list empty under an override on an unrelated directory whose path
+#     shares a prefix with the repository, which the skip still covers, and one proves the
+#     comparison passes a mise-dispatched compiler that answers with the pinned version. Check 4 fails closed
 #     when the pin is absent, when the pin names no channel, and when
 #     `scripts/check-resolved-rustc.sh` is absent. Every other case in this file runs with a
 #     compiler that agrees with the pin, so each one also proves check 4 stays silent then.
@@ -65,7 +68,8 @@
 # every path in EXTRA_FILES. It also writes a `rustc` and a `rustup` into `stub-bin/` and
 # leads PATH with that directory, so check 4 reads the case's answers rather than the
 # toolchain of whoever runs this harness. By default it links `rustc` to `rustup`, which is
-# how rustup and mise each install a `rustc` that dispatches through them; one case writes
+# how rustup installs the `rustc` that dispatches through it; two cases link both names to
+# a file named `mise`, which is how mise installs its shims; and one case writes
 # the two as separate files, which is what a compiler another installer put ahead of
 # rustup's directory on PATH looks like. The gate `cd`s to its own parent's parent, so that
 # directory becomes its repository root. No canned repository holds
@@ -112,14 +116,21 @@ failed=0
 #                     no repository file can do.
 #   PIN_CHANNEL     — the channel the canned `rust-toolchain.toml` names, or "" to write
 #                     the file with no `channel` key. PIN_PRESENT="no" writes no file.
-#   STUB_RUSTC      — the version the canned `rustc` on PATH reports.
+#   STUB_RUSTC      — the version the canned `rustc` on PATH reports, or "" to make it
+#                     exit 1 printing nothing, which is how a mise shim answers in a
+#                     directory whose `.mise.toml` mise has not trusted.
 #   STUB_RUSTUP     — the channel the canned `rustup toolchain list` reports as installed,
 #                     or "" to report an empty list.
+#   STUB_RUSTUP_BROKEN — "yes" makes every canned `rustup` subcommand exit 1 printing
+#                     nothing, which is the other half of the untrusted-directory state.
+#                     "no" leaves each subcommand answering.
 #   STUB_RUSTC_INSTALLER — "rustup" links the canned `rustc` to the canned `rustup`, which
-#                     is how rustup and mise each install a `rustc` that dispatches through
-#                     them. "other" writes `rustc` as its own file, which is what a compiler
-#                     Homebrew or a distribution package installed ahead of rustup's
-#                     directory on PATH looks like.
+#                     is how rustup installs a `rustc` that dispatches through it. "mise"
+#                     renames the canned `rustup` to `mise` and links both `rustc` and
+#                     `rustup` to it, which is how mise installs its shims — two names, one
+#                     file, and the file is not rustup. "other" writes `rustc` as its own
+#                     file, which is what a compiler Homebrew or a distribution package
+#                     installed ahead of rustup's directory on PATH looks like.
 #   STUB_OVERRIDE   — the directory the canned `rustup override list` reports an override
 #                     for: "none" reports "no overrides", "root" reports the canned
 #                     repository, "parent" reports the directory holding it, and
@@ -139,6 +150,7 @@ PIN_PRESENT="yes"
 PIN_CHANNEL="1.98.0"
 STUB_RUSTC="1.98.0"
 STUB_RUSTUP="1.98.0"
+STUB_RUSTUP_BROKEN="no"
 STUB_RUSTC_INSTALLER="rustup"
 STUB_OVERRIDE="none"
 CASE_RUSTUP_TOOLCHAIN=""
@@ -163,8 +175,21 @@ emit_stub_rustup() {
     local override_dir="$1"
     printf '#!/usr/bin/env bash\n'
     printf 'case "$(basename "$0")" in\n'
-    printf '  rustc) echo "rustc %s (0123456789 2026-08-18)"; exit 0 ;;\n' "$STUB_RUSTC"
+    if [[ -n $STUB_RUSTC ]]; then
+        printf '  rustc) echo "rustc %s (0123456789 2026-08-18)"; exit 0 ;;\n' "$STUB_RUSTC"
+    else
+        # A mise shim in a directory whose `.mise.toml` mise has not trusted exits 1 and
+        # prints its error on stderr, so the canned compiler answers with nothing.
+        printf '  rustc) exit 1 ;;\n'
+    fi
     printf 'esac\n'
+    if [[ $STUB_RUSTUP_BROKEN == "yes" ]]; then
+        # The same untrusted-directory state for the `rustup` name: every subcommand
+        # exits 1 with empty stdout, which an earlier revision of
+        # `scripts/check-resolved-rustc.sh` read as an empty override list and an empty
+        # toolchain list.
+        printf 'exit 1\n'
+    fi
     printf 'if [ "${1:-}" = "toolchain" ] && [ "${2:-}" = "list" ]; then\n'
     if [[ -n $STUB_RUSTUP ]]; then
         printf '  echo "%s-x86_64-unknown-linux-gnu (default)"\n' "$STUB_RUSTUP"
@@ -388,6 +413,14 @@ run_case() {
     fi
     if [[ $STUB_RUSTC_INSTALLER == "rustup" ]]; then
         ln -sf rustup "$root/stub-bin/rustc"
+    elif [[ $STUB_RUSTC_INSTALLER == "mise" ]]; then
+        # mise installs both of its shims as links to the `mise` binary, so the canned
+        # `rustup` becomes the file `mise` and both names link to it: `cmp` reads one
+        # file behind the two names, and the symlink chain from `rustup` ends on a file
+        # whose name is not `rustup`.
+        mv "$root/stub-bin/rustup" "$root/stub-bin/mise"
+        ln -sf mise "$root/stub-bin/rustup"
+        ln -sf mise "$root/stub-bin/rustc"
     else
         emit_stub_rustc > "$root/stub-bin/rustc"
         chmod +x "$root/stub-bin/rustc"
@@ -1082,12 +1115,12 @@ run_case "rustup-holds-no-pinned-toolchain" 0 \
 STUB_RUSTUP="1.98.0"
 STUB_RUSTC="1.98.0"
 
-# ── The three states the skip must not swallow ───────────────────────────────────────
+# ── The states the skip must not swallow ─────────────────────────────────────────────
 #
-# Each case below holds rustup's toolchain list empty, which is what an earlier revision of
-# `scripts/check-resolved-rustc.sh` read as "no compiler has resolved here". In each one a
-# compiler answers anyway and reports a version the pin does not name, so the gate compares
-# rather than skipping.
+# Each case below holds rustup's toolchain list empty, or makes rustup unable to print it,
+# which is what one or another earlier revision of `scripts/check-resolved-rustc.sh` read
+# as "no compiler has resolved here". In each one a compiler the pin does not name answers
+# anyway, or no compiler can answer at all, so the gate compares rather than skipping.
 
 # `rustup override set` selects a toolchain for a directory and its children ahead of the
 # toolchain file, and installs it as it sets it, so the checkout resolves a compiler that
@@ -1138,6 +1171,64 @@ run_case "compiler-outside-rustup-answers-with-another-version" 1 \
     routing_ok mise_ok
 STUB_RUSTC_INSTALLER="rustup"
 STUB_RUSTUP="1.98.0"
+STUB_RUSTC="1.98.0"
+
+# A mise shim dispatches both names through one file, and that file selects a toolchain of
+# its own each time it runs: it reads mise's configuration at that moment and exports
+# `RUSTUP_TOOLCHAIN` into the compiler it executes, which the gate's own environment never
+# shows. The gate's environment here holds no `RUSTUP_TOOLCHAIN`, the canned repository's
+# `.mise.toml` names no Rust version, rustup's toolchain list is empty, and no override
+# redirects the directory — every fact of the skip except the dispatcher's name — and the
+# compiler still answers with a version the pin does not name, because a mise configuration
+# in an ancestor directory names it. An earlier revision of
+# `scripts/check-resolved-rustc.sh` accepted any one file behind both names, took the skip,
+# and exited 0 in this state.
+STUB_RUSTC_INSTALLER="mise"
+STUB_RUSTUP=""
+STUB_RUSTC="1.97.1"
+run_case "mise-shim-selects-a-version-at-exec-time" 1 \
+    "rustc in this directory is 1.97.1, and rust-toolchain.toml names 1.98.0" \
+    routing_ok mise_ok
+STUB_RUSTC_INSTALLER="rustup"
+STUB_RUSTUP="1.98.0"
+STUB_RUSTC="1.98.0"
+
+# The same mise dispatch with a compiler that answers the pinned version. The gate never
+# skips behind a dispatcher that is not rustup, so it compares, and the comparison passes —
+# a machine that runs every command through mise shims is not failed for the shims alone.
+STUB_RUSTC_INSTALLER="mise"
+STUB_RUSTUP=""
+STUB_RUSTC="1.98.0"
+run_case "mise-shim-resolves-the-pinned-version" 0 \
+    "rustc 1.98.0 in this directory is the version rust-toolchain.toml names" \
+    routing_ok mise_ok
+STUB_RUSTC_INSTALLER="rustup"
+STUB_RUSTUP="1.98.0"
+STUB_RUSTC="1.98.0"
+
+# Every rustup subcommand exits 1 printing nothing, and so does `rustc`, which is the
+# state mise puts every shimmed command into in a directory whose `.mise.toml` it has not
+# trusted — where every fresh `git worktree add` of this repository starts. An earlier
+# revision of `scripts/check-resolved-rustc.sh` read the empty stdout as an empty override
+# list and an empty toolchain list, took the skip, and exited 0 on a machine whose Rust
+# tooling could not run at all. The gate compares instead, and the comparison reports that
+# no version was readable.
+STUB_RUSTUP_BROKEN="yes"
+STUB_RUSTC=""
+run_case "rustup-subcommands-fail-and-no-compiler-answers" 1 \
+    "rustc ran but printed no version this script could read" \
+    routing_ok mise_ok
+STUB_RUSTUP_BROKEN="no"
+STUB_RUSTC="1.98.0"
+
+# The rustup subcommands fail the same way while a compiler answers with a version the pin
+# does not name, so the comparison the failing subcommands force reports the mismatch.
+STUB_RUSTUP_BROKEN="yes"
+STUB_RUSTC="1.97.1"
+run_case "rustup-subcommands-fail-while-a-compiler-disagrees" 1 \
+    "rustc in this directory is 1.97.1, and rust-toolchain.toml names 1.98.0" \
+    routing_ok mise_ok
+STUB_RUSTUP_BROKEN="no"
 STUB_RUSTC="1.98.0"
 
 # The pin is unreadable. Both cases fail closed rather than reporting a compiler that

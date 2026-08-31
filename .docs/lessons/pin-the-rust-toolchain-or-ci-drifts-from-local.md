@@ -79,6 +79,19 @@ run resolve different compilers.
   consults rustup at all. In each one a compiler the pin does not name answers every cargo
   command while rustup's list holds no pinned entry, so the caller read a mismatch as a
   pass — the same fail-open the check was written to remove, moved from CI into the skip.
+  The second revision closed those two and left two more. A mise shim dispatches `rustc`
+  through the `mise` binary, and that binary reads mise's configuration files each time
+  the shim runs and exports `RUSTUP_TOOLCHAIN` into the compiler it executes, so the
+  check's read of its own environment saw no variable while the compiler resolved
+  whatever an ancestor directory's mise configuration named — the check now demands that
+  the symlink chain from the `rustup` on PATH end on a file named `rustup` before it
+  skips. And a rustup whose subcommands exit 1 printing nothing — every shimmed command
+  in a directory whose `.mise.toml` mise has not trusted, which is where every fresh
+  `git worktree add` starts — satisfied "the override list is empty" and "the toolchain
+  list is empty" through the emptiness of its failure, so the check now reads each
+  subcommand's exit status and compares wherever one fails. A skip condition that reads a
+  command's output has to read the command's exit status too, because a failing command's
+  empty stdout satisfies any "the list holds no entry" fact.
   A skip exists to buy something, in this case the 2 GB download of the pin's 13 targets on
   a runner that compiles nothing. Write the condition as the proof that the skip costs
   nothing, and give each state a test that fails without it.
