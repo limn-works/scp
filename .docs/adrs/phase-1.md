@@ -1233,6 +1233,7 @@ This test proves: identity works, encryption works, the envelope format works, s
 **Date:** March 4, 2026
 **Status:** Decided
 **Extends:** ADR-003 (DID Creation)
+**Noted by ADR-063 (Proposed, 2026-08-28):** ADR-063, the context-declared user-authentication gate (`.docs/adrs/ADR-063-context-declared-user-authentication-gate.md`), proposes a fifth Category C mechanism and declares no field. Its status is Proposed, so this note points at that ADR rather than amending this one. ADR-063's open question 7 also records that three artifact statements give `#active` three different backings: the key-properties table below reads "Software"; Enforcement Stack layer 1 reads "`#active` in hardware (Secure Enclave / Android Keystore) with session-based biometric unlock"; and §3.11.3 of `.docs/specs/03-identity.md` reads "`#active` — human-initiated authentication. Biometric-protected, appropriate for sensitive actions." A spec governs an ADR under the artifact flow, so the identity spec settles it first and this ADR follows. Every mechanism that reads `#active`'s custody depends on the answer.
 
 ### Context
 
