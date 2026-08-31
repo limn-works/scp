@@ -1704,11 +1704,10 @@ export function createNativeBridge(scp: SCP): Bridge {
       return (native.identityLinkAttestations as (d: string) => string)(did);
     },
 
-    identityRemoveLinkAttestation(did: string, attestationId: string): boolean {
-      return (native.identityRemoveLinkAttestation as (d: string, a: string) => boolean)(
-        did,
-        attestationId,
-      );
+    async identityRemoveLinkAttestation(did: string, attestationId: string): Promise<boolean> {
+      return await (
+        native.identityRemoveLinkAttestation as (d: string, a: string) => Promise<boolean>
+      )(did, attestationId);
     },
 
     identityRemove(did: string): void {
@@ -1719,16 +1718,12 @@ export function createNativeBridge(scp: SCP): Bridge {
       return (native.identityRemoveIfPresent as (d: string) => boolean)(did);
     },
 
-    async identityVerifyLinkAttestation(
-      attestationJson: string,
-      issuerPublicKeyHex: string,
-    ): Promise<boolean> {
-      // Module-level NAPI free fn (per ADR-048 §1) — route through `addon`.
-      // The previous `Scp::identity_verify_link_attestation` method (with its
-      // `let _ = &self.inner;` gate-defang) was deleted in PR-E #28.
-      return (addon.identityVerifyLinkAttestation as (j: string, k: string) => boolean)(
+    async identityVerifyLinkAttestation(attestationJson: string): Promise<boolean> {
+      // Step 1 of spec §3.5.4 resolves the issuer's DID document through this
+      // instance's registry and DHT client, so the operation is a method on the
+      // NAPI `Scp` rather than a module-level free fn.
+      return await (native.identityVerifyLinkAttestation as (j: string) => Promise<boolean>)(
         attestationJson,
-        issuerPublicKeyHex,
       );
     },
 

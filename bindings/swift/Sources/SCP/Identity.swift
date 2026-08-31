@@ -160,28 +160,38 @@ public extension SCP {
         return try AttestationWire.parseAttestations(from: json)
     }
 
-    /// Verifies a link attestation's signature against the issuer's public key.
+    /// Verifies a link attestation against the issuer's DID document.
+    ///
+    /// Step 1 of spec §3.5.4 resolves the issuer's DID document and reads its
+    /// `#active` or `#agent` public key, and step 2 checks the Ed25519
+    /// signature on the envelope against that key, so the caller passes only
+    /// the attestation. Passing the issuer key in let a caller sign an
+    /// attestation with a key it minted, pass that same key in, and read back
+    /// `true` for a DID it does not control.
     ///
     /// Uses ``IdentityAttestation/rawJson`` when available for exact
     /// roundtrip fidelity. Falls back to re-serializing the attestation
     /// if ``rawJson`` is `nil`.
     func verifyLinkAttestation(
-        _ attestation: IdentityAttestation,
-        issuerPublicKeyHex: String
-    ) throws -> Bool {
+        _ attestation: IdentityAttestation
+    ) async throws -> Bool {
         let json: String
         if let raw = attestation.rawJson {
             json = raw
         } else {
             json = try AttestationWire.serializeAttestation(attestation)
         }
-        // identityVerifyLinkAttestation moved to a UniFFI-generated free
-        // top-level function under ADR-048 §1 — Ed25519 signature verification
-        // is a pure helper that does not require the tokio runtime.
-        return try identityVerifyLinkAttestation(
-            attestationJson: json,
-            issuerPublicKeyHex: issuerPublicKeyHex
-        )
+        return try await identityVerifyLinkAttestation(attestationJson: json)
+    }
+
+    /// Revokes a link attestation, removing its `ScpIdentityLinkAttestation`
+    /// service entry from the issuer's DID document (spec §3.5.3) and
+    /// republishing that document.
+    ///
+    /// Returns `true` when this instance held the attestation and removed it.
+    @discardableResult
+    func removeLinkAttestation(did: String, attestationId: String) async throws -> Bool {
+        try await identityRemoveLinkAttestation(did: did, attestationId: attestationId)
     }
 }
 

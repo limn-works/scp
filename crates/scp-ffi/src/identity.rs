@@ -986,53 +986,17 @@ pub fn identity_verify_device_attestation(_did: &str, token_base64: &str) -> PyR
     )))
 }
 
-/// Verifies the Ed25519 signature on an identity link attestation.
-///
-/// Parses the attestation JSON string and verifies the signature using the
-/// provided issuer public key.
-///
-/// The issuer's public key cannot be reliably extracted from the DID string
-/// because attestations are signed with `#active` or `#agent` keys
-/// (spec §3.5.2), not the `#0` identity key embedded in the DID.
-///
-/// # Arguments
-///
-/// * `attestation_json` — JSON string of an `IdentityLinkAttestation`.
-/// * `issuer_public_key_hex` — Hex-encoded Ed25519 public key of the
-///   issuer.
-///
-/// # Returns
-///
-/// `True` if the signature is valid, `False` otherwise.
-///
-/// # Errors
-///
-/// Raises `IdentityError` if the JSON is malformed or the hex key is
-/// invalid.
-///
-/// See spec §3.5.1.
-#[pyfunction]
-#[pyo3(name = "py_verify_identity_link_attestation")]
-pub fn verify_identity_link_attestation(
-    py: Python<'_>,
-    attestation_json: &str,
-    issuer_public_key_hex: &str,
-) -> PyResult<bool> {
-    use scp_core::identity::attestation::IdentityLinkAttestation;
-
-    let json_owned = attestation_json.to_owned();
-    let hex_key_owned = issuer_public_key_hex.to_owned();
-
-    py.allow_threads(move || -> Result<bool, ScpPyError> {
-        let attestation: IdentityLinkAttestation = serde_json::from_str(&json_owned)
-            .map_err(|e| ScpPyError::identity(format!("failed to parse attestation JSON: {e}")))?;
-
-        let pub_bytes = hex::decode(&hex_key_owned)
-            .map_err(|e| ScpPyError::identity(format!("invalid issuer_public_key_hex: {e}")))?;
-        Ok(attestation.verify_signature(&pub_bytes).is_ok())
-    })
-    .map_err(PyErr::from)
-}
+// `identity_verify_link_attestation` is a method on `PyScp`, defined with the
+// other identity-link operations below.
+//
+// It read to be a module-level free `#[pyfunction]` under ADR-048 §1, on the
+// premise that verification is "pure Ed25519 signature verification" needing no
+// bridge-instance state. That premise held only because the caller passed the
+// issuer's public key in, which is the fail-open §3.5.4 forbids: whoever picks
+// the key decides the answer. Step 1 of §3.5.4 reads the key out of the
+// issuer's RESOLVED DID document, and resolution runs against this instance's
+// configured resolver, so the operation reads instance state by construction
+// and belongs on `PyScp`.
 
 // ---------------------------------------------------------------------------
 // PyScp methods — stateful identity operations.
@@ -2334,8 +2298,18 @@ impl crate::scp::PyScp {
     /// Creates an identity link attestation for an external platform identity.
     ///
     /// Constructs an `IdentityLinkAttestation` with a real Ed25519 signature
-    /// from the identity's active signing key. The attestation is stored in the
-    /// identity registry for retrieval via `identity_link_attestations`.
+    /// from the identity's active signing key, writes a
+    /// `ScpIdentityLinkAttestation` service entry naming the attestation's ID
+    /// into the issuer's DID document, and publishes that document (§3.5.3).
+    /// The signed envelope then lands in the identity registry, which is the
+    /// attestation store the published service entry points into.
+    ///
+    /// # Publish failure fails the call
+    ///
+    /// A caller that receives an attestation JSON believes any party resolving
+    /// the issuer's DID can discover the link. Storing the envelope while the
+    /// document publish failed would make that belief false, so this method
+    /// publishes first and stores nothing when the publish returns an error.
     ///
     /// # Arguments
     ///
@@ -2381,8 +2355,13 @@ impl crate::scp::PyScp {
         let method_owned = verification_method.to_owned();
         let platform_id_owned = platform_id.map(ToOwned::to_owned);
         let rt = crate::runtime()?;
+        // §3.5.3 makes the attestation discoverable through the issuer's
+        // published DID document, so acquire the resolver's DHT client before
+        // any signing work. An instance without one cannot publish, and this
+        // call declines rather than storing an envelope no resolver serves.
+        let publish_client = rotation_publish_client(&self.inner).map_err(PyErr::from)?;
 
-        py.allow_threads(move || {
+        let result = py.allow_threads(move || {
             // Phase 1: read custody + key handle (under DashMap lock, then drop).
             let (custody, key_handle) =
                 crate::runtime::with_identity(&bi_arc, &did_owned, |entry| {
@@ -2427,6 +2406,56 @@ impl crate::scp::PyScp {
                          ({MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID}) — cannot store additional attestations"
                     )));
                 }
+
+                // §3.5.3: write the service entry into a copy of the document,
+                // publish that copy, and commit both the document and the
+                // envelope only after the publish succeeds. The DID document
+                // enumerates the issuer's links; the registry holds the
+                // envelopes those entries point at.
+                let mut document = entry.document.clone();
+                document
+                    .set_identity_link_attestation(
+                        &attestation.claim.platform,
+                        &attestation.id,
+                    )
+                    .map_err(|e| {
+                        ScpPyError::identity(format!(
+                            "failed to add the DID document service entry for \
+                             attestation {}: {e}",
+                            attestation.id
+                        ))
+                    })?;
+
+                let sign_fn = DidDht::<FfiDhtClient, scp_clock::SystemClock>::make_sign_fn(
+                    Arc::clone(&entry.custody),
+                );
+                let did_method = DidDht::with_client_and_signer(
+                    Arc::clone(&publish_client),
+                    Arc::new(DidCache::new()),
+                    sign_fn,
+                );
+                rt.block_on(async {
+                    // `initialize_sequence` lifts this method's BEP44 sequence
+                    // past the record the resolver already serves, so the
+                    // republished document overwrites it instead of being a
+                    // silent no-op.
+                    did_method.initialize_sequence(&did_owned).await?;
+                    did_method
+                        .publish_document(&entry.identity, &document)
+                        .await
+                })
+                .map_err(|e| {
+                    tracing::warn!(
+                        did = %did_owned,
+                        attestation_id = %attestation.id,
+                        error = %e,
+                        "create_identity_link_attestation: DID document publish failed — \
+                         the attestation was not stored"
+                    );
+                    ScpPyError::from(e)
+                })?;
+
+                entry.document = document;
                 entry.identity_link_attestations.push(attestation.clone());
 
                 // Return as JSON.
@@ -2434,8 +2463,14 @@ impl crate::scp::PyScp {
                     ScpPyError::identity(format!("failed to serialize attestation: {e}"))
                 })
             })
-        })
-        .map_err(PyErr::from)
+        });
+        if result.is_ok() {
+            // The republished document carries a higher BEP44 sequence; drop
+            // the resolver's stale copy so the next resolution enumerates the
+            // new service entry.
+            crate::runtime::invalidate_resolver_cache(&self.inner, did, rt);
+        }
+        result.map_err(PyErr::from)
     }
 
     /// Lists all identity link attestations for an identity.
@@ -2470,7 +2505,19 @@ impl crate::scp::PyScp {
         .map_err(PyErr::from)
     }
 
-    /// Removes an identity link attestation by its ID.
+    /// Revokes an identity link attestation by removing it.
+    ///
+    /// Removes the attestation's `ScpIdentityLinkAttestation` service entry
+    /// from the issuer's DID document and republishes that document, which
+    /// §3.5.3 requires of every revocation, then drops the envelope from the
+    /// identity registry.
+    ///
+    /// # Publish failure fails the call
+    ///
+    /// A caller that receives `True` believes no resolver still advertises the
+    /// link. Dropping the envelope while the document publish failed would make
+    /// that belief false, so this method publishes first and keeps both the
+    /// document and the envelope when the publish returns an error.
     ///
     /// # Arguments
     ///
@@ -2483,9 +2530,10 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Raises `IdentityError` if the identity is not found.
+    /// Raises `IdentityError` if the identity is not found, if this instance
+    /// holds no resolver DHT client, or if the DID document publish fails.
     ///
-    /// See spec §3.5.1.
+    /// See spec §3.5.1, §3.5.3.
     pub fn remove_identity_link_attestation(
         &self,
         py: Python<'_>,
@@ -2496,15 +2544,125 @@ impl crate::scp::PyScp {
         validate::validate_did(did)?;
         let did_owned = did.to_owned();
         let id_owned = attestation_id.to_owned();
+        let rt = crate::runtime()?;
+        let publish_client = rotation_publish_client(&self.inner).map_err(PyErr::from)?;
 
-        py.allow_threads(move || {
+        let result = py.allow_threads(move || {
             crate::runtime::with_identity_mut(&bi_arc, &did_owned, |entry| {
-                let before = entry.identity_link_attestations.len();
+                if !entry
+                    .identity_link_attestations
+                    .iter()
+                    .any(|a| a.id == id_owned)
+                {
+                    return Ok(false);
+                }
+
+                // §3.5.3: the service entry MUST leave the document on
+                // revocation. Publish the document without it before dropping
+                // the envelope, so the registry never holds fewer attestations
+                // than the published document advertises.
+                let mut document = entry.document.clone();
+                document.remove_identity_link_attestation(&id_owned);
+
+                let sign_fn = DidDht::<FfiDhtClient, scp_clock::SystemClock>::make_sign_fn(
+                    Arc::clone(&entry.custody),
+                );
+                let did_method = DidDht::with_client_and_signer(
+                    Arc::clone(&publish_client),
+                    Arc::new(DidCache::new()),
+                    sign_fn,
+                );
+                rt.block_on(async {
+                    did_method.initialize_sequence(&did_owned).await?;
+                    did_method
+                        .publish_document(&entry.identity, &document)
+                        .await
+                })
+                .map_err(|e| {
+                    tracing::warn!(
+                        did = %did_owned,
+                        attestation_id = %id_owned,
+                        error = %e,
+                        "remove_identity_link_attestation: DID document publish failed — \
+                         the attestation is still discoverable and stays stored"
+                    );
+                    ScpPyError::from(e)
+                })?;
+
+                entry.document = document;
                 entry
                     .identity_link_attestations
                     .retain(|a| a.id != id_owned);
-                Ok(entry.identity_link_attestations.len() < before)
+                Ok(true)
             })
+        });
+        if matches!(result, Ok(true)) {
+            crate::runtime::invalidate_resolver_cache(&self.inner, did, rt);
+        }
+        result.map_err(PyErr::from)
+    }
+
+    /// Verifies an identity link attestation against the issuer's DID document.
+    ///
+    /// Step 1 of §3.5.4 resolves the issuer's DID document and extracts its
+    /// `#active` or `#agent` public key; step 2 checks the Ed25519 signature on
+    /// the envelope against that key. This method performs both against this
+    /// instance's resolver, so the caller supplies only the attestation. The
+    /// earlier signature took the public key from the caller, which let a caller
+    /// sign an attestation with a key it minted, pass that same key in, and read
+    /// back `True` for a DID it does not control.
+    ///
+    /// # Arguments
+    ///
+    /// * `attestation_json` — JSON string of an `IdentityLinkAttestation`.
+    ///
+    /// # Returns
+    ///
+    /// `True` when a key published in the issuer's document verifies the
+    /// envelope and the envelope is neither revoked nor expired, `False`
+    /// otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Raises `IdentityError` if the JSON is malformed, if the issuer's DID does
+    /// not resolve, or if the resolved document publishes neither an `#active`
+    /// nor an `#agent` verification method.
+    ///
+    /// See spec §3.5.1, §3.5.4.
+    pub fn identity_verify_link_attestation(
+        &self,
+        py: Python<'_>,
+        attestation_json: &str,
+    ) -> PyResult<bool> {
+        use scp_core::identity::attestation::IdentityLinkAttestation;
+
+        let bi_arc = Arc::clone(&self.inner);
+        let json_owned = attestation_json.to_owned();
+        let rt = crate::runtime()?;
+
+        py.allow_threads(move || -> Result<bool, ScpPyError> {
+            let attestation: IdentityLinkAttestation =
+                serde_json::from_str(&json_owned).map_err(|e| {
+                    ScpPyError::identity(format!("failed to parse attestation JSON: {e}"))
+                })?;
+
+            // §3.5.4 step 1: the issuer's resolved document supplies the key.
+            let did_method = shared_did_method(&bi_arc)?;
+            let document = rt
+                .block_on(did_method.resolve(&attestation.issuer.0))
+                .map_err(ScpPyError::from)?;
+
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| ScpPyError::identity("system clock is before UNIX epoch"))?
+                .as_secs();
+
+            scp_ffi_common::attestation::verify_link_attestation_against_document(
+                &attestation,
+                &document,
+                now_secs,
+            )
+            .map_err(|e| ScpPyError::identity(e.to_string()))
         })
         .map_err(PyErr::from)
     }
@@ -2751,7 +2909,9 @@ pub fn register_identity(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // shipped build gets the fail-closed (IDENT_1016) free fn. Both cfg arms
     // define `identity_verify_device_attestation`, so the name always resolves.
     m.add_function(wrap_pyfunction!(identity_verify_device_attestation, m)?)?;
-    m.add_function(wrap_pyfunction!(verify_identity_link_attestation, m)?)?;
+    // Identity link attestation verification is `PyScp::
+    // identity_verify_link_attestation`, not a free function: §3.5.4 step 1
+    // resolves the issuer's document through this instance's resolver.
     Ok(())
 }
 
@@ -2836,6 +2996,161 @@ mod tests {
             assert_eq!(
                 recomputed, pre_rot.commitment,
                 "PreRotationProof MUST satisfy SHA-256(revealed_key) == commitment"
+            );
+        });
+    }
+
+    /// §3.5.3: creating an identity link attestation publishes it as an
+    /// `ScpIdentityLinkAttestation` service entry in the issuer's DID document,
+    /// so any party resolving that document enumerates the issuer's links
+    /// without querying a separate registry.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn create_link_attestation_writes_a_service_entry_into_the_did_document() {
+        setup();
+
+        Python::with_gil(|py| {
+            let scp = default_scp();
+            let identity = scp.identity_create(py, "in_memory", None).unwrap();
+            let did = &identity.did;
+
+            let attestation_json = scp
+                .create_identity_link_attestation(
+                    py,
+                    did,
+                    "github.com",
+                    "alice",
+                    "https://example.com/proof-alice",
+                    "signed_post",
+                    None,
+                )
+                .unwrap();
+            let attestation: serde_json::Value = serde_json::from_str(&attestation_json).unwrap();
+            let attestation_id = attestation["id"].as_str().unwrap().to_owned();
+
+            // The document this instance holds for the issuer carries the entry.
+            let entries = crate::runtime::with_identity(&scp.inner, did, |entry| {
+                Ok(entry.document.identity_link_attestations())
+            })
+            .unwrap();
+            assert_eq!(
+                entries.len(),
+                1,
+                "the issuer's DID document must carry exactly one \
+                 ScpIdentityLinkAttestation service entry after one create"
+            );
+            assert_eq!(entries[0].platform, "github.com");
+            assert_eq!(entries[0].attestation_id, attestation_id);
+
+            // A party resolving the DID reads the same entry, which is the
+            // discovery §3.5.3 exists to provide.
+            let resolved = scp.identity_resolve(py, did).unwrap();
+            let resolved_entries = resolved.inner.identity_link_attestations();
+            assert_eq!(
+                resolved_entries
+                    .iter()
+                    .map(|e| e.attestation_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec![attestation_id.as_str()],
+                "resolving the issuer's DID must enumerate the attestation ID"
+            );
+        });
+    }
+
+    /// §3.5.3: when an attestation is revoked, the corresponding service entry
+    /// MUST be removed from the DID document.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn remove_link_attestation_clears_the_service_entry_from_the_did_document() {
+        setup();
+
+        Python::with_gil(|py| {
+            let scp = default_scp();
+            let identity = scp.identity_create(py, "in_memory", None).unwrap();
+            let did = &identity.did;
+
+            let attestation_json = scp
+                .create_identity_link_attestation(
+                    py,
+                    did,
+                    "github.com",
+                    "bob",
+                    "https://example.com/proof-bob",
+                    "signed_post",
+                    None,
+                )
+                .unwrap();
+            let attestation: serde_json::Value = serde_json::from_str(&attestation_json).unwrap();
+            let attestation_id = attestation["id"].as_str().unwrap().to_owned();
+
+            let removed = scp
+                .remove_identity_link_attestation(py, did, &attestation_id)
+                .unwrap();
+            assert!(removed, "the attestation this test created must be removed");
+
+            let entries = crate::runtime::with_identity(&scp.inner, did, |entry| {
+                Ok(entry.document.identity_link_attestations())
+            })
+            .unwrap();
+            assert!(
+                entries.is_empty(),
+                "revoking the attestation must remove its service entry from \
+                 the issuer's DID document (§3.5.3)"
+            );
+
+            let resolved = scp.identity_resolve(py, did).unwrap();
+            assert!(
+                resolved.inner.identity_link_attestations().is_empty(),
+                "resolving the issuer's DID after a revocation must enumerate \
+                 no attestation"
+            );
+        });
+    }
+
+    /// §3.5.4 step 1: verification reads the issuer's public key out of the
+    /// issuer's RESOLVED DID document, so an envelope naming an issuer whose
+    /// document publishes no key that signed it fails.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn verify_link_attestation_rejects_an_issuer_document_without_the_signing_key() {
+        setup();
+
+        Python::with_gil(|py| {
+            let scp = default_scp();
+            let signer = scp.identity_create(py, "in_memory", None).unwrap();
+            let other = scp.identity_create(py, "in_memory", None).unwrap();
+
+            let attestation_json = scp
+                .create_identity_link_attestation(
+                    py,
+                    &signer.did,
+                    "github.com",
+                    "carol",
+                    "https://example.com/proof-carol",
+                    "dns_record",
+                    None,
+                )
+                .unwrap();
+
+            // The signer's own document publishes the #active key that signed
+            // the envelope, so verification accepts it.
+            assert!(
+                scp.identity_verify_link_attestation(py, &attestation_json)
+                    .unwrap(),
+                "an attestation signed by the issuer's own #active key must verify"
+            );
+
+            // Renaming the issuer points step 1 at a document that publishes a
+            // different pair of keys, neither of which signed this envelope.
+            let mut forged: serde_json::Value = serde_json::from_str(&attestation_json).unwrap();
+            forged["issuer"] = serde_json::Value::String(other.did);
+            let forged_json = serde_json::to_string(&forged).unwrap();
+
+            assert!(
+                !scp.identity_verify_link_attestation(py, &forged_json)
+                    .unwrap(),
+                "verification must reject an attestation whose issuer document \
+                 publishes no key that signed it (§3.5.4 steps 1-2)"
             );
         });
     }

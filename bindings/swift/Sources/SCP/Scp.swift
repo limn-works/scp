@@ -790,8 +790,22 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/identityRemoveLinkAttestation`` on ``inner``.
-    func identityRemoveLinkAttestation(did: String, attestationId: String) -> Bool {
-        inner.identityRemoveLinkAttestation(did: did, attestationId: attestationId)
+    ///
+    /// Spec §3.5.3 requires a revocation to remove the attestation's
+    /// `ScpIdentityLinkAttestation` service entry from the issuer's DID
+    /// document, so the bridge republishes that document before it drops the
+    /// envelope.
+    func identityRemoveLinkAttestation(did: String, attestationId: String) async throws -> Bool {
+        try await inner.identityRemoveLinkAttestation(did: did, attestationId: attestationId)
+    }
+
+    /// Forwards to ``Scp/identityVerifyLinkAttestation`` on ``inner``.
+    ///
+    /// Step 1 of spec §3.5.4 resolves the issuer's DID document through this
+    /// instance's identity registry and DHT client, so the operation is a
+    /// method on the bridge instance rather than a free function.
+    func identityVerifyLinkAttestation(attestationJson: String) async throws -> Bool {
+        try await inner.identityVerifyLinkAttestation(attestationJson: attestationJson)
     }
 
     /// Forwards to ``Scp/identityRemove`` on ``inner``.
@@ -817,13 +831,16 @@ public extension SCP {
         try inner.identityRemoveIfPresent(did: did)
     }
 
-    // `identityResolve`, `identityVerifyDeviceAttestation`, and
-    // `identityVerifyLinkAttestation` moved to UniFFI-generated free
-    // top-level functions under ADR-048 §1 + §7 Swift bullet. Call them
-    // directly:
+    // `identityResolve` and `identityVerifyDeviceAttestation` moved to
+    // UniFFI-generated free top-level functions under ADR-048 §1 + §7 Swift
+    // bullet. Call them directly:
     //   `try await identityResolve(did:)`
     //   `try await identityVerifyDeviceAttestation(did:tokenBase64:)`
-    //   `try identityVerifyLinkAttestation(attestationJson:issuerPublicKeyHex:)`
+    //
+    // `identityVerifyLinkAttestation` is a method on the bridge instance, and
+    // the forwarder above reaches it: step 1 of spec §3.5.4 resolves the
+    // issuer's DID document through the instance's identity registry and DHT
+    // client.
 
     /// Forwards to ``Scp/isLocalDid`` on ``inner``.
     func isLocalDid(did: String) async -> Bool {

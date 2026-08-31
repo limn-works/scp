@@ -150,8 +150,9 @@ def _make_scp_without_attestation_methods(*, missing: tuple[str, ...]) -> MagicM
     mock_scp = MagicMock()
     # Start with every attestation method present, then drop the ones
     # under test so hasattr() returns False for them specifically.
-    # py_verify_identity_link_attestation moved to a module-level free fn
-    # under ADR-048 §1 — no longer probed via hasattr on self._native.
+    # `identity_verify_link_attestation` is an unguarded `SCP` method: §3.5.4
+    # step 1 resolves the issuer's DID document through the bridge instance, so
+    # the SDK does not probe it via hasattr on self._native.
     all_methods = {
         "create_identity_link_attestation",
         "identity_link_attestations",

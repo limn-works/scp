@@ -158,3 +158,113 @@ pub fn build_unsigned_attestation(
         canonical_bytes,
     })
 }
+
+// ---------------------------------------------------------------------------
+// Verification against the issuer's resolved DID document (§3.5.4)
+// ---------------------------------------------------------------------------
+
+/// Errors from [`verify_link_attestation_against_document`].
+#[derive(Debug)]
+pub enum AttestationVerifyError {
+    /// The supplied document describes a different DID than the one the
+    /// attestation names as its issuer.
+    IssuerMismatch {
+        /// The DID the attestation names as its issuer.
+        attestation_issuer: String,
+        /// The DID the supplied document identifies.
+        document_id: String,
+    },
+    /// The issuer's document publishes neither an `#active` nor an `#agent`
+    /// verification method, so no key can verify the envelope.
+    NoSigningKey(String),
+}
+
+impl fmt::Display for AttestationVerifyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IssuerMismatch {
+                attestation_issuer,
+                document_id,
+            } => write!(
+                f,
+                "attestation issuer '{attestation_issuer}' does not match the \
+                 resolved DID document '{document_id}'"
+            ),
+            Self::NoSigningKey(did) => write!(
+                f,
+                "DID document '{did}' publishes neither an #active nor an #agent \
+                 verification method, so no key verifies this attestation"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AttestationVerifyError {}
+
+/// Verifies an identity link attestation against the issuer's DID document.
+///
+/// Section 3.5.4 of the identity spec makes the issuer's resolved DID document
+/// the source of the verifying key: step 1 resolves that document and extracts
+/// the `#active` or `#agent` public key, and step 2 checks the Ed25519
+/// signature on the envelope against that key. A surface that takes the key
+/// from its caller lets the caller decide which key signs, so any caller can
+/// present a key it controls and read back `true`. This function takes the
+/// document instead and reads the key out of it.
+///
+/// Beyond the signature it applies step 3, which rejects a `Revoked` envelope,
+/// and step 4, which rejects an envelope whose `expires_at` has passed. Step 5
+/// reduces the trust weight of a stale attestation rather than rejecting it,
+/// and the Class 2 procedure fetches an external resource, so this function
+/// performs neither; a consumer that scores trust applies both on top of this
+/// result.
+///
+/// Returns `true` when one of the issuer's two signing keys verifies the
+/// envelope and the envelope is neither revoked nor expired.
+///
+/// # Errors
+///
+/// Returns [`AttestationVerifyError::IssuerMismatch`] when `document` describes
+/// a DID other than the attestation's issuer, and
+/// [`AttestationVerifyError::NoSigningKey`] when that document publishes neither
+/// verification method.
+pub fn verify_link_attestation_against_document(
+    attestation: &IdentityLinkAttestation,
+    document: &scp_did::DidDocument,
+    now_secs: u64,
+) -> Result<bool, AttestationVerifyError> {
+    let issuer = attestation.issuer.0.as_str();
+    if document.id != issuer {
+        return Err(AttestationVerifyError::IssuerMismatch {
+            attestation_issuer: issuer.to_owned(),
+            document_id: document.id.clone(),
+        });
+    }
+
+    // §3.5.2 signs the envelope with the issuer's #active or #agent key, so
+    // read both out of the document and accept a signature either one verifies.
+    let candidate_keys: Vec<[u8; 32]> = ["active", "agent"]
+        .iter()
+        .filter_map(|fragment| document.verification_method_by_fragment(fragment))
+        .filter_map(|vm| scp_did::decode_multibase_key(&vm.public_key_multibase).ok())
+        .collect();
+
+    if candidate_keys.is_empty() {
+        return Err(AttestationVerifyError::NoSigningKey(document.id.clone()));
+    }
+
+    // §3.5.4 step 3: a revoked envelope fails whatever its signature says.
+    if attestation.revocation_status != RevocationStatus::Active {
+        return Ok(false);
+    }
+
+    // §3.5.4 step 4: an envelope whose expiry has passed fails.
+    if let Some(expires_at) = attestation.expires_at
+        && expires_at <= now_secs
+    {
+        return Ok(false);
+    }
+
+    Ok(candidate_keys
+        .iter()
+        .any(|key| attestation.verify_signature(key).is_ok()))
+}

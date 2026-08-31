@@ -166,10 +166,7 @@ class StubIdentityAdvancedBindings : IdentityAdvancedBindings {
         attestationId: String,
     ): Boolean = true
 
-    override fun identityVerifyLinkAttestation(
-        attestationJson: String,
-        issuerPublicKeyHex: String,
-    ): Boolean = true
+    override fun identityVerifyLinkAttestation(attestationJson: String): Boolean = true
 }
 
 @OptIn(ExperimentalCoroutinesApi::class)

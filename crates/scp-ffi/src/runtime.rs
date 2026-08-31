@@ -2074,16 +2074,21 @@ pub fn register_identity(bi: &PyBridgeInstance, did: &str, entry: IdentityEntry)
 ///
 /// # Errors
 ///
-/// Returns `ScpPyError::IdentityError` if the DID is not found.
+/// Returns `ScpPyError::IdentityError` carrying `SCP-IDENT-1001` if the DID is
+/// not registered on this bridge instance. The NAPI bridge returns the same
+/// code from its own `with_identity`, so a caller reads one code across both.
 pub fn with_identity<T, F>(bi: &PyBridgeInstance, did: &str, f: F) -> Result<T, ScpPyError>
 where
     F: FnOnce(&IdentityEntry) -> Result<T, ScpPyError>,
 {
     let entry = identity_registry(bi).get(did).ok_or_else(|| {
-        ScpPyError::identity(format!(
-            "identity '{did}' not found in registry \
-             -- was it created with py_identity_create?"
-        ))
+        ScpPyError::identity_with_code(
+            format!(
+                "identity '{did}' is not registered on this bridge instance — \
+                 create it via identity_create / identity_create_with_custody"
+            ),
+            scp_ffi_common::error_codes::IDENT_1001,
+        )
     })?;
 
     f(entry.value())
@@ -2093,16 +2098,21 @@ where
 ///
 /// # Errors
 ///
-/// Returns `ScpPyError::IdentityError` if the DID is not found.
+/// Returns `ScpPyError::IdentityError` carrying `SCP-IDENT-1001` if the DID is
+/// not registered on this bridge instance, matching the NAPI bridge's
+/// `with_identity_mut`.
 pub fn with_identity_mut<T, F>(bi: &PyBridgeInstance, did: &str, f: F) -> Result<T, ScpPyError>
 where
     F: FnOnce(&mut IdentityEntry) -> Result<T, ScpPyError>,
 {
     let mut entry = identity_registry(bi).get_mut(did).ok_or_else(|| {
-        ScpPyError::identity(format!(
-            "identity '{did}' not found in registry \
-             -- was it created with py_identity_create?"
-        ))
+        ScpPyError::identity_with_code(
+            format!(
+                "identity '{did}' is not registered on this bridge instance — \
+                 create it via identity_create / identity_create_with_custody"
+            ),
+            scp_ffi_common::error_codes::IDENT_1001,
+        )
     })?;
 
     f(entry.value_mut())

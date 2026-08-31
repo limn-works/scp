@@ -239,11 +239,13 @@ pub(crate) fn ensure_did_resolver_initialized_on(
 /// Delegates to the shared [`BridgeInstanceCore::invalidate_resolver_cache`]
 /// (the single implementation of the invalidation body, shared across bridges).
 ///
-/// Only reached from the `testing`-gated rotation / migration methods
-/// (production create fails closed, so no identity exists to rotate — ADR-062
-/// §Decision 6).
-#[cfg(feature = "testing")]
-async fn invalidate_resolver_cache(bi: &crate::runtime::NapiBridgeInstance, did: &str) {
+/// The identity-link-attestation write path (`Scp::
+/// identity_create_link_attestation` and `Scp::identity_remove_link_attestation`)
+/// republishes the issuer's document in a bare production build too, so this
+/// helper is not `testing`-gated. The rotation / migration callers remain
+/// `testing`-gated for their own reasons (production create fails closed, so no
+/// identity exists to rotate — ADR-062 §Decision 6).
+pub(crate) async fn invalidate_resolver_cache(bi: &crate::runtime::NapiBridgeInstance, did: &str) {
     bi.core.invalidate_resolver_cache(did).await;
 }
 
@@ -355,12 +357,14 @@ impl fmt::Debug for OpaqueInMemoryKeyCustody {
 /// somehow absent (a fresh client would let the re-published document land
 /// somewhere the resolver never reads, silently defeating rotation's revocation
 /// purpose; and, in a shipped build, the in-memory arm does not even exist).
-// Only reached from the `testing`-gated rotation / migration methods
+// The identity-link-attestation write path (`Scp::identity_create_link_attestation`
+// and `Scp::identity_remove_link_attestation`) republishes the issuer's document
+// in a bare production build too, so this helper is not `testing`-gated. The
+// rotation / migration callers remain `testing`-gated for their own reasons
 // (production create fails closed, so no identity exists to rotate — ADR-062
 // §Decision 6).
-#[cfg(feature = "testing")]
 #[allow(clippy::type_complexity)]
-fn make_dht_with_signer(
+pub(crate) fn make_dht_with_signer(
     custody: &Arc<crate::custody::NapiKeyCustody>,
 ) -> Result<DidDht<FfiDhtClient, scp_clock::SystemClock>, ScpNapiError> {
     use scp_platform::traits::KeyCustody as _;
@@ -1292,6 +1296,27 @@ pub struct NapiVerificationMethod {
     pub public_key_multibase: String,
 }
 
+/// One service entry of a DID Document.
+///
+/// §3.5.3 of the identity spec publishes an identity link attestation as a
+/// service entry of type `ScpIdentityLinkAttestation` and tells a consumer to
+/// discover an issuer's links by filtering the resolved document's services on
+/// that type. `NapiDIDDocument.service_endpoints` drops the type, so a consumer
+/// reading only that field cannot tell which endpoint belongs to which service.
+/// The `PyO3` bridge's `PyDIDDocument.services` exposes the same three fields.
+#[napi(object)]
+pub struct NapiServiceEntry {
+    /// Full DID URI with fragment, such as
+    /// `did:dht:z...#attestation-github.com--0`.
+    pub id: String,
+    /// The service type, such as `ScpIdentityLinkAttestation`.
+    #[napi(js_name = "type")]
+    pub service_type: String,
+    /// The endpoint the entry points at. For an identity link attestation this
+    /// is the hex-encoded attestation ID (§3.5.2).
+    pub service_endpoint: String,
+}
+
 /// A DID Document returned by identity resolution.
 ///
 /// All fields are plain data (no crypto state) and safe to copy across the
@@ -1319,6 +1344,9 @@ pub struct NapiDIDDocument {
     pub also_known_as: Vec<String>,
     /// Service endpoint URLs declared in the DID document.
     pub service_endpoints: Vec<String>,
+    /// The document's service entries, each carrying its fragment id, its type,
+    /// and its endpoint (§3.5.3).
+    pub services: Vec<NapiServiceEntry>,
     /// Whether this document contains an `#agent` verification method.
     ///
     /// See ADR-039 acceptance criterion 19 and SCP-AB-016.
@@ -1345,47 +1373,15 @@ pub struct NapiDIDDocument {
 // `Scp` methods in `scp.rs` are now the only entry points — bridge state
 // flows through `&self.inner` rather than the process-global default.
 //
-// PR-E #28 (ADR-048 §1): `identity_verify_link_attestation` is restored
-// as a module-level free fn. The operation is pure Ed25519 signature
-// verification — no bridge-instance state is required — so the per-
-// instance method on `Scp` was Gaming-the-Gate fraud (`let _ = &self.inner;`
-// to satisfy the pure-helpers scanner). The TypeScript SDK's
-// `SCP.identityVerifyLinkAttestation` routes through the addon's module-
-// level export per ADR-048 §7 (TS keeps the method shape as a TS-local
-// ergonomic choice; the body routes via `nativeFreeFn`).
-
-/// Verifies an identity link attestation signature using a provided issuer
-/// public key.
-///
-/// Pure Ed25519 signature verification — touches no bridge-instance state
-/// and is exposed at module scope per ADR-048 §1.
-///
-/// # Errors
-///
-/// Returns `SCP-IDENT-1044` on JSON parse failure or invalid hex.
-#[napi(js_name = "identityVerifyLinkAttestation")]
-pub fn identity_verify_link_attestation(
-    attestation_json: String,
-    issuer_public_key_hex: String,
-) -> napi::Result<bool> {
-    use scp_core::identity::attestation::IdentityLinkAttestation;
-
-    let attestation: IdentityLinkAttestation =
-        serde_json::from_str(&attestation_json).map_err(|e| {
-            NapiError::from(ScpNapiError::Identity {
-                message: format!("failed to parse attestation JSON: {e}"),
-                code: codes::IDENT_1044.to_owned(),
-            })
-        })?;
-
-    let pub_bytes = hex::decode(&issuer_public_key_hex).map_err(|e| {
-        NapiError::from(ScpNapiError::Identity {
-            message: format!("invalid issuer_public_key_hex: {e}"),
-            code: codes::IDENT_1044.to_owned(),
-        })
-    })?;
-    Ok(attestation.verify_signature(&pub_bytes).is_ok())
-}
+// PR-E #28 (ADR-048 §1) moved `identity_verify_link_attestation` to a
+// module-level free fn on the premise that verification is pure Ed25519
+// signature verification needing no bridge-instance state. That premise held
+// only because the caller passed the issuer's public key in, which is the
+// fail-open §3.5.4 forbids: whoever picks the key decides the answer. Step 1 of
+// §3.5.4 reads the key out of the issuer's RESOLVED DID document, and
+// resolution runs against this instance's registry and resolver, so the
+// operation reads instance state by construction and now lives on `Scp` (see
+// `scp.rs::identity_verify_link_attestation`).
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1807,6 +1803,15 @@ mod tests {
                 .service
                 .iter()
                 .map(|s| s.service_endpoint.clone())
+                .collect(),
+            services: document
+                .service
+                .iter()
+                .map(|s| crate::identity::NapiServiceEntry {
+                    id: s.id.clone(),
+                    service_type: s.service_type.clone(),
+                    service_endpoint: s.service_endpoint.clone(),
+                })
                 .collect(),
             has_agent_key,
             agent_public_key,

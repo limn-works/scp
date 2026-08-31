@@ -934,6 +934,29 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       expect(attestation.revocationStatus.status).toBe("active");
     });
 
+    it("scp.identityCreateLinkAttestation puts a service entry in the issuer's DID document", async () => {
+      // Spec §3.5.3: creating an identity link attestation publishes it as an
+      // `ScpIdentityLinkAttestation` service entry in the issuer's DID
+      // document, so any party resolving that document enumerates the issuer's
+      // links without querying a separate registry.
+      const identity = await scp.identityCreate("in_memory");
+      const attestationJson = await scp.identityCreateLinkAttestation(
+        identity.did,
+        "github.com",
+        "dana",
+        "https://example.com/proof-dana",
+        "signed_post",
+      );
+      const attId = (JSON.parse(attestationJson) as { id: string }).id;
+
+      const doc = (await scp.identityResolve(identity.did)) as {
+        services: Array<{ id: string; type: string; serviceEndpoint: string }>;
+      };
+      const linkEntries = doc.services.filter((e) => e.type === "ScpIdentityLinkAttestation");
+      expect(linkEntries.map((e) => e.serviceEndpoint)).toContain(attId);
+      expect(linkEntries.some((e) => e.id.includes("#attestation-github.com--"))).toBe(true);
+    });
+
     it("scp.identityRemoveLinkAttestation removes a previously-added attestation", async () => {
       const identity = await scp.identityCreate("in_memory");
       const attestationJson = await scp.identityCreateLinkAttestation(
@@ -944,11 +967,22 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         "signed_post",
       );
       const attId = (JSON.parse(attestationJson) as { id: string }).id;
-      const removed = scp.identityRemoveLinkAttestation(identity.did, attId);
+      const removed = await scp.identityRemoveLinkAttestation(identity.did, attId);
       expect(removed).toBe(true);
 
+      // Spec §3.5.3: revocation removes the corresponding service entry from
+      // the DID document.
+      const doc = (await scp.identityResolve(identity.did)) as {
+        services: Array<{ type: string; serviceEndpoint: string }>;
+      };
+      expect(
+        doc.services.some(
+          (e) => e.type === "ScpIdentityLinkAttestation" && e.serviceEndpoint === attId,
+        ),
+      ).toBe(false);
+
       // Subsequent remove of the same ID returns false.
-      const removedAgain = scp.identityRemoveLinkAttestation(identity.did, attId);
+      const removedAgain = await scp.identityRemoveLinkAttestation(identity.did, attId);
       expect(removedAgain).toBe(false);
     });
 
@@ -973,6 +1007,9 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("scp.identityVerifyLinkAttestation accepts a freshly-minted attestation", async () => {
+      // Step 1 of spec §3.5.4 resolves the issuer's DID document and reads the
+      // `#active` or `#agent` key out of it, so the caller passes only the
+      // attestation.
       const identity = await scp.identityCreate("in_memory");
       const attestationJson = await scp.identityCreateLinkAttestation(
         identity.did,
@@ -981,26 +1018,25 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         "https://example.com/proof-carol",
         "dns_record",
       );
-      // The resolver needs the issuer's public key hex. We extract it
-      // from the DID document — the first verification method's
-      // publicKeyMultibase encodes the key in base58btc ("z" prefix).
-      const doc = (await scp.identityResolve(identity.did)) as {
-        verificationMethods: Array<{ publicKeyMultibase: string }>;
-      };
-      const multibase = doc.verificationMethods[0]?.publicKeyMultibase;
-      expect(multibase).toBeDefined();
-      // `scp.identityVerifyLinkAttestation` expects hex (not multibase).
-      // Rather than re-derive the hex form here, we verify that
-      // passing a *malformed* key hex rejects — which at least pins
-      // the surface. A happy-path verify requires the issuer public
-      // key hex, which is not exposed on the DID doc directly.
-      let verifyErr: unknown;
-      try {
-        await scp.identityVerifyLinkAttestation(attestationJson, "not-hex");
-      } catch (e) {
-        verifyErr = e;
-      }
-      expect(verifyErr).toBeInstanceOf(Error);
+      expect(await scp.identityVerifyLinkAttestation(attestationJson)).toBe(true);
+    });
+
+    it("scp.identityVerifyLinkAttestation rejects an attestation whose issuer document lacks the signing key", async () => {
+      // Carol signs, then rewrites the envelope to name Dave as issuer. Dave's
+      // document publishes Dave's keys, none of which verify Carol's signature,
+      // so step 2 of §3.5.4 fails.
+      const carol = await scp.identityCreate("in_memory");
+      const dave = await scp.identityCreate("in_memory");
+      const attestationJson = await scp.identityCreateLinkAttestation(
+        carol.did,
+        "github.com",
+        "carol",
+        "https://example.com/proof-carol",
+        "dns_record",
+      );
+      const forged = JSON.parse(attestationJson) as Record<string, unknown>;
+      forged.issuer = dave.did;
+      expect(await scp.identityVerifyLinkAttestation(JSON.stringify(forged))).toBe(false);
     });
   });
 

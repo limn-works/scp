@@ -185,7 +185,11 @@ interface IdentityAdvancedBindings {
     fun identityLinkAttestations(did: String): String
 
     /**
-     * Removes an identity link attestation by its ID.
+     * Revokes an identity link attestation by removing it.
+     *
+     * Spec section 3.5.3 requires a revocation to remove the attestation's
+     * `ScpIdentityLinkAttestation` service entry from the issuer's DID
+     * document, so this republishes that document before it drops the envelope.
      *
      * @param did The DID string.
      * @param attestationId The deterministic attestation ID.
@@ -197,20 +201,18 @@ interface IdentityAdvancedBindings {
     ): Boolean
 
     /**
-     * Verifies the Ed25519 signature on an identity link attestation.
+     * Verifies an identity link attestation against the issuer's DID document.
      *
-     * The issuer's public key cannot be reliably extracted from the DID string
-     * because attestations are signed with `#active` or `#agent` keys
-     * (spec section 3.5.2), not the `#0` identity key embedded in the DID.
+     * Step 1 of spec section 3.5.4 resolves the issuer's DID document and reads
+     * its `#active` or `#agent` public key, and step 2 checks the Ed25519
+     * signature on the envelope against that key, so the caller passes only the
+     * attestation.
      *
      * @param attestationJson JSON string of the attestation.
-     * @param issuerPublicKeyHex Hex-encoded Ed25519 public key of the issuer.
-     * @return true if valid.
+     * @return true when a key published in the issuer's document verifies the
+     *   envelope and the envelope is neither revoked nor expired.
      */
-    fun identityVerifyLinkAttestation(
-        attestationJson: String,
-        issuerPublicKeyHex: String,
-    ): Boolean
+    fun identityVerifyLinkAttestation(attestationJson: String): Boolean
 }
 
 /**
@@ -449,7 +451,11 @@ class IdentityAdvancedBridge internal constructor(
         bridge.ffiCall { bindings.identityLinkAttestations(did) }
 
     /**
-     * Removes an identity link attestation by its ID.
+     * Revokes an identity link attestation by removing it.
+     *
+     * Spec section 3.5.3 requires a revocation to remove the attestation's
+     * `ScpIdentityLinkAttestation` service entry from the issuer's DID
+     * document, so this republishes that document before it drops the envelope.
      *
      * @param did The DID string.
      * @param attestationId The deterministic attestation ID.
@@ -462,21 +468,21 @@ class IdentityAdvancedBridge internal constructor(
         bridge.ffiCall { bindings.identityRemoveLinkAttestation(did, attestationId) }
 
     /**
-     * Verifies the Ed25519 signature on an identity link attestation.
+     * Verifies an identity link attestation against the issuer's DID document.
      *
-     * The issuer's public key cannot be reliably extracted from the DID string
-     * because attestations are signed with `#active` or `#agent` keys
-     * (spec section 3.5.2), not the `#0` identity key embedded in the DID.
+     * Step 1 of spec section 3.5.4 resolves the issuer's DID document and reads
+     * its `#active` or `#agent` public key, and step 2 checks the Ed25519
+     * signature on the envelope against that key, so the caller passes only the
+     * attestation. Passing the issuer key in let a caller sign an attestation
+     * with a key it minted, pass that same key in, and read back true for a DID
+     * it does not control.
      *
      * @param attestationJson JSON string of the attestation.
-     * @param issuerPublicKeyHex Hex-encoded Ed25519 public key of the issuer.
-     * @return true if valid.
+     * @return true when a key published in the issuer's document verifies the
+     *   envelope and the envelope is neither revoked nor expired.
      */
-    suspend fun verifyLinkAttestation(
-        attestationJson: String,
-        issuerPublicKeyHex: String,
-    ): Boolean =
-        bridge.ffiCall { bindings.identityVerifyLinkAttestation(attestationJson, issuerPublicKeyHex) }
+    suspend fun verifyLinkAttestation(attestationJson: String): Boolean =
+        bridge.ffiCall { bindings.identityVerifyLinkAttestation(attestationJson) }
 }
 
 // ---------------------------------------------------------------------------

@@ -119,7 +119,6 @@ type NativeAddon = RawNativeAddon & {
   validateAgainstTemplate?: unknown;
   validateContextParams?: unknown;
   checkScopedCapability?: unknown;
-  identityVerifyLinkAttestation?: unknown;
 };
 
 /**
@@ -1018,29 +1017,30 @@ export class SCP {
     }
   }
 
-  identityRemoveLinkAttestation(did: string, attestationId: string): boolean {
+  async identityRemoveLinkAttestation(did: string, attestationId: string): Promise<boolean> {
+    // Revocation republishes the issuer's DID document without the
+    // attestation's `ScpIdentityLinkAttestation` service entry (spec §3.5.3),
+    // and that publish is asynchronous.
     try {
-      return (this.#native.identityRemoveLinkAttestation as (d: string, a: string) => boolean)(
-        did,
-        attestationId,
-      );
+      return await (
+        this.#native.identityRemoveLinkAttestation as (d: string, a: string) => Promise<boolean>
+      )(did, attestationId);
     } catch (err) {
       throw mapBridgeError(err);
     }
   }
 
-  async identityVerifyLinkAttestation(
-    attestationJson: string,
-    issuerPublicKeyHex: string,
-  ): Promise<boolean> {
-    // ADR-048 §1: pure Ed25519 signature verification, routed through the
-    // addon's module-level free fn (the `Scp::identity_verify_link_attestation`
-    // method was deleted in PR-E #28 along with its `let _ = &self.inner;`
-    // gate-defang). Surface stays async for SDK ABI stability; the underlying
-    // call is sync.
-    const fn = nativeFreeFn<(j: string, k: string) => boolean>("identityVerifyLinkAttestation");
+  async identityVerifyLinkAttestation(attestationJson: string): Promise<boolean> {
+    // Step 1 of spec §3.5.4 resolves the issuer's DID document and reads the
+    // `#active` or `#agent` public key out of it, so the caller passes only the
+    // attestation and the operation runs on this instance's resolver. Passing
+    // the issuer key in let a caller sign an attestation with a key it minted,
+    // pass that same key in, and read back `true` for a DID it does not
+    // control.
     try {
-      return fn(attestationJson, issuerPublicKeyHex);
+      return await (this.#native.identityVerifyLinkAttestation as (j: string) => Promise<boolean>)(
+        attestationJson,
+      );
     } catch (err) {
       throw mapBridgeError(err);
     }

@@ -130,7 +130,25 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "swift": ["identityRemoveLinkAttestation"],
     },
     ("Identity", "verify_attestation"): {
+        "python": ["verify_identity_link_attestation"],
+        "typescript": ["identityVerifyLinkAttestation"],
         "kotlin": ["verifyLinkAttestation"],
+        "swift": ["verifyLinkAttestation", "identityVerifyLinkAttestation"],
+    },
+    # §3.5.3 of the identity spec publishes an identity link attestation as an
+    # `ScpIdentityLinkAttestation` service entry in the issuer's DID document,
+    # and requires a revocation to remove that entry. Both writes happen inside
+    # creating and revoking an attestation, so §3.5.3 gives the write no
+    # separate SDK entry point, and the create-attestation symbol is what an SDK
+    # must expose to perform it. This gate checks that the symbol exists; that
+    # the symbol writes the service entry is pinned by the
+    # `link_attestation_*_did_document` assertions in
+    # `crates/scp-testing/tests/integration/pipeline_wiring.rs`.
+    ("Identity", "write_attestation_service_entry"): {
+        "python": ["create_identity_link_attestation"],
+        "typescript": ["identityCreateLinkAttestation"],
+        "kotlin": ["createLinkAttestation"],
+        "swift": ["identityCreateLinkAttestation", "createLinkAttestation"],
     },
     # Outlets streaming control plane (SCP-OUT-038): the grant/cancel methods
     # live on the InvocationHandle returned by the single public invoke() verb,

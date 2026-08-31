@@ -6451,9 +6451,16 @@ mod tests {
             .reserve_key_package("did:dht:z6MkNoSuchReserveIdentity")
             .expect_err("reserve for a non-locally-custodied identity must be rejected");
         let msg = err.to_string();
+        // `with_identity_mut` now reports the registry miss with the typed
+        // SCP-IDENT-1001 code and the same wording the napi bridge uses, so the
+        // three bridges name one condition one way.
         assert!(
-            msg.contains("not found in registry"),
-            "expected local-custody rejection (identity not found in registry), got: {msg}"
+            msg.contains("is not registered on this bridge instance"),
+            "expected local-custody rejection (identity not registered), got: {msg}"
+        );
+        assert!(
+            msg.contains("SCP-IDENT-1001"),
+            "the rejection must carry the typed registry-miss code, got: {msg}"
         );
     }
 
@@ -6750,8 +6757,12 @@ mod tests {
                 .expect_err("a non-locally-custodied inviter must be rejected")
                 .to_string();
             assert!(
-                err_uncustodied.contains("not found in registry"),
+                err_uncustodied.contains("is not registered on this bridge instance"),
                 "expected an inviter signing-key resolution failure, got: {err_uncustodied}"
+            );
+            assert!(
+                err_uncustodied.contains("SCP-IDENT-1001"),
+                "the rejection must carry the typed registry-miss code, got: {err_uncustodied}"
             );
         });
     }
