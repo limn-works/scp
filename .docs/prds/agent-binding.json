@@ -1667,10 +1667,11 @@
         "crates/scp-protocol/src/context/params.rs",
         "crates/scp-protocol/src/envelope/inner/mod.rs"
       ],
-      "description": "§4.9.3 defines agent_cosign_required as the list of capabilities that a member exercising them through #agent must additionally have signed with #active, on ContextParams, default empty. The list names capabilities rather than carrying a single boolean, because a context that required a human signature on every agent action would leave the agent nothing to do autonomously. When the invoked capability is on the list, the verifier requires a second signature over the same signed payload, produced by the #active verification method of the same DID.",
+      "description": "§4.9.3 defines agent_cosign_required as the list of capabilities that a member exercising them through #agent must additionally have signed with #active, on ContextParams, default empty. The list names capabilities rather than carrying a single boolean, because a context that required a human signature on every agent action would leave the agent nothing to do autonomously. When the invoked capability is on the list, the verifier requires a second signature over the same signed payload, produced by the #active verification method of the same DID. §4.9.3 puts two rules on the list's contents: every entry names a capability inside the context's ceiling, and the list names each capability at most once. This story applies both at context creation; SCP-AB-032 applies both on the governance write path.",
       "acceptanceCriteria": [
         "ContextParams carries a field agent_cosign_required: Vec<Capability> whose Default impl yields an empty vector",
         "Every entry of agent_cosign_required is validated against the context's ceiling at context creation, and an out-of-ceiling entry is rejected",
+        "Context creation rejects an agent_cosign_required that names one capability more than once, so the stored value holds at most one entry per ceiling capability — the bound the collection-size table in §5.9 of .docs/specs/05-contexts.md records for the field",
         "InnerEnvelope carries an optional cosignature field holding a 64-byte Ed25519 signature over the same 9.5.1 signing hash the #agent signature covers, as 4.9.3 defines it",
         "A verifier ignores a cosignature present on an artifact whose invoked capability is absent from agent_cosign_required, rather than rejecting it",
         "Verification requires the second signature when the invoked capability is on agent_cosign_required and the signing key is #agent",
@@ -1679,10 +1680,11 @@
         "Verification rejects the action when the second signature does not verify against the signer's #active verification method",
         "Verification does not require a second signature when the signing key is #active",
         "Verification does not require a second signature when the invoked capability is absent from agent_cosign_required",
-        "A test exercises governance:vote with agent_cosign_required containing governance:vote and asserts each of the accept and reject cases above"
+        "A test exercises governance:vote with agent_cosign_required containing governance:vote and asserts each of the accept and reject cases above",
+        "A test asserts context creation rejects an agent_cosign_required naming a capability outside the ceiling, and separately rejects one naming an in-ceiling capability twice"
       ],
       "actionItems": [
-        "Add agent_cosign_required to ContextParams with an empty default and ceiling validation",
+        "Add agent_cosign_required to ContextParams with an empty default, ceiling-membership validation, and rejection of a repeated capability",
         "Add the optional cosignature field to InnerEnvelope per 4.9.3, covering the existing 9.5.1 signing hash",
         "Add the co-signature verification branch",
         "Add the accept and reject tests named in the acceptance criteria"
@@ -1696,6 +1698,10 @@
         {
           "file": ".docs/specs/05-contexts.md",
           "section": "## 5.3 Capability Ceiling"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.9 Governance"
         },
         {
           "file": ".docs/adrs/phase-1.md",
@@ -1716,21 +1722,24 @@
         "crates/scp-protocol/src/context/metadata.rs",
         "crates/scp-runtime/src/context/governance_helpers.rs"
       ],
-      "description": "§5.7 lists agent policy — agent_keys_allowed, agent_rate_limit, and agent_cosign_required — among the structural fields a prospective member reads before joining, and §5.9 states that the context's governance sets and changes them through the same propose/approve path it uses for any other parameter. A change to any of the three ContextParams fields is a metadata change subject to metadata:edit; a change to an agent-restricted role assignment is subject to role:assign. Stories SCP-AB-028, SCP-AB-030, and SCP-AB-031 add the three fields; this story adds the projection and the governance gating.",
+      "description": "§5.7 lists agent policy — agent_keys_allowed, agent_rate_limit, and agent_cosign_required — among the structural fields a prospective member reads before joining, and §5.9 states that the context's governance sets and changes them through the same propose/approve path it uses for any other parameter. A change to any of the three ContextParams fields is a metadata change subject to metadata:edit; a change to an agent-restricted role assignment is subject to role:assign. Stories SCP-AB-028, SCP-AB-030, and SCP-AB-031 add the three fields; this story adds the projection and the governance gating. §4.9.3 puts two rules on agent_cosign_required's contents — every entry names a capability inside the context's ceiling, and the list names each capability at most once — and this story applies both on the governance write path, as SCP-AB-031 applies both at context creation. Without the no-repeat rule the §5.9 collection-size row for the field records a bound nothing enforces, because a value repeating one in-ceiling capability passes ceiling membership at every entry.",
       "acceptanceCriteria": [
         "The structural metadata a prospective member reads before joining includes agent_keys_allowed, agent_rate_limit, and agent_cosign_required",
         "The three fields are visible whatever the context's MetadataVisibilityPolicy holds",
         "A GovernanceAction variant changes the three Category C ContextParams fields, and executing it is gated on the metadata:edit capability",
+        "The governance change of agent_cosign_required rejects a value naming a capability outside the context's ceiling, and rejects a value naming one capability more than once, applying the two rules §4.9.3 puts on the field at both write paths",
         "A governance proposal that changes any of the three fields requires the metadata:edit capability",
         "A governance proposal that changes an agent-restricted role assignment requires the role:assign capability",
         "Executing an approved change updates the context's structural metadata and the change is visible to every member without a re-join",
         "A test asserts a member without metadata:edit cannot change agent_keys_allowed",
+        "A test asserts an approved governance change of agent_cosign_required to a value naming an out-of-ceiling capability is rejected, and separately that a change to a value naming one in-ceiling capability twice is rejected",
         "A test reads the three fields from a context the reader has not joined"
       ],
       "actionItems": [
         "Add the three fields to the structural metadata projection",
         "Add the GovernanceAction variant that changes the three fields",
         "Gate the parameter change on metadata:edit and the role change on role:assign",
+        "Apply the §4.9.3 ceiling-membership and no-repeat rules to the governance change of agent_cosign_required",
         "Add the pre-join read test and the unauthorized-change test"
       ],
       "blockedBy": [
