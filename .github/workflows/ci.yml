@@ -364,10 +364,10 @@ jobs:
   # target is a `RUSTUP_TOOLCHAIN` in a developer's or an agent's environment, and this
   # runner exports none, so here that check reports what it found and passes. The same
   # command fails in a shell carrying the variable, and an agent runs this gate locally
-  # before it pushes. This step installs no Rust: the check asks
-  # `rustup toolchain list` before it runs `rustc`, and a runner holding no pinned
-  # toolchain would otherwise download the pin's 13 targets for a comparison that cannot
-  # disagree.
+  # before it pushes. This step installs no Rust: this runner's `rustc` dispatches through
+  # rustup, no directory override redirects the checkout, and rustup holds no pinned
+  # toolchain, which is the state the check proves before it skips running `rustc` — a
+  # comparison that would otherwise download the pin's 13 targets and could not disagree.
   toolchain-wiring:
     needs: check-draft
     name: enforcement / toolchain wiring

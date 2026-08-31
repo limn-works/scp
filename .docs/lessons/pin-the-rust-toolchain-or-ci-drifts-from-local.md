@@ -69,6 +69,19 @@ run resolve different compilers.
   `.cargo/config.toml`, a workflow, or a gate script — each of which changes how the
   workspace compiles. Ask of every guard the same question the placement rule asks: in the
   state this check exists to catch, does the guard let it run?
+- **A skip branch states a claim, and the condition reaching it has to entail that claim.**
+  The first revision of `scripts/check-resolved-rustc.sh` skipped its compiler comparison
+  when `rustup toolchain list` held no entry for the pinned channel, and printed "no
+  compiler has resolved in this directory yet and none can disagree" while exiting 0. Two
+  ordinary states satisfy the condition and refute the claim: `rustup override set` selects
+  a toolchain for a directory and its children ahead of the toolchain file, and a `rustc`
+  Homebrew or a distribution package installed ahead of `~/.cargo/bin` on PATH never
+  consults rustup at all. In each one a compiler the pin does not name answers every cargo
+  command while rustup's list holds no pinned entry, so the caller read a mismatch as a
+  pass — the same fail-open the check was written to remove, moved from CI into the skip.
+  A skip exists to buy something, in this case the 2 GB download of the pin's 13 targets on
+  a runner that compiles nothing. Write the condition as the proof that the skip costs
+  nothing, and give each state a test that fails without it.
 - **A container build's base tag selects a Debian release, and glibc is backward compatible
   only.** A builder stage that links against a newer release's glibc produces binaries that
   cannot exec against an older runtime stage, which dies at startup with

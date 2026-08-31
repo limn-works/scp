@@ -44,8 +44,15 @@
 #   * Check 4 fails when `RUSTUP_TOOLCHAIN` holds a value, which replaces the toolchain file
 #     entirely, and when the compiler answering in the repository reports a version other
 #     than the channel the pin names. It passes, and says so, in the one state where running
-#     the compiler would make rustup install the pin: rustup holding no such toolchain. It
-#     fails closed when the pin is absent, when the pin names no channel, and when
+#     the compiler would make rustup install the pin: rustup dispatching the `rustc` on
+#     PATH, no directory override redirecting the repository, and rustup's toolchain list
+#     holding no entry for the channel. Three cases hold that toolchain list empty and put a
+#     disagreeing compiler on PATH anyway — under an override on the repository, under an
+#     override on its parent, and installed by something other than rustup — because each
+#     one is a state an earlier revision of `scripts/check-resolved-rustc.sh` exited 0 on. A
+#     fourth holds the list empty under an override on an unrelated directory whose path
+#     shares a prefix with the repository, which the skip still covers. Check 4 fails closed
+#     when the pin is absent, when the pin names no channel, and when
 #     `scripts/check-resolved-rustc.sh` is absent. Every other case in this file runs with a
 #     compiler that agrees with the pin, so each one also proves check 4 stays silent then.
 #     One state has no case: `rustc` absent from PATH, which a canned repository cannot
@@ -57,7 +64,10 @@
 # `.mise.toml`, `rust-toolchain.toml`, optional `Dockerfile`, optional extra root file, and
 # every path in EXTRA_FILES. It also writes a `rustc` and a `rustup` into `stub-bin/` and
 # leads PATH with that directory, so check 4 reads the case's answers rather than the
-# toolchain of whoever runs this harness. The gate `cd`s to its own parent's parent, so that
+# toolchain of whoever runs this harness. By default it links `rustc` to `rustup`, which is
+# how rustup and mise each install a `rustc` that dispatches through them; one case writes
+# the two as separate files, which is what a compiler another installer put ahead of
+# rustup's directory on PATH looks like. The gate `cd`s to its own parent's parent, so that
 # directory becomes its repository root. No canned repository holds
 # `templates/personal-relay/README.md`, the one path BUILT_FROM_DOCUMENTATION names, so
 # every case also proves that a list entry naming an absent file reports nothing.
@@ -105,6 +115,15 @@ failed=0
 #   STUB_RUSTC      — the version the canned `rustc` on PATH reports.
 #   STUB_RUSTUP     — the channel the canned `rustup toolchain list` reports as installed,
 #                     or "" to report an empty list.
+#   STUB_RUSTC_INSTALLER — "rustup" links the canned `rustc` to the canned `rustup`, which
+#                     is how rustup and mise each install a `rustc` that dispatches through
+#                     them. "other" writes `rustc` as its own file, which is what a compiler
+#                     Homebrew or a distribution package installed ahead of rustup's
+#                     directory on PATH looks like.
+#   STUB_OVERRIDE   — the directory the canned `rustup override list` reports an override
+#                     for: "none" reports "no overrides", "root" reports the canned
+#                     repository, "parent" reports the directory holding it, and
+#                     "elsewhere" reports an unrelated absolute path.
 #   CASE_RUSTUP_TOOLCHAIN — the value of `RUSTUP_TOOLCHAIN` in the gate's environment. The
 #                     empty string leaves the variable holding nothing, which the gate reads
 #                     the same way it reads an unset variable, so no case has to unset it.
@@ -120,6 +139,8 @@ PIN_PRESENT="yes"
 PIN_CHANNEL="1.98.0"
 STUB_RUSTC="1.98.0"
 STUB_RUSTUP="1.98.0"
+STUB_RUSTC_INSTALLER="rustup"
+STUB_OVERRIDE="none"
 CASE_RUSTUP_TOOLCHAIN=""
 COPY_RESOLVED_RUSTC="yes"
 
@@ -130,13 +151,36 @@ if [[ ! -f "$RESOLVED_RUSTC_CHECK" ]]; then
 fi
 
 # The canned repository's rustup and rustc. Check 4 asks rustup which toolchains it holds
-# before it runs rustc, so a case controls both answers and neither stub reaches the
-# network or the real rustup directory.
+# and which directories it overrides before it runs rustc, so a case controls all three
+# answers and no stub reaches the network or the real rustup directory.
+#
+# `emit_stub_rustup` writes one file that answers as both commands, dispatching on the name
+# it was invoked under, because that is the shape rustup and mise each install: rustup links
+# `~/.cargo/bin/rustc` to `~/.cargo/bin/rustup`, and mise links both of its shims to the
+# `mise` binary. Check 4 reads the two names as one file when their bytes match, so a case
+# that wants a compiler outside rustup writes `rustc` as its own file instead.
 emit_stub_rustup() {
+    local override_dir="$1"
     printf '#!/usr/bin/env bash\n'
+    printf 'case "$(basename "$0")" in\n'
+    printf '  rustc) echo "rustc %s (0123456789 2026-08-18)"; exit 0 ;;\n' "$STUB_RUSTC"
+    printf 'esac\n'
     printf 'if [ "${1:-}" = "toolchain" ] && [ "${2:-}" = "list" ]; then\n'
     if [[ -n $STUB_RUSTUP ]]; then
         printf '  echo "%s-x86_64-unknown-linux-gnu (default)"\n' "$STUB_RUSTUP"
+    else
+        # bash rejects a `then` with no command after it, and a stub that dies on a syntax
+        # error prints nothing, which check 4 would read as rustup holding no toolchain —
+        # the very answer the empty list is supposed to give for its own reason. `:` keeps
+        # the stub parseable and prints nothing.
+        printf '  :\n'
+    fi
+    printf 'fi\n'
+    printf 'if [ "${1:-}" = "override" ] && [ "${2:-}" = "list" ]; then\n'
+    if [[ -n $override_dir ]]; then
+        printf '  printf "%%s\\t%%s\\n" "%s" "1.97.1-x86_64-unknown-linux-gnu"\n' "$override_dir"
+    else
+        printf '  echo "no overrides"\n'
     fi
     printf 'fi\n'
 }
@@ -320,9 +364,34 @@ run_case() {
     fi
     [[ $COPY_RESOLVED_RUSTC == "yes" ]] && cp "$RESOLVED_RUSTC_CHECK" "$root/scripts/"
     [[ $PIN_PRESENT == "yes" ]] && emit_pin > "$root/rust-toolchain.toml"
-    emit_stub_rustup > "$root/stub-bin/rustup"
-    emit_stub_rustc > "$root/stub-bin/rustc"
-    chmod +x "$root/stub-bin/rustup" "$root/stub-bin/rustc"
+
+    # Check 4 resolves this repository's root with `pwd -P`, and `rustup override list`
+    # prints the path rustup canonicalized when someone set the override, so the canned
+    # override names the physical path too. On macOS `$TMPDIR` sits under a symlink, and a
+    # logical path would miss the comparison the case exists to exercise.
+    local root_physical override_dir=""
+    root_physical=$(cd "$root" && pwd -P)
+    case $STUB_OVERRIDE in
+        root) override_dir="$root_physical" ;;
+        parent) override_dir=$(dirname "$root_physical") ;;
+        elsewhere) override_dir="$root_physical-a-different-checkout" ;;
+    esac
+
+    emit_stub_rustup "$override_dir" > "$root/stub-bin/rustup"
+    chmod +x "$root/stub-bin/rustup"
+    # A stub bash rejects prints nothing and exits non-zero, and check 4 reads an empty
+    # `rustup toolchain list` as rustup holding no pinned toolchain, so a syntax error in
+    # the stub would make every skip case pass for a reason the case never states.
+    if ! bash -n "$root/stub-bin/rustup"; then
+        echo "ERROR: the canned rustup for case $name is not valid bash" >&2
+        exit 1
+    fi
+    if [[ $STUB_RUSTC_INSTALLER == "rustup" ]]; then
+        ln -sf rustup "$root/stub-bin/rustc"
+    else
+        emit_stub_rustc > "$root/stub-bin/rustc"
+        chmod +x "$root/stub-bin/rustc"
+    fi
     git -C "$root" init -q
     "$ci_producer" > "$root/.github/workflows/ci.yml"
     "$mise_producer" > "$root/.mise.toml"
@@ -1000,15 +1069,74 @@ run_case "resolved-compiler-disagrees-with-the-pin" 1 \
     routing_ok mise_ok
 STUB_RUSTC="1.98.0"
 
-# rustup holds no pinned toolchain, so no compiler has resolved here and rustup installs the
-# channel the file names on first use. The gate passes and says which of the two it did, so
-# a reader never takes the skip for a comparison. This is the state of a CI runner for a job
-# that compiles nothing, and the canned rustc reports a mismatching version to prove the
-# gate never ran it.
+# rustup dispatches the rustc on PATH, no override redirects this directory, and rustup
+# holds no pinned toolchain, so no compiler has resolved here and rustup installs the channel
+# the file names on first use. The gate passes and says which of the two it did, so a reader
+# never takes the skip for a comparison. This is the state of a CI runner for a job that
+# compiles nothing, and the canned rustc reports a mismatching version to prove the gate
+# never ran it.
 STUB_RUSTUP=""
 STUB_RUSTC="1.97.1"
 run_case "rustup-holds-no-pinned-toolchain" 0 \
     "rustup holds no 1.98.0 toolchain" routing_ok mise_ok
+STUB_RUSTUP="1.98.0"
+STUB_RUSTC="1.98.0"
+
+# ── The three states the skip must not swallow ───────────────────────────────────────
+#
+# Each case below holds rustup's toolchain list empty, which is what an earlier revision of
+# `scripts/check-resolved-rustc.sh` read as "no compiler has resolved here". In each one a
+# compiler answers anyway and reports a version the pin does not name, so the gate compares
+# rather than skipping.
+
+# `rustup override set` selects a toolchain for a directory and its children ahead of the
+# toolchain file, and installs it as it sets it, so the checkout resolves a compiler that
+# rustup's toolchain list does not hold under the pinned channel.
+STUB_RUSTUP=""
+STUB_RUSTC="1.97.1"
+STUB_OVERRIDE="root"
+run_case "directory-override-selects-a-compiler-the-pin-does-not-name" 1 \
+    "rustc in this directory is 1.97.1, and rust-toolchain.toml names 1.98.0" \
+    routing_ok mise_ok
+STUB_OVERRIDE="none"
+STUB_RUSTUP="1.98.0"
+STUB_RUSTC="1.98.0"
+
+# An override on a parent directory reaches every directory below it, which is the sentence
+# `rustup help override` states: "any time `rustc` or `cargo` is run inside that directory,
+# or one of its child directories, the override toolchain will be invoked."
+STUB_RUSTUP=""
+STUB_RUSTC="1.97.1"
+STUB_OVERRIDE="parent"
+run_case "override-on-a-parent-directory-reaches-this-one" 1 \
+    "rustc in this directory is 1.97.1, and rust-toolchain.toml names 1.98.0" \
+    routing_ok mise_ok
+STUB_OVERRIDE="none"
+STUB_RUSTUP="1.98.0"
+STUB_RUSTC="1.98.0"
+
+# An override on an unrelated directory whose path shares a prefix with this one leaves this
+# directory alone, so the skip still holds. Without this case a check that matched the path
+# as a bare prefix would pass every other case in this file.
+STUB_RUSTUP=""
+STUB_RUSTC="1.97.1"
+STUB_OVERRIDE="elsewhere"
+run_case "override-on-an-unrelated-directory-leaves-this-one-alone" 0 \
+    "rustup holds no 1.98.0 toolchain" routing_ok mise_ok
+STUB_OVERRIDE="none"
+STUB_RUSTUP="1.98.0"
+STUB_RUSTC="1.98.0"
+
+# A compiler some other installer put ahead of rustup's directory on PATH answers without
+# consulting rustup and downloads nothing, so the gate reads its version rather than reading
+# rustup's empty toolchain list as an absent compiler.
+STUB_RUSTUP=""
+STUB_RUSTC="1.97.1"
+STUB_RUSTC_INSTALLER="other"
+run_case "compiler-outside-rustup-answers-with-another-version" 1 \
+    "rustc in this directory is 1.97.1, and rust-toolchain.toml names 1.98.0" \
+    routing_ok mise_ok
+STUB_RUSTC_INSTALLER="rustup"
 STUB_RUSTUP="1.98.0"
 STUB_RUSTC="1.98.0"
 

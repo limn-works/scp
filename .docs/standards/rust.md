@@ -146,11 +146,23 @@ not name. `scripts/check-resolved-rustc.sh` holds that comparison, and
 states the criterion. It fails on the variable holding any value, because rustup applies the
 variable in place of the whole toolchain file and `RUSTUP_TOOLCHAIN=1.98.0` therefore drops
 the 13 targets the file lists while resolving the pinned version. It then compares
-`rustc --version` against the channel. rustup's shim installs the toolchain a directory
-selects the first time a compiler runs there, and installing this pin's 13 targets downloads
-about 2 GB, so the comparison runs only when `rustup toolchain list` already holds the
-channel; where it does not, no compiler has resolved in the directory and rustup installs
-exactly the channel on first use. The script prints which of the two it did.
+`rustc --version` against the channel.
+
+rustup's shim installs the toolchain a directory selects the first time a compiler runs
+there, and installing this pin's 13 targets downloads about 2 GB, so the script skips that
+comparison in the one state where running `rustc` triggers the download — which is also the
+one state where no compiler has answered in the directory and none can disagree. It proves
+that state from five facts, each read out of rustup's own directory or off disk: `rustup`
+answers on PATH; `rustc` answers on PATH and reads the same bytes as `rustup`, which is how
+rustup and mise each install a `rustc` that dispatches through them; `RUSTUP_TOOLCHAIN`
+holds nothing; `rustup override list` names no directory holding this one; and
+`rustup toolchain list` holds no entry for the channel. When any one of the five fails,
+running `rustc` reports a version and downloads nothing, so the script runs it and compares.
+Two of the five close a fail-open an earlier revision shipped: `rustup override set` selects
+a toolchain for a directory and its children ahead of the toolchain file, and a `rustc` some
+other installer put ahead of `~/.cargo/bin` on PATH never consults rustup at all, so in both
+states a compiler the pin does not name answers while rustup's toolchain list holds no
+pinned entry. The script prints which of the two it did.
 
 mise is one source of that variable and not the only one. **Every agent worktree under
 `.claude/worktrees/` sits inside the repository root, and mise loads a configuration file
