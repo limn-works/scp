@@ -1,36 +1,73 @@
-// ADR-049 §15: ContextCryptoProvider trait deleted. Tests in this
-// file construct ContextManager with the trait's mock implementations; the
-// rewire path awaits backend injection. File gated until then.
-#![cfg(any())]
-
 //! SCP-PERSIST-070: End-to-end integration tests for context persistence.
 //!
-//! Tests the full context lifecycle through `ProtocolRepository`: create contexts
-//! with members, messages, and roles -> persist -> "restart" (re-read from
-//! the same storage backend) -> verify state -> continue operations.
+//! Two layers are covered:
 //!
-//! Also covers:
-//! - Close cleanup (`delete_context` removes all persisted state).
-//! - TTL expiry (expired state persists and roundtrips correctly).
-//! - Cross-adapter parity (macro-driven, currently `InMemoryStorage` only;
-//!   ready for `SqliteStorage` and `FilesystemStorage` when they land).
-//! - Sequence number and role assignment survival across restarts.
+//! * The storage layer (`persistence_tests!` macro): create contexts with
+//!   members and roles -> persist -> "restart" (re-read from the same
+//!   `ProtocolRepository` backend) -> verify state -> continue operations.
+//!   Also covers close cleanup (`delete_context`), TTL-expiry roundtrip,
+//!   cross-adapter parity, and sequence-number / role-assignment survival.
+//! * The actor layer (`executed_proposals_survive_restart_and_accumulate`): a
+//!   governance action executed before a simulated restart leaves its
+//!   Class-S `executed_proposals` replay marker (ADR-049 §9) durably
+//!   persisted; after the context is rehydrated from persistence, the marker
+//!   is still present in the live actor, continues to accumulate new markers,
+//!   AND actively rejects a replay of the pre-restart proposal — proving the
+//!   restored marker is load-bearing, not merely present.
+//!
+//! ## ADR-049 note — what persists, and how the replay is rejected
+//!
+//! Before ADR-049 a `ContextManager` re-executed a caller-supplied proposal
+//! object, so a replay tripped the `executed_proposals` guard directly. Two
+//! kinds of governance state cross a restart in the actor-per-context model:
+//!
+//! * The Class-S `executed_proposals` marker set is snapshot-persisted in the
+//!   [`ContextSnapshot`] and rehydrated into the live actor on restore.
+//! * `approved_proposals` (proposals approved and pending execution, kept for
+//!   conflict detection) is ALSO snapshotted — see
+//!   [`ContextSnapshot::approved_proposals`] (`state.rs`), the public,
+//!   serde-serialized snapshot field that proves the claim. Governance-proposal
+//!   state is therefore NOT purely ephemeral.
+//!
+//! What is NOT persisted is the governance engine's own tracked-proposal map:
+//! `restore_governance_engine_from_snapshot` rebuilds a FRESH engine (empty
+//! `proposals`), so after restore the engine remembers no proposal by id.
+//!
+//! That shapes how a replay is caught. `execute_governance_action` resolves the
+//! authoritative proposal from the engine BEFORE consulting
+//! `executed_proposals`. A bare `ExecuteGovernanceAction`-by-id that does not
+//! first re-populate the engine is therefore rejected earlier as "not tracked".
+//! But the realistic replay — an adversary re-submitting the SAME proposal
+//! (same context, proposer, action, and timestamp) — recomputes the identical
+//! `proposal_id` via [`compute_proposal_id`] (deterministic SHA-256), so it
+//! re-populates the fresh engine, auto-approves under `SingleAdmin`, reaches the
+//! execute path, and is rejected there as "already been executed" by the
+//! rehydrated marker. This test drives exactly that re-submit replay and asserts
+//! the "already been executed" rejection, so a regression that dropped or failed
+//! to consult the restored marker (while leaving persistence intact) would let
+//! the replay auto-execute a second time and FAIL this test.
 //!
 //! See `.docs/prds/` SCP-PERSIST-070 for acceptance criteria.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use scp_core::context::governance::{
-    GovernanceAction, GovernanceContext, GovernanceEngine, KeyResolver, ProposalStatus,
-    SingleAdminEngine,
+use scp_clock::{Clock, SystemClock, TestClock};
+use scp_core::context::builder::{
+    ContextCreationError, ContextEventLogProvider, ContextTransportProvider,
 };
-use scp_core::context::manager::{ContextManager, ContextPersistence, ContextSnapshot};
-use scp_core::context::{
-    Capability, ContextHandle, ContextMode, ContextParams, ContextState, MemoryScope,
+use scp_core::context::governance::{GovernanceAction, KeyResolver, compute_proposal_id};
+use scp_core::context::persistence::ContextPersistence;
+use scp_core::context::state::ContextSnapshot;
+use scp_core::context::supervisor::{
+    DurableProviders, ProtocolRepositorySagaJournal, SagaJournal, Supervisor,
 };
+use scp_core::context::{ContextMode, ContextParams, ContextState, LocalTransportProvider};
+use scp_core::crypto::mls::provider::NodeMlsFactory;
+use scp_core::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
+use scp_core::economy::Amount;
 use scp_core::store::ProtocolRepository;
 use scp_did::DID;
 use scp_platform::in_memory::InMemoryStorage;
@@ -55,9 +92,10 @@ fn make_store() -> ProtocolRepository<InMemoryStorage> {
 
 /// Generates the full persistence test suite for a given `Storage` implementation.
 ///
-/// Currently instantiated for `InMemoryStorage` only. When `SqliteStorage` and
-/// `FilesystemStorage` land, additional instantiations will be added here,
-/// producing identical test suites for each backend.
+/// Instantiated for `InMemoryStorage` unconditionally, and for `SqliteStorage`
+/// and `FilesystemStorage` under their respective `sqlite` / `filesystem`
+/// feature gates (see the instantiations below) — producing identical test
+/// suites for each backend.
 macro_rules! persistence_tests {
     ($mod_name:ident, $make_store:expr) => {
         mod $mod_name {
@@ -199,8 +237,9 @@ macro_rules! persistence_tests {
             // ---------------------------------------------------------------
 
             /// `delete_context` removes all persisted state (state, params,
-            /// memberships, roles). Verified via `list_keys` returning empty
-            /// for context prefix.
+            /// memberships, roles). Verified via the per-key `load_*` accessors
+            /// returning `None` and `list_active_contexts` no longer listing the
+            /// context.
             #[tokio::test]
             async fn close_cleanup_removes_all_context_state() {
                 let store = $make_store;
@@ -293,10 +332,13 @@ macro_rules! persistence_tests {
             // AC3: TTL expiry state persists
             // ---------------------------------------------------------------
 
-            /// Context state with `ContextState::Expired` serialization survives
-            /// a persist/load roundtrip, and the expired context can be listed
-            /// but no longer accepts new memberships (enforced at the manager
-            /// level, not the store level -- the store is state-agnostic).
+            /// STORE-LAYER scope: a `ContextState::Expired` marker survives a
+            /// persist/load roundtrip and the expired context remains listed by
+            /// the state-agnostic store. The store neither interprets the state
+            /// nor refuses operations — lifecycle enforcement (refusing ops on a
+            /// non-`Active` context) lives at the actor layer and is asserted by
+            /// `expired_context_is_not_resurrected_and_refuses_operations`. This
+            /// test deliberately does NOT claim that enforcement.
             #[tokio::test]
             async fn ttl_expiry_state_persists_and_roundtrips() {
                 let store = $make_store;
@@ -607,12 +649,18 @@ macro_rules! persistence_tests {
             // AC3 (extended): Expired context state survives restore
             // ---------------------------------------------------------------
 
-            /// Stores a context with `ContextState::Expired`, loads it back, and
-            /// verifies the expired state is faithfully restored. This ensures
-            /// that expired contexts are not silently dropped or reset during
-            /// the persist/load cycle.
+            /// STORE-LAYER scope: stores a context with `ContextState::Expired`
+            /// (plus params and a membership), loads it back, and verifies the
+            /// expired state, params, and membership are faithfully restored and
+            /// the context is not silently dropped or reset during the
+            /// persist/load cycle. This asserts DURABILITY only — it does NOT
+            /// assert operation-refusal (the store is state-agnostic). The actual
+            /// runtime refusal on a non-restored Expired context is asserted by
+            /// `expired_context_is_not_resurrected_and_refuses_operations`;
+            /// renamed away from the former `refuses_operations` name, which
+            /// promised an enforcement this store-layer test cannot provide.
             #[tokio::test]
-            async fn expired_context_refuses_operations_after_restore() {
+            async fn expired_context_state_survives_restore() {
                 let store = $make_store;
                 let ctx_id = "ctx-expired-restore";
 
@@ -695,71 +743,18 @@ persistence_tests!(filesystem, {
 });
 
 // ---------------------------------------------------------------------------
-// ContextManager-level persistence integration test
+// Actor-layer restore test — `executed_proposals` replay-marker durability.
 // ---------------------------------------------------------------------------
-
-/// A simple `ContextPersistence` implementation using synchronous
-/// `Mutex<HashMap>` for testing the `Supervisor::restore_context`
-/// path. Avoids the "`block_on` inside runtime" problem by not using async
-/// storage under the hood.
-struct InMemoryContextPersistence {
-    contexts: std::sync::Mutex<HashMap<String, ContextSnapshot>>,
-}
-
-impl InMemoryContextPersistence {
-    fn new() -> Self {
-        Self {
-            contexts: std::sync::Mutex::new(HashMap::new()),
-        }
-    }
-}
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-#[async_trait::async_trait]
-impl ContextPersistence for InMemoryContextPersistence {
-    async fn persist_context(
-        &self,
-        context_id: &str,
-        snapshot: &ContextSnapshot,
-    ) -> Result<(), BoxError> {
-        self.contexts
-            .lock()
-            .map_err(|e| -> BoxError { Box::new(std::io::Error::other(e.to_string())) })?
-            .insert(context_id.to_owned(), snapshot.clone());
-        Ok(())
-    }
-
-    async fn load_context(&self, context_id: &str) -> Result<Option<ContextSnapshot>, BoxError> {
-        let guard = self
-            .contexts
-            .lock()
-            .map_err(|e| -> BoxError { Box::new(std::io::Error::other(e.to_string())) })?;
-        Ok(guard.get(context_id).cloned())
-    }
-
-    async fn delete_context(&self, context_id: &str) -> Result<(), BoxError> {
-        self.contexts
-            .lock()
-            .map_err(|e| -> BoxError { Box::new(std::io::Error::other(e.to_string())) })?
-            .remove(context_id);
-        Ok(())
-    }
-
-    async fn list_persisted_contexts(&self) -> Result<Vec<String>, BoxError> {
-        let guard = self
-            .contexts
-            .lock()
-            .map_err(|e| -> BoxError { Box::new(std::io::Error::other(e.to_string())) })?;
-        Ok(guard.keys().cloned().collect())
-    }
+/// In-memory `ContextPersistence` double. Two supervisors (process 1 "before
+/// restart" and process 2 "after restart") share ONE backing map through
+/// `Arc`, so the snapshot process 1 persists is the one process 2 restores.
+#[derive(Default)]
+struct SharedPersistence {
+    contexts: Mutex<HashMap<String, ContextSnapshot>>,
 }
-
-/// Newtype wrapper enabling multiple `ContextManager` instances to share
-/// the same `InMemoryContextPersistence` backing store, simulating a
-/// restart against the same durable storage. Required because the orphan
-/// rule prevents implementing `ContextPersistence` for `Arc<T>` directly.
-struct SharedPersistence(Arc<InMemoryContextPersistence>);
 
 #[async_trait::async_trait]
 impl ContextPersistence for SharedPersistence {
@@ -768,320 +763,505 @@ impl ContextPersistence for SharedPersistence {
         context_id: &str,
         snapshot: &ContextSnapshot,
     ) -> Result<(), BoxError> {
-        self.0.persist_context(context_id, snapshot)
+        self.contexts
+            .lock()
+            .unwrap()
+            .insert(context_id.to_owned(), snapshot.clone());
+        Ok(())
     }
 
     async fn load_context(&self, context_id: &str) -> Result<Option<ContextSnapshot>, BoxError> {
-        self.0.load_context(context_id)
+        Ok(self.contexts.lock().unwrap().get(context_id).cloned())
     }
 
     async fn delete_context(&self, context_id: &str) -> Result<(), BoxError> {
-        self.0.delete_context(context_id)
+        self.contexts.lock().unwrap().remove(context_id);
+        Ok(())
     }
 
     async fn list_persisted_contexts(&self) -> Result<Vec<String>, BoxError> {
-        self.0.list_persisted_contexts()
+        Ok(self.contexts.lock().unwrap().keys().cloned().collect())
     }
 }
 
-/// Minimal mock providers for `ContextManager` construction.
-/// These are never called in the broadcast restoration path -- only the
-/// persistence provider is exercised.
-mod mock_providers {
-    use scp_core::context::builder::{
-        ContextCreationError, ContextCryptoProvider, ContextEventLogProvider,
-        ContextTransportProvider,
-    };
-    use scp_core::context::{ContextError, ContextParams};
+/// `Box<dyn ContextPersistence>` newtype sharing the `Arc` backing map between
+/// the two supervisors (the constructor takes an owned `Box`, but both
+/// processes must read/write the SAME map).
+struct SharedPersistenceArc(Arc<SharedPersistence>);
 
-    pub struct MockCrypto;
-    impl ContextCryptoProvider for MockCrypto {
-        fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-        fn create_mls_group(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-        fn generate_sender_key(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-        fn init_broadcast_key(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-        fn destroy_mls_group(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-        fn destroy_sender_key(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-        fn validate_key_package(
-            &self,
-            _owner_did: &str,
-            _key_package_bytes: Option<&[u8]>,
-        ) -> Result<(), ContextError> {
-            Ok(())
-        }
-        fn add_member(
-            &self,
-            _ctx_id: &[u8; 32],
-            _member_did: &str,
-            _key_package_bytes: Option<&[u8]>,
-        ) -> Result<scp_core::context::AddMemberOutput, ContextError> {
-            Ok(scp_core::context::AddMemberOutput::default())
-        }
-        fn remove_member(
-            &self,
-            _ctx_id: &[u8; 32],
-            _member_did: &str,
-        ) -> Result<scp_core::context::RemoveMemberOutput, ContextError> {
-            Ok(scp_core::context::RemoveMemberOutput::default())
-        }
-        fn distribute_sender_key(
-            &self,
-            _ctx_id: &[u8; 32],
-            _member_did: &str,
-        ) -> Result<(), ContextError> {
-            Ok(())
-        }
-        fn remove_member_sender_key(
-            &self,
-            _ctx_id: &[u8; 32],
-            _member_did: &str,
-        ) -> Result<(), ContextError> {
-            Ok(())
-        }
-
-        fn seal(
-            &self,
-            _context_id: &[u8; 32],
-            inner: &scp_core::envelope::inner::InnerEnvelope,
-            _routing_id: &[u8],
-            _blob_ttl: u32,
-        ) -> Result<Vec<u8>, ContextError> {
-            // Mock: serialize inner envelope directly (no encryption).
-            rmp_serde::to_vec_named(inner)
-                .map_err(|e| ContextError::CryptoFailed(format!("mock seal: {e}")))
-        }
-
-        fn open(
-            &self,
-            _context_id: &[u8; 32],
-            outer_bytes: &[u8],
-        ) -> Result<scp_core::context::builder::OpenResult, ContextError> {
-            // Mock: deserialize directly as InnerEnvelope (no decryption).
-            let inner: scp_core::envelope::inner::InnerEnvelope =
-                rmp_serde::from_slice(outer_bytes)
-                    .map_err(|e| ContextError::CryptoFailed(format!("mock open: {e}")))?;
-            let sender_did = inner.sender_did.clone();
-            Ok(scp_core::context::builder::OpenResult::Application(
-                Box::new(scp_core::context::builder::OpenedEnvelope {
-                    inner,
-                    sender_did,
-                    // ADR-049 PR-4: mock open() has no live recv tracker; the
-                    // follower mirror-forward drop is non-fatal.
-                    receive_floor: scp_core::context::builder::ReceiveFloor {
-                        epoch: 0,
-                        sequence: 0,
-                    },
-                }),
-            ))
-        }
+#[async_trait::async_trait]
+impl ContextPersistence for SharedPersistenceArc {
+    async fn persist_context(
+        &self,
+        context_id: &str,
+        snapshot: &ContextSnapshot,
+    ) -> Result<(), BoxError> {
+        self.0.persist_context(context_id, snapshot).await
     }
-
-    pub struct MockTransport;
-    #[async_trait::async_trait]
-    impl ContextTransportProvider for MockTransport {
-        fn is_connected(&self) -> bool {
-            true
-        }
-        async fn publish_context(
-            &self,
-            _ctx_id: &[u8; 32],
-            _params: &ContextParams,
-        ) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-        async fn delete_published(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-        async fn send_message(
-            &self,
-            _ctx_id: &[u8; 32],
-            _encrypted_payload: &[u8],
-        ) -> Result<(), ContextError> {
-            Ok(())
-        }
+    async fn load_context(&self, context_id: &str) -> Result<Option<ContextSnapshot>, BoxError> {
+        self.0.load_context(context_id).await
     }
-
-    pub struct MockEventLog;
-    // `unused_async`: these methods have no await because they are no-op test
-    // doubles, but the ADR-049 Decision-7 async `ContextEventLogProvider` trait
-    // requires the `async fn` signature.
-    #[async_trait::async_trait]
-    #[allow(clippy::unused_async)]
-    impl ContextEventLogProvider for MockEventLog {
-        async fn init_event_log(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-        async fn append_event(
-            &self,
-            _ctx_id: &[u8; 32],
-            _event_type: scp_event_log::EventType,
-            _actor_did: &str,
-            _payload: scp_event_log::EventPayload,
-            _timestamp_secs: u64,
-        ) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-        async fn destroy_event_log(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
+    async fn delete_context(&self, context_id: &str) -> Result<(), BoxError> {
+        self.0.delete_context(context_id).await
+    }
+    async fn list_persisted_contexts(&self) -> Result<Vec<String>, BoxError> {
+        self.0.list_persisted_contexts().await
     }
 }
 
-/// Creates a mock key resolver that maps known test DIDs to verifying keys.
-fn mock_key_resolver() -> KeyResolver {
+/// No-op event-log provider (mirrors `saga_bridge_bootstrap.rs`).
+struct NoOpEventLog;
+// `unused_async`: these no-op test-double methods have no await, but the
+// ADR-049 Decision-7 async `ContextEventLogProvider` trait requires the
+// `async fn` signature.
+#[async_trait::async_trait]
+#[allow(clippy::unused_async)]
+impl ContextEventLogProvider for NoOpEventLog {
+    async fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+    async fn append_event(
+        &self,
+        _: &[u8; 32],
+        _: scp_event_log::EventType,
+        _: &str,
+        _: scp_event_log::EventPayload,
+        _timestamp_secs: u64,
+    ) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+    async fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+}
+
+fn test_mls_storage() -> Arc<dyn OpenMlsStorageAdapter> {
+    Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
+        InMemoryStorage::new(),
+    )))
+}
+
+/// Deterministic Ed25519 signing key derived from a DID string, so a matching
+/// `KeyResolver` can resolve the verifying key for governance-proposal
+/// signature validation.
+fn deterministic_signing_key(did: &DID) -> ed25519_dalek::SigningKey {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    did.as_ref().hash(&mut hasher);
+    let h = hasher.finish();
+    let mut seed = [0u8; 32];
+    seed[..8].copy_from_slice(&h.to_le_bytes());
+    ed25519_dalek::SigningKey::from_bytes(&seed)
+}
+
+fn deterministic_key_resolver() -> KeyResolver {
     Arc::new(|did: &DID, _kid: scp_did::SigningKeyId| {
-        let did_str: &str = did.as_ref();
-        match did_str {
-            "did:dht:z6MkAuthor1" => {
-                Some(ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]).verifying_key())
-            }
-            "did:dht:z6MkBob" => {
-                Some(ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]).verifying_key())
-            }
-            _ => None,
-        }
+        Some(deterministic_signing_key(did).verifying_key())
     })
 }
 
-/// End-to-end test: persist a broadcast context snapshot via
-/// `InMemoryContextPersistence`, then restore it into a fresh
-/// `ContextManager` via `restore_context`. Also verifies that
-/// `executed_proposals` (the replay protection set) persists across
-/// restart: a governance action executed before restart is rejected
-/// as a replay after restore.
-#[tokio::test]
-async fn context_manager_broadcast_restore_roundtrip() {
-    use mock_providers::*;
+/// Builds a `Supervisor` over caller-supplied shared persistence, a saga
+/// journal, and MLS storage (the ingredients `restore_on_startup` needs),
+/// mirroring `saga_bridge_bootstrap.rs::bridge_supervisor`.
+fn restore_supervisor(
+    creator_did: &str,
+    persistence: Arc<SharedPersistence>,
+    journal: Arc<dyn SagaJournal>,
+    mls_storage: Arc<dyn OpenMlsStorageAdapter>,
+    // The governance clock threaded into `ActorDeps`. Both the pre-restart
+    // supervisor and the restored one share ONE fixed clock so a re-submitted
+    // proposal recomputes the SAME `proposal_id` (the id hashes over the
+    // proposal timestamp — see `compute_proposal_id`), exercising the
+    // `executed_proposals` replay guard. `NodeMlsFactory` keeps a real
+    // `SystemClock` so MLS key-package lifetimes validate against wall time.
+    clock: Arc<dyn Clock>,
+) -> Arc<Supervisor> {
+    Supervisor::with_providers_and_journal(
+        Arc::new(NodeMlsFactory::new(
+            creator_did.to_owned(),
+            Arc::new(scp_clock::SystemClock),
+        )),
+        Box::new(LocalTransportProvider) as Box<dyn ContextTransportProvider>,
+        Box::new(NoOpEventLog) as Box<dyn ContextEventLogProvider>,
+        deterministic_key_resolver(),
+        Some(Box::new(SharedPersistenceArc(persistence))),
+        None,
+        None,
+        Some(clock),
+        DurableProviders::for_test(journal, mls_storage),
+    )
+}
 
-    let persistence = Arc::new(InMemoryContextPersistence::new());
-    let ctx_id = "ctx-manager-restore";
-    let creator_did = scp_did::DID::from("did:dht:z6MkAuthor1");
-    let bob_did = scp_did::DID::from("did:dht:z6MkBob");
+/// End-to-end: a governance `ApproveSpend` executed before a simulated restart
+/// leaves its Class-S `executed_proposals` replay marker durably persisted in
+/// the [`ContextSnapshot`]; after the context is rehydrated into a fresh
+/// `Supervisor` from that same persistence backend, the test asserts BOTH:
+///
+/// * **Accumulation** — the pre-restart marker is still present in the live
+///   actor and a SECOND governance action accumulates a new marker alongside
+///   the restored one, proving the replay-protection set (ADR-049 §9 Class-S)
+///   survives a restart.
+/// * **Replay rejection** — the pre-restart proposal, re-submitted verbatim on
+///   the restored supervisor, recomputes the identical `proposal_id` and is
+///   rejected with "already been executed" by the rehydrated marker. The
+///   durable marker is the load-bearing gate: a regression that dropped it (or
+///   stopped consulting it) would let the replay auto-execute a second time and
+///   return `Ok`, failing the assertion.
+///
+/// See the module-level ADR-049 note for how the verbatim re-submit reaches the
+/// `executed_proposals` guard and is rejected there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn executed_proposals_survive_restart_and_accumulate() {
+    let creator_str = "did:dht:z6MkPersistRestoreCreator";
+    let creator = DID::from(creator_str);
+    let signing_key = deterministic_signing_key(&creator);
+    let ctx_id = "ctx-persist-restore-replay";
 
-    // --- Phase 1: Create context, execute governance action, persist ---
+    // Shared backing stores survive the "crash" (drop of process 1's supervisor).
+    // The MLS storage backend MUST be shared too: an Encrypted context's MLS
+    // group state lives in the OpenMLS storage, and the restart's restore leg
+    // reinstates the group FROM that same backend.
+    let persistence = Arc::new(SharedPersistence::default());
+    let journal_storage = Arc::new(InMemoryStorage::new());
+    let mls_storage = test_mls_storage();
 
-    let params = ContextParams {
-        mode: ContextMode::Broadcast,
-        memory_scope: MemoryScope::Full,
-        ceiling: vec![
-            Capability::MessagesRead,
-            Capability::MessagesWrite,
-            Capability::RoleAssign,
-        ],
-        ..ContextParams::default()
+    // ONE fixed governance clock, shared by the pre-restart and restored
+    // supervisors and pinned to real wall time at test start (so it never
+    // advances but stays inside the MLS key-package validity window). A fixed
+    // timestamp is what lets the post-restore replay recompute the SAME
+    // `proposal_id` as the pre-restart proposal — the id hashes over the
+    // proposal's timestamp, so the two would otherwise diverge.
+    let clock: Arc<dyn Clock> = Arc::new(TestClock::new(SystemClock.now_secs()));
+
+    // The action re-submitted as the replay after restore. Reused verbatim so
+    // its JCS bytes — hence its `proposal_id` — match the pre-restart proposal.
+    let first_action = GovernanceAction::ApproveSpend {
+        spender: creator.clone(),
+        amount: Amount::new(1_000),
+        purpose: "restore-replay durability probe (pre-restart)".to_owned(),
     };
 
-    // ADR-049 §15 — wrap with `attach_test_supervisor`.
-    let manager = scp_core::context::attach_test_supervisor(ContextManager::with_persistence(
-        Box::new(MockCrypto),
-        Box::new(MockTransport),
-        Box::new(MockEventLog),
-        Box::new(SharedPersistence(Arc::clone(&persistence))),
-        mock_key_resolver(),
-    ));
+    // Captured before process 1 is dropped.
+    let first_proposal_id;
 
-    // Register creator DID as locally controlled.
-    manager.register_local_did(creator_did.clone()).await;
+    // === Process 1: create a context, execute a governance action, persist ===
+    {
+        let journal1: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(
+            Arc::clone(&journal_storage),
+        ));
+        let sup1 = restore_supervisor(
+            creator_str,
+            Arc::clone(&persistence),
+            journal1,
+            Arc::clone(&mls_storage),
+            Arc::clone(&clock),
+        );
+        sup1.register_local_did(creator.clone()).await.unwrap();
 
-    let _handle = manager
-        .create_context(ctx_id.into(), params.clone(), creator_did.clone(), None)
+        // `Encrypted` (MLS-backed) is the standard restore path: the group state
+        // lives in the shared OpenMLS storage and the restore leg reinstates it.
+        let params = ContextParams {
+            mode: ContextMode::Encrypted,
+            ..ContextParams::default()
+        };
+        sup1.create_context(ctx_id.to_owned(), params, creator.clone(), None)
+            .await
+            .expect("create_context");
+
+        // Under the default SingleAdmin governance the creator is admin, so this
+        // proposal auto-approves and EXECUTES — marking `executed_proposals` and
+        // persisting the Class-S snapshot fail-closed.
+        let (proposal, _events, execution) = sup1
+            .propose_governance_action(ctx_id, &creator, first_action.clone(), &signing_key)
+            .await
+            .expect("propose_governance_action (pre-restart)");
+        assert!(
+            execution.is_some(),
+            "SingleAdmin ApproveSpend by the admin must auto-execute"
+        );
+        first_proposal_id = proposal.proposal_id;
+
+        // Flush the live context to persistence — the durable `Active` snapshot
+        // the restart's restore leg must rehydrate (also captures the executed
+        // marker already committed Class-S above).
+        sup1.flush_all_contexts().await.expect("flush_all_contexts");
+
+        let snapshot = persistence
+            .load_context(ctx_id)
+            .await
+            .unwrap()
+            .expect("context must be persisted after the executed governance action");
+        assert!(
+            snapshot.executed_proposals.contains(&first_proposal_id),
+            "the executed proposal's replay marker must be Class-S persisted before restart"
+        );
+        assert_eq!(
+            snapshot.state,
+            ContextState::Active,
+            "the persisted snapshot must be Active so the restore leg rehydrates it"
+        );
+
+        // Drop sup1 (= process exit / crash) WITHOUT the in-memory actor state.
+    }
+
+    // === Process 2: fresh supervisor over the SAME durable stores, restored ===
+    let journal2: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(
+        &journal_storage,
+    )));
+    let sup2 = restore_supervisor(
+        creator_str,
+        Arc::clone(&persistence),
+        journal2,
+        Arc::clone(&mls_storage),
+        Arc::clone(&clock),
+    );
+    sup2.register_local_did(creator.clone()).await.unwrap();
+
+    // Pre-condition: the context is NOT yet resident (process 2 hasn't restored).
+    assert!(
+        sup2.read_context_state(ctx_id).await.is_none(),
+        "the context must be non-resident before restore_on_startup runs"
+    );
+
+    // Rehydrate every persisted Active context from the persistence backend.
+    let restored = sup2.restore_on_startup().await.expect("restore_on_startup");
+    assert!(
+        restored.iter().any(|id| id == ctx_id),
+        "restore_on_startup must rehydrate the persisted context, got {restored:?}"
+    );
+    assert_eq!(
+        sup2.read_context_state(ctx_id).await,
+        Some(ContextState::Active),
+        "the restored context must be a live Active actor"
+    );
+
+    // Execute a SECOND governance action after the restart. This forces the
+    // restored actor to (a) prove it rehydrated the prior `executed_proposals`
+    // marker and (b) accumulate a new one alongside it.
+    let (second_proposal, _events, second_execution) = sup2
+        .propose_governance_action(
+            ctx_id,
+            &creator,
+            GovernanceAction::ApproveSpend {
+                spender: creator.clone(),
+                amount: Amount::new(2_000),
+                purpose: "restore-replay durability probe (post-restart)".to_owned(),
+            },
+            &signing_key,
+        )
         .await
-        .unwrap();
-
-    // Build an approved AddMember governance proposal via SingleAdminEngine.
-    // AddMember does not require broadcast-specific setup -- it works with
-    // the context as created above.
-    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let mut engine = SingleAdminEngine::new(creator_did.clone(), mock_key_resolver());
-    let gov_ctx = GovernanceContext {
-        context_id: ctx_id.to_owned(),
-        members: vec![(creator_did.clone(), "admin".to_owned())],
-        admin_dids: vec![creator_did.clone()],
-        current_epoch: None,
-        now: 1000,
-    };
-    let action = GovernanceAction::AddMember {
-        did: bob_did.clone(),
-        role: "member".to_owned(),
-    };
-    let (proposal, _events) = engine
-        .propose(&creator_did, action, &gov_ctx, &signing_key)
-        .unwrap();
-    assert!(matches!(proposal.status, ProposalStatus::Approved));
-
-    // Capture the proposal_id for replay verification after restart.
-    let proposal_id = proposal.proposal_id;
-
-    // Execute the governance action (this persists the snapshot including
-    // executed_proposals via the shared persistence).
-    let result = manager.execute_governance_action(ctx_id, &proposal).await;
-    assert!(result.is_ok(), "first execution should succeed");
-
-    // Verify bob was actually added.
+        .expect("propose_governance_action (post-restart)");
     assert!(
-        manager.is_member(ctx_id, "did:dht:z6MkBob").await,
-        "bob should be a member after AddMember governance action"
+        second_execution.is_some(),
+        "the post-restart ApproveSpend must also auto-execute"
+    );
+    let second_proposal_id = second_proposal.proposal_id;
+    assert_ne!(
+        first_proposal_id, second_proposal_id,
+        "the two proposals must have distinct ids"
     );
 
-    // --- Phase 2: Verify persistence contains executed_proposals ---
-
-    let persisted = persistence.load_context(ctx_id).unwrap().unwrap();
+    // The re-persisted snapshot must carry BOTH markers: the restored one AND the
+    // post-restart one. If the restore leg had dropped `executed_proposals`, the
+    // post-restart Class-S persist would overwrite the snapshot with only the new
+    // marker and this assertion would fail.
+    let snapshot_after = persistence
+        .load_context(ctx_id)
+        .await
+        .unwrap()
+        .expect("context must remain persisted after the post-restart action");
     assert!(
-        persisted.executed_proposals.contains(&proposal_id),
-        "executed_proposals should be persisted after governance action"
-    );
-
-    // --- Phase 3: Drop first manager (simulates process exit) ---
-    drop(manager);
-
-    // --- Phase 4: Create a new manager, restore, and verify replay rejection ---
-
-    // ADR-049 §15 — wrap with `attach_test_supervisor`.
-    let manager2 = scp_core::context::attach_test_supervisor(ContextManager::with_persistence(
-        Box::new(MockCrypto),
-        Box::new(MockTransport),
-        Box::new(MockEventLog),
-        Box::new(SharedPersistence(Arc::clone(&persistence))),
-        mock_key_resolver(),
-    ));
-
-    let handle2 = ContextHandle::new(ctx_id.to_owned(), params);
-    handle2.transition_to(&ContextState::Active).unwrap();
-    manager2.restore_context(ctx_id, &handle2).await.unwrap();
-
-    // Verify membership survived restart.
-    assert!(
-        manager2.is_member(ctx_id, &creator_did.0).await,
-        "creator membership should survive restart"
+        snapshot_after
+            .executed_proposals
+            .contains(&first_proposal_id),
+        "the pre-restart replay marker must survive restore (rehydrated into the actor)"
     );
     assert!(
-        manager2.is_member(ctx_id, "did:dht:z6MkBob").await,
-        "bob membership should survive restart"
+        snapshot_after
+            .executed_proposals
+            .contains(&second_proposal_id),
+        "the post-restart replay marker must accumulate alongside the restored one"
     );
 
-    // Attempt to replay the SAME governance proposal after restart.
-    // This must be rejected -- the executed_proposals set should have
-    // been restored from persistence.
-    let replay_result = manager2.execute_governance_action(ctx_id, &proposal).await;
-    assert!(
-        replay_result.is_err(),
-        "replayed governance proposal must be rejected after restart"
+    // === Replay rejection: the rehydrated marker must BLOCK re-execution ===
+    //
+    // Re-submit the pre-restart proposal verbatim on the restored supervisor.
+    // Because the shared clock is fixed, this recomputes the identical
+    // `proposal_id` — prove it independently rather than trusting the runtime:
+    // the id is `compute_proposal_id(ctx, proposer, JCS(action), timestamp)`.
+    let replay_action_bytes =
+        scp_core::jcs::to_vec(&first_action).expect("JCS-encode the replayed action");
+    let recomputed_id =
+        compute_proposal_id(ctx_id, &creator, &replay_action_bytes, clock.now_secs());
+    assert_eq!(
+        recomputed_id, first_proposal_id,
+        "the verbatim re-submit must recompute the SAME proposal_id as the pre-restart proposal — \
+         otherwise the replay would target a fresh id and never reach the marker"
     );
-    let err_msg = format!("{}", replay_result.unwrap_err());
+
+    // The re-submit re-populates the (post-restore FRESH) governance engine and
+    // auto-approves under SingleAdmin, so it reaches `execute_governance_action`,
+    // whose replay guard finds `first_proposal_id` already in the rehydrated
+    // `executed_proposals` set and rejects it. This is the load-bearing property
+    // the durable marker exists for: a regression that dropped the restored
+    // marker (or stopped consulting it) would let this auto-execute a SECOND
+    // time and return `Ok`, failing the assertion below.
+    let replay = sup2
+        .propose_governance_action(ctx_id, &creator, first_action.clone(), &signing_key)
+        .await;
+    let err = replay.expect_err(
+        "replaying the pre-restart proposal after restore must be REJECTED — the rehydrated \
+         executed_proposals marker must block a second execution",
+    );
     assert!(
-        err_msg.contains("already been executed"),
-        "error should indicate replay: {err_msg}"
+        err.to_string().contains("already been executed"),
+        "the replay must be rejected as already-executed (the rehydrated marker firing), got: {err}"
+    );
+
+    // The rejected replay must NOT have added a third marker or mutated the set:
+    // the guard returns before the Class-S mark, so persistence still shows
+    // exactly the two legitimate markers.
+    let snapshot_after_replay = persistence
+        .load_context(ctx_id)
+        .await
+        .unwrap()
+        .expect("context must remain persisted after the rejected replay");
+    assert_eq!(
+        snapshot_after_replay.executed_proposals.len(),
+        2,
+        "the rejected replay must not add a marker — exactly the two executed proposals remain"
+    );
+    assert!(
+        snapshot_after_replay
+            .executed_proposals
+            .contains(&first_proposal_id)
+            && snapshot_after_replay
+                .executed_proposals
+                .contains(&second_proposal_id),
+        "both legitimate markers must remain after the rejected replay"
+    );
+}
+
+/// Actor-layer enforcement: a persisted context in the terminal `Expired` state
+/// is NOT resurrected by `restore_on_startup` (ADR-049 §10 anti-resurrection —
+/// only `Active` snapshots respawn), and any operation against it is REFUSED.
+///
+/// This is the runtime refusal the store-layer roundtrip tests (`ttl_expiry_*`,
+/// `expired_context_state_survives_restore`) deliberately cannot express: the
+/// `ProtocolRepository` store is state-agnostic (it persists/loads bytes and
+/// lists every context that has a state key), so lifecycle enforcement lives at
+/// the actor layer via `require_active` / the restore anti-resurrection skip —
+/// asserted here. A regression that revived a terminal context, or let a
+/// governance action execute against one, would FAIL this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_context_is_not_resurrected_and_refuses_operations() {
+    let creator_str = "did:dht:z6MkExpiredRefuseCreator";
+    let creator = DID::from(creator_str);
+    let signing_key = deterministic_signing_key(&creator);
+    let ctx_id = "ctx-expired-refuse-after-restore";
+
+    let persistence = Arc::new(SharedPersistence::default());
+    let journal_storage = Arc::new(InMemoryStorage::new());
+    let mls_storage = test_mls_storage();
+    let clock: Arc<dyn Clock> = Arc::new(TestClock::new(SystemClock.now_secs()));
+
+    // === Process 1: create an Active context and persist it. ===
+    {
+        let journal1: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(
+            Arc::clone(&journal_storage),
+        ));
+        let sup1 = restore_supervisor(
+            creator_str,
+            Arc::clone(&persistence),
+            journal1,
+            Arc::clone(&mls_storage),
+            Arc::clone(&clock),
+        );
+        sup1.register_local_did(creator.clone()).await.unwrap();
+        let params = ContextParams {
+            mode: ContextMode::Encrypted,
+            ..ContextParams::default()
+        };
+        sup1.create_context(ctx_id.to_owned(), params, creator.clone(), None)
+            .await
+            .expect("create_context");
+        sup1.flush_all_contexts().await.expect("flush_all_contexts");
+    }
+
+    // Rewrite the durable snapshot's lifecycle state to `Expired` — exactly the
+    // terminal snapshot a TTL-expiry transition leaves in persistence (the live
+    // actor's path to that state is covered by the runtime TTL-FSM tests in
+    // `scp-runtime`). This is the input the restart's restore leg must refuse to
+    // resurrect.
+    let mut expired = persistence
+        .load_context(ctx_id)
+        .await
+        .unwrap()
+        .expect("the Active snapshot must have been persisted");
+    expired.state = ContextState::Expired;
+    persistence
+        .persist_context(ctx_id, &expired)
+        .await
+        .expect("persist the terminal Expired snapshot");
+
+    // === Process 2: restart. `restore_on_startup` MUST skip the Expired snapshot. ===
+    let journal2: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(
+        &journal_storage,
+    )));
+    let sup2 = restore_supervisor(
+        creator_str,
+        Arc::clone(&persistence),
+        journal2,
+        Arc::clone(&mls_storage),
+        Arc::clone(&clock),
+    );
+    sup2.register_local_did(creator.clone()).await.unwrap();
+
+    let restored = sup2.restore_on_startup().await.expect("restore_on_startup");
+    assert!(
+        !restored.iter().any(|id| id == ctx_id),
+        "restore_on_startup must NOT resurrect a terminal Expired context, got {restored:?}"
+    );
+    assert!(
+        sup2.read_context_state(ctx_id).await.is_none(),
+        "an Expired context must not become a live actor after restore"
+    );
+
+    // A governance operation against the dormant, non-resident Expired context
+    // is refused — the enforcement this test name promises. With no live actor
+    // for the terminal context, the dispatch surfaces `ContextNotRegistered`.
+    let refused = sup2
+        .propose_governance_action(
+            ctx_id,
+            &creator,
+            GovernanceAction::ApproveSpend {
+                spender: creator.clone(),
+                amount: Amount::new(1),
+                purpose: "operation against an expired context (must be refused)".to_owned(),
+            },
+            &signing_key,
+        )
+        .await;
+    let err = refused
+        .expect_err("a governance operation on an expired, non-restored context must be REFUSED");
+    assert!(
+        matches!(
+            err,
+            scp_core::context::ContextError::ContextNotRegistered(_)
+        ),
+        "the refusal must be ContextNotRegistered (no live actor for the terminal context), got: {err:?}"
+    );
+
+    // The durable snapshot is untouched — still terminal, never resurrected.
+    let after = persistence
+        .load_context(ctx_id)
+        .await
+        .unwrap()
+        .expect("the Expired snapshot must remain persisted");
+    assert_eq!(
+        after.state,
+        ContextState::Expired,
+        "the refused operation must not have mutated or revived the terminal snapshot"
     );
 }
