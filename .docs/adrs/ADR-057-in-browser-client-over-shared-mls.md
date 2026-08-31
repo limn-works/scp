@@ -1,6 +1,6 @@
 # ADR-057: In-Browser SCP Clients Over a Shared `scp-mls` Crate (Keys On-Device)
 
-**Status:** Accepted (2026-06-30). Feasibility proven by a wasm32 compile spike; implementation staged across slices (see below). **Amended 2026-06-30** — see [Amendment: Dissolve `scp-primitives`; extract `scp-did`](#amendment-2026-06-30-dissolve-scp-primitives-extract-scp-did), which supersedes Prerequisite 3.
+**Status:** Accepted (2026-06-30). Feasibility proven by a wasm32 compile spike; implementation staged across slices (see below). **Amended 2026-06-30** — see [Amendment: Dissolve `scp-primitives`; extract `scp-did`](#amendment-2026-06-30-dissolve-scp-primitives-extract-scp-did), which supersedes Prerequisite 3. **Amended by ADR-063, inception-derived identity over a key-event log (2026-08-31)**: ADR-063 supersedes the did:dht substrate this ADR's body still describes — the did:dht `seq`-monotonicity rollback foundation and the `did:dht:z` parser path move onto the key-event log's Layer A rules — and the Track U4 drift sweep of the identity-substrate execution plan reconciles this ADR's body text; until it lands, read this ADR's did:dht prose against ADR-063's Consequences.
 
 **Amends:** ADR-055 (Remove the WASM Bridge; Browser Clients Are Remote Thin Clients) — specifically its *browser-deployment conclusion*. ADR-055's removal of the WASM **bridge** stands unchanged; this ADR revises only its claim that a browser must therefore be a *remote thin client with no in-browser protocol execution*.
 
