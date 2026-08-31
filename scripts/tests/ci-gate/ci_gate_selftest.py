@@ -1009,6 +1009,34 @@ def command_packages(tokens: list[str]) -> set[str]:
     return packages
 
 
+def command_excludes(tokens: list[str]) -> set[str]:
+    """Return the packages a cargo command drops with `--exclude`."""
+    excluded, take_next = set(), False
+    for token in tokens:
+        if take_next:
+            excluded.add(token)
+            take_next = False
+        elif token == "--exclude":
+            take_next = True
+    return excluded
+
+
+def command_covers_package(tokens: list[str], package: str) -> bool:
+    """Whether a cargo command compiles and runs `package`'s tests.
+
+    A command names a package with `-p`/`--package`, or takes every workspace
+    member with `--workspace`/`--all` and drops members with `--exclude`.
+    Reading `-p` alone reported job rust-test's `cargo nextest run --workspace`
+    as running no package at all, which would have left scp-identity's two
+    shipped-build assertions unchecked.
+    """
+    if package in command_excludes(tokens):
+        return False
+    if package in command_packages(tokens):
+        return True
+    return bool({"--workspace", "--all"} & set(tokens))
+
+
 def command_enables_testing(tokens: list[str], package: str) -> bool:
     """Whether a cargo command names `testing` for `package` in `--features`.
 
@@ -1027,21 +1055,73 @@ def command_enables_testing(tokens: list[str], package: str) -> bool:
     return False
 
 
-def command_selects(tokens: list[str], test_name: str) -> bool:
-    """Whether a cargo command runs `test_name`, given it selects its package.
+# A filterset this reader models: one or more `test(SUBSTRING)` predicates
+# joined by `+` or `|`, which are nextest's two union operators. A union selects
+# a test that any one predicate selects, so reading each predicate on its own
+# decides the whole expression.
+#
+# CRITERION for what this reader accepts: the expression must be a union of
+# `test()` predicates and nothing else. nextest also offers `-` (difference),
+# `not`, `and`, `&`, and set functions such as `all()` and `binary()`, and each
+# of those can REMOVE a test a `test()` predicate selected. Reading one of them
+# as a union would report a test as running that nextest never runs, so
+# check_shipped_build_assertions_run fails a job whose filterset this pattern
+# does not match rather than guessing at its meaning.
+NEXTEST_UNION_FILTERSET = re.compile(
+    r"^\s*test\(([^()]*)\)\s*(?:[+|]\s*test\(([^()]*)\)\s*)*$"
+)
+NEXTEST_TEST_PREDICATE = re.compile(r"test\(([^()]*)\)")
 
-    A command carrying no name filter runs every test its package compiles. A
-    command carrying an `-E` filterset or a positional filter runs `test_name`
-    only when that text names it.
+
+def filterset_patterns(text: str) -> list[str] | None:
+    """Return the substrings a `-E` filterset matches on, or None if unmodelled.
+
+    Returns None when `text` is anything other than a union of `test()`
+    predicates, so a caller fails loud instead of reading a difference or a
+    negation as a union.
     """
-    filters = []
+    if not NEXTEST_UNION_FILTERSET.match(text):
+        return None
+    return [m.group(1).strip() for m in NEXTEST_TEST_PREDICATE.finditer(text)]
+
+
+def command_filters(tokens: list[str]) -> tuple[list[str], list[str]]:
+    """Return (name substrings this command filters on, unmodelled filtersets).
+
+    An empty pair means the command runs every test its packages compile.
+    """
+    patterns: list[str] = []
+    unmodelled: list[str] = []
     for index, token in enumerate(tokens):
         if token in {"-E", "--filter-expr", "--filterset"} and index + 1 < len(tokens):
-            filters.append(tokens[index + 1])
-    filters += positional_filters(" ".join(shlex.quote(t) for t in tokens))
-    if not filters:
+            parsed = filterset_patterns(tokens[index + 1])
+            if parsed is None:
+                unmodelled.append(tokens[index + 1])
+            else:
+                patterns += parsed
+    patterns += positional_filters(" ".join(shlex.quote(t) for t in tokens))
+    return patterns, unmodelled
+
+
+def command_selects(tokens: list[str], test_name: str) -> bool:
+    """Whether a cargo command runs `test_name`, given it covers its package.
+
+    A command carrying no name filter runs every test its package compiles.
+    Every filter nextest and libtest take — a positional argument, and the
+    argument of a `test()` predicate — is a SUBSTRING of a test's full name, so
+    a filter selects `test_name` when `test_name` CONTAINS it. Reading the
+    containment the other way round (the filter text naming the test in full)
+    reported job fail-closed-pre-rotation's
+    `-E 'test(pre_rotation_severance)'` as selecting neither scp-node
+    assertion, which is why this check formerly skipped that job's package
+    outright.
+    """
+    patterns, unmodelled = command_filters(tokens)
+    if unmodelled:
+        return False
+    if not patterns:
         return True
-    return any(test_name in text for text in filters)
+    return any(pattern in test_name for pattern in patterns)
 
 
 def owning_package(source: Path) -> str:
@@ -1095,28 +1175,131 @@ def shipped_build_assertions() -> dict[str, dict[str, Path]]:
     return found
 
 
+def check_shipped_assertion_readers() -> None:
+    """Drive the three readers check_shipped_build_assertions_run rests on.
+
+    That check decides whether a fail-closed proof executes anywhere, and it
+    decides it by asking command_covers_package, filterset_patterns, and
+    command_selects about a command's tokens. A reader that answered "yes" to
+    every question would leave that check reporting success over work it did not
+    do, so each case below states an input whose answer is known and asserts the
+    reader returns it. The synthetic tokens are written here rather than read
+    from ci.yml, so a workflow edit cannot make a case vacuous.
+    """
+    workspace = split_command("cargo nextest run --workspace")
+    excluded = split_command("cargo nextest run --workspace --exclude scp-identity")
+    named = split_command("cargo nextest run -p scp-node --lib")
+    check(
+        "command_covers_package reads --workspace as covering a member",
+        command_covers_package(workspace, "scp-identity"),
+        "job rust-test runs `cargo nextest run --workspace`, so reading -p alone "
+        "would leave scp-identity's assertions checked by nothing",
+    )
+    check(
+        "command_covers_package reads --exclude as dropping a member",
+        not command_covers_package(excluded, "scp-identity"),
+        "--exclude removes the package from the run, so reporting it covered "
+        "would claim an assertion runs that nextest never compiles",
+    )
+    check(
+        "command_covers_package reads a package a command never names as uncovered",
+        not command_covers_package(named, "scp-identity"),
+        "this command names scp-node alone",
+    )
+
+    prefix_filter = split_command(
+        "cargo nextest run --no-tests=fail -p scp-node --lib "
+        "-E 'test(pre_rotation_severance)'"
+    )
+    check(
+        "command_selects reads a test() predicate as nextest does, by substring",
+        command_selects(prefix_filter, "pre_rotation_severance_generate_fails_closed"),
+        "nextest's test(SUBSTRING) matches every test whose name contains "
+        "SUBSTRING, so a filter naming a prefix does select this assertion",
+    )
+    check(
+        "command_selects rejects a name its filter's substring does not appear in",
+        not command_selects(
+            prefix_filter, "generate_fails_closed_without_pre_rotation_backend"
+        ),
+        "renaming an assertion out of a lane's -E filter must red this check; "
+        "the lane itself stays green because a sibling keeps the selection "
+        "non-empty under --no-tests=fail",
+    )
+    check(
+        "command_selects reads an unfiltered command as running every test",
+        command_selects(workspace, "pre_rotation_severance_generate_fails_closed"),
+        "`cargo nextest run --workspace` carries no name filter",
+    )
+
+    check(
+        "filterset_patterns reads a union of test() predicates",
+        filterset_patterns("test(alpha) + test(beta)") == ["alpha", "beta"],
+        "the pyo3 lane joins two predicates with +",
+    )
+    difference = split_command("cargo nextest run -p scp-node -E 'all() - test(alpha)'")
+    check(
+        "filterset_patterns refuses a filterset it does not model",
+        filterset_patterns("all() - test(alpha)") is None,
+        "a difference removes tests a test() predicate selected, so reading it "
+        "as a union would report an assertion running that nextest skips",
+    )
+    check(
+        "command_selects reports no selection for a filterset it does not model",
+        not command_selects(difference, "alpha_fails_closed"),
+        "an unmodelled filterset must fail this check by name rather than pass "
+        "on a guess about what it selects",
+    )
+
+
 def check_shipped_build_assertions_run(jobs: dict) -> None:
     """Every bridge's shipped-build assertions run in a production-config lane.
 
-    CRITERION: stated at SHIPPED_CONFIG_LANES. Two checks carry it. The first
-    requires each job in that table to run a test command over each package it
-    names, with that package's `testing` feature absent from `--features` — a
-    FLOOR, so a package holding no shipped-build assertion today still gets a
-    lane that would run one tomorrow. The second scans every `.rs` file under
-    crates/ and requires each shipped-build assertion it finds to be selected by
-    some lane's command, or to sit in a package
-    NON_BRIDGE_SHIPPED_ASSERTION_LANES pairs with the job that runs it.
+    CRITERION: stated at SHIPPED_CONFIG_LANES. Two checks carry it, and both
+    read SHIPPED_CONFIG_LANES and NON_BRIDGE_SHIPPED_ASSERTION_LANES at one
+    strength. The first requires each job either table names to run a test
+    command over each package it is paired with, with that package's `testing`
+    feature absent from `--features` — a FLOOR, so a package holding no
+    shipped-build assertion today still gets a lane that would run one
+    tomorrow. The second scans every `.rs` file under crates/ and requires each
+    shipped-build assertion it finds to be SELECTED BY NAME by a command in the
+    job its package is paired with.
+
+    The second check formerly skipped every package in
+    NON_BRIDGE_SHIPPED_ASSERTION_LANES, asking only whether that table's job
+    id was defined. Renaming `pre_rotation_severance_generate_fails_closed` out
+    of job fail-closed-pre-rotation's `-E 'test(pre_rotation_severance)'` filter
+    would then have left that assertion running in no lane while this check and
+    that job both reported success — a check reporting success over work it did
+    not do, which is the defect the pull request holding this file exists to
+    remove.
     """
-    executing: dict[str, list[list[str]]] = {}
+    # package -> every job id either table pairs it with. A set, not one id, so
+    # listing a package under two lanes reads both jobs' commands instead of
+    # letting whichever sorted last silently replace the other.
+    lanes: dict[str, set[str]] = {}
     for job_id, packages in sorted(SHIPPED_CONFIG_LANES.items()):
-        # Looked up by key so a renamed job raises a KeyError here rather than
-        # leaving this check running over nothing and reporting a pass.
-        commands = cargo_test_commands(jobs[job_id])
         for package in sorted(packages):
+            lanes.setdefault(package, set()).add(job_id)
+    for package, job_id in sorted(NON_BRIDGE_SHIPPED_ASSERTION_LANES.items()):
+        present = job_id in jobs
+        check(
+            f"{job_id}, which runs {package}'s shipped-build assertions, exists",
+            present,
+            f"ci.yml defines no job {job_id}",
+        )
+        if present:
+            lanes.setdefault(package, set()).add(job_id)
+
+    executing: dict[str, list[list[str]]] = {}
+    for package, job_ids in sorted(lanes.items()):
+        for job_id in sorted(job_ids):
+            # Looked up by key so a renamed job raises a KeyError here rather
+            # than leaving this check running over nothing and reporting a pass.
             selecting = [
                 tokens
-                for tokens in commands
-                if package in command_packages(tokens)
+                for tokens in cargo_test_commands(jobs[job_id])
+                if command_covers_package(tokens, package)
                 and not command_enables_testing(tokens, package)
             ]
             executing.setdefault(package, []).extend(selecting)
@@ -1129,26 +1312,15 @@ def check_shipped_build_assertions_run(jobs: dict) -> None:
                 f"in a lane that never executes it",
             )
 
-    for package, job_id in sorted(NON_BRIDGE_SHIPPED_ASSERTION_LANES.items()):
-        check(
-            f"{job_id}, which runs {package}'s shipped-build assertions, exists",
-            job_id in jobs,
-            f"ci.yml defines no job {job_id}",
-        )
-
-    lane_packages = {
-        package for names in SHIPPED_CONFIG_LANES.values() for package in names
-    }
     for package, assertions in sorted(shipped_build_assertions().items()):
-        if package in NON_BRIDGE_SHIPPED_ASSERTION_LANES:
-            continue
         check(
             f"{package}'s shipped-build assertions belong to a lane this check reads",
-            package in lane_packages,
+            package in lanes,
             f"{package} defines {sorted(assertions)} and appears in neither "
             f"SHIPPED_CONFIG_LANES nor NON_BRIDGE_SHIPPED_ASSERTION_LANES, so no "
             f"entry here states which job runs them",
         )
+        named = sorted(lanes.get(package, set())) or ["(no lane named)"]
         for test_name, source in sorted(assertions.items()):
             check(
                 f"{source.relative_to(REPO)}:{test_name} runs in a shipped-config lane",
@@ -1156,8 +1328,8 @@ def check_shipped_build_assertions_run(jobs: dict) -> None:
                     command_selects(tokens, test_name)
                     for tokens in executing.get(package, [])
                 ),
-                f"no command in {sorted(SHIPPED_CONFIG_LANES)} selects it, so this "
-                f"fail-closed proof executes nowhere",
+                f"no command in {named} selects it, so this fail-closed proof "
+                f"executes nowhere",
             )
 
 
@@ -1358,6 +1530,7 @@ def main() -> int:
         "shipped-config — a production-config lane runs its bridge's fail-closed "
         "assertions"
     )
+    check_shipped_assertion_readers()
     check_shipped_build_assertions_run(jobs)
 
     print(

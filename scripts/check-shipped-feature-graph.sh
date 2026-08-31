@@ -362,6 +362,12 @@ resolve_default_members_features() {
 #   Emit "scp-testing" iff a bare default-members build pulls that crate. Mirrors
 #   resolve_scp_testing_crate, which probes CRATE-NODE presence rather than
 #   feature edges, and catches a `scp-testing` pulled with no enabled features.
+#   Reads its tree through tree_names_scp_testing_crate, the single probe the
+#   fixture harness drives, so this function cannot carry the `grep -q` SIGPIPE
+#   fail-open that function's comment describes. `cargo tree -e no-dev` over
+#   every default member prints a superset of the 96,898-byte tree that comment
+#   measured, so a `grep -q` here would have read a scp-testing node near a top
+#   of that tree as ABSENT.
 resolve_default_members_testing_crate() {
   local raw rc
   raw="$(cargo tree -e no-dev 2>&1)"; rc=$?
@@ -370,7 +376,7 @@ resolve_default_members_testing_crate() {
       printf '%s\n' "$raw"; } >&2
     return 1
   fi
-  if printf '%s\n' "$raw" | grep -qE '(^|[^a-z-])scp-testing v'; then
+  if tree_names_scp_testing_crate "$raw"; then
     echo "scp-testing"
   fi
 }
@@ -478,6 +484,46 @@ expect() { # <label> <expected: PASS|FAIL> <actual-rc>
   fi
 }
 
+# assert_every_pipeline_reader_consumes_its_input
+#   Structural proof that no pipeline in THIS FILE can repeat the SIGPIPE
+#   fail-open that tree_names_scp_testing_crate's comment describes.
+#
+#   The four (SIGPIPE) fixtures below drive tree_names_scp_testing_crate with
+#   synthetic trees, so they prove that ONE probe reads its whole input. They
+#   cannot see a second probe written elsewhere in this file, and
+#   resolve_default_members_testing_crate carried exactly such a second probe:
+#   `printf | grep -qE` over the tree `cargo tree -e no-dev` prints for every
+#   default member. This fixture closes that gap over the whole file.
+#
+#   CRITERION: every stage this file pipes into reads its input to end of file.
+#   A stage that exits before its writer finishes kills that writer with SIGPIPE,
+#   `set -o pipefail` reports 141, and an `if` on that pipeline takes its else
+#   branch — the fail-open verdict on a ZERO-nullifier gate.
+#
+#   The criterion is decidable over this file because the commands this file
+#   pipes into are `grep`, `sed`, `sort`, and `comm`, and only `grep` offers an
+#   early exit: `-q`/`--quiet`/`--silent`, which stops at a first match, and
+#   `-m N`/`--max-count=N`, which stops at an Nth one. `sed`, `sort`, and `comm`
+#   read to end of file under every invocation this file writes. So rejecting
+#   those two grep options, plus a pipe into `head`, decides the criterion
+#   rather than sampling spellings of it.
+assert_every_pipeline_reader_consumes_its_input() {
+  echo ">> fixture: every stage this gate pipes into reads its whole input, so no probe can report SIGPIPE (141) as a verdict"
+  local self offenders
+  self="${BASH_SOURCE[0]}"
+  offenders="$(grep -nE '\|[[:space:]]*(head[[:space:]]|grep[[:space:]]+(-[a-zA-Z]*q|--quiet|--silent|-m[[:space:]]|--max-count))' "$self" \
+    | grep -vE '^[0-9]+:[[:space:]]*#' || true)"
+  if [[ -n "$offenders" ]]; then
+    echo "   FAIL — a pipeline stage below exits before its writer finishes, so pipefail"
+    echo "          reports 141 and the enclosing test reads a match as a NON-match:"
+    printf '%s\n' "$offenders" | sed 's/^/       x /'
+    echo "          Write 'grep -E ... >/dev/null' and read grep's own status instead."
+    fixture_failures=$((fixture_failures + 1))
+    return
+  fi
+  echo "   ok   — no pipeline in this gate feeds a reader that stops early"
+}
+
 assert_allowlist_has_no_nullifier() {
   echo ">> fixture: allowlist carries ZERO enumerated control-nullifier features — no NULLIFIER_CONTROL_FEATURES entry (custody/attestation/DHT/did:key/test-harness double, or an allow_unencrypted_storage encryption-at-rest unseal) appears (AC7)"
   local nf
@@ -563,6 +609,8 @@ run_fixtures() {
   expect "(SIGPIPE) a tree carrying no scp-testing node is still reported ABSENT" "FAIL" "$probe_rc"
   tree_names_scp_testing_crate "$(printf 'my-scp-testing v0.1.0\n%s' "$padded")"; probe_rc=$?
   expect "(SIGPIPE) a crate whose name merely ends in scp-testing is not matched" "FAIL" "$probe_rc"
+
+  assert_every_pipeline_reader_consumes_its_input
 
   assert_allowlist_has_no_nullifier
 

@@ -1,6 +1,6 @@
 # A Green Check That Asserted Nothing: Eleven Ways CI Reported Success Over Zero Work
 
-**Date:** 2026-08-16, extended 2026-08-17, 2026-08-22 and 2026-08-25
+**Date:** 2026-08-16, extended 2026-08-17, 2026-08-22, 2026-08-25 and 2026-08-31
 **Source:** branch `fix/ci-enforces-what-it-claims` — `.github/workflows/ci.yml`, `.github/workflows/fuzz.yml`, `.github/workflows/release.yml`, `scripts/check-cross-layer.sh`, `scripts/check-shipped-feature-graph.sh`
 
 ## Rule
@@ -61,6 +61,19 @@ node. There it failed OPEN rather than closed: `cargo tree -e no-dev -p scp-node
 made `grep -q` report the harness crate ABSENT, which is the verdict that lets a shipped
 artifact pass a zero-nullifier gate. Fixing one instance of this construct is not
 finishing: grep every gate for `grep -q` inside a pipeline. That grep found three more.
+Fixing one instance inside one file is not finishing either. The first pass through
+`scripts/check-shipped-feature-graph.sh` rewrote the per-artifact probe and left an
+identical `printf | grep -qE` in `resolve_default_members_testing_crate`, 120 lines
+below it, which probes the same crate node for the bare `cargo build` that
+`.github/workflows/build-matrix.yml` runs at the workspace root. `cargo tree -e no-dev`
+over every default member prints a superset of the 96,898-byte tree measured above, so
+that second probe carried the same fail-open verdict on the same gate. A fixture
+harness that drives one extracted function proves that one function reads its whole
+input and says nothing about a second probe written elsewhere in the file, so
+`assert_every_pipeline_reader_consumes_its_input` now reads the gate's own source and
+rejects any pipeline stage that stops early. It decides that question rather than
+sampling it: the commands this gate pipes into are `grep`, `sed`, `sort` and `comm`, and
+only `grep` offers an early exit — `-q`/`--quiet`/`--silent` and `-m N`/`--max-count=N`.
 `scripts/hooks/pretooluse-enforcement-files.sh`, which blocks an in-band write to any
 enforcement file, ran `echo "$command_str" | grep -qE`, so an agent defeated it by making
 its command long: measured, a 43-byte `tee` at a protected basename exited 2 (BLOCK), and
@@ -194,10 +207,36 @@ reason to leave an assertion unrun: this one took five added attributes and one 
 import gate.
 `check_shipped_build_assertions_run` in `scripts/tests/ci-gate/ci_gate_selftest.py` now
 scans every `.rs` file under `crates/` for a test carrying
-`#[cfg(not(feature = "testing"))]` and requires each one to sit in a package some
-production-config lane's command selects, or in a package a second table pairs with the
-job that runs it. A crate that gains such a test and names no lane fails that check by
-name.
+`#[cfg(not(feature = "testing"))]` and requires a command in the job its package is
+paired with to select it BY NAME. A crate that gains such a test and names no lane fails
+that check by name.
+
+That check first shipped holding its two tables to two different strengths, which is
+failure shape 11 written into the check that catches failure shape 11. For the three
+bridge packages it asked whether a lane's command selected each assertion. For the two
+packages `NON_BRIDGE_SHIPPED_ASSERTION_LANES` names — `scp-identity` and `scp-node` — it
+asked only whether that table's job id was defined in `ci.yml`, then skipped the
+per-assertion loop. Renaming `pre_rotation_severance_generate_fails_closed` out of job
+fail-closed-pre-rotation's `-E 'test(pre_rotation_severance)'` filter would have left
+that SCP-IDENT-1059 fail-closed proof running in no lane while both checks reported
+success: the lane stays green because its sibling keeps the nextest selection non-empty
+under `--no-tests=fail`, and the self-test stays green because the job id it asked about
+still exists. Measured: with that filter narrowed to
+`test(pre_rotation_severance_persistent)`, the check as first written passed 279 of 279
+assertions, and the check as it now stands names
+`pre_rotation_severance_generate_fails_closed` as running nowhere.
+
+Two readers had to widen before one criterion could cover both tables. `--workspace`
+selects every workspace member, so a reader of `-p` alone reported job `rust-test`'s
+`cargo nextest run --workspace` as running no package at all; `command_covers_package`
+now reads `--workspace`/`--all` and subtracts `--exclude`. A nextest `test(SUBSTRING)`
+predicate matches every test whose name CONTAINS that substring, so a reader asking
+whether a filter's text spells a test's full name reported
+`-E 'test(pre_rotation_severance)'` as selecting neither scp-node assertion;
+`command_selects` now reads the containment as nextest evaluates it. It models a union
+of `test()` predicates joined by `+` or `|` and nothing else, because `-`, `not`, `and`,
+`&` and the set functions can each REMOVE a test a `test()` predicate selected — a
+filterset outside that grammar fails the check rather than passing on a guess.
 
 ## Tests holding these closed
 
@@ -208,8 +247,12 @@ name.
   that input and covers every permitted option, that no step gates itself on a `changes`
   filter output, that each of the three production-config bridge jobs runs a test command
   over its own package with that package's `testing` feature absent, that every
-  `#[cfg(not(feature = "testing"))]` test under `crates/` is selected by one of those
-  commands or belongs to a package paired with the job that runs it, that the `fuzz` and
+  `#[cfg(not(feature = "testing"))]` test under `crates/` is selected by name by a
+  command in the job its package is paired with, that the readers deciding that question
+  answer nine synthetic cases correctly — `--workspace` covers a member, `--exclude`
+  drops one, a `test()` predicate selects by substring, a renamed assertion falls out of
+  that filter, an unfiltered command selects everything, and a filterset carrying a
+  difference is refused rather than guessed at — that the `fuzz` and
   `typescript-wasm` filters cover the path-dependency
   closure of the manifests they guard, that every release.yml job uploading a `-signed`
   artifact runs its non-empty-input guard before that upload and that all three known
@@ -222,6 +265,10 @@ name.
   the workspace manifest an inherited entry reads, holds that workspace's `Cargo.lock`
   once one exists, and holds no enclosing lockfile for a crate carrying its own
   `[workspace]` table.
+- `scripts/check-shipped-feature-graph.sh --self-test` — four fixtures pad a synthetic
+  `cargo tree` past 200 KB and assert `tree_names_scp_testing_crate` returns one verdict
+  whether the `scp-testing v0.1.0` line sits first or last, and a fifth reads the gate's
+  own source and rejects any pipeline stage that stops before its writer finishes.
 - `scripts/tests/cross-layer/run-tests.sh` — plants an FFI export at a first line and at
   a last line of a 155 KB diff, proves that gate finds both, then plants a missing export
   and proves it still rejects that.
