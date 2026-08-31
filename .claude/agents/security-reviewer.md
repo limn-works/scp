@@ -36,10 +36,10 @@ Errors should be helpful to users without exposing internals (stack traces, file
 
 Read `CLAUDE.md` for the technology stack. Key security surfaces include API communication (API keys), sync infrastructure (untrusted remote data), local persistence (sensitive fields), and any development-only services that must be properly gated.
 
-### SCP-specific authorization checklist (from Phase B audit):
-- **TOCTOU capability checks**: If a capability is checked under one lock acquisition and the gated action happens under a DIFFERENT lock acquisition, it's a TOCTOU. Capabilities can be revoked between check and action. Check + action must be atomic under the same lock. Known instances: GovernancePropose (fixed), GovernanceVote (known gap).
-- **Phase 3 confused deputy**: When a per-context Mutex is dropped and reacquired, the context could have been removed and recreated with the same ID. All Phase 3 reacquires MUST verify a generation token. Bare `contexts.get()` without generation check allows operations on wrong context state.
-- **Stale state in background tasks**: TTL timers and governance timeout tasks hold Arc references to per-context state. If the context is removed and recreated, the task operates on orphaned state unless generation is checked.
+### SCP-specific authorization checklist (Phase B audit, restated against the ADR-049 actor model):
+- **TOCTOU capability checks**: A capability check and its gated action are atomic only when both run inside the SAME actor mailbox turn. A capability checked supervisor-side before dispatch, or checked in one turn with the action in a later turn, can be revoked in the gap. Audit every governance and close path (GovernancePropose, GovernanceVote, ContextClose) for a check/action split across turns.
+- **Off-mailbox confused deputy**: Work that leaves the actor mailbox and re-enters later (the outlet-economy reserve → execute → settle split runs its executor supervisor-side) MUST verify the spawn-generation token captured at reserve (`Supervisor::spawn_generation`, stamped onto `PerContextState::generation`) before applying its result — the actor may have been despawned and respawned for the same context id in the gap. Resolving the context through `actors` at settle time without a generation check applies the result to a different instance's state.
+- **Stale state in background tasks**: TTL timers and governance timeout tasks hold Arc references to per-context state. If the actor for a context is despawned and respawned, the task operates on the dead instance's state unless it re-resolves the handle through `actors` or verifies the spawn generation.
 - **Webhook SSRF**: DNS hostnames bypass IP blocklist (resolved by DNS pre-resolution). Verify all outbound HTTP uses HTTPS-only + no-redirect + DNS validation.
 - **Checkpoint signature verification**: Remote checkpoints must have Ed25519 signature + membership verified BEFORE comparing Merkle roots.
 
