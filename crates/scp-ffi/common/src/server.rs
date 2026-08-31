@@ -917,6 +917,9 @@ impl RunningNode {
     /// # Errors
     ///
     /// Returns [`NodeError`] if the context is not projected or commit fails.
+    /// A deploy whose blob scan matched no asset counts as a failed commit per
+    /// §18.11.11 of `.docs/specs/18-addressability-and-deployment.md`, so the
+    /// index this context already serves stays in place.
     pub async fn commit_deploy(
         &self,
         context_id: &str,

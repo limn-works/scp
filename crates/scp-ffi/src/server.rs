@@ -1043,12 +1043,22 @@ mod tests {
             "RunningNode enable should succeed: {result:?}"
         );
 
-        // commit_deploy — will fail because no blobs exist but should return
-        // a proper error, not panic.
         let cd_result = rt().block_on(inner.commit_deploy("dispatch-ctx", "deploy-abc"));
-        // This will return an error about no assets or similar — the important
-        // thing is that dispatch works and doesn't panic.
-        assert!(cd_result.is_ok() || cd_result.is_err());
+        // Code above projected this context, which holds no staged blob, so
+        // §18.11.11 of `.docs/specs/18-addressability-and-deployment.md` makes
+        // this an empty deploy, which fails. Dispatch reached this node, which
+        // the error text proves: an unprojected context reports "not
+        // projected" instead, as
+        // `commit_deploy_on_unprojected_context_returns_error` pins. An
+        // earlier assertion read `is_ok() || is_err()`, which every value
+        // satisfies.
+        let message = cd_result
+            .expect_err("an empty deploy fails rather than swapping in an empty path index")
+            .to_string();
+        assert!(
+            message.contains("matched no staged asset"),
+            "dispatch must reach the projected context and refuse the empty deploy: {message}"
+        );
 
         // disable
         rt().block_on(inner.disable_broadcast_projection("dispatch-ctx"));

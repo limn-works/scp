@@ -1277,8 +1277,11 @@ impl<S: Storage> ApplicationNode<S> {
     /// # Errors
     ///
     /// Returns [`NodeError::InvalidConfig`] if the context is not projected
-    /// or has no site config. Returns [`NodeError::Storage`] on storage
-    /// failures.
+    /// or has no site config. Returns [`NodeError::InvalidConfig`] when the
+    /// blob scan matched no asset under `deploy_id`, which §18.11.11 of
+    /// `.docs/specs/18-addressability-and-deployment.md` requires so that an
+    /// empty deploy leaves whatever the node currently serves in place.
+    /// Returns [`NodeError::Storage`] on storage failures.
     #[allow(clippy::too_many_lines)]
     pub async fn commit_deploy(
         &self,
@@ -1452,6 +1455,18 @@ impl<S: Storage> ApplicationNode<S> {
                     content_type,
                 },
             );
+        }
+
+        // §18.11.11 step 2, empty deploy: a scan that matched no blob under
+        // this deploy_id proves nothing about operator intent, so this commit
+        // fails here — before it writes a manifest and before it swaps the
+        // pointer. Swapping an empty PathIndex in would make every path the
+        // previous deploy served answer 404, and would push that previous
+        // deploy into history behind an index serving nothing.
+        if entries.is_empty() {
+            return Err(NodeError::InvalidConfig(format!(
+                "deploy {deploy_id} matched no staged asset, so the current deploy stands"
+            )));
         }
 
         // Store deploy manifest as a special blob.

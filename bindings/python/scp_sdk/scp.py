@@ -2977,7 +2977,20 @@ class SCP:
     async def address_resolve(
         self, owner_did: str, address: str, known_contexts_json: str | None = None
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.address_resolve``."""
+        """Delegate to ``_scp_core.SCP.address_resolve``.
+
+        Returns a JSON string holding one object with two keys.
+        ``resolutions`` carries the AddressResolution entries sorted by trust
+        level, highest first. ``unavailable_layers`` carries every layer
+        nobody queried, each with a ``layer`` name and a ``reason``. Both keys
+        are always present.
+
+        Read ``unavailable_layers`` before acting on the first entry in
+        ``resolutions``: spec §22.8.2 ranks by trust, so a layer nobody
+        queried may hold a binding that outranks every entry there. This
+        bridge configures no domain, so an unscoped address always reports the
+        domain layer.
+        """
         return await asyncio.to_thread(
             self._native.address_resolve, owner_did, address, known_contexts_json
         )

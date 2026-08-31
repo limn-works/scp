@@ -22,8 +22,8 @@ use std::sync::Mutex;
 
 use scp_clock::Clock;
 use scp_core::discovery::addressing::{
-    AddressResolution, AddressType, HandleQuerier, HandleTarget, ResolutionLayer, ResolutionPath,
-    TrustLevel,
+    AddressResolution, AddressResolutionOutcome, AddressType, AddressingError, HandleQuerier,
+    HandleTarget, LayerUnavailable, ResolutionLayer, ResolutionPath, TrustLevel,
 };
 use scp_core::discovery::handles::{
     HandleEntry, HandleLookupParams, HandleRegistry, HandleTypeFilter,
@@ -128,6 +128,39 @@ pub fn address_resolution_to_json(resolution: &AddressResolution) -> serde_json:
     }
 }
 
+/// Converts one [`LayerUnavailable`] into a JSON value.
+#[must_use]
+pub fn layer_unavailable_to_json(unavailable: &LayerUnavailable) -> serde_json::Value {
+    serde_json::json!({
+        "layer": resolution_layer_name(&unavailable.layer),
+        "reason": unavailable.reason,
+    })
+}
+
+/// Converts an [`AddressResolutionOutcome`] into the JSON object every bridge
+/// returns from `address_resolve`.
+///
+/// The object holds `resolutions` and `unavailable_layers`. A caller reads
+/// `unavailable_layers` to learn which layers this deployment never queried,
+/// which §22.8.2 of `.docs/specs/22-human-readable-addressing.md` makes
+/// load-bearing: results rank by trust level, so an unqueried higher-trust
+/// layer may hold a binding that outranks every binding in `resolutions`.
+#[must_use]
+pub fn address_resolution_outcome_to_json(outcome: &AddressResolutionOutcome) -> serde_json::Value {
+    serde_json::json!({
+        "resolutions": outcome
+            .resolutions
+            .iter()
+            .map(address_resolution_to_json)
+            .collect::<Vec<_>>(),
+        "unavailable_layers": outcome
+            .unavailable_layers
+            .iter()
+            .map(layer_unavailable_to_json)
+            .collect::<Vec<_>>(),
+    })
+}
+
 /// Converts a [`TrustLevel`] into a JSON value.
 #[must_use]
 pub fn trust_level_to_json(trust_level: &TrustLevel) -> serde_json::Value {
@@ -146,16 +179,23 @@ pub fn trust_level_to_json(trust_level: &TrustLevel) -> serde_json::Value {
     }
 }
 
-/// Converts a [`ResolutionPath`] into a JSON value.
+/// Names a [`ResolutionLayer`] for JSON, so a resolution path and an
+/// unavailable layer spell one layer the same way.
 #[must_use]
-pub fn resolution_path_to_json(path: &ResolutionPath) -> serde_json::Value {
-    let layer = match path.layer {
+pub const fn resolution_layer_name(layer: &ResolutionLayer) -> &'static str {
+    match layer {
         ResolutionLayer::Petname => "Petname",
         ResolutionLayer::HandleRegistry => "HandleRegistry",
         ResolutionLayer::Attestation => "Attestation",
         ResolutionLayer::Domain => "Domain",
         ResolutionLayer::MultiLayerCorroborated => "MultiLayerCorroborated",
-    };
+    }
+}
+
+/// Converts a [`ResolutionPath`] into a JSON value.
+#[must_use]
+pub fn resolution_path_to_json(path: &ResolutionPath) -> serde_json::Value {
+    let layer = resolution_layer_name(&path.layer);
     serde_json::json!({
         "layer": layer,
         "source": path.source,
@@ -277,6 +317,35 @@ pub fn handle_entry_to_resolution(
 }
 
 // ---------------------------------------------------------------------------
+// Address-resolution error mapping
+// ---------------------------------------------------------------------------
+
+/// Maps an address-resolution failure onto one FFI error code, shared by all
+/// three bridges so that no bridge reports a different code for one failure.
+///
+/// [`AddressingError::LayersUnavailable`] carries its own code, because a
+/// caller acts differently on "this build queries no attestation index" than
+/// on "no DID registered that handle".
+///
+/// The match names every variant and uses no wildcard arm, so adding a variant
+/// to [`AddressingError`] stops this crate compiling until somebody assigns
+/// that variant a code. A wildcard arm would instead hand a new "capability
+/// absent" variant the "binding absent" code and report nothing.
+#[must_use]
+pub const fn address_resolution_error_code(error: &AddressingError) -> &'static str {
+    match error {
+        AddressingError::LayersUnavailable { .. } => crate::error_codes::VALID_7136,
+        AddressingError::EmptyAddress
+        | AddressingError::LocalPartTooLong
+        | AddressingError::InvalidLocalPartCharacters
+        | AddressingError::InvalidLocalPartBoundary
+        | AddressingError::ConsecutivePeriods
+        | AddressingError::NotFound(_)
+        | AddressingError::ResolutionFailed { .. } => crate::error_codes::VALID_7091,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HandleQuerier implementation
 // ---------------------------------------------------------------------------
 
@@ -306,12 +375,24 @@ impl HandleQuerier for LocalHandleQuerier<'_> {
         context_id: &String,
         handle: &str,
         type_filter: Option<AddressType>,
-    ) -> Vec<AddressResolution> {
+    ) -> Result<Vec<AddressResolution>, LayerUnavailable> {
         let Ok(guard) = self.registries.lock() else {
-            return Vec::new();
+            return Err(LayerUnavailable {
+                layer: ResolutionLayer::HandleRegistry,
+                reason: "handle registry mutex is poisoned on this bridge instance".to_owned(),
+            });
         };
         let Some(registry) = guard.get(context_id.as_str()) else {
-            return Vec::new();
+            // This bridge holds no registry for that context, and it invokes
+            // no remote `handle_lookup` outlet, so nobody looked. An empty
+            // result vector would instead claim that somebody looked and
+            // found no registration.
+            return Err(LayerUnavailable {
+                layer: ResolutionLayer::HandleRegistry,
+                reason: format!(
+                    "no local handle registry for context {context_id}, and this bridge invokes no remote handle_lookup outlet"
+                ),
+            });
         };
 
         let filter = type_filter.map(|tf| match tf {
@@ -326,28 +407,45 @@ impl HandleQuerier for LocalHandleQuerier<'_> {
 
         let now = scp_clock::SystemClock.now_secs();
 
-        result
+        Ok(result
             .results
             .into_iter()
             .map(|entry| handle_entry_to_resolution(&entry, context_id, now))
-            .collect()
+            .collect())
     }
 
-    async fn lookup_domain_handle(&self, _domain: &str, _handle: &str) -> Vec<AddressResolution> {
-        // Domain handle resolution requires HTTP I/O to fetch .well-known/scp.
-        // Not available in FFI bridge — requires transport layer infrastructure.
-        Vec::new()
+    async fn lookup_domain_handle(
+        &self,
+        _domain: &str,
+        _handle: &str,
+    ) -> Result<Vec<AddressResolution>, LayerUnavailable> {
+        // Domain handle resolution fetches `.well-known/scp` over HTTP, and
+        // this bridge performs no HTTP I/O. Reporting an empty result vector
+        // would tell a caller that a domain published no such handle.
+        Err(LayerUnavailable {
+            layer: ResolutionLayer::Domain,
+            reason:
+                "this bridge performs no .well-known/scp fetch, so no domain handle map was read"
+                    .to_owned(),
+        })
     }
 
     async fn lookup_attestation_handle(
         &self,
         _handle: &str,
         _platform: Option<&str>,
-    ) -> Vec<AddressResolution> {
-        // Attestation handle resolution requires querying attestation indexes
-        // in contexts with discovery outlets. Not available in FFI bridge — requires
-        // context query infrastructure.
-        Vec::new()
+    ) -> Result<Vec<AddressResolution>, LayerUnavailable> {
+        // §22.5.1 places attestation reverse-lookup behind an
+        // `attestation_lookup` outlet in a context with discovery outlets.
+        // This bridge invokes no outlet against a remote context, so it
+        // queries no attestation index. Reporting an empty result vector
+        // would tell a caller that no DID claims that platform handle.
+        Err(LayerUnavailable {
+            layer: ResolutionLayer::Attestation,
+            reason:
+                "this bridge invokes no attestation_lookup outlet, so no attestation index was queried"
+                    .to_owned(),
+        })
     }
 }
 
@@ -514,6 +612,168 @@ mod tests {
             assert_eq!(json["source"], "src");
             assert_eq!(json["source_id"], "id");
             assert_eq!(json["resolved_at"], 42);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // JSON serialization: address_resolution_outcome_to_json
+    // -----------------------------------------------------------------------
+
+    /// Every bridge returns this object from `address_resolve`, so a caller in
+    /// Python, TypeScript, Swift or Kotlin can separate "the attestation layer
+    /// held no binding" from "nobody queried the attestation layer".
+    #[test]
+    fn address_resolution_outcome_to_json_carries_both_keys() {
+        let outcome = AddressResolutionOutcome {
+            resolutions: vec![AddressResolution::Identity {
+                did: scp_did::DID::from("did:dht:zAlice"),
+                trust_level: TrustLevel::HandleRegistryVerified,
+                resolution_path: ResolutionPath {
+                    layer: ResolutionLayer::HandleRegistry,
+                    source: "cooking-community".to_owned(),
+                    source_id: Some("ctx-cooking".to_owned()),
+                    resolved_at: 1_700_000_000,
+                },
+            }],
+            unavailable_layers: vec![
+                LayerUnavailable {
+                    layer: ResolutionLayer::Attestation,
+                    reason: "this bridge invokes no attestation_lookup outlet".to_owned(),
+                },
+                LayerUnavailable {
+                    layer: ResolutionLayer::Domain,
+                    reason: "this bridge performs no .well-known/scp fetch".to_owned(),
+                },
+            ],
+        };
+
+        let json = address_resolution_outcome_to_json(&outcome);
+
+        let resolutions = json["resolutions"]
+            .as_array()
+            .expect("resolutions must serialize as an array");
+        assert_eq!(resolutions.len(), 1);
+        assert_eq!(resolutions[0]["did"], "did:dht:zAlice");
+
+        let unavailable = json["unavailable_layers"]
+            .as_array()
+            .expect("unavailable_layers must serialize as an array");
+        assert_eq!(unavailable.len(), 2);
+        assert_eq!(unavailable[0]["layer"], "Attestation");
+        assert_eq!(
+            unavailable[0]["reason"],
+            "this bridge invokes no attestation_lookup outlet"
+        );
+        assert_eq!(unavailable[1]["layer"], "Domain");
+        assert_eq!(
+            unavailable[1]["reason"],
+            "this bridge performs no .well-known/scp fetch"
+        );
+    }
+
+    /// A resolution that queried every layer still carries the key, holding an
+    /// empty array, so a caller reads one shape whatever happened.
+    #[test]
+    fn address_resolution_outcome_to_json_keeps_the_key_when_every_layer_answered() {
+        let outcome = AddressResolutionOutcome {
+            resolutions: Vec::new(),
+            unavailable_layers: Vec::new(),
+        };
+
+        let json = address_resolution_outcome_to_json(&outcome);
+
+        assert!(
+            json["unavailable_layers"].is_array(),
+            "unavailable_layers must be present even when empty"
+        );
+        assert_eq!(
+            json["unavailable_layers"]
+                .as_array()
+                .expect("checked above")
+                .len(),
+            0
+        );
+    }
+
+    /// One layer spells the same in a resolution path and in an unavailable
+    /// layer, so a caller matches one set of names.
+    #[test]
+    fn layer_unavailable_to_json_uses_the_resolution_path_layer_names() {
+        for layer in [
+            ResolutionLayer::Petname,
+            ResolutionLayer::HandleRegistry,
+            ResolutionLayer::Attestation,
+            ResolutionLayer::Domain,
+            ResolutionLayer::MultiLayerCorroborated,
+        ] {
+            let path = ResolutionPath {
+                layer: layer.clone(),
+                source: "src".to_owned(),
+                source_id: None,
+                resolved_at: 42,
+            };
+            let unavailable = LayerUnavailable {
+                layer,
+                reason: "nobody queried it".to_owned(),
+            };
+            assert_eq!(
+                resolution_path_to_json(&path)["layer"],
+                layer_unavailable_to_json(&unavailable)["layer"]
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // address_resolution_error_code
+    // -----------------------------------------------------------------------
+
+    /// A caller distinguishes "a capability is absent" from "a binding is
+    /// absent" by the code alone, so the two failures never share one code.
+    #[test]
+    fn layers_unavailable_and_not_found_carry_different_codes() {
+        let unavailable = AddressingError::LayersUnavailable {
+            address: "alice".to_owned(),
+            layers: vec![LayerUnavailable {
+                layer: ResolutionLayer::Attestation,
+                reason: "no attestation_lookup outlet".to_owned(),
+            }],
+        };
+        let not_found = AddressingError::NotFound("alice".to_owned());
+
+        assert_eq!(
+            address_resolution_error_code(&unavailable),
+            crate::error_codes::VALID_7136
+        );
+        assert_eq!(
+            address_resolution_error_code(&not_found),
+            crate::error_codes::VALID_7091
+        );
+        assert_ne!(
+            address_resolution_error_code(&unavailable),
+            address_resolution_error_code(&not_found)
+        );
+    }
+
+    /// Every parse failure keeps the address-resolution code the three bridges
+    /// reported before `LayersUnavailable` existed.
+    #[test]
+    fn parse_failures_keep_the_address_resolution_code() {
+        for error in [
+            AddressingError::EmptyAddress,
+            AddressingError::LocalPartTooLong,
+            AddressingError::InvalidLocalPartCharacters,
+            AddressingError::InvalidLocalPartBoundary,
+            AddressingError::ConsecutivePeriods,
+            AddressingError::ResolutionFailed {
+                layer: "Domain".to_owned(),
+                message: "fetch failed".to_owned(),
+            },
+        ] {
+            assert_eq!(
+                address_resolution_error_code(&error),
+                crate::error_codes::VALID_7091,
+                "unexpected code for {error:?}"
+            );
         }
     }
 
@@ -778,7 +1038,10 @@ mod tests {
         }
 
         let querier = LocalHandleQuerier::new(&core);
-        let results = querier.lookup_handle(&ctx.to_owned(), "dave", None).await;
+        let results = querier
+            .lookup_handle(&ctx.to_owned(), "dave", None)
+            .await
+            .expect("registry exists for this context");
         assert_eq!(results.len(), 1);
         match &results[0] {
             AddressResolution::Identity { did, .. } => {
@@ -788,14 +1051,24 @@ mod tests {
         }
     }
 
+    /// A context this bridge holds no registry for produces
+    /// [`LayerUnavailable`], because this bridge queries no remote
+    /// `handle_lookup` outlet. An empty result vector would instead assert
+    /// that a registry answered and held no entry.
     #[tokio::test]
-    async fn local_handle_querier_lookup_empty_when_context_not_found() {
+    async fn local_handle_querier_reports_unavailable_when_context_not_found() {
         let core = CoreFields::new();
         let querier = LocalHandleQuerier::new(&core);
-        let results = querier
+        let error = querier
             .lookup_handle(&"nonexistent-ctx-xyz".to_owned(), "anyone", None)
-            .await;
-        assert!(results.is_empty());
+            .await
+            .expect_err("no registry exists for that context");
+        assert_eq!(error.layer, ResolutionLayer::HandleRegistry);
+        assert!(
+            error.reason.contains("nonexistent-ctx-xyz"),
+            "reason names that context: {}",
+            error.reason
+        );
     }
 
     #[tokio::test]
@@ -823,31 +1096,48 @@ mod tests {
         // Filter for Identity — should find the entry.
         let identity_results = querier
             .lookup_handle(&ctx.to_owned(), "eve", Some(AddressType::Identity))
-            .await;
+            .await
+            .expect("registry exists for this context");
         assert_eq!(identity_results.len(), 1);
 
-        // Filter for Context — should find nothing (entry is Identity).
+        // Filter for Context — a registry answered and held no context entry,
+        // so an empty result vector answers honestly here.
         let context_results = querier
             .lookup_handle(&ctx.to_owned(), "eve", Some(AddressType::Context))
-            .await;
+            .await
+            .expect("registry exists for this context");
         assert!(context_results.is_empty());
     }
 
+    /// §22.11.7 names `attestation_lookup` as a normative outlet, and this
+    /// bridge invokes no outlet against a remote context. Both layers
+    /// therefore report [`LayerUnavailable`], which a caller distinguishes
+    /// from an empty result vector meaning "nobody registered that handle".
     #[tokio::test]
-    async fn local_handle_querier_domain_and_attestation_return_empty() {
+    async fn local_handle_querier_domain_and_attestation_report_unavailable() {
         let core = CoreFields::new();
         let querier = LocalHandleQuerier::new(&core);
+
+        let domain_error = querier
+            .lookup_domain_handle("example.com", "alice")
+            .await
+            .expect_err("this bridge fetches no .well-known/scp document");
+        assert_eq!(domain_error.layer, ResolutionLayer::Domain);
         assert!(
-            querier
-                .lookup_domain_handle("example.com", "alice")
-                .await
-                .is_empty()
+            domain_error.reason.contains(".well-known/scp"),
+            "reason names what is missing: {}",
+            domain_error.reason
         );
+
+        let attestation_error = querier
+            .lookup_attestation_handle("alice", Some("github"))
+            .await
+            .expect_err("this bridge invokes no attestation_lookup outlet");
+        assert_eq!(attestation_error.layer, ResolutionLayer::Attestation);
         assert!(
-            querier
-                .lookup_attestation_handle("alice", Some("github"))
-                .await
-                .is_empty()
+            attestation_error.reason.contains("attestation_lookup"),
+            "reason names what is missing: {}",
+            attestation_error.reason
         );
     }
 }

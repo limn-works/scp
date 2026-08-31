@@ -3758,11 +3758,20 @@ mod tests {
     fn core_registry_stats_includes_all_fields() {
         crate::runtime::init_context_manager_for_test(&__bi());
         let stats = crate::runtime::registry_stats(&__bi());
-        // Just verify the struct has the expected fields and doesn't panic.
-        let _ = stats.contexts;
-        let _ = stats.known_contexts;
-        let _ = stats.identities;
-        let _ = stats.relay_connected;
+        // Destructure without `..`, so adding a field to `RegistryStats`
+        // stops this test compiling. Reading each field through `let _ =`,
+        // as an earlier version did, caught a removed field but admitted a
+        // new one, which is what "includes all fields" denies.
+        let crate::runtime::RegistryStats {
+            contexts,
+            known_contexts,
+            identities,
+            relay_connected,
+        } = stats;
+        let _: usize = contexts;
+        let _: usize = known_contexts;
+        let _: usize = identities;
+        let _: bool = relay_connected;
     }
 
     // -----------------------------------------------------------------------

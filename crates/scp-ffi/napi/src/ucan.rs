@@ -939,27 +939,52 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // hex encode/decode roundtrip
+    // BridgeDidResolver rejects malformed did:key hex
+    //
+    // These three cases drive `BridgeDidResolver::resolve_public_key`, one
+    // production entry point this bridge hands to UCAN validation. An earlier
+    // trio asserted on `hex::encode` and `hex::decode` directly, which pinned
+    // behaviour of a third-party crate and left every bridge symbol free to
+    // change.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn hex_roundtrip() {
-        let bytes = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
-        let hex_str = encode_hex(&bytes);
-        let decoded = hex::decode(&hex_str).unwrap();
-        assert_eq!(decoded, bytes.to_vec());
+    fn did_key_hex_roundtrips_through_bridge_did_resolver() {
+        let pk_bytes = [0x01u8; 32];
+        let did = format!("did:key:{}", encode_hex(&pk_bytes));
+
+        let resolver = BridgeDidResolver;
+        let public_key = resolver
+            .resolve_public_key(&did)
+            .expect("a 32-byte lowercase-hex did:key must resolve");
+        assert_eq!(public_key, pk_bytes);
     }
 
     #[test]
-    fn hex_decode_rejects_odd_length() {
-        let result = hex::decode("abc");
-        assert!(result.is_err());
+    fn bridge_did_resolver_rejects_odd_length_did_key_hex() {
+        let resolver = BridgeDidResolver;
+        // 63 hex characters cannot encode 32 bytes.
+        let did = format!("did:key:{}", "a".repeat(63));
+        let error = resolver
+            .resolve_public_key(&did)
+            .expect_err("an odd-length hex body must not resolve");
+        assert!(
+            matches!(error, CoreUcanError::MalformedToken(_)),
+            "expected MalformedToken, got {error:?}"
+        );
     }
 
     #[test]
-    fn hex_decode_rejects_non_hex() {
-        let result = hex::decode("gggg");
-        assert!(result.is_err());
+    fn bridge_did_resolver_rejects_non_hex_did_key_body() {
+        let resolver = BridgeDidResolver;
+        let did = format!("did:key:{}", "g".repeat(64));
+        let error = resolver
+            .resolve_public_key(&did)
+            .expect_err("a body outside [0-9a-f] must not resolve");
+        assert!(
+            matches!(error, CoreUcanError::MalformedToken(_)),
+            "expected MalformedToken, got {error:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1069,136 +1094,285 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ucan_revoke wires to persistent state
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn revoke_then_check_revocation_list() {
-        use crate::runtime;
-        use std::cell::RefCell;
-
-        let bi = runtime::NapiBridgeInstance::new_napi();
-        let context_id = format!("ctx-revoke-wire-{}", uuid::Uuid::new_v4());
-        let creator_did = "did:dht:zCreator";
-        runtime::register_test_context(&bi, &context_id, creator_did);
-
-        // Build a deterministic token string for revocation.
-        let test_token = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsInVjdiI6IjAuMTAuMCJ9.\
-            eyJpc3MiOiJkaWQ6ZGh0OnpDcmVhdG9yIiwiYXVkIjoiZGlkOmRodDp6TWVtYmVyIiwiZXhwIjo5OTk5OTk5OTk5LCJubmMiOiIxNjk5OTk5MDAwMDAwLWFhYmJjY2RkMTEyMjMzNDQiLCJhdHQiOltdLCJwcmYiOltdfQ.\
-            dGVzdC1zaWduYXR1cmU";
-
-        // Parse outside the closure so the issuer DID can be moved.
-        let parsed = parse_ucan(test_token).unwrap();
-        let issuer_did = parsed.payload.iss;
-
-        // Simulate the full revocation pipeline via revoke_ucan.
-        runtime::with_context(&bi, &context_id, |rt| {
-            let authorizer = BridgeRevocationAuthorizer {
-                issuer_did: issuer_did.clone(),
-                creator_did: rt.core.creator_did.clone(),
-            };
-            let distributor = BridgeRevocationDistributor;
-            let event_log_cell = RefCell::new(&mut rt.core.event_log);
-            let event_logger = BridgeRevocationEventLogger {
-                event_log: &event_log_cell,
-            };
-
-            scp_core::crypto::ucan::revoke::revoke_ucan(
-                &mut rt.core.revocation_list,
-                test_token,
-                creator_did,
-                &authorizer,
-                &distributor,
-                &event_logger,
-            )
-            .unwrap();
-
-            Ok(())
-        })
-        .unwrap();
-
-        // Verify revocation is detected by the checker.
-        let token_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(test_token);
-        let checker_says_revoked = runtime::with_context(&bi, &context_id, |rt| {
-            let checker = BridgeRevocationChecker {
-                revocation_list: &rt.core.revocation_list,
-            };
-            Ok(checker.is_revoked(&token_cid))
-        })
-        .unwrap();
-
-        assert!(
-            checker_says_revoked,
-            "token revoked via revoke_ucan must be detected by ucan_validate's revocation checker"
-        );
-
-        // Verify a TokenRevoked event was appended to the event log.
-        let event_count = runtime::with_context(&bi, &context_id, |rt| {
-            Ok(scp_event_log::tree::event_count(&rt.core.event_log))
-        })
-        .unwrap();
-        assert!(
-            event_count > 0,
-            "event log must contain at least one event after revocation"
-        );
-    }
-
-    #[test]
-    fn revoke_rejects_unauthorized_revoker() {
-        use crate::runtime;
-        use std::cell::RefCell;
-
-        let bi = runtime::NapiBridgeInstance::new_napi();
-        let context_id = format!("ctx-revoke-unauth-{}", uuid::Uuid::new_v4());
-        let creator_did = "did:dht:zCreator";
-        runtime::register_test_context(&bi, &context_id, creator_did);
-
-        let test_token = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsInVjdiI6IjAuMTAuMCJ9.\
-            eyJpc3MiOiJkaWQ6ZGh0OnpDcmVhdG9yIiwiYXVkIjoiZGlkOmRodDp6TWVtYmVyIiwiZXhwIjo5OTk5OTk5OTk5LCJubmMiOiIxNjk5OTk5MDAwMDAwLWFhYmJjY2RkMTEyMjMzNDQiLCJhdHQiOltdLCJwcmYiOltdfQ.\
-            dGVzdC1zaWduYXR1cmU";
-
-        // Parse outside the closure so the issuer DID can be moved.
-        let parsed = parse_ucan(test_token).unwrap();
-        let issuer_did = parsed.payload.iss;
-
-        // Attempt revocation by an unauthorized DID (not issuer, not creator).
-        let result = runtime::with_context(&bi, &context_id, |rt| {
-            let authorizer = BridgeRevocationAuthorizer {
-                issuer_did: issuer_did.clone(),
-                creator_did: rt.core.creator_did.clone(),
-            };
-            let distributor = BridgeRevocationDistributor;
-            let event_log_cell = RefCell::new(&mut rt.core.event_log);
-            let event_logger = BridgeRevocationEventLogger {
-                event_log: &event_log_cell,
-            };
-
-            let result = scp_core::crypto::ucan::revoke::revoke_ucan(
-                &mut rt.core.revocation_list,
-                test_token,
-                "did:dht:zUnauthorized",
-                &authorizer,
-                &distributor,
-                &event_logger,
-            );
-            Ok(result)
-        })
-        .unwrap();
-
-        assert!(
-            result.is_err(),
-            "revocation by unauthorized DID must be rejected"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Identity registry — delegator != creator regression test (#771)
+    // ucan_revoke_on — the bridge operation `Scp::ucan_revoke` exports
     //
-    // The previous code used `handle.signing_key` (the context creator's key)
-    // for all UCAN delegation signing. When the delegator is different from the
-    // context creator, this produced tokens with invalid signatures. The fix
-    // (in this PR) looks up the delegator's identity via BridgeInstance identity registry.
-    // This test verifies the registry correctly distinguishes different DIDs.
+    // Both tests call `ucan_revoke_on` itself, so they fail if that function
+    // stops passing the event logger, passes the wrong revoker DID, or stops
+    // calling `revoke_ucan` at all.
+    //
+    // The module is gated on `testing` because `ucan_revoke_on` takes a real
+    // `NapiContextHandle`, and only `context_create_on` mints one from a
+    // `NapiIdentity`. On a build without `testing` every production
+    // identity-create path fails closed (ADR-062, capability injection,
+    // §Decision 6), so no identity exists, and therefore no context handle
+    // exists either. `crates/scp-ffi/napi/src/outlets.rs` gates its
+    // cross-context saga tests on `testing` for the same reason.
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "testing")]
+    mod ucan_revoke_wiring {
+        use super::*;
+        use crate::runtime;
+
+        /// The audience DID of the token both tests mint.
+        const AUDIENCE_DID: &str = "did:dht:z6MkRevocationAudience0000000001";
+
+        /// A DID that is neither the minted token's issuer nor the context
+        /// creator, so `BridgeRevocationAuthorizer` must reject it.
+        const OUTSIDER_DID: &str = "did:dht:z6MkUnauthorizedRevoker00000001";
+
+        /// Creates an ephemeral single-admin context owned by `owner`, whose
+        /// ceiling carries the capability the two tests mint a token for.
+        async fn create_revocable_context(
+            bi: &std::sync::Arc<runtime::NapiBridgeInstance>,
+            owner: &crate::identity::NapiIdentity,
+        ) -> NapiContextHandle {
+            let params = serde_json::json!({
+                "ceiling": ["messages:read", "messages:write"],
+                "governance": "single_admin",
+                "memoryScope": "ephemeral",
+            })
+            .to_string();
+            crate::context::context_create_on(bi, owner, params)
+                .await
+                .expect("context_create should succeed")
+        }
+
+        /// Reads the number of leaves in a context's UCAN-registry event log.
+        fn event_count(bi: &runtime::NapiBridgeInstance, context_id: &str) -> u64 {
+            runtime::with_context(bi, context_id, |rt| {
+                Ok(scp_event_log::tree::event_count(&rt.core.event_log))
+            })
+            .expect("the context must be registered in the UCAN state registry")
+        }
+
+        /// Asks `BridgeRevocationChecker` — the checker `ucan_validate` reads —
+        /// whether the token with `token_cid` is revoked.
+        fn checker_reports_revoked(
+            bi: &runtime::NapiBridgeInstance,
+            context_id: &str,
+            token_cid: &str,
+        ) -> bool {
+            runtime::with_context(bi, context_id, |rt| {
+                let checker = BridgeRevocationChecker {
+                    revocation_list: &rt.core.revocation_list,
+                };
+                Ok(checker.is_revoked(token_cid))
+            })
+            .expect("the context must be registered in the UCAN state registry")
+        }
+
+        /// Creates an identity, a context, and a minted token on a fresh bridge
+        /// instance, and returns everything the two tests revoke against.
+        async fn mint_revocable_token() -> (
+            std::sync::Arc<runtime::NapiBridgeInstance>,
+            NapiContextHandle,
+            String,
+            String,
+        ) {
+            let scp = crate::scp::Scp::new_in_memory_for_test();
+            let bi = std::sync::Arc::clone(&scp.inner);
+
+            let owner = scp
+                .identity_create("in_memory".to_owned(), None)
+                .await
+                .expect("identity_create should succeed");
+            let owner_did = owner.did();
+
+            let handle = create_revocable_context(&bi, &owner).await;
+
+            let token = ucan_mint_on(
+                &bi,
+                &handle,
+                AUDIENCE_DID.to_owned(),
+                vec!["messages:write".to_owned()],
+                None,
+            )
+            .await
+            .expect("ucan_mint_on should succeed")
+            .encoded
+            .clone();
+
+            // Register the UCAN state before the test reads its baseline event
+            // count, so the baseline predates the `ucan_revoke_on` call.
+            runtime::ensure_registered(&bi, &handle)
+                .expect("ensure_registered should register a freshly created context");
+
+            (bi, handle, token, owner_did)
+        }
+
+        /// `ucan_revoke_on` marks the token revoked in the context's revocation
+        /// list and appends a `TokenRevoked` event, when the context creator
+        /// revokes a token that creator issued.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn revoke_then_check_revocation_list() {
+            let (bi, handle, token, owner_did) = mint_revocable_token().await;
+            let context_id = handle.context_id();
+            let events_before = event_count(&bi, &context_id);
+
+            ucan_revoke_on(&bi, &handle, token.clone(), owner_did)
+                .await
+                .expect("ucan_revoke_on must accept the context creator as revoker");
+
+            let token_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(&token);
+            assert!(
+                checker_reports_revoked(&bi, &context_id, &token_cid),
+                "a token revoked through ucan_revoke_on must be reported as revoked by \
+                 BridgeRevocationChecker, the checker ucan_validate reads"
+            );
+
+            let events_after = event_count(&bi, &context_id);
+            assert!(
+                events_after > events_before,
+                "ucan_revoke_on must append a TokenRevoked event: the log held {events_before} \
+                 leaves before the call and {events_after} after"
+            );
+        }
+
+        /// `ucan_revoke_on` rejects a revoker that is neither the token's issuer
+        /// nor the context creator, and leaves the token unrevoked.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn revoke_rejects_unauthorized_revoker() {
+            let (bi, handle, token, _owner_did) = mint_revocable_token().await;
+            let context_id = handle.context_id();
+
+            let err = ucan_revoke_on(&bi, &handle, token.clone(), OUTSIDER_DID.to_owned())
+                .await
+                .expect_err("ucan_revoke_on must reject a revoker it never authorized");
+
+            let message = format!("{err}");
+            assert!(
+                message.contains(OUTSIDER_DID),
+                "the rejection must name the revoker it refused, got: {message}"
+            );
+            assert!(
+                message.contains("neither the token issuer"),
+                "the rejection must come from BridgeRevocationAuthorizer, got: {message}"
+            );
+
+            let token_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(&token);
+            assert!(
+                !checker_reports_revoked(&bi, &context_id, &token_cid),
+                "a rejected revocation must leave the token unrevoked"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // ucan_delegate_on signs with a delegator's own key (#771)
+    //
+    // An earlier implementation signed every delegation with
+    // `handle.signing_key`, which holds whichever key created that context.
+    // That produced a token whose `iss` named a delegator while its signature
+    // came from a creator. This test calls `ucan_delegate_on` with a delegator
+    // distinct from its context creator, then runs `ucan_evaluate_on` over
+    // that delegated token, which verifies each signature against its own
+    // issuer's DID. Restoring creator-key signing turns `signatures_valid`
+    // false.
+    //
+    // Gated on `testing` for one reason `ucan_revoke_wiring` also states: only
+    // `context_create_on` mints a `NapiContextHandle`, and it needs an
+    // identity, which every production create path refuses on a build without
+    // `testing`.
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "testing")]
+    mod ucan_delegate_wiring {
+        use super::*;
+        use crate::runtime;
+
+        /// Audience of this delegated token. Delegation requires no identity
+        /// on a bridge for its audience, so this DID holds none.
+        const DELEGATEE_DID: &str = "did:dht:z6MkDelegationAudience000000001";
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn ucan_delegate_signs_with_delegator_key_not_creator_key() {
+            let scp = crate::scp::Scp::new_in_memory_for_test();
+            let bi = std::sync::Arc::clone(&scp.inner);
+
+            let creator = scp
+                .identity_create("in_memory".to_owned(), None)
+                .await
+                .expect("identity_create should succeed for a context creator");
+            let delegator = scp
+                .identity_create("in_memory".to_owned(), None)
+                .await
+                .expect("identity_create should succeed for a delegator");
+            let creator_did = creator.did();
+            let delegator_did = delegator.did();
+            assert_ne!(
+                creator_did, delegator_did,
+                "this test needs a delegator distinct from its context creator"
+            );
+
+            let params = serde_json::json!({
+                "ceiling": ["messages:read", "messages:write"],
+                "governance": "single_admin",
+                "memoryScope": "ephemeral",
+            })
+            .to_string();
+            let handle = crate::context::context_create_on(&bi, &creator, params)
+                .await
+                .expect("context_create should succeed");
+            runtime::ensure_registered(&bi, &handle)
+                .expect("ensure_registered should register a freshly created context");
+
+            // A creator mints a token addressed to a delegator, so that
+            // delegator may attenuate it further.
+            let parent = ucan_mint_on(
+                &bi,
+                &handle,
+                delegator_did.clone(),
+                vec!["messages:write".to_owned()],
+                None,
+            )
+            .await
+            .expect("ucan_mint_on should succeed");
+
+            let delegated = ucan_delegate_on(
+                &bi,
+                &handle,
+                delegator_did.clone(),
+                DELEGATEE_DID.to_owned(),
+                parent.encoded.clone(),
+                vec!["messages:write".to_owned()],
+            )
+            .await
+            .expect("ucan_delegate_on should succeed for a parent token's audience");
+
+            assert_eq!(
+                delegated.data.issuer, delegator_did,
+                "this delegated token must name its delegator as issuer"
+            );
+
+            let context_id = handle.context_id();
+            let evaluation = ucan_evaluate_on(
+                &bi,
+                &handle,
+                delegated.encoded.clone(),
+                Some(format!("scp:ctx:{context_id}/messages:write")),
+                DELEGATEE_DID.to_owned(),
+                Some(vec![parent.encoded.clone()]),
+            )
+            .await
+            .expect("ucan_evaluate_on should return a diagnostic result");
+
+            assert!(
+                evaluation.signatures_valid,
+                "every signature in this delegation chain must verify against its own \
+                 issuer's DID; a false result here means ucan_delegate_on signed with a \
+                 key other than its delegator's"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Identity registry keeps two DIDs' custody providers apart
+    //
+    // These three tests cover `runtime::register_identity`,
+    // `runtime::with_identity`, `runtime::remove_identity` and
+    // `runtime::remove_identity_if_present`. They call no UCAN entry point, so
+    // they establish a precondition for delegation signing rather than
+    // covering it. `ucan_delegate_signs_with_delegator_key_not_creator_key`
+    // below covers `ucan_delegate_on` itself.
     // -----------------------------------------------------------------------
 
     #[cfg(feature = "testing")]
@@ -1507,9 +1681,15 @@ mod tests {
             None,
         )
         .await;
+        // Pin this rejection to `validate_did`, not to any later failure.
+        // With that DID gate deleted, this call would still fail — on a
+        // malformed token — so a bare `is_err` assertion would certify a
+        // removed gate.
+        let error = empty.expect_err("ucan_evaluate must fail closed on an empty agent DID");
         assert!(
-            empty.is_err(),
-            "ucan_evaluate must fail closed when presenting_agent_did is empty"
+            error.reason.contains("DID must not be empty"),
+            "rejection must come from validate_did, got: {}",
+            error.reason
         );
     }
 
@@ -1537,9 +1717,14 @@ mod tests {
             None,
         )
         .await;
+        // Pin this rejection to `validate_did` — see a sibling
+        // `ucan_evaluate` test for why a bare `is_err` assertion passes even
+        // with that gate deleted.
+        let error = empty.expect_err("ucan_validate must fail closed on an empty agent DID");
         assert!(
-            empty.is_err(),
-            "ucan_validate must fail closed when presenting_agent_did is empty"
+            error.reason.contains("DID must not be empty"),
+            "rejection must come from validate_did, got: {}",
+            error.reason
         );
     }
 }
