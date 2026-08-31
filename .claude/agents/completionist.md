@@ -49,7 +49,7 @@ SCP has layers; a gap can live in any link between them. Build a matrix — requ
 | Swift SDK | `bindings/swift/Sources/SCP/` |
 
 **Integration checklist (from `CLAUDE.md`) — verify every cell for new protocol logic:**
-1. The function is called from a Supervisor `dispatch_*` method or a `<domain>_helpers.rs` function that method routes to (not just exported).
+1. A Supervisor `dispatch_*` method reaches the function on its production path (not just exported) — for a per-context operation the route is `dispatch_*` → actor mailbox → `crates/scp-runtime/src/context/actor/handlers/<domain>.rs` → the `<domain>_helpers.rs` function; the lifecycle bootstrap variants (`create_context`, `import_context`, `restore_context`) call `lifecycle_helpers` from the dispatch method directly.
 2. The Supervisor operation is exported from all applicable FFI bridges.
 3. Each bridge export has a corresponding SDK wrapper method.
 4. A pipeline assertion exists in `pipeline_wiring.rs` for the new step.
