@@ -77,6 +77,13 @@ The 11 validation steps are:
 4. Verify root issuer is the context creator's DID
 5. Verify audience matches the presenting agent's DID (self-delegation valid with `fct.scp_key_scope`)
 6. Verify capability match against required capability (with wildcard support)
+   - 6b. Enforce the agent permission model (§4.9) on the presented token and on every parent the chain walk resolves out of its `prf`. Step 7 requires a child's `att` to be a subset of its parent's, so a parent may grant a capability the child never names, and a check that read the presented token alone would let a child launder its parent's Category A grant. Four rules run:
+     1. Reject a Category A capability signed by `#agent`, and record a custody violation (§4.9.1 rule 1).
+     2. Reject a capability reserved to `#0` whatever key signed the token (§4.9.1 rule 2).
+     3. Reject a root token (empty `prf`) signed by `#agent` (§4.9.1, the `#active` criterion).
+     4. When the signing key is `#agent`, reject any attestation outside the permission set `fct.scp_agent_permissions` grants (§4.9.2).
+     
+     Rules 1, 2 and 3 ship in `enforce_ucan_category_a`, on the presented token and on every parent, and that call runs after the parent's signature check so no rejection it produces names a DID that did not sign. Rule 1's rejection ships and its custody record does not — §27.4.7 of the attestations spec derives that absence as open question OQ-26. Rule 4 is what stories SCP-AB-023 through SCP-AB-027 of `.docs/prds/agent-binding.json` deliver; no code applies it today, so an agent key's authority is bounded by `att`, the context ceiling, and rules 1 through 3 alone. The count of validation steps stays at eleven: 6b narrows the `att` set that step 6 already read, so it belongs to step 6.
 7. Verify attenuation (each delegation narrows or preserves, never widens)
 8. Verify every capability the token grants is within the context's immutable capability ceiling — not only the invoked capability. The token's entire attestation set (`att`) is checked; a token carrying any out-of-ceiling attestation is rejected even if the invoked capability is itself within the ceiling.
 9. Validate nonce format, freshness, and uniqueness (replay prevention, §9.5)

@@ -255,7 +255,23 @@ const NAPI_TRUST_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/t
 // core `scp_core::trust::check_capability_requirements` call and the production
 // `IdentityDidPublicKeyResolver`. The 2J joiner (+4) and capability-admission
 // (+3) additions are disjoint, so the merged floor is 48 + 4 + 3 = 55.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 55;
+// Raised 55 -> 57 when two assertions pinned the ADR-039 Category A key
+// reservations (spec §4.9.1, §7.2.1 step 6b).
+// `ucan_step6b_enforces_category_a_over_all_att` holds `validate_ucan` to
+// calling `enforce_ucan_category_a` over the full parsed attestation set, and
+// holds that helper to applying the `#0` reservation through
+// `requires_identity_key`. `ucan_chain_walk_enforces_step6b_on_every_parent`
+// holds `verify_chain_recursive` to running the same helper on each resolved
+// parent. Pure coverage expansion.
+//
+// The same two tests then grew three assertions rather than a third test:
+// `enforce_ucan_category_a` must read `token.payload.prf.is_empty()` for the
+// rule that rejects an #agent-signed root, `evaluate_ucan` must call the helper
+// as `validate_ucan` does, and the chain walk must run step 6b BELOW
+// `verify_signature` so no custody verdict comes off unauthenticated bytes.
+// Assertions inside an existing test do not raise the active-test count, so the
+// floor stays 57. Pure coverage expansion.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 57;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -3098,6 +3114,105 @@ fn ucan_step8_enforces_ceiling_over_all_att() {
         "validate_ucan step 8 must NOT scope the ceiling check to only the \
          invoked capability — that lets a token smuggle an out-of-ceiling \
          attestation (spec §7.2.1 step 8)"
+    );
+}
+
+// ===========================================================================
+// UCAN validation step 6b — Category A key reservations
+// ===========================================================================
+
+/// Step 6b of `validate_ucan` must run the Category A key reservations over
+/// the token's FULL parsed attestation set (spec §7.2.1 step 6b, §4.9.1), and
+/// `enforce_ucan_category_a` must apply the `#0` reservation through the
+/// shared `requires_identity_key` predicate.
+///
+/// Two separate regressions this pins. Dropping the `enforce_ucan_category_a`
+/// call from `validate_ucan` would leave the whole permission model unenforced
+/// on the only path that enforces it today. Dropping `requires_identity_key`
+/// from the helper would restore the defect this assertion was written for: a
+/// UCAN granting a DID-document write passed whenever `#active` signed it,
+/// because the helper returned early on every key other than `#agent`.
+#[test]
+fn ucan_step6b_enforces_category_a_over_all_att() {
+    assert!(
+        fn_body_contains(
+            UCAN_VALIDATE_SRC,
+            "validate_ucan",
+            "enforce_ucan_category_a(token, &granted_caps)"
+        ),
+        "validate_ucan step 6b must call enforce_ucan_category_a over the full \
+         parsed attestation set (&granted_caps), per spec §7.2.1 step 6b"
+    );
+    assert!(
+        fn_body_contains(
+            UCAN_VALIDATE_SRC,
+            "enforce_ucan_category_a",
+            "requires_identity_key(cap.resource())"
+        ),
+        "enforce_ucan_category_a must reject every capability reserved to #0 \
+         whatever key signed the token (spec §4.9.1 rule 2) — #0 never signs a \
+         UCAN, so such a grant conveys authority no signer can hold"
+    );
+    assert!(
+        fn_body_contains(
+            UCAN_VALIDATE_SRC,
+            "enforce_ucan_category_a",
+            "token.payload.prf.is_empty()"
+        ),
+        "enforce_ucan_category_a must reject a root UCAN signed by #agent (spec \
+         §4.9.1, the #active criterion). Every capability a context ceiling \
+         admits is Category B, so rules 1 and 2 pass an #agent-signed root that \
+         grants the whole ceiling, and the agent acquires it with no human \
+         signature in the chain"
+    );
+    assert!(
+        fn_body_contains(
+            UCAN_VALIDATE_SRC,
+            "evaluate_ucan",
+            "enforce_ucan_category_a(token, &granted_caps)"
+        ),
+        "evaluate_ucan must run step 6b too, not only validate_ucan — the \
+         `ucan_evaluate` bridge op routes to it, so a step 6b dropped from \
+         evaluate_ucan alone leaves that op unenforced"
+    );
+}
+
+/// The delegation-chain walk must run step 6b on every parent it resolves
+/// (spec §7.2.1 step 6b).
+///
+/// Step 7 requires a child's `att` to be a subset of its parent's, so a parent
+/// may grant a Category A capability the child never names. Dropping this call
+/// restores the laundering path: an `#agent`-signed parent carrying a
+/// DID-document capability propagates through the network as soon as someone
+/// delegates one operational capability out of it, and every other gate accepts
+/// the chain.
+#[test]
+fn ucan_chain_walk_enforces_step6b_on_every_parent() {
+    assert!(
+        fn_body_contains(
+            UCAN_VALIDATE_SRC,
+            "verify_chain_recursive",
+            "enforce_ucan_category_a(&parent, &parent_caps)"
+        ),
+        "verify_chain_recursive must run step 6b on each resolved parent, per \
+         spec §7.2.1 step 6b — a parent may grant a Category A capability the \
+         child's att never names"
+    );
+    let walk = extract_fn_body(UCAN_VALIDATE_SRC, "verify_chain_recursive")
+        .expect("verify_chain_recursive must exist in the UCAN validator");
+    let signature_at = walk
+        .find("verify_signature(&parent, did_resolver)")
+        .expect("the chain walk must verify each parent's signature");
+    let step6b_at = walk
+        .find("enforce_ucan_category_a(&parent, &parent_caps)")
+        .expect("the chain walk must run step 6b on each parent");
+    assert!(
+        signature_at < step6b_at,
+        "step 6b must run AFTER verify_signature on a parent. `parent` comes out \
+         of resolve_proof, so before the signature check its iss, its kid and \
+         its att are bytes the presenter chose. Rule 1's verdict is a custody \
+         violation §4.9.1 attributes to a DID and records permanently, so \
+         running it first lets a presenter mint that verdict against any DID"
     );
 }
 

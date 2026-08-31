@@ -71,6 +71,44 @@
         "SCP-AB-021",
         "SCP-AB-022"
       ]
+    },
+    {
+      "id": "gate-permission-category-b",
+      "name": "Category B — Agent Permission Set (fct.scp_agent_permissions)",
+      "priority": "P0",
+      "status": "pending",
+      "stories": [
+        "SCP-AB-023",
+        "SCP-AB-024",
+        "SCP-AB-025",
+        "SCP-AB-026",
+        "SCP-AB-027",
+        "SCP-AB-035"
+      ]
+    },
+    {
+      "id": "gate-permission-category-c",
+      "name": "Category C — Per-Context Agent Restrictions",
+      "priority": "P0",
+      "status": "pending",
+      "stories": [
+        "SCP-AB-028",
+        "SCP-AB-029",
+        "SCP-AB-030",
+        "SCP-AB-031",
+        "SCP-AB-032",
+        "SCP-AB-033",
+        "SCP-AB-036"
+      ]
+    },
+    {
+      "id": "gate-permission-axes",
+      "name": "Category B x Category C Intersection",
+      "priority": "P0",
+      "status": "pending",
+      "stories": [
+        "SCP-AB-034"
+      ]
     }
   ],
   "stories": [
@@ -1226,6 +1264,614 @@
         {
           "file": ".docs/specs/09-security-model.md",
           "section": "## 9.11 Key Continuity Verification"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-023",
+      "title": "Add the AgentPermissions fact type with parsing and validation",
+      "gate": "gate-permission-category-b",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/crypto/ucan/agent_permissions.rs",
+        "crates/scp-protocol/src/crypto/ucan/mod.rs"
+      ],
+      "description": "Add the Rust type behind the UCAN fact fct.scp_agent_permissions per §4.9.2. The fact is a JSON object under the key scp_agent_permissions in a UCAN's fct map, with two required fields: v (integer format version, 1 today) and allow (array of {resource}:{action} strings carrying no scp:ctx:{context_id}/ prefix). This story creates the type, its serde representation, its parse-from-fct path, and its well-formedness validation. Chain resolution and enforcement are SCP-AB-024, not this story; minting is SCP-AB-026, not this story.",
+      "acceptanceCriteria": [
+        "crates/scp-protocol/src/crypto/ucan/agent_permissions.rs declares a public struct AgentPermissions with fields v: u32 and allow: Vec<String>",
+        "AgentPermissions serializes to and deserializes from the JSON object {\"v\": 1, \"allow\": [...]} under the fct key scp_agent_permissions",
+        "A public fn parse_agent_permissions(fct: &serde_json::Value) -> Result<Option<AgentPermissions>, AgentPermissionsError> returns Ok(None) when the fct map has no scp_agent_permissions key",
+        "parse_agent_permissions returns Err when v is any value other than 1, and the error names the unsupported version",
+        "parse_agent_permissions returns Err when allow is absent, when allow is not an array, or when any entry is not a string",
+        "A well-formedness check rejects an allow entry that carries the scp:ctx: prefix, that contains more than one colon, or that has an empty resource or empty action segment",
+        "A well-formedness check accepts an asterisk only as the entire action segment (outlet_call:*) and rejects it in the resource position (*:read) and as a substring (outlet_ca*l:read, messages:wr*)",
+        "A public fn AgentPermissions::permits(&self, resource: &str, action: &str) -> bool returns true on an exact {resource}:{action} match and on a {resource}:* entry, and false otherwise",
+        "A public const fn default_agent_permissions() -> AgentPermissions returns v = 1 and allow = [\"messages:read\", \"messages:write\"]",
+        "Unit tests cover every accept and reject case named in the criteria above, including the three asterisk-placement rejections"
+      ],
+      "actionItems": [
+        "Create crates/scp-protocol/src/crypto/ucan/agent_permissions.rs and declare the module in crypto/ucan/mod.rs",
+        "Define AgentPermissions with serde derives matching the §4.9.2 shape table",
+        "Implement parse_agent_permissions over a UCAN's fct value",
+        "Implement the entry grammar check (single colon, non-empty segments, asterisk only as the whole action)",
+        "Implement AgentPermissions::permits and default_agent_permissions",
+        "Add AgentPermissionsError variants and a unit test per accept/reject case"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/04-agents.md",
+          "section": "### 4.9.2 Category B — user-configurable"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "### Permission Model"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-024",
+      "title": "Enforce the agent permission set at UCAN validation step 6b",
+      "gate": "gate-permission-category-b",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/crypto/ucan/validate.rs",
+        "crates/scp-protocol/src/crypto/ucan/mod.rs"
+      ],
+      "description": "Wire the permission set into the eleven-step UCAN chain validation at step 6b per §4.9.2 'How a validator reads it' and §7.2.1. When the presented token's kid is #agent, the verifier walks the prf chain from the leaf toward the root, takes the scp_agent_permissions of the first token whose kid is #active, falls back to the protocol default when no token on the chain carries the fact, and checks every capability in the presented token's att set against that permission set. A token whose kid is #active skips both steps. The fact type comes from SCP-AB-023.",
+      "acceptanceCriteria": [
+        "enforce_ucan_category_a's caller in validate_ucan also calls a new fn enforce_agent_permissions(token, granted_caps, proof_resolver) at step 6b",
+        "enforce_agent_permissions returns Ok(()) without resolving the chain when the token's kid is #active or absent",
+        "enforce_agent_permissions resolves the permission set from the first prf-chain token, walking leaf-toward-root, that carries scp_agent_permissions, whose kid is #active, and whose iss equals the presented token's iss",
+        "enforce_agent_permissions applies default_agent_permissions() when no token on the chain satisfies all three conditions above",
+        "enforce_agent_permissions checks every entry of the presented token's att set, not only the invoked capability, and rejects the whole token when one attestation is unmatched",
+        "A new UcanError variant carries the rejected capability name and the permission set that denied it",
+        "A token whose kid is #agent and that itself carries fct.scp_agent_permissions is rejected with a distinct UcanError variant",
+        "crates/scp-ffi/common/src/ucan_errors.rs maps both new variants to an error code, and its round-trip test list includes both",
+        "A test asserts an #agent token granting messages:write passes under the default permission set",
+        "A test asserts an #agent token granting governance:vote is rejected under the default permission set",
+        "A test asserts an #agent token granting governance:vote passes when an #active parent issued by the same DID carries an allow list containing governance:vote",
+        "A test asserts an #agent token with two attestations, one inside and one outside the permission set, is rejected",
+        "A test asserts an #active-signed token granting governance:vote passes with no chain walk",
+        "A test asserts a chain carrying scp_agent_permissions on an #active token issued by a DIFFERENT DID than the presented token's iss does not raise the agent's permission set above the protocol default"
+      ],
+      "actionItems": [
+        "Add enforce_agent_permissions to validate.rs and call it at step 6b in both validate paths",
+        "Implement the leaf-toward-root prf walk that stops at the first fact-carrying #active token issued by the presented token's own DID",
+        "Add the two UcanError variants and their arms in crates/scp-ffi/common/src/ucan_errors.rs",
+        "Add the five tests named in the acceptance criteria"
+      ],
+      "blockedBy": [
+        "SCP-AB-023"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/04-agents.md",
+          "section": "### 4.9.2 Category B — user-configurable"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "### 7.2.1 Tier 1: Full UCAN Chain Validation"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "### Permission Model"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-025",
+      "title": "Reject a root UCAN signed by the agent key",
+      "gate": "gate-permission-category-b",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "done",
+      "files": [
+        "crates/scp-protocol/src/crypto/ucan/validate.rs"
+      ],
+      "description": "§4.9.1 reserves root UCAN issuance to #active: a root UCAN carries an empty prf, so its authority derives from the issuer's own key rather than from a parent token, and an agent that could issue one could grant itself every capability inside a context's ceiling. Sub-delegation stays Category B. Today enforce_ucan_category_a inspects only the capability resource type and never inspects prf, so an #agent-signed root token passes. Add the check at step 6b alongside the Category A resource check.",
+      "acceptanceCriteria": [
+        "enforce_ucan_category_a rejects a token whose kid is #agent and whose payload.prf is empty",
+        "The rejection uses a UcanError variant distinct from CategoryAViolation, because issuing a root token is not a DID-document write",
+        "crates/scp-ffi/common/src/ucan_errors.rs maps the new variant to an error code and lists it in the round-trip test",
+        "A test asserts an #agent-signed token with a non-empty prf and a Category B capability still passes, proving sub-delegation stays permitted",
+        "A test asserts an #active-signed token with an empty prf still passes",
+        "A test asserts an #agent-signed token with an empty prf is rejected even when its att set is a single Category B capability"
+      ],
+      "actionItems": [
+        "Add the empty-prf plus #agent check to enforce_ucan_category_a",
+        "Add the UcanError variant and its FFI error-code arm",
+        "Add the three tests named in the acceptance criteria"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/04-agents.md",
+          "section": "### 4.9.1 Category A — protocol-immutable"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "### Permission Model"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-026",
+      "title": "Mint the agent permission set into a UCAN's facts",
+      "gate": "gate-permission-category-b",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/crypto/ucan/mint.rs",
+        "crates/scp-runtime/src/context/mod.rs"
+      ],
+      "description": "A human raises their agent's permission set by publishing fct.scp_agent_permissions on a token their #active key signs (§4.9.2 'Who may carry it'). Add the minting path: a named field on the mint parameters that carries an AgentPermissions, the fct assembly that writes it under the scp_agent_permissions key, and the guard that refuses to mint the fact onto a token whose signing key is #agent. Validation is SCP-AB-024, not this story.",
+      "acceptanceCriteria": [
+        "The UCAN mint parameters carry a named field agent_permissions: Option<AgentPermissions>",
+        "Minting with agent_permissions = Some(...) produces a token whose fct map contains the key scp_agent_permissions with the §4.9.2 JSON shape",
+        "Minting with agent_permissions = Some(...) and a signing key of #agent returns an error rather than a token",
+        "Minting with agent_permissions = None produces a token whose fct map has no scp_agent_permissions key",
+        "A round-trip test mints with agent_permissions = Some(...) and parse_agent_permissions returns the same allow list",
+        "A test asserts the minted fact survives serialization to the encoded JWT and back"
+      ],
+      "actionItems": [
+        "Add the agent_permissions field to the mint parameter struct and thread it through every caller",
+        "Assemble the fct entry during minting",
+        "Guard the #agent signing key case with a typed error",
+        "Add the round-trip and negative tests"
+      ],
+      "blockedBy": [
+        "SCP-AB-023"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/04-agents.md",
+          "section": "### 4.9.2 Category B — user-configurable"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "### Permission Model"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-027",
+      "title": "Export the agent permission set through the three FFI bridges",
+      "gate": "gate-permission-category-b",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/src/ucan.rs",
+        "crates/scp-ffi/napi/src/ucan.rs",
+        "crates/scp-ffi/uniffi/src/ucan.rs"
+      ],
+      "description": "Export the agent permission set across the PyO3, napi-rs and UniFFI bridges. This story stops at the bridge boundary; the SDK wrappers and the capability-matrix rows are SCP-AB-035.",
+      "acceptanceCriteria": [
+        "The PyO3 bridge exports a function that mints a UCAN carrying an agent permission set and a function that reads one back",
+        "The napi-rs bridge exports the same two operations with the same argument names",
+        "The UniFFI bridge exports the same two operations with the same argument names",
+        "bindings/python, bindings/typescript, bindings/swift, and bindings/kotlin each expose a wrapper for both operations",
+        "python3.12 scripts/check-sdk-coverage.py exits zero",
+        "scripts/check-bridge-symmetry.sh exits zero"
+      ],
+      "actionItems": [
+        "Add the the agent permission set export to crates/scp-ffi/src",
+        "Add the the agent permission set export to crates/scp-ffi/napi/src",
+        "Add the the agent permission set export to crates/scp-ffi/uniffi/src"
+      ],
+      "blockedBy": [
+        "SCP-AB-026"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/04-agents.md",
+          "section": "### 4.9.2 Category B — user-configurable"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "### Permission Model"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-035",
+      "title": "Wrap the agent permission set in the four SDKs and fill the capability matrix",
+      "gate": "gate-permission-category-b",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "bindings/python/scp_sdk/scp.py",
+        "bindings/typescript/src/scp.ts",
+        "bindings/swift/Sources/SCP/Scp.swift",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Scp.kt",
+        ".docs/standards/sdk-capability-matrix.json"
+      ],
+      "description": "Wrap the the agent permission set bridge exports in the Python, TypeScript, Swift and Kotlin SDKs, and add the capability-matrix rows. Depends on SCP-AB-027 for the exports it wraps.",
+      "acceptanceCriteria": [
+        "Each of the four SDKs exposes the agent permission set with the per-SDK idiom its own standard names",
+        "The capability matrix carries a row per SDK for the agent permission set, and python3.12 scripts/check-sdk-coverage.py passes"
+      ],
+      "actionItems": [
+        "Add the the agent permission set wrapper to each of the four SDKs",
+        "Add the capability-matrix rows"
+      ],
+      "blockedBy": [
+        "SCP-AB-026",
+        "SCP-AB-035"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/04-agents.md",
+          "section": "### 4.9.2 Category B — user-configurable"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "### Permission Model"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-028",
+      "title": "Add agent_keys_allowed to ContextParams and reject agent-signed artifacts when it is false",
+      "gate": "gate-permission-category-c",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/context/params.rs",
+        "crates/scp-protocol/src/crypto/ucan/validate.rs",
+        "crates/scp-protocol/src/envelope/inner/mod.rs",
+        "crates/scp-mls/src/credential.rs"
+      ],
+      "description": "§4.9.3 defines agent_keys_allowed as a boolean on ContextParams with default true. When a context sets it false, the context admits no artifact signed by #agent: a UCAN whose kid is #agent, an inner envelope whose signing_key_id is Agent, and an MLS credential whose signing_key_id is Agent are each rejected, and members still participate through #active. Add the field, its default, and the three rejection points.",
+      "acceptanceCriteria": [
+        "ContextParams carries a field agent_keys_allowed: bool whose Default impl yields true",
+        "A context created without naming agent_keys_allowed has agent_keys_allowed == true",
+        "UCAN validation rejects a token whose kid is #agent when the context's agent_keys_allowed is false, with a typed error naming the parameter",
+        "Inner envelope verification rejects an envelope whose signing_key_id is Agent when the context's agent_keys_allowed is false",
+        "MLS credential verification rejects a credential whose signing_key_id is Agent when the context's agent_keys_allowed is false",
+        "A test asserts an #active-signed UCAN, inner envelope, and MLS credential each pass in a context whose agent_keys_allowed is false",
+        "A test asserts all three #agent-signed artifacts pass in a context whose agent_keys_allowed is true",
+        "The field round-trips through ContextParams serialization and through a ContextSnapshot"
+      ],
+      "actionItems": [
+        "Add agent_keys_allowed to ContextParams with a true default",
+        "Add the rejection at the UCAN, inner-envelope, and MLS-credential verification points",
+        "Add typed errors naming the parameter",
+        "Add the serialization round-trip and the six positive/negative tests"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/04-agents.md",
+          "section": "### 4.9.3 Category C — context-configurable"
+        },
+        {
+          "file": ".docs/specs/04-agents.md",
+          "section": "## 4.7 Context-Bound at Protocol Level"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "### Permission Model"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-029",
+      "title": "Add agent-restricted roles to role assignment",
+      "gate": "gate-permission-category-c",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/context/roles.rs",
+        "crates/scp-runtime/src/context/governance_helpers.rs"
+      ],
+      "description": "§4.9.3 lets a role assignment name a second role that applies when the signer is #agent. When the assignment names one, a capability check on an #agent-signed action reads that role's capability set; otherwise it reads the member's own role. The agent role's capability set MUST be a subset of the member's own role's set, so an agent never exceeds its human in the same context, and it MUST sit within the context's ceiling like any role definition (§5.5.1, §7.2.1).",
+      "acceptanceCriteria": [
+        "The role assignment type carries an optional agent_role field naming a second role",
+        "A capability check on an #agent-signed action reads the agent_role's capability set when agent_role is Some",
+        "A capability check on an #agent-signed action reads the member's own role when agent_role is None",
+        "A capability check on an #active-signed action always reads the member's own role, whatever agent_role holds",
+        "Assigning an agent_role whose capability set is not a subset of the member's own role's set is rejected with a typed error",
+        "Assigning an agent_role whose capability set exceeds the context's ceiling is rejected with a typed error",
+        "A test asserts an agent holding an agent_role cannot exercise a capability its human's role grants but the agent_role omits",
+        "A test asserts the same human exercising the same capability through #active succeeds"
+      ],
+      "actionItems": [
+        "Add agent_role to the role assignment type",
+        "Branch the capability check on the signing key",
+        "Add the subset-of-member-role and within-ceiling validations",
+        "Add the four tests named in the acceptance criteria"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/04-agents.md",
+          "section": "### 4.9.3 Category C — context-configurable"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.5.1 Default Role Set"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.3 Capability Ceiling"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-030",
+      "title": "Add agent_rate_limit to ContextParams and count agent-signed actions against it",
+      "gate": "gate-permission-category-c",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/context/params.rs",
+        "crates/scp-runtime/src/context/mod.rs"
+      ],
+      "description": "§4.9.3 defines agent_rate_limit as an optional cap on how many actions signed by #agent a single member takes within a rolling window, on ContextParams, default absent. It bounds the agent persona only: an action signed by #active does not count against it. The cap denies an action once the window is full, which is what distinguishes it from the cost escalation of §19.7 — that mechanism reprices a high-velocity sender and never denies the send.",
+      "acceptanceCriteria": [
+        "ContextParams carries a field agent_rate_limit: Option<AgentRateLimit> whose Default impl yields None",
+        "AgentRateLimit names both a maximum count and a window duration, and neither has a hidden default",
+        "The runtime counts an action toward the cap only when the action's signing key is #agent",
+        "An action signed by #agent that would exceed the cap is denied with a typed error naming the parameter and the window",
+        "An action signed by #active in the same window is not counted and is not denied",
+        "The window is rolling: a test advances a test clock past the window and asserts the same member's next #agent-signed action succeeds",
+        "A context whose agent_rate_limit is None denies no action on this path",
+        "The field round-trips through ContextParams serialization and through a ContextSnapshot"
+      ],
+      "actionItems": [
+        "Add agent_rate_limit and the AgentRateLimit type to ContextParams",
+        "Add the per-member rolling-window counter keyed on the #agent signing key",
+        "Add the typed denial error",
+        "Add the clock-advance, #active-exemption, and absent-parameter tests"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/04-agents.md",
+          "section": "### 4.9.3 Category C — context-configurable"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "### Permission Model"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-031",
+      "title": "Add agent_cosign_required to ContextParams and verify the human co-signature",
+      "gate": "gate-permission-category-c",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/context/params.rs",
+        "crates/scp-protocol/src/envelope/inner/mod.rs"
+      ],
+      "description": "§4.9.3 defines agent_cosign_required as the list of capabilities that a member exercising them through #agent must additionally have signed with #active, on ContextParams, default empty. The list names capabilities rather than carrying a single boolean, because a context that required a human signature on every agent action would leave the agent nothing to do autonomously. When the invoked capability is on the list, the verifier requires a second signature over the same signed payload, produced by the #active verification method of the same DID.",
+      "acceptanceCriteria": [
+        "ContextParams carries a field agent_cosign_required: Vec<Capability> whose Default impl yields an empty vector",
+        "Every entry of agent_cosign_required is validated against the context's ceiling at context creation, and an out-of-ceiling entry is rejected",
+        "InnerEnvelope carries an optional cosignature field holding a 64-byte Ed25519 signature over the same 9.5.1 signing hash the #agent signature covers, as 4.9.3 defines it",
+        "A verifier ignores a cosignature present on an artifact whose invoked capability is absent from agent_cosign_required, rather than rejecting it",
+        "Verification requires the second signature when the invoked capability is on agent_cosign_required and the signing key is #agent",
+        "Verification rejects the action when the second signature is absent, and the error names the capability that required it",
+        "Verification rejects the action when the second signature verifies against a DID other than the #agent signer's own DID",
+        "Verification rejects the action when the second signature does not verify against the signer's #active verification method",
+        "Verification does not require a second signature when the signing key is #active",
+        "Verification does not require a second signature when the invoked capability is absent from agent_cosign_required",
+        "A test exercises governance:vote with agent_cosign_required containing governance:vote and asserts each of the accept and reject cases above"
+      ],
+      "actionItems": [
+        "Add agent_cosign_required to ContextParams with an empty default and ceiling validation",
+        "Add the optional cosignature field to InnerEnvelope per 4.9.3, covering the existing 9.5.1 signing hash",
+        "Add the co-signature verification branch",
+        "Add the accept and reject tests named in the acceptance criteria"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/04-agents.md",
+          "section": "### 4.9.3 Category C — context-configurable"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.3 Capability Ceiling"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "### Permission Model"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-032",
+      "title": "Publish the Category C parameters as structural metadata and change them through governance",
+      "gate": "gate-permission-category-c",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/context/metadata.rs",
+        "crates/scp-runtime/src/context/governance_helpers.rs"
+      ],
+      "description": "§5.7 lists agent policy — agent_keys_allowed, agent_rate_limit, and agent_cosign_required — among the structural fields a prospective member reads before joining, and §5.9 states that the context's governance sets and changes them through the same propose/approve path it uses for any other parameter. A change to any of the three ContextParams fields is a metadata change subject to metadata:edit; a change to an agent-restricted role assignment is subject to role:assign.",
+      "acceptanceCriteria": [
+        "The structural metadata a prospective member reads before joining includes agent_keys_allowed, agent_rate_limit, and agent_cosign_required",
+        "The three fields are visible whatever the context's MetadataVisibilityPolicy holds",
+        "A governance proposal that changes any of the three fields requires the metadata:edit capability",
+        "A governance proposal that changes an agent-restricted role assignment requires the role:assign capability",
+        "Executing an approved change updates the context's structural metadata and the change is visible to every member without a re-join",
+        "A test asserts a member without metadata:edit cannot change agent_keys_allowed",
+        "A test reads the three fields from a context the reader has not joined"
+      ],
+      "actionItems": [
+        "Add the three fields to the structural metadata projection",
+        "Gate the parameter change on metadata:edit and the role change on role:assign",
+        "Add the pre-join read test and the unauthorized-change test"
+      ],
+      "blockedBy": [
+        "SCP-AB-028",
+        "SCP-AB-029",
+        "SCP-AB-030",
+        "SCP-AB-031"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/04-agents.md",
+          "section": "### 4.9.3 Category C — context-configurable"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.7 Metadata"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.9 Governance"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-033",
+      "title": "Export the Category C context parameters through the three FFI bridges",
+      "gate": "gate-permission-category-c",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/src/context.rs",
+        "crates/scp-ffi/napi/src/context.rs",
+        "crates/scp-ffi/uniffi/src/context.rs"
+      ],
+      "description": "Export the Category C context parameters across the PyO3, napi-rs and UniFFI bridges. This story stops at the bridge boundary; the SDK wrappers and the capability-matrix rows are SCP-AB-036.",
+      "acceptanceCriteria": [
+        "The context-creation parameters of the PyO3, napi-rs, and UniFFI bridges each carry agent_keys_allowed, agent_rate_limit, and agent_cosign_required with the same argument names",
+        "The structural-metadata read of all three bridges returns the three fields",
+        "bindings/python, bindings/typescript, bindings/swift, and bindings/kotlin each expose the three fields on their context-creation parameters and on their metadata read",
+        "python3.12 scripts/check-sdk-coverage.py exits zero",
+        "scripts/check-bridge-symmetry.sh exits zero"
+      ],
+      "actionItems": [
+        "Add the the Category C context parameters export to crates/scp-ffi/src",
+        "Add the the Category C context parameters export to crates/scp-ffi/napi/src",
+        "Add the the Category C context parameters export to crates/scp-ffi/uniffi/src"
+      ],
+      "blockedBy": [
+        "SCP-AB-032"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/04-agents.md",
+          "section": "### 4.9.3 Category C — context-configurable"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.7 Metadata"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-036",
+      "title": "Wrap the Category C context parameters in the four SDKs and fill the capability matrix",
+      "gate": "gate-permission-category-c",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "bindings/python/scp_sdk/scp.py",
+        "bindings/typescript/src/scp.ts",
+        "bindings/swift/Sources/SCP/Scp.swift",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Scp.kt",
+        ".docs/standards/sdk-capability-matrix.json"
+      ],
+      "description": "Wrap the the Category C context parameters bridge exports in the Python, TypeScript, Swift and Kotlin SDKs, and add the capability-matrix rows. Depends on SCP-AB-033 for the exports it wraps.",
+      "acceptanceCriteria": [
+        "Each of the four SDKs exposes the Category C context parameters with the per-SDK idiom its own standard names",
+        "The capability matrix carries a row per SDK for the Category C context parameters, and python3.12 scripts/check-sdk-coverage.py passes"
+      ],
+      "actionItems": [
+        "Add the the Category C context parameters wrapper to each of the four SDKs",
+        "Add the capability-matrix rows"
+      ],
+      "blockedBy": [
+        "SCP-AB-032",
+        "SCP-AB-036"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/04-agents.md",
+          "section": "### 4.9.3 Category C — context-configurable"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.7 Metadata"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-034",
+      "title": "Intersect the Category B permission set with the Category C context restrictions",
+      "gate": "gate-permission-axes",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/crypto/ucan/validate.rs",
+        "crates/scp-testing/tests/integration/agent_binding.rs"
+      ],
+      "description": "§4.9.4 states that Category B and Category C answer different questions, so neither overrides the other: a verifier admits an #agent-signed action only when both answers permit it. The effective authority of an agent key in a context is the intersection of four bounds — Category B's permission set, the context's Category C parameters, the capabilities the token grants, and the context's capability ceiling — and no one of them widens another. This story adds the conformance tests that hold each direction, and fixes whichever check the tests find missing.",
+      "acceptanceCriteria": [
+        "A test asserts an action Category B permits and the context's agent_keys_allowed forbids is rejected",
+        "A test asserts an action the context permits and the owner's Category B permission set omits is rejected",
+        "A test asserts an action both axes permit but the token's att set omits is rejected",
+        "A test asserts an action both axes permit and the token grants but the context's ceiling omits is rejected",
+        "A test asserts an action all four bounds permit is admitted",
+        "A test asserts no Category B permission set admits an #agent signature on a Category A capability",
+        "A test asserts no Category C parameter admits an #agent signature on a Category A capability",
+        "A test asserts no context parameter admits a UCAN over a capability reserved to #0",
+        "Every test above runs in crates/scp-testing/tests/integration/agent_binding.rs against the real validation pipeline, not against a helper called in isolation"
+      ],
+      "actionItems": [
+        "Write the nine conformance tests against the real validate_ucan pipeline",
+        "Fix whichever bound the tests find unenforced"
+      ],
+      "blockedBy": [
+        "SCP-AB-024",
+        "SCP-AB-028",
+        "SCP-AB-031"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/04-agents.md",
+          "section": "### 4.9.4 What a verifier does when Category B and Category C disagree"
+        },
+        {
+          "file": ".docs/specs/04-agents.md",
+          "section": "## 4.9 Agent Permission Model"
         }
       ],
       "details": {}

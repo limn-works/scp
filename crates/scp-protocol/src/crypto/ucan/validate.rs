@@ -14,7 +14,10 @@
 //!    5a. **Self-delegation** — Reject `iss == aud` unless `scp_key_scope` present (ADR-039).
 //!    5b. **Key scope** — If `fct.scp_key_scope` present, verify signing key matches scope (ADR-039).
 //! 6. **Capability match** — Verify `att` includes required capability.
-//!    6b. **Category A enforcement** — If `kid` is `#agent`, reject Category A capabilities (ADR-039).
+//!    6b. **Agent permission model** — On the presented token and on every parent the
+//!    chain walk resolves, reject a Category A capability signed by `#agent`, reject a
+//!    root UCAN (empty `prf`) signed by `#agent`, and reject a capability reserved to
+//!    `#0` whatever key signed the token (ADR-039; spec §4.9.1).
 //! 7. **Attenuation** — Verify delegations narrow or preserve.
 //! 8. **Ceiling** — Verify every granted capability is within context ceiling.
 //! 9. **Nonce** — Validate format, freshness, uniqueness.
@@ -35,7 +38,7 @@ use scp_did::SigningKeyId;
 use super::capability::{CapabilityUri, check_capability_match, verify_ceiling_compliance};
 use super::revoke::compute_revocation_cid;
 use super::{UcanError, UcanHeader, UcanPayload, UcanToken};
-use crate::trust::custody_violation::{ActionCategory, classify_action};
+use crate::trust::custody_violation::{ActionCategory, classify_action, requires_identity_key};
 
 /// Maximum token lifetime: 24 hours in seconds (spec section 9.5).
 const MAX_EXPIRY_SECS: u64 = 24 * 60 * 60;
@@ -779,9 +782,11 @@ where
     let granted_caps = parse_granted_caps(token)?;
     check_capability_match(&granted_caps, required_capability)?;
 
-    // Step 6b: Category A enforcement (ADR-039 Enforcement Stack layer 3).
-    // If the token is signed by #agent, reject any Category A capabilities
-    // (DID document modifications, pre-rotation, identity migration).
+    // Step 6b: the Category A key reservations (ADR-039 enforcement stack
+    // layer 3, §4.9.1). Rule 1 rejects an #agent signature over a Category A
+    // capability; rule 2 rejects a capability reserved to #0 whatever key
+    // signed the token. The chain walk above ran the same two rules on every
+    // parent, so this call covers the presented token only.
     enforce_ucan_category_a(token, &granted_caps)?;
 
     // Step 7 + 7b: Attenuation (capability subset + §7.3.8 caveat narrow) is
@@ -1140,7 +1145,8 @@ where
             check_capability_match(&granted_caps, required)?;
         }
 
-        // Step 6b: Category-A enforcement.
+        // Step 6b: the Category A key reservations (§4.9.1). The chain walk
+        // above ran the same two rules on every parent.
         enforce_ucan_category_a(token, &granted_caps)?;
 
         // Step 7 + 7b: attenuation (capability subset + §7.3.8 caveat narrow)
@@ -1309,15 +1315,43 @@ pub(super) fn validate_key_scope(token: &UcanToken) -> Result<(), UcanError> {
     Ok(())
 }
 
-/// Step 6b: Enforces Category A restrictions on a UCAN token (ADR-039
-/// Enforcement Stack layer 3).
+/// Step 6b: Enforces the Category A key reservations on a UCAN token (ADR-039
+/// Enforcement Stack layer 3, spec §4.9.1).
 ///
-/// If the token is signed by `#agent` (indicated by the `kid` header field)
-/// and any granted capability is a Category A action, the token is rejected
-/// with [`UcanError::CategoryAViolation`].
+/// The function applies three rules in order, and the order decides which
+/// finding a verifier reports when more than one holds:
+///
+/// 1. The token is signed by `#agent` (from the `kid` header) and grants a
+///    Category A capability. The agent key crossed a boundary the protocol
+///    fixes, so the token is rejected with [`UcanError::CategoryAViolation`].
+///    §4.9.1 rule 1 also requires a `ScpCustodyViolationAttestation`; no caller
+///    of this function writes one, and §27.4.7 of the attestations spec derives
+///    that absence and records it as open question OQ-26.
+/// 2. The token is signed by `#agent` and carries an empty `prf`, which makes
+///    it a root UCAN. ADR-039 reserves root issuance to `#active`, and the
+///    token is rejected with [`UcanError::AgentRootIssuance`]. Rules 1 and 2
+///    cannot reach this token: every capability a context ceiling admits is
+///    Category B, so an agent that issued a root granting the whole ceiling
+///    would hold every capability in it with no human signature anywhere in
+///    the chain.
+/// 3. The token grants a capability ADR-039 reserves to the Identity Key
+///    (`#0`). [`SigningKeyId`] admits `#active` and `#agent` and nothing else,
+///    so `#0` never signs a UCAN and no signer can carry that authority. The
+///    token is rejected with [`UcanError::IdentityKeyReservedCapability`],
+///    which is a malformed grant rather than a custody violation and is
+///    recorded against nobody's reputation.
+///
+/// Rule 1 runs first over the whole attestation set, so an `#agent` signature
+/// on a `#0`-reserved resource is still reported as a custody violation, and
+/// an `#agent`-signed root that also names a Category A capability is reported
+/// as a custody violation rather than as a root-issuance overreach.
 ///
 /// This is a network-level enforcement point: non-conformant SDKs can produce
-/// these signatures but they cannot propagate through the network.
+/// these signatures but they cannot propagate through the network. Both
+/// `validate_ucan` and the chain walk `verify_chain_recursive` call it, so a
+/// token is checked whether it is the presented leaf or a parent resolved out
+/// of a `prf` — step 7 lets a parent grant a capability its child never names,
+/// and a leaf-only check would let the child launder it.
 ///
 /// # Arguments
 ///
@@ -1326,8 +1360,11 @@ pub(super) fn validate_key_scope(token: &UcanToken) -> Result<(), UcanError> {
 ///
 /// # Errors
 ///
-/// Returns [`UcanError::CategoryAViolation`] if any capability is Category A
-/// and the signing key is `#agent`.
+/// Returns [`UcanError::CategoryAViolation`] when the signing key is `#agent`
+/// and any capability is Category A, [`UcanError::AgentRootIssuance`] when the
+/// signing key is `#agent` and `prf` is empty, and
+/// [`UcanError::IdentityKeyReservedCapability`] when any capability is
+/// reserved to `#0`.
 fn enforce_ucan_category_a(
     token: &UcanToken,
     granted_caps: &[CapabilityUri],
@@ -1344,13 +1381,36 @@ fn enforce_ucan_category_a(
         )));
     };
 
-    if signing_key_id != SigningKeyId::Agent {
-        return Ok(());
+    // Rule 1 — the agent key MUST NOT sign a Category A capability. Runs over
+    // the whole attestation set before rule 2, so a custody violation is
+    // reported as one even when the same capability is also #0-reserved.
+    if signing_key_id == SigningKeyId::Agent {
+        for cap in granted_caps {
+            if classify_action(cap.resource()) == ActionCategory::CategoryA {
+                return Err(UcanError::CategoryAViolation {
+                    action: cap.capability_name(),
+                    kid: kid_str.to_owned(),
+                });
+            }
+        }
     }
 
+    // Rule 3 — the agent key MUST NOT issue a root UCAN. A root token carries
+    // an empty `prf`, so its authority derives from the issuer's own key rather
+    // than from a parent, and rules 1 and 2 do not reach it: every capability a
+    // context ceiling admits is Category B, so an #agent-signed root granting
+    // the whole ceiling passes both. ADR-039 reserves root issuance to #active
+    // for that reason (§4.9.1, the #active criterion).
+    if signing_key_id == SigningKeyId::Agent && token.payload.prf.is_empty() {
+        return Err(UcanError::AgentRootIssuance {
+            kid: kid_str.to_owned(),
+        });
+    }
+
+    // Rule 2 — no UCAN carries a capability reserved to #0, whatever signed it.
     for cap in granted_caps {
-        if classify_action(cap.resource()) == ActionCategory::CategoryA {
-            return Err(UcanError::CategoryAViolation {
+        if requires_identity_key(cap.resource()) {
+            return Err(UcanError::IdentityKeyReservedCapability {
                 action: cap.capability_name(),
                 kid: kid_str.to_owned(),
             });
@@ -1523,6 +1583,28 @@ fn verify_chain_recursive(
 
         // Verify parent's signature.
         verify_signature(&parent, did_resolver)?;
+
+        // Step 6b at THIS parent (§7.2.1 step 6b, §4.9.1). Step 7's attenuation
+        // check requires the child's `att` to be a subset of the parent's, so a
+        // parent may grant a Category A capability the child never names. That
+        // parent carries the artifact rule 1 rejects — an `#agent` signature
+        // over a Category A capability — and the child launders it: without
+        // this call, delegating any Category B capability out of such a parent
+        // produces a chain every gate accepts, and the parent propagates
+        // through the network. ADR-039's enforcement-stack layer 3 requires the
+        // opposite, so the chain walk runs the same three rules on every parent
+        // that `validate_ucan` runs on the presented token.
+        //
+        // This call sits BELOW `verify_signature` deliberately. `parent` comes
+        // out of `resolve_proof`, so until the line above returns, its `iss`,
+        // its `kid` and its `att` are bytes the presenter chose. Rule 1's
+        // verdict is a custody violation that §4.9.1 attributes to a DID and
+        // records permanently, so running it over unauthenticated bytes would
+        // let a presenter mint that verdict against any DID it names. Ordering
+        // it after the signature check means every verdict this call produces
+        // names a DID that really signed the parent.
+        let parent_caps = parse_granted_caps(&parent)?;
+        enforce_ucan_category_a(&parent, &parent_caps)?;
 
         // Verify parent token has not expired (spec 7.2).
         // Wrap expiry errors as DelegationChainBroken so downstream classifiers
@@ -2036,6 +2118,7 @@ mod tests {
         AttenuationViolation, CaveatField, DaysOfWeekMask, HoursOfDayMask, InvocationCaveats,
         RateWindow,
     };
+    use crate::trust::custody_violation::{category_a_resources, identity_key_reserved_resources};
     use scp_did::DID;
 
     /// Builds a synthetic token with the given encoded string, attestation
@@ -3360,5 +3443,355 @@ mod tests {
         );
         run_chain(&chain, &TokenNbCaveatResolver)
             .expect("an honest outlet chain with origin_kind materialized at every edge must pass");
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 6b: Category A key reservations (§4.9.1, ADR-039 Permission Model)
+    // -----------------------------------------------------------------------
+
+    /// A capability outside the outlet family, so the §7.3.8 `origin_kind`
+    /// caveat the outlet capabilities require does not apply and a chain built
+    /// with no caveats passes attenuation.
+    const NON_OUTLET_CAP: &str = "scp:ctx:abc/messages:write";
+
+    /// Returns a synthetic token granting `att` and signed by `kid`.
+    fn token_signed_by(kid: &str, att: &str) -> UcanToken {
+        let mut token = synthetic_token("LEAF", &[att], &["PARENT"]);
+        token.header.kid = Some(kid.to_owned());
+        token
+    }
+
+    /// AC (§4.9.1 rule 2): a UCAN whose `att` names a capability the protocol
+    /// reserves to `#0` is rejected even when `#active` signed it, because
+    /// `#0` never signs a UCAN and no other key carries that authority.
+    #[test]
+    fn step_6b_rejects_active_kid_on_identity_key_reserved_capability() {
+        for resource in identity_key_reserved_resources() {
+            let token = token_signed_by("#active", &format!("scp:ctx:abc/{resource}:update"));
+            let caps = parse_granted_caps(&token).expect("synthetic att parses");
+            let Err(err) = enforce_ucan_category_a(&token, &caps) else {
+                panic!("`{resource}` is reserved to #0, so an #active-signed grant must reject")
+            };
+            match err {
+                UcanError::IdentityKeyReservedCapability {
+                    ref action,
+                    ref kid,
+                } => {
+                    assert_eq!(action, &format!("{resource}:update"));
+                    assert_eq!(kid, "#active");
+                }
+                other => panic!("expected IdentityKeyReservedCapability, got {other:?}"),
+            }
+        }
+    }
+
+    /// AC (§4.9.1, no over-rejection): `#active` still signs every capability
+    /// the protocol does not reserve to `#0` — two Category B capabilities,
+    /// and the one Category A resource whose key reservation ADR-039 leaves
+    /// open (`identity`, see `.docs/specs/00-open-questions.md`).
+    #[test]
+    fn step_6b_admits_active_kid_on_capability_not_reserved_to_identity_key() {
+        for att in [
+            "scp:ctx:abc/messages:write",
+            "scp:ctx:abc/outlet_call:assistant",
+            "scp:ctx:abc/identity:update",
+        ] {
+            let token = token_signed_by("#active", att);
+            let caps = parse_granted_caps(&token).expect("synthetic att parses");
+            assert!(
+                enforce_ucan_category_a(&token, &caps).is_ok(),
+                "{att} is not reserved to #0, so an #active-signed grant must pass"
+            );
+        }
+    }
+
+    /// AC (§4.9.1 rule 1 runs first): `#agent` on a `#0`-reserved capability
+    /// is reported as a custody violation, not as a malformed grant.
+    #[test]
+    fn step_6b_reports_agent_kid_on_reserved_capability_as_custody_violation() {
+        let token = token_signed_by("#agent", "scp:ctx:abc/did_document:update");
+        let caps = parse_granted_caps(&token).expect("synthetic att parses");
+        let err = enforce_ucan_category_a(&token, &caps)
+            .expect_err("#agent on a Category A capability must reject");
+        match err {
+            UcanError::CategoryAViolation {
+                ref action,
+                ref kid,
+            } => {
+                assert_eq!(action, "did_document:update");
+                assert_eq!(kid, "#agent");
+            }
+            other => panic!("expected CategoryAViolation, got {other:?}"),
+        }
+    }
+
+    /// AC (§4.9.1 rule 1): every Category A resource rejects an `#agent`
+    /// signature, including the one that is not reserved to `#0`.
+    #[test]
+    fn step_6b_rejects_agent_kid_on_every_category_a_resource() {
+        for resource in category_a_resources() {
+            let token = token_signed_by("#agent", &format!("scp:ctx:abc/{resource}:update"));
+            let caps = parse_granted_caps(&token).expect("synthetic att parses");
+            let Err(err) = enforce_ucan_category_a(&token, &caps) else {
+                panic!("#agent must not sign the Category A resource `{resource}`")
+            };
+            assert!(
+                matches!(err, UcanError::CategoryAViolation { .. }),
+                "expected CategoryAViolation for `{resource}`, got {err:?}"
+            );
+        }
+    }
+
+    /// AC (§4.9.1 rule 2 checks the whole attestation set): a token whose
+    /// first attestation is permitted and whose second is `#0`-reserved is
+    /// rejected on the second.
+    #[test]
+    fn step_6b_checks_every_attestation_not_only_the_first() {
+        let mut token = synthetic_token(
+            "LEAF",
+            &[
+                "scp:ctx:abc/messages:write",
+                "scp:ctx:abc/pre_rotation:update",
+            ],
+            &["PARENT"],
+        );
+        token.header.kid = Some("#active".to_owned());
+        let caps = parse_granted_caps(&token).expect("synthetic att parses");
+        let err = enforce_ucan_category_a(&token, &caps)
+            .expect_err("a #0-reserved attestation anywhere in att must reject the token");
+        match err {
+            UcanError::IdentityKeyReservedCapability { ref action, .. } => {
+                assert_eq!(action, "pre_rotation:update");
+            }
+            other => panic!("expected IdentityKeyReservedCapability, got {other:?}"),
+        }
+    }
+
+    /// AC (§4.9.1): the `#0` reservation omits exactly `identity` and
+    /// `service`, and it adds nothing `CATEGORY_A_RESOURCES` does not carry.
+    /// Asserting both directions is what keeps an entry from being added to the
+    /// reservation alone, which would reject a resource type no Category A
+    /// criterion selects.
+    #[test]
+    fn step_6b_reservation_omits_identity_and_service_and_adds_nothing() {
+        let unreserved: Vec<&str> = category_a_resources()
+            .iter()
+            .copied()
+            .filter(|r| !identity_key_reserved_resources().contains(r))
+            .collect();
+        assert_eq!(unreserved, vec!["identity", "service"]);
+
+        let reserved_but_not_category_a: Vec<&str> = identity_key_reserved_resources()
+            .iter()
+            .copied()
+            .filter(|r| !category_a_resources().contains(r))
+            .collect();
+        assert!(
+            reserved_but_not_category_a.is_empty(),
+            "a #0 reservation on a resource type outside CATEGORY_A_RESOURCES rejects a \
+             capability no Category A criterion selects: {reserved_but_not_category_a:?}"
+        );
+    }
+
+    /// AC (§4.9.1, no over-rejection): `service` satisfies the §5.3.1.1 custom
+    /// ceiling grammar, so a context may declare `service:read` in its own
+    /// ceiling and mean its own service registry. An `#active` signature over
+    /// it passes step 6b, exactly as it does before the `#0` reservation
+    /// existed.
+    #[test]
+    fn step_6b_admits_active_kid_on_the_service_resource() {
+        let token = token_signed_by("#active", "scp:ctx:abc/service:read");
+        let caps = parse_granted_caps(&token).expect("synthetic att parses");
+        assert!(
+            enforce_ucan_category_a(&token, &caps).is_ok(),
+            "`service` is a legal custom ceiling resource, so an #active-signed grant \
+             over it must pass"
+        );
+        assert!(
+            crate::context::roles::validate_ucan_ceiling_string("service:read").is_ok(),
+            "this test's premise is that §5.3.1.1 admits `service:read` as a custom \
+             ceiling entry — if that stops holding, the reservation can take `service` back"
+        );
+    }
+
+    /// AC (§4.9.1, the `#active` criterion; §7.2.1 step 6b rule 3): an
+    /// `#agent`-signed root UCAN is rejected, whatever it grants.
+    ///
+    /// The attack this closes: a root token carries an empty `prf`, so rule 1
+    /// and rule 2 never fire on one that grants only Category B capabilities,
+    /// and every capability a context ceiling admits is Category B. An agent
+    /// holding its human's `#agent` key could therefore mint `iss = aud = own
+    /// DID`, `kid = "#agent"`, `prf = []`, `att` = the whole ceiling, and pass
+    /// every one of the eleven validation steps — acquiring every capability
+    /// in the context with no human signature anywhere in the chain.
+    #[test]
+    fn step_6b_rejects_an_agent_signed_root_ucan() {
+        let mut token = synthetic_token("ROOT", &[NON_OUTLET_CAP], &[]);
+        token.header.kid = Some("#agent".to_owned());
+        let caps = parse_granted_caps(&token).expect("synthetic att parses");
+        let err =
+            enforce_ucan_category_a(&token, &caps).expect_err("#agent must not issue a root UCAN");
+        match err {
+            UcanError::AgentRootIssuance { ref kid } => assert_eq!(kid, "#agent"),
+            other => panic!("expected AgentRootIssuance, got {other:?}"),
+        }
+    }
+
+    /// AC (§4.9.1, no over-rejection of rule 3): the two tokens rule 3 must not
+    /// touch. An `#active`-signed root is how every delegation chain starts, and
+    /// an `#agent`-signed token that carries a proof is an ordinary
+    /// sub-delegation, which ADR-039 puts in Category B.
+    #[test]
+    fn step_6b_admits_an_active_root_and_an_agent_sub_delegation() {
+        let mut active_root = synthetic_token("ROOT", &[NON_OUTLET_CAP], &[]);
+        active_root.header.kid = Some("#active".to_owned());
+        let caps = parse_granted_caps(&active_root).expect("synthetic att parses");
+        assert!(
+            enforce_ucan_category_a(&active_root, &caps).is_ok(),
+            "an #active-signed root is the origin of every chain and must pass"
+        );
+
+        let mut agent_child = synthetic_token("LEAF", &[NON_OUTLET_CAP], &["PARENT"]);
+        agent_child.header.kid = Some("#agent".to_owned());
+        let caps = parse_granted_caps(&agent_child).expect("synthetic att parses");
+        assert!(
+            enforce_ucan_category_a(&agent_child, &caps).is_ok(),
+            "an #agent-signed sub-delegation confers no authority its parent lacked, \
+             which ADR-039 puts in Category B"
+        );
+    }
+
+    /// AC (§4.9.1, rule 1 runs first): an `#agent`-signed root that also grants
+    /// a Category A capability is reported as a custody violation, because the
+    /// agent key crossing the Category A boundary is the more specific finding.
+    #[test]
+    fn step_6b_reports_an_agent_root_granting_category_a_as_a_custody_violation() {
+        let mut token = synthetic_token("ROOT", &["scp:ctx:abc/did_document:update"], &[]);
+        token.header.kid = Some("#agent".to_owned());
+        let caps = parse_granted_caps(&token).expect("synthetic att parses");
+        let err = enforce_ucan_category_a(&token, &caps)
+            .expect_err("#agent on a Category A capability must reject");
+        assert!(
+            matches!(err, UcanError::CategoryAViolation { .. }),
+            "expected CategoryAViolation, got {err:?}"
+        );
+    }
+
+    /// AC (§4.9.1, no over-rejection): `requires_identity_key` reads the
+    /// resource segment and ignores the action segment, so rule 2 rejects
+    /// `did_document:read` as well as `did_document:update`. That costs a
+    /// verifier nothing, because no context ceiling admits any of the six
+    /// reserved tokens at any action — each carries an underscore, which
+    /// §5.3.1.1 forbids in a custom entry, and none is a built-in. This test
+    /// pins that premise: if a reserved token ever becomes a legal ceiling
+    /// entry, rule 2 starts rejecting a capability a context declared, and
+    /// the reservation has to read the action segment.
+    #[test]
+    fn step_6b_reserved_resources_are_never_legal_ceiling_entries() {
+        for resource in identity_key_reserved_resources() {
+            for action in ["read", "update", "*"] {
+                let entry = format!("{resource}:{action}");
+                assert!(
+                    crate::context::roles::validate_ucan_ceiling_string(&entry).is_err(),
+                    "`{entry}` became a legal ceiling entry, so rejecting it on the \
+                     resource segment alone now rejects a capability a context declared"
+                );
+            }
+        }
+    }
+
+    /// AC (§4.9.1 rule 1): `#agent` is still rejected on `service`, because
+    /// `service` stays in `CATEGORY_A_RESOURCES`. Omitting it from the `#0`
+    /// reservation changes what `#active` may sign and changes nothing about
+    /// what `#agent` may sign.
+    #[test]
+    fn step_6b_still_rejects_agent_kid_on_the_service_resource() {
+        let token = token_signed_by("#agent", "scp:ctx:abc/service:read");
+        let caps = parse_granted_caps(&token).expect("synthetic att parses");
+        let err = enforce_ucan_category_a(&token, &caps)
+            .expect_err("#agent must not sign a Category A resource");
+        assert!(
+            matches!(err, UcanError::CategoryAViolation { .. }),
+            "expected CategoryAViolation, got {err:?}"
+        );
+    }
+
+    /// AC (§7.2.1 step 6b, on every parent): step 7 requires the child's `att`
+    /// to be a subset of the parent's, so a parent may grant a capability the
+    /// child never names. A root granting a `#0`-reserved capability, with a
+    /// mid and a leaf that grant only `CAP`, passes every other chain check —
+    /// the walk must reject it on the root.
+    #[test]
+    fn chain_walk_rejects_a_parent_granting_a_zero_reserved_capability() {
+        let chain = build_depth3(
+            &[NON_OUTLET_CAP, "scp:ctx:abc/did_document:update"],
+            &[NON_OUTLET_CAP],
+            &[NON_OUTLET_CAP],
+            None,
+            None,
+            None,
+        );
+        let err = run_chain(&chain, &NoCaveatResolver)
+            .expect_err("a #0-reserved capability on a parent must reject the chain");
+        match err {
+            UcanError::IdentityKeyReservedCapability { ref action, .. } => {
+                assert_eq!(action, "did_document:update");
+            }
+            other => panic!("expected IdentityKeyReservedCapability, got {other:?}"),
+        }
+    }
+
+    /// AC (§4.9.1 rule 1, on every parent): an `#agent`-signed parent granting
+    /// a Category A capability is a custody violation wherever it sits in the
+    /// chain. `identity` is the case that isolates rule 1: it is Category A and
+    /// it is not `#0`-reserved, so only rule 1 can reject it, and the root that
+    /// grants it to the mid is `#active`-signed and passes.
+    #[test]
+    fn chain_walk_reports_an_agent_signed_parent_as_a_custody_violation() {
+        let att = "scp:ctx:abc/identity:update";
+        let mut chain = build_depth3(
+            &[NON_OUTLET_CAP, att],
+            &[NON_OUTLET_CAP, att],
+            &[NON_OUTLET_CAP],
+            None,
+            None,
+            None,
+        );
+        let mid = chain
+            .proof_resolver
+            .proofs
+            .get_mut("hdr.MID.sig")
+            .expect("the depth-3 fixture stores the mid token under its encoded form");
+        mid.header.kid = Some("#agent".to_owned());
+
+        let err = run_chain(&chain, &NoCaveatResolver)
+            .expect_err("an #agent-signed parent granting a Category A capability must reject");
+        match err {
+            UcanError::CategoryAViolation {
+                ref action,
+                ref kid,
+            } => {
+                assert_eq!(action, "identity:update");
+                assert_eq!(kid, "#agent");
+            }
+            other => panic!("expected CategoryAViolation, got {other:?}"),
+        }
+    }
+
+    /// AC (§4.9.1, no over-rejection on a parent): the same depth-3 chain with
+    /// only operational capabilities passes, so the parent-side step 6b adds no
+    /// rejection to an honestly-minted chain.
+    #[test]
+    fn chain_walk_admits_a_parent_granting_only_operational_capabilities() {
+        let chain = build_depth3(
+            &[NON_OUTLET_CAP, "scp:ctx:abc/service:read"],
+            &[NON_OUTLET_CAP],
+            &[NON_OUTLET_CAP],
+            None,
+            None,
+            None,
+        );
+        run_chain(&chain, &NoCaveatResolver)
+            .expect("a chain whose parents grant only operational capabilities must pass");
     }
 }
