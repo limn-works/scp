@@ -584,6 +584,7 @@ mod tests {
 
     use super::*;
     use crate::checkpoint::ConsistencyCheckpoint;
+    use crate::test_helpers::test_did_document;
     use crate::tree::{self, GENESIS_PREV_HASH};
     use crate::{Event, EventLog, EventPayload, EventType};
 
@@ -599,15 +600,7 @@ mod tests {
     }
 
     fn did_from_pubkey(verifying_key: &ed25519_dalek::VerifyingKey) -> String {
-        let hex: String = verifying_key
-            .as_bytes()
-            .iter()
-            .fold(String::new(), |mut acc, b| {
-                use std::fmt::Write;
-                let _ = write!(acc, "{b:02x}");
-                acc
-            });
-        format!("did:key:{hex}")
+        scp_did::did_dht_from_public_key(verifying_key.as_bytes()).to_string()
     }
 
     /// Must match the production `compute_event_canonical_hash` in `tree.rs`.
@@ -661,6 +654,7 @@ mod tests {
     ) -> (EventLog, Vec<Event>, Vec<[u8; 32]>) {
         let (verifying_key, signing_key) = test_keypair();
         let did = did_from_pubkey(&verifying_key);
+        let actor_document = test_did_document(&did, &verifying_key);
         let mut log = EventLog::new("ctx-prune-test".to_owned());
         let mut prev_hash = GENESIS_PREV_HASH;
         let mut events = Vec::new();
@@ -684,7 +678,7 @@ mod tests {
                 prev_hash,
                 &signing_key,
             );
-            tree::append(&mut log, &event).unwrap();
+            tree::append(&mut log, &event, &actor_document).unwrap();
 
             let serialized = rmp_serde::to_vec(&event).unwrap();
             let mut hasher = Sha256::new();
@@ -1256,6 +1250,7 @@ mod tests {
         // would be pruned with 1x retention but kept with 3x.
         let (verifying_key, signing_key) = test_keypair();
         let did = did_from_pubkey(&verifying_key);
+        let actor_document = test_did_document(&did, &verifying_key);
         let mut log = EventLog::new("ctx-prune-test".to_owned());
         let mut prev_hash = GENESIS_PREV_HASH;
         let mut events = Vec::new();
@@ -1270,7 +1265,7 @@ mod tests {
             prev_hash,
             &signing_key,
         );
-        tree::append(&mut log, &e0).unwrap();
+        tree::append(&mut log, &e0, &actor_document).unwrap();
         let serialized = rmp_serde::to_vec(&e0).unwrap();
         let mut h = Sha256::new();
         h.update([0x00]);
@@ -1288,7 +1283,7 @@ mod tests {
             prev_hash,
             &signing_key,
         );
-        tree::append(&mut log, &e1).unwrap();
+        tree::append(&mut log, &e1, &actor_document).unwrap();
         let serialized = rmp_serde::to_vec(&e1).unwrap();
         let mut h = Sha256::new();
         h.update([0x00]);
@@ -1306,7 +1301,7 @@ mod tests {
             prev_hash,
             &signing_key,
         );
-        tree::append(&mut log, &e2).unwrap();
+        tree::append(&mut log, &e2, &actor_document).unwrap();
         events.push(e2);
 
         let _checkpoint = make_checkpoint(&log, 2, 300);

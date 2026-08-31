@@ -1555,7 +1555,7 @@ async fn ucan_kid_scope_mismatch_rejected() {
         .unwrap();
 
     // Tamper: set kid to "#agent" while fct still says "#active".
-    token.header.kid = Some("#agent".to_owned());
+    token.header.kid = Some(scp_did::SigningKeyId::Agent);
 
     let mut resolver_keys = HashMap::new();
     resolver_keys.insert(issuer_did.clone(), issuer_pk);
@@ -1618,7 +1618,11 @@ async fn ucan_kid_scope_mismatch_rejected() {
     resolver_keys_with_agent.insert(issuer_did.clone(), issuer_pk);
     let did_resolver_2 = InMemoryDidResolver {
         keys: resolver_keys_with_agent,
-        kid_keys: std::iter::once(((issuer_did.clone(), "#agent".to_owned()), issuer_pk)).collect(),
+        kid_keys: std::iter::once((
+            (issuer_did.clone(), scp_did::SigningKeyId::Agent),
+            issuer_pk,
+        ))
+        .collect(),
     };
     let revocation_checker_2 = InMemoryRevocationChecker::new();
     let proof_resolver_2 = InMemoryProofResolver::new();

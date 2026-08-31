@@ -50,6 +50,12 @@ mod tests {
     }
 
     /// Creates a `DidDocument` with identity + active keys and optionally an agent key.
+    ///
+    /// `add_agent_key` rather than a hand-built `VerificationMethod`, because
+    /// it also references `{did}#agent` from `authentication` and
+    /// `assertionMethod`. Pushing the method alone modelled a document no SCP
+    /// constructor produces, and a resolver reading a verification relationship
+    /// supplies no key from it.
     fn make_did_document(
         did: &str,
         identity_pk: &[u8; 32],
@@ -58,13 +64,8 @@ mod tests {
     ) -> DidDocument {
         let mut doc = DidDocument::new(did, identity_pk, active_pk, &[0u8; 32]);
         if let Some(apk) = agent_pk {
-            let agent_vm = VerificationMethod {
-                id: format!("{did}#agent"),
-                method_type: "Ed25519VerificationKey2020".to_owned(),
-                controller: did.to_owned(),
-                public_key_multibase: format!("z{}", bs58::encode(apk).into_string()),
-            };
-            doc.verification_method.push(agent_vm);
+            doc.add_agent_key(apk)
+                .expect("a freshly built document publishes no #agent method yet");
         }
         doc
     }
@@ -123,7 +124,7 @@ mod tests {
         assert_eq!(token.payload.iss, token.payload.aud);
 
         // Verify the kid header is set from key_scope.
-        assert_eq!(token.header.kid.as_deref(), Some("#agent"));
+        assert_eq!(token.header.kid, Some(scp_did::SigningKeyId::Agent));
     }
 
     // -----------------------------------------------------------------------

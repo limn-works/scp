@@ -4456,7 +4456,7 @@ mod tests {
             // also uses `SystemClock`, so expiry + nonce-freshness both validate
             // against real time.
             let now = scp_clock::SystemClock.now_secs();
-            let header = UcanHeader::with_kid("#agent".to_owned());
+            let header = UcanHeader::with_kid(scp_did::SigningKeyId::Agent);
             let payload = UcanPayload {
                 iss: actor_did.as_ref().to_owned(),
                 aud: actor_did.as_ref().to_owned(),

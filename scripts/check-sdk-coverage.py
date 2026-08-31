@@ -131,6 +131,8 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     },
     ("Identity", "verify_attestation"): {
         "kotlin": ["verifyLinkAttestation"],
+        "typescript": ["identityVerifyLinkAttestation"],
+        "swift": ["verifyLinkAttestation", "identityVerifyLinkAttestation"],
     },
     # Outlets streaming control plane (SCP-OUT-038): the grant/cancel methods
     # live on the InvocationHandle returned by the single public invoke() verb,

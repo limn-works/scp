@@ -1197,7 +1197,8 @@ mod tests {
     use super::*;
     use crate::DID;
     use crate::test_helpers::{
-        TestSigner, did_from_pubkey, leaf_hash_from_event, sign_event, test_keypair,
+        TestSigner, did_from_pubkey, leaf_hash_from_event, sign_event, test_did_document,
+        test_keypair,
     };
     use crate::tree::{self, GENESIS_PREV_HASH};
     use crate::{EventLog, EventType};
@@ -1211,6 +1212,7 @@ mod tests {
     fn build_log(n: u64) -> (EventLog, Vec<[u8; 32]>, DID) {
         let (verifying_key, signing_key) = test_keypair();
         let did = did_from_pubkey(&verifying_key);
+        let actor_document = test_did_document(&did, &verifying_key);
         let mut log = EventLog::new("ctx-checkpoint-test".to_owned());
         let mut prev_hash = GENESIS_PREV_HASH;
         let mut leaf_hashes = Vec::new();
@@ -1225,7 +1227,7 @@ mod tests {
                 prev_hash,
                 &signing_key,
             );
-            tree::append(&mut log, &event).unwrap();
+            tree::append(&mut log, &event, &actor_document).unwrap();
             let leaf_hash = leaf_hash_from_event(&event);
             leaf_hashes.push(leaf_hash);
             prev_hash = leaf_hash;
@@ -1238,6 +1240,7 @@ mod tests {
     fn build_matching_logs(n: u64) -> (EventLog, EventLog, DID) {
         let (verifying_key, signing_key) = test_keypair();
         let did = did_from_pubkey(&verifying_key);
+        let actor_document = test_did_document(&did, &verifying_key);
         let mut log_a = EventLog::new("ctx-checkpoint-test".to_owned());
         let mut log_b = EventLog::new("ctx-checkpoint-test".to_owned());
         let mut prev_hash = GENESIS_PREV_HASH;
@@ -1252,8 +1255,8 @@ mod tests {
                 prev_hash,
                 &signing_key,
             );
-            tree::append(&mut log_a, &event).unwrap();
-            tree::append(&mut log_b, &event).unwrap();
+            tree::append(&mut log_a, &event, &actor_document).unwrap();
+            tree::append(&mut log_b, &event, &actor_document).unwrap();
             let leaf_hash = leaf_hash_from_event(&event);
             prev_hash = leaf_hash;
         }
@@ -1343,9 +1346,11 @@ mod tests {
     async fn compare_returns_divergent_for_mismatched_roots_same_count() {
         let (verifying_key_a, signing_key_a) = test_keypair();
         let did_a = did_from_pubkey(&verifying_key_a);
+        let actor_document_a = test_did_document(&did_a, &verifying_key_a);
 
         let (verifying_key_b, signing_key_b) = test_keypair();
         let did_b = did_from_pubkey(&verifying_key_b);
+        let actor_document_b = test_did_document(&did_b, &verifying_key_b);
 
         let mut log_a = EventLog::new("ctx-checkpoint-test".to_owned());
         let mut log_b = EventLog::new("ctx-checkpoint-test".to_owned());
@@ -1363,7 +1368,7 @@ mod tests {
                 prev_hash_a,
                 &signing_key_a,
             );
-            tree::append(&mut log_a, &event_a).unwrap();
+            tree::append(&mut log_a, &event_a, &actor_document_a).unwrap();
             let leaf_hash_a: [u8; 32] = {
                 let mut h = Sha256::new();
                 h.update([0x00]);
@@ -1381,7 +1386,7 @@ mod tests {
                 prev_hash_b,
                 &signing_key_b,
             );
-            tree::append(&mut log_b, &event_b).unwrap();
+            tree::append(&mut log_b, &event_b, &actor_document_b).unwrap();
             let leaf_hash_b: [u8; 32] = {
                 let mut h = Sha256::new();
                 h.update([0x00]);
@@ -1416,6 +1421,7 @@ mod tests {
     async fn compare_returns_behind_when_local_has_fewer() {
         let (verifying_key, signing_key) = test_keypair();
         let did = did_from_pubkey(&verifying_key);
+        let actor_document = test_did_document(&did, &verifying_key);
 
         let mut log_full = EventLog::new("ctx-checkpoint-test".to_owned());
         let mut log_partial = EventLog::new("ctx-checkpoint-test".to_owned());
@@ -1431,9 +1437,9 @@ mod tests {
                 prev_hash,
                 &signing_key,
             );
-            tree::append(&mut log_full, &event).unwrap();
+            tree::append(&mut log_full, &event, &actor_document).unwrap();
             if i < 7 {
-                tree::append(&mut log_partial, &event).unwrap();
+                tree::append(&mut log_partial, &event, &actor_document).unwrap();
             }
             let leaf_hash: [u8; 32] = {
                 let mut h = Sha256::new();
@@ -1462,6 +1468,7 @@ mod tests {
     async fn compare_returns_ahead_when_local_has_more() {
         let (verifying_key, signing_key) = test_keypair();
         let did = did_from_pubkey(&verifying_key);
+        let actor_document = test_did_document(&did, &verifying_key);
 
         let mut log_full = EventLog::new("ctx-checkpoint-test".to_owned());
         let mut log_partial = EventLog::new("ctx-checkpoint-test".to_owned());
@@ -1477,9 +1484,9 @@ mod tests {
                 prev_hash,
                 &signing_key,
             );
-            tree::append(&mut log_full, &event).unwrap();
+            tree::append(&mut log_full, &event, &actor_document).unwrap();
             if i < 4 {
-                tree::append(&mut log_partial, &event).unwrap();
+                tree::append(&mut log_partial, &event, &actor_document).unwrap();
             }
             let leaf_hash: [u8; 32] = {
                 let mut h = Sha256::new();
@@ -1679,8 +1686,10 @@ mod tests {
     async fn divergent_roots_indicate_equivocation() {
         let (vk_a, sk_a) = test_keypair();
         let did_a = did_from_pubkey(&vk_a);
+        let actor_document_a = test_did_document(&did_a, &vk_a);
         let (vk_b, sk_b) = test_keypair();
         let did_b = did_from_pubkey(&vk_b);
+        let actor_document_b = test_did_document(&did_b, &vk_b);
 
         let mut log_a = EventLog::new("ctx-equivocation".to_owned());
         let mut log_b = EventLog::new("ctx-equivocation".to_owned());
@@ -1698,7 +1707,7 @@ mod tests {
                 prev_a,
                 &sk_a,
             );
-            tree::append(&mut log_a, &event_a).unwrap();
+            tree::append(&mut log_a, &event_a, &actor_document_a).unwrap();
             let h_a: [u8; 32] = {
                 let mut h = Sha256::new();
                 h.update([0x00]);
@@ -1716,7 +1725,7 @@ mod tests {
                 prev_b,
                 &sk_b,
             );
-            tree::append(&mut log_b, &event_b).unwrap();
+            tree::append(&mut log_b, &event_b, &actor_document_b).unwrap();
             let h_b: [u8; 32] = {
                 let mut h = Sha256::new();
                 h.update([0x00]);

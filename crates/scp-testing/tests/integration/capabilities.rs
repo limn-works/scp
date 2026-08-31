@@ -78,17 +78,35 @@ async fn ucan_header_defaults() {
 
 #[tokio::test]
 async fn ucan_header_with_kid() {
-    let header = UcanHeader::with_kid("#agent");
-    assert_eq!(header.kid, Some("#agent".to_owned()));
+    let header = UcanHeader::with_kid(SigningKeyId::Agent);
+    assert_eq!(header.kid, Some(SigningKeyId::Agent));
     assert_eq!(header.signing_key_id(), SigningKeyId::Agent);
 
     // #active kid returns Active
-    let active_header = UcanHeader::with_kid("#active");
+    let active_header = UcanHeader::with_kid(SigningKeyId::Active);
     assert_eq!(active_header.signing_key_id(), SigningKeyId::Active);
 
     // No kid defaults to Active
     let default_header = UcanHeader::new();
     assert_eq!(default_header.signing_key_id(), SigningKeyId::Active);
+
+    // A header serializes its `kid` as the fragment a JWT carries, and parses
+    // that fragment back. `SigningKeyId`'s serde impls are the one decoder, so
+    // a header naming any other verification method fails to parse rather than
+    // reaching a reader that has to reject it.
+    let json = serde_json::to_string(&header).expect("a header serializes");
+    assert!(json.contains("\"kid\":\"#agent\""), "got {json}");
+    let parsed: UcanHeader = serde_json::from_str(&json).expect("a header round-trips");
+    assert_eq!(parsed.kid, Some(SigningKeyId::Agent));
+
+    for rejected in ["#0", "#retired-1", "active", "did:dht:zABC#active", ""] {
+        let header_json =
+            format!(r#"{{"alg":"EdDSA","typ":"JWT","ucv":"0.10.0","kid":"{rejected}"}}"#);
+        assert!(
+            serde_json::from_str::<UcanHeader>(&header_json).is_err(),
+            "kid {rejected:?} must not parse into a UCAN header"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

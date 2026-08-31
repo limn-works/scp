@@ -905,6 +905,13 @@ public protocol IdentityProtocol: AnyObject, Sendable {
      * DHT, and returns an updated `Identity` with the same DID but a new
      * active signing key.
      *
+     * This performs the soft act of ADR-003, DID creation, item 4a: it retains
+     * the old key under a `#retired-{sequence}` identifier, and §23.13
+     * paragraph 1 of the sync spec accepts that retained method on an event-log
+     * leaf, so the old key keeps verifying content this identity already
+     * signed. An owner recovering from a compromise removes the method from
+     * `verificationMethod` instead, per §9.12 of the security-model spec.
+     *
      * Requires a retained custody provider (in-memory or platform callback).
      * External/loaded identities without retained crypto state cannot rotate.
      *
@@ -1181,6 +1188,13 @@ open func rotateAgentKey()async throws  -> Identity  {
      * Generates a new Active Signing Key, updates the DID document on the
      * DHT, and returns an updated `Identity` with the same DID but a new
      * active signing key.
+     *
+     * This performs the soft act of ADR-003, DID creation, item 4a: it retains
+     * the old key under a `#retired-{sequence}` identifier, and §23.13
+     * paragraph 1 of the sync spec accepts that retained method on an event-log
+     * leaf, so the old key keeps verifying content this identity already
+     * signed. An owner recovering from a compromise removes the method from
+     * `verificationMethod` instead, per §9.12 of the security-model spec.
      *
      * Requires a retained custody provider (in-memory or platform callback).
      * External/loaded identities without retained crypto state cannot rotate.

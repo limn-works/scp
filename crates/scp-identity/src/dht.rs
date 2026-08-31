@@ -39,9 +39,7 @@ use scp_dht::DhtClient;
 // test/testing builds (ADR-062 §Decision 1), so no production path can name it.
 #[cfg(any(test, feature = "testing"))]
 use scp_dht::InMemoryDhtClient;
-use scp_did::{
-    DidDocument, DidRotationEvent, MigrationProof, PreRotationProof, decode_multibase_key,
-};
+use scp_did::{DidDocument, DidRotationEvent, MigrationProof, PreRotationProof};
 
 /// The `did:dht` DID method prefix.
 const DID_DHT_PREFIX: &str = "did:dht:";
@@ -1031,6 +1029,14 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     ///
     /// **The DID string does NOT change. The Identity Key does NOT change.**
     ///
+    /// This is the **soft** act. It retains the old key under the
+    /// `#retired-{sequence}` identifier, and §23.13 paragraph 1 of the sync spec
+    /// accepts that retained method on an event-log leaf, so the old key keeps
+    /// verifying content the owner already signed. An owner recovering from a
+    /// compromise calls [`DidDocument::remove_verification_method`] on the
+    /// retired identifier instead, because §9.12 of the security-model spec
+    /// assigns revocation of a content signature to removal alone.
+    ///
     /// After rotation, the caller MUST issue MLS Update proposals in all active
     /// contexts and revoke/reissue UCAN tokens signed by the old active key.
     ///
@@ -1272,6 +1278,14 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     /// `#agent` key to `#retired-agent-{sequence}`, installs the new key as
     /// `#agent`), signs the document with the Identity Key, and publishes to
     /// the DHT.
+    ///
+    /// This is the **soft** act. It retains the old key under the
+    /// `#retired-agent-{sequence}` identifier, and §23.13 paragraph 1 of the
+    /// sync spec accepts that retained method on an event-log leaf, so the old
+    /// key keeps verifying content the owner already signed. An owner recovering
+    /// from a compromise calls [`DidDocument::remove_verification_method`] on
+    /// the retired identifier instead, because §9.12 of the security-model spec
+    /// assigns revocation of a content signature to removal alone.
     ///
     /// # Arguments
     ///
@@ -2010,17 +2024,17 @@ pub fn verify_self_certification(
 ) -> Result<(), IdentityError> {
     let public_key = extract_public_key(did_string)?;
 
-    // Find the #0 verification method (identity key).
-    let vm0 = document
-        .verification_method_by_fragment("0")
-        .ok_or_else(|| {
-            IdentityError::SelfCertificationFailed(
-                "no #0 verification method in document".to_owned(),
-            )
-        })?;
-
-    // Decode the multibase public key from the document.
-    let doc_key_bytes = decode_multibase_key(&vm0.public_key_multibase)?;
+    // `identity_key` reads `#0` under the same three document facts every other
+    // key resolver applies — a `{document.id}#0` identifier carried exactly
+    // once, an `Ed25519VerificationKey2020` type, and this document's own DID
+    // as controller — so a document that names another DID's `#0`, repeats the
+    // identifier, or declares another suite fails self-certification here
+    // rather than supplying a key a later reader would trust.
+    let doc_key_bytes = document.identity_key().map_err(|error| {
+        IdentityError::SelfCertificationFailed(format!(
+            "#0 verification method of {did_string} is unusable: {error}"
+        ))
+    })?;
 
     if doc_key_bytes != public_key {
         return Err(IdentityError::SelfCertificationFailed(format!(
@@ -2349,19 +2363,15 @@ fn bind_old_document_to_old_did(
     let old_did_pubkey = extract_public_key(old_did).map_err(|e| {
         IdentityError::MigrationVerificationFailed(format!("old_did is not a valid did:dht: {e}"))
     })?;
-    let old_doc_vm0 = old_document
-        .verification_method_by_fragment("0")
-        .ok_or_else(|| {
-            IdentityError::MigrationVerificationFailed(
-                "old_document has no #0 verification method".to_owned(),
-            )
-        })?;
-    let old_doc_vm0_pubkey =
-        decode_multibase_key(&old_doc_vm0.public_key_multibase).map_err(|e| {
-            IdentityError::MigrationVerificationFailed(format!(
-                "old_document #0 verification method has malformed publicKeyMultibase: {e}"
-            ))
-        })?;
+    // Same three document facts every other key resolver applies: a
+    // `{document.id}#0` identifier carried exactly once, an
+    // `Ed25519VerificationKey2020` type, and this document's own DID as
+    // controller.
+    let old_doc_vm0_pubkey = old_document.identity_key().map_err(|e| {
+        IdentityError::MigrationVerificationFailed(format!(
+            "old_document #0 verification method is unusable: {e}"
+        ))
+    })?;
     if old_doc_vm0_pubkey != old_did_pubkey {
         return Err(IdentityError::MigrationVerificationFailed(format!(
             "old_document #0 verification method does not derive old_did \
@@ -2745,6 +2755,7 @@ mod tests {
     use super::*;
     use scp_clock::TestClock;
     use scp_dht::{DhtError, InMemoryDhtClient};
+    use scp_did::decode_multibase_key;
 
     /// Helper to create a fully-configured `DidDht` for testing.
     fn make_dht_with_custody(
@@ -4609,8 +4620,9 @@ mod tests {
         match err {
             IdentityError::MigrationVerificationFailed(msg) => {
                 assert!(
-                    msg.contains("old_document has no #0 verification method"),
-                    "expected missing-#0 error, got: {msg}"
+                    msg.contains("old_document #0 verification method is unusable")
+                        && msg.contains("no method carries that identifier exactly once"),
+                    "expected a missing-#0 error naming the absent identifier, got: {msg}"
                 );
             }
             other => panic!("expected MigrationVerificationFailed, got: {other:?}"),
@@ -4687,8 +4699,9 @@ mod tests {
         match err {
             IdentityError::MigrationVerificationFailed(msg) => {
                 assert!(
-                    msg.contains("malformed publicKeyMultibase"),
-                    "expected malformed-multibase error, got: {msg}"
+                    msg.contains("old_document #0 verification method is unusable")
+                        && msg.contains("multibase key must start with 'z'"),
+                    "expected a malformed-multibase error naming the decode failure, got: {msg}"
                 );
             }
             other => panic!(

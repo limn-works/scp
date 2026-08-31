@@ -741,9 +741,9 @@ pub struct Event {
    apparatus, **not** as a struct field on `Event`. The canonical
    `scp_event_log::Event` type has no `signing_key_id` field; a verifier resolves
    the correct public key from the actor's DID document the same way it does for
-   any other Ed25519 signature in the protocol. (The `signing_key_id` parameter
-   on `generate_checkpoint` in criterion 8 is a *checkpoint*-signing argument and
-   is unaffected.)
+   any other Ed25519 signature in the protocol. `ConsistencyCheckpoint` in
+   criterion 8 carries no `signing_key_id` field either, and
+   `generate_checkpoint` takes no such argument.
 
    **Timestamp assignment (committer-assigned, copied by every member).** The
    `timestamp` field is convergent by *assignment*, parallel to `sequence`: for a
@@ -1152,7 +1152,7 @@ pub struct ConsistencyCheckpoint {
 }
 ```
 
-   - **`generate_checkpoint(log: &EventLog, sender_did: &DID, epoch: u64, signing_key: &KeyHandle, signing_key_id: &str) -> Result<ConsistencyCheckpoint, EventLogError>`**: Creates and signs a checkpoint from the current log state. The `signing_key_id` (ADR-039) identifies which verification method signed (accepts `"#active"` or `"#agent"`).
+   - **`async fn generate_checkpoint(log: &EventLog, sender_did: &DID, epoch: u64, signer: &(impl EventLogSigner + ?Sized)) -> Result<ConsistencyCheckpoint, EventLogError>`**: Creates and signs a checkpoint from the current log state. It is `async` because `EventLogSigner::sign` is, and it takes `?Sized` so a caller can pass a `&dyn EventLogSigner`. `EventLogSigner` exposes one method, `async fn sign(&self, message: &[u8]) -> Result<Vec<u8>, String>`, so a caller chooses which of its own keys signs and no verification-method identity crosses this boundary. `ConsistencyCheckpoint` carries seven fields and no `signing_key_id`, the same shape criterion 1 gives `Event` and for the same reason: the credential and signature apparatus carries a verification method, not a struct field. A verifier therefore tries each operational signing key ADR-039 grants an acting agent — `#active`, then `#agent` — and accepts the checkpoint when either one verifies, which §23.12 item 1 of the sync spec states.
    - **`compare_checkpoint(local_log: &EventLog, remote_checkpoint: &ConsistencyCheckpoint) -> CheckpointComparison`**: Compares a received checkpoint against local state. Returns `Consistent`, `Divergent { first_divergent_event: Option<u64> }`, `Behind { missing_events: u64 }`, or `Ahead { extra_events: u64 }`.
    - Checkpoints are generated every 50 events or every 10 minutes, whichever comes first (spec section 9.9.3).
    - Checkpoints are sent as regular MLS application messages.

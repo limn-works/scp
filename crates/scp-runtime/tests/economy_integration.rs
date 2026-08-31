@@ -35,6 +35,7 @@ use std::time::Duration;
 use scp_clock::Clock;
 use scp_did::DID;
 use scp_event_log::proof::{prove_inclusion, verify_inclusion};
+use scp_event_log::test_helpers::test_did_document;
 use scp_event_log::tree;
 use scp_event_log::{Event, EventLog, EventPayload, EventType};
 use scp_protocol::crypto::ucan::spending::{BudgetTracker, SpendingCapability, SpendingError};
@@ -340,18 +341,14 @@ fn leaf_hash_of(event: &Event) -> [u8; 32] {
 }
 
 /// Creates a test keypair and returns (`did_string`, `signing_key`).
+///
+/// A DID comes from `scp_event_log::test_helpers::did_from_pubkey`, which
+/// builds a canonical `did:dht` string over a derived Identity Key, so
+/// `tree::append` accepts a document `test_did_document` builds for it.
 fn test_keypair() -> (String, ed25519_dalek::SigningKey) {
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
-    let verifying_key = signing_key.verifying_key();
-    let hex: String = verifying_key
-        .as_bytes()
-        .iter()
-        .fold(String::new(), |mut acc, b| {
-            use std::fmt::Write;
-            let _ = write!(acc, "{b:02x}");
-            acc
-        });
-    (format!("did:key:{hex}"), signing_key)
+    let did = scp_event_log::test_helpers::did_from_pubkey(&signing_key.verifying_key());
+    (did.to_string(), signing_key)
 }
 
 // ===========================================================================
@@ -689,6 +686,7 @@ async fn invariant_4_receipt_local_buffer_and_convergent_log_merkle_proof() {
     // governance) — never the per-payee receipt. Build one so the inclusion
     // proof exercises the real tree without implying PaymentReceived is a leaf.
     let (did, signing_key) = test_keypair();
+    let actor_document = test_did_document(&did, &signing_key.verifying_key());
     let genesis_prev = [0u8; 32];
     let event0 = signed_event(
         EventType::MemberJoined,
@@ -700,7 +698,7 @@ async fn invariant_4_receipt_local_buffer_and_convergent_log_merkle_proof() {
     );
 
     let mut log = EventLog::new("ctx-econ-test".to_owned());
-    let idx0 = tree::append(&mut log, &event0).unwrap();
+    let idx0 = tree::append(&mut log, &event0, &actor_document).unwrap();
     assert_eq!(idx0, 0);
 
     let leaf0_hash = leaf_hash_of(&event0);
@@ -712,7 +710,7 @@ async fn invariant_4_receipt_local_buffer_and_convergent_log_merkle_proof() {
         &signing_key,
         &did,
     );
-    tree::append(&mut log, &event1).unwrap();
+    tree::append(&mut log, &event1, &actor_document).unwrap();
 
     assert_eq!(tree::event_count(&log), 2);
 
@@ -1687,6 +1685,7 @@ fn integration_economic_event_types() {
 #[test]
 fn integration_merkle_tree_with_economic_events() {
     let (did, signing_key) = test_keypair();
+    let actor_document = test_did_document(&did, &signing_key.verifying_key());
 
     let mut log = EventLog::new("ctx-merkle".to_owned());
 
@@ -1716,7 +1715,7 @@ fn integration_merkle_tree_with_economic_events() {
         &signing_key,
         &did,
     );
-    tree::append(&mut log, &event0).unwrap();
+    tree::append(&mut log, &event0, &actor_document).unwrap();
 
     let leaf0_hash = leaf_hash_of(&event0);
     let event1 = signed_event(
@@ -1727,7 +1726,7 @@ fn integration_merkle_tree_with_economic_events() {
         &signing_key,
         &did,
     );
-    tree::append(&mut log, &event1).unwrap();
+    tree::append(&mut log, &event1, &actor_document).unwrap();
 
     let leaf1_hash = leaf_hash_of(&event1);
     let event2 = signed_event(
@@ -1738,7 +1737,7 @@ fn integration_merkle_tree_with_economic_events() {
         &signing_key,
         &did,
     );
-    tree::append(&mut log, &event2).unwrap();
+    tree::append(&mut log, &event2, &actor_document).unwrap();
 
     assert_eq!(tree::event_count(&log), 3);
 

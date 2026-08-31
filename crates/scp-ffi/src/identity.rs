@@ -278,8 +278,10 @@ async fn publish_to_resolver_dht_for(
 /// so that subsequent DID resolution (UCAN validation, governance vote-signature
 /// verification) sees the rotated `#active` key and rejects signatures from the
 /// retired one. Publishing into a throwaway client would leave the resolver
-/// permanently serving the stale, pre-rotation document, silently defeating
-/// rotation's revocation purpose.
+/// permanently serving the stale, pre-rotation document, so the retired key
+/// would keep passing every current-key check: a `KeyPackage` attestation
+/// (§9.7.1 check 1 of the security-model spec) and a live DID authentication
+/// (§3.11.4 steps 7 and 8 of the identity spec).
 ///
 /// Returns the shared resolver client. Rotation / agent-key / migration
 /// operations only run against an identity already in the registry, which is
@@ -289,9 +291,9 @@ async fn publish_to_resolver_dht_for(
 ///
 /// Fails closed if the client is somehow absent: fabricating a throwaway
 /// in-memory client would let the re-published document land somewhere the
-/// resolver never reads, silently defeating rotation's revocation purpose (and,
-/// in a shipped build, the in-memory arm does not even exist). A typed error is
-/// strictly better than a lie.
+/// resolver never reads, so the retired key would keep passing the two
+/// current-key checks named above (and, in a shipped build, the in-memory arm
+/// does not even exist). A typed error is strictly better than a lie.
 fn rotation_publish_client(bi: &PyBridgeInstance) -> Result<Arc<FfiDhtClient>, ScpPyError> {
     crate::runtime::resolver_dht_client(bi).ok_or_else(|| {
         ScpPyError::identity(

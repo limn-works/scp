@@ -79,30 +79,41 @@ pub trait DidResolver {
     /// Returns [`UcanError::MalformedToken`] if the DID cannot be resolved.
     fn resolve_public_key(&self, did: &str) -> Result<[u8; 32], UcanError>;
 
-    /// Resolves a specific verification method on a DID document by `kid`
-    /// (Key ID) fragment identifier (ADR-039, SCP-AB-013).
+    /// Resolves the verification method `signing_key_id` names on a DID
+    /// document, and returns its Ed25519 public key bytes (ADR-039,
+    /// SCP-AB-013).
     ///
-    /// The `kid` is a verification method fragment identifier such as
-    /// `"#active"` or `"#agent"`. Implementations should look up the
-    /// verification method matching this fragment on the DID document and
-    /// return its Ed25519 public key bytes.
+    /// [`SigningKeyId`] rather than a fragment string, so a `kid` header is
+    /// decoded once, by [`SigningKeyId::from_fragment`], at the boundary where
+    /// it arrives off the wire. Passing the fragment as a string left each
+    /// implementation to decode it, and four implementations decoded it four
+    /// ways: one compared against the literal `"#active"`, one stripped a
+    /// leading `#` first, one keyed a map on the raw string, and one forwarded
+    /// it unchanged. `resolve_export_verifying_key` asked for a bare `"active"`
+    /// and stopped resolving anything the day one of those implementations
+    /// stopped stripping, which broke every import of a remote creator's
+    /// snapshot on all three FFI bridges.
     ///
-    /// The default implementation falls back to [`DidResolver::resolve_public_key`] when
-    /// `kid` is `"#active"` (the default key), making this backward-compatible
-    /// with existing implementations that only support single-key DIDs.
+    /// The default implementation answers [`SigningKeyId::Active`] through
+    /// [`DidResolver::resolve_public_key`], so an implementation that supports
+    /// one key per DID needs no override.
     ///
     /// # Errors
     ///
     /// Returns [`UcanError::MalformedToken`] if the DID or verification
     /// method cannot be resolved.
-    fn resolve_public_key_by_kid(&self, did: &str, kid: &str) -> Result<[u8; 32], UcanError> {
-        if kid == "#active" {
-            self.resolve_public_key(did)
-        } else {
-            Err(UcanError::MalformedToken(format!(
-                "verification method '{kid}' not found on DID '{did}' \
-                 (default resolver only supports #active)"
-            )))
+    fn resolve_public_key_by_kid(
+        &self,
+        did: &str,
+        signing_key_id: SigningKeyId,
+    ) -> Result<[u8; 32], UcanError> {
+        match signing_key_id {
+            SigningKeyId::Active => self.resolve_public_key(did),
+            SigningKeyId::Agent => Err(UcanError::MalformedToken(format!(
+                "verification method '{}' not found on DID '{did}' \
+                 (default resolver only supports #active)",
+                signing_key_id.as_fragment()
+            ))),
         }
     }
 }
@@ -194,10 +205,14 @@ pub trait ProofResolver {
 pub struct InMemoryDidResolver {
     /// Map of DID string to 32-byte Ed25519 public key (default / `#active`).
     pub keys: std::collections::HashMap<String, [u8; 32]>,
-    /// Map of `(DID, kid)` to 32-byte Ed25519 public key for specific
-    /// verification methods (e.g., `#agent`). Used by
-    /// [`DidResolver::resolve_public_key_by_kid`] when `kid` is not `#active`.
-    pub kid_keys: std::collections::HashMap<(String, String), [u8; 32]>,
+    /// Map of `(DID, verification method)` to 32-byte Ed25519 public key.
+    /// Used by [`DidResolver::resolve_public_key_by_kid`].
+    ///
+    /// [`SigningKeyId`] rather than a fragment string, because a fragment
+    /// string on the inside of this boundary reopens the vocabulary the
+    /// boundary closed: a fixture writing `"active"` where the resolver probes
+    /// `"#active"` would miss silently and fall through to `keys`.
+    pub kid_keys: std::collections::HashMap<(String, SigningKeyId), [u8; 32]>,
 }
 
 impl InMemoryDidResolver {
@@ -219,17 +234,22 @@ impl DidResolver for InMemoryDidResolver {
             .ok_or_else(|| UcanError::MalformedToken(format!("DID not found: {did}")))
     }
 
-    fn resolve_public_key_by_kid(&self, did: &str, kid: &str) -> Result<[u8; 32], UcanError> {
+    fn resolve_public_key_by_kid(
+        &self,
+        did: &str,
+        signing_key_id: SigningKeyId,
+    ) -> Result<[u8; 32], UcanError> {
         // First check kid_keys for an explicit entry.
-        if let Some(pk) = self.kid_keys.get(&(did.to_owned(), kid.to_owned())) {
+        if let Some(pk) = self.kid_keys.get(&(did.to_owned(), signing_key_id)) {
             return Ok(*pk);
         }
-        // Fall back: if kid is #active, use the default key.
-        if kid == "#active" {
+        // Fall back: `#active` uses the default key.
+        if signing_key_id == SigningKeyId::Active {
             return self.resolve_public_key(did);
         }
         Err(UcanError::MalformedToken(format!(
-            "verification method '{kid}' not found on DID '{did}'"
+            "verification method '{}' not found on DID '{did}'",
+            signing_key_id.as_fragment()
         )))
     }
 }
@@ -1295,13 +1315,19 @@ pub(super) fn validate_key_scope(token: &UcanToken) -> Result<(), UcanError> {
         return Err(UcanError::SelfDelegationWithoutKeyScope);
     }
 
-    // Step 5b: If key_scope is present, verify kid matches.
+    // Step 5b: If key_scope is present, verify the header names that method.
+    //
+    // `fct.scp_key_scope` is a free JSON string an issuer wrote, so it is
+    // compared as a string against the fragment the header names. A scope
+    // naming anything outside `#active` and `#agent` therefore matches no
+    // header, which is the fail-closed direction: `UcanHeader.kid` is a
+    // `SigningKeyId` and can name only those two.
     if let Some(ref scope) = key_scope {
-        let actual_kid = token.header.kid.as_deref().unwrap_or("#active");
-        if actual_kid != scope {
+        let actual_kid = token.header.signing_key_id();
+        if actual_kid.as_fragment() != scope {
             return Err(UcanError::KeyScopeMismatch {
                 expected_scope: scope.clone(),
-                actual_kid: actual_kid.to_owned(),
+                actual_kid: actual_kid.as_fragment().to_owned(),
             });
         }
     }
@@ -1332,17 +1358,10 @@ fn enforce_ucan_category_a(
     token: &UcanToken,
     granted_caps: &[CapabilityUri],
 ) -> Result<(), UcanError> {
-    let kid_str = token.header.kid.as_deref().unwrap_or("#active");
-
-    // Parse kid to SigningKeyId via the canonical fragment decoder. Only
-    // #active and #agent are valid UCAN signing keys; `from_fragment` returns
-    // `None` for anything else, which we reject fail-closed (identical behavior
-    // to the prior hand-rolled match).
-    let Some(signing_key_id) = SigningKeyId::from_fragment(kid_str) else {
-        return Err(UcanError::MalformedToken(format!(
-            "unrecognized signing key ID (kid): {kid_str}"
-        )));
-    };
+    // `UcanHeader.kid` is a `SigningKeyId`, so a header naming any other
+    // verification method failed to deserialize and never reaches this step.
+    // A header carrying no `kid` names `#active`.
+    let signing_key_id = token.header.signing_key_id();
 
     if signing_key_id != SigningKeyId::Agent {
         return Ok(());
@@ -1352,7 +1371,7 @@ fn enforce_ucan_category_a(
         if classify_action(cap.resource()) == ActionCategory::CategoryA {
             return Err(UcanError::CategoryAViolation {
                 action: cap.capability_name(),
-                kid: kid_str.to_owned(),
+                kid: signing_key_id.as_fragment().to_owned(),
             });
         }
     }
@@ -1375,12 +1394,21 @@ pub(super) fn verify_signature(
     token: &UcanToken,
     did_resolver: &impl DidResolver,
 ) -> Result<(), UcanError> {
-    // When kid is present in the header, resolve the specific verification
-    // method from the DID document (ADR-039, SCP-AB-013).
-    let pk_bytes = match &token.header.kid {
-        Some(kid) => did_resolver.resolve_public_key_by_kid(&token.payload.iss, kid)?,
-        None => did_resolver.resolve_public_key(&token.payload.iss)?,
-    };
+    // `UcanHeader.kid` is a `SigningKeyId`, decoded once by serde when a JWT
+    // header parsed, so no reader here decodes a fragment string (ADR-039,
+    // SCP-AB-013). A header naming `#0`, a `#retired-{n}` method, a bare
+    // `active`, or a full DID URL failed to parse and never reached this step.
+    //
+    // `signing_key_id()` reads `#active` from a header that carries no `kid`,
+    // and `resolve_public_key_by_kid`'s default implementation routes `#active`
+    // to `resolve_public_key`. Branching here on whether the header carried a
+    // `kid` would state that same default a second time, and the two statements
+    // could drift: `InMemoryDidResolver` answers a `#active` lookup from its
+    // `kid_keys` map before it falls back to its default-key map, so a resolver
+    // holding both would have verified a `kid`-bearing token against one key and
+    // a `kid`-less token against another.
+    let pk_bytes = did_resolver
+        .resolve_public_key_by_kid(&token.payload.iss, token.header.signing_key_id())?;
 
     // Extract signing input from encoded token: everything before the last '.'
     let signing_input = token
@@ -2064,6 +2092,64 @@ mod tests {
             signature: Vec::new(),
             encoded: encoded.to_owned(),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Which `kid` header values a JWT header parses at all
+    // -----------------------------------------------------------------------
+
+    /// A `kid` header naming anything but `#active` or `#agent` fails to parse,
+    /// so no code downstream of JWT header deserialization sees it.
+    ///
+    /// This is the single place a wire `kid` becomes a `SigningKeyId`.
+    /// `UcanHeader.kid` holds that enum and
+    /// `DidResolver::resolve_public_key_by_kid` takes it, so a rejected
+    /// fragment reaches no resolver, no Category A check, and no key-scope
+    /// comparison — including in code a future author writes. `#retired-{n}` is
+    /// what `DidDocument::retire_active_key` assigns a key an owner rotates
+    /// out, and `#0` is the Identity Key ADR-039's key-property table marks as
+    /// signing no operational action.
+    #[test]
+    fn a_kid_outside_the_two_operational_methods_fails_to_parse() {
+        for kid in [
+            "#retired-1",
+            "#retired-agent-1",
+            "#0",
+            "active",
+            "agent",
+            "did:example:issuer#active",
+            "",
+        ] {
+            let header_json =
+                format!(r#"{{"alg":"EdDSA","typ":"JWT","ucv":"0.10.0","kid":"{kid}"}}"#);
+            let error = serde_json::from_str::<UcanHeader>(&header_json)
+                .expect_err("a kid outside #active and #agent must not parse");
+            assert!(
+                error.to_string().contains("unknown SigningKeyId"),
+                "kid {kid:?} must fail to parse as a SigningKeyId, got: {error}"
+            );
+        }
+    }
+
+    /// A `kid` naming `#active` reaches the resolver, so the rejections above
+    /// come from the decoder rather than from a resolver that answers nothing.
+    #[test]
+    fn verify_signature_passes_an_active_kid_to_the_resolver() {
+        let resolver = InMemoryDidResolver::from_keys(
+            std::iter::once(("did:example:issuer".to_owned(), [7u8; 32])).collect(),
+        );
+
+        let mut token = synthetic_token("HEADER.PAYLOAD", &[], &[]);
+        token.header.kid = Some(SigningKeyId::Active);
+
+        // The resolver answers, so verification proceeds to the Ed25519 check
+        // and fails there on an empty signature rather than on the `kid`.
+        let error = verify_signature(&token, &resolver)
+            .expect_err("an empty signature cannot verify against a resolved key");
+        assert!(
+            matches!(error, UcanError::SignatureInvalid),
+            "expected the signature check to run, got: {error:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

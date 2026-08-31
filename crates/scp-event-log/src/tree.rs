@@ -15,12 +15,17 @@
 //!
 //! See ADR-011 in `.docs/adrs/phase-2.md`.
 
+use std::collections::BTreeMap;
+
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use super::{Event, EventLog, EventLogError, EventType};
 use scp_crypto::verify_ed25519_signature;
-use scp_did::extract_public_key_from_did;
+use scp_did::{
+    DID, DidDocument, HistoricalAssertionKey, SigningKeyId, VerificationRelationship,
+    extract_public_key_from_did,
+};
 
 /// The genesis sentinel hash used as `prev_hash` for the first event.
 ///
@@ -36,13 +41,23 @@ pub const GENESIS_PREV_HASH: [u8; 32] = [0u8; 32];
 /// 1. Verifies `event.sequence` matches the expected next sequence.
 /// 2. Verifies `event.prev_hash` matches the hash of the last leaf
 ///    (or the genesis sentinel for the first event).
-/// 3. Verifies the event signature against `event.actor_did`.
+/// 3. Verifies an event signature against a verification method that
+///    `actor_document` names — see [`verify_event_signature`].
 /// 4. Serializes the event and computes `leaf_hash = SHA-256(0x00 || serialize(event))`
 ///    (RFC 6962 Section 2.1 leaf domain separation).
 /// 5. Appends the leaf hash and incrementally updates affected interior
 ///    nodes — O(log n) per append.
 /// 6. Inserts into the sorted leaf index.
 /// 7. Returns the leaf index (position in the log).
+///
+/// # Arguments
+///
+/// * `log` — a per-context Merkle log this event extends.
+/// * `event` — a signed event to append.
+/// * `actor_document` — a DID document a caller resolved for
+///   `event.actor_did`. A caller that cannot resolve that document does not
+///   call this function, so an unresolvable actor fails closed by
+///   construction (§23.13 paragraph 1).
 ///
 /// # Errors
 ///
@@ -52,7 +67,11 @@ pub const GENESIS_PREV_HASH: [u8; 32] = [0u8; 32];
 /// Returns [`EventLogError::SerializationFailed`] if serialization fails.
 ///
 /// See ADR-011 acceptance criterion 2.
-pub fn append(log: &mut EventLog, event: &Event) -> Result<u64, EventLogError> {
+pub fn append(
+    log: &mut EventLog,
+    event: &Event,
+    actor_document: &DidDocument,
+) -> Result<u64, EventLogError> {
     let expected_sequence = event_count(log);
 
     // 1. Verify sequence.
@@ -78,7 +97,7 @@ pub fn append(log: &mut EventLog, event: &Event) -> Result<u64, EventLogError> {
     }
 
     // 3. Verify signature.
-    verify_event_signature(event)?;
+    verify_event_signature(event, actor_document)?;
 
     // 4. Serialize and hash with 0x00 leaf domain prefix (RFC 6962 §2.1).
     let leaf_hash = leaf_hash(event)?;
@@ -135,12 +154,26 @@ pub fn append(log: &mut EventLog, event: &Event) -> Result<u64, EventLogError> {
 /// # Threat model
 ///
 /// Only **trusted in-process callers** should use this function. The caller
-/// must control the event content and the `EventLog` reference. Current
-/// legitimate callers:
+/// must control event content and an `EventLog` reference. Callers today:
 ///
-/// - `FfiBridgeProvider::invoke_outlet` in `crates/scp-ffi/src/mcp.rs`
-///   (emits `OutletInvokedEvent` per ADR-010 criterion 3)
+/// - `MerkleEventLogProvider` in
+///   `crates/scp-runtime/src/context/providers/event_log.rs` — every typed
+///   context event a running node records
+/// - `import_context_export` and context construction in
+///   `crates/scp-runtime/src/context/{export_import,builder}.rs` — snapshot
+///   replay, where each leaf arrives already committed
+/// - UCAN-state and outlet event-log surfaces across all three FFI bridges
+/// - `PerContextState::replay_event` in `crates/scp-client/src/context.rs`,
+///   which `ScpClient::join_context_encrypted` drives over an event stream an
+///   adder transported — an event another party produced, appended without a
+///   signature check
 /// - Test code
+///
+/// Nothing in this repository calls [`append`] outside test code, so no shipped
+/// path verifies an event signature today. [`verify_event_signature`] states
+/// what blocks a shipped caller: every shipped writer emits an empty
+/// `signature`, so a verifier wired in ahead of leaf signing would reject every
+/// honest event.
 ///
 /// # Migration plan
 ///
@@ -301,56 +334,324 @@ pub fn leaf_hash(event: &Event) -> Result<[u8; 32], EventLogError> {
     Ok(hasher.finalize().into())
 }
 
-/// Verifies the Ed25519 signature of an event against the actor's DID.
+/// Verifies an Ed25519 signature on an event against an actor's DID document,
+/// and reports which verification method produced it.
 ///
-/// The signature covers a canonical hash of all event fields except the
-/// signature itself.
-/// Verifies the Ed25519 signature on an event (M16).
+/// **Which methods this accepts.** An event signature verifies against an
+/// operational signing key that an actor's own DID document names.
+/// [`SigningKeyId::OPERATIONAL`] is that pair, and its documentation states
+/// which fragments the pair excludes and why. §7.3.1 of the trust spec says an
+/// acting agent signs an event, and ADR-039, the shared-DID human-agent
+/// identity model, grants an acting agent exactly those two operational
+/// verification methods.
 ///
-/// Extracts the signer's public key from `event.actor_did`, recomputes the
-/// canonical event hash, and verifies the signature. This function is used
-/// both during `append` (for new events) and during sync reconciliation
-/// (for events received from remote peers).
+/// **Trial order is not role pinning.** An `Event` names no verification
+/// method: ADR-011 acceptance criterion 1 defines it with seven fields and no
+/// `signing_key_id`, and §23.13 paragraph 1 of the sync spec tells a verifier to
+/// try each method `assertionMethod` authorizes and to return the one that
+/// verified. A caller attributing an event to a human holder or to agent
+/// software reads that returned [`SigningKeyId`], which is what ADR-039 gives
+/// the two methods distinct holders for. No `EventType` names an act ADR-039's
+/// Category A reserves to a human — that category covers DID document updates,
+/// pre-rotation commitments, identity migration, and root UCAN issuance — so
+/// Category A is not what a caller reads this value for.
+///
+/// Reads operational signing keys out of `actor_document`, recomputes a
+/// canonical event hash, and tries each key in
+/// [`SigningKeyId::OPERATIONAL`] until one verifies. [`append`] calls this
+/// for a new event; a caller reconciling events from a remote peer calls it
+/// through [`verify_event_batch`] (§23.13 paragraph 1).
+///
+/// # No shipped path verifies an event signature, and two questions block one
+///
+/// [`append`] has zero callers outside test code, so no shipped path reaches
+/// this function. Every shipped writer emits an event whose `signature` field
+/// is empty, so a caller who wired a verifier in today would reject every
+/// honest event.
+///
+/// Two shipped paths append an event another party produced, and both go
+/// through [`append_unsigned_event`], which runs no signature check:
+///
+/// - `scp_client::PerContextState::replay_event`, which
+///   `ScpClient::join_context_encrypted` drives over a `prior_event_log` stream
+///   an adder transported. That crate's own append path writes an empty
+///   `signature`, because ADR-057, the in-browser client, records that a
+///   browser holds no identity signing key — only an ephemeral MLS
+///   `SignatureKeyPair` in wasm.
+/// - `scp_runtime::context::export_import`, which replays a snapshot an exporter
+///   produced. It authenticates that snapshot as a whole — a full-snapshot
+///   Ed25519 signature (§23.16.8) plus a constant-time compare of the
+///   recomputed Merkle root against the signed root — rather than per event, so
+///   it trusts one exporter rather than each named actor.
+///
+/// §23.13 paragraph 1 requires per-event verification during reconciliation, so
+/// a production caller belongs on the first path. Two questions stand in front
+/// of that caller, and neither is answered in any artifact:
+///
+/// 1. **Which party's signature does a mirrored leaf carry?** §23.13 paragraph
+///    1 says the claimed actor's, and ADR-057 says a per-leaf committer
+///    signature. A `MemberJoined` leaf that every member records has one actor
+///    and one committer, and they are different parties for every member except
+///    the committer.
+/// 2. **Can a per-member signature sit in the leaf preimage at all?**
+///    [`leaf_hash`] hashes the whole event including `signature`, while
+///    [`compute_event_canonical_hash`] excludes it. §7.3.1 requires honest
+///    members to hold byte-identical leaf preimages for one event, because the
+///    §9.9.3 equivocation test compares roots at equal event counts. Two members
+///    that each signed their own copy of one logical event would hold different
+///    leaves and read as equivocating.
+///
+/// A human settles both before a signing scheme lands; this crate does not
+/// choose an answer.
+///
+/// # Why a document rather than a DID string
+///
+/// A DID string encodes an Identity Key (`#0`), which signs no operational
+/// action: ADR-039's key-property table says so, and §9.7.4 of the
+/// security-model spec confines `#0` to DID document updates plus pre-rotation
+/// commitments. A verifier recovering a key from that string would therefore
+/// accept a key an actor never signs content with, and reject every key an
+/// actor does. §23.13 paragraph 1 requires resolution from an actor's DID
+/// document, and ADR-011's dependency on ADR-003 states that same rule for an
+/// event signature. A caller resolves a document and passes it here; this crate
+/// performs no I/O, which keeps it synchronous and wasm-safe (ADR-057 crate
+/// topology) and matches
+/// [`verify_checkpoint_signature`](crate::checkpoint::verify_checkpoint_signature),
+/// which also takes a caller-resolved key.
+///
+/// # What a caller guarantees
+///
+/// `actor_document` is trusted input. This function checks that a document
+/// describes `event.actor_did` and that a key it names verifies a signature; it
+/// cannot check where that document came from, how recently a caller fetched it,
+/// or whether a resolver validated its BEP44 signature and sequence number
+/// (§3.10.4). What that costs a caller depends on which act it missed. A
+/// document cached before a **rotation** costs nothing here: a rotation retains
+/// the old key as `#retired-{n}` and this function accepts it either way. A
+/// document cached before a **removal** is what a stale caller pays for, because
+/// removal is the §9.12 compromise-recovery act, so a caller passing a
+/// pre-removal document accepts a compromised key. Removal revokes a key exactly
+/// as fast as a caller re-resolves.
+///
+/// # Fail-closed conditions
+///
+/// - `actor_document.id` differs from `event.actor_did`.
+/// - `event.actor_did` is not a canonical, supported DID string.
+/// - A document's `#0` Identity Key derives some DID other than
+///   `event.actor_did`, so that document self-certifies a different identity
+///   (§3.8, §9.6.1).
+/// - A document carries more than one `#agent` verification method, which
+///   ADR-039's structural constraint tells a verifier to reject.
+/// - A current `#active` or `#agent` method declares a type other than
+///   [`ED25519_VERIFICATION_KEY_TYPE`](scp_did::ED25519_VERIFICATION_KEY_TYPE),
+///   names a controller other than an actor,
+///   or is absent from `assertionMethod`, so a document never authorized it to
+///   sign an assertion.
+/// - A document carries no method this function accepts, current or retired.
+/// - Two accepted methods publish one key under different holders, so no
+///   signature says which holder produced it.
+/// - No accepted key verifies a signature.
+///
+/// Each condition returns [`EventLogError::InvalidSignature`], which §23.13
+/// paragraph 2 names as a rejection reason an SDK logs. None reaches for a key
+/// recovered from a DID string.
+///
+/// # Why a retired key still verifies
+///
+/// An event-log leaf is content: it records what an actor did at the sequence
+/// it occupies. §23.13 paragraph 1 therefore has this function accept a
+/// `#retired-{n}` or `#retired-agent-{n}` method the resolved document still
+/// carries, so that a later rotation does not retroactively unmake authorship.
+///
+/// That acceptance carries no sequence condition, and this function can impose
+/// none. It accepts a retired method for a leaf at every `event.sequence`,
+/// including one an event log records long after the rotation, because it holds
+/// no pair of values to compare: a DID document's publish sequence counts that
+/// document's revisions and `event.sequence` counts one context's events.
+/// Removal is what stops a retained key from signing new content, and the
+/// rotation that retired it is not.
+///
+/// A retired method is referenced by neither `authentication` nor
+/// `assertionMethod` — [`DidDocument::retire_active_key`] rebuilds both arrays
+/// as `#active` plus `#agent` — so this function reaches those keys through
+/// [`DidDocument::historical_assertion_keys`], which gates on identifier shape,
+/// key type, and controller instead of on relationship membership.
+///
+/// A retired method verifies content and nothing else. §9.7.1 check 1 of the
+/// security-model spec binds a `KeyPackage` attestation to the current
+/// `#active`/`#agent` only, because an attestation is a bearer capability a
+/// holder presents now, and §3.11.4 steps 7 and 8 of the identity spec bind a
+/// live DID authentication the same way. Removing a method from
+/// `verificationMethod` is what revokes it for content, and §9.12 of the
+/// security-model spec assigns that removal to key compromise.
+///
+/// A `SigningKeyId` this function returns names a **holder**, not a fragment.
+/// A `#retired-{n}` method answers [`SigningKeyId::Active`] and a
+/// `#retired-agent-{n}` method answers [`SigningKeyId::Agent`], because ADR-039
+/// gives the two fragments distinct holders and a rotation moves a key between
+/// identifiers without moving it between holders.
 ///
 /// # Errors
 ///
-/// Returns [`EventLogError::InvalidSignature`] if the signature is invalid
-/// or the public key cannot be extracted from the DID.
-pub fn verify_event_signature(event: &Event) -> Result<(), EventLogError> {
-    let public_key_bytes = extract_public_key_from_did(&event.actor_did).map_err(|reason| {
-        EventLogError::InvalidSignature {
-            sequence: event.sequence,
-            reason,
-        }
+/// Returns [`EventLogError::InvalidSignature`] under each condition above.
+pub fn verify_event_signature(
+    event: &Event,
+    actor_document: &DidDocument,
+) -> Result<SigningKeyId, EventLogError> {
+    let reject = |reason: String| EventLogError::InvalidSignature {
+        sequence: event.sequence,
+        reason,
+    };
+
+    if actor_document.id != *event.actor_did {
+        return Err(reject(format!(
+            "resolved DID document describes {}, not event actor {}",
+            actor_document.id, event.actor_did
+        )));
+    }
+
+    // Format and canonicality gate on an actor DID string. It admits a
+    // canonical `did:dht` string, and a `did:key:<hex>` string under a
+    // `testing` feature, so two spellings of one `did:dht` identity cannot
+    // address one actor (§3.8.1, §9.6.1). `did:dht` is what `scp-did`
+    // implements; a `did:web` fallback actor (§3.8) reaches no shipped resolver
+    // in this repository and is rejected here for that reason, not for a
+    // canonicality failure.
+    let did_identity_key = extract_public_key_from_did(&event.actor_did).map_err(|reason| {
+        reject(format!(
+            "event actor DID is not a canonical, supported DID: {reason}"
+        ))
     })?;
+
+    // Self-certification (§3.8, §9.6.1): a `did:dht` string is z-base-32 of an
+    // Identity Key, so a document whose `#0` method carries some other key
+    // describes some other identity, whatever its `id` field claims. A caller
+    // that skipped BEP44 verification hands over a document this check still
+    // rejects, which is one property of a document's origin this crate can
+    // establish on its own.
+    let document_identity_key = actor_document.identity_key().map_err(|error| {
+        reject(format!(
+            "#0 key of {} is unusable: {error}",
+            actor_document.id
+        ))
+    })?;
+    if document_identity_key != did_identity_key {
+        return Err(reject(format!(
+            "#0 key of {} derives some other DID, so that document does not describe actor {}",
+            actor_document.id, event.actor_did
+        )));
+    }
+
+    actor_document
+        .validate_agent_keys()
+        .map_err(|reason| reject(format!("actor DID document is malformed: {reason}")))?;
+
     let canonical_hash = compute_event_canonical_hash(event);
-    verify_ed25519_signature(&public_key_bytes, &canonical_hash, &event.signature).map_err(
-        |reason| EventLogError::InvalidSignature {
-            sequence: event.sequence,
-            reason,
-        },
-    )
+    let mut failures = Vec::new();
+
+    // A current operational key: `assertionMethod` authorizes it, so
+    // `signing_key_for` reads that array and reports why a method it rejects
+    // supplies nothing.
+    let mut usable_keys: Vec<(String, SigningKeyId, [u8; 32])> = Vec::new();
+    for signing_key_id in SigningKeyId::OPERATIONAL {
+        match actor_document.signing_key_for(signing_key_id, VerificationRelationship::Assertion) {
+            Ok(public_key) => usable_keys.push((
+                signing_key_id.as_fragment().to_owned(),
+                signing_key_id,
+                public_key,
+            )),
+            Err(error) => failures.push(error.to_string()),
+        }
+    }
+
+    // A key a Layer 1 rotation moved aside. §23.13 paragraph 1 accepts it for a
+    // content signature, and `historical_assertion_keys` gates it on identifier
+    // shape, key type, and controller, because a rotation leaves it referenced
+    // by neither relationship array.
+    usable_keys.extend(actor_document.historical_assertion_keys().into_iter().map(
+        |HistoricalAssertionKey {
+             fragment,
+             holder,
+             public_key,
+             // The rotation sequence orders the set `historical_assertion_keys`
+             // returns. A verifier tries every key it is given, so the order
+             // decides only which failure it reports first.
+             sequence: _,
+         }| (format!("#{fragment}"), holder, public_key),
+    ));
+
+    // ADR-039 gives `#active` and `#agent` distinct holders — a human and agent
+    // software — so a document publishing one key under two fragments with
+    // different holders erases a distinction a returned `SigningKeyId` reports.
+    // Answering `Active` for a signature agent software produced would attribute
+    // an agent's action to a human, which ADR-039's accountability argument
+    // rests on keeping apart. A rotation carries a key's holder along with it,
+    // so `#agent` matching `#retired-agent-1` says only that an owner rotated to
+    // the key it already held, and that pair keeps one holder.
+    for (index, (fragment, holder, public_key)) in usable_keys.iter().enumerate() {
+        if let Some((other_fragment, _, _)) = usable_keys[index + 1..]
+            .iter()
+            .find(|(_, other_holder, other_key)| other_key == public_key && other_holder != holder)
+        {
+            return Err(reject(format!(
+                "DID document for {} publishes one key under both {fragment} and \
+                 {other_fragment}, so no signature says which holder produced it",
+                actor_document.id
+            )));
+        }
+    }
+
+    for (fragment, holder, public_key) in usable_keys {
+        match verify_ed25519_signature(&public_key, &canonical_hash, &event.signature) {
+            Ok(()) => return Ok(holder),
+            Err(error) => failures.push(format!(
+                "{fragment} key of {} rejected a signature: {error}",
+                actor_document.id
+            )),
+        }
+    }
+
+    // Report every method a verifier tried, so an operator reading a log sees
+    // why each one failed rather than why a last one did.
+    Err(reject(failures.join("; ")))
 }
 
-/// Verifies signatures on a batch of events during sync reconciliation (M16).
+/// Verifies signatures across a batch of events a peer supplied during sync
+/// reconciliation (§23.13 paragraph 1).
 ///
-/// Iterates through the provided events and verifies each event's Ed25519
-/// signature. Returns the index and error of the first failing event, or
-/// `Ok(())` if all events pass.
+/// Verifies each event against a DID document `actor_documents` holds for that
+/// event's actor, and returns one verification method per event, in event order.
+/// A first failure ends verification and returns that failure.
 ///
-/// This is the entry point for M16 (event verification during reconciliation).
-/// Callers in the sync module should call this on received events before
-/// applying them to local state.
+/// A caller resolves one DID document per distinct actor in a batch and passes
+/// results here. An actor `actor_documents` does not cover fails closed: this
+/// function rejects that event instead of reaching for a key recovered from a
+/// DID string. Freshness of each document stays a caller's guarantee, exactly as
+/// [`verify_event_signature`] describes.
 ///
 /// # Errors
 ///
-/// Returns [`EventLogError::InvalidSignature`] for the first event that
-/// fails signature verification.
-pub fn verify_event_batch(events: &[Event]) -> Result<(), EventLogError> {
+/// Returns [`EventLogError::InvalidSignature`] for a first event whose actor
+/// `actor_documents` does not cover, or whose signature no key named by an
+/// actor's document verifies.
+pub fn verify_event_batch(
+    events: &[Event],
+    actor_documents: &BTreeMap<DID, DidDocument>,
+) -> Result<Vec<SigningKeyId>, EventLogError> {
+    let mut signing_key_ids = Vec::with_capacity(events.len());
     for event in events {
-        verify_event_signature(event)?;
+        let Some(actor_document) = actor_documents.get(&event.actor_did) else {
+            return Err(EventLogError::InvalidSignature {
+                sequence: event.sequence,
+                reason: format!(
+                    "no resolved DID document for event actor {}",
+                    event.actor_did
+                ),
+            });
+        };
+        signing_key_ids.push(verify_event_signature(event, actor_document)?);
     }
-    Ok(())
+    Ok(signing_key_ids)
 }
 
 /// Computes the canonical hash of an event for signature purposes.
@@ -654,7 +955,10 @@ pub(crate) fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
 mod tests {
     use super::*;
     use crate::EventPayload;
-    use crate::test_helpers::{did_from_pubkey, leaf_hash_from_event, sign_event, test_keypair};
+    use crate::test_helpers::{
+        did_from_pubkey, leaf_hash_from_event, sign_event, test_did_document,
+        test_did_document_with_agent, test_keypair,
+    };
 
     // -----------------------------------------------------------------------
     // append updates tree and root correctly
@@ -664,6 +968,7 @@ mod tests {
     fn append_updates_tree_and_root_correctly() {
         let (verifying_key, signing_key) = test_keypair();
         let did = did_from_pubkey(&verifying_key);
+        let actor_document = test_did_document(&did, &verifying_key);
         let mut log = EventLog::new("ctx-test".to_owned());
 
         // Append first event.
@@ -677,7 +982,7 @@ mod tests {
             &signing_key,
         );
 
-        let idx0 = append(&mut log, &event0).unwrap();
+        let idx0 = append(&mut log, &event0, &actor_document).unwrap();
         assert_eq!(idx0, 0);
         assert_eq!(event_count(&log), 1);
 
@@ -696,7 +1001,7 @@ mod tests {
             &signing_key,
         );
 
-        let idx1 = append(&mut log, &event1).unwrap();
+        let idx1 = append(&mut log, &event1, &actor_document).unwrap();
         assert_eq!(idx1, 1);
         assert_eq!(event_count(&log), 2);
 
@@ -717,6 +1022,7 @@ mod tests {
     fn append_rejects_wrong_prev_hash() {
         let (verifying_key, signing_key) = test_keypair();
         let did = did_from_pubkey(&verifying_key);
+        let actor_document = test_did_document(&did, &verifying_key);
         let mut log = EventLog::new("ctx-test".to_owned());
 
         // First event with correct genesis prev_hash.
@@ -729,7 +1035,7 @@ mod tests {
             GENESIS_PREV_HASH,
             &signing_key,
         );
-        append(&mut log, &event0).unwrap();
+        append(&mut log, &event0, &actor_document).unwrap();
 
         // Second event with wrong prev_hash.
         let wrong_prev_hash = [0xFF; 32];
@@ -743,7 +1049,7 @@ mod tests {
             &signing_key,
         );
 
-        let result = append(&mut log, &event1);
+        let result = append(&mut log, &event1, &actor_document);
         assert!(result.is_err());
         match result {
             Err(EventLogError::PrevHashMismatch { sequence }) => {
@@ -761,6 +1067,7 @@ mod tests {
     fn append_rejects_invalid_signature() {
         let (verifying_key, signing_key) = test_keypair();
         let did = did_from_pubkey(&verifying_key);
+        let actor_document = test_did_document(&did, &verifying_key);
         let mut log = EventLog::new("ctx-test".to_owned());
 
         // Create event with a tampered signature.
@@ -777,7 +1084,7 @@ mod tests {
         // Tamper with the signature.
         event0.signature = vec![0xFF; 64];
 
-        let result = append(&mut log, &event0);
+        let result = append(&mut log, &event0, &actor_document);
         assert!(result.is_err());
         match result {
             Err(EventLogError::InvalidSignature { sequence, .. }) => {
@@ -799,6 +1106,7 @@ mod tests {
         // Sign with a different key.
         let (_other_verifying, other_signing) = test_keypair();
 
+        let actor_document = test_did_document(&did, &verifying_key);
         let mut log = EventLog::new("ctx-test".to_owned());
         let event0 = sign_event(
             EventType::ContextCreated,
@@ -810,7 +1118,7 @@ mod tests {
             &other_signing, // But signed with different key
         );
 
-        let result = append(&mut log, &event0);
+        let result = append(&mut log, &event0, &actor_document);
         assert!(result.is_err());
         match result {
             Err(EventLogError::InvalidSignature { sequence, .. }) => {
@@ -828,6 +1136,7 @@ mod tests {
     fn root_consistent_after_multiple_appends() {
         let (verifying_key, signing_key) = test_keypair();
         let did = did_from_pubkey(&verifying_key);
+        let actor_document = test_did_document(&did, &verifying_key);
         let mut log = EventLog::new("ctx-test".to_owned());
 
         // Empty log root is SHA-256(""), not [0u8; 32] (spec §25.8 Vector 15).
@@ -848,7 +1157,7 @@ mod tests {
                 &signing_key,
             );
 
-            append(&mut log, &event).unwrap();
+            append(&mut log, &event, &actor_document).unwrap();
 
             let leaf_hash = leaf_hash_from_event(&event);
             leaf_hashes.push(leaf_hash);
@@ -872,6 +1181,7 @@ mod tests {
     fn event_count_returns_correct_count() {
         let (verifying_key, signing_key) = test_keypair();
         let did = did_from_pubkey(&verifying_key);
+        let actor_document = test_did_document(&did, &verifying_key);
         let mut log = EventLog::new("ctx-test".to_owned());
 
         assert_eq!(event_count(&log), 0);
@@ -888,7 +1198,7 @@ mod tests {
                 &signing_key,
             );
 
-            append(&mut log, &event).unwrap();
+            append(&mut log, &event, &actor_document).unwrap();
             assert_eq!(event_count(&log), i + 1);
 
             let leaf_hash = leaf_hash_from_event(&event);
@@ -904,6 +1214,7 @@ mod tests {
     fn append_rejects_wrong_sequence() {
         let (verifying_key, signing_key) = test_keypair();
         let did = did_from_pubkey(&verifying_key);
+        let actor_document = test_did_document(&did, &verifying_key);
         let mut log = EventLog::new("ctx-test".to_owned());
 
         // Event with sequence 5 when we expect 0.
@@ -917,7 +1228,7 @@ mod tests {
             &signing_key,
         );
 
-        let result = append(&mut log, &event);
+        let result = append(&mut log, &event, &actor_document);
         assert!(result.is_err());
         match result {
             Err(EventLogError::SequenceMismatch { expected, actual }) => {
@@ -936,6 +1247,7 @@ mod tests {
     fn sorted_leaf_index_maintained() {
         let (verifying_key, signing_key) = test_keypair();
         let did = did_from_pubkey(&verifying_key);
+        let actor_document = test_did_document(&did, &verifying_key);
         let mut log = EventLog::new("ctx-test".to_owned());
 
         let mut prev_hash = GENESIS_PREV_HASH;
@@ -950,7 +1262,7 @@ mod tests {
                 &signing_key,
             );
 
-            append(&mut log, &event).unwrap();
+            append(&mut log, &event, &actor_document).unwrap();
 
             let leaf_hash = leaf_hash_from_event(&event);
             prev_hash = leaf_hash;
@@ -977,6 +1289,7 @@ mod tests {
     fn all_event_types_append_successfully() {
         let (verifying_key, signing_key) = test_keypair();
         let did = did_from_pubkey(&verifying_key);
+        let actor_document = test_did_document(&did, &verifying_key);
         let mut log = EventLog::new("ctx-test".to_owned());
 
         let event_types = [
@@ -1020,7 +1333,7 @@ mod tests {
                 &signing_key,
             );
 
-            let idx = append(&mut log, &event).unwrap();
+            let idx = append(&mut log, &event, &actor_document).unwrap();
             assert_eq!(idx, i as u64);
 
             let leaf_hash = leaf_hash_from_event(&event);
@@ -1041,6 +1354,7 @@ mod tests {
         // Encode as did:dht:z<z-base-32(pubkey)>.
         let z32 = zbase32::encode(verifying_key.as_bytes());
         let did = format!("did:dht:z{z32}");
+        let actor_document = test_did_document(&did, &verifying_key);
 
         let mut log = EventLog::new("ctx-test".to_owned());
         let event = sign_event(
@@ -1053,8 +1367,610 @@ mod tests {
             &signing_key,
         );
 
-        let idx = append(&mut log, &event).unwrap();
+        let idx = append(&mut log, &event, &actor_document).unwrap();
         assert_eq!(idx, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Signature verification resolves an actor's DID document (§23.13 ¶1)
+    // -----------------------------------------------------------------------
+
+    /// Builds a genesis-position event signed by `signing_key` for `actor_did`.
+    fn genesis_event(actor_did: &str, signing_key: &ed25519_dalek::SigningKey) -> Event {
+        sign_event(
+            EventType::ContextCreated,
+            actor_did,
+            1_000_000,
+            0,
+            b"genesis".to_vec(),
+            GENESIS_PREV_HASH,
+            signing_key,
+        )
+    }
+
+    #[test]
+    fn append_accepts_event_signed_by_current_active_key() {
+        let (verifying_key, signing_key) = test_keypair();
+        let did = did_from_pubkey(&verifying_key);
+        let actor_document = test_did_document(&did, &verifying_key);
+        let mut log = EventLog::new("ctx-active-key".to_owned());
+
+        let event = genesis_event(&did, &signing_key);
+
+        assert_eq!(append(&mut log, &event, &actor_document).unwrap(), 0);
+    }
+
+    #[test]
+    fn append_accepts_event_signed_by_rotated_active_key() {
+        let (old_verifying_key, old_signing_key) = test_keypair();
+        let (new_verifying_key, _new_signing_key) = test_keypair();
+        let did = did_from_pubkey(&old_verifying_key);
+
+        // An actor rotates `#active` (§9.7.4 key rotation): a DID string
+        // stays put, an old key moves to `#retired-1`, and a new key
+        // takes over `#active`.
+        let mut actor_document = test_did_document(&did, &old_verifying_key);
+        actor_document.retire_active_key(new_verifying_key.as_bytes(), 1);
+        assert!(
+            actor_document
+                .verification_method_by_fragment("retired-1")
+                .is_some(),
+            "a rotated document retains its old key as #retired-1"
+        );
+        assert!(
+            !actor_document
+                .assertion_method
+                .contains(&format!("{did}#retired-1")),
+            "a rotation leaves #retired-1 out of assertionMethod, so a \
+             relationship gate would find nothing"
+        );
+
+        let mut log = EventLog::new("ctx-rotated-active".to_owned());
+        let event = genesis_event(&did, &old_signing_key);
+
+        // An event-log leaf is content, so a rotation does not retroactively
+        // unmake authorship (§23.13 ¶1).
+        assert_eq!(append(&mut log, &event, &actor_document).unwrap(), 0);
+        assert_eq!(
+            verify_event_signature(&event, &actor_document).unwrap(),
+            SigningKeyId::Active,
+            "a #retired-{{n}} method reports the holder it had before the rotation"
+        );
+    }
+
+    #[test]
+    fn verify_event_signature_rejects_event_signed_by_a_removed_active_key() {
+        let (old_verifying_key, old_signing_key) = test_keypair();
+        let (new_verifying_key, _new_signing_key) = test_keypair();
+        let did = did_from_pubkey(&old_verifying_key);
+
+        // §9.12 compromise recovery: an owner installs a new `#active` and
+        // removes the compromised method from the document entirely, rather
+        // than retaining it as `#retired-1`.
+        let mut actor_document = test_did_document(&did, &old_verifying_key);
+        actor_document.retire_active_key(new_verifying_key.as_bytes(), 1);
+        assert!(
+            actor_document
+                .remove_verification_method("retired-1")
+                .expect("removing a retired method is permitted"),
+            "the document carried #retired-1 before the removal"
+        );
+
+        let event = genesis_event(&did, &old_signing_key);
+        let error = verify_event_signature(&event, &actor_document)
+            .expect_err("a removed verification method verifies nothing");
+        assert!(
+            matches!(error, EventLogError::InvalidSignature { .. }),
+            "expected InvalidSignature, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn verify_event_signature_accepts_agent_key() {
+        let (active_verifying_key, _active_signing_key) = test_keypair();
+        let (agent_verifying_key, agent_signing_key) = test_keypair();
+        let did = did_from_pubkey(&active_verifying_key);
+        let actor_document =
+            test_did_document_with_agent(&did, &active_verifying_key, &agent_verifying_key);
+
+        let event = genesis_event(&did, &agent_signing_key);
+
+        verify_event_signature(&event, &actor_document)
+            .expect("an event an #agent key signed verifies (ADR-039)");
+    }
+
+    #[test]
+    fn verify_event_signature_accepts_rotated_agent_key_and_reports_the_agent_holder() {
+        let (active_verifying_key, _active_signing_key) = test_keypair();
+        let (old_agent_verifying_key, old_agent_signing_key) = test_keypair();
+        let (new_agent_verifying_key, new_agent_signing_key) = test_keypair();
+        let did = did_from_pubkey(&active_verifying_key);
+
+        let mut actor_document =
+            test_did_document_with_agent(&did, &active_verifying_key, &old_agent_verifying_key);
+        actor_document
+            .rotate_agent_key(new_agent_verifying_key.as_bytes(), 1)
+            .expect("rotating an existing #agent key succeeds");
+
+        // A retired #agent key verifies an event it signed while current, and
+        // reports `Agent` — ADR-039 attributes that signature to agent
+        // software, and a rotation moves a key between identifiers without
+        // moving it between holders.
+        let old_key_event = genesis_event(&did, &old_agent_signing_key);
+        assert_eq!(
+            verify_event_signature(&old_key_event, &actor_document)
+                .expect("a retired #agent key verifies an event it signed"),
+            SigningKeyId::Agent
+        );
+
+        let new_key_event = genesis_event(&did, &new_agent_signing_key);
+        assert_eq!(
+            verify_event_signature(&new_key_event, &actor_document)
+                .expect("a current #agent key verifies an event"),
+            SigningKeyId::Agent
+        );
+    }
+
+    #[test]
+    fn verify_event_signature_rejects_an_agent_key_pruned_by_bounded_retention() {
+        let (active_verifying_key, _active_signing_key) = test_keypair();
+        let (first_agent_verifying_key, first_agent_signing_key) = test_keypair();
+        let did = did_from_pubkey(&active_verifying_key);
+
+        // `DidDocument::rotate_agent_key` prunes retired agent keys past
+        // `MAX_RETIRED_AGENT_KEYS`, so three rotations drop the first agent key
+        // out of the document. A key a document does not carry verifies
+        // nothing, for the same reason a removed one does: this function reads
+        // verification methods and recovers no key from the DID string. Whoever
+        // changes that write-side retention deletes this test with it.
+        let mut actor_document =
+            test_did_document_with_agent(&did, &active_verifying_key, &first_agent_verifying_key);
+        for sequence in 1..=3 {
+            let (next_agent_verifying_key, _next_agent_signing_key) = test_keypair();
+            actor_document
+                .rotate_agent_key(next_agent_verifying_key.as_bytes(), sequence)
+                .expect("rotating an existing #agent key succeeds");
+        }
+        assert_eq!(
+            actor_document.retired_agent_key_count(),
+            2,
+            "rotate_agent_key keeps MAX_RETIRED_AGENT_KEYS retired agent keys"
+        );
+
+        let event = genesis_event(&did, &first_agent_signing_key);
+        let error = verify_event_signature(&event, &actor_document)
+            .expect_err("a key pruned out of a document verifies nothing");
+        assert!(
+            matches!(error, EventLogError::InvalidSignature { .. }),
+            "expected InvalidSignature, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn verify_event_signature_rejects_one_key_published_as_active_and_retired_agent() {
+        let (shared_verifying_key, shared_signing_key) = test_keypair();
+        let (agent_verifying_key, _agent_signing_key) = test_keypair();
+        let did = did_from_pubkey(&shared_verifying_key);
+
+        // An owner rotates `#agent` and then republishes that retired agent key
+        // as the current `#active`. One key would then answer two holders, and
+        // a returned `SigningKeyId` would attribute agent software's past
+        // actions to a human.
+        let mut actor_document =
+            test_did_document_with_agent(&did, &shared_verifying_key, &shared_verifying_key);
+        actor_document
+            .rotate_agent_key(agent_verifying_key.as_bytes(), 1)
+            .expect("rotating an existing #agent key succeeds");
+
+        let event = genesis_event(&did, &shared_signing_key);
+        let error = verify_event_signature(&event, &actor_document)
+            .expect_err("one key under two holders says nothing about who signed");
+        match error {
+            EventLogError::InvalidSignature { reason, .. } => assert!(
+                reason.contains("#active") && reason.contains("#retired-agent-1"),
+                "rejection names both identifiers: {reason}"
+            ),
+            other => panic!("expected InvalidSignature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_event_signature_rejects_key_recovered_from_the_did_string() {
+        // Every DID string encodes an Identity Key (`#0`), which never
+        // rotates. Here a signer holds exactly that key, while a document names
+        // a different `#active` key. A verifier recovering its key from a DID
+        // string would accept this event; one reading a document rejects it.
+        let (identity_verifying_key, identity_signing_key) = test_keypair();
+        let (active_verifying_key, _active_signing_key) = test_keypair();
+        let did = format!(
+            "did:dht:z{}",
+            zbase32::encode(identity_verifying_key.as_bytes())
+        );
+        let actor_document = test_did_document(&did, &active_verifying_key);
+
+        let event = genesis_event(&did, &identity_signing_key);
+
+        let error = verify_event_signature(&event, &actor_document)
+            .expect_err("a key recovered from a DID string verifies no event");
+        assert!(
+            matches!(error, EventLogError::InvalidSignature { .. }),
+            "expected InvalidSignature, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn verify_event_signature_rejects_document_whose_identity_key_derives_another_did() {
+        // §3.8 and §9.6.1: a `did:dht` string is z-base-32 of an Identity Key.
+        // A document naming a different `#0` describes a different identity,
+        // and a caller who skipped BEP44 verification supplies exactly that.
+        let (verifying_key, signing_key) = test_keypair();
+        let did = did_from_pubkey(&verifying_key);
+        let (foreign_verifying_key, _foreign_signing_key) = test_keypair();
+
+        let mut actor_document = test_did_document(&did, &verifying_key);
+        let identity_id = actor_document.verification_method_id("0");
+        for method in &mut actor_document.verification_method {
+            if method.id == identity_id {
+                method.public_key_multibase = test_did_document(
+                    &did_from_pubkey(&foreign_verifying_key),
+                    &foreign_verifying_key,
+                )
+                .verification_method
+                .iter()
+                .find(|vm| vm.id.ends_with("#0"))
+                .expect("a test document names #0")
+                .public_key_multibase
+                .clone();
+            }
+        }
+
+        let error = verify_event_signature(&genesis_event(&did, &signing_key), &actor_document)
+            .expect_err("a document naming a foreign #0 key describes another identity");
+        match error {
+            EventLogError::InvalidSignature { reason, .. } => assert!(
+                reason.contains("derives some other DID"),
+                "rejection names a self-certification failure: {reason}"
+            ),
+            other => panic!("expected InvalidSignature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_event_signature_rejects_document_describing_another_did() {
+        let (verifying_key, signing_key) = test_keypair();
+        let did = did_from_pubkey(&verifying_key);
+        let (other_verifying_key, _other_signing_key) = test_keypair();
+        let other_did = did_from_pubkey(&other_verifying_key);
+        // A document below carries an event signer's own `#active` key, so
+        // that signature alone would verify. Its `id` names a different DID,
+        // which is what this rejection turns on.
+        let foreign_document = test_did_document(&other_did, &verifying_key);
+
+        let event = genesis_event(&did, &signing_key);
+
+        let error = verify_event_signature(&event, &foreign_document)
+            .expect_err("a document for another DID authorizes no event");
+        match error {
+            EventLogError::InvalidSignature { reason, .. } => assert!(
+                reason.contains("not event actor"),
+                "rejection names a mismatch: {reason}"
+            ),
+            other => panic!("expected InvalidSignature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_event_signature_rejects_document_carrying_no_operational_key() {
+        let (verifying_key, signing_key) = test_keypair();
+        let did = did_from_pubkey(&verifying_key);
+        // Identity migration (§9.12) strips `#active` and `#agent` from an old
+        // document, leaving `#0` plus retired keys.
+        let mut migrated_document = test_did_document(&did, &verifying_key);
+        migrated_document.retire_operational_keys_for_migration();
+
+        let event = genesis_event(&did, &signing_key);
+
+        let error = verify_event_signature(&event, &migrated_document)
+            .expect_err("a document naming no operational key authorizes no event");
+        match error {
+            EventLogError::InvalidSignature { reason, .. } => assert!(
+                reason.contains("#active verification method")
+                    && reason.contains("#agent verification method")
+                    && reason.contains("no method carries that identifier"),
+                "rejection names both absent methods: {reason}"
+            ),
+            other => panic!("expected InvalidSignature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_event_signature_rejects_document_with_two_agent_keys() {
+        let (active_verifying_key, _active_signing_key) = test_keypair();
+        let (agent_verifying_key, agent_signing_key) = test_keypair();
+        let did = did_from_pubkey(&active_verifying_key);
+        let mut actor_document =
+            test_did_document_with_agent(&did, &active_verifying_key, &agent_verifying_key);
+        // ADR-039 permits exactly one `#agent` verification method, and tells a
+        // verifier to reject a document carrying more.
+        let duplicate_agent_method = actor_document
+            .agent_verification_method()
+            .expect("a test document names #agent")
+            .clone();
+        actor_document
+            .verification_method
+            .push(duplicate_agent_method);
+
+        let event = genesis_event(&did, &agent_signing_key);
+
+        let error = verify_event_signature(&event, &actor_document)
+            .expect_err("a document with two #agent methods authorizes no event");
+        match error {
+            EventLogError::InvalidSignature { reason, .. } => assert!(
+                reason.contains("malformed"),
+                "rejection names a document defect: {reason}"
+            ),
+            other => panic!("expected InvalidSignature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_event_signature_rejects_one_key_published_under_both_fragments() {
+        // ADR-039 gives `#active` to a human and `#agent` to agent software. An
+        // owner publishing one key under both fragments makes a returned
+        // `SigningKeyId` report `Active` for work agent software did, which is
+        // exactly what ADR-039's accountability argument rests on separating.
+        let (verifying_key, signing_key) = test_keypair();
+        let did = did_from_pubkey(&verifying_key);
+        let actor_document = test_did_document_with_agent(&did, &verifying_key, &verifying_key);
+
+        let error = verify_event_signature(&genesis_event(&did, &signing_key), &actor_document)
+            .expect_err("one key under both fragments identifies no holder");
+        match error {
+            EventLogError::InvalidSignature { reason, .. } => assert!(
+                reason.contains("publishes one key under both"),
+                "rejection names a duplicated key: {reason}"
+            ),
+            other => panic!("expected InvalidSignature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_event_batch_verifies_every_actor_against_its_own_document() {
+        let (verifying_key_a, signing_key_a) = test_keypair();
+        let did_a = did_from_pubkey(&verifying_key_a);
+        let (verifying_key_b, signing_key_b) = test_keypair();
+        let did_b = did_from_pubkey(&verifying_key_b);
+
+        let mut actor_documents = BTreeMap::new();
+        actor_documents.insert(did_a.clone(), test_did_document(&did_a, &verifying_key_a));
+        actor_documents.insert(did_b.clone(), test_did_document(&did_b, &verifying_key_b));
+
+        let events = vec![
+            genesis_event(&did_a, &signing_key_a),
+            genesis_event(&did_b, &signing_key_b),
+        ];
+
+        verify_event_batch(&events, &actor_documents)
+            .expect("each event verifies against its own actor's document");
+    }
+
+    #[test]
+    fn verify_event_signature_reports_which_method_verified() {
+        let (active_verifying_key, active_signing_key) = test_keypair();
+        let (agent_verifying_key, agent_signing_key) = test_keypair();
+        let did = did_from_pubkey(&active_verifying_key);
+        let actor_document =
+            test_did_document_with_agent(&did, &active_verifying_key, &agent_verifying_key);
+
+        assert_eq!(
+            verify_event_signature(&genesis_event(&did, &active_signing_key), &actor_document)
+                .unwrap(),
+            SigningKeyId::Active
+        );
+        assert_eq!(
+            verify_event_signature(&genesis_event(&did, &agent_signing_key), &actor_document)
+                .unwrap(),
+            SigningKeyId::Agent
+        );
+    }
+
+    #[test]
+    fn verify_event_signature_rejects_non_canonical_did_string() {
+        // z-base-32 pads a 32-byte payload, so 16 encodings decode to one key.
+        // `scp_did::extract_public_key_from_did` admits one canonical spelling;
+        // a verifier that skipped that gate would let two DID strings address
+        // one actor (§3.8.1).
+        let (verifying_key, signing_key) = test_keypair();
+        let canonical = did_from_pubkey(&verifying_key);
+        let canonical_suffix = canonical
+            .strip_prefix("did:dht:z")
+            .expect("a test DID carries a did:dht:z prefix");
+        let canonical_payload = crate::test_helpers::identity_key_from_did(&canonical);
+        // A 32-byte payload occupies 255 bits of 52 z-base-32 characters, so a
+        // final character carries 1 payload bit plus 4 padding bits. Sixteen
+        // spellings decode to one key; every spelling except one that
+        // re-encodes to itself is non-canonical.
+        let non_canonical_suffix = "ybndrfg8ejkmcpqxot1uwisza345h769"
+            .chars()
+            .map(|candidate| {
+                let mut characters: Vec<char> = canonical_suffix.chars().collect();
+                let last = characters.len() - 1;
+                characters[last] = candidate;
+                characters.into_iter().collect::<String>()
+            })
+            .find(|candidate_suffix| {
+                candidate_suffix != canonical_suffix
+                    && zbase32::decode(candidate_suffix).as_deref()
+                        == Ok(canonical_payload.as_slice())
+            })
+            .expect("z-base-32 padding admits a second spelling of one key");
+        let non_canonical = format!("did:dht:z{non_canonical_suffix}");
+
+        let actor_document = test_did_document(&non_canonical, &verifying_key);
+        let event = genesis_event(&non_canonical, &signing_key);
+
+        let error = verify_event_signature(&event, &actor_document)
+            .expect_err("a non-canonical DID string authorizes no event");
+        match error {
+            EventLogError::InvalidSignature { reason, .. } => assert!(
+                reason.contains("canonical"),
+                "rejection names a canonicality failure: {reason}"
+            ),
+            other => panic!("expected InvalidSignature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_event_signature_rejects_method_another_did_controls() {
+        let (verifying_key, signing_key) = test_keypair();
+        let did = did_from_pubkey(&verifying_key);
+        let (other_verifying_key, _other_signing_key) = test_keypair();
+        let other_did = did_from_pubkey(&other_verifying_key);
+
+        let mut actor_document = test_did_document(&did, &verifying_key);
+        for method in &mut actor_document.verification_method {
+            if method.id == actor_document.id.clone() + "#active" {
+                method.controller = other_did.to_string();
+            }
+        }
+
+        let error = verify_event_signature(&genesis_event(&did, &signing_key), &actor_document)
+            .expect_err("a method another DID controls authorizes no event");
+        match error {
+            EventLogError::InvalidSignature { reason, .. } => assert!(
+                reason.contains("controller"),
+                "rejection names a controller mismatch: {reason}"
+            ),
+            other => panic!("expected InvalidSignature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_event_signature_rejects_method_absent_from_assertion_method() {
+        let (verifying_key, signing_key) = test_keypair();
+        let did = did_from_pubkey(&verifying_key);
+        let mut actor_document = test_did_document(&did, &verifying_key);
+        // An owner withdraws signing authority by dropping a reference from
+        // `assertionMethod` while keeping a key readable for audit.
+        actor_document.assertion_method.clear();
+
+        let error = verify_event_signature(&genesis_event(&did, &signing_key), &actor_document)
+            .expect_err("a key no assertionMethod reference covers signs no event");
+        match error {
+            EventLogError::InvalidSignature { reason, .. } => assert!(
+                reason.contains("assertionMethod"),
+                "rejection names an assertionMethod omission: {reason}"
+            ),
+            other => panic!("expected InvalidSignature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_event_signature_rejects_method_declaring_another_suite() {
+        let (verifying_key, signing_key) = test_keypair();
+        let did = did_from_pubkey(&verifying_key);
+        let mut actor_document = test_did_document(&did, &verifying_key);
+        let active_id = actor_document.verification_method_id("active");
+        for method in &mut actor_document.verification_method {
+            if method.id == active_id {
+                method.method_type = "JsonWebKey2020".to_owned();
+            }
+        }
+
+        let error = verify_event_signature(&genesis_event(&did, &signing_key), &actor_document)
+            .expect_err("a method declaring another suite supplies no Ed25519 key");
+        match error {
+            EventLogError::InvalidSignature { reason, .. } => assert!(
+                reason.contains("declares type"),
+                "rejection names a type mismatch: {reason}"
+            ),
+            other => panic!("expected InvalidSignature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_event_signature_rejects_a_decoy_active_method_placed_first() {
+        // A document listing a method identified by some other DID ahead of an
+        // actor's own `#active` method must not shadow that real key, and must
+        // not supply a foreign key either.
+        let (verifying_key, signing_key) = test_keypair();
+        let did = did_from_pubkey(&verifying_key);
+        let (decoy_verifying_key, decoy_signing_key) = test_keypair();
+        let decoy_did = did_from_pubkey(&decoy_verifying_key);
+
+        let mut actor_document = test_did_document(&did, &verifying_key);
+        let decoy = scp_did::VerificationMethod {
+            id: format!("{decoy_did}#active"),
+            method_type: scp_did::ED25519_VERIFICATION_KEY_TYPE.to_owned(),
+            controller: decoy_did.to_string(),
+            public_key_multibase: actor_document
+                .verification_method
+                .iter()
+                .find(|vm| vm.id == actor_document.verification_method_id("active"))
+                .expect("a test document names #active")
+                .public_key_multibase
+                .clone(),
+        };
+        actor_document.verification_method.insert(0, decoy);
+
+        verify_event_signature(&genesis_event(&did, &signing_key), &actor_document)
+            .expect("an actor's own #active key still verifies past a decoy entry");
+
+        let error =
+            verify_event_signature(&genesis_event(&did, &decoy_signing_key), &actor_document)
+                .expect_err("a decoy key another DID identifies verifies no event");
+        assert!(
+            matches!(error, EventLogError::InvalidSignature { .. }),
+            "expected InvalidSignature, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn verify_event_signature_rejects_duplicate_active_methods() {
+        // W3C DID Core §5.3.1 requires a unique verification-method identifier.
+        // Two entries under one identifier leave array position deciding which
+        // key verifies, so a document carrying both authorizes nothing.
+        let (verifying_key, signing_key) = test_keypair();
+        let did = did_from_pubkey(&verifying_key);
+        let mut actor_document = test_did_document(&did, &verifying_key);
+        let duplicate = actor_document
+            .verification_method
+            .iter()
+            .find(|vm| vm.id == actor_document.verification_method_id("active"))
+            .expect("a test document names #active")
+            .clone();
+        actor_document.verification_method.push(duplicate);
+
+        let error = verify_event_signature(&genesis_event(&did, &signing_key), &actor_document)
+            .expect_err("two #active entries authorize no event");
+        match error {
+            EventLogError::InvalidSignature { reason, .. } => assert!(
+                reason.contains("no method carries that identifier"),
+                "rejection reports an unusable method set: {reason}"
+            ),
+            other => panic!("expected InvalidSignature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_event_batch_rejects_an_actor_without_a_resolved_document() {
+        let (verifying_key, signing_key) = test_keypair();
+        let did = did_from_pubkey(&verifying_key);
+
+        let events = vec![genesis_event(&did, &signing_key)];
+
+        let error = verify_event_batch(&events, &BTreeMap::new())
+            .expect_err("an unresolvable actor fails closed");
+        match error {
+            EventLogError::InvalidSignature { sequence, reason } => {
+                assert_eq!(sequence, 0);
+                assert!(
+                    reason.contains("no resolved DID document"),
+                    "rejection names a missing document: {reason}"
+                );
+            }
+            other => panic!("expected InvalidSignature, got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------

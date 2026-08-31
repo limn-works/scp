@@ -1028,6 +1028,7 @@ mod tests {
     fn test_auth_ctx() -> BridgeAuthContext {
         BridgeAuthContext {
             claims: test_claims(),
+            signing_key_id: scp_did::SigningKeyId::Active,
             bridge: BridgeConnector {
                 bridge_id: "bridge-test-001".to_owned(),
                 operator_did: scp_did::DID("did:dht:z6MkTestOperator".to_owned()),

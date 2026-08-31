@@ -4193,7 +4193,7 @@ mod restore_reconcile_tests {
         );
 
         let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
-        let header = UcanHeader::with_kid("#agent".to_owned());
+        let header = UcanHeader::with_kid(scp_did::SigningKeyId::Agent);
         let payload = UcanPayload {
             iss: joiner.as_ref().to_owned(),
             aud: joiner.as_ref().to_owned(),

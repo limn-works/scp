@@ -843,8 +843,19 @@ export class SCP {
 
   /**
    * Rotates the `#active` signing key for an identity, publishing the updated
-   * DID document (spec §9.12, ADR-003). The old key is retired; the returned
-   * {@link Identity} carries the same DID with the rotated key material.
+   * DID document (ADR-003, DID creation, item 4a; §9.7.3 of the security-model
+   * spec, which requires an MLS Update carrying a KeyPackage attestation
+   * re-issued under the new key).
+   *
+   * This performs the **soft** act: it retains the old key under a
+   * `#retired-{sequence}` identifier, and §23.13 paragraph 1 of the sync spec
+   * accepts that retained method on an event-log leaf, so the old key keeps
+   * verifying content the owner already signed. An owner recovering from a
+   * compromise removes the method from `verificationMethod` instead, per §9.12
+   * of the security-model spec.
+   *
+   * The returned {@link Identity} carries the same DID with the rotated key
+   * material.
    *
    * @param identity The identity whose `#active` key to rotate.
    * @returns The updated {@link Identity} (same DID, new key).

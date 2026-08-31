@@ -20,15 +20,16 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use ed25519_dalek::Signer;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
-use scp_did::DID;
+use scp_did::{DID, DidDocument};
 use scp_event_log::checkpoint::{CheckpointComparison, compare_checkpoint, generate_checkpoint};
+use scp_event_log::test_helpers::test_did_document;
 use scp_event_log::tree::{self, GENESIS_PREV_HASH};
 use scp_event_log::{Event, EventLog, EventPayload, EventType};
 use scp_platform::testing::InMemoryKeyCustody;
@@ -61,15 +62,10 @@ fn test_keypair() -> (ed25519_dalek::VerifyingKey, ed25519_dalek::SigningKey) {
 
 /// Encodes a public key as a test DID (`did:key:<hex>`).
 fn did_from_pubkey(verifying_key: &ed25519_dalek::VerifyingKey) -> DID {
-    let hex: String = verifying_key
-        .as_bytes()
-        .iter()
-        .fold(String::new(), |mut acc, b| {
-            use std::fmt::Write;
-            let _ = write!(acc, "{b:02x}");
-            acc
-        });
-    format!("did:key:{hex}").into()
+    // `scp_event_log::test_helpers::did_from_pubkey` builds a canonical
+    // `did:dht` string over a derived Identity Key, and `tree::append` checks a
+    // document's `#0` against that string, so both sides come from one helper.
+    scp_event_log::test_helpers::did_from_pubkey(verifying_key)
 }
 
 /// Signs an event and returns it with the signature populated.
@@ -98,8 +94,19 @@ fn sign_event(
 }
 
 /// Appends an event to a log and returns the resulting leaf hash.
-fn append_and_hash(log: &mut EventLog, event: &Event) -> [u8; 32] {
-    tree::append(log, event).expect("append should succeed");
+///
+/// `actor_documents` holds one DID document per actor in this scenario, as a
+/// resolver returns it. `tree::append` verifies each event signature against an
+/// `#active` key that an actor's document names.
+fn append_and_hash(
+    log: &mut EventLog,
+    event: &Event,
+    actor_documents: &BTreeMap<DID, DidDocument>,
+) -> [u8; 32] {
+    let actor_document = actor_documents
+        .get(&event.actor_did)
+        .expect("this scenario resolves a DID document per event actor");
+    tree::append(log, event, actor_document).expect("append should succeed");
     // RFC 6962 §2.1 leaf domain separation: SHA-256(0x00 || serialized)
     let serialized = rmp_serde::to_vec(event).expect("serialize");
     let mut hasher = Sha256::new();
@@ -223,6 +230,8 @@ async fn phase2_end_to_end_integration() {
 
     let (alice_vk, alice_sk) = test_keypair();
     let alice_did = did_from_pubkey(&alice_vk);
+    let mut actor_documents: BTreeMap<DID, DidDocument> = BTreeMap::new();
+    actor_documents.insert(alice_did.clone(), test_did_document(&alice_did, &alice_vk));
 
     let context_id = "ctx-phase2-integration";
 
@@ -360,8 +369,8 @@ async fn phase2_end_to_end_integration() {
         prev_hash,
         &alice_sk,
     );
-    prev_hash = append_and_hash(&mut alice_log, &context_created_event);
-    append_and_hash(&mut bob_log, &context_created_event);
+    prev_hash = append_and_hash(&mut alice_log, &context_created_event, &actor_documents);
+    append_and_hash(&mut bob_log, &context_created_event, &actor_documents);
 
     // Verify params are correct.
     assert_eq!(context.params().ttl, Some(Duration::from_mins(5)));
@@ -387,6 +396,7 @@ async fn phase2_end_to_end_integration() {
 
     let (bob_vk, bob_sk) = test_keypair();
     let bob_did = did_from_pubkey(&bob_vk);
+    actor_documents.insert(bob_did.clone(), test_did_document(&bob_did, &bob_vk));
 
     // Bob discovers the context (the params are visible before joining per the
     // legibility tenet). Bob inspects the ceiling, roles, outlets, TTL, and
@@ -421,8 +431,8 @@ async fn phase2_end_to_end_integration() {
         prev_hash,
         &bob_sk,
     );
-    prev_hash = append_and_hash(&mut alice_log, &bob_joined_event);
-    append_and_hash(&mut bob_log, &bob_joined_event);
+    prev_hash = append_and_hash(&mut alice_log, &bob_joined_event, &actor_documents);
+    append_and_hash(&mut bob_log, &bob_joined_event, &actor_documents);
 
     // -----------------------------------------------------------------------
     // Step 4: Bob is assigned the "member" role with UCAN tokens for
@@ -463,8 +473,8 @@ async fn phase2_end_to_end_integration() {
         prev_hash,
         &alice_sk,
     );
-    prev_hash = append_and_hash(&mut alice_log, &role_assigned_event);
-    append_and_hash(&mut bob_log, &role_assigned_event);
+    prev_hash = append_and_hash(&mut alice_log, &role_assigned_event, &actor_documents);
+    append_and_hash(&mut bob_log, &role_assigned_event, &actor_documents);
 
     // -----------------------------------------------------------------------
     // Step 5: Alice sends a message. UCAN is validated. Envelope is created,
@@ -493,8 +503,8 @@ async fn phase2_end_to_end_integration() {
         prev_hash,
         &alice_sk,
     );
-    prev_hash = append_and_hash(&mut alice_log, &message_event);
-    append_and_hash(&mut bob_log, &message_event);
+    prev_hash = append_and_hash(&mut alice_log, &message_event, &actor_documents);
+    append_and_hash(&mut bob_log, &message_event, &actor_documents);
 
     // -----------------------------------------------------------------------
     // Step 6: Bob receives the message via merged subscription stream.
@@ -579,8 +589,8 @@ async fn phase2_end_to_end_integration() {
         prev_hash,
         &bob_sk,
     );
-    prev_hash = append_and_hash(&mut alice_log, &outlet_invoked_log_event);
-    append_and_hash(&mut bob_log, &outlet_invoked_log_event);
+    prev_hash = append_and_hash(&mut alice_log, &outlet_invoked_log_event, &actor_documents);
+    append_and_hash(&mut bob_log, &outlet_invoked_log_event, &actor_documents);
 
     // -----------------------------------------------------------------------
     // Step 8: Bob attempts to assign a role (he's a member, not admin).
@@ -674,8 +684,8 @@ async fn phase2_end_to_end_integration() {
         prev_hash,
         &alice_sk,
     );
-    prev_hash = append_and_hash(&mut alice_log, &checkpoint_event);
-    append_and_hash(&mut bob_log, &checkpoint_event);
+    prev_hash = append_and_hash(&mut alice_log, &checkpoint_event, &actor_documents);
+    append_and_hash(&mut bob_log, &checkpoint_event, &actor_documents);
 
     // -----------------------------------------------------------------------
     // Step 10: TTL expires. Context transitions to Expired.
@@ -711,8 +721,8 @@ async fn phase2_end_to_end_integration() {
         prev_hash,
         &alice_sk,
     );
-    let _prev_hash_final = append_and_hash(&mut alice_log, &expired_event);
-    append_and_hash(&mut bob_log, &expired_event);
+    let _prev_hash_final = append_and_hash(&mut alice_log, &expired_event, &actor_documents);
+    append_and_hash(&mut bob_log, &expired_event, &actor_documents);
 
     // Simulate key destruction: in production this is the actor-owned crypto
     // disposal at the `ttl_close_helpers::finalize_close` seam (#2148/#2199).

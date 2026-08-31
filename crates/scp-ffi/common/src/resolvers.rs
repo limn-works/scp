@@ -18,7 +18,6 @@ use scp_core::crypto::ucan::validate::{
 };
 use scp_core::trust::TrustError;
 use scp_core::trust::attestation::DidPublicKeyResolver;
-use scp_did::decode_multibase_key;
 use scp_identity::IdentityError;
 use scp_identity::resolver::ResolvedDidDocument;
 
@@ -461,30 +460,66 @@ impl IdentityBackedDidResolver {
         Ok(())
     }
 
-    /// Extracts a public key from a resolved DID document by verification
-    /// method fragment.
+    /// Extracts the public key a resolved DID document authorizes for signing
+    /// an assertion under `signing_key_id`.
     ///
-    /// Looks up the verification method matching `fragment` (e.g., `"active"`,
-    /// `"agent"`, `"0"`) and decodes the `publicKeyMultibase` field.
+    /// `assertionMethod` gates this function. A document that withdrew a method
+    /// from `assertionMethod` — which
+    /// [`DidDocument::retire_active_key`](scp_did::DidDocument::retire_active_key)
+    /// does to every key it rotates out — supplies no key here, so a rotated
+    /// key stops verifying as soon as an owner publishes the document that
+    /// retired it. A UCAN is a bearer capability a holder presents now, which
+    /// is the class §9.12 of the security-model spec binds to the current key.
+    /// §23.13 paragraph 1 of the sync spec states the opposite rule for an
+    /// event-log leaf, which is content, and a verifier reaches a retired key
+    /// there through `DidDocument::historical_assertion_keys` rather than
+    /// through this function.
+    ///
+    /// **`assertionMethod` is this crate's choice, and §18.2.2A of the
+    /// addressability spec assigns a UCAN a different array.** That section is
+    /// the field-level schema for every SCP DID document, and it marks
+    /// `capabilityInvocation` and `capabilityDelegation` Required with fixed
+    /// membership: `capabilityInvocation` MUST reference `#0` and `#active`,
+    /// and `capabilityDelegation` MUST reference only `#0`. W3C DID Core §5.3.4
+    /// and §5.3.5 define those two for invoking and delegating a capability,
+    /// which is what a UCAN does.
+    ///
+    /// [`DidDocument`](scp_did::DidDocument) implements neither array. Every
+    /// document this codebase publishes therefore omits two fields §18.2.2A
+    /// requires, and this function reads the array the type does carry.
+    ///
+    /// **Two artifacts conflict, so a human decides before the code moves.**
+    /// §18.2.2A excludes `#agent` from `capabilityInvocation`, while ADR-039's
+    /// Category B grants an agent sub-delegation of a UCAN and its UCAN Impact
+    /// section scopes a self-delegation with `fct.scp_key_scope: "#agent"`. A
+    /// spec governs an ADR, so §18.2.2A wins on its face — and taking it at
+    /// face value removes an agent's ability to invoke any capability, which
+    /// ADR-039 exists to grant. Settling that decides which array gates this
+    /// function and what `DidDocument` must carry.
+    ///
+    /// The cost of the present choice is concrete: an owner who withdraws a key
+    /// from `assertionMethod` to stop it delegating capabilities also stops it
+    /// signing event-log leaves, governance votes, checkpoints, and
+    /// `KeyPackage` attestations, because no array separates those powers.
+    ///
+    /// A [`SigningKeyId`](scp_did::SigningKeyId) argument, rather than a
+    /// fragment string, keeps the admitted set closed at two operational
+    /// verification methods: ADR-039's key-property table marks `#0` "Signs
+    /// operational actions: No", and §9.7.4 confines it to DID document
+    /// updates plus pre-rotation commitments.
     fn extract_public_key(
         doc: &ResolvedDidDocument,
-        fragment: &str,
+        signing_key_id: scp_did::SigningKeyId,
     ) -> Result<[u8; 32], ResolutionError> {
-        let vm = doc
-            .document
-            .verification_method_by_fragment(fragment)
-            .ok_or_else(|| {
+        doc.document
+            .signing_key_for(signing_key_id, scp_did::VerificationRelationship::Assertion)
+            .map_err(|e| {
                 ResolutionError::InvalidDocument(format!(
-                    "verification method '#{fragment}' not found in DID document for {}",
+                    "verification method '{}' of {} supplies no key: {e}",
+                    signing_key_id.as_fragment(),
                     doc.document.id
                 ))
-            })?;
-
-        decode_multibase_key(&vm.public_key_multibase).map_err(|e| {
-            ResolutionError::InvalidDocument(format!(
-                "failed to decode public key from verification method '#{fragment}': {e}"
-            ))
-        })
+            })
     }
 
     /// Resolves the Ed25519 verifying key for a specific verification method on
@@ -584,20 +619,22 @@ impl DidResolver for IdentityBackedDidResolver {
             .map_err(CoreUcanError::from)?;
 
         // Default to #active (the operational signing key).
-        Self::extract_public_key(&resolved, "active").map_err(CoreUcanError::from)
+        Self::extract_public_key(&resolved, scp_did::SigningKeyId::Active)
+            .map_err(CoreUcanError::from)
     }
 
-    fn resolve_public_key_by_kid(&self, did: &str, kid: &str) -> Result<[u8; 32], CoreUcanError> {
-        debug!(did = %did, kid = %kid, "resolving DID public key via identity layer");
+    fn resolve_public_key_by_kid(
+        &self,
+        did: &str,
+        signing_key_id: scp_did::SigningKeyId,
+    ) -> Result<[u8; 32], CoreUcanError> {
+        debug!(did = %did, kid = %signing_key_id.as_fragment(), "resolving DID public key via identity layer");
 
         let resolved = self.resolve_sync(did).map_err(CoreUcanError::from)?;
         self.check_sequence(did, resolved.seq)
             .map_err(CoreUcanError::from)?;
 
-        // Strip leading '#' from kid fragment if present.
-        let fragment = kid.strip_prefix('#').unwrap_or(kid);
-
-        Self::extract_public_key(&resolved, fragment).map_err(CoreUcanError::from)
+        Self::extract_public_key(&resolved, signing_key_id).map_err(CoreUcanError::from)
     }
 }
 
@@ -612,7 +649,8 @@ impl DidPublicKeyResolver for IdentityBackedDidResolver {
             .map_err(TrustError::from)?;
 
         // Attestation verification uses the #active key by default.
-        let key = Self::extract_public_key(&resolved, "active").map_err(TrustError::from)?;
+        let key = Self::extract_public_key(&resolved, scp_did::SigningKeyId::Active)
+            .map_err(TrustError::from)?;
         Ok(key.to_vec())
     }
 }
@@ -677,10 +715,14 @@ impl DidResolver for DispatchDidResolver<'_> {
         }
     }
 
-    fn resolve_public_key_by_kid(&self, did: &str, kid: &str) -> Result<[u8; 32], CoreUcanError> {
+    fn resolve_public_key_by_kid(
+        &self,
+        did: &str,
+        signing_key_id: scp_did::SigningKeyId,
+    ) -> Result<[u8; 32], CoreUcanError> {
         match self {
-            Self::Identity(r) => DidResolver::resolve_public_key_by_kid(*r, did, kid),
-            Self::Bridge(r) => r.resolve_public_key_by_kid(did, kid),
+            Self::Identity(r) => DidResolver::resolve_public_key_by_kid(*r, did, signing_key_id),
+            Self::Bridge(r) => r.resolve_public_key_by_kid(did, signing_key_id),
         }
     }
 }
@@ -932,6 +974,37 @@ mod tests {
         IdentityBackedDidResolver::new(resolver, rt.handle().clone())
     }
 
+    /// An identity-layer resolver that answers every DID with one document a
+    /// test built, so a test can state which document a key resolver reads
+    /// without publishing that document to a DHT.
+    struct FixedDocumentResolver(ResolvedDidDocument);
+
+    impl scp_identity::resolver::DidResolver for FixedDocumentResolver {
+        fn resolve(
+            &self,
+            _did: &str,
+        ) -> impl Future<Output = Result<Option<ResolvedDidDocument>, IdentityError>> + Send
+        {
+            let document = self.0.clone();
+            async move { Ok(Some(document)) }
+        }
+    }
+
+    /// Helper: create an `IdentityBackedDidResolver` that answers with
+    /// `resolved`.
+    fn make_identity_resolver_returning(
+        resolved: ResolvedDidDocument,
+    ) -> IdentityBackedDidResolver {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        IdentityBackedDidResolver::new(
+            Arc::new(FixedDocumentResolver(resolved)),
+            rt.handle().clone(),
+        )
+    }
+
     // -----------------------------------------------------------------------
     // DispatchDidResolver
     // -----------------------------------------------------------------------
@@ -1037,19 +1110,156 @@ mod tests {
         };
 
         // Extract the #active key — should succeed.
-        let key = IdentityBackedDidResolver::extract_public_key(&resolved, "active").unwrap();
+        let key =
+            IdentityBackedDidResolver::extract_public_key(&resolved, scp_did::SigningKeyId::Active)
+                .unwrap();
         // Verify the extracted key matches the public key from custody.
         assert_eq!(key.len(), 32);
 
-        // Also verify #0 (identity key) works.
-        let identity_key = IdentityBackedDidResolver::extract_public_key(&resolved, "0").unwrap();
-        assert_eq!(identity_key.len(), 32);
-
-        // Ensure they are different keys (identity vs active).
+        // The Identity Key differs from the Active Signing Key, and this
+        // resolver reaches neither it nor any other non-operational method:
+        // `extract_public_key` takes a `SigningKeyId`, whose two variants are
+        // the only verification methods ADR-039 lets sign an operational
+        // action.
+        let identity_key = resolved.document.identity_key().unwrap();
         assert_ne!(key, identity_key, "active and identity keys should differ");
 
         // Suppress unused binding warning.
         let _ = identity;
+    }
+
+    /// A DID document that publishes `#active` and lists it under
+    /// `assertionMethod`, plus a rotated `#retired-1` method carrying this
+    /// document's own controller and the Ed25519 suite.
+    ///
+    /// `retire_active_key` builds exactly this shape on every Layer 1
+    /// rotation, so it models a real document rather than a hand-written one.
+    fn document_with_a_rotated_key() -> (ResolvedDidDocument, [u8; 32], [u8; 32]) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let custody = scp_platform::testing::InMemoryKeyCustody::new();
+        let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
+        let (_identity, mut document, _pre_rotation_handle) = rt
+            .block_on(
+                scp_identity::DidDht::with_client(std::sync::Arc::new(
+                    scp_dht::InMemoryDhtClient::new(),
+                ))
+                .create(&custody, &pre_rotation_custody),
+            )
+            .unwrap();
+
+        let rotated_out_key = document
+            .signing_key_for(
+                scp_did::SigningKeyId::Active,
+                scp_did::VerificationRelationship::Assertion,
+            )
+            .unwrap();
+        let new_active_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+            .verifying_key()
+            .to_bytes();
+        document.retire_active_key(&new_active_key, 1);
+
+        (
+            ResolvedDidDocument {
+                document,
+                seq: 2,
+                source: ResolutionSource::Cache,
+            },
+            rotated_out_key,
+            new_active_key,
+        )
+    }
+
+    /// A rotated-out `#retired-1` method and the `#0` Identity Key are both
+    /// unreachable through this resolver, and the reason is the parameter type:
+    /// `resolve_public_key_by_kid` takes a `SigningKeyId`, whose two variants
+    /// name `#active` and `#agent`. Neither fragment can be expressed, so no
+    /// runtime check rejects them and no test can call for one.
+    ///
+    /// What this test pins instead is that neither key is what `#active`
+    /// resolves to after a rotation, so a caller asking for the one reachable
+    /// operational method never receives either.
+    ///
+    /// `verify_signature` in `scp_protocol::crypto::ucan::validate` decodes a
+    /// wire `kid` into that `SigningKeyId`, and its own tests cover a `kid`
+    /// header naming `#retired-1` or `#0`.
+    #[test]
+    fn neither_a_rotated_key_nor_an_identity_key_is_what_active_resolves_to() {
+        let (resolved_doc, rotated_out_key, new_active_key) = document_with_a_rotated_key();
+        let did = resolved_doc.document.id.clone();
+        let identity_key = resolved_doc.document.identity_key().unwrap();
+
+        // The document still publishes the rotated-out method, so this test
+        // reads a document that could supply the wrong key rather than one that
+        // lacks it.
+        assert_eq!(
+            resolved_doc
+                .document
+                .verification_method_by_fragment("retired-1")
+                .map(|method| method.controller.clone()),
+            Some(did.clone()),
+            "a rotated method keeps this document's controller"
+        );
+
+        let resolver = make_identity_resolver_returning(resolved_doc);
+        let resolved_active = DidResolver::resolve_public_key(&resolver, &did).unwrap();
+
+        assert_eq!(resolved_active, new_active_key);
+        assert_ne!(
+            resolved_active, rotated_out_key,
+            "a rotated-out key must not be what #active resolves to"
+        );
+        assert_ne!(
+            resolved_active, identity_key,
+            "an Identity Key must not be what #active resolves to"
+        );
+    }
+
+    /// `resolve_export_verifying_key` resolves a remote creator's key through
+    /// this resolver, so the two must agree on how a `kid` is spelled.
+    ///
+    /// Its own tests drive a stub resolver, and a stub that accepts a spelling
+    /// this resolver rejects reports success while a shipped import fails
+    /// closed. This test pairs the production caller with the production
+    /// resolver, so a spelling disagreement between them fails here.
+    #[test]
+    fn export_verifying_key_resolves_through_this_resolver() {
+        let (resolved_doc, _rotated_out_key, new_active_key) = document_with_a_rotated_key();
+        let did = resolved_doc.document.id.clone();
+
+        let resolver = make_identity_resolver_returning(resolved_doc);
+        let key =
+            crate::export_verify::resolve_export_verifying_key(Some(&resolver), |_| None, &did)
+                .expect("a remote creator's #active key resolves for export verification");
+
+        assert_eq!(
+            key.to_bytes(),
+            new_active_key,
+            "export verification must read the key #active names after rotation"
+        );
+    }
+
+    /// `#active` resolves no key once an owner withdraws that method from
+    /// `assertionMethod`, which is the relationship a UCAN signature reads.
+    /// This is the gate that revokes a rotated key, because `retire_active_key`
+    /// rebuilds both relationship arrays and leaves the retired method out of
+    /// them. Deleting the relationship check makes this test fail.
+    #[test]
+    fn active_withdrawn_from_assertion_method_resolves_no_key() {
+        let (mut resolved_doc, _rotated_out_key, _new_active_key) = document_with_a_rotated_key();
+        resolved_doc.document.assertion_method.clear();
+        let did = resolved_doc.document.id.clone();
+
+        let resolver = make_identity_resolver_returning(resolved_doc);
+        let error =
+            DidResolver::resolve_public_key_by_kid(&resolver, &did, scp_did::SigningKeyId::Active)
+                .expect_err("a method absent from assertionMethod must resolve no key");
+        assert!(
+            error.to_string().contains("assertionMethod omits"),
+            "expected an assertionMethod-relationship rejection, got: {error}"
+        );
     }
 
     #[test]
@@ -1070,7 +1280,8 @@ mod tests {
             source: ResolutionSource::Cache,
         };
 
-        let result = IdentityBackedDidResolver::extract_public_key(&resolved, "active");
+        let result =
+            IdentityBackedDidResolver::extract_public_key(&resolved, scp_did::SigningKeyId::Active);
         assert!(
             result.is_err(),
             "should fail for missing verification method"

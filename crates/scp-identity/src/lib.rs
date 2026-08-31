@@ -445,6 +445,13 @@ impl From<scp_did::DidError> for IdentityError {
             scp_did::DidError::AgentKeyAlreadyExists => Self::AgentKeyAlreadyExists,
             scp_did::DidError::AgentKeyNotFound => Self::AgentKeyNotFound,
             scp_did::DidError::MultipleAgentKeys { count } => Self::MultipleAgentKeys { count },
+            scp_did::DidError::UnusableVerificationMethod {
+                fragment,
+                did,
+                reason,
+            } => Self::InvalidDidFormat(format!(
+                "#{fragment} verification method of {did} is unusable: {reason}"
+            )),
         }
     }
 }

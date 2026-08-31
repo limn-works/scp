@@ -305,8 +305,10 @@ fn no_pre_rotation_backend() -> ScpError {
 /// reads from — so that subsequent DID resolution (UCAN validation, governance
 /// vote-signature verification) sees the rotated `#active` key and rejects
 /// signatures from the retired one. Publishing into a throwaway client would
-/// leave the resolver permanently serving the stale, pre-rotation document,
-/// silently defeating rotation's revocation purpose.
+/// leave the resolver permanently serving the stale, pre-rotation document, so
+/// the retired key would keep passing every current-key check: a `KeyPackage`
+/// attestation (§9.7.1 check 1 of the security-model spec) and a live DID
+/// authentication (§3.11.4 steps 7 and 8 of the identity spec).
 ///
 /// Rotation / agent-key / migration only run against an identity already minted
 /// by `identity_create`, which initializes the resolver DHT client first — so by
@@ -351,8 +353,10 @@ fn rotation_publish_client(
 /// The DHT client is passed in by the caller (via [`rotation_publish_client`])
 /// so the re-published (higher-`seq`) document lands in the SAME per-instance
 /// client the resolver reads from — NOT a fresh per-call client, which would let
-/// the re-published document land somewhere the resolver never sees, silently
-/// defeating rotation's revocation purpose.
+/// the re-published document land somewhere the resolver never sees, so the
+/// retired key would keep passing every current-key check: a `KeyPackage`
+/// attestation (§9.7.1 check 1 of the security-model spec) and a live DID
+/// authentication (§3.11.4 steps 7 and 8 of the identity spec).
 // Only reached from the testing-gated identity rotate/agent-key/migrate paths
 // (production create fails closed first — ADR-062 §Decision 6).
 #[cfg(feature = "testing")]
@@ -2743,6 +2747,13 @@ impl Identity {
     /// Generates a new Active Signing Key, updates the DID document on the
     /// DHT, and returns an updated `Identity` with the same DID but a new
     /// active signing key.
+    ///
+    /// This performs the soft act of ADR-003, DID creation, item 4a: it retains
+    /// the old key under a `#retired-{sequence}` identifier, and §23.13
+    /// paragraph 1 of the sync spec accepts that retained method on an event-log
+    /// leaf, so the old key keeps verifying content this identity already
+    /// signed. An owner recovering from a compromise removes the method from
+    /// `verificationMethod` instead, per §9.12 of the security-model spec.
     ///
     /// Requires a retained custody provider (in-memory or platform callback).
     /// External/loaded identities without retained crypto state cannot rotate.
@@ -9509,8 +9520,10 @@ fn ensure_did_resolver_initialized_on(
 /// multi-day TTL and short-circuits on a cached hit without re-querying the
 /// DHT. Without this invalidation a freshly rotated identity keeps resolving to
 /// its pre-rotation document — and pre-rotation `#active` key — until the TTL
-/// expires, defeating rotation's revocation purpose. The rotation re-publish
-/// (higher BEP44 `seq`) has already landed in the shared DHT client
+/// expires, so the retired key keeps passing every current-key check: a
+/// `KeyPackage` attestation (§9.7.1 check 1 of the security-model spec) and a live
+/// DID authentication (§3.11.4 steps 7 and 8 of the identity spec). The rotation
+/// re-publish (higher BEP44 `seq`) has already landed in the shared DHT client
 /// (`rotation_publish_client`); this drops the resolver's stale copy so the
 /// next resolve reads the fresh document. Best-effort: a no-op when no resolver
 /// cache is wired on this instance.
@@ -19631,7 +19644,7 @@ mod tests {
     ///
     /// NOTE ON SCOPE: the `Sealed` happy-path (the full creator-seal ->
     /// joiner-open round-trip) is NOT asserted at THIS bridge layer. The §5.13.3
-    /// `0xFF02` KeyPackage-capabilities path IS green (9fe3b4c9b) — the runtime
+    /// `0xFF02` `KeyPackage`-capabilities path IS green (9fe3b4c9b) — the runtime
     /// already proves the round-trip in `spawn_from_welcome_tests`, and the `PyO3`
     /// / real-napi peers assert it end-to-end. `UniFFI` cannot: the invitee's
     /// `#active` verifying key is resolved through the DID resolver, and the
@@ -24028,8 +24041,10 @@ mod tests {
     /// the real bridge rotation op, and asserts the cached entry is gone — so a
     /// subsequent resolve re-queries the DHT and serves the new key. Without the
     /// invalidation the resolver would keep serving the pre-rotation document
-    /// (and its retired `#active` key) for the multi-day cache TTL, silently
-    /// defeating rotation's revocation purpose.
+    /// (and its retired `#active` key) for the multi-day cache TTL, so the
+    /// retired key would keep passing every current-key check: a `KeyPackage`
+    /// attestation (§9.7.1 check 1 of the security-model spec) and a live DID
+    /// authentication (§3.11.4 steps 7 and 8 of the identity spec).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rotate_key_invalidates_resolver_cache() {
         let scp = scp_test();

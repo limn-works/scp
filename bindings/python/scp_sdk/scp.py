@@ -965,7 +965,17 @@ class SCP:
         return Identity(raw)
 
     async def identity_rotate_key(self, identity: Any) -> Any:
-        """Delegate to ``_scp_core.SCP.identity_rotate_key`` (returns :class:`Identity`)."""
+        """Delegate to ``_scp_core.SCP.identity_rotate_key`` (returns :class:`Identity`).
+
+        Rotates the ``#active`` signing key and publishes the updated DID
+        document (ADR-003, DID creation, item 4a; spec §9.7.3, which requires an
+        MLS Update carrying a KeyPackage attestation re-issued under the new
+        key). This performs the **soft** act: it retains the old key under a
+        ``#retired-{sequence}`` identifier, and spec §23.13 paragraph 1 accepts
+        that retained method on an event-log leaf, so the old key keeps verifying
+        content the owner already signed. An owner recovering from a compromise
+        removes the method from ``verificationMethod`` instead, per spec §9.12.
+        """
         from scp_sdk.identity import Identity
 
         try:

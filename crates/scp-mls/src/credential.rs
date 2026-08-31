@@ -9,7 +9,7 @@
 // The DID data model — DID-document types and `SigningKeyId` — comes from the
 // wasm-safe `scp-did` crate, NOT from the tokio-coupled `scp-identity`, keeping
 // `scp-mls` inside the ADR-057 mechanical fence.
-use scp_did::{DidDocument, SigningKeyId, decode_multibase_key};
+use scp_did::{DidDocument, SigningKeyId, VerificationRelationship};
 use serde::{Deserialize, Serialize};
 
 use crate::error::MlsError;
@@ -155,21 +155,14 @@ impl ScpCredential {
     ///   (e.g., `#agent` is absent).
     /// - The public key multibase encoding is invalid or not 32 bytes.
     pub fn resolve_signing_key(&self, did_doc: &DidDocument) -> Result<[u8; 32], MlsError> {
-        let fragment = self.signing_key_id.fragment();
-        let vm = did_doc
-            .verification_method_by_fragment(fragment)
-            .ok_or_else(|| {
+        did_doc
+            .signing_key_for(self.signing_key_id, VerificationRelationship::Assertion)
+            .map_err(|e| {
                 MlsError::InvalidCredential(format!(
-                    "DID document for {} has no #{fragment} verification method",
+                    "DID document for {} supplies no signing key: {e}",
                     self.did
                 ))
-            })?;
-
-        decode_multibase_key(&vm.public_key_multibase).map_err(|e| {
-            MlsError::InvalidCredential(format!(
-                "failed to decode #{fragment} public key from DID document: {e}"
-            ))
-        })
+            })
     }
 }
 
@@ -370,6 +363,7 @@ mod tests {
     }
 
     /// Helper: creates a DID document with `#active` and optionally `#agent` VMs.
+    #[allow(clippy::expect_used)]
     fn test_did_doc(active_key: &[u8; 32], agent_key: Option<&[u8; 32]>) -> DidDocument {
         // Identity key must also decompress to a valid Ed25519 point so
         // any future caller that decodes #0 doesn't trip the curve-point
@@ -380,13 +374,12 @@ mod tests {
         let mut doc = DidDocument::new(TEST_DID, &identity_key, active_key, &commitment);
 
         if let Some(agent_pk) = agent_key {
-            let agent_vm = scp_did::VerificationMethod {
-                id: format!("{TEST_DID}#agent"),
-                method_type: "Ed25519VerificationKey2020".to_owned(),
-                controller: TEST_DID.to_owned(),
-                public_key_multibase: format!("z{}", bs58::encode(agent_pk).into_string()),
-            };
-            doc.verification_method.push(agent_vm);
+            // `add_agent_key` is what production uses, and it references a new
+            // method from `authentication` and `assertionMethod` as well as
+            // adding it. Pushing a bare method would model a document no SCP
+            // constructor produces, and `signing_key_for` rejects one.
+            doc.add_agent_key(agent_pk)
+                .expect("a fresh document names no #agent key");
         }
 
         doc
@@ -431,6 +424,66 @@ mod tests {
             err_msg.contains("#agent"),
             "error should mention #agent, got: {err_msg}"
         );
+    }
+
+    /// A `KeyPackage` attestation is a bearer capability a holder presents now,
+    /// so §9.7.1 check 1 of the security-model spec binds it to the current
+    /// `#active`/`#agent` only. A rotation therefore makes this resolver answer
+    /// the new key, and an attestation the retired key signed fails against it.
+    ///
+    /// The same rotation leaves that retired key verifying a content signature
+    /// (§23.13 paragraph 1 of the sync spec, reached through
+    /// `DidDocument::historical_assertion_keys`). This test asserts both halves,
+    /// because the difference between them is the rule, not an accident of
+    /// which array a rotation happens to rewrite.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn resolve_signing_key_refuses_a_rotated_out_active_key() {
+        let retired_key = fresh_ed25519_pub();
+        let new_active_key = fresh_ed25519_pub();
+        let mut doc = test_did_doc(&retired_key, None);
+        doc.retire_active_key(&new_active_key, 1);
+
+        let cred = ScpCredential::new(TEST_DID.to_string(), None, SigningKeyId::Active).unwrap();
+        let resolved = cred.resolve_signing_key(&doc).unwrap();
+        assert_eq!(
+            resolved, new_active_key,
+            "an attestation verifier resolves the current #active key"
+        );
+        assert_ne!(
+            resolved, retired_key,
+            "an attestation the retired key signed verifies against nothing this \
+             resolver returns"
+        );
+
+        let historical = doc.historical_assertion_keys();
+        assert_eq!(historical.len(), 1);
+        assert_eq!(
+            historical[0].public_key, retired_key,
+            "the same retired key stays reachable for a content signature"
+        );
+    }
+
+    /// A rotated-out `#agent` key is likewise unreachable for an attestation,
+    /// and reachable for a content signature.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn resolve_signing_key_refuses_a_rotated_out_agent_key() {
+        let active_key = fresh_ed25519_pub();
+        let retired_agent_key = fresh_ed25519_pub();
+        let new_agent_key = fresh_ed25519_pub();
+        let mut doc = test_did_doc(&active_key, Some(&retired_agent_key));
+        doc.rotate_agent_key(&new_agent_key, 1).unwrap();
+
+        let cred = ScpCredential::new(TEST_DID.to_string(), None, SigningKeyId::Agent).unwrap();
+        let resolved = cred.resolve_signing_key(&doc).unwrap();
+        assert_eq!(resolved, new_agent_key);
+        assert_ne!(resolved, retired_agent_key);
+
+        let historical = doc.historical_assertion_keys();
+        assert_eq!(historical.len(), 1);
+        assert_eq!(historical[0].public_key, retired_agent_key);
+        assert_eq!(historical[0].holder, SigningKeyId::Agent);
     }
 
     #[test]

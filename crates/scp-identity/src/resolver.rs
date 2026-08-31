@@ -40,7 +40,7 @@ use crate::republish::RelayPublisher;
 use crate::resolution::verify_relay_record;
 use scp_clock::{Clock, SystemClock};
 use scp_dht::{DhtClient, DhtRecord};
-use scp_did::{DidDocument, decode_multibase_key};
+use scp_did::DidDocument;
 use scp_protocol::envelope::did_record::DidRecordV1;
 
 // ---------------------------------------------------------------------------
@@ -823,18 +823,17 @@ fn validate_dht_result(
 ///   `|_, _| None` stub.
 ///
 /// It lives here, in the lowest layer that owns every primitive it needs
-/// ([`DidDocument::verification_method_by_fragment`], [`decode_multibase_key`],
-/// `ed25519-dalek`), so both consumers call ONE tested helper rather than
-/// duplicating the extraction — a second copy is exactly the "resolver silently
-/// ignores the `SigningKeyId`" failure mode ADR-053 §Rejected-Alternatives-3
-/// warns against. `scp-ffi-common` depends on `scp-node`, so `scp-node` cannot
-/// call the bridge copy without a crate cycle; hoisting the pure extraction here
-/// breaks that cycle.
+/// ([`DidDocument::signing_key_for`], `ed25519-dalek`), so both consumers call
+/// ONE tested helper rather than duplicating the extraction — a second copy is
+/// exactly the "resolver silently ignores the `SigningKeyId`" failure mode
+/// ADR-053 §Rejected-Alternatives-3 warns against. `scp-ffi-common` depends on
+/// `scp-node`, so `scp-node` cannot call the bridge copy without a crate cycle;
+/// hoisting the pure extraction here breaks that cycle.
 ///
-/// The lookup is keyed by [`SigningKeyId::fragment`](scp_did::SigningKeyId::fragment)
-/// (`"active"` / `"agent"`) — the `SigningKeyId` is honored, never ignored:
-/// resolving [`SigningKeyId::Agent`](scp_did::SigningKeyId::Agent) returns
-/// the document's distinct `#agent` key, not the `#active` key.
+/// [`DidDocument::signing_key_for`] keys the lookup on `kid`, so the
+/// `SigningKeyId` is honored, never ignored: resolving
+/// [`SigningKeyId::Agent`](scp_did::SigningKeyId::Agent) returns the document's
+/// distinct `#agent` key, not the `#active` key.
 ///
 /// # Purity and downgrade protection
 ///
@@ -847,18 +846,38 @@ fn validate_dht_result(
 ///
 /// # Returns
 ///
-/// `Some(key)` when the requested verification method is present and decodes to
-/// a valid Ed25519 curve point; `None` when the verification method is absent,
-/// its `publicKeyMultibase` cannot be decoded, or the bytes are not a valid
-/// Ed25519 public key. `None` is the safe per-lookup miss — a caller building a
-/// governance `KeyResolver` maps it to "vote rejected" (fail closed).
+/// `Some(key)` when `document` authorizes the requested verification method for
+/// signing an assertion and its key decodes to a valid Ed25519 curve point.
+///
+/// `None` when any one of these holds:
+///
+/// - `document` carries no method identified as `{document.id}#{fragment}`
+///   exactly once — a method some other DID identifies inside it counts for
+///   nothing, and neither does a repeated identifier;
+/// - that method declares a type other than `Ed25519VerificationKey2020`;
+/// - that method names a controller other than `document`'s own DID;
+/// - `document`'s `assertionMethod` array does not reference that method, which
+///   is what a Layer 1 rotation withdraws — ADR-003, DID creation, item 4a
+///   moves both relationship references to the new key and retains the old one
+///   as `#retired-{sequence}` for historical verification. This function serves
+///   a decision a caller makes now, so it reads the relationship array and
+///   returns no retired key. `verify_event_signature` in `scp-event-log` serves
+///   past authorship instead and reaches a retired key through
+///   `DidDocument::historical_assertion_keys`, per §23.13 paragraph 1 of the
+///   sync spec;
+/// - its `publicKeyMultibase` value does not decode to a valid Ed25519 curve
+///   point.
+///
+/// `None` is the safe per-lookup miss — a caller building a governance
+/// `KeyResolver` maps it to "vote rejected" (fail closed).
 #[must_use]
 pub fn verifying_key_from_document(
     document: &DidDocument,
     kid: scp_did::SigningKeyId,
 ) -> Option<ed25519_dalek::VerifyingKey> {
-    let vm = document.verification_method_by_fragment(kid.fragment())?;
-    let bytes = decode_multibase_key(&vm.public_key_multibase).ok()?;
+    let bytes = document
+        .signing_key_for(kid, scp_did::VerificationRelationship::Assertion)
+        .ok()?;
     ed25519_dalek::VerifyingKey::from_bytes(&bytes).ok()
 }
 

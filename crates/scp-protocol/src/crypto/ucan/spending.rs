@@ -1756,7 +1756,7 @@ mod tests {
         let now = scp_clock::SystemClock.now_secs();
 
         UcanToken {
-            header: super::super::UcanHeader::with_kid("#agent".to_owned()),
+            header: super::super::UcanHeader::with_kid(scp_did::SigningKeyId::Agent),
             payload: UcanPayload {
                 iss: "did:dht:z6MkShared".to_owned(),
                 aud: "did:dht:z6MkShared".to_owned(),

@@ -4470,12 +4470,15 @@ mod tests {
     /// byte-preservation invariant in the meantime.
     #[test]
     fn ac3_interface_established_event_log_roundtrip_byte_identical() {
-        use scp_event_log::test_helpers::{did_from_pubkey, sign_event, test_keypair};
+        use scp_event_log::test_helpers::{
+            did_from_pubkey, sign_event, test_did_document, test_keypair,
+        };
         use scp_event_log::tree::GENESIS_PREV_HASH;
         use scp_event_log::{EventLog, EventType, tree};
 
         let (verifying_key, signing_key) = test_keypair();
         let actor_did = did_from_pubkey(&verifying_key);
+        let actor_document = test_did_document(&actor_did, &verifying_key);
 
         let evt = sample_interface_established();
         let payload_bytes =
@@ -4491,7 +4494,7 @@ mod tests {
             GENESIS_PREV_HASH,
             &signing_key,
         );
-        tree::append(&mut log, &signed).expect("append should succeed");
+        tree::append(&mut log, &signed, &actor_document).expect("append should succeed");
 
         let retrieved = log
             .get_event(0)

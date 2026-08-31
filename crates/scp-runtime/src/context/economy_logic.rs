@@ -89,24 +89,22 @@ impl DidResolver for KeyResolverDidResolver<'_> {
             })
     }
 
-    fn resolve_public_key_by_kid(&self, did: &str, kid: &str) -> Result<[u8; 32], UcanError> {
-        // VM-aware resolution (ADR-039): map the UCAN `kid` fragment to the
-        // verification method it names (via the single canonical parser), then
-        // resolve that specific key from the DID document. An unrecognized
-        // fragment is a malformed token.
-        let signing_key_id = SigningKeyId::from_fragment(kid).ok_or_else(|| {
-            UcanError::MalformedToken(format!(
-                "UCAN kid '{kid}' is not a known verification method \
-                 (expected \"#active\" or \"#agent\") for DID '{did}'"
-            ))
-        })?;
+    fn resolve_public_key_by_kid(
+        &self,
+        did: &str,
+        signing_key_id: SigningKeyId,
+    ) -> Result<[u8; 32], UcanError> {
+        // VM-aware resolution (ADR-039): resolve the key `signing_key_id` names
+        // from the DID document. `verify_signature` decoded a `kid` header into
+        // this value, so no fragment string reaches here.
         let did_owned = scp_did::DID::from(did.to_owned());
         (self.key_resolver)(&did_owned, signing_key_id)
             .map(|vk| vk.to_bytes())
             .ok_or_else(|| {
                 UcanError::MalformedToken(format!(
-                    "no public key registered for DID '{did}' verification method '{kid}' \
-                     (key_resolver returned None) — spending UCAN signature cannot be verified"
+                    "no public key registered for DID '{did}' verification method '{}' \
+                     (key_resolver returned None) — spending UCAN signature cannot be verified",
+                    signing_key_id.as_fragment()
                 ))
             })
     }

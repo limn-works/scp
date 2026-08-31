@@ -816,6 +816,7 @@ mod tests {
 
     use super::*;
     use crate::proof::{Direction, InclusionProof, ProofStep};
+    use crate::test_helpers::test_did_document;
     use crate::tree::{self, GENESIS_PREV_HASH};
     use crate::{Event, EventPayload, EventType};
 
@@ -831,15 +832,7 @@ mod tests {
     }
 
     fn did_from_pubkey(verifying_key: &ed25519_dalek::VerifyingKey) -> String {
-        let hex: String = verifying_key
-            .as_bytes()
-            .iter()
-            .fold(String::new(), |mut acc, b| {
-                use std::fmt::Write;
-                let _ = write!(acc, "{b:02x}");
-                acc
-            });
-        format!("did:key:{hex}")
+        scp_did::did_dht_from_public_key(verifying_key.as_bytes()).to_string()
     }
 
     /// Must match the production `compute_event_canonical_hash` in `tree.rs`.
@@ -905,6 +898,7 @@ mod tests {
     ) -> (TieredEventLog, Vec<[u8; 32]>) {
         let (verifying_key, signing_key) = test_keypair();
         let did = did_from_pubkey(&verifying_key);
+        let actor_document = test_did_document(&did, &verifying_key);
         let mut tiered = TieredEventLog::new("ctx-tiered-test".to_owned(), config);
         let mut prev_hash = GENESIS_PREV_HASH;
         let mut leaf_hashes = Vec::new();
@@ -924,7 +918,7 @@ mod tests {
             let serialized = rmp_serde::to_vec(&event).unwrap();
             let byte_size = serialized.len() as u64;
 
-            tree::append(tiered.hot_log_mut(), &event).unwrap();
+            tree::append(tiered.hot_log_mut(), &event, &actor_document).unwrap();
             tiered.record_hot_event(timestamp, byte_size);
 
             let leaf_hash = leaf_hash_from_event(&event);
@@ -1265,6 +1259,7 @@ mod tests {
 
         let (verifying_key, signing_key) = test_keypair();
         let did = did_from_pubkey(&verifying_key);
+        let actor_document = test_did_document(&did, &verifying_key);
         let mut tiered = TieredEventLog::new("ctx-cold-test".to_owned(), config);
         let mut prev_hash = GENESIS_PREV_HASH;
 
@@ -1280,7 +1275,7 @@ mod tests {
                 &signing_key,
             );
             let serialized = rmp_serde::to_vec(&event).unwrap();
-            tree::append(tiered.hot_log_mut(), &event).unwrap();
+            tree::append(tiered.hot_log_mut(), &event, &actor_document).unwrap();
             tiered.record_hot_event(1_000_000 + i * 60, serialized.len() as u64);
             prev_hash = leaf_hash_from_event(&event);
         }
