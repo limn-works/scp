@@ -977,3 +977,106 @@ class TestBroadcastKeyHexValidation:
 
         with pytest.raises(ValueError, match="broadcast_key_hex must be exactly 64 hex characters"):
             validate_broadcast_key_hex("")
+
+
+class TestGovernanceActionResultFromBridge:
+    """``GovernanceActionResult.from_bridge`` parses an outcome or fails closed.
+
+    Governance decides authorization, so an outcome string this SDK cannot name
+    raises rather than resolving to ``EXECUTED``. Restoring an earlier
+    ``return cls.EXECUTED`` fallback makes ``test_unknown_outcome_raises`` fail.
+    """
+
+    def test_known_outcome_parses(self) -> None:
+        from scp_sdk.governance import GovernanceActionResult
+
+        assert (
+            GovernanceActionResult.from_bridge("MemberRemoved")
+            is GovernanceActionResult.MEMBER_REMOVED
+        )
+
+    def test_surrounding_whitespace_is_stripped(self) -> None:
+        from scp_sdk.governance import GovernanceActionResult
+
+        assert (
+            GovernanceActionResult.from_bridge("  RoleChanged  ")
+            is GovernanceActionResult.ROLE_CHANGED
+        )
+
+    def test_migration_outcomes_parse(self) -> None:
+        """A PyO3 bridge emits these three strings (``context.rs``), so this
+        enum names them instead of collapsing them onto ``EXECUTED``."""
+        from scp_sdk.governance import GovernanceActionResult
+
+        assert (
+            GovernanceActionResult.from_bridge("MigrationProposed")
+            is GovernanceActionResult.MIGRATION_PROPOSED
+        )
+        assert (
+            GovernanceActionResult.from_bridge("MigrationCancelled")
+            is GovernanceActionResult.MIGRATION_CANCELLED
+        )
+        assert (
+            GovernanceActionResult.from_bridge("ContextTombstoned")
+            is GovernanceActionResult.CONTEXT_TOMBSTONED
+        )
+
+    def test_unknown_outcome_raises(self) -> None:
+        import pytest
+
+        from scp_sdk.errors import GovernanceError, UnknownGovernanceOutcomeError
+        from scp_sdk.governance import GovernanceActionResult
+
+        with pytest.raises(UnknownGovernanceOutcomeError) as excinfo:
+            GovernanceActionResult.from_bridge("SomethingThisSdkDoesNotKnow")
+
+        # `SCP-GOV-11040` says an action ran under a name this SDK version does
+        # not carry, which `SCP-GOV-11000` (a governance failure) does not say.
+        assert excinfo.value.code == "SCP-GOV-11040"
+        assert excinfo.value.raw_outcome == "SomethingThisSdkDoesNotKnow"
+        assert "SomethingThisSdkDoesNotKnow" in excinfo.value.message
+        # A caller catching a governance failure catches this one too.
+        assert isinstance(excinfo.value, GovernanceError)
+
+    def test_empty_string_raises(self) -> None:
+        import pytest
+
+        from scp_sdk.errors import UnknownGovernanceOutcomeError
+        from scp_sdk.governance import GovernanceActionResult
+
+        with pytest.raises(UnknownGovernanceOutcomeError):
+            GovernanceActionResult.from_bridge("")
+
+
+class TestMemberRoleFromBridge:
+    """``MemberRole.from_bridge`` names every built-in role.
+
+    ``RESERVED_ROLE_NAMES`` in ``crates/scp-protocol/src/context/roles.rs``
+    forbids a custom role from taking any of the six built-in names, so a name
+    among them that parses to :attr:`MemberRole.CUSTOM` reports a
+    protocol-defined role as one a context's governance defined. ``author``
+    carries ``messages:write`` and the outlet capabilities, and ``subscriber``
+    is what a broadcast subscribe assigns, so a caller that cannot tell those
+    two apart cannot tell a writer from a reader. Deleting either member makes
+    ``test_every_built_in_role_name_parses_to_its_own_member`` fail.
+    """
+
+    def test_every_built_in_role_name_parses_to_its_own_member(self) -> None:
+        from scp_sdk.types import MemberRole
+
+        assert MemberRole.from_bridge("admin") is MemberRole.ADMIN
+        assert MemberRole.from_bridge("moderator") is MemberRole.MODERATOR
+        assert MemberRole.from_bridge("member") is MemberRole.MEMBER
+        assert MemberRole.from_bridge("observer") is MemberRole.OBSERVER
+        assert MemberRole.from_bridge("author") is MemberRole.AUTHOR
+        assert MemberRole.from_bridge("subscriber") is MemberRole.SUBSCRIBER
+
+    def test_governance_defined_role_name_parses_to_custom(self) -> None:
+        from scp_sdk.types import MemberRole
+
+        assert MemberRole.from_bridge("night-shift-reviewer") is MemberRole.CUSTOM
+
+    def test_quotes_and_whitespace_are_stripped(self) -> None:
+        from scp_sdk.types import MemberRole
+
+        assert MemberRole.from_bridge('  "subscriber"  ') is MemberRole.SUBSCRIBER

@@ -22,6 +22,7 @@ use napi::bindgen_prelude::Function;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use scp_platform::error::PlatformError;
+use scp_platform::file::FileKeyCustody;
 use scp_platform::traits::{
     CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
     Signature,
@@ -407,6 +408,16 @@ pub(crate) enum NapiKeyCustody {
     /// Test/dev in-memory custody (feature-gated), wrapped for redacted Debug.
     #[cfg(feature = "testing")]
     InMemory(OpaqueInMemoryKeyCustody),
+    /// Encrypted file-backed custody (Argon2id + AES-256-GCM, spec §17.8).
+    /// A Node process on a desktop or a server holds its own keys in one
+    /// encrypted file; there is no platform key store to inject. Mirrors the
+    /// `PyO3` reference bridge's `FfiKeyCustody::File`.
+    ///
+    /// Boxed because `FileKeyCustody` holds two derived keys, a handle map and
+    /// two mutexes — 288 bytes against the 72 the next-largest variant needs,
+    /// so an unboxed payload would grow every `NapiKeyCustody` value by that
+    /// difference.
+    File(Box<FileKeyCustody>),
     /// Caller-provided custody backed by JS callbacks.
     Callback(NapiCallbackKeyCustody),
 }
@@ -416,6 +427,7 @@ impl fmt::Debug for NapiKeyCustody {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(_) => f.write_str("NapiKeyCustody::InMemory([redacted])"),
+            Self::File(_) => f.write_str("NapiKeyCustody::File([encrypted])"),
             Self::Callback(_) => f.write_str("NapiKeyCustody::Callback([js])"),
         }
     }
@@ -434,6 +446,7 @@ impl NapiKeyCustody {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(_) => "in_memory",
+            Self::File(_) => "file",
             Self::Callback(_) => "callback",
         }
     }
@@ -454,6 +467,7 @@ impl NapiKeyCustody {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.export_ed25519_signing_key(handle).await,
+            Self::File(kc) => kc.export_ed25519_signing_key(handle).await,
             Self::Callback(kc) => kc.export_ed25519_signing_key(handle).await,
         }
     }
@@ -464,6 +478,7 @@ impl KeyCustody for NapiKeyCustody {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.generate_keypair(key_type).await,
+            Self::File(kc) => kc.generate_keypair(key_type).await,
             Self::Callback(kc) => kc.generate_keypair(key_type).await,
         }
     }
@@ -472,6 +487,7 @@ impl KeyCustody for NapiKeyCustody {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.sign(key, data).await,
+            Self::File(kc) => kc.sign(key, data).await,
             Self::Callback(kc) => kc.sign(key, data).await,
         }
     }
@@ -480,6 +496,7 @@ impl KeyCustody for NapiKeyCustody {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.public_key(key).await,
+            Self::File(kc) => kc.public_key(key).await,
             Self::Callback(kc) => kc.public_key(key).await,
         }
     }
@@ -488,6 +505,7 @@ impl KeyCustody for NapiKeyCustody {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.destroy_key(key).await,
+            Self::File(kc) => kc.destroy_key(key).await,
             Self::Callback(kc) => kc.destroy_key(key).await,
         }
     }
@@ -500,6 +518,7 @@ impl KeyCustody for NapiKeyCustody {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.dh_agree(key, peer_public).await,
+            Self::File(kc) => kc.dh_agree(key, peer_public).await,
             Self::Callback(kc) => kc.dh_agree(key, peer_public).await,
         }
     }
@@ -512,6 +531,7 @@ impl KeyCustody for NapiKeyCustody {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.derive_pseudonym(key, context_id).await,
+            Self::File(kc) => kc.derive_pseudonym(key, context_id).await,
             Self::Callback(kc) => kc.derive_pseudonym(key, context_id).await,
         }
     }
@@ -526,6 +546,10 @@ impl KeyCustody for NapiKeyCustody {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => {
                 kc.0.derive_rotatable_pseudonym(key, context_id, pseudonym_epoch)
+                    .await
+            }
+            Self::File(kc) => {
+                kc.derive_rotatable_pseudonym(key, context_id, pseudonym_epoch)
                     .await
             }
             Self::Callback(kc) => {
@@ -546,6 +570,10 @@ impl KeyCustody for NapiKeyCustody {
                 kc.0.ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
                     .await
             }
+            Self::File(kc) => {
+                kc.ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
+                    .await
+            }
             Self::Callback(kc) => {
                 kc.ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
                     .await
@@ -557,6 +585,7 @@ impl KeyCustody for NapiKeyCustody {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.custody_type(key),
+            Self::File(kc) => kc.custody_type(key),
             Self::Callback(kc) => kc.custody_type(key),
         }
     }
@@ -567,6 +596,7 @@ impl KeyCustody for NapiKeyCustody {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.generate_ephemeral_ed25519_seed().await,
+            Self::File(kc) => kc.generate_ephemeral_ed25519_seed().await,
             Self::Callback(kc) => kc.generate_ephemeral_ed25519_seed().await,
         }
     }
@@ -578,6 +608,7 @@ impl KeyCustody for NapiKeyCustody {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.import_ed25519_signing_key(seed).await,
+            Self::File(kc) => kc.import_ed25519_signing_key(seed).await,
             Self::Callback(kc) => kc.import_ed25519_signing_key(seed).await,
         }
     }

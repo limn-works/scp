@@ -715,12 +715,19 @@ pub trait AttestationRevocationChecker {
     fn check_revocation(&self, attestation_id: &str, issuer: &DID) -> Option<u64>;
 }
 
-/// No-op revocation checker that always returns `None` (not revoked).
+/// Revocation checker that reports every attestation as live.
 ///
-/// Suitable for testing, offline verification, or contexts where external
-/// revocation checking is not available.
+/// Test-harness-only: `#[cfg(any(test, feature = "testing"))]` keeps it out of
+/// every shipped artifact. A checker that answers "not revoked" without asking
+/// anything is an always-succeeds verifier, which CLAUDE.md's builder tenet
+/// names as a security nullifier — a shipped caller that reached for it would
+/// verify a revoked attestation and report it valid. A caller with no
+/// revocation source calls `verify_attestation`, which takes no checker, rather
+/// than passing a checker that answers for one it does not have.
+#[cfg(any(test, feature = "testing"))]
 pub struct NoOpRevocationChecker;
 
+#[cfg(any(test, feature = "testing"))]
 impl AttestationRevocationChecker for NoOpRevocationChecker {
     fn check_revocation(&self, _attestation_id: &str, _issuer: &DID) -> Option<u64> {
         None

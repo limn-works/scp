@@ -169,11 +169,16 @@ pub mod trust {
     };
     pub use scp_protocol::trust::attestation::{
         Attestation, AttestationEvidence, AttestationRevocationChecker, AttestorInfo,
-        DidPublicKeyResolver, FreshnessStatus, IdentityDidPublicKeyResolver, NoOpRevocationChecker,
-        RevocationStatus, ThresholdRequirement, ThresholdResult, canonical_attestation_bytes,
+        DidPublicKeyResolver, FreshnessStatus, IdentityDidPublicKeyResolver, RevocationStatus,
+        ThresholdRequirement, ThresholdResult, canonical_attestation_bytes,
         check_attestation_freshness, check_threshold_attestation, verify_attestation,
         verify_attestation_with_revocation,
     };
+    // `NoOpRevocationChecker` reports every attestation as live, so it carries
+    // whatever test-harness gate its definition carries; a shipped build of
+    // this facade re-exports no always-succeeds verifier.
+    #[cfg(feature = "testing")]
+    pub use scp_protocol::trust::attestation::NoOpRevocationChecker;
     pub use scp_protocol::trust::challenge::{
         ChallengeRequest, ChallengeResponse, ChallengeSigner, ChallengeType, ChallengeVerification,
         VerificationMethod, canonical_challenge_verification_bytes, issue_challenge,

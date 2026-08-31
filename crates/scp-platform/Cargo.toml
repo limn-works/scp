@@ -17,6 +17,7 @@ software_platform = [
     "dep:rand",
     "dep:hmac",
     "dep:sha2",
+    "dep:subtle",
     "dep:scp-crypto",
     "dep:uuid",
 ]
@@ -52,7 +53,10 @@ apple = ["dep:rusqlite", "dep:hex", "dep:fs2"]
 sqlite = ["dep:rusqlite", "dep:hex", "dep:argon2", "dep:rand", "dep:fs2"]
 # Encrypted file-backed key custody (Argon2id + AES-256-GCM).
 # Universal fallback for non-HSM platforms. See GitHub issue #391.
-file = ["software_platform", "dep:aes-gcm", "dep:argon2"]
+# `fs2` provides the cross-process exclusive advisory lock that `FileKeyCustody`
+# holds across a read-modify-write of the key file, which §17.8 of this spec
+# requires under "One writer at a time".
+file = ["software_platform", "dep:aes-gcm", "dep:argon2", "dep:fs2"]
 # Filesystem storage adapter (spec section 17.6).
 filesystem = []
 # EncryptingAdapter — wraps any Storage backend with AES-256-GCM per-value
@@ -76,7 +80,9 @@ zeroize = { workspace = true }
 rmp-serde = { workspace = true }
 
 # file dependencies, gated behind the `file` feature flag.
-aes-gcm = { workspace = true, optional = true }
+# `zeroize` clears an AES key schedule and a GHASH subkey when a cipher object
+# drops; aes-gcm leaves that feature off by default.
+aes-gcm = { workspace = true, features = ["zeroize"], optional = true }
 argon2 = { workspace = true, optional = true }
 
 # software_platform dependencies, gated behind the `software_platform` feature flag.
@@ -85,6 +91,9 @@ x25519-dalek = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
+# Constant-time equality for a file-custody passphrase commitment and a file
+# HMAC, so neither comparison leaks a prefix-match length.
+subtle = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 # Per-context pseudonym derivation (§9.10.4.A) lives in the wasm-safe `scp-crypto`
 # leaf (ADR-057 Option A); every software-custody backend delegates to it. Its
@@ -95,10 +104,11 @@ scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2", optional = tru
 # sqlite dependencies, gated behind the `sqlite` feature flag.
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"], optional = true }
 hex = { workspace = true, optional = true }
-# fs2 provides advisory POSIX / Windows file locking — used by SqliteStorage
-# to refuse a second process/instance trying to open the same database
-# directory concurrently (SQLite journal/WAL corruption guard, red-hat
-# RED-1002). Tiny dep (flock/LockFileEx wrappers).
+# fs2 provides advisory POSIX / Windows file locking. `SqliteStorage` uses it to
+# refuse a second process/instance trying to open the same database directory
+# concurrently (SQLite journal/WAL corruption guard, red-hat RED-1002), and
+# `FileKeyCustody` uses it to serialize every read-modify-write of one key file
+# across processes. Tiny dep (flock/LockFileEx wrappers).
 fs2 = { version = "0.4", optional = true }
 
 [dev-dependencies]

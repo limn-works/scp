@@ -65,7 +65,7 @@ cargo build --release -p scp-node --features http3
 Runs a bare `RelayServer`. No identity, no HTTP, no TLS. Suitable for infrastructure operators who want a minimal relay that accepts WebSocket connections.
 
 ```bash
-scp-relay
+SCP_RELAY_STORAGE_BACKEND=sqlite scp-relay
 ```
 
 ### scp-node modes
@@ -152,11 +152,11 @@ OPTIONS:
 
 ## 4. Blob Storage Backend Selection
 
-Both `scp-relay` and `scp-node` (in relay-only mode) select a blob storage backend via `SCP_RELAY_STORAGE_BACKEND`. The value maps to a `BlobStorageBackend` enum variant:
+Both `scp-relay` and `scp-node` (in relay-only mode) select a blob storage backend via `SCP_RELAY_STORAGE_BACKEND`. An operator sets that variable on every run: it has no default, and a relay that reads it unset prints an error naming it and exits with code 1. Persistence spec §17.17.1 (`SCP-CAPSEL-8000`) requires that explicit selection and forbids a default. That value maps to a `BlobStorageBackend` enum variant:
 
 | Value | Backend | Required env vars | Default path |
 |-------|---------|-------------------|-------------|
-| `sqlite` (default) | SQLite | `SCP_RELAY_STORAGE_PATH` | `./scp-relay.db` |
+| `sqlite` | SQLite | `SCP_RELAY_STORAGE_PATH` | `./scp-relay.db` |
 | `redb` | redb (embedded) | `SCP_RELAY_STORAGE_PATH` | `./scp-relay.redb` |
 | `postgres` | PostgreSQL | `SCP_RELAY_DATABASE_URL` (required) | N/A |
 | `s3` | S3-compatible | `SCP_RELAY_S3_BUCKET` (required), `SCP_RELAY_S3_PREFIX` | prefix: `blobs/` |
@@ -165,8 +165,10 @@ Both `scp-relay` and `scp-node` (in relay-only mode) select a blob storage backe
 ### Examples
 
 ```bash
-# SQLite (default)
-SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-relay
+# SQLite
+SCP_RELAY_STORAGE_BACKEND=sqlite \
+SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db \
+scp-relay
 
 # PostgreSQL
 SCP_RELAY_STORAGE_BACKEND=postgres \
@@ -194,10 +196,13 @@ All backends implement the `BlobStorage` trait and pass the `blob_store_conforma
 ### Standalone relay
 
 ```bash
-# Minimal: SQLite storage, bind 0.0.0.0:9000
-scp-relay
+# Minimal: SQLite storage, bind 0.0.0.0:9000. Every run names a backend —
+# `scp-relay` with `SCP_RELAY_STORAGE_BACKEND` unset prints an error and
+# exits 1.
+SCP_RELAY_STORAGE_BACKEND=sqlite scp-relay
 
 # Custom bind address and limits
+SCP_RELAY_STORAGE_BACKEND=sqlite \
 SCP_RELAY_BIND_ADDR=127.0.0.1:8080 \
 SCP_RELAY_MAX_CONNECTIONS=5000 \
 SCP_RELAY_MAX_BLOB_SIZE=524288 \
@@ -209,10 +214,10 @@ The relay logs to stderr. Control verbosity with `SCP_RELAY_LOG_LEVEL` or `RUST_
 
 ```bash
 # Structured JSON logs for production
-SCP_RELAY_LOG_FORMAT=json SCP_RELAY_LOG_LEVEL=info scp-relay
+SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_LOG_FORMAT=json SCP_RELAY_LOG_LEVEL=info scp-relay
 
 # Debug-level with RUST_LOG (overrides SCP_RELAY_LOG_LEVEL)
-RUST_LOG=scp_transport=debug scp-relay
+SCP_RELAY_STORAGE_BACKEND=sqlite RUST_LOG=scp_transport=debug scp-relay
 ```
 
 ### Graceful shutdown
@@ -242,9 +247,10 @@ The full node (`scp-node` without `--relay-only`) starts an `ApplicationNode` (d
 ### Production deployment
 
 ```bash
-# Required: domain and storage path
+# Required: domain, storage path, and a relay's blob storage backend
 SCP_NODE_DOMAIN=relay.example.com \
 SCP_STORAGE_PATH=/var/lib/scp/node \
+SCP_RELAY_STORAGE_BACKEND=sqlite \
 scp-node
 ```
 
@@ -260,7 +266,9 @@ On subsequent runs, the node loads the existing identity from SQLite and reuses 
 ### Development deployment
 
 ```bash
-# Self-signed TLS, in-memory DHT
+# Self-signed TLS, in-memory DHT. `--ephemeral` runs every subsystem in
+# memory and ignores `SCP_RELAY_STORAGE_BACKEND`, so this run names no
+# blob backend.
 SCP_NODE_DOMAIN=localhost \
 SCP_NODE_TLS_SELF_SIGNED=1 \
 SCP_NODE_DHT_MODE=memory \
@@ -344,6 +352,7 @@ For development, set `SCP_NODE_TLS_SELF_SIGNED=1`:
 ```bash
 SCP_NODE_DOMAIN=localhost \
 SCP_NODE_TLS_SELF_SIGNED=1 \
+SCP_RELAY_STORAGE_BACKEND=sqlite \
 scp-node
 ```
 
@@ -409,10 +418,12 @@ Log levels are controlled by `RUST_LOG` (takes precedence) or `SCP_RELAY_LOG_LEV
 
 ```bash
 # Module-level filtering
-RUST_LOG=scp_transport::native::server=debug,scp_node=info scp-node
+SCP_RELAY_STORAGE_BACKEND=sqlite \
+RUST_LOG=scp_transport::native::server=debug,scp_node=info \
+scp-node
 
 # Simple level override
-SCP_RELAY_LOG_LEVEL=warn scp-relay
+SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_LOG_LEVEL=warn scp-relay
 ```
 
 ### Dev API (scp-node only)

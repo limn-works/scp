@@ -12,6 +12,8 @@ from __future__ import annotations
 import enum
 from typing import TYPE_CHECKING
 
+from scp_sdk.errors import UnknownGovernanceOutcomeError
+
 if TYPE_CHECKING:
     pass
 
@@ -24,8 +26,10 @@ if TYPE_CHECKING:
 class GovernanceActionResult(enum.Enum):
     """Result of executing a governance action (ADR-031).
 
-    Each variant corresponds to one of the 24+ governance action outcomes
-    from ``scp_core::context::manager::GovernanceActionResult``.
+    Each variant corresponds to one of 29 governance action outcomes
+    ``scp_core::context::state::GovernanceActionResult`` defines. A PyO3
+    bridge maps every one of those Rust variants onto a string this enum
+    stores as its value (``crates/scp-ffi/src/context.rs``).
     """
 
     MEMBER_ADDED = "MemberAdded"
@@ -54,18 +58,46 @@ class GovernanceActionResult(enum.Enum):
     SUBSCRIBER_BANNED = "SubscriberBanned"
     SUBSCRIBER_UNBANNED = "SubscriberUnbanned"
     EXECUTED = "Executed"
+    MIGRATION_PROPOSED = "MigrationProposed"
+    MIGRATION_CANCELLED = "MigrationCancelled"
+    CONTEXT_TOMBSTONED = "ContextTombstoned"
 
     @classmethod
     def from_bridge(cls, raw: str) -> GovernanceActionResult:
         """Parse a bridge-layer result string into a typed enum member.
 
-        Falls back to :attr:`EXECUTED` for unrecognised strings.
+        Raises :class:`~scp_sdk.errors.UnknownGovernanceOutcomeError` for a
+        string that matches no member. Governance decides authorization, so a
+        caller that reads an outcome it cannot name sees an error rather than
+        :attr:`EXECUTED`: reporting an unnamed outcome as an executed action
+        tells that caller a governance action succeeded while this SDK does not
+        know which action ran. That error carries ``raw_outcome``, so a caller
+        still learns what a bridge reported.
+
+        Args:
+            raw: Outcome string a bridge returned.
+
+        Returns:
+            Enum member whose value equals ``raw`` after stripping surrounding
+            whitespace.
+
+        Raises:
+            UnknownGovernanceOutcomeError: ``raw`` matches no member of this
+                enum. A subclass of
+                :class:`~scp_sdk.errors.GovernanceError`, so a caller catching
+                that category still catches this.
         """
         stripped = raw.strip()
         for member in cls:
             if stripped == member.value:
                 return member
-        return cls.EXECUTED
+        known = ", ".join(member.value for member in cls)
+        msg = (
+            f"governance action executed, and its outcome {stripped!r} has no name in this "
+            f"SDK version; this SDK knows: {known}. Upgrade scp-python to match whichever bridge "
+            f"it calls."
+        )
+        raise UnknownGovernanceOutcomeError(msg, raw_outcome=stripped)
 
 
 # ---------------------------------------------------------------------------

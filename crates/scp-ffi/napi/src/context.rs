@@ -3479,7 +3479,11 @@ pub(crate) async fn context_execute_governance_action_on(
         _ => {}
     }
 
-    Ok(format!("{result:?}"))
+    // One shared mapping names every outcome, so this bridge hands a caller a
+    // string identical to what PyO3 and UniFFI hand theirs.
+    // `format!("{result:?}")` used to stand here, and its payload-carrying
+    // variants rendered as a Rust debug dump that no SDK enum matches.
+    Ok(scp_ffi_common::governance_result::governance_action_result_name(&result).to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -3972,14 +3976,17 @@ pub(crate) async fn context_governance_propose_on(
         );
     }
 
-    let result_str = outcome.execution_result.as_ref().map(|r| format!("{r:?}"));
-
-    let response = serde_json::json!({
-        "proposal_id": hex::encode(outcome.proposal.proposal_id),
-        "status": format!("{:?}", outcome.status),
-        "execution_result": result_str,
-    });
-    Ok(response.to_string())
+    // One shared builder names the outcome for all three bridges, so a
+    // `single_admin` auto-execution reports the same string
+    // `context_execute_governance_action` reports
+    // (`scp_ffi_common::governance_result`).
+    Ok(
+        scp_ffi_common::governance_result::governance_propose_response(
+            &outcome.proposal.proposal_id,
+            &outcome.status,
+            outcome.execution_result.as_ref(),
+        ),
+    )
 }
 
 /// Per-bridge-instance implementation of [`context_governance_approve`].

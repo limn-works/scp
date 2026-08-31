@@ -183,7 +183,12 @@ pub fn slot_publish_error_response(
         SlotPublishError::Storage(StorageError::StorageFull) => {
             (code::STORAGE_FULL, err.to_string())
         }
-        SlotPublishError::Storage(StorageError::Internal(_)) => {
+        // A backend-selection failure stops a relay before it accepts a
+        // connection, so a PUBLISH frame never observes
+        // `StorageError::Configuration`. A publishing client still needs one
+        // answer if that ever changes, and "this relay could not store your
+        // record" is what an internal fault earns.
+        SlotPublishError::Storage(StorageError::Internal(_) | StorageError::Configuration(_)) => {
             (code::INTERNAL_ERROR, err.to_string())
         }
     }

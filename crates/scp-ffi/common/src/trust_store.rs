@@ -1,13 +1,17 @@
-//! In-memory implementation of [`TrustProtocolRepository`] for FFI bridges.
+//! Trust-aggregation storage for FFI bridges.
 //!
-//! Shared across the `PyO3`, napi-rs, and `UniFFI` bridges. Each
-//! `aggregate_trust_input` call creates a fresh store, populates it with
-//! caller-provided data, runs the aggregation, and drops it. Thread safety
-//! is provided by `std::sync::Mutex` — adequate for this ephemeral use case.
+//! `populate_and_aggregate` runs an aggregation pipeline over whichever
+//! [`TrustProtocolRepository`] a bridge hands it. Every shipped bridge hands it
+//! a durable `ProtocolRepositoryTrustBridge`; tests hand it
+//! `InMemoryFfiTrustStore`, which compiles only under
+//! `#[cfg(any(test, feature = "testing"))]`.
 //!
 //! See ADR-017 acceptance criterion 10 in `.docs/adrs/phase-4.md`.
 
 use std::collections::HashMap;
+// Only a test-harness `InMemoryFfiTrustStore` below locks a `Mutex`; a durable
+// bridge holds no lock, so this import carries that store's gate.
+#[cfg(any(test, feature = "testing"))]
 use std::sync::Mutex;
 
 use scp_core::trust::aggregate::{CachedAttestation, TrustProtocolRepository};
@@ -18,16 +22,28 @@ use scp_event_log::Event;
 
 /// In-memory implementation of `TrustProtocolRepository` for the FFI bridge.
 ///
-/// Uses `std::sync::Mutex` for interior mutability. This is fine for the FFI
-/// use case: each `aggregate_trust_input` call creates a fresh store, populates
-/// it, runs the aggregation, and drops it.
+/// Uses `std::sync::Mutex` for interior mutability. Every shipped bridge path
+/// aggregates trust through a durable `ProtocolRepositoryTrustBridge`, so
+/// `#[cfg(any(test, feature = "testing"))]` keeps this store out of shipped
+/// artifacts — an identical gate to what
+/// `scp_runtime::bridge::credentials::InMemoryCredentialStore` carries
+/// (ADR-062, capability injection, §Decision 5). Tests construct it to run an
+/// aggregation pipeline against a store they populate and drop within one call.
+#[cfg(any(test, feature = "testing"))]
 pub struct InMemoryFfiTrustStore {
     attestations: Mutex<HashMap<(String, String), Vec<CachedAttestation>>>,
     revocations: Mutex<HashMap<String, HashMap<String, bool>>>,
     challenges: Mutex<HashMap<(String, String), Vec<ChallengeVerification>>>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl InMemoryFfiTrustStore {
+    /// Creates an empty in-memory trust store.
+    // No `Default` impl: a `Default` reads as a default selection of an
+    // in-memory arm, which SCP-CAPSEL-8000 (§17.17.1 of
+    // `.docs/specs/17-persistence-and-storage.md`) forbids. A caller names this
+    // store explicitly or gets a durable one.
+    #[allow(clippy::new_without_default)]
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -38,12 +54,7 @@ impl InMemoryFfiTrustStore {
     }
 }
 
-impl Default for InMemoryFfiTrustStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
+#[cfg(any(test, feature = "testing"))]
 fn lock_error() -> TrustError {
     // A poisoned lock is an INFRA fault, not a credential rejection. It must map
     // to a variant OUTSIDE the verify-on-ingest rejection allowlist
@@ -56,6 +67,7 @@ fn lock_error() -> TrustError {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 #[allow(clippy::significant_drop_tightening)]
 impl TrustProtocolRepository for InMemoryFfiTrustStore {
     fn get_cached_attestations(
@@ -368,7 +380,7 @@ pub fn verified_attestations<S: TrustProtocolRepository>(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use scp_core::trust::AttestationType;

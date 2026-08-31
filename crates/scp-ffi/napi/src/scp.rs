@@ -512,11 +512,99 @@ impl Scp {
                 }
                 Err(ScpNapiError::Identity {
                     message: "in_memory custody is not available in this build -- use \
-                              \"software\" or \"platform\" custody for production key storage"
+                              \"file\", \"software\" or \"platform\" custody for production \
+                              key storage"
                         .to_owned(),
                     code: codes::IDENT_1008.to_owned(),
                 }
                 .into())
+            }
+            // Encrypted file-backed custody, matching the `PyO3` reference
+            // bridge's `"file"` path: a Node process on a desktop or a server
+            // holds its own keys in `$HOME/.scp/keys.bin` under
+            // `SCP_KEY_PASSPHRASE` (Argon2id + AES-256-GCM, spec §17.8).
+            // Unlike `"platform"`, this needs no injected provider, which is
+            // what makes it reachable from a quick start.
+            "file" => {
+                if testing_seed_bytes.is_some() {
+                    return Err(NapiError::from(ScpNapiError::Validation {
+                        message: "`testing_seed` parameter is only valid for custody=\"in_memory\""
+                            .to_owned(),
+                        code: codes::VALID_7009.to_owned(),
+                    }));
+                }
+                // Open the key file first, so a caller who set no
+                // `SCP_KEY_PASSPHRASE` reads that rather than a pre-rotation
+                // message they cannot act on. The `PyO3` reference bridge
+                // orders its `"file"` path the same way.
+                let file_custody = scp_ffi_common::custody_file::open_default_file_custody()
+                    .map_err(|e| NapiError::from(crate::identity::file_custody_error(&e)))?;
+                let key_custody =
+                    Arc::new(crate::custody::NapiKeyCustody::File(Box::new(file_custody)));
+
+                // Pre-rotation is mandatory at creation (spec §9.7.4.1 §3),
+                // and the only `PreRotationCustody` implementation is the
+                // test-harness nullifier, so a shipped build fails closed here
+                // rather than minting it (ADR-062 §Decision 6). The `PyO3`
+                // reference bridge answers its `"file"` path the same way.
+                #[cfg(not(feature = "testing"))]
+                {
+                    let _ = key_custody;
+                    Err(NapiError::from(crate::identity::no_pre_rotation_backend()))
+                }
+
+                #[cfg(feature = "testing")]
+                {
+                    let pre_rotation_custody =
+                        Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+                    let dht = crate::identity::shared_did_method()?;
+                    let (scp_identity, document, pre_rotation_handle) = dht
+                        .create(&*key_custody, pre_rotation_custody.as_ref())
+                        .await
+                        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+                    let verifying_key_hex = crate::identity::identity_verifying_key_hex(
+                        &key_custody,
+                        &scp_identity.identity_key,
+                    )
+                    .await;
+
+                    crate::runtime::register_identity(
+                        bi,
+                        &scp_identity.did,
+                        crate::runtime::NapiIdentityEntry {
+                            identity: scp_identity.clone(),
+                            custody: Arc::clone(&key_custody),
+                            document: document.clone(),
+                            identity_link_attestations: Vec::new(),
+                            pre_rotation_handle,
+                            pre_rotation_custody,
+                        },
+                    );
+
+                    crate::identity::publish_to_shared_dht_for(
+                        &scp_identity,
+                        &document,
+                        &key_custody,
+                    )
+                    .await;
+
+                    let handle = crate::identity::NapiIdentity {
+                        inner: Arc::new(NapiIdentityInner {
+                            did: scp_identity.did.clone(),
+                            custody_type: "file".to_owned(),
+                            scp_identity: Some(scp_identity),
+                            in_memory_custody: Some(key_custody),
+                            document: Some(document),
+                            bi: Arc::clone(&self.inner),
+                            verifying_key_hex,
+                            instance_id: bi.instance_id(),
+                            rotation_event_json: None,
+                        }),
+                    };
+                    crate::increment_handle_count();
+                    Ok(handle)
+                }
             }
             "platform" | "software" => {
                 if testing_seed_bytes.is_some() {
@@ -531,7 +619,8 @@ impl Scp {
                         "custody type {custody:?} requires a wired platform \
                          KeyCustodyProvider — use the KeyCustodyProvider callback \
                          interface to inject Secure Enclave (iOS) or Android \
-                         Keystore (Android) backed custody"
+                         Keystore (Android) backed custody, or name \"file\" custody \
+                         to hold keys in an encrypted file this process owns"
                     ),
                     code: codes::IDENT_1003.to_owned(),
                 }
@@ -627,17 +716,99 @@ impl Scp {
             #[cfg(not(feature = "testing"))]
             "in_memory" => Err(ScpNapiError::Identity {
                 message: "in_memory custody is not available in this build -- use \
-                          \"software\" or \"platform\" custody for production key storage"
+                          \"file\", \"software\" or \"platform\" custody for production \
+                          key storage"
                     .to_owned(),
                 code: codes::IDENT_1008.to_owned(),
             }
             .into()),
+            // Encrypted file-backed custody, matching this bridge's own
+            // `identity_create` and the `PyO3` reference bridge, whose
+            // `identity_create_with_agent_key` routes through the one
+            // `parse_custody` that serves both creators. `validate_custody_type`
+            // accepts `"file"`, so a method without this arm reports a caller's
+            // valid custody name as a bridge bug.
+            "file" => {
+                // Open the key file first, so a caller who set no
+                // `SCP_KEY_PASSPHRASE` reads that rather than a pre-rotation
+                // message they cannot act on. `identity_create` orders its
+                // `"file"` path the same way.
+                let file_custody = scp_ffi_common::custody_file::open_default_file_custody()
+                    .map_err(|e| NapiError::from(crate::identity::file_custody_error(&e)))?;
+                let key_custody =
+                    Arc::new(crate::custody::NapiKeyCustody::File(Box::new(file_custody)));
+
+                // Pre-rotation is mandatory at creation (spec §9.7.4.1 §3),
+                // and the only `PreRotationCustody` implementation is the
+                // test-harness nullifier, so a shipped build fails closed here
+                // rather than minting it (ADR-062 §Decision 6). `PyO3` answers
+                // its `"file"` agent-key path the same way.
+                #[cfg(not(feature = "testing"))]
+                {
+                    let _ = key_custody;
+                    Err(NapiError::from(crate::identity::no_pre_rotation_backend()))
+                }
+
+                #[cfg(feature = "testing")]
+                {
+                    let pre_rotation_custody =
+                        Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+                    let dht = crate::identity::shared_did_method()?;
+                    let (scp_identity, document, pre_rotation_handle) = dht
+                        .create_with_agent_key(&*key_custody, pre_rotation_custody.as_ref())
+                        .await
+                        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+                    let verifying_key_hex = crate::identity::identity_verifying_key_hex(
+                        &key_custody,
+                        &scp_identity.identity_key,
+                    )
+                    .await;
+
+                    crate::runtime::register_identity(
+                        bi,
+                        &scp_identity.did,
+                        crate::runtime::NapiIdentityEntry {
+                            identity: scp_identity.clone(),
+                            custody: Arc::clone(&key_custody),
+                            document: document.clone(),
+                            identity_link_attestations: Vec::new(),
+                            pre_rotation_handle,
+                            pre_rotation_custody,
+                        },
+                    );
+
+                    crate::identity::publish_to_shared_dht_for(
+                        &scp_identity,
+                        &document,
+                        &key_custody,
+                    )
+                    .await;
+
+                    let handle = crate::identity::NapiIdentity {
+                        inner: Arc::new(NapiIdentityInner {
+                            did: scp_identity.did.clone(),
+                            custody_type: "file".to_owned(),
+                            scp_identity: Some(scp_identity),
+                            in_memory_custody: Some(key_custody),
+                            document: Some(document),
+                            bi: Arc::clone(&self.inner),
+                            verifying_key_hex,
+                            instance_id: bi.instance_id(),
+                            rotation_event_json: None,
+                        }),
+                    };
+                    crate::increment_handle_count();
+                    Ok(handle)
+                }
+            }
             "platform" | "software" => Err(ScpNapiError::Identity {
                 message: format!(
                     "custody type {custody:?} requires a wired platform \
                      KeyCustodyProvider — use the KeyCustodyProvider callback \
                      interface to inject Secure Enclave (iOS) or Android \
-                     Keystore (Android) backed custody"
+                     Keystore (Android) backed custody, or name \"file\" custody \
+                     to hold keys in an encrypted file this process owns"
                 ),
                 code: codes::IDENT_1003.to_owned(),
             }
@@ -5318,5 +5489,139 @@ mod identity_remove_validation_tests {
                 .expect("valid DID must not be rejected by identity_remove_if_present"),
             "removing an unregistered DID must report false"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `"file"` custody parity between the two identity creators.
+// ---------------------------------------------------------------------------
+//
+// `validate_custody_type` accepts four custody names, `identity_create` carries
+// an arm for each, and the `PyO3` reference bridge routes both of its creators
+// through the one `parse_custody`. This module pins
+// `identity_create_with_agent_key` to that same set, so no admitted name reads
+// `SCP-IDENT-1005` — the code this bridge reserves for a custody string
+// `validate_custody_type` admitted and no arm handles.
+//
+// Runs in the shipped (no-`testing`) lane, which CI drives with
+// `cargo test -p scp-ffi-napi --features server`. There the `"file"` arm opens
+// the encrypted key file and then returns the fail-closed pre-rotation error
+// `SCP-IDENT-1059` (ADR-062 §Decision 6), which is the answer `identity_create`
+// gives that lane.
+#[cfg(all(test, not(feature = "testing")))]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod file_custody_agent_key_tests {
+    use super::*;
+
+    /// Filter that selects [`every_admitted_custody_name_reaches_an_arm_inner`]
+    /// and nothing else, and the line its child prints so its parent can tell
+    /// "the inner test passed" from "the filter matched nothing".
+    const INNER_TEST_FILTER: &str = "every_admitted_custody_name_reaches_an_arm_inner";
+    const INNER_TEST_SENTINEL: &str = "[file-custody-agent-key] every admitted name reached an arm";
+
+    /// Runs [`every_admitted_custody_name_reaches_an_arm_inner`] in a child
+    /// process that carries a temporary `HOME` and a `SCP_KEY_PASSPHRASE`.
+    ///
+    /// The `"file"` arm reads both variables through
+    /// `scp_ffi_common::custody_file`, and `HOME` has to name a temporary
+    /// directory so that arm writes its key file there rather than into
+    /// whichever `$HOME/.scp` the machine running this test owns. Setting them
+    /// with `std::env::set_var` is what this test must not do: CI drives this
+    /// lane with `cargo test -p scp-ffi-napi --features server`, libtest runs a
+    /// binary's tests as threads of one process, and `server.rs` calls
+    /// `std::env::temp_dir()` — a `getenv` — in two of its tests. glibc's
+    /// `setenv` reallocates `environ` and frees the old array, so a concurrent
+    /// `getenv` reads freed memory. `Command::env` writes the child's
+    /// environment and leaves this process's environment untouched, so no
+    /// sibling test races it and nothing has to be restored afterwards.
+    ///
+    /// A child that matched no test exits 0, so this asserts on what the child
+    /// printed as well as on its status: renaming the inner test without
+    /// renaming the filter leaves both assertions red rather than passing
+    /// vacuously.
+    #[test]
+    fn every_admitted_custody_name_reaches_an_arm() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let exe = std::env::current_exe().expect("this test binary's own path");
+
+        let output = std::process::Command::new(exe)
+            .args([
+                INNER_TEST_FILTER,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("HOME", tmp.path())
+            .env("SCP_KEY_PASSPHRASE", "agent-key-file-custody-test")
+            .output()
+            .expect("re-running this test binary for the inner test");
+
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "the inner test failed in its child process.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains(INNER_TEST_SENTINEL),
+            "the child ran no inner test — {INNER_TEST_FILTER:?} matched nothing.\nstdout:\n\
+             {stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    /// Every custody name `validate_custody_type` admits reaches an arm of
+    /// `identity_create_with_agent_key`, and `"file"` reaches the same
+    /// fail-closed pre-rotation error `identity_create` reaches.
+    ///
+    /// Deleting the `"file"` arm from `identity_create_with_agent_key` drops
+    /// that name into the catch-all, which returns `SCP-IDENT-1005` and fails
+    /// both assertions below.
+    ///
+    /// Ignored so libtest skips it on a normal run:
+    /// [`every_admitted_custody_name_reaches_an_arm`] runs it, in a child
+    /// process whose `HOME` and `SCP_KEY_PASSPHRASE` that parent sets on the
+    /// child alone.
+    #[test]
+    #[ignore = "run in a child process by every_admitted_custody_name_reaches_an_arm"]
+    fn every_admitted_custody_name_reaches_an_arm_inner() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let scp = Scp::new_in_memory_for_test();
+
+        for name in ["in_memory", "file", "platform", "software"] {
+            assert!(
+                crate::error::validate_custody_type(name).is_ok(),
+                "this test covers the names `validate_custody_type` admits, and it \
+                 rejected {name:?}"
+            );
+
+            let message = match rt.block_on(scp.identity_create_with_agent_key(name.to_owned())) {
+                Ok(_) => panic!(
+                    "a shipped build must fail closed on the pre-rotation commitment rather \
+                     than minting the in-memory pre-rotation nullifier, and {name:?} succeeded"
+                ),
+                Err(err) => err.to_string(),
+            };
+
+            assert!(
+                !message.contains(codes::IDENT_1005),
+                "custody name {name:?} reached the arm this bridge reserves for a name no arm \
+                 handles: {message}"
+            );
+
+            if name == "file" {
+                assert!(
+                    message.contains(codes::IDENT_1059),
+                    "`\"file\"` custody must reach the same fail-closed pre-rotation error \
+                     `identity_create` reaches: {message}"
+                );
+            }
+        }
+
+        // Read by the parent process, which cannot otherwise tell a passing
+        // inner test from a filter that matched nothing.
+        println!("{INNER_TEST_SENTINEL}");
     }
 }

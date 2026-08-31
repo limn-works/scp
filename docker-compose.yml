@@ -5,6 +5,10 @@ services:
     ports:
       - "9000:9000"
     environment:
+      # Naming a blob storage backend is required — persistence spec §17.17.1
+      # (SCP-CAPSEL-8000) gives this variable no default, and a relay that
+      # reads it unset exits 1.
+      SCP_RELAY_STORAGE_BACKEND: "sqlite"
       SCP_RELAY_LOG_FORMAT: "pretty"
       SCP_RELAY_LOG_LEVEL: "info"
 
@@ -15,5 +19,7 @@ services:
       - "9001:9000"
     environment:
       SCP_NODE_DOMAIN: "localhost"
+      # A node serving a relay names its blob backend for that same reason.
+      SCP_RELAY_STORAGE_BACKEND: "sqlite"
       SCP_RELAY_LOG_FORMAT: "pretty"
       SCP_RELAY_LOG_LEVEL: "info"

@@ -214,6 +214,34 @@ class IdentityAdvancedBridgeTest {
                     advancedBridge.createWithAgentKey("platform")
                 }
             }
+
+        /**
+         * Custody selection is required on both overloads: persistence spec
+         * §17.17.1 (`SCP-CAPSEL-8000`) forbids a form that selects a
+         * backend for a caller, and §17:658 of that spec classifies
+         * `InMemoryKeyCustody` as a security nullifier. Restoring
+         * `custody: String = "in_memory"` gives that String overload a default
+         * again, and this reflection assertion fails.
+         */
+        @Test
+        fun `createWithAgentKey overloads carry no default custody argument`() {
+            val methods = IdentityAdvancedBridge::class.java.methods
+            // Kotlin emits a synthetic `<name>$default` method for a function
+            // that declares a default parameter value, and emits none for a
+            // function whose parameters are all required. Reading that
+            // signature needs no kotlin-reflect on a test classpath.
+            val syntheticDefaults = methods.filter { it.name == "createWithAgentKey\$default" }
+            assertTrue(
+                syntheticDefaults.isEmpty(),
+                "createWithAgentKey must require its custody argument; found $syntheticDefaults",
+            )
+            val declared = methods.filter { it.name == "createWithAgentKey" }
+            assertEquals(
+                2,
+                declared.size,
+                "expected a CustodyType overload and a String overload, found $declared",
+            )
+        }
     }
 
     @Nested

@@ -56,6 +56,7 @@ from typing import (
 )
 
 from scp_sdk.errors import ScpError, _coded_bridge_error
+from scp_sdk.governance import GovernanceActionResult
 from scp_sdk.types import CustodyType
 
 if TYPE_CHECKING:
@@ -721,20 +722,25 @@ class SCP:
             )
         return await asyncio.to_thread(self._native.identity_attest_device, identity_did)
 
-    async def identity_create(self, custody: CustodyType | str = CustodyType.FILE) -> Any:
-        """Delegate to ``_scp_core.SCP.identity_create`` (returns :class:`Identity`)."""
+    async def identity_create(self, custody: CustodyType | str) -> Any:
+        """Delegate to ``_scp_core.SCP.identity_create`` (returns :class:`Identity`).
+
+        Naming a custody backend is required, and this parameter carries no
+        default: persistence spec §17.17.1 (``SCP-CAPSEL-8000``) forbids a form
+        that selects a backend for a caller, whichever backend that form would
+        pick.
+        """
         from scp_sdk.identity import Identity
 
         custody_str = custody.value if isinstance(custody, CustodyType) else custody
         raw = await asyncio.to_thread(self._native.identity_create, custody_str)
         return Identity(raw)
 
-    async def identity_create_with_agent_key(
-        self, custody: CustodyType | str = CustodyType.FILE
-    ) -> Any:
+    async def identity_create_with_agent_key(self, custody: CustodyType | str) -> Any:
         """Delegate to ``_scp_core.SCP.identity_create_with_agent_key``.
 
-        Returns an :class:`Identity` wrapper.
+        Returns an :class:`Identity` wrapper. Naming a custody backend is
+        required here too, and :meth:`identity_create` states why.
         """
         from scp_sdk.identity import Identity
 
@@ -1750,7 +1756,7 @@ class SCP:
             self._native.governance_approve, handle, identity_did, proposal_id_hex
         )
 
-    async def governance_execute(self, handle: Any, proposal_id_hex: str) -> Any:
+    async def governance_execute(self, handle: Any, proposal_id_hex: str) -> GovernanceActionResult:
         """Delegate to ``_scp_core.SCP.governance_execute``.
 
         Executes a previously-approved governance proposal *by id*. The runtime
@@ -1758,8 +1764,18 @@ class SCP:
         quorum-validated governance engine; the caller supplies no proposal,
         action, status, or identity. The executor and consequence subject are
         resolved from the tracked proposal's proposer.
+
+        Returns:
+            Typed outcome naming which action ran.
+
+        Raises:
+            UnknownGovernanceOutcomeError: A bridge reported an outcome this
+                SDK version cannot name. Its ``raw_outcome`` carries that
+                string. A bare string would let a caller read an unnamed
+                outcome as a success, which this parse refuses.
         """
-        return await asyncio.to_thread(self._native.governance_execute, handle, proposal_id_hex)
+        raw = await asyncio.to_thread(self._native.governance_execute, handle, proposal_id_hex)
+        return GovernanceActionResult.from_bridge(str(raw))
 
     async def governance_get_proposal(self, handle: Any, proposal_id_hex: str) -> Any:
         """Delegate to ``_scp_core.SCP.governance_get_proposal``."""
@@ -1772,7 +1788,14 @@ class SCP:
         return await asyncio.to_thread(self._native.governance_list_proposals, handle)
 
     async def governance_propose(self, handle: Any, identity_did: str, action_json: str) -> Any:
-        """Delegate to ``_scp_core.SCP.governance_propose``."""
+        """Delegate to ``_scp_core.SCP.governance_propose``.
+
+        Returns a JSON string carrying ``proposal_id``, ``status``, and
+        ``execution_result``. ``execution_result`` holds the value of one
+        :class:`~scp_sdk.governance.GovernanceActionResult` member when a
+        ``single_admin`` proposal auto-approved and auto-executed, and is
+        ``null`` while a multi-admin proposal awaits votes.
+        """
 
         try:
             return await asyncio.to_thread(

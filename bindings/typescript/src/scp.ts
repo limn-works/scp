@@ -40,7 +40,14 @@
 import type { BridgeCredential } from "./bridge";
 import type { Context } from "./context";
 import type { PaymentReceiptVerificationResult } from "./economy";
-import { ContextError, mapBridgeError, mapSagaError, ValidationError } from "./errors";
+import {
+  ContextError,
+  IdentityError,
+  mapBridgeError,
+  mapSagaError,
+  UnknownGovernanceOutcomeError,
+  ValidationError,
+} from "./errors";
 import type { Identity } from "./identity";
 import { type BridgeContextHandle, getBridge, toCapabilityValidation } from "./internal/bridge";
 import { loadNativeAddon, type NativeAddon as RawNativeAddon } from "./internal/native";
@@ -62,6 +69,7 @@ import type {
   ChallengeVerification,
   ConsequenceRule,
   EventLogEntry,
+  GovernanceActionResult,
   InviteMemberOutcome,
   OutletDefinition,
   ParticipationProfile,
@@ -85,6 +93,7 @@ import {
   encodeParticipationProfile,
   encodeRequireParticipation,
   encodeThresholdRequirements,
+  GOVERNANCE_ACTION_RESULTS,
 } from "./types";
 
 /**
@@ -152,6 +161,56 @@ interface NativeScpInstance {
   // (see `#native` usage below). Keeping the type erased matches the
   // pattern in `internal/native.ts` and `server.ts`.
   [method: string]: unknown;
+}
+
+/**
+ * Parses what a bridge reported into a named governance outcome.
+ *
+ * An SDK older than its bridge reads a name no entry of
+ * {@link GOVERNANCE_ACTION_RESULTS} matches. That is two facts a caller acts
+ * on: a governance action DID execute, and this SDK cannot say which one. An
+ * `UnknownGovernanceOutcomeError` carrying `SCP-GOV-11040` reports both, and
+ * its `rawOutcome` field carries what a bridge reported.
+ */
+function parseGovernanceActionResult(raw: string): GovernanceActionResult {
+  const trimmed = raw.trim();
+  const known: readonly string[] = GOVERNANCE_ACTION_RESULTS;
+  if (known.includes(trimmed)) {
+    return trimmed as GovernanceActionResult;
+  }
+  throw new UnknownGovernanceOutcomeError(
+    `governance action executed, and its outcome "${trimmed}" has no name in this SDK ` +
+      `version; this SDK knows: ${GOVERNANCE_ACTION_RESULTS.join(", ")}. Upgrade ` +
+      "@limn-works/scp-ts to match whichever bridge it calls.",
+    trimmed,
+  );
+}
+
+/**
+ * Rejects a missing or empty custody selection.
+ *
+ * This TypeScript signature already makes `custody` a required argument, which
+ * persistence spec §17.17.1 (`SCP-CAPSEL-8000`) asks a binding to express at
+ * compile time. A JavaScript caller — or TypeScript that defeats its own types
+ * through `any` or a type-suppression directive — still reaches these methods
+ * with `undefined`, so this guard gives that caller a documented
+ * `SCP-IDENT-1061` instead of a napi conversion failure. That code reports an
+ * absent selection; `SCP-VALID-7005` reports a custody name no build
+ * recognizes, and `SCP-IDENT-1003` / `SCP-IDENT-1008` report a named backend a
+ * build cannot serve. A storage-selection guard in this `SCP` constructor pairs
+ * a required type with a runtime check that same way.
+ */
+function requireCustodySelection(custody: unknown): void {
+  if (typeof custody !== "string" || custody.trim() === "") {
+    throw new IdentityError(
+      'custody selection is required: pass "file" to hold keys in an encrypted ' +
+        "file this process owns ($HOME/.scp/keys.bin under SCP_KEY_PASSPHRASE), " +
+        'pass "platform" or "software" and wire a KeyCustodyProvider through ' +
+        'SCP.identityCreateWithCustody, or pass "in_memory" on a build carrying ' +
+        "a testing feature. There is no default custody backend.",
+      "SCP-IDENT-1061",
+    );
+  }
 }
 
 /**
@@ -700,7 +759,24 @@ export class SCP {
   // Domain: Identity
   // ───────────────────────────────────────────────────────────────────────
 
-  async identityCreate(custody: string = "in_memory"): Promise<Identity> {
+  /**
+   * Create a DID whose key material lives in a custody backend a caller
+   * names.
+   *
+   * @param custody Custody backend: `"file"` (this process holds its own keys
+   *   in `$HOME/.scp/keys.bin` under `SCP_KEY_PASSPHRASE`), `"platform"` or
+   *   `"software"` (an injected `KeyCustodyProvider`), or `"in_memory"`
+   *   (development — plaintext keys in process memory, on a build carrying a
+   *   testing feature). Naming a backend is required, and this parameter has
+   *   no default: persistence spec §17.17.1 (`SCP-CAPSEL-8000`) forbids an
+   *   omit-the-field form that selects a backend for a caller, and §17:658
+   *   classifies `InMemoryKeyCustody` as a security nullifier. Kotlin and
+   *   Swift require this same argument.
+   * @throws {IdentityError} If `custody` is missing or empty — code
+   *   `SCP-IDENT-1061`.
+   */
+  async identityCreate(custody: string): Promise<Identity> {
+    requireCustodySelection(custody);
     try {
       const raw = await (this.#native.identityCreate as (c: string) => Promise<unknown>)(custody);
       const { Identity: IdentityCls } = await import("./identity");
@@ -710,7 +786,19 @@ export class SCP {
     }
   }
 
-  async identityCreateWithAgentKey(custody: string = "in_memory"): Promise<Identity> {
+  /**
+   * Create a DID that carries an agent key, in a custody backend a caller
+   * names.
+   *
+   * @param custody Custody backend: `"file"`, `"platform"`, `"software"`, or
+   *   `"in_memory"` — the same four names {@link SCP.identityCreate} takes,
+   *   documented there. Required, with no default; {@link SCP.identityCreate}
+   *   states why.
+   * @throws {IdentityError} If `custody` is missing or empty — code
+   *   `SCP-IDENT-1061`.
+   */
+  async identityCreateWithAgentKey(custody: string): Promise<Identity> {
+    requireCustodySelection(custody);
     try {
       const raw = await (
         this.#native.identityCreateWithAgentKey as (c: string) => Promise<unknown>
@@ -2069,16 +2157,33 @@ export class SCP {
    * (broadcast/unencrypted context, or the removed member held no MLS leaf) and
    * there is nothing to distribute.
    */
-  async contextExecuteGovernanceAction(handle: unknown, proposalIdHex: string): Promise<string> {
+  async contextExecuteGovernanceAction(
+    handle: unknown,
+    proposalIdHex: string,
+  ): Promise<GovernanceActionResult> {
+    let raw: string;
     try {
-      return await (
+      raw = await (
         this.#native.contextExecuteGovernanceAction as (h: unknown, p: string) => Promise<string>
       )(handle, proposalIdHex);
     } catch (err) {
       throw mapBridgeError(err);
     }
+    // Parse after that try/catch block, so a rejected outcome name never reads as a
+    // bridge error. Governance decides authorization: handing a caller a bare
+    // string lets an outcome this SDK version cannot name pass as a success.
+    return parseGovernanceActionResult(raw);
   }
 
+  /**
+   * Submits a governance action for voting.
+   *
+   * @returns A JSON string carrying `proposal_id`, `status`, and
+   *   `execution_result`. `execution_result` holds one entry of
+   *   {@link GOVERNANCE_ACTION_RESULTS} when a `single_admin` proposal
+   *   auto-approved and auto-executed, and `null` while a multi-admin
+   *   proposal awaits votes.
+   */
   async contextGovernancePropose(
     handle: unknown,
     actionJson: string,

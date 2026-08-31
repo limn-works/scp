@@ -792,7 +792,7 @@ fn parse_custody_inner(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), Sc
                     )
                 })?);
 
-            let key_dir = dirs_home().join(".scp");
+            let key_dir = dirs_home()?.join(".scp");
             std::fs::create_dir_all(&key_dir).map_err(|e| {
                 ScpPyError::validation(format!(
                     "failed to create key directory {}: {e}",
@@ -825,12 +825,24 @@ fn parse_custody_inner(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), Sc
     }
 }
 
-/// Returns the user's home directory.
+/// Returns a home directory that `$HOME` names.
 ///
-/// Falls back to the current directory if `$HOME` is not set (unlikely on
-/// any supported platform).
-fn dirs_home() -> std::path::PathBuf {
-    std::env::var("HOME").map_or_else(|_| std::path::PathBuf::from("."), std::path::PathBuf::from)
+/// # Errors
+///
+/// Returns [`ScpPyError::ValidationError`] when `$HOME` is unset. An earlier
+/// version substituted a working directory, so a service started from two
+/// working directories wrote two key files and held two identities while
+/// reporting nothing unusual. `scp_node::self_host::resolve_storage_path`
+/// rejects an unset `$HOME` for that same reason.
+fn dirs_home() -> Result<std::path::PathBuf, ScpPyError> {
+    std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .map_err(|_| {
+            ScpPyError::validation(
+                "file custody requires a HOME environment variable naming a directory — \
+                 it holds an encrypted key file at $HOME/.scp/keys.bin",
+            )
+        })
 }
 
 // ---------------------------------------------------------------------------

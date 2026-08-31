@@ -268,6 +268,7 @@ export {
   StreamGap,
   TransportError,
   UcanPermissionError,
+  UnknownGovernanceOutcomeError,
   ValidationError,
 } from "./errors";
 
@@ -340,6 +341,7 @@ export type {
 export {
   allValid,
   Capabilities,
+  GOVERNANCE_ACTION_RESULTS,
   outletCall,
   outletQuery,
   validateAdmission,

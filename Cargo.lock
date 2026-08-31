@@ -35,6 +35,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -5541,6 +5542,7 @@ dependencies = [
  "scp-testing",
  "serde",
  "sha2 0.10.9",
+ "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

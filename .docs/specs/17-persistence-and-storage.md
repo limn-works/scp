@@ -685,6 +685,40 @@ salt       = per-file 16-byte salt             // generated once, persisted with
 
 These are the same parameters the SQLCipher passphrase key-derivation mode (§17.6) MUST use. A single Argon2id parameterization is REQUIRED across the codebase: both the `FileKeyCustody` passphrase-to-wrapping-key derivation and the SQLCipher passphrase-to-PRAGMA-key derivation MUST draw from one shared parameter source. Implementations MUST NOT define a second, divergent Argon2id parameter set.
 
+### FileKeyCustody Key-File Format
+
+A `FileKeyCustody` file holds a header followed by zero or more fixed-width encrypted entries. Version `0x02` is current:
+
+```
+version:      u8         (1 byte, 0x02)
+argon2id_salt:[u8; 16]   (16 bytes, generated once at creation)
+commitment:   [u8; 32]   (32 bytes, HMAC-SHA-256)
+file_hmac:    [u8; 32]   (32 bytes, HMAC-SHA-256)
+entry_count:  u32 LE     (4 bytes)
+entry[i]:     key_type u8 | entry_id [u8; 16] | nonce [u8; 12] | ciphertext+tag [u8; 48]
+```
+
+**Key separation.** One Argon2id derivation over a caller's passphrase and `argon2id_salt` produces a root secret. Three HMAC-SHA-256 invocations expand that root secret under three distinct labels and MUST NOT share a label: one yields an AES-256-GCM key that wraps each stored private key, one yields a file HMAC key, and one yields a stored `commitment`. Each output is a pseudorandom function of that root secret and its own label, so storing `commitment` in cleartext reveals nothing about either key.
+
+**SCP-CAPSEL-8001 at construction.** Opening an existing file MUST check both header values before returning a custody object, and MUST report them as two distinct conditions:
+
+1. A stored `commitment` that differs from one a caller's passphrase produces means those two passphrases differ. Construction MUST return an error naming a wrong passphrase. This check answers for a file holding zero entries, where no stored key exists to test a passphrase against.
+2. A `file_hmac` that does not match, computed over every byte of that file except `file_hmac` itself (version, salt, commitment, entry count, and every entry in order), means that file changed after custody wrote it. Construction MUST return an error naming an integrity failure, because an operator answers it by restoring a backup rather than by retyping a passphrase.
+
+Authenticating `entry_count` and every entry is what makes two attacks detectable: splicing one file's header onto another file's entries, and rewriting `entry_count` to zero to hide stored keys. Every write path (creation, append, and a rewrite that key destruction performs) MUST recompute `file_hmac` before it writes.
+
+**Every read, not construction alone.** An implementation MUST verify `file_hmac` on every read of that file, not once at construction. Verifying once leaves two conditions undetected in a process that already holds an open custody object. A writer who removes an entry, truncates the file, or rewrites `entry_count` changes which keys that file holds, and a read that checks nothing reports whatever survived that write as custody's whole contents. A later append or key destruction then reads bytes it never authenticated and recomputes `file_hmac` over them, which hands a modified file a valid tag under the victim's own MAC key.
+
+**Per-entry binding.** Every entry carries a 16-byte `entry_id` that an implementation draws from a cryptographic random source when it appends that entry, and that no later write changes. An implementation MUST record that `entry_id` against the handle it returns to a caller, MUST locate an entry by comparing `entry_id` rather than by indexing on a position, and MUST pass `key_type ‖ entry_id` as AES-256-GCM associated data when it encrypts that entry, where `key_type` is that entry's stored byte. A read path MUST read the stored `key_type` byte and compare it against the key type a caller's handle names before it decrypts anything, and MUST return an error naming both of those types when the two differ. An implementation MUST return an error when no entry in the file carries the `entry_id` a caller's handle names, because that key left custody. A rewrite that moves an entry to another position MUST copy that entry verbatim, because the associated data covers no position.
+
+Binding a handle to a position instead hands a caller another caller's key. Removing an entry moves every entry after it down one position, and every bridge opens one `$HOME/.scp/keys.bin`, so a handle that a second custody object over that file minted before the removal names the entry that slid into its recorded position. The stored `key_type` byte equals what that handle expects whenever both entries hold the same key type, and re-encrypting a moved entry under its new position makes the associated data match as well, so AES-256-GCM accepts a key its caller never designated and signing returns a signature under it. A destruction followed by an append reuses a position the same way, and so does a restore of an older copy of the file followed by an append. A random 16-byte identifier differs from the identifier of every entry the file ever held, so no write hands a handle any key other than the one that handle names.
+
+**One writer at a time.** An implementation MUST hold an exclusive advisory lock, which excludes other processes as well as other objects inside one process, from the read that starts a read-modify-write of a key file through the write that ends that sequence. An in-process mutex does not satisfy this requirement: every bridge opens `$HOME/.scp/keys.bin`, so a Python process and a Node process on one machine contend for one file, and a mutex that one custody object owns serializes neither those two processes nor two custody objects inside one process. Two custody objects that both start a read-modify-write read one entry count, each append an entry at that count, and the later write replaces the earlier one, so one generated private key never reaches disk while both callers read success and both handles then name the surviving entry.
+
+**Creation and versions.** Creating a file MUST use an exclusive create (`O_EXCL` or a platform equivalent), so two processes creating one path never both succeed and one never overwrites another's keys. An implementation reading a version other than `0x02` MUST reject that file by version rather than open it, because an earlier version carries neither header value and its passphrase and integrity are therefore uncheckable.
+
+**What a passphrase commitment and a file HMAC do not catch.** Both values live inside a file they authenticate, so both roll back with it. An attacker who copies a key file, waits for an operator to destroy a compromised key, and restores that copy presents a file whose commitment matches an operator's passphrase and whose HMAC matches its own bytes; construction accepts it and a destroyed key is back in service. Detecting a rollback needs monotonic state outside that file, which this format does not carry — an operator who destroys a key MUST treat a restorable copy of a key file as live key material.
+
 ## 17.9 OpenMLS StorageProvider Bridge
 
 OpenMLS requires a `StorageProvider` trait implementation for persisting MLS group state (tree nodes, key schedules, proposals, etc.). `MlsStorageBridge` wraps `ProtocolRepository` and delegates to the `mls/{context_id}/...` key prefix.
