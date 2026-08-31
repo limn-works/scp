@@ -223,6 +223,22 @@ jobs:
         # --no-tests=fail -p scp-node --lib -E 'test(no_such_name)'` exits 4.
         # This lane now reports such a loss instead of hiding it.
         run: cargo nextest run --no-tests=fail -p scp-node --lib -E 'test(pre_rotation_severance)'
+      - name: scp-identity create paths fail closed
+        # crates/scp-testing/Cargo.toml declares a normal dependency
+        # `scp-identity = { path = "../scp-identity", features = ["testing"] }`,
+        # and one cargo invocation resolves one feature set per package, so
+        # every workspace-wide test build compiles scp-identity with `testing`
+        # on — which compiles out its two `#[cfg(not(feature = "testing"))]`
+        # assertions (ephemeral_create_fails_closed_without_pre_rotation_backend
+        # and persisted_create_fails_closed_without_pre_rotation_backend at
+        # crates/scp-identity/src/config.rs). Job rust-test therefore never ran
+        # them. A `-p scp-identity` build reads no scp-testing manifest, so
+        # `testing` stays off and both assertions execute here.
+        # `--no-tests=fail` exits 4 rather than 0 when a feature flip selects
+        # zero tests, and check_testing_unification_readers in
+        # scripts/tests/ci-gate/ci_gate_selftest.py rejects re-pairing these
+        # assertions with a lane whose build turns `testing` back on.
+        run: cargo nextest run --no-tests=fail -p scp-identity --lib -E 'test(fails_closed_without_pre_rotation_backend)'
 
   # ── G1: shipped-feature-graph prove-absence gate (ADR-062 §Decision 6) ──
   # Asserts every shipped FFI bridge and the scp-node/scp-relay binaries' resolved

@@ -10,7 +10,7 @@ fail on whichever defect it exists to catch, and keep that failure as a test. Ev
 defect below produced a green check while work behind it never ran, and every one passed
 review because a check *looked* like it was doing its job.
 
-## Twelve failure shapes
+## Thirteen failure shapes
 
 **1. A command that treats "nothing matched" as success.** `cargo test -p scp-node --lib
 pre_rotation_severance` exits 0 when a filter selects no test. Two tests it named
@@ -259,6 +259,31 @@ and a key defined and not read gates no job. When one name is written in two fil
 both spellings against each other, not each against the reader that already agrees
 with it.
 
+**13. A feature check that reads the command and not the build.** The first revision of
+`NON_BRIDGE_SHIPPED_ASSERTION_LANES` paired `scp-identity` with job `rust-test` under a
+comment claiming nothing in this repository enables `scp-identity/testing`, and
+`command_enables_testing` confirmed that claim by reading the command's `--features`
+text alone. The claim was false one manifest away: `crates/scp-testing/Cargo.toml`
+declares a normal dependency `scp-identity = { path = "../scp-identity", features =
+["testing"] }`, and one cargo invocation resolves one feature set per package, so job
+rust-test's `cargo nextest run --workspace` built scp-identity with `testing` on and
+compiled out both of its `#[cfg(not(feature = "testing"))]` assertions
+(`ephemeral_create_fails_closed_without_pre_rotation_backend` and
+`persisted_create_fails_closed_without_pre_rotation_backend` in
+`crates/scp-identity/src/config.rs`) — the two SCP-IDENT-1059 proofs that
+`Identity::create` fails closed without a pre-rotation backend. The check then reported
+each one running by name, because an unfiltered workspace command selects every test its
+packages compile, and these two compiled in no lane. The lane's `--no-tests=fail`
+guarded nothing either: that exit-4 guard fires on an empty selection, and a workspace
+run over thousands of tests never selects zero. The fix runs both assertions in job
+`fail-closed-pre-rotation` over a `-p scp-identity` build, which leaves scp-testing's
+manifest out, and adds `command_unifies_testing`, which scans the manifests a command's
+build includes — every non-excluded member for `--workspace`, each named package's
+manifest plus its dev path dependencies and their no-dev closures for `-p` — for a
+dependency entry or a `[features]` value enabling `<package>/testing`, and rejects the
+lane instead of trusting the command's text. When a criterion is "feature X is off in
+this build", read what the build resolves, not what the command spells.
+
 ## Tests holding these closed
 
 - `scripts/tests/ci-gate/run-tests.sh` — asserts every job sets a `timeout-minutes`, that
@@ -276,7 +301,12 @@ with it.
   answer nine synthetic cases correctly — `--workspace` covers a member, `--exclude`
   drops one, a `test()` predicate selects by substring, a renamed assertion falls out of
   that filter, an unfiltered command selects everything, and a filterset carrying a
-  difference is refused rather than guessed at — that the `fuzz` and
+  difference is refused rather than guessed at — that `command_unifies_testing` reads a
+  `testing` edge out of a four-crate fixture workspace in each spelling (a member's
+  normal dependency, an edge reached through a `-p` package's dependency closure, a self
+  dev-dependency, an `--exclude`d member a selected member still compiles) and out of
+  this repository's own `crates/scp-testing/Cargo.toml` against scp-identity, while
+  reporting a `-p scp-identity` build clean — that the `fuzz` and
   `typescript-wasm` filters cover the path-dependency
   closure of the manifests they guard, that every release.yml job uploading a `-signed`
   artifact runs its non-empty-input guard before that upload and that all three known
