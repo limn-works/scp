@@ -70,6 +70,16 @@ nothing:
                tests enables `scp-ffi-uniffi/testing`, which compiles that test
                out. The pass that added a test step to the pyo3 twin left this
                job's note in place.
+  filter-source
+               A `changes` job publishes each output from a
+               `steps.filter.outputs.<key>` expression, and dorny/paths-filter
+               publishes nothing under a key its `filters:` block does not
+               define. Renaming `rust` to `ruts` in that expression therefore
+               published the literal "false" on every run, skipped each of the
+               sixteen jobs whose `if:` reads that output, and left both gates
+               reading ci.yml green — the aggregate reads "false" as "this job
+               was not supposed to run", the verdict a genuine docs-only change
+               earns.
   event-name   An aggregate read an absent GITHUB_EVENT_NAME as "", so
                `if: github.event_name == 'pull_request'` on job cross-layer
                judged false and a skipped cross-layer passed on a pull request.
@@ -287,6 +297,19 @@ DATE_PINNED_NIGHTLY = re.compile(r"^nightly-\d{4}-\d{2}-\d{2}$")
 # Names a filter output out of an `if:` expression, so a check below can drop
 # one published output and watch an aggregate refuse to guess at it.
 FILTER_REFERENCE = re.compile(r"needs\.changes\.outputs\.([\w-]+)")
+
+# Names a key an expression reads off a `dorny/paths-filter` step, so a check
+# below can compare the keys a `changes` job publishes against the keys that
+# step's `filters:` block defines. `{id}` takes the step's own `id`.
+FILTER_STEP_REFERENCE = r"steps\.{id}\.outputs\.([\w-]+)"
+
+# The outputs dorny/paths-filter publishes beyond one per key its `filters:`
+# block defines. Its v3 tag publishes `changes`, a JSON array naming whichever
+# keys matched. It publishes `<key>_count` and `<key>_files` only for a step
+# that sets `list-files`, and no step in this repository sets it, so a reference
+# to either reads below as a key nothing defines — which errs toward reporting a
+# gap rather than toward passing one.
+PATHS_FILTER_BUILTIN_OUTPUTS = {"changes"}
 
 
 class Scenario(NamedTuple):
@@ -651,12 +674,81 @@ def check_windows_shell(path: Path, doc: dict) -> None:
             )
 
 
+class FilterStep(NamedTuple):
+    """One `dorny/paths-filter` step: where it runs, its id, and what it defines."""
+
+    job_id: str
+    job: dict
+    step_id: str | None
+    filters: dict[str, list[str]]
+
+
+def paths_filter_steps(doc: dict) -> list[FilterStep]:
+    """Return every `dorny/paths-filter` step a workflow declares."""
+    steps = []
+    for job_id, job in sorted((doc.get("jobs") or {}).items()):
+        for step in job.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            if not str(step.get("uses") or "").startswith("dorny/paths-filter"):
+                continue
+            steps.append(
+                FilterStep(
+                    job_id,
+                    job,
+                    step.get("id"),
+                    yaml.safe_load((step.get("with") or {})["filters"]),
+                )
+            )
+    return steps
+
+
 def path_filters(jobs: dict) -> dict[str, list[str]]:
     """Return each `changes` filter name mapped to its path patterns."""
-    for step in jobs["changes"]["steps"]:
-        if str(step.get("uses", "")).startswith("dorny/paths-filter"):
-            return yaml.safe_load(step["with"]["filters"])
+    for step in paths_filter_steps({"jobs": jobs}):
+        if step.job_id == "changes":
+            return step.filters
     raise AssertionError("job `changes` runs no dorny/paths-filter step")
+
+
+def filter_step_references(node: object, step_id: str) -> set[str]:
+    """Return every output key an expression reads off one paths-filter step.
+
+    Walks the strings a parsed job holds, because a job reads a step output in
+    an `outputs:` value, in an `if:`, in an `env:` value, and in a `run:` script,
+    and each of those is a string in the same tree.
+    """
+    reference = re.compile(FILTER_STEP_REFERENCE.format(id=re.escape(step_id)))
+    named: set[str] = set()
+    pending = [node]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, dict):
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+        elif isinstance(item, str):
+            named |= set(reference.findall(item))
+    return named
+
+
+def filter_key_disagreements(
+    filters: dict, referenced: set[str]
+) -> tuple[list[str], list[str]]:
+    """Return the keys an expression reads but nothing defines, and the reverse.
+
+    dorny/paths-filter publishes one output per key its `filters:` block defines
+    and nothing for a key that block omits, so an expression naming an undefined
+    key reads the empty string. `'' == 'true'` is false, so the `changes` job
+    publishes the literal "false", every job that output guards skips, and
+    scripts/ci-aggregate-result.py reads "false" as "this job was not supposed to
+    run" and exits 0. A key the block defines that no expression reads gates
+    nothing, which is the same rename seen from its other end.
+    """
+    defined = set(filters)
+    undefined = sorted(referenced - defined - PATHS_FILTER_BUILTIN_OUTPUTS)
+    unread = sorted(defined - referenced)
+    return undefined, unread
 
 
 def workspace_dependency_specs(manifest: Path) -> tuple[dict, Path]:
@@ -1333,6 +1425,102 @@ def check_shipped_build_assertions_run(jobs: dict) -> None:
             )
 
 
+def check_filter_keys_agree(path: Path, doc: dict) -> None:
+    """A `changes` output reads a key its paths-filter step defines, and no other.
+
+    CRITERION: for each `dorny/paths-filter` step, the set of keys the enclosing
+    job's expressions read off that step equals the set of keys that step's
+    `filters:` block defines, PATHS_FILTER_BUILTIN_OUTPUTS aside.
+
+    check_filter_outputs_gate_jobs below reads the consumer side of this wiring,
+    `needs.changes.outputs.<key>`, and scripts/ci-aggregate-result.py exits 2 on
+    a job condition naming an output `changes` did not publish. Neither reads the
+    producer side: nine expressions in ci.yml and one in docs.yml read
+    `steps.filter.outputs.<key>`, and a key misspelled there yields the empty
+    string, so that output publishes "false" on every run. The aggregate then
+    reads "false" as "this job was not supposed to run" and exits 0, which is the
+    same verdict it gives a genuine docs-only change.
+    """
+    for step in paths_filter_steps(doc):
+        label = f"{path.name}:{step.job_id}"
+        check(
+            f"{label}: its dorny/paths-filter step carries an `id`",
+            step.step_id is not None,
+            "a step publishes its outputs under its own id, so a step carrying no "
+            "id publishes nothing any expression can read",
+        )
+        if step.step_id is None:
+            continue
+        referenced = filter_step_references(step.job, step.step_id)
+        undefined, unread = filter_key_disagreements(step.filters, referenced)
+        check(
+            f"{label}: every filter output it reads is a filter it defines",
+            not undefined,
+            f"reads {undefined} off step {step.step_id!r}, whose `filters:` block "
+            f"defines {sorted(step.filters)} — dorny/paths-filter publishes nothing "
+            f"under a key it does not define, so each of those reads the empty "
+            f"string and publishes 'false' on every run, which skips every job it "
+            f"gates under a green `ci`",
+        )
+        check(
+            f"{label}: every filter it defines reaches an output",
+            not unread,
+            f"defines {unread}, which no expression in job {step.job_id} reads, so "
+            f"no job can be gated on {unread} and each of those filters selects "
+            f"nothing",
+        )
+
+
+def check_filter_key_agreement_detects_a_rename(
+    documents: list[tuple[Path, dict]],
+) -> None:
+    """Renaming a filter key without its output expression fails the check above.
+
+    CRITERION: filter_key_disagreements reports a renamed key from both ends —
+    the output expression then reads a key nothing defines, and the `filters:`
+    block then defines a key no output reads. Mutating a re-parsed copy of each
+    real workflow proves that comparison runs over the shape those files carry:
+    `rust` renamed to `ruts` in ci.yml's `outputs:` mapping left both gates that
+    read that file green, which is the defect this pair closes.
+    """
+    for path, _ in documents:
+        # Re-parsed rather than mutated in place, so this mutation reaches no
+        # other check reading the same document.
+        for step in paths_filter_steps(yaml.safe_load(path.read_text())):
+            if step.step_id is None:
+                continue
+            referenced = filter_step_references(step.job, step.step_id)
+            shared = sorted(referenced & set(step.filters))
+            if not shared:
+                continue
+            target = shared[0]
+            renamed = dict(step.filters)
+            renamed[f"{target}-renamed"] = renamed.pop(target)
+            # Read as a delta against the unmutated document, so that a
+            # disagreement this workflow already carries fails
+            # check_filter_keys_agree above and leaves this pair reporting on
+            # the rename alone.
+            before = filter_key_disagreements(step.filters, referenced)
+            after = filter_key_disagreements(renamed, referenced)
+            undefined = set(after[0]) - set(before[0])
+            unread = set(after[1]) - set(before[1])
+            check(
+                f"{path.name}:{step.job_id}: renaming filter {target!r} reports a "
+                f"key nothing defines",
+                undefined == {target},
+                f"the rename added {sorted(undefined)} to the keys nothing defines, "
+                f"want [{target!r}] — an output expression reading a renamed key "
+                f"would otherwise pass this self-test",
+            )
+            check(
+                f"{path.name}:{step.job_id}: renaming filter {target!r} reports a "
+                f"filter nothing reads",
+                unread == {f"{target}-renamed"},
+                f"the rename added {sorted(unread)} to the filters nothing reads, "
+                f"want ['{target}-renamed'] — a filter no output reads gates no job",
+            )
+
+
 def check_filter_outputs_gate_jobs(jobs: dict) -> None:
     """A `changes` filter output appears only in a job-level `if:`.
 
@@ -1525,6 +1713,13 @@ def main() -> int:
 
     print("step-filter — a filter output gates a job, never a step")
     check_filter_outputs_gate_jobs(jobs)
+
+    print("filter-source — a `changes` output reads a filter key that exists")
+    # Every workflow, not ci.yml alone: docs.yml declares a `dorny/paths-filter`
+    # step of its own, and its `docs` output reads two keys off that step.
+    for path, doc in documents:
+        check_filter_keys_agree(path, doc)
+    check_filter_key_agreement_detects_a_rename(documents)
 
     print(
         "shipped-config — a production-config lane runs its bridge's fail-closed "

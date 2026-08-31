@@ -1,6 +1,6 @@
-# A Green Check That Asserted Nothing: Eleven Ways CI Reported Success Over Zero Work
+# A Green Check That Asserted Nothing: Twelve Ways CI Reported Success Over Zero Work
 
-**Date:** 2026-08-16, extended 2026-08-17, 2026-08-22, 2026-08-25 and 2026-08-31
+**Date:** 2026-08-16, extended 2026-08-17, 2026-08-22, 2026-08-25, 2026-08-31 and 2026-09-01
 **Source:** branch `fix/ci-enforces-what-it-claims` — `.github/workflows/ci.yml`, `.github/workflows/fuzz.yml`, `.github/workflows/release.yml`, `scripts/check-cross-layer.sh`, `scripts/check-shipped-feature-graph.sh`
 
 ## Rule
@@ -10,7 +10,7 @@ fail on whichever defect it exists to catch, and keep that failure as a test. Ev
 defect below produced a green check while work behind it never ran, and every one passed
 review because a check *looked* like it was doing its job.
 
-## Eleven failure shapes
+## Twelve failure shapes
 
 **1. A command that treats "nothing matched" as success.** `cargo test -p scp-node --lib
 pre_rotation_severance` exits 0 when a filter selects no test. Two tests it named
@@ -238,6 +238,27 @@ of `test()` predicates joined by `+` or `|` and nothing else, because `-`, `not`
 `&` and the set functions can each REMOVE a test a `test()` predicate selected — a
 filterset outside that grammar fails the check rather than passing on a guess.
 
+**12. A check that reads one side of a two-sided wiring.** Two files name the same
+filter keys. A `dorny/paths-filter` step defines them in its `filters:` block, and the
+`changes` job publishes one output per key from a `steps.filter.outputs.<key>`
+expression — nine such expressions in `.github/workflows/ci.yml` and one in
+`.github/workflows/docs.yml`. `check_filter_outputs_gate_jobs` read the consumer side of
+those outputs, `needs.changes.outputs.<key>`, and `resolve_operand` in
+`scripts/ci-aggregate-result.py` exits 2 on a job condition naming an output `changes`
+did not publish. Neither read the producer side. dorny/paths-filter publishes nothing
+under a key its `filters:` block omits, so a misspelled key there reads as the empty
+string, `'' == 'true'` evaluates false, and the output publishes the literal "false" on
+every run — which `evaluate` reads as "this job was not supposed to run". Measured on
+this tree: renaming `steps.filter.outputs.rust` to `steps.filter.outputs.ruts` at
+ci.yml:53 left `python3.12 scripts/tests/ci-gate/ci_gate_selftest.py` reporting 296 of
+296 assertions passed and `bash scripts/check-toolchain-wiring.sh` printing OK, while
+each of the sixteen jobs whose `if:` reads that output skipped under a green `ci`. `check_filter_keys_agree`
+now requires the keys a job reads off a paths-filter step and the keys that step defines
+to be one set, in both directions: a key read and not defined publishes "false" forever,
+and a key defined and not read gates no job. When one name is written in two files, check
+both spellings against each other, not each against the reader that already agrees
+with it.
+
 ## Tests holding these closed
 
 - `scripts/tests/ci-gate/run-tests.sh` — asserts every job sets a `timeout-minutes`, that
@@ -245,7 +266,10 @@ filterset outside that grammar fails the check rather than passing on a guess.
   test-name filter on either side of a `--`, that four binding test jobs run on a
   Rust-only change, that any job reading a runtime-scaling input sizes its budget from
   that input and covers every permitted option, that no step gates itself on a `changes`
-  filter output, that each of the three production-config bridge jobs runs a test command
+  filter output, that the keys each `changes` job reads off its paths-filter step and the
+  keys that step's `filters:` block defines are one set — with a rename planted in a
+  re-parsed copy of each real workflow proving that comparison reports the defect from
+  both ends — that each of the three production-config bridge jobs runs a test command
   over its own package with that package's `testing` feature absent, that every
   `#[cfg(not(feature = "testing"))]` test under `crates/` is selected by name by a
   command in the job its package is paired with, that the readers deciding that question
