@@ -6,8 +6,13 @@
 # directory holding it under an artifact name asserting a signature. A search
 # that matches nothing makes the loop run zero times and exit 0, so a build leg
 # that produced no binary published an artifact named as signed that carried
-# nothing signed. Each case below builds fixture directories and runs the real
-# script against them.
+# nothing signed. The guard asserts every (directory, pattern) cell holds a
+# file, because the directories arrive from independent build jobs and the
+# patterns name independently produced artifact kinds: a sum across directories
+# accepted an empty windows-artifacts/ beside a populated windows-cbindgen/,
+# and an OR across patterns accepted a Maven bundle holding a pom and no AAR.
+# Each case below builds fixture directories and runs the real script against
+# them.
 set -euo pipefail
 
 SCRIPT="$(cd "$(dirname "$0")/../.." && pwd)/assert-nonempty-signing-set.sh"
@@ -32,13 +37,15 @@ run_case() {
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-# --- Windows fixtures (job sign-windows: *.dll) ----------------------------
-mkdir -p "$WORK/with-dll/release" "$WORK/empty" "$WORK/nested/a/b/c" "$WORK/other-files"
+# --- Windows fixtures (job sign-windows: *.dll in each of two directories) --
+mkdir -p "$WORK/with-dll/release" "$WORK/second-dll" "$WORK/empty" \
+    "$WORK/nested/a/b/c" "$WORK/other-files"
 touch "$WORK/with-dll/release/scp_ffi_uniffi.dll"
+touch "$WORK/second-dll/scp_ffi_uniffi.dll"
 touch "$WORK/nested/a/b/c/scp_ffi_napi.dll"
 touch "$WORK/other-files/scp_ffi_uniffi.lib" "$WORK/other-files/README.txt"
 
-# --- Apple fixtures (job sign-apple: *.a and *.dylib) ----------------------
+# --- Apple fixtures (job sign-apple: *.a) ----------------------------------
 # An XCFramework whose slice directories carry the headers and the Info.plist
 # but no static library — the shape the Windows leg produced when it uploaded
 # .lib and .pdb files and no .dll.
@@ -55,19 +62,26 @@ touch "$WORK/xcframework-no-lib/Info.plist" \
 # codesign over a directory is not a signed library. `find -type f` must skip it.
 mkdir -p "$WORK/xcframework-dir-named-a/ios-arm64/libscp_ffi.a"
 
-# --- Maven fixtures (job sign-maven: *.aar, *.jar, *.pom) ------------------
-mkdir -p "$WORK/maven-full" "$WORK/maven-pom-only" "$WORK/maven-no-artifacts"
+# --- Maven fixtures (job sign-maven: *.aar and *.jar, each required) -------
+mkdir -p "$WORK/maven-full" "$WORK/maven-pom-only" "$WORK/maven-aar-only" \
+    "$WORK/maven-jar-only" "$WORK/maven-no-artifacts"
 touch "$WORK/maven-full/scp-kt-0.1.0.aar" \
     "$WORK/maven-full/scp-kt-0.1.0-sources.jar" \
     "$WORK/maven-full/scp-kt-0.1.0.pom"
 touch "$WORK/maven-pom-only/scp-kt-0.1.0.pom"
+touch "$WORK/maven-aar-only/scp-kt-0.1.0.aar"
+touch "$WORK/maven-jar-only/scp-kt-0.1.0-sources.jar"
 touch "$WORK/maven-no-artifacts/build.log" "$WORK/maven-no-artifacts/scp-kt.module"
 
-echo "assert-nonempty-signing-set — a signing job must reject an empty input set"
+echo "assert-nonempty-signing-set — every (directory, pattern) cell must hold a file"
 
-# sign-windows: *.dll
-run_case "one DLL beside an empty directory is accepted" 0 \
+# sign-windows: *.dll in each of two directories from independent build jobs
+run_case "two directories each carrying a DLL are accepted" 0 \
+    --name '*.dll' "$WORK/with-dll" "$WORK/second-dll"
+run_case "an empty directory beside a directory carrying a DLL is rejected" 1 \
     --name '*.dll' "$WORK/with-dll" "$WORK/empty"
+run_case "a DLL-less directory beside a directory carrying a DLL is rejected" 1 \
+    --name '*.dll' "$WORK/with-dll" "$WORK/other-files"
 run_case "a DLL nested three levels down is found" 0 --name '*.dll' "$WORK/nested"
 run_case "two directories carrying no DLL are rejected" 1 \
     --name '*.dll' "$WORK/empty" "$WORK/other-files"
@@ -78,23 +92,31 @@ run_case "a directory that does not exist is rejected" 1 \
 run_case "a missing directory beside a populated one is rejected" 1 \
     --name '*.dll' "$WORK/with-dll" "$WORK/never-downloaded"
 
-# sign-apple: *.a and *.dylib
+# sign-apple: *.a
 run_case "an XCFramework carrying a static library is accepted" 0 \
-    --name '*.a' --name '*.dylib' "$WORK/xcframework-full"
-run_case "an XCFramework carrying only a dylib is accepted" 0 \
-    --name '*.a' --name '*.dylib' "$WORK/xcframework-dylib-only"
+    --name '*.a' "$WORK/xcframework-full"
+run_case "an XCFramework carrying only a dylib and no static library is rejected" 1 \
+    --name '*.a' "$WORK/xcframework-dylib-only"
 run_case "an XCFramework carrying headers and a plist but no library is rejected" 1 \
-    --name '*.a' --name '*.dylib' "$WORK/xcframework-no-lib"
+    --name '*.a' "$WORK/xcframework-no-lib"
 run_case "a directory whose name ends in .a does not count as a library" 1 \
-    --name '*.a' --name '*.dylib' "$WORK/xcframework-dir-named-a"
+    --name '*.a' "$WORK/xcframework-dir-named-a"
 
-# sign-maven: *.aar, *.jar, *.pom
+# sign-maven: *.aar and *.jar, each required on its own
 run_case "a Maven bundle carrying an aar, a jar and a pom is accepted" 0 \
-    --name '*.aar' --name '*.jar' --name '*.pom' "$WORK/maven-full"
-run_case "a Maven bundle carrying only a pom is accepted" 0 \
-    --name '*.aar' --name '*.jar' --name '*.pom' "$WORK/maven-pom-only"
+    --name '*.aar' --name '*.jar' "$WORK/maven-full"
+run_case "a Maven bundle carrying only a pom is rejected" 1 \
+    --name '*.aar' --name '*.jar' "$WORK/maven-pom-only"
+run_case "a Maven bundle carrying an aar but no jar is rejected" 1 \
+    --name '*.aar' --name '*.jar' "$WORK/maven-aar-only"
 run_case "a Maven directory holding only a log and a module file is rejected" 1 \
-    --name '*.aar' --name '*.jar' --name '*.pom' "$WORK/maven-no-artifacts"
+    --name '*.aar' --name '*.jar' "$WORK/maven-no-artifacts"
+
+# Per-cell over both axes: each directory satisfies one pattern and misses the
+# other, so a sum over either axis alone would count one match per pattern and
+# one match per directory and pass.
+run_case "two patterns each matched in only one of two directories are rejected" 1 \
+    --name '*.aar' --name '*.jar' "$WORK/maven-aar-only" "$WORK/maven-jar-only"
 
 # Invocation errors
 run_case "naming no directory at all is rejected" 1 --name '*.dll'

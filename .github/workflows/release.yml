@@ -263,13 +263,20 @@ jobs:
         with:
           path: repo
 
-      - name: Assert the XCFramework carries libraries to sign
+      # The guard names '*.a' alone: build-matrix.yml packs exactly three
+      # static-library slices into the XCFramework and no dylib, so a dylib is
+      # not an artifact this build can be missing. Naming '*.dylib' here would
+      # fail every honest release, and the guard treats every named pattern as
+      # required — an optional alternative is what let a bundle missing its
+      # primary artifact pass. The codesign loop below still signs any dylib
+      # it finds.
+      - name: Assert the XCFramework carries static libraries to sign
         shell: bash
-        run: bash repo/scripts/assert-nonempty-signing-set.sh --name '*.a' --name '*.dylib' xcframework
+        run: bash repo/scripts/assert-nonempty-signing-set.sh --name '*.a' xcframework
 
       - name: Codesign XCFramework
         run: |
-          # Step "Assert the XCFramework carries libraries to sign" above has
+          # Step "Assert the XCFramework carries static libraries to sign" above has
           # already rejected an empty set, which this loop would otherwise run
           # zero times over and exit 0 on.
           find xcframework/ -type f \( -name "*.a" -o -name "*.dylib" \) | while read -r lib; do
@@ -312,7 +319,11 @@ jobs:
         with:
           path: repo
 
-      - name: Assert a Windows build leg produced DLLs to sign
+      # The two directories arrive from independent build-matrix.yml jobs
+      # (rust and cbindgen), and the guard requires a DLL in each one, so a
+      # rust leg that regresses to .lib and .pdb output cannot hide behind a
+      # healthy cbindgen leg.
+      - name: Assert both Windows build legs produced DLLs to sign
         shell: bash
         run: bash repo/scripts/assert-nonempty-signing-set.sh --name '*.dll' windows-artifacts windows-cbindgen
 
@@ -333,7 +344,7 @@ jobs:
       - name: Sign DLLs
         shell: pwsh
         run: |
-          # Step "Assert a Windows build leg produced DLLs to sign" above has
+          # Step "Assert both Windows build legs produced DLLs to sign" above has
           # already rejected an empty set, which this loop would otherwise run
           # zero times over and exit 0 on.
           $dlls = @(Get-ChildItem -Recurse -Include *.dll windows-artifacts/, windows-cbindgen/)
@@ -389,15 +400,22 @@ jobs:
         with:
           path: repo
 
-      - name: Assert the Maven bundle carries artifacts to sign
+      # The guard requires an AAR and a JAR each on their own — the kotlin-aar
+      # artifact's two upload paths in build-matrix.yml produce them from
+      # separate Gradle outputs, and either can be silently absent while the
+      # other uploads. '*.pom' is not named: no build step puts a pom into
+      # kotlin-aar, so requiring one would fail every honest release, and
+      # listing it as an alternative is what let a bundle carrying only a pom
+      # pass. The gpg loop below still signs any pom it finds.
+      - name: Assert the Maven bundle carries an AAR and a JAR to sign
         shell: bash
-        run: bash repo/scripts/assert-nonempty-signing-set.sh --name '*.aar' --name '*.jar' --name '*.pom' maven-artifacts
+        run: bash repo/scripts/assert-nonempty-signing-set.sh --name '*.aar' --name '*.jar' maven-artifacts
 
       - name: Sign artifacts
         env:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
-          # Step "Assert the Maven bundle carries artifacts to sign" above has
+          # Step "Assert the Maven bundle carries an AAR and a JAR to sign" above has
           # already rejected an empty set, which this loop would otherwise run
           # zero times over and exit 0 on.
           find maven-artifacts/ -type f \( -name "*.aar" -o -name "*.jar" -o -name "*.pom" \) | while read -r file; do

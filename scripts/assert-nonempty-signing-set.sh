@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# Fail when no file matching the named patterns sits under the named directories.
+# Fail unless every named directory holds at least one file matching every
+# named pattern.
 #
 # WHY THIS EXISTS. Three jobs in .github/workflows/release.yml sign a set of
 # files and then upload the directory holding them under an artifact name that
@@ -21,6 +22,16 @@
 # set reaches a signing job; a relocated or renamed output inside an XCFramework
 # or an AAR bundle is another.
 #
+# WHY THE ASSERTION IS PER (DIRECTORY, PATTERN) CELL. The directories a signing
+# job names arrive from independent build jobs, and the patterns name
+# independently produced artifact kinds, so any weaker aggregation lets one
+# populated cell mask another cell's empty set: a sum across directories
+# accepted a windows-artifacts/ holding zero DLLs whenever windows-cbindgen/
+# held one, and an OR across patterns accepted a Maven bundle holding a pom and
+# no AAR. Every cell must be nonempty; a pattern that a build produces only
+# sometimes does not belong in the invocation, because naming it would either
+# fail every honest release or weaken the guard back into an OR.
+#
 # This script runs before signing, so a release fails before an unsigned bundle
 # can be uploaded under a name that says it is signed.
 # scripts/tests/signing-guard/run-tests.sh drives it with fixture directories.
@@ -28,7 +39,8 @@
 # Usage:
 #   assert-nonempty-signing-set.sh --name <glob> [--name <glob>]... <directory>...
 #
-# Every --name is a find(1) -name glob. A file matching ANY of them counts.
+# Every --name is a find(1) -name glob. Every directory must hold at least one
+# file matching EACH of them.
 set -euo pipefail
 
 patterns=()
@@ -72,34 +84,28 @@ if [[ "${#directories[@]}" -eq 0 ]]; then
     exit 1
 fi
 
-# Build one find(1) expression ORing every --name glob, so a single walk answers
-# for all of them: \( -name A -o -name B ... \).
-expression=()
-for index in "${!patterns[@]}"; do
-    if [[ "$index" -gt 0 ]]; then
-        expression+=(-o)
-    fi
-    expression+=(-name "${patterns[$index]}")
-done
-
-total=0
+empty_cells=()
 for directory in "${directories[@]}"; do
     if [[ ! -d "$directory" ]]; then
         echo "assert-nonempty-signing-set.sh: '$directory' does not exist — a build leg uploaded no artifact for it" >&2
         exit 1
     fi
-    # `find … | wc -l`, never `find … -quit` or a `grep -q`: a reader that stops
-    # early closes a pipe while its writer is still writing, and `set -o
-    # pipefail` then reports that writer's SIGPIPE exit status instead of a
-    # count. scripts/check-cross-layer.sh shipped that bug.
-    found="$(find "$directory" -type f \( "${expression[@]}" \) | wc -l | tr -d ' ')"
-    echo "  $directory: $found file(s) matching ${patterns[*]}"
-    total=$((total + found))
+    for pattern in "${patterns[@]}"; do
+        # `find … | wc -l`, never `find … -quit` or a `grep -q`: a reader that
+        # stops early closes a pipe while its writer is still writing, and `set
+        # -o pipefail` then reports that writer's SIGPIPE exit status instead
+        # of a count. scripts/check-cross-layer.sh shipped that bug.
+        found="$(find "$directory" -type f -name "$pattern" | wc -l | tr -d ' ')"
+        echo "  $directory × $pattern: $found file(s)"
+        if [[ "$found" -eq 0 ]]; then
+            empty_cells+=("$directory × $pattern")
+        fi
+    done
 done
 
-if [[ "$total" -eq 0 ]]; then
-    echo "assert-nonempty-signing-set.sh: found 0 files matching ${patterns[*]} under ${directories[*]}. Signing nothing and uploading it as a signed artifact would publish unsigned binaries." >&2
+if [[ "${#empty_cells[@]}" -gt 0 ]]; then
+    echo "assert-nonempty-signing-set.sh: ${#empty_cells[@]} empty cell(s): ${empty_cells[*]}. A build leg produced none of an artifact this signing job exists to sign; uploading the bundle as a signed artifact would publish it with that artifact absent or unsigned." >&2
     exit 1
 fi
 
-echo "assert-nonempty-signing-set.sh: $total file(s) matching ${patterns[*]} across ${#directories[@]} director(ies)"
+echo "assert-nonempty-signing-set.sh: every cell of ${#directories[@]} director(ies) × ${#patterns[@]} pattern(s) holds at least one file"
