@@ -93,6 +93,18 @@ nothing:
   event-name   An aggregate read an absent GITHUB_EVENT_NAME as "", so
                `if: github.event_name == 'pull_request'` on job cross-layer
                judged false and a skipped cross-layer passed on a pull request.
+  doc-flag     Job rust-doc in ci.yml ran `cargo doc` without
+               `--document-private-items`, while the `rust-docs` job of
+               docs.yml passed that flag. rustdoc resolves a link written on a
+               private item only under that flag, so three unresolved links in
+               the private module crates/scp-runtime/src/context/
+               outlets_helpers.rs compiled clean under the sole required status
+               check and failed only in docs.yml, which the Default ruleset
+               does not require. They rode `main` for ten days after pull
+               request #2274 merged. Pull request #2329 then repaired the three
+               links and added a `push: branches: [main]` trigger to docs.yml,
+               which shortened time-to-detection and left the required check
+               unable to produce the diagnostic.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
@@ -1949,6 +1961,158 @@ def check_signing_guard(documents: list[tuple[Path, dict]]) -> None:
     )
 
 
+def cargo_doc_commands(doc: dict) -> list[tuple[str, str]]:
+    """Return (job_id, command) for every `cargo doc` a workflow's steps run."""
+    found = []
+    for job_id, job in sorted((doc.get("jobs") or {}).items()):
+        for step in job.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            for line in logical_lines(step.get("run") or ""):
+                if line.startswith("cargo doc ") or line == "cargo doc":
+                    found.append((job_id, line))
+    return found
+
+
+def command_flags(command: str) -> set[str]:
+    """Return a command's flags, each carrying its value when it takes one.
+
+    A flag written `--features a,b` and one written `--features=a,b` normalize
+    to the same members, and a comma-separated value splits into one member per
+    element, so a command enabling fewer features compares as a subset rather
+    than as a difference.
+    """
+    flags: set[str] = set()
+    pending: str | None = None
+    for token in split_command(command):
+        if pending is not None:
+            name, value = pending, token
+            pending = None
+        elif token in VALUE_FLAGS:
+            pending = token
+            continue
+        elif token.startswith("-"):
+            name, _, value = token.partition("=")
+        else:
+            continue
+        if not value:
+            flags.add(name)
+        else:
+            flags.update(f"{name}={element}" for element in value.split(","))
+    if pending is not None:
+        flags.add(pending)
+    return flags
+
+
+def required_rustdoc_flags(documents: list[tuple[Path, dict]]) -> set[str]:
+    """Return the flags every `cargo doc` in the required workflow passes."""
+    flags: set[str] = set()
+    for path, doc in documents:
+        if path == WORKFLOW:
+            for _, command in cargo_doc_commands(doc):
+                flags |= command_flags(command)
+    return flags
+
+
+def rustdoc_surface_gaps(
+    documents: list[tuple[Path, dict]], required: set[str]
+) -> list[tuple[Path, str, set[str]]]:
+    """Return each rustdoc outside the required workflow and the flags it adds.
+
+    A returned entry names a `cargo doc` command, and the flags it passes that
+    `required` does not carry. Each such flag enlarges what rustdoc resolves in
+    that command alone, so a diagnostic it produces reaches no required status
+    check.
+    """
+    gaps = []
+    for path, doc in documents:
+        if path == WORKFLOW:
+            continue
+        for job_id, command in cargo_doc_commands(doc):
+            gaps.append((path, job_id, command_flags(command) - required))
+    return gaps
+
+
+def check_required_rustdoc_surface(documents: list[tuple[Path, dict]]) -> None:
+    """The required check's rustdoc reads whatever any other workflow's reads.
+
+    THE CRITERION: a rustdoc diagnostic that any workflow in this repository
+    can produce, `ci` can produce. `ci` is the sole required status check on the
+    Default ruleset, so a diagnostic only an advisory workflow produces blocks
+    no merge, and a pull request carrying that diagnostic merges under a green
+    required check.
+
+    A `cargo doc` flag decides which items rustdoc resolves links on, so a flag
+    one command carries and the required check's command omits names a
+    diagnostic class the required check cannot produce. This check compares the
+    two flag sets rather than naming `--document-private-items`, so a flag added
+    to docs.yml later fails here until ci.yml carries it too.
+    """
+    required = required_rustdoc_flags(documents)
+    check(
+        f"{WORKFLOW.name} runs rustdoc",
+        bool(required),
+        "no `cargo doc` command — a required check running no rustdoc produces "
+        "no rustdoc diagnostic",
+    )
+    for path, job_id, missing in rustdoc_surface_gaps(documents, required):
+        check(
+            f"{path.name}:{job_id} rustdoc surface reaches {WORKFLOW.name}",
+            not missing,
+            f"{sorted(missing)} enlarge what rustdoc reads in a workflow the "
+            f"ruleset does not require, and nothing in `ci` reads it",
+        )
+
+
+def check_rustdoc_surface_detects_a_dropped_flag(
+    documents: list[tuple[Path, dict]],
+) -> None:
+    """Dropping a flag from the required rustdoc fails the check above.
+
+    CRITERION: rustdoc_surface_gaps reports a flag that an advisory workflow's
+    rustdoc passes and the required workflow's rustdoc does not. Dropping one
+    flag at a time from the required set proves the comparison runs over the
+    commands these workflows carry rather than over an empty set — a comparison
+    that read no command would report no gap and pass the check above, which is
+    the shape ci.yml carried while `--document-private-items` sat in docs.yml
+    alone.
+    """
+    required = required_rustdoc_flags(documents)
+    elsewhere = {
+        flag
+        for path, doc in documents
+        if path != WORKFLOW
+        for _, command in cargo_doc_commands(doc)
+        for flag in command_flags(command)
+    }
+    shared = sorted(required & elsewhere)
+    check(
+        "a rustdoc outside the required workflow shares a flag with it",
+        bool(shared),
+        "no shared flag — this mutation would drop nothing and report nothing",
+    )
+    # Read as a delta against the unmutated set, so that a gap these workflows
+    # already carry fails check_required_rustdoc_surface above and leaves this
+    # mutation reporting on the dropped flag alone.
+    baseline = {
+        missing_flag
+        for _, _, missing in rustdoc_surface_gaps(documents, required)
+        for missing_flag in missing
+    }
+    for flag in shared:
+        reported = {
+            missing_flag
+            for _, _, missing in rustdoc_surface_gaps(documents, required - {flag})
+            for missing_flag in missing
+        } - baseline
+        check(
+            f"dropping {flag} from {WORKFLOW.name}'s rustdoc reports it",
+            reported == {flag},
+            f"reported {sorted(reported)}, want [{flag!r}] — a required check "
+            f"omitting that flag would otherwise pass this self-test",
+        )
+
+
 def collect_pinned_nightlies(doc: dict) -> set[str]:
     """Return every date-pinned nightly a workflow's steps request."""
     pinned = set()
@@ -2011,6 +2175,10 @@ def main() -> int:
         f"{requested} — a fuzz build check under one nightly says nothing about a "
         f"fuzz run under another",
     )
+
+    print("doc-flag — the required check's rustdoc reads every other rustdoc's surface")
+    check_required_rustdoc_surface(documents)
+    check_rustdoc_surface_detects_a_dropped_flag(documents)
 
     print("win-shell — every `run:` step a Windows runner can execute names a shell")
     for path, doc in documents:
