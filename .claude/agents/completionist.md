@@ -39,7 +39,7 @@ SCP has layers; a gap can live in any link between them. Build a matrix — requ
 | Layer | Location |
 |-------|----------|
 | Pure protocol types | `crates/scp-protocol/` |
-| Async orchestration (ContextManager) | `crates/scp-runtime/` |
+| Async orchestration (Supervisor, actor-per-context) | `crates/scp-runtime/` |
 | PyO3 bridge (reference, 100% target) | `crates/scp-ffi/src/` |
 | UniFFI bridge (Swift, Kotlin) | `crates/scp-ffi/uniffi/` |
 | NAPI bridge (Node/Bun → TS) | `crates/scp-ffi/napi/` |
@@ -49,8 +49,8 @@ SCP has layers; a gap can live in any link between them. Build a matrix — requ
 | Swift SDK | `bindings/swift/Sources/SCP/` |
 
 **Integration checklist (from `CLAUDE.md`) — verify every cell for new protocol logic:**
-1. The function is called from a ContextManager method (not just exported).
-2. The ContextManager method is exported from all applicable FFI bridges.
+1. A Supervisor `dispatch_*` method reaches the function on its production path (not just exported) — for a per-context operation the route is `dispatch_*` → actor mailbox → `crates/scp-runtime/src/context/actor/handlers/<domain>.rs` → the `<domain>_helpers.rs` function; the lifecycle bootstrap variants (`create_context`, `import_context`, `restore_context`) call `lifecycle_helpers` from the dispatch method directly.
+2. The Supervisor operation is exported from all applicable FFI bridges.
 3. Each bridge export has a corresponding SDK wrapper method.
 4. A pipeline assertion exists in `pipeline_wiring.rs` for the new step.
 5. The SDK capability matrix (`.docs/standards/sdk-capability-matrix.json`) is updated.
