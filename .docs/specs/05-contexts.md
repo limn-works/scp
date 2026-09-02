@@ -2036,14 +2036,14 @@ Author-level, cryptographic, pull-based — the same protocol as encrypted conte
 
 Blocking is per-author. Author A blocking a subscriber does not affect the subscriber's access to Author B's content.
 
-**Governance-level subscriber ban.** When the context's capability ceiling includes `member:ban` (§5.3), governance can execute `RevokeAccess { did, access: Read }` (§5.9, ADR-031) against broadcast subscribers. Unlike per-author blocking (which is unilateral and affects only one author's content), a governance ban removes the subscriber from the registry AND adds them to ALL authors' block lists simultaneously. All authors MUST rotate keys after a governance ban (mandatory `KeyEpochAdvance`). This mirrors `RevokeAccess` semantics in encrypted contexts (MLS group removal), adapted for broadcast's per-author key model.
+**Governance-level subscriber ban.** When the context's capability ceiling includes `member:ban` (§5.3), governance can execute `RevokeAccess { did, access: Read }` (§5.9, ADR-031) against broadcast subscribers. Unlike per-author blocking (which is unilateral and affects only one author's content), a governance ban removes the subscriber from the registry AND adds them to ALL authors' block lists simultaneously. All authors MUST rotate keys after a governance ban (mandatory `KeyEpochAdvance`, fail-closed per ADR-011: convergent governance trigger → convergent leaf). This mirrors `RevokeAccess` semantics in encrypted contexts (MLS group removal), adapted for broadcast's per-author key model.
 
 Governance ban lifecycle:
 
 1. Governance proposal: `RevokeAccess { did, access: Read }` — proposed via the standard governance flow (§5.9).
 2. Context manager verifies `member:ban` capability in ceiling — rejects with `PermissionDenied` if absent.
 3. On approval: subscriber removed from registry, added to all authors' block lists.
-4. All authors rotate keys — mandatory `KeyEpochAdvance` per author.
+4. All authors rotate keys — mandatory `KeyEpochAdvance` per author, fail-closed per ADR-011 (convergent governance trigger → convergent leaf).
 5. `ReadAccessRevoked` event emitted to event log.
 6. Future `handle_key_request` from banned subscriber returns `Deny` for all authors.
 
@@ -2054,6 +2054,8 @@ A governance ban is recorded in a durable per-context ban record independent of 
 Default template configuration: encrypted templates include `member:ban` in their ceiling by default (§5.12.1); broadcast templates do not. Broadcast contexts can add `member:ban` via explicit `ContextParams` at creation or via `ModifyCeiling` governance action if `CeilingPolicy::Governed`.
 
 **Author removal.** Removing an author from a broadcast context (revoking their broadcast key and preventing future publishing) is a governance-gated action. Author removal uses `GovernanceAction::RevokeAccess { did, access: Write }` — the general content access revocation mechanism (§5.9, ADR-031). `RevokeAccess` with `access: Both` stops publishing AND suppresses historical content; `access: Write` stops future publishing only. There is no standalone API to remove an author without governance approval. This enforces the protocol tenet: "Agents are participants, not enforcers." When the governance proposal is approved and executed: the author's broadcast key is destroyed, `publish()` returns `PermissionDenied`, key requests for the author return `Deny`, and a `WriteAccessRevoked` event is emitted. Subscribers who cached the author's old key can still decrypt historical messages (unless `access: Both` was used, in which case access keys are also destroyed per §9.17).
+
+**`RotateContentKeys` broadcast key rotation.** When the `RotateContentKeys` governance action executes on a broadcast context, all authors MUST advance their broadcast key epoch — a mandatory epoch-state advance per author (identical to the governance-ban rotation above, and fail-closed); the `KeyEpochAdvance` event-log leaf is emitted fail-closed per ADR-011 (convergent governance trigger → convergent leaf). This is the governance-triggered key hygiene path: it does not add to block lists or modify subscriber registry, but advances every author's epoch to forward-fence observers who hold cached broadcast keys. The `KeyEpochAdvance` leaves are emitted to the event log after the durable `ContentKeysRotated` leaf.
 
 **Sybil resistance.** Broadcast contexts are the primary target for Sybil block bypass because key requests travel as relay messages (not MLS application messages). The membership gate in `handle_sender_key_request` verifies that the requester is a registered subscriber before distributing keys. Identity-linked block expansion and group blocking further mitigate Sybil attacks. See §9.16.6 for the full mitigation specification.
 

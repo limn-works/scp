@@ -5793,6 +5793,16 @@ impl Supervisor {
                 let _ = reply.send(Ok(()));
                 Outcome::ok(())
             }
+            // Test-only seed seam — context must exist.
+            #[cfg(feature = "testing")]
+            BroadcastCommand::SeedBroadcastAuthor {
+                context_id, reply, ..
+            } => {
+                let err = ContextError::ContextNotRegistered(context_id);
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
+            }
         }
     }
 
@@ -14483,6 +14493,48 @@ impl Supervisor {
         })?
     }
 
+    /// Registers an additional DID as a broadcast author on an existing
+    /// broadcast context, bypassing the governance round-trip — test-only.
+    ///
+    /// Single-node integration tests that need a multi-author broadcast
+    /// context cannot drive genuine governance (the bridge key-resolver only
+    /// sees one actor's custody). This seam populates the author registry
+    /// mirroring the author-publish/add path, so multi-author KEA-leaf and
+    /// checkpoint-counter tests can exercise the real code path instead of
+    /// being limited to the creator-only case.
+    ///
+    /// Mirrors [`Self::seed_peer_pseudonym`] in purpose and gating. Gated
+    /// behind `testing` — never compiled into production builds, never
+    /// reachable from any FFI bridge.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::MembershipFailed`] if the context is not a
+    ///   broadcast context.
+    /// - [`ContextError::PermissionDenied`] if `author_did` is already
+    ///   registered.
+    /// - [`ContextError::ContextNotRegistered`] if the context has no actor.
+    /// - [`ContextError::TransportFailed`] if the actor reply channel closes.
+    #[cfg(feature = "testing")]
+    pub async fn seed_broadcast_author(
+        &self,
+        context_id: &str,
+        author_did: DID,
+    ) -> Result<(), ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = BroadcastCommand::SeedBroadcastAuthor {
+            context_id: context_id.to_owned(),
+            author_did,
+            reply: tx,
+        };
+        self.dispatch_broadcast_command(cmd).await?;
+        bounded_reply_await(rx).await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::seed_broadcast_author — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
     /// Installs a member's §9.17 access key directly into a context's access
     /// key store via the actor mailbox — test-only.
     ///
@@ -15268,6 +15320,9 @@ impl Supervisor {
             BroadcastCommand::ReleaseBroadcastReservation { payload, .. } => {
                 Some(payload.context_id.as_str())
             }
+            // Test-only seed seam — routed to the per-context actor.
+            #[cfg(feature = "testing")]
+            BroadcastCommand::SeedBroadcastAuthor { context_id, .. } => Some(context_id.as_str()),
             // PublishBroadcast / PublishBroadcastContent need
             // KeyCustody on the shim, so they have no string target for
             // this custody-free router.

@@ -2644,6 +2644,41 @@ impl<'a> ClassCMut<'a> {
             checkpoint_events_since: &mut *self.checkpoint_events_since,
         }
     }
+
+    /// Test seam: registers `author_did` as a broadcast author with an initial
+    /// epoch, mirroring the author-publish/add path. Bypasses the governance
+    /// round-trip.
+    ///
+    /// Mirrors the rationale of
+    /// [`MessagingCommand::SeedPeerPseudonym`](crate::context::actor::commands::MessagingCommand::SeedPeerPseudonym):
+    /// single-node integration tests cannot drive genuine governance to produce
+    /// a second broadcast author; this seam populates the author registry so
+    /// multi-author KEA-leaf and counter tests can exercise the real code path.
+    ///
+    /// Gated behind the `testing` feature — never compiled into production
+    /// builds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::MembershipFailed`] if not a broadcast context,
+    /// or [`ContextError::PermissionDenied`] if the author is already
+    /// registered (matches
+    /// [`BroadcastContext::add_author`](scp_protocol::context::BroadcastContext::add_author)).
+    #[cfg(feature = "testing")]
+    pub(crate) fn seed_broadcast_author(
+        &mut self,
+        author_did: &scp_did::DID,
+    ) -> Result<(), scp_protocol::context::ContextError> {
+        self.broadcast_context
+            .as_mut()
+            .ok_or_else(|| {
+                scp_protocol::context::ContextError::MembershipFailed(
+                    "seed_broadcast_author: not a broadcast context".into(),
+                )
+            })?
+            .add_author(author_did.as_ref())
+            .map(|_| ())
+    }
 }
 
 /// Outcome of a [`ClassSCell::commit_class_s_then_append`] that did not complete

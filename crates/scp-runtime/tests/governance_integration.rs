@@ -46,8 +46,13 @@ use scp_protocol::context::governance::{
     GovernanceContext, GovernanceEngine, GovernanceEvent, KeyResolver, ProposalStatus,
     SingleAdminEngine, VoteType, actions_conflict, sign_vote,
 };
-use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
+use scp_protocol::context::params::{
+    Capability, ContextMode, ContextParams, GovernanceModel, MemoryScope,
+};
 use scp_protocol::context::{ContextError, ContextState};
+use scp_runtime::context::actor::commands::{
+    BroadcastBlockPayload, BroadcastCommand, SubscribeBroadcastPayload, UnsubscribeBroadcastPayload,
+};
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_runtime::context::governance::timeout::{DeadlockCondition, DeadlockDetectionState};
 use scp_runtime::context::state::{GovernanceActionResult, ProposalOutcome};
@@ -3055,5 +3060,618 @@ async fn governance_deadlock_recovery_appends_both_event_leaves() {
         "GovernanceDeadlockRecovery (seq {}) must follow GovernanceReconfigured (seq {})",
         recovery_entry.sequence,
         reconfigured_seq
+    );
+}
+
+// =========================================================================
+// governance_logic.rs:156 / §9.9.3: execute_reconfigure_governance must
+// emit EXACTLY 2 action-specific leaves (GovernanceReconfigured +
+// GovernanceDeadlockRecovery), corresponding to checkpoint_events_since
+// being bumped by exactly 2 for those leaves. The counter is internal to
+// the actor, so this test verifies the invariant indirectly by asserting
+// each leaf type appears exactly once and that no extra action-specific
+// leaves appear (the proposal lifecycle emits one additional leaf bringing
+// the total delta to 3).
+// =========================================================================
+
+#[tokio::test]
+async fn reconfigure_governance_bumps_checkpoint_counter_by_exactly_two() {
+    use scp_protocol::context::governance::{DeadlockJustification, GovernanceReconfigAction};
+
+    let manager = new_manager_with_real_event_log();
+    let ctx_id = "ctx-reconfig-counter-1847";
+
+    let params = ContextParams {
+        ceiling: governance_ceiling(),
+        governance: GovernanceModel::Threshold {
+            threshold: 1,
+            signers: vec![alice(), bob()],
+        },
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    // Baseline: count leaves present before the ReconfigureGovernance execute.
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let baseline_count = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist")
+        .len();
+
+    let justification = DeadlockJustification {
+        unavailable_dids: vec![bob()],
+        missed_windows: vec![(bob(), 3)],
+        detected_at: 1_700_000_001,
+    };
+    let action = GovernanceAction::ReconfigureGovernance {
+        changes: vec![GovernanceReconfigAction::RemoveInactiveSigner { did: bob() }],
+        justification: justification.clone(),
+    };
+    let sk_alice = signing_key_for_did(&alice());
+
+    // Proposal auto-executes (threshold=1, alice auto-votes).
+    let (proposal, _events, _) = manager
+        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .await
+        .unwrap();
+    assert_eq!(
+        proposal.status,
+        ProposalStatus::Approved,
+        "threshold=1: proposer auto-vote must immediately approve and execute"
+    );
+
+    // Assert that EXACTLY ONE GovernanceReconfigured and ONE
+    // GovernanceDeadlockRecovery leaf were emitted by execute_reconfigure_governance.
+    // These are the two leaves that bump checkpoint_events_since by 2 (§9.9.3).
+    // (The proposal lifecycle itself emits an additional leaf — that is expected
+    // and verified by the total delta, NOT by this counter-specific assertion.)
+    let after_entries = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist after reconfigure");
+
+    let reconfigured_count = after_entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::GovernanceReconfigured)
+        .count();
+    let recovery_count = after_entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::GovernanceDeadlockRecovery)
+        .count();
+
+    assert_eq!(
+        reconfigured_count, 1,
+        "execute_reconfigure_governance must emit exactly 1 GovernanceReconfigured leaf \
+         (checkpoint_events_since += 1 for this leaf, §9.9.3)"
+    );
+    assert_eq!(
+        recovery_count, 1,
+        "execute_reconfigure_governance must emit exactly 1 GovernanceDeadlockRecovery leaf \
+         (checkpoint_events_since += 1 for this leaf, §9.9.3; total bump = 2)"
+    );
+
+    // Total delta = 3: GovernanceProposed (proposal lifecycle) +
+    // GovernanceReconfigured + GovernanceDeadlockRecovery (action-specific).
+    // This verifies no extra leaves sneak in from the execution path.
+    assert_eq!(
+        after_entries.len() - baseline_count,
+        3,
+        "total delta must be exactly 3 (1 proposal lifecycle leaf + 2 action-specific leaves)"
+    );
+}
+
+// =========================================================================
+// §5.14.8 / §5.14.10: RotateContentKeys on a broadcast context must emit
+// one ContentKeysRotated leaf AND one KeyEpochAdvance leaf per broadcast
+// author.  Verifies the checkpoint counter fix (Bug 2 fast-follow #2218):
+// each durable leaf bumps the counter once — a crash after the first but
+// before the second append must not leave the counter under-counted.
+// =========================================================================
+
+#[tokio::test]
+async fn rotate_content_keys_broadcast_kea_governance_integration() {
+    let manager = new_manager_with_real_event_log();
+    let ctx_id = "ctx-broadcast-rotate-kea";
+    let params = ContextParams {
+        mode: ContextMode::Broadcast,
+        memory_scope: MemoryScope::Full,
+        ceiling: governance_ceiling(),
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    // Execute RotateContentKeys as SingleAdmin (auto-approve + auto-execute).
+    let sk_alice = signing_key_for_did(&alice());
+    let (proposal, _events, result) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::RotateContentKeys { reason: None },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    let _ = proposal;
+    assert!(
+        result.is_some(),
+        "SingleAdmin must auto-execute RotateContentKeys"
+    );
+
+    // Verify event log: 1 ContentKeysRotated + 1 KeyEpochAdvance (alice is the sole author).
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let entries = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist");
+
+    let rotated_count = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::ContentKeysRotated)
+        .count();
+    let kea_count = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::KeyEpochAdvance)
+        .count();
+
+    assert_eq!(
+        rotated_count, 1,
+        "exactly 1 ContentKeysRotated leaf must be emitted"
+    );
+    assert_eq!(
+        kea_count, 1,
+        "exactly 1 KeyEpochAdvance leaf per broadcast author (alice is sole author)"
+    );
+}
+
+/// Verify that `execute_rotate_content_keys` emits one `KeyEpochAdvance` leaf
+/// per registered broadcast author and that `checkpoint_events_since` accounts
+/// for all of them.
+///
+/// This test extends the single-author variant above with a second author (bob)
+/// seeded via `Supervisor::seed_broadcast_author`, then checks that
+/// `RotateContentKeys` produces:
+/// - exactly 1 `ContentKeysRotated` leaf, and
+/// - exactly 2 `KeyEpochAdvance` leaves (one per author).
+///
+/// The total action-specific leaf delta (after subtracting `GovernanceProposed`)
+/// must equal 1 + `num_authors` = 3, which is what `checkpoint_events_since`
+/// should be incremented by.
+#[tokio::test]
+async fn rotate_content_keys_counter_multi_author() {
+    let manager = new_manager_with_real_event_log();
+    let ctx_id = "ctx-broadcast-rotate-counter-multi-author";
+    let num_authors: usize = 2;
+    let params = ContextParams {
+        mode: ContextMode::Broadcast,
+        memory_scope: MemoryScope::Full,
+        ceiling: governance_ceiling(),
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    // Add bob as a second broadcast author via the test-only seam.  This
+    // mirrors the state that a real `RotateContentKeys` with a pre-existing
+    // second author would produce.
+    manager.seed_broadcast_author(ctx_id, bob()).await.unwrap();
+
+    // Record the baseline event-log length before RotateContentKeys.
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let baseline = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist")
+        .len();
+
+    // Execute RotateContentKeys as SingleAdmin (auto-approve + auto-execute).
+    let sk_alice = signing_key_for_did(&alice());
+    let (proposal, _events, result) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::RotateContentKeys { reason: None },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    let _ = proposal;
+    assert!(
+        result.is_some(),
+        "SingleAdmin must auto-execute RotateContentKeys"
+    );
+
+    // Verify event-log leaf counts.
+    let entries = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist");
+
+    let ckr_count = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::ContentKeysRotated)
+        .count();
+    let kea_count = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::KeyEpochAdvance)
+        .count();
+
+    assert_eq!(ckr_count, 1, "exactly 1 ContentKeysRotated leaf");
+    assert_eq!(
+        kea_count, num_authors,
+        "exactly 1 KeyEpochAdvance per broadcast author ({num_authors} authors)"
+    );
+
+    // Total action-specific leaves = 1 (ContentKeysRotated) + num_authors (KEA).
+    // Subtract GovernanceProposed (always 1) from the delta to isolate execute
+    // leaves — this mirrors the checkpoint_events_since increment.
+    let total_delta = entries.len() - baseline;
+    let governance_proposed = 1_usize;
+    let action_specific_delta = total_delta - governance_proposed;
+    assert_eq!(
+        action_specific_delta,
+        1 + num_authors,
+        "checkpoint_events_since delta must be 1 + num_authors (ContentKeysRotated + KEA per author)"
+    );
+}
+
+// =========================================================================
+// §5.14.8 / §9.9.3: governance ban (execute_revoke) must bump
+// checkpoint_events_since by 1 (AccessRevoked) + N (one KeyEpochAdvance per
+// rotated broadcast author).  Two authors (alice + seeded bob); subscriber
+// carol is banned; expected delta = 1 + 2 = 3.
+// =========================================================================
+
+/// Verify that `execute_revoke` on a broadcast context with N registered
+/// authors bumps `checkpoint_events_since` by exactly 1 (for `AccessRevoked`)
+/// + N (one `KeyEpochAdvance` per rotated author).
+///
+/// Two authors are registered: alice (auto-registered at context creation) and
+/// bob (seeded via `Supervisor::seed_broadcast_author`). Carol is subscribed so
+/// there is a subscriber to ban. Banning carol triggers `governance_ban_subscriber`,
+/// which rotates BOTH authors' broadcast keys and emits 2 `KeyEpochAdvance`
+/// leaves (fail-closed, per ADR-011). The total action-specific leaf delta must
+/// therefore be 1 + 2 = 3.
+#[tokio::test]
+async fn governance_ban_subscriber_bumps_counter_per_kea() {
+    let manager = new_manager_with_real_event_log();
+    let ctx_id = "ctx-ban-counter-per-kea";
+    let num_authors: usize = 2;
+
+    let params = ContextParams {
+        mode: ContextMode::Broadcast,
+        memory_scope: MemoryScope::Full,
+        ceiling: governance_ceiling(),
+        governance: GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    // Seed bob as a second broadcast author.
+    manager.seed_broadcast_author(ctx_id, bob()).await.unwrap();
+
+    // Subscribe carol so there is a subscriber to ban.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = BroadcastCommand::SubscribeBroadcast {
+        payload: Box::new(SubscribeBroadcastPayload {
+            context_id: ctx_id.to_owned(),
+            subscriber_did: carol(),
+            ucan: None,
+            timestamp: 1_700_000_000,
+        }),
+        reply: tx,
+    };
+    manager
+        .dispatch_broadcast_command(cmd)
+        .await
+        .expect("dispatch SubscribeBroadcast for carol");
+    rx.await
+        .expect("subscribe carol reply")
+        .expect("subscribe carol succeeds");
+
+    // Baseline: count leaves present before the ban.
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let baseline = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist")
+        .len();
+
+    // Alice (SingleAdmin) bans carol with AccessScope::Both.  This auto-executes
+    // execute_revoke, which calls governance_ban_subscriber and emits:
+    //   - 1 AccessRevoked leaf (fail-closed)
+    //   - N KeyEpochAdvance leaves, one per rotated author (fail-closed, ADR-011)
+    let sk_alice = signing_key_for_did(&alice());
+    let (proposal, _events, _) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::RevokeAccess {
+                did: carol(),
+                access: AccessScope::Both,
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        proposal.status,
+        ProposalStatus::Approved,
+        "SingleAdmin RevokeAccess must auto-execute"
+    );
+
+    // Verify event-log leaf counts.
+    let entries = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist after ban");
+
+    let access_revoked_count = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::AccessRevoked)
+        .count();
+    let kea_count = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::KeyEpochAdvance)
+        .count();
+
+    assert_eq!(
+        access_revoked_count, 1,
+        "execute_revoke must emit exactly 1 AccessRevoked leaf"
+    );
+    assert_eq!(
+        kea_count, num_authors,
+        "execute_revoke must emit exactly 1 KeyEpochAdvance per rotated author ({num_authors} authors)"
+    );
+
+    // Total action-specific leaves = 1 (AccessRevoked) + num_authors (KEA).
+    // Subtract GovernanceProposed (always 1) from the delta to isolate execute
+    // leaves — this mirrors the checkpoint_events_since increment.
+    let total_delta = entries.len() - baseline;
+    let governance_proposed = 1_usize;
+    let action_specific_delta = total_delta - governance_proposed;
+    assert_eq!(
+        action_specific_delta,
+        1 + num_authors,
+        "checkpoint_events_since delta must be 1 + num_authors (AccessRevoked + KEA per author)"
+    );
+}
+
+// =========================================================================
+// §5.14.8 / §9.9.3: block_broadcast_subscriber must bump
+// checkpoint_events_since by exactly 2: 1 for the fail-closed MemberBlocked
+// leaf + 1 for the best-effort KeyEpochAdvance leaf (always succeeds on the
+// in-memory event log used in tests).
+// =========================================================================
+
+/// Verify that `block_broadcast_subscriber` bumps `checkpoint_events_since`
+/// by exactly 2 (1 for `MemberBlocked` + 1 for `KeyEpochAdvance`) when the
+/// in-memory event log always succeeds.
+///
+/// Alice (the author) blocks bob (the subscriber).  Both the fail-closed
+/// `MemberBlocked` leaf and the best-effort `KeyEpochAdvance` leaf are
+/// appended on every run (the in-memory log never fails), so the total leaf
+/// delta must be exactly 2.
+#[tokio::test]
+async fn block_broadcast_subscriber_counter() {
+    let manager = new_manager_with_real_event_log();
+    let ctx_id = "ctx-block-counter-two";
+
+    let params = ContextParams {
+        mode: ContextMode::Broadcast,
+        memory_scope: MemoryScope::Full,
+        ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
+        governance: GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    // Subscribe bob so there is a registered subscriber to block.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = BroadcastCommand::SubscribeBroadcast {
+        payload: Box::new(SubscribeBroadcastPayload {
+            context_id: ctx_id.to_owned(),
+            subscriber_did: bob(),
+            ucan: None,
+            timestamp: 1_700_000_000,
+        }),
+        reply: tx,
+    };
+    manager
+        .dispatch_broadcast_command(cmd)
+        .await
+        .expect("dispatch SubscribeBroadcast for bob");
+    rx.await
+        .expect("subscribe bob reply")
+        .expect("subscribe bob succeeds");
+
+    // Baseline: count leaves present before the block.
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let baseline = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist")
+        .len();
+
+    // Alice blocks bob.  The handler appends MemberBlocked (fail-closed) then
+    // KeyEpochAdvance (best-effort — always succeeds on in-memory log).
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = BroadcastCommand::BlockBroadcastSubscriber {
+        payload: Box::new(BroadcastBlockPayload {
+            context_id: ctx_id.to_owned(),
+            author_did: alice(),
+            subscriber_did: bob(),
+        }),
+        reply: tx,
+    };
+    manager
+        .dispatch_broadcast_command(cmd)
+        .await
+        .expect("dispatch BlockBroadcastSubscriber");
+    rx.await.expect("block reply").expect("block bob succeeds");
+
+    // Verify event-log leaf counts — each leaf corresponds to one
+    // checkpoint_events_since increment.
+    let entries = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist after block");
+
+    let total_delta = entries.len() - baseline;
+    assert_eq!(
+        total_delta, 2,
+        "checkpoint_events_since delta must be exactly 2 \
+         (1 MemberBlocked + 1 KeyEpochAdvance) after block_broadcast_subscriber"
+    );
+
+    // Verify the individual leaf types for clarity.
+    let member_blocked_count = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::MemberBlocked)
+        .count();
+    let kea_count = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::KeyEpochAdvance)
+        .count();
+    assert_eq!(member_blocked_count, 1, "exactly 1 MemberBlocked leaf");
+    assert_eq!(
+        kea_count, 1,
+        "exactly 1 KeyEpochAdvance leaf (best-effort KEA, in-memory log always succeeds)"
+    );
+}
+
+// =========================================================================
+// §5.14.10 / §9.9.3: unsubscribe_broadcast with rotate_keys=true must bump
+// checkpoint_events_since by 1 (MemberLeft) + N (one KeyEpochAdvance per
+// rotated broadcast author).  Two authors (alice + seeded bob); subscriber
+// carol unsubscribes; expected delta = 1 + 2 = 3.
+// =========================================================================
+
+/// Verify that `unsubscribe_broadcast` with `rotate_keys = true` on a
+/// broadcast context with N registered authors bumps
+/// `checkpoint_events_since` by exactly 1 (for `MemberLeft`) + N (one
+/// `KeyEpochAdvance` per rotated author).
+///
+/// Two authors are registered: alice (auto-registered at context creation)
+/// and bob (seeded via `Supervisor::seed_broadcast_author`). Carol is
+/// subscribed so there is a subscriber to unsubscribe. Carol's voluntary
+/// unsubscribe with `rotate_keys = true` triggers key rotation for BOTH
+/// authors, emitting 2 `KeyEpochAdvance` leaves plus 1 `MemberLeft` leaf.
+/// The total leaf delta must therefore be 1 + 2 = 3.
+#[tokio::test]
+async fn unsubscribe_broadcast_counter_with_kea() {
+    let manager = new_manager_with_real_event_log();
+    let ctx_id = "ctx-unsub-counter-kea";
+    let num_authors: usize = 2;
+
+    let params = ContextParams {
+        mode: ContextMode::Broadcast,
+        memory_scope: MemoryScope::Full,
+        ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    // Seed bob as a second broadcast author.
+    manager.seed_broadcast_author(ctx_id, bob()).await.unwrap();
+
+    // Subscribe carol so there is a subscriber to unsubscribe.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = BroadcastCommand::SubscribeBroadcast {
+        payload: Box::new(SubscribeBroadcastPayload {
+            context_id: ctx_id.to_owned(),
+            subscriber_did: carol(),
+            ucan: None,
+            timestamp: 1_700_000_000,
+        }),
+        reply: tx,
+    };
+    manager
+        .dispatch_broadcast_command(cmd)
+        .await
+        .expect("dispatch SubscribeBroadcast for carol");
+    rx.await
+        .expect("subscribe carol reply")
+        .expect("subscribe carol succeeds");
+
+    // Baseline: count leaves present before the unsubscribe.
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let baseline = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist")
+        .len();
+
+    // Carol unsubscribes with rotate_keys=true.  The handler appends:
+    //   - 1 MemberLeft leaf (fail-closed)
+    //   - N KeyEpochAdvance leaves, one per rotated author (best-effort)
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = BroadcastCommand::UnsubscribeBroadcast {
+        payload: Box::new(UnsubscribeBroadcastPayload {
+            context_id: ctx_id.to_owned(),
+            subscriber_did: carol(),
+            rotate_keys: true,
+        }),
+        reply: tx,
+    };
+    manager
+        .dispatch_broadcast_command(cmd)
+        .await
+        .expect("dispatch UnsubscribeBroadcast for carol");
+    rx.await
+        .expect("unsubscribe carol reply")
+        .expect("unsubscribe carol succeeds");
+
+    // Verify event-log leaf counts — each leaf corresponds to one
+    // checkpoint_events_since increment.
+    let entries = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist after unsubscribe");
+
+    let member_left_count = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::MemberLeft)
+        .count();
+    let kea_count = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::KeyEpochAdvance)
+        .count();
+
+    assert_eq!(
+        member_left_count, 1,
+        "unsubscribe_broadcast must emit exactly 1 MemberLeft leaf"
+    );
+    assert_eq!(
+        kea_count, num_authors,
+        "unsubscribe_broadcast must emit exactly 1 KeyEpochAdvance per rotated author \
+         ({num_authors} authors)"
+    );
+
+    // Total leaf delta = 1 (MemberLeft) + num_authors (KEA).
+    // This mirrors the checkpoint_events_since increment.
+    let total_delta = entries.len() - baseline;
+    assert_eq!(
+        total_delta,
+        1 + num_authors,
+        "checkpoint_events_since delta must be 1 + num_authors \
+         (MemberLeft + KEA per author)"
     );
 }

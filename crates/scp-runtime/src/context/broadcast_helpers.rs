@@ -257,9 +257,12 @@ pub async fn unsubscribe_broadcast(
     // epoch was advanced as a consequence of the unsubscription. Emit one
     // `KeyEpochAdvance` leaf per rotated author so the event log reflects the
     // new epoch state. Best-effort: a failure here does not roll back the
-    // unsubscription. `rotate_sender_key_for_block` (reused internally by
-    // `unsubscribe`) always increments by exactly 1, so `old_epoch =
+    // unsubscription (§5.14.8: voluntary unsubscribe with forward-secrecy key
+    // rotation is authorization-UPWARD-safe and is intentionally coalesced).
+    // `unsubscribe` always increments by exactly 1, so `old_epoch =
     // new_epoch.saturating_sub(1)` is exact.
+    // Bump the checkpoint counter inline per durable KEA leaf — failed best-effort
+    // leaves are never durable and must not inflate the counter (§9.9.3).
     for rotation in &result.key_rotations {
         let old_epoch = rotation.new_epoch.saturating_sub(1);
         match scp_event_log::payload::encode_payload(
@@ -286,6 +289,9 @@ pub async fn unsubscribe_broadcast(
                         error = %e,
                         "KeyEpochAdvance event-log append failed on unsubscribe (best-effort)"
                     );
+                } else {
+                    // Leaf is durable — count it immediately.
+                    *cell.class_c_view().checkpoint_events_since_mut() += 1;
                 }
             }
             Err(e) => {
@@ -719,10 +725,22 @@ pub async fn block_broadcast_subscriber(
         )
         .await?;
 
+    // MemberBlocked is fail-closed: bump the checkpoint counter immediately
+    // after the durable append above.
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
+
     // ADR-007 §5: blocking a subscriber rotates the author's sender-key epoch.
     // Append the KeyEpochAdvance leaf immediately after MemberBlocked so the
-    // two leaves are always co-located in the Merkle log. rotate_sender_key_for_block
-    // always increments by exactly 1, so old = new.saturating_sub(1) is exact.
+    // two are intended to be co-located (appended immediately after MemberBlocked
+    // when possible) in the Merkle log. rotate_sender_key_for_block always
+    // increments by exactly 1, so old = new.saturating_sub(1) is exact.
+    //
+    // A per-author unilateral block is **not** a convergent governance trigger
+    // (single-origin, not MLS-commit-ordered). ADR-011: fail-closed applies only
+    // to convergent triggers → convergent leaves. `MemberBlocked` itself is
+    // fail-closed (above) because confidentiality enforcement requires it; the
+    // companion `KeyEpochAdvance` is a trailing audit leaf on a non-convergent
+    // trigger and remains best-effort.
     let old_epoch = result.new_epoch.saturating_sub(1);
     match scp_event_log::payload::encode_payload(&scp_event_log::payload::KeyEpochAdvancePayload {
         old_epoch,
@@ -745,6 +763,9 @@ pub async fn block_broadcast_subscriber(
                     error = %e,
                     "KeyEpochAdvance event-log append failed (best-effort)"
                 );
+            } else {
+                // KEA leaf is durable — bump the counter for this leaf too.
+                *cell.class_c_view().checkpoint_events_since_mut() += 1;
             }
         }
         Err(e) => {
@@ -755,7 +776,6 @@ pub async fn block_broadcast_subscriber(
             );
         }
     }
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(result)
 }
