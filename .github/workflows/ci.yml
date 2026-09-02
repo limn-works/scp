@@ -949,10 +949,22 @@ jobs:
           python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
       - name: Run doc tests and build docs
+        # `--document-private-items` is what makes this job read a link written in a
+        # private module. Rustdoc resolves an intra-doc link only inside an item it
+        # documents, so without that flag `crates/scp-runtime/src/lib.rs`'s
+        # `#![deny(rustdoc::broken_intra_doc_links)]` fires on nothing a private module
+        # writes. All three links pull request #2274, the structured
+        # OutletErrorSurface change, broke sat in
+        # `crates/scp-runtime/src/context/outlets_helpers.rs`, a private module: this
+        # job passed, `ci` reported success, and only the advisory `SDK Docs` workflow —
+        # which passes the flag and blocks no merge — went red. That is why they rode
+        # `main` for ten days. `check_rustdoc_documents_private_items` in
+        # scripts/tests/ci-gate/ci_gate_selftest.py rejects a `cargo doc` command in any
+        # workflow of this repository that omits the flag.
         run: |
           export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           cargo test --workspace --doc --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint
-          cargo doc --workspace --no-deps --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint
+          cargo doc --workspace --no-deps --document-private-items --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint
 
   rust-deny:
     needs: changes
@@ -1655,12 +1667,17 @@ jobs:
   # tests. scripts/tests/ci-gate/run-tests.sh feeds synthetic dependency
   # results to scripts/ci-aggregate-result.py and asserts each verdict against
   # a table of its own naming which jobs a scenario selects, never against that
-  # script's reading of an `if:` condition. It also asserts four structural
-  # properties of these workflows that no single run can demonstrate: every job
-  # carries a timeout-minutes, every job is a dependency of `ci`, every
-  # `dtolnay/rust-toolchain` step names a ref that action publishes, and an
-  # `if:` naming a filter output `changes` never published stops that gate
-  # rather than holding a job at `skipped`.
+  # script's reading of an `if:` condition. It also asserts structural properties
+  # of these workflows that no single run can demonstrate. The docstring of
+  # scripts/tests/ci-gate/ci_gate_selftest.py names every one of them and the
+  # defect each one closes; six of them, as examples: every job carries a
+  # timeout-minutes, every job is a dependency of `ci`, every
+  # `dtolnay/rust-toolchain` step names a ref that action publishes, an `if:`
+  # naming a filter output `changes` never published stops that gate rather than
+  # holding a job at `skipped`, a filter gating a `--workspace` cargo command
+  # matches every member the root Cargo.toml lists, and a `cargo doc` command
+  # passes `--document-private-items` so that rustdoc reads the private modules
+  # where `scp-runtime`'s denied intra-doc links live.
   ci-workflow-selftest:
     needs: check-draft
     name: CI workflow / self-test
