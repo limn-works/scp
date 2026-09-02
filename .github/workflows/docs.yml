@@ -98,24 +98,27 @@ jobs:
               - 'rust-toolchain.toml'
               - '.cargo/**'
             docs:
-              # Manifests count: a dependency removal or a feature-flag change
-              # readily breaks a cross-crate intra-doc link in `scp-runtime`,
-              # the crate that denies `rustdoc::broken_intra_doc_links`.
+              # `rust-docs` runs `cargo doc --workspace`, which compiles every one of the
+              # 26 members the root Cargo.toml lists, so this filter names the whole
+              # `crates/` tree. The list it replaced named eleven crate directories one
+              # at a time and matched no file under `crates/scp-event-log/src/`, while
+              # `crates/scp-runtime/src/` writes 49 intra-doc links into
+              # `scp_event_log::*` and `crates/scp-runtime/src/lib.rs` denies
+              # `rustdoc::broken_intra_doc_links`. A pull request confined to
+              # scp-event-log therefore skipped `rust-docs` on the pull request and again
+              # on the push to `main`, so rustdoc could break on `main` while every job
+              # that reads it skipped. `check_workspace_scoped_filters` in
+              # scripts/tests/ci-gate/ci_gate_selftest.py reads the members out of the
+              # root manifest and fails when a filter guarding a `--workspace` command
+              # leaves one of them unmatched, so a crate added later is covered without
+              # editing this list.
+              #
+              # Manifests count for the same reason: a dependency removal or a
+              # feature-flag change readily breaks a cross-crate intra-doc link.
               - 'Cargo.toml'
               - 'Cargo.lock'
-              - 'crates/*/Cargo.toml'
+              - 'crates/**'
               - 'bindings/**'
-              - 'crates/scp-core/src/**'
-              - 'crates/scp-protocol/src/**'
-              - 'crates/scp-runtime/src/**'
-              - 'crates/scp-ffi/**'
-              - 'crates/scp-did/src/**'
-              - 'crates/scp-dht/src/**'
-              - 'crates/scp-clock/src/**'
-              - 'crates/scp-crypto/src/**'
-              - 'crates/scp-mls/src/**'
-              - 'crates/scp-client/src/**'
-              - 'crates/scp-client-wasm/src/**'
 
   # ---- Rust (rustdoc) ----
   rust-docs:
