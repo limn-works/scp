@@ -14101,10 +14101,8 @@ impl Supervisor {
     /// create path leaves it. The per-member access-key store starts empty: a
     /// joiner's access key is minted by the inviter with a random key (§9.17.2)
     /// and delivered out-of-band, not regenerable locally.
-    // Called only from `spawn_actor_from_welcome` (test-only until the FFI
-    // follow-on slice wires the FFI consumer), so it inherits the same dead-code
-    // allowance.
-    #[allow(dead_code)]
+    // Called only from `spawn_actor_from_welcome`, which the FFI slice (pull
+    // request #2036) wired to production bridge consumers.
     #[allow(clippy::too_many_lines)]
     fn build_welcome_joiner_state(
         deps: &crate::context::actor::deps::ActorDeps,

@@ -332,13 +332,12 @@ pub trait MlsBackend: Send + Sync {
     /// join — the call is rejected with a typed error, defeating a replay at
     /// the crypto layer independent of any higher-level reservation
     /// bookkeeping. On a successful join the init key is durably added to the
-    /// set. The backstop covers every join that flows through THIS method
-    /// (`MlsBackend::join_from_welcome`); the legacy
-    /// `NodeMlsFactory::join_from_welcome` path calls
-    /// `group::join_group_from_bytes` directly and is production-unreachable
-    /// (test/feature-gated, `#[cfg(any(test, feature = "testing"))]`), slated for
-    /// deletion when the spawn-from-Welcome entrypoint lands — so there is no
-    /// LIVE production gap, only a test/feature-gated path that will be removed.
+    /// set. The backstop covers every join because THIS method
+    /// (`MlsBackend::join_from_welcome`) is the only join primitive: the
+    /// ADR-049 §9(b) 2F-residual slice deleted the legacy single-slot
+    /// `NodeMlsFactory::join_from_welcome` path, which called
+    /// `group::join_group_from_bytes` directly, and
+    /// `scripts/check-deleted-primitives.sh` rejects its reintroduction.
     /// The production implementation FAILS CLOSED when no store has been
     /// attached — it never silently skips the check.
     ///
