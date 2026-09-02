@@ -78,6 +78,35 @@ export interface BridgeCredential {
 // ---------------------------------------------------------------------------
 
 /**
+ * Optional §12.2.1 registration fields.
+ *
+ * `platformKey` and `platformKeyId` travel together: cooperative mode requires
+ * both, and every other mode rejects both. A platform sends `platformKeyId` in
+ * `X-SCP-Platform-Key-Id` on every webhook request, and every webhook signature
+ * covers it (spec §12.10.2), so a cooperative bridge registered without both
+ * values could never verify a webhook signature.
+ */
+export interface BridgeRegistrationOptions {
+  /** Cooperative mode only: the platform's webhook receiver URL. */
+  readonly webhookUrl?: string;
+  /** Cooperative mode only: the platform's 32-byte Ed25519 webhook key. */
+  readonly platformKey?: Uint8Array;
+  /**
+   * Cooperative mode only: the platform's identifier for `platformKey`.
+   * Spec §12.2.1 accepts 1–128 bytes of printable US-ASCII.
+   */
+  readonly platformKeyId?: string;
+  /** Governance-configured shadow limit for this bridge (default 10,000). */
+  readonly maxShadows?: number;
+  /** Human-readable name for this bridge. */
+  readonly displayName?: string;
+  /** Free-text description of what this bridge carries. */
+  readonly description?: string;
+  /** How to reach this bridge's operator. */
+  readonly operatorContact?: string;
+}
+
+/**
  * Register a bridge connector for a context (spec §12, ADR-023).
  *
  * Wraps the NAPI `bridge_register` free function exposed on the internal
@@ -90,7 +119,12 @@ export interface BridgeCredential {
  * @param governanceDid The DID authorizing the registration.
  * @param platform The external platform identifier.
  * @param mode The bridge operating mode.
+ * @param options Optional §12.2.1 fields, including the cooperative-mode
+ *   platform key and its identifier.
  * @returns A {@link BridgeRegistration} describing the registered bridge.
+ * @throws When a cooperative registration omits `platformKey` or
+ *   `platformKeyId`, when a non-cooperative registration carries either one,
+ *   or when `platformKeyId` breaks the shape spec §12.2.1 requires.
  */
 export async function bridgeRegister(
   scp: SCP,
@@ -99,11 +133,25 @@ export async function bridgeRegister(
   governanceDid: string,
   platform: string,
   mode: BridgeMode,
+  options: BridgeRegistrationOptions = {},
 ): Promise<BridgeRegistration> {
   const bridge = await getBridge(scp);
   // The internal Bridge returns snake_case keys (matching the Rust wire
   // shape); map to the public camelCase BridgeRegistration.
-  const raw = bridge.bridgeRegister(contextId, operatorDid, governanceDid, platform, mode);
+  const raw = bridge.bridgeRegister(
+    contextId,
+    operatorDid,
+    governanceDid,
+    platform,
+    mode,
+    options.webhookUrl,
+    options.platformKey,
+    options.platformKeyId,
+    options.maxShadows,
+    options.displayName,
+    options.description,
+    options.operatorContact,
+  );
   return {
     bridgeId: raw.bridge_id,
     operatorDid: raw.operator_did,

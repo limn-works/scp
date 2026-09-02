@@ -1612,9 +1612,80 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         "api",
         "cooperative",
       ] as const satisfies readonly BridgeMode[]) {
-        const reg = addon.bridgeRegister(`ctx-${mode}`, "did:key:op", "did:key:gov", "slack", mode);
+        // Spec §12.2.1 requires a platform key plus its identifier for
+        // cooperative mode and forbids both outside it.
+        const cooperative = mode === "cooperative";
+        const reg = addon.bridgeRegister(
+          `ctx-${mode}`,
+          "did:key:op",
+          "did:key:gov",
+          "slack",
+          mode,
+          cooperative ? "https://platform.example.com/hooks" : undefined,
+          cooperative ? new Array(32).fill(7) : undefined,
+          cooperative ? "platform-key-1" : undefined,
+        );
         expect(reg.status).toBe("active");
       }
+    });
+
+    test("rejects a cooperative bridge carrying no platform key identifier", () => {
+      expect(() =>
+        addon.bridgeRegister(
+          "ctx-coop-missing-key-id",
+          "did:key:op",
+          "did:key:gov",
+          "slack",
+          "cooperative",
+          "https://platform.example.com/hooks",
+          new Array(32).fill(7),
+        ),
+      ).toThrow(/platform_key/);
+    });
+
+    // The addon declares `platform_key: Option<Vec<u8>>`, which napi-rs reads
+    // with `napi_is_array` — false for a Uint8Array. Every SDK caller reaches
+    // `bridgeRegister` through the wrapper in `src/internal/native.ts`, and
+    // that wrapper takes a Uint8Array, so this test drives the wrapper rather
+    // than the addon: calling the addon directly with a plain array cannot
+    // detect a missing conversion inside the wrapper.
+    test("registers a cooperative bridge through the wrapper, which takes a Uint8Array", () => {
+      const reg = napi.bridgeRegister(
+        "ctx-coop-wrapper",
+        "did:key:op",
+        "did:key:gov",
+        "slack",
+        "cooperative",
+        "https://platform.example.com/hooks",
+        new Uint8Array(32).fill(7),
+        "platform-key-wrapper",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+      );
+      expect(reg.status).toBe("active");
+      expect(reg.mode).toBe("cooperative");
+      expect(reg.context_id).toBe("ctx-coop-wrapper");
+    });
+
+    test("registers a non-cooperative bridge through the wrapper with no platform key", () => {
+      const reg = napi.bridgeRegister(
+        "ctx-relay-wrapper",
+        "did:key:op",
+        "did:key:gov",
+        "slack",
+        "relay",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+      );
+      expect(reg.status).toBe("active");
+      expect(reg.mode).toBe("relay");
     });
   });
 

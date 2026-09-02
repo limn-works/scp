@@ -35,7 +35,8 @@ use scp_protocol::bridge::provenance::{
     BridgeTrustLevel, evaluate_bridge_trust_level, mark_bridge_provenance,
 };
 use scp_protocol::bridge::registration::{
-    BridgeRegistrationRequest, BridgeRegistry, approve_registration, register_bridge,
+    BridgeRegistrationRequest, BridgeRegistry, approve_registration, derive_bridge_id,
+    register_bridge,
 };
 use scp_protocol::bridge::shadow::{CreateShadowParams, ShadowRegistry, create_shadow};
 use scp_protocol::bridge::{BridgeMode, BridgeStatus, ShadowProvenanceStatus};
@@ -260,40 +261,46 @@ fn bridge_registration_shadow_creation_provenance_and_claiming() {
     assert!(bridge_registry.bridges().is_empty());
 
     // -- Step 2: Register a bridge connector (operator DID, "discord", Relay mode) --
+    // Spec §12.2.1 step 3 assigns the bridge id, and `register_bridge` rejects
+    // any other value, so this test derives the id the same way.
+    let requested_at = 1_700_000_000;
+    let bridge_id = derive_bridge_id(context_id, operator_did.as_ref(), "discord", requested_at);
     let registration_request = BridgeRegistrationRequest {
-        bridge_id: "bridge-phase5-001".to_owned(),
+        bridge_id: bridge_id.clone(),
         operator_did: operator_did.clone(),
         platform: "discord".to_owned(),
         mode: BridgeMode::Relay,
         context_id: context_id.to_owned(),
-        requested_at: 1_700_000_000,
+        requested_at,
         self_hosted: false,
         webhook_url: None,
         platform_key: None,
+        platform_key_id: None,
         max_shadows: 10_000,
         metadata: scp_protocol::bridge::registration::BridgeRegistrationMetadata::default(),
     };
 
     let reg_event = register_bridge(&mut bridge_registry, registration_request)
         .expect("bridge registration should succeed");
-    assert_eq!(reg_event.bridge_id, "bridge-phase5-001");
+    assert_eq!(reg_event.bridge_id, bridge_id);
     assert_eq!(bridge_registry.pending_requests().len(), 1);
 
     // -- Step 3: Governance approves the registration --
-    let (connector, approval_event) = approve_registration(
+    let (approved, approval_event) = approve_registration(
         &mut bridge_registry,
-        "bridge-phase5-001",
+        &bridge_id,
         &governance_did,
         1_700_000_001,
     )
     .expect("bridge approval should succeed");
 
-    assert_eq!(connector.bridge_id, "bridge-phase5-001");
+    let connector = approved.into_parts().0;
+    assert_eq!(connector.bridge_id, bridge_id);
     assert_eq!(connector.platform, "discord");
     assert_eq!(connector.mode, BridgeMode::Relay);
     assert_eq!(connector.status, BridgeStatus::Active);
     assert_eq!(connector.operator_did, operator_did);
-    assert_eq!(approval_event.bridge_id, "bridge-phase5-001");
+    assert_eq!(approval_event.bridge_id, bridge_id);
     assert_eq!(bridge_registry.bridges().len(), 1);
     assert!(bridge_registry.pending_requests().is_empty());
 
@@ -305,7 +312,7 @@ fn bridge_registration_shadow_creation_provenance_and_claiming() {
     let mut sender_key_store = SenderKeyStore::new();
     let shadow_params = CreateShadowParams {
         shadow_id,
-        bridge_id: "bridge-phase5-001",
+        bridge_id: &bridge_id,
         bridge_mode: BridgeMode::Relay,
         platform_handle,
         context_member_dids: &[],
@@ -317,7 +324,7 @@ fn bridge_registration_shadow_creation_provenance_and_claiming() {
 
     assert_eq!(shadow.shadow_id, shadow_id);
     assert_eq!(shadow.platform_handle, platform_handle);
-    assert_eq!(shadow.bridge_id, "bridge-phase5-001");
+    assert_eq!(shadow.bridge_id, bridge_id);
     assert_eq!(shadow.attributed_role, "observer");
     assert_eq!(shadow.provenance_status, ShadowProvenanceStatus::Shadow);
     assert_eq!(creation_event.shadow_id, shadow_id);
@@ -347,7 +354,7 @@ fn bridge_registration_shadow_creation_provenance_and_claiming() {
         ShadowProvenanceStatus::Shadow
     );
     assert_eq!(bridge_provenance.originating_platform, "discord");
-    assert_eq!(bridge_provenance.bridge_connector_id, "bridge-phase5-001");
+    assert_eq!(bridge_provenance.bridge_connector_id, bridge_id);
     assert_eq!(bridge_provenance.operator_did, operator_did);
     assert_eq!(bridge_provenance.bridge_mode, BridgeMode::Relay);
 
@@ -747,6 +754,7 @@ fn cross_adr_bridge_provenance_carries_correct_metadata() {
         status: BridgeStatus::Active,
         registration_context: "ctx-cross-test".to_owned(),
         registered_at: 1_700_000_000,
+        max_shadows: 10_000,
     };
 
     let shadow = scp_protocol::bridge::ShadowIdentity {

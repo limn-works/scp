@@ -1609,6 +1609,7 @@ fn conf_036_bridge_registration() {
         status: BridgeStatus::Active,
         registration_context: "gov-context".to_owned(),
         registered_at: 1_700_000_000,
+        max_shadows: 10_000,
     };
 
     print_step(2, "Verify bridge status is Active");
@@ -1694,6 +1695,7 @@ fn conf_038_bridged_provenance() {
         status: BridgeStatus::Active,
         registration_context: "reg-ctx".to_owned(),
         registered_at: 1_700_000_000,
+        max_shadows: 10_000,
     };
 
     use scp_core::bridge::ShadowProvenanceStatus;

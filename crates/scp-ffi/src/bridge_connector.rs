@@ -118,6 +118,10 @@ fn credential_store_for(bi: &PyBridgeInstance) -> PyResult<FfiCredentialStore> {
 ///   URL (spec §12.2.1). `None` for non-cooperative modes.
 /// * `platform_key` -- For cooperative mode: the platform's Ed25519 public
 ///   key as 32 bytes (spec §12.2.1, §12.10.2). `None` for non-cooperative modes.
+/// * `platform_key_id` -- For cooperative mode: the platform's identifier for
+///   `platform_key` (spec §12.2.1, §12.10.2). A platform sends it in
+///   `X-SCP-Platform-Key-Id` on a webhook request and every webhook signature
+///   covers it. `None` for non-cooperative modes.
 /// * `max_shadows` -- Governance-configured shadow limit for this bridge
 ///   (spec §12.2.1). Defaults to 10,000.
 /// * `metadata_display_name` -- Human-readable display name for the bridge.
@@ -135,7 +139,10 @@ fn credential_store_for(bi: &PyBridgeInstance) -> PyResult<FfiCredentialStore> {
 /// structure, method not lowercase alphanumeric, or contains control
 /// characters), or if `mode` is not recognized.
 /// Raises `ContextError` if the governance DID matches the operator DID
-/// (self-approval) or if registration fails.
+/// (self-approval), if a cooperative registration omits `platform_key` or
+/// `platform_key_id`, if a non-cooperative registration carries either one, or
+/// if registration fails. Spec §12.2.1 requires both cooperative-mode fields
+/// together and forbids both outside cooperative mode.
 #[pyfunction]
 #[pyo3(name = "bridge_register")]
 #[pyo3(signature = (
@@ -146,6 +153,7 @@ fn credential_store_for(bi: &PyBridgeInstance) -> PyResult<FfiCredentialStore> {
     mode,
     webhook_url=None,
     platform_key=None,
+    platform_key_id=None,
     max_shadows=10_000,
     metadata_display_name="",
     metadata_description="",
@@ -161,6 +169,7 @@ pub fn py_bridge_register(
     mode: &str,
     webhook_url: Option<&str>,
     platform_key: Option<Vec<u8>>,
+    platform_key_id: Option<&str>,
     max_shadows: u32,
     metadata_display_name: &str,
     metadata_description: &str,
@@ -196,6 +205,7 @@ pub fn py_bridge_register(
         self_hosted: false,
         webhook_url: webhook_url.map(String::from),
         platform_key: parsed_platform_key,
+        platform_key_id: platform_key_id.map(String::from),
         max_shadows,
         metadata: BridgeRegistrationMetadata {
             display_name: metadata_display_name.to_string(),
@@ -210,7 +220,7 @@ pub fn py_bridge_register(
     })?;
 
     let approver_did: scp_did::DID = governance_did.into();
-    let (connector, _approval_event) =
+    let (approved, _approval_event) =
         approve_registration(&mut registry, &bridge_id, &approver_did, 0).map_err(|e| {
             ScpPyError::ContextError {
                 message: format!("bridge approval failed: {e}"),
@@ -219,7 +229,7 @@ pub fn py_bridge_register(
         })?;
 
     let dict = PyDict::new(py);
-    dict.set_item("bridge_id", &connector.bridge_id)?;
+    dict.set_item("bridge_id", &approved.connector().bridge_id)?;
     dict.set_item("operator_did", operator_did)?;
     dict.set_item("platform", platform)?;
     dict.set_item("mode", mode)?;
@@ -288,6 +298,7 @@ pub fn py_bridge_evaluate_trust(
         status: BridgeStatus::Active,
         registration_context: String::new(),
         registered_at: 0,
+        max_shadows: 10_000,
     };
 
     let shadow = ShadowIdentity {
@@ -607,6 +618,7 @@ pub fn py_bridge_seal_shadow_envelope(
         status: BridgeStatus::Active,
         registration_context: context_id.to_string(),
         registered_at: 0,
+        max_shadows: 10_000,
     };
 
     let base_provenance = DataProvenance {
@@ -1517,6 +1529,7 @@ mod tests {
                 "relay",
                 None,
                 None,
+                None,
                 10_000,
                 "",
                 "",
@@ -1551,6 +1564,7 @@ mod tests {
                 "relay",
                 None,
                 None,
+                None,
                 10_000,
                 "",
                 "",
@@ -1573,6 +1587,7 @@ mod tests {
                 "cooperative",
                 Some("https://example.com/webhook"),
                 Some(vec![42u8; 32]),
+                Some("platform-key-1"),
                 500,
                 "My Discord Bridge",
                 "Bridges #general channel",
@@ -1598,6 +1613,7 @@ mod tests {
                 "cooperative",
                 None,
                 Some(vec![42u8; 16]), // wrong length
+                Some("platform-key-1"),
                 10_000,
                 "",
                 "",

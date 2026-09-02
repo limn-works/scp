@@ -313,6 +313,7 @@ mod tests {
             status: BridgeStatus::Active,
             registration_context: "ctx-reg".to_string(),
             registered_at: 1_700_000_000,
+            max_shadows: 10_000,
         }
     }
 

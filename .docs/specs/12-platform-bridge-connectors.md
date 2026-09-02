@@ -55,18 +55,34 @@ RegisterBridge {
   mode:            BridgeMode,       // Relay | Puppet | API | Cooperative
   webhook_url:     Option<String>,   // for cooperative mode: platform's webhook receiver URL
   platform_key:    Option<[u8; 32]>, // for cooperative mode: platform's Ed25519 public key
+  platform_key_id: Option<String>,   // for cooperative mode: platform's identifier for platform_key
   max_shadows:     u32,              // governance-configured shadow limit for this bridge
   metadata:        BridgeMetadata,   // display name, description, operator contact
 }
 ```
 
+**Cooperative-mode fields.** A proposal whose `mode` is `Cooperative` MUST carry both `platform_key` and `platform_key_id`; a proposal that omits either one MUST be rejected at submission. `platform_key_id` is what a platform sends in `X-SCP-Platform-Key-Id` on every webhook request (§12.10.2), and a bridge node stores `platform_key` under that identifier, so a cooperative bridge registered without both values can never verify a webhook signature. `platform_key_id` MUST be 1–128 bytes of printable US-ASCII (`0x21`–`0x7E`), which keeps it usable as an HTTP header value and keeps it free of `0x00`, a byte §12.10.2 reserves as a delimiter in a signed payload. Non-cooperative modes leave both fields absent.
+
 **Registration flow:**
 
 1. The bridge operator submits a `RegisterBridge` proposal to the context via the standard governance mechanism (§5.9). The operator MUST be a context member or hold a valid UCAN granting `bridging` capability in the context.
 2. The context's governance model processes the proposal (SingleAdmin: admin approves; Threshold/MajorityVote/Unanimity: members vote).
-3. On approval, the context emits a `BridgeRegistered` event in the Merkle event log containing the full `RegisterBridge` payload, the approving governance action ID, and the assigned `bridge_id` (lowercase hex-encoded SHA-256 of `context_id || operator_did || platform || timestamp`). The result is a 64-character hex string carried as `String` on the wire (see §12.12).
+3. On approval, the context emits a `BridgeRegistered` event in the Merkle event log containing the full `RegisterBridge` payload, the approving governance action ID, and the assigned `bridge_id`. That identifier is the lowercase hex-encoded SHA-256 of a **length-prefixed** concatenation:
+
+   ```
+   u64_be(len(context_id))  || context_id
+   u64_be(len(operator_did)) || operator_did
+   u64_be(len(platform))     || platform
+   u64_be(requested_at)
+   ```
+
+   Every length and the timestamp are eight big-endian bytes. `requested_at` comes from that request, not from approval, because a pending request is keyed on its own identifier before any approval timestamp exists.
+
+   A length prefix is what makes this derivation injective. Concatenating three variable-length strings without one lets two different registrations produce one identifier: context `ctx-a` with operator `bc` and context `ctx-ab` with operator `c` flatten to the same bytes. A bridge identifier decides which context a request acts inside and which operator a token must come from, so two registrations sharing one identifier would let either reach the other's scope. §12.10.2's signed webhook payload separates its segments for the same reason.
+
+   The result is a 64-character hex string carried as `String` on the wire (see §12.12). Submission MUST reject a request whose `bridge_id` differs from that derivation, so one identifier names exactly one registration and no caller picks an identifier that a different context, operator, platform, or request time derives.
 4. The context metadata is republished with the new bridge in the `bridges` structural field (§5.7).
-5. For cooperative mode: the bridge node stores the `platform_key` for webhook signature verification (§12.10.2).
+5. For cooperative mode: the bridge node stores `platform_key` under `platform_key_id`, associated with this bridge instance, and verifies webhook signatures against it (§12.10.2).
 
 **Bridge status state machine:**
 
@@ -97,7 +113,7 @@ RevokeBridge {
 3. The bridge's `BridgeStatus` transitions to `Revoked`.
 4. If `destroy_shadows` is true: all shadow identities associated with this bridge are retired. Each shadow retirement emits a `ShadowRetired` event. Historical actions attributed to shadows remain in the event log with their original provenance.
 5. If `destroy_shadows` is false: shadows persist but are orphaned — no new messages can be emitted through them, but their historical attributions remain.
-6. The credential store for this bridge instance MUST destroy all delegated credentials (§12.11.1 Phase 5).
+6. The credential store for this bridge instance MUST destroy all delegated credentials (§12.11.1 Phase 5). A bridge node MUST also delete every webhook signing key it stored against this bridge (§12.10.2), so a platform holding a revoked bridge's key can no longer authenticate a webhook request. A bridge node MUST keep that revoked bridge's `BridgeConnector` record in `Revoked` status rather than deleting it, because §12.2.1 makes `Revoked` terminal and a deleted record would let a re-registration under that same `bridge_id` return that bridge to `Active`.
 7. In-flight messages from shadows that have not yet been committed to the event log are dropped. The bridge node receives a `BRIDGE_SUSPENDED` or `BRIDGE_FORBIDDEN` error on subsequent API calls.
 8. Context metadata is republished with the bridge removed from the `bridges` field.
 
@@ -367,15 +383,25 @@ X-SCP-Platform-Key-Id: <platform's signing key identifier>
 X-SCP-Timestamp: <Unix timestamp in seconds>
 ```
 
-**Canonical payload construction.** The signed payload is constructed as: `timestamp_bytes || raw_request_body_bytes`, where `timestamp_bytes` is the ASCII decimal representation of the `X-SCP-Timestamp` value. This prevents replay attacks — the bridge node MUST reject requests where `X-SCP-Timestamp` differs from the current time by more than 300 seconds (5 minutes).
+**Canonical payload construction.** A platform signs this payload:
 
-**Platform key registration mechanism.** The platform's Ed25519 public key is registered during bridge setup via the `RegisterBridge` governance action (§12.2.1), which includes an optional `platform_key: Option<[u8; 32]>` field. For cooperative mode, this field is REQUIRED. The key exchange flow:
+```
+key_id_bytes || 0x00 || timestamp_bytes || 0x00 || raw_request_body_bytes
+```
 
-1. Before registration, the bridge operator and platform operator exchange the platform's Ed25519 public key out-of-band (e.g., via the platform's developer console, an API call to the platform, or manual configuration).
-2. The bridge operator includes the `platform_key` in the `RegisterBridge` proposal.
-3. On governance approval, the bridge node stores the platform key associated with the bridge instance.
-4. All subsequent webhook requests from the platform are verified against this key.
-5. Key rotation: the platform publishes a new key by having the bridge operator submit a `UpdateBridgePlatformKey { bridge_id, new_platform_key }` governance action. During the rotation period (24 hours), the bridge node accepts signatures from either key.
+`key_id_bytes` is an ASCII `X-SCP-Platform-Key-Id` value and `timestamp_bytes` is an ASCII decimal representation of an `X-SCP-Timestamp` value. A bridge node MUST reject a request whose `X-SCP-Platform-Key-Id` or `X-SCP-Timestamp` carries a `0x00` byte, so both delimiters split a payload exactly one way.
+
+Covering a timestamp stops a captured request from replaying against its own bridge: a bridge node MUST reject a request whose `X-SCP-Timestamp` differs from current time by more than 300 seconds (5 minutes).
+
+Covering a key id stops that captured request from replaying against a second bridge. `X-SCP-Platform-Key-Id` selects which registered key a node verifies against, and each registered key names one bridge instance inside one context (§12.2.1 step 5), so that header decides which context a node applies an event to. One platform bridging into two contexts registers one Ed25519 key twice, once per bridge, under two key identifiers. Leaving a key id outside a signed payload lets whoever captures a request that a platform signed for a first bridge swap that header and replay it into a second bridge's context, because one key backs both identifiers and a signature over `timestamp || body` alone still verifies. Covering a key id makes each signature valid for exactly one registered key.
+
+**Platform key registration mechanism.** A platform's Ed25519 public key is registered during bridge setup via a `RegisterBridge` governance action (§12.2.1), which carries `platform_key: Option<[u8; 32]>` and `platform_key_id: Option<String>`. For cooperative mode, both fields are REQUIRED. Key exchange runs this way:
+
+1. Before registration, a bridge operator and a platform operator exchange that platform's Ed25519 public key together with an identifier that platform uses for it, out-of-band (e.g., via a platform developer console, an API call to that platform, or manual configuration).
+2. That bridge operator puts both `platform_key` and `platform_key_id` in a `RegisterBridge` proposal.
+3. On governance approval, a bridge node stores that platform key under `platform_key_id`, associated with this bridge instance. A bridge node MUST reject a registration whose `platform_key_id` already names a different bridge instance on that node, because one identifier naming two bridges leaves a node unable to decide which context a signed request acts inside.
+4. A bridge node verifies every subsequent webhook request from that platform against whichever key `X-SCP-Platform-Key-Id` names, and restricts that request to whichever bridge instance and context that key names.
+5. Key rotation: a platform publishes a new key by having a bridge operator submit an `UpdateBridgePlatformKey { bridge_id, new_platform_key, new_platform_key_id }` governance action. `new_platform_key_id` MUST differ from an identifier this bridge's current key sits under, so a request signed under either key names exactly one of them. During a 24-hour rotation period, a bridge node accepts signatures under either identifier; at rotation close, a bridge node deletes an outgoing identifier.
 
 ### 12.10.3 Error Format
 
@@ -725,7 +751,11 @@ The `context.event` generic fallback carries only the variant name so that new `
 
 The bridge node mediates between the platform's HTTP API and SCP protocol operations. The lifecycle is:
 
-1. **Registration.** The bridge operator registers the bridge with an SCP context via `register_bridge()` (§12.2). The registration includes the platform's webhook URL and authentication credentials.
+1. **Registration.** A bridge operator registers a bridge with an SCP context via `register_bridge()` (§12.2). That registration carries a platform webhook URL and authentication credentials. Once governance approves it, that operator admits an approved registration into whichever bridge node serves those endpoints, and that node stores three records: an approved `BridgeConnector`, an operator DID document that §12.10.2 bearer-token verification resolves `iss` against, and, for cooperative mode, `platform_key` under `platform_key_id`. A bridge node that holds no such record for a bridge answers `BRIDGE_NOT_AUTHORIZED` (401) to every request naming it, so admission is what turns an approved registration into a bridge a platform can reach.
+
+   **A bridge node MUST decide a lifecycle question from durable storage, not from a cache.** §12.2.1 makes `Revoked` terminal and §12.2.2 step 6 destroys a revoked bridge's signing keys, and both guarantees rest on a node reading a record it already holds. A node that cannot read its bridge registry MUST fail to start rather than serve those endpoints against a record set it knows is incomplete, because an admission decided against an empty view returns a revoked bridge to `Active` and moves one bridge's `platform_key_id` onto a second bridge.
+
+   **A bridge node MUST NOT substitute key material through admission.** Re-admitting a registration a node already holds is how an operator replays after a partial failure or a restart, so it carries a stored lifecycle status forward and changes nothing. A registration that carries different key material under a stored `platform_key_id` is a rotation, and §12.10.2 step 5 routes a rotation through `UpdateBridgePlatformKey`, so admission rejects it.
 2. **Shadow creation.** The bridge node calls `POST /v1/scp/bridge/shadow` to create shadow identities for platform participants as they become relevant to the context.
 3. **Bidirectional message flow.** SCP-to-platform: the bridge operator receives and decrypts SCP messages as an MLS group member, translates them to the platform's native format, and forwards them via the platform's API (§12.10.5). Platform-to-SCP: the platform pushes events via the webhook endpoint, and the bridge node constructs SCP envelopes with bridge provenance (§12.10.4).
 4. **Attestation.** The platform attests to user identities via `POST /v1/scp/bridge/attest`. These attestations strengthen the trust evaluation for cooperative-mode shadows.
@@ -908,6 +938,7 @@ This section tabulates the wire format for all bridge protocol types that cross 
 | `status` | `BridgeStatus` | Yes | Current lifecycle state. |
 | `registration_context` | `String` | Yes | Context ID where the bridge is registered. |
 | `registered_at` | `u64` | Yes | Unix timestamp (seconds). |
+| `max_shadows` | `u32` | Yes | Governance-configured shadow limit, copied from the approved `RegisterBridge` request (§12.2.1). Shadow creation MUST count a bridge's own shadows against this limit rather than against a registry default. |
 
 ### 12.12.2 Bridge Registration
 
@@ -915,13 +946,18 @@ This section tabulates the wire format for all bridge protocol types that cross 
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
-| `bridge_id` | `String` | Yes | Proposed bridge identifier. |
+| `bridge_id` | `String` | Yes | Bridge identifier, derived per §12.2.1 step 3 as lowercase hex SHA-256 over a length-prefixed concatenation of `context_id`, `operator_did`, `platform`, and `requested_at`. A request carrying any other value MUST be rejected, so no caller picks an identifier. |
 | `operator_did` | `String` (DID) | Yes | Operator's DID. |
 | `platform` | `String` | Yes | Target platform. |
 | `mode` | `BridgeMode` | Yes | Requested operating mode. |
 | `context_id` | `String` | Yes | Context to register with. |
 | `requested_at` | `u64` | Yes | Unix timestamp (seconds). |
 | `self_hosted` | `bool` | Yes | Whether the operator runs bridge infrastructure. |
+| `webhook_url` | `Option<String>` | Cooperative mode only | Platform webhook receiver URL. |
+| `platform_key` | `Option<[u8; 32]>` | Cooperative mode only | Platform Ed25519 webhook signing key. |
+| `platform_key_id` | `Option<String>` | Cooperative mode only | Platform identifier for `platform_key`; 1–128 bytes of printable US-ASCII, sent as `X-SCP-Platform-Key-Id` (§12.10.2). |
+| `max_shadows` | `u32` | Yes | Governance-configured shadow limit for this bridge. |
+| `metadata` | `BridgeRegistrationMetadata` | Yes | Display name, description, operator contact. |
 
 **`RegistrationDecision`** — Governance decision on bridge registration.
 

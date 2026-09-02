@@ -640,7 +640,16 @@ jobs:
           # in-memory custody tests run. Mobile production builds (iOS
           # XCFramework, Android .aar) MUST NOT enable this feature.
           # See GitHub issue #88.
-          cargo nextest run --workspace --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/testing,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/testing,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/testing,scp-ffi-uniffi/outlet-capability-test-grant
+          #
+          # scp-node/testing gates ApplicationNode::dev, which every
+          # crates/scp-node test that drives a whole node builds through —
+          # crates/scp-node/tests/bridge_registration_wiring.rs among them.
+          # Without that feature those tests compile to empty binaries and
+          # assert nothing. A shipped node build still never enables it
+          # (ADR-062 §Decision 1 keeps it out of every default feature list),
+          # so the in-memory DHT test double stays absent from shipped
+          # artifacts; this line enables it for a test lane only.
+          cargo nextest run --workspace --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/testing,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/testing,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/testing,scp-ffi-uniffi/outlet-capability-test-grant,scp-node/testing
           # Test scp-transport with optional features that aren't enabled by
           # --workspace (combined includes rusqlite + scp-platform; local-cache
           # enables caching logic).
