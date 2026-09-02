@@ -22,7 +22,7 @@ use futures::StreamExt;
 use openmls::prelude::KeyPackageIn;
 use scp_core::crypto::mls::credential::ScpCredential;
 use scp_core::crypto::mls::group::ScpMlsGroup;
-use scp_core::crypto::mls::group::{add_member, create_group, generate_key_package, join_group};
+use scp_core::crypto::mls::group::{add_member, create_group, join_group};
 use scp_core::crypto::sender_keys::{
     HandleRequestParams, NonceDedup, SenderKeyRequest, SenderKeyResponse, SenderKeyStore,
     generate_sender_key, handle_sender_key_request, open_sender_key_response,

@@ -68,6 +68,19 @@ use crate::context::providers::event_log::MerkleEventLogProvider;
 use crate::context::supervisor::Supervisor;
 use crate::context::supervisor::key_package_actor::KeyPackageCommand;
 
+/// Registers a `KeyPackage`-attestation signer for `did` on `sup`.
+///
+/// §9.7.1 binds a pooled leaf to its DID through a signed `0xFF03` attestation,
+/// and the `KeyPackage` actor refuses to mint without a signer, so every fixture
+/// that reserves a real `KeyPackage` calls this first.
+async fn register_attestation_signer(sup: &Arc<Supervisor>, did: &DID) {
+    sup.set_attestation_signer(
+        did.clone(),
+        Arc::new(crate::crypto::mls::attestation_signer::TestAttestationSigner::generate().0),
+    )
+    .await;
+}
+
 /// Alice's (creator) fixed bundle-signing key. The bootstrap resolver maps
 /// `alice_did` to its verifying key so the joiner can verify the creator-signed
 /// invitation bundle.
@@ -273,6 +286,9 @@ pub fn stand_up_two_party(ctx_str: &str, alice_did: &str, bob_did: &str) -> TwoP
                 )
                 .await
                 .expect("publish bob's wrapping key");
+
+            register_attestation_signer(&bob_sup, &bob).await;
+
             let (reservation_id, kp_public_bytes) = bob_sup
                 .reserve_key_package(bob.clone())
                 .await

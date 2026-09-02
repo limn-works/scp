@@ -64,7 +64,7 @@ pub trait RelayExt {
 impl RelayExt for Relay {
     fn new_party(&self, did: &str, offset: u64) -> Party {
         let (conn, sink) = self.connect();
-        let signer = Arc::new(LocalSigner::active(did));
+        let signer = Arc::new(LocalSigner::active_for_testing(did));
         let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
         let clock: Arc<dyn Clock> = Arc::new(TestClock::new(SystemClock.now_secs() + offset));
         let client = ScpClient::new(signer, storage, clock, sink).expect("construct client");

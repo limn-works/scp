@@ -262,7 +262,8 @@ mod seal_open_tests {
     use crate::envelope::inner::{InnerEnvelopeParams, MessageType, Provenance};
     use scp_did::SigningKeyId;
     use scp_mls::credential::ScpCredential;
-    use scp_mls::group::{add_member, create_group, generate_key_package, join_group};
+    use scp_mls::group::{add_member, create_group, join_group};
+    use scp_mls::mint_key_package_for_testing;
     use scp_protocol::crypto::sender_keys::generate_sender_key;
     use scp_protocol::envelope::padding::strip_padding;
 
@@ -283,8 +284,13 @@ mod seal_open_tests {
         let mut alice_group = create_group(&alice_cred, &scp_clock::SystemClock).unwrap();
 
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, bob_signer, bob_provider) =
-            generate_key_package(&bob_cred, &scp_clock::SystemClock).unwrap();
+        let (bob_kp_bundle, bob_signer, bob_provider) = mint_key_package_for_testing(
+            &bob_cred,
+            &[0x5C; 32],
+            &scp_clock::SystemClock,
+            &ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng),
+        )
+        .unwrap();
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
 
         let add_result = add_member(&mut alice_group, bob_kp, &scp_clock::SystemClock).unwrap();

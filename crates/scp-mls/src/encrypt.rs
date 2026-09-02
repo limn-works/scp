@@ -934,10 +934,19 @@ mod tests {
     use super::*;
     use crate::credential::ScpCredential;
     use crate::group::{
-        add_member, add_member_with_convergent_timestamp, create_group, generate_key_package,
-        generate_key_package_with_wrapping_key, join_group,
+        SCP_CIPHERSUITE, add_member, add_member_with_convergent_timestamp, create_group, join_group,
     };
+    use crate::keypackage_mint::mint_key_package_for_testing;
+    use crate::lifetime::key_package_lifetime;
+    use ed25519_dalek::SigningKey;
+    use openmls_basic_credential::SignatureKeyPair;
+    use rand::rngs::OsRng;
     use scp_clock::{SystemClock, TestClock};
+
+    /// Distinct 32-byte X25519 wrapping public keys, one per test member, so no
+    /// two leaves in one test carry the same `0xFF01` value.
+    const BOB_WRAPPING_KEY: [u8; 32] = [0xB0; 32];
+    const CAROL_WRAPPING_KEY: [u8; 32] = [0xC0; 32];
 
     #[allow(clippy::unwrap_used)]
     fn test_credential(name: &str) -> ScpCredential {
@@ -957,8 +966,10 @@ mod tests {
         let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
 
         let bob_cred = test_credential("bob");
+        let bob_att_key = SigningKey::generate(&mut OsRng);
         let (bob_kp_bundle, bob_signer, bob_provider) =
-            generate_key_package(&bob_cred, &SystemClock).unwrap();
+            mint_key_package_for_testing(&bob_cred, &BOB_WRAPPING_KEY, &SystemClock, &bob_att_key)
+                .unwrap();
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
 
         let add_result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
@@ -1203,8 +1214,10 @@ mod tests {
         let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
 
         let bob_cred = test_credential("bob");
+        let bob_att_key = SigningKey::generate(&mut OsRng);
         let (bob_kp_bundle, bob_signer, bob_provider) =
-            generate_key_package(&bob_cred, &SystemClock).unwrap();
+            mint_key_package_for_testing(&bob_cred, &BOB_WRAPPING_KEY, &SystemClock, &bob_att_key)
+                .unwrap();
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
 
         let add_result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
@@ -1277,8 +1290,10 @@ mod tests {
         let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
 
         let bob_cred = test_credential("bob");
+        let bob_att_key = SigningKey::generate(&mut OsRng);
         let (bob_kp_bundle, bob_signer, bob_provider) =
-            generate_key_package(&bob_cred, &SystemClock).unwrap();
+            mint_key_package_for_testing(&bob_cred, &BOB_WRAPPING_KEY, &SystemClock, &bob_att_key)
+                .unwrap();
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
         let add_bob = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
         let mut bob_group = join_group(&add_bob.welcome, bob_provider, bob_signer).unwrap();
@@ -1288,8 +1303,9 @@ mod tests {
         // scp_wrapping_key leaf extension, or the fail-closed add-extraction in
         // decrypt_with_membership_changes rejects the add pre-merge (INVARIANT 3).
         let carol_wk = [0xCC_u8; 32];
+        let carol_att_key = SigningKey::generate(&mut OsRng);
         let (carol_kp_bundle, _carol_signer, _carol_provider) =
-            generate_key_package_with_wrapping_key(&carol_cred, Some(&carol_wk), &SystemClock)
+            mint_key_package_for_testing(&carol_cred, &carol_wk, &SystemClock, &carol_att_key)
                 .unwrap();
         let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
         // ADR-057: the add-Carol commit binds a convergent timestamp into
@@ -1348,8 +1364,9 @@ mod tests {
 
         let bob_cred = test_credential("bob");
         let bob_wk = [0xBB_u8; 32];
+        let bob_att_key = SigningKey::generate(&mut OsRng);
         let (bob_kp_bundle, bob_signer, bob_provider) =
-            generate_key_package_with_wrapping_key(&bob_cred, Some(&bob_wk), &SystemClock).unwrap();
+            mint_key_package_for_testing(&bob_cred, &bob_wk, &SystemClock, &bob_att_key).unwrap();
         let add_bob = add_member(
             &mut alice_group,
             bob_kp_bundle.key_package().clone().into(),
@@ -1358,10 +1375,38 @@ mod tests {
         .unwrap();
         let mut bob_group = join_group(&add_bob.welcome, bob_provider, bob_signer).unwrap();
 
-        // Carol's KeyPackage has NO wrapping key (plain generate_key_package).
+        // Carol's KeyPackage carries NO scp_wrapping_key leaf extension — the
+        // deficiency this test exercises. `mint_key_package_for_testing` cannot
+        // produce it: §9.5.2 field 5 binds the 0xFF01 value into the attestation,
+        // so the mint requires a wrapping key and always attaches one. The leaf
+        // is therefore built here directly, with default capabilities and no
+        // leaf extensions, and Alice's group is a plain (no-0xFF02) group, so
+        // openmls accepts the Add and the SCP-layer pre-merge check is what
+        // rejects it.
         let carol_cred = test_credential("carol");
-        let (carol_kp_bundle, _carol_signer, _carol_provider) =
-            generate_key_package(&carol_cred, &SystemClock).unwrap();
+        let carol_provider = crate::InMemoryMlsProvider::default();
+        let carol_signer = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm()).unwrap();
+        carol_signer.store(carol_provider.storage()).unwrap();
+        let carol_kp_bundle = KeyPackage::builder()
+            .key_package_lifetime(key_package_lifetime(&SystemClock))
+            .build(
+                SCP_CIPHERSUITE,
+                &carol_provider,
+                &carol_signer,
+                CredentialWithKey {
+                    credential: BasicCredential::new(carol_cred.to_bytes().unwrap()).into(),
+                    signature_key: carol_signer.to_public_vec().into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            crate::wrapping_extension::extract_wrapping_key(
+                carol_kp_bundle.key_package().leaf_node().extensions()
+            )
+            .unwrap(),
+            None,
+            "the fixture leaf must carry no scp_wrapping_key, or the test proves nothing"
+        );
         let add_carol = add_member_with_convergent_timestamp(
             &mut alice_group,
             carol_kp_bundle.key_package().clone().into(),
@@ -1398,8 +1443,10 @@ mod tests {
         let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
 
         let bob_cred = test_credential("bob");
+        let bob_att_key = SigningKey::generate(&mut OsRng);
         let (bob_kp_bundle, bob_signer, bob_provider) =
-            generate_key_package(&bob_cred, &SystemClock).unwrap();
+            mint_key_package_for_testing(&bob_cred, &BOB_WRAPPING_KEY, &SystemClock, &bob_att_key)
+                .unwrap();
         let add_bob = add_member(
             &mut alice_group,
             bob_kp_bundle.key_package().clone().into(),
@@ -1412,8 +1459,9 @@ mod tests {
         // ADR-057 sender-key distribution INVARIANT 3: Carol's KeyPackage must
         // publish an scp_wrapping_key leaf extension so Bob's add-Carol receive
         // (a Commit-arm decrypt) accepts pre-merge.
+        let carol_att_key = SigningKey::generate(&mut OsRng);
         let (carol_kp_bundle, _carol_signer, _carol_provider) =
-            generate_key_package_with_wrapping_key(&carol_cred, Some(&[0xCC_u8; 32]), &SystemClock)
+            mint_key_package_for_testing(&carol_cred, &[0xCC_u8; 32], &SystemClock, &carol_att_key)
                 .unwrap();
         // ADR-057: bind a convergent timestamp so Bob's add-Carol receive
         // (a Commit-arm decrypt) accepts.
@@ -1594,7 +1642,14 @@ mod tests {
 
         // Carol's KP is minted at real-now (not_after ~ real-now + 84d).
         let carol_cred = test_credential("carol");
-        let (carol_kp_bundle, _s, _p) = generate_key_package(&carol_cred, &SystemClock).unwrap();
+        let carol_att_key = SigningKey::generate(&mut OsRng);
+        let (carol_kp_bundle, _s, _p) = mint_key_package_for_testing(
+            &carol_cred,
+            &CAROL_WRAPPING_KEY,
+            &SystemClock,
+            &carol_att_key,
+        )
+        .unwrap();
         let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
         let add_carol = add_member(&mut alice_group, carol_kp, &SystemClock).unwrap();
         let commit_bytes = add_carol.commit.tls_serialize_detached().unwrap();
@@ -1627,7 +1682,14 @@ mod tests {
         let bob_epoch_before = bob_group.epoch().unwrap();
 
         let carol_cred = test_credential("carol");
-        let (carol_kp_bundle, _s, _p) = generate_key_package(&carol_cred, &SystemClock).unwrap();
+        let carol_att_key = SigningKey::generate(&mut OsRng);
+        let (carol_kp_bundle, _s, _p) = mint_key_package_for_testing(
+            &carol_cred,
+            &CAROL_WRAPPING_KEY,
+            &SystemClock,
+            &carol_att_key,
+        )
+        .unwrap();
         let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
         // Alice adds Carol with the REAL clock (so her side accepts Carol's KP,
         // whose not_after ~ real_now + 84d) but binds a convergent timestamp at
@@ -1699,8 +1761,9 @@ mod tests {
         // Carol carries a wrapping key (an otherwise-valid add), so the Commit
         // reaches the convergent-timestamp AAD check rather than the fail-closed
         // wrapping-key check that precedes it (both are pre-merge).
+        let carol_att_key = SigningKey::generate(&mut OsRng);
         let (carol_kp_bundle, _s, _p) =
-            generate_key_package_with_wrapping_key(&carol_cred, Some(&[0xCC_u8; 32]), &SystemClock)
+            mint_key_package_for_testing(&carol_cred, &[0xCC_u8; 32], &SystemClock, &carol_att_key)
                 .unwrap();
         let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
         // Plain add_member — binds NO convergent-timestamp AAD.
@@ -1735,7 +1798,14 @@ mod tests {
         let bob_epoch_before = bob_group.epoch().unwrap();
 
         let carol_cred = test_credential("carol");
-        let (carol_kp_bundle, _s, _p) = generate_key_package(&carol_cred, &SystemClock).unwrap();
+        let carol_att_key = SigningKey::generate(&mut OsRng);
+        let (carol_kp_bundle, _s, _p) = mint_key_package_for_testing(
+            &carol_cred,
+            &CAROL_WRAPPING_KEY,
+            &SystemClock,
+            &carol_att_key,
+        )
+        .unwrap();
         let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
         let ts = SystemClock.now_secs();
         let add_carol =
@@ -1775,7 +1845,14 @@ mod tests {
         let bob_epoch_before = bob_group.epoch().unwrap();
 
         let carol_cred = test_credential("carol");
-        let (carol_kp_bundle, _s, _p) = generate_key_package(&carol_cred, &SystemClock).unwrap();
+        let carol_att_key = SigningKey::generate(&mut OsRng);
+        let (carol_kp_bundle, _s, _p) = mint_key_package_for_testing(
+            &carol_cred,
+            &CAROL_WRAPPING_KEY,
+            &SystemClock,
+            &carol_att_key,
+        )
+        .unwrap();
         let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
         // A distinctive timestamp so its encoded AAD blob is unambiguously
         // locatable in the cleartext `authenticated_data` on the wire.

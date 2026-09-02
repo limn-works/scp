@@ -64,6 +64,22 @@ const STATE_SRC: &str = include_str!("../../../../crates/scp-runtime/src/context
 const SUPERVISOR_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/context/supervisor/supervisor.rs");
 
+// KeyPackage-actor source — owns `replenish_to_min`, the one production site
+// that mints an MLS `KeyPackage`. §9.7.1 requires every minted leaf to carry an
+// `#active`/`#agent`-signed `scp_keypackage_attestation` (`0xFF03`) extension,
+// so the assertions below pin that this mint reaches the attested backend
+// method and refuses to mint without a signer.
+const KEY_PACKAGE_ACTOR_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/supervisor/key_package_actor.rs");
+
+// Production MLS backend source — owns both halves of the §9.7.1 KeyPackage
+// attestation: `generate_attested_key_package` (the three-phase mint) and
+// `validate_key_package` (the Add-path verifier). The assertions below pin that
+// the mint reaches `scp_mls::prepare_key_package` / `finish_key_package` and
+// that the Add path reaches `verify_add_attestation`.
+const PRODUCTION_BACKEND_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/crypto/mls/production_backend.rs");
+
 // Outlet invocation source — owns the SCP-OUT-046 off-mailbox streaming-saga
 // seal task (`run_streaming_saga_seal_task`). The `ac8_*` structural assertion
 // below pins the ADR-061 "commit once over the bounded root" invariant: the
@@ -1045,6 +1061,83 @@ fn pyo3_reserve_key_package_reaches_supervisor_seam() {
             ),
         "PyO3 reserve_key_package must resolve the bridge Supervisor and reach \
          Supervisor::reserve_key_package (mints the single-use MLS KeyPackage)"
+    );
+}
+
+// KeyPackage attestation (§9.7.1; ADR-057 Amendment 2026-08-01). An MLS leaf
+// `signature_key` is ephemeral and carries no DID attribution on its own, so a
+// published `KeyPackage` binds its leaf to a DID through an `#active`/`#agent`-
+// signed `scp_keypackage_attestation` (`0xFF03`) LeafNode extension. These four
+// assertions pin both halves of that binding — the mint and the verify — at the
+// one production site of each, so a refactor cannot re-sever them the way they
+// were severed before this wiring landed (the 13-check verifier existed with no
+// signer, and no production leaf carried the extension).
+#[test]
+fn key_package_actor_mint_reaches_the_attested_backend_method() {
+    assert!(
+        fn_body_contains(
+            KEY_PACKAGE_ACTOR_SRC,
+            "replenish_to_min",
+            ".generate_attested_key_package("
+        ),
+        "KeyPackageStoreActor::replenish_to_min must mint through \
+         MlsBackend::generate_attested_key_package, the only method that attaches the \
+         §9.7.1 scp_keypackage_attestation (0xFF03) extension"
+    );
+}
+
+#[test]
+fn key_package_actor_refuses_to_mint_without_an_attestation_signer() {
+    assert!(
+        fn_body_contains(
+            KEY_PACKAGE_ACTOR_SRC,
+            "replenish_to_min",
+            "attestation_signer"
+        ) && fn_body_contains(KEY_PACKAGE_ACTOR_SRC, "replenish_to_min", "wrapping_pubkey"),
+        "KeyPackageStoreActor::replenish_to_min must read BOTH the attestation signer and \
+         the scp_wrapping_key before minting: §9.7.1 rejects a leaf with no attestation, \
+         and §9.5.2 field 5 binds the 0xFF01 wrapping key the attestation must match"
+    );
+}
+
+#[test]
+fn production_backend_mint_reaches_the_two_phase_attested_path() {
+    assert!(
+        fn_body_contains(
+            PRODUCTION_BACKEND_SRC,
+            "generate_attested_key_package",
+            "prepare_key_package("
+        ) && fn_body_contains(
+            PRODUCTION_BACKEND_SRC,
+            "generate_attested_key_package",
+            "sign_attestation("
+        ) && fn_body_contains(
+            PRODUCTION_BACKEND_SRC,
+            "generate_attested_key_package",
+            "finish_key_package("
+        ),
+        "ProductionMlsBackend::generate_attested_key_package must run all three mint \
+         phases: scp_mls::prepare_key_package (leaf keys + unsigned attestation), \
+         KeyPackageAttestationSigner::sign_attestation (the #active/#agent custody \
+         signature), and scp_mls::finish_key_package (the signed 0xFF03 leaf extension)"
+    );
+}
+
+#[test]
+fn production_backend_add_path_reaches_the_attestation_verifier() {
+    assert!(
+        fn_body_contains(
+            PRODUCTION_BACKEND_SRC,
+            "validate_key_package",
+            "read_attested_key_package("
+        ) && fn_body_contains(
+            PRODUCTION_BACKEND_SRC,
+            "validate_key_package",
+            "verify_add_attestation("
+        ),
+        "ProductionMlsBackend::validate_key_package — the one gate both admission paths \
+         (execute_add_member, join_context) traverse — must read the joiner leaf's 0xFF03 \
+         attestation and run verify_add_attestation over it (§9.7.1 checks 1–13)"
     );
 }
 

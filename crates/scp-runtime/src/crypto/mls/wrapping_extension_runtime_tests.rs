@@ -231,8 +231,13 @@ fn sender_keys_wrapping_stable_001() {
     // 4. Extension survives as the same value across MLS Updates when
     //    the wrapping key is explicitly preserved.
     let bob_cred = test_credential("bob");
-    let (bob_kp, _bob_signer, _bob_provider) =
-        scp_mls::group::generate_key_package(&bob_cred, &scp_clock::SystemClock).unwrap();
+    let (bob_kp, _bob_signer, _bob_provider) = scp_mls::mint_key_package_for_testing(
+        &bob_cred,
+        &[0x5C; 32],
+        &scp_clock::SystemClock,
+        &ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng),
+    )
+    .unwrap();
     let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
 
     let mut group_mut = group;

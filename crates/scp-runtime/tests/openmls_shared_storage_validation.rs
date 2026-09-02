@@ -106,7 +106,7 @@ async fn drive_actor(
     // Add a second member so we have a real epoch advance.
     let other_cred = test_credential(&format!("{name}-bob"));
     let kp = backend
-        .generate_key_package(&other_cred, None)
+        .generate_attested_key_package(&other_cred, &[0x5C_u8; 32], &test_attestation_signer())
         .await
         .expect("generate_kp");
     let _added = backend
@@ -240,4 +240,12 @@ async fn assertion_5_same_group_id_race_no_silent_corruption() {
         s.starts_with("actor-0-round-") || s.starts_with("actor-1-round-"),
         "final value must be a complete writer message: {s}"
     );
+}
+
+/// A fresh attestation signer for one mint (§9.7.1). Reports `#active`, which
+/// every credential in these tests names, because
+/// `generate_attested_key_package` rejects a persona mismatch before it mints.
+fn test_attestation_signer() -> scp_runtime::crypto::mls::attestation_signer::TestAttestationSigner
+{
+    scp_runtime::crypto::mls::attestation_signer::TestAttestationSigner::generate().0
 }

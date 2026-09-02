@@ -31,12 +31,11 @@ use scp_clock::Clock;
 use scp_event_log::{Event, EventType};
 use scp_mls::group::{
     add_member_with_convergent_timestamp, create_group_with_wrapping_key, destroy_group,
-    generate_key_package_with_wrapping_key, join_group_from_bytes, key_package_in_did,
-    key_package_in_wrapping_key,
+    join_group_from_bytes, key_package_in_did, key_package_in_wrapping_key,
 };
 use scp_mls::{
-    InMemoryMlsProvider, MlsError, ScpCredential, SignatureKeyPair, restore_pending_join,
-    serialize_pending_join,
+    InMemoryMlsProvider, MlsError, ScpCredential, SignatureKeyPair, finish_key_package,
+    prepare_key_package, restore_pending_join, serialize_pending_join,
 };
 use scp_protocol::context::context_routing_id;
 use scp_protocol::context::membership::ContextEvent;
@@ -462,8 +461,8 @@ impl ScpClient {
         Ok(())
     }
 
-    /// Generates a single-use `KeyPackage` so this participant can be added to
-    /// `context_id` by an existing member.
+    /// Generates a single-use, attested `KeyPackage` so this participant can be
+    /// added to `context_id` by an existing member.
     ///
     /// Returns the TLS-serialized public `KeyPackage` bytes to hand to the
     /// adder. The matching private join material (signer + provider) is retained
@@ -471,12 +470,26 @@ impl ScpClient {
     /// [`Self::join_context_encrypted`] when the Welcome arrives. Calling this
     /// again for the same context replaces the prior pending material.
     ///
+    /// The leaf carries the `0xFF03` `scp_keypackage_attestation` extension
+    /// §9.7.1 requires, signed by this participant's `#active`/`#agent` key
+    /// through [`Signer::sign_key_package_attestation`]. ADR-057's 2026-08-01
+    /// amendment names that call the on-device signing boundary: a browser
+    /// client "joins with an attestation minted by a custody-capable surface".
+    ///
+    /// **Fail-closed.** When the signer holds no attestation key, this returns
+    /// [`ClientError::AttestationSignerUnavailable`] rather than publishing an
+    /// unattested leaf. An unattested leaf names a DID no verifier can check,
+    /// and every `Add` verifier rejects it, so minting one would trade a
+    /// detectable refusal for an undetectable one.
+    ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Mls`] if key-package generation or pending-material
-    /// serialization fails, [`ClientError::Codec`] if the public key package
-    /// cannot be serialized, or [`ClientError::StorageBackend`] if persisting the
-    /// pending-join blob fails.
+    /// Returns [`ClientError::AttestationSignerUnavailable`] when the signer
+    /// holds no attestation key, [`ClientError::Mls`] if key-package generation
+    /// or pending-material serialization fails, [`ClientError::Codec`] if the
+    /// public key package cannot be serialized, or
+    /// [`ClientError::StorageBackend`] if persisting the pending-join blob
+    /// fails.
     pub fn generate_key_package_for_join(
         &mut self,
         context_id: &str,
@@ -491,15 +504,20 @@ impl ScpClient {
         let (wrapping_public, wrapping_secret) = generate_wrapping_keypair();
         // Wrap the transient secret in `Zeroizing` so this binding's copy is
         // wiped on drop (best-effort — `[u8; 32]` is `Copy`, so downstream
-        // holders take their own copies); the persisted blob and the retained `PendingJoin` each take
-        // their own copy from it below.
+        // holders take their own copies); the persisted blob and the retained
+        // `PendingJoin` each take their own copy from it below.
         let wrapping_secret = Zeroizing::new(wrapping_secret);
+
+        // §9.7.1: prepare the leaf, sign its attestation on-device, then finish.
+        // The two-call shape exists so the signing hash reaches the custody
+        // boundary without the private leaf material leaving `scp-mls`.
+        let prepared = prepare_key_package(&credential, &wrapping_public, self.clock.as_ref())?;
+        let signature = self
+            .signer
+            .sign_key_package_attestation(&prepared.attestation_signing_hash())
+            .ok_or(ClientError::AttestationSignerUnavailable)?;
         let (bundle, signer, provider): (KeyPackageBundle, _, InMemoryMlsProvider) =
-            generate_key_package_with_wrapping_key(
-                &credential,
-                Some(&wrapping_public),
-                self.clock.as_ref(),
-            )?;
+            finish_key_package(prepared, signature)?;
 
         let kp_bytes = bundle
             .key_package()

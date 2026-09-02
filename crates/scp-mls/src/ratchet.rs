@@ -210,7 +210,10 @@ pub fn serialize_mls_message(message: &MlsMessageOut) -> Result<Vec<u8>, MlsErro
 mod tests {
     use super::*;
     use crate::credential::ScpCredential;
-    use crate::group::{add_member, create_group, generate_key_package, join_group};
+    use crate::group::{add_member, create_group, join_group};
+    use crate::keypackage_mint::mint_key_package_for_testing;
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
     use scp_clock::SystemClock;
 
     #[allow(clippy::unwrap_used)]
@@ -231,8 +234,13 @@ mod tests {
         let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
 
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, bob_signer, bob_provider) =
-            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let (bob_kp_bundle, bob_signer, bob_provider) = mint_key_package_for_testing(
+            &bob_cred,
+            &[0x77; 32],
+            &SystemClock,
+            &SigningKey::generate(&mut OsRng),
+        )
+        .unwrap();
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
 
         let add_result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
