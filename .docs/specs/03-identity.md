@@ -19,11 +19,11 @@ The identity layer abstracts custody. The user authenticates however they choose
 
 ### 3.2.1 Key Custody Migration Protocol
 
-Custody migration moves the operational signing capability from one custody provider to another (e.g., Secure Enclave to hardware security key, or passkey to self-managed key) without changing the identity (DID string). The Identity Key (`#0`) remains the root of trust throughout.
+Custody migration moves the operational signing capability from one custody provider to another (e.g., Secure Enclave to hardware security key, or passkey to self-managed key) without changing the identifier. The root key `#0` is unchanged by an operational-key custody migration; case 2 below is the one case in which the root itself changes.
 
 **Two cases:**
 
-1. **Active Signing Key migration (common).** The Active Signing Key (`#active`) is rotatable by design (ADR-003 §4a). Migration generates a new `#active` key in the target custody provider and publishes an updated DID document signed by `#0`. The old `#active` key is revoked. The DID string does not change because it is derived from `#0`, not `#active`. This is the standard `rotate_active_key` operation applied to a custody change rather than a compromise.
+1. **Active Signing Key migration (common).** The Active Signing Key (`#active`) is rotatable by design (ADR-003 §4a). Migration generates a new `#active` key in the target custody provider and publishes an updated DID document signed by `#0`. The old `#active` key is revoked. The identifier does not change because it derives from the inception event (`09-security-model.md` §9.7.4.2 R2), not from any key. This is the standard `rotate_active_key` operation applied to a custody change rather than a compromise.
 
 2. **Root key change (rare).** If `#0` must change because it is compromised, the root changes by a `RootRecovery` event (`09-security-model.md` §9.7.4.2 R3): the standing pre-rotation key authorizes the event, a fresh root generated in operational custody is installed, and the identifier does not change — no new DID, no `alsoKnownAs` forwarding record, and no `DidRotationEvent`. Relying parties re-verify key continuity (§9.11) on the recovery event. Whether a planned root move with no compromise — a Secure Enclave device being decommissioned with its key unexportable — uses the same event is not yet fixed in this spec.
 

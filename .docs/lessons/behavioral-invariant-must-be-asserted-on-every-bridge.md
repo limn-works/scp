@@ -1,5 +1,7 @@
 # Cryptographic Invariants Must Be Asserted On Every Bridge, Not Just Named in the Matrix
 
+> **Dating note (2026-09-02):** this lesson describes `migrate_identity` and the pre-rotation model as `09-security-model.md` §9.7.4.1 and §9.12 read before the key-event-log recovery amendment. Under the amended §9.7.4.2 a `RootRecovery` installs a fresh root and never installs the revealed key, the commitment is domain-separated under `"SCP-PREROTATION-COMMITMENT-V1:"`, and the "Partial-publish recovery" paragraph is replaced by R10. The lesson's principle stands; its spec citations are historical.
+
 > **Scope:** ADR-055, which removed the WASM bridge, left three bridges — PyO3, NAPI, and UniFFI. The passages below name a fourth wasm-bindgen bridge, which was the one that re-asserted the invariant. The rule binds the three that remain: the browser surface ADR-057 later added, `crates/scp-client-wasm`, emits no rotation event, so it emits no artifact this rule covers.
 
 **Source:** three native bridges silently emitted invalid pre-rotation proofs, because only the WASM bridge re-asserted the `SHA-256(revealed_key) == commitment` invariant that Pre-Rotation Key Custody, §9.7.4.1 of the security-model spec `09-security-model.md`, requires.

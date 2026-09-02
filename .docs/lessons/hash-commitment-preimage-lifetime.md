@@ -1,5 +1,7 @@
 # Hash-Then-Reveal Commitments Require Preimage Retention From t=commit Through t=reveal
 
+> **Dating note (2026-09-02):** this lesson describes `migrate_identity` and the pre-rotation model as `09-security-model.md` §9.7.4.1 and §9.12 read before the key-event-log recovery amendment. Under the amended §9.7.4.2 a `RootRecovery` installs a fresh root and never installs the revealed key, the commitment is domain-separated under `"SCP-PREROTATION-COMMITMENT-V1:"`, and the "Partial-publish recovery" paragraph is replaced by R10. The lesson's principle stands; its spec citations are historical.
+
 **Source:** the pre-rotation key, destroyed at create time and then required at migrate time. `.docs/lessons/pre-rotation-key-must-be-stored-at-creation.md`, from the SCP-214 review, predicted this failure before it occurred.
 
 ## Rule

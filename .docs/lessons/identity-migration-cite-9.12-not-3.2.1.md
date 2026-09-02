@@ -1,5 +1,7 @@
 # `identity_migrate` Cites §9.12 and ADR-003 §4b, Not §3.2.1
 
+> **Dating note (2026-09-02):** this lesson describes `migrate_identity` and the pre-rotation model as `09-security-model.md` §9.7.4.1 and §9.12 read before the key-event-log recovery amendment. Under the amended §9.7.4.2 a `RootRecovery` installs a fresh root and never installs the revealed key, the commitment is domain-separated under `"SCP-PREROTATION-COMMITMENT-V1:"`, and the "Partial-publish recovery" paragraph is replaced by R10. The lesson's principle stands; its spec citations are historical.
+
 **Problem**: the identity spec defines two migration operations. They look alike on the SDK
 surface, they share the verb "migrate", and they cite different sections because they do
 different things. Citing the custody-migration section for the new-DID operation sends a
