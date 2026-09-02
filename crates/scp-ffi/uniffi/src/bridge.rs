@@ -42,9 +42,11 @@ use scp_clock::Clock;
 use scp_dht::DhtClient;
 // `InMemoryDhtClient` is the §17.17.3 DHT nullifier. Since the cfg-gated DHT
 // construction is now hoisted into `scp_ffi_common::dht::build_ffi_dht_client`,
-// this bridge names the type only in its own `#[cfg(test)]` unit tests — hence
-// the bare `test` gate (the `testing`-feature seam lives in scp-ffi-common now).
-#[cfg(test)]
+// this bridge names the type only in its own unit tests. Every one of those
+// tests carries `#[cfg(feature = "testing")]`, so this import carries the same
+// gate: under a bare `test` gate it goes unused in the shipped configuration
+// that job rust-build-uniffi-production tests, which warns.
+#[cfg(all(test, feature = "testing"))]
 use scp_dht::InMemoryDhtClient;
 use scp_ffi_common::dht::FfiDhtClient;
 // `DidCache` / `DualLayerResolver` / `NoOpRelayQuerier` back
@@ -20633,7 +20635,13 @@ mod tests {
         let instance_id = scp.instance_id();
         // Synthetic pre-rotation custody — never inspected by callers that
         // only exercise non-migration paths, but the field is non-optional
-        // so the test handle has to provide something.
+        // so the test handle has to provide something. `Identity` declares
+        // `pre_rotation_custody` `#[cfg(feature = "testing")]`, and
+        // `InMemoryPreRotationCustody` is a §17.17.2 nullifier that
+        // `scp-platform/testing` compiles, so both the binding and the field
+        // carry that gate: without it this helper fails to compile in the
+        // shipped configuration job rust-build-uniffi-production tests.
+        #[cfg(feature = "testing")]
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
         Arc::new(Identity {
@@ -20649,6 +20657,7 @@ mod tests {
             bi: Arc::clone(&scp.inner),
             rotation_event_json: None,
             pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
+            #[cfg(feature = "testing")]
             pre_rotation_custody,
         })
     }
@@ -22208,6 +22217,15 @@ mod tests {
     /// type used by the bridge function via the global `DID_RESOLVER`. Uses a
     /// shared `InMemoryDhtClient` so the DID published during identity
     /// creation is visible to the verify resolver.
+    ///
+    /// Gated `#[cfg(feature = "testing")]` because `DidCache`,
+    /// `DualLayerResolver`, `NoOpRelayQuerier`, `InMemoryDhtClient`,
+    /// `InMemoryKeyCustody` and `InMemoryPreRotationCustody` all carry that
+    /// gate. Job rust-test enables `scp-ffi-uniffi/testing`, so this test runs
+    /// there exactly as it did before the gate; job
+    /// rust-build-uniffi-production compiles this file with `testing` off and
+    /// needs it skipped.
+    #[cfg(feature = "testing")]
     #[tokio::test]
     async fn scpid_sign_verify_roundtrip_via_identity_backed_resolver() {
         use scp_core::identity::{
@@ -23982,6 +24000,11 @@ mod tests {
             bi: Arc::clone(&live.bi),
             rotation_event_json: None,
             pre_rotation_handle: live.pre_rotation_handle,
+            // `Identity` declares this field `#[cfg(feature = "testing")]`, so
+            // the initializer carries the same gate. Without it this test fails
+            // to compile in the shipped configuration job
+            // rust-build-uniffi-production tests.
+            #[cfg(feature = "testing")]
             pre_rotation_custody: Arc::clone(&live.pre_rotation_custody),
         });
 
@@ -24016,6 +24039,13 @@ mod tests {
     /// `DidDht::new()` regression in place, the `publish` below fails with the
     /// signer error and the test fails; with the fix it succeeds and the
     /// `#active` key changes while `#0` and the DID are preserved.
+    ///
+    /// Gated `#[cfg(feature = "testing")]` because `make_dht_with_signer`,
+    /// `InMemoryDhtClient` and `InMemoryPreRotationCustody` all carry that gate.
+    /// Job rust-test enables `scp-ffi-uniffi/testing`, so this test runs there
+    /// exactly as it did before the gate; job rust-build-uniffi-production
+    /// compiles this file with `testing` off and needs it skipped.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rotate_key_signer_is_wired_over_callback_custody() {
         use scp_identity::DidMethod;

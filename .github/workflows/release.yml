@@ -73,12 +73,15 @@ jobs:
   conformance:
     name: "Step 1: Conformance tests"
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@nextest
 
       - name: Cache Cargo registry and build
         uses: actions/cache@v4
@@ -98,7 +101,16 @@ jobs:
       - name: Run conformance test suite
         run: |
           if [ -d tests/conformance ]; then
-            cargo test --release -p scp-testing -- conformance
+            # nextest with --no-tests=fail, not `cargo test … -- conformance`.
+            # `cargo test` hands a bare word after `--` to a test harness as a
+            # name filter, and that harness exits 0 when its filter selects no
+            # test. A rename that moved every conformance test out of a name
+            # carrying "conformance" would have left this release gate green
+            # over zero assertions. nextest exits 4 on an empty selection.
+            # scripts/tests/ci-gate/ci_gate_selftest.py reads this workflow and
+            # rejects any `cargo test` carrying a name filter, before or after
+            # a `--`.
+            cargo nextest run --no-tests=fail --release -p scp-testing -E 'test(conformance)'
           else
             echo "::notice::Conformance fixture directory not yet created — workspace tests serve as gate"
           fi
@@ -115,6 +127,7 @@ jobs:
   changelog:
     name: "Step 2: Verify changelog"
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -141,6 +154,7 @@ jobs:
     name: "Step 3: Create version tags"
     needs: [conformance, changelog]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
       core-tag: ${{ steps.tags.outputs.core-tag }}
     steps:
@@ -216,6 +230,7 @@ jobs:
     name: "Step 5a: Apple codesigning"
     needs: [build]
     runs-on: macos-latest
+    timeout-minutes: 45
     steps:
       - name: Download XCFramework
         uses: actions/download-artifact@v4
@@ -240,9 +255,31 @@ jobs:
           security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PWD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
           security list-keychain -d user -s "$KEYCHAIN_PATH"
 
+      # Runs before signing, so a release fails before an unsigned XCFramework
+      # can reach an artifact named `swift-xcframework-signed`. A checkout
+      # supplies this script, which the download step above does not.
+      - name: Check out this repository
+        uses: actions/checkout@v5
+        with:
+          path: repo
+
+      # The guard names '*.a' alone: build-matrix.yml packs exactly three
+      # static-library slices into the XCFramework and no dylib, so a dylib is
+      # not an artifact this build can be missing. Naming '*.dylib' here would
+      # fail every honest release, and the guard treats every named pattern as
+      # required — an optional alternative is what let a bundle missing its
+      # primary artifact pass. The codesign loop below still signs any dylib
+      # it finds.
+      - name: Assert the XCFramework carries static libraries to sign
+        shell: bash
+        run: bash repo/scripts/assert-nonempty-signing-set.sh --name '*.a' xcframework
+
       - name: Codesign XCFramework
         run: |
-          find xcframework/ -name "*.a" -o -name "*.dylib" | while read -r lib; do
+          # Step "Assert the XCFramework carries static libraries to sign" above has
+          # already rejected an empty set, which this loop would otherwise run
+          # zero times over and exit 0 on.
+          find xcframework/ -type f \( -name "*.a" -o -name "*.dylib" \) | while read -r lib; do
             codesign --force --sign "Developer ID Application" \
               --options runtime \
               --timestamp \
@@ -260,6 +297,7 @@ jobs:
     name: "Step 5b: Authenticode signing"
     needs: [build]
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - name: Download Windows artifacts
         uses: actions/download-artifact@v4
@@ -272,6 +310,22 @@ jobs:
         with:
           name: cbindgen-x86_64-pc-windows-msvc
           path: windows-cbindgen/
+
+      # Runs before signing, so a release fails before an unsigned bundle can
+      # reach an artifact named `windows-signed`. A checkout supplies this
+      # script, which the two download steps above do not.
+      - name: Check out this repository
+        uses: actions/checkout@v5
+        with:
+          path: repo
+
+      # The two directories arrive from independent build-matrix.yml jobs
+      # (rust and cbindgen), and the guard requires a DLL in each one, so a
+      # rust leg that regresses to .lib and .pdb output cannot hide behind a
+      # healthy cbindgen leg.
+      - name: Assert both Windows build legs produced DLLs to sign
+        shell: bash
+        run: bash repo/scripts/assert-nonempty-signing-set.sh --name '*.dll' windows-artifacts windows-cbindgen
 
       - name: Import Authenticode certificate
         env:
@@ -290,9 +344,22 @@ jobs:
       - name: Sign DLLs
         shell: pwsh
         run: |
-          Get-ChildItem -Recurse -Include *.dll windows-artifacts/, windows-cbindgen/ | ForEach-Object {
-            & signtool sign /sha1 $env:SIGN_THUMBPRINT /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $_.FullName
-            Write-Host "Signed: $($_.FullName)"
+          # Step "Assert both Windows build legs produced DLLs to sign" above has
+          # already rejected an empty set, which this loop would otherwise run
+          # zero times over and exit 0 on.
+          $dlls = @(Get-ChildItem -Recurse -Include *.dll windows-artifacts/, windows-cbindgen/)
+          Write-Host "Signing $($dlls.Count) DLL(s)"
+          foreach ($dll in $dlls) {
+            & signtool sign /sha1 $env:SIGN_THUMBPRINT /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $dll.FullName
+            # signtool is a native command, so a non-zero exit sets
+            # $LASTEXITCODE without stopping this script. Only a last
+            # invocation's code reaches GitHub, so an earlier failure would
+            # otherwise ship one unsigned DLL under a green step.
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "signtool exited $LASTEXITCODE for $($dll.FullName)"
+              exit $LASTEXITCODE
+            }
+            Write-Host "Signed: $($dll.FullName)"
           }
 
       - name: Upload signed Windows artifacts
@@ -308,6 +375,7 @@ jobs:
     name: "Step 5c: GPG sign Maven artifacts"
     needs: [build]
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Download Kotlin AAR artifacts
         uses: actions/download-artifact@v4
@@ -324,10 +392,32 @@ jobs:
           echo "allow-preset-passphrase" >> ~/.gnupg/gpg-agent.conf
           gpgconf --reload gpg-agent
 
+      # Runs before signing, so a release fails before an unsigned bundle can
+      # reach an artifact named `maven-signed`. A checkout supplies this script,
+      # which the download step above does not.
+      - name: Check out this repository
+        uses: actions/checkout@v5
+        with:
+          path: repo
+
+      # The guard requires an AAR and a JAR each on their own — the kotlin-aar
+      # artifact's two upload paths in build-matrix.yml produce them from
+      # separate Gradle outputs, and either can be silently absent while the
+      # other uploads. '*.pom' is not named: no build step puts a pom into
+      # kotlin-aar, so requiring one would fail every honest release, and
+      # listing it as an alternative is what let a bundle carrying only a pom
+      # pass. The gpg loop below still signs any pom it finds.
+      - name: Assert the Maven bundle carries an AAR and a JAR to sign
+        shell: bash
+        run: bash repo/scripts/assert-nonempty-signing-set.sh --name '*.aar' --name '*.jar' maven-artifacts
+
       - name: Sign artifacts
         env:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
+          # Step "Assert the Maven bundle carries an AAR and a JAR to sign" above has
+          # already rejected an empty set, which this loop would otherwise run
+          # zero times over and exit 0 on.
           find maven-artifacts/ -type f \( -name "*.aar" -o -name "*.jar" -o -name "*.pom" \) | while read -r file; do
             gpg --batch --yes --passphrase "$GPG_PASSPHRASE" \
               --pinentry-mode loopback \
@@ -350,6 +440,7 @@ jobs:
     needs: [sign-apple, sign-windows, sign-maven]
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Free disk space
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
@@ -507,6 +598,7 @@ jobs:
     needs: [sign-apple, sign-windows, sign-maven]
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     # Uses Trusted Publishers (OIDC) — no token required
     environment:
       name: pypi
@@ -535,6 +627,7 @@ jobs:
     needs: [sign-apple, sign-windows, sign-maven]
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -643,6 +736,7 @@ jobs:
     needs: [sign-apple, sign-windows, sign-maven]
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -693,6 +787,7 @@ jobs:
     needs: [sign-apple]
     if: ${{ !inputs.dry-run }}
     runs-on: macos-latest
+    timeout-minutes: 30
     outputs:
       xcframework-zip: ScpFFI-${{ inputs.version }}.xcframework.zip
     steps:
@@ -780,6 +875,7 @@ jobs:
       - publish-spm
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -859,6 +955,7 @@ jobs:
     needs: [build]
     if: ${{ inputs.dry-run }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Download build artifacts
         uses: actions/download-artifact@v4

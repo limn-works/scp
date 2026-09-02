@@ -60,6 +60,7 @@ jobs:
       github.event_name == 'push' ||
       github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - run: echo "Not a draft PR, proceeding"
 
@@ -82,6 +83,7 @@ jobs:
     # `.github/workflows/ci.yml` uses. `scripts/check-toolchain-wiring.sh` reads the
     # outputs out of every workflow that declares a `dorny/paths-filter` step and fails
     # when one of them drops the OR.
+    timeout-minutes: 10
     outputs:
       docs: ${{ steps.filter.outputs.docs == 'true' || steps.filter.outputs.toolchain == 'true' }}
     steps:
@@ -121,6 +123,7 @@ jobs:
     if: needs.changes.outputs.docs == 'true'
     name: "Rust API docs (rustdoc)"
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -147,6 +150,7 @@ jobs:
     if: needs.changes.outputs.docs == 'true'
     name: "Python API docs (sphinx)"
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
@@ -175,6 +179,7 @@ jobs:
     if: needs.changes.outputs.docs == 'true'
     name: "TypeScript API docs (typedoc)"
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
@@ -197,6 +202,7 @@ jobs:
     if: needs.changes.outputs.docs == 'true'
     name: "Kotlin API docs (Dokka)"
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-java@v4
@@ -219,6 +225,7 @@ jobs:
     needs: [check-draft, rust-docs, python-docs, typescript-docs, kotlin-docs]
     if: startsWith(github.ref, 'refs/tags/scp-core@')
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
