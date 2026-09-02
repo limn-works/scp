@@ -44,6 +44,30 @@ rules separate them.
   `RUSTFLAGS="-Zsanitizer=address,undefined"`, because rustc offers no `undefined`
   sanitizer — it names the ones it accepts in the error. That second defect sat behind the
   first and would have outlived the repair.
+- **A tool's output format decides what a check can see, so prove the format carries the
+  thing you check for.** `cargo tree -e features` renders a feature node for a feature a
+  *dependency* has activated and renders none for a feature the tree's *root* package
+  activates through its own `[features]` table. `scripts/check-shipped-feature-graph.sh`
+  extracted its resolved feature set from that rendering alone, then gained two artifact
+  entries — `scp-node` and `scp-relay` — that make the root package the artifact itself.
+  For those two entries the extraction could not name a single feature the artifact's own
+  manifest turns on, which is the whole class the entries were added to police:
+  `crates/scp-node/Cargo.toml` declares
+  `testing = ["scp-dht/testing", "scp-platform/testing", "allow_unencrypted_storage"]`, and
+  running that gate with `--features testing` returned a set byte-identical to the clean
+  one and printed OK. Appending
+  `default = ["root_local_nullifier"]` to `crates/scp-relay/Cargo.toml` made the gate
+  print `G1 PASSED` and exit 0 while the shipped relay binary carried a feature nothing
+  allowlists. The repair reads a second rendering — `cargo tree -f '{p}|{f}'`, whose
+  per-package list is each package's resolved *enabled* feature set — and checks the union
+  of the two.
+- **A gate that reports absence carries a positive control that runs every time.** Every
+  OK the gate above prints means "this artifact resolves no nullifier feature", and it
+  means that only while the resolver can report one at all. That gate now resolves
+  `-p scp-node --features testing` on every run and fails when the ⊆ check *accepts* it,
+  so a rendering change that re-blinds the resolver fails the gate instead of emptying it.
+  A synthetic fixture proves the same property over hand-written trees; the two are not
+  redundant, because the fixture cannot see a cargo release that changes the rendering.
 - **Read a shared build cache everywhere, and write it only from a push to the default
   branch.** A cache written on a pull-request ref is readable only by that pull request,
   and it evicts entries from the budget every other cache step in the workflow shares.

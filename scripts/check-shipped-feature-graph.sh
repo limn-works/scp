@@ -38,12 +38,30 @@
 # The four nullifier feature names below appear ONLY in the self-test fixtures as
 # POSITIVE-CONTROL INPUTS the whitelist must reject — never as the mechanism.
 #
-# CRITICAL: DEV-DEPENDENCIES ARE EXCLUDED (`-e features,no-dev`)
-# -------------------------------------------------------------
+# CRITICAL: DEV-DEPENDENCIES ARE EXCLUDED (`no-dev`)
+# --------------------------------------------------
 # A shipped artifact is built WITHOUT dev-dependencies. `cargo tree` includes
 # dev-deps by default (and feature-unifies their `testing` edges into the graph),
 # which does NOT reflect what ships. The `no-dev` edge kind restricts the graph to
 # the normal + build dependencies that actually compile into the artifact.
+#
+# CRITICAL: THIS GATE READS TWO CARGO RENDERINGS, NOT ONE
+# -------------------------------------------------------
+# `cargo tree -e features` renders a feature node for a feature a DEPENDENCY has
+# activated, and renders none for a feature the tree's ROOT package activates
+# through that package's own `[features]` table. The scp-node and scp-relay
+# entries make the root package the artifact itself, so an extraction that read
+# only that rendering could not see `crates/scp-node/Cargo.toml`'s own
+# `testing = ["scp-dht/testing", "scp-platform/testing",
+# "allow_unencrypted_storage"]` — the exact nullifier wiring those two entries
+# were added to police — and printed OK for a build carrying all three features.
+# Every default member is likewise a root of the bare default-members
+# resolution. So both resolvers read the edge rendering AND
+# `cargo tree -f '{p}|{f}'`, whose per-package list is each package's resolved
+# ENABLED feature set, and check the UNION (merge_resolved_feature_sets).
+# run_gate drives a live positive control — `-p scp-node --features testing`
+# must FAIL the ⊆ check — so a rendering change that re-blinds either resolver
+# fails this gate instead of quietly emptying it.
 #
 # Usage:
 #   scripts/check-shipped-feature-graph.sh            # gate the real workspace
@@ -69,6 +87,27 @@ cd "$REPO_ROOT"
 # allowlist may carry permitted-but-unresolved rows (it is durability-only, not a
 # nullifier, so its presence widens nothing that matters).
 #
+# NINE ROWS NAME A ROOT PACKAGE'S OWN PRODUCTION FEATURE. Each shipped build
+# invocation activates a feature on the package it names with `-p`, and cargo
+# renders that activation only in the per-package `{f}` list, never as a feature
+# edge — so this gate could not see any of the nine until it began reading both
+# renderings (see merge_resolved_feature_sets). Their classification:
+#   - `scp-ffi/server`, `scp-ffi-napi/server`, `scp-ffi-uniffi/server` — the
+#     feature each ARTIFACTS entry passes as `--features server`. Each expands to
+#     `["scp-ffi-common/server", "dep:scp-node"]`, the real node/relay startup
+#     path.
+#   - `scp-ffi/default`, `scp-ffi-napi/default`, `scp-ffi-uniffi/default` — each
+#     is `["server"]`, and a bare `cargo build` at this root resolves it for
+#     those three default members.
+#   - `scp-ffi-common/server` — pulls the real transport, node, platform, and
+#     identity crates plus three durability-only `scp-platform` rows this list
+#     already carries (`in-memory-storage`, `file`, `encrypting`).
+#   - `scp-client-wasm/default` — an EMPTY feature list. Cargo reports `default`
+#     as enabled on that default member and it activates nothing.
+# None of the nine forwards a `testing` edge or an `allow_unencrypted_storage`
+# edge; each such forward resolves as its own `crate/feature` pair that this list
+# omits, so admitting a `default` row never admits what that default expands to.
+#
 # `scp-platform/filesystem` was such a row until three FFI bridges stopped
 # depending on it: `start_node_local` no longer opens a plaintext
 # `FilesystemStorage` under its data directory, so no shipped artifact resolves
@@ -79,13 +118,15 @@ cd "$REPO_ROOT"
 # Five artifacts are gated: the three shipped FFI bridges (built
 # `--no-default-features --features server`) plus the scp-node and scp-relay
 # binaries (built with DEFAULT features — neither binary has a `server` feature).
-# The three bridges resolve one identical SCP-crate feature set; each binary
-# resolves a SUBSET of it (scp-node ~25, scp-relay ~19 SCP-crate feature edges).
-# This single allowlist is therefore a SUPERSET covering all five — one list
-# suffices. `cargo tree` DERIVES each artifact's resolved set (never a hand-list);
-# this allowlist is the hand-maintained set of what is PERMITTED.
+# The three bridges resolve one SCP-crate feature set each, differing only in the
+# `scp-ffi*/server` row naming the bridge itself (33 pairs); each binary resolves
+# 25 pairs for scp-node and 19 for scp-relay. This single allowlist is therefore
+# a SUPERSET covering all five — one list suffices. `cargo tree` DERIVES each
+# artifact's resolved set (never a hand-list); this allowlist is the
+# hand-maintained set of what is PERMITTED.
 # ---------------------------------------------------------------------------
 PERMITTED_ALLOWLIST="$(cat <<'EOF'
+scp-client-wasm/default
 scp-client/default
 scp-clock/default
 scp-core/default
@@ -97,6 +138,13 @@ scp-event-log/default
 scp-ffi-common/custody
 scp-ffi-common/default
 scp-ffi-common/resolvers
+scp-ffi-common/server
+scp-ffi-napi/default
+scp-ffi-napi/server
+scp-ffi-uniffi/default
+scp-ffi-uniffi/server
+scp-ffi/default
+scp-ffi/server
 scp-identity/default
 scp-identity/production-dht
 scp-mcp/default
@@ -207,22 +255,123 @@ NULLIFIER_CONTROL_FEATURES=(
 resolve_scp_features() {
   local crate="$1"; shift
   local features="$1"
-  local raw rc
+  local edge_raw pkg_raw rc
   # Capture stdout+stderr and the exit status. Do NOT swallow a cargo failure
   # silently: if resolution fails (e.g. the feature args name a feature this
   # artifact lacks), surface the cargo error and return non-zero so the caller
   # fails loud instead of proceeding with an empty (vacuously-passing) set.
   # shellcheck disable=SC2086
-  raw="$(cargo tree -e features,no-dev -p "$crate" $features 2>&1)"; rc=$?
+  edge_raw="$(cargo tree -e features,no-dev -p "$crate" $features 2>&1)"; rc=$?
   if [[ "$rc" -ne 0 ]]; then
-    { echo "cargo tree failed for '$crate' (feature args: '$features'):"
-      printf '%s\n' "$raw"; } >&2
+    { echo "cargo tree (feature edges) failed for '$crate' (feature args: '$features'):"
+      printf '%s\n' "$edge_raw"; } >&2
     return 1
   fi
-  printf '%s\n' "$raw" \
+  # shellcheck disable=SC2086
+  pkg_raw="$(cargo tree -e no-dev -p "$crate" $features -f '{p}|{f}' 2>&1)"; rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    { echo "cargo tree (per-package feature lists) failed for '$crate' (feature args: '$features'):"
+      printf '%s\n' "$pkg_raw"; } >&2
+    return 1
+  fi
+  merge_resolved_feature_sets "$edge_raw" "$pkg_raw"
+}
+
+# ---------------------------------------------------------------------------
+# extract_feature_edges <cargo-tree-output>
+#   Emit one `crate/feature` per line for every FEATURE EDGE that `cargo tree
+#   -e features` renders — a line of the form `scp-<crate> feature "<name>"`.
+#
+#   WHAT THIS RENDERING CANNOT SEE: cargo renders a feature node for a feature
+#   a DEPENDENCY has activated. It renders none for a feature the tree's ROOT
+#   package activates through that package's own `[features]` table. Running
+#   `cargo tree -e features,no-dev -p scp-node --features testing` on this
+#   workspace prints the string `testing` zero times, and the set this function
+#   extracts from that tree is byte-identical to the set it extracts without
+#   `--features testing`. extract_package_features below reads the second
+#   rendering, which does carry those features, and
+#   merge_resolved_feature_sets unions the two.
+# ---------------------------------------------------------------------------
+extract_feature_edges() {
+  printf '%s\n' "$1" \
     | grep -oE 'scp-[a-z0-9-]+ feature "[^"]+"' \
     | sed -E 's/ feature "/\//; s/"$//' \
     | sort -u
+}
+
+# ---------------------------------------------------------------------------
+# extract_package_features <cargo-tree-output-rendered-as-{p}|{f}>
+#   Emit one `crate/feature` per line for every feature ENABLED on every scp-*
+#   package the tree names, THE ROOT PACKAGE INCLUDED. `cargo tree -f '{p}|{f}'`
+#   prints, per package, `<name> v<version> (<path>)|<f1>,<f2>,…`, where that
+#   list is the package's resolved enabled feature set rather than an edge its
+#   parent declared. That is the only cargo rendering in which an artifact's OWN
+#   `testing` / `allow_unencrypted_storage` activation appears.
+#
+#   This splits the comma list in a bash `while` loop rather than in a pipe into
+#   `awk`, because assert_every_pipeline_reader_consumes_its_input decides its
+#   criterion by enumerating the commands this file pipes into, and a bash loop
+#   reads its whole input by construction, so splitting here adds no command to
+#   that enumeration. The two `sed` stages and the closing `sort -u` each read to
+#   end of file.
+# ---------------------------------------------------------------------------
+extract_package_features() {
+  local normalized name feats feature
+  # Strip cargo's tree-drawing prefix and its ` (*)` already-shown marker, keep
+  # only scp-* package lines, and reduce each to `<name>|<f1>,<f2>,…`.
+  normalized="$(printf '%s\n' "$1" \
+    | sed -E 's/^[^A-Za-z0-9_]*//; s/ \(\*\)[[:space:]]*$//' \
+    | sed -E -n 's/^(scp-[a-z0-9-]+) v.*\|(.*)$/\1|\2/p' \
+    | sort -u)"
+  while IFS='|' read -r name feats; do
+    [[ -z "$name" ]] && continue
+    while [[ -n "$feats" ]]; do
+      feature="${feats%%,*}"
+      if [[ "$feats" == *,* ]]; then feats="${feats#*,}"; else feats=""; fi
+      [[ -n "$feature" ]] && printf '%s/%s\n' "$name" "$feature"
+    done
+  done <<<"$normalized" | sort -u
+}
+
+# ---------------------------------------------------------------------------
+# merge_resolved_feature_sets <edge-tree> <package-feature-tree>
+#   Emit the UNION of both renderings, sorted-unique — one artifact's complete
+#   resolved SCP-crate feature set.
+#
+#   Each rendering carries what the other omits, so this gate reads both and
+#   neither alone:
+#     - the edge rendering names a `default` edge on a crate that declares no
+#       `default` feature (`scp-core feature "default"`, for one), which the
+#       per-package rendering reports as an empty feature list;
+#     - the per-package rendering names every feature the ROOT package activates
+#       through its own `[features]` table, which the edge rendering omits.
+#   That second omission made this gate vacuous on the two artifacts whose root
+#   package IS the artifact — scp-node and scp-relay — for exactly the
+#   activation the gate exists to reject: `crates/scp-node/Cargo.toml` declares
+#   `testing = ["scp-dht/testing", "scp-platform/testing",
+#   "allow_unencrypted_storage"]`, and the edge-only extraction returned the same
+#   set with and without that feature. run_gate now drives a live positive
+#   control over this function to prove the union sees it.
+#
+#   Returns 1 when EITHER rendering yields an empty set. Both legitimately yield
+#   a non-empty set for every artifact this gate checks and for a bare
+#   default-members build, so an empty one means cargo resolved nothing or a
+#   rendering changed shape. Either way the caller fails loud rather than accept
+#   a half-empty union.
+# ---------------------------------------------------------------------------
+merge_resolved_feature_sets() {
+  local edge_tree="$1" pkg_tree="$2" edges pkgs
+  edges="$(extract_feature_edges "$edge_tree" || true)"
+  pkgs="$(extract_package_features "$pkg_tree" || true)"
+  if [[ -z "$edges" ]]; then
+    echo "no scp-* feature EDGE appears in a cargo tree this gate resolved" >&2
+    return 1
+  fi
+  if [[ -z "$pkgs" ]]; then
+    echo "no scp-* PER-PACKAGE feature list appears in a cargo tree this gate resolved" >&2
+    return 1
+  fi
+  printf '%s\n%s\n' "$edges" "$pkgs" | sort -u
 }
 
 # resolve_scp_testing_crate <crate> <features...>
@@ -343,19 +492,28 @@ resolution_is_nonempty() {
 #   `scp-dht/testing`, and `allow_unencrypted_storage` sit on its NORMAL edges.
 #   Root `Cargo.toml` therefore omits it from `default-members`, and this check
 #   is what keeps that omission true.
+#
+#   EVERY DEFAULT MEMBER IS A ROOT PACKAGE of this resolution, so the feature-edge
+#   rendering alone omits every feature each member activates through its own
+#   `[features]` table — the same blindness merge_resolved_feature_sets
+#   describes. This function therefore reads both renderings and unions them
+#   through that one merge helper, as resolve_scp_features does.
 # ---------------------------------------------------------------------------
 resolve_default_members_features() {
-  local raw rc
-  raw="$(cargo tree -e features,no-dev 2>&1)"; rc=$?
+  local edge_raw pkg_raw rc
+  edge_raw="$(cargo tree -e features,no-dev 2>&1)"; rc=$?
   if [[ "$rc" -ne 0 ]]; then
-    { echo "cargo tree failed for a bare default-members resolution:"
-      printf '%s\n' "$raw"; } >&2
+    { echo "cargo tree (feature edges) failed for a bare default-members resolution:"
+      printf '%s\n' "$edge_raw"; } >&2
     return 1
   fi
-  printf '%s\n' "$raw" \
-    | grep -oE 'scp-[a-z0-9-]+ feature "[^"]+"' \
-    | sed -E 's/ feature "/\//; s/"$//' \
-    | sort -u
+  pkg_raw="$(cargo tree -e no-dev -f '{p}|{f}' 2>&1)"; rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    { echo "cargo tree (per-package feature lists) failed for a bare default-members resolution:"
+      printf '%s\n' "$pkg_raw"; } >&2
+    return 1
+  fi
+  merge_resolved_feature_sets "$edge_raw" "$pkg_raw"
 }
 
 # resolve_default_members_testing_crate
@@ -434,6 +592,41 @@ run_gate() {
     fi
   done
 
+  # LIVE POSITIVE CONTROL — this gate must be able to SEE a nullifier that this
+  # workspace can actually activate on a shipped artifact.
+  #
+  # CRITERION: resolving a shipped artifact with a nullifier feature turned on
+  # produces a set the ⊆ check REJECTS. Every OK printed above means "this
+  # artifact resolves no nullifier feature"; it means that only while the
+  # resolver can report one at all. `crates/scp-node/Cargo.toml` declares
+  # `testing = ["scp-dht/testing", "scp-platform/testing",
+  # "allow_unencrypted_storage"]`, so `-p scp-node --features testing` is the
+  # nearest real build to the shipped `scp-node` entry that carries nullifiers.
+  #
+  # The fixtures prove the same property on synthetic trees; this control proves
+  # it against cargo's live rendering, so a future cargo release that changes
+  # either rendering fails this gate instead of silently emptying it.
+  echo ">> positive control  (scp-node --features testing — a resolution this gate MUST reject)"
+  local pc_resolved
+  if ! pc_resolved="$(resolve_scp_features "scp-node" "--features testing")"; then
+    echo "   FAIL — resolving scp-node with --features testing errored. This gate"
+    echo "          cannot demonstrate that it observes a nullifier feature, so"
+    echo "          every OK above is unproven. Restore that feature, or point"
+    echo "          this control at another artifact whose own [features] table"
+    echo "          activates a nullifier."
+    failures=$((failures + 1))
+  elif check_subset "$pc_resolved" "$PERMITTED_ALLOWLIST" >/dev/null; then
+    echo "   FAIL — scp-node built with its own \`testing\` feature resolved a set"
+    echo "          this allowlist ACCEPTS. The resolver is blind to the features"
+    echo "          an artifact's ROOT package activates through its own"
+    echo "          [features] table, so every OK printed above proves nothing."
+    echo "          Fix resolve_scp_features — do NOT delete this control."
+    failures=$((failures + 1))
+  else
+    echo "   OK — that resolution is REJECTED, so this gate observes a nullifier"
+    echo "        an artifact's own [features] table activates"
+  fi
+
   # A bare workspace build — one `.github/workflows/build-matrix.yml` runs
   # and uploads bridge cdylibs from. Resolver 2 unifies normal-dependency
   # features across every default member, so this union can carry a nullifier no
@@ -482,6 +675,95 @@ expect() { # <label> <expected: PASS|FAIL> <actual-rc>
     echo "   FAIL — $label (expected $expected, got $actual)"
     fixture_failures=$((fixture_failures + 1))
   fi
+}
+
+# expect_lines <label> <expected-lines> <actual-lines>
+#   Compare two newline-separated sets exactly. Used by the root-package
+#   fixtures below, which assert WHICH pairs an extractor emits rather than only
+#   that it emitted something.
+expect_lines() {
+  local label="$1" expected="$2" actual="$3"
+  if [[ "$expected" == "$actual" ]]; then
+    echo "   ok   — $label"
+    return
+  fi
+  echo "   FAIL — $label"
+  echo "          expected:"
+  printf '%s\n' "$expected" | sed 's/^/            /'
+  echo "          actual:"
+  printf '%s\n' "$actual" | sed 's/^/            /'
+  fixture_failures=$((fixture_failures + 1))
+}
+
+# assert_root_package_features_are_extracted
+#   The regression this gate shipped with, proved on synthetic input.
+#
+#   CRITERION: for an artifact whose ROOT package activates a nullifier feature
+#   through that package's own `[features]` table, the resolved set this gate
+#   checks names that feature, and check_subset rejects the set.
+#
+#   `cargo tree -e features` renders a feature node only for a feature a
+#   DEPENDENCY has activated, so the root package's own activations appear
+#   nowhere in that tree. The two synthetic trees below are that exact shape: the
+#   edge tree names no `testing` feature at all, and the per-package tree names
+#   `scp-node|allow_unencrypted_storage,testing`. Under the edge-only extraction
+#   this gate shipped with, the first assertion passed and the ⊆ check returned
+#   OK on a graph carrying three nullifier features.
+assert_root_package_features_are_extracted() {
+  echo ">> fixture: an artifact's ROOT package activating its own testing/allow_unencrypted_storage feature is EXTRACTED and REJECTED (the edge rendering alone cannot see it)"
+  local edge_tree pkg_tree edges pkgs merged rc
+
+  # What `cargo tree -e features,no-dev -p scp-node --features testing` prints:
+  # feature nodes for DEPENDENCY activations only, and no `testing` anywhere.
+  edge_tree="$(cat <<'TREE'
+scp-node v0.1.0-beta.2 (/w/crates/scp-node)
+├── scp-core feature "default"
+│   └── scp-core v0.1.0-beta.2 (/w/crates/scp-core)
+└── scp-platform feature "sqlite"
+    └── scp-platform v0.1.0-beta.2 (/w/crates/scp-platform)
+TREE
+)"
+  # What `cargo tree -e no-dev -p scp-node --features testing -f '{p}|{f}'`
+  # prints for the same resolution: per-package ENABLED feature lists, root
+  # included, with cargo's ` (*)` already-shown marker on a repeat node and an
+  # empty list on a crate that has no features.
+  pkg_tree="$(cat <<'TREE'
+scp-node v0.1.0-beta.2 (/w/crates/scp-node)|allow_unencrypted_storage,testing
+├── scp-core v0.1.0-beta.2 (/w/crates/scp-core)|default
+├── scp-platform v0.1.0-beta.2 (/w/crates/scp-platform)|sqlite,testing (*)
+└── scp-clock v0.1.0-beta.2 (/w/crates/scp-clock)|
+TREE
+)"
+
+  edges="$(extract_feature_edges "$edge_tree")"
+  expect_lines "the edge rendering of that resolution names NO root-package feature" \
+    "$(printf 'scp-core/default\nscp-platform/sqlite')" "$edges"
+
+  # An edge-only resolved set passes the ⊆ check — the vacuous verdict this
+  # gate returned for scp-node and scp-relay.
+  check_subset "$edges" "$PERMITTED_ALLOWLIST" >/dev/null 2>&1; rc=$?
+  expect "(root-blind) the edge-only set of a nullifier-carrying scp-node build is ACCEPTED, which is why the edge rendering cannot be this gate's only input" "PASS" "$rc"
+
+  pkgs="$(extract_package_features "$pkg_tree")"
+  expect_lines "the per-package rendering names the root's own features, drops cargo's (*) marker, and emits nothing for a crate with no features" \
+    "$(printf 'scp-core/default\nscp-node/allow_unencrypted_storage\nscp-node/testing\nscp-platform/sqlite\nscp-platform/testing')" \
+    "$pkgs"
+
+  merged="$(merge_resolved_feature_sets "$edge_tree" "$pkg_tree")"
+  expect_lines "the union carries every pair from both renderings" \
+    "$(printf 'scp-core/default\nscp-node/allow_unencrypted_storage\nscp-node/testing\nscp-platform/sqlite\nscp-platform/testing')" \
+    "$merged"
+
+  check_subset "$merged" "$PERMITTED_ALLOWLIST" >/dev/null 2>&1; rc=$?
+  expect "(root-blind) the union of both renderings is REJECTED for that same build" "FAIL" "$rc"
+
+  # A half-empty union means cargo resolved nothing or a rendering changed
+  # shape. Accepting it would hand run_gate a set drawn from one rendering while
+  # the message says both — so the merge fails loud instead.
+  merge_resolved_feature_sets "" "$pkg_tree" >/dev/null 2>&1; rc=$?
+  expect "(root-blind) an empty EDGE rendering fails the merge loud" "FAIL" "$rc"
+  merge_resolved_feature_sets "$edge_tree" "" >/dev/null 2>&1; rc=$?
+  expect "(root-blind) an empty PER-PACKAGE rendering fails the merge loud" "FAIL" "$rc"
 }
 
 # assert_every_pipeline_reader_consumes_its_input
@@ -609,6 +891,8 @@ run_fixtures() {
   expect "(SIGPIPE) a tree carrying no scp-testing node is still reported ABSENT" "FAIL" "$probe_rc"
   tree_names_scp_testing_crate "$(printf 'my-scp-testing v0.1.0\n%s' "$padded")"; probe_rc=$?
   expect "(SIGPIPE) a crate whose name merely ends in scp-testing is not matched" "FAIL" "$probe_rc"
+
+  assert_root_package_features_are_extracted
 
   assert_every_pipeline_reader_consumes_its_input
 
