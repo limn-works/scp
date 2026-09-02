@@ -841,20 +841,29 @@ impl KeyCustody for CallbackKeyCustody {
         // # Storage isolation status (spec §9.7.4.1 §3)
         //
         // **Type-level isolation is satisfied** (the bytes never enter
-        // the operational `KeyCustody` provider). **Substrate isolation
-        // is NOT yet satisfied**: the bridge process and the
-        // currently-shipped `InMemoryPreRotationCustody` co-reside in
-        // the same Rust process memory as the operational
-        // `KeyHandle` ID space. A process-memory dump compromises
-        // both.
+        // the operational `KeyCustody` provider). **Substrate
+        // isolation would NOT be satisfied by an in-process
+        // `PreRotationCustody` backend**: such a backend co-resides in
+        // the same Rust process memory as this bridge and the
+        // operational `KeyHandle` ID space, so a single process-memory
+        // dump compromises both. That reasoning is why an in-process
+        // backend can never be the answer here.
+        //
+        // No `PreRotationCustody` backend ships at all today. The only
+        // implementation in the tree, `InMemoryPreRotationCustody`, is
+        // a test-harness nullifier in `scp-platform`'s
+        // `#[cfg(feature = "testing")]` `testing` module (ADR-062
+        // §Decision 6). On a shipped (no-`testing`) build the identity
+        // paths fail closed with `SCP-IDENT-1059` via
+        // `no_pre_rotation_backend` rather than substituting it, so the
+        // capability is honestly absent — not degraded.
         //
         // Full §9.7.4.1 §3 substrate isolation requires a non-in-memory
         // `PreRotationCustody` backend (FIDO2, passkey-PRF, Apple
         // Keychain entry under a separate access-control class,
         // Android Keystore alias with separate authentication flow,
-        // encrypted offline backup, Shamir, BIP39). Production
-        // backends are a separate workstream — see the
-        // `PreRotationCustodyKind::InMemory` doc-comment.
+        // encrypted offline backup, Shamir, BIP39). Those are tracked
+        // by #1729 / RFC #2130.
         //
         // For HSM-bound platforms where `OsRng` is not the appropriate
         // CSPRNG source, the SDK MUST instead generate pre-rotation

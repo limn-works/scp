@@ -7,9 +7,11 @@
 //!
 //! # Variants
 //!
-//! - `InMemoryKeyCustody` — Test/development only. Keys exist only in memory
-//!   and are lost when the process exits. Available because `scp-ffi` enables
-//!   `scp-platform/testing`.
+//! - `InMemoryKeyCustody` — Test-harness nullifier. Keys exist only in memory
+//!   and are lost when the process exits. Compiled ONLY under `scp-ffi`'s own
+//!   `testing` feature, which is the sole place that forwards
+//!   `scp-platform/testing` (ADR-062 §Decision 6); the variant does not exist
+//!   in a shipped build.
 //! - [`FileKeyCustody`] — Encrypted-at-rest key storage using Argon2id +
 //!   AES-256-GCM. The default production custody for desktop/server platforms.
 //!
@@ -34,8 +36,9 @@ use scp_platform::traits::{
 /// delegates each method to the active variant.
 #[allow(clippy::large_enum_variant)]
 pub enum FfiKeyCustody {
-    /// Test/development in-memory custody. Keys are lost on process exit.
-    /// Available because `scp-ffi` enables `scp-platform/testing`.
+    /// Test-harness in-memory custody (nullifier). Keys are lost on process
+    /// exit. Compiled only under `scp-ffi`'s `testing` feature, the sole
+    /// place forwarding `scp-platform/testing` — absent from a shipped build.
     #[cfg(feature = "testing")]
     InMemory(InMemoryKeyCustody),
     /// Encrypted file-backed custody (Argon2id + AES-256-GCM).
@@ -600,9 +603,12 @@ impl KeyCustody for PyCallbackKeyCustody {
         //
         // Storage-isolation status: type-level isolation holds (the seed
         // never enters the operational provider); substrate isolation
-        // depends on the `PreRotationCustody` backend (currently in-memory).
-        // HSM-bound platforms should instead route platform-CSPRNG bytes
-        // directly into a `PreRotationCustody`, bypassing `KeyCustody`.
+        // depends on the `PreRotationCustody` backend, and no such backend
+        // ships — the only implementation is the `testing`-gated
+        // `InMemoryPreRotationCustody` nullifier, so a shipped build fails
+        // closed with `SCP-IDENT-1059` instead (#1729 / RFC #2130 track the
+        // real backends). HSM-bound platforms should route platform-CSPRNG
+        // bytes directly into a `PreRotationCustody`, bypassing `KeyCustody`.
         use rand::RngCore;
         let mut seed = zeroize::Zeroizing::new([0u8; 32]);
         rand::rngs::OsRng.fill_bytes(seed.as_mut());
