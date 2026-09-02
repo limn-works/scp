@@ -1932,7 +1932,19 @@ pub(crate) fn fresh_governance_state(
         deadlock: DeadlockDetectionState::default(),
         pending_ceiling_modification: None,
         pending_economic_policy_change: None,
-        registered_outlets: Vec::new(),
+        // §5.1/§5.12: outlets are declared at creation. Seed the genesis-declared
+        // `params.outlets` into the live registry here — the single shared helper
+        // for the create AND Welcome-join genesis paths, so a creator and a
+        // welcome-joiner install the SAME initial outlet set and the two paths
+        // cannot drift (GitHub #2020). The authenticated provenance record — an
+        // `OutletRegistered` event-log leaf per genesis outlet (§5.4: "silent
+        // outlet modification is not possible") — is appended by the creator's
+        // authoritative genesis writer (`builder::create_context`, alongside the
+        // `ContextCreated`/`MemberJoined` leaves) and travels to joiners via log
+        // replication, exactly as the `ContextCreated` leaf does. The creator's
+        // count is bounded by `validate_params` (`MAX_REGISTERED_OUTLETS`) before
+        // this runs; a joiner's `params` are the creator-validated set.
+        registered_outlets: params.outlets.clone(),
         outlet_interfaces: Vec::new(),
         pruning_policy: None,
         message_pricing: crate::context::lifecycle_logic::derive_message_pricing(
