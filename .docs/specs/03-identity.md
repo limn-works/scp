@@ -958,7 +958,7 @@ The SDK prevents this by default. RepublishManager publishes to both layers on e
 
 ### 3.10.7 Version Resolution
 
-The BEP44 sequence number is the sole authority for document freshness. The highest valid sequence number wins, regardless of which layer served it. Split-brain is impossible: the sequence number is monotonically increasing, and only the identity owner (holder of the Ed25519 private key) can increment it.
+The sequence number orders one key-event chain against its own prefixes: among heads of one chain, the highest valid sequence is the newest, regardless of which layer served it, and only the holder of the signing key can increment it. The sequence decides nothing between two chains that diverge from a shared prefix, because each chain's author assigned its own sequence numbers. Two owner-signed divergent chains are the root-key-compromise or equivocation case, and a resolver settles which chain it adopts by the fork-precedence rule of the security-model spec (`09-security-model.md` §9.7.4.2 R6); that rule may adopt a chain whose head sequence is lower than the head the resolver previously held (§9.7.4.2 R12).
 
 Stale documents are detected by comparing the received sequence number against the last known sequence number for that DID. A relay or DHT node serving a stale document is not malicious — it simply has not received the latest publish. The stale document is overwritten on the next republish cycle.
 

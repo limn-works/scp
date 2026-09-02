@@ -56,7 +56,7 @@ SCP uses multiple DID document service endpoint types, each serving a distinct p
 | `SCPRelay` | Transport-layer relay URLs for encrypted blob routing | `TransportManager` (ADR-012) | §18.2.1 |
 | `SCPCapabilities` | Application-layer capability endpoints (outlet schemas, agent descriptions) | Discovery Engine (§6.2.2) | ADR-020 |
 | `IdentityPrivateState` | Relay URLs storing identity private state blobs | Identity Manager | §3.7 |
-| `PreRotationCommitment` | SHA-256 commitment hash for pre-rotation key (applies to `#0` and `#active` only; `#agent` is a software key with simpler rotation — no pre-rotation needed, see ADR-039) | Identity Manager (§9.12) | ADR-003 |
+| `PreRotationCommitment` | **Retired.** The pre-rotation commitment is a field of the inception event and of every reveal-authorized event in the key-event log, not a service endpoint (`09-security-model.md` §9.7.4.2 R1–R4) | — | §9.7.4.2 |
 | `SCPBroadcastContext` | Broadcast context ID + relay URLs for author discovery | Discovery Engine | §5.14.11 |
 | `ParticipationStatements` | Relay URL(s) where the agent's participation statements can be fetched by verifiers | Participation Admission (§7.3.2.1) | §7.3.2.1 |
 | `AttestationRevocations` | Endpoint(s) for checking attestation revocation status | Attestation Verification (§7.4.4) | §7.4.4 |
@@ -116,11 +116,6 @@ SCP DID documents follow the W3C DID Core specification (v1.0) with SCP-specific
       "id": "#scp-private-state",
       "type": "IdentityPrivateState",
       "serviceEndpoint": ["wss://relay1.example.com/scp/v1", "wss://relay2.example.com/scp/v1"]
-    },
-    {
-      "id": "#scp-prerotation",
-      "type": "PreRotationCommitment",
-      "serviceEndpoint": "<sha256-hex-of-prerotation-public-key>"
     },
     {
       "id": "#scp-participation",
