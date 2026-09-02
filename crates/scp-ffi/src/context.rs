@@ -3250,16 +3250,49 @@ impl crate::scp::PyScp {
     ///   hold the `ContextClose` capability (typically the context creator or
     ///   an admin).
     ///
+    /// The close is idempotent once the supervisor has taken the context out
+    /// of service on its own: when no actor serves the context (a completed
+    /// TTL expiry, an all-members-left teardown) or the supervisor reports a
+    /// closing or terminal state (a peer's close, a migration tombstone), the
+    /// call skips the supervisor dispatch and only releases this bridge's
+    /// state for the id.
+    ///
     /// # Errors
     ///
-    /// Returns `RuntimeError` if the context is not in "active" state.
+    /// Returns `RuntimeError` if the supervisor reports the context in a live
+    /// non-active state (`creating`, `migrating_out`, `poisoned`).
     /// Returns `ContextError` if the caller lacks the `ContextClose` capability.
     #[pyo3(signature = (handle, identity_did))]
     pub fn context_close(&self, handle: &PyContextHandle, identity_did: &str) -> PyResult<()> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(identity_did)?;
-        require_active_context(bi, &handle.context_id, "close")?;
+        // Read the supervisor, not the handle's cached string. A close is the
+        // one lifecycle operation that stays valid after the supervisor took
+        // the context out of service on its own: a TTL expiry despawns the
+        // actor, and a peer's close moves the context to `Closing`. In both
+        // cases the close already happened, and this bridge still holds an
+        // `FfiBridgeState` for the id that only this path releases. So an
+        // absent actor and a closing or terminal state skip the dispatch and
+        // fall through to the release below; only a live non-active state
+        // (`Creating`, `MigratingOut`, `Poisoned`) refuses the close.
+        let close_already_happened =
+            match crate::runtime::read_live_context_state(bi, &handle.context_id)? {
+                None => true,
+                Some(scp_core::context::ContextState::Active) => false,
+                Some(
+                    scp_core::context::ContextState::Closing
+                    | scp_core::context::ContextState::Closed
+                    | scp_core::context::ContextState::Expired
+                    | scp_core::context::ContextState::Tombstoned,
+                ) => true,
+                Some(other) => {
+                    let state_name = context_state_str(&other);
+                    return Err(PyRuntimeError::new_err(format!(
+                        "cannot close context in '{state_name}' state -- context must be 'active'"
+                    )));
+                }
+            };
 
         // Authorization is enforced by the ContextManager (which delegates to
         // ttl::close_context checking the ContextClose capability). No bridge-layer
@@ -3305,8 +3338,10 @@ impl crate::scp::PyScp {
 
         // Delegate close to the shared supervisor FIRST so close
         // authorization (and any other precondition) is honored before the
-        // FFI bridge state is touched.
-        {
+        // FFI bridge state is touched. A close that already happened (see the
+        // supervisor read above) skips the dispatch: no actor serves the
+        // context, so the bridge only has to release its own state.
+        if !close_already_happened {
             let initiator_did = scp_did::DID(identity_did.to_owned());
             let rt = crate::runtime()?;
             let sup = crate::runtime::supervisor(bi)
@@ -7901,16 +7936,6 @@ mod tests {
             "leave reported: {leave}"
         );
 
-        let close = scp
-            .context_close(&handle, creator)
-            .expect_err("close must refuse a closed context");
-        assert!(
-            close
-                .to_string()
-                .contains("cannot close context in 'closing'"),
-            "close reported: {close}"
-        );
-
         let send = Python::with_gil(|py| {
             let payload = pyo3::types::PyBytes::new(py, b"hello");
             scp.context_send(&handle, creator, payload.as_any(), None)
@@ -7932,6 +7957,58 @@ mod tests {
                 .contains("cannot receive from context in 'closing'"),
             "receive reported: {receive}"
         );
+
+        // The close already happened behind the handle, so a second close is
+        // idempotent: it succeeds, releases the bridge state for the id, and
+        // moves the handle's cached string to "closed".
+        scp.context_close(&handle, creator)
+            .expect("close after a peer close must succeed idempotently");
+        assert!(
+            !crate::runtime::ffi_state_registry(&scp.inner).contains_key(handle.context_id()),
+            "close after a peer close must release the bridge state"
+        );
+        assert_eq!(handle.state().expect("state"), "closed");
+    }
+
+    /// A close of a context whose actor the supervisor despawned succeeds
+    /// idempotently and releases the bridge state for that id.
+    ///
+    /// A TTL expiry despawns the actor once the expiry is durable, and the
+    /// handle's cached string still reads `"active"`. The close already
+    /// happened, so `context_close` skips the supervisor dispatch and releases
+    /// the `FfiBridgeState` — the only path that releases it after creation.
+    /// Before this test existed, the close gate refused the despawned context
+    /// with "has no live supervisor state", and every short-TTL context leaked
+    /// its registry entry for the life of the process.
+    #[test]
+    fn close_after_the_supervisor_despawned_the_actor_releases_bridge_state() {
+        crate::init_runtime().ok();
+        let bi = __bi();
+        let creator = "did:dht:z6MkDespawnedCloseCreator";
+        let context_id = format!("a3{}", "0".repeat(56));
+        crate::runtime::init_context_manager_for_test(&bi);
+        crate::runtime::register_context(&bi, &context_id, creator, &[])
+            .expect("fixture registration");
+        // No `create_supervisor_context_for_test`: this context has no actor,
+        // which is the state a completed TTL expiry leaves behind.
+        assert!(crate::runtime::ffi_state_registry(&bi).contains_key(&context_id));
+
+        let handle = active_handle_for(&bi, &context_id, creator);
+        let scp = crate::scp::PyScp {
+            inner: std::sync::Arc::clone(&bi),
+        };
+
+        scp.context_close(&handle, creator)
+            .expect("close of a despawned context must succeed idempotently");
+        assert!(
+            !crate::runtime::ffi_state_registry(&bi).contains_key(&context_id),
+            "close must release the bridge state for a despawned context"
+        );
+        assert_eq!(handle.state().expect("state"), "closed");
+
+        // A second close stays idempotent: no state to release, no error.
+        scp.context_close(&handle, creator)
+            .expect("a repeated close must stay idempotent");
     }
 
     /// A context no supervisor actor serves fails every lifecycle gate closed.

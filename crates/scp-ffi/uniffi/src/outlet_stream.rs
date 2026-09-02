@@ -492,7 +492,8 @@ pub(crate) async fn outlet_stream_open_impl(
         &ucan_token,
         &caller_did,
         proof_tokens.as_ref(),
-    )?;
+    )
+    .await?;
 
     // §7.3.8 effective-caveat resolution from the VALIDATED invocation UCAN's
     // narrowed `nb` — mirrors `outlet_invoke`. `ucan_cid` keys the owned Class-S
@@ -1096,27 +1097,20 @@ fn no_active_saga_err(saga_id: &str) -> ScpError {
 /// Resolves the TARGET context's raw Ed25519 Active Signing Key from a
 /// context-id STRING (the streaming-saga RECOVER path has no `ContextHandle`,
 /// only the `target_context_id` pinned in the registry entry). Reads the
-/// context creator DID off the per-context UCAN state, then exports that
-/// identity's Active Signing Key from this instance's identity custody registry
+/// context creator DID off the supervisor actor, then exports that identity's
+/// Active Signing Key from this instance's identity custody registry
 /// (co-resident single-tenant). The key never enters the runtime autonomously
 /// (ADR-006) — it is resolved per-call here and passed to the seal.
+///
+/// The creator DID comes from the actor rather than from the per-context UCAN
+/// state, because this call chooses the authority a streaming saga signs as. An
+/// `AdminTransferred` governance action moves that authority, and the UCAN
+/// state's copy would keep signing as the previous holder.
 async fn resolve_context_active_signing_key_by_id(
     bi: &Arc<UniffiBridgeInstance>,
     context_id: &str,
 ) -> Result<ed25519_dalek::SigningKey, ScpError> {
-    let creator_did = bi
-        .with_ucan_state(context_id, |state| state.creator_did.clone())
-        .ok_or_else(|| ScpError::Context {
-            msg: format!(
-                "context '{context_id}' not found in the UCAN registry — cannot resolve its \
-                 Active Signing Key for streaming-saga reconnect recovery"
-            ),
-            // Same "not hosted by this bridge instance" (channel-auth /
-            // co-resident single-tenant) class as the identity-custody miss
-            // below — a context whose per-context UCAN state is absent here is
-            // not hosted here. Aligned to CTX_2001 for cross-bridge consistency.
-            code: codes::CTX_2001.to_owned(),
-        })?;
+    let creator_did = bi.live_role_state(context_id).await?.creator_did;
     let (custody, key_handle) = {
         let registry = identity_custody_registry(bi);
         let entry = registry.get(&creator_did).ok_or_else(|| ScpError::Context {
@@ -1295,7 +1289,8 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
         &ucan_token,
         &caller_did,
         proof_tokens.as_ref(),
-    )?;
+    )
+    .await?;
 
     // §7.3.8 effective-caveat resolution from the VALIDATED invocation UCAN's
     // narrowed `nb`. `ucan_cid` keys the owned Class-S counters and anchors the

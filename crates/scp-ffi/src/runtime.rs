@@ -1763,14 +1763,36 @@ pub fn live_context_state(
     bi: &PyBridgeInstance,
     context_id: &str,
 ) -> Result<scp_core::context::ContextState, ScpPyError> {
-    let sup = Arc::clone(supervisor(bi)?);
-    let ctx = context_id.to_owned();
-    block_on_supervisor_query(async move { sup.read_context_state(&ctx).await })?.ok_or_else(|| {
+    read_live_context_state(bi, context_id)?.ok_or_else(|| {
         ScpPyError::context(format!(
             "context '{context_id}' has no live supervisor state — refusing to run a \
              lifecycle-gated operation against a context no actor serves"
         ))
     })
+}
+
+/// Reads a context's lifecycle state from that context's supervisor actor, and
+/// reports an absent actor as `None` instead of as an error.
+///
+/// [`live_context_state`] is the gate form: it turns `None` into an error so a
+/// gate never admits an operation on an absent answer. `context_close` calls
+/// this form instead, because a close of a context whose actor the supervisor
+/// already despawned — a completed TTL expiry, an all-members-left teardown —
+/// is idempotent: the close already happened, and the bridge still has to
+/// release the [`FfiBridgeState`] it holds for that id. Refusing that close
+/// would leave the registry entry alive for the life of the process.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` when the supervisor is unavailable or
+/// when the tokio bridge fails (see [`block_on_supervisor_query`]).
+pub fn read_live_context_state(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+) -> Result<Option<scp_core::context::ContextState>, ScpPyError> {
+    let sup = Arc::clone(supervisor(bi)?);
+    let ctx = context_id.to_owned();
+    block_on_supervisor_query(async move { sup.read_context_state(&ctx).await })
 }
 
 /// Reads a context's capability ceiling from that context's supervisor actor,

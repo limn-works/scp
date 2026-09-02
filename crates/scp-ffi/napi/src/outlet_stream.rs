@@ -445,6 +445,7 @@ pub(crate) async fn outlet_stream_open_on(
         &ucan_token,
         &proof_resolver,
     )
+    .await
     .map_err(napi::Error::from)?;
 
     // §7.3.8 effective-caveat resolution from the VALIDATED invocation UCAN's
@@ -1148,8 +1149,6 @@ pub(crate) async fn outlet_streaming_saga_open_on(
 
     let caller_context_id = source_handle.context_id();
     let target_context_id = target_handle.context_id();
-    let caller_creator_did = source_handle.creator_did();
-    let target_creator_did = target_handle.creator_did();
 
     // Both contexts MUST be Active before this money-moving open touches any
     // state. Read the AUTHORITATIVE lifecycle state from the per-context
@@ -1266,6 +1265,7 @@ pub(crate) async fn outlet_streaming_saga_open_on(
         &ucan_token,
         &proof_resolver,
     )
+    .await
     .map_err(napi::Error::from)?;
 
     // §7.3.8 effective-caveat resolution from the VALIDATED invocation UCAN's
@@ -1423,11 +1423,9 @@ pub(crate) async fn outlet_streaming_saga_open_on(
 
     // ----- (d) signing keys: each co-resident context's Active Signing Key ----
     let target_signing_key =
-        crate::outlets::resolve_context_signing_key(bi, &target_creator_did, &target_context_id)
-            .await?;
+        crate::outlets::resolve_context_signing_key(bi, &target_context_id).await?;
     let caller_signing_key =
-        crate::outlets::resolve_context_signing_key(bi, &caller_creator_did, &caller_context_id)
-            .await?;
+        crate::outlets::resolve_context_signing_key(bi, &caller_context_id).await?;
 
     // ----- Chokepoint (ADR-056): id STRING → [u8; 32] -------------------------
     let caller_context_bytes = scp_core::context::state::context_id_to_bytes(&caller_context_id);
@@ -1601,14 +1599,9 @@ pub(crate) async fn outlet_streaming_saga_recover_truncated_close_on(
     }
 
     // Resolve the TARGET context's Active Signing Key per-call from custody
-    // (never envelope-asserted): its creator_did off the per-context FFI state,
-    // then the raw signing key via the shared saga resolver.
-    let target_creator_did =
-        crate::runtime::with_context(bi, &target_context_id, |rt| Ok(rt.core.creator_did.clone()))
-            .map_err(napi::Error::from)?;
-    let target_key =
-        crate::outlets::resolve_context_signing_key(bi, &target_creator_did, &target_context_id)
-            .await?;
+    // (never envelope-asserted): the shared saga resolver reads the creator DID
+    // off the supervisor actor, then exports the raw signing key.
+    let target_key = crate::outlets::resolve_context_signing_key(bi, &target_context_id).await?;
     let signing_key =
         scp_core::context::actor::commands::SigningKeyBytes::from_signing_key(&target_key);
     let supervisor = crate::runtime::supervisor(bi)?.clone();

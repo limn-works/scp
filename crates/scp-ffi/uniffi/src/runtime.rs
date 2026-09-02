@@ -968,35 +968,134 @@ impl UniffiBridgeInstance {
         self.core.set_supervisor(supervisor_arc);
     }
 
-    /// Per-instance equivalent of the module-level
-    /// `sync_role_state_from_manager` free function.
+    /// Reads a context's role state from that context's supervisor actor.
     ///
-    /// Validates that the attached `ContextManager` has role state for the
-    /// given context after a governance operation. Logs the sync for
-    /// traceability.
+    /// Every UniFFI entry point that decides authorization, membership, a role,
+    /// a capability, or a capability ceiling reads through this function. The
+    /// per-context UCAN state carries a `creator_did` and a `ceiling_strings`
+    /// set recorded when THIS bridge registered the context, so a `ModifyCeiling`
+    /// governance action or an `AdminTransferred` action leaves those two fields
+    /// granting what the supervisor already withdrew. The `PyO3` and NAPI
+    /// bridges read the actor at the same decisions.
+    ///
+    /// Fails closed. A context whose actor holds no role state yields
+    /// `ScpError::Context`; no caller receives a permissive default.
     ///
     /// # Errors
     ///
-    /// Returns `ScpError::Context` (code `SCP-CTX-2040`) if the context is
-    /// not registered in the attached `ContextManager`, or any error returned
-    /// by [`UniffiBridgeInstance::context_manager_or_error`] if no manager is
-    /// attached.
-    #[allow(dead_code)]
-    pub async fn sync_role_state_from_manager(
+    /// Returns any error [`UniffiBridgeInstance::context_manager_or_error`]
+    /// returns, or `ScpError::Context` when the supervisor holds no role state
+    /// for `context_id`.
+    pub async fn live_role_state(
         &self,
         context_id: &str,
-    ) -> Result<(), crate::ScpError> {
+    ) -> Result<scp_core::context::roles::ContextRoleState, crate::ScpError> {
         let supervisor = self.context_manager_or_error()?;
-        let _role_state = supervisor.get_role_state(context_id).await.ok_or_else(|| {
-            crate::ScpError::Context {
+        supervisor
+            .get_role_state(context_id)
+            .await
+            .ok_or_else(|| crate::ScpError::Context {
                 msg: format!(
-                    "context '{context_id}' not found in Supervisor during role state sync"
+                    "context '{context_id}' has no live supervisor role state — refusing to \
+                     authorize against an absent membership record"
                 ),
-                code: codes::CTX_2040.to_owned(),
-            }
-        })?;
-        tracing::debug!(context_id = %context_id, "UniFFI: role state synced after governance operation");
-        Ok(())
+                code: codes::CTX_2023.to_owned(),
+            })
+    }
+
+    /// Synchronous form of [`UniffiBridgeInstance::live_role_state`] for the two
+    /// callers the `scp_mcp::server::ContextProvider` trait forces to be
+    /// synchronous.
+    ///
+    /// Runs the mailbox round trip through `block_in_place`, matching the shape
+    /// `McpUniFfiBridgeProvider::agent_role` already uses. The caller must sit on
+    /// a multi-thread runtime worker, which every MCP server task does.
+    /// `scripts/check-block-in-place.py` excludes `crates/scp-ffi/**` because
+    /// every FFI bridge needs a synchronous-to-async seam of exactly this shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns every error [`UniffiBridgeInstance::live_role_state`] returns.
+    pub fn live_role_state_blocking(
+        &self,
+        context_id: &str,
+    ) -> Result<scp_core::context::roles::ContextRoleState, crate::ScpError> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.live_role_state(context_id))
+        })
+    }
+
+    /// Reads a context's lifecycle state from that context's supervisor actor,
+    /// and reports an absent actor as `None` instead of as an error.
+    ///
+    /// [`UniffiBridgeInstance::require_active_context`] is the gate form: it
+    /// turns `None` into an error so a gate never admits an operation on an
+    /// absent answer. `context_close` reads this form instead, because a close
+    /// of a context whose actor the supervisor already despawned — a completed
+    /// TTL expiry, an all-members-left teardown — is idempotent: the close
+    /// already happened, and the bridge still has to release the per-context
+    /// UCAN state it holds for that id.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error [`UniffiBridgeInstance::context_manager_or_error`]
+    /// returns, or `ScpError::Context` when the supervisor state read fails.
+    pub async fn read_live_context_state(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<scp_core::context::ContextState>, crate::ScpError> {
+        let supervisor = self.context_manager_or_error()?;
+        supervisor
+            .read_context_state(context_id)
+            .await
+            .map_err(|e| crate::ScpError::Context {
+                msg: format!("supervisor state read failed: {e}"),
+                code: codes::CTX_2000.to_owned(),
+            })
+    }
+
+    /// Refuses `verb` unless `context_id`'s supervisor actor reports `Active`.
+    ///
+    /// The lifecycle gate reads the supervisor actor, never the `state` a
+    /// [`ContextHandle`](crate::ContextHandle) caches. That cached state records
+    /// only the transitions THIS bridge observed, so a TTL expiry the supervisor
+    /// applied on its own timer, a close another member initiated, a migration
+    /// that tombstoned the context, and an actor the watchdog poisoned all leave
+    /// it reading `Active`. A gate reading it admits an operation into a context
+    /// the supervisor stopped serving. The `PyO3` and NAPI bridges gate on the
+    /// same live read, so the three bridges answer one lifecycle question one
+    /// way.
+    ///
+    /// Fails closed: a context no actor serves refuses the operation. `mk_err`
+    /// wraps the refusal message in the error variant and the error code the
+    /// calling operation reports, so a lifecycle refusal keeps whichever
+    /// `ScpError` variant that operation already returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Context` when the supervisor reports any state other
+    /// than `Active`, when no actor serves `context_id`, or when the supervisor
+    /// query fails.
+    pub async fn require_active_context<F>(
+        &self,
+        context_id: &str,
+        verb: &str,
+        mk_err: F,
+    ) -> Result<(), crate::ScpError>
+    where
+        F: FnOnce(String) -> crate::ScpError,
+    {
+        let state = self.read_live_context_state(context_id).await?;
+        match state {
+            Some(scp_core::context::ContextState::Active) => Ok(()),
+            Some(other) => Err(mk_err(format!(
+                "cannot {verb} in {other:?} state — context must be active"
+            ))),
+            None => Err(mk_err(format!(
+                "context '{context_id}' has no live supervisor state — refusing to run a \
+                 lifecycle-gated operation against a context no actor serves"
+            ))),
+        }
     }
 
     /// Per-instance equivalent of the module-level
@@ -1536,11 +1635,9 @@ pub fn build_event_log_provider() -> (
 pub type UcanContextState = scp_ffi_common::bridge_runtime::UcanContextStateCore;
 
 // Phase D (#1695): module-level `ucan_registry`, `ensure_ucan_registered`,
-// `with_ucan_state`, `remove_ucan_state`, `sync_role_state_from_manager`,
-// and `with_rate_limit_tracker` free functions deleted. Every caller
-// accesses the per-instance equivalents on `UniffiBridgeInstance`
-// (`ensure_ucan_registered`, `with_ucan_state`, `remove_ucan_state`,
-// `sync_role_state_from_manager`, `with_rate_limit_tracker`).
+// `with_ucan_state`, `remove_ucan_state`, and `with_rate_limit_tracker` free
+// functions deleted. Every caller accesses the per-instance equivalents on
+// `UniffiBridgeInstance`.
 
 /// Queries event counts for trust scoring within a context.
 ///

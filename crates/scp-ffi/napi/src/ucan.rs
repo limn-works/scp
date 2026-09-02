@@ -290,6 +290,15 @@ pub(crate) async fn ucan_validate_on(
 
     let context_id = handle.context_id();
 
+    // ADR-016 step 8 compares the token's grants against the context's
+    // capability ceiling, and the chain check anchors on the context creator.
+    // Both come from the supervisor actor, so a `ModifyCeiling` governance
+    // action or an admin transfer binds the very next validation.
+    let role_state = crate::runtime::live_role_state(bi, &context_id)
+        .await
+        .map_err(napi::Error::from)?;
+    let ceiling_strings = role_state.ceiling().to_ucan_string_set();
+
     // Run validation inside with_context to use persistent revocation list
     // and nonce tracker from the runtime registry. This ensures:
     // - Revoked tokens are rejected across calls (persistent RevocationList).
@@ -312,8 +321,8 @@ pub(crate) async fn ucan_validate_on(
             nonce_tracker: &mut nonce_adapter,
             revocation_checker: &revocation_checker,
             proof_resolver: &proof_resolver,
-            ceiling: &rt.core.ceiling_strings,
-            context_creator_did: &rt.core.creator_did,
+            ceiling: &ceiling_strings,
+            context_creator_did: &role_state.creator_did,
             presenting_agent_did: agent_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
@@ -403,6 +412,14 @@ pub(crate) async fn ucan_evaluate_on(
 
     let context_id = handle.context_id();
 
+    // The ceiling and the creator DID come from the supervisor actor for the
+    // same reason `ucan_validate_on` reads them there: a bridge copy kept
+    // reporting a permission a governance action had already withdrawn.
+    let role_state = crate::runtime::live_role_state(bi, &context_id)
+        .await
+        .map_err(napi::Error::from)?;
+    let ceiling_strings = role_state.ceiling().to_ucan_string_set();
+
     // evaluate_ucan takes `&ValidationContext` and is read-only — it probes the
     // nonce tracker via check_replay but never records, so the persistent
     // NonceTracker is not mutated.
@@ -422,8 +439,8 @@ pub(crate) async fn ucan_evaluate_on(
             nonce_tracker: &mut nonce_adapter,
             revocation_checker: &revocation_checker,
             proof_resolver: &proof_resolver,
-            ceiling: &rt.core.ceiling_strings,
-            context_creator_did: &rt.core.creator_did,
+            ceiling: &ceiling_strings,
+            context_creator_did: &role_state.creator_did,
             presenting_agent_did: agent_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
@@ -458,38 +475,43 @@ pub(crate) async fn ucan_mint_on(
         }
     }
 
-    // Extract key custody and signing key from the context handle. Available
-    // for any context whose creator identity retains custody — in-memory OR a
-    // production callback custody (`identityCreateWithCustody`).
-    let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
-        napi::Error::from(ScpNapiError::Identity {
-            message: "UCAN minting requires retained signing custody — the context creator \
-                  identity has no retained custody (it was externally loaded)"
-                .to_owned(),
-            code: codes::IDENT_1017.to_owned(),
-        })
-    })?;
-    let signing_key = handle.signing_key.ok_or_else(|| {
-        napi::Error::from(ScpNapiError::Identity {
-            message: "UCAN minting requires retained signing custody — the context creator \
-                  identity has no active signing key"
-                .to_owned(),
-            code: codes::IDENT_1017.to_owned(),
-        })
-    })?;
-
-    let creator_did = handle.creator_did();
     let context_id = handle.context_id();
 
-    // Get ceiling from the context handle for mint-time enforcement (#339).
-    // Empty ceiling means the user passed `[]` — apply the default ceiling
-    // instead of `None` (which would mean unlimited). See #1419.
-    let ceiling_strings: std::collections::HashSet<String> = handle.ceiling().into_iter().collect();
-    let ceiling = Some(if ceiling_strings.is_empty() {
-        scp_core::context::roles::default_ceiling().to_ucan_string_set()
-    } else {
-        ceiling_strings
-    });
+    // The issuer is the context creator, and the ceiling bounds what may be
+    // minted (#339, the ceiling-enforcement issue). Both come from the
+    // supervisor actor: an admin transfer moves the issuer, and a
+    // `ModifyCeiling` governance action narrows what a mint may grant. The
+    // handle's `creator_did` and `ceiling` record what THIS bridge saw at
+    // registration, so a mint reading them granted what the supervisor had
+    // already withdrawn.
+    let role_state = crate::runtime::live_role_state(bi, &context_id)
+        .await
+        .map_err(napi::Error::from)?;
+    let creator_did = role_state.creator_did.clone();
+    let ceiling = Some(role_state.ceiling().to_ucan_string_set());
+
+    // Resolve the custody and the Active Signing Key from THIS instance's
+    // identity registry under the live creator DID, never off the handle. The
+    // handle carries the custody of whoever created the context, so signing
+    // with it while issuing as the live creator would mint a token whose `iss`
+    // names one principal and whose signature belongs to another. The `PyO3`
+    // bridge resolves both from the registry under the live creator for the
+    // same reason.
+    let (custody, signing_key) = crate::runtime::with_identity(bi, &creator_did, |entry| {
+        Ok((
+            std::sync::Arc::clone(&entry.custody),
+            entry.identity.active_signing_key,
+        ))
+    })
+    .map_err(|_| {
+        napi::Error::from(ScpNapiError::Identity {
+            message: format!(
+                "UCAN minting requires retained signing custody — this bridge instance hosts \
+                 no identity for context creator '{creator_did}'"
+            ),
+            code: codes::IDENT_1017.to_owned(),
+        })
+    })?;
 
     let params = MintParams {
         issuer_did: &creator_did,
@@ -607,15 +629,14 @@ pub(crate) async fn ucan_delegate_on(
         .collect::<Result<Vec<_>, ScpNapiError>>()
         .map_err(napi::Error::from)?;
 
-    // Get ceiling from the context handle for delegation-time enforcement (#339).
-    // Empty ceiling means the user passed `[]` — apply the default ceiling
-    // instead of `None` (which would mean unlimited). See #1419.
-    let ceiling_strings: std::collections::HashSet<String> = handle.ceiling().into_iter().collect();
-    let ceiling = Some(if ceiling_strings.is_empty() {
-        scp_core::context::roles::default_ceiling().to_ucan_string_set()
-    } else {
-        ceiling_strings
-    });
+    // The ceiling bounds what a delegation may carry (#339, the
+    // ceiling-enforcement issue); it comes from the supervisor actor so a
+    // narrowed ceiling binds the next delegation.
+    let ceiling = Some(
+        crate::runtime::live_ceiling_strings(bi, &handle.context_id())
+            .await
+            .map_err(napi::Error::from)?,
+    );
 
     // Look up the DELEGATOR's identity from the global identity registry.
     // This is critical: the delegation must be signed with the delegator's

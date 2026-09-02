@@ -4355,7 +4355,7 @@ pub fn identity_verify_link_attestation(
 ///
 /// Runs the full 11-step ADR-016 pipeline, requiring `outlet_call:{outlet_id}`
 /// or `outlet_call:*` capability. Extracted to keep `outlet_invoke` focused.
-pub(crate) fn validate_outlet_ucan_uniffi(
+pub(crate) async fn validate_outlet_ucan_uniffi(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     handle: &ContextHandle,
     outlet_id: &str,
@@ -4384,11 +4384,20 @@ pub(crate) fn validate_outlet_ucan_uniffi(
     let proof_resolver = scp_ffi_common::BridgeProofResolver { proofs };
 
     // Ensure UCAN state is registered for this context on the caller's instance.
+    // The registration carries the bridge-owned revocation list and nonce
+    // tracker; it does NOT decide authorization.
     bi.ensure_ucan_registered(
         &handle.context_id,
         &handle.creator_did,
         &handle.ceiling_strings,
     );
+
+    // ADR-016 step 8 compares the token's grants against the context's
+    // capability ceiling, and the chain check anchors on the context creator.
+    // Both come from the supervisor actor, so a `ModifyCeiling` governance
+    // action or an admin transfer binds the very next validation.
+    let role_state = bi.live_role_state(&handle.context_id).await?;
+    let ceiling_strings = role_state.ceiling().to_ucan_string_set();
 
     bi.with_ucan_state(&handle.context_id, |ucan_state| {
         let production_resolver = bi.did_resolver();
@@ -4405,8 +4414,8 @@ pub(crate) fn validate_outlet_ucan_uniffi(
             nonce_tracker: &mut nonce_adapter,
             revocation_checker: &revocation_checker,
             proof_resolver: &proof_resolver,
-            ceiling: &ucan_state.ceiling_strings,
-            context_creator_did: &ucan_state.creator_did,
+            ceiling: &ceiling_strings,
+            context_creator_did: &role_state.creator_did,
             presenting_agent_did: identity_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
@@ -4988,6 +4997,13 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                 })?
             };
 
+            // The ceiling and the creator DID come from the supervisor actor,
+            // never from the per-context UCAN state this bridge registered.
+            let role_state = bi
+                .live_role_state_blocking(context_id)
+                .map_err(|e| e.to_string())?;
+            let ceiling_strings = role_state.ceiling().to_ucan_string_set();
+
             let agent_did = self.agent_did.clone();
             bi.with_ucan_state(context_id, |ucan_state| {
                 let production_resolver = bi.did_resolver();
@@ -5005,8 +5021,8 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                     nonce_tracker: &mut nonce_adapter,
                     revocation_checker: &revocation_checker,
                     proof_resolver: &proof_resolver,
-                    ceiling: &ucan_state.ceiling_strings,
-                    context_creator_did: &ucan_state.creator_did,
+                    ceiling: &ceiling_strings,
+                    context_creator_did: &role_state.creator_did,
                     presenting_agent_did: &agent_did,
                     clock_skew_tolerance_secs:
                         scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
@@ -10803,18 +10819,16 @@ impl Scp {
             .spawn(async move {
                 validate_did(&identity.did)?;
 
-                let state = handle.state.lock().await;
-
-                if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Context {
-                        msg: format!(
-                            "cannot join context in {:?} state — context must be active",
-                            *state
-                        ),
+                // The supervisor actor answers the lifecycle question, never
+                // the handle's cached state — see
+                // `UniffiBridgeInstance::require_active_context`.
+                bi.require_active_context(&handle.context_id, "join context", |msg| {
+                    ScpError::Context {
+                        msg,
                         code: codes::CTX_2013.to_owned(),
-                    });
-                }
-                drop(state);
+                    }
+                })
+                .await?;
 
                 // Parse the optional spending UCAN JWT once at the bridge boundary
                 // so malformed tokens are rejected before the manager is touched.
@@ -10979,18 +10993,16 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                let state = handle.state.lock().await;
-
-                if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Context {
-                        msg: format!(
-                            "cannot leave context in {:?} state — context must be active",
-                            *state
-                        ),
+                // The supervisor actor answers the lifecycle question, never
+                // the handle's cached state — see
+                // `UniffiBridgeInstance::require_active_context`.
+                bi.require_active_context(&handle.context_id, "leave context", |msg| {
+                    ScpError::Context {
+                        msg,
                         code: codes::CTX_2015.to_owned(),
-                    });
-                }
-                drop(state);
+                    }
+                })
+                .await?;
 
                 // Route through the ADR-049 lifecycle dispatch surface.
                 let sup = bi.context_manager_or_error()?;
@@ -11067,30 +11079,59 @@ impl Scp {
                 // bridge-layer auth check — the ContextManager is authoritative.
                 let identity_did = identity.did.clone();
 
+                // Read the supervisor, not the handle's cached state. A close
+                // is the one lifecycle operation that stays valid after the
+                // supervisor took the context out of service on its own: a TTL
+                // expiry despawns the actor, and a peer's close moves the
+                // context to `Closing`. In both cases the close already
+                // happened, and this bridge still holds per-context UCAN state
+                // for the id that only this path releases. So an absent actor
+                // and a closing or terminal state skip the dispatch and fall
+                // through to the release below; only a live non-active state
+                // (`Creating`, `MigratingOut`, `Poisoned`) refuses the close.
+                // `scp_core::context::ContextState` is the supervisor's own
+                // enum; the UniFFI-exported `ContextState` is a separate type,
+                // so this match names the core one explicitly.
+                use scp_core::context::ContextState as CoreContextState;
+                let close_already_happened = match bi
+                    .read_live_context_state(&handle.context_id)
+                    .await?
+                {
+                    None => true,
+                    Some(CoreContextState::Active) => false,
+                    Some(
+                        CoreContextState::Closing
+                        | CoreContextState::Closed
+                        | CoreContextState::Expired
+                        | CoreContextState::Tombstoned,
+                    ) => true,
+                    Some(other) => {
+                        return Err(ScpError::Context {
+                            msg: format!(
+                                "cannot close context in {other:?} state — context must be active"
+                            ),
+                            code: codes::CTX_2017.to_owned(),
+                        });
+                    }
+                };
                 let mut state = handle.state.lock().await;
-                if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Context {
-                        msg: format!(
-                            "cannot close context in {:?} state — context must be active",
-                            *state
-                        ),
-                        code: codes::CTX_2017.to_owned(),
-                    });
-                }
 
                 // Route through the ADR-049 lifecycle dispatch surface. The
                 // actor mailbox preserves byte-identical close semantics; the
                 // Supervisor is the authoritative auth layer (ttl::close_context
-                // ContextClose capability check).
-                let sup = bi.context_manager_or_error()?;
-                let core_handle = scp_core::context::ContextHandle::new(
-                    handle.context_id.clone(),
-                    scp_core::context::ContextParams::default(),
-                );
-                let _ = core_handle.transition_to(&scp_core::context::ContextState::Active);
+                // ContextClose capability check). A close that already happened
+                // (see the supervisor read above) skips the dispatch: no actor
+                // serves the context, so the bridge only has to release its own
+                // state.
+                if !close_already_happened {
+                    let sup = bi.context_manager_or_error()?;
+                    let core_handle = scp_core::context::ContextHandle::new(
+                        handle.context_id.clone(),
+                        scp_core::context::ContextParams::default(),
+                    );
+                    let _ = core_handle.transition_to(&scp_core::context::ContextState::Active);
 
-                let initiator_did: scp_did::DID = identity_did.clone().into();
-                {
+                    let initiator_did: scp_did::DID = identity_did.clone().into();
                     use scp_core::context::actor::commands::{
                         CloseContextPayload, LifecycleCommand,
                     };
@@ -11175,18 +11216,16 @@ impl Scp {
             .spawn(async move {
                 validate_did(&identity.did)?;
 
-                let state = handle.state.lock().await;
-
-                if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Context {
-                        msg: format!(
-                            "cannot send to context in {:?} state — context must be active",
-                            *state
-                        ),
+                // The supervisor actor answers the lifecycle question, never
+                // the handle's cached state — see
+                // `UniffiBridgeInstance::require_active_context`.
+                bi.require_active_context(&handle.context_id, "send to context", |msg| {
+                    ScpError::Context {
+                        msg,
                         code: codes::CTX_2019.to_owned(),
-                    });
-                }
-                drop(state);
+                    }
+                })
+                .await?;
 
                 // Validate inner envelope signing via the retained KeyCustody
                 // (SCP-214 criterion 6). This ensures the identity's mandatory
@@ -11321,18 +11360,17 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
-        let state = handle.state.lock().await;
-
-        if !matches!(*state, ContextState::Active) {
-            return Err(ScpError::Context {
-                msg: format!(
-                    "cannot subscribe to context in {:?} state — context must be active",
-                    *state
-                ),
-                code: codes::CTX_2021.to_owned(),
-            });
-        }
-        drop(state);
+        // The supervisor actor answers the lifecycle question, never
+        // the handle's cached state — see
+        // `UniffiBridgeInstance::require_active_context`.
+        self.inner
+            .require_active_context(&handle.context_id, "subscribe to context", |msg| {
+                ScpError::Context {
+                    msg,
+                    code: codes::CTX_2021.to_owned(),
+                }
+            })
+            .await?;
 
         // Signal stream completion — full transport wiring connects this
         // listener to the message pipeline in integration stories.
@@ -11454,21 +11492,9 @@ impl Scp {
                 code: codes::CTX_2032.to_owned(),
             })??;
 
-        // Re-sync role state from ContextManager after governance execution (#796).
-        // Governance actions may modify roles/membership; without this sync the
-        // Swift/Kotlin SDKs see stale role state for UCAN/outlet capability checks.
-        if let Err(e) = self
-            .inner
-            .sync_role_state_from_manager(&handle.context_id)
-            .await
-        {
-            tracing::warn!(
-                context_id = %handle.context_id,
-                proposal_id = %proposal_id_log,
-                error = %e,
-                "failed to sync role state after governance execution"
-            );
-        }
+        // No role-state re-sync: the per-context actor holds the mutation
+        // this governance action applied, and every UniFFI authorization
+        // site reads that record from the actor at its next decision.
 
         // Sync FFI handle state for migration transitions (§5.11A).
         match result.as_str() {
@@ -11540,18 +11566,9 @@ impl Scp {
                 code: codes::CTX_2041.to_owned(),
             })??;
 
-        if let Err(e) = self
-            .inner
-            .sync_role_state_from_manager(&handle.context_id)
-            .await
-        {
-            tracing::warn!(
-                context_id = %handle.context_id,
-                action = action_name,
-                error = %e,
-                "failed to sync role state after governance proposal"
-            );
-        }
+        // No role-state re-sync: the per-context actor holds the mutation
+        // this governance action applied, and every UniFFI authorization
+        // site reads that record from the actor at its next decision.
 
         Ok(result)
     }
@@ -11612,17 +11629,9 @@ impl Scp {
                 code: codes::CTX_2042.to_owned(),
             })?;
 
-        if let Err(e) = self
-            .inner
-            .sync_role_state_from_manager(&handle.context_id)
-            .await
-        {
-            tracing::warn!(
-                context_id = %handle.context_id,
-                error = %e,
-                "failed to sync role state after governance approval"
-            );
-        }
+        // No role-state re-sync: the per-context actor holds the mutation
+        // this governance action applied, and every UniFFI authorization
+        // site reads that record from the actor at its next decision.
 
         result
     }
@@ -11683,17 +11692,9 @@ impl Scp {
                 code: codes::CTX_2043.to_owned(),
             })?;
 
-        if let Err(e) = self
-            .inner
-            .sync_role_state_from_manager(&handle.context_id)
-            .await
-        {
-            tracing::warn!(
-                context_id = %handle.context_id,
-                error = %e,
-                "failed to sync role state after governance rejection"
-            );
-        }
+        // No role-state re-sync: the per-context actor holds the mutation
+        // this governance action applied, and every UniFFI authorization
+        // site reads that record from the actor at its next decision.
 
         result
     }
@@ -11733,17 +11734,9 @@ impl Scp {
                 code: codes::CTX_2044.to_owned(),
             })?;
 
-        if let Err(e) = self
-            .inner
-            .sync_role_state_from_manager(&handle.context_id)
-            .await
-        {
-            tracing::warn!(
-                context_id = %handle.context_id,
-                error = %e,
-                "failed to sync role state after governance withdrawal"
-            );
-        }
+        // No role-state re-sync: the per-context actor holds the mutation
+        // this governance action applied, and every UniFFI authorization
+        // site reads that record from the actor at its next decision.
 
         result
     }
@@ -13344,22 +13337,23 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
                 validate_outlet_name(&definition.name)?;
 
-                let state = handle.state.lock().await;
-
-                if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Outlet {
-                        msg: format!(
-                            "cannot register outlet in context in {:?} state — context must be active",
-                            *state
-                        ),
+                // The supervisor actor answers the lifecycle question, never
+                // the handle's cached state — see
+                // `UniffiBridgeInstance::require_active_context`.
+                bi.require_active_context(
+                    &handle.context_id,
+                    "register outlet in context",
+                    |msg| ScpError::Outlet {
+                        msg,
                         code: codes::OUTLET_6003.to_owned(),
-                    });
-                }
-                drop(state);
+                    },
+                )
+                .await?;
 
                 let input_schema: serde_json::Value =
                     serde_json::from_str(&definition.input_schema_json).map_err(|e| {
@@ -13397,13 +13391,16 @@ impl Scp {
                 let test_vectors: Vec<scp_core::context::outlets::OutletTestVector> =
                     match definition.test_vectors_json.as_deref() {
                         None => Vec::new(),
-                        Some(json) => serde_json::from_str(json).map_err(|e| ScpError::Validation {
-                            msg: format!("invalid test_vectors_json: {e}"),
-                            code: codes::VALID_7037.to_owned(),
-                        })?,
+                        Some(json) => {
+                            serde_json::from_str(json).map_err(|e| ScpError::Validation {
+                                msg: format!("invalid test_vectors_json: {e}"),
+                                code: codes::VALID_7037.to_owned(),
+                            })?
+                        }
                     };
 
-                let implementation_hash: [u8; 32] = match definition.implementation_hash.as_deref() {
+                let implementation_hash: [u8; 32] = match definition.implementation_hash.as_deref()
+                {
                     None => [0u8; 32],
                     Some(bytes) => scp_ffi_common::validate::expect_fixed_bytes::<32>(
                         bytes,
@@ -13415,18 +13412,23 @@ impl Scp {
                     })?,
                 };
 
-                let outlet_id = format!("outlet-{}", definition.name.replace(' ', "-").to_lowercase());
+                let outlet_id = format!(
+                    "outlet-{}",
+                    definition.name.replace(' ', "-").to_lowercase()
+                );
 
-                let cost = definition.cost.map(|c| scp_core::context::outlets::OutletCost {
-                    // ADR-060: `OutletCost.amount` is the `Amount` newtype. UniFFI
-                    // carries it as a native `u64` (Swift `UInt64` / Kotlin
-                    // `ULong`), which represents the full smallest-unit range
-                    // exactly.
-                    amount: scp_core::economy::Amount(c.amount),
-                    currency: c.currency,
-                    payee: c.payee.into(),
-                    cost_formula: c.cost_formula,
-                });
+                let cost = definition
+                    .cost
+                    .map(|c| scp_core::context::outlets::OutletCost {
+                        // ADR-060: `OutletCost.amount` is the `Amount` newtype. UniFFI
+                        // carries it as a native `u64` (Swift `UInt64` / Kotlin
+                        // `ULong`), which represents the full smallest-unit range
+                        // exactly.
+                        amount: scp_core::economy::Amount(c.amount),
+                        currency: c.currency,
+                        payee: c.payee.into(),
+                        cost_formula: c.cost_formula,
+                    });
 
                 let core_registration = scp_core::context::outlets::OutletRegistration {
                     outlet_id: outlet_id.clone(),
@@ -13527,18 +13529,16 @@ impl Scp {
                     validate_ucan_token(jwt)?;
                 }
 
-                let state = handle.state.lock().await;
-
-                if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Outlet {
-                        msg: format!(
-                            "cannot invoke outlet in context in {:?} state — context must be active",
-                            *state
-                        ),
+                // The supervisor actor answers the lifecycle question, never
+                // the handle's cached state — see
+                // `UniffiBridgeInstance::require_active_context`.
+                bi.require_active_context(&handle.context_id, "invoke outlet in context", |msg| {
+                    ScpError::Outlet {
+                        msg,
                         code: codes::OUTLET_6005.to_owned(),
-                    });
-                }
-                drop(state);
+                    }
+                })
+                .await?;
 
                 // SCP-OUT-014: select the split capability stem from the
                 // outlet's registered kind — `outlet_query:{id}` for Query
@@ -13569,7 +13569,8 @@ impl Scp {
                     &ucan_token,
                     &identity.did,
                     proof_tokens.as_ref(),
-                )?;
+                )
+                .await?;
 
                 // Parse the optional spending UCAN JWT (§19.5
                 // AND-composition). Mirrors `context_send`. An invalid JWT
@@ -13597,9 +13598,7 @@ impl Scp {
                 let invocation_ucan_token =
                     scp_core::crypto::ucan::validate::parse_ucan(&ucan_token).map_err(|e| {
                         ScpError::Permission {
-                            msg: format!(
-                                "invalid invocation UCAN for outlet '{outlet_id}': {e}"
-                            ),
+                            msg: format!("invalid invocation UCAN for outlet '{outlet_id}': {e}"),
                             code: codes::PERM_3001.to_owned(),
                         }
                     })?;
@@ -13674,7 +13673,9 @@ impl Scp {
                             },
                             |h| {
                                 h(input).map_err(|e| {
-                                    format!("outlet handler for '{outlet_id_for_executor}' failed: {e}")
+                                    format!(
+                                        "outlet handler for '{outlet_id_for_executor}' failed: {e}"
+                                    )
                                 })
                             },
                         )
@@ -13683,7 +13684,8 @@ impl Scp {
 
                 let manager = bi.context_manager_expect()?;
                 let invoker_did_typed: scp_did::DID = identity.did.clone().into();
-                let outlet_id_typed = scp_core::context::outlets::OutletId::from(outlet_id.as_str());
+                let outlet_id_typed =
+                    scp_core::context::outlets::OutletId::from(outlet_id.as_str());
                 let outcome = manager
                     .invoke_outlet_with_economy(
                         &context_id,
@@ -13728,20 +13730,19 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                let state = handle.state.lock().await;
-
-                if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Outlet {
-                        msg: format!(
-                            "cannot verify outlet in context in {:?} state — context must be active",
-                            *state
-                        ),
+                // The supervisor actor answers the lifecycle question, never
+                // the handle's cached state — see
+                // `UniffiBridgeInstance::require_active_context`.
+                bi.require_active_context(&handle.context_id, "verify outlet in context", |msg| {
+                    ScpError::Outlet {
+                        msg,
                         code: codes::OUTLET_6007.to_owned(),
-                    });
-                }
-                drop(state);
+                    }
+                })
+                .await?;
 
                 Ok(OutletVerificationResult {
                     outlet_id,
@@ -13860,7 +13861,8 @@ impl Scp {
                     &ucan_token,
                     &identity.did,
                     proof_tokens.as_ref(),
-                )?;
+                )
+                .await?;
 
                 let input_value: serde_json::Value =
                     serde_json::from_str(&input_json).map_err(|e| ScpError::Outlet {
@@ -14194,17 +14196,16 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                let state = handle.state.lock().await;
-                if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Outlet {
-                        msg: format!(
-                            "cannot create session in context in {:?} state — context must be active",
-                            *state
-                        ),
+                // The supervisor actor answers the lifecycle question, never
+                // the handle's cached state — see
+                // `UniffiBridgeInstance::require_active_context`.
+                bi.require_active_context(&handle.context_id, "create session in context", |msg| {
+                    ScpError::Outlet {
+                        msg,
                         code: codes::OUTLET_6014.to_owned(),
-                    });
-                }
-                drop(state);
+                    }
+                })
+                .await?;
 
                 let mut store = handle.session_store.lock().await;
 
@@ -14274,17 +14275,16 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                let state = handle.state.lock().await;
-                if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Outlet {
-                        msg: format!(
-                            "cannot invoke session in context in {:?} state — context must be active",
-                            *state
-                        ),
+                // The supervisor actor answers the lifecycle question, never
+                // the handle's cached state — see
+                // `UniffiBridgeInstance::require_active_context`.
+                bi.require_active_context(&handle.context_id, "invoke session in context", |msg| {
+                    ScpError::Outlet {
+                        msg,
                         code: codes::OUTLET_6017.to_owned(),
-                    });
-                }
-                drop(state);
+                    }
+                })
+                .await?;
 
                 // Look up outlet_id from session for UCAN validation.
                 let outlet_id_for_ucan = {
@@ -14322,7 +14322,8 @@ impl Scp {
                     &ucan_token,
                     &identity.did,
                     proof_tokens.as_ref(),
-                )?;
+                )
+                .await?;
 
                 let mut store = handle.session_store.lock().await;
 
@@ -14454,21 +14455,23 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
                 validate_outlet_id(&outlet_id)?;
 
-                let state = handle.state.lock().await;
-                if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Outlet {
-                        msg: format!(
-                            "cannot expose outlet interface in context in {:?} state — context must be active",
-                            *state
-                        ),
+                // The supervisor actor answers the lifecycle question, never
+                // the handle's cached state — see
+                // `UniffiBridgeInstance::require_active_context`.
+                bi.require_active_context(
+                    &handle.context_id,
+                    "expose outlet interface in context",
+                    |msg| ScpError::Outlet {
+                        msg,
                         code: codes::OUTLET_6030.to_owned(),
-                    });
-                }
-                drop(state);
+                    },
+                )
+                .await?;
 
                 let rate_limit = match rate_limit_json {
                     Some(ref json) => {
@@ -14542,19 +14545,21 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                let state = handle.state.lock().await;
-                if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Outlet {
-                        msg: format!(
-                            "cannot accept outlet interface in context in {:?} state — context must be active",
-                            *state
-                        ),
+                // The supervisor actor answers the lifecycle question, never
+                // the handle's cached state — see
+                // `UniffiBridgeInstance::require_active_context`.
+                bi.require_active_context(
+                    &handle.context_id,
+                    "accept outlet interface in context",
+                    |msg| ScpError::Outlet {
+                        msg,
                         code: codes::OUTLET_6032.to_owned(),
-                    });
-                }
-                drop(state);
+                    },
+                )
+                .await?;
 
                 let mut interface: scp_core::context::outlets::interface::OutletInterface =
                     serde_json::from_str(&interface_json).map_err(|e| ScpError::Validation {
@@ -19484,6 +19489,79 @@ mod tests {
             scp.inner.with_ucan_state(&context_id, |_| ()).is_none(),
             "UCAN state must be rolled back after a failed spawn"
         );
+    }
+
+    /// A lifecycle gate reads the supervisor actor, so a despawned actor
+    /// refuses join, leave, and send, while close stays idempotent and releases
+    /// the bridge's per-context UCAN state.
+    ///
+    /// `ContextHandle::state` still reads `Active` after the supervisor
+    /// despawns the actor — a TTL expiry does that on the supervisor's own
+    /// timer — so a gate reading that cached state admits an operation into a
+    /// context the supervisor stopped serving, and a close reading it dispatches
+    /// to an actor that no longer exists.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn lifecycle_gates_read_the_supervisor_not_the_cached_handle_state() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+        let context_id = handle.context_id();
+        assert!(scp.inner.with_ucan_state(&context_id, |_| ()).is_some());
+
+        // A TTL expiry despawns the actor once the expiry is durable. The
+        // handle's cached state still reads `Active` afterwards.
+        rt.block_on(async {
+            scp.inner
+                .context_manager_or_error()
+                .expect("supervisor")
+                .despawn_actor(&context_id)
+                .await
+        });
+        assert!(matches!(
+            *rt.block_on(handle.state.lock()),
+            ContextState::Active
+        ));
+
+        let join = rt
+            .block_on(scp.context_join(Arc::clone(&handle), Arc::clone(&identity), None))
+            .expect_err("join must refuse a context no actor serves");
+        assert!(
+            format!("{join}").contains("no live supervisor state"),
+            "join reported: {join}"
+        );
+
+        let send = rt
+            .block_on(scp.context_send(
+                Arc::clone(&handle),
+                Arc::clone(&identity),
+                b"hi".to_vec(),
+                None,
+            ))
+            .expect_err("send must refuse a context no actor serves");
+        assert!(
+            format!("{send}").contains("no live supervisor state"),
+            "send reported: {send}"
+        );
+
+        // Close stays reachable: the close already happened, and only this path
+        // releases the bridge's per-context UCAN state.
+        rt.block_on(scp.context_close(Arc::clone(&handle), Arc::clone(&identity)))
+            .expect("close of a despawned context must succeed idempotently");
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_none(),
+            "close must release the per-context UCAN state"
+        );
+        assert!(matches!(
+            *rt.block_on(handle.state.lock()),
+            ContextState::Closed
+        ));
     }
 
     /// A context already active on this instance collides at the atomic UCAN

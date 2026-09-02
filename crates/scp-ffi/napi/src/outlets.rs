@@ -21,7 +21,7 @@ use crate::error::ScpNapiError;
 /// Validates a UCAN token for outlet invocation authorization.
 ///
 /// Performs the full 11-step ADR-016 validation pipeline.
-pub(crate) fn validate_ucan_for_outlet(
+pub(crate) async fn validate_ucan_for_outlet(
     bi: &crate::runtime::NapiBridgeInstance,
     context_id: &str,
     outlet_id: &str,
@@ -29,6 +29,15 @@ pub(crate) fn validate_ucan_for_outlet(
     ucan_token: &str,
     proof_resolver: &scp_ffi_common::BridgeProofResolver,
 ) -> Result<(), ScpNapiError> {
+    // ADR-016 step 8 compares the token's grants against the context's
+    // capability ceiling, and the chain check anchors on the context creator.
+    // Both come from the supervisor actor, read HERE — a bridge copy of either
+    // kept granting what a `ModifyCeiling` governance action had already
+    // narrowed, and it kept anchoring on a creator an `AdminTransferred` action
+    // had already replaced.
+    let role_state = crate::runtime::live_role_state(bi, context_id).await?;
+    let ceiling_strings = role_state.ceiling().to_ucan_string_set();
+
     crate::runtime::with_context(bi, context_id, |rt| {
         // SCP-OUT-014: select the split capability stem from the outlet's
         // registered kind — `outlet_query:{id}` for Query outlets,
@@ -58,8 +67,8 @@ pub(crate) fn validate_ucan_for_outlet(
             nonce_tracker: &mut nonce_adapter,
             revocation_checker: &revocation_checker,
             proof_resolver,
-            ceiling: &rt.core.ceiling_strings,
-            context_creator_did: &rt.core.creator_did,
+            ceiling: &ceiling_strings,
+            context_creator_did: &role_state.creator_did,
             presenting_agent_did: identity_did,
             clock_skew_tolerance_secs:
                 scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
@@ -246,7 +255,6 @@ fn validate_implementation_hash(bytes: Option<&[u8]>) -> napi::Result<[u8; 32]> 
 // ---------------------------------------------------------------------------
 
 /// Per-bridge-instance implementation of [`outlet_register`].
-#[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
 pub(crate) async fn outlet_register_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -255,16 +263,19 @@ pub(crate) async fn outlet_register_on(
     crate::napi_check_handle!(&bi.core, handle);
     validate_outlet_name(&definition.name).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
-    let state_str = handle.state()?;
-    if state_str != "active" {
-        return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot register outlet in context in {state_str:?} state — context must be active"
-            ),
+    // The supervisor actor answers the lifecycle question, never the
+    // handle's cached string — see `crate::runtime::require_active_context`.
+    crate::runtime::require_active_context(
+        bi,
+        &handle.context_id(),
+        "register outlet in context",
+        |msg| ScpNapiError::Outlet {
+            message: msg,
             code: codes::OUTLET_6003.to_owned(),
-        }
-        .into());
-    }
+        },
+    )
+    .await
+    .map_err(napi::Error::from)?;
 
     // Ensure UCAN state is registered so the outlet registry is available.
     crate::runtime::ensure_registered(bi, handle)?;
@@ -322,13 +333,23 @@ pub(crate) async fn outlet_register_on(
         signature: Vec::new(),
     };
 
+    // Read the registrant's authority from the supervisor actor BEFORE taking
+    // the FFI shard lock. `register_outlet` decides whether the registrant holds
+    // `outlet:register`, so it reads the role state the supervisor holds now,
+    // not a bridge copy that a governance action or a membership change could
+    // have left permissive.
+    let role_state = crate::runtime::live_role_state(bi, &context_id)
+        .await
+        .map_err(napi::Error::from)?;
+    let creator_did = role_state.creator_did.clone();
+
     // Register the outlet in the context's outlet registry.
     let registered_id = crate::runtime::with_context(bi, &context_id, |rt| {
         let (registered_id, _event) = scp_core::context::outlets::register_outlet(
             &mut rt.outlet_registry,
-            &rt.role_state,
+            &role_state,
             core_registration,
-            &rt.core.creator_did.clone(),
+            &creator_did,
         )
         .map_err(|e| ScpNapiError::Outlet {
             message: format!("outlet registration failed: {e}"),
@@ -361,16 +382,19 @@ pub(crate) async fn outlet_invoke_on(
         validate_ucan_token(jwt).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     }
 
-    let state_str = handle.state()?;
-    if state_str != "active" {
-        return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot invoke outlet in context in {state_str:?} state — context must be active"
-            ),
+    // The supervisor actor answers the lifecycle question, never the
+    // handle's cached string — see `crate::runtime::require_active_context`.
+    crate::runtime::require_active_context(
+        bi,
+        &handle.context_id(),
+        "invoke outlet in context",
+        |msg| ScpNapiError::Outlet {
+            message: msg,
             code: codes::OUTLET_6005.to_owned(),
-        }
-        .into());
-    }
+        },
+    )
+    .await
+    .map_err(napi::Error::from)?;
 
     let context_id = handle.context_id();
     crate::runtime::ensure_registered(bi, handle)?;
@@ -393,6 +417,7 @@ pub(crate) async fn outlet_invoke_on(
         &ucan_token,
         &proof_resolver,
     )
+    .await
     .map_err(napi::Error::from)?;
 
     // Parse the optional spending UCAN JWT (§19.5 AND-composition).
@@ -526,23 +551,25 @@ pub(crate) async fn outlet_invoke_on(
 }
 
 /// Per-bridge-instance implementation of [`outlet_verify`].
-#[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
 pub(crate) async fn outlet_verify_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
     outlet_id: String,
 ) -> napi::Result<NapiOutletVerificationResult> {
     crate::napi_check_handle!(&bi.core, handle);
-    let state_str = handle.state()?;
-    if state_str != "active" {
-        return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot verify outlet in context in {state_str:?} state — context must be active"
-            ),
+    // The supervisor actor answers the lifecycle question, never the
+    // handle's cached string — see `crate::runtime::require_active_context`.
+    crate::runtime::require_active_context(
+        bi,
+        &handle.context_id(),
+        "verify outlet in context",
+        |msg| ScpNapiError::Outlet {
+            message: msg,
             code: codes::OUTLET_6007.to_owned(),
-        }
-        .into());
-    }
+        },
+    )
+    .await
+    .map_err(napi::Error::from)?;
 
     let context_id = handle.context_id();
     crate::runtime::ensure_registered(bi, handle)?;
@@ -608,27 +635,29 @@ pub(crate) async fn outlet_invoke_cross_context_on(
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, source_handle, target_handle);
     // Validate both contexts are active.
-    let source_state = source_handle.state()?;
-    if source_state != "active" {
-        return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot invoke cross-context outlet: source context in {source_state:?} state"
-            ),
+    crate::runtime::require_active_context(
+        bi,
+        &source_handle.context_id(),
+        "use source context",
+        |msg| ScpNapiError::Outlet {
+            message: format!("cannot invoke cross-context outlet: {msg}"),
             code: codes::OUTLET_6010.to_owned(),
-        }
-        .into());
-    }
+        },
+    )
+    .await
+    .map_err(napi::Error::from)?;
 
-    let target_state = target_handle.state()?;
-    if target_state != "active" {
-        return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot invoke cross-context outlet: target context in {target_state:?} state"
-            ),
+    crate::runtime::require_active_context(
+        bi,
+        &target_handle.context_id(),
+        "use target context",
+        |msg| ScpNapiError::Outlet {
+            message: format!("cannot invoke cross-context outlet: {msg}"),
             code: codes::OUTLET_6011.to_owned(),
-        }
-        .into());
-    }
+        },
+    )
+    .await
+    .map_err(napi::Error::from)?;
 
     let source_context_id = source_handle.context_id();
     let target_context_id = target_handle.context_id();
@@ -673,6 +702,7 @@ pub(crate) async fn outlet_invoke_cross_context_on(
         &ucan_token,
         &proof_resolver,
     )
+    .await
     .map_err(napi::Error::from)?;
 
     let input_value: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
@@ -822,16 +852,19 @@ pub(crate) fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> S
 /// Key (spec §6.2.4 "Signer authorization": the receipt key MUST be the one
 /// authorized to act for `target_context_id`).
 ///
-/// `creator_did` is read off the context HANDLE (`creator_did()`), the
-/// authoritative owner the handle was minted with — not via the UCAN-state
-/// registry, which a freshly-created context only populates lazily on its first
-/// UCAN/outlet call. `context_id` is carried only for the error message.
+/// The creator DID comes from the supervisor actor rather than from the
+/// context handle, because this call chooses the authority a cross-context saga
+/// signs as. An `AdminTransferred` governance action moves that authority, and a
+/// handle minted before that action would keep signing as the previous holder.
 pub(crate) async fn resolve_context_signing_key(
     bi: &crate::runtime::NapiBridgeInstance,
-    creator_did: &str,
     context_id: &str,
 ) -> napi::Result<ed25519_dalek::SigningKey> {
-    let (custody, key_handle) = crate::runtime::with_identity(bi, creator_did, |entry| {
+    let creator_did = crate::runtime::live_role_state(bi, context_id)
+        .await
+        .map_err(napi::Error::from)?
+        .creator_did;
+    let (custody, key_handle) = crate::runtime::with_identity(bi, &creator_did, |entry| {
         Ok((entry.custody.clone(), entry.identity.active_signing_key))
     })
     .map_err(napi::Error::from)?;
@@ -972,31 +1005,31 @@ pub(crate) async fn outlet_invoke_cross_context_saga_on(
 
     crate::napi_check_handle!(&bi.core, source_handle, target_handle);
 
-    let source_state = source_handle.state()?;
-    if source_state != "active" {
-        return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot start cross-context saga: caller context in {source_state:?} state"
-            ),
+    crate::runtime::require_active_context(
+        bi,
+        &source_handle.context_id(),
+        "use caller context",
+        |msg| ScpNapiError::Outlet {
+            message: format!("cannot start cross-context saga: {msg}"),
             code: codes::OUTLET_6010.to_owned(),
-        }
-        .into());
-    }
-    let target_state = target_handle.state()?;
-    if target_state != "active" {
-        return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot start cross-context saga: target context in {target_state:?} state"
-            ),
+        },
+    )
+    .await
+    .map_err(napi::Error::from)?;
+    crate::runtime::require_active_context(
+        bi,
+        &target_handle.context_id(),
+        "use target context",
+        |msg| ScpNapiError::Outlet {
+            message: format!("cannot start cross-context saga: {msg}"),
             code: codes::OUTLET_6011.to_owned(),
-        }
-        .into());
-    }
+        },
+    )
+    .await
+    .map_err(napi::Error::from)?;
 
     let caller_context_id = source_handle.context_id();
     let target_context_id = target_handle.context_id();
-    let caller_creator_did = source_handle.creator_did();
-    let target_creator_did = target_handle.creator_did();
 
     scp_ffi_common::validate::validate_context_id(&caller_context_id)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
@@ -1030,10 +1063,8 @@ pub(crate) async fn outlet_invoke_cross_context_saga_on(
     let target_context_bytes = scp_core::context::state::context_id_to_bytes(&target_context_id);
 
     // ----- Signing keys: each context's Active Signing Key -------------------
-    let target_signing_key =
-        resolve_context_signing_key(bi, &target_creator_did, &target_context_id).await?;
-    let caller_signing_key =
-        resolve_context_signing_key(bi, &caller_creator_did, &caller_context_id).await?;
+    let target_signing_key = resolve_context_signing_key(bi, &target_context_id).await?;
+    let caller_signing_key = resolve_context_signing_key(bi, &caller_context_id).await?;
 
     // ----- Executor: snapshot the TARGET context's outlet handler --------------
     //
@@ -1125,16 +1156,19 @@ pub(crate) async fn outlet_session_create_on(
     ttl_seconds: Option<u32>,
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, handle);
-    let state_str = handle.state()?;
-    if state_str != "active" {
-        return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot create session in context in {state_str:?} state — context must be active"
-            ),
+    // The supervisor actor answers the lifecycle question, never the
+    // handle's cached string — see `crate::runtime::require_active_context`.
+    crate::runtime::require_active_context(
+        bi,
+        &handle.context_id(),
+        "create session in context",
+        |msg| ScpNapiError::Outlet {
+            message: msg,
             code: codes::OUTLET_6014.to_owned(),
-        }
-        .into());
-    }
+        },
+    )
+    .await
+    .map_err(napi::Error::from)?;
 
     let context_id = handle.context_id();
     crate::runtime::ensure_registered(bi, handle)?;
@@ -1181,7 +1215,6 @@ pub(crate) async fn outlet_session_create_on(
 }
 
 /// Per-bridge-instance implementation of [`outlet_session_invoke`].
-#[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
 pub(crate) async fn outlet_session_invoke_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -1192,16 +1225,19 @@ pub(crate) async fn outlet_session_invoke_on(
     proof_tokens: Option<Vec<String>>,
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, handle);
-    let state_str = handle.state()?;
-    if state_str != "active" {
-        return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot invoke session in context in {state_str:?} state — context must be active"
-            ),
+    // The supervisor actor answers the lifecycle question, never the
+    // handle's cached string — see `crate::runtime::require_active_context`.
+    crate::runtime::require_active_context(
+        bi,
+        &handle.context_id(),
+        "invoke session in context",
+        |msg| ScpNapiError::Outlet {
+            message: msg,
             code: codes::OUTLET_6017.to_owned(),
-        }
-        .into());
-    }
+        },
+    )
+    .await
+    .map_err(napi::Error::from)?;
 
     let context_id = handle.context_id();
     crate::runtime::ensure_registered(bi, handle)?;
@@ -1237,6 +1273,7 @@ pub(crate) async fn outlet_session_invoke_on(
         &ucan_token,
         &proof_resolver,
     )
+    .await
     .map_err(napi::Error::from)?;
 
     let output = crate::runtime::with_context(bi, &context_id, |rt| {
@@ -1319,7 +1356,6 @@ pub(crate) async fn outlet_session_invoke_on(
 }
 
 /// Per-bridge-instance implementation of [`outlet_session_close`].
-#[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
 pub(crate) async fn outlet_session_close_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -1346,7 +1382,6 @@ pub(crate) async fn outlet_session_close_on(
 // ---------------------------------------------------------------------------
 
 /// Per-bridge-instance implementation of [`outlet_interface_expose`].
-#[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
 pub(crate) async fn outlet_interface_expose_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -1360,16 +1395,19 @@ pub(crate) async fn outlet_interface_expose_on(
     scp_ffi_common::validate::validate_context_id(&target_context_id)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
-    let state_str = handle.state()?;
-    if state_str != "active" {
-        return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot expose outlet interface in context in {state_str:?} state — context must be active"
-            ),
+    // The supervisor actor answers the lifecycle question, never the
+    // handle's cached string — see `crate::runtime::require_active_context`.
+    crate::runtime::require_active_context(
+        bi,
+        &handle.context_id(),
+        "expose outlet interface in context",
+        |msg| ScpNapiError::Outlet {
+            message: msg,
             code: codes::OUTLET_6030.to_owned(),
-        }
-        .into());
-    }
+        },
+    )
+    .await
+    .map_err(napi::Error::from)?;
 
     let context_id = handle.context_id();
     crate::runtime::ensure_registered(bi, handle)?;
@@ -1388,6 +1426,15 @@ pub(crate) async fn outlet_interface_expose_on(
         None => None,
     };
 
+    // `expose_outlet` decides whether the caller may offer this context's outlet
+    // to another context, reading roles and the creator DID. Both come from the
+    // supervisor actor so an admin transfer or a role change lands before the
+    // offer is minted.
+    let role_state = crate::runtime::live_role_state(bi, &context_id)
+        .await
+        .map_err(napi::Error::from)?;
+    let creator_did = role_state.creator_did.clone();
+
     crate::runtime::with_context(bi, &context_id, |rt| {
         let context_handle = scp_core::context::ContextHandle::new(
             context_id.clone(),
@@ -1398,8 +1445,8 @@ pub(crate) async fn outlet_interface_expose_on(
             context_handle.context_id(),
             &outlet_id,
             &target_context_id,
-            &rt.role_state,
-            &rt.core.creator_did,
+            &role_state,
+            &creator_did,
             &rt.outlet_registry,
             rate_limit,
             None,
@@ -1418,25 +1465,26 @@ pub(crate) async fn outlet_interface_expose_on(
 }
 
 /// Per-bridge-instance implementation of [`outlet_interface_accept`].
-#[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
 pub(crate) async fn outlet_interface_accept_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
     interface_json: String,
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, handle);
-    let state_str = handle.state()?;
-    if state_str != "active" {
-        return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot accept outlet interface in context in {state_str:?} state — context must be active"
-            ),
-            code: codes::OUTLET_6032.to_owned(),
-        }
-        .into());
-    }
-
     let context_id = handle.context_id();
+    // The supervisor actor answers the lifecycle question, never the handle's
+    // cached string — see `crate::runtime::require_active_context`.
+    crate::runtime::require_active_context(
+        bi,
+        &context_id,
+        "accept outlet interface in context",
+        |msg| ScpNapiError::Outlet {
+            message: msg,
+            code: codes::OUTLET_6032.to_owned(),
+        },
+    )
+    .await
+    .map_err(napi::Error::from)?;
     crate::runtime::ensure_registered(bi, handle)?;
 
     let mut interface: scp_core::context::outlets::interface::OutletInterface =
@@ -1447,7 +1495,14 @@ pub(crate) async fn outlet_interface_accept_on(
             })
         })?;
 
-    crate::runtime::with_context(bi, &context_id, |rt| {
+    // `accept_outlet_interface` decides whether the caller may bind another
+    // context's outlet offer into this context, reading roles and the creator
+    // DID from the supervisor actor.
+    let role_state = crate::runtime::live_role_state(bi, &context_id)
+        .await
+        .map_err(napi::Error::from)?;
+
+    crate::runtime::with_context(bi, &context_id, |_rt| {
         let context_handle = scp_core::context::ContextHandle::new(
             context_id.clone(),
             scp_core::context::ContextParams::default(),
@@ -1456,8 +1511,8 @@ pub(crate) async fn outlet_interface_accept_on(
         scp_core::context::outlets::interface::accept_outlet_interface(
             context_handle.context_id(),
             &mut interface,
-            &rt.role_state,
-            &rt.core.creator_did,
+            &role_state,
+            &role_state.creator_did,
             None,
         )
         .map_err(|e| ScpNapiError::Outlet {
@@ -1474,7 +1529,6 @@ pub(crate) async fn outlet_interface_accept_on(
 }
 
 /// Per-bridge-instance implementation of [`outlet_interface_revoke`].
-#[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
 pub(crate) async fn outlet_interface_revoke_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
