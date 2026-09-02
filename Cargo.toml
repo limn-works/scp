@@ -138,7 +138,7 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false, feat
 unicode-normalization = "0.1"
 arc-swap = "1"
 futures = "0.3"
-rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 redb = "2"
 static_assertions = "1.1"
 # wasm-bindgen stack for the browser participant surface (ADR-057 Slice 3).

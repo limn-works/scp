@@ -129,7 +129,22 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # Python wheels — maturin-built manylinux2014 / macOS / Windows wheels
+  # Python wheels — maturin-built manylinux_2_28 / macOS / Windows wheels
+  #
+  # Every quirk below was learned the hard way on the 0.1.0b3 publish (the
+  # first CI wheel build — this job previously carried latent bugs because no
+  # run had ever reached it):
+  #   - maturin in CI finds no python by itself; each leg pins an explicit
+  #     interpreter (`-i`).
+  #   - manylinux 2_28, not 2014: CentOS 7 (EOL) can build neither
+  #     ring/aws-lc-sys (glibc >= 2.18, newer gcc) nor vendored OpenSSL.
+  #   - x86_64 2_28 container ships a minimal perl that openssl-src's
+  #     Configure rejects -> install the full perl distribution. The aarch64
+  #     leg is an Ubuntu-based rust-cross image (complete perl, NO dnf) — a
+  #     dnf attempt there exits 127, so it must get no container prep.
+  #   - Windows needs NASM for the vendored-OpenSSL MSVC assembly.
+  #   - No --manifest-path arg: bindings/python/pyproject.toml already carries
+  #     [tool.maturin] manifest-path.
   # ---------------------------------------------------------------------------
   python-wheels:
     name: Python wheel (${{ matrix.target }})
@@ -140,32 +155,49 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
-            manylinux: manylinux2014
+            manylinux: 2_28
+            interpreter: python3.12
+            before-script: dnf install -y perl
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
-            manylinux: manylinux2014
+            manylinux: 2_28
+            interpreter: python3.12
+            before-script: "true"
           - target: x86_64-apple-darwin
             runner: macos-latest
             manylinux: auto
+            interpreter: python
           - target: aarch64-apple-darwin
             runner: macos-latest
             manylinux: auto
+            interpreter: python
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             manylinux: auto
+            interpreter: python
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup NASM (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
 
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
+          before-script-linux: ${{ matrix.before-script }}
           args: >-
             --release
             --out dist
-            --manifest-path crates/scp-ffi/Cargo.toml
+            -i ${{ matrix.interpreter }}
           working-directory: bindings/python
 
       - name: Upload Python wheel
@@ -182,13 +214,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      # No --manifest-path: pyproject.toml carries [tool.maturin] manifest-path.
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
           args: >-
             --out dist
-            --manifest-path crates/scp-ffi/Cargo.toml
           working-directory: bindings/python
 
       - name: Upload sdist

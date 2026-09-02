@@ -93,7 +93,7 @@ uuid = { workspace = true, optional = true }
 scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2", optional = true }
 
 # sqlite dependencies, gated behind the `sqlite` feature flag.
-rusqlite = { version = "0.32", features = ["bundled-sqlcipher"], optional = true }
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"], optional = true }
 hex = { workspace = true, optional = true }
 # fs2 provides advisory POSIX / Windows file locking — used by SqliteStorage
 # to refuse a second process/instance trying to open the same database
