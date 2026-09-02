@@ -30,8 +30,12 @@ on:
     # ADVISORY -- `ci` is the only required status check on the Default ruleset,
     # which is why PR #2274's failing `Rust API docs (rustdoc)` job (run
     # 30878568409, attempt 1, never re-run) did not block its merge and three
-    # broken intra-doc links rode `main` for ten days. Making rustdoc a required
-    # check is the actual fix; this trigger only shortens time-to-detection.
+    # broken intra-doc links rode `main` for ten days. Job rust-doc in ci.yml now
+    # runs `cargo doc --document-private-items` under the same feature set, so a
+    # broken intra-doc link — the class that rode `main` — reds the required
+    # check itself. This trigger shortens time-to-detection for whatever this
+    # workflow builds and ci.yml does not: the sphinx, typedoc and Dokka jobs
+    # below.
     branches: [main]
     tags:
       - "scp-core@*"
@@ -72,11 +76,13 @@ jobs:
     # `rust-docs` runs `cargo doc --workspace --document-private-items`, which compiles
     # every crate of this workspace, so `rust-toolchain.toml` selects the compiler that
     # job's rustdoc runs and `.cargo/config.toml` sets the rustflags it compiles under.
-    # `rust-docs` is also the one job in this repository that exercises rustdoc across the
-    # whole workspace, and `scp-runtime` denies `rustdoc::broken_intra_doc_links`, so a
-    # pull request that raises the pin and changes nothing else has to run it: a new
-    # release's rustdoc diagnostic would otherwise first appear on the next pull request
-    # that touches `crates/scp-runtime/src/**`, against code its author did not write.
+    # `scp-runtime` denies `rustdoc::broken_intra_doc_links`, so a pull request that
+    # raises the pin and changes nothing else has to run `rust-docs`: a new release's
+    # rustdoc diagnostic would otherwise first appear on the next pull request that
+    # touches `crates/scp-runtime/src/**`, against code its author did not write. Job
+    # rust-doc in ci.yml runs the same rustdoc command and its `rust` output ORs a
+    # `toolchain` filter of its own, so both workflows report that diagnostic on a pin
+    # change, and only ci.yml's report can block a merge.
     #
     # The `toolchain` filter below holds `rust-toolchain.toml` and `.cargo/**`, and the
     # `docs` output ORs that filter in, which is the shape
