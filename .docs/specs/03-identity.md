@@ -25,7 +25,7 @@ Custody migration moves the operational signing capability from one custody prov
 
 1. **Active Signing Key migration (common).** The Active Signing Key (`#active`) is rotatable by design (ADR-003 §4a). Migration generates a new `#active` key in the target custody provider and publishes an updated DID document signed by `#0`. The old `#active` key is revoked. The DID string does not change because it is derived from `#0`, not `#active`. This is the standard `rotate_active_key` operation applied to a custody change rather than a compromise.
 
-2. **Identity Key migration (rare).** If `#0` itself must move (e.g., the Secure Enclave device is being decommissioned and the key cannot be exported), the pre-rotation key mechanism (ADR-003 §4b, §9.12) is used. This creates a new DID — identity continuity is maintained through the `alsoKnownAs` forwarding record and the `DidRotationEvent` sent to all active contexts. The pre-rotation proof cryptographically binds the old identity to the new one.
+2. **Root key change (rare).** If `#0` must change because it is compromised, the root changes by a `RootRecovery` event (`09-security-model.md` §9.7.4.2 R3): the standing pre-rotation key authorizes the event, a fresh root generated in operational custody is installed, and the identifier does not change — no new DID, no `alsoKnownAs` forwarding record, and no `DidRotationEvent`. Relying parties re-verify key continuity (§9.11) on the recovery event. Whether a planned root move with no compromise — a Secure Enclave device being decommissioned with its key unexportable — uses the same event is not yet fixed in this spec.
 
 **Migration protocol (case 1 — Active Signing Key):**
 
@@ -962,7 +962,7 @@ The sequence number orders one key-event chain against its own prefixes: among h
 
 Stale documents are detected by comparing the received sequence number against the last known sequence number for that DID. A relay or DHT node serving a stale document is not malicious — it simply has not received the latest publish. The stale document is overwritten on the next republish cycle.
 
-When both layers return valid documents with different sequence numbers, the higher sequence number is authoritative. The resolver SHOULD update its cache and MAY re-publish the fresher document to the layer that returned the stale one (protocol-level healing).
+When both layers return valid heads of the same chain at different sequence numbers, the higher sequence is authoritative; heads of divergent chains are settled first by the fork-precedence rule (`09-security-model.md` §9.7.4.2 R6). The resolver SHOULD update its cache and MAY re-publish the winning head to the layer that returned the stale one (protocol-level healing).
 
 ### 3.10.8 Security Analysis
 

@@ -14,7 +14,7 @@ Bare `Err` is acceptable ONLY when every step before the failure is fully revers
 
 ## What the lesson is about
 
-`DidDht::migrate_identity` performs eight steps. Step 5 (`destroy_after_migration`) consumes the OLD pre-rotation private bytes from cold custody — the operation is irreversible by design (spec §9.7.4.1 §6 "post-rotation key cycling"). Step 7 (publish NEW DID document) and step 8 (republish OLD document with `alsoKnownAs`) BOTH happen AFTER step 5. If either publish fails, the caller cannot retry: step 1 would fail at `reveal_public_key` against a missing handle.
+`DidDht::migrate_identity` performs eight steps. Step 5 (`destroy_after_migration`) consumes the OLD pre-rotation private bytes from cold custody — the operation is irreversible by design (spec §9.7.4.1 item 6 as it then read, "post-rotation key cycling"; the item is now "Next commitment and destruction of the spent key", and the ceremony order lives in §9.7.4.2 R10). Step 7 (publish NEW DID document) and step 8 (republish OLD document with `alsoKnownAs`) BOTH happen AFTER step 5. If either publish fails, the caller cannot retry: step 1 would fail at `reveal_public_key` against a missing handle.
 
 The original code returned `IdentityError::DhtPublishFailed(...)` for both publish failures — the caller had no recovery handle. The fix introduces:
 

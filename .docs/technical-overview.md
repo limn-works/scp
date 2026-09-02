@@ -437,9 +437,9 @@ Equivocation is detected by the Relay Consistency Protocol: periodic signed `Con
 | Scenario | Action |
 |---|---|
 | Active Signing Key compromised | `rotate_active_key` — new keypair, DID doc update signed by Identity Key. DID doesn't change. MLS Update in all contexts. |
-| Identity Key compromised | `migrate_identity` — pre-rotation key proves legitimacy. New DID. `DidRotationEvent` in all contexts. |
-| Both compromised, pre-rotation available | Same as Identity Key — pre-rotation key resolves the race |
-| All keys compromised | Social recovery — trusted contacts with admin roles remove + re-add under new identity |
+| Identity Key (`#0`) compromised | `RootRecovery` (`09-security-model.md` §9.7.4.2) — the pre-rotation key authorizes, a fresh root is installed, the identifier does not change. MLS Update in all contexts; key-continuity re-verification (§9.11). |
+| `#0` and `#active` compromised, pre-rotation key intact | Same as `#0` compromised — the `RootRecovery` installs fresh operational keys too |
+| All keys compromised | Root cannot be recovered — the person establishes a new identity; context admins remove the old identity and admit the new one |
 
 After any recovery: UCAN revocation, KeyPackage rotation, contact notification, identity private state re-encryption. The exposure window is bounded by the PCS interval (default 24hrs, configurable to 1hr).
 
