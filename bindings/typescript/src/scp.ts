@@ -119,7 +119,6 @@ type NativeAddon = RawNativeAddon & {
   validateAgainstTemplate?: unknown;
   validateContextParams?: unknown;
   checkScopedCapability?: unknown;
-  identityVerifyLinkAttestation?: unknown;
 };
 
 /**
@@ -1029,18 +1028,49 @@ export class SCP {
     }
   }
 
+  /**
+   * Verifies an identity link attestation per spec §3.5.4.
+   *
+   * Routes to the per-instance NAPI method
+   * `Scp::identity_verify_link_attestation`, which resolves an issuer's DID
+   * document through this instance's resolver before any signature check
+   * (§3.5.4 step 1). GitHub issue #2335 finding 2 recorded the earlier route
+   * through a module-level free function, which checked a caller-supplied
+   * attestation against a caller-supplied key and answered `true` for an
+   * attacker who supplied both. That free function now declines with
+   * `SCP-IDENT-1060`.
+   *
+   * `issuerPublicKeyHex` states which key a caller believes belongs to this
+   * issuer; this method checks that statement against an issuer's resolved
+   * document rather than trusting it.
+   *
+   * `referenceProof` reports what this caller did about a class 2
+   * (`signed_post` / `dns_record`) proof resource, per §3.5.4 Class 2 step 2.
+   * `"confirmed"` reports that this caller fetched the resource
+   * `evidence.proof` names and found this issuer's DID in it, which yields a
+   * `true` or a `false`. `"not_fetched"` reports that this caller fetched
+   * nothing, which raises `SCP-IDENT-1062` for a class 2 attestation. A class 1
+   * (`did_control`) attestation ignores this argument. Any other string raises
+   * `SCP-IDENT-1044`.
+   *
+   * @throws `SCP-IDENT-1044` for a malformed argument, `SCP-IDENT-1060` when an
+   * issuer's DID document does not resolve, `SCP-IDENT-1061` when an issuer
+   * publishes an `AttestationRevocations` service endpoint no bridge fetches,
+   * and `SCP-IDENT-1062` for an unfetched class 2 proof resource.
+   */
   async identityVerifyLinkAttestation(
     attestationJson: string,
     issuerPublicKeyHex: string,
+    referenceProof: string,
   ): Promise<boolean> {
-    // ADR-048 §1: pure Ed25519 signature verification, routed through the
-    // addon's module-level free fn (the `Scp::identity_verify_link_attestation`
-    // method was deleted in PR-E #28 along with its `let _ = &self.inner;`
-    // gate-defang). Surface stays async for SDK ABI stability; the underlying
-    // call is sync.
-    const fn = nativeFreeFn<(j: string, k: string) => boolean>("identityVerifyLinkAttestation");
     try {
-      return fn(attestationJson, issuerPublicKeyHex);
+      return await (
+        this.#native.identityVerifyLinkAttestation as (
+          j: string,
+          k: string,
+          r: string,
+        ) => Promise<boolean>
+      )(attestationJson, issuerPublicKeyHex, referenceProof);
     } catch (err) {
       throw mapBridgeError(err);
     }

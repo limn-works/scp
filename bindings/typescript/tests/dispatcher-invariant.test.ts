@@ -440,6 +440,24 @@ describe("dispatcher invariant (ADR-048 §1 + §7)", () => {
       // outside an SCP context (test harnesses, examples) can invoke it
       // without constructing an SCP. native.ts routes through the class.
       "checkScopedCapability",
+      // crates/scp-ffi/napi/src/{scp.rs,identity.rs} — spec §3.5.4 step 1
+      // resolves an issuer's DID document before any signature check, which
+      // needs a per-instance resolver, so `Scp::identity_verify_link_attestation`
+      // carries that operation. A module-level free fn of that same JS name
+      // remains exported and DECLINES with `SCP-IDENT-1060`, because phase D
+      // (#1695) deleted every process-wide default bridge instance and it
+      // therefore reaches no resolver. Every SDK wrapper — scp.ts, native.ts,
+      // Swift, and Kotlin — now routes through that per-instance class method,
+      // and that declining free fn stays exported so a caller who reached it
+      // by name receives SCP-IDENT-1060 rather than a silent verify-valid
+      // (GitHub issue #2335 finding 2).
+      //
+      // ADR-048 authorizes neither half of this overlap: searching
+      // .docs/adrs/ADR-048-scp-multi-instance.md for `verify_link_attestation`
+      // returns zero matches, so that document names no identity-link
+      // verification operation. GitHub issue #2335 finding 2 decided it, and
+      // this entry records that decision rather than an ADR-048 clause.
+      "identityVerifyLinkAttestation",
     ]);
     const { classMethods, freeFns } = extractNapiSurface();
     const observed: string[] = [];

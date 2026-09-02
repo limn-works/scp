@@ -392,20 +392,43 @@ async fn test_agent_binding_full_flow() {
     // Step 8: Counter-attestation for reputation restoration
     // -----------------------------------------------------------------------
 
-    let counter = CounterAttestation {
-        subject_did: DID(did.clone()),
-        violation_reference: "sha256:abc123def456".to_owned(),
-        explanation: "Agent key was compromised; key has been rotated.".to_owned(),
-        timestamp: 1_700_001_000,
-        signature: active_sk
+    // Spec section §9.5.2 derives `violation_reference` from a contested
+    // record, so build that record and let `referencing` compute a reference
+    // rather than inventing an identifier no verifier can recompute.
+    let contested = ScpCustodyViolationAttestation::new(
+        DID(did.clone()),
+        1_700_000_500,
+        CustodyViolationType::CategoryAViolation {
+            action: "did_document_update".to_owned(),
+            signer_key_id: SigningKeyId::Agent,
+            signature_evidence: vec![9, 9, 9, 9],
+        },
+        vec![8, 8, 8, 8],
+        DID("did:dht:z6MkVerifier".to_owned()),
+    )
+    .expect("a well-formed violation record must build");
+
+    let counter = CounterAttestation::referencing(
+        &contested,
+        "Agent key was compromised; key has been rotated.".to_owned(),
+        1_700_001_000,
+        active_sk
             .sign(b"counter-attestation-payload")
             .to_bytes()
             .to_vec(),
-    };
+    )
+    .expect("a counter-attestation with well-formed fields must build");
 
+    assert_eq!(
+        counter.violation_reference,
+        contested
+            .signing_hash()
+            .expect("a violation record must produce a signing hash"),
+        "a counter-claim's reference equals a contested record's signing hash"
+    );
     assert!(
-        counter.validate().is_ok(),
-        "counter-attestation with valid fields must pass validation"
+        counter.validate_field_shape().is_ok(),
+        "counter-attestation with well-formed fields must pass a shape check"
     );
 }
 
@@ -598,35 +621,54 @@ fn test_custody_violation_attestation_construction() {
     }
 }
 
-/// `CounterAttestation` validation rejects empty fields.
+/// `CounterAttestation` shape checking rejects empty fields, and a 32-byte
+/// `violation_reference` removes an empty-reference case a free-form string
+/// used to admit.
 #[test]
 fn test_counter_attestation_validation() {
     let (_, sk) = test_keypair();
     let sig = sk.sign(b"test").to_bytes().to_vec();
 
-    // Valid counter-attestation.
-    let valid = CounterAttestation {
-        subject_did: DID("did:dht:z6MkTest".to_owned()),
-        violation_reference: "sha256:abc".to_owned(),
-        explanation: "Key compromised and rotated.".to_owned(),
-        timestamp: 1_700_000_000,
-        signature: sig,
-    };
-    assert!(valid.validate().is_ok());
+    let contested = ScpCustodyViolationAttestation::new(
+        DID("did:dht:z6MkTest".to_owned()),
+        1_699_999_000,
+        CustodyViolationType::CategoryAViolation {
+            action: "did_document_update".to_owned(),
+            signer_key_id: SigningKeyId::Agent,
+            signature_evidence: vec![4, 4, 4, 4],
+        },
+        vec![3, 3, 3, 3],
+        DID("did:dht:z6MkVerifier".to_owned()),
+    )
+    .expect("a well-formed violation record must build");
 
-    // Empty violation_reference must fail.
-    let empty_ref = CounterAttestation {
-        violation_reference: String::new(),
-        ..valid.clone()
-    };
-    assert!(empty_ref.validate().is_err());
+    // Well-formed counter-attestation.
+    let valid = CounterAttestation::referencing(
+        &contested,
+        "Key compromised and rotated.".to_owned(),
+        1_700_000_000,
+        sig.clone(),
+    )
+    .expect("well-formed fields must build");
+    assert!(valid.validate_field_shape().is_ok());
 
-    // Empty explanation must fail.
-    let empty_expl = CounterAttestation {
-        explanation: String::new(),
-        ..valid
-    };
-    assert!(empty_expl.validate().is_err());
+    // An empty explanation must fail.
+    assert!(
+        CounterAttestation::referencing(&contested, String::new(), 1_700_000_000, sig).is_err(),
+        "an empty explanation must be rejected"
+    );
+
+    // An empty signature must fail.
+    assert!(
+        CounterAttestation::referencing(
+            &contested,
+            "Key compromised and rotated.".to_owned(),
+            1_700_000_000,
+            Vec::new(),
+        )
+        .is_err(),
+        "an empty signature must be rejected"
+    );
 }
 
 /// `SigningKeyId` serialization round-trip (JSON).

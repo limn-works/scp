@@ -1018,17 +1018,58 @@ class SCP:
         )
 
     async def verify_identity_link_attestation(
-        self, attestation_json: str, issuer_public_key_hex: str
+        self, attestation_json: str, issuer_public_key_hex: str, reference_proof: str
     ) -> Any:
-        """Delegate to ``_scp_core.py_verify_identity_link_attestation``.
+        """Verify an identity link attestation per spec §3.5.4.
 
-        ADR-048 §1: pure helper exposed as a module-level free function.
+        Delegates to ``_scp_core.SCP.verify_identity_link_attestation``, a
+        per-instance method. It resolves an issuer's DID document through this
+        instance's resolver (§3.5.4 step 1), then checks structure, a binding
+        between that document and an issuer, a signature under a key that
+        document publishes at ``#active`` or ``#agent`` (steps 1 and 2),
+        revocation status (step 3), expiry (step 4), and evidence freshness
+        (step 5, which lowers trust weight rather than rejecting).
+
+        ``issuer_public_key_hex`` states which key a caller believes belongs to
+        this issuer. That statement is checked against an issuer's resolved
+        document; it is never a substitute for it. Before GitHub issue #2335
+        finding 2, a module-level free function verified against that key alone
+        and returned ``True`` for an attacker who supplied both an attestation
+        and a key. That free function now raises ``SCP-IDENT-1060``.
+
+        Returns ``True`` when §3.5.4 steps 1 through 5 pass and a key a caller
+        named is one an issuer's document publishes. Returns ``False`` when a
+        check rejects: a bad signature, a revoked or expired attestation, or a
+        key an issuer's document publishes at neither fragment.
+
+        ``reference_proof`` reports what this caller did about a Class 2
+        (``signed_post`` / ``dns_record``) proof resource, per spec §3.5.4
+        Class 2 step 2. Pass ``"confirmed"`` after fetching the resource
+        ``evidence.proof`` names and finding this issuer's DID in it, which
+        yields ``True`` or ``False``. Pass ``"not_fetched"`` after fetching
+        nothing, which raises ``SCP-IDENT-1062`` for a Class 2 attestation. A
+        Class 1 (``did_control``) attestation ignores this argument. Any other
+        string raises ``SCP-IDENT-1044``.
+
+        Two conditions raise instead of returning a verdict:
+
+        - ``SCP-IDENT-1061`` when an issuer's DID document publishes an
+          ``AttestationRevocations`` service endpoint. Spec §3.5.2 requires a
+          verifier to read that list of revoked attestation IDs regardless of
+          an attestation's own ``revocation_status``, and no bridge fetches it.
+        - ``SCP-IDENT-1062`` for a Class 2 attestation this caller reported as
+          ``"not_fetched"``. Spec §3.5.4 Class 2 step 3 leaves such an
+          attestation unverified and forbids caching a negative result, so
+          ``False`` would be wrong.
+
+        Raises ``SCP-IDENT-1044`` when an argument is malformed, and
+        ``SCP-IDENT-1060`` when an issuer's DID document cannot be resolved.
         """
-        mod = _native_mod()
         return await asyncio.to_thread(
-            mod.py_verify_identity_link_attestation,
+            self._native.verify_identity_link_attestation,
             attestation_json,
             issuer_public_key_hex,
+            reference_proof,
         )
 
     # endregion Identity

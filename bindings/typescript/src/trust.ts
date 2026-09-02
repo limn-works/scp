@@ -93,7 +93,18 @@ export interface AggregatedTrustInput {
   challenge_results: readonly Record<string, unknown>[];
   /** Consequence rules (Layer 4). */
   consequence_structure: readonly Record<string, unknown>[];
-  /** Threshold counts per attestation type: [met, required]. */
+  /**
+   * Threshold counts per attestation type: `[valid, required]`.
+   *
+   * A first element counts attestors an aggregation admitted, not a
+   * met-or-not verdict. Spec §7.3.5 admits an attestor only when that
+   * attestor's attestation names an evaluated subject, names that attestor as
+   * its own issuer, carries a verifying signature, and carries a DID no
+   * admitted attestor already used. Compare a first element against a second
+   * yourself; a threshold is met when a first reaches a second AND an
+   * independence score reaches its own threshold, which this pair does not
+   * carry.
+   */
   threshold_counts: Readonly<Record<string, readonly [number, number]>>;
 }
 
