@@ -88,12 +88,20 @@ failed=0
 #                     canned repository, or "" to copy the gate unchanged. One case uses it
 #                     to put a name Docker builds into the gate's own quotation list, which
 #                     no repository file can do.
+#   SCRIPT_JOB      — "<lane>[ <lane>…]|<line>" appends one more job to the canned `ci.yml`,
+#                     guarded by an `if:` that ORs those lanes and holding `<line>` as its
+#                     one step. "" appends no such job. Check 2e reads the pair of that
+#                     job's lanes and the `scripts/` paths its lines name.
+#   SWIFT_FILTER_EXTRA — one more path entry appended to the canned `swift` filter, or ""
+#                     for none. A case routes the script it appended by setting this.
 OMIT_OUTPUT=""
 OMIT_FILTER=""
 MISE_SOURCE="none"
 EXTRA_ROOT_FILE=""
 EXTRA_FILES=()
 GATE_TRANSFORM=""
+SCRIPT_JOB=""
+SWIFT_FILTER_EXTRA=""
 
 # Every output the canned `changes` job declares. `fuzz` is last and is the one output the
 # gate exempts, because `fuzz-build` compiles from `fuzz/` on a different toolchain file.
@@ -154,7 +162,11 @@ YAML
     emit_filter typescript-wasm 'bindings/typescript-wasm/**'
     emit_filter scaffold-typescript-web 'scaffolds/typescript-web/**'
     emit_filter kotlin 'bindings/kotlin/**'
-    emit_filter swift 'bindings/swift/**'
+    if [[ -n $SWIFT_FILTER_EXTRA ]]; then
+        emit_filter swift 'bindings/swift/**' "$SWIFT_FILTER_EXTRA"
+    else
+        emit_filter swift 'bindings/swift/**'
+    fi
     emit_filter fuzz 'crates/scp-protocol/**' 'fuzz/**'
     # A second job, so the gate's output reader stops at the end of the `changes` job
     # rather than reading another job's outputs as this one's.
@@ -168,6 +180,25 @@ YAML
     steps:
       - run: cargo clippy
 YAML
+    emit_script_job
+}
+
+# The extra paths-filtered job check 2e reads. `SCRIPT_JOB` holds the lanes its `if:` ORs
+# and the one step line it carries, separated by `|`.
+emit_script_job() {
+    [[ -n $SCRIPT_JOB ]] || return 0
+    local lanes=${SCRIPT_JOB%%|*} step=${SCRIPT_JOB#*|} lane condition=""
+    for lane in $lanes; do
+        if [[ -n $condition ]]; then
+            condition="$condition || "
+        fi
+        condition="${condition}needs.changes.outputs.$lane == 'true'"
+    done
+    printf '  gate-job:\n    needs: changes\n'
+    # No lane means no `if:` at all, which is the job shape check 2e leaves alone: a job
+    # nothing guards runs on every pull request.
+    [[ -n $condition ]] && printf '    if: %s\n' "$condition"
+    printf '    runs-on: ubuntu-latest\n    steps:\n%s\n' "$step"
 }
 
 emit_mise() {
@@ -542,6 +573,52 @@ run_case "nested-cargo-config-under-an-unrouted-directory" 1 \
 EXTRA_FILES=("crates/scp-mls/.cargo/config.toml" cargo_config_wasm_rustflags)
 run_case "nested-cargo-config-routed-by-the-rust-filter" 0 "" emit_ci mise_ok
 EXTRA_FILES=()
+
+# ── Check 2e: the scripts a paths-filtered job runs ──────────────────────────────────
+#
+# A script a filtered job runs is a file whose text decides what that job asserts, so a
+# pull request that edits only the script has to make the job run. Two jobs in `ci.yml`
+# failed that when this check was written: `swift-bindings-fresh` ran
+# `scripts/check-swift-bindings-fresh.sh` behind a `swift` filter listing no `scripts/`
+# path, and `python-lint` ran `scripts/check-python-falsy-optionals.py` behind a `python`
+# filter listing none either.
+
+# The defect itself: one lane guards the job, and that lane lists no `scripts/` path.
+SCRIPT_JOB="swift|      - run: bash scripts/check-swift-bindings-fresh.sh"
+run_case "filtered-job-runs-a-script-no-filter-routes" 1 \
+    "the 'gate-job' job names scripts/check-swift-bindings-fresh.sh, and none of the paths filters that guard it (swift) lists that path" \
+    emit_ci mise_ok
+
+# The same job with the script listed in the filter that guards it.
+SWIFT_FILTER_EXTRA="scripts/check-swift-bindings-fresh.sh"
+run_case "filtered-job-script-listed-in-its-own-filter" 0 "" emit_ci mise_ok
+SWIFT_FILTER_EXTRA=""
+
+# A job whose `if:` ORs three lanes runs when ANY of them is true, so one lane listing the
+# path is enough. `bridge-parity-kotlin` in `ci.yml` has that shape.
+SCRIPT_JOB="python kotlin swift|      - run: bash scripts/check-swift-bindings-fresh.sh"
+SWIFT_FILTER_EXTRA="scripts/check-swift-bindings-fresh.sh"
+run_case "multi-lane-job-needs-one-lane-to-list-the-script" 0 "" emit_ci mise_ok
+SWIFT_FILTER_EXTRA=""
+
+# The same three-lane job with no lane listing the path. The gate names all three lanes so
+# the author can pick which filter to extend.
+run_case "multi-lane-job-with-the-script-in-no-lane" 1 \
+    "none of the paths filters that guard it (python kotlin swift) lists that path" \
+    emit_ci mise_ok
+
+# A `scripts/` path a comment inside the job names, which the job does not run. `ci.yml`'s
+# own `changes` job comments name this gate, so counting comment lines would fail the
+# repository on its own documentation.
+SCRIPT_JOB="swift|      # See scripts/check-swift-bindings-fresh.sh for what this asserts.
+      - run: swift build"
+run_case "script-named-only-in-a-comment-demands-no-entry" 0 "" emit_ci mise_ok
+
+# A job no paths filter guards runs on every pull request, so the script it runs needs no
+# filter entry. Check 2e binds the filtered jobs alone.
+SCRIPT_JOB="|      - run: bash scripts/check-swift-bindings-fresh.sh"
+run_case "unfiltered-job-running-a-script-needs-no-entry" 0 "" emit_ci mise_ok
+SCRIPT_JOB=""
 
 # ── Check 3: mise names no Rust version source ───────────────────────────────────────
 #

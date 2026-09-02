@@ -143,13 +143,45 @@
 #   where rustup resolves `fuzz/rust-toolchain.toml`, so the `fuzz` filter's `fuzz/**`
 #   entry is what routes a change to that nightly.
 #
+#   2e — THE SCRIPTS A FILTERED JOB RUNS. THE CRITERION: a repository script that a
+#   paths-filtered job executes is a file whose text decides what that job asserts, so a
+#   change to it must make that job run. This is check 2's criterion applied to the one
+#   population that closes the loop on itself, because the pull request that edits a gate
+#   script is the pull request that has to run the edited gate. When no filter guarding
+#   the job lists the script, that pull request leaves every one of those filter outputs
+#   'false', the job skips, the `ci` aggregator counts the skip as a pass, and a gate
+#   rewritten to `exit 0` merges without executing once. Every later pull request then
+#   runs the disabled gate and passes.
+#
+#   Two jobs held that defect when this check was written. `swift-bindings-fresh` runs
+#   `scripts/check-swift-bindings-fresh.sh` behind the `swift` filter, and `python-lint`
+#   runs `scripts/check-python-falsy-optionals.py` behind the `python` filter, and
+#   neither filter listed any path under `scripts/`.
+#
+#   HOW THE GATE ENUMERATES THE PAIRS, rather than reading a list someone remembered to
+#   add: for each workflow a paths filter guards, it walks that workflow's jobs, and for
+#   each job whose keys before `steps:` name at least one `needs.changes.outputs.<lane>`,
+#   it collects every `scripts/<path>` token appearing on a non-comment line of that job.
+#   The entries of one of that job's lanes must match each collected path, or the
+#   `toolchain` filter every lane ORs in must match it. A job added later that runs a
+#   script is covered without anyone editing this file.
+#
+#   WHAT 2e DOES NOT COVER, stated rather than implied. It reads the workflow's text, so a
+#   script a job reaches indirectly — a build tool that shells out to one, a script that
+#   sources another — stays invisible to it, and under-detection is its failure mode. It
+#   over-detects in one direction deliberately: a `scripts/` path written in a step `name:`
+#   or in an environment value, which the job never executes, also demands a filter entry.
+#   Over-detection costs an author one line, and it fails closed.
+#
 #   Checks 2c and 2d read `ci.yml` alone, because the `rust` and `fuzz` filters they name
-#   live there and guard the jobs that compile from those files.
+#   live there and guard the jobs that compile from those files. Check 2e reads every
+#   paths-filtered workflow, because any one of them can guard a job that runs a script.
 #
 # An `OK` from check 2 is not a claim that the filters are correct. It says the pin reaches
-# every lane of every paths-filtered workflow, and that every root-level file and every
-# cargo configuration file is classified. A `rust` filter stripped of `crates/**` still
-# passes, and it does not need this gate: that omission reveals itself.
+# every lane of every paths-filtered workflow, that every root-level file and every cargo
+# configuration file is classified, and that every script a filtered job runs is routed to
+# that job. A `rust` filter stripped of `crates/**` still passes, and it does not need this
+# gate: that omission reveals itself.
 #
 # ── CHECK 3: mise names no Rust version source ───────────────────────────────────────
 #
@@ -496,6 +528,90 @@ check_pin_reaches_every_lane() {
     done <<< "$outputs"
 }
 
+# Print `<job>\t<lane> <lane>…\t<scripts/… path>` for every pair of a paths-filtered job
+# and a repository script that job names, one line per pair.
+#
+# Scoped per job: a job header sits at indent 2 under `jobs:`, and every key the job itself
+# declares sits deeper, so the next indent-2 key ends the block.
+#
+# The lanes come only from the keys ABOVE the job's `steps:` line, which is where `if:`
+# sits. Reading them from the whole block would let a lane named inside a `run:` script
+# widen the set of filters that may route a path, which weakens the check.
+#
+# The script paths come from every line of the block whose first non-blank character is not
+# `#`. A comment naming a script the job does not run would otherwise demand a filter entry
+# for it, and this workflow's `changes` job comments name this very gate.
+filtered_job_scripts() {
+    awk '
+        function flush(   i) {
+            if (job != "" && lanes != "") {
+                for (i = 1; i <= nscripts; i++) print job "\t" lanes "\t" scripts[i]
+            }
+            job = ""; lanes = ""; nscripts = 0; insteps = 0; delete scripts
+        }
+        /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ {
+            flush()
+            job = $0
+            sub(/^  /, "", job)
+            sub(/:[[:space:]]*$/, "", job)
+            next
+        }
+        job == "" { next }
+        {
+            if ($0 ~ /^[[:space:]]*#/) next
+            if ($0 ~ /^    steps:[[:space:]]*$/) insteps = 1
+            if (insteps == 0) {
+                rest = $0
+                while (match(rest, /needs\.changes\.outputs\.[A-Za-z0-9_-]+/)) {
+                    lane = substr(rest, RSTART + 22, RLENGTH - 22)
+                    if (index(" " lanes " ", " " lane " ") == 0) {
+                        lanes = (lanes == "" ? lane : lanes " " lane)
+                    }
+                    rest = substr(rest, RSTART + RLENGTH)
+                }
+            }
+            rest = $0
+            while (match(rest, /scripts\/[A-Za-z0-9_.\/-]+/)) {
+                path = substr(rest, RSTART, RLENGTH)
+                seen = 0
+                for (i = 1; i <= nscripts; i++) if (scripts[i] == path) seen = 1
+                if (seen == 0) scripts[++nscripts] = path
+                rest = substr(rest, RSTART + RLENGTH)
+            }
+        }
+        END { flush() }
+    ' "$1"
+}
+
+# 2e for one workflow: every script a paths-filtered job runs is routed to that job.
+check_filtered_jobs_route_their_scripts() {
+    local wf=$1 wf_toolchain_entries job lanes script lane entries routed
+    wf_toolchain_entries=$(filter_entries "$wf" "$TOOLCHAIN_FILTER")
+    while IFS=$'\t' read -r job lanes script; do
+        [[ -n $script ]] || continue
+        routed=0
+        # Every lane ORs the `toolchain` filter in — check 2b is what holds that — so a
+        # path listed there routes to every filtered job of the workflow.
+        if [[ -n $wf_toolchain_entries ]] && routed_by "$script" "$wf_toolchain_entries"; then
+            routed=1
+        fi
+        if [[ $routed -eq 0 ]]; then
+            # The job runs when ANY lane its `if:` names is true, so ONE lane listing the
+            # path is enough to make a change to that path run the job.
+            for lane in $lanes; do
+                entries=$(filter_entries "$wf" "$lane")
+                if [[ -n $entries ]] && routed_by "$script" "$entries"; then
+                    routed=1
+                    break
+                fi
+            done
+        fi
+        if [[ $routed -eq 0 ]]; then
+            report "$wf: the '$job' job names $script, and none of the paths filters that guard it ($lanes) lists that path. A pull request that changes only $script leaves every one of those filter outputs 'false', '$job' skips, and the 'ci' aggregator job counts the skip as a pass — so the pull request that edits the script is the one that never runs it. List $script in one of those filters."
+        fi
+    done < <(filtered_job_scripts "$wf")
+}
+
 # 2a/2b — over every workflow a paths filter guards, `ci.yml` among them.
 filtered_workflows=$(paths_filter_workflows)
 if [[ -z $filtered_workflows ]]; then
@@ -504,6 +620,8 @@ else
     while IFS= read -r workflow; do
         [[ -n $workflow ]] || continue
         check_pin_reaches_every_lane "$workflow"
+        # 2e — every script a paths-filtered job of this workflow runs is routed to it.
+        check_filtered_jobs_route_their_scripts "$workflow"
     done <<< "$filtered_workflows"
 fi
 
@@ -625,7 +743,7 @@ fi
 
 if [[ $fail -eq 0 ]]; then
     printf 'OK: every container build asserts it resolved the compiler %s names\n' "$PIN"
-    printf 'OK: every lane of every paths-filtered workflow routes a %s change, and every root-level file and cargo configuration file is routed or declared unread\n' "$PIN"
+    printf 'OK: every lane of every paths-filtered workflow routes a %s change, every root-level file and cargo configuration file is routed or declared unread, and every script a paths-filtered job runs is routed to that job\n' "$PIN"
     printf 'OK: %s names no Rust version source, so rustup resolves each directory from its own toolchain file\n' "$MISE_CONFIG"
     exit 0
 fi

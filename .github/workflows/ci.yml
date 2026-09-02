@@ -103,6 +103,13 @@ jobs:
               - 'bindings/python/**'
               - 'crates/scp-ffi/src/**'
               - 'crates/scp-ffi/common/**'
+              # `python-lint` runs this script, so the script's own text decides what
+              # that job asserts. A pull request that edits only the script would
+              # otherwise leave this output 'false', skip the job, and merge the edited
+              # check without running it once. `scripts/check-toolchain-wiring.sh`
+              # check 2e reads the run steps of every filtered job and fails when a
+              # script one of them runs reaches none of its filters.
+              - 'scripts/check-python-falsy-optionals.py'
             typescript:
               - 'bindings/typescript/**'
               - 'crates/scp-ffi/napi/**'
@@ -133,10 +140,35 @@ jobs:
               - 'bindings/kotlin/**'
               - 'crates/scp-ffi/uniffi/**'
               - 'crates/scp-ffi/common/**'
+              # `kotlin-test` runs this script to generate the UniFFI Kotlin bindings it
+              # then compiles, and `bindings/kotlin`'s `generateUniffiBindings` Gradle
+              # task runs it too. The script's text decides which bindings that job
+              # compiles, so a change to it has to make the job run.
+              - 'scripts/generate-uniffi-kotlin.sh'
             swift:
               - 'bindings/swift/**'
               - 'crates/scp-ffi/uniffi/**'
               - 'crates/scp-ffi/common/**'
+              # `swift-bindings-fresh` runs this script, and the script IS the check:
+              # its text decides whether the job accepts a stale
+              # `bindings/swift/Sources/SCP/Internal/ScpBindings.swift`.
+              - 'scripts/check-swift-bindings-fresh.sh'
+              # `bindings/swift/Sources/SCP/Internal/ScpBindings.swift` is the one
+              # checked-in UniFFI-generated artifact, and its bytes are a function of
+              # the `uniffi` version cargo resolves, not of the FFI source alone:
+              # `crates/scp-ffi/uniffi/Cargo.toml` names a caret range, and `Cargo.lock`
+              # holds the resolution `uniffi-bindgen` runs at. A dependency-update pull
+              # request that moves `uniffi` inside that range emits different Swift, so
+              # it stales the committed artifact while touching no path the three
+              # entries above match. Without these two entries `swift-bindings-fresh`
+              # skips on exactly that pull request, and the `ci` aggregator counts the
+              # skip as a pass, so the SDK ships an artifact whose
+              # `uniffiCheckApiChecksums()` calls `fatalError` at initialization.
+              # The Kotlin filter needs no such entry: `kotlin-test` regenerates its
+              # bindings in-job and this repository commits none of them, so no
+              # resolution change can leave a stale Kotlin artifact behind.
+              - 'Cargo.toml'
+              - 'Cargo.lock'
             fuzz:
               - 'fuzz/**'
               - 'crates/scp-protocol/**'

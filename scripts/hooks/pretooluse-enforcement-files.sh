@@ -40,6 +40,7 @@ PROTECTED_REPO_RELATIVE_PATHS=(
     "scripts/check-pure-helpers.sh"
     "scripts/pure-helpers-allowlist.txt"
     "scripts/check-construction-pattern.py"
+    "scripts/check-swift-bindings-fresh.sh"
     "scripts/check-toolchain-wiring.sh"
     "scripts/hooks/pretooluse-enforcement-files.sh"
 )
