@@ -1132,6 +1132,34 @@ jobs:
           ./gradlew :scp-kt:test :scp-kt-android:testDebugUnitTest
 
   # ── Swift ──────────────────────────────────────────────────────────
+  # Freshness of `bindings/swift/Sources/SCP/Internal/ScpBindings.swift`, the
+  # ONLY checked-in UniFFI-generated artifact. This MUST be its own job:
+  # `swift-build-test` below runs `build-xcframework.sh --dev`, which
+  # OVERWRITES that file before compiling, so it always builds fresh bindings
+  # and can never observe that the committed copy has gone stale. UniFFI folds
+  # each function's signature and doc text into a per-method checksum guard, so
+  # a stale committed copy is a hard `fatalError` at Swift SDK init.
+  #
+  # Runs on macOS because that is the platform that produces the shipped
+  # artifact (`build-xcframework.sh` requires xcodebuild/lipo) — regenerating
+  # on the same platform keeps the comparison free of any cross-platform
+  # codegen assumption.
+  swift-bindings-fresh:
+    needs: changes
+    if: needs.changes.outputs.swift == 'true'
+    name: Swift / bindings freshness
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Self-test MUST run first: it corrupts a checksum guard and proves the
+      # gate REJECTS it, before we trust the gate's verdict on the real tree.
+      - name: Self-test gate
+        run: bash scripts/check-swift-bindings-fresh.sh --self-test
+      - name: Real check (committed bindings ↔ uniffi-bindgen output)
+        run: bash scripts/check-swift-bindings-fresh.sh
+
   swift-lint:
     needs: changes
     if: needs.changes.outputs.swift == 'true'
@@ -1468,6 +1496,7 @@ jobs:
       - scaffold-typescript-web-check
       - kotlin-lint
       - kotlin-test
+      - swift-bindings-fresh
       - swift-lint
       - swift-build-test
       - fuzz-build
@@ -1521,6 +1550,7 @@ jobs:
             "${{ needs.scaffold-typescript-web-check.result }}" \
             "${{ needs.kotlin-lint.result }}" \
             "${{ needs.kotlin-test.result }}" \
+            "${{ needs.swift-bindings-fresh.result }}" \
             "${{ needs.swift-lint.result }}" \
             "${{ needs.swift-build-test.result }}" \
             "${{ needs.fuzz-build.result }}" \
