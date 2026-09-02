@@ -932,7 +932,10 @@
       "details": {
         "sealPath": "seal_envelope: serialize inner envelope -> MLS encrypt -> wrap in outer envelope with routing_id, recipient_hint, blob_ttl",
         "openPath": "open_envelope: MLS decrypt -> deserialize inner envelope -> strip padding -> verify payload_hash == SHA256(stripped_payload) -> verify inner signature -> verify generation number -> return verified inner envelope",
-        "superseded_by": ["SCP-OUT-002", "SCP-OUT-003"]
+        "superseded_by": [
+          "SCP-OUT-002",
+          "SCP-OUT-003"
+        ]
       },
       "result": "seal_envelope and open_envelope with full integrity verification. 13 tests (12 + 1 proptest). All passing."
     },
@@ -1133,7 +1136,9 @@
         "hpkeAssembly": "HPKE: (1) generate ephemeral X25519 keypair (software-generated), (2) ECDH between ephemeral secret and requester wrapping pubkey, (3) HKDF to derive encryption key, (4) AES-128-GCM encrypt the sender key. Ephemeral public key included in response.",
         "hpkeOpen": "Uses key_custody.dh_agree(wrapping_key_handle, ephemeral_pk) to compute shared secret inside custody boundary, then KDF + AEAD in software to recover sender key. Wrapping private key never leaves KeyCustody.",
         "blockNotificationVerification": "Receiver MUST verify Ed25519 signature by resolving the public key identified by signing_key_id (#active or #agent) from the blocker's DID document per §9.16.3 and ADR-039. Discard without action if verification fails. Log discarded notification for anomaly detection.",
-        "superseded_by": ["SCP-OUT-002"]
+        "superseded_by": [
+          "SCP-OUT-002"
+        ]
       },
       "result": "Implemented pull-based sender key protocol: SenderKeyEpochAdvance, SenderKeyRequest/Response with HPKE, block notifications, rotate_sender_key_for_block. 15 tests."
     },
@@ -1464,7 +1469,9 @@
         "TemplateId enum": "```rust\npub enum TemplateId {\n    BilateralEphemeral,\n    BilateralPersistent,\n    Coordination,\n    GroupDiscussion,\n    PublicBroadcast,\n    GatedBroadcast,\n}\n```\nTemplates are protocol constants — not user-extensible. When present, all other ContextParams fields must match the template definition exactly.",
         "Implementation notes": "Language: Rust. Crate: scp-core. Module: scp-core/context/. Async runtime: tokio (TTL timers, MLS operations, transport). State persistence: Via ProtocolRepository (§17.4), which wraps the scp-platform Storage trait with typed domain methods. Context state is serialized and persisted on every transition so contexts survive process restarts. Key convention follows §17.3.",
         "Concurrency model": "All public handle types (Identity, Context, TransportManager) are safe to share across threads/tasks. In Rust: Send + Sync. In Python: safe to use from any asyncio task on the same event loop. In Swift: Sendable. In Go: safe for concurrent use. In Kotlin: safe across coroutines. Individual operations are serialized internally — concurrent sends on the same context are safe and ordered. No SDK user should ever need an external lock to use SCP types safely.",
-        "superseded_by": ["SCP-OUT-002"]
+        "superseded_by": [
+          "SCP-OUT-002"
+        ]
       },
       "result": "Implemented context types: ContextState FSM, ContextHandle, ContextParams, all parameter enums. 52 tests."
     },
@@ -2591,7 +2598,9 @@
         }
       ],
       "details": {
-        "superseded_by": ["SCP-OUT-005"]
+        "superseded_by": [
+          "SCP-OUT-005"
+        ]
       },
       "result": "PyOutletRegistration, PyOutletVerificationResult, PyTransportStatus, PyUcanToken, PyEvent, PyProof types + 10 bridge functions across outlets.rs, transport.rs, ucan.rs, event_log.rs"
     },
@@ -2630,7 +2639,10 @@
         }
       ],
       "details": {
-        "superseded_by": ["SCP-OUT-005", "SCP-OUT-006"]
+        "superseded_by": [
+          "SCP-OUT-005",
+          "SCP-OUT-006"
+        ]
       },
       "result": "Implemented in iteration 3"
     },
@@ -5359,11 +5371,12 @@
       "gate": "gate-5",
       "priority": "P1",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
-        "bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift"
+        "bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift",
+        "bindings/swift/Tests/SCPTests/Platform/AppleDeviceAttestationTests.swift"
       ],
-      "description": "Implement Apple App Attest device attestation adapter in `scp-platform/apple/app_attest.rs`. Implements the `DeviceAttestation` trait for Apple platforms.\n\nApp Attest integration: attestation flow, server-side verification, fraud metric handling. App Attest provides hardware-backed device attestation that can be verified server-side.\n\nPer §9.15 key destruction verification: hardware-attested is the strongest trust level. App Attest provides the attestation primitive for this.\n\nThis is a stub ADR (ADR-025) — implementation details will be refined when the full ADR is written.",
+      "description": "Implement the Apple App Attest device attestation adapter as the Swift class `AppleDeviceAttestation` in `bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift`. ADR-025, the Apple platform adapter, decides that the Apple adapter is a set of Swift classes conforming to the UniFFI callback interfaces, so no Rust file implements this story. An earlier revision of this description named `scp-platform/apple/app_attest.rs`; that file never existed and ADR-025 rules it out.\n\nApp Attest integration: attestation flow, server-side verification, fraud metric handling. App Attest provides hardware-backed device attestation that can be verified server-side.\n\nPer §9.15 key destruction verification: hardware-attested is the strongest trust level. App Attest provides the attestation primitive for this.\n\nStatus correction on 2026-08-15: this story carried `status: \"done\"` while acceptance criteria 3, 4, and 6 had no implementation in any file, before and after the fail-closed rewrite of `AppleDeviceAttestation`. `details.criteriaStatus` names the evidence for each of the six criteria. ADR-025 states the relay-side requirement behind criterion 3 in its own acceptance criterion 3. No ADR and no spec states the fraud-metric requirement behind criterion 4, so an upstream artifact has to state that requirement before an implementer can close the criterion.\n\nReassessment on 2026-08-16: `verify(token:)` now applies all four clauses of ADR-025 acceptance criterion 3, so it parses each `x5c` element as a DER X.509 certificate and reads named authenticator-data fields, where an earlier revision read CBOR structure alone. That change moves no criterion of this story from unmet to met: criteria 3, 4, and 6 stay unmet, because no code walks a certificate chain to Apple's App Attest root, no code reads a risk metric, and no test reaches Apple's App Attest sandbox. `public init(appId:)` replaced `public init()` in that same change, because clause 4 binds an accepted attestation to this app's App ID.",
       "acceptanceCriteria": [
         "Implements DeviceAttestation trait for Apple platforms",
         "Attestation request generates App Attest attestation object",
@@ -5388,16 +5401,52 @@
         {
           "file": ".docs/adrs/phase-5.md",
           "section": "### What This ADR Will Decide"
+        },
+        {
+          "file": ".docs/adrs/phase-5.md",
+          "section": "### Acceptance Criteria"
         }
       ],
       "details": {
-        "stubADR": true,
+        "stubADR": false,
         "adr": "ADR-025",
         "protocolSections": [
           "§9.15"
         ],
         "expectedDecisions": {
           "appAttest": "Attestation flow, server-side verification, fraud metric handling"
+        },
+        "criteriaStatus": {
+          "assessedOn": "2026-08-17",
+          "assessedAgainst": "bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift and bindings/swift/Tests/SCPTests/Platform/AppleDeviceAttestationTests.swift, after the change that anchors an `x5c` chain at Apple's App Attest root certificate, serializes App Attest calls, and binds authenticator data to the credential certificate and to this app's stored App Attest key identifier",
+          "met": [
+            {
+              "criterion": "Implements DeviceAttestation trait for Apple platforms",
+              "evidence": "`AppleDeviceAttestation` declares conformance to `DeviceAttestationProvider`, the UniFFI callback interface for the Rust `DeviceAttestation` trait, and implements `attest(challenge:deviceId:)` and `assertRequest(requestHash:)`, which that interface declares. It also implements `verify(token:)`, which that interface does not declare, so a Swift caller reaches `verify(token:)` and the Rust engine does not."
+            },
+            {
+              "criterion": "Attestation request generates App Attest attestation object",
+              "evidence": "`attest(challenge:deviceId:)` calls `DCAppAttestService.attestKey(_:clientDataHash:)` and returns the raw CBOR attestation-object bytes Apple signed."
+            },
+            {
+              "criterion": "Attestation bound to specific key material",
+              "evidence": "`resolveKeyId()` reads a stored key ID and publishes its generation task inside one critical section, so concurrent first callers generate one App Attest key, and it persists that key ID under `dev.limn.scp.appAttest.keyId`; `attest` passes that key ID to `attestKey` and `assertRequest` passes the same key ID to `generateAssertion`, so both bind to one Secure Enclave key. `AppAttestCallSerializer` runs those two calls one at a time, so `classify(_:keyId:operation:)` reads an attestation record that describes App Attest's state rather than a record a concurrent call had not yet written, and it discards a stored key ID only for the one `DCError.invalidKey` condition that means Apple rejected that key. `AppleDeviceAttestationTests.swift` pins those properties: `concurrentAttestsGenerateOneKey` runs 50 rounds of eight concurrent first calls, `attestDiscardsRejectedKey` plus `assertRequestDiscardsRejectedKey` drive that rejection path, and `concurrentAttestKeepsAttestedKey` plus `appAttestCallsNeverOverlap` drive the ordering."
+            }
+          ],
+          "unmet": [
+            {
+              "criterion": "Server-side verification validates attestation against Apple's attestation root",
+              "evidence": "`verify(token:)` calls `AppAttestAttestationObject.isWellFormed(_:relyingPartyIdHash:anchorCertificates:appAttestKeyIdentifier:)`, which applies the five clauses of ADR-025 acceptance criterion 3 and evaluates the `x5c` chain as an X.509 certification path anchored at Apple's App Attest root certificate: `AppAttestAnchor` carries that root's DER bytes, `chainTerminatesAtAnchor(_:anchorCertificates:)` passes them to `SecTrustSetAnchorCertificates` with `SecTrustSetAnchorCertificatesOnly` and network fetching turned off, and it requires the evaluated path to begin with `x5c` element 0 and element 1. A device therefore rejects a chain Apple did not sign. Clause 5 then requires the credential ID in `authData` to equal `SHA-256` of the credential certificate's public key and to equal the App Attest key identifier this adapter stored, so a chain Apple issued for one app's App Attest key no longer accepts authenticator data written for a second app, and `AppAttestCredentialBindingTests` drives that rejection. This criterion names server-side verification, and no relay code performs it: no file under `crates/` reads an `x5c` chain, calls Apple's App Attest attestation endpoint, or validates the receipt, and nothing anywhere binds an attestation to the challenge a relay issued."
+            },
+            {
+              "criterion": "Fraud metric handling integrated (risk metric from Apple)",
+              "evidence": "The strings `fraud` and `risk metric` appear in no file under `crates/` or `bindings/` other than one unrelated comment in `crates/scp-ffi/napi/src/identity.rs`. No code extracts the App Attest receipt, exchanges it with Apple, or reads a risk metric. No ADR and no spec states this requirement, so the criterion has no upstream source to implement against."
+            },
+            {
+              "criterion": "Tests pass with App Attest sandbox environment",
+              "evidence": "`AppleDeviceAttestationTests.swift` drives the adapter with `UnsupportedAppAttestService`, `CountingAppAttestService`, and `InvalidKeyAppAttestService` — `DCAppAttestService` subclasses that override `isSupported`, `generateKey`, `attestKey`, and `generateAssertion` — and with locally built CBOR fixtures and self-generated certificates. No test contacts Apple's App Attest sandbox and no test runs on a physical device."
+            }
+          ]
         }
       }
     },
