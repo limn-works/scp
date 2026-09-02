@@ -300,70 +300,35 @@ jobs:
             x86_64-apple-ios,
             aarch64-apple-ios-sim
 
-      - name: Build for macOS (x86_64)
-        run: cargo build --release --target x86_64-apple-darwin -p scp-ffi-uniffi
-
-      - name: Build for macOS (aarch64)
-        run: cargo build --release --target aarch64-apple-darwin -p scp-ffi-uniffi
-
-      - name: Build for iOS (arm64)
-        run: cargo build --release --target aarch64-apple-ios -p scp-ffi-uniffi
-
-      - name: Build for iOS Simulator (arm64)
-        run: cargo build --release --target aarch64-apple-ios-sim -p scp-ffi-uniffi
-
-      - name: Build for iOS Simulator (x86_64)
-        run: cargo build --release --target x86_64-apple-ios -p scp-ffi-uniffi
-
-      - name: Create universal macOS binary
-        run: |
-          mkdir -p target/universal-macos/release
-          lipo -create \
-            target/x86_64-apple-darwin/release/libscp_ffi_uniffi.a \
-            target/aarch64-apple-darwin/release/libscp_ffi_uniffi.a \
-            -output target/universal-macos/release/libscp_ffi_uniffi.a
-
-      - name: Create universal iOS Simulator binary
-        run: |
-          mkdir -p target/universal-ios-sim/release
-          lipo -create \
-            target/aarch64-apple-ios-sim/release/libscp_ffi_uniffi.a \
-            target/x86_64-apple-ios/release/libscp_ffi_uniffi.a \
-            -output target/universal-ios-sim/release/libscp_ffi_uniffi.a
-
-      - name: Generate UniFFI Swift bindings
-        run: |
-          cargo run -p scp-ffi-uniffi --bin uniffi-bindgen -- generate \
-            --library target/aarch64-apple-darwin/release/libscp_ffi_uniffi.dylib \
-            --language swift \
-            --out-dir bindings/swift/Sources/SCP
-
-      - name: Create module map
-        run: |
-          mkdir -p bindings/swift/ScpFFI.xcframework/Headers
-          cat > bindings/swift/ScpFFI.xcframework/Headers/module.modulemap <<'MODULEMAP'
-          framework module ScpFFI {
-            header "scpFFI.h"
-            export *
-          }
-          MODULEMAP
-
+      # Delegate to the canonical builder (single source of truth). It builds all
+      # five Apple targets, lipos the macOS + iOS-simulator fat libraries,
+      # generates the UniFFI bindings into the single committed file
+      # Sources/SCP/Internal/ScpBindings.swift (no duplicate scp_ffi_uniffi.swift at
+      # the target root), writes ScpFFI.h + module.modulemap into the XCFramework's
+      # Headers, and packages ScpFFI.xcframework. Production mode passes no
+      # `testing` feature, and `testing` is the feature that gates the in-memory
+      # custody arm. Reimplementing these steps inline previously diverged: the
+      # inline steps wrote duplicate bindings and named the header wrongly.
       - name: Build XCFramework
-        run: |
-          xcodebuild -create-xcframework \
-            -library target/universal-macos/release/libscp_ffi_uniffi.a \
-            -headers bindings/swift/ScpFFI.xcframework/Headers \
-            -library target/aarch64-apple-ios/release/libscp_ffi_uniffi.a \
-            -headers bindings/swift/ScpFFI.xcframework/Headers \
-            -library target/universal-ios-sim/release/libscp_ffi_uniffi.a \
-            -headers bindings/swift/ScpFFI.xcframework/Headers \
-            -output bindings/swift/ScpFFI.xcframework
+        working-directory: bindings/swift
+        run: ./build-xcframework.sh
 
       - name: Upload XCFramework
         uses: actions/upload-artifact@v4
         with:
           name: swift-xcframework
           path: bindings/swift/ScpFFI.xcframework/
+          retention-days: 7
+
+      # Swift sources post-generation: hand-written wrapper + the UniFFI bindings
+      # just regenerated for this exact release commit (so they match the binary
+      # in the XCFramework). Consumed by release.yml's publish-spm job to populate
+      # the limn-works/scp-swift mirror, which strips everything but *.swift.
+      - name: Upload Swift sources
+        uses: actions/upload-artifact@v4
+        with:
+          name: swift-sources
+          path: bindings/swift/Sources/
           retention-days: 7
 
       - name: Generate Swift DocC
@@ -423,13 +388,6 @@ jobs:
             cargo build --release --target "$target" -p scp-ffi-uniffi
           done
 
-      - name: Generate Kotlin bindings
-        run: |
-          cargo run -p scp-ffi-uniffi --bin uniffi-bindgen -- generate \
-            --library target/release/libscp_ffi_uniffi.so \
-            --language kotlin \
-            --out-dir bindings/kotlin/src/main/kotlin
-
       - name: Stage native libraries for AAR
         run: |
           JNILIBS=bindings/kotlin/scp-kt-android/src/main/jniLibs
@@ -439,21 +397,147 @@ jobs:
           cp target/x86_64-linux-android/release/libscp_ffi_uniffi.so "$JNILIBS/x86_64/"
           cp target/i686-linux-android/release/libscp_ffi_uniffi.so "$JNILIBS/x86/"
 
-      - name: Build Android AAR
+      # Generate the UniFFI Kotlin bindings via the canonical Gradle task, which
+      # host-builds the cdylib and writes to the correct scp-kt module path.
+      # release.yml's publish-maven downloads these (kotlin-bindings) and runs
+      # `-x generateUniffiBindings`, so the credential-bearing publish step never
+      # invokes cargo (no dependency build script ever sees the signing key).
+      - name: Generate Kotlin bindings
         working-directory: bindings/kotlin
-        run: ./gradlew :scp-kt-android:assembleRelease
+        run: ./gradlew :scp-kt:generateUniffiBindings
 
-      - name: Build Kotlin JVM JAR
+      # Compile both published Kotlin modules here, in the credential-free build
+      # gate. release.yml's publish-maven runs these same two tasks, but it runs
+      # them with the GPG signing key and the Central Portal token in its
+      # environment and alongside publish-crates, publish-pypi, and publish-npm,
+      # which all depend on the same two signing jobs and therefore start
+      # together. crates.io, PyPI, and npm reject a re-upload of a version, so a
+      # Kotlin compile error that first surfaced in publish-maven would force a
+      # version bump across every SDK. Compiling here fails the release before
+      # any registry has taken an upload, and it fails a dry run too, because
+      # publish-maven is skipped when dry-run is true.
+      #
+      # `-x generateUniffiBindings` reuses the bindings the previous step wrote
+      # instead of running cargo a second time, which is the same exclusion
+      # publish-maven passes.
+      - name: Compile Kotlin modules
         working-directory: bindings/kotlin
-        run: ./gradlew :scp-kt:jar
+        run: |
+          ./gradlew :scp-kt:assemble :scp-kt-android:assembleRelease \
+            -x generateUniffiBindings
 
-      - name: Upload Kotlin AAR
+      # The cross-compiled UniFFI jniLibs (one .so per Android ABI). publish-maven
+      # downloads + re-stages these so Gradle assembles the published AAR with
+      # native libraries present — without a second NDK cross-compile in the
+      # publish job (which would also have to track the ABI list above).
+      - name: Upload Android jniLibs
         uses: actions/upload-artifact@v4
         with:
-          name: kotlin-aar
-          path: |
-            bindings/kotlin/scp-kt-android/build/outputs/aar/*-release.aar
-            bindings/kotlin/scp-kt/build/libs/*.jar
+          name: kotlin-jnilibs
+          path: bindings/kotlin/scp-kt-android/src/main/jniLibs/
+          retention-days: 7
+
+      - name: Upload Kotlin bindings
+        uses: actions/upload-artifact@v4
+        with:
+          name: kotlin-bindings
+          path: bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Kotlin — JVM native libraries for works.limn:scp-kt
+  #
+  # The published JVM coordinate carries UniFFI's generated loader, which calls
+  # JNA's `Native.load("scp_ffi_uniffi", ...)`. JNA searches `jna.library.path`,
+  # then the system library path, then the classpath at
+  # `<Platform.RESOURCE_PREFIX>/<mapSharedLibraryName(name)>`. A consumer who
+  # installed no SCP library reaches only the third search, so the JAR must carry
+  # one library per resource prefix or every SCP call throws
+  # `UnsatisfiedLinkError`. `.docs/scaffold/kotlin.md` section "Maven Central
+  # Publishing" lists the platforms the package carries, and `matrix.include`
+  # below is that list. `scripts/check-release-pipeline.py` reads these rows as
+  # the set the `publish-maven` job of release.yml must stage.
+  #
+  # This job compiles the crate the `cbindgen` job below also compiles, and it
+  # does not download that job's artifact: the comment on that job's cargo step
+  # calls the command a stand-in until a future story adds a cbindgen crate, so
+  # that artifact states nothing about what the published JAR needs.
+  # ---------------------------------------------------------------------------
+  kotlin-jvm-natives:
+    name: Kotlin JVM native (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            jna-prefix: linux-x86-64
+            lib-file: libscp_ffi_uniffi.so
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            jna-prefix: linux-aarch64
+            lib-file: libscp_ffi_uniffi.so
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            jna-prefix: darwin-x86-64
+            lib-file: libscp_ffi_uniffi.dylib
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            jna-prefix: darwin-aarch64
+            lib-file: libscp_ffi_uniffi.dylib
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            jna-prefix: win32-x86-64
+            lib-file: scp_ffi_uniffi.dll
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (aarch64-linux)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      # Default features only. The `testing` feature swaps a production custody
+      # provider for `InMemoryKeyCustody`, which CLAUDE.md forbids on a shipped
+      # path, and the `kotlin-aar` job above builds the Android libraries the
+      # same way.
+      - name: Build cdylib
+        run: cargo build --release --target ${{ matrix.target }} -p scp-ffi-uniffi
+
+      - name: Stage library under its JNA resource prefix (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          mkdir -p "jvm-natives/${{ matrix.jna-prefix }}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.lib-file }}" \
+             "jvm-natives/${{ matrix.jna-prefix }}/${{ matrix.lib-file }}"
+
+      - name: Stage library under its JNA resource prefix (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force "jvm-natives/${{ matrix.jna-prefix }}" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.lib-file }}" "jvm-natives/${{ matrix.jna-prefix }}/${{ matrix.lib-file }}"
+
+      # `if-no-files-found: error` fails this leg when the staging step produced
+      # nothing, so release.yml never reaches the Central Portal with a JAR that
+      # is missing a platform.
+      - name: Upload JVM native library
+        uses: actions/upload-artifact@v4
+        with:
+          name: kotlin-jvm-natives-${{ matrix.target }}
+          path: jvm-natives/
+          if-no-files-found: error
           retention-days: 7
 
   # ---------------------------------------------------------------------------
@@ -526,6 +610,7 @@ jobs:
       - typescript-napi
       - swift-xcframework
       - kotlin-aar
+      - kotlin-jvm-natives
       - cbindgen
     steps:
       - name: Download all artifacts

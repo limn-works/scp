@@ -30,6 +30,10 @@ bindings/kotlin/.gradle/
 bindings/kotlin/**/build/
 # UniFFI-generated Kotlin bindings (regenerated from Rust source)
 bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/*.kt
+# JVM native libraries the release pipeline stages into the scp-kt JAR
+# (cross-compiled per JNA resource prefix by the kotlin-jvm-natives job of
+# .github/workflows/build-matrix.yml, never committed)
+bindings/kotlin/scp-kt/src/main/resources/
 
 # Native build artifacts
 *.node
