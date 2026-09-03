@@ -29,7 +29,13 @@
 # This is not hypothetical: when this gate was written the committed copy was
 # stale by five methods (`media_activate_session`, `media_end_session`, and
 # three `outlet_streaming_saga_*` methods) and carried five checksum literals
-# that no longer matched the Rust source. This gate closes that class.
+# that no longer matched the Rust source — `identity_resolve`,
+# `identity_rotation_event_json`, `configure_local_transport`,
+# `configure_relay_transport`, and `identity_execute_recovery`. Each of those
+# five literals was a `fatalError` the Swift SDK would have raised at
+# initialization. The commit that added this gate regenerated the artifact, so
+# the gate and the file it compares landed together. This gate closes that
+# class.
 #
 # Note that `swift-build-test` in CI runs `bindings/swift/build-xcframework.sh
 # --dev`, which OVERWRITES the committed file before building. That job
@@ -134,15 +140,23 @@ esac
 [[ -f "$DYLIB" ]] || die "compiled library not found at $DYLIB (build failed?)"
 
 # ---------------------------------------------------------------------------
-# Step 2: Generate Swift bindings into the temp dir. Same invocation as
-# `bindings/swift/build-xcframework.sh`, which produces the shipped artifact.
+# Step 2: Generate Swift bindings into the temp dir. The `generate` arguments
+# are the ones `bindings/swift/build-xcframework.sh` passes, which is what
+# produces the shipped artifact.
+#
+# `--release` builds `uniffi-bindgen` into the same profile directory step 1
+# just filled, so the two commands share every compiled dependency.
+# `build-xcframework.sh` omits it and pays for a second, debug copy of the
+# crate graph; the generated Swift is the same either way, because
+# `uniffi-bindgen` reads its input out of the library named by `--library` and
+# its own optimization level does not reach the output.
 # ---------------------------------------------------------------------------
 
 GEN_DIR="$TMP_DIR/uniffi-out"
 mkdir -p "$GEN_DIR"
 
 log "Generating Swift bindings via uniffi-bindgen"
-cargo run --quiet -p scp-ffi-uniffi --bin uniffi-bindgen -- \
+cargo run --release --quiet -p scp-ffi-uniffi --bin uniffi-bindgen -- \
     generate \
     --library "$DYLIB" \
     --language swift \
