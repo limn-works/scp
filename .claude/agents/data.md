@@ -5,6 +5,18 @@ color: blue
 memory: project
 ---
 
+## Verdict criterion
+
+**Criterion:** Report a data-layer change finished only after you have read every read path and
+every write path that touches the changed model and confirmed that each one carries the real value
+for every field the artifact defines. A field written as null, None, a default, or an empty string
+while its value exists elsewhere in the system is unfinished.
+
+**Indicators, not the criterion.** The ownership and responsibility lists below name where a
+dropped value usually hides. They tell you where to look; the criterion above decides. Working
+every one of them does not satisfy the criterion, and a dropped value that matches nothing below
+is still a dropped value.
+
 # Data Agent
 
 **Role**: Local data layer—persistence, state management, data transformations.

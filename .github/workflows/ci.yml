@@ -560,6 +560,25 @@ jobs:
       - name: Real scan
         run: python3.12 scripts/check-doc-citations.py
 
+  # Every agent definition in `.claude/agents/` opens with a `## Verdict criterion`
+  # section carrying a `**Criterion:**` line and an `**Indicators, not the criterion.**`
+  # line, so the sentence in the Agent execution rules of CLAUDE.md describes the tree
+  # instead of asserting a state nobody produced. It runs on every pull request, without
+  # a paths filter, because the `ci` aggregator counts a skipped job as a pass.
+  agent-verdict-criterion:
+    needs: check-draft
+    name: Agents / every definition states a verdict criterion
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: Real check
+        run: bash scripts/check-agent-verdict-criterion.sh
+      # The cases run after the real check and plant each way the section can break,
+      # so a gate that can no longer go red fails here instead of reporting green.
+      - name: Run agent-verdict-criterion cases
+        run: bash scripts/tests/agent-verdict-criterion/run-tests.sh
+
   deleted-primitives:
     needs: check-draft
     name: Actor / deleted primitives ban
@@ -1755,6 +1774,7 @@ jobs:
       - saga-gating-granularity
       - block-in-place
       - doc-citations
+      - agent-verdict-criterion
       - deleted-primitives
       - bridge-instance-lifecycle
       - toolchain-wiring

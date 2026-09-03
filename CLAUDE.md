@@ -150,6 +150,11 @@ file to a lane or declares it unread; .mise.toml names no Rust version source; t
 compiler this shell resolves is the one rust-toolchain.toml names),
 check-resolved-rustc.sh (the fourth of those checks, which
 scripts/hooks/pre-commit and scripts/setup-toolchain.sh also run),
+check-agent-verdict-criterion.sh (every file under .claude/agents/, README.md
+excepted, opens with a `## Verdict criterion` section carrying a `**Criterion:**`
+line and an `**Indicators, not the criterion.**` line; the check fails when the
+directory matches no agent file, so an emptied directory reports a failure
+instead of passing over nothing),
 check-doc-citations.py (every `§N.M` citation in `.docs/standards/`,
 `.docs/lessons/`, `.claude/agents/` and CLAUDE.md names a heading its spec file
 contains, or carries the literal marker `[no such section]`; the check holds no
@@ -292,7 +297,7 @@ The orchestrator never writes code. It manages execution, maintains plan alignme
 - Never say "done" without showing verification output.
 
 **Agent execution rules (MANDATORY):**
-- **Write every agent prompt as a contract, never as your recipe.** State what the agent must make true, and state how you will check it. Then, separately and labelled as such, give the recipe you would have followed: the files to read, the greps to run, the symbols to trace. An agent that receives only a recipe satisfies the recipe and reports success, which is how `let _ = function_name;` came to satisfy a string-search test while calling nothing. The same rule governs the standing agent definitions in `.claude/agents/`: each one states its verdict criterion, and its review dimensions serve that criterion as evidence rather than replacing it.
+- **Write every agent prompt as a contract, never as your recipe.** State what the agent must make true, and state how you will check it. Then, separately and labelled as such, give the recipe you would have followed: the files to read, the greps to run, the symbols to trace. An agent that receives only a recipe satisfies the recipe and reports success, which is how `let _ = function_name;` came to satisfy a string-search test while calling nothing. The same rule governs the standing agent definitions in `.claude/agents/`: each one opens with a `## Verdict criterion` section that states what its agent must confirm before it reports a verdict and labels the remaining sections as indicators, so those review dimensions serve the criterion as evidence rather than replacing it. `scripts/check-agent-verdict-criterion.sh` reads every definition in that directory and fails when one drops either line, so this sentence describes a property of the tree rather than an obligation on whoever edits a definition next. The gate reads the shape of the section and never the meaning of its sentences, so a reviewer editing a definition still decides whether the criterion line states a criterion or restates the recipe.
 - Every agent prompt must specify which branch to start from. Include: "Verify with `git log --oneline -3` that you see [expected commits]. If not, STOP."
 - Never checkout migration/feature branches on the main worktree. All branch work happens in worktrees. Main worktree stays on main.
 - When the plan says "delete X and import Y," agents MUST delete X and import Y. No excuses. "Different serde format," "different field types," "architectural mismatch" are NOT valid reasons to keep local reimplementations when there are zero consumers. The only valid reason is a compiler-level mechanical restriction.
