@@ -1,6 +1,6 @@
 # A Green Check That Asserted Nothing: Twelve Ways CI Reported Success Over Zero Work
 
-**Date:** 2026-08-16, extended 2026-08-17, 2026-08-22, 2026-08-25, 2026-08-31 and 2026-09-01
+**Date:** 2026-08-16, extended 2026-08-17, 2026-08-22, 2026-08-25, 2026-08-31, 2026-09-01 and 2026-09-03
 **Source:** branch `fix/ci-enforces-what-it-claims` — `.github/workflows/ci.yml`, `.github/workflows/fuzz.yml`, `.github/workflows/release.yml`, `scripts/check-cross-layer.sh`, `scripts/check-shipped-feature-graph.sh`
 
 ## Rule
@@ -10,7 +10,7 @@ fail on whichever defect it exists to catch, and keep that failure as a test. Ev
 defect below produced a green check while work behind it never ran, and every one passed
 review because a check *looked* like it was doing its job.
 
-## Thirteen failure shapes
+## Fourteen failure shapes
 
 **1. A command that treats "nothing matched" as success.** `cargo test -p scp-node --lib
 pre_rotation_severance` exits 0 when a filter selects no test. Two tests it named
@@ -284,7 +284,39 @@ dependency entry or a `[features]` value enabling `<package>/testing`, and rejec
 lane instead of trusting the command's text. When a criterion is "feature X is off in
 this build", read what the build resolves, not what the command spells.
 
+**14. A resolver that reads a projection of the graph instead of the graph.**
+`scripts/check-shipped-feature-graph.sh` derived each shipped artifact's feature set by
+grepping `scp-<crate> feature "<name>"` edges out of `cargo tree -e features,no-dev -p
+<artifact>`. That tree roots its display at the artifact's package node, and the edges the
+artifact's OWN `[features]` table contributes hang off the artifact's feature nodes, which
+sit outside that subtree — so the whole activation class "this package's feature table
+turns on a dependency's feature" was invisible. Measured on this tree: with
+`default = ["testing"]` added to `crates/scp-node/Cargo.toml`, that command printed zero
+lines containing `testing` while the gate's scp-node entry printed OK, although the build
+compiled `scp-dht/testing`, `scp-platform/testing` and `allow_unencrypted_storage`. A
+positive control in the same experiment proved cargo had read the edited manifest:
+`default = ["testing", "quic"]` pulled `quinn` into the crate graph (25 lines) and still
+drew no `scp-transport feature "quic"` edge. Both binaries that pull request #2305 added
+to the gate carry an empty feature-arg string, so their entire nullifier exposure ran
+through that blind class; scp-node's leak surfaced only because `crates/scp-ffi` depends
+on scp-node and the three bridge entries caught it transitively, and no package outside
+scp-relay depends on scp-relay, so scp-relay had no such incidental catch — a
+`default = ["scp-transport/local-cache"]` planted in `crates/scp-relay/Cargo.toml` passed
+every one of the six checks. The fix reads cargo's own resolved feature list per package
+(`cargo tree -e no-dev --prefix none --format '{p}|{f}'`), which reports what the build
+enables rather than what the tree draws. When a criterion is "which features does this
+artifact resolve", ask the resolver for its answer; do not reconstruct that answer from a
+rendering built for human reading.
+
 ## Tests holding these closed
+
+- `scripts/check-shipped-feature-graph.sh` — `assert_resolver_sees_own_feature_table_activation`
+  runs before the artifact loop and fails the gate when the resolver stops reporting
+  `scp-ffi-common/server`, which `crates/scp-ffi/Cargo.toml` activates through scp-ffi's
+  own `server = ["scp-ffi-common/server", "dep:scp-node"]` list and which the feature-edge
+  reader never reported; two `--self-test` fixtures drive the pure
+  `parse_resolved_features` with a synthetic `{p}|{f}` block whose ROOT line carries
+  `testing`, asserting the parse emits it and that the subset check then rejects it.
 
 - `scripts/tests/ci-gate/run-tests.sh` — asserts every job sets a `timeout-minutes`, that
   every job is a dependency of `ci`, that no `cargo test` in any workflow carries a

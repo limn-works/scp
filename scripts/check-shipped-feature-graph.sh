@@ -38,12 +38,50 @@
 # The four nullifier feature names below appear ONLY in the self-test fixtures as
 # POSITIVE-CONTROL INPUTS the whitelist must reject — never as the mechanism.
 #
-# CRITICAL: DEV-DEPENDENCIES ARE EXCLUDED (`-e features,no-dev`)
-# -------------------------------------------------------------
+# CRITICAL: DEV-DEPENDENCIES ARE EXCLUDED (`-e no-dev`)
+# -----------------------------------------------------
 # A shipped artifact is built WITHOUT dev-dependencies. `cargo tree` includes
 # dev-deps by default (and feature-unifies their `testing` edges into the graph),
 # which does NOT reflect what ships. The `no-dev` edge kind restricts the graph to
 # the normal + build dependencies that actually compile into the artifact.
+#
+# CRITICAL: READ CARGO'S RESOLVED FEATURE LIST, NOT THE FEATURE-EDGE TREE
+# ----------------------------------------------------------------------
+# This gate reads each package's resolved feature list out of
+# `cargo tree --format '{p}|{f}'`, where `{f}` prints the features cargo actually
+# enabled for that package. It does NOT read the feature-edge tree that
+# `cargo tree -e features` draws, because that tree omits an entire class of
+# activation: a package's OWN `[features]` table activating a feature on one of
+# its dependencies. `cargo tree -e features -p X` roots its display at the
+# package node of X, while the edges X's feature table contributes hang off X's
+# feature nodes (`X feature "testing"`), which are not in that displayed subtree.
+# Measured on this tree: with `default = ["testing"]` added to
+# `crates/scp-node/Cargo.toml`, `cargo tree -e features,no-dev -p scp-node`
+# printed ZERO lines containing `testing` while `--format '{p}|{f}'` printed
+# `scp-dht|default,production-dht,testing` and
+# `scp-node|allow_unencrypted_storage,default,testing`. The same blindness held
+# for a CLI-supplied feature: `-p scp-node --features quic` pulled `quinn` into
+# the crate graph (25 lines) and still drew no `scp-transport feature "quic"`
+# edge, and it held for every bridge — `-p scp-ffi --no-default-features
+# --features server` drew no `scp-ffi-common feature "server"` edge although
+# `server = ["scp-ffi-common/server", "dep:scp-node"]` in
+# `crates/scp-ffi/Cargo.toml` activates it.
+#
+# Every ARTIFACTS entry below is exposed to that class, and the two binaries are
+# exposed to it entirely: `scp-node` and `scp-relay` are gated with an empty
+# feature-arg string, so their whole nullifier exposure runs through their own
+# manifests. The scp-node leak above still failed the run, because
+# `crates/scp-ffi` depends on scp-node and the three bridge entries resolved it
+# transitively. No package outside scp-relay depends on scp-relay, so scp-relay
+# had no such incidental catch: a `default = ["scp-transport/local-cache"]`
+# planted in `crates/scp-relay/Cargo.toml` passed the feature-edge reader's
+# scp-relay entry, passed its default-members check, and printed
+# `G1 PASSED`.
+#
+# `assert_resolver_sees_own_feature_table_activation` in `run_gate` is the
+# positive control that keeps this file on the resolved-list reader: it fails the
+# gate if the resolver stops reporting `scp-ffi-common/server`, an activation a
+# feature-edge reader cannot see.
 #
 # Usage:
 #   scripts/check-shipped-feature-graph.sh            # gate the real workspace
@@ -64,6 +102,23 @@ cd "$REPO_ROOT"
 # NULLIFIER_CONTROL_FEATURES entry is added, so a future edit cannot quietly add
 # a nullifier exception.
 #
+# `scp-ffi/server`, `scp-ffi-napi/server`, `scp-ffi-uniffi/server` and
+# `scp-ffi-common/server` are the production bridge feature this gate itself
+# builds each bridge with (`--no-default-features --features server`): it wires
+# the shared relay/node startup code into the bridge and compiles no test double.
+# They are on this allowlist because the resolved-list reader described in the
+# header now SEES a bridge's own `[features]` table activating them; the
+# feature-edge reader this gate used before never reported them.
+#
+# `scp-ffi/default`, `scp-ffi-napi/default`, `scp-ffi-uniffi/default` and
+# `scp-client-wasm/default` are what a bare `cargo build` at this root enables on
+# those default members, which the default-members check below resolves. The
+# three bridge rows expand to `["server"]` and the wasm row expands to `[]`.
+# Permitting a `default` row admits nothing beyond its expansion: the reader
+# reports cargo's RESOLVED list, so every feature `default` pulls in appears as
+# its own row and meets this ⊆ check on its own. Adding a nullifier to any of
+# those four `default` lists would surface that nullifier here and FAIL.
+#
 # `scp-platform/in-memory-push` is an intentionally-permitted, currently-unused
 # durability-only entry: no shipped artifact resolves it today, but a superset
 # allowlist may carry permitted-but-unresolved rows (it is durability-only, not a
@@ -80,30 +135,30 @@ cd "$REPO_ROOT"
 # `--no-default-features --features server`) plus the scp-node and scp-relay
 # binaries (built with DEFAULT features — neither binary has a `server` feature).
 # The three bridges resolve one identical SCP-crate feature set; each binary
-# resolves a SUBSET of it (scp-node ~25, scp-relay ~19 SCP-crate feature edges).
+# resolves a SUBSET of it (scp-node ~17, scp-relay ~11 SCP-crate features).
 # This single allowlist is therefore a SUPERSET covering all five — one list
 # suffices. `cargo tree` DERIVES each artifact's resolved set (never a hand-list);
 # this allowlist is the hand-maintained set of what is PERMITTED.
 # ---------------------------------------------------------------------------
 PERMITTED_ALLOWLIST="$(cat <<'EOF'
+scp-client-wasm/default
 scp-client/default
-scp-clock/default
-scp-core/default
-scp-crypto/default
 scp-dht/default
 scp-dht/production-dht
 scp-did/default
-scp-event-log/default
 scp-ffi-common/custody
 scp-ffi-common/default
 scp-ffi-common/resolvers
+scp-ffi-common/server
+scp-ffi-napi/default
+scp-ffi-napi/server
+scp-ffi-uniffi/default
+scp-ffi-uniffi/server
+scp-ffi/default
+scp-ffi/server
 scp-identity/default
 scp-identity/production-dht
-scp-mcp/default
-scp-media/default
 scp-mls/default
-scp-node/default
-scp-platform/default
 scp-platform/encrypting
 scp-platform/file
 scp-platform/in-memory-push
@@ -111,9 +166,6 @@ scp-platform/in-memory-storage
 scp-platform/software_platform
 scp-platform/sqlite
 scp-protocol/default
-scp-relay-client/default
-scp-runtime/default
-scp-transport/default
 scp-transport/postgres-blob
 scp-transport/redb-blob
 scp-transport/s3-blob
@@ -192,17 +244,57 @@ NULLIFIER_CONTROL_FEATURES=(
 )
 
 # ---------------------------------------------------------------------------
+# parse_resolved_features <cargo-tree-output>
+#   Turn `cargo tree --prefix none --format '{p}|{f}'` output into one
+#   `crate/feature` line per enabled feature of every SCP workspace crate,
+#   sorted-unique. `{p}` prints `<name> v<version> (<path>)` and `{f}` prints the
+#   comma-separated feature list cargo resolved FOR THAT PACKAGE, so a feature a
+#   package's own `[features]` table activated on a dependency appears here — the
+#   activation class the feature-edge tree omits (see the header).
+#
+#   Pure: takes text, writes text, calls no cargo. run_fixtures drives it with
+#   synthetic input, so the parse is asserted without a workspace.
+#
+#   Reads its input with a bash `while read` loop rather than `awk`, so the
+#   commands this file pipes into stay `grep`, `sed`, `sort` and `comm` — the
+#   closed set `assert_every_pipeline_reader_consumes_its_input` decides its
+#   criterion over.
+# ---------------------------------------------------------------------------
+parse_resolved_features() {
+  local raw="$1" normalized pkg feats feature
+  # Strip cargo's ` (*)` deduplication marker, keep only SCP workspace packages,
+  # and reduce `<name> v<version> (<path>)|<features>` to `<name>|<features>`.
+  normalized="$(printf '%s\n' "$raw" \
+    | sed -E 's/ \(\*\)$//' \
+    | sed -E -n 's/^(scp-[a-z0-9-]+) v[^|]*\|/\1|/p')"
+  while IFS='|' read -r pkg feats; do
+    [[ -n "$pkg" && -n "$feats" ]] || continue
+    local -a enabled=()
+    IFS=',' read -ra enabled <<< "$feats"
+    for feature in "${enabled[@]}"; do
+      [[ -n "$feature" ]] && printf '%s/%s\n' "$pkg" "$feature"
+    done
+  done <<< "$normalized" | sort -u
+}
+
+# ---------------------------------------------------------------------------
 # resolve_scp_features <crate> <features...>
 #   Emit the COMPLETE resolved SCP-crate feature set of the shipped artifact,
 #   one `crate/feature` per line, sorted-unique. Excludes dev-dependencies.
 #
+#   Reads cargo's RESOLVED FEATURE LIST per package (`--format '{p}|{f}'`), not
+#   the `-e features` edge tree. The header records the measurement: the edge
+#   tree omits every feature a package's own `[features]` table activates on a
+#   dependency, which is the whole nullifier exposure of the two binaries this
+#   gate covers with an empty feature-arg string.
+#
 #   DELIBERATE SPLIT from resolve_scp_testing_crate (NOT a redundant twin): this
-#   extracts FEATURE edges (`scp-* feature "…"`) from the `-e features,no-dev`
-#   tree, whereas resolve_scp_testing_crate probes CRATE-NODE presence
-#   (`scp-testing v…`) in the `-e no-dev` tree. A `scp-testing` pulled with
-#   `default-features = false` and no features enabled contributes NO feature
-#   edge here (so this grep would miss it) yet still appears as a crate node —
-#   so the two checks catch distinct cases and are both load-bearing.
+#   reports FEATURES, whereas resolve_scp_testing_crate probes CRATE-NODE
+#   presence (`scp-testing v…`). A `scp-testing` pulled with
+#   `default-features = false` and no features enabled resolves an EMPTY feature
+#   list here (so this function emits nothing for it) yet still appears as a
+#   crate node — so the two checks catch distinct cases and are both
+#   load-bearing.
 # ---------------------------------------------------------------------------
 resolve_scp_features() {
   local crate="$1"; shift
@@ -213,16 +305,13 @@ resolve_scp_features() {
   # artifact lacks), surface the cargo error and return non-zero so the caller
   # fails loud instead of proceeding with an empty (vacuously-passing) set.
   # shellcheck disable=SC2086
-  raw="$(cargo tree -e features,no-dev -p "$crate" $features 2>&1)"; rc=$?
+  raw="$(cargo tree -e no-dev -p "$crate" $features --prefix none --format '{p}|{f}' 2>&1)"; rc=$?
   if [[ "$rc" -ne 0 ]]; then
     { echo "cargo tree failed for '$crate' (feature args: '$features'):"
       printf '%s\n' "$raw"; } >&2
     return 1
   fi
-  printf '%s\n' "$raw" \
-    | grep -oE 'scp-[a-z0-9-]+ feature "[^"]+"' \
-    | sed -E 's/ feature "/\//; s/"$//' \
-    | sort -u
+  parse_resolved_features "$raw"
 }
 
 # resolve_scp_testing_crate <crate> <features...>
@@ -325,6 +414,16 @@ resolution_is_nonempty() {
 #   Emit a COMPLETE resolved SCP-crate feature set for a bare `cargo build` at
 #   this workspace root — no `-p`, so cargo resolves `[workspace] default-members`
 #   and unifies normal-dependency features across every package on that list.
+#   Reads cargo's resolved feature list through parse_resolved_features, the same
+#   reader resolve_scp_features uses, so a default member's OWN `[features]`
+#   table activating a dependency feature is reported here too. A feature-edge
+#   reader reported that class for a member ANOTHER member depends on (scp-ffi
+#   depends on scp-node, so scp-node's feature nodes render inside scp-ffi's
+#   subtree) and MISSED it for a member nothing depends on, which stays a display
+#   root of its own. Measured: with `default = ["scp-transport/local-cache"]`
+#   added to `crates/scp-relay/Cargo.toml` — and no package outside scp-relay
+#   depending on scp-relay — the feature-edge reader printed OK for the scp-relay
+#   entry AND for this default-members check, while this reader fails both.
 #
 #   WHY THIS EXISTS SEPARATELY FROM resolve_scp_features
 #   ---------------------------------------------------
@@ -346,16 +445,13 @@ resolution_is_nonempty() {
 # ---------------------------------------------------------------------------
 resolve_default_members_features() {
   local raw rc
-  raw="$(cargo tree -e features,no-dev 2>&1)"; rc=$?
+  raw="$(cargo tree -e no-dev --prefix none --format '{p}|{f}' 2>&1)"; rc=$?
   if [[ "$rc" -ne 0 ]]; then
     { echo "cargo tree failed for a bare default-members resolution:"
       printf '%s\n' "$raw"; } >&2
     return 1
   fi
-  printf '%s\n' "$raw" \
-    | grep -oE 'scp-[a-z0-9-]+ feature "[^"]+"' \
-    | sed -E 's/ feature "/\//; s/"$//' \
-    | sort -u
+  parse_resolved_features "$raw"
 }
 
 # resolve_default_members_testing_crate
@@ -382,12 +478,66 @@ resolve_default_members_testing_crate() {
 }
 
 # ---------------------------------------------------------------------------
+# assert_resolver_sees_own_feature_table_activation
+#   Positive control on the RESOLVER, not on the ⊆ decision procedure.
+#
+#   CRITERION: the resolver must report a feature that a shipped artifact's OWN
+#   `[features]` table activates on one of that artifact's dependencies. A
+#   resolver that reads only the `cargo tree -e features` edge tree reports
+#   nothing for that class, and the two binaries in ARTIFACTS carry an empty
+#   feature-arg string, so their entire nullifier exposure runs through it.
+#
+#   WITNESS: `crates/scp-ffi/Cargo.toml` declares
+#   `server = ["scp-ffi-common/server", "dep:scp-node"]`, and this gate builds
+#   scp-ffi with `--no-default-features --features server`, so a correct resolver
+#   reports `scp-ffi-common/server`. Measured against the edge-tree reader this
+#   gate used before: `cargo tree -e features,no-dev -p scp-ffi
+#   --no-default-features --features server` printed no
+#   `scp-ffi-common feature "server"` line at all.
+#
+#   This assertion FAILS THE GATE rather than warning, and it runs before the
+#   artifact loop, so a resolver that has gone blind cannot print five OK lines
+#   first. Renaming that feature must break this control loudly; re-point the
+#   witness at another own-table activation rather than deleting the control.
+# ---------------------------------------------------------------------------
+assert_resolver_sees_own_feature_table_activation() {
+  local witness_crate="scp-ffi"
+  local witness_features="--no-default-features --features server"
+  local witness_entry="scp-ffi-common/server"
+  local resolved
+  echo ">> positive control: the resolver reports a feature an artifact's own [features] table activates on a dependency"
+  if ! resolved="$(resolve_scp_features "$witness_crate" "$witness_features")"; then
+    echo "   FAIL — the positive-control resolution itself failed for '$witness_crate'."
+    return 1
+  fi
+  if printf '%s\n' "$resolved" | grep -xF "$witness_entry" >/dev/null; then
+    echo "   ok   — '$witness_entry' is reported for \`$witness_crate $witness_features\`"
+    return 0
+  fi
+  echo "   FAIL — the resolver did NOT report '$witness_entry' for"
+  echo "          \`cargo tree -p $witness_crate $witness_features\`, although"
+  echo "          crates/scp-ffi/Cargo.toml declares"
+  echo "          server = [\"scp-ffi-common/server\", \"dep:scp-node\"]."
+  echo "          A resolver blind to a package's own [features] table cannot see"
+  echo "          a nullifier that scp-node or scp-relay enables through its own"
+  echo "          manifest — both are gated here with an EMPTY feature-arg string."
+  echo "          Read cargo's resolved feature list (--format '{p}|{f}'); do NOT"
+  echo "          go back to grepping the \`-e features\` edge tree."
+  return 1
+}
+
+# ---------------------------------------------------------------------------
 # Real gate.
 # ---------------------------------------------------------------------------
 run_gate() {
   local failures=0
   echo "G1 shipped-feature-graph gate (ADR-062 §Decision 6) — dev-deps EXCLUDED"
   echo "-------------------------------------------------------------------------"
+  # Prove the resolver still sees the activation class the edge-tree reader
+  # missed BEFORE reading any artifact, so a blind resolver cannot print five OK
+  # lines ahead of its own failure.
+  assert_resolver_sees_own_feature_table_activation || failures=$((failures + 1))
+  echo
   for spec in "${ARTIFACTS[@]}"; do
     local crate="${spec%%|*}" features="${spec#*|}"
     echo ">> $crate  ($features)"
@@ -591,6 +741,37 @@ run_fixtures() {
   expect "(empty-guard) empty resolved set is REJECTED" "FAIL" "$rc"
   resolution_is_nonempty "scp-core/default"; rc=$?
   expect "(empty-guard) non-empty resolved set is ACCEPTED" "PASS" "$rc"
+
+  # (resolver parse) parse_resolved_features must read the ROOT package's own
+  #     resolved feature list, strip cargo's ` (*)` dedup marker, split a
+  #     comma-separated list, ignore a non-SCP package, and emit nothing for a
+  #     package whose resolved list is empty. The root line is the load-bearing
+  #     case: a feature a package's own `[features]` table activates appears in
+  #     cargo's resolved list and NOWHERE in the `-e features` edge tree.
+  local synthetic parsed expected_parse
+  synthetic="$(printf '%s\n' \
+    'scp-node v0.1.0-beta.2 (/w/crates/scp-node)|allow_unencrypted_storage,default,testing' \
+    'scp-dht v0.1.0-beta.2 (/w/crates/scp-dht)|default,production-dht,testing (*)' \
+    'scp-clock v0.1.0-beta.2 (/w/crates/scp-clock)|' \
+    'tokio v1.49.0|full,macros')"
+  expected_parse="$(printf '%s\n' \
+    'scp-dht/default' 'scp-dht/production-dht' 'scp-dht/testing' \
+    'scp-node/allow_unencrypted_storage' 'scp-node/default' 'scp-node/testing')"
+  parsed="$(parse_resolved_features "$synthetic")"
+  if [[ "$parsed" == "$expected_parse" ]]; then rc=0; else rc=1; fi
+  expect "(resolver parse) a root package's own resolved features, dedup markers, and non-SCP packages are read correctly" "PASS" "$rc"
+  if [[ "$parsed" != "$expected_parse" ]]; then
+    echo "          expected:"; printf '%s\n' "$expected_parse" | sed 's/^/            /'
+    echo "          got:";      printf '%s\n' "$parsed"          | sed 's/^/            /'
+  fi
+
+  # (resolver parse) A resolved list that names a nullifier feature must reach
+  #     the ⊆ check as an offender. This joins the parse to the decision
+  #     procedure, so neither half can be green while the pair is broken.
+  local nullifier_parse
+  nullifier_parse="$(parse_resolved_features 'scp-platform v0.1.0-beta.2 (/w/crates/scp-platform)|sqlite,testing')"
+  check_subset "$nullifier_parse" "$PERMITTED_ALLOWLIST" >/dev/null 2>&1; rc=$?
+  expect "(resolver parse) a parsed 'scp-platform/testing' is REJECTED by the subset check" "FAIL" "$rc"
 
   # (SIGPIPE) A crate-node probe must return one verdict wherever a match sits.
   #     Under `grep -q`, a match on a first line of a tree larger than a pipe
