@@ -5,7 +5,9 @@
 # `rust-toolchain.toml` is the one place this repository names a stable Rust version, and
 # `fuzz/rust-toolchain.toml` the one place it names a nightly. Every consumer derives the
 # version from one of those two files, so no two consumers can disagree. This gate checks
-# the three things a derivation cannot establish on its own.
+# the four things a derivation cannot establish on its own. Check 4 belongs here because
+# checks 2a through 2e all rest on how the `ci` aggregator treats a skipped job, and that
+# aggregator has to observe the `changes` job whose failure produces the skips.
 #
 # ── CHECK 1: every container build proves which compiler it resolved ─────────────────
 #
@@ -251,15 +253,23 @@
 # invented one survives.
 #
 # WHICH JOB IS THE VERDICT JOB, and how the gate finds it rather than reading a name
-# someone remembered to add: a job whose own `if:` key is `always()` and whose body reads
-# at least one `needs.<name>.result`. `if: always()` is what makes a job run after its
-# dependencies skip, and reading a result is what makes it a verdict rather than a step;
-# no other job in this repository's workflows has both. The gate checks every workflow
-# GitHub Actions runs — each tracked `.yml` or `.yaml` file under `.github/workflows/`,
-# which leaves a `.disabled` name out — and a workflow declaring no such job is silent
-# here. That silence is sound: a required check whose job the workflow does not declare
-# never reports, and GitHub blocks the merge on a pending required check, so deleting the
-# aggregator fails closed on its own.
+# someone remembered to add: a job whose own `if:` expression names `always()` and whose
+# body reads at least one `needs.<name>.result`. `always()` is what makes a job run after
+# its dependencies skip, and reading a result is what makes it a verdict rather than a
+# step; no other job in this repository's workflows has both. The gate checks every
+# workflow GitHub Actions runs — each tracked `.yml` or `.yaml` file under
+# `.github/workflows/`, which leaves a `.disabled` name out — and a workflow declaring no
+# such job is silent here. That silence is sound: a required check whose job the workflow
+# does not declare never reports, and GitHub blocks the merge on a pending required
+# check, so deleting the aggregator fails closed on its own.
+#
+# The gate reads the whole `if:` value rather than one spelling of it: the text on the
+# key's own line, plus every following line indented deeper than the key, which is how
+# YAML continues a folded or literal scalar. `if: always()`, `if: ${{ always() }}`,
+# `if: always() && github.event_name == 'push'`, and an `if: >-` whose continuation lines
+# hold `always()` therefore all name the same job. Matching the one line `if: always()`
+# would have let an author un-gate the aggregator by rewrapping its condition, and this
+# check exists because an un-gated aggregator looks exactly like a passing one.
 #
 # WHAT CHECK 4 DOES NOT COVER, stated rather than implied. It reads which results the
 # aggregator's text names, not what its shell does with them. An aggregator that reads
@@ -826,6 +836,19 @@ workflow_job_names() {
     ' "$1"
 }
 
+# Print one job block's `if:` value: the text on the key's own line, and every following
+# line indented deeper than the key, which is what YAML reads as the continuation of a
+# folded or literal scalar. A job with no `if:` key prints nothing.
+job_if_expression() {
+    awk '
+        /^    if:/ { inif = 1; print; next }
+        inif {
+            if ($0 ~ /^ {5,}[^ ]/) { print; next }
+            exit
+        }
+    '
+}
+
 # Print the lines of one job: everything after its header, up to the next job header.
 job_block() {
     awk -v job="$2" '
@@ -898,7 +921,7 @@ check_verdict_job_observes_every_job() {
     while IFS= read -r job; do
         [[ -n $job ]] || continue
         block=$(job_block "$wf" "$job")
-        grep -qE '^    if:[[:space:]]*always\(\)[[:space:]]*$' <<< "$block" || continue
+        job_if_expression <<< "$block" | grep -qF 'always()' || continue
         grep -qE 'needs\.[A-Za-z0-9_.-]+\.result' <<< "$block" || continue
         if [[ -n $verdict ]]; then
             report "$wf declares two jobs that each run with 'if: always()' and read a 'needs.<job>.result' — '$verdict' and '$job'. This gate cannot tell which one branch protection requires, so it cannot check that the required one observes every job. Leave one such job in the workflow."

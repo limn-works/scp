@@ -52,7 +52,10 @@
 #     every other case in this file writes a `ci.yml` declaring no verdict job at all,
 #     which is the shape check 4 leaves alone. A workflow whose only job is its verdict job
 #     gets a case of its own: the set of other jobs is empty there, and the gate has to
-#     report the unknown names rather than abort on a `grep` that matched nothing.
+#     report the unknown names rather than abort on a `grep` that matched nothing. Four
+#     further cases hold the discovery rule to the `if:` value rather than to one spelling
+#     of it: `${{ always() }}`, `always() && …`, and a folded scalar holding `always()`
+#     each name a verdict job, and an `if:` naming no `always()` does not.
 #
 # HOW EACH CASE IS BUILT. `run_case` makes a temporary directory, writes the gate into
 # `scripts/`, runs `git init` so the gate's `git grep` search and its file listings have a
@@ -1015,12 +1018,34 @@ GATE_TRANSFORM=""
 #   NEEDS_STYLE — "block" writes the `needs:` list as a block sequence, "flow" as a flow
 #                 sequence on the key's own line, "scalar" as a single job name, and
 #                 "absent" writes no `needs:` key at all.
+#   IF_STYLE    — how the verdict job spells its `if:`: "bare" writes `if: always()`,
+#                 "interpolated" writes `if: ${{ always() }}`, "conjunction" writes
+#                 `always() && ...`, "folded" writes a `>-` block scalar whose
+#                 continuation lines hold `always()`, and "no-always" writes an `if:`
+#                 naming a different function. Every spelling but the last names the same
+#                 job, so a case that changes only IF_STYLE must produce the same verdict.
 NEEDS_STYLE="block"
+IF_STYLE="bare"
 
 # emit_verdict_job <needs names> <result names>
 emit_verdict_job() {
     local needs=$1 results=$2 name joined=""
-    printf '  ci:\n    if: always()\n'
+    printf '  ci:\n'
+    case "$IF_STYLE" in
+        bare) printf '    if: always()\n' ;;
+        interpolated) printf '    if: ${{ always() }}\n' ;;
+        conjunction) printf "    if: always() && github.event_name != 'schedule'\n" ;;
+        folded)
+            printf '    if: >-\n'
+            printf "      github.event_name == 'push' ||\n"
+            printf '      always()\n'
+            ;;
+        no-always) printf "    if: github.event_name == 'push'\n" ;;
+        *)
+            echo "ERROR: unknown IF_STYLE '$IF_STYLE'" >&2
+            exit 1
+            ;;
+    esac
     case "$NEEDS_STYLE" in
         block)
             printf '    needs:\n'
@@ -1137,6 +1162,26 @@ two_verdict_jobs() {
 run_case "workflow-declares-two-verdict-jobs" 1 \
     "declares two jobs that each run with 'if: always()' and read a 'needs.<job>.result'" \
     two_verdict_jobs mise_ok
+
+# The `if:` spellings. A verdict job stays a verdict job through every one of them, so
+# each case below omits `changes` and expects the same finding the bare spelling produces.
+# Matching only the one line `if: always()` turns each of these green, which would let an
+# author un-gate the aggregator by rewrapping its condition.
+for if_style in interpolated conjunction folded; do
+    IF_STYLE="$if_style"
+    run_case "verdict-job-spells-its-if-as-$if_style" 1 \
+        "does not name these jobs in its 'needs:' — changes" \
+        verdict_omits_the_changes_job mise_ok
+done
+IF_STYLE="bare"
+
+# The other direction: a job that reads results and whose `if:` names no `always()` is not
+# a verdict job, because GitHub never runs it once a dependency skips. The gate leaves it
+# alone even though it omits `changes`.
+IF_STYLE="no-always"
+run_case "job-reading-results-without-always-is-not-a-verdict-job" 0 "" \
+    verdict_omits_the_changes_job mise_ok
+IF_STYLE="bare"
 
 # A second workflow whose only job is its verdict job. The set of other jobs is then
 # empty, and every name that job reads is unknown. The case exists for what the gate does
