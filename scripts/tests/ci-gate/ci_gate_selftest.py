@@ -2149,9 +2149,17 @@ def collect_pinned_nightlies(doc: dict) -> set[str]:
 def main() -> int:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     jobs = workflow["jobs"]
+    # GitHub Actions runs a workflow file whose extension is `.yml` or `.yaml`,
+    # and scripts/check-toolchain-wiring.sh enumerates both. This glob read
+    # `.yml` alone, so a workflow written with the other spelling would have
+    # escaped every assertion below while both gates printed OK. No workflow
+    # here carries it today, which is why widening the glob changes no result.
     documents = [
         (path, yaml.safe_load(path.read_text()))
-        for path in sorted((REPO / ".github/workflows").glob("*.yml"))
+        for path in sorted(
+            set((REPO / ".github/workflows").glob("*.yml"))
+            | set((REPO / ".github/workflows").glob("*.yaml"))
+        )
     ]
 
     print("timeout — every job in every workflow bounds its own runtime")
