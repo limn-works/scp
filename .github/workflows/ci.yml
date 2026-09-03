@@ -548,6 +548,28 @@ jobs:
       - uses: actions/checkout@v5
       - run: bash scripts/check-deleted-primitives.sh
 
+  # The prose standard's per-sentence self-check asks whether a sentence uses
+  # any of the forbidden constructions. A writer can answer that only for an
+  # entry that states what decides membership, so this gate requires every
+  # entry to state one. It runs on every pull request, without a paths filter,
+  # because the `ci` aggregator counts a skipped job as a pass.
+  prose-constructions:
+    needs: check-draft
+    name: Prose / forbidden constructions state a criterion
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Self-test MUST run first: it proves the checker rejects each way the
+      # list can break before we trust its verdict on the real standard.
+      - name: Self-test checker
+        run: python3.12 scripts/check-prose-constructions.py --self-test
+      - name: Real scan
+        run: python3.12 scripts/check-prose-constructions.py
+
   handler-no-panic:
     needs: check-draft
     name: Actor / handler panic-family ban (ADR-049 §10)
@@ -1734,6 +1756,7 @@ jobs:
       - saga-gating-granularity
       - block-in-place
       - deleted-primitives
+      - prose-constructions
       - bridge-instance-lifecycle
       - toolchain-wiring
       - docker-image
