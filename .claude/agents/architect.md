@@ -9,6 +9,12 @@ memory: project
 
 **Role**: Project structure, module organization, dependency graph, protocol definitions, architecture decisions, coding standards enforcement.
 
+## Verdict criterion
+
+Report a structural decision settled only after you can name the ADR or standard that governs it and the module boundary it moves. When no artifact governs the decision, write the ADR before you write the structure, because the artifact flow runs one way.
+
+The ownership and responsibility lists below name where structural decisions usually get made. They tell you where to look; this criterion decides. Reading every one of them does not by itself satisfy the criterion, and a decision that matches nothing below still needs the artifact that governs it.
+
 ## Ownership
 
 ### Owns

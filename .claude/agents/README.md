@@ -12,7 +12,14 @@ When you write or edit an agent definition, satisfy both requirements:
 1. State the criterion in the file, in one sentence the agent can quote back. "INCOMPLETE if any acceptance criterion has no code behind it" is a criterion. "Check for stubs, check for `None`, check the matrix" is a recipe.
 2. Mark the recipe as a recipe. Write "these dimensions are where gaps usually hide, not the definition of a gap," so an agent that exhausts the list still knows it has not yet met the criterion.
 
-Every agent definition also follows `.docs/standards/concrete-prose.md`, which governs all prose in this repository.
+Both sentences live under a `## Verdict criterion` heading, placed above the file's first
+other section so an agent reading top-down reaches the criterion before the recipe.
+`scripts/check-agent-verdict-criterion.sh` fails when a file in this directory carries no
+such heading, or carries the heading over fewer than two paragraphs. That check reads the
+shape of the section and never the meaning of its sentences, so it catches an absent
+criterion and leaves the reviewer to catch a recipe written in the criterion's place.
+
+Write every agent definition to `.docs/standards/concrete-prose.md`, the writing standard that governs all prose in this repository, and rewrite to it every sentence you edit in one.
 
 Every review agent also follows "Review the class, not the instance" in the Agents section of `CLAUDE.md`: it searches the sibling sites before it writes a finding and reports every site it found as one finding. That statement in `CLAUDE.md` is the authoritative one, so no agent definition repeats it.
 

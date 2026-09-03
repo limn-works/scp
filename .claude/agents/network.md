@@ -9,6 +9,12 @@ memory: project
 
 **Role**: Remote data layer—all communication with external services.
 
+## Verdict criterion
+
+Report transport work finished only after you have read the retry path, the timeout path, and the offline path of every request the change adds, and confirmed that each one surfaces a typed error to its caller. A request whose failure path returns cached or default data hides the failure from the layer above.
+
+The ownership and responsibility lists below name where a hidden failure usually sits. They tell you where to look; this criterion decides. Reading every one of them does not by itself satisfy the criterion, and a hidden failure that matches nothing below is still a hidden failure.
+
 ## Ownership
 
 ### Owns

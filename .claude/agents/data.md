@@ -9,6 +9,12 @@ memory: project
 
 **Role**: Local data layer—persistence, state management, data transformations.
 
+## Verdict criterion
+
+Report a data-layer change finished only after you have read every read path and every write path that touches the changed model and confirmed that each one carries the real value. A field left at a default while the value exists elsewhere in the system is unfinished.
+
+The ownership and responsibility lists below name where a dropped value usually hides. They tell you where to look; this criterion decides. Reading every one of them does not by itself satisfy the criterion, and a dropped value that matches nothing below is still a dropped value.
+
 ## Ownership
 
 ### Owns

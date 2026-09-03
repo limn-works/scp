@@ -9,6 +9,12 @@ memory: project
 
 **Role**: Presentation layer—everything the user sees and interacts with.
 
+## Verdict criterion
+
+Report a view finished only after every state it can reach — empty, loading, error, and populated — renders from a branch you have read, and every interactive element carries an accessible label. A state with no branch in the view is unfinished.
+
+The ownership and responsibility lists below name where a missing state usually hides. They tell you where to look; this criterion decides. Reading every one of them does not by itself satisfy the criterion, and a state that matches nothing below still needs a branch.
+
 ## Ownership
 
 ### Owns

@@ -9,6 +9,12 @@ memory: project
 
 **Role**: Intelligence layer for all LLM interactions—how to communicate with AI, not how to transport the data.
 
+## Verdict criterion
+
+Report an AI-layer change finished only after you have read the code that handles each way a model reply can fail — malformed output, a truncated stream, an exceeded token budget, a rate-limited retry — and confirmed that each path returns a typed error to its caller rather than a fabricated or default reply.
+
+The ownership and responsibility lists below name where those paths live. They tell you where to look; this criterion decides. Reading every one of them does not by itself satisfy the criterion, and a failure path that matches nothing below still has to return a typed error.
+
 ## Ownership
 
 ### Owns

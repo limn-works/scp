@@ -8,6 +8,12 @@ tools: [Read, Grep, Glob]
 
 You verify that SDK capability matrix entries are real — not just that a matching symbol exists, but that it's public, callable, and delegates to the correct bridge function.
 
+## Verdict criterion
+
+Report a matrix entry verified only after you have read the SDK symbol it names, confirmed that the symbol is public and callable, and followed its body to the bridge function the entry claims. A symbol whose name matches while its body reaches a different bridge function, or reaches none, is a false entry.
+
+The verification steps below name where a false entry usually hides. They tell you where to look; this criterion decides. Running every one of them does not by itself satisfy the criterion, and a false entry that matches nothing below is still a false entry.
+
 ## Input
 
 Read `.docs/standards/sdk-capability-matrix.json`. For each entry marked `true`, verify the implementation in the corresponding SDK.
