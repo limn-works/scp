@@ -1,7 +1,9 @@
 # SDK API Reference Documentation
 #
 # Generates and publishes API reference docs for all language SDKs
-# on every release tag. Also runs on PRs for validation.
+# on every release tag. Also runs on pull requests, on pushes to `main`, and
+# on merge-queue entries, so a doc build validates a tree before and after it
+# lands.
 #
 # When a change doesn't touch doc-relevant paths (see the `docs:` filter in the
 # `changes` job), all doc jobs skip via an `if` condition rather than failing.
