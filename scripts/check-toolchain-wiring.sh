@@ -265,8 +265,9 @@
 # aggregator's text names, not what its shell does with them. An aggregator that reads
 # every result and then discards them all — a loop whose body is `true`, a comparison
 # against a value GitHub never produces — satisfies this check. Set equality is the
-# property a name-based check can establish; the loop's own logic is not, and it lives in
-# fourteen lines directly under the `needs:` list this check holds complete.
+# property a name-based check can establish, and the loop's own logic is not. That loop
+# is seven lines long in `ci.yml`, and it sits in the same step as the list of results
+# this check holds complete, so a reader checking one reads the other.
 #
 # The gate FAILS CLOSED: a missing workflow, a missing filter, a filter with no path
 # entries, a `changes` job with no outputs, an empty root-file listing, an undiscoverable
@@ -875,6 +876,17 @@ job_needs_names() {
     '
 }
 
+# Print the lines of stdin that hold a non-blank name, sorted and deduplicated.
+#
+# `comm` compares sorted lists line by line, and a blank line is a line, so a list that
+# carries one compares as a member named "". Every set below passes through here, which
+# keeps that member out and gives `comm` the sorted input it requires. `|| true` covers
+# an empty list: `grep` exits 1 when it matches nothing, and this gate runs under
+# `set -e`.
+name_set() {
+    grep -v '^[[:space:]]*$' | sort -u || true
+}
+
 # One workflow: its verdict job, when it declares one, reads every other job's result.
 check_verdict_job_observes_every_job() {
     local wf=$1 job block needs_names result_names all_names others verdict=""
@@ -905,10 +917,12 @@ check_verdict_job_observes_every_job() {
         report "$wf: the verdict job '$verdict' declares no 'needs:' this gate can read, so nothing holds it to the jobs of this workflow. Write the list as a block sequence, as a flow sequence, or as a single job name."
         return 0
     fi
-    needs_names=$(sort -u <<< "$needs_names")
+    needs_names=$(name_set <<< "$needs_names")
     result_names=$(grep -oE 'needs\.[A-Za-z0-9_.-]+\.result' <<< "$block" \
-        | sed -E 's/^needs\.//; s/\.result$//' | sort -u)
-    others=$(grep -vxF -- "$verdict" <<< "$all_names" | sort -u)
+        | sed -E 's/^needs\.//; s/\.result$//' | name_set)
+    # A workflow whose only job is the verdict job leaves this empty, and every name that
+    # job reads is then unknown, which the two unknown-name reports below state.
+    others=$({ grep -vxF -- "$verdict" <<< "$all_names" || true; } | name_set)
 
     missing_needs=$(comm -23 <(printf '%s\n' "$others") <(printf '%s\n' "$needs_names") | paste -sd' ' -)
     missing_results=$(comm -23 <(printf '%s\n' "$others") <(printf '%s\n' "$result_names") | paste -sd' ' -)

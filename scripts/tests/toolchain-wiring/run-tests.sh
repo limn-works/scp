@@ -50,7 +50,9 @@
 #     cannot then tell which one branch protection requires. Cases cover the two remaining
 #     `needs:` spellings GitHub Actions accepts — a flow sequence and a single scalar — and
 #     every other case in this file writes a `ci.yml` declaring no verdict job at all,
-#     which is the shape check 4 leaves alone.
+#     which is the shape check 4 leaves alone. A workflow whose only job is its verdict job
+#     gets a case of its own: the set of other jobs is empty there, and the gate has to
+#     report the unknown names rather than abort on a `grep` that matched nothing.
 #
 # HOW EACH CASE IS BUILT. `run_case` makes a temporary directory, writes the gate into
 # `scripts/`, runs `git init` so the gate's `git grep` search and its file listings have a
@@ -1135,6 +1137,31 @@ two_verdict_jobs() {
 run_case "workflow-declares-two-verdict-jobs" 1 \
     "declares two jobs that each run with 'if: always()' and read a 'needs.<job>.result'" \
     two_verdict_jobs mise_ok
+
+# A second workflow whose only job is its verdict job. The set of other jobs is then
+# empty, and every name that job reads is unknown. The case exists for what the gate does
+# on the way to saying so: `grep -vxF` matches nothing, and under `set -euo pipefail` an
+# unguarded pipeline there aborts the whole gate before it prints anything, which reads as
+# a crash rather than as a finding. Check 4 skips this workflow's paths-filter checks
+# because it declares no `dorny/paths-filter` step, so the finding below is the only one
+# it can produce.
+solo_verdict_workflow() {
+    cat <<'YAML'
+name: Release
+jobs:
+  release-gate:
+    if: always()
+    needs:
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ needs.build.result }}"
+YAML
+}
+EXTRA_FILES=(".github/workflows/release.yml" solo_verdict_workflow)
+run_case "verdict-job-is-the-workflows-only-job" 1 \
+    "declares no job by those names — build" routing_ok mise_ok
+EXTRA_FILES=()
 
 echo ""
 echo "toolchain-wiring cases: $passed passed, $failed failed"
