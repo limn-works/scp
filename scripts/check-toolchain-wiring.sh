@@ -220,11 +220,59 @@
 # The parse reads `.mise.toml`, the one mise configuration file this repository tracks, and
 # fails when that file is absent.
 #
+# ── CHECK 4: the workflow's verdict job observes every job in the workflow ───────────
+#
+# THE CRITERION: a job that reports a workflow's verdict to branch protection must read
+# the result of every other job that workflow declares. A result it never reads cannot
+# turn it red, so a job left out of its list contributes nothing to the required check.
+#
+# WHY A MISSING NAME IS INVISIBLE RATHER THAN LOUD. Checks 2a through 2e all rest on one
+# fact about the aggregator, stated in their headers: it fails on 'failure' and on
+# 'cancelled', and every other result — 'skipped', and the empty string a name no job
+# carries evaluates to — passes. That is deliberate for a paths-filtered lane, whose skip
+# means the filter matched nothing. It is not deliberate for the job that computes those
+# filter outputs. GitHub gives a job whose dependency failed the result 'skipped', so a
+# `changes` job that errors — the `dorny/paths-filter` step hitting an API error or a rate
+# limit, or a syntax error in the `filters:` block of the pull request under test — skips
+# every lane at once, and an aggregator that does not read `needs.changes.result` reads
+# nothing but 'skipped' and 'success' and reports green. One failure then silences every
+# paths-filtered gate in the workflow while the one required check passes, which is the
+# whole-set version of the defect checks 2c and 2e each close one file at a time.
+#
+# `.github/workflows/ci.yml` held that defect when this check was written: its `ci` job
+# named 49 jobs in `needs:` and read the same 49 results, and the workflow declares 52
+# jobs. The two it did not name were `check-draft` and `changes` — the upstream of every
+# other job in the file.
+#
+# A name in the aggregator's list that no job carries is the same hole read from the other
+# side: `needs.rust-tests.result` for a job named `rust-test` evaluates to the empty
+# string, the loop accepts it, and that job's failure never reaches the required check.
+# The gate requires set equality in both directions, so neither a missing name nor an
+# invented one survives.
+#
+# WHICH JOB IS THE VERDICT JOB, and how the gate finds it rather than reading a name
+# someone remembered to add: a job whose own `if:` key is `always()` and whose body reads
+# at least one `needs.<name>.result`. `if: always()` is what makes a job run after its
+# dependencies skip, and reading a result is what makes it a verdict rather than a step;
+# no other job in this repository's workflows has both. The gate checks every workflow
+# GitHub Actions runs — each tracked `.yml` or `.yaml` file under `.github/workflows/`,
+# which leaves a `.disabled` name out — and a workflow declaring no such job is silent
+# here. That silence is sound: a required check whose job the workflow does not declare
+# never reports, and GitHub blocks the merge on a pending required check, so deleting the
+# aggregator fails closed on its own.
+#
+# WHAT CHECK 4 DOES NOT COVER, stated rather than implied. It reads which results the
+# aggregator's text names, not what its shell does with them. An aggregator that reads
+# every result and then discards them all — a loop whose body is `true`, a comparison
+# against a value GitHub never produces — satisfies this check. Set equality is the
+# property a name-based check can establish; the loop's own logic is not, and it lives in
+# fourteen lines directly under the `needs:` list this check holds complete.
+#
 # The gate FAILS CLOSED: a missing workflow, a missing filter, a filter with no path
 # entries, a `changes` job with no outputs, an empty root-file listing, an undiscoverable
-# git tree, a `.mise.toml` no TOML parser accepts, and no available TOML parser are each
-# failures, never skipped checks. See
-# `.docs/lessons/coverage-gates-must-fail-closed.md`.
+# git tree, a `.mise.toml` no TOML parser accepts, no available TOML parser, and a
+# workflow whose verdict job declares an empty `needs:` list are each failures, never
+# skipped checks. See `.docs/lessons/coverage-gates-must-fail-closed.md`.
 #
 # Usage: bash scripts/check-toolchain-wiring.sh
 set -euo pipefail
@@ -741,10 +789,165 @@ else
     fi
 fi
 
+# ── Check 4 ──────────────────────────────────────────────────────────────────────────
+
+# Print every workflow GitHub Actions runs.
+#
+# `--others` matters for the same reason it does in checks 1 and 2: a workflow added but
+# not yet committed is what a pre-push run has to cover.
+runnable_workflows() {
+    local wf
+    while IFS= read -r wf; do
+        [[ -n $wf ]] || continue
+        [[ -f $wf ]] || continue
+        case $wf in
+            *.yml | *.yaml) printf '%s\n' "$wf" ;;
+        esac
+    done < <(git ls-files --cached --others --exclude-standard -- "$WORKFLOW_DIR" 2>/dev/null || true)
+}
+
+# Print every job name a workflow declares, one per line.
+#
+# A job header is a key at exactly two spaces of indentation under the top-level `jobs:`
+# mapping, and a job's own keys sit at four or more. Starting at `jobs:` is what keeps the
+# `push:`, `pull_request:`, and `merge_group:` keys of the `on:` block out of the listing,
+# and those three are the only other two-space keys these workflows write.
+workflow_job_names() {
+    awk '
+        /^jobs:[[:space:]]*$/ { injobs = 1; next }
+        injobs && /^[A-Za-z]/ { exit }
+        injobs && /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ {
+            name = $0
+            sub(/^  /, "", name)
+            sub(/:[[:space:]]*$/, "", name)
+            print name
+        }
+    ' "$1"
+}
+
+# Print the lines of one job: everything after its header, up to the next job header.
+job_block() {
+    awk -v job="$2" '
+        $0 ~ "^  " job ":[[:space:]]*$" { inblock = 1; next }
+        inblock && /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ { exit }
+        inblock { print }
+    ' "$1"
+}
+
+# Print the job names one job block's `needs:` key lists, one per line.
+#
+# The three shapes GitHub Actions accepts: a block sequence, a flow sequence on the key's
+# own line, and a single scalar. A shape none of the three matches yields no name, and the
+# caller then reports the job as naming none, which fails the gate rather than passing it.
+job_needs_names() {
+    awk '
+        /^    needs:[[:space:]]*\[/ {
+            line = $0
+            sub(/^[[:space:]]*needs:[[:space:]]*\[/, "", line)
+            sub(/\].*$/, "", line)
+            n = split(line, parts, ",")
+            for (i = 1; i <= n; i++) {
+                gsub(/[[:space:]"'"'"']/, "", parts[i])
+                if (parts[i] != "") print parts[i]
+            }
+            next
+        }
+        /^    needs:[[:space:]]*$/ { inneeds = 1; next }
+        /^    needs:[[:space:]]*[A-Za-z0-9_.-]+[[:space:]]*$/ {
+            name = $0
+            sub(/^[[:space:]]*needs:[[:space:]]*/, "", name)
+            sub(/[[:space:]]*$/, "", name)
+            print name
+            next
+        }
+        inneeds {
+            if ($0 ~ /^[[:space:]]*#/) next
+            if ($0 ~ /^[[:space:]]*$/) next
+            if ($0 ~ /^      -[[:space:]]/) {
+                name = $0
+                sub(/^      -[[:space:]]*/, "", name)
+                gsub(/[[:space:]"'"'"']/, "", name)
+                if (name != "") print name
+                next
+            }
+            exit
+        }
+    '
+}
+
+# One workflow: its verdict job, when it declares one, reads every other job's result.
+check_verdict_job_observes_every_job() {
+    local wf=$1 job block needs_names result_names all_names others verdict=""
+    local missing_needs missing_results unknown_needs unknown_results
+
+    all_names=$(workflow_job_names "$wf")
+    [[ -n $all_names ]] || return 0
+
+    while IFS= read -r job; do
+        [[ -n $job ]] || continue
+        block=$(job_block "$wf" "$job")
+        grep -qE '^    if:[[:space:]]*always\(\)[[:space:]]*$' <<< "$block" || continue
+        grep -qE 'needs\.[A-Za-z0-9_.-]+\.result' <<< "$block" || continue
+        if [[ -n $verdict ]]; then
+            report "$wf declares two jobs that each run with 'if: always()' and read a 'needs.<job>.result' — '$verdict' and '$job'. This gate cannot tell which one branch protection requires, so it cannot check that the required one observes every job. Leave one such job in the workflow."
+            return 0
+        fi
+        verdict=$job
+    done <<< "$all_names"
+
+    # No verdict job is not a defect: a required check whose job the workflow never
+    # declares stays pending, and GitHub blocks the merge on a pending required check.
+    [[ -n $verdict ]] || return 0
+
+    block=$(job_block "$wf" "$verdict")
+    needs_names=$(job_needs_names <<< "$block")
+    if [[ -z $needs_names ]]; then
+        report "$wf: the verdict job '$verdict' declares no 'needs:' this gate can read, so nothing holds it to the jobs of this workflow. Write the list as a block sequence, as a flow sequence, or as a single job name."
+        return 0
+    fi
+    needs_names=$(sort -u <<< "$needs_names")
+    result_names=$(grep -oE 'needs\.[A-Za-z0-9_.-]+\.result' <<< "$block" \
+        | sed -E 's/^needs\.//; s/\.result$//' | sort -u)
+    others=$(grep -vxF -- "$verdict" <<< "$all_names" | sort -u)
+
+    missing_needs=$(comm -23 <(printf '%s\n' "$others") <(printf '%s\n' "$needs_names") | paste -sd' ' -)
+    missing_results=$(comm -23 <(printf '%s\n' "$others") <(printf '%s\n' "$result_names") | paste -sd' ' -)
+    unknown_needs=$(comm -13 <(printf '%s\n' "$others") <(printf '%s\n' "$needs_names") | paste -sd' ' -)
+    unknown_results=$(comm -13 <(printf '%s\n' "$others") <(printf '%s\n' "$result_names") | paste -sd' ' -)
+
+    if [[ -n $missing_needs ]]; then
+        report "$wf: the verdict job '$verdict' does not name these jobs in its 'needs:' — $missing_needs. GitHub gives a job whose dependency failed the result 'skipped', and '$verdict' passes on 'skipped', so a failure in a job it does not name reaches the required check as green. Add each name to 'needs:' and read its result."
+    fi
+    if [[ -n $missing_results ]]; then
+        report "$wf: the verdict job '$verdict' never reads the result of these jobs — $missing_results. A result it does not read cannot turn it red, so those jobs contribute nothing to the required check. Read \"\${{ needs.<job>.result }}\" for each one."
+    fi
+    if [[ -n $unknown_needs ]]; then
+        report "$wf: the verdict job '$verdict' names these in its 'needs:' and this workflow declares no job by those names — $unknown_needs. Correct each name to the job it meant."
+    fi
+    if [[ -n $unknown_results ]]; then
+        report "$wf: the verdict job '$verdict' reads 'needs.<job>.result' for these names and this workflow declares no job by them — $unknown_results. Such an expression evaluates to the empty string, which '$verdict' accepts, so the job it meant to read reaches the required check as green. Correct each name to the job it meant."
+    fi
+}
+
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    report "not inside a git working tree, so the gate cannot enumerate the workflows whose verdict job must observe every job"
+else
+    runnable=$(runnable_workflows)
+    if [[ -z $runnable ]]; then
+        report "no file under $WORKFLOW_DIR has an extension GitHub Actions runs, so the gate cannot check that a workflow's verdict job observes every job that workflow declares"
+    else
+        while IFS= read -r workflow_file; do
+            [[ -n $workflow_file ]] || continue
+            check_verdict_job_observes_every_job "$workflow_file"
+        done <<< "$runnable"
+    fi
+fi
+
 if [[ $fail -eq 0 ]]; then
     printf 'OK: every container build asserts it resolved the compiler %s names\n' "$PIN"
     printf 'OK: every lane of every paths-filtered workflow routes a %s change, every root-level file and cargo configuration file is routed or declared unread, and every script a paths-filtered job runs is routed to that job\n' "$PIN"
     printf 'OK: %s names no Rust version source, so rustup resolves each directory from its own toolchain file\n' "$MISE_CONFIG"
+    printf "OK: every workflow's verdict job reads the result of every job that workflow declares\n"
     exit 0
 fi
 exit 1

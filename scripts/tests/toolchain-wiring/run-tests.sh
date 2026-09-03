@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run-tests.sh — exercise all three checks in `scripts/check-toolchain-wiring.sh` against
+# run-tests.sh — exercise all four checks in `scripts/check-toolchain-wiring.sh` against
 # canned repositories.
 #
 # WHAT THIS TESTS.
@@ -41,6 +41,16 @@
 #     of that key holds the gate's parse to all eight spellings mise resolves, and three
 #     further cases cover a tool whose name merely holds the letters `rust`, the setting
 #     naming a tool other than rust, and a document TOML rejects.
+#
+#   * Check 4 fails when the workflow's verdict job — the job whose own `if:` is
+#     `always()` and whose body reads a `needs.<job>.result` — leaves a job out of its
+#     `needs:` list, reads no result for a job it does name, names a job the workflow does
+#     not declare, reads a result for a name no job carries, or declares no `needs:` the
+#     gate can read. Two such jobs in one workflow is a case of its own, because the gate
+#     cannot then tell which one branch protection requires. Cases cover the two remaining
+#     `needs:` spellings GitHub Actions accepts — a flow sequence and a single scalar — and
+#     every other case in this file writes a `ci.yml` declaring no verdict job at all,
+#     which is the shape check 4 leaves alone.
 #
 # HOW EACH CASE IS BUILT. `run_case` makes a temporary directory, writes the gate into
 # `scripts/`, runs `git init` so the gate's `git grep` search and its file listings have a
@@ -987,6 +997,144 @@ GATE_TRANSFORM=gate_declares_a_dockerfile_a_quotation
 run_case "quotation-list-cannot-name-a-file-docker-builds" 1 \
     "whose basename is a name Docker builds" routing_ok mise_ok docker_omits_the_block
 GATE_TRANSFORM=""
+
+# ── Check 4: the workflow's verdict job observes every job in the workflow ───────────
+#
+# Every case above writes a `ci.yml` whose jobs are `changes` and `rust-clippy` and no
+# verdict job, so check 4 stays silent there and each of those cases also proves that a
+# workflow declaring no verdict job reports nothing. The cases below append one.
+#
+# `emit_verdict_job` writes the job's `needs:` list and the names its shell reads
+# separately, so a case can make the two disagree — which is the defect
+# `.github/workflows/ci.yml` held: its `ci` job named 49 jobs and read the same 49
+# results while the workflow declared 52, leaving `check-draft` and `changes` — the
+# upstream of every other job — out of both.
+#
+#   NEEDS_STYLE — "block" writes the `needs:` list as a block sequence, "flow" as a flow
+#                 sequence on the key's own line, "scalar" as a single job name, and
+#                 "absent" writes no `needs:` key at all.
+NEEDS_STYLE="block"
+
+# emit_verdict_job <needs names> <result names>
+emit_verdict_job() {
+    local needs=$1 results=$2 name joined=""
+    printf '  ci:\n    if: always()\n'
+    case "$NEEDS_STYLE" in
+        block)
+            printf '    needs:\n'
+            for name in $needs; do printf '      - %s\n' "$name"; done
+            ;;
+        flow)
+            for name in $needs; do
+                if [[ -n $joined ]]; then joined="$joined, "; fi
+                joined="$joined$name"
+            done
+            printf '    needs: [%s]\n' "$joined"
+            ;;
+        scalar)
+            printf '    needs: %s\n' "$needs"
+            ;;
+        absent) : ;;
+        *)
+            echo "ERROR: unknown NEEDS_STYLE '$NEEDS_STYLE'" >&2
+            exit 1
+            ;;
+    esac
+    printf '    runs-on: ubuntu-latest\n    steps:\n'
+    printf '      - name: Check job results\n        run: |\n          results=( \\\n'
+    for name in $results; do
+        printf '            "${{ needs.%s.result }}" \\\n' "$name"
+    done
+    printf '          )\n'
+    printf '          for r in "${results[@]}"; do\n'
+    printf '            if [[ "$r" == "failure" || "$r" == "cancelled" ]]; then exit 1; fi\n'
+    printf '          done\n'
+}
+
+verdict_complete() {
+    routing_ok
+    emit_verdict_job "changes rust-clippy" "changes rust-clippy"
+}
+
+run_case "verdict-job-observes-every-job" 0 "" verdict_complete mise_ok
+
+NEEDS_STYLE="flow"
+run_case "verdict-job-needs-written-as-a-flow-sequence" 0 "" verdict_complete mise_ok
+NEEDS_STYLE="block"
+
+# The `scalar` spelling with one dependency. The workflow declares one other job, so the
+# single name is the complete list.
+verdict_scalar_single_dependency() {
+    OMIT_OUTPUT=""
+    OMIT_FILTER=""
+    # `changes` alone plus the verdict job: `emit_ci` always writes `rust-clippy` too, so
+    # this case keeps both and names them through the two-name block list instead. The
+    # scalar spelling is exercised by the case below, which omits a job deliberately.
+    routing_ok
+    emit_verdict_job "changes" "changes"
+}
+NEEDS_STYLE="scalar"
+run_case "verdict-job-needs-written-as-a-scalar-omitting-a-job" 1 \
+    "does not name these jobs in its 'needs:' — rust-clippy" \
+    verdict_scalar_single_dependency mise_ok
+NEEDS_STYLE="block"
+
+# The defect `ci.yml` held. `changes` computes every paths-filter output, so its failure
+# skips every lane, and a verdict job that does not read its result reports green.
+verdict_omits_the_changes_job() {
+    routing_ok
+    emit_verdict_job "rust-clippy" "rust-clippy"
+}
+run_case "verdict-job-omits-the-changes-job" 1 \
+    "does not name these jobs in its 'needs:' — changes" \
+    verdict_omits_the_changes_job mise_ok
+
+# The half-wired shape: the job waits for `changes` and then never reads its result, so
+# the dependency orders the run and decides nothing.
+verdict_needs_a_job_it_never_reads() {
+    routing_ok
+    emit_verdict_job "changes rust-clippy" "rust-clippy"
+}
+run_case "verdict-job-needs-a-job-whose-result-it-never-reads" 1 \
+    "never reads the result of these jobs — changes" \
+    verdict_needs_a_job_it_never_reads mise_ok
+
+# A misspelled name. `needs.rust-tests.result` for a job named `rust-clippy` evaluates to
+# the empty string, and a verdict job that fails on 'failure' and 'cancelled' accepts it.
+verdict_reads_a_name_no_job_carries() {
+    routing_ok
+    emit_verdict_job "changes rust-clippy" "changes rust-clippy rust-tests"
+}
+run_case "verdict-job-reads-a-name-no-job-carries" 1 \
+    "declares no job by them — rust-tests" \
+    verdict_reads_a_name_no_job_carries mise_ok
+
+verdict_needs_a_name_no_job_carries() {
+    routing_ok
+    emit_verdict_job "changes rust-clippy rust-tests" "changes rust-clippy"
+}
+run_case "verdict-job-needs-a-name-no-job-carries" 1 \
+    "names these in its 'needs:' and this workflow declares no job by those names — rust-tests" \
+    verdict_needs_a_name_no_job_carries mise_ok
+
+# No `needs:` at all. GitHub then starts the job immediately, and every result it reads is
+# the empty string. The gate fails rather than reading that as complete coverage.
+NEEDS_STYLE="absent"
+run_case "verdict-job-declares-no-needs" 1 \
+    "declares no 'needs:' this gate can read" verdict_complete mise_ok
+NEEDS_STYLE="block"
+
+# Two verdict jobs. The gate cannot tell which one branch protection requires, so it
+# reports that rather than choosing one and checking it.
+two_verdict_jobs() {
+    routing_ok
+    emit_verdict_job "changes rust-clippy" "changes rust-clippy"
+    printf '  ci-mirror:\n    if: always()\n    needs:\n      - changes\n'
+    printf '    runs-on: ubuntu-latest\n    steps:\n      - run: echo "${{ needs.changes.result }}"\n'
+}
+run_case "workflow-declares-two-verdict-jobs" 1 \
+    "declares two jobs that each run with 'if: always()' and read a 'needs.<job>.result'" \
+    two_verdict_jobs mise_ok
 
 echo ""
 echo "toolchain-wiring cases: $passed passed, $failed failed"
