@@ -136,7 +136,7 @@ Every section of every current spec file, classified as:
 - **Agent Signing Key (`#agent`) verification method format** — how it appears in the DID document, its relationship to the `#active` key
 - **Self-delegation UCAN format** — `iss == aud` (same DID) with `fct.scp_key_scope: "#agent"`, UCAN header `signing_key_id`
 - **`ScpKeyCustodyAttestation` service entry format** — DID document service entry declaring key custody model
-- **`ScpCustodyViolationAttestation` format** — permanent violation logging for Category A violations by `#agent`
+- **`ScpCustodyViolationAttestation` format** — permanent violation logging for Category A violations by `#agent` — **withdrawn: Alec cut the record on 2026-08-25; §27.1.3 of the attestations spec states the ruling**
 - **Permission category definitions** — Category A (`#0` only), Category B (user-configurable), Category C (context-configurable)
 
 This is a P0 gap for the Identity document — the multi-key architecture and shared-DID human-agent model are novel contributions and must be specified precisely enough for independent implementation.
@@ -698,7 +698,7 @@ JSON files, one per category, structured as:
    - **`signing_key_id` field** in InnerEnvelope, ScpCredential, SenderKeyEpochAdvance — how it's serialized and validated
    - **Inner signature preimage** updated to include `signing_key_id` — must match between spec §9.8.1 and ADR-039
    - **`ScpKeyCustodyAttestation`** DID document service entry format
-   - **`ScpCustodyViolationAttestation`** format for permanent violation logging
+   - **`ScpCustodyViolationAttestation`** format for permanent violation logging — **withdrawn: Alec cut the record on 2026-08-25; §27.1.3 of the attestations spec states the ruling**
    - **Permission category definitions:** Category A (`#0` only), Category B (user-configurable), Category C (context-configurable)
    - **`MintSpendingParams` refactoring:** `{ did, key_scope }` replaces `{ issuer_did, agent_did }` — wire format change in §19
 
@@ -799,7 +799,7 @@ Processing order (dependencies first):
     - Inner signature preimage with `signing_key_id` (per ADR-039)
     - Self-delegation UCAN format (`iss == aud`, `fct.scp_key_scope`)
     - `ScpKeyCustodyAttestation` DID document service entry
-    - `ScpCustodyViolationAttestation` format
+    - `ScpCustodyViolationAttestation` format — **withdrawn: Alec cut the record on 2026-08-25; §27.1.3 of the attestations spec states the ruling**
     - `MintSpendingParams` updated format (`{ did, key_scope }` replacing `{ issuer_did, agent_did }`)
     - Key rotation authorization message
     - BEP44 signed mutable item format (for DHT publishing)

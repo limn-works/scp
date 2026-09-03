@@ -18,7 +18,8 @@
     public nonisolated enum AttestationError: Error, Sendable {
         /// The platform App Attest service returned an error.
         case serviceError(String)
-        /// App Attest is not supported and no fallback was possible.
+        /// This device does not provide App Attest, so `attest` and
+        /// `assertRequest` produce nothing.
         case unsupported(String)
         /// The stored App Attest key ID is missing; call `attest` first.
         case keyNotFound
@@ -33,10 +34,6 @@
     private enum StorageKey {
         /// `UserDefaults` key under which the App Attest key ID is persisted.
         static let appAttestKeyId = "dev.limn.scp.appAttest.keyId"
-        /// Prefix for synthetic software-only attestation tokens.
-        static let softwareTokenPrefix = "software-attestation-"
-        /// Prefix for synthetic software-only assertion tokens.
-        static let softwareAssertionPrefix = "software-assertion-"
     }
 
     // ---------------------------------------------------------------------------
@@ -57,12 +54,29 @@
     ///    where `clientDataHash = SHA-256(clientDataJSON)`.
     /// 3. `generateAssertion(_:clientData:)` — per-request proof of possession.
     ///
-    /// ## Software fallback (simulator / unavailable)
+    /// ## Unsupported device (simulator, Mac, App Attest unavailable)
     ///
-    /// When `DCAppAttestService.shared.isSupported` is `false`, the adapter
-    /// returns a deterministic synthetic token and never throws. The caller
-    /// receives a valid-shaped but software-only token, allowing the protocol to
-    /// proceed in development and simulator environments.
+    /// When `DCAppAttestService.shared.isSupported` is `false`, both
+    /// `attest(challenge:deviceId:)` and `assertRequest(requestHash:)` throw
+    /// `AttestationError.unsupported`. Neither substitutes a token the adapter
+    /// did not obtain from the App Attest service. Apple documents that
+    /// `isSupported` reads `false` on every Mac, including Mac Catalyst apps and
+    /// iOS apps running on Apple silicon, so a macOS caller always takes this
+    /// path. §9.3 of the security model spec states that a device attestation is
+    /// "an optional SDK-level trust signal, not a protocol-level uniqueness
+    /// gate," that "Its absence is expected — desktop users, non-native clients,
+    /// protocol-only implementations — and is not penalizing," and that "macOS,
+    /// Linux, and Windows have no App Attest or Play Integrity equivalent." A
+    /// caller reads `isHardwareBacked` to learn which path it will take.
+    ///
+    /// ## No client-side verifier
+    ///
+    /// This adapter exposes no method that verifies an attestation token. A
+    /// client cannot verify an App Attest attestation object without Apple's
+    /// attestation service, so the adapter states the capability's absence by
+    /// declaring no verifier rather than by returning a value no check produced.
+    /// The no-dev-stand-in tenet of `CLAUDE.md` requires that: a construct that
+    /// reports success for work it did not do ships a false guarantee.
     ///
     /// ## Thread safety
     ///
@@ -85,9 +99,12 @@
         private let lock: NSLock
         private var generationTask: Task<String, Error>?
 
-        /// Whether this instance is running in hardware-backed mode.
+        /// Whether `DCAppAttestService` provides App Attest on this device.
         ///
-        /// `false` on simulator or devices where App Attest is unavailable.
+        /// `false` on a simulator, on every Mac, and on any device where App
+        /// Attest is unavailable. A caller that reads `false` learns that
+        /// `attest(challenge:deviceId:)` and `assertRequest(requestHash:)` will
+        /// throw `AttestationError.unsupported`.
         public var isHardwareBacked: Bool {
             service.isSupported
         }
@@ -126,19 +143,23 @@
         /// 3. Calls `DCAppAttestService.attestKey(_:clientDataHash:)`.
         /// 4. Returns the raw CBOR attestation bytes.
         ///
-        /// On simulator or when App Attest is unavailable:
-        /// Returns a synthetic token of the form
-        /// `"software-attestation-<UUID>"` (UTF-8 encoded).
+        /// On simulator, on macOS, or wherever App Attest is unavailable, this
+        /// method throws `AttestationError.unsupported` and mints no substitute
+        /// token.
         ///
         /// - Parameters:
         ///   - challenge: Server-issued random challenge bytes.
         ///   - deviceId: Stable device/identity identifier bytes.
         /// - Returns: Attestation token bytes.
-        /// - Throws: `AttestationError.serviceError` if the App Attest service
+        /// - Throws: `AttestationError.unsupported` if `DCAppAttestService`
+        ///   reports that this device does not provide App Attest.
+        ///   `AttestationError.serviceError` if the App Attest service
         ///   returns an error on a real device.
         public func attest(challenge: Data, deviceId: Data) async throws -> Data {
             guard service.isSupported else {
-                return softwareAttestationToken()
+                throw AttestationError.unsupported(
+                    "App Attest is unavailable on this device, so this adapter produces no attestation token."
+                )
             }
 
             let keyId = try await resolveKeyId()
@@ -165,17 +186,22 @@
         /// `DCAppAttestService.generateAssertion(_:clientData:)`. The assertion
         /// binds the request hash to the stored App Attest key.
         ///
-        /// On simulator or when App Attest is unavailable, returns a synthetic
-        /// assertion of the form `"software-assertion-<UUID>"` (UTF-8 encoded).
+        /// On simulator, on macOS, or wherever App Attest is unavailable, this
+        /// method throws `AttestationError.unsupported` and mints no substitute
+        /// assertion.
         ///
         /// - Parameter requestHash: SHA-256 digest of the request payload.
         /// - Returns: Assertion bytes to include in the relay request.
-        /// - Throws: `AttestationError.keyNotFound` if no key ID is stored
+        /// - Throws: `AttestationError.unsupported` if `DCAppAttestService`
+        ///   reports that this device does not provide App Attest.
+        ///   `AttestationError.keyNotFound` if no key ID is stored
         ///   (i.e., `attest` was never called).
         ///   `AttestationError.serviceError` if the App Attest service fails.
         public func assertRequest(requestHash: Data) async throws -> Data {
             guard service.isSupported else {
-                return softwareAssertionToken()
+                throw AttestationError.unsupported(
+                    "App Attest is unavailable on this device, so this adapter produces no request assertion."
+                )
             }
 
             guard let keyId = loadKeyId() else {
@@ -195,33 +221,6 @@
                     }
                 }
             }
-        }
-
-        // MARK: - Token verification (client-side)
-
-        /// Perform client-side format validation of an attestation token.
-        ///
-        /// Full server-side verification is performed by the SCP relay, which
-        /// calls Apple's App Attest attestation endpoint. This method is a
-        /// lightweight sanity check only:
-        /// - Hardware tokens: non-empty bytes.
-        /// - Software tokens: UTF-8 string with `"software-attestation-"` prefix.
-        ///
-        /// - Parameter token: Raw attestation bytes to validate.
-        /// - Returns: `true` if the token passes format validation.
-        public func verify(token: Data) -> Bool {
-            if token.isEmpty {
-                return false
-            }
-            // Software-only tokens carry the known prefix; hardware tokens are
-            // CBOR-encoded and will not start with this prefix.
-            if let string = String(data: token, encoding: .utf8),
-               string.hasPrefix(StorageKey.softwareTokenPrefix) {
-                return true
-            }
-            // Non-empty non-software bytes are assumed valid for client-side
-            // purposes; full verification is server-side.
-            return true
         }
 
         // MARK: - Private helpers
@@ -334,34 +333,6 @@
             lock.lock()
             defer { lock.unlock() }
             defaults.set(keyId, forKey: StorageKey.appAttestKeyId)
-        }
-
-        // MARK: Software fallback tokens
-
-        /// Returns a synthetic software-only attestation token.
-        ///
-        /// Used when `DCAppAttestService.shared.isSupported == false` (simulator
-        /// or devices without App Attest). The token is a UUID-suffixed string
-        /// encoded as UTF-8 bytes. It is valid for client-side format checks but
-        /// will be treated as `method: .softwareOnly` by the relay.
-        ///
-        /// - Returns: UTF-8-encoded synthetic attestation token.
-        private func softwareAttestationToken() -> Data {
-            let token = "\(StorageKey.softwareTokenPrefix)\(UUID().uuidString)"
-            // Encoding cannot fail for a pure ASCII string.
-            return token.data(using: .utf8) ?? Data(token.utf8)
-        }
-
-        /// Returns a synthetic software-only assertion token.
-        ///
-        /// Used when `DCAppAttestService.shared.isSupported == false` (simulator
-        /// or devices without App Attest). The token is a UUID-suffixed string
-        /// encoded as UTF-8 bytes.
-        ///
-        /// - Returns: UTF-8-encoded synthetic assertion token.
-        private func softwareAssertionToken() -> Data {
-            let token = "\(StorageKey.softwareAssertionPrefix)\(UUID().uuidString)"
-            return token.data(using: .utf8) ?? Data(token.utf8)
         }
     }
 
