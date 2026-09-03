@@ -385,10 +385,12 @@ cargo test --workspace --doc
 # Dependency audit
 cargo deny check
 
-# Generate docs. `--document-private-items` is what makes rustdoc resolve an
-# intra-doc link inside a private module, which is where the deny in
-# `crates/scp-runtime/src/lib.rs` caught three broken links CI missed for ten
-# days while it documented public items alone.
+# Generate docs. `--document-private-items` makes rustdoc resolve an intra-doc
+# link inside a private module, and the deny in `crates/scp-runtime/src/lib.rs`
+# turns an unresolved one into an error. Job `rust-doc` in
+# `.github/workflows/ci.yml` omitted the flag, so three broken links in the
+# private module `crates/scp-runtime/src/context/outlets_helpers.rs` rode `main`
+# for ten days under a green required check.
 cargo doc --workspace --no-deps --document-private-items
 ```
 
