@@ -352,7 +352,7 @@ Implement the Apple platform adapter in Swift (`bindings/swift/Sources/SCP/Platf
 
 **Key custody:** `AppleKeyCustody` stores Ed25519 and X25519 key material in the Apple Keychain as generic password items with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` protection. Keys are tagged with a `scp.key.<key_id>` label and access group `$(AppIdentifierPrefix).dev.limn.scp`. The Secure Enclave is not used for Ed25519/X25519 keys — the hardware does not support these key types. Signing operations and DH agreement are performed in software using the key material retrieved from Keychain. Private key bytes are never passed across the Swift/Rust FFI boundary; all signing and key agreement operations happen entirely within the Swift `AppleKeyCustody` implementation.
 
-**Device attestation:** `AppleDeviceAttestation` uses `DCAppAttestService` (App Attest). A Secure Enclave-backed P-256 key is generated via `generateKey(completionHandler:)`. Attestations are requested via `attestKey(_:clientDataHash:completionHandler:)` where `clientDataHash` is `SHA-256(challenge || deviceID)`. Assertions are generated via `generateAssertion(_:clientData:completionHandler:)` for subsequent operations. The attestation token is forwarded to the SCP relay for server-side verification via Apple's attestation service endpoints. On simulator and in environments where App Attest is unavailable, the adapter falls back to a software-only attestation with `method: .softwareOnly`.
+**Device attestation:** `AppleDeviceAttestation` uses `DCAppAttestService` (App Attest). A Secure Enclave-backed P-256 key is generated via `generateKey(completionHandler:)`. Attestations are requested via `attestKey(_:clientDataHash:completionHandler:)` where `clientDataHash` is `SHA-256(challenge || deviceID)`. Assertions are generated via `generateAssertion(_:clientData:completionHandler:)` for subsequent operations. The attestation token is forwarded to the SCP relay for server-side verification via Apple's attestation service endpoints. On a simulator, on a Mac, and wherever App Attest is unavailable, `DCAppAttestService.isSupported` reads `false`, and the adapter throws `AttestationError.unsupported` rather than returning a token it did not obtain from the service. The Amendment (2026-09-03) below records that change.
 
 **Push notifications:** `ApplePushProvider` wraps UNUserNotificationCenter and registers with APNs via `UIApplication.registerForRemoteNotifications()` / `NSApplication.registerForRemoteNotifications()`. The APNs payload is strictly opaque per §10.7: `{"aps": {"content-available": 1}}` with no additional fields. A content-available notification (silent push) wakes the app. The app then connects to its relay set and pulls all pending encrypted envelopes. No context ID, sender DID, message preview, or other metadata is included in the payload. Apple/Google learn only that the device received a notification at a specific time.
 
@@ -521,8 +521,8 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
 
 3. **`AppleDeviceAttestation` — App Attest:**
    - `attest() -> DeviceAttestationToken`: Generates an App Attest key via `DCAppAttestService.generateKey`, requests attestation with `clientDataHash = SHA256(clientDataJSON)` where `clientDataJSON = '{"challenge":"<base64(challenge)>","deviceId":"<base64(deviceId)>","type":"scp-device-attestation-v1"}'` (fields in this exact order, RFC 4648 base64, no line breaks). Returns a `DeviceAttestationToken` containing the raw attestation bytes and the key ID.
-   - `verify(token: DeviceAttestationToken) -> Bool`: Verifies the attestation token structure. Full verification is server-side (relay calls Apple's attestation endpoint). Client-side verification checks that the attestation bytes are non-empty and the key ID is present.
-   - On simulator or when App Attest is unavailable: `DCAppAttestService.shared.isSupported == false` → returns a synthetic token with `method: .softwareOnly`. Does not crash or throw; the caller receives a valid (but software-only) token.
+   - The adapter declares no method that verifies an attestation token. A client cannot check an App Attest attestation object without Apple's attestation service, and no artifact states what a relying party checks on a token it reads out of another participant's DID document — open question OQ-2 of §27, the attestations spec, asks a human for that rule. The Amendment (2026-09-03) below records the removal of the client-side verifier this bullet previously specified.
+   - On simulator, on macOS, or when App Attest is unavailable: `DCAppAttestService.shared.isSupported == false` → `attest` and `assertRequest` each throw `AttestationError.unsupported`. Neither returns a substitute token.
    - `generateAssertion(keyId: String, clientData: Data) -> Data`: Generates a per-request assertion via `DCAppAttestService.generateAssertion(_:clientData:)`. Used for subsequent authenticated operations after initial attestation.
 
 4. **`ApplePushProvider` — APNs:**
@@ -569,7 +569,7 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
    - Tests run on real devices (CI must include a physical iOS device lane for Keychain and App Attest tests). Simulator-only tests use `#if targetEnvironment(simulator)` fallback paths.
    - `AppleKeyCustody` round-trip test: `generateKeypair(.ed25519)` → `sign(data)` → `publicKey()` → verify signature → `destroyKey()` → confirm re-fetch fails.
    - `AppleStorage` round-trip test: `store(key, data)` → `retrieve(key)` → `listKeys(prefix)` → `delete(key)` → `exists(key) == false`.
-   - `AppleDeviceAttestation` test on real device: `attest()` returns non-empty token. On simulator: returns software-only token without crashing.
+   - `AppleDeviceAttestation` test on real device: `attest()` returns non-empty token. On simulator: `attest()` and `assertRequest()` each throw `AttestationError.unsupported`, which `bindings/swift/Tests/SCPTests/Platform/AppleDeviceAttestationTests.swift` asserts against an injected `DCAppAttestService` whose `isSupported` reads `false`.
    - `ApplePushProvider` test: `register()` returns a non-empty token string. `handleNotification` rejects non-opaque payloads.
 
 8. **No Secure Enclave signing key:**
@@ -593,12 +593,24 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
 | File | Purpose |
 |------|---------|
 | `bindings/swift/Sources/SCP/Platform/AppleKeyCustody.swift` | `KeyCustodyProvider` — Keychain storage, Ed25519 signing, X25519 DH, pseudonym derivation, key destruction |
-| `bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift` | `DeviceAttestationProvider` — App Attest key generation, attestation, assertion, simulator fallback |
+| `bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift` | `DeviceAttestationProvider` — App Attest key generation, attestation, assertion; throws on a device without App Attest |
 | `bindings/swift/Sources/SCP/Platform/ApplePushProvider.swift` | `PushProvider` — APNs registration, opaque silent push payload enforcement |
 | `bindings/swift/Sources/SCP/Platform/AppleStorage.swift` | `StorageProvider` — SQLCipher-encrypted SQLite, Keychain key derivation, `NSFileProtection` |
 | `bindings/swift/Sources/SCP/Platform/PlatformAdapter.swift` | `ApplePlatformAdapter.make()` — aggregates all four providers, injected by `SCP.init()` |
 
 **Estimated functions:** ~20 public methods across four provider implementations, ~10 internal helpers (Keychain query builders, error mapping, SQLCipher connection setup).
+
+---
+
+### Amendment (2026-09-03): the Apple attestation adapter fails closed on a device without App Attest, and declares no verifier
+
+This ADR previously decided three things that reported success for work `AppleDeviceAttestation` did not do: `attest` returned `"software-attestation-<UUID>"` when `DCAppAttestService.isSupported` read `false`, `assertRequest` returned `"software-assertion-<UUID>"` on the same condition, and `verify(token:)` returned `true` for every non-empty token. All three sat on a shipped path under no `#if DEBUG` and no test flag. Apple's `DCAppAttestService` header states that `isSupported` reads `false` on every Mac, including Mac Catalyst apps and iOS apps running on Apple silicon, so every macOS caller of the shipped SDK took the synthetic-token path.
+
+The no-dev-stand-in tenet of `CLAUDE.md` governs the decision and admits no exception: "If the real backend isn't built, the capability **fails closed** (a typed error, or an honest protocol-supported absent state) — it does NOT silently fall back to the dev stand-in." §9.3 of the security model spec states what an unsupported device produces, and the fail-closed behaviour matches it: a device attestation is "an optional SDK-level trust signal, not a protocol-level uniqueness gate," "Its absence is expected — desktop users, non-native clients, protocol-only implementations — and is not penalizing," and "macOS, Linux, and Windows have no App Attest or Play Integrity equivalent."
+
+`attest(challenge:deviceId:)` and `assertRequest(requestHash:)` each throw `AttestationError.unsupported` when `DCAppAttestService.isSupported` reads `false`, and `AppleDeviceAttestation` declares no `verify` method. A caller reads `isHardwareBacked` before calling either method to learn which path it will take. `AndroidDeviceAttestation` already threw `ScpException` with `CODE_ATTESTATION_FAILED` on every Play Integrity failure and declared no verify method, so this amendment makes the two platform adapters agree.
+
+What a relying party checks on a device-attestation token stays undecided. §27.4.3 of the attestations spec records that no artifact states those checks, and its open question OQ-2 asks a human for the construction and the DID binding. Removing the always-true verifier decides nothing about that question; it removes a method that answered it with `true`.
 
 ---
 
