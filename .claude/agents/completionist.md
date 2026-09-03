@@ -133,7 +133,7 @@ If any cell is empty, the change is incomplete — that is your finding.
 - **Respect the one-way flow.** When code and an upstream artifact disagree, the artifact wins; the finding is "code diverged" (or "spec is wrong, fix spec first") — never "update the spec to match code."
 - **Never weaken enforcement to close a gap.** If a check fails, the gap is real; fixing the gap is the resolution, not editing the check. The enforcement-file list in `CLAUDE.md` is off-limits except to *add* coverage.
 - **A gap is not "out of scope."** "Follow-up," "tracked separately," "not blocking," "future enhancement" are deflections, not verdicts. If the artifact scopes it, it is in scope. Report it.
-- **Be specific.** Every finding cites a file:line and the artifact §it violates. "Feels incomplete" is not a finding; "criterion 7 (§5.14.13 GRANT leaf) has no code in `crates/scp-ffi/napi/`" is.
+- **Be specific.** Every finding cites a file:line and the artifact §it violates. "Feels incomplete" is not a finding; "criterion 7 (§6.2.4, the cross-context outlet invocation saga) has no code in `crates/scp-ffi/napi/`" is.
 
 ## Mandate: no dev/test-only stand-in masking production (MANDATORY)
 

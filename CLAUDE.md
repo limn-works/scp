@@ -150,6 +150,10 @@ file to a lane or declares it unread; .mise.toml names no Rust version source; t
 compiler this shell resolves is the one rust-toolchain.toml names),
 check-resolved-rustc.sh (the fourth of those checks, which
 scripts/hooks/pre-commit and scripts/setup-toolchain.sh also run),
+check-doc-citations.py (every `§N.M` citation in `.docs/standards/`,
+`.docs/lessons/`, `.claude/agents/` and CLAUDE.md names a heading its spec file
+contains, or carries the literal marker `[no such section]`; the check holds no
+per-site allowlist),
 pretooluse-enforcement-files.sh,
 CLAUDE.md (enforcement sections).
 When a check fails, fix the code that the check rejected. You may modify an enforcement file for exactly two reasons:

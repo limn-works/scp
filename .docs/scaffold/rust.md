@@ -50,11 +50,10 @@ crates/
     src/
       lib.rs
       clock.rs              # SimulatedClock (§16.3)
-      relay/                # InMemoryRelay, InMemoryBlobStore, BehaviorMode
+      relay/                # InMemoryRelay, BehaviorMode, SubscriptionRegistry
         mod.rs
-        blob_store.rs       # InMemoryBlobStore (§16.4.2)
-        behavior.rs         # BehaviorMode enum, fault injection configs (§16.4.4)
-        subscription.rs     # SubscriptionRegistry (§16.4.5)
+        behavior.rs         # BehaviorMode enum, fault injection configs (§16.4.3)
+        subscription.rs     # SubscriptionRegistry (§16.4.4)
       transport.rs          # InMemoryTransport — TransportAdapter impl (§16.5)
       simulator/            # NetworkSimulator, topology, fault injection
         mod.rs              # NetworkSimulator (§16.8)
