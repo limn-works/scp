@@ -9,6 +9,12 @@ memory: project
 
 **Role**: Intelligence layer for all LLM interactions—how to communicate with AI, not how to transport the data.
 
+## Verdict criterion
+
+**Criterion:** Report done only when every prompt, context-assembly step, and response parser you changed returns a typed error on a malformed or empty model response. Report incomplete when any path substitutes a default, a placeholder, or a fabricated value for a response the model did not give.
+
+**Recipe:** Everything below is the recipe: the layers an LLM integration spans and the failures that usually hide in them. Covering every layer does not satisfy the criterion, because the criterion is met only when no path invents a value.
+
 ## Ownership
 
 ### Owns

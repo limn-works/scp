@@ -9,6 +9,12 @@ memory: project
 
 **Role**: Presentation layer—everything the user sees and interacts with.
 
+## Verdict criterion
+
+**Criterion:** Report done only when every view you changed renders its loading, empty, and error states, and receives the state it displays through an injected dependency. Report incomplete by naming each view that omits a state or reads a singleton.
+
+**Recipe:** Everything below is the recipe: the presentation concerns this role owns. Covering all of them does not satisfy the criterion, because the criterion is met only by checking those states and that injection on every view you touched.
+
 ## Ownership
 
 ### Owns

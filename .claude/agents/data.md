@@ -9,6 +9,12 @@ memory: project
 
 **Role**: Local data layer—persistence, state management, data transformations.
 
+## Verdict criterion
+
+**Criterion:** Report done only when every model change you made carries both the write path that populates it and the read path that consumes it, and every persisted field the spec defines holds a real value. Report incomplete when a field holds a placeholder while the real value exists elsewhere in the system.
+
+**Recipe:** Everything below is the recipe: the persistence concerns this role owns. Covering all of them does not satisfy the criterion, because the criterion is met only when every defined field holds a real value on a wired path.
+
 ## Ownership
 
 ### Owns

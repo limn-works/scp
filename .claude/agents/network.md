@@ -9,6 +9,12 @@ memory: project
 
 **Role**: Remote data layer—all communication with external services.
 
+## Verdict criterion
+
+**Criterion:** Report done only when every request path you changed handles a timeout, a non-success status, and a malformed body with a typed error. Report incomplete when a path substitutes a default value, an empty collection, or a cached value for a call that failed.
+
+**Recipe:** Everything below is the recipe: the transport concerns this role owns. Covering all of them does not satisfy the criterion, because the criterion is met only when no failed call reaches a caller as a success.
+
 ## Ownership
 
 ### Owns

@@ -9,6 +9,12 @@ memory: project
 
 **Role**: Project structure, module organization, dependency graph, protocol definitions, architecture decisions, coding standards enforcement.
 
+## Verdict criterion
+
+**Criterion:** Report done only when every type you added satisfies a protocol declared before it, every dependency arrives through an initializer, and no code you wrote reaches a singleton or a mutable global. Report incomplete when any one of the three fails, and name the type that fails it.
+
+**Recipe:** Everything below is the recipe: the structural concerns this role owns and the standards that govern them. Covering all of them does not satisfy the criterion, because the criterion is met only by checking those three properties against the code you wrote.
+
 ## Ownership
 
 ### Owns

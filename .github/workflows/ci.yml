@@ -548,6 +548,24 @@ jobs:
       - uses: actions/checkout@v5
       - run: bash scripts/check-deleted-primitives.sh
 
+  agent-verdict-criterion:
+    needs: check-draft
+    name: Agents / every definition states a verdict criterion
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      # Self-test MUST run first: it plants a definition with no criterion
+      # section, one whose section has no `**Criterion:**` line, one whose
+      # section has no `**Recipe:**` line, one whose section sits below another
+      # heading (all four must FAIL), a compliant definition (must PASS), and an
+      # empty agents directory (must report an invocation error) — proving the
+      # gate can go red before the real scan's green means anything.
+      - name: Self-test gate
+        run: bash scripts/check-agent-verdict-criterion.sh --self-test
+      - name: Real check
+        run: bash scripts/check-agent-verdict-criterion.sh
+
   handler-no-panic:
     needs: check-draft
     name: Actor / handler panic-family ban (ADR-049 §10)
@@ -1734,6 +1752,7 @@ jobs:
       - saga-gating-granularity
       - block-in-place
       - deleted-primitives
+      - agent-verdict-criterion
       - bridge-instance-lifecycle
       - toolchain-wiring
       - docker-image
