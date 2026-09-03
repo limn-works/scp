@@ -1124,6 +1124,8 @@ The regenerator is `#[ignore]` by default so the default `cargo test` run does n
 
 ## 25.25 Custody Violation and Counter-Attestation Signing Vectors (§9.5.2, §9.18.2)
 
+**Ruling (2026-08-25): Alec cut both records from the protocol.** §9.5.2 of the security spec states the ruling beside the two preimage tables, and §27.1.3 of the attestations spec states it in full. Vector 38 and Vector 39 below pin the construction `crates/scp-protocol/src/trust/custody_violation.rs` carries on `origin/main` today. An independent implementer does not implement either record, so §25.1's requirement that an implementer reproduce every vector in this spec does not reach these two, and the branch that removes the record removes this section with it.
+
 Domains: `"SCP-CUSTODY-VIOLATION-V1:"` and `"SCP-COUNTER-ATTESTATION-V1:"`.
 
 ADR-039, shared-DID human-agent identity model, makes a custody violation a permanent record that one verifier writes about a subject who never consented to it, and gives that subject a counter-attestation to publish beside it. Vector 38 and Vector 39 form one pair: Vector 38 is a violation record a verifier signs, and Vector 39 is a counter-attestation that record's subject signs against it. An implementer reproduces Vector 39's `violation_reference` only by reproducing Vector 38's canonical hash first, so this pair also pins §9.5.2's derivation rule, which binds one counter-claim to one violation record.
