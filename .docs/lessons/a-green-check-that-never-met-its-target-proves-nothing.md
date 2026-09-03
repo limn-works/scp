@@ -47,6 +47,28 @@ rules separate them.
 - **Read a shared build cache everywhere, and write it only from a push to the default
   branch.** A cache written on a pull-request ref is readable only by that pull request,
   and it evicts entries from the budget every other cache step in the workflow shares.
+- **A check that reads a tool's output inherits every default that tool applies, and a
+  default narrows what the check can see.** `scripts/check-shipped-feature-graph.sh` and
+  `scripts/check-protocol-deps.sh` each ran `cargo tree` with no `--target`, and cargo's
+  default resolves the runner's host triple, which discards every
+  `[target.'cfg(…)'.dependencies]` edge whose cfg is false there. The G1 job runs on
+  ubuntu-latest while `.github/workflows/build-matrix.yml` builds the three gated bridges
+  for seven other triples and `.github/workflows/release.yml` signs the iOS, macOS and
+  Windows artifacts, so a `scp-platform = { features = ["testing"] }` declared under
+  `cfg(target_os = "ios")` compiled three §17.17.2 security nullifiers into a signed
+  xcframework while G1 printed `G1 PASSED`. Both scripts now pass `--target all`, which
+  resolves the union over every triple rather than an enumeration of the triples anyone
+  remembered to list.
+- **Name the population a check reads, then ask which members of it the reading omits.**
+  G1's other default was `cargo tree -e features`, which prints a feature edge for a
+  feature a package requests through a dependency declaration and prints no edge for a
+  feature the invocation's ROOT package activates in its own `[features]` table. Every
+  artifact G1 gated had a parent package to declare its features until the two binaries
+  were added — `scp-node` and `scp-relay` are exactly the entries with no parent — so
+  adding them widened the population past what the reading covered, and a
+  `default = ["testing"]` in `crates/scp-node/Cargo.toml` resolved to a set the ⊆ check
+  accepted. G1 now unions `cargo tree -e no-dev --format '{p}|{f}'`, which prints each
+  resolved package's complete enabled-feature set.
 
 ## See also
 
