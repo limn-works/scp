@@ -1387,3 +1387,11 @@ Agent key compromise (most common case — agent runtime is less secure than dev
 18. `CounterAttestation` type for reputation restoration.
 19. All FFI bridges (PyO3, NAPI, UniFFI) expose agent key creation, rotation, and status.
 20. Integration test: create identity with agent key → mint scoped UCAN → join MLS group with agent credential → send message → verify at recipient → rotate agent key → verify credential update.
+
+### Amendment (2026-08-25): the custody-violation record and `CounterAttestation` leave the protocol
+
+Alec cut `ScpCustodyViolationAttestation` and `CounterAttestation`. Issue #2422, a filed future idea for a general subject-side counter-attestation, records the cut and its date, and Alec closed that issue on 2026-08-31 with "keep CounterAttestation cut. The axe from 2026-08-25 stands". §27.1.3 of the attestations spec states the ruling in full and lists every artifact that still specifies either record.
+
+The amendment withdraws acceptance criteria 17 and 18 above and the sentence of Enforcement Stack layer 4 reading "Unambiguous violations (Category A attempts with `#agent`, attestation mismatches with hardware proof) are permanently logged as `ScpCustodyViolationAttestation` records. DID owners can publish counter-attestations for reputation restoration." An implementation of this ADR builds neither type and satisfies neither criterion.
+
+The amendment leaves the rest of the Enforcement Stack standing. Layer 3 — "all conformant verifiers reject Category A actions (DID document modifications) signed by `#agent`" — keeps its rejection, and `enforce_category_a` in `crates/scp-protocol/src/trust/custody_violation.rs` implements it; layer 3's closing clause "The attempt is both rejected and logged as a custody violation" loses its logging half with the record. What a verifier writes in place of that log, and what §9.9.3 of the security spec's durable cross-context relay trust penalty reads on once the record leaves, are two decisions this amendment does not make. Open question OQ-53 in §27.7 of the attestations spec records the first, and open questions OQ-13 and OQ-42 of that section record the second.
