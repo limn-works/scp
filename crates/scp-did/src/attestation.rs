@@ -1,8 +1,13 @@
 //! Key custody attestation for DID document service entries (ADR-039 Layer 4).
 //!
 //! At identity creation, the DID document includes a service entry declaring
-//! the key custody model for each verification method. This provides a
-//! verifiable signal about how signing keys are stored and protected.
+//! the key custody model for each verification method. The entry carries a
+//! declaration the DID owner wrote, not a finding any code checked. §27.4.4 of
+//! `.docs/specs/27-attestations.md` records a human ruling of 2026-08-25 on
+//! what a consumer reads off it, and
+//! [`ScpKeyCustodyAttestation::active_custody_model`] and
+//! [`ScpKeyCustodyAttestation::agent_custody_model`] apply that ruling's
+//! clauses.
 //!
 //! Absence of attestation is a valid state — it is itself a signal ("I cannot
 //! prove my keys are isolated"). The attestation is signed by `#0` (Identity
@@ -16,9 +21,12 @@
 //!
 //! # Platform Attestation
 //!
-//! Optional platform-specific proof bytes (Apple App Attest / Android Key
-//! Attestation) can accompany the custody model declaration. These proofs are
-//! opaque to the protocol — verification is platform-specific.
+//! Platform-specific proof bytes (Apple App Attest / Android Key Attestation)
+//! can accompany the custody model declaration, and the field stays optional
+//! because §27.4.4 conditions the reading rather than the record's shape. These
+//! proofs are opaque to the protocol, and no SCP implementation verifies one
+//! today, so every declaration naming a hardware model reads as
+//! [`KeyCustodyModel::Software`].
 //!
 //! See ADR-039 §Enforcement Stack Layer 4 in `.docs/adrs/phase-1.md`.
 
@@ -61,11 +69,15 @@ pub struct ScpKeyCustodyAttestation {
     /// Platform attestation proof (Apple App Attest / Android Key Attestation)
     /// accompanying the declaration.
     ///
-    /// A declaration naming a hardware model carries no weight unless this
-    /// proof is present and a verification of it returns a pass (§27.4.4 of
-    /// `.docs/specs/27-attestations.md`, clause 1). No SCP implementation
-    /// verifies this proof today, and open questions OQ-2, OQ-29, and OQ-51 own
-    /// the verification procedure and what a pass would establish.
+    /// A consumer reads a declaration naming a hardware model as
+    /// [`KeyCustodyModel::Software`] unless the entry carries this proof and a
+    /// verification of it returns a pass (§27.4.4 of
+    /// `.docs/specs/27-attestations.md`, clause 1). That clause conditions the
+    /// reading, so the field stays optional: an entry carrying no proof is
+    /// well-formed, and clause 2 gives the consumer `Software` for the key that
+    /// entry declares. No SCP implementation verifies this proof today, and open
+    /// questions OQ-2, OQ-29, and OQ-51 own the verification procedure and what
+    /// a pass would establish.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform_attestation: Option<PlatformAttestation>,
 
@@ -1294,6 +1306,26 @@ mod custody_reading_rule_tests {
         assert!(entry.service_endpoint.contains("hardware-biometric"));
         let back = ScpKeyCustodyAttestation::from_service_entry(&entry).unwrap();
         assert_eq!(back, a);
+        assert_eq!(back.active_custody_model(), KeyCustodyModel::Software);
+    }
+
+    #[test]
+    fn the_ruling_leaves_the_platform_proof_optional() {
+        // Clause 1 conditions what a consumer reads on a verification
+        // returning a pass, and states no requirement that an entry carry a
+        // proof. An entry carrying none is well-formed, serializes without the
+        // key, and parses back, and clause 2 then gives the consumer
+        // `Software`.
+        // This test goes red if a later author reads the ruling as making
+        // `platform_attestation` a required field and drops the `Option`.
+        let a = attestation(KeyCustodyModel::HardwareBiometric, None, None);
+        assert!(a.platform_attestation.is_none());
+
+        let entry = a.to_service_entry("did:dht:test").unwrap();
+        assert!(!entry.service_endpoint.contains("platform_attestation"));
+
+        let back = ScpKeyCustodyAttestation::from_service_entry(&entry).unwrap();
+        assert!(back.platform_attestation.is_none());
         assert_eq!(back.active_custody_model(), KeyCustodyModel::Software);
     }
 }
