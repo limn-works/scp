@@ -248,9 +248,11 @@ jobs:
   # feature, and no allow_unencrypted_storage feature (which unseals
   # ProtocolRepository::new_for_testing), can reach a production binary. Closed
   # ⊆-whitelist carrying ZERO nullifier exceptions — see ADR-062 §Decision 6.
-  # The fixture harness (a/b/c + soundness + allowlist hygiene) runs
-  # first and must pass before the real workspace gate. NEVER add a resolved
-  # nullifier feature to the allowlist to make this pass — fix the dependency edge.
+  # The fixture harness (a/b/c + soundness + root-blindness + allowlist hygiene)
+  # runs first and must pass before the real workspace gate, and the real gate
+  # ends with a positive control requiring it to REJECT `scp-node --features
+  # testing`. NEVER add a resolved nullifier feature to the allowlist to make
+  # this pass — fix the dependency edge.
   shipped-feature-graph:
     needs: check-draft
     name: Shipped-feature-graph (G1 prove-absence)
