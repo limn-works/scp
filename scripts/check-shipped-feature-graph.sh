@@ -432,27 +432,33 @@ extract_feature_edges() {
 #   A package whose resolved list is empty prints a leading `|` and contributes
 #   no line.
 #
-#   The awk program carries no `exit`, so it reads its whole input;
-#   `assert_every_pipeline_reader_consumes_its_input` decides its criterion over
-#   that property.
+#   The comma list is split in a bash `while` loop rather than in a pipe into
+#   `awk`, because `assert_every_pipeline_reader_consumes_its_input` decides its
+#   criterion by enumerating the commands this file pipes into, and a bash loop
+#   reads its whole input by construction, so splitting here adds no command to
+#   that enumeration. The `sed` stage and the closing `sort -u` each read to end
+#   of file.
 #
 #   Fail-closed on a format change: if cargo stops printing this shape, no line
 #   matches, the extracted set is EMPTY, and merge_resolved_feature_sets rejects
 #   it rather than handing run_gate half a union.
 # ---------------------------------------------------------------------------
 extract_package_features() {
+  local line feats rest name feature
   printf '%s\n' "$1" \
-    | sed -E 's/ \(\*\)$//' \
-    | awk -F'|' '
-        NF < 2 { next }
-        $2 !~ /^scp-[a-z0-9-]+ v[0-9]/ { next }
-        {
-          split($2, pkg, " ")
-          n = split($1, feats, ",")
-          for (i = 1; i <= n; i++) {
-            if (feats[i] != "") { print pkg[1] "/" feats[i] }
-          }
-        }' \
+    | sed -E 's/ \(\*\)[[:space:]]*$//' \
+    | while IFS= read -r line; do
+        [[ "$line" == *"|"* ]] || continue
+        feats="${line%%|*}"
+        rest="${line#*|}"
+        [[ "$rest" =~ ^(scp-[a-z0-9-]+)\ v[0-9] ]] || continue
+        name="${BASH_REMATCH[1]}"
+        while [[ -n "$feats" ]]; do
+          feature="${feats%%,*}"
+          if [[ "$feats" == *,* ]]; then feats="${feats#*,}"; else feats=""; fi
+          [[ -n "$feature" ]] && printf '%s/%s\n' "$name" "$feature"
+        done
+      done \
     | sort -u
 }
 
@@ -921,30 +927,39 @@ expect() { # <label> <expected: PASS|FAIL> <actual-rc>
 #   branch — the fail-open verdict on a ZERO-nullifier gate.
 #
 #   The criterion is decidable over this file because the commands this file
-#   pipes into are `grep`, `sed`, `sort`, `comm`, and `awk`, and only two of them
-#   offer an early exit. `grep` stops at a first match under
-#   `-q`/`--quiet`/`--silent` and at an Nth one under `-m N`/`--max-count=N`.
-#   `awk` stops when its program reaches `exit`; the one awk program this file
-#   writes, in extract_package_features, has no `exit`, so it reads to end of
-#   file. `sed`, `sort`, and `comm` read to end of file under every invocation
-#   this file writes. So rejecting those two grep options, an `exit` inside a
-#   piped-to awk program, and a pipe into `head`, decides the criterion rather
-#   than sampling spellings of it.
+#   pipes into are `grep`, `sed`, `sort`, `comm`, `tr`, and a bash `while` loop,
+#   and only `grep` among them offers an early exit: `-q`/`--quiet`/`--silent`
+#   stops at a first match, and `-m N`/`--max-count=N` stops at an Nth one.
+#   `sed`, `sort`, `comm`, and `tr` read to end of file under every invocation
+#   this file writes, and a bash loop reads to end of file by construction.
+#
+#   `awk` is the one command in that neighbourhood that can stop early on its own
+#   program's `exit`, and deciding whether a given awk program reaches `exit`
+#   means reading a program that spans lines, which a line-matching grep cannot
+#   do. `extract_package_features` therefore splits its comma list in a bash
+#   loop, and this fixture rejects a pipe into `awk` outright rather than
+#   inspecting one. Rejecting a pipe into `awk` or into `head`, plus those two
+#   grep options, decides the criterion rather than sampling spellings of it.
+#   Anyone who wants awk here has to state, in this comment, why the program they
+#   wrote reads to end of file — and then this fixture needs a rule that reads
+#   that program, not this one.
 assert_every_pipeline_reader_consumes_its_input() {
   echo ">> fixture: every stage this gate pipes into reads its whole input, so no probe can report SIGPIPE (141) as a verdict"
   local self offenders
   self="${BASH_SOURCE[0]}"
-  offenders="$(grep -nE '\|[[:space:]]*(head[[:space:]]|awk[^|]*[^_a-zA-Z]exit[^_a-zA-Z]|grep[[:space:]]+(-[a-zA-Z]*q|--quiet|--silent|-m[[:space:]]|--max-count))' "$self" \
+  offenders="$(grep -nE '\|[[:space:]]*(head[[:space:]]|awk[[:space:]]|grep[[:space:]]+(-[a-zA-Z]*q|--quiet|--silent|-m[[:space:]]|--max-count))' "$self" \
     | grep -vE '^[0-9]+:[[:space:]]*#' || true)"
   if [[ -n "$offenders" ]]; then
-    echo "   FAIL — a pipeline stage below exits before its writer finishes, so pipefail"
+    echo "   FAIL — a pipeline stage below can stop before its writer finishes, so pipefail"
     echo "          reports 141 and the enclosing test reads a match as a NON-match:"
     printf '%s\n' "$offenders" | sed 's/^/       x /'
     echo "          Write 'grep -E ... >/dev/null' and read grep's own status instead."
+    echo "          Split a list in a bash loop rather than in a pipe into awk, whose"
+    echo "          program can carry an 'exit' that this line-matching check cannot read."
     fixture_failures=$((fixture_failures + 1))
     return
   fi
-  echo "   ok   — no pipeline in this gate feeds a reader that stops early"
+  echo "   ok   — no pipeline in this gate feeds a reader that can stop early"
 }
 
 # assert_every_cargo_tree_resolves_every_target
