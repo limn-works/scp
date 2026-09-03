@@ -50,9 +50,19 @@ pub struct ScpKeyCustodyAttestation {
     /// Custody model the DID owner declared for the `#active` key.
     ///
     /// This is a declaration, not a finding. Read it through
-    /// [`Self::active_custody_model`], which applies the §27.4.4 clauses. The
-    /// field is crate-private so that no consumer can read the declared value
-    /// in place of the model those clauses produce.
+    /// [`Self::active_custody_model`], which applies the §27.4.4 clauses.
+    ///
+    /// The `pub(crate)` visibility removes direct field access from code
+    /// outside this crate. It removes nothing else. Three paths still hand the
+    /// declared value to an external reader: [`Self::to_service_entry`] writes
+    /// the value into the `serviceEndpoint` string a DID document publishes,
+    /// the derived `Serialize` writes it into any JSON an external caller
+    /// produces from this struct, and the derived `Debug` prints it. The
+    /// declaration is the published record, which a DID document makes
+    /// world-readable, so no visibility rule closes those three paths. The type
+    /// system therefore does not enforce clause 4 of §27.4.4 in
+    /// `.docs/specs/27-attestations.md`, which still binds a consumer that
+    /// reads the declared value out of any of the three.
     pub(crate) active_key_custody: KeyCustodyModel,
 
     /// Custody model the DID owner declared for the `#agent` key. `None` if no
@@ -1307,6 +1317,42 @@ mod custody_reading_rule_tests {
         let back = ScpKeyCustodyAttestation::from_service_entry(&entry).unwrap();
         assert_eq!(back, a);
         assert_eq!(back.active_custody_model(), KeyCustodyModel::Software);
+    }
+
+    #[test]
+    fn field_visibility_leaves_three_read_paths_carrying_the_declaration() {
+        // Pins the doc comment on `active_key_custody`: `pub(crate)` removes
+        // direct field access from outside this crate and removes nothing else.
+        // The declared value is the published record, so `to_service_entry`,
+        // the derived `Serialize`, and the derived `Debug` each hand it to an
+        // external reader. Clause 4 of §27.4.4 binds a consumer reading through
+        // any of the three, and no code enforces clause 4 on those paths.
+        //
+        // This test goes red if a later author adds `#[serde(skip)]` to the two
+        // declared fields to close the JSON path. That change would drop the
+        // owner's declaration out of the record a document republishes, which
+        // `the_declaration_still_round_trips_on_the_wire` above forbids.
+        let a = attestation(
+            KeyCustodyModel::HardwareBiometric,
+            Some(KeyCustodyModel::HardwarePin),
+            None,
+        );
+
+        let json = serde_json::to_value(&a).unwrap();
+        assert_eq!(json["active_key_custody"], "hardware-biometric");
+        assert_eq!(json["agent_key_custody"], "hardware-pin");
+
+        let entry = a.to_service_entry("did:dht:test").unwrap();
+        assert!(entry.service_endpoint.contains("hardware-biometric"));
+        assert!(entry.service_endpoint.contains("hardware-pin"));
+
+        let debug = format!("{a:?}");
+        assert!(debug.contains("HardwareBiometric"));
+        assert!(debug.contains("HardwarePin"));
+
+        // The accessor is the enforcement, and it still fails closed.
+        assert_eq!(a.active_custody_model(), KeyCustodyModel::Software);
+        assert_eq!(a.agent_custody_model(), Some(KeyCustodyModel::Software));
     }
 
     #[test]
