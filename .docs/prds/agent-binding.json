@@ -971,7 +971,7 @@
         "crates/scp-identity/src/document.rs",
         "crates/scp-identity/src/attestation.rs"
       ],
-      "description": "Implement ScpKeyCustodyAttestation per ADR-039 acceptance criterion 16 and Enforcement Stack layer 4. At identity creation, the DID document includes a service entry declaring key custody model. The attestation declares: custody_model (hardware-biometric, hardware-pin, software), platform (ios, android, desktop, browser), platform_attestation (optional platform-specific proof — Apple App Attest token or Android Key Attestation certificate chain). Absence of attestation is itself a signal (feeds into trust evaluation per §7.1). Create attestation.rs module in scp-identity. Add ScpKeyCustodyAttestation as a DID document service entry type. The attestation is signed by #0.",
+      "description": "Implement ScpKeyCustodyAttestation per ADR-039 acceptance criterion 16 and Enforcement Stack layer 4. At identity creation, the DID document includes a service entry declaring key custody model. The attestation declares: custody_model (hardware-biometric, hardware-pin, software), platform (ios, android, desktop, browser), platform_attestation (optional platform-specific proof — Apple App Attest token or Android Key Attestation certificate chain). Per the 2026-08-25 ruling in §27.4.4 of the attestations spec, a declaration naming a hardware model reads as software unless a verification of that proof returns a pass, so a consumer reads the model §27.4.4's clauses produce and never the declared string. Absence of attestation is itself a signal. Create attestation.rs module in scp-identity. Add ScpKeyCustodyAttestation as a DID document service entry type. The attestation is signed by #0.",
       "acceptanceCriteria": [
         "ScpKeyCustodyAttestation struct with fields: custody_model, platform, platform_attestation (optional), timestamp",
         "CustodyModel enum: HardwareBiometric, HardwarePin, Software",
@@ -981,7 +981,7 @@
         "create_custody_attestation() generates attestation for current platform",
         "Attestation serializes/deserializes correctly as DID document service entry",
         "DID document can be created without custody attestation (backward-compatible)",
-        "Tests verify attestation creation for each custody model",
+        "Tests verify attestation creation for each custody model, and verify that a hardware custody model declared without a verified platform attestation proof reads as software (§27.4.4 clause 2)",
         "Tests verify attestation round-trip through DID document service entries",
         "Tests verify attestation signature verification"
       ],
