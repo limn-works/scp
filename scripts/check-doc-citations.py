@@ -3,8 +3,9 @@
 
 CRITERION
     Every `§N.M` citation in a governing artifact names a heading that exists in
-    `.docs/specs/N-*.md`, or the citing file declares the citation dead by writing the
-    reference once followed by the literal marker `[no such section]`.
+    `.docs/specs/N-*.md`, or the citing file declares that the citation resolves to
+    nothing by writing the reference once followed by the literal marker
+    `[no such section]`.
 
     `.docs/standards/concrete-prose.md` states the rule this check enforces: "Name the
     thing first, then give the identifier so the reader can find it." A number that
