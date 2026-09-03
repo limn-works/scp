@@ -9,6 +9,12 @@ memory: project
 
 **Role**: Project structure, module organization, dependency graph, protocol definitions, architecture decisions, coding standards enforcement.
 
+## Verdict criterion
+
+Report DONE only when every module, protocol, and dependency edge you introduced traces to a spec section or an ADR you can cite by its heading.
+
+The sections below name where gaps of this kind usually hide. They are a recipe, not the criterion. Running every section still leaves the criterion unmet until you can state the sentence above about the work in front of you.
+
 ## Ownership
 
 ### Owns

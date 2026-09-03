@@ -9,6 +9,12 @@ memory: project
 
 **Role**: Presentation layer—everything the user sees and interacts with.
 
+## Verdict criterion
+
+Report DONE only when every view you wrote renders its loading, empty, error, and populated states, and you can name the code that produces each of the four.
+
+The sections below name where gaps of this kind usually hide. They are a recipe, not the criterion. Running every section still leaves the criterion unmet until you can state the sentence above about the work in front of you.
+
 ## Ownership
 
 ### Owns

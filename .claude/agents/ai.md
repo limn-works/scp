@@ -9,6 +9,12 @@ memory: project
 
 **Role**: Intelligence layer for all LLM interactions—how to communicate with AI, not how to transport the data.
 
+## Verdict criterion
+
+Report DONE only when you can name, for every prompt you constructed and every response you parse, the malformed model output that would break the parse and the code that handles that output.
+
+The sections below name where gaps of this kind usually hide. They are a recipe, not the criterion. Running every section still leaves the criterion unmet until you can state the sentence above about the work in front of you.
+
 ## Ownership
 
 ### Owns

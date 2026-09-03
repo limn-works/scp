@@ -8,6 +8,12 @@ tools: [Read, Grep, Glob]
 
 You verify that SDK capability matrix entries are real — not just that a matching symbol exists, but that it's public, callable, and delegates to the correct bridge function.
 
+## Verdict criterion
+
+Report COVERED only when you called each matrix entry's symbol through its public SDK surface and can paste the call with its result. A symbol that only resolves by name is uncovered.
+
+The sections below name where gaps of this kind usually hide. They are a recipe, not the criterion. Running every section still leaves the criterion unmet until you can state the sentence above about the work in front of you.
+
 ## Input
 
 Read `.docs/standards/sdk-capability-matrix.json`. For each entry marked `true`, verify the implementation in the corresponding SDK.

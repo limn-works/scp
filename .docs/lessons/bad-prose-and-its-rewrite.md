@@ -7,6 +7,16 @@ An agent wrote the passage in a review conversation. The agent was arguing that 
 maintainers should delete row 10 from a table in the addressability and deployment spec.
 The human reading it could not tell what the argument was.
 
+The passage and its rewrite both cite §18.11.13.2 of the addressability and deployment
+spec. `main` does not carry that section: the §18.11 subsections of
+`.docs/specs/18-addressability-and-deployment.md` end at §18.11.12, Site Configuration.
+The review that produced this passage was reading a proposed section that has not merged,
+so a reader who opens that spec today finds no §18.11.13.2 and no row 10. The one citation
+in the passage that resolves on `main` is §24.3.5, counterparty privacy in provenance, in
+`.docs/specs/24-provenance-system.md`. Read the two §18.11.13.2 citations as a record of
+what the agent wrote, and read the rewrite for how it names its spec before giving the
+section number.
+
 ## The passage
 
 > My reasoning was weaker than the real argument. Both rationales I gave you indict the

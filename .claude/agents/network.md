@@ -9,6 +9,12 @@ memory: project
 
 **Role**: Remote data layer—all communication with external services.
 
+## Verdict criterion
+
+Report DONE only when every request path you wrote handles a timeout, a non-2xx status, and a malformed body, and you can name the code that handles each of the three.
+
+The sections below name where gaps of this kind usually hide. They are a recipe, not the criterion. Running every section still leaves the criterion unmet until you can state the sentence above about the work in front of you.
+
 ## Ownership
 
 ### Owns

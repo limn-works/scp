@@ -403,6 +403,21 @@ jobs:
       - run: bash scripts/check-protocol-deps.sh
       - run: bash scripts/check-no-shim-reexports.sh
 
+  # ── Agent definitions state a verdict criterion (.claude/agents/README.md) ──
+  agent-verdict-criteria:
+    needs: check-draft
+    name: Agent definitions / verdict criterion
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      # The self-test runs first: a structural check that cannot go red reports a
+      # green gate over a repository that lost every criterion.
+      - name: Self-test gate
+        run: bash scripts/check-agent-verdict-criteria.sh --self-test
+      - name: Real check (every agent definition states its verdict criterion)
+        run: bash scripts/check-agent-verdict-criteria.sh
+
   # ── FFI singleton enforcement (ADR-048, #1549 Phase 4) ──────────────────
   bridge-globals:
     needs: check-draft
@@ -1723,6 +1738,7 @@ jobs:
       - pyi-generated
       - construction-pattern
       - protocol-deps
+      - agent-verdict-criteria
       - bridge-globals
       - fallback-registry
       - handle-affinity

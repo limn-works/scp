@@ -9,8 +9,10 @@ An agent file must say, in one sentence, what the agent has to confirm before it
 An agent handed a checklist and no criterion completes the checklist and reports success. That is how `let _ = function_name;` came to satisfy a string-search test while calling nothing.
 
 When you write or edit an agent definition, satisfy both requirements:
-1. State the criterion in the file, in one sentence the agent can quote back. "INCOMPLETE if any acceptance criterion has no code behind it" is a criterion. "Check for stubs, check for `None`, check the matrix" is a recipe.
+1. State the criterion in the file, under a `## Verdict criterion` heading, in one sentence the agent can quote back. "INCOMPLETE if any acceptance criterion has no code behind it" is a criterion. "Check for stubs, check for `None`, check the matrix" is a recipe.
 2. Mark the recipe as a recipe. Write "these dimensions are where gaps usually hide, not the definition of a gap," so an agent that exhausts the list still knows it has not yet met the criterion.
+
+`scripts/check-agent-verdict-criteria.sh` reads every definition in this directory and fails when one drops either part. It checks that both parts are present. A human reads the criterion sentence and decides whether it is a criterion, because no script can decide that.
 
 Every agent definition also follows `.docs/standards/concrete-prose.md`, which governs all prose in this repository.
 

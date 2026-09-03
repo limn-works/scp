@@ -143,6 +143,8 @@ bridge_ratchet_baseline.json, ratchet/once-lock-count.json,
 check-shipped-feature-graph.sh (ADR-062 §Decision 6 G1 — the shipped-artifact
 feature-graph ⊆-allowlist prove-absence gate; the allowlist permits durability-only
 features only, ZERO nullifier exceptions),
+check-agent-verdict-criteria.sh (every agent definition in `.claude/agents/`
+states a verdict criterion and marks its dimensions as a recipe),
 check-toolchain-wiring.sh (every container build asserts which compiler it resolved;
 the changes job of every paths-filtered workflow routes a pin change to every lane that
 compiles on it, and ci.yml routes every root-level file and every cargo configuration
@@ -288,7 +290,7 @@ The orchestrator never writes code. It manages execution, maintains plan alignme
 - Never say "done" without showing verification output.
 
 **Agent execution rules (MANDATORY):**
-- **Write every agent prompt as a contract, never as your recipe.** State what the agent must make true, and state how you will check it. Then, separately and labelled as such, give the recipe you would have followed: the files to read, the greps to run, the symbols to trace. An agent that receives only a recipe satisfies the recipe and reports success, which is how `let _ = function_name;` came to satisfy a string-search test while calling nothing. The same rule governs the standing agent definitions in `.claude/agents/`: each one states its verdict criterion, and its review dimensions serve that criterion as evidence rather than replacing it.
+- **Write every agent prompt as a contract, never as your recipe.** State what the agent must make true, and state how you will check it. Then, separately and labelled as such, give the recipe you would have followed: the files to read, the greps to run, the symbols to trace. An agent that receives only a recipe satisfies the recipe and reports success, which is how `let _ = function_name;` came to satisfy a string-search test while calling nothing. The same rule governs the standing agent definitions in `.claude/agents/`: each one states, under a `## Verdict criterion` heading, the one thing its agent confirms before it reports a verdict, and each one marks its review dimensions as a recipe that serves the criterion. `scripts/check-agent-verdict-criteria.sh` fails when any definition drops either part.
 - Every agent prompt must specify which branch to start from. Include: "Verify with `git log --oneline -3` that you see [expected commits]. If not, STOP."
 - Never checkout migration/feature branches on the main worktree. All branch work happens in worktrees. Main worktree stays on main.
 - When the plan says "delete X and import Y," agents MUST delete X and import Y. No excuses. "Different serde format," "different field types," "architectural mismatch" are NOT valid reasons to keep local reimplementations when there are zero consumers. The only valid reason is a compiler-level mechanical restriction.
