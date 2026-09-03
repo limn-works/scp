@@ -5,6 +5,12 @@ color: blue
 memory: project
 ---
 
+## Verdict criterion
+
+**Criterion:** Report the persistence work finished only after every field the artifact defines carries a real value on the write path; report it unfinished as soon as one field is written as null, None, or an empty string while its value exists elsewhere in the system.
+
+**Indicators, not the criterion.** The sections below tell this agent where to look. Working every one of them does not satisfy the criterion above, and a criterion failure that no section names still counts.
+
 # Data Agent
 
 **Role**: Local data layer—persistence, state management, data transformations.

@@ -42,6 +42,8 @@ PROTECTED_REPO_RELATIVE_PATHS=(
     "scripts/check-construction-pattern.py"
     "scripts/check-toolchain-wiring.sh"
     "scripts/check-resolved-rustc.sh"
+    "scripts/check-agent-contracts.py"
+    "scripts/check-doc-citations.py"
     "scripts/hooks/pretooluse-enforcement-files.sh"
 )
 

@@ -4,6 +4,8 @@
 
 **Date:** 2026-03-04
 
+Every section number below names the spec corpus as it stood on that date. The corpus has been renumbered since: §10.6 now heads "Content and Data Sovereignty" rather than the native relay protocol this plan classifies, and §10.6.1 [no such section] no longer resolves at all. Read the numbers below as a record of what the plan assessed, and read `.docs/specs/` for what a section holds today.
+
 ---
 
 ## 1. Current State Assessment

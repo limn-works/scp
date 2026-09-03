@@ -5,6 +5,12 @@ color: red
 memory: project
 ---
 
+## Verdict criterion
+
+**Criterion:** Report the transport work finished only after every request path handles the offline case and the retry case in code you can point at; report it unfinished as soon as one path assumes the network answered.
+
+**Indicators, not the criterion.** The sections below tell this agent where to look. Working every one of them does not satisfy the criterion above, and a criterion failure that no section names still counts.
+
 # Network Agent
 
 **Role**: Remote data layer—all communication with external services.

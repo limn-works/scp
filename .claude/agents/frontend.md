@@ -5,6 +5,12 @@ color: blue
 memory: project
 ---
 
+## Verdict criterion
+
+**Criterion:** Report the view finished only after all four states render — loading, empty, error, and populated; report it unfinished while any of those four renders nothing or renders a placeholder.
+
+**Indicators, not the criterion.** The sections below tell this agent where to look. Working every one of them does not satisfy the criterion above, and a criterion failure that no section names still counts.
+
 # Frontend Agent
 
 **Role**: Presentation layer—everything the user sees and interacts with.

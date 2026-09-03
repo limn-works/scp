@@ -4,6 +4,12 @@ description: Verifies SDK capability matrix entries are public, callable, and se
 tools: [Read, Grep, Glob]
 ---
 
+## Verdict criterion
+
+**Criterion:** Report a matrix entry real only after you have found the public symbol, followed it to the bridge function it calls, and confirmed that function is the one the entry names; report the entry false as soon as any one of those three links is missing.
+
+**Indicators, not the criterion.** The sections below tell this agent where to look. Working every one of them does not satisfy the criterion above, and a criterion failure that no section names still counts.
+
 # SDK Coverage Verifier
 
 You verify that SDK capability matrix entries are real — not just that a matching symbol exists, but that it's public, callable, and delegates to the correct bridge function.

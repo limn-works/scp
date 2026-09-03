@@ -539,6 +539,27 @@ jobs:
       - name: Real scan
         run: python3.12 scripts/check-block-in-place.py
 
+  agent-and-doc-contracts:
+    needs: check-draft
+    name: Docs / agent verdict criteria + spec citations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Self-tests MUST run first: each plants the defect its checker exists to
+      # catch and asserts the checker reports it, so a green real scan means the
+      # checker read the tree rather than that it can no longer fail.
+      - name: Self-test agent-contract checker
+        run: python3.12 scripts/check-agent-contracts.py --self-test
+      - name: Agent definitions state a verdict criterion
+        run: python3.12 scripts/check-agent-contracts.py
+      - name: Self-test citation checker
+        run: python3.12 scripts/check-doc-citations.py --self-test
+      - name: Spec citations resolve
+        run: python3.12 scripts/check-doc-citations.py
+
   deleted-primitives:
     needs: check-draft
     name: Actor / deleted primitives ban
@@ -1734,6 +1755,7 @@ jobs:
       - saga-gating-granularity
       - block-in-place
       - deleted-primitives
+      - agent-and-doc-contracts
       - bridge-instance-lifecycle
       - toolchain-wiring
       - docker-image
