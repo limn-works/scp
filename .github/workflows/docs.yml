@@ -1,16 +1,27 @@
 # SDK API Reference Documentation
 #
 # Generates and publishes API reference docs for all language SDKs
-# on every release tag. Also runs on PRs for validation.
+# on every release tag. Also runs on pull requests, on pushes to `main`, and on
+# merge-queue entries, so a doc build reads a tree before it lands and again
+# after it lands.
 #
 # When a change doesn't touch doc-relevant paths (see the `docs:` filter in the
 # `changes` job), all doc jobs skip via an `if` condition rather than failing.
 # GitHub counts a skipped job as passing for a required status check, so these
 # jobs are safe to promote to required -- that promotion is the standing plan.
+# The `merge_group:` trigger below is what makes the promotion mechanical. A
+# merge queue evaluates every required status check against the `merge_group`
+# ref, so a workflow that does not run on that event reports no check there and
+# every queue entry waits on a status that never arrives. This workflow carried
+# no such trigger while this header called the promotion safe.
+# `check_merge_queue_triggers` in scripts/tests/ci-gate/ci_gate_selftest.py now
+# fails when a workflow that skips its jobs through a `dorny/paths-filter` runs
+# on `pull_request` and not on `merge_group`.
 #
-# Until it happens this whole workflow is ADVISORY: `ci` is the sole required
-# status check, so nothing here can block a merge. See the note on the `push`
-# trigger below for what that cost us.
+# Until an operator adds these job names to the Default ruleset this whole
+# workflow is ADVISORY: `ci` is the sole required status check, so nothing here
+# can block a merge. See the note on the `push` trigger below for what that
+# cost us.
 #
 # Source: .docs/scaffold/shared.md section "SDK Documentation Requirements"
 # Story: SCP-139
@@ -41,6 +52,11 @@ on:
       - "scp-core@*"
   pull_request:
     branches: [main]
+  # A merge queue evaluates required status checks against the `merge_group`
+  # ref. Without this trigger these jobs cannot be promoted to required at all,
+  # and they also never read the batched tree that lands on `main`, which is the
+  # tree a two-entry batch can break without either entry breaking it alone.
+  merge_group:
 
 permissions:
   contents: read
@@ -62,6 +78,7 @@ jobs:
   check-draft:
     if: >-
       github.event_name == 'push' ||
+      github.event_name == 'merge_group' ||
       github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 5

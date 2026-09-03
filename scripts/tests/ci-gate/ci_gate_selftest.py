@@ -123,6 +123,11 @@ nothing:
                still unable to produce the diagnostic. Reading the two flag sets
                against each other names that gap for any flag, not for
                `--document-private-items` alone.
+  merge-queue  docs.yml carried a header calling its jobs safe to promote to a
+               required status check while the workflow triggered on `push` and
+               `pull_request` only. A merge queue evaluates a required check
+               against the `merge_group` ref, so following that header would
+               have left every queue entry waiting on a status no run reports.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
@@ -1176,7 +1181,24 @@ def check_rustdoc_documents_private_items(
     `rustdoc::broken_intra_doc_links`, and that denial fires on a link written in
     a private module only when the command passes `--document-private-items`, so
     a `cargo doc` run without the flag reports success over links it never read.
+
+    The flag buys that denial and nothing else, so this also asserts that a crate
+    under crates/ still declares the attribute. Delete the attribute and every
+    `cargo doc` below reports a broken link as a warning and exits 0, which is
+    the same green check the missing flag produced.
     """
+    denying = sorted(
+        str(source.relative_to(REPO))
+        for source in (REPO / "crates").rglob("src/lib.rs")
+        if "deny(rustdoc::broken_intra_doc_links)" in source.read_text()
+    )
+    check(
+        "a crate attribute makes a broken intra-doc link an error",
+        bool(denying),
+        "no crate under crates/ declares "
+        "`#![deny(rustdoc::broken_intra_doc_links)]`, so every `cargo doc` command "
+        "below reports a broken link as a warning and exits 0",
+    )
     for path, doc in documents:
         for job_id, command in rustdoc_commands(doc):
             check(
@@ -2437,6 +2459,42 @@ def check_rustdoc_surface_detects_a_dropped_flag(
         )
 
 
+def workflow_triggers(doc: dict) -> set[str]:
+    """Return the event names a workflow triggers on.
+
+    PyYAML resolves the unquoted key `on` to the boolean True, so a caller
+    reading `doc["on"]` reads nothing on every workflow in this repository.
+    """
+    node = doc.get(True, doc.get("on"))
+    if isinstance(node, (dict, list)):
+        return set(node)
+    return {node} if isinstance(node, str) else set()
+
+
+def check_merge_queue_triggers(documents: list[tuple[Path, dict]]) -> None:
+    """A workflow written to be required also runs on the merge_group event.
+
+    CRITERION: a merge queue evaluates every required status check against the
+    `merge_group` ref, so a workflow that never runs on that event reports no
+    check there and every queue entry waits on a status that never arrives.
+    INDICATOR that a workflow is written for that role: it skips its jobs
+    through a `dorny/paths-filter` output instead of failing them, which is the
+    shape that exists so a skipped job reports success to branch protection.
+    The header of .github/workflows/docs.yml states that reason in those words.
+    """
+    for path, doc in documents:
+        triggers = workflow_triggers(doc)
+        if "pull_request" not in triggers or not paths_filter_steps(doc):
+            continue
+        check(
+            f"{path.name} runs on merge_group",
+            "merge_group" in triggers,
+            f"triggers on {sorted(triggers)} — its jobs skip to a success status "
+            f"so branch protection can require them, and a required check that "
+            f"never runs on the merge_group ref holds every queue entry pending",
+        )
+
+
 def collect_pinned_nightlies(doc: dict) -> set[str]:
     """Return every date-pinned nightly a workflow's steps request."""
     pinned = set()
@@ -2453,9 +2511,18 @@ def collect_pinned_nightlies(doc: dict) -> set[str]:
 def main() -> int:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     jobs = workflow["jobs"]
+    # GitHub Actions runs a workflow file whose extension is `.yml` or `.yaml`,
+    # and scripts/check-toolchain-wiring.sh enumerates both. This glob read
+    # `.yml` alone, so a workflow written with the other spelling would have
+    # escaped every assertion below while both gates printed OK. No workflow
+    # here carries that spelling today, which is why widening the glob changes
+    # no result.
     documents = [
         (path, yaml.safe_load(path.read_text()))
-        for path in sorted((REPO / ".github/workflows").glob("*.yml"))
+        for path in sorted(
+            set((REPO / ".github/workflows").glob("*.yml"))
+            | set((REPO / ".github/workflows").glob("*.yaml"))
+        )
     ]
 
     print("timeout — every job in every workflow bounds its own runtime")
@@ -2552,6 +2619,9 @@ def main() -> int:
     check_rustdoc_documents_private_items(documents)
     check_private_items_detects_a_dropped_flag(documents)
     check_workspace_and_rustdoc_readers(documents)
+
+    print("merge-queue — a workflow that skips to a success status runs in the queue")
+    check_merge_queue_triggers(documents)
 
     print("step-filter — a filter output gates a job, never a step")
     check_filter_outputs_gate_jobs(jobs)
