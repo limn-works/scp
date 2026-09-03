@@ -358,6 +358,16 @@ pub struct RelayDeletionRequest {
 
 ---
 
+### Amendment (2026-08-25): a hardware destruction claim rates as software-only without a verified proof
+
+Alec ruled that a hardware-backed declaration reads as software-backed unless a verified platform attestation proof accompanies it. §27.4.6 of the attestations spec (`.docs/specs/27-attestations.md`) quotes the three statements he wrote, names the binary an agent posed to him, and states the ruling in four clauses; the sentence before this one is that section's statement of what he decided and is not his wording. §9.15 of the security spec assigns a confidence rating to the method those clauses produce. This ADR states no reading rule of its own.
+
+The ruling governs acceptance criterion 7 above. Its ordering sentence — "Hardware-attested (Secure Enclave/Keystore) > software-only > no attestation" — orders the levels a consumer reads, and the Rationale above states that a level reaches other members: "higher assurance levels are visible to other participants." A `KeyDestructionLevel::HardwareAttested` value a member shows another participant therefore ranks at software-only unless a verification of an accompanying platform attestation proof returns a pass. Criterion 7's remaining sentences stand unchanged: the level is metadata recorded in the close event, and no gate reads it.
+
+No SCP implementation verifies a destruction platform proof today, and the signing preimage of the published record leaves the proof outside the signed bytes, so every hardware level a member publishes ranks at software-only. Open question OQ-8 of the attestations spec asks a human whether the proof enters that signed scope, and open questions OQ-2 and OQ-29 of the same spec ask what a verification of it would check. The close path records `KeyDestructionLevel::SoftwareOnly` from the disposal outcome it observed, which is the level the ruling produces for that path either way.
+
+---
+
 ## ADR-019: Data Provenance
 
 **Status:** Decided

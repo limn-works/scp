@@ -1421,7 +1421,7 @@ KeyDestructionAttestation {
   contextID:             String
   memberDID:             DID
   destroyedAt:           DateTime
-  platformAttestation:   PlatformAttestation?  // hardware-backed if available
+  platformAttestation:   PlatformAttestation?  // absent on a .softwareOnly record; a .hardwareBacked record rates as software-only without a verified one
   method:                .hardwareBacked | .softwareOnly
   signature:             Ed25519Signature       // signed by #0 (Identity Key) or #active (Active Signing Key); NOT #agent — agents cannot sign destruction attestations (ADR-039)
 }
@@ -1429,11 +1429,15 @@ KeyDestructionAttestation {
 
 4. Attestations are published to relays (outside the now-destroyed context). They are signed by the identity key so they remain verifiable after context keys are destroyed.
 
-**Trust levels for destruction claims:**
+**Trust levels for destruction claims.** Each level rates the method a consumer verified, never the method the record declared:
 
-- **Hardware-attested** (Secure Enclave / Keystore attestation): High confidence. The hardware claims the key is gone.
-- **Software-only** (`memset(0)` on key material in memory): Moderate confidence. Memory dumps, swap files, or crash logs may have retained the key.
+- **Hardware-attested** (Secure Enclave / Keystore attestation, where a verification of that attestation returns a pass): High confidence. The hardware claims the key is gone.
+- **Software-only** (`memset(0)` on key material in memory), and every record declaring `.hardwareBacked` that no verified `platformAttestation` accompanies: Moderate confidence. Memory dumps, swap files, or crash logs may have retained the key.
 - **No attestation** (member went offline before close): No confidence. The member may still have the key.
+
+**Ruling (2026-08-25): a hardware-backed declaration rates as software-only until a verified platform proof accompanies it.** Alec ruled that a hardware-backed declaration reads as software-backed unless a verified platform attestation proof accompanies it. §27.4.6 of the attestations spec quotes the three statements he wrote and names the binary an agent posed to him; the sentence before this one states what those statements decided and is not his wording. Answering that binary is also what keeps the High-versus-Moderate split above: the arm he rejected removed the rating and left `method` describing a setup. The three levels above carry his answer: a record's `method` field is the publisher's declaration and is not the input to the rating, and a consumer reaches High confidence only through a verification of the `platformAttestation` the same record carries. A record declaring `.softwareOnly` needs no proof and rates as Moderate. §27.4.6 of the attestations spec (`.docs/specs/27-attestations.md`) states the ruling in four clauses and gives the reasoning Alec used to reach it; this section states no reading rule beyond the level assignments above, so the two cannot drift apart on the rule's wording.
+
+No SCP implementation verifies a destruction `platformAttestation` today, and no artifact states the checks such a verification would run — open questions OQ-2 and OQ-29 of the attestations spec own that procedure. The shipped signing preimage also leaves `platformAttestation` outside the signed bytes, so a holder detaches the proof from the signature that binds `method`; open question OQ-8 of that spec asks a human whether the field enters the signed scope, and until it does, a verification of the proof establishes nothing about the declaration beside it. Every published `.hardwareBacked` record therefore rates as Moderate confidence today.
 
 The protocol provides the strongest guarantees the hardware supports and is explicit about where those guarantees end. This is consistent with the honest limitations acknowledged in §5.11.
 
