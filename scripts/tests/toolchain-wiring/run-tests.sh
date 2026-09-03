@@ -42,20 +42,27 @@
 #     further cases cover a tool whose name merely holds the letters `rust`, the setting
 #     naming a tool other than rust, and a document TOML rejects.
 #
-#   * Check 4 fails when the workflow's verdict job — the job whose own `if:` is
-#     `always()` and whose body reads a `needs.<job>.result` — leaves a job out of its
-#     `needs:` list, reads no result for a job it does name, names a job the workflow does
-#     not declare, reads a result for a name no job carries, or declares no `needs:` the
-#     gate can read. Two such jobs in one workflow is a case of its own, because the gate
-#     cannot then tell which one branch protection requires. Cases cover the two remaining
-#     `needs:` spellings GitHub Actions accepts — a flow sequence and a single scalar — and
-#     every other case in this file writes a `ci.yml` declaring no verdict job at all,
-#     which is the shape check 4 leaves alone. A workflow whose only job is its verdict job
-#     gets a case of its own: the set of other jobs is empty there, and the gate has to
-#     report the unknown names rather than abort on a `grep` that matched nothing. Four
-#     further cases hold the discovery rule to the `if:` value rather than to one spelling
-#     of it: `${{ always() }}`, `always() && …`, and a folded scalar holding `always()`
-#     each name a verdict job, and an `if:` naming no `always()` does not.
+#   * Check 4 fails when the workflow's verdict job — the job whose own `if:` names one of
+#     GitHub Actions' four status check functions — leaves a job out of its `needs:` list,
+#     reads no result for a job it does name, names a job the workflow does not declare,
+#     reads a result for a name no job carries, or declares no `needs:` the gate can read.
+#     Two such jobs in one workflow is a case of its own, because the gate cannot then tell
+#     which one branch protection requires. Cases cover the two remaining `needs:`
+#     spellings GitHub Actions accepts — a flow sequence and a single scalar — and every
+#     other case in this file writes a `ci.yml` declaring no verdict job at all, which is
+#     the shape check 4 leaves alone. A workflow whose only job is its verdict job gets a
+#     case of its own: the set of other jobs is empty there, and the gate has to report the
+#     unknown names rather than abort on a `grep` that matched nothing.
+#   * Checks 2e and 4 read the parsed workflow, so a rewording GitHub Actions reads
+#     identically produces the same verdict as the spelling it replaces. One case per
+#     rewording: `${{ always() }}`, `always() && …`, a folded scalar holding `always()`,
+#     `${{ !cancelled() }}`, `${{ !failure() }}`, and a quoted `"if":` key each name a
+#     verdict job; a trailing comment on the `ci:` header and job keys written at six
+#     spaces leave that job in the listing; `${{ join(needs.*.result, ' ') }}` reads the
+#     result of every job the `needs:` list names; and a paths-filtered job whose `if:`
+#     sits below its `steps:` still names its lane. An `if:` naming none of the four status
+#     check functions names no verdict job, which is the one direction that stays silent. A
+#     workflow no YAML parser accepts fails rather than passing.
 #
 # HOW EACH CASE IS BUILT. `run_case` makes a temporary directory, writes the gate into
 # `scripts/`, runs `git init` so the gate's `git grep` search and its file listings have a
@@ -109,6 +116,10 @@ failed=0
 #                     job's lanes and the `scripts/` paths its lines name.
 #   SWIFT_FILTER_EXTRA — one more path entry appended to the canned `swift` filter, or ""
 #                     for none. A case routes the script it appended by setting this.
+#   IF_PLACEMENT — where that job writes its own `if:` key: "above" puts it before
+#                     `steps:`, "below-steps" after the last step. GitHub Actions reads the
+#                     same job either way, so a case that changes only this must produce
+#                     the same verdict.
 OMIT_OUTPUT=""
 OMIT_FILTER=""
 MISE_SOURCE="none"
@@ -117,6 +128,7 @@ EXTRA_FILES=()
 GATE_TRANSFORM=""
 SCRIPT_JOB=""
 SWIFT_FILTER_EXTRA=""
+IF_PLACEMENT="above"
 
 # Every output the canned `changes` job declares. `fuzz` is last and is the one output the
 # gate exempts, because `fuzz-build` compiles from `fuzz/` on a different toolchain file.
@@ -212,8 +224,16 @@ emit_script_job() {
     printf '  gate-job:\n    needs: changes\n'
     # No lane means no `if:` at all, which is the job shape check 2e leaves alone: a job
     # nothing guards runs on every pull request.
-    [[ -n $condition ]] && printf '    if: %s\n' "$condition"
+    if [[ -n $condition && $IF_PLACEMENT == "above" ]]; then
+        printf '    if: %s\n' "$condition"
+    fi
     printf '    runs-on: ubuntu-latest\n    steps:\n%s\n' "$step"
+    # YAML mapping keys carry no required order, so GitHub Actions reads the same job when
+    # its `if:` sits below `steps:`. A gate that collected lanes from the lines above
+    # `steps:` collected none here and dropped the job from check 2e.
+    if [[ -n $condition && $IF_PLACEMENT == "below-steps" ]]; then
+        printf '    if: %s\n' "$condition"
+    fi
 }
 
 emit_mise() {
@@ -633,6 +653,25 @@ run_case "script-named-only-in-a-comment-demands-no-entry" 0 "" emit_ci mise_ok
 # filter entry. Check 2e binds the filtered jobs alone.
 SCRIPT_JOB="|      - run: bash scripts/check-swift-bindings-fresh.sh"
 run_case "unfiltered-job-running-a-script-needs-no-entry" 0 "" emit_ci mise_ok
+
+# The same defect with the job's `if:` written below its `steps:` key. YAML mapping keys
+# carry no required order, so GitHub Actions runs the job the `swift` filter guards either
+# way, and the finding must be the one the "above" placement produces. A gate that read a
+# job's lanes only from the lines above `steps:` found no lane here, dropped the job from
+# check 2e, and printed the OK line for a workflow holding the defect this case names.
+SCRIPT_JOB="swift|      - run: bash scripts/check-swift-bindings-fresh.sh"
+IF_PLACEMENT="below-steps"
+run_case "filtered-job-writes-its-if-below-steps" 1 \
+    "the 'gate-job' job names scripts/check-swift-bindings-fresh.sh, and none of the paths filters that guard it (swift) lists that path" \
+    emit_ci mise_ok
+
+# The same placement with the script routed. The lane the gate reads out of the misplaced
+# `if:` has to be the `swift` lane and not some other, so this case holds the placement to
+# producing no finding once the `swift` filter lists the path.
+SWIFT_FILTER_EXTRA="scripts/check-swift-bindings-fresh.sh"
+run_case "if-below-steps-with-the-script-routed" 0 "" emit_ci mise_ok
+SWIFT_FILTER_EXTRA=""
+IF_PLACEMENT="above"
 SCRIPT_JOB=""
 
 # ── Check 3: mise names no Rust version source ───────────────────────────────────────
@@ -1021,26 +1060,52 @@ GATE_TRANSFORM=""
 #   IF_STYLE    — how the verdict job spells its `if:`: "bare" writes `if: always()`,
 #                 "interpolated" writes `if: ${{ always() }}`, "conjunction" writes
 #                 `always() && ...`, "folded" writes a `>-` block scalar whose
-#                 continuation lines hold `always()`, and "no-always" writes an `if:`
-#                 naming a different function. Every spelling but the last names the same
-#                 job, so a case that changes only IF_STYLE must produce the same verdict.
+#                 continuation lines hold `always()`, "not-cancelled" writes
+#                 `${{ !cancelled() }}`, "not-failure" writes `${{ !failure() }}`,
+#                 "quoted-key" writes the key itself in quotes as `"if": always()`, and
+#                 "no-status-function" writes an `if:` naming none of GitHub Actions' four
+#                 status check functions. Every spelling but the last names the same job,
+#                 so a case that changes only IF_STYLE must produce the same verdict.
+#   HEADER_COMMENT — "yes" writes the verdict job's header as `  ci:  # …`, "no" writes it
+#                 bare. A trailing comment is YAML a parser drops and a line matcher chokes
+#                 on, and dropping the job from the listing hid both the aggregator and the
+#                 job the aggregator has to name.
+#   KEY_INDENT  — how many spaces the verdict job's own keys sit at, "4" or "6". YAML fixes
+#                 no depth for a nested mapping, so GitHub Actions reads the same job at
+#                 either.
+#   RESULT_STYLE — how the verdict job reads its dependencies' results: "per-job" writes one
+#                 `${{ needs.<job>.result }}` for each name, "object-filter" writes the one
+#                 expression `${{ join(needs.*.result, ' ') }}`, which GitHub Actions
+#                 expands over the job's whole `needs:` context.
 NEEDS_STYLE="block"
 IF_STYLE="bare"
+HEADER_COMMENT="no"
+KEY_INDENT="4"
+RESULT_STYLE="per-job"
 
 # emit_verdict_job <needs names> <result names>
 emit_verdict_job() {
-    local needs=$1 results=$2 name joined=""
-    printf '  ci:\n'
+    local needs=$1 results=$2 name joined="" pad step_pad
+    pad=$(printf '%*s' "$KEY_INDENT" "")
+    step_pad="$pad  "
+    if [[ $HEADER_COMMENT == "yes" ]]; then
+        printf '  ci:  # the job branch protection requires\n'
+    else
+        printf '  ci:\n'
+    fi
     case "$IF_STYLE" in
-        bare) printf '    if: always()\n' ;;
-        interpolated) printf '    if: ${{ always() }}\n' ;;
-        conjunction) printf "    if: always() && github.event_name != 'schedule'\n" ;;
+        bare) printf '%sif: always()\n' "$pad" ;;
+        interpolated) printf '%sif: ${{ always() }}\n' "$pad" ;;
+        conjunction) printf "%sif: always() && github.event_name != 'schedule'\n" "$pad" ;;
         folded)
-            printf '    if: >-\n'
-            printf "      github.event_name == 'push' ||\n"
-            printf '      always()\n'
+            printf '%sif: >-\n' "$pad"
+            printf "%s  github.event_name == 'push' ||\n" "$pad"
+            printf '%s  always()\n' "$pad"
             ;;
-        no-always) printf "    if: github.event_name == 'push'\n" ;;
+        not-cancelled) printf '%sif: ${{ !cancelled() }}\n' "$pad" ;;
+        not-failure) printf '%sif: ${{ !failure() }}\n' "$pad" ;;
+        quoted-key) printf '%s"if": always()\n' "$pad" ;;
+        no-status-function) printf "%sif: github.event_name == 'push'\n" "$pad" ;;
         *)
             echo "ERROR: unknown IF_STYLE '$IF_STYLE'" >&2
             exit 1
@@ -1048,18 +1113,18 @@ emit_verdict_job() {
     esac
     case "$NEEDS_STYLE" in
         block)
-            printf '    needs:\n'
-            for name in $needs; do printf '      - %s\n' "$name"; done
+            printf '%sneeds:\n' "$pad"
+            for name in $needs; do printf '%s  - %s\n' "$pad" "$name"; done
             ;;
         flow)
             for name in $needs; do
                 if [[ -n $joined ]]; then joined="$joined, "; fi
                 joined="$joined$name"
             done
-            printf '    needs: [%s]\n' "$joined"
+            printf '%sneeds: [%s]\n' "$pad" "$joined"
             ;;
         scalar)
-            printf '    needs: %s\n' "$needs"
+            printf '%sneeds: %s\n' "$pad" "$needs"
             ;;
         absent) : ;;
         *)
@@ -1067,15 +1132,20 @@ emit_verdict_job() {
             exit 1
             ;;
     esac
-    printf '    runs-on: ubuntu-latest\n    steps:\n'
-    printf '      - name: Check job results\n        run: |\n          results=( \\\n'
-    for name in $results; do
-        printf '            "${{ needs.%s.result }}" \\\n' "$name"
-    done
-    printf '          )\n'
-    printf '          for r in "${results[@]}"; do\n'
-    printf '            if [[ "$r" == "failure" || "$r" == "cancelled" ]]; then exit 1; fi\n'
-    printf '          done\n'
+    printf '%sruns-on: ubuntu-latest\n%ssteps:\n' "$pad" "$pad"
+    printf '%s- name: Check job results\n%s  run: |\n' "$step_pad" "$step_pad"
+    if [[ $RESULT_STYLE == "object-filter" ]]; then
+        printf "%s    results=( \${{ join(needs.*.result, ' ') }} )\n" "$step_pad"
+    else
+        printf '%s    results=( \\\n' "$step_pad"
+        for name in $results; do
+            printf '%s      "${{ needs.%s.result }}" \\\n' "$step_pad" "$name"
+        done
+        printf '%s    )\n' "$step_pad"
+    fi
+    printf '%s    for r in "${results[@]}"; do\n' "$step_pad"
+    printf '%s      if [[ "$r" == "failure" || "$r" == "cancelled" ]]; then exit 1; fi\n' "$step_pad"
+    printf '%s    done\n' "$step_pad"
 }
 
 verdict_complete() {
@@ -1160,14 +1230,16 @@ two_verdict_jobs() {
     printf '    runs-on: ubuntu-latest\n    steps:\n      - run: echo "${{ needs.changes.result }}"\n'
 }
 run_case "workflow-declares-two-verdict-jobs" 1 \
-    "declares two jobs that each run with 'if: always()' and read a 'needs.<job>.result'" \
+    "declares two jobs whose 'if:' names one of GitHub Actions' status check functions" \
     two_verdict_jobs mise_ok
 
 # The `if:` spellings. A verdict job stays a verdict job through every one of them, so
 # each case below omits `changes` and expects the same finding the bare spelling produces.
 # Matching only the one line `if: always()` turns each of these green, which would let an
-# author un-gate the aggregator by rewrapping its condition.
-for if_style in interpolated conjunction folded; do
+# author un-gate the aggregator by rewrapping its condition. GitHub Actions runs a job
+# guarded by `!cancelled()` or by `!failure()` after a dependency fails, exactly as it runs
+# one guarded by `always()`, so those two report a verdict to branch protection too.
+for if_style in interpolated conjunction folded not-cancelled not-failure quoted-key; do
     IF_STYLE="$if_style"
     run_case "verdict-job-spells-its-if-as-$if_style" 1 \
         "does not name these jobs in its 'needs:' — changes" \
@@ -1175,13 +1247,47 @@ for if_style in interpolated conjunction folded; do
 done
 IF_STYLE="bare"
 
-# The other direction: a job that reads results and whose `if:` names no `always()` is not
-# a verdict job, because GitHub never runs it once a dependency skips. The gate leaves it
-# alone even though it omits `changes`.
-IF_STYLE="no-always"
-run_case "job-reading-results-without-always-is-not-a-verdict-job" 0 "" \
+# The other direction: a job whose `if:` names none of GitHub Actions' four status check
+# functions is not a verdict job, because GitHub applies an implicit `success()` to it and
+# never runs it once a dependency fails or skips. The gate leaves it alone even though it
+# omits `changes`.
+IF_STYLE="no-status-function"
+run_case "job-whose-if-names-no-status-function-is-not-a-verdict-job" 0 "" \
     verdict_omits_the_changes_job mise_ok
 IF_STYLE="bare"
+
+# A trailing comment on the verdict job's header. YAML carries the comment and drops it at
+# parse time, so GitHub Actions reads the same `ci` job — while a line matcher requiring
+# the header to end at the colon listed no such job, which left the aggregator unrecognised
+# and left every job the aggregator has to name out of the set it is compared against.
+HEADER_COMMENT="yes"
+run_case "verdict-job-header-carries-a-trailing-comment" 1 \
+    "does not name these jobs in its 'needs:' — changes" \
+    verdict_omits_the_changes_job mise_ok
+run_case "verdict-job-header-comment-with-every-job-observed" 0 "" verdict_complete mise_ok
+HEADER_COMMENT="no"
+
+# The verdict job's own keys at six spaces. YAML fixes no depth for a nested mapping, so
+# GitHub Actions reads the same job, and a matcher anchored on four spaces read neither its
+# `if:` nor its `needs:`.
+KEY_INDENT="6"
+run_case "verdict-job-writes-its-keys-at-six-spaces" 1 \
+    "does not name these jobs in its 'needs:' — changes" \
+    verdict_omits_the_changes_job mise_ok
+run_case "verdict-job-at-six-spaces-observing-every-job" 0 "" verdict_complete mise_ok
+KEY_INDENT="4"
+
+# `${{ join(needs.*.result, ' ') }}` in place of one expression per job. GitHub Actions
+# expands the object filter over the job's own `needs:` context, so the job reads the
+# result of every name that list carries, and the gate compares the `needs:` list against
+# the workflow's jobs. A gate requiring a literal `needs.<name>.result` recognised no
+# verdict job at all here and printed its OK line.
+RESULT_STYLE="object-filter"
+run_case "verdict-job-reads-results-through-the-object-filter" 0 "" verdict_complete mise_ok
+run_case "object-filter-does-not-excuse-a-missing-needs-entry" 1 \
+    "does not name these jobs in its 'needs:' — changes" \
+    verdict_omits_the_changes_job mise_ok
+RESULT_STYLE="per-job"
 
 # A second workflow whose only job is its verdict job. The set of other jobs is then
 # empty, and every name that job reads is unknown. The case exists for what the gate does
@@ -1206,6 +1312,23 @@ YAML
 EXTRA_FILES=(".github/workflows/release.yml" solo_verdict_workflow)
 run_case "verdict-job-is-the-workflows-only-job" 1 \
     "declares no job by those names — build" routing_ok mise_ok
+EXTRA_FILES=()
+
+# A workflow no YAML parser accepts. The gate reads a workflow's jobs by parsing it, and a
+# parse that fails answers none of the six questions checks 2e and 4 ask, so the gate
+# reports the parser's own refusal rather than passing over the file.
+unparsable_workflow() {
+    cat <<'YAML'
+name: Release
+jobs:
+  release-gate:
+    if: always()
+   needs: build
+YAML
+}
+EXTRA_FILES=(".github/workflows/release.yml" unparsable_workflow)
+run_case "workflow-no-yaml-parser-accepts" 1 \
+    "the gate cannot read the jobs of .github/workflows/release.yml" routing_ok mise_ok
 EXTRA_FILES=()
 
 echo ""

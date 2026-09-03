@@ -56,7 +56,7 @@ so no group setting would have avoided it — and the `Rust / clippy` required c
 every branch overnight while local runs on 1.97.1 reported a clean pass. See
 `.docs/lessons/pin-the-rust-toolchain-or-ci-drifts-from-local.md`.
 
-`scripts/check-toolchain-wiring.sh` checks the three properties the derivation cannot
+`scripts/check-toolchain-wiring.sh` checks the four properties the derivation cannot
 supply.
 
 First, that every file Docker builds from a `rust` base image carries the ASSERT-PINNED-RUSTC
@@ -136,6 +136,35 @@ holds a `rust` key, rather than matching a line: TOML reaches one key many ways,
 `rust = { version = "…" }`, `"rust" = "…"`, `[tools.rust]`, `[tools."rust"]`,
 `tools.rust = "…"`, `rust.version = "…"`, and `rust = ["…"]`. The line matcher the check ran
 before read four of the eight and reported OK for the other four.
+
+Fourth, that each workflow's verdict job reads the result of every job that workflow
+declares. A verdict job is one whose own `if:` names a status check function — GitHub
+Actions defines exactly four, `success()`, `always()`, `cancelled()`, and `failure()`, and
+applies an implicit `success()` to any `if:` that names none of them — so a job that runs
+after a dependency fails or skips names one of the four and reports its result to branch
+protection. The gate requires that job's `needs:` list and the set of `needs.<job>.result`
+expressions it reads to each equal the set of the workflow's other jobs. A job it does not
+name reports `skipped` when the `changes` job fails, and the aggregator passes on
+`skipped`, so one `dorny/paths-filter` error would otherwise silence every paths-filtered
+gate in the workflow behind one green required check.
+
+The gate parses each workflow with PyYAML and queries the parsed document, for the reason
+it parses `.mise.toml` with `tomllib`: a line matcher reads one spelling per pattern, so an
+author who rewords a workflow without changing what GitHub Actions reads makes the matcher
+find nothing, and a check that finds nothing reports nothing. Six such rewordings each
+turned this gate green while the defect stayed in the file — `${{ !cancelled() }}` for
+`always()`, a job-level `if:` written below `steps:`, a trailing comment on a job header, a
+quoted job header or job key, job keys at six spaces of indentation, and
+`${{ join(needs.*.result, ' ') }}` for the per-job result expressions. See
+`.docs/lessons/parse-structured-config-do-not-match-its-text.md`. The
+`enforcement / toolchain wiring` job installs PyYAML before it runs the gate, and the gate
+fails when no interpreter on PATH imports it.
+
+The paths-filter check covers one further population for the same reason: every repository
+script a paths-filtered job runs. A script's text decides what that job asserts, so a pull
+request that edits only the script has to run the edited job — otherwise a gate rewritten
+to `exit 0` merges without executing once, and every later pull request runs the disabled
+gate and passes.
 
 The `Dockerfile` base tag selects a Debian release, so keep the builder stage and the
 runtime stage on the same one. The builder reads `rust:slim-bookworm` and the runtime reads

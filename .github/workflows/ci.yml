@@ -402,6 +402,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # The workflow checks parse each workflow with PyYAML, which the standard library
+      # does not carry, and `actions/setup-python` installs a CPython that ships pip and
+      # nothing else. The gate fails when no interpreter on PATH imports yaml, so this step
+      # is what keeps that failure out of the run rather than a convenience.
+      - run: python -m pip install --disable-pip-version-check pyyaml
       - run: bash scripts/check-toolchain-wiring.sh
       - name: Run toolchain-wiring cases
         run: bash scripts/tests/toolchain-wiring/run-tests.sh

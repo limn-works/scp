@@ -161,18 +161,29 @@
 #   neither filter listed any path under `scripts/`.
 #
 #   HOW THE GATE ENUMERATES THE PAIRS, rather than reading a list someone remembered to
-#   add: for each workflow a paths filter guards, it walks that workflow's jobs, and for
-#   each job whose keys before `steps:` name at least one `needs.changes.outputs.<lane>`,
-#   it collects every `scripts/<path>` token appearing on a non-comment line of that job.
-#   The entries of one of that job's lanes must match each collected path, or the
-#   `toolchain` filter every lane ORs in must match it. A job added later that runs a
-#   script is covered without anyone editing this file.
+#   add: for each workflow a paths filter guards, it parses that workflow with PyYAML and
+#   walks the jobs of the parsed document. For each job whose keys other than `steps` name
+#   at least one `needs.changes.outputs.<lane>`, it collects every `scripts/<path>` token
+#   the whole job holds. The entries of one of that job's lanes must match each collected
+#   path, or the `toolchain` filter every lane ORs in must match it. A job added later that
+#   runs a script is covered without anyone editing this file.
 #
-#   WHAT 2e DOES NOT COVER, stated rather than implied. It reads the workflow's text, so a
-#   script a job reaches indirectly — a build tool that shells out to one, a script that
+#   The lanes come from the job's keys other than `steps` because a lane named inside a
+#   `run:` script would widen the set of filters this check accepts as routing a path,
+#   which weakens it. Reading them from the parsed document rather than from the lines
+#   above `steps:` is what makes the collection independent of key order: YAML mapping keys
+#   carry no required order, and an `if:` moved below `steps:` left the earlier line
+#   matcher collecting no lane at all, which dropped the job from this check entirely. The
+#   workflow reader below records that rewording and five more.
+#
+#   WHAT 2e DOES NOT COVER, stated rather than implied. It reads what the workflow says, so
+#   a script a job reaches indirectly — a build tool that shells out to one, a script that
 #   sources another — stays invisible to it, and under-detection is its failure mode. It
-#   over-detects in one direction deliberately: a `scripts/` path written in a step `name:`
-#   or in an environment value, which the job never executes, also demands a filter entry.
+#   over-detects in three directions deliberately: a `scripts/` path written in a step
+#   `name:` or in an environment value, which the job never executes, demands a filter
+#   entry; so does one written in a comment inside a `run:` block, which the parser hands
+#   over as part of the script the job runs; and so does one a job names while running some
+#   other script. Over-detection costs an author one line, and it fails closed.
 #   Over-detection costs an author one line, and it fails closed.
 #
 #   Checks 2c and 2d read `ci.yml` alone, because the `rust` and `fuzz` filters they name
@@ -253,23 +264,42 @@
 # invented one survives.
 #
 # WHICH JOB IS THE VERDICT JOB, and how the gate finds it rather than reading a name
-# someone remembered to add: a job whose own `if:` expression names `always()` and whose
-# body reads at least one `needs.<name>.result`. `always()` is what makes a job run after
-# its dependencies skip, and reading a result is what makes it a verdict rather than a
-# step; no other job in this repository's workflows has both. The gate checks every
-# workflow GitHub Actions runs — each tracked `.yml` or `.yaml` file under
-# `.github/workflows/`, which leaves a `.disabled` name out — and a workflow declaring no
-# such job is silent here. That silence is sound: a required check whose job the workflow
-# does not declare never reports, and GitHub blocks the merge on a pending required
-# check, so deleting the aggregator fails closed on its own.
+# someone remembered to add: a job whose own `if:` expression names one of the four status
+# check functions GitHub Actions defines — `success()`, `always()`, `cancelled()`, or
+# `failure()`. GitHub Actions applies an implicit `success()` to a job's `if:` unless that
+# expression itself names one of the four, so a job that runs after a dependency does not
+# succeed names one of them, and a job that names none of them never runs after a
+# dependency fails or skips. That set is closed by GitHub's own expression grammar rather
+# than by a list of spellings this file keeps: `always()`, `${{ always() }}`,
+# `always() && github.event_name == 'push'`, `!cancelled()`, and `!failure()` all select
+# the same job. The gate checks every workflow GitHub Actions runs — each tracked `.yml` or
+# `.yaml` file under `.github/workflows/`, which leaves a `.disabled` name out — and a
+# workflow declaring no such job is silent here. That silence is sound for a deleted
+# aggregator: a required check whose job the workflow does not declare never reports, and
+# GitHub blocks the merge on a pending required check.
 #
-# The gate reads the whole `if:` value rather than one spelling of it: the text on the
-# key's own line, plus every following line indented deeper than the key, which is how
-# YAML continues a folded or literal scalar. `if: always()`, `if: ${{ always() }}`,
-# `if: always() && github.event_name == 'push'`, and an `if: >-` whose continuation lines
-# hold `always()` therefore all name the same job. Matching the one line `if: always()`
-# would have let an author un-gate the aggregator by rewrapping its condition, and this
-# check exists because an un-gated aggregator looks exactly like a passing one.
+# The rule over-detects in one direction deliberately. A job that runs after a failure for
+# some other purpose — a step that posts a notification, say — also names one of the four,
+# so this check demands that it observe every job of its workflow. That job does report a
+# result branch protection can require, and demanding the full list costs its author one
+# `needs:` entry per job, while the opposite error hides an aggregator. No workflow in this
+# repository declares such a job today, and the two-verdict-job report is what an author
+# reads when one appears.
+#
+# The silence is NOT sound for an aggregator the gate fails to recognise, which is why the
+# discovery rule reads the parsed document rather than the file's text. An earlier revision
+# required the literal string `always()` and a literal `needs.<name>.result`, and three
+# rewordings that leave GitHub's reading of `.github/workflows/ci.yml` unchanged each made
+# it find no verdict job and print its OK line: `if: ${{ !cancelled() }}`, a `ci:` header
+# carrying a trailing comment, and `${{ join(needs.*.result, ' ') }}` in place of the 51
+# per-job result expressions. The workflow reader below records all six rewordings the
+# parse closes. An un-gated aggregator looks exactly like a passing one, and so does an
+# unread check.
+#
+# `needs.*.result` reads the result of every job the verdict job's `needs:` names, because
+# GitHub Actions expands that object filter over the job's own `needs:` context. The gate
+# treats it as naming that whole list, so the `needs:` list stays the one set both
+# comparisons run against.
 #
 # WHAT CHECK 4 DOES NOT COVER, stated rather than implied. It reads which results the
 # aggregator's text names, not what its shell does with them. An aggregator that reads
@@ -281,9 +311,10 @@
 #
 # The gate FAILS CLOSED: a missing workflow, a missing filter, a filter with no path
 # entries, a `changes` job with no outputs, an empty root-file listing, an undiscoverable
-# git tree, a `.mise.toml` no TOML parser accepts, no available TOML parser, and a
-# workflow whose verdict job declares an empty `needs:` list are each failures, never
-# skipped checks. See `.docs/lessons/coverage-gates-must-fail-closed.md`.
+# git tree, a `.mise.toml` no TOML parser accepts, no available TOML parser, a workflow no
+# YAML parser accepts, no interpreter that imports PyYAML, and a workflow whose verdict job
+# declares an empty `needs:` list are each failures, never skipped checks. See
+# `.docs/lessons/coverage-gates-must-fail-closed.md`.
 #
 # Usage: bash scripts/check-toolchain-wiring.sh
 set -euo pipefail
@@ -587,90 +618,182 @@ check_pin_reaches_every_lane() {
     done <<< "$outputs"
 }
 
-# Print `<job>\t<lane> <lane>…\t<scripts/… path>` for every pair of a paths-filtered job
-# and a repository script that job names, one line per pair.
+# ── The workflow reader ──────────────────────────────────────────────────────────────
 #
-# Scoped per job: a job header sits at indent 2 under `jobs:`, and every key the job itself
-# declares sits deeper, so the next indent-2 key ends the block.
+# Checks 2e and 4 ask six questions about a workflow's jobs: which jobs the workflow
+# declares, what each job's `if:` says, which jobs the `needs:` of one job names, which
+# `needs.changes.outputs.<lane>` a job reads outside its steps, which `scripts/…` paths a
+# job names, and which `needs.<job>.result` expressions a job holds. An interpreter that
+# parses the file with PyYAML answers all six from the parsed document, and the program
+# below prints those answers as one tab-separated fact per line.
 #
-# The lanes come only from the keys ABOVE the job's `steps:` line, which is where `if:`
-# sits. Reading them from the whole block would let a lane named inside a `run:` script
-# widen the set of filters that may route a path, which weakens the check.
+# WHY A PARSER RATHER THAN A LINE MATCHER. YAML reaches one key many ways, and a line
+# matcher reads one spelling per pattern, so an author who rewords a workflow without
+# changing what GitHub Actions reads makes the matcher find nothing — and a check that
+# finds nothing reports nothing. Check 3 made this same move for TOML, after a
+# `grep -E` matched four of the eight spellings mise resolves. The awk this program
+# replaces missed each of the six rewordings below, and GitHub Actions runs a workflow
+# carrying any of them exactly as it runs the spelling the awk did match:
 #
-# The script paths come from every line of the block whose first non-blank character is not
-# `#`. A comment naming a script the job does not run would otherwise demand a filter entry
-# for it, and this workflow's `changes` job comments name this very gate.
-filtered_job_scripts() {
-    awk '
-        function flush(   i) {
-            if (job != "" && lanes != "") {
-                for (i = 1; i <= nscripts; i++) print job "\t" lanes "\t" scripts[i]
-            }
-            job = ""; lanes = ""; nscripts = 0; insteps = 0; delete scripts
-        }
-        /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ {
-            flush()
-            job = $0
-            sub(/^  /, "", job)
-            sub(/:[[:space:]]*$/, "", job)
-            next
-        }
-        job == "" { next }
-        {
-            if ($0 ~ /^[[:space:]]*#/) next
-            if ($0 ~ /^    steps:[[:space:]]*$/) insteps = 1
-            if (insteps == 0) {
-                rest = $0
-                while (match(rest, /needs\.changes\.outputs\.[A-Za-z0-9_-]+/)) {
-                    lane = substr(rest, RSTART + 22, RLENGTH - 22)
-                    if (index(" " lanes " ", " " lane " ") == 0) {
-                        lanes = (lanes == "" ? lane : lanes " " lane)
-                    }
-                    rest = substr(rest, RSTART + RLENGTH)
-                }
-            }
-            rest = $0
-            while (match(rest, /scripts\/[A-Za-z0-9_.\/-]+/)) {
-                path = substr(rest, RSTART, RLENGTH)
-                seen = 0
-                for (i = 1; i <= nscripts; i++) if (scripts[i] == path) seen = 1
-                if (seen == 0) scripts[++nscripts] = path
-                rest = substr(rest, RSTART + RLENGTH)
-            }
-        }
-        END { flush() }
-    ' "$1"
+#   * `if: ${{ !cancelled() }}` in place of `if: always()`. GitHub Actions runs a job
+#     guarded by `!cancelled()` after a dependency fails, exactly as it runs one guarded
+#     by `always()`, so that aggregator still reports its result to branch protection.
+#   * A job-level `if:` key written below that job's `steps:` key. YAML mapping keys carry
+#     no required order, and check 2e collected a job's lanes only from the lines above
+#     `steps:`.
+#   * A job header carrying a trailing comment, `  ci:  # the verdict job`. The job
+#     listing dropped that job, so nothing held the aggregator to naming it and nothing
+#     recognised it as the aggregator.
+#   * A job header or a job key written in quotes: `  "ci":`, or `  "if": always()`.
+#   * A job whose own keys sit at six spaces of indentation rather than four.
+#   * `${{ join(needs.*.result, ' ') }}` in place of one `${{ needs.<job>.result }}`
+#     expression per job. GitHub Actions expands that object filter over the job's `needs:`
+#     context, so the aggregator reads the same results.
+#
+# Each of those is one spelling, and one pattern per spelling never closes the set. PyYAML
+# resolves all six to the same document, which removes the spelling question.
+#
+# WHAT THE PROGRAM PRINTS. One fact per line, fields separated by a tab:
+#
+#   job<TAB><job>                 — the workflow declares this job.
+#   if<TAB><job><TAB><expression> — this job declares this `if:` value.
+#   needs<TAB><job><TAB><name>    — this job's `needs:` names this other job.
+#   lane<TAB><job><TAB><lane>     — a key of this job other than `steps` reads
+#                                   `needs.changes.outputs.<lane>`.
+#   script<TAB><job><TAB><path>   — this job names this `scripts/…` path.
+#   result<TAB><job><TAB><name>   — this job reads `needs.<name>.result`; the name `*`
+#                                   stands for the object filter `needs.*.result`.
+#
+# The lanes come from every key of the job except `steps`, which is the scope check 2e's
+# criterion asks for: a lane named inside a `run:` script would widen the set of filters
+# that check accepts as routing a path, which weakens it. The script paths come from the
+# whole job, its steps included, because a step is what runs a script. PyYAML drops
+# comments, so a comment naming a script the job never runs demands no filter entry, and
+# this repository's `changes` job carries such comments.
+#
+# A `needs:` value that is neither a string nor a sequence yields no `needs` fact, and
+# check 4 then reports that verdict job as declaring no `needs:` the gate can read, which
+# fails the gate rather than passing it.
+read -r -d '' WORKFLOW_FACTS_PROGRAM <<'PYTHON' || true
+import re
+import sys
+
+import yaml
+
+LANE = re.compile(r"needs\.changes\.outputs\.([A-Za-z0-9_-]+)")
+SCRIPT = re.compile(r"scripts/[A-Za-z0-9_./-]+")
+RESULT = re.compile(r"needs\.(\*|[A-Za-z0-9_.-]+)\.result")
+
+
+def emit(*fields):
+    print("\t".join(field.replace("\t", " ").replace("\n", " ") for field in fields))
+
+
+# `width` disables the line wrapping `safe_dump` applies by default, which would otherwise
+# split a long `scripts/…` path across two lines and hide it from the search below.
+def render(value):
+    return yaml.safe_dump(value, default_flow_style=False, allow_unicode=True, width=10**9)
+
+
+try:
+    with open(sys.argv[1], "rb") as handle:
+        document = yaml.safe_load(handle)
+except (OSError, yaml.YAMLError) as error:
+    print(error, file=sys.stderr)
+    sys.exit(2)
+
+jobs = document.get("jobs") if isinstance(document, dict) else None
+if not isinstance(jobs, dict):
+    sys.exit(0)
+
+for name, job in jobs.items():
+    name = str(name)
+    emit("job", name)
+    if not isinstance(job, dict):
+        continue
+    condition = job.get("if")
+    if condition is not None:
+        emit("if", name, str(condition))
+    needs = job.get("needs")
+    if isinstance(needs, str):
+        needs = [needs]
+    if isinstance(needs, (list, tuple)):
+        for dependency in needs:
+            emit("needs", name, str(dependency))
+    outside_steps = render({key: value for key, value in job.items() if key != "steps"})
+    whole = render(job)
+    for lane in dict.fromkeys(LANE.findall(outside_steps)):
+        emit("lane", name, lane)
+    for script in dict.fromkeys(SCRIPT.findall(whole)):
+        emit("script", name, script)
+    for result in dict.fromkeys(RESULT.findall(whole)):
+        emit("result", name, result)
+PYTHON
+
+# The first interpreter that imports PyYAML. When no candidate imports it, every check
+# that reads a workflow's jobs fails rather than skipping.
+yaml_reader=""
+for candidate in python3.12 python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'import yaml' >/dev/null 2>&1; then
+        yaml_reader=$candidate
+        break
+    fi
+done
+
+# Print one workflow's facts. Exit 1 with the reason on stdout when the gate cannot read
+# them; the caller reports that reason. `report` assigns a variable, so no caller runs it
+# inside a command substitution, where the assignment would be lost.
+workflow_facts() {
+    if [[ -z $yaml_reader ]]; then
+        printf 'no python3.12, python3, or python on PATH imports yaml. PyYAML is what this gate parses a workflow with, and the toolchain-wiring job installs it before running this gate.\n'
+        return 1
+    fi
+    "$yaml_reader" -c "$WORKFLOW_FACTS_PROGRAM" "$1" 2>&1 || return 1
 }
+
+# Print the values of one job's facts of one kind, one per line.
+job_facts() {
+    local kind=$1 job=$2
+    awk -F'\t' -v kind="$kind" -v job="$job" '$1 == kind && $2 == job { print $3 }'
+}
+
+# The opening clause of every report a workflow this gate cannot read produces.
+wf_read_failure_prefix="the gate cannot read the jobs of"
 
 # 2e for one workflow: every script a paths-filtered job runs is routed to that job.
 check_filtered_jobs_route_their_scripts() {
-    local wf=$1 wf_toolchain_entries job lanes script lane entries routed
+    local wf=$1 facts=$2 wf_toolchain_entries job lanes script lane entries routed
     wf_toolchain_entries=$(filter_entries "$wf" "$TOOLCHAIN_FILTER")
-    while IFS=$'\t' read -r job lanes script; do
-        [[ -n $script ]] || continue
-        routed=0
-        # Every lane ORs the `toolchain` filter in — check 2b is what holds that — so a
-        # path listed there routes to every filtered job of the workflow.
-        if [[ -n $wf_toolchain_entries ]] && routed_by "$script" "$wf_toolchain_entries"; then
-            routed=1
-        fi
-        if [[ $routed -eq 0 ]]; then
-            # The job runs when ANY lane its `if:` names is true, so ONE lane listing the
-            # path is enough to make a change to that path run the job.
-            for lane in $lanes; do
-                entries=$(filter_entries "$wf" "$lane")
-                if [[ -n $entries ]] && routed_by "$script" "$entries"; then
-                    routed=1
-                    break
-                fi
-            done
-        fi
-        if [[ $routed -eq 0 ]]; then
-            report "$wf: the '$job' job names $script, and none of the paths filters that guard it ($lanes) lists that path. A pull request that changes only $script leaves every one of those filter outputs 'false', '$job' skips, and the 'ci' aggregator job counts the skip as a pass — so the pull request that edits the script is the one that never runs it. List $script in one of those filters."
-        fi
-    done < <(filtered_job_scripts "$wf")
+    while IFS= read -r job; do
+        [[ -n $job ]] || continue
+        lanes=$(job_facts lane "$job" <<< "$facts" | paste -sd' ' -)
+        # A job no paths filter guards names no lane, and check 2e binds the filtered jobs.
+        [[ -n $lanes ]] || continue
+        while IFS= read -r script; do
+            [[ -n $script ]] || continue
+            routed=0
+            # Every lane ORs the `toolchain` filter in — check 2b is what holds that — so a
+            # path listed there routes to every filtered job of the workflow.
+            if [[ -n $wf_toolchain_entries ]] && routed_by "$script" "$wf_toolchain_entries"; then
+                routed=1
+            fi
+            if [[ $routed -eq 0 ]]; then
+                # The job runs when ANY lane its `if:` names is true, so ONE lane listing
+                # the path is enough to make a change to that path run the job.
+                for lane in $lanes; do
+                    entries=$(filter_entries "$wf" "$lane")
+                    if [[ -n $entries ]] && routed_by "$script" "$entries"; then
+                        routed=1
+                        break
+                    fi
+                done
+            fi
+            if [[ $routed -eq 0 ]]; then
+                report "$wf: the '$job' job names $script, and none of the paths filters that guard it ($lanes) lists that path. A pull request that changes only $script leaves every one of those filter outputs 'false', '$job' skips, and the 'ci' aggregator job counts the skip as a pass — so the pull request that edits the script is the one that never runs it. List $script in one of those filters."
+            fi
+        done < <(job_facts script "$job" <<< "$facts")
+    done < <(awk -F'\t' '$1 == "job" { print $2 }' <<< "$facts")
 }
-
 # 2a/2b — over every workflow a paths filter guards, `ci.yml` among them.
 filtered_workflows=$(paths_filter_workflows)
 if [[ -z $filtered_workflows ]]; then
@@ -680,7 +803,11 @@ else
         [[ -n $workflow ]] || continue
         check_pin_reaches_every_lane "$workflow"
         # 2e — every script a paths-filtered job of this workflow runs is routed to it.
-        check_filtered_jobs_route_their_scripts "$workflow"
+        if workflow_jobs=$(workflow_facts "$workflow"); then
+            check_filtered_jobs_route_their_scripts "$workflow" "$workflow_jobs"
+        else
+            report "$wf_read_failure_prefix $workflow, so the gate cannot check that every script its paths-filtered jobs run is routed to those jobs: $workflow_jobs"
+        fi
     done <<< "$filtered_workflows"
 fi
 
@@ -817,87 +944,17 @@ runnable_workflows() {
     done < <(git ls-files --cached --others --exclude-standard -- "$WORKFLOW_DIR" 2>/dev/null || true)
 }
 
-# Print every job name a workflow declares, one per line.
+# The four status check functions GitHub Actions defines, matched as whole identifiers
+# followed by their call parentheses.
 #
-# A job header is a key at exactly two spaces of indentation under the top-level `jobs:`
-# mapping, and a job's own keys sit at four or more. Starting at `jobs:` is what keeps the
-# `push:`, `pull_request:`, and `merge_group:` keys of the `on:` block out of the listing,
-# and those three are the only other two-space keys these workflows write.
-workflow_job_names() {
-    awk '
-        /^jobs:[[:space:]]*$/ { injobs = 1; next }
-        injobs && /^[A-Za-z]/ { exit }
-        injobs && /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ {
-            name = $0
-            sub(/^  /, "", name)
-            sub(/:[[:space:]]*$/, "", name)
-            print name
-        }
-    ' "$1"
-}
-
-# Print one job block's `if:` value: the text on the key's own line, and every following
-# line indented deeper than the key, which is what YAML reads as the continuation of a
-# folded or literal scalar. A job with no `if:` key prints nothing.
-job_if_expression() {
-    awk '
-        /^    if:/ { inif = 1; print; next }
-        inif {
-            if ($0 ~ /^ {5,}[^ ]/) { print; next }
-            exit
-        }
-    '
-}
-
-# Print the lines of one job: everything after its header, up to the next job header.
-job_block() {
-    awk -v job="$2" '
-        $0 ~ "^  " job ":[[:space:]]*$" { inblock = 1; next }
-        inblock && /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ { exit }
-        inblock { print }
-    ' "$1"
-}
-
-# Print the job names one job block's `needs:` key lists, one per line.
-#
-# The three shapes GitHub Actions accepts: a block sequence, a flow sequence on the key's
-# own line, and a single scalar. A shape none of the three matches yields no name, and the
-# caller then reports the job as naming none, which fails the gate rather than passing it.
-job_needs_names() {
-    awk '
-        /^    needs:[[:space:]]*\[/ {
-            line = $0
-            sub(/^[[:space:]]*needs:[[:space:]]*\[/, "", line)
-            sub(/\].*$/, "", line)
-            n = split(line, parts, ",")
-            for (i = 1; i <= n; i++) {
-                gsub(/[[:space:]"'"'"']/, "", parts[i])
-                if (parts[i] != "") print parts[i]
-            }
-            next
-        }
-        /^    needs:[[:space:]]*$/ { inneeds = 1; next }
-        /^    needs:[[:space:]]*[A-Za-z0-9_.-]+[[:space:]]*$/ {
-            name = $0
-            sub(/^[[:space:]]*needs:[[:space:]]*/, "", name)
-            sub(/[[:space:]]*$/, "", name)
-            print name
-            next
-        }
-        inneeds {
-            if ($0 ~ /^[[:space:]]*#/) next
-            if ($0 ~ /^[[:space:]]*$/) next
-            if ($0 ~ /^      -[[:space:]]/) {
-                name = $0
-                sub(/^      -[[:space:]]*/, "", name)
-                gsub(/[[:space:]"'"'"']/, "", name)
-                if (name != "") print name
-                next
-            }
-            exit
-        }
-    '
-}
+# This set is what makes the verdict-job discovery closed by construction rather than a
+# list of spellings. GitHub Actions applies an implicit `success()` to a job's `if:` unless
+# that expression itself names a status check function, and it defines exactly four of
+# them: `success()`, `always()`, `cancelled()`, and `failure()`. A job that runs after a
+# dependency does not succeed therefore names one of the four — `always()`, `!cancelled()`,
+# `!failure()`, and `!success()` all do — and a job that names none of the four never runs
+# after a dependency fails or skips, so it reports no verdict on that dependency.
+STATUS_CHECK_FUNCTION='(^|[^A-Za-z0-9_-])(success|always|cancelled|failure)[[:space:]]*\('
 
 # Print the lines of stdin that hold a non-blank name, sorted and deduplicated.
 #
@@ -912,19 +969,19 @@ name_set() {
 
 # One workflow: its verdict job, when it declares one, reads every other job's result.
 check_verdict_job_observes_every_job() {
-    local wf=$1 job block needs_names result_names all_names others verdict=""
+    local wf=$1 facts=$2 job condition needs_names result_names all_names others verdict=""
     local missing_needs missing_results unknown_needs unknown_results
 
-    all_names=$(workflow_job_names "$wf")
+    all_names=$(awk -F'\t' '$1 == "job" { print $2 }' <<< "$facts")
     [[ -n $all_names ]] || return 0
 
     while IFS= read -r job; do
         [[ -n $job ]] || continue
-        block=$(job_block "$wf" "$job")
-        job_if_expression <<< "$block" | grep -qF 'always()' || continue
-        grep -qE 'needs\.[A-Za-z0-9_.-]+\.result' <<< "$block" || continue
+        condition=$(job_facts if "$job" <<< "$facts")
+        [[ -n $condition ]] || continue
+        grep -qE "$STATUS_CHECK_FUNCTION" <<< "$condition" || continue
         if [[ -n $verdict ]]; then
-            report "$wf declares two jobs that each run with 'if: always()' and read a 'needs.<job>.result' — '$verdict' and '$job'. This gate cannot tell which one branch protection requires, so it cannot check that the required one observes every job. Leave one such job in the workflow."
+            report "$wf declares two jobs whose 'if:' names one of GitHub Actions' status check functions — '$verdict' and '$job'. Each of them runs after a dependency does not succeed, so each can report a verdict to branch protection, and this gate cannot tell which one branch protection requires. Leave one such job in the workflow."
             return 0
         fi
         verdict=$job
@@ -934,15 +991,21 @@ check_verdict_job_observes_every_job() {
     # declares stays pending, and GitHub blocks the merge on a pending required check.
     [[ -n $verdict ]] || return 0
 
-    block=$(job_block "$wf" "$verdict")
-    needs_names=$(job_needs_names <<< "$block")
+    needs_names=$(job_facts needs "$verdict" <<< "$facts")
     if [[ -z $needs_names ]]; then
-        report "$wf: the verdict job '$verdict' declares no 'needs:' this gate can read, so nothing holds it to the jobs of this workflow. Write the list as a block sequence, as a flow sequence, or as a single job name."
+        report "$wf: the verdict job '$verdict' declares no 'needs:' this gate can read, so nothing holds it to the jobs of this workflow. Write the list as a sequence or as a single job name."
         return 0
     fi
     needs_names=$(name_set <<< "$needs_names")
-    result_names=$(grep -oE 'needs\.[A-Za-z0-9_.-]+\.result' <<< "$block" \
-        | sed -E 's/^needs\.//; s/\.result$//' | name_set)
+    result_names=$(job_facts result "$verdict" <<< "$facts")
+    if grep -qxF -- '*' <<< "$result_names"; then
+        # GitHub Actions expands the object filter `needs.*.result` over the job's own
+        # `needs:` context, so that one expression reads the result of every job the
+        # `needs:` list names, and the comparison below is against that list.
+        result_names=$needs_names
+    else
+        result_names=$(name_set <<< "$result_names")
+    fi
     # A workflow whose only job is the verdict job leaves this empty, and every name that
     # job reads is then unknown, which the two unknown-name reports below state.
     others=$({ grep -vxF -- "$verdict" <<< "$all_names" || true; } | name_set)
@@ -965,7 +1028,6 @@ check_verdict_job_observes_every_job() {
         report "$wf: the verdict job '$verdict' reads 'needs.<job>.result' for these names and this workflow declares no job by them — $unknown_results. Such an expression evaluates to the empty string, which '$verdict' accepts, so the job it meant to read reaches the required check as green. Correct each name to the job it meant."
     fi
 }
-
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     report "not inside a git working tree, so the gate cannot enumerate the workflows whose verdict job must observe every job"
 else
@@ -975,7 +1037,11 @@ else
     else
         while IFS= read -r workflow_file; do
             [[ -n $workflow_file ]] || continue
-            check_verdict_job_observes_every_job "$workflow_file"
+            if workflow_jobs=$(workflow_facts "$workflow_file"); then
+                check_verdict_job_observes_every_job "$workflow_file" "$workflow_jobs"
+            else
+                report "$wf_read_failure_prefix $workflow_file, so the gate cannot check that its verdict job observes every job it declares: $workflow_jobs"
+            fi
         done <<< "$runnable"
     fi
 fi
