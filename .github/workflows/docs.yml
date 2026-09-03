@@ -7,10 +7,22 @@
 # `changes` job), all doc jobs skip via an `if` condition rather than failing.
 # GitHub counts a skipped job as passing for a required status check, so these
 # jobs are safe to promote to required -- that promotion is the standing plan.
+# The `merge_group:` trigger below is what makes the promotion mechanical. A
+# merge queue evaluates every required status check against the `merge_group`
+# ref, so a workflow that does not run on that event reports no check there and
+# every queue entry waits on a status that never arrives. This workflow carried
+# no such trigger while its header called the promotion safe.
+# `scripts/tests/ci-gate/ci_gate_selftest.py` now fails when a workflow that
+# skips its jobs through a `dorny/paths-filter` runs on `pull_request` and not
+# on `merge_group`.
 #
-# Until it happens this whole workflow is ADVISORY: `ci` is the sole required
-# status check, so nothing here can block a merge. See the note on the `push`
-# trigger below for what that cost us.
+# Until an operator adds these job names to the Default ruleset this whole
+# workflow is ADVISORY: `ci` is the sole required status check, so nothing here
+# can block a merge. The broken-intra-doc-link class that rode `main` for ten
+# days no longer depends on that promotion: job `rust-doc` in
+# `.github/workflows/ci.yml` passes `--document-private-items` to `cargo doc`,
+# and `ci` aggregates that job, so the same diagnostic now reds the one
+# required check.
 #
 # Source: .docs/scaffold/shared.md section "SDK Documentation Requirements"
 # Story: SCP-139
@@ -28,15 +40,23 @@ on:
   push:
     # Also run on `main` so the post-merge tip is doc-tested. NOTE: this run is
     # ADVISORY -- `ci` is the only required status check on the Default ruleset,
-    # which is why PR #2274's failing `Rust API docs (rustdoc)` job (run
-    # 30878568409, attempt 1, never re-run) did not block its merge and three
-    # broken intra-doc links rode `main` for ten days. Making rustdoc a required
-    # check is the actual fix; this trigger only shortens time-to-detection.
+    # which is why pull request #2274's failing `Rust API docs (rustdoc)` job
+    # (run 30878568409, attempt 1, never re-run) did not block its merge and
+    # three broken intra-doc links rode `main` for ten days. Job `rust-doc` in
+    # `.github/workflows/ci.yml` now passes `--document-private-items`, so `ci`
+    # reds on that one diagnostic. This trigger shortens time-to-detection for
+    # every other failure the four doc jobs here report.
     branches: [main]
     tags:
       - "scp-core@*"
   pull_request:
     branches: [main]
+  # A merge queue evaluates required status checks against the `merge_group`
+  # ref. Without this trigger these jobs cannot be promoted to required at all,
+  # and they also never read the batched tree that actually lands on `main`,
+  # which is the tree a two-entry batch can break without either entry breaking
+  # it alone.
+  merge_group:
 
 permissions:
   contents: read
@@ -58,6 +78,7 @@ jobs:
   check-draft:
     if: >-
       github.event_name == 'push' ||
+      github.event_name == 'merge_group' ||
       github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -103,19 +124,21 @@ jobs:
               # the crate that denies `rustdoc::broken_intra_doc_links`.
               - 'Cargo.toml'
               - 'Cargo.lock'
-              - 'crates/*/Cargo.toml'
               - 'bindings/**'
-              - 'crates/scp-core/src/**'
-              - 'crates/scp-protocol/src/**'
-              - 'crates/scp-runtime/src/**'
-              - 'crates/scp-ffi/**'
-              - 'crates/scp-did/src/**'
-              - 'crates/scp-dht/src/**'
-              - 'crates/scp-clock/src/**'
-              - 'crates/scp-crypto/src/**'
-              - 'crates/scp-mls/src/**'
-              - 'crates/scp-client/src/**'
-              - 'crates/scp-client-wasm/src/**'
+              # `rust-docs` runs `cargo doc --workspace`, which documents all
+              # 26 members the root manifest declares, and
+              # `crates/scp-runtime/src/lib.rs` denies
+              # `rustdoc::broken_intra_doc_links` while linking into
+              # `scp_event_log` and into `scp_platform`. An enumeration of crate
+              # source directories stood here and reached 15 of those members,
+              # so a rename inside any of the other 11 -- `scp-event-log` and
+              # `scp-platform` among them -- skipped this job while `cargo doc`
+              # broke. One directory glob covers every member the workspace
+              # holds now and every member added later, which is the shape the
+              # `rust:` filter of `.github/workflows/ci.yml` uses.
+              # `scripts/tests/ci-gate/ci_gate_selftest.py` fails when a member
+              # directory reaches no entry of this filter.
+              - 'crates/**'
 
   # ---- Rust (rustdoc) ----
   rust-docs:

@@ -8,7 +8,7 @@ Overview of all GitHub Actions workflows in this repository.
 |----------|---------|---------|
 | [`ci.yml`](ci.yml) | Push to `main`, PRs to `main` | Lint, build, and test the Rust workspace |
 | [`ci-fix.yml`](ci-fix.yml) | After `CI` workflow completes | Auto-fix CI failures (formatting, etc.) |
-| [`docs.yml`](docs.yml) | Release tags (`scp-core@*`), PRs touching `bindings/` or `crates/scp-core/src/` or `crates/scp-ffi/` | Generate and publish SDK API reference docs |
+| [`docs.yml`](docs.yml) | Release tags (`scp-core@*`); pushes to `main`; merge-queue entries; PRs touching `bindings/`, `crates/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml` or `.cargo/` | Generate and publish SDK API reference docs |
 | [`build-matrix.yml`](build-matrix.yml) | Release tags (`scp-*@*`), called by `release.yml` | Build platform-specific release artifacts for all SDKs |
 | [`release.yml`](release.yml) | Release tags (`scp-core@*`) | 7-step release pipeline: conformance, changelog, build, sign, publish |
 | [`pr-review.yml`](pr-review.yml) | PRs touching `crates/` or `Cargo.*` | Automated PR review |

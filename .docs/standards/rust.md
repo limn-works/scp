@@ -385,8 +385,11 @@ cargo test --workspace --doc
 # Dependency audit
 cargo deny check
 
-# Generate docs
-cargo doc --workspace --no-deps
+# Generate docs. `--document-private-items` is what makes rustdoc resolve an
+# intra-doc link inside a private module, which is where the deny in
+# `crates/scp-runtime/src/lib.rs` caught three broken links CI missed for ten
+# days while it documented public items alone.
+cargo doc --workspace --no-deps --document-private-items
 ```
 
 ## CI Matrix
@@ -403,7 +406,7 @@ Every push to a PR branch. Target: < 3 minutes.
 | clippy | ubuntu-latest | `cargo clippy --workspace --all-targets -- -D warnings` |
 | test | ubuntu-latest, macos-latest | `cargo nextest run --workspace` |
 | build-release | ubuntu-latest, macos-latest, windows-latest | `cargo build --workspace --release` |
-| doc | ubuntu-latest | `cargo test --workspace --doc && cargo doc --workspace --no-deps` |
+| doc | ubuntu-latest | `cargo test --workspace --doc && cargo doc --workspace --no-deps --document-private-items` |
 | deny | ubuntu-latest | `cargo deny check` |
 
 Unit tests and conformance macro suites (`transport_conformance!()`, `storage_conformance!()`, etc.) run as part of `cargo nextest run --workspace` against in-memory implementations.

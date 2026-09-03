@@ -93,6 +93,29 @@ nothing:
   event-name   An aggregate read an absent GITHUB_EVENT_NAME as "", so
                `if: github.event_name == 'pull_request'` on job cross-layer
                judged false and a skipped cross-layer passed on a pull request.
+  workspace-doc
+               The `docs` filter of docs.yml enumerated crate source
+               directories and reached 15 of the 26 members the root manifest
+               declares, while job rust-docs runs `cargo doc --workspace`.
+               crates/scp-runtime/src/lib.rs denies
+               `rustdoc::broken_intra_doc_links` and links into scp_event_log
+               and into scp_platform, and the sources of neither crate reached
+               that filter, so a rename inside either one skipped the one job
+               that compiles the link.
+  private-items
+               Job rust-doc in ci.yml ran `cargo doc --workspace --no-deps`
+               without `--document-private-items`. rustdoc resolves an
+               intra-doc link only inside an item it documents, so the deny in
+               crates/scp-runtime/src/lib.rs never fired on a private module,
+               and three broken links in the private module
+               crates/scp-runtime/src/context/outlets_helpers.rs passed the one
+               required status check while job rust-docs in docs.yml, which
+               passes the flag and which no ruleset requires, reported them.
+  merge-queue  docs.yml carried a header calling its jobs safe to promote to a
+               required status check while the workflow triggered on `push` and
+               `pull_request` only. A merge queue evaluates a required check
+               against the `merge_group` ref, so following that header would
+               have left every queue entry waiting on a status no run reports.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
@@ -1949,6 +1972,167 @@ def check_signing_guard(documents: list[tuple[Path, dict]]) -> None:
     )
 
 
+def workflow_triggers(doc: dict) -> set[str]:
+    """Return the event names a workflow triggers on.
+
+    PyYAML resolves the unquoted key `on` to the boolean True, so a caller
+    reading `doc["on"]` reads nothing on every workflow in this repository.
+    """
+    node = doc.get(True, doc.get("on"))
+    if isinstance(node, (dict, list)):
+        return set(node)
+    return {node} if isinstance(node, str) else set()
+
+
+def guard_filter_patterns(doc: dict, job: dict) -> set[str] | None:
+    """Return the path patterns behind the filter outputs one job's `if:` reads.
+
+    Returns None when no `needs.<job>.outputs.<key>` expression guards the job,
+    which says the job runs on every change rather than that it routes none.
+    """
+    guard = job.get("if")
+    if not isinstance(guard, str):
+        return None
+    references = re.findall(
+        r"needs\.([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)", guard
+    )
+    if not references:
+        return None
+    patterns: set[str] = set()
+    for producer_id, output in references:
+        producer = (doc.get("jobs") or {}).get(producer_id)
+        if producer is None:
+            continue
+        expression = (producer.get("outputs") or {}).get(output)
+        for step in paths_filter_steps({"jobs": {producer_id: producer}}):
+            if step.step_id is None:
+                continue
+            for key in filter_step_references(expression, step.step_id):
+                patterns |= set(step.filters.get(key) or [])
+    return patterns
+
+
+def member_probe_paths() -> dict[str, list[str]]:
+    """Return, per workspace member directory, the files a filter must select.
+
+    Two files stand for a member here: its manifest, and one source file under
+    its `src/` directory. A filter can cover one and miss the other -- the
+    `docs` filter of docs.yml listed `crates/*/Cargo.toml` for every member and
+    `<crate>/src/**` for eleven of them -- and a change confined to either
+    shape changes what `cargo doc --workspace` compiles.
+    """
+    probes: dict[str, list[str]] = {}
+    for manifest in member_manifests(REPO).values():
+        directory = manifest.parent
+        paths = [str(manifest.relative_to(REPO))]
+        sources = sorted((directory / "src").rglob("*.rs"))
+        if sources:
+            paths.append(str(sources[0].relative_to(REPO)))
+        probes[str(directory.relative_to(REPO))] = paths
+    return probes
+
+
+def check_workspace_doc_routing(documents: list[tuple[Path, dict]]) -> None:
+    """A job compiling the whole workspace routes a change to every member of it.
+
+    CRITERION: a `run:` line holding `cargo doc --workspace` compiles every
+    member the root manifest declares, so a change confined to any one member
+    directory must reach that job. When a paths-filter output guards the job,
+    the patterns behind that output decide which changes reach it, and a member
+    directory no pattern selects lets the job skip while `cargo doc` breaks.
+    GitHub counts that skip as a pass.
+    """
+    probes = member_probe_paths()
+    for path, doc in documents:
+        for job_id, job in sorted((doc.get("jobs") or {}).items()):
+            documents_workspace = any(
+                line.startswith("cargo doc ") and "--workspace" in line
+                for step in (job.get("steps") or [])
+                if isinstance(step, dict)
+                for line in logical_lines(step.get("run") or "")
+            )
+            if not documents_workspace:
+                continue
+            patterns = guard_filter_patterns(doc, job)
+            if patterns is None:
+                # No filter output guards this job, so every change reaches it.
+                continue
+            unrouted = sorted(
+                directory
+                for directory, files in probes.items()
+                if not all(pattern_covers(patterns, file) for file in files)
+            )
+            check(
+                f"{path.name}:{job_id} routes every workspace member it documents",
+                not unrouted,
+                f"{len(unrouted)} of {len(probes)} members reach no filter entry: "
+                f"{unrouted} -- a change confined to one of those skips the job "
+                f"that compiles its intra-doc links",
+            )
+
+
+def check_doc_reads_private_items(documents: list[tuple[Path, dict]]) -> None:
+    """Every workspace `cargo doc` line documents private items.
+
+    CRITERION: rustdoc resolves an intra-doc link only inside an item it
+    documents, so a `#![deny(rustdoc::broken_intra_doc_links)]` crate attribute
+    catches a broken link in a private module only under
+    `--document-private-items`. A `cargo doc` line without the flag therefore
+    reports success over the private half of every crate it compiles.
+    """
+    denying = sorted(
+        str(source.relative_to(REPO))
+        for source in (REPO / "crates").rglob("src/lib.rs")
+        if "deny(rustdoc::broken_intra_doc_links)" in source.read_text()
+    )
+    check(
+        "a crate attribute makes a broken intra-doc link an error",
+        bool(denying),
+        "no crate under crates/ declares "
+        "`#![deny(rustdoc::broken_intra_doc_links)]`, so every `cargo doc` job "
+        "below reports a broken link as a warning and exits 0",
+    )
+    for path, doc in documents:
+        for job_id, job in sorted((doc.get("jobs") or {}).items()):
+            for step in job.get("steps") or []:
+                if not isinstance(step, dict):
+                    continue
+                for line in logical_lines(step.get("run") or ""):
+                    if not line.startswith("cargo doc ") or "--workspace" not in line:
+                        continue
+                    check(
+                        f"{path.name}:{job_id}: cargo doc documents private items",
+                        "--document-private-items" in line,
+                        f"`{line[:70]}` omits --document-private-items, so the deny "
+                        f"in {denying[0] if denying else 'no crate'} cannot fire on "
+                        f"a private module",
+                    )
+
+
+def check_merge_queue_triggers(documents: list[tuple[Path, dict]]) -> None:
+    """A workflow written to be required also runs on the merge_group event.
+
+    CRITERION: a merge queue evaluates every required status check against the
+    `merge_group` ref, so a workflow that never runs on that event reports no
+    check there and every queue entry waits on a status that never arrives.
+    INDICATOR that a workflow is written for that role: it skips its jobs
+    through a `dorny/paths-filter` output instead of failing them, which is the
+    shape that exists so a skipped job reports success to branch protection --
+    the header of .github/workflows/docs.yml states that reason in those words.
+    """
+    for path, doc in documents:
+        triggers = workflow_triggers(doc)
+        if "pull_request" not in triggers or not paths_filter_steps(doc):
+            continue
+        check(
+            f"{path.name} runs on merge_group",
+            "merge_group" in triggers,
+            f"triggers on {sorted(triggers)} -- its jobs skip to a success status "
+            f"so branch protection can require them, and a required check that "
+            f"never runs on the merge_group ref holds every queue entry pending",
+        )
+
+
 def collect_pinned_nightlies(doc: dict) -> set[str]:
     """Return every date-pinned nightly a workflow's steps request."""
     pinned = set()
@@ -2048,6 +2232,15 @@ def main() -> int:
 
     print("step-filter — a filter output gates a job, never a step")
     check_filter_outputs_gate_jobs(jobs)
+
+    print("workspace-doc — a filter routes every member `cargo doc` compiles")
+    check_workspace_doc_routing(documents)
+
+    print("private-items — a workspace `cargo doc` resolves private-item links")
+    check_doc_reads_private_items(documents)
+
+    print("merge-queue — a workflow that skips to a success status runs in the queue")
+    check_merge_queue_triggers(documents)
 
     print("filter-source — a `changes` output reads a filter key that exists")
     # Every workflow, not ci.yml alone: docs.yml declares a `dorny/paths-filter`
