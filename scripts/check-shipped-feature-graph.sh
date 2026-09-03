@@ -35,15 +35,70 @@
 # `testing = ["scp-did/testing", …]` did:key edge would bypass it. A positive ⊆
 # whitelist is CLOSED BY CONSTRUCTION: anything not explicitly permitted fails,
 # so novel/future nullifier features are caught without ever being named here.
-# The four nullifier feature names below appear ONLY in the self-test fixtures as
-# POSITIVE-CONTROL INPUTS the whitelist must reject — never as the mechanism.
+# The nullifier feature names in NULLIFIER_CONTROL_FEATURES appear ONLY as
+# POSITIVE-CONTROL INPUTS the whitelist must reject, and as the input the
+# allowlist-hygiene fixture scans this allowlist for — never as the mechanism.
 #
-# CRITICAL: DEV-DEPENDENCIES ARE EXCLUDED (`-e features,no-dev`)
-# -------------------------------------------------------------
+# CRITICAL: DEV-DEPENDENCIES ARE EXCLUDED (`no-dev`)
+# --------------------------------------------------
 # A shipped artifact is built WITHOUT dev-dependencies. `cargo tree` includes
 # dev-deps by default (and feature-unifies their `testing` edges into the graph),
 # which does NOT reflect what ships. The `no-dev` edge kind restricts the graph to
 # the normal + build dependencies that actually compile into the artifact.
+#
+# CRITICAL: TWO RENDERINGS, BECAUSE `-e features` IS BLIND AT THE ROOT
+# -------------------------------------------------------------------
+# `cargo tree -e features` prints a `<crate> feature "<name>"` line for a feature
+# a DEPENDENCY declaration activates. It prints NO such line for a feature the
+# ROOT package of the invocation activates through that package's own
+# `[features]` table, because the root's feature nodes sit above the node cargo
+# prints as the tree root. The `scp-node` and `scp-relay` entries in ARTIFACTS
+# make the root package the artifact itself and pass an EMPTY feature-arg string,
+# so their whole nullifier exposure runs through that blind class.
+#
+# Measured on this workspace with cargo 1.98.0: the feature-edge extraction over
+# `-p scp-node` and over `-p scp-node --features testing` produces a
+# byte-identical 25-row set, and the whole `--features testing` tree prints the
+# string `testing` zero times, although `crates/scp-node/Cargo.toml` declares
+# `testing = ["scp-dht/testing", "scp-platform/testing",
+# "allow_unencrypted_storage"]`. Cargo does apply the flag — `--features quic`
+# pulls `quinn` into the crate graph — so the RESOLUTION is right and only the
+# RENDERING omits the root's own activations.
+#
+# So every resolution below reads TWO renderings of the same non-dev graph and
+# checks their UNION (see resolve_feature_set):
+#   1. `-e features,no-dev` — feature EDGES. Names an `X/default` edge for a
+#      dependency taken with `default-features = true` even when `X` declares no
+#      `default` feature (`scp-core` on this tree), which rendering 2 omits.
+#   2. `-e no-dev --prefix none --format '{f}|{p}'` — the ENABLED feature set
+#      cargo RESOLVED per package, the root included. Names every
+#      root-`[features]`-table activation, at any depth.
+# Neither rendering contains the other, so the gate reads both. run_gate drives
+# two live positive controls over the union, so a cargo release that changes
+# either rendering fails this gate instead of quietly emptying it.
+#
+# CRITICAL: EVERY SHIPPED TARGET TRIPLE IS RESOLVED (`--target all`)
+# -----------------------------------------------------------------
+# Without `--target`, cargo evaluates every `[target.'cfg(…)'.dependencies]`
+# table against the triple the runner happens to compile for, and DISCARDS every
+# edge whose cfg is false there. This job runs on `ubuntu-latest`, which resolves
+# x86_64-unknown-linux-gnu, while `.github/workflows/build-matrix.yml` builds the
+# three gated bridges for aarch64-apple-ios, aarch64-apple-ios-sim,
+# x86_64-apple-ios, aarch64-apple-darwin, x86_64-apple-darwin,
+# x86_64-pc-windows-msvc and aarch64-unknown-linux-gnu, and
+# `.github/workflows/release.yml` Authenticode-signs the Windows DLL and
+# Apple-signs the iOS/macOS framework. A `[target.'cfg(target_os = "ios")'
+# .dependencies]` table naming `scp-platform = { features = ["testing"] }` is
+# therefore invisible to a host-triple resolution and compiles three §17.17.2
+# security nullifiers into a signed xcframework. Four workspace crates already
+# carry such a table — scp-protocol, scp-mls, scp-client and scp-client-wasm, all
+# on `cfg(target_arch = "wasm32")` — so the construct is in use here today.
+# `--target all` resolves the UNION over every triple rather than an enumeration
+# of the triples anyone remembered to list, so a triple a build matrix adds
+# tomorrow is covered without editing this gate. Measured on this tree, the union
+# and the host resolution agree row for row on every artifact, so `--target all`
+# costs no false rejection. `assert_every_cargo_tree_resolves_every_target`
+# asserts that flag across every shell script under scripts/.
 #
 # Usage:
 #   scripts/check-shipped-feature-graph.sh            # gate the real workspace
@@ -76,16 +131,42 @@ cd "$REPO_ROOT"
 # a future dependency edge pull plaintext key-per-file storage back into a
 # shipped graph with no gate failure to announce it.
 #
-# Five artifacts are gated: the three shipped FFI bridges (built
-# `--no-default-features --features server`) plus the scp-node and scp-relay
-# binaries (built with DEFAULT features — neither binary has a `server` feature).
-# The three bridges resolve one identical SCP-crate feature set; each binary
-# resolves a SUBSET of it (scp-node ~25, scp-relay ~19 SCP-crate feature edges).
-# This single allowlist is therefore a SUPERSET covering all five — one list
-# suffices. `cargo tree` DERIVES each artifact's resolved set (never a hand-list);
-# this allowlist is the hand-maintained set of what is PERMITTED.
+# EIGHT ROWS NAME A FEATURE A ROOT PACKAGE ACTIVATES THROUGH ITS OWN `[features]`
+# TABLE. `cargo tree -e features` renders no feature EDGE for any of them (see
+# "TWO RENDERINGS" in the header), so this gate could not observe one until it
+# began reading the per-package resolved-feature rendering. Their classification:
+#   - `scp-ffi/server`, `scp-ffi-napi/server`, `scp-ffi-uniffi/server` — the
+#     production feature each bridge ARTIFACTS entry passes as
+#     `--features server`. Each expands to `["scp-ffi-common/server",
+#     "dep:scp-node"]`, the real node/relay startup path.
+#   - `scp-ffi-common/server` — what those three activate on the shared bridge
+#     crate. It pulls the real transport, node, platform and identity crates plus
+#     three durability-only `scp-platform` rows this list already carries
+#     (`in-memory-storage`, `file`, `encrypting`).
+#   - `scp-ffi/default`, `scp-ffi-napi/default`, `scp-ffi-uniffi/default` — each
+#     is `["server"]`, which a bare `cargo build` at this root and the three
+#     default-feature bridge ARTIFACTS entries resolve.
+#   - `scp-client-wasm/default` — an EMPTY feature list. Cargo reports `default`
+#     as enabled on that default member and it activates nothing.
+# None of the eight forwards a `testing` edge or an `allow_unencrypted_storage`
+# edge. The reader reports cargo's RESOLVED list, so every feature a `default`
+# row expands to appears as its own row and meets this ⊆ check on its own —
+# permitting a `default` row therefore admits nothing beyond that row.
+# NULLIFIER_CONTROL_FEATURES names all five bridge/binary `testing` features, so
+# `assert_allowlist_has_no_nullifier` rejects an edit that adds one here.
+#
+# Nine artifact configurations are gated: the three shipped FFI bridges under
+# `--no-default-features --features server`, the same three under their DEFAULT
+# features, `scp-core`, and the scp-node and scp-relay binaries (built with
+# DEFAULT features — neither binary has a `server` feature). Each artifact's
+# resolved set is the UNION of the two renderings the header describes. This
+# single allowlist is a SUPERSET covering all nine plus the bare default-members
+# build — one list suffices. `cargo tree` DERIVES each artifact's resolved set
+# (never a hand-list); this allowlist is the hand-maintained set of what is
+# PERMITTED.
 # ---------------------------------------------------------------------------
 PERMITTED_ALLOWLIST="$(cat <<'EOF'
+scp-client-wasm/default
 scp-client/default
 scp-clock/default
 scp-core/default
@@ -97,6 +178,13 @@ scp-event-log/default
 scp-ffi-common/custody
 scp-ffi-common/default
 scp-ffi-common/resolvers
+scp-ffi-common/server
+scp-ffi-napi/default
+scp-ffi-napi/server
+scp-ffi-uniffi/default
+scp-ffi-uniffi/server
+scp-ffi/default
+scp-ffi/server
 scp-identity/default
 scp-identity/production-dht
 scp-mcp/default
@@ -134,8 +222,11 @@ EOF
 #     so passing `--features server` here would ERROR — they are correctly gated
 #     with an empty feature-arg string, not with `--features server`.
 #
-# DRIFT CAVEAT: each entry's build-invocation string above MUST be kept in
-# lockstep with the actual shipped build config — the Dockerfile
+# DRIFT, NOW ASSERTED RATHER THAN CAVEATED: each entry's build-invocation string
+# above must stay in lockstep with the actual shipped build config, and
+# `assert_shipping_invocations_are_gated` reads the three files that carry those
+# commands and fails when they drift. The paragraph below names what those files
+# build — the Dockerfile
 # `cargo build --release -p scp-relay -p scp-node`, a
 # `.github/workflows/release.yml` `cargo publish` step, `maturin`'s
 # `--manifest-path crates/scp-ffi/Cargo.toml` wheel build (which keeps default
@@ -143,26 +234,87 @@ EOF
 # SCP-crate edge, so it resolves an `scp-ffi` set named below), and a
 # `.github/workflows/build-matrix.yml` "Build shipped bridge artifacts" step,
 # which builds one package per invocation into `target-shipped` so its uploaded
-# cdylibs resolve those same per-package sets these entries name. This gate
-# checks a feature config NAMED HERE, not whatever those workflows actually
-# build; when those two drift apart, coverage silently narrows (an artifact
-# would be gated in a config it no longer ships). One drift class is covered
-# mechanically rather than
-# by this caveat: a `default-members` check in `run_gate` resolves a bare
-# `cargo build` at this root, so a member that unifies a nullifier into its
-# siblings fails whether or not anyone updates this comment.
+# cdylibs resolve those same per-package sets these entries name. Two mechanisms
+# keep that lockstep rather than a reader's diligence: a `default-members` check
+# in `run_gate` resolves a bare `cargo build` at this root, so a member that
+# unifies a nullifier into its siblings fails whether or not anyone updates this
+# comment; and `assert_shipping_invocations_are_gated` fails when a shipping file
+# names a package this gate resolves in no configuration, or carries a
+# feature-selection flag nobody declared.
 #
 # uniffi-bindgen (the third workspace `[[bin]]`, in `crates/scp-ffi/uniffi`) is
 # deliberately NOT a separate ARTIFACTS entry: it is a build-time code-generation
 # tool, not a shipped runtime artifact, and its dependencies are already covered
 # transitively by the `scp-ffi-uniffi` package entry above.
+#
+# The four DEFAULT-feature entries below mirror the "Build shipped bridge
+# artifacts (one package per invocation)" step of
+# `.github/workflows/build-matrix.yml`, which runs
+# `for pkg in scp-core scp-ffi scp-ffi-napi scp-ffi-uniffi; do cargo build
+# --release --target <triple> -p "$pkg" --target-dir target-shipped; done` and
+# uploads what it produces, and `.github/workflows/release.yml` signs those
+# uploads. That loop passes no `--features` argument, so it resolves each
+# package's DEFAULT feature set — a different resolution from the
+# `--no-default-features --features server` one the three bridge entries above
+# gate, and one nothing gated until these entries existed.
 ARTIFACTS=(
   "scp-ffi|--no-default-features --features server"
   "scp-ffi-napi|--no-default-features --features server"
   "scp-ffi-uniffi|--no-default-features --features server"
+  "scp-ffi|"
+  "scp-ffi-napi|"
+  "scp-ffi-uniffi|"
+  "scp-core|"
   "scp-node|"
   "scp-relay|"
 )
+
+# ---------------------------------------------------------------------------
+# Shipping files: the three files whose cargo invocations compile or publish a
+# shipped artifact. assert_shipping_invocations_are_gated reads exactly these.
+# ---------------------------------------------------------------------------
+SHIPPING_FILES=(
+  "Dockerfile"
+  ".github/workflows/build-matrix.yml"
+  ".github/workflows/release.yml"
+)
+
+# Every line of a SHIPPING_FILES file that carries a cargo feature-selection flag
+# (`--features`, `-F`, `--all-features`, `--no-default-features`), normalized to
+# single spaces with leading and trailing whitespace removed.
+#
+# assert_shipping_invocations_are_gated compares the shipping files against this
+# list and FAILS on any difference, in either direction. Both lines below run
+# `cargo test`, which compiles no shipped artifact, so neither one changes what
+# ARTIFACTS must gate. A new or edited feature flag in any shipping file fails
+# this gate until whoever wrote it either declares it here or adds the
+# configuration it selects to ARTIFACTS.
+DECLARED_SHIPPING_FEATURE_FLAG_LINES="$(cat <<'EOF'
+run: cargo test --workspace --release --target ${{ matrix.target }} --features scp-core/testing,scp-runtime/saga-witness-test-mint
+run: cargo test --workspace --release --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/saga-witness-test-mint
+EOF
+)"
+
+# Every line of a SHIPPING_FILES file that names an SCP package after `-p` while
+# compiling no shipped artifact, normalized the same way.
+#
+# assert_shipping_invocations_are_gated drops these lines before it reads
+# package names, and FAILS when a declared line no longer appears in any
+# shipping file. The line below runs the conformance suite as a release
+# precondition: `cargo nextest run` compiles a test binary,
+# `.github/workflows/release.yml` publishes no `scp-testing` crate and uploads
+# no artifact built from that command, so the package it names needs no
+# ARTIFACTS entry. `scp-testing` is the test-harness crate itself — root
+# `Cargo.toml` omits it from `default-members` precisely so its nullifier
+# features never unify into a shipped build — so gating it as a shipped artifact
+# would assert the opposite of what this gate exists to prove. A `-p` line this
+# list does not carry fails the gate until whoever wrote it either adds the
+# configuration it builds to ARTIFACTS or declares here why that line ships
+# nothing.
+DECLARED_NON_SHIPPING_PACKAGE_LINES="$(cat <<'EOF'
+cargo nextest run --no-tests=fail --release -p scp-testing -E 'test(conformance)'
+EOF
+)"
 
 # Nullifier features / crates used ONLY as positive-control fixture inputs and by
 # the allowlist-hygiene self-test. NEVER the gate mechanism.
@@ -179,7 +331,33 @@ NULLIFIER_CONTROL_FEATURES=(
   "scp-mls/testing"
   "scp-client/testing"
   "scp-client-wasm/testing"
+  "scp-event-log/testing"
+  "scp-identity/testing"
   "scp-testing"
+  # A root package's own `testing` feature. The feature-EDGE rendering never
+  # names one (see "TWO RENDERINGS" in the header), so until the per-package
+  # rendering landed no gate run could produce these names and nobody could
+  # allowlist one. The per-package rendering produces them, so name them here.
+  # Each bridge `testing` feature folds in `scp-platform/testing` +
+  # `scp-dht/testing` + `dep:scp-testing`, and `scp-node/testing` folds in
+  # `scp-dht/testing` + `scp-platform/testing` + `allow_unencrypted_storage`.
+  "scp-ffi/testing"
+  "scp-ffi-common/testing"
+  "scp-ffi-napi/testing"
+  "scp-ffi-uniffi/testing"
+  "scp-node/testing"
+  # `outlet-capability-test-grant` mints an outlet capability a real
+  # authorization path would have to issue, and `saga-witness-test-mint` mints a
+  # saga witness the same way. Each returns success for work it did not do, so
+  # each is a nullifier (spec §17.17.2). Every crate that re-exports one gate
+  # down a dependency chain is named, for the reason the
+  # `allow_unencrypted_storage` block below gives.
+  "scp-core/outlet-capability-test-grant"
+  "scp-runtime/outlet-capability-test-grant"
+  "scp-ffi/outlet-capability-test-grant"
+  "scp-ffi-napi/outlet-capability-test-grant"
+  "scp-ffi-uniffi/outlet-capability-test-grant"
+  "scp-runtime/saga-witness-test-mint"
   # `allow_unencrypted_storage` gates `ProtocolRepository::new_for_testing`,
   # which takes any `Storage` where `ProtocolRepository::new` demands a sealed
   # `EncryptedStorage` bound, so this feature unseals encryption at rest — a
@@ -192,37 +370,166 @@ NULLIFIER_CONTROL_FEATURES=(
 )
 
 # ---------------------------------------------------------------------------
+# extract_feature_edges <feature-edge-tree>
+#   Pure. Emit one `crate/feature` line per FEATURE EDGE that
+#   `cargo tree -e features` renders — a line of the form
+#   `scp-<crate> feature "<name>"` — sorted-unique.
+#
+#   WHAT THIS RENDERING CANNOT SEE: cargo renders a feature node for a feature a
+#   DEPENDENCY declaration activated, and none for a feature the tree's ROOT
+#   package activates through that package's own `[features]` table. Running
+#   `cargo tree -e features,no-dev --target all -p scp-node --features testing`
+#   on this workspace prints the string `testing` zero times, and the set this
+#   function extracts from that tree is byte-identical to the set it extracts
+#   without `--features testing`. extract_package_features reads the second
+#   rendering, which does carry those features, and merge_resolved_feature_sets
+#   unions the two.
+#
+#   WHAT ONLY THIS RENDERING SEES: cargo renders an `X feature "default"` edge
+#   for a dependency taken with `default-features = true` even when `X` declares
+#   no `default` feature — `scp-core` on this tree — and the per-package
+#   rendering then lists nothing for `X`. Neither rendering contains the other.
+# ---------------------------------------------------------------------------
+#   grep exits 0 on a match, 1 on no match, and 2 or higher on its own error.
+#   Returning a grep error unchanged would make it read as "this rendering names
+#   no feature", which drops half of a resolved set while the ⊆ check still
+#   prints OK — the same FAIL-OPEN verdict the SIGPIPE comment above
+#   tree_names_scp_testing_crate describes. A status above 1 therefore aborts
+#   this gate, and a status of 1 prints nothing and returns 0, which
+#   merge_resolved_feature_sets then rejects as an empty half.
+extract_feature_edges() {
+  local matches rc=0
+  matches="$(printf '%s\n' "$1" | grep -oE 'scp-[a-z0-9-]+ feature "[^"]+"')" || rc=$?
+  if [[ "$rc" -gt 1 ]]; then
+    echo "grep failed with status $rc while extracting feature edges from a cargo tree" >&2
+    exit 1
+  fi
+  [[ -z "$matches" ]] && return 0
+  printf '%s\n' "$matches" \
+    | sed -E 's/ feature "/\//; s/"$//' \
+    | sort -u
+}
+
+# ---------------------------------------------------------------------------
+# extract_package_features <per-package-tree>
+#   Pure. Emit one `crate/feature` line per feature cargo ENABLED on every SCP
+#   workspace package the tree names, THE ROOT PACKAGE INCLUDED, sorted-unique.
+#
+#   Input is what `cargo tree --prefix none --format '{f}|{p}'` prints: one line
+#   per node, reading `<f1>,<f2>,…|<name> v<version> (<path>)`, where the
+#   left-hand list is that package's RESOLVED enabled feature set rather than an
+#   edge its parent declared. That is the only cargo rendering in which an
+#   artifact's OWN `testing` / `allow_unencrypted_storage` activation appears.
+#
+#   `{f}` sits BEFORE `{p}` because a feature name never contains `|` while a
+#   package's filesystem path may, so splitting on the FIRST `|` is correct by
+#   construction. `--prefix none` strips cargo's tree-drawing characters, so
+#   every node starts at column 0 and the `^scp-` anchor on the package field
+#   rejects an indented line. The ` v` in that anchor separates a package name
+#   from a package whose name merely ends in one: `my-scp-node v0.1.0` does not
+#   match `^scp-[a-z0-9-]+ v[0-9]`. Cargo appends ` (*)` to a node whose subtree
+#   it already printed, and the `sed` below strips that marker before the parse.
+#   A package whose resolved list is empty prints a leading `|` and contributes
+#   no line.
+#
+#   The awk program carries no `exit`, so it reads its whole input;
+#   `assert_every_pipeline_reader_consumes_its_input` decides its criterion over
+#   that property.
+#
+#   Fail-closed on a format change: if cargo stops printing this shape, no line
+#   matches, the extracted set is EMPTY, and merge_resolved_feature_sets rejects
+#   it rather than handing run_gate half a union.
+# ---------------------------------------------------------------------------
+extract_package_features() {
+  printf '%s\n' "$1" \
+    | sed -E 's/ \(\*\)$//' \
+    | awk -F'|' '
+        NF < 2 { next }
+        $2 !~ /^scp-[a-z0-9-]+ v[0-9]/ { next }
+        {
+          split($2, pkg, " ")
+          n = split($1, feats, ",")
+          for (i = 1; i <= n; i++) {
+            if (feats[i] != "") { print pkg[1] "/" feats[i] }
+          }
+        }' \
+    | sort -u
+}
+
+# ---------------------------------------------------------------------------
+# merge_resolved_feature_sets <feature-edge-tree> <per-package-tree>
+#   Pure. Emit the UNION of both renderings, sorted-unique — one artifact's
+#   complete resolved SCP-crate feature set.
+#
+#   Returns 1 when EITHER rendering yields an empty set. Both legitimately yield
+#   a non-empty set for every artifact this gate checks and for a bare
+#   default-members build, so an empty one means cargo resolved nothing or a
+#   rendering changed shape. Either way the caller fails loud rather than accept
+#   a half-empty union that the ⊆ check would still green.
+# ---------------------------------------------------------------------------
+merge_resolved_feature_sets() {
+  local edge_tree="$1" package_tree="$2" edges pkgs
+  edges="$(extract_feature_edges "$edge_tree")"
+  pkgs="$(extract_package_features "$package_tree")"
+  if [[ -z "$edges" ]]; then
+    echo "no scp-* feature EDGE appears in a cargo tree this gate resolved" >&2
+    return 1
+  fi
+  if [[ -z "$pkgs" ]]; then
+    echo "no scp-* PER-PACKAGE feature list appears in a cargo tree this gate resolved" >&2
+    return 1
+  fi
+  printf '%s\n%s\n' "$edges" "$pkgs" | sort -u
+}
+
+# ---------------------------------------------------------------------------
+# resolve_feature_set <cargo-tree-args...>
+#   Run both renderings of one cargo resolution and emit their union.
+#   resolve_scp_features and resolve_default_members_features both call this, so
+#   the per-artifact path and the default-members path cannot drift apart in
+#   what they observe.
+#
+#   Capture stdout+stderr and the exit status of each rendering. Do NOT swallow
+#   a cargo failure silently: if resolution fails (e.g. the feature args name a
+#   feature this artifact lacks), surface the cargo error and return non-zero so
+#   the caller fails loud instead of proceeding with an empty
+#   (vacuously-passing) set.
+# ---------------------------------------------------------------------------
+resolve_feature_set() {
+  local edge_tree package_tree rc
+  edge_tree="$(cargo tree -e features,no-dev --target all "$@" 2>&1)"; rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    { echo "cargo tree (feature edges) failed for: cargo tree -e features,no-dev --target all $*"
+      printf '%s\n' "$edge_tree"; } >&2
+    return 1
+  fi
+  package_tree="$(cargo tree -e no-dev --target all --prefix none --format '{f}|{p}' "$@" 2>&1)"; rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    { echo "cargo tree (per-package feature lists) failed for: cargo tree -e no-dev --target all --prefix none --format '{f}|{p}' $*"
+      printf '%s\n' "$package_tree"; } >&2
+    return 1
+  fi
+  merge_resolved_feature_sets "$edge_tree" "$package_tree"
+}
+
+# ---------------------------------------------------------------------------
 # resolve_scp_features <crate> <features...>
 #   Emit the COMPLETE resolved SCP-crate feature set of the shipped artifact,
 #   one `crate/feature` per line, sorted-unique. Excludes dev-dependencies.
 #
 #   DELIBERATE SPLIT from resolve_scp_testing_crate (NOT a redundant twin): this
-#   extracts FEATURE edges (`scp-* feature "…"`) from the `-e features,no-dev`
-#   tree, whereas resolve_scp_testing_crate probes CRATE-NODE presence
-#   (`scp-testing v…`) in the `-e no-dev` tree. A `scp-testing` pulled with
-#   `default-features = false` and no features enabled contributes NO feature
-#   edge here (so this grep would miss it) yet still appears as a crate node —
-#   so the two checks catch distinct cases and are both load-bearing.
+#   reports FEATURES, whereas resolve_scp_testing_crate probes CRATE-NODE
+#   presence (`scp-testing v…`) in the `-e no-dev` tree. A `scp-testing` pulled
+#   with `default-features = false` and no features enabled contributes no
+#   feature edge and an EMPTY resolved feature list here, so neither rendering
+#   names it, yet it still appears as a crate node — the two checks catch
+#   distinct cases and are both load-bearing.
 # ---------------------------------------------------------------------------
 resolve_scp_features() {
   local crate="$1"; shift
   local features="$1"
-  local raw rc
-  # Capture stdout+stderr and the exit status. Do NOT swallow a cargo failure
-  # silently: if resolution fails (e.g. the feature args name a feature this
-  # artifact lacks), surface the cargo error and return non-zero so the caller
-  # fails loud instead of proceeding with an empty (vacuously-passing) set.
   # shellcheck disable=SC2086
-  raw="$(cargo tree -e features,no-dev -p "$crate" $features 2>&1)"; rc=$?
-  if [[ "$rc" -ne 0 ]]; then
-    { echo "cargo tree failed for '$crate' (feature args: '$features'):"
-      printf '%s\n' "$raw"; } >&2
-    return 1
-  fi
-  printf '%s\n' "$raw" \
-    | grep -oE 'scp-[a-z0-9-]+ feature "[^"]+"' \
-    | sed -E 's/ feature "/\//; s/"$//' \
-    | sort -u
+  resolve_feature_set -p "$crate" $features
 }
 
 # resolve_scp_testing_crate <crate> <features...>
@@ -243,7 +550,7 @@ resolve_scp_testing_crate() {
   local features="$1"
   local raw rc
   # shellcheck disable=SC2086
-  raw="$(cargo tree -e no-dev -p "$crate" $features 2>&1)"; rc=$?
+  raw="$(cargo tree -e no-dev --target all -p "$crate" $features 2>&1)"; rc=$?
   if [[ "$rc" -ne 0 ]]; then
     { echo "cargo tree (scp-testing probe) failed for '$crate' (feature args: '$features'):"
       printf '%s\n' "$raw"; } >&2
@@ -343,19 +650,19 @@ resolution_is_nonempty() {
 #   `scp-dht/testing`, and `allow_unencrypted_storage` sit on its NORMAL edges.
 #   Root `Cargo.toml` therefore omits it from `default-members`, and this check
 #   is what keeps that omission true.
+#
+#   EVERY DEFAULT MEMBER IS A ROOT PACKAGE of this resolution, so the
+#   feature-edge rendering alone omits every feature each member activates
+#   through its own `[features]` table. A member that ANOTHER member depends on
+#   escaped that blindness incidentally — `crates/scp-ffi` depends on scp-node,
+#   so scp-node's feature nodes render inside scp-ffi's subtree — while a member
+#   nothing depends on stayed a display root of its own, and `crates/scp-relay`
+#   is such a member. This function therefore reads both renderings through
+#   resolve_feature_set, the same helper resolve_scp_features calls, so the two
+#   paths cannot drift apart in what they observe.
 # ---------------------------------------------------------------------------
 resolve_default_members_features() {
-  local raw rc
-  raw="$(cargo tree -e features,no-dev 2>&1)"; rc=$?
-  if [[ "$rc" -ne 0 ]]; then
-    { echo "cargo tree failed for a bare default-members resolution:"
-      printf '%s\n' "$raw"; } >&2
-    return 1
-  fi
-  printf '%s\n' "$raw" \
-    | grep -oE 'scp-[a-z0-9-]+ feature "[^"]+"' \
-    | sed -E 's/ feature "/\//; s/"$//' \
-    | sort -u
+  resolve_feature_set
 }
 
 # resolve_default_members_testing_crate
@@ -370,7 +677,7 @@ resolve_default_members_features() {
 #   of that tree as ABSENT.
 resolve_default_members_testing_crate() {
   local raw rc
-  raw="$(cargo tree -e no-dev 2>&1)"; rc=$?
+  raw="$(cargo tree -e no-dev --target all 2>&1)"; rc=$?
   if [[ "$rc" -ne 0 ]]; then
     { echo "cargo tree (scp-testing probe) failed for a bare default-members resolution:"
       printf '%s\n' "$raw"; } >&2
@@ -382,29 +689,136 @@ resolve_default_members_testing_crate() {
 }
 
 # ---------------------------------------------------------------------------
+# assert_resolver_sees_own_feature_table_activation
+#   Positive control on the RESOLVER, not on the ⊆ decision procedure. Returns 0
+#   when the resolver reports the witness row, 1 when it does not.
+#
+#   CRITERION: the resolver reports a feature that a shipped artifact's OWN
+#   `[features]` table activates on one of that artifact's dependencies. A
+#   resolver that reads only the `cargo tree -e features` edge rendering reports
+#   nothing for that class, and the two binaries in ARTIFACTS carry an empty
+#   feature-arg string, so their entire nullifier exposure runs through it.
+#
+#   WITNESS: `crates/scp-ffi/Cargo.toml` declares
+#   `server = ["scp-ffi-common/server", "dep:scp-node"]`, and this gate builds
+#   scp-ffi with `--no-default-features --features server`, so a correct resolver
+#   reports `scp-ffi-common/server`. Measured against the edge-only reader this
+#   gate used before: `cargo tree -e features,no-dev -p scp-ffi
+#   --no-default-features --features server` printed no
+#   `scp-ffi-common feature "server"` line at all.
+#
+#   This control runs BEFORE the artifact loop, so a resolver that has gone blind
+#   cannot print nine OK lines ahead of its own failure. Renaming that feature
+#   must break this control loudly; re-point the witness at another own-table
+#   activation rather than deleting the control.
+# ---------------------------------------------------------------------------
+assert_resolver_sees_own_feature_table_activation() {
+  local witness_crate="scp-ffi"
+  local witness_features="--no-default-features --features server"
+  local witness_entry="scp-ffi-common/server"
+  local resolved rc=0
+  echo ">> positive control: the resolver reports a feature an artifact's own [features] table activates on a dependency"
+  if ! resolved="$(resolve_scp_features "$witness_crate" "$witness_features")"; then
+    echo "   FAIL — the positive-control resolution itself failed for '$witness_crate'."
+    return 1
+  fi
+  printf '%s\n' "$resolved" | grep -xF "$witness_entry" >/dev/null || rc=$?
+  if [[ "$rc" -gt 1 ]]; then
+    echo "grep failed with status $rc while probing a resolved feature set for '$witness_entry'" >&2
+    exit 1
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    echo "   OK — '$witness_entry' is reported for \`$witness_crate $witness_features\`"
+    return 0
+  fi
+  echo "   FAIL — the resolver did NOT report '$witness_entry' for"
+  echo "          \`cargo tree -p $witness_crate $witness_features\`, although"
+  echo "          crates/scp-ffi/Cargo.toml declares"
+  echo "          server = [\"scp-ffi-common/server\", \"dep:scp-node\"]."
+  echo "          A resolver blind to a package's own [features] table cannot see"
+  echo "          a nullifier that scp-node or scp-relay enables through its own"
+  echo "          manifest — both are gated here with an EMPTY feature-arg string."
+  echo "          Read cargo's resolved feature list (--format '{f}|{p}'); do NOT"
+  echo "          go back to reading the \`-e features\` edge rendering alone."
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# assert_positive_control_rejects_nullifier_build
+#   REAL-TREE positive control on the whole gate: resolve
+#   `scp-node --features testing` through the same union path run_gate uses for a
+#   shipped artifact, and require the ⊆ check to REJECT it. Returns 0 on
+#   rejection, 1 when that resolution passes the ⊆ check.
+#
+#   WHY A REAL-TREE CONTROL AND NOT ONLY A SYNTHETIC FIXTURE
+#   -------------------------------------------------------
+#   The fixture harness drives check_subset with hand-written strings, so it
+#   proves the DECISION PROCEDURE rejects a nullifier row. It cannot prove the
+#   RESOLUTION produces that row from a real workspace, and that is exactly what
+#   broke: `cargo tree -e features,no-dev -p scp-node --features testing`
+#   extracted a set byte-identical to the clean resolve, so every synthetic
+#   fixture stayed green while the gate could not fail on the regression the
+#   scp-node and scp-relay ARTIFACTS entries exist to catch.
+#
+#   `crates/scp-node/Cargo.toml` declares `testing = ["scp-dht/testing",
+#   "scp-platform/testing", "allow_unencrypted_storage"]`, none of which this
+#   allowlist admits, so a working gate MUST reject this resolution. A cargo
+#   failure here — scp-node losing its `testing` feature — fails the control
+#   rather than passing it: an unresolvable control proves nothing.
+# ---------------------------------------------------------------------------
+assert_positive_control_rejects_nullifier_build() {
+  local control_resolved control_offenders
+  if ! control_resolved="$(resolve_scp_features scp-node "--features testing")"; then
+    echo "   FAIL — the positive control did not resolve. Does 'scp-node' still"
+    echo "          declare a 'testing' feature? A control that cannot resolve"
+    echo "          proves nothing about whether this gate can fail."
+    return 1
+  fi
+  if control_offenders="$(check_subset "$control_resolved" "$PERMITTED_ALLOWLIST")"; then
+    echo "   FAIL — a scp-node build with --features testing passed the ⊆ check."
+    echo "          That build compiles InMemoryDhtClient, DhtMode::Memory,"
+    echo "          build_memory_did_method and ProtocolRepository::new_for_testing."
+    echo "          This gate cannot fail on the regression it exists to catch, so"
+    echo "          its OK lines above are a false guarantee. Fix the resolution —"
+    echo "          do NOT delete this control."
+    return 1
+  fi
+  echo "   OK — rejected, on $(printf '%s\n' "$control_offenders" | grep -c .) non-allowlisted feature(s):"
+  printf '%s\n' "$control_offenders" | sed 's/^/       ✗ /'
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Real gate.
 # ---------------------------------------------------------------------------
 run_gate() {
   local failures=0
   echo "G1 shipped-feature-graph gate (ADR-062 §Decision 6) — dev-deps EXCLUDED"
   echo "-------------------------------------------------------------------------"
+  # Prove the resolver still sees the activation class the edge rendering misses
+  # BEFORE reading any artifact, so a blind resolver cannot print a run of OK
+  # lines ahead of its own failure.
+  assert_resolver_sees_own_feature_table_activation || failures=$((failures + 1))
+  echo
   for spec in "${ARTIFACTS[@]}"; do
     local crate="${spec%%|*}" features="${spec#*|}"
     echo ">> $crate  ($features)"
 
     local resolved offenders
     # resolve_scp_features returns non-zero (and surfaces cargo's stderr) if
-    # resolution fails; the non-empty guard additionally rejects an empty result
-    # from any cause. Either way the artifact FAILS LOUD — an empty set must
-    # NEVER be accepted as a vacuous "empty ⊆ allowlist" pass.
+    # either rendering fails to resolve or yields an empty extraction; the
+    # non-empty guard additionally rejects an empty union from any cause. Either
+    # way the artifact FAILS LOUD — an empty set must NEVER be accepted as a
+    # vacuous "empty ⊆ allowlist" pass.
     if ! resolved="$(resolve_scp_features "$crate" "$features")" \
         || ! resolution_is_nonempty "$resolved"; then
       echo "   FAIL — resolved SCP-crate feature set is EMPTY (cargo resolution"
-      echo "          failed or the feature args are wrong — e.g. '$features'"
-      echo "          names a feature '$crate' does not have). Every shipped"
-      echo "          artifact (3 bridges + scp-node + scp-relay) legitimately"
-      echo "          resolves a NON-EMPTY set; refusing to treat an empty"
-      echo "          resolution as 'empty ⊆ allowlist' PASS."
+      echo "          failed, one of the two renderings changed shape, or the"
+      echo "          feature args are wrong — e.g. '$features' names a feature"
+      echo "          '$crate' does not have). Every gated artifact"
+      echo "          configuration legitimately resolves a NON-EMPTY set under"
+      echo "          both renderings; refusing to treat an empty resolution as"
+      echo "          'empty ⊆ allowlist' PASS."
       failures=$((failures + 1))
       continue
     fi
@@ -466,6 +880,12 @@ run_gate() {
       failures=$((failures + 1))
     fi
   fi
+
+  # Real-tree positive control — proves the resolution above can actually go red
+  # on the workspace this run reads, not only on a synthetic fixture.
+  echo ">> positive control  (scp-node --features testing MUST be rejected)"
+  assert_positive_control_rejects_nullifier_build || failures=$((failures + 1))
+
   return "$failures"
 }
 
@@ -501,17 +921,20 @@ expect() { # <label> <expected: PASS|FAIL> <actual-rc>
 #   branch — the fail-open verdict on a ZERO-nullifier gate.
 #
 #   The criterion is decidable over this file because the commands this file
-#   pipes into are `grep`, `sed`, `sort`, and `comm`, and only `grep` offers an
-#   early exit: `-q`/`--quiet`/`--silent`, which stops at a first match, and
-#   `-m N`/`--max-count=N`, which stops at an Nth one. `sed`, `sort`, and `comm`
-#   read to end of file under every invocation this file writes. So rejecting
-#   those two grep options, plus a pipe into `head`, decides the criterion
-#   rather than sampling spellings of it.
+#   pipes into are `grep`, `sed`, `sort`, `comm`, and `awk`, and only two of them
+#   offer an early exit. `grep` stops at a first match under
+#   `-q`/`--quiet`/`--silent` and at an Nth one under `-m N`/`--max-count=N`.
+#   `awk` stops when its program reaches `exit`; the one awk program this file
+#   writes, in extract_package_features, has no `exit`, so it reads to end of
+#   file. `sed`, `sort`, and `comm` read to end of file under every invocation
+#   this file writes. So rejecting those two grep options, an `exit` inside a
+#   piped-to awk program, and a pipe into `head`, decides the criterion rather
+#   than sampling spellings of it.
 assert_every_pipeline_reader_consumes_its_input() {
   echo ">> fixture: every stage this gate pipes into reads its whole input, so no probe can report SIGPIPE (141) as a verdict"
   local self offenders
   self="${BASH_SOURCE[0]}"
-  offenders="$(grep -nE '\|[[:space:]]*(head[[:space:]]|grep[[:space:]]+(-[a-zA-Z]*q|--quiet|--silent|-m[[:space:]]|--max-count))' "$self" \
+  offenders="$(grep -nE '\|[[:space:]]*(head[[:space:]]|awk[^|]*[^_a-zA-Z]exit[^_a-zA-Z]|grep[[:space:]]+(-[a-zA-Z]*q|--quiet|--silent|-m[[:space:]]|--max-count))' "$self" \
     | grep -vE '^[0-9]+:[[:space:]]*#' || true)"
   if [[ -n "$offenders" ]]; then
     echo "   FAIL — a pipeline stage below exits before its writer finishes, so pipefail"
@@ -522,6 +945,208 @@ assert_every_pipeline_reader_consumes_its_input() {
     return
   fi
   echo "   ok   — no pipeline in this gate feeds a reader that stops early"
+}
+
+# assert_every_cargo_tree_resolves_every_target
+#   Structural proof that no dependency-graph absence proof under scripts/ reads
+#   one host triple.
+#
+#   CRITERION: every `cargo tree` invocation in every shell script under
+#   scripts/ names `--target all`. Without it cargo evaluates each
+#   `[target.'cfg(…)'.dependencies]` table against the triple the runner
+#   compiles for and DISCARDS every edge whose cfg is false there, so a
+#   dependency added under `cfg(target_os = "ios")` is absent from a graph
+#   resolved on ubuntu-latest while `.github/workflows/build-matrix.yml` compiles
+#   it into a signed xcframework.
+#
+#   The criterion is decidable over these files because bash starts a command
+#   word at a line start, or after `$(`, an unescaped backtick, `|`, `;`, or `&`,
+#   and this fixture matches `cargo` at each of those positions. A `\`` sequence
+#   is a literal backtick and starts no command, so the `sed` stage below deletes
+#   every escaped backtick before the match; it runs line for line, so grep's
+#   line numbers still name the source line. Without that stage a prose line
+#   quoting a cargo command inside an escaped-backtick pair read as an
+#   invocation. It covers scripts/check-protocol-deps.sh as well as this file:
+#   that gate proves scp-protocol depends on no tokio / scp-platform / openmls,
+#   and crates/scp-protocol/Cargo.toml already carries a
+#   `[target.'cfg(target_arch = "wasm32")'.dependencies]` table, so the same
+#   host-triple blindness would hide a banned crate declared under a cfg.
+assert_every_cargo_tree_resolves_every_target() {
+  echo ">> fixture: every cargo tree invocation under scripts/ names --target all, so no cfg-gated dependency edge is invisible to an absence proof"
+  local script offenders all_offenders="" cmd_word
+  cmd_word='(^|[`;&|]|\$\()[[:space:]]*cargo[[:space:]]+tree[[:space:]]'
+  while IFS= read -r script; do
+    offenders="$(sed -E 's/\\`//g' "$script" \
+      | grep -nE "$cmd_word" \
+      | grep -vE '^[0-9]+:[[:space:]]*#' \
+      | grep -vF -e '--target all' || true)"
+    if [[ -n "$offenders" ]]; then
+      all_offenders="$all_offenders$(printf '%s\n' "$offenders" | sed "s|^|${script}:|")
+"
+    fi
+  done < <(find scripts -type f -name '*.sh' | sort)
+  if [[ -n "${all_offenders//[[:space:]]/}" ]]; then
+    echo "   FAIL — a cargo tree invocation below resolves only the runner's host"
+    echo "          triple, so every cfg-gated dependency edge that is false there"
+    echo "          is absent from a graph this repository reads as proof:"
+    printf '%s\n' "$all_offenders" | sed -E '/^$/d; s/^/       x /'
+    echo "          Add '--target all' so cargo resolves the union over every triple."
+    fixture_failures=$((fixture_failures + 1))
+    return
+  fi
+  echo "   ok   — every cargo tree invocation under scripts/ resolves every target triple"
+}
+
+# ---------------------------------------------------------------------------
+# normalize_shipping_lines <text>
+#   Emit the lines of <text> with leading and trailing whitespace removed and
+#   every internal whitespace run collapsed to one space, empty lines dropped,
+#   sorted-unique. Both declaration lists near ARTIFACTS are written in this
+#   normalized form, so a line indented inside a YAML `run: |` block compares
+#   equal to the declaration a reader wrote flush-left.
+# ---------------------------------------------------------------------------
+normalize_shipping_lines() {
+  printf '%s\n' "$1" \
+    | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/ /g; /^$/d' \
+    | sort -u
+}
+
+# ---------------------------------------------------------------------------
+# packages_built_by_shipping_lines <shipping-lines> <declared-non-shipping-lines>
+#   Emit one SCP package name per line, sorted-unique, for every package the
+#   shipping lines name after `-p` or list in a `for pkg in …;` loop, after
+#   dropping every line that appears verbatim in <declared-non-shipping-lines>.
+#   Both arguments pass through normalize_shipping_lines, so a declaration
+#   matches its shipping line whatever indentation that line carries.
+#
+#   The declaration list is what keeps this decidable rather than a guess about
+#   which cargo subcommands build something: a `-p` line either names a package
+#   this gate resolves, or a human declares in DECLARED_NON_SHIPPING_PACKAGE_LINES
+#   why that exact line compiles no shipped artifact. Reading the subcommand
+#   instead — `build` ships, `nextest` does not — would be a denylist of
+#   spellings, and `cargo run -p scp-ffi-uniffi --bin uniffi-bindgen` already
+#   shows a subcommand that neither reading classifies on its name alone.
+#
+#   Pure, so run_fixtures drives it with synthetic lines, including the case a
+#   declared line must NOT suppress.
+# ---------------------------------------------------------------------------
+packages_built_by_shipping_lines() {
+  local kept
+  kept="$(comm -23 <(normalize_shipping_lines "$1") <(normalize_shipping_lines "$2"))"
+  { printf '%s\n' "$kept" | grep -oE '\-p "?scp-[a-z0-9-]+"?' | sed -E 's/^-p "?//; s/"$//' || true
+    printf '%s\n' "$kept" | grep -oE '^for pkg in [a-z0-9 -]+;' \
+      | sed -E 's/^for pkg in //; s/;$//' | tr ' ' '\n' || true
+  } | sed -E '/^$/d' | sort -u
+}
+
+# assert_shipping_invocations_are_gated
+#   The DRIFT property this gate could not previously assert: ARTIFACTS names a
+#   feature configuration per shipped artifact, and nothing read the commands
+#   that actually build those artifacts, so an edit to Dockerfile or to a
+#   workflow could change what ships while this gate kept resolving the
+#   configuration written here and printing OK.
+#
+#   CRITERION (two halves, each decidable over the shipping files):
+#     1. Every SCP package a shipping file names after `-p`, or lists in the
+#        `for pkg in …` loop that builds the uploaded bridge cdylibs, is a
+#        package this gate resolves — an ARTIFACTS entry, or a node of the
+#        default-members tree the default-members check resolves — unless the
+#        line naming it appears verbatim in DECLARED_NON_SHIPPING_PACKAGE_LINES,
+#        where a human wrote why that line compiles no shipped artifact. A
+#        package built alone resolves a SUBSET of what the default-members
+#        invocation unifies, so a package inside that clean tree cannot carry a
+#        feature the allowlist rejects.
+#     2. Every line of a shipping file carrying a cargo feature-selection flag
+#        appears verbatim in DECLARED_SHIPPING_FEATURE_FLAG_LINES. The set of
+#        flags that changes cargo's feature resolution is closed —
+#        `--features`, `-F`, `--all-features`, `--no-default-features` — so
+#        matching those four decides the criterion instead of sampling
+#        spellings of it. Whoever adds a fifth spelling to cargo also has to add
+#        it here, and until then an undeclared flag line fails this gate.
+#
+#   Both halves fail CLOSED: a shipping file this function cannot read fails, and
+#   a package or a flag line it cannot account for fails.
+assert_shipping_invocations_are_gated() {
+  echo ">> fixture: every package a shipping file builds is gated, and every feature flag in one is declared (drift between ARTIFACTS and the shipped build commands)"
+  local file missing_files="" gated_packages="" dm_tree pkg flag_lines undeclared
+
+  for file in "${SHIPPING_FILES[@]}"; do
+    [[ -f "$file" ]] || missing_files="$missing_files $file"
+  done
+  if [[ -n "$missing_files" ]]; then
+    echo "   FAIL — shipping file(s) named by SHIPPING_FILES do not exist:$missing_files"
+    echo "          A renamed or deleted shipping file leaves its build commands unread."
+    fixture_failures=$((fixture_failures + 1))
+    return
+  fi
+
+  # Half 1 — packages built by a shipping file.
+  local spec
+  for spec in "${ARTIFACTS[@]}"; do
+    gated_packages="$gated_packages
+${spec%%|*}"
+  done
+  if ! dm_tree="$(cargo tree -e no-dev --target all --prefix none -f "{p}" 2>&1)"; then
+    echo "   FAIL — cargo could not resolve the default-members tree this fixture reads:"
+    printf '%s\n' "$dm_tree" | sed 's/^/       /'
+    fixture_failures=$((fixture_failures + 1))
+    return
+  fi
+  gated_packages="$gated_packages
+$(printf '%s\n' "$dm_tree" | sed -E -n 's/^(scp-[a-z0-9-]+) v[0-9].*/\1/p')"
+  gated_packages="$(printf '%s\n' "$gated_packages" | sed -E '/^$/d' | sort -u)"
+
+  local shipping_lines built_packages ungated="" stale_pkg_lines
+  shipping_lines="$(cat "${SHIPPING_FILES[@]}")"
+  built_packages="$(packages_built_by_shipping_lines "$shipping_lines" "$DECLARED_NON_SHIPPING_PACKAGE_LINES")"
+  for pkg in $built_packages; do
+    if ! printf '%s\n' "$gated_packages" | grep -xF "$pkg" >/dev/null; then
+      ungated="$ungated $pkg"
+    fi
+  done
+  if [[ -n "$ungated" ]]; then
+    echo "   FAIL — a shipping file builds SCP package(s) this gate resolves in no configuration:$ungated"
+    echo "          Add an ARTIFACTS entry for each, or restore its default-members membership."
+    echo "          A line that compiles no shipped artifact belongs instead in"
+    echo "          DECLARED_NON_SHIPPING_PACKAGE_LINES with the reason it ships nothing."
+    fixture_failures=$((fixture_failures + 1))
+    return
+  fi
+  stale_pkg_lines="$(comm -13 <(normalize_shipping_lines "$shipping_lines") \
+                              <(normalize_shipping_lines "$DECLARED_NON_SHIPPING_PACKAGE_LINES"))"
+  if [[ -n "$stale_pkg_lines" ]]; then
+    echo "   FAIL — DECLARED_NON_SHIPPING_PACKAGE_LINES declares line(s) no shipping file carries:"
+    printf '%s\n' "$stale_pkg_lines" | sed 's/^/       x /'
+    echo "          A stale declaration suppresses the next edit to the line it once described."
+    fixture_failures=$((fixture_failures + 1))
+    return
+  fi
+
+  # Half 2 — feature-selection flags in a shipping file.
+  flag_lines="$(grep -hE '(^|[[:space:]])(--features|-F|--all-features|--no-default-features)([[:space:]]|=|$)' "${SHIPPING_FILES[@]}" \
+    | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/ /g' | sort -u)"
+  undeclared="$(comm -23 <(printf '%s\n' "$flag_lines" | sed -E '/^$/d' | sort -u) \
+                         <(printf '%s\n' "$DECLARED_SHIPPING_FEATURE_FLAG_LINES" | sed -E '/^$/d' | sort -u))"
+  if [[ -n "$undeclared" ]]; then
+    echo "   FAIL — a shipping file carries a cargo feature-selection flag this gate never declared:"
+    printf '%s\n' "$undeclared" | sed 's/^/       x /'
+    echo "          Either that line builds a shipped artifact — then gate its configuration in"
+    echo "          ARTIFACTS — or it builds no shipped artifact, and belongs in"
+    echo "          DECLARED_SHIPPING_FEATURE_FLAG_LINES with the reason it ships nothing."
+    fixture_failures=$((fixture_failures + 1))
+    return
+  fi
+  local stale
+  stale="$(comm -13 <(printf '%s\n' "$flag_lines" | sed -E '/^$/d' | sort -u) \
+                    <(printf '%s\n' "$DECLARED_SHIPPING_FEATURE_FLAG_LINES" | sed -E '/^$/d' | sort -u))"
+  if [[ -n "$stale" ]]; then
+    echo "   FAIL — DECLARED_SHIPPING_FEATURE_FLAG_LINES declares line(s) no shipping file carries:"
+    printf '%s\n' "$stale" | sed 's/^/       x /'
+    echo "          A stale declaration hides the next edit to the line it once described."
+    fixture_failures=$((fixture_failures + 1))
+    return
+  fi
+  echo "   ok   — every package a shipping file builds is gated, every feature-flag line in one is declared, and each declaration still names a line a shipping file carries"
 }
 
 assert_allowlist_has_no_nullifier() {
@@ -577,7 +1202,12 @@ run_fixtures() {
   local nf leaked
   for nf in "scp-platform/testing" "scp-dht/testing" "scp-did/testing" "scp-testing" \
             "scp-core/allow_unencrypted_storage" "scp-node/allow_unencrypted_storage" \
-            "scp-runtime/allow_unencrypted_storage"; do
+            "scp-runtime/allow_unencrypted_storage" \
+            "scp-node/testing" "scp-ffi/testing" "scp-ffi-napi/testing" \
+            "scp-ffi-uniffi/testing" "scp-ffi-common/testing" \
+            "scp-event-log/testing" "scp-identity/testing" \
+            "scp-core/outlet-capability-test-grant" \
+            "scp-runtime/saga-witness-test-mint"; do
     leaked="$(printf '%s\n%s' "$PERMITTED_ALLOWLIST" "$nf")"
     check_subset "$leaked" "$PERMITTED_ALLOWLIST" >/dev/null 2>&1; rc=$?
     expect "(soundness) leaked nullifier feature '$nf' is REJECTED" "FAIL" "$rc"
@@ -610,9 +1240,113 @@ run_fixtures() {
   tree_names_scp_testing_crate "$(printf 'my-scp-testing v0.1.0\n%s' "$padded")"; probe_rc=$?
   expect "(SIGPIPE) a crate whose name merely ends in scp-testing is not matched" "FAIL" "$probe_rc"
 
+  # (root-blindness) The per-package rendering must read a ROOT package's own
+  #     `[features]`-table activations, at every depth, and the ⊆ check must then
+  #     reject them. `cargo tree -e features` renders none of these rows, so the
+  #     edge extraction alone reported ABSENCE for a build carrying four
+  #     nullifiers. The two synthetic trees below are the shapes cargo prints for
+  #     `-p scp-node --features testing`: the edge tree names no `testing`
+  #     anywhere, and the per-package tree carries the root's own row first, a
+  #     repeated node with cargo's ` (*)` marker, a package with no enabled
+  #     feature, a non-SCP package, a package whose name merely ends in an SCP
+  #     crate name, and an indented line `--prefix none` would never print.
+  local edge_tree pkg_tree edges pkgs merged
+  edge_tree="$(cat <<'TREE'
+scp-node v0.1.0-beta.2 (/w/crates/scp-node)
+├── scp-core feature "default"
+│   └── scp-core v0.1.0-beta.2 (/w/crates/scp-core)
+└── scp-platform feature "sqlite"
+    └── scp-platform v0.1.0-beta.2 (/w/crates/scp-platform)
+TREE
+)"
+  pkg_tree="$(cat <<'TREE'
+allow_unencrypted_storage,testing|scp-node v0.1.0-beta.2 (/w/crates/scp-node)
+default,production-dht,testing|scp-dht v0.1.0-beta.2 (/w/crates/scp-dht)
+sqlite,testing|scp-platform v0.1.0-beta.2 (/w/crates/scp-platform) (*)
+allow_unencrypted_storage|scp-runtime v0.1.0-beta.2 (/w/crates/scp-runtime)
+|scp-crypto v0.1.0-beta.2 (/w/crates/scp-crypto)
+full,macros|tokio v1.49.0
+testing|my-scp-node v0.1.0 (/w/vendor)
+testing|   +-- scp-media v0.1.0-beta.2 (/w/crates/scp-media)
+TREE
+)"
+
+  edges="$(extract_feature_edges "$edge_tree")"
+  if [[ "$edges" == "$(printf 'scp-core/default\nscp-platform/sqlite')" ]]; then rc=0; else rc=1; fi
+  expect "(root-blindness) the edge rendering of a nullifier-carrying scp-node resolve names NO root-package feature" "PASS" "$rc"
+  check_subset "$edges" "$PERMITTED_ALLOWLIST" >/dev/null 2>&1; rc=$?
+  expect "(root-blindness) that edge-only set is ACCEPTED, which is why the edge rendering cannot be this gate's only input" "PASS" "$rc"
+
+  pkgs="$(extract_package_features "$pkg_tree")"
+  local expected_pkgs
+  expected_pkgs="$(printf '%s\n' \
+    'scp-dht/default' 'scp-dht/production-dht' 'scp-dht/testing' \
+    'scp-node/allow_unencrypted_storage' 'scp-node/testing' \
+    'scp-platform/sqlite' 'scp-platform/testing' \
+    'scp-runtime/allow_unencrypted_storage')"
+  if [[ "$pkgs" == "$expected_pkgs" ]]; then rc=0; else rc=1; fi
+  expect "(root-blindness) the per-package rendering emits exactly the root's own rows plus every dependency row, dropping cargo's (*) marker, an empty feature list, a non-SCP package, a package whose name merely ends in an SCP crate name, and an indented line" "PASS" "$rc"
+  if [[ "$rc" -ne 0 ]]; then
+    echo "          expected:"; printf '%s\n' "$expected_pkgs" | sed 's/^/            /'
+    echo "          actual:";   printf '%s\n' "$pkgs"          | sed 's/^/            /'
+  fi
+
+  merged="$(merge_resolved_feature_sets "$edge_tree" "$pkg_tree")"
+  local want
+  for want in "scp-node/testing" "scp-node/allow_unencrypted_storage" \
+              "scp-dht/testing" "scp-platform/testing" \
+              "scp-runtime/allow_unencrypted_storage"; do
+    printf '%s\n' "$merged" | grep -xF "$want" >/dev/null; rc=$?
+    expect "(root-blindness) the union names '$want', which only the per-package rendering carries" "PASS" "$rc"
+  done
+  printf '%s\n' "$merged" | grep -xF 'scp-core/default' >/dev/null; rc=$?
+  expect "(root-blindness) the union keeps 'scp-core/default', which only the edge rendering carries" "PASS" "$rc"
+  check_subset "$merged" "$PERMITTED_ALLOWLIST" >/dev/null 2>&1; rc=$?
+  expect "(root-blindness) the union of both renderings is REJECTED for that same build" "FAIL" "$rc"
+
+  # A half-empty union means cargo resolved nothing or a rendering changed
+  # shape. Accepting it would hand run_gate a set drawn from one rendering while
+  # every message says both, so the merge fails loud instead.
+  merge_resolved_feature_sets "" "$pkg_tree" >/dev/null 2>&1; rc=$?
+  expect "(root-blindness) an empty EDGE rendering fails the merge loud" "FAIL" "$rc"
+  merge_resolved_feature_sets "$edge_tree" "" >/dev/null 2>&1; rc=$?
+  expect "(root-blindness) an empty PER-PACKAGE rendering fails the merge loud" "FAIL" "$rc"
+
+  # (shipping-drift) packages_built_by_shipping_lines decides half 1 of the
+  #     drift check, so these cases prove the declaration list suppresses ONLY
+  #     the exact line a human declared. A blanket per-package suppression would
+  #     let a later `cargo build -p scp-testing` reach a shipped artifact with no
+  #     gate failure, which is the fail-open shape this whole gate rejects.
+  local synthetic_lines declared_lines packages
+  declared_lines="cargo nextest run --release -p scp-testing -E 'test(conformance)'"
+  synthetic_lines="$(printf '%s\n' \
+    '            cargo nextest run --release -p scp-testing -E '"'"'test(conformance)'"'"'' \
+    'RUN cargo build --release -p scp-relay -p scp-node' \
+    '          for pkg in scp-core scp-ffi scp-ffi-napi; do' \
+    'echo not a cargo command at all')"
+  packages="$(packages_built_by_shipping_lines "$synthetic_lines" "$declared_lines")"
+  printf '%s\n' "$packages" | grep -xF 'scp-testing' >/dev/null; rc=$?
+  expect "(shipping-drift) a declared non-shipping line contributes no package, whatever its indentation" "FAIL" "$rc"
+  printf '%s\n' "$packages" | grep -xF 'scp-node' >/dev/null; rc=$?
+  expect "(shipping-drift) an undeclared '-p' line still contributes its package" "PASS" "$rc"
+  printf '%s\n' "$packages" | grep -xF 'scp-ffi-napi' >/dev/null; rc=$?
+  expect "(shipping-drift) a 'for pkg in …;' loop contributes each package it lists" "PASS" "$rc"
+  packages="$(packages_built_by_shipping_lines \
+    "$(printf '%s\n%s\n' "$synthetic_lines" 'RUN cargo build --release -p scp-testing')" \
+    "$declared_lines")"
+  printf '%s\n' "$packages" | grep -xF 'scp-testing' >/dev/null; rc=$?
+  expect "(shipping-drift) declaring one line does not suppress the same package on a DIFFERENT line" "PASS" "$rc"
+  packages="$(packages_built_by_shipping_lines "$synthetic_lines" "")"
+  printf '%s\n' "$packages" | grep -xF 'scp-testing' >/dev/null; rc=$?
+  expect "(shipping-drift) an undeclared test invocation naming a package is REPORTED, so the list is load-bearing" "PASS" "$rc"
+
   assert_every_pipeline_reader_consumes_its_input
 
+  assert_every_cargo_tree_resolves_every_target
+
   assert_allowlist_has_no_nullifier
+
+  assert_shipping_invocations_are_gated
 
   echo "-------------------------------------------------------------------------------"
   if [[ "$fixture_failures" -eq 0 ]]; then
