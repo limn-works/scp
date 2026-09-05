@@ -31,7 +31,7 @@
 //! objects: a `WebCrypto`-backed key-custody object (its bound DID becomes this
 //! participant's identity; see [`custody`] for the ADR-057 friction note on
 //! where the MLS signing key currently lives), an `IndexedDB`/OPFS-backed storage
-//! object, and a [`socket::JsSocket`] wrapping the tab's relay WebSocket (the
+//! object, and a `socket::JsSocket` wrapping the tab's relay WebSocket (the
 //! outbound relay port; inbound frames are pushed back in via
 //! [`WasmScpClient::handle_relay_frame`]). The clock is **not** injected: it is
 //! the hardened captured-`Date.now` source ([`time::WasmClock`]) built inside wasm
@@ -277,7 +277,7 @@ impl WasmScpClient {
     /// directly, exercising the same driver construction the browser path uses.
     ///
     /// **Gated off the `wasm32` target** (`#[cfg(not(target_arch = "wasm32"))]`):
-    /// on a browser build the ONLY constructor is [`WasmScpClient::from_js`], which
+    /// on a browser build the ONLY constructor is `WasmScpClient::from_js`, which
     /// builds the hardened captured-`Date.now` [`WasmClock`](crate::time::WasmClock)
     /// internally. Exposing `from_parts` (which accepts an INJECTED clock) on the
     /// wasm surface would let a caller substitute a soft/attacker-controllable clock
@@ -892,7 +892,7 @@ pub fn outlet_stream_compute_caveats_binding(
 /// preimage binds `(context_id, outlet_id, chunk.request_id, chunk.sequence,
 /// caveats_binding, chunk.payload)`.
 ///
-/// `chunk` is the JSON-serialized [`OutletStreamChunk`] (the same wire encoding
+/// `chunk` is the JSON-serialized [`OutletStreamChunk`](scp_protocol::context::outlets::stream::OutletStreamChunk) (the same wire encoding
 /// the NAPI bridge accepts, so the TS SDK produces/consumes ONE chunk form
 /// across bindings). `operatorPk` and `caveatsBinding` are 32-byte values.
 ///
@@ -959,7 +959,7 @@ pub fn outlet_stream_verify_chunk_signature(
 /// reconstructs the invoker's `SigningKey` from `signingKeySeed`, signs the
 /// §5.4.5 credit-grant preimage via
 /// [`scp_protocol::context::outlets::stream::sign_credit_grant`], assembles the
-/// [`OutletStreamCredit`] (`request_id` ‖ `grant` ‖ `monotonic_seq` ‖ `sig`),
+/// [`OutletStreamCredit`](scp_protocol::context::outlets::stream::OutletStreamCredit) (`request_id` ‖ `grant` ‖ `monotonic_seq` ‖ `sig`),
 /// and returns its JSON encoding.
 ///
 /// `monotonicSeq` and `streamEpoch` are `u64` → JS `BigInt`.
@@ -1023,7 +1023,7 @@ pub fn outlet_stream_sign_credit(
 /// This is the #1980-forward `WebCrypto` seam: it returns the 32-byte SHA-256
 /// hash the invoker's signature covers, WITHOUT touching any private key, so an
 /// off-wasm signer (`WebCrypto`, hardware custody) can sign the preimage and the
-/// caller assembles the [`OutletStreamCredit`] itself. `outletStreamSignCredit`
+/// caller assembles the [`OutletStreamCredit`](scp_protocol::context::outlets::stream::OutletStreamCredit) itself. `outletStreamSignCredit`
 /// is the in-wasm counterpart for the current seed-in-wasm posture.
 ///
 /// `monotonicSeq` and `streamEpoch` are `u64` → JS `BigInt`.

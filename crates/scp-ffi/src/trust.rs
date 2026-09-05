@@ -721,7 +721,7 @@ fn run_aggregation<S: scp_platform::EncryptedStorage + 'static>(
 ///
 /// The scalar projection of scp-core's
 /// [`ParticipationRecord`](scp_core::trust::ParticipationRecord), produced by
-/// [`PyScp::participation_record`]. Counts are flattened ONCE in the shared Rust
+/// [`PyScp::participation_record`](crate::scp::PyScp::participation_record). Counts are flattened ONCE in the shared Rust
 /// core (`ParticipationFacts`) so Python RECEIVES the facts rather than
 /// re-aggregating event-log collections — eliminating cross-binding divergence
 /// by construction.

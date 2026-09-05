@@ -128,6 +128,18 @@ nothing:
                `pull_request` only. A merge queue evaluates a required check
                against the `merge_group` ref, so following that header would
                have left every queue entry waiting on a status no run reports.
+  lint-scope   One crate declared the lint the two rustdoc jobs exist to fire:
+               crates/scp-runtime/src/lib.rs carried
+               `#![deny(rustdoc::broken_intra_doc_links)]` and none of the other
+               25 members did, so job rust-doc, run verbatim on the tree that
+               added `--document-private-items`, exited 0 over 271 unresolved
+               intra-doc links in twelve other crate directories (218 of them
+               under crates/scp-ffi/). The root Cargo.toml now sets that lint to
+               `forbid` under `[workspace.lints.rustdoc]`, and every member
+               inherits the table through `[lints] workspace = true`. The level
+               is `forbid` because rustc lets a source-level `#![allow]` lower a
+               `deny` and rejects an `allow` that contradicts a `forbid`, so no
+               crate can reopen the hole from inside its own source.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
@@ -265,11 +277,23 @@ WORKSPACE_SCOPE_FLAG = "--workspace"
 
 # CRITERION for check_rustdoc_documents_private_items: rustdoc resolves an
 # intra-doc link only inside an item it documents, so a `cargo doc` run without
-# this flag applies `#![deny(rustdoc::broken_intra_doc_links)]` to the public
-# surface alone and reads no link a private module writes. Every `cargo doc`
-# command in every workflow of this repository exists to catch such a link, so
-# each one passes this flag.
+# this flag applies the workspace's `forbid(rustdoc::broken_intra_doc_links)` to
+# the public surface alone and reads no link a private module writes. Every
+# `cargo doc` command in every workflow of this repository exists to catch such
+# a link, so each one passes this flag.
 DOCUMENT_PRIVATE_ITEMS_FLAG = "--document-private-items"
+
+# CRITERION for check_rustdoc_lint_reaches_every_member: the flag above buys a
+# diagnostic only where the lint level makes an unresolved link an error, and
+# cargo applies a lint level per package. The root Cargo.toml sets this lint to
+# `forbid` under `[workspace.lints.rustdoc]`, and a member receives that table
+# only when its own manifest declares `[lints] workspace = true`, so a member
+# without that declaration documents under rustdoc's default `warn` and both
+# rustdoc jobs exit 0 over every link it breaks. The level is `forbid` and not
+# `deny` because rustc honours a source-level `#![allow]` against a `deny` and
+# rejects one against a `forbid`.
+RUSTDOC_LINT = "broken_intra_doc_links"
+RUSTDOC_LINT_LEVEL = "forbid"
 
 # A FLOOR under those two criteria, not the criteria themselves. Both checks
 # iterate whatever the workflows declare, so a renamed job, a `cargo doc` moved
@@ -1171,34 +1195,114 @@ def rustdoc_commands(doc: dict):
                     yield job_id, line
 
 
+def rustdoc_lint_level(root_document: dict) -> str | None:
+    """Return the level the root manifest's `[workspace.lints.rustdoc]` gives RUSTDOC_LINT.
+
+    Cargo accepts either `lint = "level"` or `lint = { level = "level", .. }`;
+    both spellings read to the level string. A manifest that does not name the
+    lint reads to None, which is rustdoc's default `warn` seen from the
+    workspace's end.
+    """
+    entry = (
+        root_document.get("workspace", {})
+        .get("lints", {})
+        .get("rustdoc", {})
+        .get(RUSTDOC_LINT)
+    )
+    if isinstance(entry, dict):
+        entry = entry.get("level")
+    return entry if isinstance(entry, str) else None
+
+
+def inherits_workspace_lints(member_document: dict) -> bool:
+    """Report whether a member manifest declares `[lints] workspace = true`."""
+    return member_document.get("lints", {}).get("workspace") is True
+
+
+def check_rustdoc_lint_reaches_every_member(root: Path | None = None) -> None:
+    """The workspace forbids the lint and every member inherits the table.
+
+    CRITERION: cargo applies `[workspace.lints]` to a package only through that
+    package's own `[lints] workspace = true`, so the lint's reach is the set of
+    members carrying that line. Before this check, one member of 26 declared
+    the lint in its lib.rs and job rust-doc exited 0 over 271 unresolved links
+    in the other crate directories. Reading the members out of the root
+    manifest means a crate added later is held to the lint the moment its
+    member entry lands.
+    """
+    root = (REPO if root is None else root).resolve()
+    root_document = tomllib.loads((root / "Cargo.toml").read_text())
+    level = rustdoc_lint_level(root_document)
+    check(
+        f"Cargo.toml: [workspace.lints.rustdoc] sets {RUSTDOC_LINT} to "
+        f"{RUSTDOC_LINT_LEVEL}",
+        level == RUSTDOC_LINT_LEVEL,
+        f"the root manifest gives rustdoc::{RUSTDOC_LINT} the level {level!r}, so "
+        f"a broken intra-doc link is an error in no member (a `deny` would let any "
+        f"member's `#![allow]` lower it back to a warning)",
+    )
+    for member in sorted(workspace_member_directories(root)):
+        member_document = tomllib.loads((root / member / "Cargo.toml").read_text())
+        check(
+            f"{member}/Cargo.toml: [lints] workspace = true",
+            inherits_workspace_lints(member_document),
+            f"the member does not inherit [workspace.lints], so rustdoc documents "
+            f"it under the default `warn` and both rustdoc jobs exit 0 over every "
+            f"intra-doc link it breaks",
+        )
+
+
+def check_rustdoc_lint_readers_detect_a_lowered_level() -> None:
+    """A lowered level and a member without the table flip the two predicates.
+
+    CRITERION: rustdoc_lint_level reads the level out of the manifest and
+    inherits_workspace_lints reads the boolean, so a manifest carrying `warn`,
+    a manifest naming no rustdoc table, and a member manifest without `[lints]`
+    each read as not held to the lint. Without this pair, a reader that always
+    returned the forbid level would leave check_rustdoc_lint_reaches_every_member
+    printing `ok` over a workspace that never set it.
+    """
+    lowered = {"workspace": {"lints": {"rustdoc": {RUSTDOC_LINT: "warn"}}}}
+    lowered_table = {
+        "workspace": {"lints": {"rustdoc": {RUSTDOC_LINT: {"level": "deny"}}}}
+    }
+    absent = {"workspace": {"lints": {"clippy": {"all": "warn"}}}}
+    for name, document, expected in (
+        ("a `warn` string reads as warn", lowered, "warn"),
+        ("a `{ level = \"deny\" }` table reads as deny", lowered_table, "deny"),
+        ("a manifest naming no rustdoc table reads as None", absent, None),
+    ):
+        check(
+            f"rustdoc_lint_level: {name}",
+            rustdoc_lint_level(document) == expected,
+            f"rustdoc_lint_level returned {rustdoc_lint_level(document)!r}, so it "
+            f"reads something other than the manifest's lint level",
+        )
+    for name, document in (
+        ("a member with no [lints] table", {"package": {"name": "x"}}),
+        ("a member setting [lints] workspace = false", {"lints": {"workspace": False}}),
+        ("a member declaring its own lints", {"lints": {"rustdoc": {RUSTDOC_LINT: "forbid"}}}),
+    ):
+        check(
+            f"inherits_workspace_lints: {name} -> not inherited",
+            not inherits_workspace_lints(document),
+            "inherits_workspace_lints returned True over a manifest carrying no "
+            "`[lints] workspace = true`, so it reads something other than that line",
+        )
+
+
 def check_rustdoc_documents_private_items(
     documents: list[tuple[Path, dict]],
 ) -> None:
     """Every `cargo doc` command in every workflow documents private items.
 
     CRITERION: rustdoc resolves an intra-doc link only inside an item it
-    documents. `crates/scp-runtime/src/lib.rs` denies
-    `rustdoc::broken_intra_doc_links`, and that denial fires on a link written in
-    a private module only when the command passes `--document-private-items`, so
-    a `cargo doc` run without the flag reports success over links it never read.
-
-    The flag buys that denial and nothing else, so this also asserts that a crate
-    under crates/ still declares the attribute. Delete the attribute and every
-    `cargo doc` below reports a broken link as a warning and exits 0, which is
-    the same green check the missing flag produced.
+    documents. The workspace forbids `rustdoc::broken_intra_doc_links`
+    (check_rustdoc_lint_reaches_every_member holds that), and that level fires on
+    a link written in a private module only when the command passes
+    `--document-private-items`, so a `cargo doc` run without the flag reports
+    success over links it never read.
     """
-    denying = sorted(
-        str(source.relative_to(REPO))
-        for source in (REPO / "crates").rglob("src/lib.rs")
-        if "deny(rustdoc::broken_intra_doc_links)" in source.read_text()
-    )
-    check(
-        "a crate attribute makes a broken intra-doc link an error",
-        bool(denying),
-        "no crate under crates/ declares "
-        "`#![deny(rustdoc::broken_intra_doc_links)]`, so every `cargo doc` command "
-        "below reports a broken link as a warning and exits 0",
-    )
     for path, doc in documents:
         for job_id, command in rustdoc_commands(doc):
             check(
@@ -2616,6 +2720,8 @@ def main() -> int:
     check_workspace_scope_detects_a_narrowed_filter(documents)
 
     print("private-items — every `cargo doc` reads the links private modules write")
+    check_rustdoc_lint_reaches_every_member()
+    check_rustdoc_lint_readers_detect_a_lowered_level()
     check_rustdoc_documents_private_items(documents)
     check_private_items_detects_a_dropped_flag(documents)
     check_workspace_and_rustdoc_readers(documents)

@@ -1,10 +1,10 @@
 //! In-memory [`PreRotationCustody`] for testing.
 //!
 //! Stores pre-rotation keypairs in a `HashMap` keyed by an opaque
-//! [`PreRotationKeyHandle`]. Distinct from [`InMemoryKeyCustody`]: there is
+//! [`PreRotationKeyHandle`]. Distinct from [`InMemoryKeyCustody`](crate::testing::InMemoryKeyCustody): there is
 //! NO shared state, NO shared lock, NO shared handle namespace. This
 //! satisfies spec §9.7.4.1 §3 ("storage isolation") at the type level —
-//! callers cannot pass an operational [`KeyHandle`] to this custody.
+//! callers cannot pass an operational [`KeyHandle`](crate::KeyHandle) to this custody.
 //!
 //! **Not suitable for production.** This implementation co-resides in
 //! process memory with operational keys; the §9.7.4.1 §3 substrate-isolation
@@ -24,7 +24,7 @@ use crate::traits::{
 ///
 /// Stores `(public_key, private_key)` per handle. Handles are allocated
 /// from an internal `AtomicU64`; they do not collide with operational
-/// [`KeyHandle`] IDs because the type system prevents conversion in either
+/// [`KeyHandle`](crate::KeyHandle) IDs because the type system prevents conversion in either
 /// direction.
 #[derive(Debug, Default)]
 pub struct InMemoryPreRotationCustody {

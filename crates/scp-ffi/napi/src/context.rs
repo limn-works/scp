@@ -873,7 +873,7 @@ pub(crate) async fn context_create_on(
     Ok(handle)
 }
 
-/// Per-bridge-instance implementation of [`context_join`].
+/// Per-bridge-instance implementation of [`Scp::context_join`](crate::scp::Scp::context_join).
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) async fn context_join_on(
     bi: &NapiBridgeInstance,
@@ -1572,7 +1572,7 @@ pub(crate) async fn invite_member_on(
     Ok(NapiInviteMemberOutcome::from_outcome(outcome))
 }
 
-/// Per-bridge-instance implementation of [`context_leave`].
+/// Per-bridge-instance implementation of [`Scp::context_leave`](crate::scp::Scp::context_leave).
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) async fn context_leave_on(
     bi: &NapiBridgeInstance,
@@ -1630,7 +1630,7 @@ pub(crate) async fn context_leave_on(
     Ok(())
 }
 
-/// Per-bridge-instance implementation of [`context_close`].
+/// Per-bridge-instance implementation of [`Scp::context_close`](crate::scp::Scp::context_close).
 pub(crate) async fn context_close_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -1742,7 +1742,7 @@ pub(crate) async fn context_seed_peer_pseudonym_on(
     Ok(())
 }
 
-/// Per-bridge-instance implementation of [`context_send`].
+/// Per-bridge-instance implementation of [`Scp::context_send`](crate::scp::Scp::context_send).
 pub(crate) async fn context_send_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -1917,7 +1917,7 @@ impl ActiveFlagGuard {
     }
 }
 
-/// Per-bridge-instance implementation of [`context_subscribe`].
+/// Per-bridge-instance implementation of [`Scp::context_subscribe`](crate::scp::Scp::context_subscribe).
 pub(crate) async fn context_subscribe_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -2372,7 +2372,7 @@ pub(crate) async fn context_subscribe_on(
     Ok(())
 }
 
-/// Per-bridge-instance implementation of [`context_cancel_subscription`].
+/// Per-bridge-instance implementation of [`Scp::context_cancel_subscription`](crate::scp::Scp::context_cancel_subscription).
 pub(crate) fn context_cancel_subscription_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -2388,7 +2388,7 @@ pub(crate) fn context_cancel_subscription_on(
 // Bridge functions — membership queries (delegated to ContextManager)
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`context_member_count`].
+/// Per-bridge-instance implementation of [`Scp::context_member_count`](crate::scp::Scp::context_member_count).
 ///
 /// Routed through the ADR-049 query dispatch surface
 /// ([`Supervisor::dispatch_query`](scp_core::context::supervisor::Supervisor::dispatch_query)).
@@ -2417,7 +2417,7 @@ pub(crate) async fn context_member_count_on(
     Ok(u32::try_from(count).unwrap_or(u32::MAX))
 }
 
-/// Per-bridge-instance implementation of [`context_is_member`].
+/// Per-bridge-instance implementation of [`Scp::context_is_member`](crate::scp::Scp::context_is_member).
 ///
 /// Routed through the ADR-049 query dispatch surface. The handler acquires
 /// the same per-context mutex as the legacy `is_member` path.
@@ -2445,7 +2445,7 @@ pub(crate) async fn context_is_member_on(
         .map_err(|e| napi::Error::from_reason(e.to_string()))
 }
 
-/// Per-bridge-instance implementation of [`context_member_dids`].
+/// Per-bridge-instance implementation of [`Scp::context_member_dids`](crate::scp::Scp::context_member_dids).
 ///
 /// Routed through the ADR-049 query dispatch surface.
 pub(crate) async fn context_member_dids_on(
@@ -2470,7 +2470,7 @@ pub(crate) async fn context_member_dids_on(
         .map_err(|e| napi::Error::from_reason(e.to_string()))
 }
 
-/// Per-bridge-instance implementation of [`context_member_role`].
+/// Per-bridge-instance implementation of [`Scp::context_member_role`](crate::scp::Scp::context_member_role).
 ///
 /// Routed through the ADR-049 query dispatch surface. Returns the role name
 /// as a string, or `null` if the member is not found.
@@ -2504,7 +2504,7 @@ pub(crate) async fn context_member_role_on(
 // Bridge functions — events (delegated to ContextManager)
 // ---------------------------------------------------------------------------
 
-/// Formats a [`ContextEvent`] as a human-readable string.
+/// Formats a [`ContextEvent`](scp_core::context::membership::ContextEvent) as a human-readable string.
 ///
 /// Consequence events (`ConsequenceTriggered`, `ConsequenceEnforced`) are
 /// formatted with structured key=value pairs for observability. All other
@@ -2553,7 +2553,7 @@ fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> 
     }
 }
 
-/// Per-bridge-instance implementation of [`context_drain_events`].
+/// Per-bridge-instance implementation of [`Scp::context_drain_events`](crate::scp::Scp::context_drain_events).
 ///
 /// Routed through the ADR-049 messaging dispatch surface
 /// ([`Supervisor::dispatch_command`](scp_core::context::supervisor::Supervisor::dispatch_command)).
@@ -2587,7 +2587,7 @@ pub(crate) async fn context_drain_events_on(
 // Bridge functions — access key lifecycle (#1529, ADR-049 dispatch surface)
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`access_key_generate`].
+/// Per-bridge-instance implementation of [`Scp::access_key_generate`](crate::scp::Scp::access_key_generate).
 ///
 /// Routed through the ADR-049 lifecycle dispatch surface
 /// ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command)).
@@ -2617,7 +2617,7 @@ pub(crate) async fn access_key_generate_on(
         .map_err(|e| napi::Error::from_reason(format!("[SCP-CTX-2070] {e}")))
 }
 
-/// Per-bridge-instance implementation of [`access_key_revoke`].
+/// Per-bridge-instance implementation of [`Scp::access_key_revoke`](crate::scp::Scp::access_key_revoke).
 ///
 /// Routed through the ADR-049 lifecycle dispatch surface.
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
@@ -2646,7 +2646,7 @@ pub(crate) async fn access_key_revoke_on(
         .map_err(|e| napi::Error::from_reason(format!("[SCP-CTX-2071] {e}")))
 }
 
-/// Per-bridge-instance implementation of [`access_key_restore`].
+/// Per-bridge-instance implementation of [`Scp::access_key_restore`](crate::scp::Scp::access_key_restore).
 ///
 /// Routed through the ADR-049 lifecycle dispatch surface.
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
@@ -2679,7 +2679,7 @@ pub(crate) async fn access_key_restore_on(
 // Bridge functions — broadcast (delegated to ContextManager)
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`context_broadcast_subscriber_count`].
+/// Per-bridge-instance implementation of [`Scp::context_broadcast_subscriber_count`](crate::scp::Scp::context_broadcast_subscriber_count).
 ///
 /// Routed through the ADR-049 broadcast dispatch surface.
 pub(crate) async fn context_broadcast_subscriber_count_on(
@@ -2706,7 +2706,7 @@ pub(crate) async fn context_broadcast_subscriber_count_on(
     Ok(count.map(|c| c as u32))
 }
 
-/// Per-bridge-instance implementation of [`context_is_broadcast_subscriber`].
+/// Per-bridge-instance implementation of [`Scp::context_is_broadcast_subscriber`](crate::scp::Scp::context_is_broadcast_subscriber).
 ///
 /// Routed through the ADR-049 broadcast dispatch surface.
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
@@ -2733,7 +2733,7 @@ pub(crate) async fn context_is_broadcast_subscriber_on(
         .map_err(|e| napi::Error::from_reason(e.to_string()))
 }
 
-/// Per-bridge-instance implementation of [`context_broadcast_admission`].
+/// Per-bridge-instance implementation of [`Scp::context_broadcast_admission`](crate::scp::Scp::context_broadcast_admission).
 ///
 /// Routed through the ADR-049 broadcast dispatch surface.
 pub(crate) async fn context_broadcast_admission_on(
@@ -2763,7 +2763,7 @@ pub(crate) async fn context_broadcast_admission_on(
 // Bridge functions — broadcast mutations (delegated to ContextManager)
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`broadcast_subscribe`].
+/// Per-bridge-instance implementation of [`Scp::broadcast_subscribe`](crate::scp::Scp::broadcast_subscribe).
 ///
 /// Routed through the ADR-049 broadcast dispatch surface. For a GATED broadcast
 /// context, `messages_read_ucan_jwt` MUST carry the `messages:read` JWT issued to
@@ -2814,7 +2814,7 @@ pub(crate) async fn broadcast_subscribe_on(
     Ok(())
 }
 
-/// Per-bridge-instance implementation of [`broadcast_unsubscribe`].
+/// Per-bridge-instance implementation of [`Scp::broadcast_unsubscribe`](crate::scp::Scp::broadcast_unsubscribe).
 ///
 /// When `rotate_keys` is `true`, all authors rotate their broadcast keys
 /// for forward secrecy. Routed through the ADR-049 broadcast dispatch surface.
@@ -2850,7 +2850,7 @@ pub(crate) async fn broadcast_unsubscribe_on(
     Ok(())
 }
 
-/// Per-bridge-instance implementation of [`broadcast_publish`].
+/// Per-bridge-instance implementation of [`Scp::broadcast_publish`](crate::scp::Scp::broadcast_publish).
 pub(crate) async fn broadcast_publish_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -2944,7 +2944,7 @@ pub struct NapiBatchPublishResult {
     pub deploy_id: String,
 }
 
-/// Per-bridge-instance implementation of [`broadcast_publish_asset`].
+/// Per-bridge-instance implementation of [`Scp::broadcast_publish_asset`](crate::scp::Scp::broadcast_publish_asset).
 pub(crate) async fn broadcast_publish_asset_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -3071,7 +3071,7 @@ pub(crate) async fn broadcast_publish_asset_on(
     })
 }
 
-/// Per-bridge-instance implementation of [`broadcast_publish_assets`].
+/// Per-bridge-instance implementation of [`Scp::broadcast_publish_assets`](crate::scp::Scp::broadcast_publish_assets).
 pub(crate) async fn broadcast_publish_assets_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -3210,7 +3210,7 @@ pub(crate) async fn broadcast_publish_assets_on(
     })
 }
 
-/// Per-bridge-instance implementation of [`broadcast_block_subscriber`].
+/// Per-bridge-instance implementation of [`Scp::broadcast_block_subscriber`](crate::scp::Scp::broadcast_block_subscriber).
 ///
 /// The subscriber is removed from the registry and added to all authors'
 /// block lists; all author keys are rotated. Routed through the ADR-049
@@ -3249,7 +3249,7 @@ pub(crate) async fn broadcast_block_subscriber_on(
     Ok(())
 }
 
-/// Per-bridge-instance implementation of [`broadcast_unblock_subscriber`] (§9.16.8).
+/// Per-bridge-instance implementation of [`Scp::broadcast_unblock_subscriber`](crate::scp::Scp::broadcast_unblock_subscriber) (§9.16.8).
 ///
 /// Forward-only: the unblocked subscriber can request the current key on
 /// next pull but cannot decrypt content from the block period. Routed through
@@ -3288,7 +3288,7 @@ pub(crate) async fn broadcast_unblock_subscriber_on(
     Ok(())
 }
 
-/// Per-bridge-instance implementation of [`broadcast_handle_key_request`].
+/// Per-bridge-instance implementation of [`Scp::broadcast_handle_key_request`](crate::scp::Scp::broadcast_handle_key_request).
 ///
 /// Validates the author DID is locally controlled, then HPKE-seals the author's
 /// current broadcast key to the requester's X25519 `wrapping_pubkey`
@@ -3889,7 +3889,7 @@ fn parse_napi_proposal_id(hex_str: &str) -> napi::Result<[u8; 32]> {
     Ok(arr)
 }
 
-/// Per-bridge-instance implementation of [`context_governance_propose`].
+/// Per-bridge-instance implementation of [`Scp::context_governance_propose`](crate::scp::Scp::context_governance_propose).
 pub(crate) async fn context_governance_propose_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -3982,7 +3982,7 @@ pub(crate) async fn context_governance_propose_on(
     Ok(response.to_string())
 }
 
-/// Per-bridge-instance implementation of [`context_governance_approve`].
+/// Per-bridge-instance implementation of [`Scp::context_governance_approve`](crate::scp::Scp::context_governance_approve).
 pub(crate) async fn context_governance_approve_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -4045,7 +4045,7 @@ pub(crate) async fn context_governance_approve_on(
     Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
 }
 
-/// Per-bridge-instance implementation of [`context_governance_reject`].
+/// Per-bridge-instance implementation of [`Scp::context_governance_reject`](crate::scp::Scp::context_governance_reject).
 pub(crate) async fn context_governance_reject_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -4107,7 +4107,7 @@ pub(crate) async fn context_governance_reject_on(
     Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
 }
 
-/// Per-bridge-instance implementation of [`context_governance_withdraw`].
+/// Per-bridge-instance implementation of [`Scp::context_governance_withdraw`](crate::scp::Scp::context_governance_withdraw).
 ///
 /// Routed through the ADR-049 governance dispatch surface. No signing key
 /// is required.
@@ -4168,7 +4168,7 @@ pub(crate) async fn context_governance_withdraw_on(
 // Bridge functions — governance queries (#621)
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`context_governance_get_proposal`].
+/// Per-bridge-instance implementation of [`Scp::context_governance_get_proposal`](crate::scp::Scp::context_governance_get_proposal).
 ///
 /// Returns the full proposal as a JSON string, or rejects if not found.
 /// Routed through the ADR-049 governance dispatch surface.
@@ -4219,7 +4219,7 @@ pub(crate) async fn context_governance_get_proposal_on(
     })
 }
 
-/// Per-bridge-instance implementation of [`context_governance_list_proposals`].
+/// Per-bridge-instance implementation of [`Scp::context_governance_list_proposals`](crate::scp::Scp::context_governance_list_proposals).
 ///
 /// Returns a JSON array of proposals, or an empty array if the context has
 /// no pending proposals. Routed through the ADR-049 governance dispatch surface.
@@ -4270,7 +4270,7 @@ pub(crate) async fn context_governance_list_proposals_on(
 // Bridge functions — ceiling modification, close, checkpoint, restore (#559)
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`context_apply_pending_ceiling_modification`].
+/// Per-bridge-instance implementation of [`Scp::context_apply_pending_ceiling_modification`](crate::scp::Scp::context_apply_pending_ceiling_modification).
 pub(crate) async fn context_apply_pending_ceiling_modification_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -4312,7 +4312,7 @@ pub(crate) async fn context_apply_pending_ceiling_modification_on(
         })
 }
 
-/// Per-bridge-instance implementation of [`context_finalize_close`].
+/// Per-bridge-instance implementation of [`Scp::context_finalize_close`](crate::scp::Scp::context_finalize_close).
 ///
 /// Transitions the context from `Closing` to `Closed`, destroys keys per
 /// memory scope, and records a `ContextClosed` event. Routed through the
@@ -4371,7 +4371,7 @@ pub(crate) async fn context_finalize_close_on(
     Ok(())
 }
 
-/// Per-bridge-instance implementation of [`context_create_governance_checkpoint`].
+/// Per-bridge-instance implementation of [`Scp::context_create_governance_checkpoint`](crate::scp::Scp::context_create_governance_checkpoint).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn context_create_governance_checkpoint_on(
     bi: &NapiBridgeInstance,
@@ -4454,7 +4454,7 @@ pub(crate) async fn context_create_governance_checkpoint_on(
     })
 }
 
-/// Per-bridge-instance implementation of [`context_add_checkpoint_cosignature`].
+/// Per-bridge-instance implementation of [`Scp::context_add_checkpoint_cosignature`](crate::scp::Scp::context_add_checkpoint_cosignature).
 pub(crate) async fn context_add_checkpoint_cosignature_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -4525,7 +4525,7 @@ pub(crate) async fn context_add_checkpoint_cosignature_on(
     Ok(response.to_string())
 }
 
-/// Per-bridge-instance implementation of [`context_restore`].
+/// Per-bridge-instance implementation of [`Scp::context_restore`](crate::scp::Scp::context_restore).
 ///
 /// Routed through the ADR-049 lifecycle dispatch surface. The handler
 /// loads the persisted snapshot itself and reconstructs an ephemeral
@@ -4568,7 +4568,7 @@ pub(crate) async fn context_restore_on(
         })
 }
 
-/// Per-bridge-instance implementation of [`context_restore_all`].
+/// Per-bridge-instance implementation of [`Scp::context_restore_all`](crate::scp::Scp::context_restore_all).
 ///
 /// Returns a JSON array of restored context ID strings. Routes through the
 /// supervisor-scope direct method `restore_on_startup` (ADR-049),
@@ -4615,7 +4615,7 @@ fn parse_napi_hex_32(hex_str: &str, field_name: &str) -> napi::Result<[u8; 32]> 
 // Bridge functions — context migration (§5.11A, #580)
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`context_tombstone_migrated`].
+/// Per-bridge-instance implementation of [`Scp::context_tombstone_migrated`](crate::scp::Scp::context_tombstone_migrated).
 pub(crate) async fn context_tombstone_migrated_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -4659,7 +4659,7 @@ pub(crate) async fn context_tombstone_migrated_on(
     Ok(())
 }
 
-/// Per-bridge-instance implementation of [`context_migration_state`] (§5.11A).
+/// Per-bridge-instance implementation of [`Scp::context_migration_state`](crate::scp::Scp::context_migration_state) (§5.11A).
 ///
 /// Returns a JSON string with migration state fields, or `null` if the
 /// context is not migrating. Routed through the ADR-049 governance dispatch surface.
@@ -4716,7 +4716,7 @@ pub(crate) async fn context_migration_state_on(
 // Bridge functions — TTL (delegated to ContextManager)
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`context_handle_ttl_expiry`].
+/// Per-bridge-instance implementation of [`Scp::context_handle_ttl_expiry`](crate::scp::Scp::context_handle_ttl_expiry).
 ///
 /// Routed through the ADR-049 TTL-close dispatch surface.
 pub(crate) async fn context_handle_ttl_expiry_on(
@@ -4746,7 +4746,7 @@ pub(crate) async fn context_handle_ttl_expiry_on(
     Ok(())
 }
 
-/// Per-bridge-instance implementation of [`context_propose_ttl_extension`].
+/// Per-bridge-instance implementation of [`Scp::context_propose_ttl_extension`](crate::scp::Scp::context_propose_ttl_extension).
 ///
 /// Routed through the ADR-049 TTL-close dispatch surface. Records consent
 /// from the given member. Returns `true` if the extension was unanimously
@@ -4783,7 +4783,7 @@ pub(crate) async fn context_propose_ttl_extension_on(
     Ok(unanimous)
 }
 
-/// Per-bridge-instance implementation of [`context_reset_ttl_timer`].
+/// Per-bridge-instance implementation of [`Scp::context_reset_ttl_timer`](crate::scp::Scp::context_reset_ttl_timer).
 ///
 /// EXTENDS the existing convergent TTL deadline by `new_duration_secs`
 /// (`old_deadline + new_duration_secs`), NOT a local `now + duration` — every
@@ -4834,7 +4834,7 @@ pub(crate) async fn context_reset_ttl_timer_on(
 // Context export/import (#363)
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`context_export`].
+/// Per-bridge-instance implementation of [`Scp::context_export`](crate::scp::Scp::context_export).
 ///
 /// Returns serialized `StoredValue<ContextExport>` bytes (§17.5) suitable for
 /// backup, migration, or transfer to another node.
@@ -4907,10 +4907,10 @@ pub(crate) async fn context_export_on(
     })
 }
 
-/// Per-bridge-instance implementation of [`context_import`].
+/// Per-bridge-instance implementation of [`Scp::context_import`](crate::scp::Scp::context_import).
 ///
 /// The bytes must be a `StoredValue<ContextExport>` envelope (§17.5), as
-/// produced by [`context_export`]. Routed through the ADR-049 lifecycle
+/// produced by [`Scp::context_export`](crate::scp::Scp::context_export). Routed through the ADR-049 lifecycle
 /// dispatch surface. Returns the context ID of the imported context.
 pub(crate) async fn context_import_on(
     bi: &NapiBridgeInstance,
@@ -5022,7 +5022,7 @@ pub(crate) async fn context_import_on(
 // Economic policy bridge (§19.3, ADR-033)
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`context_set_economic_policy`].
+/// Per-bridge-instance implementation of [`Scp::context_set_economic_policy`](crate::scp::Scp::context_set_economic_policy).
 #[allow(clippy::used_underscore_binding)] // param exists for API surface; body rejects all calls
 #[allow(clippy::needless_pass_by_ref_mut)] // matches &mut handle signature of free fn
 pub(crate) fn context_set_economic_policy_on(
@@ -5040,7 +5040,7 @@ pub(crate) fn context_set_economic_policy_on(
     }))
 }
 
-/// Per-bridge-instance implementation of [`context_get_economic_policy`].
+/// Per-bridge-instance implementation of [`Scp::context_get_economic_policy`](crate::scp::Scp::context_get_economic_policy).
 pub(crate) fn context_get_economic_policy_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,

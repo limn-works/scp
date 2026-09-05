@@ -28,7 +28,7 @@
 //! spec §10.14.3 item 4; ADR-037), wraps the resulting adapter in a
 //! [`scp_transport::TransportManager`], and
 //! stores the manager in the global transport state (see
-//! [`crate::runtime`]). The manager provides multi-relay fanout,
+//! `crate::runtime`). The manager provides multi-relay fanout,
 //! per-context relay set assignment, suppression detection, and reliability
 //! scoring. This manager is shared with `py_mcp_load_contexts` for
 //! relay-based context discovery.

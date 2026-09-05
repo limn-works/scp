@@ -71,6 +71,19 @@ rules separate them.
   compute its population from the tree: `check_workspace_scoped_filters` and
   `check_path_dep_closures` in `scripts/tests/ci-gate/ci_gate_selftest.py` read
   `[workspace] members` and each crate's path-dependency closure out of the manifests.
+- **A lint one crate declares is a check that runs in one crate.** After the two fixes
+  above, job `rust-doc` ran `cargo doc --workspace --document-private-items` and still
+  exited 0 over 271 unresolved intra-doc links (218 of them under `crates/scp-ffi/`),
+  because `crates/scp-runtime/src/lib.rs` was the one `lib.rs` of the 26 members that
+  declared `#![deny(rustdoc::broken_intra_doc_links)]`, and rustdoc's default for the lint
+  is `warn`. The self-test's own floor codified that reach: it passed when at least one
+  crate declared the attribute. The root `Cargo.toml` now sets the lint to `forbid` under
+  `[workspace.lints.rustdoc]`, every member inherits the table through
+  `[lints] workspace = true`, and `check_rustdoc_lint_reaches_every_member` reads the
+  member list out of the manifest and fails when one omits that line. The level is
+  `forbid` because rustc lets a source-level `#![allow]` lower a `deny` and rejects one
+  that contradicts a `forbid`. When a check depends on a lint level, ask which packages
+  carry the level, and set it where every package inherits it.
 
 ## See also
 

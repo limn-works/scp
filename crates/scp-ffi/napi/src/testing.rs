@@ -119,7 +119,7 @@ pub(crate) fn fullstack_reset_network_on(bi: &NapiBridgeInstance) {
     *guard = None;
 }
 
-/// Per-bridge-instance implementation of [`fullstack_create_context`].
+/// Per-bridge-instance implementation of [`Scp::fullstack_create_context`](crate::scp::Scp::fullstack_create_context).
 ///
 /// Enforces per-instance handle affinity: the supplied `node` must have
 /// been minted by the same [`NapiBridgeInstance`] `bi` (see ADR-048).
@@ -189,7 +189,7 @@ pub(crate) fn fullstack_create_context_on(
     Ok(context_id)
 }
 
-/// Per-bridge-instance implementation of [`fullstack_add_member`].
+/// Per-bridge-instance implementation of [`Scp::fullstack_add_member`](crate::scp::Scp::fullstack_add_member).
 pub(crate) fn fullstack_add_member_on(
     bi: &NapiBridgeInstance,
     node: &NapiFullStackNode,
@@ -221,7 +221,7 @@ pub(crate) fn fullstack_add_member_on(
         })
 }
 
-/// Per-bridge-instance implementation of [`fullstack_join_from_welcome`].
+/// Per-bridge-instance implementation of [`Scp::fullstack_join_from_welcome`](crate::scp::Scp::fullstack_join_from_welcome).
 ///
 /// The joiner opens the creator-signed, HPKE-sealed invitation under its
 /// #active split custody and stands up a live, send-capable per-context ACTOR
@@ -263,7 +263,7 @@ pub(crate) fn fullstack_join_from_welcome_on(
     Ok(())
 }
 
-/// Per-bridge-instance implementation of [`fullstack_sync_sender_keys`].
+/// Per-bridge-instance implementation of [`Scp::fullstack_sync_sender_keys`](crate::scp::Scp::fullstack_sync_sender_keys).
 ///
 /// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): sender keys are no longer shuffled by an
 /// explicit provider `distribute` / `pickup`. The inviter's in-actor MLS add
@@ -289,7 +289,7 @@ pub(crate) fn fullstack_sync_sender_keys_on(
     Ok(())
 }
 
-/// Per-bridge-instance implementation of [`fullstack_send_message`].
+/// Per-bridge-instance implementation of [`Scp::fullstack_send_message`](crate::scp::Scp::fullstack_send_message).
 pub(crate) fn fullstack_send_message_on(
     bi: &NapiBridgeInstance,
     node: &NapiFullStackNode,
@@ -336,7 +336,7 @@ pub(crate) fn fullstack_send_message_on(
     Ok(Buffer::from(sent[0].1.clone()))
 }
 
-/// Per-bridge-instance implementation of [`fullstack_decrypt_message`].
+/// Per-bridge-instance implementation of [`Scp::fullstack_decrypt_message`](crate::scp::Scp::fullstack_decrypt_message).
 pub(crate) fn fullstack_decrypt_message_on(
     bi: &NapiBridgeInstance,
     node: &NapiFullStackNode,
@@ -364,7 +364,7 @@ pub(crate) fn fullstack_decrypt_message_on(
     Ok(Buffer::from(plaintext))
 }
 
-/// Per-bridge-instance implementation of [`fullstack_remove_member`].
+/// Per-bridge-instance implementation of [`Scp::fullstack_remove_member`](crate::scp::Scp::fullstack_remove_member).
 pub(crate) fn fullstack_remove_member_on(
     bi: &NapiBridgeInstance,
     node: &NapiFullStackNode,
@@ -408,7 +408,7 @@ pub(crate) fn fullstack_remove_member_on(
     Ok(())
 }
 
-/// Per-bridge-instance implementation of [`fullstack_seed_peer_pseudonym`].
+/// Per-bridge-instance implementation of [`Scp::fullstack_seed_peer_pseudonym`](crate::scp::Scp::fullstack_seed_peer_pseudonym).
 ///
 /// Test-only: seeds a peer's per-context pseudonym routing ID (§9.10.4) into
 /// this node's `Supervisor`, simulating a delivered `PseudonymAnnouncement` so

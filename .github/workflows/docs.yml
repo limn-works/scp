@@ -93,10 +93,10 @@ jobs:
     # `rust-docs` runs `cargo doc --workspace --document-private-items`, which compiles
     # every crate of this workspace, so `rust-toolchain.toml` selects the compiler that
     # job's rustdoc runs and `.cargo/config.toml` sets the rustflags it compiles under.
-    # `scp-runtime` denies `rustdoc::broken_intra_doc_links`, so a pull request that
-    # raises the pin and changes nothing else has to run `rust-docs`: a new release's
-    # rustdoc diagnostic would otherwise first appear on the next pull request that
-    # touches `crates/scp-runtime/src/**`, against code its author did not write. Job
+    # The root Cargo.toml forbids `rustdoc::broken_intra_doc_links` in every member, so a
+    # pull request that raises the pin and changes nothing else has to run `rust-docs`: a
+    # new release's rustdoc diagnostic would otherwise first appear on the next pull
+    # request that touches `crates/**`, against code its author did not write. Job
     # rust-doc in ci.yml runs the same rustdoc command and its `rust` output ORs a
     # `toolchain` filter of its own, so both workflows report that diagnostic on a pin
     # change, and only ci.yml's report can block a merge.
@@ -126,8 +126,8 @@ jobs:
               # `crates/` tree. The list it replaced named eleven crate directories one
               # at a time and matched no file under `crates/scp-event-log/src/`, while
               # `crates/scp-runtime/src/` writes 49 intra-doc links into
-              # `scp_event_log::*` and `crates/scp-runtime/src/lib.rs` denies
-              # `rustdoc::broken_intra_doc_links`. A pull request confined to
+              # `scp_event_log::*` and the root Cargo.toml forbids
+              # `rustdoc::broken_intra_doc_links` in every member. A pull request confined to
               # scp-event-log therefore skipped `rust-docs` on the pull request and again
               # on the push to `main`, so rustdoc could break on `main` while every job
               # that reads it skipped. `check_workspace_scoped_filters` in

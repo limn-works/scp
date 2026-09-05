@@ -204,7 +204,7 @@ fn parse_signing_key_id(s: &str) -> napi::Result<SigningKeyId> {
     }
 }
 
-/// Maps an [`ScpIdError`] variant to its canonical SCP error code.
+/// Maps an [`ScpIdError`](scp_core::identity::ScpIdError) variant to its canonical SCP error code.
 const fn scpid_error_code(e: &scp_core::identity::ScpIdError) -> &'static str {
     use scp_core::identity::ScpIdError;
     match e {

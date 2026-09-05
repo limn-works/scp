@@ -951,9 +951,16 @@ jobs:
       - name: Run doc tests and build docs
         # `--document-private-items` is what lets this job reject a broken intra-doc
         # link written in a private module. Rustdoc resolves an intra-doc link only
-        # inside an item it documents, so without that flag
-        # `crates/scp-runtime/src/lib.rs`'s `#![deny(rustdoc::broken_intra_doc_links)]`
+        # inside an item it documents, so without that flag the workspace's
+        # `forbid(rustdoc::broken_intra_doc_links)` (`[workspace.lints.rustdoc]` in the
+        # root Cargo.toml, inherited by every member through `[lints] workspace = true`)
         # fires on the public surface alone and reads nothing a private module writes.
+        # That table is what makes the flag reach every crate: while
+        # `crates/scp-runtime/src/lib.rs` alone declared the lint, this command exited
+        # 0 over 271 unresolved links in the other crate directories, and
+        # `check_rustdoc_lint_reaches_every_member` in
+        # scripts/tests/ci-gate/ci_gate_selftest.py now fails when a member omits the
+        # inheriting line.
         # All three links pull request #2274, the structured OutletErrorSurface change,
         # broke sat in `crates/scp-runtime/src/context/outlets_helpers.rs`, a private
         # module. This job passed, `ci` reported success, and only the `rust-docs` job

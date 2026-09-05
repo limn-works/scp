@@ -25,7 +25,7 @@
 //! - `OpenMLS` group create / add / remove / encrypt / decrypt. On the receive
 //!   side (Commit merge, sender-key install, message decrypt) this now runs
 //!   through the REAL per-context actor via
-//!   [`Supervisor::deliver_commit_blob`](scp_core::context::Supervisor::deliver_commit_blob)
+//!   [`Supervisor::deliver_commit_blob`](scp_core::context::supervisor::Supervisor::deliver_commit_blob)
 //!   (ADR-049 PR-7, SCP-CRYPTOMOVE-001) — the provider `open` /
 //!   `mls_encrypt_management` / `drain_pending_sender_key_messages` twins were
 //!   deleted when crypto ownership moved onto the actor. Group create / add and
@@ -135,7 +135,7 @@ impl E2eCryptoProvider {
     /// Commits are now merged through the REAL actor receive path. The caller
     /// ([`super::node::FullStackNode`]) wraps each raw Commit in a throwaway
     /// `OuterEnvelope` and feeds it to
-    /// [`Supervisor::deliver_commit_blob`](scp_core::context::Supervisor::deliver_commit_blob),
+    /// [`Supervisor::deliver_commit_blob`](scp_core::context::supervisor::Supervisor::deliver_commit_blob),
     /// which routes it through the actor's `decrypt_and_dispatch` MLS control
     /// path and merges the staged commit (advancing the group epoch).
     #[must_use]
@@ -166,7 +166,7 @@ impl E2eCryptoProvider {
     /// `OuterEnvelope` (harvested from the inviter's transport, where the
     /// inviter's actor pushed it during `invite_member`). The caller
     /// ([`super::node::FullStackNode`]) feeds each straight to
-    /// [`Supervisor::deliver_commit_blob`](scp_core::context::Supervisor::deliver_commit_blob),
+    /// [`Supervisor::deliver_commit_blob`](scp_core::context::supervisor::Supervisor::deliver_commit_blob),
     /// whose `decrypt_and_dispatch` MLS-opens it and installs the authenticated
     /// sender key through the same gate-before-install path production uses.
     #[must_use]

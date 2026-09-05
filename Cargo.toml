@@ -151,6 +151,20 @@ js-sys = "0.3"
 web-sys = "0.3"
 serde-wasm-bindgen = "0.6"
 
+# CRITERION: an intra-doc link that resolves to nothing is an error in every member
+# of this workspace, on every `cargo doc` cargo runs for it.
+# Cargo applies a lint level per package and a member receives this table only
+# through its own `[lints] workspace = true`, so `check_rustdoc_lint_reaches_every_member`
+# in scripts/tests/ci-gate/ci_gate_selftest.py reads every `[workspace] members` entry
+# above and fails when one omits that line. The level is `forbid` because rustc honours
+# a source-level `#![allow(rustdoc::broken_intra_doc_links)]` against a `deny` and
+# rejects one against a `forbid`, so no crate can lower the level from inside its own
+# source. Before this table, `crates/scp-runtime/src/lib.rs` alone declared the lint as
+# a crate attribute, and job rust-doc in .github/workflows/ci.yml exited 0 over 271
+# unresolved intra-doc links in the other crate directories.
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "forbid"
+
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
