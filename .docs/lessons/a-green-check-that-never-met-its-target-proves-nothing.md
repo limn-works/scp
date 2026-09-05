@@ -44,6 +44,73 @@ rules separate them.
   `RUSTFLAGS="-Zsanitizer=address,undefined"`, because rustc offers no `undefined`
   sanitizer — it names the ones it accepts in the error. That second defect sat behind the
   first and would have outlived the repair.
+- **A tool's output format decides what a check can see, so prove the format carries the
+  thing you check for.** `cargo tree -e features` renders a feature node for a feature a
+  *dependency* has activated and renders none for a feature the tree's *root* package
+  activates through its own `[features]` table. `scripts/check-shipped-feature-graph.sh`
+  extracted its resolved feature set from that rendering alone, then gained two artifact
+  entries — `scp-node` and `scp-relay` — that make the root package the artifact itself.
+  For those two entries the extraction could not name a single feature the artifact's own
+  manifest turns on, which is the whole class the entries were added to police:
+  `crates/scp-node/Cargo.toml` declares
+  `testing = ["scp-dht/testing", "scp-platform/testing", "allow_unencrypted_storage"]`, and
+  running that gate with `--features testing` returned a set byte-identical to the clean
+  one and printed OK. Appending `default = ["scp-transport/local-cache"]` to
+  `crates/scp-relay/Cargo.toml` made the gate print `G1 PASSED` and exit 0 while the
+  shipped relay binary carried a feature nothing allowlists, and no other artifact
+  backstopped that binary, because no package outside scp-relay depends on scp-relay. The
+  repair reads a second rendering — `cargo tree --format '{f}|{p}'`, whose per-package list
+  is each package's resolved *enabled* feature set — and checks the union of the two.
+- **A check that reads a tool's output inherits every default that tool applies, and a
+  default narrows what the check can see.** `scripts/check-shipped-feature-graph.sh` and
+  `scripts/check-protocol-deps.sh` each ran `cargo tree` with no `--target`, and cargo's
+  default resolves the runner's host triple, which discards every
+  `[target.'cfg(…)'.dependencies]` edge whose cfg is false there. The G1 job runs on
+  ubuntu-latest while `.github/workflows/build-matrix.yml` builds the three gated bridges
+  for seven other triples and `.github/workflows/release.yml` signs the iOS, macOS and
+  Windows artifacts, so a `scp-platform = { features = ["testing"] }` declared under
+  `cfg(target_os = "ios")` compiled three §17.17.2 security nullifiers into a signed
+  xcframework while G1 printed `G1 PASSED`. Both scripts now pass `--target all`, which
+  resolves the union over every triple rather than an enumeration of the triples anyone
+  remembered to list.
+- **Name the population a check reads, then ask which members of it the reading omits.**
+  Every artifact G1 gated had a parent package to declare its features until the two
+  binaries were added — `scp-node` and `scp-relay` are exactly the entries with no parent —
+  so adding them widened the population past what the reading covered.
+- **A build tool that takes its feature list from a configuration file makes that file a
+  shipping input, and a check that reads only the command lines never sees it.**
+  `assert_shipping_invocations_are_gated` in `scripts/check-shipped-feature-graph.sh` read
+  the three files that carry cargo commands — `Dockerfile`,
+  `.github/workflows/build-matrix.yml`, `.github/workflows/release.yml` — and failed on
+  any `--features` token it found there. The maturin step in build-matrix.yml passes no
+  `--features`, because maturin reads the wheel's cargo feature list from the
+  `[tool.maturin]` table of `bindings/python/pyproject.toml`, and the gate opened no
+  pyproject.toml. Changing that table to `features = ["extension-module", "testing"]`
+  left every shipping line unchanged, so the self-test printed "all behavioral proofs
+  passed" and the gate resolved the two `scp-ffi` configurations it had always resolved,
+  while the wheel that table builds compiled `scp-platform/testing`, `scp-dht/testing`
+  and `scp-testing`. The repair names every pyproject.toml a shipping-file maturin step
+  can read (`MATURIN_PROJECT_FILES`), derives the cargo configuration each one's table
+  selects, and fails unless `ARTIFACTS` carries that configuration verbatim, so the
+  allowlist decides what the wheel ships. The population to name is every input the build
+  tool reads its feature selection from, and a command line is one of those inputs, not
+  the whole set.
+- **A gate that reports absence carries a positive control that runs every time.** Every
+  OK the gate above prints means "this artifact resolves no nullifier feature", and it
+  means that only while the resolver can report one at all. That gate now resolves
+  `-p scp-node --features testing` on every run and fails when the ⊆ check *accepts* it,
+  and it requires the resolver to report `scp-ffi-common/server`, an activation only the
+  per-package rendering carries, before it reads any artifact. A synthetic fixture proves
+  the same properties over hand-written trees; the two are not redundant, because the
+  fixture cannot see a cargo release that changes the rendering.
+- **A check that names what ships reads the commands that ship it.** G1 carried a written
+  caveat saying its ARTIFACTS list must stay in lockstep with the Dockerfile and the two
+  release workflows, and nothing read those files.
+  `assert_shipping_invocations_are_gated` now fails when a shipping file names an SCP
+  package this gate resolves in no configuration, or carries a cargo feature-selection
+  flag nobody declared. It found that `.github/workflows/build-matrix.yml` builds and
+  uploads `scp-core` and the three bridges under their DEFAULT features, a resolution no
+  ARTIFACTS entry gated, so four entries were added.
 - **Read a shared build cache everywhere, and write it only from a push to the default
   branch.** A cache written on a pull-request ref is readable only by that pull request,
   and it evicts entries from the budget every other cache step in the workflow shares.
