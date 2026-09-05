@@ -111,8 +111,9 @@ fails it.
 
 `.github/workflows/docs.yml` carries the same two pieces for the same reason: its
 `rust-docs` job runs `cargo doc --workspace --document-private-items`, which compiles every
-crate on the pinned compiler, and it is the one job in this repository that runs rustdoc
-over the whole workspace while `scp-runtime` denies `rustdoc::broken_intra_doc_links`. The
+crate on the pinned compiler, and it runs rustdoc over the whole workspace while the root
+`Cargo.toml` forbids `rustdoc::broken_intra_doc_links` in every member (job `rust-doc` in
+`.github/workflows/ci.yml` runs the same command and is the one a merge waits on). The
 gate enumerates the workflows it checks from the tree — each tracked file under
 `.github/workflows/` whose extension GitHub Actions runs and that declares a
 `dorny/paths-filter` step — so a paths-filtered workflow added later is covered without
@@ -385,8 +386,16 @@ cargo test --workspace --doc
 # Dependency audit
 cargo deny check
 
-# Generate docs
-cargo doc --workspace --no-deps
+# Generate docs. `--document-private-items` makes rustdoc resolve an intra-doc
+# link inside a private module, and `[workspace.lints.rustdoc]` in the root
+# Cargo.toml, which every member inherits through `[lints] workspace = true`,
+# turns an unresolved one into an error in every crate. Job `rust-doc` in
+# `.github/workflows/ci.yml` omitted the flag, so three broken links in the
+# private module `crates/scp-runtime/src/context/outlets_helpers.rs` rode `main`
+# for ten days under a green required check; and until the workspace table
+# existed, `crates/scp-runtime/src/lib.rs` alone declared the lint, so that
+# same job exited 0 over 271 unresolved links in the other crate directories.
+cargo doc --workspace --no-deps --document-private-items
 ```
 
 ## CI Matrix
@@ -403,7 +412,7 @@ Every push to a PR branch. Target: < 3 minutes.
 | clippy | ubuntu-latest | `cargo clippy --workspace --all-targets -- -D warnings` |
 | test | ubuntu-latest, macos-latest | `cargo nextest run --workspace` |
 | build-release | ubuntu-latest, macos-latest, windows-latest | `cargo build --workspace --release` |
-| doc | ubuntu-latest | `cargo test --workspace --doc && cargo doc --workspace --no-deps` |
+| doc | ubuntu-latest | `cargo test --workspace --doc && cargo doc --workspace --no-deps --document-private-items` |
 | deny | ubuntu-latest | `cargo deny check` |
 
 Unit tests and conformance macro suites (`transport_conformance!()`, `storage_conformance!()`, etc.) run as part of `cargo nextest run --workspace` against in-memory implementations.

@@ -1,16 +1,27 @@
 # SDK API Reference Documentation
 #
 # Generates and publishes API reference docs for all language SDKs
-# on every release tag. Also runs on PRs for validation.
+# on every release tag. Also runs on pull requests, on pushes to `main`, and on
+# merge-queue entries, so a doc build reads a tree before it lands and again
+# after it lands.
 #
 # When a change doesn't touch doc-relevant paths (see the `docs:` filter in the
 # `changes` job), all doc jobs skip via an `if` condition rather than failing.
 # GitHub counts a skipped job as passing for a required status check, so these
 # jobs are safe to promote to required -- that promotion is the standing plan.
+# The `merge_group:` trigger below is what makes the promotion mechanical. A
+# merge queue evaluates every required status check against the `merge_group`
+# ref, so a workflow that does not run on that event reports no check there and
+# every queue entry waits on a status that never arrives. This workflow carried
+# no such trigger while this header called the promotion safe.
+# `check_merge_queue_triggers` in scripts/tests/ci-gate/ci_gate_selftest.py now
+# fails when a workflow that skips its jobs through a `dorny/paths-filter` runs
+# on `pull_request` and not on `merge_group`.
 #
-# Until it happens this whole workflow is ADVISORY: `ci` is the sole required
-# status check, so nothing here can block a merge. See the note on the `push`
-# trigger below for what that cost us.
+# Until an operator adds these job names to the Default ruleset this whole
+# workflow is ADVISORY: `ci` is the sole required status check, so nothing here
+# can block a merge. See the note on the `push` trigger below for what that
+# cost us.
 #
 # Source: .docs/scaffold/shared.md section "SDK Documentation Requirements"
 # Story: SCP-139
@@ -30,13 +41,22 @@ on:
     # ADVISORY -- `ci` is the only required status check on the Default ruleset,
     # which is why PR #2274's failing `Rust API docs (rustdoc)` job (run
     # 30878568409, attempt 1, never re-run) did not block its merge and three
-    # broken intra-doc links rode `main` for ten days. Making rustdoc a required
-    # check is the actual fix; this trigger only shortens time-to-detection.
+    # broken intra-doc links rode `main` for ten days. Job rust-doc in ci.yml now
+    # runs `cargo doc --document-private-items` under the same feature set, so
+    # the required check itself fails on a broken intra-doc link, which is the
+    # class that rode `main`. This trigger shortens time-to-detection for the
+    # three doc builds ci.yml does not run: the sphinx, typedoc and Dokka jobs
+    # below.
     branches: [main]
     tags:
       - "scp-core@*"
   pull_request:
     branches: [main]
+  # A merge queue evaluates required status checks against the `merge_group`
+  # ref. Without this trigger these jobs cannot be promoted to required at all,
+  # and they also never read the batched tree that lands on `main`, which is the
+  # tree a two-entry batch can break without either entry breaking it alone.
+  merge_group:
 
 permissions:
   contents: read
@@ -58,6 +78,7 @@ jobs:
   check-draft:
     if: >-
       github.event_name == 'push' ||
+      github.event_name == 'merge_group' ||
       github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -72,11 +93,13 @@ jobs:
     # `rust-docs` runs `cargo doc --workspace --document-private-items`, which compiles
     # every crate of this workspace, so `rust-toolchain.toml` selects the compiler that
     # job's rustdoc runs and `.cargo/config.toml` sets the rustflags it compiles under.
-    # `rust-docs` is also the one job in this repository that exercises rustdoc across the
-    # whole workspace, and `scp-runtime` denies `rustdoc::broken_intra_doc_links`, so a
-    # pull request that raises the pin and changes nothing else has to run it: a new
-    # release's rustdoc diagnostic would otherwise first appear on the next pull request
-    # that touches `crates/scp-runtime/src/**`, against code its author did not write.
+    # The root Cargo.toml forbids `rustdoc::broken_intra_doc_links` in every member, so a
+    # pull request that raises the pin and changes nothing else has to run `rust-docs`: a
+    # new release's rustdoc diagnostic would otherwise first appear on the next pull
+    # request that touches `crates/**`, against code its author did not write. Job
+    # rust-doc in ci.yml runs the same rustdoc command and its `rust` output ORs a
+    # `toolchain` filter of its own, so both workflows report that diagnostic on a pin
+    # change, and only ci.yml's report can block a merge.
     #
     # The `toolchain` filter below holds `rust-toolchain.toml` and `.cargo/**`, and the
     # `docs` output ORs that filter in, which is the shape
@@ -98,24 +121,27 @@ jobs:
               - 'rust-toolchain.toml'
               - '.cargo/**'
             docs:
-              # Manifests count: a dependency removal or a feature-flag change
-              # readily breaks a cross-crate intra-doc link in `scp-runtime`,
-              # the crate that denies `rustdoc::broken_intra_doc_links`.
+              # `rust-docs` runs `cargo doc --workspace`, which compiles every one of the
+              # 26 members the root Cargo.toml lists, so this filter names the whole
+              # `crates/` tree. The list it replaced named eleven crate directories one
+              # at a time and matched no file under `crates/scp-event-log/src/`, while
+              # `crates/scp-runtime/src/` writes 49 intra-doc links into
+              # `scp_event_log::*` and the root Cargo.toml forbids
+              # `rustdoc::broken_intra_doc_links` in every member. A pull request confined to
+              # scp-event-log therefore skipped `rust-docs` on the pull request and again
+              # on the push to `main`, so rustdoc could break on `main` while every job
+              # that reads it skipped. `check_workspace_scoped_filters` in
+              # scripts/tests/ci-gate/ci_gate_selftest.py reads the members out of the
+              # root manifest and fails when a filter guarding a `--workspace` command
+              # leaves one of them unmatched, so a crate added later is covered without
+              # editing this list.
+              #
+              # Manifests count for the same reason: a dependency removal or a
+              # feature-flag change readily breaks a cross-crate intra-doc link.
               - 'Cargo.toml'
               - 'Cargo.lock'
-              - 'crates/*/Cargo.toml'
+              - 'crates/**'
               - 'bindings/**'
-              - 'crates/scp-core/src/**'
-              - 'crates/scp-protocol/src/**'
-              - 'crates/scp-runtime/src/**'
-              - 'crates/scp-ffi/**'
-              - 'crates/scp-did/src/**'
-              - 'crates/scp-dht/src/**'
-              - 'crates/scp-clock/src/**'
-              - 'crates/scp-crypto/src/**'
-              - 'crates/scp-mls/src/**'
-              - 'crates/scp-client/src/**'
-              - 'crates/scp-client-wasm/src/**'
 
   # ---- Rust (rustdoc) ----
   rust-docs:

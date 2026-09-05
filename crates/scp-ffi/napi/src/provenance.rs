@@ -63,7 +63,7 @@ pub(crate) async fn evaluate_provenance_quality_on(
     Ok(quality as u32)
 }
 
-/// Per-bridge-instance implementation of [`provenance_attach`].
+/// Per-bridge-instance implementation of [`Scp::provenance_attach`](crate::scp::Scp::provenance_attach).
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_arguments)] // napi-rs requires explicit params
 pub(crate) fn provenance_attach_on(

@@ -243,7 +243,7 @@ impl From<CapabilityValidation> for NapiCapabilityValidation {
 // Bridge functions
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`ucan_validate`].
+/// Per-bridge-instance implementation of [`Scp::ucan_validate`](crate::scp::Scp::ucan_validate).
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Option<Vec>
 pub(crate) async fn ucan_validate_on(
@@ -333,7 +333,7 @@ pub(crate) async fn ucan_validate_on(
     Ok(())
 }
 
-/// Per-bridge-instance implementation of [`ucan_evaluate`].
+/// Per-bridge-instance implementation of [`Scp::ucan_evaluate`](crate::scp::Scp::ucan_evaluate).
 ///
 /// Diagnostic, **side-effect-free** counterpart to [`ucan_validate_on`]: runs
 /// the same 11-step ADR-016 pipeline via `evaluate_ucan` but returns a
@@ -440,7 +440,7 @@ pub(crate) async fn ucan_evaluate_on(
     Ok(NapiCapabilityValidation::from(result))
 }
 
-/// Per-bridge-instance implementation of [`ucan_mint`].
+/// Per-bridge-instance implementation of [`Scp::ucan_mint`](crate::scp::Scp::ucan_mint).
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Vec/Option<Vec>
 #[allow(clippy::unused_async)] // napi requires async for Promise return type
 pub(crate) async fn ucan_mint_on(
@@ -535,7 +535,7 @@ pub(crate) async fn ucan_mint_on(
     })
 }
 
-/// Per-bridge-instance implementation of [`ucan_delegate`].
+/// Per-bridge-instance implementation of [`Scp::ucan_delegate`](crate::scp::Scp::ucan_delegate).
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Vec
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub(crate) async fn ucan_delegate_on(
@@ -667,7 +667,7 @@ pub(crate) async fn ucan_delegate_on(
     })
 }
 
-/// Per-bridge-instance implementation of [`ucan_revoke`].
+/// Per-bridge-instance implementation of [`Scp::ucan_revoke`](crate::scp::Scp::ucan_revoke).
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub(crate) async fn ucan_revoke_on(

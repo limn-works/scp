@@ -177,7 +177,7 @@ fn auto_wire_context_manager(
 /// (spec §12.10.5).
 ///
 /// This is the `PyO3` reference bridge's node-startup wire. The production
-/// `Supervisor` built by [`crate::runtime`]'s `build_supervisor` always enables
+/// `Supervisor` built by `crate::runtime`'s `build_supervisor` always enables
 /// its event channel, so `subscribe_events()` yields a receiver. Delegates the
 /// subscribe → wire → supervise block to the shared
 /// [`RunningNode::wire_and_supervise_context_events`] seam so all three bridges
@@ -187,9 +187,9 @@ fn auto_wire_context_manager(
 /// # Precondition (identical across all three bridges)
 ///
 /// One-shot wiring at node startup gates on the shared
-/// [`CoreFields::check_ready`]: skip (log, never fail startup) if the instance
+/// [`CoreFields::check_ready`](scp_ffi_common::bridge_instance::CoreFields::check_ready): skip (log, never fail startup) if the instance
 /// is suspended OR shut down, then fetch the supervisor via
-/// [`CoreFields::try_supervisor`]. All three bridges (`PyO3`, `NAPI`, `UniFFI`)
+/// [`CoreFields::try_supervisor`](scp_ffi_common::bridge_instance::CoreFields::try_supervisor). All three bridges (`PyO3`, `NAPI`, `UniFFI`)
 /// use this same `check_ready()` + `try_supervisor()` pair so they make the SAME
 /// decision about when to wire — rather than the general-purpose `supervisor(bi)`
 /// accessor, whose warn-on-shutdown-and-proceed semantics suit per-op dispatch

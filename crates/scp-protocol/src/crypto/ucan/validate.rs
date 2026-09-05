@@ -410,7 +410,7 @@ impl ProofResolver for InMemoryProofResolver {
 //     imposed, but rule-4 explicit-`origin_kind` still enforced).
 //   - parent `None`, child `None`  → admissible.
 
-/// Resolves the [`InvocationCaveats`] (§7.3.8) carried by a UCAN token.
+/// Resolves the [`InvocationCaveats`](crate::trust::caveats::InvocationCaveats) (§7.3.8) carried by a UCAN token.
 ///
 /// Each implementation chooses how it associates caveats with tokens — the
 /// canonical wire location is the UCAN `nb` field (§7.3.8), but validation
@@ -437,7 +437,7 @@ impl ProofResolver for InMemoryProofResolver {
 /// `Send + Sync` super-bound makes such futures `Send` without
 /// per-call-site adapters.
 pub trait CaveatResolver: Send + Sync {
-    /// Resolves the [`InvocationCaveats`] for the given token, or returns
+    /// Resolves the [`InvocationCaveats`](crate::trust::caveats::InvocationCaveats) for the given token, or returns
     /// `None` if the token carries no caveat-level constraints.
     fn resolve_caveats(
         &self,
@@ -466,7 +466,7 @@ impl CaveatResolver for NoCaveatResolver {
 ///
 /// This is the production resolver for outlet-stream open: it feeds the
 /// leaf token's signed `nb` and every parent proof's `nb` into the
-/// per-edge `narrow()` loop ([`verify_attenuation`] Step 7b) and into the
+/// per-edge `narrow()` loop (the test-only `verify_attenuation` wrapper over `verify_edge_attenuation`, Step 7b) and into the
 /// leaf time-box gate ([`verify_caveat_time_box`] Step 11b), so the set
 /// that survives validation is the VALIDATED-NARROWED `effective_caveats`
 /// the §5.4.5 `caveats_binding` is computed over — not an unverified leaf
@@ -508,11 +508,11 @@ impl CaveatResolver for TokenNbCaveatResolver {
 /// (e.g., during a transient envelope rewrite) rather than reading from
 /// the `nb` field.
 ///
-/// Map values are owned [`InvocationCaveats`] records — the resolver
+/// Map values are owned [`InvocationCaveats`](crate::trust::caveats::InvocationCaveats) records — the resolver
 /// returns clones so the validation pipeline can take an owned snapshot
 /// without holding a borrow on the resolver across recursive chain walks.
 pub struct InMemoryCaveatResolver {
-    /// Map of `UcanToken::encoded` → [`InvocationCaveats`].
+    /// Map of `UcanToken::encoded` → [`InvocationCaveats`](crate::trust::caveats::InvocationCaveats).
     pub caveats: std::collections::HashMap<String, crate::trust::caveats::InvocationCaveats>,
 }
 
@@ -1625,7 +1625,7 @@ fn verify_attenuation(
 /// Step 7 + 7b for a single delegation edge `(child, parent)`.
 ///
 /// This is the per-edge body shared by the leaf-edge wrapper
-/// [`verify_attenuation`] and the interior-edge walk in
+/// the test-only `verify_attenuation` wrapper and the interior-edge walk in
 /// [`verify_chain_recursive`]. Running it at EVERY edge (not just
 /// leaf -> direct-parent) is the §7.3.8 / §5.4.5 invariant: an interior
 /// token cannot widen a capability or relax a caveat that a more-distant
@@ -1641,7 +1641,7 @@ fn verify_attenuation(
 ///
 ///   - parent `Some`, child `None`  → REJECT: a non-root child whose parent
 ///     bound caveats MUST re-materialize the full set; an absent child
-///     laundered the bound. The precise [`AttenuationViolation`] is
+///     laundered the bound. The precise [`AttenuationViolation`](crate::trust::caveats::AttenuationViolation) is
 ///     surfaced by narrowing the parent against an all-absent child.
 ///   - parent `Some`, child `Some`  → `parent_caveats.narrow(child)`.
 ///   - parent `None`, child `Some`  → `empty().narrow(child)` (no field

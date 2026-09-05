@@ -21,11 +21,11 @@
 //! unifies them behind one on-device key boundary").
 //!
 //! Consequently this module:
-//! - restores the full [`JsKeyCustody`] extern surface (sign / getPublicKey /
+//! - restores the full `JsKeyCustody` extern surface (sign / getPublicKey /
 //!   generateKeypair / destroyKey / dhAgree) so the `WebCrypto` custody seam is
 //!   present and a later slice can route the MLS key through it **without a
 //!   signature change**; and
-//! - wires a [`JsSigner`] that reads the on-device DID identity (DID string +
+//! - wires a `JsSigner` that reads the on-device DID identity (DID string +
 //!   key id) from the injected custody object to satisfy today's `Signer`
 //!   contract.
 //!

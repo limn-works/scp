@@ -76,7 +76,7 @@ fn set_transport_manager_on(
 /// (called by [`crate::server`] auto-wire where the caller needs to
 /// construct the manager externally).
 ///
-/// Delegates to [`CoreFields::set_transport`].
+/// Delegates to [`CoreFields::set_transport`](scp_ffi_common::bridge_instance::CoreFields::set_transport).
 ///
 /// # Errors
 ///
@@ -361,7 +361,7 @@ pub(crate) async fn transport_status_on(
     })
 }
 
-/// Per-bridge-instance implementation of [`transport_disconnect`].
+/// Per-bridge-instance implementation of [`Scp::transport_disconnect`](crate::scp::Scp::transport_disconnect).
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub(crate) async fn transport_disconnect_on(
     bi: &NapiBridgeInstance,
@@ -614,7 +614,7 @@ pub(crate) fn transport_assign_relay_set_on(
     })
 }
 
-/// Per-bridge-instance implementation of [`transport_adapter_count`].
+/// Per-bridge-instance implementation of [`Scp::transport_adapter_count`](crate::scp::Scp::transport_adapter_count).
 pub(crate) fn transport_adapter_count_on(bi: &NapiBridgeInstance) -> napi::Result<u32> {
     with_transport_manager_on(bi, |manager| {
         #[allow(clippy::cast_possible_truncation)]
@@ -622,7 +622,7 @@ pub(crate) fn transport_adapter_count_on(bi: &NapiBridgeInstance) -> napi::Resul
     })
 }
 
-/// Per-bridge-instance implementation of [`transport_reliability`].
+/// Per-bridge-instance implementation of [`Scp::transport_reliability`](crate::scp::Scp::transport_reliability).
 pub(crate) fn transport_reliability_on(
     bi: &NapiBridgeInstance,
     adapter_index: u32,

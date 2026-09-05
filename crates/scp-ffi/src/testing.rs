@@ -86,7 +86,7 @@ pub struct PyFullStackNode {
     /// [`PyBridgeInstance`] that minted this node. Every `#[pymethods]`
     /// fullstack entry point invokes [`crate::pyscp_check_handle!`] so a
     /// `PyFullStackNode` created on `SCP` A cannot be handed into `SCP`
-    /// B's testing surface — cross-wiring the shared [`KeyExchange`]
+    /// B's testing surface — cross-wiring the shared [`KeyExchange`](scp_testing::fullstack::KeyExchange)
     /// silently produces false-positive E2E test passes. Mismatches
     /// return [`scp_ffi_common::error_codes::PERM_3030`].
     pub(crate) instance_id: u64,

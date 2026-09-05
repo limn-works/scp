@@ -821,7 +821,7 @@ impl<S: Storage> ApplicationNode<S> {
     /// certificate (the "be your own CA" no-DNS model, §10.12.11): the cert's
     /// SANs depend on the node's external/LAN IP, which is only known after
     /// `build()`, so the config is constructed at serve time and injected here
-    /// rather than baked into [`NodeState`]'s `tls_config` (which stays `None`
+    /// rather than baked into [`NodeState`](crate::http::NodeState)'s `tls_config` (which stays `None`
     /// in no-domain mode). TLS is purely what is spoken on the bound TCP port;
     /// the NAT/port-mapping behavior is unchanged.
     ///
@@ -2369,7 +2369,8 @@ const MIN_MAPPING_RENEWAL_INTERVAL: Duration = Duration::from_secs(5);
 /// NAT-PMP/PCP report explicit lifetimes and UPnP-IGD echoes the requested lease,
 /// so in practice the real TTL is always used; this is only the fall-back when a
 /// gateway returns a degenerate value. 3600s (1h) matches the NAT-PMP default
-/// lease requested by [`scp_transport::nat::NatPmpPortMapper`].
+/// lease requested by `NatPmpPortMapper` in `scp_transport::nat::upnp`, an item that
+/// crate compiles only under its `upnp` feature, which this crate does not enable.
 const DEFAULT_MAPPING_LEASE: Duration = Duration::from_hours(1);
 
 /// Backoff before retrying after a failed renewal attempt.
@@ -3400,7 +3401,7 @@ fn push_relay_service(document: &mut DidDocument, relay_url: &str) {
 /// (`NodeDidPublisher::publish`, in `published_state`), so every publish this
 /// node performs — startup and NAT tier change alike — honors the mode.
 ///
-/// It takes a [`PublishAuthorization`] by value, whose sole constructor is
+/// It takes a [`PublishAuthorization`](crate::published_state::PublishAuthorization) by value, whose sole constructor is
 /// private to `published_state`. So even though it is `pub(crate)`, it is
 /// **uncallable outside the publish seam by construction, not by convention**:
 /// a would-be in-crate caller that reached the [`DidMethod`] around this gate —
@@ -3408,7 +3409,7 @@ fn push_relay_service(document: &mut DidDocument, relay_url: &str) {
 /// seeding the live slot (the served≠published divergence AC-6 forbids) — cannot
 /// mint the token, so it does not compile. This completes AC-6's structural
 /// guarantee for the real DHT/relay publish itself, matching the guard on
-/// [`DidPublisher::publish`].
+/// [`DidPublisher::publish`](crate::published_state::DidPublisher::publish).
 ///
 /// The asymmetry is deliberate and honest:
 ///

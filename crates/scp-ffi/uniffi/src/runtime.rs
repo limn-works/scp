@@ -101,10 +101,10 @@ pub enum StorageConfig {
 /// an invalid state, so there is exactly one happy path per variant. This
 /// mirrors the `PyO3` bridge's `SqliteKeyMaterial`.
 ///
-/// - [`SqliteKeyMaterial::Raw`] feeds [`SqliteStorage::new`] directly (raw-key
+/// - [`SqliteKeyMaterial::Raw`] feeds [`SqliteStorage::new`](scp_platform::sqlite::SqliteStorage::new) directly (raw-key
 ///   mode; the existing, unchanged path).
 /// - [`SqliteKeyMaterial::Passphrase`] feeds
-///   [`SqliteStorage::with_passphrase`], which derives the `SQLCipher` PRAGMA
+///   [`SqliteStorage::with_passphrase`](scp_platform::sqlite::SqliteStorage::with_passphrase), which derives the `SQLCipher` PRAGMA
 ///   key from the passphrase via the shared Argon2id parameterization with a
 ///   persisted per-database salt sidecar.
 ///
@@ -153,7 +153,7 @@ impl std::fmt::Debug for SqliteKeyMaterial {
 /// Surfacing this (rather than silently degrading to in-memory or no storage)
 /// is the fail-closed contract from spec §17.6: a failed durable-backend open
 /// is a terminal error the caller observes, never a condition the system
-/// recovers from by downgrading durability. Converted to [`ScpError`] (and so
+/// recovers from by downgrading durability. Converted to [`ScpError`](crate::bridge::ScpError) (and so
 /// to a Swift `throws` / Kotlin exception) via the [`From`] impl below.
 ///
 /// Mirrors the `PyO3` bridge's `StorageInitError`. The message never contains
@@ -475,8 +475,8 @@ impl UniffiBridgeInstance {
     ///   view is backed by the same encrypted in-memory store as the event
     ///   log (dev/test affordance; spec §17.6).
     /// - [`StorageConfig::Sqlite`] — opens a `SQLCipher`-encrypted database at
-    ///   `{path}/scp.db`. The raw-key path feeds [`SqliteStorage::new`]; the
-    ///   passphrase path feeds [`SqliteStorage::with_passphrase`] (Argon2id;
+    ///   `{path}/scp.db`. The raw-key path feeds [`SqliteStorage::new`](scp_platform::sqlite::SqliteStorage::new); the
+    ///   passphrase path feeds [`SqliteStorage::with_passphrase`](scp_platform::sqlite::SqliteStorage::with_passphrase) (Argon2id;
     ///   spec §17.6). The ONE `Arc<SqliteStorage>` backs the context-snapshot
     ///   persistence bridge, the Merkle event log + trust aggregation
     ///   repository, AND the supervisor's `mls_storage` `OpenMLS` view, so
@@ -579,7 +579,7 @@ impl UniffiBridgeInstance {
     }
 
     /// Internal helper: constructs a new `UniffiBridgeInstance`
-    /// pre-populated with a shared [`ContextPersistence`] provider.
+    /// pre-populated with a shared [`ContextPersistence`](scp_core::context::ContextPersistence) provider.
     ///
     /// Accepts an `Arc<dyn ContextPersistence + Send + Sync>` so the same
     /// persistence provider is later picked up by
@@ -587,7 +587,7 @@ impl UniffiBridgeInstance {
     /// [`scp_ffi_common::bridge_instance::CoreFields::persistence_arc_clone`],
     /// avoiding duplicate `SqliteStorage` connections to the same database.
     /// Constructs a `UniffiBridgeInstance` with both the
-    /// [`ContextPersistence`] provider and the [`ProtocolRepoVariant`]
+    /// [`ContextPersistence`](scp_core::context::ContextPersistence) provider and the [`ProtocolRepoVariant`]
     /// explicitly configured.
     ///
     /// `with_storage_uniffi(StorageConfig::Sqlite)` uses this so the event
@@ -1434,7 +1434,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// providers.
 ///
 /// ADR-049 commit 12c.9g.3.6 — the FFI bridge no longer touches
-/// [`scp_core::context::manager::ContextManager`] at all.
+/// the deleted `ContextManager` at all.
 /// [`scp_core::context::supervisor::Supervisor::with_providers`] is
 /// the single entry point that constructs the supervisor + populates
 /// the lifted-provider slots. The supervisor is the only handle

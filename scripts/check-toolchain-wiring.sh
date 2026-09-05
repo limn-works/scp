@@ -90,9 +90,11 @@
 # criterion while the gate printed OK: its `rust-docs` job runs
 # `cargo doc --workspace --document-private-items`, which compiles every crate of this
 # workspace on whatever the pin names, and its `docs` filter listed no toolchain file, so
-# a pull request that raised the pin skipped the one job that exercises rustdoc on the new
-# compiler. That workflow's own header records what an unrun `rust-docs` cost once
-# already: three broken intra-doc links rode `main` for ten days.
+# a pull request that raised the pin skipped that job. Job rust-doc in ci.yml runs the
+# same rustdoc command and its `rust` output ORs a `toolchain` filter, so a pin change now
+# reaches rustdoc through the required check as well. That workflow's own header records
+# what an unrun `rust-docs` cost once already: three broken intra-doc links rode `main`
+# for ten days.
 #
 # `on: pull_request: paths:` is the other way a workflow narrows what it runs, and the
 # criterion does not bind it: a required check whose workflow never starts stays pending

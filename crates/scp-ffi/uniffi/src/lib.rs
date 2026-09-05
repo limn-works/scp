@@ -210,7 +210,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// Global count of live opaque FFI handle objects.
 ///
 /// Incremented in each opaque type's constructor and decremented in `Drop`.
-/// Used by [`scp_shutdown`] to block runtime teardown until all handles
+/// Used by [`Scp::shutdown`](crate::scp::Scp::shutdown) to block runtime teardown until all handles
 /// are released.
 pub(crate) static HANDLE_COUNT: AtomicUsize = AtomicUsize::new(0);
 

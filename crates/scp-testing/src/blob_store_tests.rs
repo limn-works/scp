@@ -1,6 +1,6 @@
 //! Conformance tests for `InMemoryBlobStorage`.
 //!
-//! Applies the [`blob_store_conformance`] macro to the in-memory blob storage
+//! Applies the [`blob_store_conformance`](crate::blob_store_conformance) macro to the in-memory blob storage
 //! implementation to verify it satisfies the spec (section 17.11, 17.13).
 
 #[cfg(test)]

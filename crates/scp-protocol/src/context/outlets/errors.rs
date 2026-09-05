@@ -87,7 +87,7 @@ use crate::serde_util::serde_hash_32;
 /// for slugs (the slug field is a class-prefixed catalog key in
 /// canonical form).
 ///
-/// This newtype is **shared** with [`MessageTemplate::try_new`] in
+/// This newtype is **shared** with [`MessageTemplate::try_new`](crate::context::outlets::message_catalog::MessageTemplate::try_new) in
 /// SCP-OUT-040 — both validation paths produce the same constraint. Defined
 /// here (SCP-OUT-024) so the catalog-key invariant precedes the catalog
 /// itself in the dependency graph.

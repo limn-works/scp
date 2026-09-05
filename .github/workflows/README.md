@@ -4,19 +4,41 @@ Overview of all GitHub Actions workflows in this repository.
 
 ## Workflow Map
 
+GitHub Actions runs a file under `.github/workflows/` whose extension is `.yml`
+or `.yaml`. Ten files here end in `.disabled` instead, so GitHub reads none of
+them. The first table lists the seven workflows that run; the second lists the
+ten that do not, because a reader who meets one of those names in a comment or a
+runbook otherwise cannot tell that its triggers never fire.
+
+### Workflows GitHub runs
+
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
-| [`ci.yml`](ci.yml) | Push to `main`, PRs to `main` | Lint, build, and test the Rust workspace |
-| [`ci-fix.yml`](ci-fix.yml) | After `CI` workflow completes | Auto-fix CI failures (formatting, etc.) |
-| [`docs.yml`](docs.yml) | Release tags (`scp-core@*`), PRs touching `bindings/` or `crates/scp-core/src/` or `crates/scp-ffi/` | Generate and publish SDK API reference docs |
+| [`ci.yml`](ci.yml) | Pushes to `main`, PRs to `main`, merge-queue entries | Lint, build, and test the Rust workspace. Its `ci` job aggregates every other job in the file, and the Default ruleset requires that one status check |
+| [`docs.yml`](docs.yml) | Release tags (`scp-core@*`), pushes to `main`, PRs to `main`, merge-queue entries. Its `changes` job then skips every doc job unless the diff touches `crates/`, `bindings/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml` or `.cargo/` | Generate and publish SDK API reference docs |
+| [`codeql.yml`](codeql.yml) | Pushes to `main`, PRs to `main`, Sundays at 00:00 UTC | CodeQL analysis of the JavaScript/TypeScript, Python and Rust sources |
 | [`build-matrix.yml`](build-matrix.yml) | Release tags (`scp-*@*`), called by `release.yml` | Build platform-specific release artifacts for all SDKs |
-| [`release.yml`](release.yml) | Release tags (`scp-core@*`) | 7-step release pipeline: conformance, changelog, build, sign, publish |
-| [`pr-review.yml`](pr-review.yml) | PRs touching `crates/` or `Cargo.*` | Automated PR review |
-| [`spec-drift.yml`](spec-drift.yml) | PRs touching `crates/`, `Cargo.*`, or `bindings/` | Detect drift between specs and implementation |
-| [`artifact-review.yml`](artifact-review.yml) | Daily at 3am ET, manual | Health review of project artifacts |
-| [`issue-triage.yml`](issue-triage.yml) | New issues opened | Auto-triage and label new issues |
-| [`issue-dedup.yml`](issue-dedup.yml) | New issues opened | Detect duplicate issues |
-| [`claude.yml`](claude.yml) | Issue comments, PR review comments, issues opened/assigned | Claude Code integration for automated responses |
+| [`release.yml`](release.yml) | Manual dispatch | 7-step release pipeline: conformance, changelog, build, sign, publish |
+| [`fuzz.yml`](fuzz.yml) | Daily at 03:00 UTC, Saturdays at 00:00 UTC, manual dispatch | Run the cargo-fuzz targets in `fuzz/` on the nightly `fuzz/rust-toolchain.toml` names |
+| [`issue-prd-validate.yml`](issue-prd-validate.yml) | Issues opened or edited | Validate a story issue against `.docs/standards/prd.md` |
+
+### Workflows a `.disabled` suffix stops GitHub from reading
+
+Each row names the file as it sits in the tree and the trigger the file declares.
+GitHub Actions ignores every one of them, so none of those triggers fires.
+
+| File | Trigger it declares | Purpose |
+|------|---------------------|---------|
+| `ci-fix.yml.disabled` | After the `CI` workflow completes | Auto-fix CI failures (formatting, etc.) |
+| `pr-review.yml.disabled` | PRs touching `crates/`, `bindings/`, `tests/`, `scripts/`, `.docs/` or `Cargo.*` | Automated PR review |
+| `pr-story-review.yml.disabled` | PRs opened, synchronized, marked ready, or labeled | Review a pull request against the PRD story it claims |
+| `prd-validate.yml.disabled` | PRs touching `.docs/prds/`, `.docs/specs/`, `.docs/adrs/` or `.docs/standards/prd.md` | Validate PRD stories |
+| `spec-drift.yml.disabled` | PRs touching `crates/`, `bindings/`, `tests/`, `scripts/`, `.docs/` or `Cargo.*` | Detect drift between specs and implementation |
+| `sdk-coverage-verify.yml.disabled` | PRs touching `bindings/` or `.docs/standards/sdk-capability-matrix.json` | Verify the SDK capability matrix against the bindings |
+| `artifact-review.yml.disabled` | Daily at 08:00 UTC, manual dispatch | Health review of project artifacts |
+| `issue-triage.yml.disabled` | New issues opened | Auto-triage and label new issues |
+| `issue-dedup.yml.disabled` | New issues opened | Detect duplicate issues |
+| `claude.yml.disabled` | Issue comments, PR review comments, issues opened or assigned | Claude Code integration for automated responses |
 
 ## SDK Documentation Generation
 
