@@ -129,7 +129,7 @@ Identity link attestations are sub-classified into two classes based on when and
 
 - The SDK performs the verification flow (OAuth code exchange, challenge-response round trip) locally at creation time.
 - On success, the SDK extracts the minimal identifying claim (`provider`, `subject_id`, `verified_at`) and signs it with the DID's signing key. This SDK-signed proof replaces the raw provider token — no JWT, no OIDC ID token, no PII is stored.
-- The attestation proof is: `{ "provider": "<platform>", "subject_id": "<platform_user_id>", "verified_at": <unix_s> }` signed by the issuer's `#active` or `#agent` key. The signature is the one on the `IdentityLinkAttestation` envelope itself — the proof field carries the claim content, the envelope signature covers it.
+- The attestation proof is: `{ "provider": "<platform>", "subject_id": "<platform_user_id>", "verified_at": <unix_s> }` signed by the issuer's `#active` key. The signature is the one on the `IdentityLinkAttestation` envelope itself — the proof field carries the claim content, the envelope signature covers it.
 - Self-attestation model: issuer == subject. The DID owner asserts "I verified this at creation time." Consumers trust the assertion because: (a) the DID key signed it, (b) the claim is minimal (no forgery incentive beyond the link itself), and (c) falsifying the link provides no benefit — shadow claiming (§3.5.5) and social graph import (§3.6) only work if the external account is genuinely controlled.
 - **No raw token storage.** The SDK MUST discard the OAuth access token, refresh token, and ID token after extracting the `subject_id`. Only the minimal signed claim persists. This eliminates PII leakage — Google OIDC tokens always include `email`, Apple tokens include `email` when requested. None of that data enters the attestation.
 
@@ -178,7 +178,7 @@ The following 16 platforms are supported for identity link attestations. New pro
 
 **`ChallengeResponse` creation flow:**
 1. A verifier sends a random 32-byte challenge to the subject.
-2. The subject signs the challenge with their SCP signing key (`#active` or `#agent`).
+2. The subject signs the challenge with their Active Signing Key (`#active`).
 3. The SDK constructs the proof: `{ "challenge": "<hex>", "response_signature": "<hex>" }`.
 4. The full `IdentityLinkAttestation` envelope is signed by the subject's DID key.
 
@@ -224,7 +224,7 @@ Identity attestations use the attestation envelope defined in §7.4.1, with iden
     verifier_did:   Option<DID>, // DID of the verifier, if third-party verified (challenge_response only)
   },
   revocation_status: RevocationStatus, // Active or Revoked (§7.4.1). MUST be in signed scope.
-  signature:    Ed25519Signature,  // Signs §9.5.1 canonical hash (see Signature scope below), using issuer's #active or #agent key
+  signature:    Ed25519Signature,  // Signs §9.5.1 canonical hash (see Signature scope below), using issuer's #active key
 }
 ```
 
@@ -286,7 +286,7 @@ Verification procedure depends on the attestation class (§3.5.0).
 
 **Class 1 (Cryptographic) verification:**
 
-1. Resolve the issuer's DID document. Extract the `#active` or `#agent` public key.
+1. Resolve the issuer's DID document. Extract the `#active` public key.
 2. Verify the Ed25519 signature on the attestation envelope against the issuer's public key.
 3. Check `revocation_status` is `Active`. If `Revoked`, reject.
 4. Check `expires_at` (if present). If expired, reject.
@@ -429,10 +429,9 @@ Context state handles multi-party social data. Identity private state handles si
 ```
 Identity (DID)
 ├── Public State (DID Document)
-│   ├── Verification methods (ADR-039)
+│   ├── Verification methods (`09-security-model.md` §9.7.4.2 definitions)
 │   │   ├── #0 — Identity Key (Ed25519, root of trust, offline)
 │   │   ├── #active — Human Signing Key (Ed25519, hardware-backed)
-│   │   └── #agent — Agent Signing Key (Ed25519, optional, software-held, rotatable)
 │   ├── Service endpoints / relay list
 │   └── Published attestations
 │
@@ -446,6 +445,8 @@ Identity (DID)
     ├── Draft attestations (not yet published)
     └── (extensible — any identity-level private data)
 ```
+
+**The human identity's key state names one operational role, `#active`** (`09-security-model.md` §9.7.4.2 definitions). An agent is a separate identity with its own key-event log, which the human's log anchors by cooperative delegation, so no agent key appears in a human's identity: ADR-063, the key-event-log identity substrate, overturns the shared-DID `#agent` verification method of ADR-039, and ADR-064, the forthcoming specification of the cooperative-delegation events, states how a delegator anchors a delegate's establishment events. `09-security-model.md` §9.1 invariant 1 is the home of that model, and this spec cites it rather than restating it.
 
 **Encryption model.** Private state is encrypted with a dedicated symmetric **Private State Key (PSK)** — an AES-256 key used exclusively for identity private state encryption. The PSK is not derived from any signing key. Ed25519 keys are signing-only — they cannot be used for encryption. The PSK is generated independently and distributed to the identity owner's devices via HPKE (§3.7.2).
 
@@ -1062,7 +1063,7 @@ Client (DID holder)                    Relying Party (service)
        |  2. { nonce, audience, expires_at }    |
        | <------------------------------------  |
        |                                       |
-       |  3. Sign challenge with #active/#agent |
+       |  3. Sign challenge with #active        |
        |                                       |
        |  4. POST /auth/verify                  |
        |     { did, signing_key_id, signature, ts }     |
@@ -1110,7 +1111,7 @@ The client constructs and signs the response:
 ScpIdResponse {
     protocol:       String,   // "scpid/1.0" — MUST reject unrecognized versions
     did:            DID,      // The signer's DID
-    signing_key_id: String,   // Verification method ID: "#active" or "#agent"
+    signing_key_id: String,   // Verification method ID: "#active"
     nonce:          [u8; 32], // Echo of the challenge nonce
     audience:       String,   // Echo of the challenge audience
     signed_at:      u64,      // Unix timestamp (ms) when the client signed
@@ -1126,7 +1127,7 @@ The signed content follows the §9.5.1 canonical hash construction: SHA-256 of d
 signed_bytes = SHA-256(
     "SCP-DID-AUTH-V1:"
     || BE32(len(did))              || did              // signer's DID, UTF-8
-    || BE32(len(signing_key_id))   || signing_key_id   // "#active" or "#agent", UTF-8
+    || BE32(len(signing_key_id))   || signing_key_id   // "#active", UTF-8
     || nonce                                            // 32 bytes, fixed (no length prefix per §9.5.1)
     || BE32(len(audience))         || audience          // audience URI, UTF-8
     || signed_at as u64 BE                              // 8 bytes, big-endian
@@ -1144,12 +1145,12 @@ signature = Ed25519_sign(private_key, signed_bytes)
 | 4 | `audience` | 4-byte BE length prefix + UTF-8 bytes |
 | 5 | `signed_at` | 8-byte big-endian u64 |
 
-The domain separator `"SCP-DID-AUTH-V1:"` prevents cross-protocol signature reuse. The SHA-256 wrap aligns with the majority SCP signing pattern (InnerEnvelope, BroadcastEnvelope, sender keys, access keys, sync structures, claims). The `did` and `signing_key_id` fields bind the signature to the signer's identity and key role, preventing signature transplant across DIDs and key confusion between `#active` and `#agent`.
+The domain separator `"SCP-DID-AUTH-V1:"` prevents cross-protocol signature reuse. The SHA-256 wrap aligns with the majority SCP signing pattern (InnerEnvelope, BroadcastEnvelope, sender keys, access keys, sync structures, claims). The `did` and `signing_key_id` fields bind the signature to the signer's identity and to the verification method that produced it, so a relying party cannot be shown a signature transplanted from another identity or presented under a method that did not sign.
 
-**Signing key selection:**
+**Signing key and signing identity:**
 
-- `#active` — human-initiated authentication. Biometric-protected, appropriate for sensitive actions.
-- `#agent` — agent-initiated authentication. Software-held, no biometric gate. Appropriate for autonomous background operations. The relying party MAY distinguish between `#active` and `#agent` values of `signing_key_id` for authorization decisions (e.g., requiring `#active` for account-level changes). Because `signing_key_id` is included in the signed content (§3.11.3), this distinction is cryptographically authenticated — a signature produced with `#agent` cannot be presented as `#active`.
+- `#active` — the identity's one operational signing key (`09-security-model.md` §9.7.4.2 definitions). A human identity signs an SCPID response under it, and the custody substrate holding it supplies whatever local gate it offers, such as a biometric prompt.
+- A delegated agent identity signs its own SCPID responses under its own `#active`. A relying party tells an agent from a human by the responding identity and not by a verification-method fragment, because a delegated identity's key state names the delegator that anchors it (`09-security-model.md` §9.7.4.2 definitions). ADR-064, the forthcoming specification of the cooperative-delegation events, states how a verifier checks that anchor; until ADR-064 lands a verifier rejects a chain that claims delegation, so no delegated agent identity resolves.
 
 ### 3.11.4 Verification Procedure
 
@@ -1174,8 +1175,8 @@ The relying party verifies a response:
       a fresh resolution.
 6. Extract the public key for signing_key_id from the DID document's
    verificationMethod array.
-7. Confirm signing_key_id is one of "#active" or "#agent". Reject any
-   other value with KEY_NOT_AUTHORIZED.
+7. Confirm signing_key_id is "#active". Reject any other value
+   with KEY_NOT_AUTHORIZED.
 8. Confirm signing_key_id is listed in the DID document's "authentication"
    relationship. Reject if not.
 9. Reconstruct signed_bytes from did, signing_key_id, nonce, audience,
@@ -1194,7 +1195,7 @@ The relying party verifies a response:
 | Audience mismatch | `AUDIENCE_MISMATCH` | `SCP-IDENT-1031` |
 | `signed_at` outside challenge window or challenge expired | `TIMESTAMP_INVALID` | `SCP-IDENT-1032` |
 | DID resolution failed | `DID_RESOLUTION_FAILED` | `SCP-IDENT-1033` |
-| `signing_key_id` not `#active`/`#agent` or not in `authentication` | `KEY_NOT_AUTHORIZED` | `SCP-IDENT-1034` |
+| `signing_key_id` not `#active` or not in `authentication` | `KEY_NOT_AUTHORIZED` | `SCP-IDENT-1034` |
 | Signature verification failed | `SIGNATURE_INVALID` | `SCP-IDENT-1035` |
 | DID document stale (> 300s, refresh failed) | `DID_DOCUMENT_STALE` | `SCP-IDENT-1036` |
 | Key custody or signing operation failed | `SIGNING_FAILED` | `SCP-IDENT-1037` |
@@ -1248,7 +1249,7 @@ The `protocol` field identifies the authentication scheme and version. Relying p
 
 **MITM resistance.** SCPID does not provide channel binding. If the transport between client and relying party is compromised (no TLS), an attacker can intercept and replay the challenge-response in real time. Relying parties MUST serve challenges and accept responses over TLS. The audience field mitigates relay attacks across services but does not replace transport-layer encryption.
 
-**Agent vs. human distinction.** The `signing_key_id` field tells the relying party whether a human (`#active`, biometric-gated) or an agent (`#agent`, software-held) signed the challenge. Because `signing_key_id` is included in the signed content (§3.11.3), this distinction is cryptographically authenticated. The relying party can enforce authorization policies based on this distinction — e.g., requiring `#active` for destructive operations and accepting `#agent` for routine API access.
+**Agent vs. human distinction.** The responding identity tells the relying party whether a human or an agent signed the challenge: a human identity signs under its own `#active`, and an agent signs under the `#active` of its own delegated identity, whose key state names the human that anchors it (`09-security-model.md` §9.7.4.2 definitions). The `did` field is inside the signed content (§3.11.3), so the distinction is cryptographically authenticated. The relying party can enforce authorization policies on it — requiring a human identity for destructive operations and accepting a delegated agent identity for routine API access.
 
 ### 3.11.7 Relationship to Context Membership
 
