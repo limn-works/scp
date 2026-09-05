@@ -77,6 +77,24 @@ rules separate them.
   Every artifact G1 gated had a parent package to declare its features until the two
   binaries were added — `scp-node` and `scp-relay` are exactly the entries with no parent —
   so adding them widened the population past what the reading covered.
+- **A build tool that takes its feature list from a configuration file makes that file a
+  shipping input, and a check that reads only the command lines never sees it.**
+  `assert_shipping_invocations_are_gated` in `scripts/check-shipped-feature-graph.sh` read
+  the three files that carry cargo commands — `Dockerfile`,
+  `.github/workflows/build-matrix.yml`, `.github/workflows/release.yml` — and failed on
+  any `--features` token it found there. The maturin step in build-matrix.yml passes no
+  `--features`, because maturin reads the wheel's cargo feature list from the
+  `[tool.maturin]` table of `bindings/python/pyproject.toml`, and the gate opened no
+  pyproject.toml. Changing that table to `features = ["extension-module", "testing"]`
+  left every shipping line unchanged, so the self-test printed "all behavioral proofs
+  passed" and the gate resolved the two `scp-ffi` configurations it had always resolved,
+  while the wheel that table builds compiled `scp-platform/testing`, `scp-dht/testing`
+  and `scp-testing`. The repair names every pyproject.toml a shipping-file maturin step
+  can read (`MATURIN_PROJECT_FILES`), derives the cargo configuration each one's table
+  selects, and fails unless `ARTIFACTS` carries that configuration verbatim, so the
+  allowlist decides what the wheel ships. The population to name is every input the build
+  tool reads its feature selection from, and a command line is one of those inputs, not
+  the whole set.
 - **A gate that reports absence carries a positive control that runs every time.** Every
   OK the gate above prints means "this artifact resolves no nullifier feature", and it
   means that only while the resolver can report one at all. That gate now resolves

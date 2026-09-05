@@ -131,7 +131,7 @@ cd "$REPO_ROOT"
 # a future dependency edge pull plaintext key-per-file storage back into a
 # shipped graph with no gate failure to announce it.
 #
-# EIGHT ROWS NAME A FEATURE A ROOT PACKAGE ACTIVATES THROUGH ITS OWN `[features]`
+# NINE ROWS NAME A FEATURE A ROOT PACKAGE ACTIVATES THROUGH ITS OWN `[features]`
 # TABLE. `cargo tree -e features` renders no feature EDGE for any of them (see
 # "TWO RENDERINGS" in the header), so this gate could not observe one until it
 # began reading the per-package resolved-feature rendering. Their classification:
@@ -146,6 +146,11 @@ cd "$REPO_ROOT"
 #   - `scp-ffi/default`, `scp-ffi-napi/default`, `scp-ffi-uniffi/default` — each
 #     is `["server"]`, which a bare `cargo build` at this root and the three
 #     default-feature bridge ARTIFACTS entries resolve.
+#   - `scp-ffi/extension-module` — `["pyo3/extension-module"]`, which tells pyo3
+#     to leave the Python symbols to the interpreter that loads the cdylib. The
+#     `scp-ffi|--features extension-module` ARTIFACTS entry, the PyPI wheel's
+#     configuration read from `[tool.maturin]`, resolves it. It activates no
+#     SCP-crate feature and no dependency edge.
 #   - `scp-client-wasm/default` — an EMPTY feature list. Cargo reports `default`
 #     as enabled on that default member and it activates nothing.
 # None of the eight forwards a `testing` edge or an `allow_unencrypted_storage`
@@ -184,6 +189,7 @@ scp-ffi-napi/server
 scp-ffi-uniffi/default
 scp-ffi-uniffi/server
 scp-ffi/default
+scp-ffi/extension-module
 scp-ffi/server
 scp-identity/default
 scp-identity/production-dht
@@ -229,18 +235,24 @@ EOF
 # build — the Dockerfile
 # `cargo build --release -p scp-relay -p scp-node`, a
 # `.github/workflows/release.yml` `cargo publish` step, `maturin`'s
-# `--manifest-path crates/scp-ffi/Cargo.toml` wheel build (which keeps default
-# features and adds `extension-module`, a pyo3-only feature that changes no
-# SCP-crate edge, so it resolves an `scp-ffi` set named below), and a
+# `--manifest-path crates/scp-ffi/Cargo.toml` wheel build, and a
 # `.github/workflows/build-matrix.yml` "Build shipped bridge artifacts" step,
 # which builds one package per invocation into `target-shipped` so its uploaded
-# cdylibs resolve those same per-package sets these entries name. Two mechanisms
-# keep that lockstep rather than a reader's diligence: a `default-members` check
-# in `run_gate` resolves a bare `cargo build` at this root, so a member that
-# unifies a nullifier into its siblings fails whether or not anyone updates this
-# comment; and `assert_shipping_invocations_are_gated` fails when a shipping file
-# names a package this gate resolves in no configuration, or carries a
-# feature-selection flag nobody declared.
+# cdylibs resolve those same per-package sets these entries name. Three
+# mechanisms keep that lockstep rather than a reader's diligence: a
+# `default-members` check in `run_gate` resolves a bare `cargo build` at this
+# root, so a member that unifies a nullifier into its siblings fails whether or
+# not anyone updates this comment; `assert_shipping_invocations_are_gated` fails
+# when a shipping file names a package this gate resolves in no configuration,
+# or carries a feature-selection flag nobody declared; and
+# `assert_wheel_feature_selection_is_gated` reads the `[tool.maturin]` table of
+# every pyproject.toml maturin builds the wheel from (MATURIN_PROJECT_FILES),
+# because the maturin step in build-matrix.yml passes no `--features` and
+# maturin takes the wheel's cargo feature list from that table, and fails
+# unless ARTIFACTS carries the exact configuration that table selects. Today
+# that table selects `extension-module`, a pyo3-only feature that changes no
+# SCP-crate edge, and the `scp-ffi|--features extension-module` entry below is
+# the wheel's configuration.
 #
 # uniffi-bindgen (the third workspace `[[bin]]`, in `crates/scp-ffi/uniffi`) is
 # deliberately NOT a separate ARTIFACTS entry: it is a build-time code-generation
@@ -267,6 +279,12 @@ ARTIFACTS=(
   "scp-core|"
   "scp-node|"
   "scp-relay|"
+  # The PyPI wheel. `maturin_artifact_entry` derives this exact string from the
+  # `[tool.maturin]` table of each MATURIN_PROJECT_FILES file, and
+  # `assert_wheel_feature_selection_is_gated` fails when the string it derives
+  # is not in this list, so an edit to that table changes what this gate
+  # resolves or fails the gate.
+  "scp-ffi|--features extension-module"
 )
 
 # ---------------------------------------------------------------------------
@@ -277,6 +295,30 @@ SHIPPING_FILES=(
   "Dockerfile"
   ".github/workflows/build-matrix.yml"
   ".github/workflows/release.yml"
+)
+
+# ---------------------------------------------------------------------------
+# Maturin project files: every pyproject.toml whose `[tool.maturin]` table
+# maturin can read when a shipping file runs it. maturin reads the pyproject.toml
+# of its working directory when one exists, and otherwise the one beside the
+# Cargo.toml its `--manifest-path` names, so both files below are inputs of the
+# wheel build: build-matrix.yml runs maturin with
+# `working-directory: bindings/python` and `--manifest-path
+# crates/scp-ffi/Cargo.toml`. That table's `features`, `all-features`, and
+# `no-default-features` keys select the wheel's cargo features, and the maturin
+# step passes no `--features` of its own, so a `testing` entry added to either
+# table compiles `scp-platform/testing`, `scp-dht/testing`, and `scp-testing`
+# into a published wheel while every line of SHIPPING_FILES stays unchanged.
+#
+# `assert_wheel_feature_selection_is_gated` derives the cargo configuration each
+# file selects and fails unless ARTIFACTS carries it verbatim, and
+# `assert_maturin_project_files_are_complete` fails when a `--manifest-path` or
+# a `working-directory:` line in a shipping file reaches a pyproject.toml this
+# list omits, or when this list names a file no shipping line reaches.
+# ---------------------------------------------------------------------------
+MATURIN_PROJECT_FILES=(
+  "bindings/python/pyproject.toml"
+  "crates/scp-ffi/pyproject.toml"
 )
 
 # Every line of a SHIPPING_FILES file that lines_carrying_cargo_feature_selection
@@ -914,6 +956,9 @@ run_gate() {
 # Self-test / fixture harness (AC7 + AC8 behavioral proofs).
 # ---------------------------------------------------------------------------
 fixture_failures=0
+same_string() { # <actual> <expected> — exit 0 iff equal, so a caller reads a command status
+  [[ "$1" == "$2" ]]
+}
 expect() { # <label> <expected: PASS|FAIL> <actual-rc>
   local label="$1" expected="$2" rc="$3" actual
   [[ "$rc" -eq 0 ]] && actual="PASS" || actual="FAIL"
@@ -1145,6 +1190,215 @@ packages_built_by_shipping_lines() {
     printf '%s\n' "$kept" | grep -oE '^for pkg in [a-z0-9 -]+;' \
       | sed -E 's/^for pkg in //; s/;$//' | tr ' ' '\n' || true
   } | sed -E '/^$/d' | sort -u
+}
+
+# ---------------------------------------------------------------------------
+# The wheel's feature selection lives outside the shipping files. maturin reads
+# `features`, `all-features`, and `no-default-features` from the
+# `[tool.maturin]` table of a pyproject.toml and passes them to cargo, so the
+# four functions below read that table, derive the cargo configuration it
+# selects, and tie it to an ARTIFACTS entry.
+# ---------------------------------------------------------------------------
+
+# maturin_project_files_named_by_shipping_lines <shipping-lines>
+#   Emit, sorted-unique, every repository-relative pyproject.toml that exists
+#   beside a Cargo.toml a shipping line passes to `--manifest-path`, or inside a
+#   directory a shipping line names after `working-directory:`. Those are the
+#   two places maturin looks for its pyproject.toml, so a pyproject.toml this
+#   function does not emit is one no shipping-file maturin step can read.
+#   Pure over its argument, apart from the existence test on each candidate.
+maturin_project_files_named_by_shipping_lines() {
+  local line tok i n candidate
+  local -a toks
+  while IFS= read -r line; do
+    read -r -a toks <<<"$line"
+    n=${#toks[@]}
+    for ((i = 0; i < n; i++)); do
+      tok="${toks[i]}"
+      candidate=""
+      case "$tok" in
+        --manifest-path)   candidate="$(dirname "${toks[i + 1]:-.}")/pyproject.toml" ;;
+        --manifest-path=*) candidate="$(dirname "${tok#--manifest-path=}")/pyproject.toml" ;;
+        working-directory:) candidate="${toks[i + 1]:-.}/pyproject.toml" ;;
+      esac
+      if [[ -n "$candidate" && -f "$candidate" ]]; then printf '%s\n' "$candidate"; fi
+    done
+  done <<<"$1" | sed -E 's#^\./##; /^$/d' | sort -u
+}
+
+# maturin_table_text <pyproject.toml>
+#   Emit the body of the `[tool.maturin]` table as one space-joined line, with
+#   comments removed. A `[tool.maturin.<sub>]` table is a different table and is
+#   not emitted. FAILS (non-zero, reason on stderr) when the file does not
+#   exist, or when the file spells a maturin key in a TOML form this reader does
+#   not parse — an inline table (`maturin = { … }`) or a dotted key
+#   (`tool.maturin.features = …`) — because a spelling the reader cannot parse
+#   must not read as "no features selected".
+maturin_table_text() {
+  local file="$1" unparsed
+  if [[ ! -f "$file" ]]; then
+    echo "maturin project file does not exist: $file" >&2
+    return 1
+  fi
+  unparsed="$(grep -nE '(^|[[:space:].])maturin[[:space:]]*=[[:space:]]*\{|(^|[[:space:].])maturin\.(features|all-features|no-default-features|manifest-path)[[:space:]]*=' "$file" || true)"
+  if [[ -n "$unparsed" ]]; then
+    { echo "$file spells a maturin key as an inline table or a dotted key, which this reader does not parse:"
+      printf '%s\n' "$unparsed" | sed 's/^/  /'; } >&2
+    return 1
+  fi
+  awk '
+    /^[[:space:]]*\[/ {
+      in_table = ($0 ~ /^[[:space:]]*\[[[:space:]]*tool[[:space:]]*\.[[:space:]]*maturin[[:space:]]*\][[:space:]]*(#.*)?$/)
+      next
+    }
+    in_table { sub(/(^|[[:space:]])#.*$/, ""); printf "%s ", $0 }
+    END { printf "\n" }
+  ' "$file"
+}
+
+# maturin_feature_args <pyproject.toml>
+#   Emit the cargo feature arguments the `[tool.maturin]` table of the file
+#   selects, spelled the way ARTIFACTS spells them: `--all-features`, then
+#   `--no-default-features`, then `--features a,b`, each present only when the
+#   table selects it; an empty line when the table selects nothing. FAILS
+#   (non-zero) on anything maturin_table_text fails on, and on a key whose value
+#   is not a TOML array of strings (`features`) or a TOML boolean
+#   (`all-features`, `no-default-features`).
+maturin_feature_args() {
+  local file="$1" text args="" list features
+  text="$(maturin_table_text "$file")" || return 1
+  local re_all='(^|[[:space:]])all-features[[:space:]]*=[[:space:]]*(true|false)([[:space:]]|$)'
+  local re_nodef='(^|[[:space:]])no-default-features[[:space:]]*=[[:space:]]*(true|false)([[:space:]]|$)'
+  local re_feat='(^|[[:space:]])features[[:space:]]*=[[:space:]]*\[([^]]*)\]'
+  if [[ "$text" =~ (^|[[:space:]])all-features[[:space:]]*= ]]; then
+    if [[ ! "$text" =~ $re_all ]]; then
+      echo "$file: all-features is not a TOML boolean" >&2; return 1
+    fi
+    if [[ "${BASH_REMATCH[2]}" == "true" ]]; then args="--all-features"; fi
+  fi
+  if [[ "$text" =~ (^|[[:space:]])no-default-features[[:space:]]*= ]]; then
+    if [[ ! "$text" =~ $re_nodef ]]; then
+      echo "$file: no-default-features is not a TOML boolean" >&2; return 1
+    fi
+    if [[ "${BASH_REMATCH[2]}" == "true" ]]; then args="${args:+$args }--no-default-features"; fi
+  fi
+  if [[ "$text" =~ (^|[[:space:]])features[[:space:]]*= ]]; then
+    if [[ ! "$text" =~ $re_feat ]]; then
+      echo "$file: features is not a TOML array" >&2; return 1
+    fi
+    list="${BASH_REMATCH[2]}"
+    local re_bad='[^-A-Za-z0-9_./@:+, "'"'"']'
+    if [[ "$list" =~ $re_bad ]]; then
+      echo "$file: features carries a character no quoted cargo feature name uses: $list" >&2; return 1
+    fi
+    features="$(printf '%s\n' "$list" | tr -d "\"'" | tr ',' '\n' \
+      | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; /^$/d' | paste -sd, -)"
+    if [[ -n "$features" ]]; then args="${args:+$args }--features $features"; fi
+  fi
+  printf '%s\n' "$args"
+}
+
+# maturin_artifact_entry <pyproject.toml>
+#   Emit the ARTIFACTS entry (`<package>|<feature-args>`) the file's
+#   `[tool.maturin]` table makes maturin build: the package is the `[package]
+#   name` of the Cargo.toml the table's `manifest-path` names, resolved against
+#   the pyproject.toml's directory, or of the Cargo.toml beside the
+#   pyproject.toml when the table names none. FAILS (non-zero) when
+#   maturin_feature_args fails, when that Cargo.toml does not exist, or when it
+#   carries no `[package] name`.
+maturin_artifact_entry() {
+  local file="$1" args text dir manifest pkg
+  args="$(maturin_feature_args "$file")" || return 1
+  text="$(maturin_table_text "$file")" || return 1
+  dir="$(dirname "$file")"
+  local re_mp='(^|[[:space:]])manifest-path[[:space:]]*=[[:space:]]*["'"'"']([^"'"'"']+)["'"'"']'
+  if [[ "$text" =~ $re_mp ]]; then
+    manifest="${BASH_REMATCH[2]}"
+    if [[ "$manifest" != /* ]]; then manifest="$dir/$manifest"; fi
+  else
+    manifest="$dir/Cargo.toml"
+  fi
+  if [[ ! -f "$manifest" ]]; then
+    echo "$file: manifest-path names no file: $manifest" >&2
+    return 1
+  fi
+  pkg="$(awk '
+    /^[[:space:]]*\[/ { in_pkg = ($0 ~ /^[[:space:]]*\[package\][[:space:]]*(#.*)?$/); next }
+    in_pkg && /^[[:space:]]*name[[:space:]]*=/ {
+      sub(/^[[:space:]]*name[[:space:]]*=[[:space:]]*["'"'"']/, ""); sub(/["'"'"'].*$/, ""); print; exit
+    }
+  ' "$manifest")"
+  if [[ -z "$pkg" ]]; then
+    echo "$file: $manifest carries no [package] name" >&2
+    return 1
+  fi
+  printf '%s|%s\n' "$pkg" "$args"
+}
+
+# assert_wheel_feature_selection_is_gated <pyproject.toml>...
+#   CRITERION: for every file given, the configuration its `[tool.maturin]`
+#   table makes maturin build appears verbatim in ARTIFACTS, so run_gate
+#   resolves exactly what the wheel compiles. A file the reader cannot parse
+#   fails; a configuration ARTIFACTS lacks fails and names the entry to add,
+#   after which run_gate's allowlist decides whether that configuration ships.
+#   Takes its files as arguments so run_fixtures can prove, on a planted file,
+#   that the assertion goes red.
+assert_wheel_feature_selection_is_gated() {
+  echo ">> fixture: the cargo configuration each maturin project file selects for the wheel is an ARTIFACTS entry (drift between ARTIFACTS and [tool.maturin])"
+  local file entry spec found
+  for file in "$@"; do
+    if ! entry="$(maturin_artifact_entry "$file" 2>&1)"; then
+      echo "   FAIL — cannot derive the wheel configuration from $file:"
+      printf '%s\n' "$entry" | sed 's/^/       /'
+      echo "          A maturin project file this gate cannot read leaves the wheel's feature list ungated."
+      fixture_failures=$((fixture_failures + 1))
+      return
+    fi
+    found=0
+    for spec in "${ARTIFACTS[@]}"; do
+      if [[ "$spec" == "$entry" ]]; then found=1; fi
+    done
+    if [[ "$found" -eq 0 ]]; then
+      echo "   FAIL — $file makes maturin build a configuration ARTIFACTS does not gate:"
+      echo "       x $entry"
+      echo "          Add that exact entry to ARTIFACTS so run_gate resolves what the wheel"
+      echo "          compiles; the permitted-production allowlist then decides whether it ships."
+      fixture_failures=$((fixture_failures + 1))
+      return
+    fi
+  done
+  echo "   ok   — every maturin project file selects a configuration ARTIFACTS gates"
+}
+
+# assert_maturin_project_files_are_complete
+#   CRITERION: the set of pyproject.toml files a shipping-file maturin step can
+#   read (maturin_project_files_named_by_shipping_lines over SHIPPING_FILES)
+#   equals MATURIN_PROJECT_FILES. A reachable file the list omits fails, because
+#   assert_wheel_feature_selection_is_gated never reads it; a listed file no
+#   shipping line reaches fails, because a stale entry describes no build.
+assert_maturin_project_files_are_complete() {
+  echo ">> fixture: every pyproject.toml a shipping-file maturin step can read is a MATURIN_PROJECT_FILES entry, and each entry is reachable"
+  local named unlisted stale
+  named="$(maturin_project_files_named_by_shipping_lines "$(cat "${SHIPPING_FILES[@]}")")"
+  unlisted="$(comm -23 <(printf '%s\n' "$named" | sed -E '/^$/d' | sort -u) \
+                       <(printf '%s\n' "${MATURIN_PROJECT_FILES[@]}" | sort -u))"
+  if [[ -n "$unlisted" ]]; then
+    echo "   FAIL — a shipping file reaches pyproject.toml file(s) MATURIN_PROJECT_FILES omits:"
+    printf '%s\n' "$unlisted" | sed 's/^/       x /'
+    echo "          Add each one so its [tool.maturin] feature selection is read."
+    fixture_failures=$((fixture_failures + 1))
+    return
+  fi
+  stale="$(comm -13 <(printf '%s\n' "$named" | sed -E '/^$/d' | sort -u) \
+                    <(printf '%s\n' "${MATURIN_PROJECT_FILES[@]}" | sort -u))"
+  if [[ -n "$stale" ]]; then
+    echo "   FAIL — MATURIN_PROJECT_FILES names file(s) no shipping line reaches:"
+    printf '%s\n' "$stale" | sed 's/^/       x /'
+    echo "          A stale entry describes no wheel build; remove it or restore the line that reads it."
+    fixture_failures=$((fixture_failures + 1))
+    return
+  fi
+  echo "   ok   — MATURIN_PROJECT_FILES equals the pyproject.toml files the shipping files reach"
 }
 
 # assert_shipping_invocations_are_gated
@@ -1504,6 +1758,119 @@ TREE
   printf '%s\n' "$seen" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 8 >/dev/null; rc=$?
   expect "(shipping-drift, spellings) the three lines carrying no feature-selection flag are NOT read" "PASS" "$rc"
 
+  # (wheel-drift) maturin takes the wheel's cargo feature list from the
+  #     `[tool.maturin]` table of a pyproject.toml, which no shipping file
+  #     carries. Each case below writes one synthetic pyproject.toml and reads
+  #     the ARTIFACTS entry maturin_artifact_entry derives from it, and the
+  #     planted case proves assert_wheel_feature_selection_is_gated goes red
+  #     when that table adds `testing`. An earlier revision read no maturin
+  #     project file, so `features = ["extension-module", "testing"]` in
+  #     bindings/python/pyproject.toml published a wheel carrying
+  #     scp-platform/testing, scp-dht/testing, and scp-testing under a passing
+  #     gate.
+  local wheel_dir wheel_file wheel_entry wheel_manifest
+  wheel_dir="$(mktemp -d)"
+  wheel_file="$wheel_dir/pyproject.toml"
+  wheel_manifest="$REPO_ROOT/crates/scp-ffi/Cargo.toml"
+  printf '%s\n' \
+    '[build-system]' \
+    'requires = ["maturin>=1.0,<2.0"]' \
+    '' \
+    '[tool.maturin]' \
+    'features = ["extension-module"] # the pyo3 feature the wheel selects' \
+    "manifest-path = \"$wheel_manifest\"" \
+    'module-name = "scp_sdk._scp_core"' \
+    '' \
+    '[tool.maturin.sub]' \
+    'features = ["not-read-from-a-subtable"]' \
+    '' \
+    '[tool.other]' \
+    'features = ["not-read-from-another-table"]' > "$wheel_file"
+  wheel_entry="$(maturin_artifact_entry "$wheel_file" 2>/dev/null)"; rc=$?
+  expect "(wheel-drift) a [tool.maturin] table matching the shipped one derives an entry" "PASS" "$rc"
+  same_string "$wheel_entry" "scp-ffi|--features extension-module"; rc=$?
+  expect "(wheel-drift) that entry is 'scp-ffi|--features extension-module', read from the main table only" "PASS" "$rc"
+  ( fixture_failures=0; assert_wheel_feature_selection_is_gated "$wheel_file" >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(wheel-drift) the assertion ACCEPTS a table whose configuration ARTIFACTS gates" "PASS" "$rc"
+
+  printf '%s\n' \
+    '[tool.maturin]' \
+    'features = ["extension-module", "testing"]' \
+    "manifest-path = \"$wheel_manifest\"" > "$wheel_file"
+  wheel_entry="$(maturin_artifact_entry "$wheel_file" 2>/dev/null)"; rc=$?
+  expect "(wheel-drift) a table that adds 'testing' still derives an entry" "PASS" "$rc"
+  same_string "$wheel_entry" "scp-ffi|--features extension-module,testing"; rc=$?
+  expect "(wheel-drift) that entry names both features in cargo's comma spelling" "PASS" "$rc"
+  printf '%s\n' "${ARTIFACTS[@]}" | grep -xF -- "$wheel_entry" >/dev/null; rc=$?
+  expect "(wheel-drift) ARTIFACTS gates no configuration carrying 'testing'" "FAIL" "$rc"
+  ( fixture_failures=0; assert_wheel_feature_selection_is_gated "$wheel_file" >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(wheel-drift) the assertion REJECTS a table that adds 'testing', so the reader is load-bearing" "FAIL" "$rc"
+
+  printf '%s\n' \
+    '[tool.maturin]' \
+    'all-features = false' \
+    'no-default-features = true' \
+    'features = [' \
+    '  "extension-module",' \
+    '  "server", # multi-line array' \
+    ']' \
+    "manifest-path = '$wheel_manifest'" > "$wheel_file"
+  wheel_entry="$(maturin_artifact_entry "$wheel_file" 2>/dev/null)"; rc=$?
+  expect "(wheel-drift) a multi-line array with boolean keys derives an entry" "PASS" "$rc"
+  same_string "$wheel_entry" "scp-ffi|--no-default-features --features extension-module,server"; rc=$?
+  expect "(wheel-drift) that entry spells the booleans and the list the way ARTIFACTS does" "PASS" "$rc"
+
+  printf '%s\n' '[tool.maturin]' 'all-features = true' "manifest-path = \"$wheel_manifest\"" > "$wheel_file"
+  wheel_entry="$(maturin_artifact_entry "$wheel_file" 2>/dev/null)"; rc=$?
+  expect "(wheel-drift) 'all-features = true' derives an entry" "PASS" "$rc"
+  same_string "$wheel_entry" "scp-ffi|--all-features"; rc=$?
+  expect "(wheel-drift) that entry is 'scp-ffi|--all-features'" "PASS" "$rc"
+
+  printf '%s\n' '[package]' 'name = "fixture-pkg"' 'version = "0.0.0"' > "$wheel_dir/Cargo.toml"
+  printf '%s\n' '[build-system]' 'build-backend = "maturin"' > "$wheel_file"
+  wheel_entry="$(maturin_artifact_entry "$wheel_file" 2>/dev/null)"; rc=$?
+  expect "(wheel-drift) a file with no [tool.maturin] table derives an entry from the Cargo.toml beside it" "PASS" "$rc"
+  same_string "$wheel_entry" "fixture-pkg|"; rc=$?
+  expect "(wheel-drift) that entry is the package's default configuration" "PASS" "$rc"
+
+  printf '%s\n' 'tool.maturin.features = ["testing"]' "tool.maturin.manifest-path = \"$wheel_manifest\"" > "$wheel_file"
+  maturin_artifact_entry "$wheel_file" >/dev/null 2>&1; rc=$?
+  expect "(wheel-drift) a dotted-key spelling FAILS instead of reading as 'no features'" "FAIL" "$rc"
+  printf '%s\n' '[tool]' 'maturin = { features = ["testing"] }' > "$wheel_file"
+  maturin_artifact_entry "$wheel_file" >/dev/null 2>&1; rc=$?
+  expect "(wheel-drift) an inline-table spelling FAILS instead of reading as 'no features'" "FAIL" "$rc"
+  printf '%s\n' '[tool.maturin]' 'features = "testing"' "manifest-path = \"$wheel_manifest\"" > "$wheel_file"
+  maturin_artifact_entry "$wheel_file" >/dev/null 2>&1; rc=$?
+  expect "(wheel-drift) a features value that is not an array FAILS" "FAIL" "$rc"
+  printf '%s\n' '[tool.maturin]' 'no-default-features = "yes"' "manifest-path = \"$wheel_manifest\"" > "$wheel_file"
+  maturin_artifact_entry "$wheel_file" >/dev/null 2>&1; rc=$?
+  expect "(wheel-drift) a boolean key whose value is not a TOML boolean FAILS" "FAIL" "$rc"
+  printf '%s\n' '[tool.maturin]' 'features = ["extension-module"]' 'manifest-path = "nowhere/Cargo.toml"' > "$wheel_file"
+  maturin_artifact_entry "$wheel_file" >/dev/null 2>&1; rc=$?
+  expect "(wheel-drift) a manifest-path naming no file FAILS" "FAIL" "$rc"
+  rm -f "$wheel_file"
+  maturin_artifact_entry "$wheel_file" >/dev/null 2>&1; rc=$?
+  expect "(wheel-drift) a missing maturin project file FAILS" "FAIL" "$rc"
+  ( fixture_failures=0; assert_wheel_feature_selection_is_gated "$wheel_file" >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(wheel-drift) the assertion REJECTS a maturin project file it cannot read" "FAIL" "$rc"
+  rm -rf "$wheel_dir"
+
+  # (wheel-drift, reach) the two places maturin looks for its pyproject.toml.
+  local reach_lines reached
+  reach_lines="$(printf '%s\n' \
+    '            --manifest-path crates/scp-ffi/Cargo.toml' \
+    '          working-directory: bindings/python' \
+    '          working-directory: bindings/kotlin' \
+    '        run: cargo publish --manifest-path=crates/scp-node/Cargo.toml' \
+    'echo not a maturin invocation at all')"
+  reached="$(maturin_project_files_named_by_shipping_lines "$reach_lines")"
+  printf '%s\n' "$reached" | grep -xF 'crates/scp-ffi/pyproject.toml' >/dev/null; rc=$?
+  expect "(wheel-drift, reach) the pyproject.toml beside a --manifest-path Cargo.toml is reached" "PASS" "$rc"
+  printf '%s\n' "$reached" | grep -xF 'bindings/python/pyproject.toml' >/dev/null; rc=$?
+  expect "(wheel-drift, reach) the pyproject.toml of a working-directory: is reached" "PASS" "$rc"
+  printf '%s\n' "$reached" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 2 >/dev/null; rc=$?
+  expect "(wheel-drift, reach) a directory with no pyproject.toml and a non-maturin line reach nothing" "PASS" "$rc"
+
   assert_every_pipeline_reader_consumes_its_input
 
   assert_every_cargo_tree_resolves_every_target
@@ -1511,6 +1878,10 @@ TREE
   assert_allowlist_has_no_nullifier
 
   assert_shipping_invocations_are_gated
+
+  assert_wheel_feature_selection_is_gated "${MATURIN_PROJECT_FILES[@]}"
+
+  assert_maturin_project_files_are_complete
 
   echo "-------------------------------------------------------------------------------"
   if [[ "$fixture_failures" -eq 0 ]]; then
