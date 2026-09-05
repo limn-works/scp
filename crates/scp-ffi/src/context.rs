@@ -3278,14 +3278,17 @@ impl crate::scp::PyScp {
         // (`Creating`, `MigratingOut`, `Poisoned`) refuses the close.
         let close_already_happened =
             match crate::runtime::read_live_context_state(bi, &handle.context_id)? {
-                None => true,
-                Some(scp_core::context::ContextState::Active) => false,
-                Some(
+                // No actor answers (a completed TTL expiry), or the actor
+                // reports a closing or terminal state (a peer's close, a
+                // migration tombstone): the close already happened.
+                None
+                | Some(
                     scp_core::context::ContextState::Closing
                     | scp_core::context::ContextState::Closed
                     | scp_core::context::ContextState::Expired
                     | scp_core::context::ContextState::Tombstoned,
                 ) => true,
+                Some(scp_core::context::ContextState::Active) => false,
                 Some(other) => {
                     let state_name = context_state_str(&other);
                     return Err(PyRuntimeError::new_err(format!(

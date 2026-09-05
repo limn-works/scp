@@ -689,7 +689,6 @@ pub(crate) async fn ucan_delegate_on(
 }
 
 /// Per-bridge-instance implementation of [`ucan_revoke`].
-#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub(crate) async fn ucan_revoke_on(
     bi: &NapiBridgeInstance,
@@ -707,12 +706,24 @@ pub(crate) async fn ucan_revoke_on(
     let parsed = parse_ucan(&token).map_err(ScpNapiError::from)?;
 
     let context_id = handle.context_id();
+
+    // `revoke_ucan` admits a revoker who is either the token's issuer or the
+    // context creator, and that creator comes from the supervisor actor: an
+    // `AdminTransferred` action moves it. `UcanContextState` records the creator
+    // THIS bridge saw at registration, so reading it left revocation authority
+    // with a principal the supervisor had already replaced. The `PyO3` bridge
+    // reads the actor at this decision for the same reason.
+    let creator_did = crate::runtime::live_role_state(bi, &context_id)
+        .await
+        .map_err(napi::Error::from)?
+        .creator_did;
+
     crate::runtime::with_context(bi, &context_id, |rt| {
         use std::cell::RefCell;
 
         let authorizer = BridgeRevocationAuthorizer {
             issuer_did: parsed.payload.iss.clone(),
-            creator_did: rt.core.creator_did.clone(),
+            creator_did: creator_did.clone(),
         };
         let distributor = BridgeRevocationDistributor;
         let event_log_cell = RefCell::new(&mut rt.core.event_log);
@@ -996,7 +1007,7 @@ mod tests {
         let context_id = format!("ctx-revoke-persist-{}", uuid::Uuid::new_v4());
 
         // Manually register a context in the runtime registry.
-        runtime::register_test_context(&bi, &context_id, "did:dht:zCreator");
+        runtime::register_test_context(&bi, &context_id);
 
         // First call: revoke a CID.
         runtime::with_context(&bi, &context_id, |rt| {
@@ -1038,7 +1049,7 @@ mod tests {
 
         let bi = runtime::NapiBridgeInstance::new_napi();
         let context_id = format!("ctx-nonce-persist-{}", uuid::Uuid::new_v4());
-        runtime::register_test_context(&bi, &context_id, "did:dht:zCreator");
+        runtime::register_test_context(&bi, &context_id);
 
         let now_millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1101,7 +1112,7 @@ mod tests {
         let bi = runtime::NapiBridgeInstance::new_napi();
         let context_id = format!("ctx-revoke-wire-{}", uuid::Uuid::new_v4());
         let creator_did = "did:dht:zCreator";
-        runtime::register_test_context(&bi, &context_id, creator_did);
+        runtime::register_test_context(&bi, &context_id);
 
         // Build a deterministic token string for revocation.
         let test_token = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsInVjdiI6IjAuMTAuMCJ9.\
@@ -1116,7 +1127,7 @@ mod tests {
         runtime::with_context(&bi, &context_id, |rt| {
             let authorizer = BridgeRevocationAuthorizer {
                 issuer_did: issuer_did.clone(),
-                creator_did: rt.core.creator_did.clone(),
+                creator_did: creator_did.to_owned(),
             };
             let distributor = BridgeRevocationDistributor;
             let event_log_cell = RefCell::new(&mut rt.core.event_log);
@@ -1172,7 +1183,7 @@ mod tests {
         let bi = runtime::NapiBridgeInstance::new_napi();
         let context_id = format!("ctx-revoke-unauth-{}", uuid::Uuid::new_v4());
         let creator_did = "did:dht:zCreator";
-        runtime::register_test_context(&bi, &context_id, creator_did);
+        runtime::register_test_context(&bi, &context_id);
 
         let test_token = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsInVjdiI6IjAuMTAuMCJ9.\
             eyJpc3MiOiJkaWQ6ZGh0OnpDcmVhdG9yIiwiYXVkIjoiZGlkOmRodDp6TWVtYmVyIiwiZXhwIjo5OTk5OTk5OTk5LCJubmMiOiIxNjk5OTk5MDAwMDAwLWFhYmJjY2RkMTEyMjMzNDQiLCJhdHQiOltdLCJwcmYiOltdfQ.\
@@ -1186,7 +1197,7 @@ mod tests {
         let result = runtime::with_context(&bi, &context_id, |rt| {
             let authorizer = BridgeRevocationAuthorizer {
                 issuer_did: issuer_did.clone(),
-                creator_did: rt.core.creator_did.clone(),
+                creator_did: creator_did.to_owned(),
             };
             let distributor = BridgeRevocationDistributor;
             let event_log_cell = RefCell::new(&mut rt.core.event_log);
@@ -1480,11 +1491,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ucan_mint_without_retained_custody_returns_ident_1017() {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
-        let handle = crate::context::NapiContextHandle::test_active_on(
-            &bi,
-            "ctx-no-custody-mint".to_owned(),
-            "did:dht:z6MkCreatorNoCustody".to_owned(),
-        );
+        let ctx_id = format!("ctx-no-custody-mint-{}", uuid::Uuid::new_v4());
+        let creator_did = "did:dht:z6MkCreatorNoCustody";
+        // `ucan_mint_on` reads the ceiling and the creator off the actor before
+        // it resolves custody, so the actor has to answer for this context.
+        // Then the mint fails at the custody lookup, which is what this test
+        // pins, rather than at the live read.
+        crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator_did, &[]).await;
+        let handle =
+            crate::context::NapiContextHandle::test_active_on(&bi, ctx_id, creator_did.to_owned());
 
         let result = ucan_mint_on(
             &bi,

@@ -1356,6 +1356,13 @@ pub(crate) async fn outlet_session_invoke_on(
 }
 
 /// Per-bridge-instance implementation of [`outlet_session_close`].
+///
+/// Carries no lifecycle gate, unlike the nine outlet entry points that decide
+/// an authorization question: this one releases one session entry the bridge
+/// itself owns, and refusing that release in a `Closing` or `Expired` context
+/// would strand the entry until `context_close_on` drops the whole
+/// `UcanContextState`.
+#[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
 pub(crate) async fn outlet_session_close_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -1529,6 +1536,13 @@ pub(crate) async fn outlet_interface_accept_on(
 }
 
 /// Per-bridge-instance implementation of [`outlet_interface_revoke`].
+///
+/// Carries no lifecycle gate, unlike the nine outlet entry points that decide
+/// an authorization question: this one reads no context state and grants
+/// nothing. It builds an `InterfaceRevoked` event from the interface id and the
+/// clock and hands it back for the caller to distribute, so gating it would
+/// deny a member the record of a revocation without withholding any capability.
+#[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
 pub(crate) async fn outlet_interface_revoke_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -1746,6 +1760,10 @@ mod tests {
         let ctx_id = format!("ctx-napi-ts-test-{}", std::process::id());
         let creator_did = "did:dht:z6MkNapiTsTest";
 
+        // `outlet_register_on` gates on the actor and authorizes off the
+        // actor's role state, so the fixture creates the context in a
+        // supervisor rather than only registering bridge state.
+        crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator_did, &[]).await;
         let handle = NapiContextHandle::test_active_on(&bi, ctx_id.clone(), creator_did.to_owned());
 
         let definition = NapiOutletDefinition {
@@ -1796,6 +1814,10 @@ mod tests {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
         let ctx_id = format!("ctx-napi-kind-test-{}", std::process::id());
         let creator_did = "did:dht:z6MkNapiKindTest";
+        // `outlet_register_on` gates on the actor and authorizes off the
+        // actor's role state, so the fixture creates the context in a
+        // supervisor rather than only registering bridge state.
+        crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator_did, &[]).await;
         let handle = NapiContextHandle::test_active_on(&bi, ctx_id.clone(), creator_did.to_owned());
 
         let definition = NapiOutletDefinition {

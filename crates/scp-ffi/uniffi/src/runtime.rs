@@ -44,7 +44,6 @@ use scp_ffi_common::credentials::FfiCredentialStore;
 // path.
 pub use scp_ffi_common::bridge_instance::CoreFields;
 use scp_ffi_common::error_codes as codes;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -970,13 +969,14 @@ impl UniffiBridgeInstance {
 
     /// Reads a context's role state from that context's supervisor actor.
     ///
-    /// Every UniFFI entry point that decides authorization, membership, a role,
+    /// Every `UniFFI` entry point that decides authorization, membership, a role,
     /// a capability, or a capability ceiling reads through this function. The
-    /// per-context UCAN state carries a `creator_did` and a `ceiling_strings`
-    /// set recorded when THIS bridge registered the context, so a `ModifyCeiling`
-    /// governance action or an `AdminTransferred` action leaves those two fields
-    /// granting what the supervisor already withdrew. The `PyO3` and NAPI
-    /// bridges read the actor at the same decisions.
+    /// per-context UCAN state carried a `creator_did` and a `ceiling_strings`
+    /// set recorded when THIS bridge registered the context, and a
+    /// `ModifyCeiling` governance action or an `AdminTransferred` action left
+    /// those two fields granting what the supervisor already withdrew, so both
+    /// fields are deleted. The `PyO3` and NAPI bridges read the actor at the
+    /// same decisions.
     ///
     /// Fails closed. A context whose actor holds no role state yields
     /// `ScpError::Context`; no caller receives a permissive default.
@@ -1039,19 +1039,15 @@ impl UniffiBridgeInstance {
     /// # Errors
     ///
     /// Returns any error [`UniffiBridgeInstance::context_manager_or_error`]
-    /// returns, or `ScpError::Context` when the supervisor state read fails.
+    /// returns. The state read itself reports an absent actor as `Ok(None)`,
+    /// never as an error, so a caller distinguishes "no actor serves this
+    /// context" from "this bridge cannot ask".
     pub async fn read_live_context_state(
         &self,
         context_id: &str,
     ) -> Result<Option<scp_core::context::ContextState>, crate::ScpError> {
         let supervisor = self.context_manager_or_error()?;
-        supervisor
-            .read_context_state(context_id)
-            .await
-            .map_err(|e| crate::ScpError::Context {
-                msg: format!("supervisor state read failed: {e}"),
-                code: codes::CTX_2000.to_owned(),
-            })
+        Ok(supervisor.read_context_state(context_id).await)
     }
 
     /// Refuses `verb` unless `context_id`'s supervisor actor reports `Active`.
@@ -1147,14 +1143,14 @@ impl UniffiBridgeInstance {
     /// Ensures UCAN validation state is registered for `context_id` in this
     /// instance's UCAN registry. No-op if the context is already registered.
     #[allow(dead_code)]
-    pub fn ensure_ucan_registered(&self, context_id: &str, creator_did: &str, ceiling: &[String]) {
+    pub fn ensure_ucan_registered(&self, context_id: &str) {
         if self.ucan_registry.contains_key(context_id) {
             return;
         }
 
         self.ucan_registry.insert(
             context_id.to_owned(),
-            Self::build_ucan_context_state(context_id, creator_did, ceiling),
+            Self::build_ucan_context_state(context_id),
         );
     }
 
@@ -1182,12 +1178,7 @@ impl UniffiBridgeInstance {
     /// Returns `ScpError::Context` (`SCP-CTX-2014`) if the context's UCAN
     /// state is already registered on this instance.
     #[allow(dead_code)]
-    pub fn register_ucan_occupied(
-        &self,
-        context_id: &str,
-        creator_did: &str,
-        ceiling: &[String],
-    ) -> Result<(), crate::ScpError> {
+    pub fn register_ucan_occupied(&self, context_id: &str) -> Result<(), crate::ScpError> {
         use dashmap::mapref::entry::Entry;
 
         match self.ucan_registry.entry(context_id.to_owned()) {
@@ -1199,70 +1190,31 @@ impl UniffiBridgeInstance {
                 // `build_ucan_context_state` never touches `ucan_registry`, so
                 // building it while holding this shard's `Entry` write guard
                 // cannot deadlock (mirrors the napi reference's Vacant arm).
-                vacant.insert(Self::build_ucan_context_state(
-                    context_id,
-                    creator_did,
-                    ceiling,
-                ));
+                vacant.insert(Self::build_ucan_context_state(context_id));
                 Ok(())
             }
         }
     }
 
-    /// Builds the per-context UCAN validation state (revocation list, nonce
-    /// tracker, event log, normalized capability ceiling) for a context.
+    /// Builds the per-context UCAN validation state — the revocation list, the
+    /// nonce tracker, and the event log — for a context.
     ///
     /// Shared by [`Self::ensure_ucan_registered`] (idempotent lazy path) and
     /// [`Self::register_ucan_occupied`] (atomic Welcome-join gate) so both
     /// construct byte-identical state. Does NOT insert into `ucan_registry` —
     /// the caller decides the insert semantics.
-    fn build_ucan_context_state(
-        context_id: &str,
-        creator_did: &str,
-        ceiling: &[String],
-    ) -> UcanContextState {
-        let ceiling_strings = if ceiling.is_empty() {
-            scp_core::context::roles::default_ceiling()
-                .iter()
-                .map(scp_core::context::roles::Capability::ucan_capability_name)
-                .collect::<HashSet<String>>()
-        } else {
-            // Ceiling-entry grammar enforcement (spec §5.3.1.1). This per-instance
-            // UCAN-state cache is populated AFTER `context_create` already routed
-            // through the runtime creation gate (`lifecycle_helpers::create_context`
-            // → `ContextRoleState::new`), which rejects any malformed ceiling — so
-            // every surviving entry is well-formed. As infallible defense-in-depth,
-            // a malformed entry is SKIPPED rather than normalized: this forecloses
-            // the silent broadening where a no-colon `payments` would become
-            // `payments:*` via `Capability::new` + `ucan_capability_name`.
-            //
-            // Filter on the PARSED enum (`Capability::new(s)
-            // .validate_as_ceiling_entry()`) — NOT the raw string — so the
-            // accept/skip decision uses EXACTLY the capability that gets enforced
-            // (and mapped via `ucan_capability_name` on the next line). The runtime
-            // gate validates the same parsed-enum form, so this filter never skips
-            // an entry the runtime accepted nor keeps one it rejected. Validating
-            // the raw string instead would diverge on a prefix-stripped custom: the
-            // raw `"custom:payments"` passes a raw-string check but parses to
-            // `Custom("payments")` (enforced `payments:payments`), a no-colon custom
-            // the parsed-enum check correctly rejects (BLACK-003).
-            ceiling
-                .iter()
-                .filter(|s| {
-                    scp_core::context::roles::Capability::new(s)
-                        .is_some_and(|c| c.validate_as_ceiling_entry().is_ok())
-                })
-                .filter_map(|s| {
-                    scp_core::context::roles::Capability::new(s).map(|c| c.ucan_capability_name())
-                })
-                .collect::<HashSet<String>>()
-        };
-
+    ///
+    /// The state carries no capability ceiling and no context creator DID.
+    /// `ucan_validate`, `ucan_evaluate`, `ucan_mint`, `ucan_delegate`,
+    /// `ucan_revoke`, and the three outlet entry points read both from the
+    /// per-context supervisor actor through [`Self::live_role_state`] at the
+    /// moment each decides, because a `ModifyCeiling` governance action moves
+    /// the ceiling and an `AdminTransferred` action moves the creator after
+    /// this registration runs.
+    fn build_ucan_context_state(context_id: &str) -> UcanContextState {
         UcanContextState {
             revocation_list: RevocationList::new(context_id.to_owned()),
             nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
-            ceiling_strings,
-            creator_did: creator_did.to_owned(),
             event_log: EventLog::new(context_id.to_owned()),
         }
     }
@@ -1713,8 +1665,6 @@ mod tests {
             UcanContextState {
                 revocation_list: RevocationList::new("test-ctx".to_owned()),
                 nonce_tracker: NonceTracker::new("test-ctx".to_owned(), SystemClock),
-                ceiling_strings: HashSet::new(),
-                creator_did: "did:dht:test".to_owned(),
                 event_log: EventLog::new("test-ctx".to_owned()),
             },
         );

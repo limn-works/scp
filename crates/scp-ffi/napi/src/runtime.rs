@@ -35,7 +35,7 @@ use scp_clock::SystemClock;
 use scp_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_core::context::outlets::{OutletRegistry, SessionStore};
 use scp_core::context::persistence::ContextPersistence;
-use scp_core::context::roles::{ContextRoleState, default_ceiling};
+use scp_core::context::roles::ContextRoleState;
 use scp_core::context::state::ContextSnapshot;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
@@ -1629,77 +1629,64 @@ pub(crate) fn ucan_registry(bi: &NapiBridgeInstance) -> &DashMap<String, UcanCon
     bi.ucan_registry.as_ref()
 }
 
-/// Builds a fresh [`UcanContextState`] for a context, validating the caller's
-/// ceiling entries (§5.3.1.1) before normalizing them into the UCAN ceiling
-/// string set.
+/// Builds a fresh [`UcanContextState`] for a context after rejecting a caller
+/// ceiling entry that violates the §5.3.1.1 grammar.
 ///
 /// Shared by [`ensure_registered`] (lazy, idempotent — the UCAN-op path) and
 /// [`register_ffi_state`] (eager, fail-closed — the Welcome-join path) so the
-/// two cannot drift in how they construct per-context FFI state. Mirrors the
-/// `PyO3` reference bridge's `register_ffi_state` state-building: the role state
-/// is seeded from `default_ceiling()` with `creator_did` as admin, and the
-/// caller ceiling drives only the UCAN `ceiling_strings`.
+/// two cannot drift in how they construct per-context FFI state.
+///
+/// `user_ceiling` reaches this function for that grammar check alone. The state
+/// this function builds stores no ceiling and no creator DID: `ucan_validate`,
+/// `ucan_evaluate`, `ucan_mint`, `ucan_delegate`, `ucan_revoke`, and the three
+/// outlet entry points read both from the per-context supervisor actor through
+/// [`live_role_state`] at the moment each decides, because a `ModifyCeiling`
+/// governance action and an `AdminTransferred` action move them after this
+/// registration runs.
 ///
 /// # Errors
 ///
 /// Returns `ScpNapiError::Validation` if a ceiling entry violates the §5.3.1.1
-/// grammar, or `ScpNapiError::Context` if role-state construction fails.
+/// grammar.
 fn build_ucan_context_state(
     context_id: &str,
-    creator_did: &str,
     user_ceiling: &[String],
 ) -> Result<UcanContextState, ScpNapiError> {
-    let ceiling_strings = if user_ceiling.is_empty() {
-        scp_core::context::roles::default_ceiling()
-            .iter()
-            .map(scp_core::context::roles::Capability::ucan_capability_name)
-            .collect::<HashSet<String>>()
-    } else {
-        // Ceiling-entry grammar enforcement (spec §5.3.1.1) on each user entry
-        // BEFORE it is normalized into the UCAN ceiling string set. Validate the
-        // PARSED enum (`Capability::new(entry).validate_as_ceiling_entry()`) — NOT
-        // the raw string — so the validation checks EXACTLY the capability that
-        // gets enforced. `Capability::new` strips a `custom:` prefix: the raw
-        // string `"custom:payments"` has one colon (would pass a raw-string check)
-        // but parses to `Custom("payments")`, whose enforced form
-        // (`ucan_capability_name` → `payments:payments`) corresponds to a no-colon
-        // custom that `validate_as_ceiling_entry` REJECTS. Routing through the
-        // parsed enum keeps the raw-string validation and the enforced parse in
-        // agreement on one canonical form (BLACK-003), and still rejects a
-        // no-colon `payments` that would otherwise be widened to `payments:*`.
-        for entry in user_ceiling {
-            // Fail-closed: a malformed capability string (deleted legacy
-            // outlet-invoke / pre-rename outlet-invoke stems, invalid §5.4.2.1
-            // outlet suffix) parses to `None` and is rejected at the FFI
-            // boundary rather than silently dropped.
-            let cap = scp_core::context::roles::Capability::new(entry).ok_or_else(|| {
-                ScpNapiError::Validation {
-                    message: format!(
-                        "invalid capability {entry:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
-                    ),
-                    code: codes::VALID_7000.to_owned(),
-                }
+    // Ceiling-entry grammar enforcement (spec §5.3.1.1) on each user entry.
+    // Validate the PARSED enum (`Capability::new(entry).validate_as_ceiling_entry()`)
+    // — NOT the raw string — so the validation checks EXACTLY the capability that
+    // gets enforced. `Capability::new` strips a `custom:` prefix: the raw
+    // string `"custom:payments"` has one colon (would pass a raw-string check)
+    // but parses to `Custom("payments")`, whose enforced form
+    // (`ucan_capability_name` → `payments:payments`) corresponds to a no-colon
+    // custom that `validate_as_ceiling_entry` REJECTS. Routing through the
+    // parsed enum keeps the raw-string validation and the enforced parse in
+    // agreement on one canonical form (BLACK-003), and still rejects a
+    // no-colon `payments` that would otherwise be widened to `payments:*`.
+    for entry in user_ceiling {
+        // Fail-closed: a malformed capability string (deleted legacy
+        // outlet-invoke / pre-rename outlet-invoke stems, invalid §5.4.2.1
+        // outlet suffix) parses to `None` and is rejected at the FFI
+        // boundary rather than silently dropped.
+        let cap = scp_core::context::roles::Capability::new(entry).ok_or_else(|| {
+            ScpNapiError::Validation {
+                message: format!(
+                    "invalid capability {entry:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
+                ),
+                code: codes::VALID_7000.to_owned(),
+            }
+        })?;
+        cap.validate_as_ceiling_entry()
+            .map_err(|e| ScpNapiError::Validation {
+                message: e.to_string(),
+                code: codes::VALID_7000.to_owned(),
             })?;
-            cap.validate_as_ceiling_entry()
-                .map_err(|e| ScpNapiError::Validation {
-                    message: e.to_string(),
-                    code: codes::VALID_7000.to_owned(),
-                })?;
-        }
-        user_ceiling
-            .iter()
-            .filter_map(|s| {
-                scp_core::context::roles::Capability::new(s).map(|c| c.ucan_capability_name())
-            })
-            .collect::<HashSet<String>>()
-    };
+    }
 
     Ok(UcanContextState {
         core: scp_ffi_common::bridge_runtime::UcanContextStateCore {
             revocation_list: RevocationList::new(context_id.to_owned()),
             nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
-            ceiling_strings,
-            creator_did: creator_did.to_owned(),
             event_log: EventLog::new(context_id.to_owned()),
         },
         outlet_registry: OutletRegistry::new(),
@@ -1731,7 +1718,6 @@ fn build_ucan_context_state(
 pub fn register_ffi_state(
     bi: &NapiBridgeInstance,
     context_id: &str,
-    creator_did: &str,
     user_ceiling: &[String],
 ) -> Result<(), ScpNapiError> {
     use dashmap::mapref::entry::Entry;
@@ -1742,7 +1728,7 @@ pub fn register_ffi_state(
             code: codes::CTX_2023.to_owned(),
         }),
         Entry::Vacant(vacant) => {
-            let state = build_ucan_context_state(context_id, creator_did, user_ceiling)?;
+            let state = build_ucan_context_state(context_id, user_ceiling)?;
             vacant.insert(state);
             Ok(())
         }
@@ -1770,7 +1756,7 @@ pub fn ensure_registered(
         return Ok(());
     }
 
-    let state = build_ucan_context_state(&context_id, &handle.creator_did(), &handle.ceiling())?;
+    let state = build_ucan_context_state(&context_id, &handle.ceiling())?;
     map.entry(context_id).or_insert(state);
     Ok(())
 }
@@ -1908,8 +1894,10 @@ pub async fn live_ceiling_strings(
 ///
 /// # Errors
 ///
-/// Returns [`ScpNapiError::Context`] when the supervisor is unavailable or when
-/// the supervisor state read fails.
+/// Returns [`ScpNapiError::Context`] when this instance holds no supervisor.
+/// The state read itself reports an absent actor as `Ok(None)`, never as an
+/// error, so a caller distinguishes "no actor serves this context" from "this
+/// bridge cannot ask".
 pub async fn read_live_context_state(
     bi: &NapiBridgeInstance,
     context_id: &str,
@@ -1919,12 +1907,7 @@ pub async fn read_live_context_state(
         code: codes::CTX_2000.to_owned(),
     })?;
     let sup = Arc::clone(sup);
-    sup.read_context_state(context_id)
-        .await
-        .map_err(|e| ScpNapiError::Context {
-            message: format!("supervisor state read failed: {e}"),
-            code: codes::CTX_2000.to_owned(),
-        })
+    Ok(sup.read_context_state(context_id).await)
 }
 
 /// Refuses `verb` unless `context_id`'s supervisor actor reports `Active`.
@@ -2049,27 +2032,19 @@ pub fn query_trust_event_counts(
 
 /// Registers a test context in the UCAN state registry.
 ///
-/// # Panics
-///
-/// Panics if `ContextRoleState::new` fails with default ceiling and no
-/// custom roles, which should be infallible.
+/// The state this registers carries the revocation list, the nonce tracker, and
+/// the event log — the three the bridge itself owns. It carries no creator DID
+/// and no ceiling, so a test that exercises an authorization decision registers
+/// a supervisor context for the same id and lets the actor answer.
 #[cfg(test)]
-#[allow(clippy::expect_used)]
-pub fn register_test_context(bi: &NapiBridgeInstance, context_id: &str, creator_did: &str) {
+pub fn register_test_context(bi: &NapiBridgeInstance, context_id: &str) {
     let map = ucan_registry(bi);
-
-    let ceiling_strings = scp_core::context::roles::default_ceiling()
-        .iter()
-        .map(scp_core::context::roles::Capability::ucan_capability_name)
-        .collect::<HashSet<String>>();
 
     let state = UcanContextState {
         core: scp_ffi_common::bridge_runtime::UcanContextStateCore {
             event_log: EventLog::new(context_id.to_owned()),
             revocation_list: RevocationList::new(context_id.to_owned()),
             nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
-            ceiling_strings,
-            creator_did: creator_did.to_owned(),
         },
         outlet_registry: OutletRegistry::new(),
         outlet_handlers: HashMap::new(),
@@ -2077,6 +2052,62 @@ pub fn register_test_context(bi: &NapiBridgeInstance, context_id: &str, creator_
     };
 
     map.entry(context_id.to_owned()).or_insert(state);
+}
+
+/// Attaches a supervisor to `bi` if none is attached, then creates `context_id`
+/// inside it under `creator_did` with `ceiling` as the capability ceiling.
+///
+/// [`register_test_context`] alone registers the bridge-owned UCAN state; it
+/// does NOT create the context inside a supervisor, so a unit test that only
+/// calls it leaves every authorization read failing closed. Tests call this to
+/// give the context the role state a real `context_create` would have created.
+/// It mirrors the `PyO3` reference bridge's `create_supervisor_context_for_test`.
+///
+/// `ceiling` entries take the colon form the TypeScript surface accepts
+/// (`"outlet:register"`, `"messages:write"`). An empty slice creates the context
+/// with `default_ceiling()`.
+///
+/// # Panics
+///
+/// Panics when a `ceiling` entry fails the §5.4.2.1 capability parser, when no
+/// supervisor can be attached, or when `create_context` rejects the request —
+/// each one is a broken test fixture rather than a condition under test.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)] // A broken test fixture panics; production paths keep the deny.
+pub(crate) async fn create_supervisor_context_for_test(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+    creator_did: &str,
+    ceiling: &[&str],
+) {
+    init_supervisor_for_test_on(bi);
+    let capabilities: Vec<scp_core::context::roles::Capability> = if ceiling.is_empty() {
+        scp_core::context::roles::default_ceiling()
+            .iter()
+            .cloned()
+            .collect()
+    } else {
+        ceiling
+            .iter()
+            .map(|entry| {
+                scp_core::context::roles::Capability::new(entry)
+                    .unwrap_or_else(|| panic!("test ceiling entry {entry:?} must parse"))
+            })
+            .collect()
+    };
+    let params = scp_core::context::ContextParams {
+        ceiling: capabilities,
+        ..scp_core::context::ContextParams::default()
+    };
+    let sup = Arc::clone(supervisor(bi).expect("test supervisor must be attached"));
+    sup.create_context(
+        context_id.to_owned(),
+        params,
+        scp_did::DID(creator_did.to_owned()),
+        None,
+    )
+    .await
+    .expect("test supervisor context creation must succeed");
 }
 
 // ---------------------------------------------------------------------------

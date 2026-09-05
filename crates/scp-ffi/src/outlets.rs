@@ -967,6 +967,42 @@ fn outlet_invoke_cross_context_impl(
     }
     let input_json = py_dict_to_json(input)?;
 
+    // Lifecycle gate: both contexts MUST be Active, read from each context's
+    // supervisor actor via `read_context_state`. The saga sibling
+    // (`outlet_invoke_cross_context_saga_impl`) and the streaming sibling
+    // (`outlet_streaming_saga_open_impl`) gate on these same two reads with the
+    // same two codes, and both twin bridges gate this unary entry point too:
+    // NAPI's `outlet_invoke_cross_context_on` calls `require_active_context` on
+    // each axis, and UniFFI's `outlet_invoke_cross_context` calls the UniFFI
+    // equivalent. This entry point carried no lifecycle gate at all, so a
+    // Closing, Expired, or MigratingOut context refused every sibling call and
+    // admitted this one. A missing actor (`None`) counts as non-active, so the
+    // gate fails closed.
+    {
+        let supervisor = crate::runtime::supervisor(bi)?;
+        let tokio_rt = crate::runtime()?;
+        let source_state = tokio_rt.block_on(supervisor.read_context_state(source_context_id));
+        if !matches!(source_state, Some(scp_core::context::ContextState::Active)) {
+            return Err(ScpPyError::ContextError {
+                message: format!(
+                    "cannot invoke cross-context outlet: source context in {source_state:?} state"
+                ),
+                code: codes::OUTLET_6010.to_owned(),
+            }
+            .into());
+        }
+        let target_state = tokio_rt.block_on(supervisor.read_context_state(target_context_id));
+        if !matches!(target_state, Some(scp_core::context::ContextState::Active)) {
+            return Err(ScpPyError::ContextError {
+                message: format!(
+                    "cannot invoke cross-context outlet: target context in {target_state:?} state"
+                ),
+                code: codes::OUTLET_6011.to_owned(),
+            }
+            .into());
+        }
+    }
+
     // Primary authorization: UCAN token validation via the full 11-step
     // ADR-016 pipeline against the TARGET context's ceiling.
     // See spec §6.2, §8, ADR-016, and issue #319.
@@ -3170,5 +3206,97 @@ mod tests {
             "the refusal must name the absent supervisor role state: {message}"
         );
         crate::runtime::remove_context(&scp.inner, &ctx_id);
+    }
+
+    /// Registers FFI state for a second context on `scp` and creates NO
+    /// supervisor actor for it, so every live read against that id fails closed
+    /// while the other context in the same test stays live.
+    fn register_context_without_supervisor(
+        scp: &crate::scp::PyScp,
+        prefix: &str,
+        creator: &str,
+    ) -> String {
+        let ctx_id = format!("{prefix}-{}", uuid::Uuid::new_v4());
+        crate::runtime::register_context(&scp.inner, &ctx_id, creator, &[]).unwrap();
+        ctx_id
+    }
+
+    /// The unary `outlet_invoke_cross_context` gates its SOURCE axis on the
+    /// source context's supervisor actor. It carried no lifecycle gate at all,
+    /// so a source context the supervisor had stopped serving reached the UCAN
+    /// pipeline; the saga sibling and both twin bridges refused the same call.
+    #[test]
+    fn cross_context_invoke_refuses_a_source_context_no_actor_serves() {
+        let creator = "did:dht:z6MkXctxUnarySourceNoActor";
+        let (scp, target_id) = live_scp("xctx-unary-target-live", creator, &["messages:write"]);
+        let source_id = register_context_without_supervisor(&scp, "xctx-unary-source", creator);
+
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let input = PyDict::new(py);
+            let err = scp
+                .outlet_invoke_cross_context(
+                    py,
+                    &source_id,
+                    &target_id,
+                    "probe-outlet",
+                    &input,
+                    creator,
+                    "not-a-real-token",
+                    1,
+                    None,
+                )
+                .expect_err("a source context no actor serves must refuse the invocation");
+            let message = format!("{err}");
+            assert!(
+                message.contains(codes::OUTLET_6010),
+                "the refusal must carry the caller-axis code: {message}"
+            );
+            assert!(
+                message.contains("source context"),
+                "the refusal must name the source axis: {message}"
+            );
+        });
+        crate::runtime::remove_context(&scp.inner, &source_id);
+        crate::runtime::remove_context(&scp.inner, &target_id);
+    }
+
+    /// The unary `outlet_invoke_cross_context` gates its TARGET axis on the
+    /// target context's supervisor actor. The source stays live here, so the
+    /// target-axis code identifies which of the two reads refused.
+    #[test]
+    fn cross_context_invoke_refuses_a_target_context_no_actor_serves() {
+        let creator = "did:dht:z6MkXctxUnaryTargetNoActor";
+        let (scp, source_id) = live_scp("xctx-unary-source-live", creator, &["messages:write"]);
+        let target_id = register_context_without_supervisor(&scp, "xctx-unary-target", creator);
+
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let input = PyDict::new(py);
+            let err = scp
+                .outlet_invoke_cross_context(
+                    py,
+                    &source_id,
+                    &target_id,
+                    "probe-outlet",
+                    &input,
+                    creator,
+                    "not-a-real-token",
+                    1,
+                    None,
+                )
+                .expect_err("a target context no actor serves must refuse the invocation");
+            let message = format!("{err}");
+            assert!(
+                message.contains(codes::OUTLET_6011),
+                "the refusal must carry the target-axis code: {message}"
+            );
+            assert!(
+                message.contains("target context"),
+                "the refusal must name the target axis: {message}"
+            );
+        });
+        crate::runtime::remove_context(&scp.inner, &source_id);
+        crate::runtime::remove_context(&scp.inner, &target_id);
     }
 }

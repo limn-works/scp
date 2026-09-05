@@ -241,9 +241,14 @@ async fn live_poll_next_drains_to_terminal() {
     // open-time UCAN signature check resolves the issuer key.
     seed_owner_document_into_resolver(&creator_identity, &resolver_dht).await;
 
-    // Context owned by the creator; ceiling admits the Action outlet stem.
+    // Context owned by the creator; ceiling admits the Action outlet stem and
+    // the registration the creator performs below. `outlet_register_on` reads
+    // the ceiling off the supervisor actor, so a capability this list omits is
+    // one the registration no longer has; the bridge-local role-state copy it
+    // used to read carried `default_ceiling()` and admitted the call whatever
+    // this list said.
     let params = serde_json::json!({
-        "ceiling": ["outlet:call:*", "messages:read", "messages:write", "governance:propose"],
+        "ceiling": ["outlet:register", "outlet:call:*", "messages:read", "messages:write", "governance:propose"],
         "governance": "single_admin",
         "memoryScope": "ephemeral",
     })
@@ -885,8 +890,11 @@ mod streaming_vectors_live {
 
         seed_owner_document_into_resolver(&creator_identity, &resolver_dht).await;
 
+        // The ceiling admits the registration the creator performs below.
+        // `outlet_register_on` reads it off the supervisor actor, so a
+        // capability this list omits is one the registration no longer has.
         let params = serde_json::json!({
-            "ceiling": ["outlet:call:*", "messages:read", "messages:write", "governance:propose"],
+            "ceiling": ["outlet:register", "outlet:call:*", "messages:read", "messages:write", "governance:propose"],
             "governance": "single_admin",
             "memoryScope": "ephemeral",
         })

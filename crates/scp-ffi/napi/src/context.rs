@@ -1359,8 +1359,7 @@ pub(crate) async fn context_join_from_welcome_on(
     // spawned actor holds the AUTHENTICATED membership and ceiling, and every
     // authorization site reads that record through
     // `crate::runtime::live_role_state`.
-    crate::runtime::register_ffi_state(bi, &sealed.context_id, &sealed.creator_did, &[])
-        .map_err(NapiError::from)?;
+    crate::runtime::register_ffi_state(bi, &sealed.context_id, &[]).map_err(NapiError::from)?;
 
     let req = scp_core::context::supervisor::WelcomeJoinRequest {
         creator_did: DID(sealed.creator_did.clone()),
@@ -1627,14 +1626,17 @@ pub(crate) async fn context_close_on(
             .await
             .map_err(NapiError::from)?
         {
-            None => true,
-            Some(scp_core::context::ContextState::Active) => false,
-            Some(
+            // No actor answers (a completed TTL expiry), or the actor reports a
+            // closing or terminal state (a peer's close, a migration tombstone):
+            // the close already happened.
+            None
+            | Some(
                 scp_core::context::ContextState::Closing
                 | scp_core::context::ContextState::Closed
                 | scp_core::context::ContextState::Expired
                 | scp_core::context::ContextState::Tombstoned,
             ) => true,
+            Some(scp_core::context::ContextState::Active) => false,
             Some(other) => {
                 return Err(ScpNapiError::Context {
                     message: format!(
@@ -3418,7 +3420,6 @@ pub(crate) async fn context_execute_governance_action_on(
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, handle);
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
-    let proposal_id_log = hex::encode(proposal_id);
 
     // Route through the ADR-049 governance dispatch surface.
     use scp_core::context::actor::commands::{ExecuteGovernanceActionPayload, GovernanceCommand};
@@ -3899,8 +3900,6 @@ pub(crate) async fn context_governance_propose_on(
             code: codes::CTX_2040.to_owned(),
         })
     })?;
-
-    let action_name = action.variant_name();
 
     use scp_core::context::actor::commands::{
         GovernanceCommand, ProposeGovernanceActionPayload, SigningKeyBytes,
@@ -6025,7 +6024,7 @@ mod tests {
         let ctx_id = "b".repeat(64);
 
         // Pre-occupy the FFI-state slot for this context id.
-        crate::runtime::register_test_context(&bi, &ctx_id, "did:dht:z6MkNapiOccupiedCreator");
+        crate::runtime::register_test_context(&bi, &ctx_id);
 
         // A well-formed 32-byte `enc` so control passes the bridge enc-length
         // check and reaches the `register_ffi_state` Occupied precheck (which runs
@@ -6270,7 +6269,7 @@ mod tests {
             ..ContextParams::default()
         };
         test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
-        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        crate::runtime::register_test_context(&bi, &ctx_id);
 
         let handle =
             super::NapiContextHandle::test_active_on(&bi, ctx_id.clone(), creator.to_owned());
@@ -6320,7 +6319,7 @@ mod tests {
             ..ContextParams::default()
         };
         test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
-        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        crate::runtime::register_test_context(&bi, &ctx_id);
 
         // Seed a RoleAssigned leaf carrying the affected member's subject_did
         // into the supervisor-owned event log (the manager-path source).
@@ -6453,7 +6452,7 @@ mod tests {
             ..ContextParams::default()
         };
         test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
-        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        crate::runtime::register_test_context(&bi, &ctx_id);
 
         let fabricated = [0xABu8; 32];
         let result = test_dispatch_execute_by_id(&bi, &ctx_id, fabricated).await;
@@ -6511,7 +6510,7 @@ mod tests {
         crate::runtime::init_supervisor_for_test_on(&bi);
         let ctx_id = format!("napi-no-actor-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiNoActorCreator";
-        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        crate::runtime::register_test_context(&bi, &ctx_id);
         let handle = active_handle_for(&bi, &ctx_id, creator);
         assert_eq!(handle.state().expect("state"), "active");
 
@@ -6543,9 +6542,9 @@ mod tests {
     /// Outlet registration, exposure, and acceptance authorize against the
     /// supervisor actor, so a context no actor serves refuses all three.
     ///
-    /// Before this test existed the bridge kept a `role_state` copy that
-    /// `register_test_context` seeded with the creator as admin, so all three
-    /// operations authorized off that copy and never asked the supervisor.
+    /// Before this test existed the bridge kept a `role_state` copy seeded with
+    /// the creator as admin, so all three operations authorized off that copy
+    /// and never asked the supervisor.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn outlet_authorization_fails_closed_without_a_supervisor_actor() {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
@@ -6561,7 +6560,7 @@ mod tests {
             DID(creator.to_owned()),
         )
         .await;
-        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        crate::runtime::register_test_context(&bi, &ctx_id);
         let handle = active_handle_for(&bi, &ctx_id, creator);
 
         let role_state = crate::runtime::live_role_state(&bi, &ctx_id)
@@ -6611,7 +6610,7 @@ mod tests {
         crate::runtime::init_supervisor_for_test_on(&bi);
         let ctx_id = format!("napi-close-despawned-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiCloseDespawned";
-        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        crate::runtime::register_test_context(&bi, &ctx_id);
         assert!(crate::runtime::ucan_registry(&bi).contains_key(&ctx_id));
 
         let handle = active_handle_for(&bi, &ctx_id, creator);
@@ -6645,7 +6644,7 @@ mod tests {
             ..ContextParams::default()
         };
         test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
-        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        crate::runtime::register_test_context(&bi, &ctx_id);
 
         assert!(
             !crate::runtime::live_role_state(&bi, &ctx_id)

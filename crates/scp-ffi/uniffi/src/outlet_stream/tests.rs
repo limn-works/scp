@@ -350,7 +350,13 @@ async fn live_poll_next_drains_to_terminal() {
     let handle = scp
         .context_create(
             Arc::clone(&creator_identity),
+            // The ceiling admits the registration the creator performs below.
+            // `outlet_register` reads it off the supervisor actor, so a
+            // capability this list omits is one the registration no longer has;
+            // the `ContextRoleState` the bridge used to build on the spot from
+            // `default_ceiling()` admitted the call whatever this list said.
             streaming_context_params(&[
+                "outlet:register",
                 "outlet:call:*",
                 "messages:read",
                 "messages:write",
@@ -563,7 +569,10 @@ mod streaming_vectors_live {
         let handle = scp
             .context_create(
                 Arc::clone(&creator_identity),
+                // The ceiling admits the registration the creator performs
+                // below; `outlet_register` reads it off the supervisor actor.
                 streaming_context_params(&[
+                    "outlet:register",
                     "outlet:call:*",
                     "messages:read",
                     "messages:write",
@@ -1169,14 +1178,16 @@ mod xctx_streaming_saga_tests {
     }
 
     /// (CRYPTO defense-in-depth, SCP-OUT-047) The streaming-saga RECOVER derives
-    /// the TARGET context's Active Signing Key from the `creator_did` it reads out
-    /// of the UCAN-state registry (`with_ucan_state`), whereas the context handle
-    /// carries its OWN `creator_did`. In the co-resident model these are the SAME
-    /// fact from two sources; this pins that they never diverge for a registered
-    /// context, so a future refactor that lets one drift from the other (letting
-    /// recover seal under a different context's key) is caught here.
+    /// the TARGET context's Active Signing Key from the `creator_did` it reads
+    /// off that context's supervisor actor (`live_role_state`), whereas the
+    /// context handle carries its OWN `creator_did` recorded at creation. For a
+    /// context whose creator no `AdminTransferred` action has moved, these are
+    /// the SAME fact from two sources, and this pins that they agree at
+    /// creation, so a future refactor that seals under a different context's key
+    /// is caught here. The handle copy is the one that goes stale after an admin
+    /// transfer, which is why recover reads the actor and not the handle.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn xctx_streaming_saga_ucan_state_creator_did_matches_handle() {
+    async fn xctx_streaming_saga_live_creator_did_matches_handle() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
         let bi = Arc::clone(&scp.inner);
         let _resolver = install_seedable_resolver(&bi);
@@ -1193,14 +1204,16 @@ mod xctx_streaming_saga_tests {
             .await
             .expect("context_create should succeed");
 
-        let ucan_creator = bi
-            .with_ucan_state(&handle.context_id, |state| state.creator_did.clone())
-            .expect("a created context must be registered in the UCAN-state registry");
+        let live_creator = bi
+            .live_role_state(&handle.context_id)
+            .await
+            .expect("a created context's actor must answer the role-state read")
+            .creator_did;
         assert_eq!(
-            ucan_creator, handle.creator_did,
-            "the UCAN-state creator_did (the recover signing-key source) must equal the handle's \
-             creator_did — a divergence would let streaming-saga recover seal under a different \
-             context's Active Signing Key"
+            live_creator, handle.creator_did,
+            "the supervisor's creator_did (the recover signing-key source) must equal the \
+             handle's creator_did at creation — a divergence would let streaming-saga recover \
+             seal under a different context's Active Signing Key"
         );
     }
 }
