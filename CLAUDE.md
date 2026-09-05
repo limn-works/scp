@@ -143,6 +143,10 @@ bridge_ratchet_baseline.json, ratchet/once-lock-count.json,
 check-shipped-feature-graph.sh (ADR-062 §Decision 6 G1 — the shipped-artifact
 feature-graph ⊆-allowlist prove-absence gate; the allowlist permits durability-only
 and real-backend features, ZERO nullifier exceptions),
+shipped-feature-graph-declared-rewritten-command-lines.txt (the rows that gate's
+third shipping-drift half compares every shipping-file command line against: a
+command line carrying a token the shell rewrites is declared here with the reason
+its expansion selects no cargo feature, or the gate fails),
 check-toolchain-wiring.sh (every container build asserts which compiler it resolved;
 the changes job of every paths-filtered workflow routes a pin change to every lane that
 compiles on it, and ci.yml routes every root-level file and every cargo configuration

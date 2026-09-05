@@ -119,13 +119,36 @@ rules separate them.
   neither the `--features` arm nor the `-F` arm, the gate modelled the build as
   `scp-node` with default features and printed `G1 PASSED`, and the image compiled the
   `scp-node/testing` nullifiers. The repair removes one balanced quote pair from every
-  token before classifying it, and fails on every cargo-invoking line that carries a token
+  token before classifying it, and fails on every command line that carries a token
   the shell still rewrites — a `$FLAGS` parameter, a `$(…)` or backtick substitution, a
-  `--fea{,}tures` brace expansion, a backslash escape, a leftover quote, or a
-  `${{ … }}` expression — until a human declares the line in
-  `DECLARED_SHELL_REWRITTEN_CARGO_LINES` with the reason its expansion selects no
+  `--fea{,}tures` brace expansion, a backslash escape, a leftover quote, a `*` or `[…]`
+  filename expansion, a tilde, or a `${{ … }}` expression — until a human declares the
+  line in `DECLARED_REWRITTEN_COMMAND_LINES` with the reason its expansion selects no
   feature. The set of rewriting characters comes from the shell's grammar, so a new
   spelling of an expansion is already a member of the set.
+- **A reader decides which lines reach a process from the file's grammar, not from the
+  words on the line.** The first repair above reported a rewritten token only on a line
+  one of whose whitespace-split tokens was the literal word `cargo`. Two reviewers ran the
+  assertion over one-line Dockerfiles with every declaration list empty and read `ok` for
+  `RUN ["cargo", "build", "--release", "-p", "scp-node", "--features", "scp-node/testing"]`
+  (the exec form; the token is `["cargo",`, and `"--features",` matches no flag arm
+  either), for `RUN sh -c "cargo build --release $FLAGS -p scp-node"` (`"cargo`), for
+  `RUN /usr/local/cargo/bin/cargo build $FLAGS` (a path), for `RUN set -e;cargo build
+  $FLAGS` and `RUN (cargo build $FLAGS)` (an operator glued to the word), for `RUN maturin
+  build $MATURIN_FLAGS` (maturin passes `--features` to cargo), and for a
+  `${{ env.MATURIN_ARGS }}` line inside an `args: >-` folded scalar, where the word `cargo`
+  sits on no physical line. The set of spellings by which a command line reaches cargo
+  without the bare token is open, so "the word `cargo` appears" was an indicator written as
+  the criterion. The repair asks the file's grammar, which is closed: `dockerfile_command_lines`
+  emits the argument of every RUN, CMD, ENTRYPOINT, SHELL, and HEALTHCHECK instruction,
+  every heredoc body line such an instruction opens, and every line whose first word is
+  none of the eighteen Dockerfile instructions; `workflow_command_lines` emits every
+  `run:`, `shell:`, and `with:` key and every line indented beneath it, whichever scalar
+  style the file uses; a shipping file neither reader claims fails the gate. Every command
+  line carrying a rewritten token is then declared, whether or not it names cargo, which
+  put two hundred and fifteen rows in `DECLARED_REWRITTEN_COMMAND_LINES` on the day the
+  reader landed: that count is the price of a criterion the reader can apply, and each
+  row names the program that receives the expansion instead of cargo.
 - **Read a shared build cache everywhere, and write it only from a push to the default
   branch.** A cache written on a pull-request ref is readable only by that pull request,
   and it evicts entries from the budget every other cache step in the workflow shares.

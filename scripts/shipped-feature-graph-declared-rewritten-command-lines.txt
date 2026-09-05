@@ -1,0 +1,303 @@
+# Declared rewritten command lines of the G1 prove-absence gate
+# (scripts/check-shipped-feature-graph.sh, assert_shipping_invocations_are_gated,
+# half 3). One row per command line of a SHIPPING_FILES file — a line a
+# Dockerfile RUN, CMD, ENTRYPOINT, SHELL, or HEALTHCHECK instruction, or a
+# workflow `run:`, `shell:`, or `with:` key, hands to a process — that carries a
+# token the shell or GitHub's expression evaluator rewrites before the process
+# reads it. Each row is the line as join_continued_lines and
+# normalize_shipping_lines render it: comments dropped, backslash continuations
+# joined with one space, leading and trailing whitespace removed, internal
+# whitespace collapsed to one space. The gate FAILS on a command line with a
+# rewritten token this file does not carry, and FAILS on a row no shipping file
+# carries, so an edit to any row's source line changes this file in the same
+# pull request.
+#
+# A `#` line is a grouping comment the gate drops before comparing. Each group
+# states the reason the expansion selects no cargo feature. Two reasons recur
+# and are named once here:
+#
+#   (R1) The line's command word is a literal program or shell builtin that is
+#        not cargo and not a program that passes its arguments to cargo (echo,
+#        cp, mkdir, cat, git, gh, gpg, security, codesign, find, zip, shasum,
+#        sha256sum, npm, node, python, gradlew, apt-get, a PowerShell cmdlet),
+#        and the expansion is one of its arguments, a redirection target, or the
+#        text of a heredoc it reads on stdin. The expansion becomes argv of that
+#        program, and cargo never receives it.
+#   (R2) The line is a shell assignment, a shell keyword line (`if`, `for`,
+#        `[`), a heredoc body line, or a line of a PowerShell, Node, or Python
+#        script the step runs with a non-bash `shell:`. It runs no cargo.
+#
+# The cargo lines carry two expansions with their own reasons. `${{ matrix.target
+# }}` and `"$target"` follow `--target`, an option that takes exactly one value.
+# When the expansion produces a token that begins with `-`, cargo exits with
+# `"--target" takes a target architecture as an argument` and builds nothing;
+# any other token names a triple rustc has to know. Neither path selects a
+# feature, and run_gate resolves every triple at once with `--target all`, so
+# the triple's value changes no verdict. `"$pkg"` follows `-p` inside the
+# `for pkg in scp-core scp-ffi scp-ffi-napi scp-ffi-uniffi; do` loop, and
+# packages_built_by_shipping_lines reads the four names from that `for` line,
+# so each package the expansion names is one the gate resolves. The `cargo test`
+# line compiles no shipped artifact and is declared under
+# DECLARED_SHIPPING_FEATURE_FLAG_LINES in the gate for that reason.
+#
+# Action inputs under `with:` are declared because the gate cannot know which
+# action passes an input to cargo: `PyO3/maturin-action` passes `args` to
+# maturin, which passes `--features` to cargo. The inputs below name a toolchain
+# target, a cache key or path, an artifact name or glob, or a manylinux tag;
+# the `maturin-action` step's `args` input carries no expansion, so it is a line
+# the gate's two token readers classify in full.
+#
+# --- Dockerfile ---
+# (R1) apt-get receives the glob `/var/lib/apt/lists/*` through rm.
+RUN apt-get update && apt-get install -y --no-install-recommends cmake perl pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 && rm -rf /var/lib/apt/lists/*
+# (R1) The ASSERT-PINNED-RUSTC block: sed, rustc --version, cut, [, and echo.
+RUN pin="$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n 1)"; got="$(rustc --version | cut -d' ' -f2)"; [ -n "$pin" ] && [ "$got" = "$pin" ] || { echo "image resolved rustc '$got'; rust-toolchain.toml names '$pin'" >&2; exit 1; }
+# Exec form: the image runs the scp-relay binary this Dockerfile built. No
+# argument, no feature flag.
+ENTRYPOINT ["/usr/local/bin/scp-relay"]
+# --- .github/workflows/build-matrix.yml ---
+# with: inputs of the toolchain, cache, upload-artifact, and maturin-action
+# steps — a target triple, a cache key or path, an artifact name, a glob, a
+# manylinux tag. None is an `args` input.
+targets: ${{ matrix.target }}
+~/.cargo/registry
+~/.cargo/git
+key: rust-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+restore-keys: rust-${{ matrix.target }}-
+name: rust-${{ matrix.target }}
+target-shipped/${{ matrix.target }}/release/libscp_core*
+target-shipped/${{ matrix.target }}/release/scp_core*
+target-shipped/${{ matrix.target }}/release/libscp_ffi*
+target-shipped/${{ matrix.target }}/release/scp_ffi*
+target: ${{ matrix.target }}
+manylinux: ${{ matrix.manylinux }}
+name: python-wheel-${{ matrix.target }}
+path: bindings/python/dist/*.whl
+path: bindings/python/dist/*.tar.gz
+key: napi-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+restore-keys: napi-${{ matrix.target }}-
+name: napi-${{ matrix.target }}
+bindings/kotlin/scp-kt-android/build/outputs/aar/*-release.aar
+bindings/kotlin/scp-kt/build/libs/*.jar
+name: cbindgen-${{ matrix.target }}
+target/${{ matrix.target }}/release/*scp_ffi_uniffi*.${{ matrix.lib-ext }}
+target/${{ matrix.target }}/release/*scp_ffi_uniffi*.a
+# (R1) echo writes a linker variable into $GITHUB_ENV.
+echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> $GITHUB_ENV
+echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang" >> $GITHUB_ENV
+echo "CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang" >> $GITHUB_ENV
+echo "CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android21-clang" >> $GITHUB_ENV
+echo "CARGO_TARGET_I686_LINUX_ANDROID_LINKER=$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/i686-linux-android21-clang" >> $GITHUB_ENV
+# The cargo lines: --target takes one value, -p "$pkg" iterates the for line.
+run: cargo build --release --target ${{ matrix.target }}
+run: cargo test --workspace --release --target ${{ matrix.target }} --features scp-core/testing,scp-runtime/saga-witness-test-mint
+cargo build --release --target ${{ matrix.target }} -p "$pkg" --target-dir target-shipped
+run: cargo build -p scp-ffi-napi --release --target ${{ matrix.target }}
+cargo build --release --target "$target" -p scp-ffi-uniffi
+run: cargo build --release --target ${{ matrix.target }} -p scp-ffi-uniffi
+# (R1, R2) The napi step locates and copies the built cdylib: find, [, cp,
+# Copy-Item.
+LIB=$(find "target/${{ matrix.target }}/release" -maxdepth 1 \( -name "libscp_ffi_napi.dylib" -o -name "libscp_ffi_napi.so" \) | head -1)
+[ -z "$LIB" ] && { echo "::error::cdylib not found"; exit 1; }
+cp "$LIB" napi-out/index.node
+Copy-Item "target/${{ matrix.target }}/release/scp_ffi_napi.dll" napi-out/index.node
+# (R1, R2) cat writes a module map from a heredoc body.
+cat > bindings/swift/ScpFFI.xcframework/Headers/module.modulemap <<'MODULEMAP'
+framework module ScpFFI {
+export *
+}
+# (R1) mkdir and cp place the Android cdylibs under $JNILIBS.
+mkdir -p "$JNILIBS/arm64-v8a" "$JNILIBS/armeabi-v7a" "$JNILIBS/x86_64" "$JNILIBS/x86"
+cp target/aarch64-linux-android/release/libscp_ffi_uniffi.so "$JNILIBS/arm64-v8a/"
+cp target/armv7-linux-androideabi/release/libscp_ffi_uniffi.so "$JNILIBS/armeabi-v7a/"
+cp target/x86_64-linux-android/release/libscp_ffi_uniffi.so "$JNILIBS/x86_64/"
+cp target/i686-linux-android/release/libscp_ffi_uniffi.so "$JNILIBS/x86/"
+# --- .github/workflows/release.yml ---
+# with: inputs — a cache key and path, a download pattern, an upload path, a
+# reusable-workflow input.
+key: conformance-${{ hashFiles('**/Cargo.lock') }}
+scp-core-version: ${{ inputs.version }}
+pattern: python-wheel-*
+pattern: napi-*
+path: ScpFFI-${{ env.VERSION }}.xcframework.zip
+# (R1, R2) The conformance and changelog checks: [, echo, grep.
+if [ -d tests/conformance ]; then
+echo "::notice::Conformance fixture directory not yet created — workspace tests serve as gate"
+if [ ! -f CHANGELOG.md ]; then
+echo "::error::CHANGELOG.md not found in repository root"
+if ! grep -qE "## \[?v?${{ env.VERSION }}\]?" CHANGELOG.md; then
+echo "::error::CHANGELOG.md does not contain an entry for version ${{ env.VERSION }}"
+echo "Expected a section header like: ## ${{ env.VERSION }} or ## [v${{ env.VERSION }}]"
+echo "Changelog entry found for ${{ env.VERSION }}"
+# (R1, R2) The crate-version check: grep, sed, [, echo.
+CARGO_VERSION=$(grep -m1 '^version' "crates/$CRATE/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
+if [ "$CARGO_VERSION" != "${{ env.VERSION }}" ]; then
+echo "::error::$CRATE/Cargo.toml version ($CARGO_VERSION) does not match release version (${{ env.VERSION }})"
+echo "Update crates/$CRATE/Cargo.toml before releasing."
+echo "Version verified for $CRATE: $CARGO_VERSION"
+# (R1, R2) The tag step: elements of the TAGS array, for, git rev-parse, git
+# tag, echo.
+"scp-clock@${{ env.VERSION }}"
+"scp-crypto@${{ env.VERSION }}"
+"scp-did@${{ env.VERSION }}"
+"scp-dht@${{ env.VERSION }}"
+"scp-platform@${{ env.VERSION }}"
+"scp-event-log@${{ env.VERSION }}"
+"scp-protocol@${{ env.VERSION }}"
+"scp-identity@${{ env.VERSION }}"
+"scp-mls@${{ env.VERSION }}"
+"scp-client@${{ env.VERSION }}"
+"scp-runtime@${{ env.VERSION }}"
+"scp-core@${{ env.VERSION }}"
+"scp-transport@${{ env.VERSION }}"
+"scp-mcp@${{ env.VERSION }}"
+"scp-media@${{ env.VERSION }}"
+"scp-node@${{ env.VERSION }}"
+"scp-relay@${{ env.VERSION }}"
+for tag in "${TAGS[@]}"; do
+if git rev-parse "$tag" >/dev/null 2>&1; then
+echo "::warning::Tag $tag already exists — skipping"
+git tag -a "$tag" -m "Release $tag"
+echo "Created tag: $tag"
+echo "core-tag=scp-core@${{ env.VERSION }}" >> "$GITHUB_OUTPUT"
+# (R1, R2) macOS signing: assignments, base64, security, find, codesign, and
+# the signing-set assertion script (a bash script that runs find).
+CERT_PATH=$RUNNER_TEMP/certificate.p12
+KEYCHAIN_PATH=$RUNNER_TEMP/release.keychain-db
+KEYCHAIN_PWD=$(openssl rand -base64 32)
+echo -n "$APPLE_CERTIFICATE" | base64 --decode -o "$CERT_PATH"
+security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PWD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+security list-keychain -d user -s "$KEYCHAIN_PATH"
+run: bash repo/scripts/assert-nonempty-signing-set.sh --name '*.a' xcframework
+find xcframework/ -type f \( -name "*.a" -o -name "*.dylib" \) | while read -r lib; do
+codesign --force --sign "Developer ID Application" --options runtime --timestamp "$lib"
+# (R1, R2) Windows signing: a PowerShell script (shell: pwsh) and the
+# signing-set assertion script.
+run: bash repo/scripts/assert-nonempty-signing-set.sh --name '*.dll' windows-artifacts windows-cbindgen
+$certBytes = [Convert]::FromBase64String($env:WINDOWS_SIGN_CERT)
+$certPath = Join-Path $env:RUNNER_TEMP "certificate.pfx"
+[IO.File]::WriteAllBytes($certPath, $certBytes)
+$cert = Import-PfxCertificate -FilePath $certPath `
+-CertStoreLocation Cert:\CurrentUser\My `
+-Password (ConvertTo-SecureString -String $env:WINDOWS_SIGN_PWD -AsPlainText -Force)
+echo "SIGN_THUMBPRINT=$($cert.Thumbprint)" >> $env:GITHUB_ENV
+$dlls = @(Get-ChildItem -Recurse -Include *.dll windows-artifacts/, windows-cbindgen/)
+Write-Host "Signing $($dlls.Count) DLL(s)"
+foreach ($dll in $dlls) {
+& signtool sign /sha1 $env:SIGN_THUMBPRINT /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $dll.FullName
+if ($LASTEXITCODE -ne 0) {
+Write-Error "signtool exited $LASTEXITCODE for $($dll.FullName)"
+exit $LASTEXITCODE
+}
+Write-Host "Signed: $($dll.FullName)"
+# (R1, R2) Maven signing: gpg, echo, find, and the signing-set assertion script.
+echo -n "$GPG_PRIVATE_KEY" | gpg --batch --import
+echo "allow-preset-passphrase" >> ~/.gnupg/gpg-agent.conf
+run: bash repo/scripts/assert-nonempty-signing-set.sh --name '*.aar' --name '*.jar' maven-artifacts
+find maven-artifacts/ -type f \( -name "*.aar" -o -name "*.jar" -o -name "*.pom" \) | while read -r file; do
+gpg --batch --yes --passphrase "$GPG_PASSPHRASE" --pinentry-mode loopback --armor --detach-sign "$file"
+echo "Signed: $file"
+# (R1, R2) npm publish: echo to ~/.npmrc, a Node script that rewrites
+# package.json, the napi platform-package loop (assignments, [, awk, mkdir, cp,
+# a heredoc JSON body, echo, npm publish).
+run: echo "@limn-works:registry=https://registry.npmjs.org/" >> ~/.npmrc
+node -e "
+const fs = require('fs');
+const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+pkg.version = '${{ env.VERSION }}';
+for (const k of Object.keys(pkg.optionalDependencies || {})) {
+pkg.optionalDependencies[k] = '${{ env.VERSION }}';
+}
+fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+"
+["napi-x86_64-unknown-linux-gnu"]="linux-x64-gnu linux x64"
+["napi-aarch64-unknown-linux-gnu"]="linux-arm64-gnu linux arm64"
+["napi-x86_64-apple-darwin"]="darwin-x64 darwin x64"
+["napi-aarch64-apple-darwin"]="darwin-arm64 darwin arm64"
+["napi-x86_64-pc-windows-msvc"]="win32-x64-msvc win32 x64"
+for artifact in /tmp/napi-artifacts/napi-*/; do
+artifact_name=$(basename "$artifact")
+info="${TARGET_MAP[$artifact_name]}"
+if [ -z "$info" ]; then
+echo "::warning::Unknown artifact $artifact_name — skipping"
+suffix=$(echo "$info" | awk '{print $1}')
+os=$(echo "$info" | awk '{print $2}')
+cpu=$(echo "$info" | awk '{print $3}')
+pkg_name="@limn-works/scp-ts-napi-${suffix}"
+pkg_dir="/tmp/pkg-${suffix}"
+mkdir -p "$pkg_dir"
+cp "$artifact/index.node" "$pkg_dir/index.node"
+cat > "$pkg_dir/package.json" <<JSON
+{
+"name": "${pkg_name}",
+"version": "${{ env.VERSION }}",
+"description": "${os} ${cpu} native addon for @limn-works/scp-ts",
+"os": ["${os}"],
+"cpu": ["${cpu}"],
+"main": "index.node",
+"files": ["index.node"],
+"license": "MIT OR Apache-2.0",
+"repository": { "type": "git", "url": "https://github.com/limn/scp" },
+"publishConfig": { "access": "public" }
+echo "Publishing ${pkg_name}@${{ env.VERSION }}…"
+npm publish "$pkg_dir" --access public
+# (R1) Maven publish: gradlew receives the version as a Gradle property; the
+# Kotlin build consumes the cdylibs build-matrix.yml built and runs no cargo.
+./gradlew :scp-kt:publishMavenJavaPublicationToSonatypeStagingRepository -PscpVersion=${{ env.VERSION }}
+./gradlew :scp-kt-android:publishReleasePublicationToSonatypeStagingRepository -PscpVersion=${{ env.VERSION }}
+# (R1, R2) Swift release: git config, zip, shasum, echo, a Python script that
+# rewrites Package.swift, git commit, git tag, git push.
+git config user.name "github-actions[bot]"
+git config user.email "github-actions[bot]@users.noreply.github.com"
+ZIP="ScpFFI-${{ env.VERSION }}.xcframework.zip"
+zip -r "../$ZIP" .
+CHECKSUM=$(shasum -a 256 "$ZIP" | awk '{print $1}')
+echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+echo "checksum=$CHECKSUM" >> "$GITHUB_OUTPUT"
+echo "XCFramework zip: $ZIP ($CHECKSUM)"
+RELEASE_URL="https://github.com/limn-works/scp/releases/download/scp-core@${{ env.VERSION }}/ScpFFI-${{ env.VERSION }}.xcframework.zip"
+path = pathlib.Path("bindings/swift/Package.swift")
+old = r'\.binaryTarget\(\s*name:\s*"ScpFFI"[^)]*\)'
+'.binaryTarget(\n'
+' name: "ScpFFI",\n'
+f' url: "{os.environ["RELEASE_URL"]}",\n'
+f' checksum: "{os.environ["CHECKSUM"]}"\n'
+' )'
+assert updated != src, "Pattern not found in Package.swift — update the regex"
+git commit -m "chore(swift): update Package.swift binary target for ${{ env.VERSION }}"
+git tag -a "scp-swift@${{ env.VERSION }}" -m "Swift SDK ${{ env.VERSION }}"
+git push origin "scp-swift@${{ env.VERSION }}"
+# (R1, R2) GitHub release: awk, [, echo, git tag, git log, sha256sum, gh
+# release create with artifact globs.
+NOTES=$(awk "/^## \[?v?${{ env.VERSION }}\]?/{flag=1; next} /^## /{flag=0} flag" CHANGELOG.md)
+if [ -z "$NOTES" ]; then
+NOTES="Release ${{ env.VERSION }}"
+echo "$NOTES" > release-notes.md
+PREV_TAG=$(git tag --list 'scp-core@*' --sort=-version:refname | head -1)
+echo "" >> release-notes.md
+echo "### Commits" >> release-notes.md
+if [ -n "$PREV_TAG" ]; then
+git log "${PREV_TAG}..HEAD" --pretty=format:"- %s (%h)" --no-merges >> release-notes.md
+git log --pretty=format:"- %s (%h)" --no-merges -50 >> release-notes.md
+sha256sum "$file"
+echo "Generated checksums for $(wc -l < SHA256SUMS) files"
+gh release create "scp-core@${{ env.VERSION }}" --title "SCP ${{ env.VERSION }}" --notes-file release-notes.md --verify-tag release-artifacts/SHA256SUMS release-artifacts/ScpFFI-${{ env.VERSION }}.xcframework.zip release-artifacts/python-wheel-*/*.whl release-artifacts/python-sdist/*.tar.gz
+# (R1, R2) Dry-run summary: du, echo into $GITHUB_STEP_SUMMARY.
+echo "## Dry-run release summary for v${{ env.VERSION }}" >> $GITHUB_STEP_SUMMARY
+echo "" >> $GITHUB_STEP_SUMMARY
+echo "### Artifacts built:" >> $GITHUB_STEP_SUMMARY
+SIZE=$(du -h "$f" | cut -f1)
+echo "- \`$f\` ($SIZE)" >> $GITHUB_STEP_SUMMARY
+echo "### Registries that would be published to:" >> $GITHUB_STEP_SUMMARY
+echo "- crates.io: scp-clock, scp-crypto, scp-did, scp-dht, scp-platform, scp-event-log, scp-protocol, scp-identity, scp-mls, scp-client, scp-runtime, scp-core, scp-relay-client, scp-transport, scp-mcp, scp-media, scp-node, scp-relay" >> $GITHUB_STEP_SUMMARY
+echo "- PyPI: scp-python" >> $GITHUB_STEP_SUMMARY
+echo "- npm: @limn-works/scp-ts + @limn-works/scp-ts-napi-{linux-x64-gnu,linux-arm64-gnu,darwin-x64,darwin-arm64,win32-x64-msvc}" >> $GITHUB_STEP_SUMMARY
+echo "- Maven Central: works.limn:scp-kt, works.limn:scp-kt-android" >> $GITHUB_STEP_SUMMARY
+echo "- SPM: SCP (via GitHub Release)" >> $GITHUB_STEP_SUMMARY
+echo "- Go: github.com/limn-works/scp-go (via tag)" >> $GITHUB_STEP_SUMMARY
+echo "> Re-run without dry-run to publish." >> $GITHUB_STEP_SUMMARY
