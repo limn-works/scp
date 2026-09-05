@@ -279,21 +279,36 @@ SHIPPING_FILES=(
   ".github/workflows/release.yml"
 )
 
-# Every line of a SHIPPING_FILES file that carries a cargo feature-selection flag
-# (`--features`, `-F`, `--all-features`, `--no-default-features`), normalized to
-# single spaces with leading and trailing whitespace removed.
+# Every line of a SHIPPING_FILES file that lines_carrying_cargo_feature_selection
+# reads as carrying a cargo feature-selection flag (`--features`, `-F`,
+# `--all-features`, `--no-default-features`, in every spelling cargo's option
+# grammar admits), normalized to single spaces with leading and trailing
+# whitespace removed.
 #
 # assert_shipping_invocations_are_gated compares the shipping files against this
-# list and FAILS on any difference, in either direction. Both lines below run
-# `cargo test`, which compiles no shipped artifact, so neither one changes what
-# ARTIFACTS must gate. A new or edited feature flag in any shipping file fails
+# list and FAILS on any difference, in either direction. The two `cargo test`
+# lines below compile no shipped artifact, so neither one changes what ARTIFACTS
+# must gate. The three PowerShell lines below carry no cargo flag at all: a
+# PowerShell parameter is one dash plus a name (`-FilePath`, `-Force`), which is
+# the same token as cargo's `-F` with an attached value, and the reader cannot
+# tell a PowerShell command from a cargo command without a denylist of command
+# words, so it reads the line and a human declares here that it selects no
+# feature. A new or edited line the reader reports in any shipping file fails
 # this gate until whoever wrote it either declares it here or adds the
 # configuration it selects to ARTIFACTS.
-DECLARED_SHIPPING_FEATURE_FLAG_LINES="$(cat <<'EOF'
+#
+# `read -d ''` fills the variable instead of `$(cat <<'EOF' …)` because the first
+# PowerShell line ends in a literal backtick (PowerShell's line continuation),
+# and bash scans the text inside `$( … )` for a matching backtick before it
+# honours the quoted heredoc, so that spelling failed to parse. `read -d ''`
+# returns 1 at end of input, hence `|| true` under `set -e`.
+IFS= read -r -d '' DECLARED_SHIPPING_FEATURE_FLAG_LINES <<'EOF' || true
 run: cargo test --workspace --release --target ${{ matrix.target }} --features scp-core/testing,scp-runtime/saga-witness-test-mint
 run: cargo test --workspace --release --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/saga-witness-test-mint
+$cert = Import-PfxCertificate -FilePath $certPath `
+-Password (ConvertTo-SecureString -String $env:WINDOWS_SIGN_PWD -AsPlainText -Force)
+New-Item -ItemType Directory -Force napi-out | Out-Null
 EOF
-)"
 
 # Every line of a SHIPPING_FILES file that names an SCP package after `-p` while
 # compiling no shipped artifact, normalized the same way.
@@ -1027,12 +1042,89 @@ normalize_shipping_lines() {
 }
 
 # ---------------------------------------------------------------------------
+# The option grammar cargo's argument parser (clap) accepts. Both readers below
+# walk the whitespace-separated tokens of a line under this grammar, so a line
+# carries an option when the grammar says it does, whichever of the accepted
+# spellings the line uses:
+#
+#   --<long> VALUE      --<long>=VALUE
+#   -<x> VALUE          -<x>VALUE          -<x>=VALUE
+#   -ab<x> VALUE        -ab<x>VALUE        -ab<x>=VALUE
+#
+# The third row is a short-flag cluster: cargo reads each letter as a flag until
+# it reaches a letter that takes a value, and that letter consumes the rest of
+# the token, or the next token when the rest is empty. cargo rejects an
+# abbreviated long option (`cargo build --feat x` exits 1), so the long spelling
+# is exact. The readers cannot know which earlier letter of a cluster consumes
+# the rest of the token (`-Fp…` is a feature named `p…`, not a package), so they
+# read a cluster as carrying <x> whenever <x> appears anywhere in it. That reads
+# MORE lines than cargo does, never fewer, and every extra line fails closed:
+# an extra feature-flag line has to be declared, and an extra package value
+# either fails the `scp-` name filter or fails the gate naming its line.
+#
+# An earlier revision matched one spelling per option (`-F ` with a following
+# space, `-p ` with a following space), so `-Fscp-node/testing` in Dockerfile
+# shipped a nullifier feature under a passing gate. The grammar above is what
+# cargo accepts, so a spelling that grammar admits is a spelling these readers
+# see.
+# ---------------------------------------------------------------------------
+
+# cargo_option_values <lines> <long-name> <short-letter>
+#   Emit, one per line, the value every occurrence of the option receives on
+#   every line of <lines>, under the grammar above. A `--<long>` or a cluster
+#   ending in <short-letter> at the end of a line emits an empty value, which
+#   every caller drops.
+cargo_option_values() {
+  local long="$2" short="$3" line tok i n
+  local -a toks
+  while IFS= read -r line; do
+    read -r -a toks <<<"$line"
+    n=${#toks[@]}
+    for ((i = 0; i < n; i++)); do
+      tok="${toks[i]}"
+      case "$tok" in
+        --"$long")      printf '%s\n' "${toks[i + 1]:-}" ;;
+        --"$long"=*)    printf '%s\n' "${tok#--"$long"=}" ;;
+        --*)            ;;
+        -*"$short")     printf '%s\n' "${toks[i + 1]:-}" ;;
+        -*"$short"*)    tok="${tok#*"$short"}"; printf '%s\n' "${tok#=}" ;;
+      esac
+    done
+  done <<<"$1"
+}
+
+# lines_carrying_cargo_feature_selection <lines>
+#   Emit every line of <lines> that carries a flag which changes cargo's feature
+#   resolution: `--features` (with a following or an attached value), `-F` in
+#   any short spelling the grammar above admits, `--all-features`, or
+#   `--no-default-features`. Those four options are the closed set cargo
+#   documents for feature selection; the grammar decides the spellings.
+lines_carrying_cargo_feature_selection() {
+  local line tok
+  local -a toks
+  while IFS= read -r line; do
+    read -r -a toks <<<"$line"
+    for tok in "${toks[@]+"${toks[@]}"}"; do
+      case "$tok" in
+        --features|--features=*|--all-features|--no-default-features)
+          printf '%s\n' "$line"; break ;;
+        --*) ;;
+        -*F*) printf '%s\n' "$line"; break ;;
+      esac
+    done
+  done <<<"$1"
+}
+
+# ---------------------------------------------------------------------------
 # packages_built_by_shipping_lines <shipping-lines> <declared-non-shipping-lines>
 #   Emit one SCP package name per line, sorted-unique, for every package the
-#   shipping lines name after `-p` or list in a `for pkg in …;` loop, after
-#   dropping every line that appears verbatim in <declared-non-shipping-lines>.
-#   Both arguments pass through normalize_shipping_lines, so a declaration
-#   matches its shipping line whatever indentation that line carries.
+#   shipping lines pass to `-p`/`--package` in any spelling the grammar above
+#   admits, or list in a `for pkg in …;` loop, after dropping every line that
+#   appears verbatim in <declared-non-shipping-lines>. Both arguments pass
+#   through normalize_shipping_lines, so a declaration matches its shipping line
+#   whatever indentation that line carries. A value keeps only its package name:
+#   surrounding quotes and a `@version` suffix are stripped, and a value that is
+#   not an `scp-` name (a shell variable, a `mkdir -p` directory) is dropped.
 #
 #   The declaration list is what keeps this decidable rather than a guess about
 #   which cargo subcommands build something: a `-p` line either names a package
@@ -1048,7 +1140,8 @@ normalize_shipping_lines() {
 packages_built_by_shipping_lines() {
   local kept
   kept="$(comm -23 <(normalize_shipping_lines "$1") <(normalize_shipping_lines "$2"))"
-  { printf '%s\n' "$kept" | grep -oE '\-p "?scp-[a-z0-9-]+"?' | sed -E 's/^-p "?//; s/"$//' || true
+  { cargo_option_values "$kept" package p \
+      | sed -E "s/^[\"']//; s/[\"']$//; s/@.*$//" | grep -E '^scp-[a-z0-9-]+$' || true
     printf '%s\n' "$kept" | grep -oE '^for pkg in [a-z0-9 -]+;' \
       | sed -E 's/^for pkg in //; s/;$//' | tr ' ' '\n' || true
   } | sed -E '/^$/d' | sort -u
@@ -1073,11 +1166,14 @@ packages_built_by_shipping_lines() {
 #        feature the allowlist rejects.
 #     2. Every line of a shipping file carrying a cargo feature-selection flag
 #        appears verbatim in DECLARED_SHIPPING_FEATURE_FLAG_LINES. The set of
-#        flags that changes cargo's feature resolution is closed —
-#        `--features`, `-F`, `--all-features`, `--no-default-features` — so
-#        matching those four decides the criterion instead of sampling
-#        spellings of it. Whoever adds a fifth spelling to cargo also has to add
-#        it here, and until then an undeclared flag line fails this gate.
+#        options that changes cargo's feature resolution is closed —
+#        `--features`, `-F`, `--all-features`, `--no-default-features` — and
+#        lines_carrying_cargo_feature_selection reads each one in every spelling
+#        cargo's option grammar admits (`-F x`, `-Fx`, `-F=x`, `-qFx`,
+#        `--features=x`), so the grammar decides the criterion instead of one
+#        sampled spelling per option. Whoever adds a fifth option to cargo also
+#        has to add it there, and until then an undeclared flag line fails this
+#        gate.
 #
 #   Both halves fail CLOSED: a shipping file this function cannot read fails, and
 #   a package or a flag line it cannot account for fails.
@@ -1138,16 +1234,16 @@ $(printf '%s\n' "$dm_tree" | sed -E -n 's/^(scp-[a-z0-9-]+) v[0-9].*/\1/p')"
   fi
 
   # Half 2 — feature-selection flags in a shipping file.
-  flag_lines="$(grep -hE '(^|[[:space:]])(--features|-F|--all-features|--no-default-features)([[:space:]]|=|$)' "${SHIPPING_FILES[@]}" \
-    | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/ /g' | sort -u)"
+  flag_lines="$(normalize_shipping_lines "$(lines_carrying_cargo_feature_selection "$shipping_lines")")"
   undeclared="$(comm -23 <(printf '%s\n' "$flag_lines" | sed -E '/^$/d' | sort -u) \
                          <(printf '%s\n' "$DECLARED_SHIPPING_FEATURE_FLAG_LINES" | sed -E '/^$/d' | sort -u))"
   if [[ -n "$undeclared" ]]; then
     echo "   FAIL — a shipping file carries a cargo feature-selection flag this gate never declared:"
     printf '%s\n' "$undeclared" | sed 's/^/       x /'
     echo "          Either that line builds a shipped artifact — then gate its configuration in"
-    echo "          ARTIFACTS — or it builds no shipped artifact, and belongs in"
-    echo "          DECLARED_SHIPPING_FEATURE_FLAG_LINES with the reason it ships nothing."
+    echo "          ARTIFACTS — or it builds no shipped artifact (a test run, or a non-cargo"
+    echo "          command whose single-dash parameter spells cargo's -F), and belongs in"
+    echo "          DECLARED_SHIPPING_FEATURE_FLAG_LINES with the reason it selects no feature."
     fixture_failures=$((fixture_failures + 1))
     return
   fi
@@ -1354,6 +1450,59 @@ TREE
   packages="$(packages_built_by_shipping_lines "$synthetic_lines" "")"
   printf '%s\n' "$packages" | grep -xF 'scp-testing' >/dev/null; rc=$?
   expect "(shipping-drift) an undeclared test invocation naming a package is REPORTED, so the list is load-bearing" "PASS" "$rc"
+
+  # (shipping-drift, spellings) cargo accepts every spelling its option grammar
+  #     admits, so each reader has to see each of them. An earlier revision
+  #     matched `-p ` and `-F ` with a following space only, and
+  #     `RUN cargo build --release -p scp-relay -p scp-node -Fscp-node/testing`
+  #     in Dockerfile compiled the scp-node `testing` nullifiers under a passing
+  #     gate. Each case below names one spelling; the expected package is a
+  #     distinct name per line so a case that passes for the wrong reason
+  #     cannot hide behind a neighbour.
+  local spelling_lines spelled
+  spelling_lines="$(printf '%s\n' \
+    'run: cargo build --release -pscp-clock' \
+    'run: cargo build --release -p=scp-crypto' \
+    'run: cargo build --release --package scp-did' \
+    'run: cargo build --release --package=scp-dht' \
+    'run: cargo build --release -qp scp-mls' \
+    'run: cargo build --release -qpscp-media' \
+    'run: cargo build --release -p "scp-identity"' \
+    "run: cargo build --release -p 'scp-transport'" \
+    'run: cargo build --release -p scp-event-log@0.1.0' \
+    'cargo build --release --target ${{ matrix.target }} -p "$pkg" --target-dir target-shipped' \
+    'run: mkdir -p dist')"
+  spelled="$(packages_built_by_shipping_lines "$spelling_lines" "")"
+  for pkg in scp-clock scp-crypto scp-did scp-dht scp-mls scp-media scp-identity scp-transport scp-event-log; do
+    printf '%s\n' "$spelled" | grep -xF "$pkg" >/dev/null; rc=$?
+    expect "(shipping-drift, spellings) the package spelling that names $pkg is READ" "PASS" "$rc"
+  done
+  printf '%s\n' "$spelled" | grep -vxE 'scp-[a-z0-9-]+' >/dev/null; rc=$?
+  expect "(shipping-drift, spellings) a shell variable or a mkdir directory after -p is NOT read as a package" "FAIL" "$rc"
+  printf '%s\n' "$spelled" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 9 >/dev/null; rc=$?
+  expect "(shipping-drift, spellings) the eleven spelling lines yield exactly the nine packages they name" "PASS" "$rc"
+
+  local flag_probe seen
+  flag_probe="$(printf '%s\n' \
+    'RUN cargo build --release -p scp-relay -p scp-node -Fscp-node/testing' \
+    'RUN cargo build --release -p scp-relay -F scp-node/testing' \
+    'RUN cargo build --release -p scp-relay -F=scp-node/testing' \
+    'RUN cargo build --release -p scp-relay -qFscp-node/testing' \
+    'RUN cargo build --release -p scp-relay --features scp-node/testing' \
+    'RUN cargo build --release -p scp-relay --features=scp-node/testing' \
+    'RUN cargo build --release -p scp-relay --all-features' \
+    'RUN cargo build --release -p scp-relay --no-default-features' \
+    'RUN cargo build --release -p scp-relay -p scp-node' \
+    'run: cargo build --release --target ${{ matrix.target }}' \
+    'echo not a cargo command at all')"
+  seen="$(lines_carrying_cargo_feature_selection "$flag_probe")"
+  for spelled in '-Fscp-node/testing' '-F scp-node/testing' '-F=scp-node/testing' '-qFscp-node/testing' \
+                 '--features scp-node/testing' '--features=scp-node/testing' '--all-features' '--no-default-features'; do
+    printf '%s\n' "$seen" | grep -F -- "$spelled" >/dev/null; rc=$?
+    expect "(shipping-drift, spellings) a line carrying '$spelled' is READ as feature selection" "PASS" "$rc"
+  done
+  printf '%s\n' "$seen" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 8 >/dev/null; rc=$?
+  expect "(shipping-drift, spellings) the three lines carrying no feature-selection flag are NOT read" "PASS" "$rc"
 
   assert_every_pipeline_reader_consumes_its_input
 
