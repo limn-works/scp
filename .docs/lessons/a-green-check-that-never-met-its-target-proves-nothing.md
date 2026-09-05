@@ -111,6 +111,21 @@ rules separate them.
   flag nobody declared. It found that `.github/workflows/build-matrix.yml` builds and
   uploads `scp-core` and the three bridges under their DEFAULT features, a resolution no
   ARTIFACTS entry gated, so four entries were added.
+- **A reader of build commands classifies the token cargo receives, not the token the
+  file spells, and a token it cannot resolve fails the gate.** A Dockerfile `RUN` line and
+  a workflow `run:` block reach cargo through a shell, which removes quotes and expands
+  parameters before cargo reads argv. The readers in `assert_shipping_invocations_are_gated`
+  classified each raw token, so `"--features" scp-node/testing` in `Dockerfile` matched
+  neither the `--features` arm nor the `-F` arm, the gate modelled the build as
+  `scp-node` with default features and printed `G1 PASSED`, and the image compiled the
+  `scp-node/testing` nullifiers. The repair removes one balanced quote pair from every
+  token before classifying it, and fails on every cargo-invoking line that carries a token
+  the shell still rewrites — a `$FLAGS` parameter, a `$(…)` or backtick substitution, a
+  `--fea{,}tures` brace expansion, a backslash escape, a leftover quote, or a
+  `${{ … }}` expression — until a human declares the line in
+  `DECLARED_SHELL_REWRITTEN_CARGO_LINES` with the reason its expansion selects no
+  feature. The set of rewriting characters comes from the shell's grammar, so a new
+  spelling of an expansion is already a member of the set.
 - **Read a shared build cache everywhere, and write it only from a push to the default
   branch.** A cache written on a pull-request ref is readable only by that pull request,
   and it evicts entries from the budget every other cache step in the workflow shares.

@@ -376,6 +376,37 @@ cargo nextest run --no-tests=fail --release -p scp-testing -E 'test(conformance)
 EOF
 )"
 
+# Every line of a SHIPPING_FILES file that invokes cargo and carries a token the
+# shell, or GitHub's expression evaluator, rewrites before cargo reads it (see
+# shell_rewrites_token), normalized and joined the same way. The two token
+# readers classify the tokens the file spells, so a token spelled `$FLAGS` is
+# one they cannot classify, and it can expand to `--features scp-node/testing`.
+# assert_shipping_invocations_are_gated FAILS on such a line until a human
+# declares it here with the reason its expansion selects no feature, and FAILS
+# when a declared line no longer appears in any shipping file.
+#
+# The six lines below carry two expansions. `${{ matrix.target }}` and
+# `"$target"` follow `--target`, an option that takes exactly one value. When
+# the expansion produces a token that begins with `-`, cargo exits with
+# `"--target" takes a target architecture as an argument` and builds nothing;
+# any other token names a triple rustc has to know. Neither path selects a
+# feature, and run_gate resolves every triple at once with `--target all`, so
+# the triple's value changes no verdict. `"$pkg"` follows `-p` inside the
+# `for pkg in scp-core scp-ffi scp-ffi-napi scp-ffi-uniffi; do` loop, and
+# packages_built_by_shipping_lines reads the four names from that `for` line,
+# so each package the expansion names is one the gate resolves. The `cargo test`
+# line compiles no shipped artifact and is declared under
+# DECLARED_SHIPPING_FEATURE_FLAG_LINES for that reason.
+DECLARED_SHELL_REWRITTEN_CARGO_LINES="$(cat <<'EOF'
+cargo build --release --target "$target" -p scp-ffi-uniffi
+cargo build --release --target ${{ matrix.target }} -p "$pkg" --target-dir target-shipped
+run: cargo build --release --target ${{ matrix.target }}
+run: cargo build --release --target ${{ matrix.target }} -p scp-ffi-uniffi
+run: cargo build -p scp-ffi-napi --release --target ${{ matrix.target }}
+run: cargo test --workspace --release --target ${{ matrix.target }} --features scp-core/testing,scp-runtime/saga-witness-test-mint
+EOF
+)"
+
 # Nullifier features / crates used ONLY as positive-control fixture inputs and by
 # the allowlist-hygiene self-test. NEVER the gate mechanism.
 NULLIFIER_CONTROL_FEATURES=(
@@ -1120,6 +1151,21 @@ normalize_shipping_lines() {
 #   Pure, so run_fixtures drives it with a split `-p` line and proves the
 #   package reader finds the name only after the join.
 # ---------------------------------------------------------------------------
+# drop_comment_lines <text>
+#   Emit the lines of <text> whose first non-blank character is not `#`. A line
+#   that begins with `#` reaches no shell in any of the three shipping files: a
+#   Dockerfile removes a comment line before it runs an instruction, a YAML
+#   parser removes a comment line outside a block scalar, and inside a `run: |`
+#   block the shell reads the line as a comment and runs nothing. Runs BEFORE
+#   join_continued_lines because a comment consumes its own trailing backslash
+#   in both Dockerfile and shell, so a comment line continues nothing. Without
+#   this stage a prose comment such as "the `cargo` command runs" is a line
+#   cargo_lines_with_shell_rewritten_tokens reports, and every reader below
+#   reads its tokens as an invocation.
+drop_comment_lines() {
+  printf '%s\n' "$1" | sed -E '/^[[:space:]]*#/d'
+}
+
 join_continued_lines() {
   local line joined="" continuing=0
   while IFS= read -r line; do
@@ -1169,7 +1215,89 @@ join_continued_lines() {
 # shipped a nullifier feature under a passing gate. The grammar above is what
 # cargo accepts, so a spelling that grammar admits is a spelling these readers
 # see.
+#
+# THE SHELL REWRITES A TOKEN BEFORE CARGO READS IT. A Dockerfile `RUN` line and
+# a workflow `run:` block reach cargo through a shell, and the shell performs
+# quote removal and word expansion on every token first (bash manual §3.5,
+# "Shell Expansions"). Every reader below therefore walks the tokens
+# read_shell_tokens produces, which removes one balanced pair of surrounding
+# quotes from each token, so `"--features"` and `'-F'` are the option tokens
+# cargo receives. A second revision classified each raw token, so
+# `"--features" scp-node/testing` in Dockerfile matched neither the long arm nor
+# the short arm and shipped a nullifier feature under a passing gate.
+#
+# Quote removal is the one rewrite a reader can perform. Parameter expansion
+# (`$FLAGS`), command substitution (`$(…)`, a backtick), brace expansion
+# (`--fea{,}tures`), a backslash escape (`--fea\tures`), a quote that survives
+# the pair removal (`--fea"tures"`), and a GitHub expression (`${{ … }}`) all
+# replace a token with text the reader cannot compute from the file, and that
+# text can be a feature-selection flag. shell_rewrites_token names the closed
+# set of characters that introduce those rewrites, and
+# assert_shipping_invocations_are_gated fails on every cargo-invoking line that
+# carries one until a human declares the line in
+# DECLARED_SHELL_REWRITTEN_CARGO_LINES with the reason its expansion selects no
+# feature. A token the reader cannot resolve is a line the gate cannot vouch for.
 # ---------------------------------------------------------------------------
+
+# read_shell_tokens <line>
+#   Fill the SHELL_TOKENS array with the whitespace-separated tokens of <line>,
+#   each with one balanced pair of surrounding double or single quotes removed,
+#   which is the quote removal the shell performs on a token that carries no
+#   further expansion. A token of two characters or fewer is kept as written, so
+#   an empty quoted argument (`""`) keeps its quotes and shell_rewrites_token
+#   reports it. Sets a global because bash 3.2, the interpreter macOS ships,
+#   passes no array by name.
+SHELL_TOKENS=()
+read_shell_tokens() {
+  local i n tok
+  read -r -a SHELL_TOKENS <<<"$1"
+  n=${#SHELL_TOKENS[@]}
+  for ((i = 0; i < n; i++)); do
+    tok="${SHELL_TOKENS[i]}"
+    case "$tok" in
+      \"?*\"|\'?*\') SHELL_TOKENS[i]="${tok:1:${#tok}-2}" ;;
+    esac
+  done
+}
+
+# shell_rewrites_token <token>
+#   Exit 0 when the shell, or the GitHub expression evaluator that runs before
+#   it, replaces <token> with text this file cannot compute: the token carries a
+#   parameter or command substitution (`$`), a backtick command substitution, a
+#   brace expansion (`{` or `}`), a backslash escape, or a quote that
+#   read_shell_tokens did not remove. Exit 1 for a token cargo receives as
+#   written. The character set is the set of expansion and quoting operators the
+#   bash manual lists, so it is closed by the shell's grammar, not by the
+#   spellings this file has met.
+shell_rewrites_token() {
+  case "$1" in
+    *\$*|*\`*|*\"*|*\'*|*\\*|*\{*|*\}*) return 0 ;;
+  esac
+  return 1
+}
+
+# cargo_lines_with_shell_rewritten_tokens <lines>
+#   Emit every line of <lines> that invokes cargo — one of its tokens is the
+#   word `cargo` — and carries a token shell_rewrites_token reports. The gate
+#   vouches for the lines whose command word is the literal `cargo`; a line that
+#   reaches cargo through a variable, a script, or a Makefile is outside the
+#   three shipping files this gate reads, as it always was. A line that does not
+#   invoke cargo (a PowerShell signing step, a YAML `if:` expression) carries no
+#   cargo argv, so its expansions select no cargo feature and this reader skips
+#   it.
+cargo_lines_with_shell_rewritten_tokens() {
+  local line tok invokes_cargo rewritten
+  while IFS= read -r line; do
+    read_shell_tokens "$line"
+    invokes_cargo=0
+    rewritten=0
+    for tok in "${SHELL_TOKENS[@]+"${SHELL_TOKENS[@]}"}"; do
+      if [[ "$tok" == cargo ]]; then invokes_cargo=1; fi
+      if shell_rewrites_token "$tok"; then rewritten=1; fi
+    done
+    if (( invokes_cargo && rewritten )); then printf '%s\n' "$line"; fi
+  done <<<"$1"
+}
 
 # cargo_option_values <lines> <long-name> <short-letter>
 #   Emit, one per line, the value every occurrence of the option receives on
@@ -1178,17 +1306,16 @@ join_continued_lines() {
 #   every caller drops.
 cargo_option_values() {
   local long="$2" short="$3" line tok i n
-  local -a toks
   while IFS= read -r line; do
-    read -r -a toks <<<"$line"
-    n=${#toks[@]}
+    read_shell_tokens "$line"
+    n=${#SHELL_TOKENS[@]}
     for ((i = 0; i < n; i++)); do
-      tok="${toks[i]}"
+      tok="${SHELL_TOKENS[i]}"
       case "$tok" in
-        --"$long")      printf '%s\n' "${toks[i + 1]:-}" ;;
+        --"$long")      printf '%s\n' "${SHELL_TOKENS[i + 1]:-}" ;;
         --"$long"=*)    printf '%s\n' "${tok#--"$long"=}" ;;
         --*)            ;;
-        -*"$short")     printf '%s\n' "${toks[i + 1]:-}" ;;
+        -*"$short")     printf '%s\n' "${SHELL_TOKENS[i + 1]:-}" ;;
         -*"$short"*)    tok="${tok#*"$short"}"; printf '%s\n' "${tok#=}" ;;
       esac
     done
@@ -1203,10 +1330,9 @@ cargo_option_values() {
 #   documents for feature selection; the grammar decides the spellings.
 lines_carrying_cargo_feature_selection() {
   local line tok
-  local -a toks
   while IFS= read -r line; do
-    read -r -a toks <<<"$line"
-    for tok in "${toks[@]+"${toks[@]}"}"; do
+    read_shell_tokens "$line"
+    for tok in "${SHELL_TOKENS[@]+"${SHELL_TOKENS[@]}"}"; do
       case "$tok" in
         --features|--features=*|--all-features|--no-default-features)
           printf '%s\n' "$line"; break ;;
@@ -1266,17 +1392,16 @@ packages_built_by_shipping_lines() {
 #   Pure over its argument, apart from the existence test on each candidate.
 maturin_project_files_named_by_shipping_lines() {
   local line tok i n candidate
-  local -a toks
   while IFS= read -r line; do
-    read -r -a toks <<<"$line"
-    n=${#toks[@]}
+    read_shell_tokens "$line"
+    n=${#SHELL_TOKENS[@]}
     for ((i = 0; i < n; i++)); do
-      tok="${toks[i]}"
+      tok="${SHELL_TOKENS[i]}"
       candidate=""
       case "$tok" in
-        --manifest-path)   candidate="$(dirname "${toks[i + 1]:-.}")/pyproject.toml" ;;
+        --manifest-path)   candidate="$(dirname "${SHELL_TOKENS[i + 1]:-.}")/pyproject.toml" ;;
         --manifest-path=*) candidate="$(dirname "${tok#--manifest-path=}")/pyproject.toml" ;;
-        working-directory:) candidate="${toks[i + 1]:-.}/pyproject.toml" ;;
+        working-directory:) candidate="${SHELL_TOKENS[i + 1]:-.}/pyproject.toml" ;;
       esac
       if [[ -n "$candidate" && -f "$candidate" ]]; then printf '%s\n' "$candidate"; fi
     done
@@ -1484,10 +1609,22 @@ assert_maturin_project_files_are_complete() {
 #        `--features=x`), so the grammar decides the criterion instead of one
 #        sampled spelling per option. Whoever adds a fifth option to cargo also
 #        has to add it there, and until then an undeclared flag line fails this
-#        gate.
+#        gate. Both readers classify the token the shell hands cargo, with one
+#        balanced pair of surrounding quotes removed (read_shell_tokens), so
+#        `"--features"` and `'-F'` are the flags they spell.
+#     3. Every line of a shipping file that invokes cargo and carries a token the
+#        shell rewrites before cargo reads it — a parameter or command
+#        substitution, a brace expansion, a backslash escape, a quote the pair
+#        removal did not consume, or a GitHub `${{ … }}` expression
+#        (shell_rewrites_token) — appears verbatim in
+#        DECLARED_SHELL_REWRITTEN_CARGO_LINES. Halves 1 and 2 classify the
+#        tokens the file spells, and a token such as `$FLAGS` can expand to a
+#        flag neither half saw, so the gate cannot vouch for the line until a
+#        human states why the expansion selects no feature.
 #
-#   Both halves fail CLOSED: a shipping file this function cannot read fails, and
-#   a package or a flag line it cannot account for fails.
+#   All three halves fail CLOSED: a shipping file this function cannot read
+#   fails, and a package, a flag line, or a shell-rewritten line it cannot
+#   account for fails.
 assert_shipping_invocations_are_gated() {
   echo ">> fixture: every package a shipping file builds is gated, and every feature flag in one is declared (drift between ARTIFACTS and the shipped build commands)"
   local file missing_files="" gated_packages="" dm_tree pkg flag_lines undeclared
@@ -1519,9 +1656,10 @@ $(printf '%s\n' "$dm_tree" | sed -E -n 's/^(scp-[a-z0-9-]+) v[0-9].*/\1/p')"
   gated_packages="$(printf '%s\n' "$gated_packages" | sed -E '/^$/d' | sort -u)"
 
   local shipping_lines built_packages ungated="" stale_pkg_lines
-  # Joined once here, so half 1, half 2, and both stale-declaration checks read
-  # the same command the shell runs, whatever line breaks the file spells it with.
-  shipping_lines="$(join_continued_lines "$(cat "${SHIPPING_FILES[@]}")")"
+  # Comment lines dropped, then continued lines joined, once here, so every half
+  # and every stale-declaration check reads the same command the shell runs,
+  # whatever line breaks the file spells it with.
+  shipping_lines="$(join_continued_lines "$(drop_comment_lines "$(cat "${SHIPPING_FILES[@]}")")")"
   built_packages="$(packages_built_by_shipping_lines "$shipping_lines" "$DECLARED_NON_SHIPPING_PACKAGE_LINES")"
   for pkg in $built_packages; do
     if ! printf '%s\n' "$gated_packages" | grep -xF "$pkg" >/dev/null; then
@@ -1570,7 +1708,33 @@ $(printf '%s\n' "$dm_tree" | sed -E -n 's/^(scp-[a-z0-9-]+) v[0-9].*/\1/p')"
     fixture_failures=$((fixture_failures + 1))
     return
   fi
-  echo "   ok   — every package a shipping file builds is gated, every feature-flag line in one is declared, and each declaration still names a line a shipping file carries"
+
+  # Half 3 — cargo invocations the shell rewrites before cargo reads them.
+  local rewritten_lines undeclared_rewritten stale_rewritten
+  rewritten_lines="$(normalize_shipping_lines "$(cargo_lines_with_shell_rewritten_tokens "$shipping_lines")")"
+  undeclared_rewritten="$(comm -23 <(printf '%s\n' "$rewritten_lines" | sed -E '/^$/d' | sort -u) \
+                                   <(normalize_shipping_lines "$DECLARED_SHELL_REWRITTEN_CARGO_LINES"))"
+  if [[ -n "$undeclared_rewritten" ]]; then
+    echo "   FAIL — a shipping file invokes cargo with a token the shell rewrites before cargo reads it, so the flag and package readers cannot classify what cargo receives:"
+    printf '%s\n' "$undeclared_rewritten" | sed 's/^/       x /'
+    echo "          A parameter or command substitution, a brace expansion, a backslash escape, a"
+    echo "          quote the pair removal did not consume, or a \${{ … }} expression can expand to"
+    echo "          a feature-selection flag. Spell the flags and packages literally, or declare the"
+    echo "          line in DECLARED_SHELL_REWRITTEN_CARGO_LINES with the reason its expansion"
+    echo "          selects no feature."
+    fixture_failures=$((fixture_failures + 1))
+    return
+  fi
+  stale_rewritten="$(comm -13 <(printf '%s\n' "$rewritten_lines" | sed -E '/^$/d' | sort -u) \
+                              <(normalize_shipping_lines "$DECLARED_SHELL_REWRITTEN_CARGO_LINES"))"
+  if [[ -n "$stale_rewritten" ]]; then
+    echo "   FAIL — DECLARED_SHELL_REWRITTEN_CARGO_LINES declares line(s) no shipping file carries:"
+    printf '%s\n' "$stale_rewritten" | sed 's/^/       x /'
+    echo "          A stale declaration hides the next edit to the line it once described."
+    fixture_failures=$((fixture_failures + 1))
+    return
+  fi
+  echo "   ok   — every package a shipping file builds is gated, every feature-flag line in one is declared, every shell-rewritten cargo line is declared, and each declaration still names a line a shipping file carries"
 }
 
 assert_allowlist_has_no_nullifier() {
@@ -1771,7 +1935,10 @@ TREE
   #     in Dockerfile compiled the scp-node `testing` nullifiers under a passing
   #     gate. Each case below names one spelling; the expected package is a
   #     distinct name per line so a case that passes for the wrong reason
-  #     cannot hide behind a neighbour.
+  #     cannot hide behind a neighbour. The shell removes a balanced quote pair
+  #     from an OPTION token as it does from a value, so `"-p"` and
+  #     `'--package'` are the same options to cargo; a later revision classified
+  #     the raw token, so a quoted option matched no arm.
   local spelling_lines spelled
   spelling_lines="$(printf '%s\n' \
     'run: cargo build --release -pscp-clock' \
@@ -1783,17 +1950,20 @@ TREE
     'run: cargo build --release -p "scp-identity"' \
     "run: cargo build --release -p 'scp-transport'" \
     'run: cargo build --release -p scp-event-log@0.1.0' \
+    'run: cargo build --release "-p" scp-relay-client' \
+    "run: cargo build --release '--package' scp-mcp" \
+    'run: cargo build --release "--package=scp-protocol"' \
     'cargo build --release --target ${{ matrix.target }} -p "$pkg" --target-dir target-shipped' \
     'run: mkdir -p dist')"
   spelled="$(packages_built_by_shipping_lines "$spelling_lines" "")"
-  for pkg in scp-clock scp-crypto scp-did scp-dht scp-mls scp-media scp-identity scp-transport scp-event-log; do
+  for pkg in scp-clock scp-crypto scp-did scp-dht scp-mls scp-media scp-identity scp-transport scp-event-log scp-relay-client scp-mcp scp-protocol; do
     printf '%s\n' "$spelled" | grep -xF "$pkg" >/dev/null; rc=$?
     expect "(shipping-drift, spellings) the package spelling that names $pkg is READ" "PASS" "$rc"
   done
   printf '%s\n' "$spelled" | grep -vxE 'scp-[a-z0-9-]+' >/dev/null; rc=$?
   expect "(shipping-drift, spellings) a shell variable or a mkdir directory after -p is NOT read as a package" "FAIL" "$rc"
-  printf '%s\n' "$spelled" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 9 >/dev/null; rc=$?
-  expect "(shipping-drift, spellings) the eleven spelling lines yield exactly the nine packages they name" "PASS" "$rc"
+  printf '%s\n' "$spelled" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 12 >/dev/null; rc=$?
+  expect "(shipping-drift, spellings) the fourteen spelling lines yield exactly the twelve packages they name" "PASS" "$rc"
 
   local flag_probe seen
   flag_probe="$(printf '%s\n' \
@@ -1805,17 +1975,115 @@ TREE
     'RUN cargo build --release -p scp-relay --features=scp-node/testing' \
     'RUN cargo build --release -p scp-relay --all-features' \
     'RUN cargo build --release -p scp-relay --no-default-features' \
+    'RUN cargo build --release -p scp-relay -p scp-node "--features" scp-node/testing' \
+    "RUN cargo build --release -p scp-relay -p scp-node '-F' scp-node/testing" \
+    'RUN cargo build --release -p scp-relay -p scp-node "--features=scp-node/testing"' \
+    "RUN cargo build --release -p scp-relay -p scp-node '--all-features'" \
     'RUN cargo build --release -p scp-relay -p scp-node' \
     'run: cargo build --release --target ${{ matrix.target }}' \
     'echo not a cargo command at all')"
   seen="$(lines_carrying_cargo_feature_selection "$flag_probe")"
   for spelled in '-Fscp-node/testing' '-F scp-node/testing' '-F=scp-node/testing' '-qFscp-node/testing' \
-                 '--features scp-node/testing' '--features=scp-node/testing' '--all-features' '--no-default-features'; do
+                 '--features scp-node/testing' '--features=scp-node/testing' '--all-features' '--no-default-features' \
+                 '"--features" scp-node/testing' "'-F' scp-node/testing" '"--features=scp-node/testing"' "'--all-features'"; do
     printf '%s\n' "$seen" | grep -F -- "$spelled" >/dev/null; rc=$?
     expect "(shipping-drift, spellings) a line carrying '$spelled' is READ as feature selection" "PASS" "$rc"
   done
-  printf '%s\n' "$seen" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 8 >/dev/null; rc=$?
+  printf '%s\n' "$seen" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 12 >/dev/null; rc=$?
   expect "(shipping-drift, spellings) the three lines carrying no feature-selection flag are NOT read" "PASS" "$rc"
+
+  # (shipping-drift, shell-rewrite) the shell rewrites a token before cargo
+  #     reads it. Quote removal is the one rewrite the readers perform; a
+  #     parameter or command substitution, a brace expansion, a backslash
+  #     escape, a quote the pair removal leaves behind, and a GitHub expression
+  #     each replace a token with text the readers cannot compute, so a line
+  #     that invokes cargo and carries one is REPORTED for a human to declare. A
+  #     line whose quotes strip clean is not reported (the flag reader already
+  #     sees its flag), and a line that does not invoke cargo is not reported
+  #     whatever it expands.
+  local rewrite_probe rewritten
+  rewrite_probe="$(printf '%s\n' \
+    'RUN cargo build --release $CARGO_FLAGS -p scp-node' \
+    'RUN cargo build --release ${CARGO_FLAGS} -p scp-node' \
+    'RUN cargo build --release $(cat flags.txt) -p scp-node' \
+    'RUN cargo build --release `cat flags.txt` -p scp-node' \
+    'RUN cargo build --release --fea{,}tures scp-node/testing' \
+    'RUN cargo build --release --fea\tures scp-node/testing' \
+    'RUN cargo build --release --fea"tures" scp-node/testing' \
+    'run: cargo build --release --target ${{ matrix.target }}' \
+    'RUN cargo build --release --features "scp-node/testing"' \
+    "RUN cargo build --release '-p' scp-relay" \
+    'RUN cargo build --release -p scp-relay -p scp-node' \
+    '$cert = Import-PfxCertificate -FilePath $certPath `' \
+    'echo "$HOME" ${{ github.sha }}')"
+  rewritten="$(cargo_lines_with_shell_rewritten_tokens "$rewrite_probe")"
+  for spelled in '$CARGO_FLAGS' '${CARGO_FLAGS}' '$(cat flags.txt)' '`cat flags.txt`' '--fea{,}tures' '--fea\tures' '--fea"tures"' '${{ matrix.target }}'; do
+    printf '%s\n' "$rewritten" | grep -F -- "$spelled" >/dev/null; rc=$?
+    expect "(shipping-drift, shell-rewrite) a cargo line carrying '$spelled' is REPORTED as shell-rewritten" "PASS" "$rc"
+  done
+  printf '%s\n' "$rewritten" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 8 >/dev/null; rc=$?
+  expect "(shipping-drift, shell-rewrite) the three clean cargo lines and the two non-cargo lines are NOT reported" "PASS" "$rc"
+
+  # (shipping-drift, comment) a line whose first non-blank character is `#`
+  #     reaches no shell, so no reader reads it. Without this stage the
+  #     Dockerfile prose comment naming `cargo` in backticks was a line the
+  #     shell-rewrite reader reported.
+  local comment_probe kept_lines
+  comment_probe="$(printf '%s\n' \
+    '# the `cargo` command runs here, -p scp-testing is prose' \
+    '   # RUN cargo build --release --features scp-node/testing' \
+    'RUN cargo build --release -p scp-relay # trailing comment' \
+    'RUN echo "#" -p scp-clock')"
+  kept_lines="$(drop_comment_lines "$comment_probe")"
+  printf '%s\n' "$kept_lines" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 2 >/dev/null; rc=$?
+  expect "(shipping-drift, comment) the two comment lines are dropped and the two command lines kept" "PASS" "$rc"
+  printf '%s\n' "$kept_lines" | grep -F 'RUN echo "#" -p scp-clock' >/dev/null; rc=$?
+  expect "(shipping-drift, comment) a # that is not the first non-blank character drops nothing" "PASS" "$rc"
+  packages_built_by_shipping_lines "$comment_probe" "" | grep -xF scp-testing >/dev/null; rc=$?
+  expect "(shipping-drift, comment) WITHOUT the drop, the comment reader sees a prose package (the drop is load-bearing)" "PASS" "$rc"
+  packages_built_by_shipping_lines "$kept_lines" "" | grep -xF scp-testing >/dev/null; rc=$?
+  expect "(shipping-drift, comment) WITH the drop, the prose package is NOT read" "FAIL" "$rc"
+
+  # (shipping-drift, planted) the assertion itself, run over one synthetic
+  #     shipping file with every declaration list empty, so each case proves the
+  #     whole path from file text to verdict. The quoted flag is the line that
+  #     passed the second revision's raw-token readers: `"--features"` is not
+  #     `--features` to a case arm, and the shell hands cargo `--features`.
+  local planted_dir planted_file
+  planted_dir="$(mktemp -d)"
+  planted_file="$planted_dir/Dockerfile"
+  printf '%s\n' 'RUN cargo build --release -p scp-relay -p scp-node' > "$planted_file"
+  ( fixture_failures=0; SHIPPING_FILES=("$planted_file"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+    DECLARED_NON_SHIPPING_PACKAGE_LINES=""; DECLARED_SHELL_REWRITTEN_CARGO_LINES=""
+    assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(shipping-drift, planted) the assertion ACCEPTS the literal shipped build line with no declaration" "PASS" "$rc"
+  printf '%s\n' 'RUN cargo build --release -p scp-relay -p scp-node "--features" scp-node/testing' > "$planted_file"
+  ( fixture_failures=0; SHIPPING_FILES=("$planted_file"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+    DECLARED_NON_SHIPPING_PACKAGE_LINES=""; DECLARED_SHELL_REWRITTEN_CARGO_LINES=""
+    assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(shipping-drift, planted) the assertion REJECTS a shipped build line whose feature flag is spelled \"--features\" in quotes" "FAIL" "$rc"
+  printf '%s\n' "RUN cargo build --release -p scp-relay -p scp-node '-F' scp-node/testing" > "$planted_file"
+  ( fixture_failures=0; SHIPPING_FILES=("$planted_file"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+    DECLARED_NON_SHIPPING_PACKAGE_LINES=""; DECLARED_SHELL_REWRITTEN_CARGO_LINES=""
+    assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(shipping-drift, planted) the assertion REJECTS a shipped build line whose feature flag is spelled '-F' in quotes" "FAIL" "$rc"
+  printf '%s\n' 'RUN cargo build --release $CARGO_FLAGS -p scp-relay -p scp-node' > "$planted_file"
+  ( fixture_failures=0; SHIPPING_FILES=("$planted_file"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+    DECLARED_NON_SHIPPING_PACKAGE_LINES=""; DECLARED_SHELL_REWRITTEN_CARGO_LINES=""
+    assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(shipping-drift, planted) the assertion REJECTS a shipped build line carrying an undeclared \$CARGO_FLAGS expansion" "FAIL" "$rc"
+  ( fixture_failures=0; SHIPPING_FILES=("$planted_file"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+    DECLARED_NON_SHIPPING_PACKAGE_LINES=""
+    DECLARED_SHELL_REWRITTEN_CARGO_LINES='RUN cargo build --release $CARGO_FLAGS -p scp-relay -p scp-node'
+    assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(shipping-drift, planted) the assertion ACCEPTS that line once a human declares it" "PASS" "$rc"
+  printf '%s\n' 'RUN cargo build --release -p scp-relay -p scp-node' > "$planted_file"
+  ( fixture_failures=0; SHIPPING_FILES=("$planted_file"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+    DECLARED_NON_SHIPPING_PACKAGE_LINES=""
+    DECLARED_SHELL_REWRITTEN_CARGO_LINES='RUN cargo build --release $CARGO_FLAGS -p scp-relay -p scp-node'
+    assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(shipping-drift, planted) the assertion REJECTS a shell-rewrite declaration no shipping file carries (stale)" "FAIL" "$rc"
+  rm -rf "$planted_dir"
 
   # (shipping-drift, continuation) the shell joins a line ending in a backslash
   #     to the next one, so `-p \` followed by `scp-testing` on the next line is
