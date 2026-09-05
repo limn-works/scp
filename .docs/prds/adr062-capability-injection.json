@@ -203,7 +203,7 @@
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "### 17.17.3 The DHT Backend Is an Instance — and Its In-Memory Arm Is a Nullifier"
+          "section": "### 17.17.3 Identity Resolution Is an Instance — and Its In-Memory Arm Is a Nullifier"
         },
         {
           "file": ".docs/specs/03-identity.md",

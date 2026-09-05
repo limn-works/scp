@@ -93,7 +93,7 @@
       "sources": [
         {
           "file": ".docs/specs/09-security-model.md",
-          "section": "### 9.10.12 Relay DID-Record Frame"
+          "section": "### 9.10.12 Relay Key-Event Record Frame"
         },
         {
           "file": ".docs/specs/03-identity.md",
@@ -154,7 +154,7 @@
         },
         {
           "file": ".docs/specs/09-security-model.md",
-          "section": "### 9.10.12 Relay DID-Record Frame"
+          "section": "### 9.10.12 Relay Key-Event Record Frame"
         }
       ],
       "details": {
@@ -210,7 +210,7 @@
         },
         {
           "file": ".docs/specs/09-security-model.md",
-          "section": "### 9.10.12 Relay DID-Record Frame"
+          "section": "### 9.10.12 Relay Key-Event Record Frame"
         },
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
@@ -299,7 +299,7 @@
         },
         {
           "file": ".docs/specs/09-security-model.md",
-          "section": "### 9.10.12 Relay DID-Record Frame"
+          "section": "### 9.10.12 Relay Key-Event Record Frame"
         },
         {
           "file": ".docs/specs/03-identity.md",
@@ -424,7 +424,7 @@
         },
         {
           "file": ".docs/specs/09-security-model.md",
-          "section": "### 9.10.12 Relay DID-Record Frame"
+          "section": "### 9.10.12 Relay Key-Event Record Frame"
         },
         {
           "file": ".docs/specs/18-addressability-and-deployment.md",
@@ -545,7 +545,7 @@
         },
         {
           "file": ".docs/specs/09-security-model.md",
-          "section": "### 9.10.12 Relay DID-Record Frame"
+          "section": "### 9.10.12 Relay Key-Event Record Frame"
         }
       ],
       "details": {
