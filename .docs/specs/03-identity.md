@@ -52,7 +52,8 @@ Custody migration moves the operational signing capability from one custody prov
       one indexed signature per named index, at least t of them (R3).
 
 3. PUBLISH:
-   a. Publish the extended key-event log to both resolution layers (§3.10.5).
+   a. Publish the extended key-event log to the identity's own relays and
+      to the fallback set (§3.10.5).
    b. Issue MLS Update proposals in all active contexts with credentials
       referencing the new #active key (§9.7.3).
    c. Revoke all UCAN tokens signed by the old #active key.
@@ -66,7 +67,8 @@ Custody migration moves the operational signing capability from one custody prov
 
 5. DESTROY old key material:
    a. After confirmation that the KeyState has propagated (verified by
-      resolving the log from at least one relay and the DHT), the old
+      resolving the log from two independent relays, one of them in the
+      fallback set, 09 §9.7.4.2 R11), the old
       #active private key is destroyed in the source custody provider.
    b. Destruction is best-effort for HSM-backed keys (the HSM may not support
       explicit deletion, but the key becomes inaccessible once the device
@@ -76,7 +78,7 @@ Custody migration moves the operational signing capability from one custody prov
 **Failure semantics:**
 
 - **Step 2 fails (authorization denied):** No state change. The old custody provider remains active. The new keypair generated in step 1 is discarded.
-- **Step 3a fails (publication fails on some relays/DHT):** The SDK retries publication. The RepublishManager (§3.10.5) will propagate on its next cycle. Partial publication is safe — a peer that resolves the shorter chain derives the old key state and keeps verifying under the old `#active`, and a peer that resolves the extended chain uses the new key. The two chains do not diverge: one is a prefix of the other, so sequence settles them (`09-security-model.md` §9.7.4.2 R12) and no fork-precedence question arises.
+- **Step 3a fails (publication fails on some relays):** The SDK retries publication. The RepublishManager (§3.10.5) will propagate on its next cycle. Partial publication is safe — a peer that resolves the shorter chain derives the old key state and keeps verifying under the old `#active`, and a peer that resolves the extended chain uses the new key. The two chains do not diverge: one is a prefix of the other, so sequence settles them (`09-security-model.md` §9.7.4.2 R12) and no fork-precedence question arises.
 - **Step 3b/3c fails (MLS Update or UCAN reissuance fails in some contexts):** The SDK queues failed operations for retry. A context whose log records no retirement Commit for the old `#active` holds no boundary for that key, and `09-security-model.md` §9.7.1 decides what its members do — that spec states the rule and this one cites it. The migration converges as retries succeed.
 - **Step 5 fails (old key destruction fails):** The migration is still complete — the latest state-carrying event lists the new key `current` and the old one retired. The old key is orphaned but bounded: UCAN tokens signed by it are revoked, its attestations no longer verify (attestation class, `09-security-model.md` §9.7.1), and its content signatures verify under the rule `09-security-model.md` §9.7.1 states for a retired key, which this spec cites rather than restating.
 
@@ -258,7 +260,7 @@ Identity link attestations are published as service entries in the issuer's DID 
 
 ```
 Service {
-  id:              "<did>#attestation-<platform>--<index>",  // e.g., "did:dht:z...#attestation-github.com--0"
+  id:              "<did>#attestation-<platform>--<index>",  // e.g., "<identifier>#attestation-github.com--0"
   type:            "ScpIdentityLinkAttestation",
   serviceEndpoint: "<attestation_id>"                       // Hex-encoded attestation ID (§3.5.2)
 }
@@ -270,7 +272,7 @@ Service {
 
 - `id`: Full DID URI with fragment. The fragment encodes the platform for human readability. The `<index>` disambiguates multiple attestations for the same platform.
 - `type`: `ScpIdentityLinkAttestation` (constant). Consumers filter DID document services by this type to discover identity link attestations.
-- `serviceEndpoint`: The attestation ID (hex string). Consumers use this to look up the full `IdentityLinkAttestation` from the identity's attestation store (via relay or DHT).
+- `serviceEndpoint`: The attestation ID (hex string). Consumers use this to look up the full `IdentityLinkAttestation` from the identity's attestation store on a relay.
 
 **Maximum attestations per DID document:** 64. This prevents DID document bloat — each service entry adds to the DID document size, which is replicated across resolvers — while providing enough headroom for users with many platform identities. The limit applies to service entries of type `ScpIdentityLinkAttestation` only; other service types have their own limits.
 
@@ -518,7 +520,7 @@ The domain separator `"SCP-PRIVATE-LOG-V1:"` prevents cross-domain hash collisio
 - **Relay obligations.** Same storage class and retention as context events. No differentiated commitment — relays treat all encrypted blobs uniformly. A relay that stores context events for a DID stores identity private state under the same terms.
 - **Key rotation.** On identity key rotation (§9.12), the PSK is rotated: generate a new PSK, re-encrypt private state events, distribute the new PSK to all enrolled devices via HPKE (§3.7.2). The old PSK is destroyed on all devices after re-encryption completes. For large private state, re-encryption is incremental: most recent events first, backfill in background. Each re-encrypted event receives a fresh random nonce.
 - **Discovery pointer.** Explicit. The DID document includes a service endpoint of type `IdentityPrivateState` listing relays that store private state. This cleanly disambiguates context event fetches from private state fetches without relay-side guessing.
-- **Relay service endpoints.** The DID document includes service endpoints of type `SCPRelay` listing the identity's transport-layer relay URLs — the endpoints where `TransportManager` routes encrypted blobs for this identity. Multiple entries are recommended for suppression resistance (§9.9.2). Self-certified via BEP44 signature (§9.6.3). See §18.2 for the full specification of DID document service endpoint types.
+- **Relay service endpoints.** The DID document includes service endpoints of type `SCPRelay` listing the identity's transport-layer relay URLs — the endpoints where `TransportManager` routes encrypted blobs for this identity. Multiple entries are recommended for suppression resistance (§9.9.2). The relay list is key state, so a root signature over the latest state-carrying event covers it (§9.6.3). See §18.2 for the full specification of DID document service endpoint types.
 
 ### 3.7.1 Block List Storage
 
@@ -747,58 +749,46 @@ The PSK MUST be stored in the platform's secure key store (Keychain on Apple, Ke
 
 ## 3.8 DID Resolution Security
 
-DID resolution is the trust root for the entire protocol. If resolution can be MITMed, every layer above — encryption, authentication, capability validation — is compromised. The security properties depend on the DID method:
+DID resolution is the trust root for the entire protocol. If resolution can be MITMed, every layer above — encryption, authentication, capability validation — is compromised.
 
-**Inception-derived identifier (target method):** Self-certifying through the key-event log. The identifier is the digest of the inception event's signed preimage and encodes no key (`09-security-model.md` §9.7.4.2 R13). A resolver recomputes the identifier from the served chain's inception event and verifies every later event under R3, so a served record is verifiable against the identifier without trusting any intermediary. MITM on resolution is impossible given the correct identifier. A stale head of the accepted chain is rejected by sequence, and two chains that diverge are settled by fork precedence (R6, R12). See §9.6.1 for the full specification.
-
-**did:web (fallback only):** NOT self-certifying. Security depends on DNS + TLS + server integrity. The SDK MUST use TLS pinning + TOFU (Trust On First Use) + key change alerts to mitigate. did:web exists as a fallback if did:dht libraries prove unusable — not as a planned stepping stone. See §9.6.2 for required mitigations.
+**The protocol has one identifier method, and it is inception-derived.** An identifier is self-certifying through its key-event log: the identifier is the digest of the inception event's signed preimage and encodes no key (`09-security-model.md` §9.7.4.2 R13). A resolver recomputes the identifier from the served chain's inception event and verifies every later event under R3, so a served record is verifiable against the identifier without trusting any intermediary. MITM on resolution is impossible given the correct identifier. A stale head of the accepted chain is rejected by sequence, and two chains that diverge are settled by fork precedence (R6, R12). See §9.6.1 for the full specification.
 
 **Key Continuity Verification:** Signal-style safety numbers for DIDs, enabling out-of-band verification that two parties have the correct keys for each other. See §9.11.
 
 ### 3.8.1 Canonical DID string form (deterministic-derivation input)
 
-Wherever a DID string feeds a **deterministic hash preimage** — any place two independent resolvers must agree byte-for-byte or they would derive divergent identifiers (e.g. the `derived_context_id` of §5.15.8) — the DID MUST be reduced to its **canonical string form**, the single comparison form DID resolution yields per method.
+Wherever a DID string feeds a **deterministic hash preimage** — any place two independent resolvers must agree byte-for-byte or they would derive divergent identifiers (e.g. the `derived_context_id` of §5.15.8) — the DID MUST be reduced to its **canonical string form**, the single comparison form resolution yields.
 
 **Purpose (canonical agreement, not injectivity).** With the §5.15.8 derivation now length-prefixed (§9.5.1), field-boundary injectivity is unconditional **by construction** and does **not** depend on this section. §3.8.1's sole job is **byte-agreement**: both parties MUST feed **byte-identical** DID strings into any shared preimage so they do not split-brain onto divergent identifiers. (Even with length prefixes, two encodings of the *same* logical DID are two distinct byte strings and would length-prefix to two distinct preimages — hence the canonicalization requirement remains load-bearing, but for agreement, not for disambiguating field boundaries.)
 
-- **An inception-derived identifier** — its 32-byte digest form (`09-security-model.md` §9.7.4.2 R13), whose textual encoding a later revision of that section fixes together with the preimage field order. **The byte-agreement guarantee is AIRTIGHT for the production method**: the identifier is a fixed-length digest, so a derivation that consumes the digest bytes admits exactly one encoding and two honest resolvers cannot diverge.
-- **did:web** — canonicalized per the W3C did:web method, with the specific-id normalized per **RFC 3986 §6.2.2 syntax-based normalization** to a single byte string:
-  - **Percent-encoding normalization** — decode percent-encodings of **unreserved** characters (`ALPHA / DIGIT / "-" / "." / "_" / "~"`, RFC 3986 §6.2.2.2) to their literal form; uppercase the hex digits of each remaining `%XX` triplet (RFC 3986 §6.2.2.1). This normalizes the two hex **digits** of a percent-encoding and is **orthogonal** to the host/scheme alpha-case normalization below — which lowercases literal ALPHA characters, **never** the hex digits of a percent-encoding (RFC 3986 §6.2.2.1 treats percent-encoding hex-digit case and host/scheme alpha-case as disjoint normalizations targeting different characters, so on a percent-encoded host octet they do not overlap: the `%XX` hex digits go uppercase, the unescaped host ALPHA goes lowercase).
-  - **Case normalization** — lowercase the scheme and host (RFC 3986 §6.2.2.1).
-  - **Host (IDN)** — normalize per **RFC 5895 / IDNA2008**: apply **NFC** normalization **before** punycode / A-label conversion; reduce an internationalized host to its A-label (punycode) form; omit the default `:443` port; the authority carries **no trailing dot**.
-  - **Literal `:` separators** of the method-specific identifier are percent-encoded as **`%3A`** — still required even with length-prefixing, because the whole specific-id rides the preimage as one canonical byte string and the two sides must agree on its bytes.
+**The canonical form is the identifier's 32-byte digest** (`09-security-model.md` §9.7.4.2 R13), whose textual encoding a later revision of that section fixes together with the preimage field order. **The byte-agreement guarantee is airtight**: the identifier is a fixed-length digest, so a derivation that consumes the digest bytes admits exactly one encoding and two honest resolvers cannot diverge.
 
-A DID whose method admits **no** canonical string form (no deterministic single comparison form) is **rejected at a fail-loud method-admission gate** — never silently coerced — so a deterministic derivation can never be fed an un-normalizable DID. (This admission gate is about *canonical agreement*, distinct from the retired §5.15.8 colon-freedom assumption, which length-prefixing made unnecessary.)
-
-**did:web residual (disclosed honestly).** did:web is **fallback-only** and **not a planned deployment path** (§3.8). Even with the RFC-3986 + RFC-5895 profile above, byte-agreement for did:web is **best-effort at the exotic margins** — adversarially-constructed hosts/paths can in principle still admit encodings two implementations normalize differently. The protocol does **not** claim did:web agreement is airtight (only the inception-derived identifier is). The backstop is **defense-in-depth at the receiver**: the §5.15.8 step-4(a0) **Welcome-receipt mismatch guard** re-derives the `derived_context_id` from the receiver's own canonical inputs and **rejects** the Welcome on any mismatch, turning a canonicalization divergence into a clean local rejection rather than a silent split-brain. **Availability dual (disclosed tradeoff).** The same receive-side guard converts an *adversarially-constructed* did:web canonicalization divergence — an attacker who controls a did:web document published under a specific-id that two resolvers normalize differently — into a deterministic, **undiagnosable** pairing-denial: the §5.15.8 indistinguishable-rejection requirement (no existence/decline oracle) is in tension with diagnosability for the legitimate-but-divergent case, so a genuine honest divergence and an adversarial one are equally opaque to the rejecting party. This availability tradeoff is **accepted explicitly**, and it is **bounded**: did:web is fallback-only, and the inception-derived identifier (the production method) is airtight (above) and entirely unaffected.
+A DID string that is not the canonical form of an inception-derived identifier is **rejected at a fail-loud admission gate** — never silently coerced — so a deterministic derivation can never be fed a DID it cannot reduce. (This admission gate is about *canonical agreement*, distinct from the retired §5.15.8 colon-freedom assumption, which length-prefixing made unnecessary.)
 
 ## 3.9 Key Lifecycle
 
 Identity keys follow a defined lifecycle: generation (in the substrates `09-security-model.md` §9.7.4.1 item 4 names), distribution (as key state carried by the identity's key-event log), rotation (a `KeyState` or `RootRecovery` event signed by the standing root set, `09-security-model.md` §9.7.4.2 R3), and destruction (for ephemeral context keys). The full key lifecycle specification, including compromise recovery, is in §9.7.4.
 
-## 3.10 DID Resolution Layers
+## 3.10 DID Resolution
 
-DID resolution is the trust root for identity verification (§3.8). The current architecture resolves identities exclusively via Mainline DHT — BEP44 signed mutable items stored on BitTorrent's distributed hash table, a network of millions of nodes with over 20 years of operational history. This works, and it works well. But it routes all identity resolution through infrastructure SCP does not control, cannot improve, and cannot guarantee will continue to operate on terms compatible with the protocol's needs.
+DID resolution is the trust root for identity verification (§3.8). **The SCP relay network carries identity, and the protocol runs no second resolution layer.** An identity publishes its key-event log to SCP relays through the existing PUBLISH/QUERY operations (ADR-004), addressed by a deterministic `routing_id`. An SCP-native relay validates each DID-record blob it stores and keeps one slot per (routing id, divergent suffix) (§3.10.2, `09-security-model.md` §9.7.4.2 R9), which is what makes the relay layer suppression-resistant (§3.10.8); a foreign transport that cannot validate stores the record opaquely and stays correct through client-side verification.
 
-SCP introduces a dual-layer resolution architecture:
+Resolution is self-certifying through the key-event log: the resolver recomputes the identifier from the chain's inception event and verifies every later event under the standing root (`09-security-model.md` §9.6.1, §9.7.4.2 R2 and R3). Every relay is untrusted. Trust derives from the cryptographic binding between the identifier and the inception event that produced it, not from the infrastructure serving it. An SCP-native relay MAY additionally validate the records it stores (§3.10.2) — a validating relay verifies the chain and keeps one slot per divergent suffix, which resists suppression — but this is an availability property layered on top, never a trust dependency: the resolver re-verifies every record independently and accepts nothing on the relay's word (§3.10.4).
 
-- **Primary: SCP relay-based resolution.** DID records published to SCP relays via the existing PUBLISH/QUERY operations (ADR-004), addressed by a deterministic `routing_id`. An SCP-native relay validates each DID-record blob it stores and keeps one slot per (routing id, divergent suffix) (§3.10.2, `09-security-model.md` §9.7.4.2 R9), which is what makes the relay layer suppression-resistant (§3.10.8); foreign transports that cannot validate store the record opaquely and stay correct via client-side verification. Grows with the SCP network.
-- **Fallback: Mainline DHT.** Existing did:dht resolution via BEP44, carrying the signed head pointer that the 1000-byte BEP44 value cap admits rather than the log (§3.10.3). Works from day one. Transitions from "only path" to "fallback path" as the relay network matures.
+### 3.10.1 Which Relays a Resolution Queries
 
-Resolution is self-certifying through the key-event log: the resolver recomputes the identifier from the chain's inception event and verifies every later event under the standing root (`09-security-model.md` §9.6.1, §9.7.4.2 R2 and R3). The relay layer serves that chain; the DHT layer serves a signed pointer to its head, which the resolver checks against the chain and never adopts on its own. The storage backend — whether an SCP relay or a DHT node — is untrusted. Trust derives from the cryptographic binding between the identifier and the inception event that produced it, not from the infrastructure serving it. An SCP-native relay MAY additionally validate the records it stores (§3.10.2) — a validating relay verifies the chain and keeps one slot per divergent suffix, which resists suppression — but this is an availability property layered on top, never a trust dependency: the resolver re-verifies every record independently and accepts nothing on the relay's word (§3.10.4).
+A resolver queries two disjoint sets of relays, and it queries them in parallel:
 
-### 3.10.1 Resolution Priority
+| Relay set | Where the resolver learns it | Day-one availability |
+|-----------|------------------------------|----------------------|
+| The identity's own relays | the relay list the latest state-carrying event of the identity's chain carries (`09-security-model.md` §9.6.3) | Only after the resolver holds a chain for that identity |
+| The fallback set | any entry of the bootstrap relay list of `18-addressability-and-deployment.md` §18.5.1 that the identity's own chain does not name | Day one |
 
-| Layer | Backend | Day-one availability | Latency | SCP dependency |
-|-------|---------|---------------------|---------|----------------|
-| 1 | SCP relays | Low (few relays exist) | Low (relay QUERY, single hop) | Yes |
-| 2 | Mainline DHT | High (millions of nodes) | Higher (DHT traversal, 1-3s typical) | No |
+A served chain is **valid** when it recomputes to the target identifier and every one of its events verifies under `09-security-model.md` §9.7.4.2 R2 and R3. Among valid chains the resolver takes the higher-sequence head where one chain is a prefix of the other, and settles two chains that diverge by fork precedence (§9.7.4.2 R6). A first response does not end the resolution when the resolver holds no accepted baseline for the identifier: it needs two independent relays, at least one of them in the fallback set (§9.7.4.2 R11).
 
-Resolution strategy: query both layers in parallel. "Valid" means the served chain recomputes to the target identifier and every one of its events verifies under `09-security-model.md` §9.7.4.2 R2 and R3. Among valid chains the resolver takes the higher-sequence head where one chain is a prefix of the other, and settles two chains that diverge by fork precedence (§9.7.4.2 R6). A first response does not end the resolution when the resolver holds no accepted baseline for the identifier: it needs two sources (§9.7.4.2 R11), and the DHT layer's head pointer is one of them.
+Parallel query means resolution latency is the latency of the fastest relay that answers. Once a resolver holds an accepted baseline for the identifier, it cancels the remaining queries as soon as one valid response arrives; on a first contact it waits for the second relay R11 requires.
 
-Parallel query means resolution latency is `min(relay_latency, dht_latency)`. The slower query is cancelled once the first valid response arrives.
-
-### 3.10.2 Layer 1: SCP Relay-Based Resolution
+### 3.10.2 Relay-Based Resolution
 
 DID records are published to SCP relays using the existing PUBLISH/QUERY operations (ADR-004) — no new wire types. An identity's key-event log rides in a minimal, fixed-layout **DID-record relay frame** (§9.10.12), addressed by a deterministic `routing_id`. What is new versus a plain opaque blob is a relay *behavior*: an SCP-native relay verifies the chain the frame carries and keeps one slot per (routing id, divergent suffix). This is issue #482.
 
@@ -808,7 +798,7 @@ DID records are published to SCP relays using the existing PUBLISH/QUERY operati
 did_routing_id = SHA-256("scp:did:" || identifier_bytes)
 ```
 
-`09-security-model.md` §9.7.4.2 R13 states this derivation; the input is the identifier's 32 raw digest bytes for an inception-derived identifier, and the canonical DID string of §3.8.1 for a did:web identifier.
+`09-security-model.md` §9.7.4.2 R13 states this derivation, and its input is the identifier's 32 raw digest bytes.
 
 The `"scp:did:"` domain separator prevents collision with other routing ID derivation schemes in the protocol: encrypted context routing IDs use HKDF from identity key material (§9.10.4), broadcast context routing IDs use `SHA-256(context_id)` (§5.14), and context metadata routing IDs use `HMAC-SHA256(context_metadata_key, context_id || "scp-metadata-v2")` (§9.10.4.B). The domain separator ensures that a DID string can never produce a routing ID that collides with a context ID or metadata address. Because DID records live at their own `routing_id` domain, the address is the type discriminant — the frame carries no magic tag or record-kind byte (§9.10.12).
 
@@ -833,14 +823,14 @@ QUERY {
 }
 ```
 
-`limit: N` (N = 16) **dominates `limit: 1`** and costs nothing where it does not help. Against a **validating** SCP-native relay the routing ID is slot-exclusive (below) and holds at most `MAX_RETAINED_SUFFIXES` slots, one per divergent suffix, so `N` covers every slot with margin and a resolver receives every chain it needs to run fork precedence. Against a **non-validating or foreign** transport that accumulates multiple blobs per `routing_id`, `limit: N` lets the resolver retrieve up to N candidates and sift them by chain verification and fork precedence (§3.10.4 step 5) — defeating an intra-relay shadowing attempt that a single-record fetch would miss, and giving a `DhtMode::Disabled` node (relay-only resolution, which the spec permits) a fighting chance against a non-validating relay. Under an *active* flood on a non-validating relay this remains best-effort (§3.10.8 residual): N candidates may all be junk. The resolver's selection across relays and the DHT (§3.10.4) still returns the genuine chain whenever any queried source holds it.
+`limit: N` (N = 16) **dominates `limit: 1`** and costs nothing where it does not help. Against a **validating** SCP-native relay the routing ID is slot-exclusive (below) and holds at most `MAX_RETAINED_SUFFIXES` slots, one per divergent suffix, so `N` covers every slot with margin and a resolver receives every chain it needs to run fork precedence. Against a **non-validating or foreign** transport that accumulates multiple blobs per `routing_id`, `limit: N` lets the resolver retrieve up to N candidates and sift them by chain verification and fork precedence (§3.10.4 step 5) — defeating an intra-relay shadowing attempt that a single-record fetch would miss, Under an *active* flood on a non-validating relay this remains best-effort (§3.10.8 residual): N candidates may all be junk. The resolver's selection across relays (§3.10.4) still returns the genuine chain whenever any queried relay holds it.
 
 **Relay-side validation (SCP-native relays).** The whole path sits behind the existing per-IP PUBLISH rate limit (ADR-004). On PUBLISH of a blob at a `routing_id`, an SCP-native relay performs the checks **cheapest-first**, so junk is rejected before any expensive work:
 
 1. **Structural decode.** Attempt to decode the blob as a DID-record frame (§9.10.12). A blob that does not decode is not a candidate DID record (it is governed by the slot-exclusivity rule below).
 2. **Identifier→routing_id binding.** Confirm that `routing_id` equals `SHA-256("scp:did:" || identifier_bytes)` over the 32 raw digest bytes the frame's `identifier` field carries — the derivation `09-security-model.md` §9.7.4.2 R13 states. The identifier encodes no key (R13), so the relay derives no key from any frame field. This binding is the discriminant that lets a validating relay recognize a DID record without any new wire type or knowledge of `routing_id` semantics — and it is a plain hash, cheaper than a signature verify, so it runs **before** step 3.
 3. **Chain verification.** Only for a blob that passed steps 1–2, verify the key-event log the `value` carries: recompute the identifier from its inception event and reject a chain that recomputes to anything but the `identifier` field of step 2, then verify every event under `09-security-model.md` §9.7.4.2 R2 and R3. This is the relay's write authorization — the chain authorizes the write, and no key the writer supplies does.
-4. **BEP44 signature.** Verify the BEP44 signature over `bencode(seq, value)` against the designated service key of the chain the `value` itself carries, in every case; step 3 verified that chain from inception, so the key comes out of a verified chain and never out of the writer's bytes (`09-security-model.md` §9.10.12 step 4). The signature and `seq` are the relay's write rule; a resolver's trust decision never reads them (`09-security-model.md` §9.6.1).
+4. **Record signature.** Verify the record signature over `SHA-256("SCP-DID-RECORD-V1:" || identifier || seq || value)` against the designated service key of the chain the `value` itself carries, in every case; step 3 verified that chain from inception, so the key comes out of a verified chain and never out of the writer's bytes (`09-security-model.md` §9.10.12 step 4). The signature and `seq` are the relay's write rule; a resolver's trust decision never reads them (`09-security-model.md` §9.6.1).
 5. **Slot placement.** For a frame that passed steps 1–4, place its chain under `09-security-model.md` §9.7.4.2 R9, which is authoritative for the slot key, what opens a slot, what a slot holds, and the eviction rule; this section restates none of it. Where the frame's chain is prefix-related to a stored chain it writes to that slot, and the relay rejects a `seq` at or below the stored slot's `seq` unless an equal-`seq` frame is byte-identical to the stored record (an idempotent TTL refresh), replacing the slot only on a strictly-higher valid `seq` whose chain extends the stored one (`09-security-model.md` §9.10.12 step 5).
 
 **Slot-exclusivity.** A validating relay does not store DID records alongside arbitrary blobs. The moment a binding-valid, signature-valid frame first **establishes a slot** at a `routing_id`, that `routing_id` becomes **slot-exclusive**:
@@ -852,37 +842,24 @@ QUERY {
 
 **Before** the first valid frame, the relay cannot recognize the `routing_id` as DID-domain — `SHA-256` is one-way, so it cannot distinguish a not-yet-claimed DID `routing_id` from any other opaque-blob address. Pre-seeded junk (published *before* the victim's first DID publish) therefore simply sits as ordinary opaque blobs until the first binding-valid frame establishes the slot, at which point rule (b) evicts it. This closes the pre-seeding / non-frame-junk gap: on a validating relay, once the DID owner has published even once, QUERY cannot be made to return anything but the single genuine slot. Slot-exclusivity is a property of a *claimed* slot, and the in-memory slot index can be **cold** (empty) for two distinct reasons that have different consequences:
 
-1. **Blob TTL-expiry** (owner offline past the 6-day republish cycle): the slot record's own blob has expired, so the genuine record is *genuinely absent* from storage. Reversion here is not a suppression bypass — there is nothing to suppress; any attacker blob at that routing id fails the resolver's chain verification under `09-security-model.md` §9.7.4.2 R2 and R3 (§3.10.4 step 3), so the resolver discards it whatever the relay's index state; resolution falls through to the DHT, and the owner's next republish re-establishes the slot and re-fires rule (b).
+1. **Blob TTL-expiry** (owner offline past the 6-day republish cycle): the slot record's own blob has expired, so the genuine record is *genuinely absent* from storage. Reversion here is not a suppression bypass — there is nothing to suppress; any attacker blob at that routing id fails the resolver's chain verification under `09-security-model.md` §9.7.4.2 R2 and R3 (§3.10.4 step 3), so the resolver discards it whatever the relay's index state; resolution falls through to the identity's other relays, and the owner's next republish re-establishes the slot and re-fires rule (b).
 
-2. **Relay restart or store-sharing peer node** (the slot index is not persisted, so it starts empty even though the durable blob is **still present** in storage): the genuine record is *present*, only the cache forgot it. This is a real, bounded, availability-only window on that one relay until the next binding-valid publish re-warms the index. Two properties keep it availability-only, never integrity: (i) the **read path is storage-authoritative** — QUERY (rule (c)) re-derives the slot from the stored self-certifying frames, so a cold-index QUERY still returns only the genuine highest-`seq` record and never surfaces co-located junk as genuine; and (ii) the **DELETE gate (rule (d)) and establish reconciliation are storage-derived**, so a replayed lower-`seq` genuine frame cannot delete or roll back the present higher-`seq` record even against a cold index. The residual — a junk flood that pushes the genuine record outside a narrow QUERY `limit` window on that single relay before the index warms — is covered by the resolver's selection across the identity's other relays, and by the DHT head pointer, which names the head this relay is not serving (§3.10.4). The earlier claim that "the genuine record is already absent" applies **only** to case 1; for case 2 the record is present and the mitigation is the storage-authoritative read and DELETE gates plus multi-source resolution, not absence. **Both gates are relay-side code**, so neither closes anything against a relay whose operator omits them; the control that covers a first contact on a single source is the two-source rule of `09-security-model.md` §9.7.4.2 R11.
+2. **Relay restart or store-sharing peer node** (the slot index is not persisted, so it starts empty even though the durable blob is **still present** in storage): the genuine record is *present*, only the cache forgot it. This is a real, bounded, availability-only window on that one relay until the next binding-valid publish re-warms the index. Two properties keep it availability-only, never integrity: (i) the **read path is storage-authoritative** — QUERY (rule (c)) re-derives the slot from the stored self-certifying frames, so a cold-index QUERY still returns only the genuine highest-`seq` record and never surfaces co-located junk as genuine; and (ii) the **DELETE gate (rule (d)) and establish reconciliation are storage-derived**, so a replayed lower-`seq` genuine frame cannot delete or roll back the present higher-`seq` record even against a cold index. The residual — a junk flood that pushes the genuine record outside a narrow QUERY `limit` window on that single relay before the index warms — is covered by the resolver's selection across the identity's other relays and the fallback set (§3.10.4). The earlier claim that "the genuine record is already absent" applies **only** to case 1; for case 2 the record is present and the mitigation is the storage-authoritative read and DELETE gates plus multi-relay resolution, not absence. **Both gates are relay-side code**, so neither closes anything against a relay whose operator omits them; the control that covers a first contact on a single relay is the two-relay rule of `09-security-model.md` §9.7.4.2 R11.
 
 Slot-exclusivity is a relay **storage** behavior (the base relay stores multiple opaque blobs per `routing_id` with no per-`routing_id` cap, ADR-004). This spec section is authoritative for the behavior; the relay-storage mechanics (single highest-`seq` slot, eviction, cold-index reconciliation, the storage-derived DELETE gate) are transcribed in the companion **ADR-004 "DID-Record Slot-Exclusivity" subsection** (implemented under #482 / SCP-RELAYRES-003). The threat-model conclusions — the flood-inert enumeration and the DELETE-rollback vector — are owned by §3.10.8; ADR-004 records how the relay storage layer realizes them.
 
-This mirrors, and extends to a stored public record, the exact check `BRIDGE_REGISTER` already performs on the control plane — Ed25519 signature + the same `SHA-256("scp:did:" || identifier_bytes) == routing_id` binding (§10.12.4). It is what Mainline DHT BEP44 nodes already do for mutable items. It is an **availability and anti-suppression measure, never a trust dependency** (see the client-verify property below).
+This mirrors, and extends to a stored public record, the exact check `BRIDGE_REGISTER` already performs on the control plane — Ed25519 signature + the same `SHA-256("scp:did:" || identifier_bytes) == routing_id` binding (§10.12.4). It is an **availability and anti-suppression measure, never a trust dependency** (see the client-verify property below).
 
-**Relay-side validation is an OPTIONAL capability of SCP-native relays.** The protocol MUST NOT require a validating relay. Foreign transports and adapters (Nostr, Matrix, etc.) that cannot validate treat the frame as an opaque blob; resolution stays correct over them via client-side verification, the DHT, and multi-relay publishing. The suppression-resistance property of the relay layer (§3.10.8) is delivered by validating SCP-native relays; non-validating storage contributes availability only.
+**Relay-side validation is an OPTIONAL capability of SCP-native relays.** The protocol MUST NOT require a validating relay. Foreign transports and adapters (Nostr, Matrix, etc.) that cannot validate treat the frame as an opaque blob; resolution stays correct over them via client-side verification and multi-relay publishing. The suppression-resistance property of the relay layer (§3.10.8) is delivered by validating SCP-native relays; non-validating storage contributes availability only.
 
 **Properties:**
 
 - **Client always re-verifies (relay untrusted).** The resolver ALWAYS authenticates a served record by the key-event log the frame's `value` carries — recompute the identifier from the inception event and verify every event under `09-security-model.md` §9.7.4.2 R2 and R3 — and never by the frame's framing bytes or the relay's acceptance; the identifier encodes no key (`09-security-model.md` §9.7.4.2 R13). Relay validation is defense-in-depth for availability; it is never a trust input. A relay that skips, botches, or lies about validation degrades availability only, never integrity.
 - **Why the frame carries no public key.** A relay authorizes a write against the designated service key of the chain it already holds in the slot, or of the chain the frame's `value` carries when the frame opens a slot — both keys the relay reads out of a verified chain rather than out of the writer's bytes. A writer-supplied key would authorize the writer against itself, which is why the frame carries none.
-- **Self-verifying blob payload.** The frame carries the key-event log, so a resolver authenticates the record from the blob alone — no DHT round-trip and no second fetch is required to obtain the chain the verification reads.
+- **Self-verifying blob payload.** The frame carries the key-event log, so a resolver authenticates the record from the blob alone — no second fetch is required to obtain the chain the verification reads.
 - **Multi-relay.** A resolver can QUERY any relay that stores the target DID document. Identity owners SHOULD publish to multiple relays — their own relays plus bootstrap relays from the fallback relay list (§18.5.1) — for availability and suppression resistance.
 - **Size budget, measured on the chain.** The relay stores a key-event chain, not a projected DID document, and a chain's bytes grow with the square of its key-event count because every state-carrying event lists every key the chain ever installed (`09-security-model.md` §9.7.4.2 R8). One frame carries one contiguous chain segment, bounded by the 256KB relay blob size limit (ADR-004) less the frame's fixed prefix, and a relay serves a slot's chain as the ordered sequence of frames covering inception through head (`09-security-model.md` §9.7.4.2 R9). The chain itself is bounded by `MAX_KEY_EVENTS_PER_CHAIN` (`09-security-model.md` §9.18.17). A projected DID document of 2-30KB is what a resolver derives after it assembles and verifies the chain, and it is not what the relay stores.
-- **TTL and republishing.** The maximum relay blob TTL is 604800 seconds (7 days). Identity owners MUST republish to relays at least every 6 days (1-day safety margin). The RepublishManager already handles periodic DHT republishing on a 2-hour cycle; relay republishing adds a separate 6-day cycle for relay-stored DID documents.
-
-### 3.10.3 Layer 2: Mainline DHT (Fallback)
-
-Existing did:dht resolution via BEP44 signed mutable items on Mainline DHT. What changes is the layer's role — from "only resolution path" to "fallback resolution path" — and what it carries. **BEP 44 caps a mutable item's value at 1000 bytes** (`MAX_DHT_RECORD_BYTES`, `09-security-model.md` §9.18.17), and one state-carrying event of a minimal identity already runs 550 to 650 bytes because it lists the root set, every operational key with its custody type, every key the chain ever installed with its condition, the witness set with two cosigning parameters, the relay list, and the commitment list. A two-event chain therefore does not fit, so **the DHT layer carries the signed head pointer of `09-security-model.md` §9.6.1 and never the log**.
-
-What the head pointer carries is enough for four jobs, and for none of them does a resolver adopt a key state from the DHT alone:
-
-- **A second source on first contact.** A resolver holding no baseline needs two sources, one outside the served chain's own relay list (`09-security-model.md` §9.7.4.2 R11); the DHT pointer is that source for an identity whose relays a reader has never met.
-- **Detection of a truncated chain.** A relay serving a genuine prefix truncated before the event a reader needs produces a chain whose head the pointer does not name, and the resolver returns `Inconclusive` rather than adopting the prefix.
-- **The head an identity's own relays are down.** The pointer names the head and the relay list, so a resolver that reaches no listed relay learns that a newer head exists and which relays should hold it, rather than silently accepting whatever a bootstrap relay holds.
-- **Cross-network interoperability.** Any BEP44-capable client can read an SCP identity's head pointer without running SCP software, and follows the relay list the pointer names to obtain the chain.
-
-**An identity therefore publishes its chain to relays, always.** A deployment that published only to the DHT would leave every reader with a head pointer and no chain to verify, which is not a resolution; §3.10.6 makes both publications a MUST for that reason.
+- **TTL and republishing.** The maximum relay blob TTL is 604800 seconds (7 days). Identity owners MUST republish to relays at least every 6 days (1-day safety margin). The RepublishManager runs that 6-day cycle, and it is the only republication cycle the protocol defines.
 
 ### 3.10.4 Resolution Protocol
 
@@ -890,18 +867,15 @@ The full resolution sequence:
 
 ```
 1. Compute did_routing_id = SHA-256("scp:did:" || identifier_bytes)
-2. In parallel:
-   a. QUERY did_routing_id on known SCP relays (existing QUERY operation,
-      ADR-004; the stored blob is a DID-record frame, §9.10.12)
-      (identity's published relays if known, else bootstrap relays from §18.5.1)
-   b. DhtClient.resolve(identifier) on Mainline DHT — returns the signed
-      head pointer (§3.10.3), not a chain
-3. For each response, obtain what it carries:
-   a. Relay response: decode the DID-record frame (§9.10.12), take its
-      `value`, and assemble the chain segments the slot served. DHT
-      response: a signed head pointer, not a chain (§3.10.3). Framing bytes
-      are unsigned and MUST NOT be trusted; only the chain the relay values
-      carry is verified, and the pointer is checked against it.
+2. QUERY did_routing_id in parallel on the identity's own relays (the relay
+   list of the chain the resolver last accepted, where it holds one) and on
+   the bootstrap relays of the fallback set (§18.5.1), using the existing
+   QUERY operation (ADR-004; the stored blob is a DID-record frame,
+   §9.10.12).
+3. For each response:
+   a. Decode the DID-record frame (§9.10.12), take its `value`, and assemble
+      the chain segments the slot served. Framing bytes are unsigned and
+      MUST NOT be trusted; only the chain the relay values carry is verified.
    b. Recompute the identifier from the chain's inception event and DISCARD
       the response if it differs from the identifier being resolved
       (09 §9.7.4.2 R2).
@@ -915,94 +889,77 @@ The full resolution sequence:
       accepted state (09 §9.7.4.2 R12).
    b. Where two chains diverge from a shared prefix, apply fork precedence
       (09 §9.7.4.2 R6) and return `Contested` where it ties (R7).
-5. Check every head pointer held against the adopted chain: the pointer's
-   head digest and head sequence MUST name that chain's head. A pointer
-   naming a head no reachable relay served returns `Inconclusive` and the
-   resolver adopts nothing (09 §9.6.1).
-6. Where the resolver holds no accepted baseline for this identifier, it
-   MUST have reached two sources, one of them outside the served chain's
-   own relay list; otherwise it returns `Inconclusive{SingleSource}` and
-   adopts no head (09 §9.7.4.2 R11).
-7. Derive the key state, and with it the DID document, from the latest
+5. Where the resolver holds no accepted baseline for this identifier, it
+   MUST have reached two relays, one of them in the fallback set;
+   otherwise it returns `Inconclusive{SingleSource}` and adopts no head
+   (09 §9.7.4.2 R11).
+6. Derive the key state, and with it the DID document, from the latest
    state-carrying event of the chain adopted in step 4 (09 §9.7.4.2 R8).
-8. Cache result per §9.10.7 caching policy
+7. Cache result per §9.10.7 caching policy
    (24h refresh for active contacts, 7d for inactive)
 ```
 
-The relay query in step 2a targets relays in priority order: the identity's own relays (from a previously cached DID document), then bootstrap relays. If the resolver has no prior knowledge of the identity's relays, only bootstrap relays are queried for the relay layer — the DHT layer provides the backup.
+Step 2 queries the identity's own relays and the fallback set together, never one after the other: a resolver that holds no chain for the identity knows no relay of its own to query, and a resolver that holds one still needs a relay outside that list to satisfy R11's second relay.
 
 **Cancellation and contradiction semantics:**
 
 The parallel query model (step 2) requires clear rules for when queries are cancelled, how contradictions are resolved, and what happens on failure:
 
-- **First-response optimization.** When the first valid response arrives, the resolver SHOULD continue waiting for the second layer's response for up to 2 seconds (not cancel immediately); on a first contact it MUST wait for a second source or return `Inconclusive{SingleSource}` (09 §9.7.4.2 R11). This allows the resolver to detect a stale chain: where both layers return valid chains and one is a prefix of the other, the longer chain is authoritative (step 4a). Cancelling the slower query immediately would miss a longer chain on the slower layer, and would also hide a divergence the resolver must settle under fork precedence.
-- **Two relays succeed with heads of one chain at the same sequence.** The two records MUST be byte-identical. If they differ, the two heads are divergent events at one sequence, and the resolver settles them under fork precedence (step 4b) rather than picking one. The DHT pointer is not compared this way: it carries different bytes by construction, and the resolver checks its head digest and head sequence against the chain instead (09 §9.6.1).
+- **First-response optimization.** When the first valid response arrives, the resolver SHOULD continue waiting for a second relay's response for up to 2 seconds rather than cancelling immediately; on a first contact it MUST wait for a second relay or return `Inconclusive{SingleSource}` (09 §9.7.4.2 R11). Waiting lets the resolver detect a stale chain: where two relays return valid chains and one is a prefix of the other, the longer chain is authoritative (step 4a). Cancelling the slower query immediately would miss a longer chain on the slower relay, and would also hide a divergence the resolver must settle under fork precedence.
+- **Two relays succeed with heads of one chain at the same sequence.** The two records MUST be byte-identical. If they differ, the two heads are divergent events at one sequence, and the resolver settles them under fork precedence (step 4b) rather than picking one.
 - **Two relays succeed with heads of one chain at different sequences.** The longer chain is authoritative. The resolver MAY re-publish the longer chain to the relay that returned the shorter one (protocol-level healing, §3.10.7).
-- **One layer fails, one succeeds.** The successful response is accepted. The failed layer's error is logged but does not prevent resolution. The resolver does NOT retry the failed layer synchronously — the next resolution cycle (24h for active contacts, 7d for inactive) will attempt both layers again.
-- **Both layers fail.** If a cached key state exists and is less than 7 days old, it is returned with a `resolution_source: "cache"` indicator, and §9.11's auto-accept gates treat a cache older than `MAX_ATTESTATION_KEY_RESOLUTION_STALENESS` as unusable for a standing check. If no cache exists or the cache is older than 7 days, resolution fails with error `DID_RESOLUTION_FAILED` (code 5010). The resolver MUST NOT fabricate a document.
-- **One layer returns a chain that fails verification.** The response is discarded as if the layer had failed. A chain whose recomputed identifier differs, or whose events carry an author-attributable defect, is logged at WARN level (it may indicate relay tampering). The resolver does not fall back to the failing chain under any circumstances.
-- **Relay blob fails frame decoding.** A relay blob that does not decode as a valid DID-record frame (§9.10.12) — shorter than the 137-byte fixed prefix, carrying an empty `value`, exceeding the bounded `value` length, or an unrecognized `version` — is discarded as if the relay had failed. Malformed framing is never trusted and never partially parsed (§9.10.12 decoder rules); the resolver falls through to the other layer exactly as for a chain that fails verification.
-- **Timeout.** Each layer query has a 5-second timeout. If a layer does not respond within 5 seconds, it is treated as a failure for that resolution attempt.
+- **One relay fails, another succeeds.** The successful response is accepted, subject to step 5's two-relay rule on a first contact. The failed relay's error is logged but does not prevent resolution. The resolver does NOT retry the failed relay synchronously — the next resolution cycle (24h for active contacts, 7d for inactive) queries it again.
+- **Every relay fails.** If a cached key state exists and is less than 7 days old, it is returned with a `resolution_source: "cache"` indicator, and §9.11's auto-accept gates treat a cache older than `MAX_ATTESTATION_KEY_RESOLUTION_STALENESS` as unusable for a standing check. If no cache exists or the cache is older than 7 days, resolution fails with error `DID_RESOLUTION_FAILED` (code 5010). The resolver MUST NOT fabricate a document.
+- **A relay returns a chain that fails verification.** The response is discarded as if that relay had failed. A chain whose recomputed identifier differs, or whose events carry an author-attributable defect, is logged at WARN level (it may indicate relay tampering). The resolver does not fall back to the failing chain under any circumstances.
+- **Relay blob fails frame decoding.** A relay blob that does not decode as a valid DID-record frame (§9.10.12) — shorter than the 105-byte fixed prefix, carrying an empty `value`, exceeding the bounded `value` length, or an unrecognized `version` — is discarded as if that relay had failed. Malformed framing is never trusted and never partially parsed (§9.10.12 decoder rules); the resolver falls through to the other relays exactly as for a chain that fails verification.
+- **Timeout.** Each relay query has a 5-second timeout. A relay that does not respond within 5 seconds is treated as a failure for that resolution attempt.
 
 ### 3.10.5 Publishing Protocol
 
-Identity owners publish to both layers on every key event they append:
+Identity owners publish to relays on every key event they append:
 
 ```
 On appending a key event to the log:
-1. Build the two payloads the two layers carry (09 §9.6.1):
-   a. Relay payload: the chain from the inception event to the new head,
-      split into contiguous segments each fitting one frame
-      (09 §9.7.4.2 R9).
-   b. DHT payload: the signed head pointer — identifier, head digest, head
-      sequence, and the relay list or its digest — bounded by
-      MAX_DHT_RECORD_BYTES (09 §9.18.17).
-2. Sign each payload via BEP44 with the designated service key the latest
-   state-carrying event names (Ed25519 signature over the BEP44-canonical
-   bencoded buffer bencode(salt?, seq, value) — the sequence number precedes
-   the value, `3:seqi<seq>e1:v<value>`, per the BEP44 spec, which is
-   authoritative for this ordering; SCP uses no salt). This signature is the
-   relay and DHT write rule, never a resolver's trust input (09 §9.6.1).
-3. In parallel:
-   a. Wrap (identifier, seq, signature, value) in a DID-record frame
-      (§9.10.12) per segment and PUBLISH the frame bytes to SCP relays
-      (own relays + bootstrap relays) via the existing PUBLISH operation,
-      blob_ttl: 604800. The frame is transport framing around `value` — it is
-      NEVER part of the bencoded signed bytes.
-   b. DhtClient.publish(service_key, signature, head_pointer, seq) to
-      Mainline DHT
-4. RepublishManager schedules:
-   - Relay republishing: every 6 days (blob_ttl is 7 days, 1-day margin)
-   - DHT republishing: every 2 hours (existing cycle, unchanged)
+1. Build the relay payload (09 §9.6.1): the chain from the inception event
+   to the new head, split into contiguous segments each fitting one frame
+   (09 §9.7.4.2 R9).
+2. Sign each segment with the designated service key the latest
+   state-carrying event names: an Ed25519 signature over
+   SHA-256("SCP-DID-RECORD-V1:" || identifier || seq || value) under the
+   09 §9.5.1 construction. This signature is the relay's write rule, never
+   a resolver's trust input (09 §9.6.1).
+3. Wrap (identifier, seq, signature, value) in a DID-record frame
+   (§9.10.12) per segment and PUBLISH the frame bytes to the identity's own
+   relays and to the bootstrap relays of the fallback set (§18.5.1) via the
+   existing PUBLISH operation, blob_ttl: 604800. The frame is transport
+   framing around `value` — it is NEVER part of the signed bytes.
+4. RepublishManager republishes to every one of those relays every 6 days
+   (blob_ttl is 7 days, 1-day margin).
 ```
-
-The two layers carry different payloads, and no rule compares them byte for byte: the relay layer carries the chain, and the DHT layer carries the head pointer the 1000-byte BEP44 cap forces (09 §9.6.1). A resolver checks a pointer against the chain it assembled by comparing the pointer's head digest and head sequence with the chain's head; a pointer naming a head no reachable relay serves is evidence of suppression and the resolver adopts nothing (09 §9.6.1).
 
 ### 3.10.6 Anti-Segmentation Invariant
 
-**Publishing to both layers is a MUST, not a SHOULD**: the chain to every relay the identity's key state lists, and the head pointer to the DHT (§3.10.5). Each layer carries the payload that layer can hold, so the MUST is satisfiable for every identity at every chain length. Resolution reads both layers, and a resolver holding no accepted baseline for an identifier MUST reach two sources (`09-security-model.md` §9.7.4.2 R11), of which the DHT pointer is one.
+**Publishing to the fallback set is a MUST, not a SHOULD**: an identity publishes its chain to every relay its key state lists **and** to the bootstrap relays of the fallback set (§18.5.1, §3.10.5). Resolution reads both sets, and a resolver holding no accepted baseline for an identifier MUST reach two independent relays, one of them in the fallback set (`09-security-model.md` §9.7.4.2 R11).
 
-The risk: if the DHT layer works well enough and relay-based resolution is "just faster," developers may skip DHT publishing as unnecessary overhead. If this becomes widespread, identity resolution fragments — some DIDs resolvable only on relays, others only on DHT. A resolver that checks only one layer misses identities published only on the other. The network splits into two resolution namespaces without anyone intending it.
+The risk the MUST forecloses: an identity that published only to relays of its own would be resolvable only by a party that already holds that identity's relay list, because a first-contact reader knows no relay of that identity to query. Identities would partition into islands reachable by their existing contacts and by nobody else, and a stranger's first contact — the case §9.7.4.2 R11 governs — would fail for every identity that skipped the fallback set. The network would segment without anyone intending it.
 
-The SDK prevents this by default. RepublishManager publishes to both layers on every cycle. Disabling either layer requires explicit opt-out (`RepublishConfig::disable_dht()` or `RepublishConfig::disable_relay()`) and the SDK MUST log a warning when either is disabled. The warning states: "DID resolution layer disabled. This identity may not be resolvable by all peers."
-
-**The DHT *backend* is a selected provider capability (§17.17).** The rule above governs whether the DHT *layer* is published to; the choice of which DHT *backend implementation* serves that layer is a further instance of the general capability-selection principle in §17.17. In particular, an in-memory DHT backend is a **security nullifier**, not a durability-only development affordance (§17.17.3, SCP-CAPSEL-8013): it silently empties the DHT resolution namespace — the extreme case of the segmentation this invariant forbids — so a rotation or revocation never propagates (§3.9, §3.10.7). It MUST therefore be provably absent from shipped production artifacts (SCP-CAPSEL-8012), and the DHT backend selection MUST be explicit and fail closed (SCP-CAPSEL-8000/8001), never silently defaulted to the in-memory arm.
+RepublishManager publishes to both relay sets on every cycle (§3.10.5), and this section adds no mechanism of its own. A publish cycle that reached no relay in the fallback set MUST be reported to the caller as a failed publication, never as a success: an SDK that reported success would leave the controller believing its chain is resolvable by a stranger when no stranger can reach it, which is the segmentation this invariant forbids.
 
 ### 3.10.7 Version Resolution
 
-The sequence number orders one key-event chain against its own prefixes, and it does so because an event's sequence is its predecessor's plus one (`09-security-model.md` §9.7.4.2 definitions): chain order and sequence order are one order, so among heads of one chain the highest sequence is the newest, regardless of which layer served it. A verifier rejects an event whose sequence is anything but its predecessor's plus one, which is what makes that claim true rather than assumed. The sequence decides nothing between two chains that diverge from a shared prefix, because each chain's author assigned its own sequence numbers past the fork. Two owner-signed divergent chains are the root-key-compromise or equivocation case, and a resolver settles which chain it adopts by the fork-precedence rule of the security-model spec (`09-security-model.md` §9.7.4.2 R6); that rule may adopt a chain whose head sequence is lower than the head the resolver previously held (§9.7.4.2 R12).
+The sequence number orders one key-event chain against its own prefixes, and it does so because an event's sequence is its predecessor's plus one (`09-security-model.md` §9.7.4.2 definitions): chain order and sequence order are one order, so among heads of one chain the highest sequence is the newest, regardless of which relay served it. A verifier rejects an event whose sequence is anything but its predecessor's plus one, which is what makes that claim true rather than assumed. The sequence decides nothing between two chains that diverge from a shared prefix, because each chain's author assigned its own sequence numbers past the fork. Two owner-signed divergent chains are the root-key-compromise or equivocation case, and a resolver settles which chain it adopts by the fork-precedence rule of the security-model spec (`09-security-model.md` §9.7.4.2 R6); that rule may adopt a chain whose head sequence is lower than the head the resolver previously held (§9.7.4.2 R12).
 
-Stale documents are detected by comparing the received sequence number against the last known sequence number for that DID. A relay or DHT node serving a stale document is not malicious — it simply has not received the latest publish. The stale document is overwritten on the next republish cycle.
+Stale documents are detected by comparing the received sequence number against the last known sequence number for that DID. A relay serving a stale document is not malicious — it simply has not received the latest publish. The stale document is overwritten on the next republish cycle.
 
-When both layers return valid heads of the same chain at different sequence numbers, the higher sequence is authoritative; heads of divergent chains are settled first by the fork-precedence rule (`09-security-model.md` §9.7.4.2 R6). The resolver SHOULD update its cache and MAY re-publish the winning head to the layer that returned the stale one (protocol-level healing).
+When two relays return valid heads of the same chain at different sequence numbers, the higher sequence is authoritative; heads of divergent chains are settled first by the fork-precedence rule (`09-security-model.md` §9.7.4.2 R6). The resolver SHOULD update its cache and MAY re-publish the winning head to the relay that returned the stale one (protocol-level healing).
 
 ### 3.10.8 Security Analysis
 
-The dual-layer architecture preserves all security properties of §9.6.1 (self-certification) while adding relay-layer resilience:
+Resolution over the relay network preserves every security property of §9.6.1 (self-certification) and adds the resilience a validating relay supplies:
 
-- **Self-certification preserved.** The resolver authenticates a served record by the key-event log it carries — recompute the identifier from the inception event, verify every later event under the standing root (`09-security-model.md` §9.7.4.2 R2 and R3). The storage backend (relay or DHT) is untrusted; the resolver never trusts a relay's acceptance and reads no key out of the frame. §9.6.1 properties are unchanged.
-- **Relay serves a stale head of the accepted chain.** Detected by sequence comparison against the accepted head (`09-security-model.md` §9.7.4.2 R12). The resolver falls through to other relays or DHT. Stale documents do not compromise security — they delay propagation of key rotations, which is bounded by the republish cycle (6 days for relays, 2 hours for DHT).
-- **Relay unresponsive, slow, or withholding.** Resolution queries all of an identity's relay URLs plus the DHT concurrently, each relay guarded by an independent per-relay timeout (§3.10.4). A single slow, hung, or withholding relay cannot block a result obtained from a faster relay or the DHT, and suppression by any one source does not prevent resolution — multi-relay publishing (§9.9.2) applies to DID documents as it does to context blobs.
+- **Self-certification preserved.** The resolver authenticates a served record by the key-event log it carries — recompute the identifier from the inception event, verify every later event under the standing root (`09-security-model.md` §9.7.4.2 R2 and R3). Every relay is untrusted; the resolver never trusts a relay's acceptance and reads no key out of the frame. §9.6.1 properties are unchanged.
+- **Relay serves a stale head of the accepted chain.** Detected by sequence comparison against the accepted head (`09-security-model.md` §9.7.4.2 R12). The resolver falls through to the identity's other relays and to the fallback set. Stale documents do not compromise security — they delay propagation of key rotations, which is bounded by the 6-day republish cycle (§3.10.5).
+- **Relay unresponsive, slow, or withholding.** Resolution queries all of an identity's relay URLs and the fallback set concurrently, each relay guarded by an independent per-relay timeout (§3.10.4). A single slow, hung, or withholding relay cannot block a result obtained from a faster one, and suppression by any one relay does not prevent resolution — multi-relay publishing (§9.9.2) applies to DID documents as it does to context blobs.
 - **Relay serves another identity's record.** The chain recomputes to that other identity's identifier, not to the one being resolved, so step 3b of §3.10.4 discards it. Substitution would require an inception event whose signed preimage digests to the target identifier.
 - **Attacker floods junk at the DID routing ID.** The `routing_id = SHA-256("scp:did:" || identifier_bytes)` is publicly derivable, so any party can PUBLISH to it. On a **validating SCP-native relay every flood variant is inert**, because the relay verifies the chain each frame carries, keeps one slot per divergent suffix, and makes the `routing_id` slot-exclusive once claimed (§3.10.2):
   - **Junk frame** (malformed, wrong binding, a chain that fails verification, or a bad signature) — rejected at validation; never enters a slot.
@@ -1013,27 +970,27 @@ The dual-layer architecture preserves all security properties of §9.6.1 (self-c
 
   This is precisely why the relay layer is suppression-resistant: presence-in-the-QUERY-window is controlled by the validating relay's write rule, not by the attacker's PUBLISH volume or timing.
 - **Attacker DELETEs the slot blob (an integrity vector, closed by the DELETE gate).** DELETE is an unauthenticated relay operation addressing a blob by `blob_id` (`= SHA-256(blob)`), and a DID record is public — so an attacker can compute the genuine record's `blob_id` and issue `DELETE`. Left ungated this is an **integrity** attack, not merely availability: on a cold index (a restarted relay or a store-sharing peer, §3.10.2) the attacker DELETEs the genuine highest-`seq` record from durable storage, then PUBLISHes a captured older lower-`seq` genuine frame; cold-index establish reconciliation, finding the genuine record gone, **establishes that stale newcomer** (it has no higher-`seq` record left in storage to reconcile against) — rolling the victim's DID document back to a rotated-out/revoked key. Note the replayed frame carries a genuine prefix of the owner's own chain, so it passes chain verification; what would otherwise reject it is the client's sequence check against its accepted head, and that is defeated on a cold-cache first resolution — which is why the relay-side DELETE gate, not client re-verification, is the control that closes this vector. This is closed by **slot-exclusivity rule (d) (§3.10.2): the relay rejects a DELETE of any slot blob**, and the gate is **storage-derived** (it re-reads the blob and re-verifies the chain it carries), so it holds even against a cold index. The gate is rate-limited (its storage read + signature verify is not an unmetered amplification surface) and fails closed on a storage error. With rule (d), a DELETE cannot purge a genuine record and the rollback is foreclosed.
-- **Suppression resilience (validating SCP-native relays).** With chain-verifying, per-root-set slot validation, an attacker cannot evict the genuine record by flooding, and cannot reorder it out of a bounded QUERY window (a routing id holds at most `MAX_RETAINED_SUFFIXES` slots and `limit: N` at N = 16 covers them). To prevent resolution, an attacker must suppress the chain on ALL of an identity's validating relays AND the head pointer on all reachable DHT nodes. **The DHT's contribution here is a second source, not eviction resistance of its own**: which BEP44 public key addresses an identity's pointer is open until the identifier byte-layout revision fixes it (`09-security-model.md` §9.6.1), so this spec claims no independent suppression resistance for the DHT layer. What the pointer does supply is detection — a resolver holding a pointer whose head no reachable relay serves returns `Inconclusive` and adopts nothing. **On integrity:** relay misbehavior is availability-only, never integrity, *because* a set of controls hold together, each covering a distinct failure mode — the client's chain verification (`09-security-model.md` §9.6.1, §9.7.4.2 R2 and R3) rejects a **forged** record; the resolver's sequence check plus fork precedence across relays and the DHT (§3.10.4, §3.10.7) rejects a **stale or replayed genuine** record on any warm-cache or multi-source resolution; and the storage-derived, cold-index-immune establish reconciliation plus the **DELETE gate (rule (d))** raise the cost of the **cold-cache DELETE-purge-then-replay rollback** on a relay that runs them. **Those two are relay-side code, so they close nothing against the relay's own operator**, who omits them: the control that covers a first contact is the client-side two-source rule of `09-security-model.md` §9.7.4.2 R11, which makes a resolver holding no baseline read the identifier from a second source outside the served chain's own relay list and return `Inconclusive{SingleSource}` when it cannot. The availability-only-never-integrity claim above is therefore scoped to a warm-cache or multi-source resolution; on a single-source first contact the integrity control is R11's rule and nothing on the relay. A relay that omits them (a foreign or non-validating relay) provides no integrity control of its own — integrity there rests entirely on the client-side checks.
-- **Residual: foreign / non-validating relays are best-effort.** A foreign transport or a non-validating relay that accumulates multiple blobs per `routing_id` can be flooded, and its bounded QUERY window can be made to omit the genuine record. Resolution over such storage alone is therefore best-effort for suppression; the resolver still recovers the genuine record via any validating relay, via multi-relay publishing (§9.9.2), or via the DHT, and its chain verification (§3.10.4) discards the junk. What foreign/non-validating storage contributes is availability, not anti-suppression.
+- **Suppression resilience (validating SCP-native relays).** With chain-verifying, per-root-set slot validation, an attacker cannot evict the genuine record by flooding, and cannot reorder it out of a bounded QUERY window (a routing id holds at most `MAX_RETAINED_SUFFIXES` slots and `limit: N` at N = 16 covers them). To prevent resolution, an attacker must suppress the chain on ALL of an identity's validating relays AND on the fallback set (§18.5.1), because a resolver reads both. **On integrity:** relay misbehavior is availability-only, never integrity, *because* a set of controls hold together, each covering a distinct failure mode — the client's chain verification (`09-security-model.md` §9.6.1, §9.7.4.2 R2 and R3) rejects a **forged** record; the resolver's sequence check plus fork precedence across relays (§3.10.4, §3.10.7) rejects a **stale or replayed genuine** record on any warm-cache or multi-relay resolution; and the storage-derived, cold-index-immune establish reconciliation plus the **DELETE gate (rule (d))** raise the cost of the **cold-cache DELETE-purge-then-replay rollback** on a relay that runs them. **Those two are relay-side code, so they close nothing against the relay's own operator**, who omits them: the control that covers a first contact is the client-side two-relay rule of `09-security-model.md` §9.7.4.2 R11, which makes a resolver holding no baseline read the identifier from a second relay outside the served chain's own relay list and return `Inconclusive{SingleSource}` when it cannot. The availability-only-never-integrity claim above is therefore scoped to a warm-cache or multi-relay resolution; on a single-relay first contact the integrity control is R11's rule and nothing on the relay. A relay that omits them (a foreign or non-validating relay) provides no integrity control of its own — integrity there rests entirely on the client-side checks.
+- **Residual: foreign / non-validating relays are best-effort.** A foreign transport or a non-validating relay that accumulates multiple blobs per `routing_id` can be flooded, and its bounded QUERY window can be made to omit the genuine record. Resolution over such storage alone is therefore best-effort for suppression; the resolver still recovers the genuine record via any validating relay or via multi-relay publishing (§9.9.2), and its chain verification (§3.10.4) discards the junk. What foreign/non-validating storage contributes is availability, not anti-suppression.
 
 ### 3.10.9 Privacy Properties
 
-| Layer | What the backend learns |
-|-------|------------------------|
-| SCP relay | Resolver's IP address queried a specific `routing_id`. The relay can infer which DID is being resolved if the relay knows the DID (it can compute the same `SHA-256("scp:did:" \|\| identifier_bytes)` for identifiers it knows). |
-| Mainline DHT | Resolver's IP address queried a public key. DHT routing traffic makes isolation harder (§9.10.7). |
+| Relay set | What the relay operator learns |
+|-----------|-------------------------------|
+| The identity's own relays | The resolver's IP address queried a specific `routing_id`. The operator can infer which identity is being resolved for any identity it already knows, because it computes the same `SHA-256("scp:did:" \|\| identifier_bytes)`. It already sees that identity's message traffic. |
+| The fallback set (§18.5.1) | The resolver's IP address queried a specific `routing_id`. A bootstrap relay that stores no chain of its own learns the routing ID and nothing else about the identity. |
 
-Adding relay-based resolution does not degrade privacy relative to DHT-only resolution. It adds one additional observer (the relay operator) who, for identities hosted on that relay, already sees message traffic for that identity. The DID resolution query does not reveal information the relay operator did not already have.
+A resolution discloses to the identity's own relay operator nothing that operator did not already have, because that operator already carries the identity's message traffic (§9.9.1). A first contact spreads its two queries across an identity relay and a fallback relay (`09-security-model.md` §9.7.4.2 R11), so no single operator observes a whole first contact. A resolver that requires IP anonymity uses a VPN or Tor at the transport layer (§9.10.11).
 
-Caching policy from §9.10.7 applies to both layers: 24-hour refresh for active contacts, 7-day for inactive. The local Mainline DHT node on desktop (§9.10.7) continues to provide resolution privacy for DHT queries.
+Caching policy from §9.10.7 applies to every relay query: 24-hour refresh for active contacts, 7-day for inactive.
 
 ### 3.10.10 DidResolver Trait
 
-The SDK exposes a unified resolution interface that composes both layers:
+The SDK exposes the resolution interface:
 
 ```rust
-/// Unified DID resolution across SCP relays and Mainline DHT.
-/// Implements the parallel dual-layer resolution protocol (§3.10.4).
+/// DID resolution across the SCP relay network.
+/// Implements the parallel multi-relay resolution protocol (§3.10.4).
 pub trait DidResolver: Send + Sync {
     fn resolve(&self, did: &str)
         -> impl Future<Output = Result<Option<ResolvedDidDocument>, IdentityError>> + Send;
@@ -1047,50 +1004,48 @@ pub struct ResolvedDidDocument {
     /// and MAY decrease when fork precedence adopts a lower-sequence winner
     /// (`09-security-model.md` §9.7.4.2 R12, `Adopted{baseline_decreased}`).
     pub seq: u64,
-    /// Which resolution layer served this document.
+    /// Which relays served the chain this document derives from.
     pub source: ResolutionSource,
 }
 
-/// Provenance of a resolved DID document. The chain the document
-/// derives from always comes from a relay: the DHT layer carries a
-/// signed head pointer, never the chain (§3.10.3).
+/// Provenance of a resolved DID document.
 pub enum ResolutionSource {
-    /// Chain served by an SCP relay, with no DHT pointer corroborating it.
-    ScpRelay { relay_url: String },
-    /// Chain served by an SCP relay and corroborated by a DHT head
-    /// pointer naming that chain's head — the two-source case
+    /// Chain served by one relay, against a baseline the resolver already
+    /// held. A first contact never returns this variant
     /// (`09-security-model.md` §9.7.4.2 R11).
-    ScpRelayWithDhtPointer { relay_url: String },
-    /// Served from local cache (original source recorded at cache time).
+    SingleRelay { relay_url: String },
+    /// Chain served by two independent relays, at least one of them in the
+    /// fallback set — the two-relay case R11 requires on a first contact.
+    TwoRelays { relay_urls: [String; 2] },
+    /// Served from local cache (the relays that served it recorded at cache time).
     Cache,
 }
 ```
 
-`DidResolver` composes the relay QUERY path with `DhtClient::resolve()` internally: the relay path yields the chain segments, and `DhtClient::resolve()` yields the head pointer the resolver checks against the assembled chain. A first contact that reaches only one of the two returns `Inconclusive{SingleSource}` rather than a document (`09-security-model.md` §9.7.4.2 R11).
+`DidResolver` queries the identity's own relays and the fallback set in parallel and settles the chains they serve under §3.10.4. A first contact that reaches fewer than two relays returns `Inconclusive{SingleSource}` rather than a document (`09-security-model.md` §9.7.4.2 R11).
 
 ### 3.10.11 Bootstrap and Network Growth
 
-The dual-layer architecture is designed to be self-reinforcing as the SCP network grows:
+The relay network is designed to be self-reinforcing as it grows:
 
-- **Day one.** Few relays exist, so an identity publishes its chain to the bootstrap relays of §18.5.1 and its head pointer to the DHT. **A resolution reads the chain from a relay in every case**, because the DHT layer's 1000-byte value cap admits the pointer and not the log (§3.10.3); what the DHT supplies on day one is the second source a first contact needs and the detection of a relay serving a truncated chain.
-- **Growth.** More relays come online and more identities publish their chains to relays of their own rather than to the bootstrap set alone. Relay-layer resolution succeeds more often and faster than DHT traversal. The DHT pointer query still runs in parallel.
-- **Maturity.** Most identities list several relays of their own, so a resolver reaches two chain-serving relays as well as the DHT pointer. DHT latency becomes irrelevant because relay responses arrive first. The DHT pointer stays the corroborating source and the suppression signal.
-- **DHT is never removed.** The cost of maintaining DHT publishing is one BEP44 put every 2 hours — negligible. The benefit is permanent: a resolution path that works even if every SCP relay is unreachable. Removing it would violate the anti-segmentation invariant (§3.10.6).
+- **Day one.** Few relays exist, so an identity publishes its chain to the bootstrap relays of §18.5.1 and lists no relay of its own. A resolution reads two of those bootstrap relays. That satisfies R11's two-relay rule, because an identity that lists no relay of its own names none of them, which puts every bootstrap relay in that identity's fallback set (`09-security-model.md` §9.7.4.2 definitions).
+- **Growth.** More relays come online and more identities publish their chains to relays of their own alongside the bootstrap set. A resolution reaches an identity relay first and a bootstrap relay second, so the fallback set carries less of the load.
+- **Maturity.** Most identities list several relays of their own, so a resolver reaches an identity relay and a fallback relay quickly and R11's second relay costs no perceptible latency. The fallback set stays the set of relays the identity's own key state does not name, which is the property R11 reads.
 
 ### 3.10.12 Phase Integration
 
 | Component | Phase | Crate | Notes |
 |-----------|-------|-------|-------|
 | `did_routing_id` derivation | Phase 1 patch | `scp-core` | Pure function, no dependencies. SHA-256 over the domain separator and the identifier's 32 digest bytes (`09-security-model.md` §9.7.4.2 R13). |
-| DID document PUBLISH to relays | Phase 2 | `scp-core` | RepublishManager gains relay publishing cycle alongside existing DHT cycle. |
-| DID document QUERY from relays | Phase 2 | `scp-core` | Extends existing DID resolution path with relay QUERY before/parallel to DHT. |
-| `DidResolver` trait | Phase 2 | `scp-core` | Unified interface composing relay + DHT resolution. |
-| Parallel dual-layer resolution | Phase 2 | `scp-core` | Orchestration of parallel queries: relay chain segments plus the DHT head pointer, settled under §3.10.4 and the two-source rule of `09-security-model.md` §9.7.4.2 R11. |
+| DID record PUBLISH to relays | Phase 2 | `scp-core` | RepublishManager publishes each chain segment to the identity's own relays and the fallback set on a 6-day cycle (§3.10.5). |
+| DID record QUERY from relays | Phase 2 | `scp-core` | Parallel QUERY across the identity's own relays and the fallback set (§3.10.4). |
+| `DidResolver` trait | Phase 2 | `scp-core` | The resolution interface over the relay network (§3.10.10). |
+| Multi-relay resolution | Phase 2 | `scp-core` | Orchestration of the parallel queries and their settlement under §3.10.4, including the two-relay rule of `09-security-model.md` §9.7.4.2 R11. |
 | DID-record relay frame (§9.10.12) | Phase 2 (#482) | `scp-protocol` | Deterministic binary encode/decode of the minimal fixed-layout DID-record frame (`DidRecordV1`). Pure sync wasm-compatible type; consumed by the relay publisher + DID resolver in `scp-identity` and by the relay-side validation path. |
 
 ## 3.11 DID Authentication for External Services (SCPID)
 
-SCP identities can authenticate to services outside the protocol. A relying party — SCP-native or not — can verify that a request comes from the holder of a specific DID without joining a context, understanding MLS, or running SCP infrastructure. The only requirement is the ability to resolve a `did:dht` document (a single DHT lookup) and verify an Ed25519 signature.
+SCP identities can authenticate to services outside the protocol. A relying party — SCP-native or not — can verify that a request comes from the holder of a specific DID without joining a context, understanding MLS, or running SCP infrastructure. The only requirement is the ability to resolve an SCP identity's key-event log from an SCP relay and verify an Ed25519 signature.
 
 This is analogous to "Sign in with Ethereum" (EIP-4361) but simpler: no blockchain state, no gas, no wallet abstraction. The identity's key-event log is the identity provider, self-certifying because the identifier is the digest of its inception event (`09-security-model.md` §9.6.1).
 
@@ -1210,8 +1165,10 @@ The relying party verifies a response:
 4. Check the challenge has not expired: current_time <= expires_at.
    Check signed_at is within the challenge's [issued_at, expires_at] window.
 5. Resolve the DID document:
-   a. Resolve did via DHT (BEP44 lookup) or SCP relay QUERY (§3.10.4).
-   b. Verify the BEP44 signature on the DID document (§9.6.1).
+   a. QUERY the identity's routing ID on SCP relays (§3.10.4).
+   b. Recompute the identifier from the served chain's inception event and
+      verify every event of the chain (§9.6.1); derive the DID document
+      from the chain's latest state-carrying event.
    c. Cache policy: the DID document MUST be fresh — fetched within the last
       300 seconds or cached with valid TTL. Stale documents MUST trigger
       a fresh resolution.
@@ -1264,7 +1221,7 @@ The relying party verifies a response:
 ```json
 {
   "protocol": "scpid/1.0",
-  "did": "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
+  "did": "<the signer's identifier in its canonical string form, §3.8.1>",
   "signing_key_id": "#active",
   "nonce": "<64 hex chars>",
   "audience": "https://app.example.com",
@@ -1367,7 +1324,7 @@ pub struct ScpIdAuthentication {
 ```
 
 **Non-SCP relying parties** can implement verification without the SCP SDK. The only dependencies are:
-1. A `did:dht` resolver (BEP44 lookup — libraries exist for most languages).
+1. An SCP relay QUERY client and the key-event-log verification of §9.6.1 (recompute the identifier, verify every event).
 2. SHA-256 (standard, available everywhere).
 3. An Ed25519 signature verifier (PureEdDSA per RFC 8032 §5.1.6).
 4. JSON parsing.
@@ -1378,7 +1335,7 @@ This is intentional. SCPID is designed to be implementable by services that have
 
 A service that wants to accept SCP DID authentication without running SCP software:
 
-1. **DID resolution.** Use any `did:dht` resolver library. The DID document is a BEP44 signed mutable item on Mainline DHT. Libraries: `did-dht` (Rust), `@decentralized-identity/did-dht` (JS), or raw BEP44 lookups via any DHT client. For SCPID verification, DID documents MUST be cached for no more than 300 seconds. The general §3.10.4 caching policy (24h/7d) does NOT apply to SCPID verification — authentication requires current key state.
+1. **DID resolution.** QUERY the identity's routing ID, `SHA-256("scp:did:" || identifier_bytes)`, on the SCP relays the identity lists and on the bootstrap relays of §18.5.1; each stored blob is a DID-record frame (§9.10.12) whose `value` carries a segment of the identity's key-event log. Assemble the chain, recompute the identifier from its inception event, verify every event, and derive the DID document from the latest state-carrying event (§9.6.1). A relying party that holds no prior chain for the identity reads two independent relays, one of them in the fallback set (`09-security-model.md` §9.7.4.2 R11). For SCPID verification, DID documents MUST be cached for no more than 300 seconds. The general §3.10.4 caching policy (24h/7d) does NOT apply to SCPID verification — authentication requires current key state.
 
 2. **DID document parsing.** The document is W3C DID Core JSON (§18.2.2A). Extract the `verificationMethod` array and `authentication` relationship. Match `signing_key_id` to a verification method, confirm it appears in `authentication`, extract `publicKeyMultibase`. Decoding: strip the `z` prefix (multibase indicator for base58btc), base58btc-decode the remainder to get the raw 32-byte Ed25519 public key.
 
@@ -1386,4 +1343,4 @@ A service that wants to accept SCP DID authentication without running SCP softwa
 
 4. **Nonce management.** Store issued nonces with their `expires_at`. Reject duplicates. Prune expired entries. For distributed deployments, use a strongly-consistent store or HMAC-based nonce generation (§3.11.6).
 
-No SCP SDK, no MLS, no context management, no relay connections. The entire verification path is: one DHT lookup + one JSON parse + one SHA-256 + one Ed25519 verify.
+No SCP SDK, no MLS, and no context management. The verification path is: two relay QUERYs, the chain verification of §9.6.1, one JSON parse, one SHA-256, and one Ed25519 verify.

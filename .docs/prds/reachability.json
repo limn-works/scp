@@ -346,7 +346,7 @@
       "sources": [
         {
           "file": ".docs/specs/03-identity.md",
-          "section": "### 3.10.2 Layer 1: SCP Relay-Based Resolution"
+          "section": "### 3.10.2 Relay-Based Resolution"
         }
       ],
       "details": {
@@ -395,7 +395,7 @@
         },
         {
           "file": ".docs/specs/03-identity.md",
-          "section": "### 3.10.2 Layer 1: SCP Relay-Based Resolution"
+          "section": "### 3.10.2 Relay-Based Resolution"
         }
       ],
       "details": {
@@ -444,7 +444,7 @@
         },
         {
           "file": ".docs/specs/03-identity.md",
-          "section": "### 3.10.2 Layer 1: SCP Relay-Based Resolution"
+          "section": "### 3.10.2 Relay-Based Resolution"
         }
       ],
       "details": {
