@@ -325,7 +325,9 @@ MATURIN_PROJECT_FILES=(
 # reads as carrying a cargo feature-selection flag (`--features`, `-F`,
 # `--all-features`, `--no-default-features`, in every spelling cargo's option
 # grammar admits), normalized to single spaces with leading and trailing
-# whitespace removed.
+# whitespace removed. A command the file splits with a trailing backslash is
+# declared as the one line join_continued_lines makes of it, one space where
+# each break was, because that joined line is what the assertion reads.
 #
 # assert_shipping_invocations_are_gated compares the shipping files against this
 # list and FAILS on any difference, in either direction. The two `cargo test`
@@ -353,7 +355,8 @@ New-Item -ItemType Directory -Force napi-out | Out-Null
 EOF
 
 # Every line of a SHIPPING_FILES file that names an SCP package after `-p` while
-# compiling no shipped artifact, normalized the same way.
+# compiling no shipped artifact, normalized the same way, and joined the same
+# way when the file splits the command with a trailing backslash.
 #
 # assert_shipping_invocations_are_gated drops these lines before it reads
 # package names, and FAILS when a declared line no longer appears in any
@@ -1087,6 +1090,60 @@ normalize_shipping_lines() {
 }
 
 # ---------------------------------------------------------------------------
+# join_continued_lines <text>
+#   Emit the lines of <text> with every line that ends in a backslash joined to
+#   the line after it: the backslash goes, the next line's leading whitespace
+#   goes, and one space stands where the break was. A Dockerfile `RUN` and a
+#   workflow `run:` block both hand their text to a shell, and the shell reads a
+#   trailing backslash as a line continuation, so
+#
+#       cargo build --release -p \
+#           scp-testing
+#
+#   is the one command `cargo build --release -p scp-testing`. The two token
+#   readers below walk one line at a time, so without this join the `-p` on the
+#   first line receives an empty value, which its caller drops, and the package
+#   name on the second line is a token no reader looks at: the package ships
+#   under a passing gate. A feature flag split the same way still fails, because
+#   the flag itself stays on the first line, so only the package reader was
+#   blind, and the join runs before both readers so they read the same command.
+#
+#   The join fires on every trailing backslash, including one the shell would
+#   read as an escaped literal (`\\` at end of line). A join the shell did not
+#   perform merges two commands into one line the readers still walk token by
+#   token, and a merged line matches no declaration, so that error fails closed.
+#   A join the shell did perform and this function did not would fail open, so
+#   the function joins on the shell's spelling alone and never declines.
+#   PowerShell continues a line with a backtick, which this function does not
+#   read, so the PowerShell declarations above stay one line each.
+#
+#   Pure, so run_fixtures drives it with a split `-p` line and proves the
+#   package reader finds the name only after the join.
+# ---------------------------------------------------------------------------
+join_continued_lines() {
+  local line joined="" continuing=0
+  while IFS= read -r line; do
+    if (( continuing )); then
+      line="${line#"${line%%[![:space:]]*}"}"
+      joined="$joined $line"
+    else
+      joined="$line"
+    fi
+    if [[ "$joined" == *\\ ]]; then
+      joined="${joined%\\}"
+      joined="${joined%"${joined##*[![:space:]]}"}"
+      continuing=1
+      continue
+    fi
+    printf '%s\n' "$joined"
+    continuing=0
+  done <<<"$1"
+  if (( continuing )); then
+    printf '%s\n' "$joined"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # The option grammar cargo's argument parser (clap) accepts. Both readers below
 # walk the whitespace-separated tokens of a line under this grammar, so a line
 # carries an option when the grammar says it does, whichever of the accepted
@@ -1462,7 +1519,9 @@ $(printf '%s\n' "$dm_tree" | sed -E -n 's/^(scp-[a-z0-9-]+) v[0-9].*/\1/p')"
   gated_packages="$(printf '%s\n' "$gated_packages" | sed -E '/^$/d' | sort -u)"
 
   local shipping_lines built_packages ungated="" stale_pkg_lines
-  shipping_lines="$(cat "${SHIPPING_FILES[@]}")"
+  # Joined once here, so half 1, half 2, and both stale-declaration checks read
+  # the same command the shell runs, whatever line breaks the file spells it with.
+  shipping_lines="$(join_continued_lines "$(cat "${SHIPPING_FILES[@]}")")"
   built_packages="$(packages_built_by_shipping_lines "$shipping_lines" "$DECLARED_NON_SHIPPING_PACKAGE_LINES")"
   for pkg in $built_packages; do
     if ! printf '%s\n' "$gated_packages" | grep -xF "$pkg" >/dev/null; then
@@ -1757,6 +1816,46 @@ TREE
   done
   printf '%s\n' "$seen" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 8 >/dev/null; rc=$?
   expect "(shipping-drift, spellings) the three lines carrying no feature-selection flag are NOT read" "PASS" "$rc"
+
+  # (shipping-drift, continuation) the shell joins a line ending in a backslash
+  #     to the next one, so `-p \` followed by `scp-testing` on the next line is
+  #     the command `-p scp-testing`. An earlier revision read one line at a
+  #     time, so that split handed `-p` an empty value and left `scp-testing` an
+  #     unread token: `RUN cargo build --release -p scp-relay -p scp-node -p \`
+  #     over `    scp-testing` in Dockerfile passed G1. The split feature flag
+  #     is included to show the flag reader sees the joined line too, and the
+  #     PowerShell backtick line to show a backtick joins nothing. The unjoined
+  #     probe is read on purpose: the package must be ABSENT from it, or the
+  #     join is not what finds the package.
+  local split_probe joined_probe split_packages joined_packages
+  split_probe="$(printf '%s\n' \
+    'RUN cargo build --release -p scp-relay -p scp-node -p \' \
+    '    scp-testing' \
+    'run: cargo build --release --features \' \
+    '    scp-node/testing' \
+    '$cert = Import-PfxCertificate -FilePath $certPath `' \
+    '-Password (ConvertTo-SecureString -String $env:WINDOWS_SIGN_PWD -AsPlainText -Force)' \
+    'run: cargo build --release --package \' \
+    '    scp-clock')"
+  joined_probe="$(join_continued_lines "$split_probe")"
+  printf '%s\n' "$joined_probe" | grep -xF 'RUN cargo build --release -p scp-relay -p scp-node -p scp-testing' >/dev/null; rc=$?
+  expect "(shipping-drift, continuation) a trailing backslash joins the next line with one space where the break was" "PASS" "$rc"
+  printf '%s\n' "$joined_probe" | grep -xF 'run: cargo build --release --package scp-clock' >/dev/null; rc=$?
+  expect "(shipping-drift, continuation) a continued line at the end of the input is still emitted" "PASS" "$rc"
+  printf '%s\n' "$joined_probe" | grep -xF '$cert = Import-PfxCertificate -FilePath $certPath `' >/dev/null; rc=$?
+  expect "(shipping-drift, continuation) a PowerShell backtick joins nothing" "PASS" "$rc"
+  printf '%s\n' "$joined_probe" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 5 >/dev/null; rc=$?
+  expect "(shipping-drift, continuation) the eight split lines join into exactly five" "PASS" "$rc"
+  split_packages="$(packages_built_by_shipping_lines "$split_probe" "")"
+  printf '%s\n' "$split_packages" | grep -xF 'scp-testing' >/dev/null; rc=$?
+  expect "(shipping-drift, continuation) WITHOUT the join, the package on the continued line is NOT read (the join is load-bearing)" "FAIL" "$rc"
+  joined_packages="$(packages_built_by_shipping_lines "$joined_probe" "")"
+  for pkg in scp-testing scp-clock; do
+    printf '%s\n' "$joined_packages" | grep -xF "$pkg" >/dev/null; rc=$?
+    expect "(shipping-drift, continuation) WITH the join, the package $pkg on the continued line is READ" "PASS" "$rc"
+  done
+  lines_carrying_cargo_feature_selection "$joined_probe" | grep -xF 'run: cargo build --release --features scp-node/testing' >/dev/null; rc=$?
+  expect "(shipping-drift, continuation) the flag reader sees the joined feature line" "PASS" "$rc"
 
   # (wheel-drift) maturin takes the wheel's cargo feature list from the
   #     `[tool.maturin]` table of a pyproject.toml, which no shipping file
