@@ -726,21 +726,21 @@ Domain-based deployment is not a paid tier or a higher service level. Operators 
 
 TLS is required for all domain-based relay connections (§9.13). Self-hosted relays without a domain present a challenge: a laptop behind NAT with no domain cannot obtain a CA-signed TLS certificate, and self-signed certificates provide no trust benefit over plaintext (no trust anchor for the connecting peer to verify against).
 
-**Key decision: `ws://` (plaintext WebSocket) is permitted where `09-security-model.md` §9.13 permits it** — when the resolver took the relay URL from a key-event log it verified. §9.13 states that criterion and this section applies it to the tiers below; the relay list is key state carried in the log (§9.6.3), so a verified chain is a self-certifying source for a relay URL whichever storage layer served the chain, and the criterion is the verification rather than the layer.
+**Key decision: `ws://` (plaintext WebSocket) is permitted exactly where `09-security-model.md` §9.13 permits it.** §9.13 is the one home of that criterion and this section restates none of it; the table below records which tier each source falls on.
 
 | Relay type | Where the resolver took the URL | Transport | TLS required |
 |-----------|---------------|-----------|-------------|
 | Domain-based | `.well-known/scp` or explicit URL | `wss://` | Yes (§9.13) |
-| Self-hosted, no domain | the relay list of a verified key-event log | `ws://` permitted | No |
+| Self-hosted, no domain | the source §9.13's criterion admits | `ws://` permitted | No |
 | Self-hosted, with domain | Either | `wss://` | Yes |
 
 **Rationale.** TLS serves two purposes: confidentiality and server authentication.
 
 1. **Confidentiality** is already provided by MLS. Every blob delivered through a relay is MLS-encrypted before it reaches the transport layer (§10.5). TLS on the relay connection protects already-encrypted traffic — defense in depth, not the confidentiality boundary. Removing TLS from a self-hosted relay connection does not expose message content. The confidentiality guarantee is MLS, not TLS.
 
-2. **Server authentication** via TLS requires a domain name and a CA-signed certificate. A relay identified only by IP address behind NAT has no domain and cannot complete ACME challenges. Self-signed certificates provide no authentication benefit — any attacker can generate one. The key-event log itself is the authentication mechanism: a resolver recomputes the identifier from the chain's inception event and verifies every later event under the standing root (§9.6.1), and the relay list is a field of the key state that a root signature covers (§9.6.3). The relay URL a verified chain names IS the authenticated relay address — the trust anchor is the chain, not a TLS certificate and not the BEP44 signature, which is only a write rule.
+2. **Server authentication** via TLS requires a domain name and a CA-signed certificate. A relay identified only by IP address behind NAT has no domain and cannot complete ACME challenges. Self-signed certificates provide no authentication benefit — any attacker can generate one. What authenticates a relay URL instead is the chain of verifications §9.13's criterion names, and the trust anchor is that chain rather than a TLS certificate.
 
-**Enforcement constraint:** under §9.13's criterion the SDK rejects a `ws://` relay URL from `.well-known/scp` and from every other source that is not the relay list of a verified key-event log. That rejection is what stops a downgrade attack in which an attacker substitutes `ws://` URLs into HTTP-based discovery, which carries no signature binding the URL to the identity.
+**Enforcement constraint:** the SDK rejects a `ws://` relay URL from every source §9.13's criterion excludes, `.well-known/scp` among them. That rejection is what stops a downgrade attack in which an attacker substitutes `ws://` URLs into HTTP-based discovery, which carries no signature binding the URL to the identity.
 
 **Metadata tradeoff.** Without TLS, network intermediaries (ISPs, network operators) can observe the same metadata that any relay operator already sees (§9.9.1): connection timing, blob sizes, routing IDs. They cannot read MLS-encrypted content. This is an accepted tradeoff for the zero-config floor. The metadata exposure is not new — it is the same exposure the relay operator has. TLS merely prevents intermediaries other than the relay from seeing it.
 
