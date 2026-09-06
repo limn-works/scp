@@ -322,19 +322,22 @@ The legacy format `scp://broadcast/<context_id_hex>?relay=<url>` (§5.14.11) is 
 
 How a new identity learns its first relay. This closes the relay discovery open question from §00.
 
-### 18.5.1 Bootstrap Priority Order
+### 18.5.1 The Community Relay List and Bootstrap Priority Order
 
-When an identity needs to discover relays, the SDK follows this priority chain:
+**The community relay list is one shipped artifact, and this section defines it.** The SDK ships a fixed list of well-known community relays, identical in every language binding of one release. **Every entry declares three things: the relay's URL, the operator identity that runs it (the operator's 32-byte inception-derived identifier, `09-security-model.md` §9.7.4.2 R13), and whether the relay is free** (an entry with no `economic` field in `relay_config` is free). The list MUST carry at least one free entry, which is a protocol invariant that prevents economic gatekeeping of basic protocol operation (§19.8, §19.14). Two entries declaring one operator identity are two relays under one operator, and a rule that counts independent sources counts them once. These relays are not privileged: they are default suggestions a deployer overrides.
+
+**The fallback set of `09-security-model.md` §9.7.4.2 draws from this artifact and from no other source.** It is the entries of this list an identity's own service record does not name. No level of the priority chain below feeds it: a relay a deployer configured, a relay a `.well-known` document advertised, and a relay a peer supplied are all outside the fallback set unless this list carries them, because the whole property the fallback set delivers is that the identity being resolved did not choose the source.
+
+**Transport relay discovery follows a separate priority chain**, which selects relays to connect to and never populates the fallback set:
 
 1. **Explicit configuration.** Relay URLs provided directly in `TransportConfig` at SDK initialization. Highest trust — the operator or user explicitly chose these relays.
-2. **DID document resolution.** Resolve the identity's own DID document via Mainline DHT. Extract `SCPRelay` service entries. Self-certifying (§9.6.3).
-3. **`.well-known/scp` resolution.** If a bootstrap domain is configured, fetch `https://<domain>/.well-known/scp` and extract the relay URL. Verify against DID document (§18.3.2).
-4. **Peer relay discovery.** For identities that share contexts with known peers, resolve the peer's DID document and use overlapping relay sets. This enables relay discovery through the social graph.
-5. **Fallback relay list.** A hardcoded list of well-known community relays shipped with the SDK. Last resort. These relays are not privileged — they are default suggestions that can be overridden. The SDK SHOULD warn when falling back to default relays. The fallback list MUST include at least one free relay (no `economic` field in `relay_config`) — this is a protocol invariant that prevents economic gatekeeping of basic protocol operation (§19.8, §19.14).
+2. **`.well-known/scp` resolution.** If a bootstrap domain is configured, fetch `https://<domain>/.well-known/scp` and extract the relay URL. Verify it against the identity's service record (`03-identity.md` §3.10.13, §18.3.2).
+3. **Peer relay discovery.** For identities that share contexts with known peers, resolve the peer's service record (`03-identity.md` §3.10.13) and use overlapping relay sets. This enables relay discovery through the social graph.
+4. **The community relay list above.** Last resort for transport. The SDK SHOULD warn when it falls back to these relays for transport.
 
-Each priority level is tried in order. The first level that yields at least one reachable relay is used. The SDK MAY combine results from multiple levels (e.g., explicit + DID document) for suppression resistance.
+Each priority level is tried in order. The first level that yields at least one reachable relay is used. The SDK MAY combine results from multiple levels for suppression resistance. **The Mainline DHT is not a level and no level resolves a DID document**: ADR-063, the inception-derived key-event-log identity substrate, replaced both with the key-event log the SCP relay network carries (`03-identity.md` §3.10.2).
 
-Bootstrap relays SHOULD support STUN service (§10.12.3) — this makes them available as NAT type detection endpoints for self-hosted relays behind residential NAT. Bootstrap relays also serve as DID resolution endpoints: identity owners SHOULD publish DID documents to bootstrap relays via the relay-based resolution layer (§3.10.2), and resolvers SHOULD query bootstrap relays when the identity's own relays are unknown.
+Community relays SHOULD support STUN service (§10.12.3) — this makes them available as NAT type detection endpoints for self-hosted relays behind residential NAT. They also serve as identity-resolution endpoints: identity owners MUST publish their key-event record and their service record to the community relays of their fallback set (`03-identity.md` §3.10.6), and resolvers query them on every first contact (`09-security-model.md` §9.7.4.2 R11).
 
 ### 18.5.2 Agent Deployment Case
 
