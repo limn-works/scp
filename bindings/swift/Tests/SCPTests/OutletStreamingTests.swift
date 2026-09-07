@@ -48,8 +48,9 @@ final class OutletStreamingTests: XCTestCase {
 
     func testInvokeReturnsHandleWithoutOpening() async throws {
         let native = try FakeNative(chunks: [dataChunk(0, ["n": 1]), endChunk(1, aggregate: ["n": 1])])
-        let handle = invoke(native)
-        XCTAssertTrue(handle is InvocationHandle)
+        // `invoke` returns `InvocationHandle`, so its type needs no assertion,
+        // and this case reads what the handle did rather than what it is.
+        _ = invoke(native)
         // Lazy open: invoke() must not have opened the stream yet.
         let openCalls = await native.openCalls
         XCTAssertTrue(openCalls.isEmpty)

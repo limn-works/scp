@@ -790,8 +790,21 @@ pub trait PreRotationCustody: Send + Sync {
 /// Device attestation trait.
 ///
 /// Abstracts platform-specific device attestation (Apple App Attest, Android
-/// `SafetyNet` / Play Integrity). The testing implementation returns synthetic
-/// attestation tokens that always verify. See ADR-006.
+/// `SafetyNet` / Play Integrity). ADR-006, the platform abstraction, in
+/// `.docs/adrs/phase-1.md` defines this trait signature.
+///
+/// `InMemoryDeviceAttestation`, the `testing`-gated implementation in
+/// `crate::testing`, mints tokens carrying the byte prefix
+/// `scp-test-attestation-v1:` followed by a sequence number. Its
+/// [`verify`](DeviceAttestation::verify) returns `true` for a token carrying
+/// that prefix and `false` for every token that does not. Two unit tests in
+/// that module, `verify_foreign_token_returns_false` and
+/// `verify_empty_token_returns_false`, pin the rejecting branch.
+///
+/// Each platform adapter states the criterion its own `verify` applies. ADR-025,
+/// the Apple platform adapter, in `.docs/adrs/phase-5.md` states the Apple
+/// criterion in acceptance criterion 3, which governs
+/// `AppleDeviceAttestation.verify` in place of ADR-006 alone.
 pub trait DeviceAttestation: Send + Sync {
     /// Generate a device attestation token.
     ///
