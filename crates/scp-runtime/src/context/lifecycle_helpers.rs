@@ -1684,6 +1684,9 @@ pub async fn create_context(
             initial_members,
             &context_id,
             Arc::clone(&deps.clock),
+            // The creator at genesis: no governance action has run, so the live
+            // registry equals the genesis declaration (GitHub #2020).
+            crate::context::state::OutletRegistrySeed::GenesisDeclaration,
         ),
         role_state,
         receive_buffer: ReceiveBuffer::new(),

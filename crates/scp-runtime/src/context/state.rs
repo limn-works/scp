@@ -1894,20 +1894,84 @@ pub(crate) fn create_governance_engine(
     }
 }
 
+/// Says whether the caller of [`fresh_governance_state`] may seed the live
+/// outlet registry from the immutable genesis declaration `ContextParams.outlets`.
+///
+/// `ContextParams` is frozen at genesis: `governance_helpers::execute_remove_outlet`
+/// deletes an outlet from the live `GovernanceState::registered_outlets` and
+/// writes nothing back to `params`, so `params.outlets` records what the creator
+/// declared and never records what governance later revoked. Registry membership
+/// is an authorization grant — `actor::handlers::saga` rejects a cross-context
+/// `PrepareB` whose outlet id is absent from `registered_outlets` — so installing
+/// the genesis declaration at a moment when governance may already have revoked
+/// an entry grants authority the context withdrew.
+///
+/// The two genesis callers stand at different points in the context's life, so
+/// they get different variants (GitHub #2250).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum OutletRegistrySeed {
+    /// The creator, inside `builder::create_context`, at genesis. No governance
+    /// action has run yet, so the live registry equals `params.outlets` by
+    /// construction. `validate_params` has already bounded the count by
+    /// [`MAX_REGISTERED_OUTLETS`].
+    GenesisDeclaration,
+    /// A Welcome-joiner, inside `Supervisor::build_welcome_joiner_state`, at an
+    /// arbitrary later epoch. This joiner has read no live registry, so it starts
+    /// empty and converges from the authenticated `OutletRegistered` /
+    /// `OutletRemoved` event-log leaves, which are the only record that carries
+    /// removals (§5.4: "silent outlet modification is not possible — any change is
+    /// visible to all context members"). Until those leaves replicate, every
+    /// registry read on the joiner finds nothing and the outlet-invocation paths
+    /// fail closed with `PermissionDenied`, which a caller can detect. Seeding
+    /// from `params.outlets` instead would answer those reads with a stale genesis
+    /// snapshot that cannot express a removal.
+    AwaitingLeafReplication,
+}
+
+/// Rejects a genesis outlet declaration larger than the per-context registry cap.
+///
+/// Both entrypoints that accept a `ContextParams` and reach
+/// [`fresh_governance_state`] call this: `builder::validate_params` for the
+/// creator's own parameters, and `Supervisor::spawn_actor_from_welcome`'s
+/// Precheck C for the creator-signed parameters a joiner receives from a peer.
+/// `governance_helpers::execute_register_outlet` enforces the same
+/// [`MAX_REGISTERED_OUTLETS`] bound on the runtime governance-registration path,
+/// so no path that puts an `OutletRegistration` into a context escapes the bound
+/// (GitHub #2250).
+///
+/// # Errors
+///
+/// Returns [`ContextCreationError::CreationFailed`] when `outlets` holds more
+/// than [`MAX_REGISTERED_OUTLETS`] entries.
+pub(crate) fn validate_genesis_outlet_count(
+    outlets: &[OutletRegistration],
+) -> Result<(), ContextCreationError> {
+    if outlets.len() > MAX_REGISTERED_OUTLETS {
+        return Err(ContextCreationError::CreationFailed(format!(
+            "genesis outlet count {} exceeds the per-context limit of {MAX_REGISTERED_OUTLETS}",
+            outlets.len(),
+        )));
+    }
+    Ok(())
+}
+
 /// Builds the fresh-context [`GovernanceState`] shared by BOTH the creator-side
 /// create path ([`crate::context::lifecycle_helpers::create_context`]) and the
 /// join-side spawn-from-Welcome path
 /// ([`crate::context::supervisor::Supervisor::build_welcome_joiner_state`]).
 ///
 /// Both entrypoints stand up an identical fresh governance bucket — empty
-/// proposal/outlet/ceiling/economy maps, the matrix-default hard rate limiter, a
+/// proposal/ceiling/economy maps, the matrix-default hard rate limiter, a
 /// 60-second velocity window, and a fresh spending-nonce tracker — differing
 /// only in the already-built `engine`, the initial `last_known_members` roster,
-/// and the `context_id`/`clock` the nonce tracker binds. Extracting the field
-/// set here means the two paths cannot silently DRIFT: a new `GovernanceState`
-/// field forces one edit, not two. The import/restore paths are deliberately
-/// NOT routed through this helper — they populate the bucket from a persisted
-/// snapshot, not from fresh defaults.
+/// the `context_id`/`clock` the nonce tracker binds, and the `outlet_seed` the
+/// caller states. Extracting the field set here means the two paths cannot
+/// silently DRIFT: a new `GovernanceState` field forces one edit, not two. The
+/// outlet registry is the one field the two paths deliberately differ on, and
+/// [`OutletRegistrySeed`] makes each caller declare which it is rather than
+/// leaving the difference to a literal at the call site. The import/restore
+/// paths are deliberately NOT routed through this helper — they populate the
+/// bucket from a persisted snapshot, not from fresh defaults.
 ///
 /// The threshold signer set + quorum value are derived from
 /// `params.governance` here (empty / zero for non-`Threshold` models), matching
@@ -1918,6 +1982,7 @@ pub(crate) fn fresh_governance_state(
     last_known_members: HashSet<DID>,
     context_id: &str,
     clock: Arc<dyn Clock>,
+    outlet_seed: OutletRegistrySeed,
 ) -> GovernanceState {
     let (threshold_signers, threshold_value) = match &params.governance {
         GovernanceModel::Threshold { threshold, signers } => (signers.clone(), *threshold),
@@ -1932,19 +1997,15 @@ pub(crate) fn fresh_governance_state(
         deadlock: DeadlockDetectionState::default(),
         pending_ceiling_modification: None,
         pending_economic_policy_change: None,
-        // §5.1/§5.12: outlets are declared at creation. Seed the genesis-declared
-        // `params.outlets` into the live registry here — the single shared helper
-        // for the create AND Welcome-join genesis paths, so a creator and a
-        // welcome-joiner install the SAME initial outlet set and the two paths
-        // cannot drift (GitHub #2020). The authenticated provenance record — an
-        // `OutletRegistered` event-log leaf per genesis outlet (§5.4: "silent
-        // outlet modification is not possible") — is appended by the creator's
-        // authoritative genesis writer (`builder::create_context`, alongside the
-        // `ContextCreated`/`MemberJoined` leaves) and travels to joiners via log
-        // replication, exactly as the `ContextCreated` leaf does. The creator's
-        // count is bounded by `validate_params` (`MAX_REGISTERED_OUTLETS`) before
-        // this runs; a joiner's `params` are the creator-validated set.
-        registered_outlets: params.outlets.clone(),
+        // §5.1/§5.12: outlets are declared at creation, so the creator seeds the
+        // live registry from `params.outlets` (GitHub #2020). The caller states
+        // which genesis path it is on, because only the creator may read the
+        // immutable genesis declaration as the live registry — see
+        // [`OutletRegistrySeed`] for why a Welcome-joiner may not.
+        registered_outlets: match outlet_seed {
+            OutletRegistrySeed::GenesisDeclaration => params.outlets.clone(),
+            OutletRegistrySeed::AwaitingLeafReplication => Vec::new(),
+        },
         outlet_interfaces: Vec::new(),
         pruning_policy: None,
         message_pricing: crate::context::lifecycle_logic::derive_message_pricing(

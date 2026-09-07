@@ -13678,6 +13678,15 @@ impl Supervisor {
         scp_protocol::context::roles::CapabilityCeiling::new(params.ceiling.iter().cloned())
             .validate_entries()
             .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
+        // Genesis outlet-count bound (§5.9). `builder::validate_params` runs this
+        // on the creator's own parameters, and `create_context` is its only caller,
+        // so a joiner — whose `params` arrive from a peer — would otherwise accept
+        // an outlet declaration of any length and retain it in `handle` and in the
+        // persisted `context_params`. Call the SAME validator here, on the same
+        // `params`, so the bound holds on both sides of the invitation (GitHub
+        // #2250).
+        crate::context::state::validate_genesis_outlet_count(&params.outlets)
+            .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
 
         // Build the joiner's actor deps (crypto, transport, event log, KP store,
         // mls_storage, persistence, capability token) for the owning identity.
@@ -14186,6 +14195,12 @@ impl Supervisor {
                 initial_members,
                 context_id,
                 Arc::clone(&deps.clock),
+                // A joiner arrives at an arbitrary later epoch, and `params` is the
+                // frozen genesis declaration, which records no outlet that
+                // governance removed after genesis. The joiner's registry therefore
+                // starts empty and converges from the authenticated
+                // `OutletRegistered`/`OutletRemoved` leaves (GitHub #2250).
+                crate::context::state::OutletRegistrySeed::AwaitingLeafReplication,
             ),
             role_state,
             receive_buffer: scp_protocol::context::membership::ReceiveBuffer::new(),

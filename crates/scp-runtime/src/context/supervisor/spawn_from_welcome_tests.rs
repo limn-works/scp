@@ -690,7 +690,8 @@ async fn spawn_from_welcome_yields_a_live_send_capable_actor() {
 }
 
 // ---------------------------------------------------------------------------
-// Test A1b — the joiner INSTALLS the genesis-declared outlets (GitHub #2020).
+// Test A1b — the joiner does NOT install the genesis outlet declaration
+// (GitHub #2250, on top of the genesis-seeding fix for GitHub #2020).
 // ---------------------------------------------------------------------------
 
 /// Builds a minimal valid genesis [`OutletRegistration`] fixture (GitHub #2020),
@@ -717,20 +718,25 @@ fn genesis_outlet(outlet_id: &str) -> scp_protocol::context::outlets::OutletRegi
     }
 }
 
-/// §5.1/§5.12 (GitHub #2020): a Welcome-joiner INSTALLS the genesis-declared
-/// `params.outlets` into its live registry (via the shared
-/// `state::fresh_governance_state`), so the joiner sees the SAME initial outlet
-/// set the creator declared at genesis. Before the fix the join path dropped
-/// `params.outlets`, so a joiner's registry came up empty.
+/// A Welcome-joiner's live outlet registry starts EMPTY, even when the
+/// creator-signed `ContextParams.outlets` declares outlets (GitHub #2250).
 ///
-/// The joiner appends NO local `OutletRegistered` leaf — those are
-/// creator-authoritative and converge via event-log leaf replication, exactly
-/// like `ContextCreated`/`MemberJoined` (Test A). The installed set is asserted
-/// on the joiner's persisted Class-S snapshot, which the spawn writes fail-closed
-/// BEFORE registering the actor, so it is a faithful read of the joiner's live
-/// `governance.registered_outlets`.
+/// `ContextParams` freezes at genesis: `execute_remove_outlet` deletes an outlet
+/// from the live `governance.registered_outlets` and writes nothing back to
+/// `params`, so `params.outlets` cannot express a removal. A joiner that seeded
+/// its registry from `params.outlets` would therefore re-install every outlet
+/// governance had already revoked, and registry membership authorizes — the
+/// cross-context saga rejects a `PrepareB` whose outlet id is absent from
+/// `registered_outlets`. The joiner instead starts empty and converges from the
+/// authenticated `OutletRegistered` / `OutletRemoved` leaves, which do carry
+/// removals, so an unreplicated registry read fails closed rather than granting
+/// revoked authority.
+///
+/// The registry is asserted on the joiner's persisted Class-S snapshot, which the
+/// spawn writes fail-closed BEFORE registering the actor, so it is a faithful read
+/// of the joiner's live `governance.registered_outlets`.
 #[tokio::test]
-async fn welcome_joiner_installs_genesis_outlets() {
+async fn welcome_joiner_does_not_install_the_genesis_outlet_declaration() {
     let params = ContextParams {
         outlets: vec![genesis_outlet("alpha"), genesis_outlet("beta")],
         ..joiner_params()
@@ -744,26 +750,41 @@ async fn welcome_joiner_installs_genesis_outlets() {
         None,
     )
     .await;
-    result.expect("welcome join succeeds with genesis outlets");
+    result.expect("welcome join succeeds with genesis outlets declared in params");
 
     let snapshot = rec
         .store
         .get(&j.ctx_id)
         .map(|e| e.value().clone())
         .expect("the joiner persisted a Class-S snapshot before spawning");
-    let ids: Vec<&str> = snapshot
-        .registered_outlets
-        .iter()
-        .map(|o| o.outlet_id.as_str())
-        .collect();
-    assert_eq!(
-        ids,
-        vec!["alpha", "beta"],
-        "the joiner installs the creator's genesis-declared outlets into its live registry"
+    assert!(
+        snapshot.registered_outlets.is_empty(),
+        "the joiner installs no outlet from the frozen genesis declaration; it \
+         converges from the authenticated leaves, which alone carry removals — \
+         found {:?}",
+        snapshot
+            .registered_outlets
+            .iter()
+            .map(|o| o.outlet_id.as_str())
+            .collect::<Vec<_>>()
     );
 
-    // No joiner-local OutletRegistered leaf: the joiner reconstructs its registry
-    // from `params` and converges the authenticated leaves via replication.
+    // Non-vacuity: the declaration the joiner declined to install DID reach the
+    // joiner, on the params it persisted. The empty registry is a decision about
+    // `params.outlets`, not an empty input.
+    assert_eq!(
+        snapshot
+            .context_params
+            .outlets
+            .iter()
+            .map(|o| o.outlet_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "beta"],
+        "the creator-signed genesis declaration reached the joiner's params"
+    );
+
+    // No joiner-local OutletRegistered leaf either: those leaves are
+    // creator-authoritative and converge via replication.
     assert!(
         j.sup
             .event_log_entries(&j.ctx_bytes)
@@ -772,6 +793,88 @@ async fn welcome_joiner_installs_genesis_outlets() {
                 .iter()
                 .all(|e| e.event_type != scp_event_log::EventType::OutletRegistered)),
         "joiner emits no local OutletRegistered leaf; genesis leaves converge via replication"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test A1c — an over-cap genesis outlet declaration is rejected BEFORE the KP
+// consume (GitHub #2250).
+// ---------------------------------------------------------------------------
+
+/// `builder::validate_params` bounds the genesis outlet count by
+/// `MAX_REGISTERED_OUTLETS`, and `create_context` is its only caller, so the bound
+/// held on the creator's own parameters and on nothing a peer sent. Precheck C now
+/// calls the same validator, so a creator-signed bundle declaring more outlets than
+/// the cap is refused on the joiner too.
+///
+/// The refusal is a REVERSIBLE precheck: it fires before the irreversible
+/// `ConfirmConsume`, so the single-use `KeyPackage` is NOT burned. Non-vacuity: the
+/// SAME reservation + Welcome, retried with an at-cap declaration, then succeeds.
+#[tokio::test]
+async fn over_cap_genesis_outlets_are_rejected_before_the_kp_consume() {
+    let bob = DID::from(BOB_DID);
+    let ctx_id = ctx_hex(0x2d);
+
+    let (sup, _bob_crypto) = bob_supervisor(None);
+    let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
+    let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
+
+    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    let params_with = |count: usize| ContextParams {
+        outlets: (0..count)
+            .map(|i| genesis_outlet(&format!("outlet-{i}")))
+            .collect(),
+        ..joiner_params()
+    };
+    let make_req = |count: usize| {
+        let bundle = signed_bundle(
+            &alice_signing_key(),
+            &DID::from(ALICE_DID),
+            &ctx_id,
+            &params_with(count),
+            welcome.clone(),
+        );
+        seal_bundle(
+            &bundle,
+            &bob_recipient,
+            &ctx_id,
+            &DID::from(ALICE_DID),
+            reservation_id.clone(),
+            some_pseudonym(),
+        )
+    };
+
+    let over_cap = crate::context::state::MAX_REGISTERED_OUTLETS + 1;
+    let err = sup
+        .spawn_actor_from_welcome(bob.clone(), &bob_custody, &bob_handle, make_req(over_cap))
+        .await
+        .expect_err("an over-cap genesis outlet declaration must be refused on the joiner");
+    let crate::context::ContextError::CreationFailed(message) = &err else {
+        panic!("expected CreationFailed for an over-cap outlet declaration, got {err:?}");
+    };
+    assert!(
+        message.contains("genesis outlet count"),
+        "the refusal must name the outlet-count bound (not some other precheck), got {message}"
+    );
+    assert!(
+        sup.lookup(&ctx_id).is_none(),
+        "no actor may be registered after an over-cap outlet rejection"
+    );
+
+    // KP NOT burned: the same reservation + Welcome succeed with a within-cap
+    // declaration, so the rejection happened before `ConfirmConsume`. The
+    // within-cap count is 0 here because `alice_welcome_for` commits
+    // `joiner_params()` into the group's `0xFF02` extension, and the §5.13.3
+    // cross-check runs against that committed set; the 2-outlet join in Test A1b
+    // shows the joiner accepts a non-empty declaration, so the refusal above is a
+    // bound on the count, not a refusal of outlets.
+    sup.spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, make_req(0))
+        .await
+        .expect("the within-cap retry succeeds — the KeyPackage was never burned");
+    assert_eq!(
+        sup.member_count(&ctx_id).await,
+        Some(2),
+        "the within-cap retry stands up the live joiner actor"
     );
 }
 

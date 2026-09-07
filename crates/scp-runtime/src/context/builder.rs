@@ -823,19 +823,16 @@ fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
     // policy is Governed, that is technically valid (no capabilities to
     // narrow). No structural constraint to enforce here.
 
-    // §5.1/§5.12: outlets are declared at creation and installed into the live
-    // registry (GitHub #2020). Reject a genesis outlet set that would exceed the
-    // per-context registry cap here, at creation, so the genesis-seeding path
+    // §5.1/§5.12: outlets are declared at creation and the creator installs them
+    // into the live registry (GitHub #2020). Reject a genesis outlet set larger
+    // than the per-context registry cap, so the genesis-seeding path
     // (`state::fresh_governance_state`) and the runtime governance-registration
     // path (`governance_helpers::execute_register_outlet`) enforce the SAME
-    // `MAX_REGISTERED_OUTLETS` bound — no genesis bypass of the cap.
-    if params.outlets.len() > crate::context::state::MAX_REGISTERED_OUTLETS {
-        return Err(ContextCreationError::CreationFailed(format!(
-            "genesis outlet count {} exceeds the per-context limit of {}",
-            params.outlets.len(),
-            crate::context::state::MAX_REGISTERED_OUTLETS,
-        )));
-    }
+    // `MAX_REGISTERED_OUTLETS` bound — no genesis bypass of the cap. A joiner
+    // receives its `params` from a peer rather than from this caller, so
+    // `Supervisor::spawn_actor_from_welcome`'s Precheck C calls the SAME
+    // validator on the creator-signed parameters (GitHub #2250).
+    crate::context::state::validate_genesis_outlet_count(&params.outlets)?;
 
     // Validate memory scope is permitted for the context mode (§5.11).
     // Broadcast contexts only support MemoryScope::Full — Ephemeral and
@@ -1132,9 +1129,12 @@ pub async fn create_context(
     // outlets are UNIFORM authenticated log leaves (§5.4: "silent outlet
     // modification is not possible — any change is visible to all context
     // members"). The corresponding live-registry seed happens in
-    // `state::fresh_governance_state`; a Welcome-joiner receives these leaves via
-    // log replication (dormant today, exactly like the `ContextCreated` leaf) and
-    // seeds its own registry from the same `params.outlets`. `actor_did` is the
+    // `state::fresh_governance_state`, which seeds from `params.outlets` for THIS
+    // creator alone (`OutletRegistrySeed::GenesisDeclaration`); a Welcome-joiner
+    // builds its registry from these leaves once log replication lands (dormant
+    // today, exactly like the `ContextCreated` leaf) and never from
+    // `params.outlets`, because the frozen genesis declaration records no removal
+    // that governance made after genesis (GitHub #2250). `actor_did` is the
     // creator (the genesis declarant), and every leaf carries the convergent
     // creator-assigned `creation_timestamp_secs` (§7.3.1, §9.9.3). A failure
     // rolls back the whole creation, exactly like the leaves above.
