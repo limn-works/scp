@@ -157,8 +157,9 @@ directory matches no agent file, so an emptied directory reports a failure
 instead of passing over nothing),
 check-doc-citations.py (every `§N.M` citation in `.docs/standards/`,
 `.docs/lessons/`, `.claude/agents/` and CLAUDE.md names a heading its spec file
-contains, or carries the literal marker `[no such section]`; the check holds no
-per-site allowlist),
+contains, or carries the literal marker `[no such section]` on that same line,
+which exempts the one occurrence beside it and exempts no other occurrence in
+the file; the check holds no per-site allowlist),
 pretooluse-enforcement-files.sh,
 CLAUDE.md (enforcement sections).
 When a check fails, fix the code that the check rejected. You may modify an enforcement file for exactly two reasons:

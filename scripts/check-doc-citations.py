@@ -3,12 +3,18 @@
 
 CRITERION
     Every `§N.M` citation in a governing artifact names a heading that exists in
-    `.docs/specs/N-*.md`, or the citing file declares that the citation resolves to
-    nothing by writing the reference once followed by the literal marker
-    `[no such section]`.
+    `.docs/specs/N-*.md`, or the citing line itself declares that the citation resolves
+    to nothing by carrying the literal marker `[no such section]` directly after the
+    reference on that same line. The marker exempts the one occurrence it sits beside
+    and exempts no other occurrence, including a second occurrence of the same reference
+    further down the same file, because a reader who reaches an unmarked occurrence sees
+    no marker and goes looking for a section the spec does not carry. A marker scoped to
+    the whole file would let one marker launder every unmarked twin in that file, which
+    is the per-site allowlist the section below refuses.
 
-    `.docs/standards/concrete-prose.md` states the rule this check enforces: "Name the
-    thing first, then give the identifier so the reader can find it." A number that
+    `.docs/standards/concrete-prose.md` states both rules this check enforces: "Name the
+    thing first, then give the identifier so the reader can find it", and write a dead
+    reference "followed by `[no such section]` on the same line". A number that
     resolves to nothing leaves the reader unable to decide whether the spec lost the
     section or the author invented it. `.docs/lessons/bad-prose-and-its-rewrite.md`
     records the citation that prompted this check: §18.11.13.2 of the addressability and
@@ -40,10 +46,14 @@ USAGE
     python3.12 scripts/check-doc-citations.py [--self-test]
 
     --self-test builds a scratch tree holding one resolving citation, one dead citation,
-    one dead citation carrying the marker, one RFC citation, and one citation to a
-    number that names no spec file. It then asserts the scanner reports exactly the
-    unmarked dead one. Run it before the real scan: a scanner that reports nothing on a
-    tree with a planted defect proves nothing about the tree it scans next.
+    one dead citation carrying the marker, one RFC citation, one citation to a number
+    that names no spec file, and one file that marks a dead reference on its first line
+    and repeats that same reference unmarked on a later line. It then asserts the
+    scanner reports exactly the two unmarked dead citations. The repeated reference is
+    the case a file-wide marker test passes and a same-line marker test fails, so the
+    self-test goes red if anyone widens the marker back to the whole file. Run it before
+    the real scan: a scanner that reports nothing on a tree with a planted defect proves
+    nothing about the tree it scans next.
 """
 
 from __future__ import annotations
@@ -122,7 +132,7 @@ def scan(root: Path) -> list[tuple[Path, int, str]]:
                     heading_cache[top] = headings(specs[top])
                 if ref in heading_cache[top]:
                     continue
-                if f"§{ref} {MARKER}" in text:
+                if f"§{ref} {MARKER}" in line:
                     continue
                 failures.append((path, number, ref))
     return failures
@@ -146,6 +156,13 @@ The passage cites §18.11.13.2 [no such section], which this scratch spec does n
 SELF_TEST_BAD = """The addressability and deployment spec says, in §18.11.99, that a verifier reads JSON.
 """
 
+# One marked occurrence and one unmarked occurrence of the same reference in one file.
+# A marker test scoped to the whole file passes this; a marker test scoped to the citing
+# line reports the second line.
+SELF_TEST_TWIN = """The passage cites §18.11.13.2 [no such section], which no merged spec carries.
+A later paragraph repeats §18.11.13.2 and carries no marker of its own.
+"""
+
 
 def self_test() -> int:
     """Prove the scanner reports a planted dead citation and nothing else."""
@@ -158,17 +175,22 @@ def self_test() -> int:
         lessons.mkdir(parents=True)
         (lessons / "good.md").write_text(SELF_TEST_GOOD)
         (lessons / "bad.md").write_text(SELF_TEST_BAD)
+        (lessons / "twin.md").write_text(SELF_TEST_TWIN)
 
         failures = scan(root)
-        got = sorted((f.name, ref) for f, _, ref in failures)
-        want = [("bad.md", "18.11.99")]
+        got = sorted((f.name, line, ref) for f, line, ref in failures)
+        want = [("bad.md", 1, "18.11.99"), ("twin.md", 2, "18.11.13.2")]
         if got != want:
             print(f"SELF-TEST FAILED: expected {want}, scanner reported {got}")
             return 1
-    print("SELF-TEST PASSED: the scanner reports a planted dead citation and skips")
     print(
-        "  a resolving citation, an RFC citation, a non-spec number, and a marked one."
+        "SELF-TEST PASSED: the scanner reports both planted dead citations, including"
     )
+    print("  the unmarked repeat of a reference the same file marks one line earlier,")
+    print(
+        "  and skips a resolving citation, an RFC citation, a non-spec number, and the"
+    )
+    print("  occurrence that carries the marker on its own line.")
     return 0
 
 
@@ -190,7 +212,7 @@ def main() -> int:
     print(
         "Fix the number, or, when the file quotes a dead citation as evidence, write the"
     )
-    print(f"reference once followed by the literal marker `{MARKER}`.\n")
+    print(f"marker `{MARKER}` after the reference on each line listed below.\n")
     for path, line, ref in failures:
         print(f"  {path.relative_to(root)}:{line}: §{ref}")
     return 1

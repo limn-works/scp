@@ -15,16 +15,20 @@ Configuration, and stops there, so §18.11.13.2 [no such section] resolves to no
 spec. A reader who opens
 that spec today therefore cannot check the sentence the passage quotes, and cannot tell
 whether the spec lost the section or the agent invented it. The rewrite below drops that
-citation and cites two sections a reader can open.
+citation and cites two sections a reader can open. Every citation of that withdrawn
+number below carries the bracketed marker `[no such section]`, which this lesson inserted
+and the quoted agent did not write, because `scripts/check-doc-citations.py` requires the
+marker beside each occurrence rather than once per file.
 
 ## The passage
 
 > My reasoning was weaker than the real argument. Both rationales I gave you indict the
 > envelope exactly as hard as the attestation, so neither justified cutting only one. The
-> decisive argument is self-contained: §18.11.13.2 claims "no decryption, no MessagePack,
-> no AEAD, no key" — and that claim is false while row 10 exists, because the provenance
-> hash is defined over MessagePack while the document serves JSON. Cutting row 10 is what
-> makes the spec's own claim true. No §24.3.5 reasoning needed.
+> decisive argument is self-contained: §18.11.13.2 [no such section] claims "no
+> decryption, no MessagePack, no AEAD, no key" — and that claim is false while row 10
+> exists, because the provenance hash is defined over MessagePack while the document
+> serves JSON. Cutting row 10 is what makes the spec's own claim true. No §24.3.5
+> reasoning needed.
 
 ## What fails, sentence by sentence
 
@@ -33,8 +37,8 @@ citation and cites two sections a reader can open.
 | "My reasoning was weaker than the real argument." | Report, do not appraise. Delete modifiers a reader cannot check. | The whole sentence appraises the author's own earlier work and carries no claim. "Weaker" has no scale, and "the real argument" names nothing. |
 | "indict the envelope exactly as hard as the attestation" | Resist metaphor. | Rationales do not indict anything. The literal claim — each rationale applies equally to three rows, so no rationale selects one row — disappears behind the figure. |
 | "justified cutting only one" | Give every verb its object. | "Cutting" has no agent and no source. The reader cannot tell who cuts what out of which artifact. |
-| "§18.11.13.2 claims" and "No §24.3.5 reasoning needed" | Never reference by an identifier alone. | Neither citation names its spec. A reader without both section numbers memorized must open two files before the sentence resolves. |
-| "§18.11.13.2" | Never reference by an identifier alone: the rule asks that the reader can find the thing. | The merged addressability and deployment spec numbers §18.11 up to §18.11.12 and carries nothing past it, because the thirteenth subsection the author was reading sits on a branch nobody has merged. A reader who opens the file to check the quoted sentence cannot tell whether the spec lost a section, the author invented one, or the author cited a draft. |
+| "§18.11.13.2 [no such section] claims" and "No §24.3.5 reasoning needed" | Never reference by an identifier alone. | Neither citation names its spec. A reader without both section numbers memorized must open two files before the sentence resolves. |
+| "§18.11.13.2 [no such section]" | Never reference by an identifier alone: the rule asks that the reader can find the thing. | The merged addressability and deployment spec numbers §18.11 up to §18.11.12 and carries nothing past it, because the thirteenth subsection the author was reading sits on a branch nobody has merged. A reader who opens the file to check the quoted sentence cannot tell whether the spec lost a section, the author invented one, or the author cited a draft. |
 | "the provenance hash is defined over MessagePack" | Active voice. | The passive hides the definer. Row 10 defines the hash, and row 10 is the thing under discussion, so the sentence deletes its own subject. |
 | "while the document serves JSON" | No contradictory readings. | "While" reads as either "during the time that" or "whereas". Both readings survive, and they support different conclusions. |
 | "Cutting row 10 is what makes the spec's own claim true." | Active voice. Concision. | The cleft construction deletes the agent and spends six words reaching the verb. |
@@ -64,10 +68,12 @@ tell agents how to write: `.docs/standards/`, `.docs/lessons/`, `.claude/agents/
 `CLAUDE.md`. It reads every `§N.M` citation in those files and fails when the citation
 names a section its spec file does not contain. A file that has to quote a citation no
 merged spec resolves — because the spec withdrew the section, or because the author copied
-the number out of a draft — writes the reference once followed by the literal marker
-`[no such section]`, as this file does above and as the saga-admission lesson,
-`.docs/lessons/saga-admission-and-topology-guards.md`, does for the withdrawn broadcast
-hosting handshake.
+the number out of a draft — writes the literal marker `[no such section]` after the
+reference on every line that carries the reference. One marker exempts the occurrence
+beside it and no other occurrence, so a reader reaching any of them stops looking. This
+file marks all four of its occurrences above. The saga-admission lesson,
+`.docs/lessons/saga-admission-and-topology-guards.md`, marks the one occurrence it carries
+of the section number that the withdrawn broadcast hosting handshake used.
 
 ## The failure mode this example names
 
