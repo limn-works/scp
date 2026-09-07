@@ -294,7 +294,7 @@ Not a replacement for `.docs/architecture.md` — a reading guide for it:
 
 ### 21.10.1 Requirements
 
-1. The rustdoc command §21.10.2 names MUST produce diagnostic-free output. The root `Cargo.toml` sets `broken_intra_doc_links = "forbid"` under `[workspace.lints.rustdoc]`, so an unresolved intra-doc link is an error rather than a warning in every member that declares `[lints] workspace = true`.
+1. The rustdoc command that §21.10.2, Rust (rustdoc), names MUST produce diagnostic-free output. The root `Cargo.toml` sets `broken_intra_doc_links = "forbid"` under `[workspace.lints.rustdoc]`, so an unresolved intra-doc link is an error rather than a warning in every member that declares `[lints] workspace = true`.
 2. CI generates docs on each merge to `main` (`.github/workflows/docs.yml`).
 3. Docs published to GitHub Pages on each release tag.
 4. Cross-crate links resolve correctly in rustdoc output (scp-core -> scp-identity, etc.).
@@ -358,7 +358,9 @@ The `publish-docs` job in `docs.yml` handles aggregation and deployment. Rust, P
 Developers and agents can generate docs locally:
 
 ```bash
-# Rust. §21.10.2 gives the flags; `--open` adds a browser and no diagnostic.
+# Rust. §21.10.2, Rust (rustdoc), gives the flags and says why each one is
+# here. `--open` opens a browser over output rustdoc already wrote, so it
+# changes no diagnostic.
 cargo doc --workspace --no-deps --document-private-items --open \
   --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint
 
