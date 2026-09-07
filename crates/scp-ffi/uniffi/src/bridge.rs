@@ -19384,21 +19384,22 @@ mod tests {
         }
     }
 
-    /// Every identity operation the callback-custody block below names must
-    /// still COMPILE INTO a shipped (no-`testing`) library, and each must state
-    /// its shipped outcome rather than vanish. Naming and calling each one here
-    /// makes re-gating any of them on `testing` a compile error in the test
-    /// target job rust-build-uniffi-production builds — the coverage the
-    /// callback-custody block header used to claim for tests that now carry
-    /// `#[cfg(feature = "testing")]`.
+    /// Each identity operation the callback-custody block below names compiles
+    /// into a shipped (no-`testing`) library, and each states an outcome there.
+    /// This test names and calls every one of them, so re-gating any of them on
+    /// `testing` stops the test target compiling that job
+    /// rust-build-uniffi-production builds. The callback-custody block header
+    /// claimed that coverage for tests which now carry
+    /// `#[cfg(feature = "testing")]`, and this test replaces it.
     ///
-    /// The three agent-key ops decline with `SCP-IDENT-1059` because their
+    /// The three agent-key ops decline with `SCP-IDENT-1059`, because their
     /// shipped bodies fail closed for want of a `PreRotationCustody` backend
     /// (ADR-062, capability injection and prove-absent dev backends,
-    /// §Decision 6). `identity_load`, `scpid_sign`, `identity_remove_if_present`
-    /// and `identity_link_attestations` carry no such severance: they run their
-    /// real bodies here and decline for reasons an externally-loaded handle
-    /// earns — no core state, and no registry entry.
+    /// §Decision 6). `identity_load`, `scpid_sign`,
+    /// `identity_create_link_attestation`, `identity_link_attestations` and
+    /// `identity_remove*` carry no such severance: each runs its real body
+    /// here, and each declines on the state an externally-loaded handle holds,
+    /// which is no core identity and no custody-registry entry.
     #[cfg(not(feature = "testing"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shipped_build_reaches_every_callback_custody_identity_op() {
