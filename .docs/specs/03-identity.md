@@ -78,10 +78,19 @@ Custody migration moves the operational signing capability from one custody prov
       as part of the migration transaction.
 
 5. DESTROY old key material:
-   a. After confirmation that the KeyState has propagated (verified by
-      resolving the log from two relays under distinct declared
-      operators, one of them in the fallback set, 09 §9.7.4.2 R11), the old
-      #active private key is destroyed in the source custody provider.
+   a. After the KeyState is ESTABLISHED — the controller holds, for a
+      threshold of the identity's designated witnesses, a cosigned head at
+      or above that event, which it reads exactly as every relying party
+      does (09 §9.7.4.2 definitions, and R10's self-observation) — the old
+      #active private key is destroyed in the source custody provider. The
+      controller reaches that state by the witness submission §3.10.6's
+      publication invariant already requires of every publish cycle.
+      Propagation is NOT the gate. An event that reached every relay and no
+      witness derives no key state at any relying party, so every party
+      still resolves the OLD #active as current; a controller that
+      destroyed it at propagation would leave the identity unable to sign
+      anything anyone accepts, and unable to fix that, because a further
+      KeyState is pending for the same reason.
    b. Destruction is best-effort for HSM-backed keys (the HSM may not support
       explicit deletion, but the key becomes inaccessible once the device
       is decommissioned).
@@ -106,7 +115,7 @@ No seed phrases. Recovery uses social and device mechanisms:
 - **Social recovery:** Trusted contacts confirm your identity. After social recovery re-establishes key custody, the recovering device is enrolled as a new device (§3.7.2) and receives the PSK from any existing enrolled device. If no enrolled devices remain (all devices lost), PSK recovery requires re-keying: a new PSK is generated, existing private state history encrypted under the old PSK is permanently inaccessible (same forward-only property as §9.17.5), and the identity starts a fresh private state log.
 - **Platform-backed recovery:** If custody is delegated to Apple/Google, their recovery mechanisms apply. The PSK is stored in the platform's secure key store (Keychain, Keystore — §17.8) and may be recoverable through platform backup/restore mechanisms (e.g., iCloud Keychain sync, Google Cloud Key Vault). This provides a recovery path for the PSK that does not depend on another SCP device being available.
 
-**Every recovery path above ends at establishment, not at publication.** A recovery that re-establishes custody appends a key event, and that event takes effect at a relying party only once a threshold of the identity's designated witnesses has cosigned it (`09-security-model.md` §9.7.4.3), so the recovering device submits the event to the witness set and re-submits until the threshold is met. **Where the identity's designated witnesses are themselves gone**, the controller waits out the freshness bound, at which point every relying party observes the identity as lapsed, and then signs a `RootRecovery` carrying a fresh witness set, which §9.7.4.3's escape establishes under the set that event itself carries; every relying party sets `PendingReverify` on it and the exit is the out-of-band fingerprint comparison of `09-security-model.md` §9.11.
+**Every recovery path above ends at establishment, not at publication.** A recovery that re-establishes custody appends a key event, and that event takes effect at a relying party only once a threshold of the identity's designated witnesses has cosigned it (`09-security-model.md` §9.7.4.3), so the recovering device submits the event to the witness set and re-submits until the threshold is met. **Where the identity cannot reach the accountability threshold of its designated witnesses**, the controller waits out the freshness bound, at which point every relying party holds fewer than that many fresh cosignatures for it, and then signs a `RootRecovery` carrying a fresh witness set, which §9.7.4.3's escape establishes under the set that event itself carries at each party that also holds a baseline and an established event for the chain; every relying party sets `PendingReverify` on it and the exit is the out-of-band fingerprint comparison of `09-security-model.md` §9.11.
 
 For new users with a single device and no SCP contacts, platform-backed recovery is the practical safety net. Social and device recovery grow in value over time as users add devices and build connections. Apps should prompt for trusted recovery contacts during onboarding — the same pattern Google and Apple use today.
 
@@ -868,7 +877,7 @@ Slot-exclusivity is a relay **storage** behavior (the base relay stores multiple
 
 This mirrors, and extends to a stored public record, the exact check `BRIDGE_REGISTER` already performs on the control plane — Ed25519 signature + the same `SHA-256("scp:did:" || identifier_bytes) == routing_id` binding (§10.12.4). It is an **availability and anti-suppression measure, never a trust dependency** (see the client-verify property below).
 
-**A validating relay also stores the witness layer's two records, and a designated relay also witnesses.** Cosigned heads and conflict statements are stored at their own routing derivations, `SHA-256("scp:wit:" || subject_identifier_bytes)` and `SHA-256("scp:wcf:" || subject_identifier_bytes)` (`09-security-model.md` §9.7.4.2 R13), in the frames §9.10.12 states. A relay accepts such a record when the object's signature verifies against the key its witness operator's own key-event log lists `current` in the `#active` role at the position the object's `witness_key_state_head` names, and it rejects it otherwise; the slot-exclusivity rules above govern the key-event routing derivation and neither of these two. **A relay an identity's key state designates as a witness runs the five checks and holds the durable per-subject state `09-security-model.md` §9.7.4.3 states**, and this section restates neither.
+**A validating relay also stores the witness layer's two records, and a designated relay also witnesses.** Cosigned heads and conflict statements are stored at their own routing derivations, `SHA-256("scp:wit:" || subject_identifier_bytes)` and `SHA-256("scp:wcf:" || subject_identifier_bytes)` (`09-security-model.md` §9.7.4.2 R13), in the frames §9.10.12 states. A relay accepts such a record when three things hold, and it rejects it otherwise: the object's signature verifies against the key its witness operator's own key-event log lists `current` in the `#active` role at the position the object's `witness_key_state_head` names; **the object's `witness` names a member of the subject's standing witness set on a chain the relay itself holds for that subject** (`09-security-model.md` §9.7.4.2 definitions), so a relay holding no chain for a subject accepts no witness record for it; and the address is not already full for that (subject, witness) pair under the caps below. **The address is capped rather than left to grow.** A relay keeps at most one cosigned head per (subject, witness), replacing a stored one only with a strictly higher `sequence`, and at most `MAX_RETAINED_SUFFIXES` conflict statements per (subject, witness) (`09-security-model.md` §9.18.17), evicting the lowest `observed_at` beyond that — the same shape `09-security-model.md` §9.7.4.2 R9 gives a verifier, so both addresses hold at most `MAX_WITNESS_SET_SIZE` cosigned heads and `MAX_WITNESS_SET_SIZE × MAX_RETAINED_SUFFIXES` conflict statements per subject. **Both the filter and the cap are load-bearing and neither alone suffices.** Without the filter, any party that mints an identity — which costs it nothing — writes cosigned-head records for any subject whose identifier is public, and the honest objects a resolver needs are then buried under a page budget or a TTL eviction, which returns `Inconclusive{NotEstablished{…}}` and closes the admission and grant gate against the victim at every party (`09-security-model.md` §9.11); cosigning may never be priced, so no economic defense exists against it. Without the cap, a member of the standing set writes without bound. The slot-exclusivity rules above govern the key-event routing derivation and neither of these two. **A relay an identity's key state designates as a witness runs the five checks and holds the durable per-subject state `09-security-model.md` §9.7.4.3 states**, and this section restates neither.
 
 **Relay-side validation is an OPTIONAL capability of SCP-native relays, and witnessing is a separate role a relay takes only where an identity designates it.** The protocol MUST NOT require a validating relay. Foreign transports and adapters (Nostr, Matrix, etc.) that cannot validate treat the frame as an opaque blob; resolution stays correct over them via client-side verification and multi-relay publishing. The suppression-resistance property of the relay layer (§3.10.8) is delivered by validating SCP-native relays; non-validating storage contributes availability only.
 
@@ -915,7 +924,14 @@ The full resolution sequence:
    a chain step 3 discarded; otherwise it returns `Inconclusive{SingleSource}`
    and adopts no head. A resolver holding an accepted baseline resolves
    against one relay, and this step does not apply to it.
-5a. QUERY SHA-256("scp:wit:" || identifier_bytes) on the same relays,
+5a. QUERY SHA-256("scp:wit:" || identifier_bytes). A resolver at first
+   contact, and a resolver evaluating 09 §9.7.4.3's
+   witness-set-replacement escape, MUST issue that query to at least two entries of the community
+   relay list under distinct declared operators (09 §9.7.4.2 R11,
+   definitions) and returns `Inconclusive{SingleSource}` where it reaches
+   fewer, because one relay that serves the chain faithfully and serves
+   nothing at this address manufactures the appearance of a lapse; every
+   other resolver issues it to the relays it used above. Then
    verify each cosigned head against the key its witness operator's own
    key-event log lists `current` at the position the object names, discard
    a cosignature whose witness the resolver's recognized set does not
@@ -993,7 +1009,7 @@ The sequence number orders one key-event chain against its own prefixes, and it 
 
 A stale chain is detected by comparing the served head's sequence against the accepted head's (`09-security-model.md` §9.7.4.2 R12). A relay serving a stale chain is not malicious — it simply has not received the latest publish. The next republish cycle replaces it.
 
-When two relays return valid heads of the same chain at different sequence numbers, the higher sequence is authoritative; heads of divergent chains are settled first by the fork-precedence rule (`09-security-model.md` §9.7.4.2 R6). The resolver SHOULD update its cache and MAY re-publish the winning head to the relay that returned the stale one (protocol-level healing).
+When two relays return valid heads of the same chain at different sequence numbers, the higher sequence **among established heads** is authoritative, and the resolver's stored baseline is the established head rather than the chain head (`09-security-model.md` §9.7.4.2 R12): a head above it that a threshold of recognized witnesses has not cosigned is pending, and a resolver that adopted it would derive key state from a pending event, which R8 forbids. Heads of divergent chains are settled first by the fork-precedence rule (`09-security-model.md` §9.7.4.2 R6). The resolver SHOULD update its cache and MAY re-publish the winning head to the relay that returned the stale one (protocol-level healing).
 
 ### 3.10.8 Security Analysis
 
