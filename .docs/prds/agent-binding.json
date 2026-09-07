@@ -236,7 +236,7 @@
         "§4.2 states binding is via #agent verification method on the human's DID",
         "§4.3 states one-agent-per-context is mechanically enforced by DID document structure (one #agent VM max)",
         "§4.5 states human-agent pair shares one DID, agent accountability is structural not inferential",
-        "§4.7 documents Category C context restrictions: agent_keys_allowed, agent-specific roles, agent_rate_limit, agent_cosign_required",
+        "§4.7 states that a context restricts an agent through four Category C mechanisms and routes a reader to §4.9.3 for their shapes, rather than enumerating them",
         "§4.8 documents fleet operation under shared-DID model: one agent per DID, multiple DIDs for fleet (full Sybil cost each)",
         "No references to separate agent DIDs or UCAN-delegation-based binding remain in §4"
       ],
@@ -1499,18 +1499,17 @@
         "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Scp.kt",
         ".docs/standards/sdk-capability-matrix.json"
       ],
-      "description": "Wrap the the agent permission set bridge exports in the Python, TypeScript, Swift and Kotlin SDKs, and add the capability-matrix rows. Depends on SCP-AB-027 for the exports it wraps.",
+      "description": "Wrap the agent permission set bridge exports in the Python, TypeScript, Swift and Kotlin SDKs, and add the capability-matrix rows. Depends on SCP-AB-027 for the exports it wraps.",
       "acceptanceCriteria": [
         "Each of the four SDKs exposes the agent permission set with the per-SDK idiom its own standard names",
         "The capability matrix carries a row per SDK for the agent permission set, and python3.12 scripts/check-sdk-coverage.py passes"
       ],
       "actionItems": [
-        "Add the the agent permission set wrapper to each of the four SDKs",
+        "Add the agent permission set wrapper to each of the four SDKs",
         "Add the capability-matrix rows"
       ],
       "blockedBy": [
-        "SCP-AB-026",
-        "SCP-AB-035"
+        "SCP-AB-027"
       ],
       "sources": [
         {
@@ -1668,24 +1667,26 @@
         "crates/scp-protocol/src/context/params.rs",
         "crates/scp-protocol/src/envelope/inner/mod.rs"
       ],
-      "description": "§4.9.3 defines agent_cosign_required as the list of capabilities that a member exercising them through #agent must additionally have signed with #active, on ContextParams, default empty. The list names capabilities rather than carrying a single boolean, because a context that required a human signature on every agent action would leave the agent nothing to do autonomously. When the invoked capability is on the list, the verifier requires a second signature over the same signed payload, produced by the #active verification method of the same DID.",
+      "description": "§4.9.3 defines agent_cosign_required as the list of capabilities that a member exercising them through #agent must additionally have signed with #active, on ContextParams, default empty. The list names capabilities rather than carrying a single boolean, because a context that required a human signature on every agent action would leave the agent nothing to do autonomously. A list entry reaches an invoked capability when the entry covers that capability under the ceiling-coverage relation §5.3.1 and §5.3.1.1 of .docs/specs/05-contexts.md define for a ceiling entry, read between a list entry and an invoked capability. That relation holds between two equal strings, between outlet:query:* and every outlet:query:{outlet_id} capability, between outlet:call:* and every outlet:call:{outlet_id} capability, and between a custom {resource}:* over a non-built-in resource and every action under {resource}. When a list entry reaches the invoked capability, the verifier requires a second signature over the same signed payload, produced by the #active verification method of the same DID. §4.9.3 puts two rules on the list's contents: every entry is one of the entries the context's ceiling declares, compared string for string, and the list names each capability at most once. The entry rule tests the ceiling's declared entries rather than wildcard coverage, because a ceiling declaring outlet:call:* covers every outlet:call:{outlet_id} string the §5.4.2.1 outlet_id grammar admits, so a coverage test would admit an unbounded family of distinct entries, and a ceiling declaring a custom payments:* covers every kebab-case action under payments for the same reason. This story applies both rules at context creation; SCP-AB-032 applies both on the governance write path.",
       "acceptanceCriteria": [
         "ContextParams carries a field agent_cosign_required: Vec<Capability> whose Default impl yields an empty vector",
-        "Every entry of agent_cosign_required is validated against the context's ceiling at context creation, and an out-of-ceiling entry is rejected",
+        "Context creation rejects an agent_cosign_required entry that is not one of the entries the context's ceiling declares, comparing each entry against the ceiling's declared entries by equality rather than through the wildcard-coverage predicate CapabilityCeiling::contains applies",
+        "Context creation rejects an agent_cosign_required that names one capability more than once, so the stored value holds at most one entry per capability the ceiling declares — the bound the collection-size table in §5.9 of .docs/specs/05-contexts.md records for the field",
         "InnerEnvelope carries an optional cosignature field holding a 64-byte Ed25519 signature over the same 9.5.1 signing hash the #agent signature covers, as 4.9.3 defines it",
-        "A verifier ignores a cosignature present on an artifact whose invoked capability is absent from agent_cosign_required, rather than rejecting it",
-        "Verification requires the second signature when the invoked capability is on agent_cosign_required and the signing key is #agent",
+        "A verifier ignores a cosignature present on an artifact whose invoked capability no agent_cosign_required entry reaches, rather than rejecting it",
+        "Verification requires the second signature when an agent_cosign_required entry reaches the invoked capability and the signing key is #agent, where an entry reaches a capability when the entry covers that capability under the §5.3.1 and §5.3.1.1 ceiling-coverage relation — two equal strings, OutletQueryAll over every OutletQuery(id), OutletCallAll over every OutletCall(id), and a custom {resource}:* over every custom {resource}:{action}; OutletQueryAll reaches no OutletCall(id), OutletCallAll reaches no OutletQuery(id), and a custom {resource}:* reaches no action under a different resource",
         "Verification rejects the action when the second signature is absent, and the error names the capability that required it",
         "Verification rejects the action when the second signature verifies against a DID other than the #agent signer's own DID",
         "Verification rejects the action when the second signature does not verify against the signer's #active verification method",
         "Verification does not require a second signature when the signing key is #active",
-        "Verification does not require a second signature when the invoked capability is absent from agent_cosign_required",
-        "A test exercises governance:vote with agent_cosign_required containing governance:vote and asserts each of the accept and reject cases above"
+        "Verification does not require a second signature when no agent_cosign_required entry reaches the invoked capability",
+        "A test exercises governance:vote with agent_cosign_required containing governance:vote and asserts each of the accept and reject cases above, a second test asserts an agent_cosign_required holding OutletCallAll requires the co-signature on an OutletCall(id) invocation and requires none on an OutletQuery(id) invocation, and a third test asserts an agent_cosign_required holding the custom wildcard payments:* requires the co-signature on a payments:refund invocation and requires none on a billing:refund invocation",
+        "A test asserts context creation rejects an agent_cosign_required naming a capability the ceiling does not declare — including OutletCall(id) against a ceiling that declares only OutletCallAll, and payments:refund against a ceiling that declares only the custom wildcard payments:*, each of which the coverage relation would admit — and separately rejects one naming a declared ceiling entry twice"
       ],
       "actionItems": [
-        "Add agent_cosign_required to ContextParams with an empty default and ceiling validation",
+        "Add agent_cosign_required to ContextParams with an empty default, validation of each entry against the ceiling's declared entries by equality, and rejection of a repeated capability",
         "Add the optional cosignature field to InnerEnvelope per 4.9.3, covering the existing 9.5.1 signing hash",
-        "Add the co-signature verification branch",
+        "Add the co-signature verification branch, matching a list entry against the invoked capability under the §5.3.1 and §5.3.1.1 ceiling-coverage relation, which covers two equal strings, the two outlet wildcard families, and a custom {resource}:* wildcard",
         "Add the accept and reject tests named in the acceptance criteria"
       ],
       "blockedBy": [],
@@ -1697,6 +1698,10 @@
         {
           "file": ".docs/specs/05-contexts.md",
           "section": "## 5.3 Capability Ceiling"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.9 Governance"
         },
         {
           "file": ".docs/adrs/phase-1.md",
@@ -1713,22 +1718,28 @@
       "severity": "major",
       "status": "pending",
       "files": [
+        "crates/scp-protocol/src/context/governance/mod.rs",
         "crates/scp-protocol/src/context/metadata.rs",
         "crates/scp-runtime/src/context/governance_helpers.rs"
       ],
-      "description": "§5.7 lists agent policy — agent_keys_allowed, agent_rate_limit, and agent_cosign_required — among the structural fields a prospective member reads before joining, and §5.9 states that the context's governance sets and changes them through the same propose/approve path it uses for any other parameter. A change to any of the three ContextParams fields is a metadata change subject to metadata:edit; a change to an agent-restricted role assignment is subject to role:assign.",
+      "description": "§5.7 lists agent policy — agent_keys_allowed, agent_rate_limit, and agent_cosign_required — among the structural fields a prospective member reads before joining, and §5.9 states that the context's governance sets and changes them through the same propose/approve path it uses for any other parameter. A change to any of the three ContextParams fields is a metadata change subject to metadata:edit; a change to an agent-restricted role assignment is subject to role:assign. Stories SCP-AB-028, SCP-AB-030, and SCP-AB-031 add the three fields; this story adds the projection and the governance gating. §4.9.3 puts two rules on agent_cosign_required's contents — every entry is one of the entries the context's ceiling declares, compared string for string, and the list names each capability at most once — and this story applies both on the governance write path, as SCP-AB-031 applies both at context creation. Both rules carry the §5.9 collection-size row's bound: without the no-repeat rule a value repeating one declared entry passes the entry rule at every position, and without the declared-entry rule a value naming 50,000 distinct outlet:call:{outlet_id} capabilities passes wildcard coverage against a ceiling that declares only outlet:call:*, or 50,000 distinct payments:{action} capabilities against a ceiling that declares only the custom wildcard payments:*.",
       "acceptanceCriteria": [
         "The structural metadata a prospective member reads before joining includes agent_keys_allowed, agent_rate_limit, and agent_cosign_required",
         "The three fields are visible whatever the context's MetadataVisibilityPolicy holds",
+        "A GovernanceAction variant changes the three Category C ContextParams fields, and executing it is gated on the metadata:edit capability",
+        "The governance change of agent_cosign_required rejects a value naming a capability the context's ceiling does not declare, comparing each entry against the ceiling's declared entries by equality rather than through the wildcard-coverage predicate CapabilityCeiling::contains applies, and rejects a value naming one capability more than once, applying the two rules §4.9.3 puts on the field at both write paths",
         "A governance proposal that changes any of the three fields requires the metadata:edit capability",
         "A governance proposal that changes an agent-restricted role assignment requires the role:assign capability",
         "Executing an approved change updates the context's structural metadata and the change is visible to every member without a re-join",
         "A test asserts a member without metadata:edit cannot change agent_keys_allowed",
+        "A test asserts an approved governance change of agent_cosign_required to a value naming a capability the ceiling does not declare is rejected — including OutletCall(id) against a ceiling that declares only OutletCallAll, and payments:refund against a ceiling that declares only the custom wildcard payments:* — and separately that a change to a value naming one declared ceiling entry twice is rejected",
         "A test reads the three fields from a context the reader has not joined"
       ],
       "actionItems": [
         "Add the three fields to the structural metadata projection",
+        "Add the GovernanceAction variant that changes the three fields",
         "Gate the parameter change on metadata:edit and the role change on role:assign",
+        "Apply the §4.9.3 declared-ceiling-entry and no-repeat rules to the governance change of agent_cosign_required",
         "Add the pre-join read test and the unauthorized-change test"
       ],
       "blockedBy": [
@@ -1749,6 +1760,10 @@
         {
           "file": ".docs/specs/05-contexts.md",
           "section": "## 5.9 Governance"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.18.B Configurable Parameters"
         }
       ],
       "details": {}
@@ -1763,20 +1778,19 @@
       "files": [
         "crates/scp-ffi/src/context.rs",
         "crates/scp-ffi/napi/src/context.rs",
-        "crates/scp-ffi/uniffi/src/context.rs"
+        "crates/scp-ffi/uniffi/src/bridge.rs"
       ],
-      "description": "Export the Category C context parameters across the PyO3, napi-rs and UniFFI bridges. This story stops at the bridge boundary; the SDK wrappers and the capability-matrix rows are SCP-AB-036.",
+      "description": "Export the three Category C context parameters ADR-039 decided across the PyO3, napi-rs and UniFFI bridges. This story stops at the bridge boundary; the SDK wrappers and the capability-matrix rows are SCP-AB-036.",
       "acceptanceCriteria": [
         "The context-creation parameters of the PyO3, napi-rs, and UniFFI bridges each carry agent_keys_allowed, agent_rate_limit, and agent_cosign_required with the same argument names",
+        "agent_cosign_required crosses all three bridges as a list of ceiling-entry strings in the colon form §5.3.1 and §5.3.1.1 define, a custom entry included, the same wire encoding ContextParams::ceiling already uses",
         "The structural-metadata read of all three bridges returns the three fields",
-        "bindings/python, bindings/typescript, bindings/swift, and bindings/kotlin each expose the three fields on their context-creation parameters and on their metadata read",
-        "python3.12 scripts/check-sdk-coverage.py exits zero",
         "scripts/check-bridge-symmetry.sh exits zero"
       ],
       "actionItems": [
-        "Add the the Category C context parameters export to crates/scp-ffi/src",
-        "Add the the Category C context parameters export to crates/scp-ffi/napi/src",
-        "Add the the Category C context parameters export to crates/scp-ffi/uniffi/src"
+        "Add the three Category C context parameters to crates/scp-ffi/src",
+        "Add the three Category C context parameters to crates/scp-ffi/napi/src",
+        "Add the three Category C context parameters to crates/scp-ffi/uniffi/src"
       ],
       "blockedBy": [
         "SCP-AB-032"
@@ -1807,18 +1821,18 @@
         "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Scp.kt",
         ".docs/standards/sdk-capability-matrix.json"
       ],
-      "description": "Wrap the the Category C context parameters bridge exports in the Python, TypeScript, Swift and Kotlin SDKs, and add the capability-matrix rows. Depends on SCP-AB-033 for the exports it wraps.",
+      "description": "Wrap the three Category C context-parameter bridge exports in the Python, TypeScript, Swift and Kotlin SDKs, and add the capability-matrix rows. Depends on SCP-AB-033 for the exports it wraps.",
       "acceptanceCriteria": [
-        "Each of the four SDKs exposes the Category C context parameters with the per-SDK idiom its own standard names",
-        "The capability matrix carries a row per SDK for the Category C context parameters, and python3.12 scripts/check-sdk-coverage.py passes"
+        "Each of the four SDKs exposes agent_keys_allowed, agent_rate_limit, and agent_cosign_required on its context-creation parameters and on its structural-metadata read",
+        "The four SDKs spell the three fields identically up to each SDK's own casing convention, and each takes agent_cosign_required as a list of colon-form capability strings",
+        "The capability matrix carries a row per SDK for the Category C context parameters, and python3.12 scripts/check-sdk-coverage.py exits zero"
       ],
       "actionItems": [
-        "Add the the Category C context parameters wrapper to each of the four SDKs",
+        "Add the Category C context parameters wrapper to each of the four SDKs",
         "Add the capability-matrix rows"
       ],
       "blockedBy": [
-        "SCP-AB-032",
-        "SCP-AB-036"
+        "SCP-AB-033"
       ],
       "sources": [
         {
