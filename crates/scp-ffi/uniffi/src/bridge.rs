@@ -42,9 +42,10 @@ use scp_clock::Clock;
 use scp_dht::DhtClient;
 // `InMemoryDhtClient` is the §17.17.3 DHT nullifier. Since the cfg-gated DHT
 // construction is now hoisted into `scp_ffi_common::dht::build_ffi_dht_client`,
-// this bridge names the type only in its own `#[cfg(test)]` unit tests — hence
-// the bare `test` gate (the `testing`-feature seam lives in scp-ffi-common now).
-#[cfg(test)]
+// this bridge names the type only in its own unit tests, and every one of those
+// tests is `testing`-gated because the nullifier reaches no other build — hence
+// both gates (the `testing`-feature seam lives in scp-ffi-common now).
+#[cfg(all(test, feature = "testing"))]
 use scp_dht::InMemoryDhtClient;
 use scp_ffi_common::dht::FfiDhtClient;
 // `DidCache` / `DualLayerResolver` / `NoOpRelayQuerier` are named only by the
@@ -9784,10 +9785,13 @@ impl Scp {
                     // resolver reads from (matching PyO3/NAPI behavior).
                     ensure_did_resolver_initialized_on(&bi, tokio::runtime::Handle::current())?;
                     let dht = DidDht::with_client(rotation_publish_client(&bi)?);
-                    // Mint a fresh per-identity pre-rotation custody (ADR-003 §4b).
-                    // Production callback custody integration is a follow-up
-                    // workstream; in-memory custody is used here so the
-                    // commitment invariant holds for tests and dev/desktop builds.
+                    // Mint a fresh per-identity pre-rotation custody (ADR-003,
+                    // DID creation on did:dht, §4b). This arm compiles only under
+                    // `testing`, so the mint reaches no shipped build of any
+                    // profile, desktop included. It holds the commitment
+                    // invariant for the test harness. Issue #1729, production
+                    // `PreRotationCustody` backends, tracks the substrate a
+                    // shipped build will use instead.
                     let pre_rotation_custody =
                         Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
                     let (identity, document, pre_rotation_handle) = dht
@@ -19132,6 +19136,115 @@ mod tests {
         crate::scp::Scp::new_in_memory_for_test()
     }
 
+    /// A `KeyCustodyProvider` whose every method returns an error, used to prove
+    /// that `identity_create_with_custody` declines BEFORE it calls the provider.
+    /// A shipped build must reject the create at the pre-rotation check, so a
+    /// provider that can satisfy no request still yields `SCP-IDENT-1059` — never
+    /// a custody error and never an identity.
+    #[cfg(not(feature = "testing"))]
+    struct NeverAnsweringCustodyProvider;
+
+    #[cfg(not(feature = "testing"))]
+    impl NeverAnsweringCustodyProvider {
+        fn refuse(method: &str) -> ScpError {
+            ScpError::Identity {
+                msg: format!(
+                    "NeverAnsweringCustodyProvider::{method} was called — \
+                     identity_create_with_custody must fail closed on the pre-rotation \
+                     check before it reaches the injected custody provider"
+                ),
+                code: codes::IDENT_1003.to_owned(),
+            }
+        }
+    }
+
+    #[cfg(not(feature = "testing"))]
+    #[async_trait::async_trait]
+    impl crate::KeyCustodyProvider for NeverAnsweringCustodyProvider {
+        async fn sign(&self, _key_id: String, _message: Vec<u8>) -> Result<Vec<u8>, ScpError> {
+            Err(Self::refuse("sign"))
+        }
+
+        async fn get_public_key(&self, _key_id: String) -> Result<Vec<u8>, ScpError> {
+            Err(Self::refuse("get_public_key"))
+        }
+
+        async fn destroy_key(&self, _key_id: String) -> Result<(), ScpError> {
+            Err(Self::refuse("destroy_key"))
+        }
+
+        async fn generate_keypair(&self, _key_type: String) -> Result<String, ScpError> {
+            Err(Self::refuse("generate_keypair"))
+        }
+
+        async fn dh_agree(
+            &self,
+            _key_id: String,
+            _peer_public: Vec<u8>,
+        ) -> Result<Vec<u8>, ScpError> {
+            Err(Self::refuse("dh_agree"))
+        }
+
+        async fn derive_pseudonym(
+            &self,
+            _key_id: String,
+            _context_id: Vec<u8>,
+        ) -> Result<Vec<u8>, ScpError> {
+            Err(Self::refuse("derive_pseudonym"))
+        }
+
+        /// The only infallible method on the trait. It reports `"software"`
+        /// because the create path must decline for want of a pre-rotation
+        /// backend, not for want of a recognized custody type.
+        fn custody_type(&self, _key_id: String) -> String {
+            "software".to_owned()
+        }
+    }
+
+    /// ADR-062 §Decision 6 acceptance criterion 5, the `UniFFI` arm: on a shipped
+    /// (no-`testing`) build `identity_create_with_custody` returns the typed
+    /// `SCP-IDENT-1059` error instead of minting an identity, because the tree's
+    /// only `PreRotationCustody` implementation is the `testing`-gated
+    /// `InMemoryPreRotationCustody` nullifier.
+    ///
+    /// This is the per-bridge twin of the `PyO3`
+    /// `identity_create_fails_closed_without_pre_rotation_backend`
+    /// (`crates/scp-ffi/src/scp.rs`) and the NAPI test of the same name
+    /// (`crates/scp-ffi/napi/src/identity.rs`). It asserts more than either of
+    /// those two: a `UniFFI` `KeyCustodyProvider` is a plain Rust trait, so this
+    /// test drives the callback-custody entry point itself and reads
+    /// `SCP-IDENT-1059` off it directly, rather than stopping at the earlier
+    /// custody-unavailable codes those bridges reach.
+    ///
+    /// Gated `#[cfg(not(feature = "testing"))]`: the fail-closed arm is selected
+    /// by the FEATURE being off — the shipped configuration — not by `test` cfg,
+    /// so `cargo test -p scp-ffi-uniffi` (default features) exercises the arm a
+    /// released Swift/Kotlin SDK compiles.
+    #[cfg(not(feature = "testing"))]
+    #[test]
+    fn identity_create_with_custody_fails_closed_without_pre_rotation_backend() {
+        let scp = scp_test();
+        let result = runtime()
+            .block_on(scp.identity_create_with_custody(Box::new(NeverAnsweringCustodyProvider)));
+        match result {
+            Ok(_) => panic!(
+                "shipped identity_create_with_custody must FAIL CLOSED — no identity may \
+                 be minted on a production path without a real pre-rotation backend"
+            ),
+            Err(ScpError::Identity { msg, code }) => {
+                assert_eq!(
+                    code,
+                    codes::IDENT_1059,
+                    "expected the pre-rotation fail-closed code SCP-IDENT-1059, got \
+                     code {code} with message: {msg}"
+                );
+            }
+            Err(other) => {
+                panic!("expected ScpError::Identity carrying SCP-IDENT-1059, got: {other:?}")
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // ADR-049 Phase 2J: reserve_key_package / context_join_from_welcome
     // -----------------------------------------------------------------------
@@ -20504,8 +20617,12 @@ mod tests {
     fn test_identity_for(scp: &Arc<crate::scp::Scp>) -> Arc<Identity> {
         let instance_id = scp.instance_id();
         // Synthetic pre-rotation custody — never inspected by callers that
-        // only exercise non-migration paths, but the field is non-optional
-        // so the test handle has to provide something.
+        // only exercise non-migration paths. `Identity::pre_rotation_custody`
+        // exists only under `testing` (ADR-062, capability injection and
+        // prove-absent dev backends, §Decision 6), so a default-feature build
+        // of this crate's test target constructs the handle without it and
+        // never names the nullifier.
+        #[cfg(feature = "testing")]
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
         Arc::new(Identity {
@@ -20521,6 +20638,7 @@ mod tests {
             bi: Arc::clone(&scp.inner),
             rotation_event_json: None,
             pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
+            #[cfg(feature = "testing")]
             pre_rotation_custody,
         })
     }
@@ -22080,6 +22198,7 @@ mod tests {
     /// type used by the bridge function via the global `DID_RESOLVER`. Uses a
     /// shared `InMemoryDhtClient` so the DID published during identity
     /// creation is visible to the verify resolver.
+    #[cfg(feature = "testing")]
     #[tokio::test]
     async fn scpid_sign_verify_roundtrip_via_identity_backed_resolver() {
         use scp_core::identity::{
@@ -23610,6 +23729,7 @@ mod tests {
     /// per-instance custody registry so `identity_remove_if_present` reports
     /// `true` on first removal — proving the registry exists and is populated in
     /// a BARE (no `testing`) build over callback custody.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn callback_identity_is_registered_for_remove_if_present() {
         let scp = scp_test();
@@ -23635,6 +23755,7 @@ mod tests {
     /// a response whose signature verifies against the identity's `#active`
     /// public key. Pins that the op is un-gated and routes through
     /// `resolve_identity_custody` → `UniffiKeyCustody::Callback`.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scpid_sign_works_over_callback_custody() {
         let scp = scp_test();
@@ -23670,6 +23791,7 @@ mod tests {
     /// key and registers the identity, so a subsequent
     /// `identity_remove_link_attestation` (which requires the DID present in the
     /// custody registry) returns `true`.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn link_attestation_create_and_remove_over_callback_custody() {
         let scp = scp_test();
@@ -23714,6 +23836,7 @@ mod tests {
     /// resolves custody via `resolve_identity_custody` →
     /// `UniffiKeyCustody::Callback` and signs the DHT publish with the callback
     /// key.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn add_agent_key_works_over_callback_custody() {
         let scp = scp_test();
@@ -23751,6 +23874,7 @@ mod tests {
     /// a BARE build: it generates a fresh `#agent` key, retires the old one,
     /// republishes the DID document, and returns a handle that still has an
     /// agent key (with a different public key than before rotation).
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rotate_agent_key_works_over_callback_custody() {
         let scp = scp_test();
@@ -23792,6 +23916,7 @@ mod tests {
     /// `remove_agent_key` must work over callback custody (production path) in
     /// a BARE build: it strips the `#agent` verification method, republishes
     /// the DID document, and returns a handle with no agent key.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remove_agent_key_works_over_callback_custody() {
         let scp = scp_test();
@@ -23829,6 +23954,7 @@ mod tests {
     /// live key custody — the shape of an externally-loaded identity — must
     /// reject `add_agent_key` with SCP-IDENT-1008. Without custody there is no
     /// signing key for the DHT publish, so the op cannot proceed.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn add_agent_key_without_custody_returns_ident_1008() {
         let scp = scp_test();
@@ -23888,6 +24014,7 @@ mod tests {
     /// `DidDht::new()` regression in place, the `publish` below fails with the
     /// signer error and the test fails; with the fix it succeeds and the
     /// `#active` key changes while `#0` and the DID are preserved.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rotate_key_signer_is_wired_over_callback_custody() {
         use scp_identity::DidMethod;
@@ -23975,6 +24102,7 @@ mod tests {
     /// path failed with `DhtNotFound`. This test now pins the corrected
     /// behavior: rotation succeeds, preserving the DID and the identity key
     /// `#0` while installing a fresh `#active` key.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rotate_key_over_callback_custody_round_trips_via_shared_dht() {
         let scp = scp_test();
@@ -24010,6 +24138,7 @@ mod tests {
     /// invalidation the resolver would keep serving the pre-rotation document
     /// (and its retired `#active` key) for the multi-day cache TTL, silently
     /// defeating rotation's revocation purpose.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rotate_key_invalidates_resolver_cache() {
         let scp = scp_test();
@@ -24073,6 +24202,7 @@ mod tests {
     /// `publish_document`, this test cannot observe the migrate DHT-signer fix —
     /// that guard lives in `rotate_key_signer_is_wired_over_callback_custody`,
     /// which reaches the signer-bearing publish directly.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn migrate_over_callback_custody_fails_fast_at_seed_import() {
         let scp = scp_test();
@@ -24254,6 +24384,7 @@ mod tests {
     /// checkpoint, producing a non-empty signature. Pins that
     /// `event_log_checkpoint_impl` is un-gated and resolves custody via
     /// `resolve_identity_custody` → `UniffiKeyCustody::Callback`.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn event_log_checkpoint_works_over_callback_custody() {
         let scp = scp_test();
@@ -24286,6 +24417,7 @@ mod tests {
     /// `event_log_checkpoint_by_did_impl` is un-gated and resolves custody via
     /// `resolve_identity_custody` → `UniffiKeyCustody::Callback` on the bare
     /// canary, with the `did == identity.did` `VALID_7000` binding satisfied.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn event_log_checkpoint_by_did_works_over_callback_custody() {
         let scp = scp_test();
