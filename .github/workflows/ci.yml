@@ -1688,8 +1688,9 @@ jobs:
   # naming a filter output `changes` never published stops that gate rather than
   # holding a job at `skipped`, a filter gating a `--workspace` cargo command
   # matches every member the root Cargo.toml lists, and a `cargo doc` command
-  # passes `--document-private-items` so that rustdoc reads the private modules
-  # where `scp-runtime`'s denied intra-doc links live.
+  # passes `--document-private-items` so that rustdoc reads the intra-doc links
+  # private modules write in every member the root Cargo.toml holds to
+  # `forbid(rustdoc::broken_intra_doc_links)`.
   ci-workflow-selftest:
     needs: check-draft
     name: CI workflow / self-test

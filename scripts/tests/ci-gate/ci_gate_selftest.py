@@ -99,7 +99,8 @@ nothing:
                time out of the twenty-six members the root Cargo.toml lists.
                `crates/scp-event-log/src/**` matched nothing, while
                crates/scp-runtime/src/ writes 49 intra-doc links into
-               `scp_event_log::*` and denies `rustdoc::broken_intra_doc_links`,
+               `scp_event_log::*` and the root Cargo.toml forbids
+               `rustdoc::broken_intra_doc_links` in every member,
                so a pull request confined to scp-event-log skipped the one job
                that compiles rustdoc across the workspace — on the pull request
                and again on the push to `main`.
