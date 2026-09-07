@@ -667,8 +667,9 @@ mod tests {
     /// A shipped (no-`testing`) build rejects `"in_memory"` at the boundary with
     /// `SCP-IDENT-1008` rather than admitting a custody kind whose only backing
     /// implementation the feature severs. This is the shipped half of the
-    /// severance, and it runs in `cargo test -p scp-ffi-uniffi` (default
-    /// features) — the configuration a released Swift/Kotlin SDK compiles.
+    /// severance. Job rust-build-uniffi-production names this test in its `-E`
+    /// filter and runs it against `--features server`, which is the
+    /// configuration a released Swift/Kotlin SDK compiles.
     #[cfg(not(feature = "testing"))]
     #[test]
     fn parse_custody_method_rejects_in_memory_on_a_shipped_build() {

@@ -848,8 +848,8 @@ impl KeyCustody for CallbackKeyCustody {
         // `PreRotationCustody` backend**: such a backend co-resides in
         // the same Rust process memory as this bridge and the
         // operational `KeyHandle` ID space, so a single process-memory
-        // dump compromises both. That reasoning is why an in-process
-        // backend can never be the answer here.
+        // dump compromises both, which disqualifies every in-process
+        // backend from satisfying §9.7.4.1 §3.
         //
         // No `PreRotationCustody` backend ships at all today. The only
         // implementation in the tree, `InMemoryPreRotationCustody`, is
@@ -857,8 +857,8 @@ impl KeyCustody for CallbackKeyCustody {
         // `#[cfg(feature = "testing")]` `testing` module (ADR-062
         // §Decision 6). On a shipped (no-`testing`) build the identity
         // paths fail closed with `SCP-IDENT-1059` via
-        // `no_pre_rotation_backend` rather than substituting it, so the
-        // capability is honestly absent — not degraded.
+        // `no_pre_rotation_backend` rather than substituting it, so a caller
+        // reads the capability as absent rather than as present and weak.
         //
         // Full §9.7.4.1 §3 substrate isolation requires a non-in-memory
         // `PreRotationCustody` backend (FIDO2, passkey-PRF, Apple
@@ -19354,10 +19354,11 @@ mod tests {
     /// `SCP-IDENT-1059` off it directly, rather than stopping at the earlier
     /// custody-unavailable codes those bridges reach.
     ///
-    /// Gated `#[cfg(not(feature = "testing"))]`: the fail-closed arm is selected
-    /// by the FEATURE being off — the shipped configuration — not by `test` cfg,
-    /// so `cargo test -p scp-ffi-uniffi` (default features) exercises the arm a
-    /// released Swift/Kotlin SDK compiles.
+    /// Gated `#[cfg(not(feature = "testing"))]`, because the FEATURE being off
+    /// selects the fail-closed arm and `test` cfg does not. Job
+    /// rust-build-uniffi-production names this test in its `-E` filter and runs
+    /// it against `--features server`, which is the configuration a released
+    /// Swift/Kotlin SDK compiles.
     #[cfg(not(feature = "testing"))]
     #[test]
     fn identity_create_with_custody_fails_closed_without_pre_rotation_backend() {
