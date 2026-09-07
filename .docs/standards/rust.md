@@ -416,7 +416,7 @@ Every push to a PR branch. Target: < 3 minutes.
 | clippy | ubuntu-latest | `cargo clippy --workspace --all-targets -- -D warnings` |
 | test | ubuntu-latest, macos-latest | `cargo nextest run --workspace` |
 | build-release | ubuntu-latest, macos-latest, windows-latest | `cargo build --workspace --release` |
-| doc | ubuntu-latest | `cargo test --workspace --doc && cargo doc --workspace --no-deps --document-private-items --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint` |
+| doc | ubuntu-latest | `cargo test --workspace --doc`, then the `cargo doc` the CI Commands section above gives. A table cell holds no fenced block, and `scripts/tests/ci-gate/ci_gate_selftest.py` compares a documented `cargo doc` against job `rust-doc` in `.github/workflows/ci.yml` only where a shell block encloses it, so this row names that command rather than repeating its flags. |
 | deny | ubuntu-latest | `cargo deny check` |
 
 Unit tests and conformance macro suites (`transport_conformance!()`, `storage_conformance!()`, etc.) run as part of `cargo nextest run --workspace` against in-memory implementations.

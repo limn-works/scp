@@ -149,7 +149,14 @@ nothing:
                ci.yml passes. Four intra-doc links in crates/scp-node name items
                those features gate, so every documented command exited 101 on an
                unmodified `main`, naming a crate the developer's change never
-               touched, while the required job exited 0.
+               touched, while the required job exited 0. That comparison reads a
+               shell-labelled fenced block and nothing else, so two copies of
+               the flag list written inline — the normative clause §21.10.2
+               item 2 of .docs/specs/21-documentation.md, and the Tier 1
+               CI-matrix row for job `doc` in .docs/standards/rust.md — reached
+               no assertion. Both now sit in a fenced block or name the block
+               that holds the command, and a check rejects a `cargo doc` naming
+               `--features` on any Markdown line no shell fence encloses.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
@@ -339,7 +346,29 @@ RUSTDOC_JOBS = {("ci.yml", "rust-doc"), ("docs.yml", "rust-docs")}
 # already produced rather than which links it resolves, so it changes no
 # diagnostic and this check permits it.
 SHELL_FENCE_LANGUAGES = {"bash", "sh", "shell", "console"}
-FEATURES_FLAG_PREFIX = "--features="
+FEATURES_FLAG = "--features"
+FEATURES_FLAG_PREFIX = f"{FEATURES_FLAG}="
+
+# CRITERION for check_rustdoc_enumerations_sit_in_a_shell_block: Markdown text
+# that writes out the flag set job `rust-doc` in .github/workflows/ci.yml passes
+# sits where check_documented_rustdoc_reproduces_the_required_job compares it
+# against that job, which reads shell-labelled fenced blocks and nothing else. A
+# `cargo doc` carrying `--features` writes out that set, because the feature
+# list is the part of the command that changes when the required job changes and
+# the part no sentence about rustdoc needs. A sentence naming one flag to make a
+# point about that flag — four in `.docs/lessons/`, two in
+# `.claude/agent-memory/`, one in `.docs/standards/rust.md` — writes out no set
+# and drifts nowhere, so this
+# check reads a `--features` list as what marks an enumeration. Both enumerations
+# this repository carried outside a shell block sat one edit away from going
+# stale: `.docs/specs/21-documentation.md` stated the flags a second time in the
+# normative clause §21.10.2 item 2, and `.docs/standards/rust.md` stated them a
+# second time in the Tier 1 CI-matrix row for job `doc`. A document recording a
+# feature list job `rust-doc` no longer passes — a lesson naming what a past run
+# enabled — names those features without writing them as a `cargo doc
+# --features` command, because a fenced block would put the stale list under the
+# comparison against the current job and an inline command reaches no comparison
+# at all. Neither place holds a runnable command nobody should run.
 
 # A FLOOR under that criterion, not the criterion itself. The scan iterates
 # whatever `git ls-files` returns, so a renamed file, a fence relabelled to a
@@ -347,7 +376,10 @@ FEATURES_FLAG_PREFIX = "--features="
 # iteration and leaves this check printing nothing and failing nothing — the
 # zero-test defect this file's docstring records. These three paths carry such a
 # command today. Add an entry when a Markdown file gains one; remove one only
-# alongside the command it names.
+# alongside the command it names. check_rustdoc_enumerations_sit_in_a_shell_block
+# reaches the second and third of those three moves independently of this
+# constant, because it reads every line a shell fence does not enclose and
+# rejects a `cargo doc` naming `--features` among them.
 DOCUMENTED_RUSTDOC_FILES = {
     ".docs/specs/21-documentation.md",
     ".docs/standards/rust.md",
@@ -2771,6 +2803,159 @@ def check_documented_rustdoc_detects_a_feature_drift(
         )
 
 
+def lines_outside_shell_blocks(text: str) -> list[tuple[int, str]]:
+    """Return (line number, text) for each Markdown line no shell block encloses.
+
+    A fence line returns nothing, and so does every line a fence this file's
+    shell set labels encloses, because documented_rustdoc_commands already reads
+    those. A fence labelled anything else keeps its body, so relabelling a
+    `cargo doc` block from ```bash to ```text moves the command into this
+    scan rather than out of every scan in this file.
+
+    A line ending in a backslash joins the line after it and reports under the
+    first line's number, because a shell command written across two Markdown
+    lines names its command on one and its flags on the next.
+    """
+    kept: list[tuple[int, str]] = []
+    language: str | None = None
+    pending: tuple[int, str] | None = None
+    for number, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            if language is None:
+                label = stripped[3:].strip().lower().split()
+                language = label[0] if label else ""
+            else:
+                language = None
+            continue
+        if language is not None and language in SHELL_FENCE_LANGUAGES:
+            continue
+        if pending is None:
+            start, joined = number, stripped
+        else:
+            start, joined = pending[0], f"{pending[1]} {stripped}"
+        if joined.endswith("\\"):
+            pending = (start, joined[:-1].rstrip())
+            continue
+        kept.append((start, joined))
+        pending = None
+    if pending is not None:
+        kept.append(pending)
+    return kept
+
+
+def rustdoc_enumerations_outside_shell_blocks(text: str) -> list[tuple[int, str]]:
+    """Return each line writing a `cargo doc` with `--features` outside a block."""
+    return [
+        (number, line)
+        for number, line in lines_outside_shell_blocks(text)
+        if "cargo doc" in line and FEATURES_FLAG in line
+    ]
+
+
+def unheld_rustdoc_enumerations() -> list[tuple[str, int, str]]:
+    """Return every rustdoc flag enumeration in Markdown that no check reads."""
+    found: list[tuple[str, int, str]] = []
+    for path in tracked_markdown_paths():
+        text = (REPO / path).read_text(encoding="utf-8")
+        if "cargo doc" not in text:
+            continue
+        for number, line in rustdoc_enumerations_outside_shell_blocks(text):
+            found.append((path, number, line))
+    return found
+
+
+def check_rustdoc_enumerations_sit_in_a_shell_block() -> None:
+    """Every rustdoc flag enumeration in Markdown sits where a check reads it.
+
+    THE CRITERION, stated at FEATURES_FLAG above: Markdown text writing out the
+    flag set job `rust-doc` in .github/workflows/ci.yml passes sits inside a
+    shell-labelled fenced block, which is the only place
+    check_documented_rustdoc_reproduces_the_required_job compares a documented
+    command against that job. An enumeration outside such a block reaches no
+    comparison, so a later edit to the required job's `--features` list leaves it
+    stating flags the merge no longer waits on while this file reports every
+    assertion passing.
+    """
+    unheld = unheld_rustdoc_enumerations()
+    check(
+        "every rustdoc `--features` enumeration in Markdown sits in a shell block",
+        not unheld,
+        "; ".join(f"{path}:{number} writes {line!r}" for path, number, line in unheld)
+        + " — a `cargo doc` naming `--features` outside a shell-labelled fence "
+        "reaches no comparison against the required job, so its flags drift while "
+        "this self-test stays green",
+    )
+
+
+def check_enumeration_scan_reads_the_text_it_is_given() -> None:
+    """Perturbing a document reports through the check above.
+
+    CRITERION: rustdoc_enumerations_outside_shell_blocks reports a `cargo doc`
+    written with `--features` in running text, in a table cell, in a fence
+    labelled for a language nobody runs, and across a backslash continuation,
+    and reports nothing for the same command inside a shell block. A scan whose
+    match never fires reports nothing on every document and leaves the check
+    above passing over zero lines — the zero-test defect this file's docstring
+    records. The scan reads the tree through tracked_markdown_paths, so this
+    check also asserts that iteration reaches a file naming `cargo doc`.
+    """
+    carriers = [
+        path
+        for path in tracked_markdown_paths()
+        if "cargo doc" in (REPO / path).read_text(encoding="utf-8")
+    ]
+    check(
+        "the enumeration scan reads at least one Markdown file naming `cargo doc`",
+        bool(carriers),
+        "no tracked Markdown file names `cargo doc` — the check above would "
+        "iterate nothing and report nothing",
+    )
+    command = (
+        "cargo doc --workspace --document-private-items --features scp-core/testing"
+    )
+    cases: list[tuple[str, str, list[int]]] = [
+        (
+            "running text naming a rustdoc with `--features` reports",
+            f"Generate with `{command}` before pushing.\n",
+            [1],
+        ),
+        (
+            "a table cell naming a rustdoc with `--features` reports",
+            f"| doc | ubuntu-latest | `{command}` |\n",
+            [1],
+        ),
+        (
+            "a rustdoc with `--features` in a fence naming no shell reports",
+            f"```text\n{command}\n```\n",
+            [2],
+        ),
+        (
+            "a rustdoc whose `--features` sits after a backslash reports",
+            "Run `cargo doc --workspace \\\n--features scp-core/testing`.\n",
+            [1],
+        ),
+        (
+            "the same rustdoc inside a shell block reports nothing",
+            f"```bash\n{command}\n```\n",
+            [],
+        ),
+        (
+            "a rustdoc naming no `--features` reports nothing",
+            "The job ran `cargo doc --workspace --document-private-items`.\n",
+            [],
+        ),
+    ]
+    for name, document, want in cases:
+        reported = rustdoc_enumerations_outside_shell_blocks(document)
+        got = [number for number, _ in reported]
+        check(
+            name,
+            got == want,
+            f"reported lines {got}, want {want} — {document!r}",
+        )
+
+
 def workflow_triggers(doc: dict) -> set[str]:
     """Return the event names a workflow triggers on.
 
@@ -2886,6 +3071,8 @@ def main() -> int:
     print("doc-command — a documented rustdoc reports what the merge waits on")
     check_documented_rustdoc_reproduces_the_required_job(documents)
     check_documented_rustdoc_detects_a_feature_drift(documents)
+    check_rustdoc_enumerations_sit_in_a_shell_block()
+    check_enumeration_scan_reads_the_text_it_is_given()
 
     print("win-shell — every `run:` step a Windows runner can execute names a shell")
     for path, doc in documents:

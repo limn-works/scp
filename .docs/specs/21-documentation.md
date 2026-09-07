@@ -303,7 +303,13 @@ Not a replacement for `.docs/architecture.md` — a reading guide for it:
 ### 21.10.2 Rust (rustdoc)
 
 1. Add `#![doc = include_str!("../README.md")]` to each crate's `lib.rs` so the crate-level doc page shows the README.
-2. Generate with `cargo doc --workspace --no-deps --document-private-items --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint`. Job `rust-doc` in `.github/workflows/ci.yml` runs that command and a merge waits on it, so every command this specification names carries the same flags: `--document-private-items` makes rustdoc resolve a link a private module writes, and the six features gate items that four intra-doc links in `crates/scp-node` name.
+2. Generate with the command below. Job `rust-doc` in `.github/workflows/ci.yml` runs that command and a merge waits on it, so every command this specification names carries the same flags: `--document-private-items` makes rustdoc resolve a link a private module writes, and the six features gate items that four intra-doc links in `crates/scp-node` name. A fenced shell block holds the command because `scripts/tests/ci-gate/ci_gate_selftest.py` compares a documented `cargo doc` against job `rust-doc` only where a shell block encloses it, so an inline copy of these flags goes stale under a green self-test.
+
+   ```bash
+   cargo doc --workspace --no-deps --document-private-items \
+     --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint
+   ```
+
 3. Cross-crate links use `[`item`](crate_name::path::to::item)` syntax.
 4. The `docs.yml` CI workflow already builds rustdoc and uploads as artifact.
 5. On release tags, docs are deployed to GitHub Pages.
