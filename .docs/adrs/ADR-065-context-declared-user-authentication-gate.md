@@ -1,4 +1,4 @@
-# ADR-063: Context-Declared User-Authentication Gate
+# ADR-065: Context-Declared User-Authentication Gate
 
 **Status:** Proposed (2026-08-28). §Open questions names what a human decides before this ADR moves to Accepted. No spec section declares a field for the mechanism this ADR proposes, and §Decision 1 states why.
 
@@ -107,7 +107,7 @@ This ADR does not choose. Choosing decides whether Category C restricts agent ac
 
 ## Open questions
 
-Each entry states what no artifact decides, which artifact or person should decide it, and what breaks while it stays open. This ADR answers none of the nine. Issue #2417, the ADR-063 open questions, carries them to a human, and the Category C entry in `.docs/specs/00-open-questions.md` indexes them. No story in `.docs/prds/agent-binding.json` implements this mechanism, because no artifact declares a field for it.
+Each entry states what no artifact decides, which artifact or person should decide it, and what breaks while it stays open. This ADR answers none of the nine. Issue #2417, the ADR-065 open questions, carries them to a human, and the Category C entry in `.docs/specs/00-open-questions.md` indexes them. No story in `.docs/prds/agent-binding.json` implements this mechanism, because no artifact declares a field for it.
 
 ### Whether the mechanism is permitted, and whether it is the right mechanism
 

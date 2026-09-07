@@ -234,7 +234,7 @@ Two rules govern the list's contents. Every entry must be one of the entries the
 
 The second signature travels in an optional inner-envelope field `cosignature` (§9.5.2), a 64-byte Ed25519 signature over the identical §9.5.1 signing hash the `#agent` signature covers. Covering the same hash rather than a second preimage is what makes the two signatures attest to one payload: a verifier that recomputes the hash once checks both against it, and no field can differ between what the agent signed and what the human co-signed. The field is absent on every artifact a context's `agent_cosign_required` does not reach, and a verifier that finds it on such an artifact ignores it rather than rejecting, because a co-signature grants nothing on its own. The signing key for `cosignature` is always the `#active` verification method of the DID that the envelope's `signing_key_id` names, so the field carries no DID of its own.
 
-A fifth Category C mechanism is under design, and this section specifies no parameter for it. The Category C entry in `.docs/specs/00-open-questions.md` states what it would do and what a human decides first, and ADR-063, the context-declared user-authentication gate, carries the evidence and the decisions.
+A fifth Category C mechanism is under design, and this section specifies no parameter for it. The Category C entry in `.docs/specs/00-open-questions.md` states what it would do and what a human decides first, and ADR-065, the context-declared user-authentication gate, carries the evidence and the decisions.
 
 ### 4.9.4 What a verifier does when Category B and Category C disagree
 

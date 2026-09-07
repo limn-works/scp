@@ -1,6 +1,6 @@
 # Device Attestation Proves a Device, Not a Gesture
 
-**Source:** I ran the primary-source check behind ADR-063, the context-declared user-authentication gate, on 2026-08-28, against the pages each row of the table below cites.
+**Source:** I ran the primary-source check behind ADR-065, the context-declared user-authentication gate, on 2026-08-28, against the pages each row of the table below cites.
 **Applies to:** any design that would gate a protocol action on a biometric, a passcode entry, or any other user-presence check, and that would read a platform attestation as that proof.
 
 ## The Claim That Is Wrong
