@@ -19383,6 +19383,113 @@ mod tests {
         }
     }
 
+
+    /// Every identity operation the callback-custody block below names must
+    /// still COMPILE INTO a shipped (no-`testing`) library, and each must state
+    /// its shipped outcome rather than vanish. Naming and calling each one here
+    /// makes re-gating any of them on `testing` a compile error in the test
+    /// target job rust-build-uniffi-production builds — the coverage the
+    /// callback-custody block header used to claim for tests that now carry
+    /// `#[cfg(feature = "testing")]`.
+    ///
+    /// The three agent-key ops decline with `SCP-IDENT-1059` because their
+    /// shipped bodies fail closed for want of a `PreRotationCustody` backend
+    /// (ADR-062, capability injection and prove-absent dev backends,
+    /// §Decision 6). `identity_load`, `scpid_sign`, `identity_remove_if_present`
+    /// and `identity_link_attestations` carry no such severance: they run their
+    /// real bodies here and decline for reasons an externally-loaded handle
+    /// earns — no core state, and no registry entry.
+    #[cfg(not(feature = "testing"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shipped_build_reaches_every_callback_custody_identity_op() {
+        let scp = scp_test();
+        let did = "did:dht:z6MkShippedBuildProbe".to_owned();
+        let identity = scp
+            .identity_load(did.clone())
+            .await
+            .expect("identity_load commits no pre-rotation commitment, so a shipped build loads");
+
+        // `scpid_sign` ships un-severed. An externally-loaded handle carries no
+        // `core_id`, so the real body declines with SCP-IDENT-1010.
+        let challenge =
+            scpid_challenge("https://relying.example".to_owned(), 60).expect("scpid_challenge");
+        match scp.scpid_sign(
+            Arc::clone(&identity),
+            "active".to_owned(),
+            challenge,
+            None,
+        ) {
+            Err(ScpError::Identity { code, .. }) => assert_eq!(
+                code,
+                codes::IDENT_1010,
+                "a loaded handle has no core identity, so shipped scpid_sign must say so"
+            ),
+            other => panic!("expected SCP-IDENT-1010 from shipped scpid_sign, got: {other:?}"),
+        }
+
+        // The three agent-key ops ship as symbols whose bodies fail closed.
+        for (name, result) in [
+            ("add_agent_key", Arc::clone(&identity).add_agent_key().await),
+            (
+                "rotate_agent_key",
+                Arc::clone(&identity).rotate_agent_key().await,
+            ),
+            (
+                "remove_agent_key",
+                Arc::clone(&identity).remove_agent_key().await,
+            ),
+        ] {
+            match result {
+                Err(ScpError::Identity { code, .. }) => assert_eq!(
+                    code,
+                    codes::IDENT_1059,
+                    "shipped {name} must decline with the pre-rotation fail-closed code"
+                ),
+                other => panic!("expected SCP-IDENT-1059 from shipped {name}, got: {other:?}"),
+            }
+        }
+
+        // `identity_create_link_attestation` ships un-severed and declines for
+        // want of retained identity state, not for want of the op.
+        match scp
+            .identity_create_link_attestation(
+                Arc::clone(&identity),
+                "github".to_owned(),
+                "octocat".to_owned(),
+                "https://gist.github.com/octocat/deadbeef".to_owned(),
+                "#active".to_owned(),
+                None,
+            )
+            .await
+        {
+            Err(ScpError::Identity { code, .. }) => assert_eq!(
+                code,
+                codes::IDENT_1040,
+                "a loaded handle retains no identity state, so the shipped op must say so"
+            ),
+            other => panic!(
+                "expected SCP-IDENT-1040 from shipped identity_create_link_attestation, \
+                 got: {other:?}"
+            ),
+        }
+
+        // The registry ops ship un-severed and read an empty per-instance
+        // registry, because no shipped build can register an identity.
+        assert_eq!(
+            scp.identity_link_attestations(did.clone())
+                .expect("identity_link_attestations must accept a valid DID"),
+            "[]",
+            "a shipped build registers no link attestation for a loaded DID"
+        );
+        assert!(
+            !scp.identity_remove_if_present(did.clone())
+                .expect("identity_remove_if_present must accept a valid DID"),
+            "a loaded handle never enters the custody registry, so removal reports absence"
+        );
+        scp.identity_remove(did)
+            .expect("identity_remove is unconditional and accepts a valid DID");
+    }
+
     // -----------------------------------------------------------------------
     // ADR-049 Phase 2J: reserve_key_package / context_join_from_welcome
     // -----------------------------------------------------------------------
@@ -23755,13 +23862,31 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Production (callback-custody) path coverage — NOT gated on
-    // `testing`. These pin the bare-build fix: re-typing the
-    // identity custody registry to the `UniffiKeyCustody` enum un-gated
-    // `scpid_sign`, `identity_create_link_attestation`, and `identity_remove*`
-    // so they ship in the released Swift/Kotlin SDKs and route over callback
-    // (Secure Enclave / Android Keystore) custody. Before the fix these ops
-    // were `#[cfg(testing)]`-gated and silently absent.
+    // Production (callback-custody) path coverage.
+    //
+    // These tests drive `scpid_sign`, `identity_create_link_attestation`,
+    // `identity_remove*` and the three agent-key ops over a callback
+    // (Secure Enclave / Android Keystore) `KeyCustodyProvider` — the custody a
+    // released Swift/Kotlin SDK uses. Re-typing the identity custody registry
+    // to the `UniffiKeyCustody` enum un-gated those ops; before that change
+    // they carried `#[cfg(feature = "testing")]` and were absent from the
+    // shipped library.
+    //
+    // Every test in this block carries `#[cfg(feature = "testing")]`, so job
+    // rust-test runs each of them and job rust-build-uniffi-production compiles
+    // none of them. Each one opens by minting an identity through
+    // `identity_create_with_custody`, and a shipped build declines that call
+    // with SCP-IDENT-1059 because this tree ships no `PreRotationCustody`
+    // backend (ADR-062, capability injection and prove-absent dev backends,
+    // §Decision 6). No test can hold a callback-custody identity in a bare
+    // build, so no assertion below states anything about the shipped
+    // configuration.
+    //
+    // `shipped_build_reaches_every_callback_custody_identity_op` carries the
+    // shipped-configuration half: it names and calls each op above in a
+    // `#[cfg(not(feature = "testing"))]` test, so re-gating any of them on
+    // `testing` fails to compile the test target that job
+    // rust-build-uniffi-production builds.
     // -----------------------------------------------------------------------
 
     /// A full `KeyCustodyProvider` backed by real Ed25519 keys with a
@@ -23875,8 +24000,8 @@ mod tests {
 
     /// `identity_create_with_custody` must register the callback identity in the
     /// per-instance custody registry so `identity_remove_if_present` reports
-    /// `true` on first removal — proving the registry exists and is populated in
-    /// a BARE (no `testing`) build over callback custody.
+    /// `true` on first removal, proving the registry exists and is populated
+    /// over callback custody.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn callback_identity_is_registered_for_remove_if_present() {
@@ -23901,8 +24026,10 @@ mod tests {
 
     /// `scpid_sign` must work over callback custody (production path), producing
     /// a response whose signature verifies against the identity's `#active`
-    /// public key. Pins that the op is un-gated and routes through
-    /// `resolve_identity_custody` → `UniffiKeyCustody::Callback`.
+    /// public key. Pins that the op routes through `resolve_identity_custody` →
+    /// `UniffiKeyCustody::Callback`. That the op stays un-gated is pinned by
+    /// `shipped_build_reaches_every_callback_custody_identity_op`, which names
+    /// it in a build carrying no `testing` feature.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scpid_sign_works_over_callback_custody() {
@@ -23976,14 +24103,15 @@ mod tests {
         );
     }
 
-    /// `add_agent_key` must work over callback custody (production path) in a
-    /// BARE (no `testing`) build, returning a handle whose DID
-    /// document and retained identity both carry the new `#agent` key. Before
-    /// the fix this op was `#[cfg(testing)]`-gated and the
-    /// bare build returned SCP-IDENT-1008 unconditionally. Pins that the op
-    /// resolves custody via `resolve_identity_custody` →
+    /// `add_agent_key` must work over callback custody (production path),
+    /// returning a handle whose DID document and retained identity both carry
+    /// the new `#agent` key. Before the fix this op was `#[cfg(testing)]`-gated
+    /// and a bare build returned SCP-IDENT-1008 unconditionally. Pins that the
+    /// op resolves custody via `resolve_identity_custody` →
     /// `UniffiKeyCustody::Callback` and signs the DHT publish with the callback
-    /// key.
+    /// key. A shipped build reaches the op and declines with SCP-IDENT-1059
+    /// instead, which
+    /// `shipped_build_reaches_every_callback_custody_identity_op` asserts.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn add_agent_key_works_over_callback_custody() {
@@ -24018,10 +24146,12 @@ mod tests {
         );
     }
 
-    /// `rotate_agent_key` must work over callback custody (production path) in
-    /// a BARE build: it generates a fresh `#agent` key, retires the old one,
-    /// republishes the DID document, and returns a handle that still has an
-    /// agent key (with a different public key than before rotation).
+    /// `rotate_agent_key` must work over callback custody (production path): it
+    /// generates a fresh `#agent` key, retires the old one, republishes the DID
+    /// document, and returns a handle that still has an agent key (with a
+    /// different public key than before rotation). A shipped build reaches the
+    /// op and declines with SCP-IDENT-1059 instead, which
+    /// `shipped_build_reaches_every_callback_custody_identity_op` asserts.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rotate_agent_key_works_over_callback_custody() {
@@ -24061,9 +24191,11 @@ mod tests {
         );
     }
 
-    /// `remove_agent_key` must work over callback custody (production path) in
-    /// a BARE build: it strips the `#agent` verification method, republishes
-    /// the DID document, and returns a handle with no agent key.
+    /// `remove_agent_key` must work over callback custody (production path): it
+    /// strips the `#agent` verification method, republishes the DID document,
+    /// and returns a handle with no agent key. A shipped build reaches the op
+    /// and declines with SCP-IDENT-1059 instead, which
+    /// `shipped_build_reaches_every_callback_custody_identity_op` asserts.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remove_agent_key_works_over_callback_custody() {
@@ -24401,11 +24533,20 @@ mod tests {
     // the `testing`-only custody and fail-closed
     // (SCP-IDENT-1017) in a bare production build — even when the context
     // creator used platform/callback (OS-keychain / HSM) custody. These tests
-    // pin the production path: in a BARE build (no `testing`),
-    // a callback-custody context handle / identity must sign UCANs and event-log
-    // checkpoints, and the produced UCAN signature must verify against the
-    // custody's `#active` public key. They are NOT cfg-gated, so they run on the
-    // release canary.
+    // pin the production path: a callback-custody context handle or identity
+    // must sign UCANs and event-log checkpoints, and the produced UCAN
+    // signature must verify against the custody's `#active` public key.
+    //
+    // The block splits by how each test obtains its custody. The `ucan_*` tests
+    // build a `ContextHandle` directly through `callback_context_handle`, so
+    // they compile and pass with `testing` off; job
+    // rust-build-uniffi-production names them in its `-E` filter and runs them
+    // on the shipped configuration. The `event_log_checkpoint*` tests mint an
+    // identity through `identity_create_with_custody`, which a shipped build
+    // declines with SCP-IDENT-1059 for want of a `PreRotationCustody` backend
+    // (ADR-062, capability injection and prove-absent dev backends,
+    // §Decision 6), so they carry `#[cfg(feature = "testing")]` and run in job
+    // rust-test alone.
     // -----------------------------------------------------------------------
 
     /// Builds a `ContextHandle` carrying a real-Ed25519 [`ProdLikeCustody`]
@@ -24681,9 +24822,9 @@ mod tests {
     /// `identity_create_with_custody`, carrying `core_id.active_signing_key` in
     /// its callback store) signs a checkpoint attributed to its own DID,
     /// producing a non-empty signature attributed to that same DID. Pins that
-    /// `event_log_checkpoint_by_did_impl` is un-gated and resolves custody via
-    /// `resolve_identity_custody` → `UniffiKeyCustody::Callback` on the bare
-    /// canary, with the `did == identity.did` `VALID_7000` binding satisfied.
+    /// `event_log_checkpoint_by_did_impl` resolves custody via
+    /// `resolve_identity_custody` → `UniffiKeyCustody::Callback`, with the
+    /// `did == identity.did` `VALID_7000` binding satisfied.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn event_log_checkpoint_by_did_works_over_callback_custody() {

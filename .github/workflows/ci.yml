@@ -917,16 +917,39 @@ jobs:
           cargo build -p scp-ffi-uniffi --features server
       - name: Shipped uniffi fail-closed assertion
         run: |
-          # `identity_create_in_memory_rejected_without_feature` at
-          # crates/scp-ffi/uniffi/src/lib.rs:710 asserts that a shipped uniffi
-          # build rejects `in_memory` custody with SCP-IDENT-1008. It carries
-          # `#[cfg(not(feature = "testing"))]`. The three lanes that run uniffi
-          # tests each enable `scp-ffi-uniffi/testing`, which compiles that test
-          # out: job rust-test and job rust-doc in this file, and job
-          # conformance in release.yml. It therefore executed in no lane,
-          # while this job built the bridge and tested nothing, and
-          # build-matrix.yml ships that bridge in an iOS XCFramework and an
-          # Android AAR at tag time.
+          # The four `#[cfg(not(feature = "testing"))]` assertions this bridge
+          # defines, and what each one asserts about a shipped build:
+          #
+          #   identity_create_in_memory_rejected_without_feature
+          #     (crates/scp-ffi/uniffi/src/lib.rs) — `identity_create` rejects
+          #     `in_memory` custody with SCP-IDENT-1008.
+          #   parse_custody_method_rejects_in_memory_on_a_shipped_build
+          #     (same file) — the boundary parser rejects the same string with
+          #     the same code, one layer earlier.
+          #   identity_create_with_custody_fails_closed_without_pre_rotation_backend
+          #     (crates/scp-ffi/uniffi/src/bridge.rs) — a create over CALLBACK
+          #     custody declines with SCP-IDENT-1059, because the tree's only
+          #     `PreRotationCustody` implementation is a `testing`-gated
+          #     nullifier (ADR-062, capability injection and prove-absent dev
+          #     backends, §Decision 6).
+          #   shipped_build_reaches_every_callback_custody_identity_op
+          #     (same file) — `identity_load`, `scpid_sign`,
+          #     `identity_create_link_attestation`, `identity_remove*` and the
+          #     three agent-key ops each compile into a shipped library and
+          #     state their shipped outcome. Re-gating any of them on `testing`
+          #     stops this test target compiling.
+          #
+          # The four `ucan_*_over_callback_custody` tests carry no cfg gate and
+          # need none: they build a `ContextHandle` directly rather than
+          # minting an identity, so they run their real bodies here. Until this
+          # filter named them they ran only in lanes that enable
+          # `scp-ffi-uniffi/testing`, which proves nothing about the mobile libs
+          # build-matrix.yml ships at tag time.
+          #
+          # The three lanes that run uniffi tests each enable
+          # `scp-ffi-uniffi/testing`, which compiles every
+          # `#[cfg(not(feature = "testing"))]` test out: job rust-test and job
+          # rust-doc in this file, and job conformance in release.yml.
           #
           # `--no-tests=fail` exits 4 rather than 0 when a feature flip selects
           # zero tests. `check_shipped_build_assertions_run` in
@@ -934,7 +957,7 @@ jobs:
           # a `#[cfg(not(feature = "testing"))]` test this bridge defines is
           # absent from the filter below.
           cargo nextest run --no-tests=fail -p scp-ffi-uniffi --features server --lib \
-            -E 'test(identity_create_in_memory_rejected_without_feature)'
+            -E 'test(identity_create_in_memory_rejected_without_feature) + test(parse_custody_method_rejects_in_memory_on_a_shipped_build) + test(identity_create_with_custody_fails_closed_without_pre_rotation_backend) + test(shipped_build_reaches_every_callback_custody_identity_op) + test(ucan_mint_works_over_callback_custody) + test(ucan_delegate_works_over_callback_custody) + test(ucan_delegate_signs_with_delegator_key_not_context_creator_key) + test(ucan_mint_without_retained_custody_returns_ident_1017)'
 
   rust-doc:
     needs: changes
