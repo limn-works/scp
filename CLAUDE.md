@@ -145,7 +145,9 @@ feature-graph ⊆-allowlist prove-absence gate; the allowlist permits durability
 and real-backend features, ZERO nullifier exceptions),
 shipped-feature-graph-declared-rewritten-command-lines.txt (the rows that gate's
 third shipping-drift half compares every shipping-file command line against: a
-command line carrying a token the shell rewrites is declared here with the reason
+command line carrying a token spelled outside the characters cargo's own grammar
+uses — the whitelist that closes the test across every interpreter a `shell:` key
+or a Dockerfile `SHELL` instruction can name — is declared here with the reason
 its expansion selects no cargo feature, or the gate fails),
 check-toolchain-wiring.sh (every container build asserts which compiler it resolved;
 the changes job of every paths-filtered workflow routes a pin change to every lane that

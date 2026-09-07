@@ -379,7 +379,8 @@ EOF
 # Every command line of a SHIPPING_FILES file — a line whose text a Dockerfile
 # instruction or a workflow `run:`, `shell:`, or `with:` key hands to a process
 # (dockerfile_command_lines, workflow_command_lines) — that carries a token the
-# shell, or GitHub's expression evaluator, rewrites before the process reads it
+# command interpreter the file selects, or GitHub's expression evaluator, may
+# rewrite before the process reads it
 # (shell_rewrites_token), normalized and joined the same way. The two token
 # readers classify the tokens the file spells, so a token spelled `$FLAGS` is
 # one they cannot classify, and it can expand to `--features scp-node/testing`,
@@ -1221,9 +1222,10 @@ join_continued_lines() {
 # cargo accepts, so a spelling that grammar admits is a spelling these readers
 # see.
 #
-# THE SHELL REWRITES A TOKEN BEFORE CARGO READS IT. A Dockerfile `RUN` line and
-# a workflow `run:` block reach cargo through a shell, and the shell performs
-# quote removal and word expansion on every token first (bash manual §3.5,
+# THE COMMAND INTERPRETER REWRITES A TOKEN BEFORE CARGO READS IT. A Dockerfile
+# `RUN` line and a workflow `run:` block reach cargo through a command
+# interpreter, and that interpreter performs quote removal and word expansion on
+# every token first (bash manual §3.5,
 # "Shell Expansions"). Every reader below therefore walks the tokens
 # read_shell_tokens produces, which removes one balanced pair of surrounding
 # quotes from each token, so `"--features"` and `'-F'` are the option tokens
@@ -1232,18 +1234,19 @@ join_continued_lines() {
 # the short arm and shipped a nullifier feature under a passing gate.
 #
 # Quote removal is the one rewrite a reader can perform. Parameter expansion
-# (`$FLAGS`), command substitution (`$(…)`, a backtick), brace expansion
-# (`--fea{,}tures`), a backslash escape (`--fea\tures`), a quote that survives
-# the pair removal (`--fea"tures"`), filename expansion (`*`, `?`, `[…]`), tilde
-# expansion, and a GitHub expression (`${{ … }}`) all replace a token with text
-# the reader cannot compute from the file, and that text can be a
-# feature-selection flag or the command word itself. shell_rewrites_token names
-# the closed set of characters that introduce those rewrites, and
+# (`$FLAGS`, and cmd's `%FLAGS%` and `!FLAGS!`), command substitution (`$(…)`, a
+# backtick), brace expansion (`--fea{,}tures`), a backslash escape
+# (`--fea\tures`), a quote that survives the pair removal (`--fea"tures"`),
+# filename expansion (`*`, `?`, `[…]`), tilde expansion, and a GitHub expression
+# (`${{ … }}`) all replace a token with text the reader cannot compute from the
+# file, and that text can be a feature-selection flag or the command word
+# itself. shell_rewrites_token names the closed set of characters a token may
+# consist of and still reach the process as written, and
 # assert_shipping_invocations_are_gated fails on every command line (see WHICH
-# LINES REACH A COMMAND INTERPRETER below) that carries one until a human
-# declares the line in DECLARED_REWRITTEN_COMMAND_LINES with the reason its
-# expansion selects no feature. A token the reader cannot resolve is a line the
-# gate cannot vouch for.
+# LINES REACH A COMMAND INTERPRETER below) that carries a token outside that set
+# until a human declares the line in DECLARED_REWRITTEN_COMMAND_LINES with the
+# reason its expansion selects no feature. A token the reader cannot resolve is
+# a line the gate cannot vouch for.
 # ---------------------------------------------------------------------------
 
 # read_shell_tokens <line>
@@ -1268,31 +1271,50 @@ read_shell_tokens() {
 }
 
 # shell_rewrites_token <token>
-#   Exit 0 when the shell, or the GitHub expression evaluator that runs before
-#   it, replaces <token> with text this file cannot compute. Exit 1 for a token
-#   cargo receives as written. The character set is the set of operators the
-#   bash manual's "Shell Expansions" chapter (§3.5) and "Quoting" section (§3.1.2)
-#   name, so the shell's grammar closes it, and the spellings this file has met
-#   do not:
+#   Exit 0 when the command interpreter that reads the line, or the GitHub
+#   expression evaluator that runs before it, may replace <token> with text this
+#   file cannot compute. Exit 1 for a token every interpreter hands to the
+#   process as written.
 #
-#     $   parameter expansion, command substitution `$(…)`, arithmetic `$((…))`,
-#         and a GitHub `${{ … }}` expression
-#     `   command substitution
-#     { } brace expansion
-#     \   backslash escape
-#     " ' a quote read_shell_tokens did not remove (an unbalanced or an interior
-#         quote), and the `"` of a Dockerfile exec-form JSON array, whose quotes
-#         sit inside `[`…`,`…`]` and never surround a whole token
-#     [ ] * ? filename expansion (a bracket expression, `*`, `?`)
-#     ~   tilde expansion
+#   The test is a whitelist: <token> reaches the process as written when it
+#   consists only of
 #
-#   A revision that named `$`, the backtick, the braces, the backslash, and the
-#   quotes alone read `RUN ["cargo", "build", "--features", "scp-node/testing"]`
-#   through the `"` characters by accident and read `cargo build *` through
-#   nothing, so this set names every expansion the chapter lists.
+#     A-Z a-z 0-9 - _ . / : , = +
+#
+#   and needs a declaration otherwise. Those twelve character classes are the
+#   ones cargo's own grammar uses — an option (`--features`, `-p`), a feature or
+#   package name (`scp-node/testing`), an attached value (`--target=x86_64-…`), a
+#   comma-joined feature list, a manifest path — and every command interpreter a
+#   shipping file can select passes each of them through as a literal.
+#
+#   A denylist of operator characters cannot close here, and a revision that
+#   wrote one shipped a hole. That revision named `$ ` backtick `" ' \ { } [ ] *
+#   ? ~`, the operators the bash manual's "Shell Expansions" chapter (§3.5) and
+#   "Quoting" section (§3.1.2) list, and argued that bash's grammar closed the
+#   set. Bash's grammar closes bash's spellings and closes nothing about the
+#   other interpreters these files select: a workflow step names its interpreter
+#   with `shell:`, which GitHub Actions accepts as `bash`, `sh`, `pwsh`,
+#   `powershell`, `python`, `cmd`, or any `<program> {0}` template, and a
+#   Dockerfile `SHELL` instruction sets the program every later `RUN` line runs.
+#   cmd expands `%CARGO_FLAGS%`, and under `setlocal enabledelayedexpansion`
+#   `!CARGO_FLAGS!`; neither spelling carries a character that denylist named, so
+#   `cargo build --release -p scp-node %CARGO_FLAGS%` under `shell: cmd` passed
+#   the gate with the expansion free to be `--features scp-node/testing`. The
+#   set of interpreters a shipping file may select is open, so the set of their
+#   operator characters is open too, and only the set of characters cargo itself
+#   needs is closed. A `shell:` line is itself a command line this reader
+#   classifies, and the `{0}` of a `<program> {0}` template falls outside the
+#   whitelist, so a shipping file cannot name an interpreter outside GitHub's
+#   seven without a human declaring that line first.
+#
+#   The whitelist reports more lines than the denylist did — a `;`, a `|`, a
+#   `(`, a `>` redirection, or a non-ASCII character in a prose string now needs
+#   a row in DECLARED_REWRITTEN_COMMAND_LINES — and each extra row states why
+#   that line selects no cargo feature. Reporting a line the interpreter would
+#   have passed through costs one declaration; missing one ships a nullifier.
 shell_rewrites_token() {
   case "$1" in
-    *\$*|*\`*|*\"*|*\'*|*\\*|*\{*|*\}*|*\[*|*\]*|*\**|*\?*|*~*) return 0 ;;
+    *[!-A-Za-z0-9_./:,=+]*) return 0 ;;
   esac
   return 1
 }
@@ -1895,14 +1917,16 @@ $file_lines"
   undeclared_rewritten="$(comm -23 <(printf '%s\n' "$rewritten_lines" | sed -E '/^$/d' | sort -u) \
                                    <(printf '%s\n' "$declared_rewritten"))"
   if [[ -n "$undeclared_rewritten" ]]; then
-    echo "   FAIL — a shipping file hands a process a command line carrying a token the shell rewrites before the process reads it, so the flag and package readers cannot classify what that process receives:"
+    echo "   FAIL — a shipping file hands a process a command line carrying a token spelled outside the characters cargo's own grammar uses, so the flag and package readers cannot classify what that process receives:"
     printf '%s\n' "$undeclared_rewritten" | sed 's/^/       x /'
-    echo "          A parameter or command substitution, a brace or filename expansion, a backslash"
-    echo "          escape, a quote the pair removal did not consume, a Dockerfile exec-form array,"
-    echo "          or a \${{ … }} expression can expand to a feature-selection flag, or to the"
-    echo "          command word cargo. Spell the command literally, or declare the line in"
-    echo "          DECLARED_REWRITTEN_COMMAND_LINES with the reason its expansion selects no"
-    echo "          cargo feature."
+    echo "          A token reaches the process as written only when it consists of A-Z a-z 0-9"
+    echo "          - _ . / : , = and +. Any other character can be an operator of whichever"
+    echo "          interpreter the file selects — bash's \$ or backtick, cmd's % or !, a quote"
+    echo "          the pair removal did not consume, a Dockerfile exec-form array, a \${{ … }}"
+    echo "          expression — and the text it produces can be a feature-selection flag, or"
+    echo "          the command word cargo. Spell the command in those characters, or declare"
+    echo "          the line in DECLARED_REWRITTEN_COMMAND_LINES with the reason its expansion"
+    echo "          selects no cargo feature."
     fixture_failures=$((fixture_failures + 1))
     return
   fi
@@ -2173,18 +2197,29 @@ TREE
   printf '%s\n' "$seen" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 12 >/dev/null; rc=$?
   expect "(shipping-drift, spellings) the three lines carrying no feature-selection flag are NOT read" "PASS" "$rc"
 
-  # (shipping-drift, shell-rewrite) the shell rewrites a token before the
-  #     process reads it. Quote removal is the one rewrite the readers perform;
-  #     a parameter or command substitution, a brace expansion, a backslash
-  #     escape, a quote the pair removal leaves behind, a filename expansion, a
-  #     tilde, a Dockerfile exec-form array, and a GitHub expression each
-  #     replace a token with text the readers cannot compute, so a command line
-  #     carrying one is REPORTED for a human to declare, whether or not it
+  # (shipping-drift, shell-rewrite) the command interpreter rewrites a token
+  #     before the process reads it. Quote removal is the one rewrite the
+  #     readers perform; a parameter or command substitution, a brace expansion,
+  #     a backslash escape, a quote the pair removal leaves behind, a filename
+  #     expansion, a tilde, a Dockerfile exec-form array, and a GitHub expression
+  #     each replace a token with text the readers cannot compute, so a command
+  #     line carrying one is REPORTED for a human to declare, whether or not it
   #     spells the word `cargo`: the PowerShell line and the echo line below
   #     are reported too, because the reader decides from the file's grammar
   #     which lines reach a process, not from the line's words. A line whose
   #     quotes strip clean is not reported (the flag reader already sees its
   #     flag).
+  #
+  #     shell_rewrites_token decides by whitelist, so the four cmd and operator
+  #     spellings below are reported without anyone naming them: `%FLAGS%` is
+  #     cmd's parameter expansion, `!FLAGS!` is cmd's delayed expansion, `^` is
+  #     cmd's escape character, and a `;`, `|`, or `>` glued to a token ends the
+  #     command the reader thought it was reading. A denylist of bash's
+  #     operators reported none of the four. The last clean line carries every
+  #     character class the whitelist admits — an attached `=` value, a `/` in a
+  #     feature name, a `,` between two features, a `.` in a manifest path — so a
+  #     tightening of the whitelist that stopped cargo's own grammar from
+  #     resolving goes red here.
   local rewrite_probe rewritten
   rewrite_probe="$(printf '%s\n' \
     'RUN cargo build --release $CARGO_FLAGS -p scp-node' \
@@ -2208,19 +2243,29 @@ TREE
     '${{ env.MATURIN_ARGS }}' \
     '$cert = Import-PfxCertificate -FilePath $certPath `' \
     'echo "$HOME" ${{ github.sha }}' \
+    'RUN cargo build --release -p scp-node %CARGO_FLAGS%' \
+    'RUN cargo build --release -p scp-node !CARGO_FLAGS!' \
+    'RUN cargo build --release -p scp-node ^CARGO_FLAGS' \
+    'RUN cargo build --release -p scp-node; echo built' \
+    'RUN cargo build --release -p scp-node | tee build.log' \
+    'RUN cargo build --release -p scp-node > build.log' \
     'RUN cargo build --release --features "scp-node/testing"' \
     "RUN cargo build --release '-p' scp-relay" \
+    'RUN cargo build --release --target=x86_64-unknown-linux-gnu --manifest-path crates/scp-ffi/Cargo.toml --features=scp-core/testing,scp-runtime/testing -p scp-node' \
     'RUN cargo build --release -p scp-relay -p scp-node')"
   rewritten="$(command_lines_the_reader_cannot_compute "$rewrite_probe")"
   # shellcheck disable=SC2088  # '~/flags' is the probe's literal text; the fixture asserts that the reader reports the tilde, so it must not expand here.
   for spelled in '$CARGO_FLAGS' '${CARGO_FLAGS}' '$(cat flags.txt)' '`cat flags.txt`' '--fea{,}tures' '--fea\tures' '--fea"tures"' '${{ matrix.target }}' \
                  'scp-node *' '-F?' '[-]F' '~/flags' '["cargo",' 'sh -c "cargo' '/usr/local/cargo/bin/cargo' 'set -e;cargo' '(cargo' 'maturin build' \
-                 '${{ env.MATURIN_ARGS }}' '$cert = Import-PfxCertificate' 'echo "$HOME"'; do
+                 '${{ env.MATURIN_ARGS }}' '$cert = Import-PfxCertificate' 'echo "$HOME"' \
+                 '%CARGO_FLAGS%' '!CARGO_FLAGS!' '^CARGO_FLAGS' 'scp-node; echo built' 'scp-node | tee' 'scp-node > build.log'; do
     printf '%s\n' "$rewritten" | grep -F -- "$spelled" >/dev/null; rc=$?
     expect "(shipping-drift, shell-rewrite) a command line carrying '$spelled' is REPORTED as rewritten" "PASS" "$rc"
   done
-  printf '%s\n' "$rewritten" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 21 >/dev/null; rc=$?
-  expect "(shipping-drift, shell-rewrite) the three clean cargo lines are NOT reported and the twenty-one rewritten lines are" "PASS" "$rc"
+  printf '%s\n' "$rewritten" | grep -F -- '--features=scp-core/testing,scp-runtime/testing' >/dev/null; rc=$?
+  expect "(shipping-drift, shell-rewrite) a cargo line spelling an attached --target=, a --manifest-path, and a comma-joined --features= list is NOT reported (the whitelist admits cargo's own grammar)" "FAIL" "$rc"
+  printf '%s\n' "$rewritten" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 27 >/dev/null; rc=$?
+  expect "(shipping-drift, shell-rewrite) the four clean cargo lines are NOT reported and the twenty-seven rewritten lines are" "PASS" "$rc"
 
   # (shipping-drift, dockerfile-lines) the Dockerfile reader emits the lines an
   #     instruction hands to a process — RUN in either case, the instruction an
@@ -2401,6 +2446,38 @@ TREE
     DECLARED_NON_SHIPPING_PACKAGE_LINES=""; DECLARED_REWRITTEN_COMMAND_LINES=""
     assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
   expect "(shipping-drift, planted, command-word) the assertion REJECTS an undeclared \${{ env.MATURIN_ARGS }} line of a folded args: scalar with no cargo word on any physical line" "FAIL" "$rc"
+  # (shipping-drift, planted, interpreter) the step names cmd as its interpreter
+  #     with `shell:`, and cmd expands `%CARGO_FLAGS%`. The line carries no
+  #     literal `--features` for halves 1 and 2 to read and no bash operator, so
+  #     a revision whose rewritten-token reader listed bash's operators returned
+  #     `G1 PASSED` while the job's `env:` was free to set
+  #     `CARGO_FLAGS=--features testing`. The whitelist reports the token, and
+  #     the second case shows the declaration is what clears it.
+  printf '%s\n' 'jobs:' '  node:' '    steps:' \
+    '      - name: Build node binary (Windows cmd)' '        shell: cmd' \
+    '        run: cargo build --release -p scp-node %CARGO_FLAGS%' > "$planted_yml"
+  ( fixture_failures=0; SHIPPING_FILES=("$planted_yml"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+    DECLARED_NON_SHIPPING_PACKAGE_LINES=""; DECLARED_REWRITTEN_COMMAND_LINES=""
+    assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(shipping-drift, planted, interpreter) the assertion REJECTS an undeclared cmd expansion %CARGO_FLAGS% on a shell: cmd step" "FAIL" "$rc"
+  ( fixture_failures=0; SHIPPING_FILES=("$planted_yml"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+    DECLARED_NON_SHIPPING_PACKAGE_LINES=""
+    DECLARED_REWRITTEN_COMMAND_LINES='run: cargo build --release -p scp-node %CARGO_FLAGS%'
+    assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(shipping-drift, planted, interpreter) the assertion ACCEPTS that cmd line once a human declares it" "PASS" "$rc"
+  printf '%s\n' 'jobs:' '  node:' '    steps:' \
+    '      - shell: cmd' \
+    '        run: setlocal enabledelayedexpansion && cargo build --release -p scp-node !CARGO_FLAGS!' > "$planted_yml"
+  ( fixture_failures=0; SHIPPING_FILES=("$planted_yml"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+    DECLARED_NON_SHIPPING_PACKAGE_LINES=""; DECLARED_REWRITTEN_COMMAND_LINES=""
+    assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(shipping-drift, planted, interpreter) the assertion REJECTS an undeclared cmd delayed expansion !CARGO_FLAGS! on a shell: cmd step" "FAIL" "$rc"
+  printf '%s\n' 'FROM mcr.microsoft.com/windows/servercore:ltsc2022' 'SHELL ["cmd", "/S", "/C"]' \
+    'RUN cargo build --release -p scp-node %CARGO_FLAGS%' > "$planted_file"
+  ( fixture_failures=0; SHIPPING_FILES=("$planted_file"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+    DECLARED_NON_SHIPPING_PACKAGE_LINES=""; DECLARED_REWRITTEN_COMMAND_LINES=""
+    assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(shipping-drift, planted, interpreter) the assertion REJECTS an undeclared %CARGO_FLAGS% on a RUN line a Dockerfile SHELL instruction points at cmd" "FAIL" "$rc"
   printf '%s\n' 'jobs:' '  wheel:' "    if: \${{ github.ref == 'refs/heads/main' }}" '    env:' '      FLAGS: ${{ inputs.flags }}' '    steps:' \
     '      - run: cargo build --release -p scp-node' > "$planted_yml"
   ( fixture_failures=0; SHIPPING_FILES=("$planted_yml"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
