@@ -377,16 +377,19 @@ EOF
 )"
 
 # Every line of a SHIPPING_FILES file that reaches a process — a line whose text
-# a Dockerfile instruction or a workflow `run:`, `shell:`, `with:`, or `env:`
-# key hands to one, plus every line the workflow reader parses no mapping key
-# from (dockerfile_lines_tagged, workflow_lines_tagged) — whose effect on the
+# a Dockerfile instruction or a workflow `run:`, `shell:`, `with:`, `env:`,
+# `uses:`, `container:`, `services:`, or `working-directory:` key hands to one,
+# plus every line the workflow reader parses no mapping key from
+# (dockerfile_lines_tagged, workflow_lines_tagged) — whose effect on the
 # build this gate cannot resolve, normalized and joined the same way. A line
 # qualifies when it carries a token the command interpreter the file selects, or
 # GitHub's expression evaluator, may rewrite before the process reads it
 # (shell_rewrites_token); when its command word is neither `cargo` nor `maturin`
-# so the program it names can run a cargo build no reader here sees; or when it
-# assigns an environment variable, which rustc and cargo read outside argv
-# (lines_whose_process_the_reader_cannot_name). The two token readers classify
+# so the program it names can run a cargo build no reader here sees; when it
+# assigns an environment variable, which rustc and cargo read outside argv; or
+# when it carries an option token outside the whitelist of cargo options the
+# readers parse, because `cargo --config build.rustflags=…` puts `--cfg
+# feature="testing"` on rustc's argv (lines_whose_process_the_reader_cannot_name). The two token readers classify
 # the tokens the file spells, so a token spelled `$FLAGS` is one they cannot
 # classify, and it can expand to `--features scp-node/testing`, or to the
 # command word `cargo` itself. assert_shipping_invocations_are_gated FAILS on
@@ -1351,8 +1354,8 @@ shell_rewrites_token() {
 #   unread — the reader cannot classify the line under the file's grammar, so
 #            it cannot prove the line reaches no process.
 #
-# THREE INPUTS DECIDE WHAT rustc COMPILES INTO A SHIPPED ARTIFACT, AND HALF 3
-# NAMES ALL THREE.
+# FOUR INPUTS DECIDE WHAT rustc COMPILES INTO A SHIPPED ARTIFACT, AND HALF 3
+# NAMES ALL FOUR.
 #
 #   (i) The tokens the process receives. shell_rewrites_token reports a token
 #       spelled outside the characters cargo's own grammar uses, because the
@@ -1384,7 +1387,21 @@ shell_rewrites_token() {
 #       gate. So every `env`-kind line needs a declaration naming what its
 #       assignment does, and a value edit to a declared line — `RUSTFLAGS: "-D
 #       warnings"` becoming `RUSTFLAGS: --cfg feature=testing` — changes the row
-#       and fails the gate.
+#       and fails the gate. A job's `container:` `options:` string reaches the
+#       same environment through `docker create`, so the workflow reader tags
+#       that block `env` too.
+#
+#   (iv) The options the process receives. `cargo --config <KEY=VALUE|PATH>`
+#       sets `build.rustflags`, and cargo puts what it finds there on the argv of
+#       every rustc the build runs, so `--cfg feature="testing"` in that file
+#       compiles the three scp-platform in-memory doubles into scp-relay and
+#       scp-node with no feature edge for `cargo tree` to print. Every character
+#       of `--config=ci-flags.toml` sits inside the character whitelist, the
+#       command word is `cargo`, and the token assigns no environment variable,
+#       so conditions (i), (ii), and (iii) each reported nothing about it. `-Z`
+#       names an unstable cargo feature and a bare `--` hands every later token
+#       to a second program. cargo_option_the_readers_cannot_resolve decides
+#       this by whitelist, for the reason the block above it states.
 #
 # A revision that decided which lines reach a process from the line's words —
 # "one token is the literal `cargo`" — vouched for `RUN ["cargo", "build",
@@ -1531,9 +1548,37 @@ dockerfile_lines_tagged() {
 #   list indicator (`- `), then reads a plain key (`run:`, `run :`) or a quoted
 #   key (`"run":`, `'run':`), which YAML resolves to the same key. A `run:` key
 #   is `run` and carries the first token of its value as the command word; a
-#   `shell:` or `with:` key is `arg`; an `env:` key is `env`. A key this reader
-#   knows hands its value to no process — `if:`, `name:`, `uses:`, `needs:`,
-#   `runs-on:` — emits nothing. A line whose text parses as no key at all is
+#   `shell:`, `with:`, or `working-directory:` key is `arg`; an `env:`,
+#   `container:`, or `services:` key is `env`; a `uses:` key is `run` and
+#   carries its action reference as the command word, which is neither `cargo`
+#   nor `maturin`, so lines_whose_process_the_reader_cannot_name reports it.
+#
+#   THE KEYS THAT REACH A PROCESS ARE THE ONES GITHUB'S WORKFLOW-SYNTAX
+#   REFERENCE DEFINES AS REACHING ONE, AND THE ARMS BELOW NAME ALL OF THEM.
+#   `run:` and `shell:` name a command and the interpreter that reads it;
+#   `with:` supplies an action's inputs, and `PyO3/maturin-action` forwards its
+#   `args` input to maturin as argv; `env:` assigns the environment every later
+#   process of the step or the job reads; `uses:` names the action the runner
+#   executes, and that action's own `action.yml` can run `cargo build --features
+#   scp-node/testing` in a file no reader here opens; `container:` and
+#   `services:` name the image a job's every step runs inside and carry an
+#   `options:` string the runner passes to `docker create`, where `--env
+#   RUSTFLAGS=--cfg feature=testing` sets the environment of every later step;
+#   `working-directory:` sets the directory a later `run:` command starts in,
+#   which decides which `Cargo.toml` cargo reads. Every other key GitHub's
+#   reference defines — `name:`, `if:`, `needs:`, `runs-on:`, `id:`,
+#   `strategy:`, `matrix:`, `permissions:`, `concurrency:`, `outputs:`,
+#   `timeout-minutes:`, `continue-on-error:`, `defaults:`, `on:`, `jobs:`,
+#   `steps:` — the runner reads itself and hands to no process, and so does
+#   every author-chosen name (a job id, a matrix field, a `with:` input, an
+#   environment-variable name), each of which sits inside a block one of the
+#   seven keys above already owns. A revision that carried arms for `run`,
+#   `shell|with`, and `env` only emitted nothing for a `uses:` step, so
+#   replacing `run: cargo build --release -p scp-node` with a `uses:` step
+#   naming a local composite action moved the whole build into a file the gate
+#   never reads while the gate kept printing `G1 PASSED`.
+#
+#   A line whose text parses as no key at all is
 #   `unread`: a YAML flow mapping (`- {run: cargo build %FLAGS%}`), a sequence
 #   scalar, a folded-scalar continuation. The scalar or mapping beneath an
 #   emitted key consists of the lines that follow it and are blank or indented
@@ -1585,9 +1630,35 @@ workflow_lines_tagged() {
         esac
         printf 'run\t%s\t%s\n' "$word" "$line"
         kind="run" ;;
-      shell|with)
+      shell|with|working-directory)
         printf 'arg\t\t%s\n' "$line"
         kind="arg" ;;
+      uses)
+        # The runner executes the action this value names, and that action's
+        # own `action.yml` runs commands no reader here opens. The action
+        # reference is the command word, so the program condition of
+        # lines_whose_process_the_reader_cannot_name reports the step until a
+        # human declares what the action runs. A `uses:` value is a single
+        # scalar, so the block this key opens carries the step's sibling keys,
+        # and each of them is measured against this key's own indentation.
+        value="${rest#*:}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        word=""
+        case "$value" in
+          ''|'|'*|'>'*) ;;
+          *) read -r word _ <<<"$value" ;;
+        esac
+        printf 'run\t%s\t%s\n' "$word" "$line"
+        kind="run" ;;
+      container|services)
+        # The runner passes this block's `image:` to `docker create` as the
+        # program every step of the job runs inside, and its `options:` string
+        # to the same command, where `--env RUSTFLAGS=--cfg feature=testing`
+        # sets the environment rustc reads. Tagging the block `env` puts every
+        # line of it under condition (iii), so each one needs a declaration
+        # stating what it assigns.
+        printf 'env\t\t%s\n' "$line"
+        kind="env" ;;
       env)
         # The `env:` key line itself assigns nothing — its mapping entries do,
         # and each of those is tagged `env` by the block branch above. Tagging
@@ -1651,6 +1722,114 @@ command_lines_the_reader_cannot_compute() {
   done <<<"$1"
 }
 
+# ---------------------------------------------------------------------------
+# A CARGO OPTION THE READERS DO NOT PARSE IS A FOURTH INPUT INTO WHAT rustc
+# COMPILES. `cargo --config <KEY=VALUE|PATH>` sets any key of cargo's
+# configuration for the duration of the invocation, `build.rustflags` and
+# `target.<triple>.rustflags` among them, and cargo puts what it finds there on
+# the argv of every rustc it runs. `cargo build --config=ci-flags.toml` whose
+# file holds `[build]` / `rustflags = ["--cfg", "feature=\"testing\""]` compiles
+# `#[cfg(feature = "testing")]` as true in every crate of the build, so
+# crates/scp-platform/src/lib.rs compiles InMemoryKeyCustody,
+# InMemoryDeviceAttestation, and InMemoryPreRotationCustody into scp-relay and
+# scp-node, while `cargo tree -e features` prints no `scp-platform/testing` edge
+# for run_gate to reject. Every character of `--config=ci-flags.toml` sits inside
+# the character whitelist, the command word is `cargo`, and the token assigns no
+# environment variable, so conditions (i), (ii), and (iii) each reported nothing
+# about it. `-Z` names an unstable cargo feature (`-Zbuild-std` recompiles the
+# standard library), and a bare `--` hands every token after it to a second
+# program (`cargo rustc -- --cfg feature=testing` reaches rustc directly).
+#
+# Naming those three options would be a denylist, and the set of cargo options
+# that reach rustc is open: whoever adds a fourth to cargo adds a hole to a
+# denylist and nothing to a whitelist. So the whitelist below names the options
+# this gate has checked, and every other option token on a line handed to cargo,
+# to maturin, or to a process this reader cannot name needs a declaration.
+#
+# THE CRITERION for a whitelist entry: one of this gate's own readers parses the
+# option's value, or the cargo book documents an effect that changes neither the
+# features cargo resolves, nor the flags and cfgs rustc receives, nor which
+# manifest cargo reads. An option that fails that test belongs in
+# DECLARED_REWRITTEN_COMMAND_LINES on the line that carries it, where a human
+# states what its value does to the build.
+# ---------------------------------------------------------------------------
+
+# The long options (spelled without the leading `--`) that satisfy the criterion
+# above, each with the reason it does.
+CARGO_LONG_OPTIONS_THE_READERS_RESOLVE=(
+  # Read by a reader of this gate.
+  package               # half 1 reads its value (packages_built_by_shipping_lines)
+  features              # half 2 reads the line (lines_carrying_cargo_feature_selection)
+  all-features          # half 2 reads the line
+  no-default-features   # half 2 reads the line
+  target                # target_triples_of_shipping_lines resolves every triple it names
+  manifest-path         # maturin_project_files_named_by_shipping_lines reads its value
+  # Inert on what rustc compiles, per the cargo book.
+  release               # selects the `release` profile, which sets no cfg and no feature
+  profile               # selects a named profile, which sets no cfg and no feature
+  bin                   # selects a binary target inside a package already resolved
+  bins                  # selects every binary target inside a package already resolved
+  lib                   # selects the library target inside a package already resolved
+  locked                # requires Cargo.lock to be current; changes no resolution
+  frozen                # `--locked --offline`
+  offline               # forbids network access; changes no resolution
+  quiet                 # output verbosity
+  verbose               # output verbosity
+  color                 # output formatting
+  message-format        # output formatting
+  jobs                  # parallelism of the build
+  keep-going            # error handling after a failed unit
+  target-dir            # where cargo writes output; changes no compiler input
+  allow-dirty           # `cargo publish` skips its clean-tree check
+  no-verify             # `cargo publish` skips its verification build
+)
+
+# The short options (spelled without the leading `-`) that satisfy the same
+# criterion, split by whether cargo's grammar gives the option a value: a
+# value-taking letter consumes the rest of its cluster, and a flag letter does
+# not.
+CARGO_SHORT_VALUE_OPTIONS_THE_READERS_RESOLVE=(p F j)
+CARGO_SHORT_FLAG_OPTIONS_THE_READERS_RESOLVE=(q v r)
+
+# cargo_option_the_readers_cannot_resolve <token>
+#   Exit 0 when <token> is an option this gate's readers do not parse and whose
+#   effect on what rustc compiles this gate has not checked. Exit 1 for a token
+#   that is no option at all (a subcommand, a value, a path) and for every
+#   option on the two whitelists above.
+#
+#   A long token is `--<name>` or `--<name>=<value>`, and `<name>` decides. A
+#   bare `--` carries no name and reports, because cargo hands every token after
+#   it to a second program. A short token is a cluster of letters after one
+#   dash: a flag letter lets the scan continue, a value-taking letter consumes
+#   the rest of the cluster and ends the scan, and any other letter reports.
+cargo_option_the_readers_cannot_resolve() {
+  local tok="$1" name known i ch
+  case "$tok" in
+    --) return 0 ;;
+    --*)
+      name="${tok#--}"
+      name="${name%%=*}"
+      for known in "${CARGO_LONG_OPTIONS_THE_READERS_RESOLVE[@]}"; do
+        [[ "$name" == "$known" ]] && return 1
+      done
+      return 0 ;;
+    -?*)
+      name="${tok#-}"
+      for ((i = 0; i < ${#name}; i++)); do
+        ch="${name:i:1}"
+        for known in "${CARGO_SHORT_VALUE_OPTIONS_THE_READERS_RESOLVE[@]}"; do
+          [[ "$ch" == "$known" ]] && return 1
+        done
+        for known in "${CARGO_SHORT_FLAG_OPTIONS_THE_READERS_RESOLVE[@]}"; do
+          [[ "$ch" == "$known" ]] && continue 2
+        done
+        return 0
+      done
+      return 1 ;;
+  esac
+  return 1
+}
+
 # lines_whose_process_the_reader_cannot_name <tagged-lines>
 #   Emit the line of every tagged line whose input this gate cannot resolve for
 #   a reason the token whitelist does not cover:
@@ -1662,7 +1841,13 @@ command_lines_the_reader_cannot_compute() {
 #     every `env`-kind line, because rustc and cargo read `RUSTFLAGS`,
 #     `CARGO_BUILD_RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, and every other
 #     `CARGO_<SECTION>_<KEY>` variable out of the environment and never out of
-#     argv (condition (iii) above).
+#     argv (condition (iii) above), and
+#
+#     every line handed to cargo, to maturin, or to a process this reader does
+#     not name (an `arg`-kind line) that carries an option token outside the two
+#     whitelists above, because `--config build.rustflags=…` puts `--cfg
+#     feature="testing"` on rustc's argv and `cargo tree -e features` prints no
+#     feature edge for it (condition (iv) above).
 #
 #   A `run`-kind line with an empty command word carries a block indicator
 #   whose own lines this reader classifies one by one, and `|` and `>` sit
@@ -1687,13 +1872,34 @@ lines_whose_process_the_reader_cannot_name() {
     case "$kind" in
       run)
         case "$word" in
-          ''|cargo|maturin) ;;
+          # `if`, not `predicate && printf`: this file runs under `set -e`, the
+          # loop body is no tested context, and an AND-list whose left side
+          # fails is one edit away from exiting the subshell that reads this
+          # function's output — which would truncate the report after the first
+          # clean cargo line and pass every line beneath it.
+          ''|cargo|maturin)
+            if option_reports_line "$text"; then printf '%s\n' "$text"; fi ;;
           *) printf '%s\n' "$text" ;;
         esac ;;
+      arg)
+        if option_reports_line "$text"; then printf '%s\n' "$text"; fi ;;
       env)
         printf '%s\n' "$text" ;;
     esac
   done <<<"$1"
+}
+
+# option_reports_line <line>
+#   Exit 0 when <line> carries a token cargo_option_the_readers_cannot_resolve
+#   reports. Named apart from that predicate because the caller walks the
+#   shell tokens of a whole line and the predicate classifies one token.
+option_reports_line() {
+  local tok
+  read_shell_tokens "$1"
+  for tok in "${SHELL_TOKENS[@]+"${SHELL_TOKENS[@]}"}"; do
+    if cargo_option_the_readers_cannot_resolve "$tok"; then return 0; fi
+  done
+  return 1
 }
 
 # cargo_option_values <lines> <long-name> <short-letter>
@@ -2011,16 +2217,18 @@ assert_maturin_project_files_are_complete() {
 #        `"--features"` and `'-F'` are the flags they spell.
 #     3. Every line of a shipping file that reaches a process — a line a
 #        Dockerfile RUN, CMD, ENTRYPOINT, SHELL, HEALTHCHECK, ENV, or ARG
-#        instruction, or a workflow `run:`, `shell:`, `with:`, or `env:` key,
-#        hands to one, plus every line the workflow reader parses no mapping key
+#        instruction, or a workflow `run:`, `shell:`, `with:`, `env:`, `uses:`,
+#        `container:`, `services:`, or `working-directory:` key, hands to one,
+#        plus every line the workflow reader parses no mapping key
 #        from (dockerfile_lines_tagged, workflow_lines_tagged) — that carries a
 #        token the shell rewrites before the process reads it — a parameter or
 #        command substitution, a brace or filename expansion, a backslash
 #        escape, a quote the pair removal did not consume, or a GitHub
 #        `${{ … }}` expression (shell_rewrites_token) — or whose command word is
-#        neither cargo nor maturin, or which assigns an environment variable
-#        (lines_whose_process_the_reader_cannot_name) — appears verbatim in
-#        DECLARED_REWRITTEN_COMMAND_LINES. Halves 1 and 2 classify the tokens
+#        neither cargo nor maturin, or which assigns an environment variable, or
+#        which carries an option token outside the whitelist of cargo options
+#        the readers parse (lines_whose_process_the_reader_cannot_name) —
+#        appears verbatim in DECLARED_REWRITTEN_COMMAND_LINES. Halves 1 and 2 classify the tokens
 #        the file spells, and a token such as `$FLAGS` can expand to a flag
 #        neither half saw, or to the command word cargo, so the gate cannot
 #        vouch for the line until a human states why the expansion selects no
@@ -2144,7 +2352,7 @@ $(lines_whose_process_the_reader_cannot_name "$tagged_lines")")"
   if [[ -n "$undeclared_rewritten" ]]; then
     echo "   FAIL — a shipping file hands a process a line whose effect on the build this gate cannot resolve, so the flag and package readers cannot classify what that process compiles:"
     printf '%s\n' "$undeclared_rewritten" | sed 's/^/       x /'
-    echo "          A line qualifies for one of three reasons. (i) A token reaches the process"
+    echo "          A line qualifies for one of four reasons. (i) A token reaches the process"
     echo "          as written only when it consists of A-Z a-z 0-9 - _ . / : , = and +. Any"
     echo "          other character can be an operator of whichever interpreter the file"
     echo "          selects — bash's \$ or backtick, cmd's % or !, a quote the pair removal did"
@@ -2156,7 +2364,12 @@ $(lines_whose_process_the_reader_cannot_name "$tagged_lines")")"
     echo "          rustc reads RUSTFLAGS — and cargo reads CARGO_BUILD_RUSTFLAGS,"
     echo "          CARGO_ENCODED_RUSTFLAGS, and every other CARGO_<SECTION>_<KEY> — out of the"
     echo "          environment rather than out of argv, so --cfg feature=\"testing\" there"
-    echo "          compiles a nullifier that cargo tree prints no feature edge for."
+    echo "          compiles a nullifier that cargo tree prints no feature edge for. (iv) The"
+    echo "          line carries an option token outside CARGO_LONG_OPTIONS_THE_READERS_RESOLVE"
+    echo "          and the two short-option lists beside it, so no reader here parses its"
+    echo "          value: cargo --config build.rustflags=… puts --cfg feature=\"testing\" on"
+    echo "          rustc's argv, -Z names an unstable cargo feature, and a bare -- hands every"
+    echo "          later token to a second program."
     echo "          Spell the command in those characters, or declare the line in"
     echo "          DECLARED_REWRITTEN_COMMAND_LINES with the reason it selects no cargo"
     echo "          feature and changes nothing rustc compiles."
@@ -2553,9 +2766,12 @@ TREE
   #     or with: key and every line beneath it — a literal block, a folded
   #     scalar, a nested mapping — and stops at the first line indented no
   #     deeper than the key, measured from the key and not from a list dash.
-  #     name:, on:, env:, if:, and uses: hold values the runner passes to no
-  #     process and are not emitted; the env: value carrying a literal flag is
-  #     still a line the flag reader reads.
+  #     name:, on:, env:, and if: hold values the runner passes to no process
+  #     and are not emitted; the env: value carrying a literal flag is still a
+  #     line the flag reader reads. uses: IS emitted, tagged `run` and carrying
+  #     the action reference as its command word, because the runner executes
+  #     that action and the action's own action.yml runs commands no reader
+  #     here opens.
   local workflow_probe workflow_lines
   workflow_probe="$(printf '%s\n' \
     'name: build' \
@@ -2584,12 +2800,15 @@ TREE
   workflow_tagged="$(workflow_lines_tagged "$workflow_probe")"
   workflow_lines="$(untag_lines "$workflow_tagged")"
   for spelled in 'with:' 'target: ${{ matrix.target }}' 'args: >-' '--release' '${{ env.MATURIN_ARGS }}' 'run: |' 'cargo build' '--release $FLAGS' 'shell: bash' \
-                 '- run: cargo build --release $FLAGS -p scp-node' 'MATURIN_ARGS: --features scp-ffi/testing' 'FLAGS: --features scp-node/testing'; do
+                 '- run: cargo build --release $FLAGS -p scp-node' 'MATURIN_ARGS: --features scp-ffi/testing' 'FLAGS: --features scp-node/testing' \
+                 '- uses: PyO3/maturin-action@v1'; do
     printf '%s\n' "$workflow_lines" | grep -F -- "$spelled" >/dev/null; rc=$?
     expect "(shipping-drift, workflow-lines) the workflow line '$spelled' is READ as a line that reaches a process" "PASS" "$rc"
   done
-  printf '%s\n' "$workflow_lines" | grep -E '^[[:space:]]*(- )?(name|on|if|uses|jobs|build|steps):' >/dev/null; rc=$?
-  expect "(shipping-drift, workflow-lines) name:, on:, if:, uses:, jobs:, and steps: are NOT read, because the runner hands their values to no process" "FAIL" "$rc"
+  printf '%s\n' "$workflow_lines" | grep -E '^[[:space:]]*(- )?(name|on|if|jobs|build|steps):' >/dev/null; rc=$?
+  expect "(shipping-drift, workflow-lines) name:, on:, if:, jobs:, and steps: are NOT read, because the runner hands their values to no process" "FAIL" "$rc"
+  printf '%s\n' "$workflow_tagged" | grep -xF "$(printf 'run\tPyO3/maturin-action@v1\t      - uses: PyO3/maturin-action@v1')" >/dev/null; rc=$?
+  expect "(shipping-drift, workflow-lines) uses: is tagged 'run' and carries the action reference as its command word, because the runner executes that action" "PASS" "$rc"
   printf '%s\n' "$workflow_tagged" | grep -xF "$(printf 'env\t\t  MATURIN_ARGS: --features scp-ffi/testing')" >/dev/null; rc=$?
   expect "(shipping-drift, workflow-lines) a mapping entry beneath env: is tagged 'env', because every later process of the job reads it" "PASS" "$rc"
   printf '%s\n' "$workflow_tagged" | grep -xF "$(printf 'run\tcargo\t      - run: cargo build --release $FLAGS -p scp-node')" >/dev/null; rc=$?
@@ -2598,8 +2817,40 @@ TREE
   expect "(shipping-drift, workflow-lines) a run: key whose value is a block indicator carries no command word, because its block lines carry the commands" "PASS" "$rc"
   printf '%s\n' "$workflow_tagged" | grep -xF "$(printf 'arg\t\t        with:')" >/dev/null; rc=$?
   expect "(shipping-drift, workflow-lines) with: is tagged 'arg', because the named action receives its inputs" "PASS" "$rc"
-  printf '%s\n' "$workflow_lines" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 14 >/dev/null; rc=$?
-  expect "(shipping-drift, workflow-lines) the twenty-two-line workflow yields exactly fourteen lines that reach a process" "PASS" "$rc"
+  printf '%s\n' "$workflow_lines" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 15 >/dev/null; rc=$?
+  expect "(shipping-drift, workflow-lines) the twenty-two-line workflow yields exactly fifteen lines that reach a process" "PASS" "$rc"
+
+  # (shipping-drift, workflow-lines, process-reaching-key) every key GitHub's
+  #     workflow-syntax reference defines as reaching a process is a key this
+  #     reader emits a tagged line for. A revision that carried arms for `run`,
+  #     `shell|with`, and `env` only emitted nothing for `uses:`, for
+  #     `container:` and its `options:` string, for `services:`, and for
+  #     `working-directory:`, so a build moved into a local composite action, or
+  #     a job given `container:` / `options: --env RUSTFLAGS=--cfg
+  #     feature=testing`, changed what rustc compiled while the gate printed
+  #     `G1 PASSED`. Each probe below is one key with a value that reaches a
+  #     process, and each must produce a tagged line.
+  local key_probe key_tagged
+  for spelled in '      - uses: ./.github/actions/build-node' \
+                 '    services:' \
+                 '        working-directory: bindings/python' \
+                 '        run: cargo build --release -p scp-node' \
+                 '        shell: bash' \
+                 '        with:' \
+                 '    env:'; do
+    key_probe="$(printf '%s\n' 'jobs:' '  node:' "$spelled")"
+    key_tagged="$(workflow_lines_tagged "$key_probe" | sed -E '/^[[:space:]]*$/d')"
+    printf '%s\n' "$key_tagged" | grep -F -- "$spelled" >/dev/null; rc=$?
+    expect "(shipping-drift, workflow-lines, process-reaching-key) the reader emits a tagged line for '$spelled'" "PASS" "$rc"
+  done
+  #     A `container:` block names the image every step of the job runs inside
+  #     and carries the `options:` string the runner passes to `docker create`,
+  #     so the key and both of its entries are tagged `env`.
+  key_probe="$(printf '%s\n' 'jobs:' '  node:' '    container:' '      image: rust:1.98' \
+    '      options: --env RUSTFLAGS=--cfg feature=testing')"
+  key_tagged="$(workflow_lines_tagged "$key_probe" | sed -E '/^[[:space:]]*$/d')"
+  printf '%s\n' "$key_tagged" | grep -cE $'^env\t' | grep -xF 3 >/dev/null; rc=$?
+  expect "(shipping-drift, workflow-lines, process-reaching-key) a container: block tags its key, its image:, and its options: line 'env'" "PASS" "$rc"
 
   # (shipping-drift, workflow-keys) the reader parses the mapping key rather
   #     than matching the physical line's text, so the YAML spellings that
@@ -2833,6 +3084,98 @@ TREE
     DECLARED_REWRITTEN_COMMAND_LINES='- run: ./build-release.sh'
     assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
   expect "(shipping-drift, planted, program) the assertion ACCEPTS that step once a human declares what the script runs" "PASS" "$rc"
+
+  # (shipping-drift, cargo-option) the option reader classifies one token and
+  #     the line reader walks a whole file, so a clean cargo line must not stop
+  #     the walk. This file runs under `set -e`, and an AND-list whose left side
+  #     fails inside the loop body would exit the subshell that reads this
+  #     function's output, reporting nothing for every line beneath the first
+  #     clean one.
+  local option_probe
+  option_probe="$(printf 'run\tcargo\tRUN cargo build --release -p scp-node\nenv\t\tENV RUSTFLAGS=--cfg\nrun\tmake\tRUN make release\n')"
+  lines_whose_process_the_reader_cannot_name "$option_probe" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 2 >/dev/null; rc=$?
+  expect "(shipping-drift, cargo-option) a clean cargo line does not stop the walk: the env line and the program line beneath it are both reported" "PASS" "$rc"
+  for spelled in --config --config=ci-flags.toml -Zbuild-std -- --unstable-options --all-targets --workspace; do
+    cargo_option_the_readers_cannot_resolve "$spelled" >/dev/null; rc=$?
+    expect "(shipping-drift, cargo-option) the option '$spelled' is one no reader here resolves" "PASS" "$rc"
+  done
+  for spelled in -p --package --features -F -qF --features=scp-node/testing --release --target=x86_64-unknown-linux-gnu --manifest-path --locked cargo build scp-node/testing; do
+    cargo_option_the_readers_cannot_resolve "$spelled" >/dev/null; rc=$?
+    expect "(shipping-drift, cargo-option) the token '$spelled' is one a reader here resolves" "FAIL" "$rc"
+  done
+
+  # (shipping-drift, planted, cargo-option) `cargo --config <KEY=VALUE|PATH>`
+  #     sets any key of cargo's configuration for the invocation, and
+  #     `build.rustflags` there reaches the argv of every rustc the build runs,
+  #     so `--cfg feature="testing"` in that file compiles InMemoryKeyCustody,
+  #     InMemoryDeviceAttestation, and InMemoryPreRotationCustody into scp-relay
+  #     and scp-node while `cargo tree -e features` prints no
+  #     scp-platform/testing edge. Every character of `--config=ci-flags.toml`
+  #     sits inside the character whitelist, the command word is `cargo`, and
+  #     the token assigns no environment variable, so conditions (i), (ii), and
+  #     (iii) each reported nothing and the gate printed `G1 PASSED`. `-Z` names
+  #     an unstable cargo feature and a bare `--` hands every token after it to
+  #     a second program, and `cargo rustc -- --cfg feature=testing` reaches
+  #     rustc through that door.
+  for spelled in 'RUN cargo build --release -p scp-relay -p scp-node --config=ci-flags.toml' \
+                 'RUN cargo build --release -p scp-node --config build.rustflags=[--cfg]' \
+                 'RUN cargo build --release -p scp-node -Zbuild-std' \
+                 'RUN cargo rustc --release -p scp-node -- --cfg feature=testing'; do
+    printf '%s\n' 'FROM rust:slim-bookworm AS builder' "$spelled" > "$planted_file"
+    ( fixture_failures=0; SHIPPING_FILES=("$planted_file"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+      DECLARED_NON_SHIPPING_PACKAGE_LINES=""; DECLARED_REWRITTEN_COMMAND_LINES=""
+      assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+    expect "(shipping-drift, planted, cargo-option) the assertion REJECTS the undeclared Dockerfile line: $spelled" "FAIL" "$rc"
+  done
+  printf '%s\n' 'FROM rust:slim-bookworm AS builder' \
+    'RUN cargo build --release -p scp-relay -p scp-node --config=ci-flags.toml' > "$planted_file"
+  ( fixture_failures=0; SHIPPING_FILES=("$planted_file"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+    DECLARED_NON_SHIPPING_PACKAGE_LINES=""
+    DECLARED_REWRITTEN_COMMAND_LINES='RUN cargo build --release -p scp-relay -p scp-node --config=ci-flags.toml'
+    assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(shipping-drift, planted, cargo-option) the assertion ACCEPTS that --config line once a human declares what its file sets" "PASS" "$rc"
+  printf '%s\n' 'FROM rust:slim-bookworm AS builder' \
+    'RUN cargo build --release -p scp-relay -p scp-node --target=x86_64-unknown-linux-gnu --locked' > "$planted_file"
+  ( fixture_failures=0; SHIPPING_FILES=("$planted_file"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+    DECLARED_NON_SHIPPING_PACKAGE_LINES=""; DECLARED_REWRITTEN_COMMAND_LINES=""
+    assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(shipping-drift, planted, cargo-option) the assertion ACCEPTS a build line whose every option sits on the whitelist" "PASS" "$rc"
+  printf '%s\n' 'jobs:' '  wheel:' '    steps:' '      - run: maturin build --release' '        with:' \
+    '          args: --config=ci-flags.toml' > "$planted_yml"
+  ( fixture_failures=0; SHIPPING_FILES=("$planted_yml"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+    DECLARED_NON_SHIPPING_PACKAGE_LINES=""; DECLARED_REWRITTEN_COMMAND_LINES=""
+    assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(shipping-drift, planted, cargo-option) the assertion REJECTS an undeclared --config inside an action's args: input" "FAIL" "$rc"
+
+  # (shipping-drift, planted, workflow-process-key) the runner executes the
+  #     action a `uses:` value names, and that action's own action.yml runs
+  #     cargo commands no reader here opens — the same condition (ii) the
+  #     assertion applies to `RUN ./build-release.sh`. The runner also passes a
+  #     job's `container:` `options:` string to `docker create`, where `--env
+  #     RUSTFLAGS=--cfg feature=testing` sets the environment of every later
+  #     step — the same condition (iii) it applies to a workflow `env:` key. A
+  #     revision whose workflow reader carried arms for `run`, `shell|with`, and
+  #     `env` only emitted nothing for either spelling, so moving the build into
+  #     a local composite action returned `G1 PASSED` while spelling the same
+  #     build `RUN ./build-release.sh` failed.
+  printf '%s\n' 'jobs:' '  node:' '    steps:' \
+    '      - uses: ./.github/actions/build-node' > "$planted_yml"
+  ( fixture_failures=0; SHIPPING_FILES=("$planted_yml"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+    DECLARED_NON_SHIPPING_PACKAGE_LINES=""; DECLARED_REWRITTEN_COMMAND_LINES=""
+    assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(shipping-drift, planted, workflow-process-key) the assertion REJECTS a uses: step naming a local composite action whose action.yml this gate never reads" "FAIL" "$rc"
+  ( fixture_failures=0; SHIPPING_FILES=("$planted_yml"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+    DECLARED_NON_SHIPPING_PACKAGE_LINES=""
+    DECLARED_REWRITTEN_COMMAND_LINES='- uses: ./.github/actions/build-node'
+    assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(shipping-drift, planted, workflow-process-key) the assertion ACCEPTS that uses: step once a human declares what the action runs" "PASS" "$rc"
+  printf '%s\n' 'jobs:' '  node:' '    container:' '      image: rust:1.98' \
+    '      options: --env RUSTFLAGS=--cfg feature=testing' '    steps:' \
+    '      - run: cargo build --release -p scp-node' > "$planted_yml"
+  ( fixture_failures=0; SHIPPING_FILES=("$planted_yml"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+    DECLARED_NON_SHIPPING_PACKAGE_LINES=""; DECLARED_REWRITTEN_COMMAND_LINES=""
+    assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(shipping-drift, planted, workflow-process-key) the assertion REJECTS a job whose container: options: sets RUSTFLAGS for every later step" "FAIL" "$rc"
 
   # (shipping-drift, planted, yaml-key) YAML resolves a flow-mapping step, a
   #     quoted key, and a key with whitespace before its colon to the same

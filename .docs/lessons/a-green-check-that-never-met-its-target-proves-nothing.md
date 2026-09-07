@@ -180,6 +180,47 @@ rules separate them.
   now fails on a command word that is neither `cargo` nor `maturin`, the two programs whose
   argv the gate parses, and on every environment assignment, and a value edit to a declared
   assignment changes its row.
+- **An option a check does not parse is an input the check does not read.** The reader
+  above named three inputs — the tokens a process receives, the program that receives
+  them, and the environment it runs in — and read a `cargo` command line's argv only for
+  the options its own halves parse: `-p`, the four feature-selection options, and
+  `--target`. `cargo --config <KEY=VALUE|PATH>` sets any key of cargo's configuration for
+  the invocation, `build.rustflags` among them, and cargo puts what it finds there on the
+  argv of every rustc the build runs. Every character of `--config=ci-flags.toml` sits
+  inside the character whitelist, the command word is `cargo`, and the token assigns no
+  environment variable, so all three conditions passed and
+  `assert_shipping_invocations_are_gated` returned `ok` for `RUN cargo build --release -p
+  scp-relay -p scp-node --config=ci-flags.toml` with every declaration list empty, while
+  that file's `rustflags = ["--cfg", "feature=\"testing\""]` compiles `InMemoryKeyCustody`,
+  `InMemoryDeviceAttestation`, and `InMemoryPreRotationCustody` into both binaries with no
+  feature edge for `cargo tree` to print. `-Z` names an unstable cargo feature and a bare
+  `--` hands every later token to a second program, so naming those three options would
+  have been a denylist. The repair whitelists the options instead:
+  `CARGO_LONG_OPTIONS_THE_READERS_RESOLVE` and the two short-option lists beside it name
+  every option a reader parses or a human has checked against the cargo book as changing
+  neither the features cargo resolves, nor the flags and cfgs rustc receives, nor which
+  manifest cargo reads, and every other option token needs a row in
+  `DECLARED_REWRITTEN_COMMAND_LINES` stating what its value does. Whoever adds a fourth
+  option to cargo adds a hole to a denylist and adds nothing to a whitelist.
+- **A grammar-driven reader is sound only over the keys it enumerates, and a key it omits
+  is a passing verdict.** `workflow_lines_tagged` decided a line's kind from the YAML key
+  rather than from the line's words, which closed the spelling problem and left the key set
+  open: its `case` carried arms for `run`, `shell|with`, and `env`, and every other key
+  fell through emitting nothing. `uses:` is such a key, and the runner executes the action
+  it names, so replacing `- run: cargo build --release -p scp-node` in
+  `.github/workflows/build-matrix.yml` with `- uses: ./.github/actions/build-node`
+  moved the whole build into an `action.yml` no reader opens, and the assertion returned
+  `ok` with every declaration list empty — while the identical hole spelled `RUN
+  ./build-release.sh` failed. `container:` is another: the runner passes a job's
+  `options:` string to `docker create`, where `--env RUSTFLAGS=--cfg feature=testing` sets
+  the environment of every later step, which is the environment condition the same commit
+  had just added for `env:`. The repair reads GitHub's workflow-syntax reference for the
+  keys that hand a value to a process and gives each one an arm: `uses:` is tagged `run`
+  with the action reference as its command word, `container:` and `services:` are tagged
+  `env`, and `working-directory:` is tagged `arg`. A fixture drives every one of those
+  keys through the reader and fails when any of them emits nothing, and the two fixtures
+  that had asserted `uses:` is NOT read — a blind spot locked in by a passing test — now
+  assert the opposite.
 - **Read a shared build cache everywhere, and write it only from a push to the default
   branch.** A cache written on a pull-request ref is readable only by that pull request,
   and it evicts entries from the budget every other cache step in the workflow shares.

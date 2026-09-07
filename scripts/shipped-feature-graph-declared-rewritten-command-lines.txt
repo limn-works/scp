@@ -2,9 +2,10 @@
 # (scripts/check-shipped-feature-graph.sh, assert_shipping_invocations_are_gated,
 # half 3). One row per line of a SHIPPING_FILES file that reaches a process —
 # a line a Dockerfile RUN, CMD, ENTRYPOINT, SHELL, HEALTHCHECK, ENV, or ARG
-# instruction, or a workflow `run:`, `shell:`, `with:`, or `env:` key, hands to
-# one, plus every line the workflow reader cannot parse as a mapping key at all
-# — whose effect on the build the gate cannot resolve for one of three reasons:
+# instruction, or a workflow `run:`, `shell:`, `with:`, `env:`, `uses:`,
+# `container:`, `services:`, or `working-directory:` key, hands to one, plus
+# every line the workflow reader cannot parse as a mapping key at all — whose
+# effect on the build the gate cannot resolve for one of four reasons:
 #
 #   (i) The line carries a token the command interpreter the file selects, or
 #       GitHub's expression evaluator, may rewrite before the process reads it.
@@ -30,6 +31,20 @@
 #       CARGO_<SECTION>_<KEY> config variable the same way, so `--cfg
 #       feature="testing"` in one of them compiles a nullifier that `cargo tree
 #       -e features` prints no feature edge for.
+#
+#   (iv) The line carries an option token this gate's readers do not parse and
+#       whose effect on what rustc compiles nobody has checked. `cargo --config
+#       <KEY=VALUE|PATH>` sets `build.rustflags`, and cargo puts what it finds
+#       there on the argv of every rustc the build runs, so `--cfg
+#       feature="testing"` in that file compiles InMemoryKeyCustody,
+#       InMemoryDeviceAttestation, and InMemoryPreRotationCustody into scp-relay
+#       and scp-node with no feature edge for `cargo tree` to print. `-Z` names
+#       an unstable cargo feature and a bare `--` hands every later token to a
+#       second program. The gate decides this by whitelist:
+#       CARGO_LONG_OPTIONS_THE_READERS_RESOLVE and the two short-option lists
+#       beside it name every option a reader parses or a human has checked
+#       against the cargo book as changing neither the features cargo resolves,
+#       nor the flags and cfgs rustc receives, nor which manifest cargo reads.
 #
 # Each row is the line as join_continued_lines, join_continued_tagged_lines, and
 # normalize_shipping_lines render it: comments dropped, backslash continuations
@@ -69,6 +84,13 @@
 #        A sequence scalar and a block-scalar body under a key the reader passes
 #        over arrive here. The row names the key that owns the line and what the
 #        runner does with its value.
+#   (R6) The line hands cargo, maturin, or an action an option token outside the
+#        whitelist of options this gate's readers parse, which is reason (iv).
+#        The row names the option and states what its value does to the build.
+#   (R7) The line is a `uses:` step, so the runner executes the action it names
+#        and that action's own `action.yml` runs commands no reader here opens,
+#        which is reason (ii) for a program the workflow grammar rather than a
+#        shell selects. The row names what the action runs.
 #
 # The cargo lines carry two expansions with their own reasons. `${{ matrix.target
 # }}` and `"$target"` follow `--target`, an option that takes exactly one value.
@@ -98,6 +120,20 @@ run: |
 path: |
 args: >-
 targets: >-
+# (R7) Actions both workflows run. None of them compiles a crate of this
+# repository: checkout clones the repository into the workspace, cache restores
+# and saves a directory, upload-artifact and download-artifact move files
+# between a job and the run's artifact store, rust-toolchain runs rustup to
+# install a toolchain, setup-java installs a JDK, and setup-android installs the
+# Android SDK. Each row pins the action reference, so bumping a version or
+# swapping an action changes the row.
+uses: actions/checkout@v5
+uses: actions/cache@v4
+uses: actions/upload-artifact@v4
+uses: actions/download-artifact@v4
+uses: dtolnay/rust-toolchain@stable
+uses: actions/setup-java@v4
+uses: android-actions/setup-android@v3
 # --- Dockerfile ---
 # (R1) apt-get receives the glob `/var/lib/apt/lists/*` through rm.
 RUN apt-get update && apt-get install -y --no-install-recommends cmake perl pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
@@ -107,6 +143,13 @@ RUN pin="$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\
 # Exec form: the image runs the scp-relay binary this Dockerfile built. No
 # argument, no feature flag.
 ENTRYPOINT ["/usr/local/bin/scp-relay"]
+# (R6) `--recipe-path` is cargo-chef's own option and names the file the planner
+# stage wrote from this repository's manifests. cargo-chef reads that file to
+# build the dependency graph the manifests already declare, so the option
+# selects no feature and puts nothing on rustc's argv. The `-p` values of the
+# cook line are the two binaries ARTIFACTS gates, and half 1 reads them.
+RUN cargo chef prepare --recipe-path recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json -p scp-relay -p scp-node
 # --- .github/workflows/build-matrix.yml ---
 # with: inputs of the toolchain, cache, upload-artifact, and maturin-action
 # steps — a target triple, a cache key or path, an artifact name, a glob, a
@@ -176,6 +219,24 @@ for target in aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
 New-Item -ItemType Directory -Force napi-out | Out-Null
 run: sdkmanager "ndk;27.2.12479018"
 run: find release-artifacts/ -type f | sort
+# (R7) PyO3/maturin-action runs maturin, the second of the two programs whose
+# argv this gate parses. The action passes its `args` input to maturin as argv
+# and maturin passes `--features` from the `[tool.maturin]` table to cargo, so
+# the `args: >-` block and every line of it is declared above, and
+# assert_wheel_feature_selection_is_gated derives the wheel's cargo
+# configuration from bindings/python/pyproject.toml and
+# crates/scp-ffi/pyproject.toml and fails unless ARTIFACTS carries it verbatim.
+uses: PyO3/maturin-action@v1
+# (R6) `--out` is maturin's own option and names the directory maturin writes
+# the wheel into. It selects no cargo feature and puts nothing on rustc's argv.
+--out dist
+# (R6) `cargo run -- generate …` hands every token after the bare `--` to the
+# uniffi-bindgen binary the same command just built, not to cargo and not to
+# rustc: `--library`, `--language`, and `--out-dir` are uniffi-bindgen's own
+# options, and it reads the cdylib the preceding cargo build wrote. The `-p` and
+# `--bin` values name the package and the binary target, which half 1 resolves.
+cargo run -p scp-ffi-uniffi --bin uniffi-bindgen -- generate --library target/aarch64-apple-darwin/release/libscp_ffi_uniffi.dylib --language swift --out-dir bindings/swift/Sources/SCP
+cargo run -p scp-ffi-uniffi --bin uniffi-bindgen -- generate --library target/release/libscp_ffi_uniffi.so --language kotlin --out-dir bindings/kotlin/src/main/kotlin
 # --- .github/workflows/release.yml ---
 # with: inputs — a cache key and path, a download pattern, an upload path, a
 # reusable-workflow input.
@@ -385,6 +446,33 @@ echo "- Maven Central: works.limn:scp-kt, works.limn:scp-kt-android" >> $GITHUB_
 echo "- SPM: SCP (via GitHub Release)" >> $GITHUB_STEP_SUMMARY
 echo "- Go: github.com/limn-works/scp-go (via tag)" >> $GITHUB_STEP_SUMMARY
 echo "> Re-run without dry-run to publish." >> $GITHUB_STEP_SUMMARY
+# (R7) Actions this workflow runs. taiki-e/install-action downloads a prebuilt
+# cargo-nextest binary; when no prebuilt binary exists for the runner it builds
+# cargo-nextest from crates.io, which compiles no crate of this repository
+# either way. setup-node installs Node and writes an npm registry URL,
+# setup-bun installs bun, and gh-action-pypi-publish uploads wheels another job
+# already built. None of them runs cargo over this workspace.
+- uses: taiki-e/install-action@nextest
+uses: actions/setup-node@v4
+uses: oven-sh/setup-bun@v2
+uses: pypa/gh-action-pypi-publish@release/v1
+# (R7) The reusable workflow that builds every uploaded artifact. SHIPPING_FILES
+# names that file, so the gate reads every command line of what this step runs.
+uses: ./.github/workflows/build-matrix.yml
+# (R6) `--workspace` selects every member of the workspace, including the
+# `scp-testing` harness that root Cargo.toml keeps out of default-members, and
+# `--all-targets` adds the test and bench targets, so both options widen the
+# graph beyond what half 1 resolves. Every token after the bare `--` reaches the
+# clippy driver and rustfmt rather than cargo. Neither command writes a binary,
+# a cdylib, or a wheel that any job uploads: clippy emits diagnostics and
+# rustfmt emits a diff, so the widened graph compiles into no shipped artifact.
+run: cargo clippy --workspace --all-targets -- -D warnings
+run: cargo fmt --all -- --check
+# (R6) `--workspace` selects every member, `scp-testing` among them. The command
+# compiles test binaries and no shipped artifact — release.yml uploads nothing
+# built from it — and the line is declared under
+# DECLARED_SHIPPING_FEATURE_FLAG_LINES in the gate for the same reason.
+run: cargo test --workspace --release --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/saga-witness-test-mint
 # ===========================================================================
 # (R4) ENVIRONMENT ASSIGNMENTS. rustc reads RUSTFLAGS out of its environment and
 # never out of argv, and cargo reads CARGO_BUILD_RUSTFLAGS,

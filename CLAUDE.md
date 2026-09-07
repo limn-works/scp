@@ -150,8 +150,14 @@ changes nothing rustc compiles, when it carries a token spelled outside the
 characters cargo's own grammar uses — the whitelist that closes the test across
 every interpreter a `shell:` key or a Dockerfile `SHELL` instruction can name —
 when its command word is neither `cargo` nor `maturin`, the two programs whose
-argv the gate parses, or when it assigns an environment variable, which rustc and
-cargo read outside argv. An undeclared line fails the gate),
+argv the gate parses — a workflow `uses:` step names such a program, because the
+runner executes that action and the action's own `action.yml` runs commands no
+reader here opens — when it assigns an environment variable, which rustc and
+cargo read outside argv and which a job's `container:` `options:` string also
+sets through `docker create`, or when it carries an option token outside the
+whitelist of cargo options the gate's readers parse, because `cargo --config
+build.rustflags=…` puts `--cfg feature="testing"` on rustc's argv and `cargo tree
+-e features` prints no feature edge for it. An undeclared line fails the gate),
 check-toolchain-wiring.sh (every container build asserts which compiler it resolved;
 the changes job of every paths-filtered workflow routes a pin change to every lane that
 compiles on it, and ci.yml routes every root-level file and every cargo configuration
