@@ -43,7 +43,7 @@ use scp_protocol::envelope::did_record::DidRecordV1;
 /// the cheapest-first order [`classify_did_record_frame`] applies. A test can
 /// therefore assert the binding is checked *before* the signature by observing
 /// that a frame with **both** a wrong binding and a bad signature is rejected
-/// as [`BindingMismatch`](Self::BindingMismatch) (never [`SignatureInvalid`]).
+/// as [`BindingMismatch`](Self::BindingMismatch) (never [`SignatureInvalid`](Self::SignatureInvalid)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DidRecordRejection {
     /// `SHA-256("scp:did:" || did(public_key)) != routing_id` — the frame's

@@ -83,7 +83,7 @@ use crate::{decrement_handle_count, increment_handle_count, runtime};
 /// Generates a real MLS key package for a joining member.
 ///
 /// Mirrors the NAPI bridge's `generate_mls_key_package_bytes`: builds an
-/// [`ScpCredential`] from the joiner's DID and TLS-serializes a fresh
+/// [`ScpCredential`](scp_core::crypto::mls::credential::ScpCredential) from the joiner's DID and TLS-serializes a fresh
 /// `KeyPackage` bundle produced by `generate_key_package_with_context_params`.
 /// The output bytes are what `NodeMlsFactory::validate_key_package` and
 /// `NodeMlsFactory::add_member` require — the old `FfiBridgeCrypto` stub
@@ -268,7 +268,7 @@ async fn snapshot_verifying_key_hex<C: KeyCustody>(custody: &C, key: &KeyHandle)
 /// closed**.
 ///
 /// Delegates to the single cfg-gated [`scp_ffi_common::dht::build_ffi_dht_client`]
-/// (shared by all three bridges) and maps its [`DhtInitError`] to a `ScpError`.
+/// (shared by all three bridges) and maps its [`DhtInitError`](scp_ffi_common::dht::DhtInitError) to a `ScpError`.
 /// A shipped (non-`testing`) build constructs the real Mainline Pkarr client; a
 /// malformed gateway or a Mainline build failure surfaces as
 /// [`codes::IDENT_1058`] (dedicated DHT-init-failure code), never an in-memory
@@ -902,7 +902,7 @@ impl KeyCustody for CallbackKeyCustody {
 impl CallbackKeyCustody {
     /// Exports the raw Ed25519 signing key for the given handle.
     ///
-    /// Delegates to [`KeyCustodyProvider::export_signing_key_bytes`] on the
+    /// Delegates to [`KeyCustodyProvider::export_signing_key_bytes`](crate::KeyCustodyProvider::export_signing_key_bytes) on the
     /// platform callback. Required for governance vote signing.
     pub(crate) async fn export_ed25519_signing_key(
         &self,
@@ -2627,7 +2627,7 @@ pub struct Identity {
     pub(crate) verifying_key_hex: Option<String>,
     /// Monotonic identifier of the bridge instance that minted this handle.
     ///
-    /// Consumed by [`uniffi_check_handle!`](crate::uniffi_check_handle) at
+    /// Consumed by [`CoreFields::check_handle`](scp_ffi_common::bridge_instance::CoreFields::check_handle) at
     /// every `#[uniffi::export]` entry that accepts an `Identity`. Mismatches
     /// map to `ScpError::Permission` with code `SCP-PERM-3030`.
     pub(crate) instance_id: u64,
@@ -3349,7 +3349,7 @@ pub struct ContextHandle {
     pub(crate) core_context_params: scp_core::context::ContextParams,
     /// Monotonic identifier of the bridge instance that minted this handle.
     ///
-    /// Consumed by [`uniffi_check_handle!`](crate::uniffi_check_handle) at
+    /// Consumed by [`CoreFields::check_handle`](scp_ffi_common::bridge_instance::CoreFields::check_handle) at
     /// every `#[uniffi::export]` entry that accepts a `ContextHandle`.
     /// Mismatches map to `ScpError::Permission` with code `SCP-PERM-3030`.
     pub(crate) instance_id: u64,
@@ -3560,7 +3560,7 @@ pub struct TransportManager {
     pub(crate) bi: Arc<crate::runtime::UniffiBridgeInstance>,
     /// Monotonic identifier of the bridge instance that minted this handle.
     ///
-    /// Consumed by [`uniffi_check_handle!`](crate::uniffi_check_handle) at
+    /// Consumed by [`CoreFields::check_handle`](scp_ffi_common::bridge_instance::CoreFields::check_handle) at
     /// every `#[uniffi::export]` entry that accepts a `TransportManager`.
     pub(crate) instance_id: u64,
 }
@@ -4845,14 +4845,14 @@ struct McpUniFfiBridgeProvider {
     ///
     /// # Why `Weak` and not `Arc` (#1549 round-2 bug-catcher)
     ///
-    /// The provider is installed in an [`McpServer`] that lives inside a
+    /// The provider is installed in an [`McpServer`](scp_mcp::server::McpServer) that lives inside a
     /// background task spawned on the shared tokio runtime
     /// (`runtime().spawn(...)`). That task is NOT enrolled in the
     /// per-instance
     /// [`JoinSet`](scp_ffi_common::bridge_instance::CoreFields::task_handle)
     /// aborted by `emergency_cancel_tasks`, so it survives
     /// [`crate::runtime::UniffiBridgeInstance::drop`] unless the caller
-    /// explicitly sends a shutdown via [`mcp_server_stop`].
+    /// explicitly sends a shutdown via [`Scp::mcp_server_stop`](crate::scp::Scp::mcp_server_stop).
     ///
     /// If this field were `Arc<UniffiBridgeInstance>`, the server task
     /// would keep the instance alive forever when the caller forgets to
@@ -4877,7 +4877,7 @@ struct McpUniFfiBridgeProvider {
 }
 
 impl McpUniFfiBridgeProvider {
-    /// Upgrades the stored [`Weak`] to a live [`Arc<UniffiBridgeInstance>`].
+    /// Upgrades the stored [`Weak`](std::sync::Weak) to a live [`Arc<UniffiBridgeInstance>`].
     ///
     /// Returns an error string if the bridge instance has been dropped.
     /// Callers MUST drop the returned `Arc` before the next `.await` so
@@ -5457,7 +5457,7 @@ async fn run_mcp_stdio_server_uniffi(
 // MCP allowlist error mapping
 // ---------------------------------------------------------------------------
 
-/// Maps [`AllowlistError`] to the appropriate [`ScpError`] variant.
+/// Maps [`AllowlistError`](scp_mcp::allowlist::AllowlistError) to the appropriate [`ScpError`] variant.
 ///
 /// Input-validation errors map to `Validation`. Runtime/policy errors
 /// map to `Transport`. Exhaustive match ensures new variants produce
@@ -5527,7 +5527,7 @@ fn mcp_allowlist_lock_poisoned() -> ScpError {
 // See ADR-021 acceptance criterion 6.
 // ---------------------------------------------------------------------------
 
-/// Inner implementation of [`ucan_mint`].
+/// Inner implementation of [`Scp::ucan_mint`](crate::scp::Scp::ucan_mint).
 async fn ucan_mint_impl(
     handle: Arc<ContextHandle>,
     member_did: String,
@@ -5604,7 +5604,7 @@ async fn ucan_mint_impl(
         })?
 }
 
-/// Inner implementation of [`ucan_delegate`].
+/// Inner implementation of [`Scp::ucan_delegate`](crate::scp::Scp::ucan_delegate).
 ///
 /// Signs each delegation with that delegation's own delegator key, which this
 /// function reads from `bi`'s DID-keyed identity custody registry under
@@ -6554,7 +6554,7 @@ pub struct BatchPublishResult {
 // Free functions — events (#387)
 // ---------------------------------------------------------------------------
 
-/// Formats a [`ContextEvent`] as a human-readable string.
+/// Formats a [`ContextEvent`](scp_core::context::membership::ContextEvent) as a human-readable string.
 ///
 /// Consequence events (`ConsequenceTriggered`, `ConsequenceEnforced`) are
 /// formatted with structured key=value pairs for observability. All other
@@ -7211,7 +7211,7 @@ pub fn check_capability_requirements(
 }
 
 /// Builds a `ProtocolRepositoryTrustBridge` over the concrete backend behind a
-/// [`ProtocolRepoVariant`] arm and reads back the subject's verified
+/// [`ProtocolRepoVariant`](scp_ffi_common::bridge_runtime::ProtocolRepoVariant) arm and reads back the subject's verified
 /// attestations. Single source of truth for the per-backend
 /// attestation-sourcing path: both `ProtocolRepoVariant` arms route through this
 /// one generic body (mirroring the `PyO3` bridge's `run_verified_attestations`).
@@ -7238,7 +7238,7 @@ fn run_verified_attestations<S: scp_platform::traits::Storage + 'static>(
 // aggregate_trust_input (§7.3)
 // ---------------------------------------------------------------------------
 
-/// Per-instance equivalent of [`uniffi_append_provenance_event`].
+/// Per-instance replacement for the deleted free function `uniffi_append_provenance_event`.
 ///
 /// Appends a provenance event to the UCAN event log on `bi`. Phase D
 /// (#1695, ADR-048) replaces the prior free function that consulted the
@@ -8022,7 +8022,7 @@ pub fn discovery_normalize_address(address: String) -> String {
 // Shared helper for petname/handle/scope/address_resolve methods on `Scp`.
 use scp_ffi_common::petname_helpers;
 
-/// Parses a [`HandleTarget`] from a JSON string, delegating to `scp-ffi-common`.
+/// Parses a [`HandleTarget`](scp_core::discovery::HandleTarget) from a JSON string, delegating to `scp-ffi-common`.
 fn uniffi_parse_handle_target(
     json: &str,
 ) -> Result<scp_core::discovery::addressing::HandleTarget, ScpError> {
@@ -9044,7 +9044,7 @@ fn parse_scpid_signing_key_id(s: &str) -> Result<scp_did::SigningKeyId, ScpError
     }
 }
 
-/// Maps an [`ScpIdError`] variant to its canonical SCP error code.
+/// Maps an [`ScpIdError`](scp_core::identity::ScpIdError) variant to its canonical SCP error code.
 const fn scpid_error_code(e: &scp_core::identity::ScpIdError) -> &'static str {
     use scp_core::identity::ScpIdError;
     match e {
@@ -9449,7 +9449,7 @@ fn parse_observable_metrics(json: &str) -> Result<scp_core::economy::ObservableM
 
 /// Per-instance DID-resolver initializer.
 ///
-/// Stores the resolver on the caller's [`UniffiBridgeInstance`] rather than
+/// Stores the resolver on the caller's [`UniffiBridgeInstance`](crate::runtime::UniffiBridgeInstance) rather than
 /// any process-wide slot. Invoked lazily on first use by the
 /// [`crate::scp::Scp`] identity methods to keep "init on first use"
 /// semantics scoped to the owning instance.
@@ -9527,7 +9527,7 @@ pub(crate) fn ensure_did_resolver_initialized_on(
 /// next resolve reads the fresh document. Best-effort: a no-op when no resolver
 /// cache is wired on this instance.
 ///
-/// Delegates to the shared [`BridgeInstanceCore::invalidate_resolver_cache`]
+/// Delegates to the shared [`CoreFields::invalidate_resolver_cache`](scp_ffi_common::bridge_instance::CoreFields::invalidate_resolver_cache)
 /// (the single implementation of the invalidation body, shared across bridges).
 ///
 /// Only reached from the testing-gated identity rotate/agent-key/migrate paths
@@ -15645,7 +15645,7 @@ impl Scp {
 
     /// Diagnostic, read-only evaluation of a UCAN token.
     ///
-    /// Counterpart to [`SCP::ucan_validate`]: runs the same 11-step ADR-016
+    /// Counterpart to [`Scp::ucan_validate`](crate::scp::Scp::ucan_validate): runs the same 11-step ADR-016
     /// pipeline via `evaluate_ucan` but returns a structured
     /// [`CapabilityValidationRecord`] (six booleans) instead of failing at the
     /// first error, and never records the token's nonce (read-only probe).
@@ -18840,7 +18840,7 @@ impl Scp {
     /// Per-instance equivalent of the free-function `economy_verify_payment_receipts`.
     ///
     /// Deserializes a JSON array of [`scp_core::economy::PaymentReceipt`] and
-    /// dispatches an [`EconomyCommand::VerifyPaymentReceipts`] to the
+    /// dispatches an [`EconomyCommand::VerifyPaymentReceipts`](scp_core::context::actor::commands::EconomyCommand::VerifyPaymentReceipts) to the
     /// supervisor, returning a JSON `{"all_valid": <bool>, "results": [...]}`
     /// document with one entry per receipt. Mirrors the `PyO3` reference bridge
     /// exactly. Maximum 10,000 receipts per call.

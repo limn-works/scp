@@ -114,6 +114,43 @@ rules separate them.
 - **Read a shared build cache everywhere, and write it only from a push to the default
   branch.** A cache written on a pull-request ref is readable only by that pull request,
   and it evicts entries from the budget every other cache step in the workflow shares.
+- **When a required job and an advisory job run the same tool, compare their flags.** Job
+  `rust-doc` in `.github/workflows/ci.yml` is the only rustdoc job the required `ci`
+  aggregator depends on, and it ran `cargo doc` without `--document-private-items`.
+  Rustdoc resolves an intra-doc link only inside an item it documents, so that command
+  applied `crates/scp-runtime/src/lib.rs`'s `#![deny(rustdoc::broken_intra_doc_links)]` to
+  the public surface alone. The three links pull request #2274, the structured
+  OutletErrorSurface change, broke sat in
+  `crates/scp-runtime/src/context/outlets_helpers.rs`, a private module. The required job
+  passed, and only the `SDK Docs` workflow — which passes the flag and blocks no merge —
+  went red, so the links rode `main` for ten days. Two jobs running the same command under
+  different flags are two different checks, and the weaker one is the one that decides
+  merges.
+- **A path filter written as a list of names stops covering the moment someone adds a
+  member.** The `docs` filter guarding `cargo doc --workspace` in
+  `.github/workflows/docs.yml` named eleven crate directories out of the 26 members the
+  root `Cargo.toml` lists, so a pull request confined to `crates/scp-event-log/` skipped
+  the one job that compiles rustdoc across the workspace — on the pull request and again
+  on the push to `main` — while `crates/scp-runtime/src/` writes 49 intra-doc links into
+  `scp_event_log::*`. `.github/workflows/ci.yml`'s `rust` filter answers the same question
+  with `crates/**`, which covers a crate added later without anyone editing the filter.
+  Write the closed pattern, and where a filter must stay narrower than the whole tree,
+  compute its population from the tree: `check_workspace_scoped_filters` and
+  `check_path_dep_closures` in `scripts/tests/ci-gate/ci_gate_selftest.py` read
+  `[workspace] members` and each crate's path-dependency closure out of the manifests.
+- **A lint one crate declares is a check that runs in one crate.** After the two fixes
+  above, job `rust-doc` ran `cargo doc --workspace --document-private-items` and still
+  exited 0 over 271 unresolved intra-doc links (218 of them under `crates/scp-ffi/`),
+  because `crates/scp-runtime/src/lib.rs` was the one `lib.rs` of the 26 members that
+  declared `#![deny(rustdoc::broken_intra_doc_links)]`, and rustdoc's default for the lint
+  is `warn`. The self-test's own floor codified that reach: it passed when at least one
+  crate declared the attribute. The root `Cargo.toml` now sets the lint to `forbid` under
+  `[workspace.lints.rustdoc]`, every member inherits the table through
+  `[lints] workspace = true`, and `check_rustdoc_lint_reaches_every_member` reads the
+  member list out of the manifest and fails when one omits that line. The level is
+  `forbid` because rustc lets a source-level `#![allow]` lower a `deny` and rejects one
+  that contradicts a `forbid`. When a check depends on a lint level, ask which packages
+  carry the level, and set it where every package inherits it.
 
 ## See also
 

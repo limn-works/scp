@@ -4,7 +4,7 @@
 //! persisting relay operational state (subscriptions, rate limits) across
 //! relay restarts. Follows the async-provider-trait pattern used by
 //! `ContextPersistence` / `EventLogPersistence` in `scp-core` (ADR-049
-//! Decision 7): the methods `.await` the async [`Storage`](scp_platform::Storage)
+//! Decision 7): the methods `.await` the async `Storage` trait of `scp-platform`
 //! backend directly — there is NO `block_in_place` sync→async bridge.
 //!
 //! The canonical implementation `StorageRelayPersistence` wraps any

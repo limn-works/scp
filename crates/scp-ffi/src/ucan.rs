@@ -151,7 +151,7 @@ impl PyUcanToken {
 
 /// Structured, side-effect-free result of evaluating a UCAN token.
 ///
-/// Produced by [`PyScp::ucan_evaluate`], this mirrors scp-core's
+/// Produced by [`PyScp::ucan_evaluate`](crate::scp::PyScp::ucan_evaluate), this mirrors scp-core's
 /// [`CapabilityValidation`] — the diagnostic counterpart to the fail-closed
 /// `ucan_validate` gate. Each boolean reflects whether the corresponding
 /// pipeline stage ran and passed; because the pipeline short-circuits, a field
@@ -346,7 +346,7 @@ impl crate::scp::PyScp {
     /// summary instead of throwing at the first failure.
     ///
     /// This is the diagnostic, **side-effect-free** counterpart to
-    /// [`PyScp::ucan_validate`]. It runs the EXACT same 11-step ADR-016
+    /// [`PyScp::ucan_validate`](crate::scp::PyScp::ucan_validate). It runs the EXACT same 11-step ADR-016
     /// pipeline via `scp_core::crypto::ucan::validate::evaluate_ucan`, but:
     ///
     /// - returns a [`PyCapabilityValidation`] (six booleans) rather than
@@ -375,7 +375,7 @@ impl crate::scp::PyScp {
     /// `evaluate_ucan(None, ..)` in scp-core). This is the mode the SDK trust
     /// signal uses. When a capability IS supplied, the token must additionally
     /// grant it (identical to the historical mandatory-capability behavior). The
-    /// enforcing gate [`PyScp::ucan_validate`] keeps a MANDATORY capability.
+    /// enforcing gate [`PyScp::ucan_validate`](crate::scp::PyScp::ucan_validate) keeps a MANDATORY capability.
     ///
     /// # Returns
     ///

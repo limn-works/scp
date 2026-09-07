@@ -994,7 +994,7 @@ impl TerminateReason {
     /// emits when no caller override is supplied.
     ///
     /// Matches the strings produced by
-    /// [`super::super::stream::CancelAckTracker::cancel_ack_timeout_payload`]
+    /// `CancelAckTracker::cancel_ack_timeout_payload`
     /// and `credit_stall_payload` in the runtime so a `TerminateReason`-
     /// driven terminal chunk is byte-identical to a timer-driven one
     /// (modulo the operator signature, which depends on `request_id` /

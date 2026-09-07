@@ -475,7 +475,7 @@ async fn run_mcp_stdio_server(
 // Bridge functions
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`mcp_server_create`].
+/// Per-bridge-instance implementation of [`Scp::mcp_server_create`](crate::scp::Scp::mcp_server_create).
 #[allow(clippy::unused_async)]
 pub(crate) async fn mcp_server_create_on(
     bi: &NapiBridgeInstance,
@@ -556,7 +556,7 @@ pub(crate) async fn mcp_server_create_on(
     })
 }
 
-/// Per-bridge-instance implementation of [`mcp_server_stop`].
+/// Per-bridge-instance implementation of [`Scp::mcp_server_stop`](crate::scp::Scp::mcp_server_stop).
 #[allow(clippy::unused_async)]
 pub(crate) async fn mcp_server_stop_on(
     bi: &NapiBridgeInstance,
@@ -595,7 +595,7 @@ pub(crate) async fn mcp_server_stop_on(
     Ok(())
 }
 
-/// Per-bridge-instance implementation of [`mcp_client_connect_stdio`].
+/// Per-bridge-instance implementation of [`Scp::mcp_client_connect_stdio`](crate::scp::Scp::mcp_client_connect_stdio).
 #[allow(clippy::unused_async)]
 pub(crate) async fn mcp_client_connect_stdio_on(
     bi: &NapiBridgeInstance,
@@ -638,7 +638,7 @@ pub(crate) async fn mcp_client_connect_stdio_on(
     })
 }
 
-/// Per-bridge-instance implementation of [`mcp_client_connect_sse`].
+/// Per-bridge-instance implementation of [`Scp::mcp_client_connect_sse`](crate::scp::Scp::mcp_client_connect_sse).
 #[allow(clippy::unused_async)]
 pub(crate) async fn mcp_client_connect_sse_on(
     bi: &NapiBridgeInstance,
@@ -668,7 +668,7 @@ pub(crate) async fn mcp_client_connect_sse_on(
     })
 }
 
-/// Per-bridge-instance implementation of [`mcp_client_disconnect`].
+/// Per-bridge-instance implementation of [`Scp::mcp_client_disconnect`](crate::scp::Scp::mcp_client_disconnect).
 #[allow(clippy::unused_async)]
 pub(crate) async fn mcp_client_disconnect_on(
     bi: &NapiBridgeInstance,
@@ -686,7 +686,7 @@ pub(crate) async fn mcp_client_disconnect_on(
     Ok(())
 }
 
-/// Per-bridge-instance implementation of [`mcp_client_list_tools`].
+/// Per-bridge-instance implementation of [`Scp::mcp_client_list_tools`](crate::scp::Scp::mcp_client_list_tools).
 #[allow(clippy::unused_async)]
 pub(crate) async fn mcp_client_list_tools_on(
     bi: &NapiBridgeInstance,
@@ -728,7 +728,7 @@ pub(crate) async fn mcp_client_list_tools_on(
         .collect())
 }
 
-/// Per-bridge-instance implementation of [`mcp_client_invoke`].
+/// Per-bridge-instance implementation of [`Scp::mcp_client_invoke`](crate::scp::Scp::mcp_client_invoke).
 #[allow(clippy::unused_async)]
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) async fn mcp_client_invoke_on(
@@ -792,7 +792,7 @@ pub(crate) async fn mcp_client_invoke_on(
 // Stdio allowlist error mapping
 // ---------------------------------------------------------------------------
 
-/// Maps [`AllowlistError`] to the appropriate [`ScpNapiError`] variant.
+/// Maps [`AllowlistError`](scp_mcp::allowlist::AllowlistError) to the appropriate [`ScpNapiError`] variant.
 ///
 /// Input-validation errors map to `Validation`. Runtime/policy errors
 /// map to `Transport`. Exhaustive match ensures new variants produce

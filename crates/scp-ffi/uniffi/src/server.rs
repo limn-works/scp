@@ -197,7 +197,7 @@ async fn auto_wire_context_manager(
 /// (spec §12.10.5).
 ///
 /// Mirrors the `PyO3` reference bridge (`crates/scp-ffi/src/server.rs`). The
-/// production `Supervisor` built by [`build_supervisor`](crate::runtime) always
+/// production `Supervisor` built by `build_supervisor` in `crate::runtime` always
 /// enables its event channel, so `subscribe_events()` yields a receiver.
 /// Delegates the subscribe → wire → supervise block to the shared
 /// [`RunningNode::wire_and_supervise_context_events`] seam so all three bridges
@@ -207,9 +207,9 @@ async fn auto_wire_context_manager(
 /// # Precondition (identical across all three bridges)
 ///
 /// This is one-shot wiring at node startup, so the readiness gate is the
-/// shared [`CoreFields::check_ready`] — skip (log, never fail startup) if the
+/// shared [`CoreFields::check_ready`](scp_ffi_common::bridge_instance::CoreFields::check_ready) — skip (log, never fail startup) if the
 /// instance is suspended OR shut down, then fetch the supervisor via
-/// [`CoreFields::try_supervisor`]. All three bridges (`PyO3`, `NAPI`, `UniFFI`)
+/// [`CoreFields::try_supervisor`](scp_ffi_common::bridge_instance::CoreFields::try_supervisor). All three bridges (`PyO3`, `NAPI`, `UniFFI`)
 /// gate on the same `check_ready()` + `try_supervisor()` pair so they make the
 /// SAME decision about when to wire. (Previously this path used
 /// `context_manager_expect()` while `PyO3`/`NAPI` used the general-purpose

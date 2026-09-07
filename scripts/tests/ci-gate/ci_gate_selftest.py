@@ -93,6 +93,70 @@ nothing:
   event-name   An aggregate read an absent GITHUB_EVENT_NAME as "", so
                `if: github.event_name == 'pull_request'` on job cross-layer
                judged false and a skipped cross-layer passed on a pull request.
+  workspace-scope
+               The `docs` filter guarding job rust-docs, which runs
+               `cargo doc --workspace`, named eleven crate directories one at a
+               time out of the twenty-six members the root Cargo.toml lists.
+               `crates/scp-event-log/src/**` matched nothing, while
+               crates/scp-runtime/src/ writes 49 intra-doc links into
+               `scp_event_log::*` and the root Cargo.toml forbids
+               `rustdoc::broken_intra_doc_links` in every member,
+               so a pull request confined to scp-event-log skipped the one job
+               that compiles rustdoc across the workspace — on the pull request
+               and again on the push to `main`.
+  private-items
+               Job rust-doc in ci.yml, the only rustdoc job the required `ci`
+               aggregator depends on, ran `cargo doc` without
+               `--document-private-items`. Rustdoc resolves an intra-doc link
+               only inside an item it documents, so that command read no link
+               written in a private module. All three links pull request #2274,
+               the structured OutletErrorSurface change, broke sat in the
+               private module
+               crates/scp-runtime/src/context/outlets_helpers.rs: the required
+               job passed and only the advisory SDK Docs workflow, which passes
+               the flag and blocks no merge, went red.
+  doc-flag     The `rust-docs` job of docs.yml passed
+               `--document-private-items` while job rust-doc in ci.yml did not,
+               so the workflow that could report the diagnostic was the one no
+               ruleset requires. Pull request #2329 then repaired the three
+               links and added a `push: branches: [main]` trigger to docs.yml,
+               which shortened time-to-detection and left the required check
+               still unable to produce the diagnostic. Reading the two flag sets
+               against each other names that gap for any flag, not for
+               `--document-private-items` alone.
+  merge-queue  docs.yml carried a header calling its jobs safe to promote to a
+               required status check while the workflow triggered on `push` and
+               `pull_request` only. A merge queue evaluates a required check
+               against the `merge_group` ref, so following that header would
+               have left every queue entry waiting on a status no run reports.
+  lint-scope   One crate declared the lint the two rustdoc jobs exist to fire:
+               crates/scp-runtime/src/lib.rs carried
+               `#![deny(rustdoc::broken_intra_doc_links)]` and none of the other
+               25 members did, so job rust-doc, run verbatim on the tree that
+               added `--document-private-items`, exited 0 over 271 unresolved
+               intra-doc links in twelve other crate directories (218 of them
+               under crates/scp-ffi/). The root Cargo.toml now sets that lint to
+               `forbid` under `[workspace.lints.rustdoc]`, and every member
+               inherits the table through `[lints] workspace = true`. The level
+               is `forbid` because rustc lets a source-level `#![allow]` lower a
+               `deny` and rejects an `allow` that contradicts a `forbid`, so no
+               crate can reopen the hole from inside its own source.
+  doc-command  The `forbid` above made an unresolved link an error in every
+               member, and the three Markdown files that hand a developer a
+               `cargo doc` command to run — .docs/standards/rust.md,
+               .github/workflows/README.md and .docs/specs/21-documentation.md —
+               named that command without the six `--features` job rust-doc in
+               ci.yml passes. Four intra-doc links in crates/scp-node name items
+               those features gate, so every documented command exited 101 on an
+               unmodified `main`, naming a crate the developer's change never
+               touched, while the required job exited 0. That comparison reads a
+               shell-labelled fenced block and nothing else, so two copies of
+               the flag list written inline — the normative clause §21.10.2
+               item 2 of .docs/specs/21-documentation.md, and the Tier 1
+               CI-matrix row for job `doc` in .docs/standards/rust.md — reached
+               no assertion. Both now sit in a fenced block or name the block
+               that holds the command, and a check rejects a `cargo doc` naming
+               `--features` on any Markdown line no shell fence encloses.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
@@ -217,6 +281,109 @@ EXPRESSION = re.compile(r"\$\{\{[^}]*\}\}")
 PATH_DEP_CLOSURE_FILTERS = {
     "fuzz": "fuzz/Cargo.toml",
     "typescript-wasm": "crates/scp-client-wasm/Cargo.toml",
+}
+
+# CRITERION for check_workspace_scoped_filters: a cargo command carrying
+# `--workspace` compiles every member the root manifest lists, so a path filter
+# deciding whether that command runs must match a change to any file of any
+# member. The check reads the member list out of the root Cargo.toml rather than
+# out of a list written here, so a crate added to the workspace later is covered
+# without editing this file — which is the property the `docs` filter's
+# hand-written list of eleven crate directories did not have.
+WORKSPACE_SCOPE_FLAG = "--workspace"
+
+# CRITERION for check_rustdoc_documents_private_items: rustdoc resolves an
+# intra-doc link only inside an item it documents, so a `cargo doc` run without
+# this flag applies the workspace's `forbid(rustdoc::broken_intra_doc_links)` to
+# the public surface alone and reads no link a private module writes. Every
+# `cargo doc` command in every workflow of this repository exists to catch such
+# a link, so each one passes this flag.
+DOCUMENT_PRIVATE_ITEMS_FLAG = "--document-private-items"
+
+# CRITERION for check_rustdoc_lint_reaches_every_member: the flag above buys a
+# diagnostic only where the lint level makes an unresolved link an error, and
+# cargo applies a lint level per package. The root Cargo.toml sets this lint to
+# `forbid` under `[workspace.lints.rustdoc]`, and a member receives that table
+# only when its own manifest declares `[lints] workspace = true`, so a member
+# without that declaration documents under rustdoc's default `warn` and both
+# rustdoc jobs exit 0 over every link it breaks. The level is `forbid` and not
+# `deny` because rustc honours a source-level `#![allow]` against a `deny` and
+# rejects one against a `forbid`.
+RUSTDOC_LINT = "broken_intra_doc_links"
+RUSTDOC_LINT_LEVEL = "forbid"
+
+# A FLOOR under those two criteria, not the criteria themselves. Both checks
+# iterate whatever the workflows declare, so a renamed job, a `cargo doc` moved
+# into a shell script, or a `--workspace` command rewritten as one `-p` per
+# crate empties that iteration and leaves each check printing nothing and
+# failing nothing — the zero-test defect this file's docstring records, seen
+# from the reader's end rather than from cargo's. These two sets name what the
+# workflows carry today. Add an entry when a workflow gains a job of either
+# kind; remove one only alongside the job it names.
+WORKSPACE_SCOPED_JOBS = {
+    ("ci.yml", "rust-clippy"),
+    ("ci.yml", "rust-doc"),
+    ("ci.yml", "rust-test"),
+    ("docs.yml", "rust-docs"),
+}
+RUSTDOC_JOBS = {("ci.yml", "rust-doc"), ("docs.yml", "rust-docs")}
+
+# CRITERION for check_documented_rustdoc_reproduces_the_required_job: a `cargo
+# doc` line inside a shell-labelled fenced block of a tracked Markdown file is a
+# command this repository hands a developer to run, so that command and job
+# `rust-doc` in .github/workflows/ci.yml must report the same diagnostics. A
+# documented command breaks that in two directions. It omits a flag the required
+# job passes, and then a developer whose local run exits 0 has proven nothing
+# about the merge. Or its `--features` list differs from that job's, and then it
+# reports a break the merge does not have: `.docs/standards/rust.md` named the
+# command with no `--features` at all, four intra-doc links in crates/scp-node
+# resolve only under the six features that job enables, and the workspace
+# `forbid` this branch added turns each one into an error, so a developer who
+# ran the documented command on an unmodified `main` read exit 101 naming a
+# crate their change never touched. A flag outside `--features` that a
+# documented command adds and the required job omits — `--open` in
+# .docs/specs/21-documentation.md — decides what rustdoc does with output it
+# already produced rather than which links it resolves, so it changes no
+# diagnostic and this check permits it.
+SHELL_FENCE_LANGUAGES = {"bash", "sh", "shell", "console"}
+FEATURES_FLAG = "--features"
+FEATURES_FLAG_PREFIX = f"{FEATURES_FLAG}="
+
+# CRITERION for check_rustdoc_enumerations_sit_in_a_shell_block: Markdown text
+# that writes out the flag set job `rust-doc` in .github/workflows/ci.yml passes
+# sits where check_documented_rustdoc_reproduces_the_required_job compares it
+# against that job, which reads shell-labelled fenced blocks and nothing else. A
+# `cargo doc` carrying `--features` writes out that set, because the feature
+# list is the part of the command that changes when the required job changes and
+# the part no sentence about rustdoc needs. A sentence naming one flag to make a
+# point about that flag — four in `.docs/lessons/`, two in
+# `.claude/agent-memory/`, one in `.docs/standards/rust.md` — writes out no set
+# and drifts nowhere, so this
+# check reads a `--features` list as what marks an enumeration. Both enumerations
+# this repository carried outside a shell block sat one edit away from going
+# stale: `.docs/specs/21-documentation.md` stated the flags a second time in the
+# normative clause §21.10.2 item 2, and `.docs/standards/rust.md` stated them a
+# second time in the Tier 1 CI-matrix row for job `doc`. A document recording a
+# feature list job `rust-doc` no longer passes — a lesson naming what a past run
+# enabled — names those features without writing them as a `cargo doc
+# --features` command, because a fenced block would put the stale list under the
+# comparison against the current job and an inline command reaches no comparison
+# at all. Neither place holds a runnable command nobody should run.
+
+# A FLOOR under that criterion, not the criterion itself. The scan iterates
+# whatever `git ls-files` returns, so a renamed file, a fence relabelled to a
+# language this set does not name, or a command rewritten into prose empties the
+# iteration and leaves this check printing nothing and failing nothing — the
+# zero-test defect this file's docstring records. These three paths carry such a
+# command today. Add an entry when a Markdown file gains one; remove one only
+# alongside the command it names. check_rustdoc_enumerations_sit_in_a_shell_block
+# reaches the second and third of those three moves independently of this
+# constant, because it reads every line a shell fence does not enclose and
+# rejects a `cargo doc` naming `--features` among them.
+DOCUMENTED_RUSTDOC_FILES = {
+    ".docs/specs/21-documentation.md",
+    ".docs/standards/rust.md",
+    ".github/workflows/README.md",
 }
 
 # Rejects an empty signing-input set. Every release.yml job that uploads an
@@ -910,6 +1077,376 @@ def resolution_manifests(manifest: Path, root: Path | None = None) -> set[str]:
         if workspace_manifest != crate_manifest.resolve():
             files.add(str(workspace_manifest.relative_to(root)))
     return files
+
+
+def workspace_member_directories(root: Path | None = None) -> set[str]:
+    """Return every crate directory the root manifest's `[workspace] members` lists.
+
+    A cargo command carrying `--workspace` compiles each of these, so a path
+    filter selecting such a command must match a change to any file under any of
+    them. Reading the list here rather than restating it means a crate added to
+    the workspace later is covered the moment its member entry lands.
+
+    Cargo accepts a glob in a member entry, so an entry holding `*` expands
+    against the tree; every entry this repository writes today is a literal path.
+    """
+    root = (REPO if root is None else root).resolve()
+    document = tomllib.loads((root / "Cargo.toml").read_text())
+    members: set[str] = set()
+    for entry in document["workspace"]["members"]:
+        if "*" in entry:
+            members |= {
+                str(match.parent.relative_to(root))
+                for match in root.glob(f"{entry}/Cargo.toml")
+            }
+        else:
+            members.add(entry)
+    return members
+
+
+def directory_covered(patterns: set[str], directory: str) -> bool:
+    """Report whether a dorny/paths-filter pattern set selects every file below one directory.
+
+    An entry ending in `/**` selects every file below the prefix it names, so it
+    covers a directory when that prefix is the directory itself or an ancestor of
+    it — `crates/**` covers `crates/scp-event-log`. An entry naming a
+    subdirectory, such as `crates/scp-runtime/src/**`, selects part of the
+    directory and leaves the rest of it unmatched, so it does not cover; reading
+    such an entry as covering is what let a manifest-only or README-only change
+    to a listed crate skip the job that compiles it.
+    """
+    for pattern in patterns:
+        if not pattern.endswith("/**"):
+            continue
+        prefix = pattern[: -len("/**")]
+        if directory == prefix or directory.startswith(f"{prefix}/"):
+            return True
+    return False
+
+
+def gating_filter_keys(doc: dict, job: dict) -> set[str]:
+    """Return each paths-filter key that decides whether one job runs.
+
+    A job reads `needs.<changes>.outputs.<name>` in its `if:`, and the `changes`
+    job publishes each such name from an expression reading one or more
+    `steps.<id>.outputs.<key>` values off its `dorny/paths-filter` step. This
+    walks that second hop, so a caller compares a job against the path patterns
+    that actually gate it rather than against a filter key someone assumed.
+    """
+    named = set(FILTER_REFERENCE.findall(str(job.get("if") or "")))
+    keys: set[str] = set()
+    for step in paths_filter_steps(doc):
+        if step.step_id is None:
+            continue
+        outputs = doc["jobs"][step.job_id].get("outputs") or {}
+        reference = re.compile(FILTER_STEP_REFERENCE.format(id=re.escape(step.step_id)))
+        for name in named:
+            keys |= set(reference.findall(str(outputs.get(name) or "")))
+    return keys
+
+
+def uncovered_members(patterns: set[str], members: set[str]) -> list[str]:
+    """Return every workspace member no pattern in the set selects in full."""
+    return sorted(
+        directory for directory in members if not directory_covered(patterns, directory)
+    )
+
+
+def workspace_scoped_jobs(doc: dict):
+    """Yield each job running a `--workspace` cargo command under a path filter.
+
+    Yields `(job_id, keys, patterns)`, where `keys` names the paths-filter keys
+    that decide whether the job runs and `patterns` holds their path entries. A
+    job carrying no filter-gated `if:` runs on every event, so it needs no
+    filter and this skips it.
+    """
+    steps = paths_filter_steps(doc)
+    if not steps:
+        return
+    for job_id, job in sorted((doc.get("jobs") or {}).items()):
+        workspace_wide = any(
+            WORKSPACE_SCOPE_FLAG in line.split()
+            for step in (job.get("steps") or [])
+            if isinstance(step, dict)
+            for line in logical_lines(step.get("run") or "")
+        )
+        if not workspace_wide:
+            continue
+        keys = gating_filter_keys(doc, job)
+        if not keys:
+            continue
+        patterns = {
+            pattern
+            for step in steps
+            for key in keys
+            for pattern in (step.filters.get(key) or [])
+        }
+        yield job_id, keys, patterns
+
+
+def check_workspace_scoped_filters(path: Path, doc: dict) -> None:
+    """A filter gating a `--workspace` compile matches every member crate.
+
+    CRITERION: a cargo command carrying `--workspace` compiles every member the
+    root Cargo.toml lists, so a change to any one of them changes what that
+    command compiles and must select the job running it.
+    """
+    members = workspace_member_directories()
+    for job_id, keys, patterns in workspace_scoped_jobs(doc):
+        missing = uncovered_members(patterns, members)
+        check(
+            f"{path.name}:{job_id}: its filter covers every workspace member",
+            not missing,
+            f"filter keys {sorted(keys)} leave {missing} unmatched — a change confined "
+            f"to one of those skips a job that compiles it, and a skipped job counts "
+            f"as a pass",
+        )
+
+
+def check_workspace_scope_detects_a_narrowed_filter(
+    documents: list[tuple[Path, dict]],
+) -> None:
+    """Narrowing such a filter to one crate's `src/` fails the check above.
+
+    CRITERION: uncovered_members reports a member the filter stops matching.
+    Mutating a re-parsed copy of each real workflow proves that comparison runs
+    over the shape those files carry. The mutation reproduces the exact defect
+    this pair closes: the `docs` filter guarding `cargo doc --workspace` listed
+    eleven `crates/<name>/src/**` entries out of twenty-six members, so a change
+    confined to crates/scp-event-log skipped the one job that compiles rustdoc
+    across the workspace.
+    """
+    members = workspace_member_directories()
+    for path, _ in documents:
+        # Re-parsed rather than mutated in place, so this mutation reaches no
+        # other check reading the same document.
+        doc = yaml.safe_load(path.read_text())
+        for job_id, _keys, patterns in workspace_scoped_jobs(doc):
+            sample = min(members)
+            narrowed = {
+                pattern
+                for pattern in patterns
+                if not any(directory_covered({pattern}, member) for member in members)
+            } | {f"{sample}/src/**"}
+            # Read as a delta against the unmutated filter, so a member the real
+            # filter already leaves unmatched fails check_workspace_scoped_filters
+            # above and leaves this pair reporting on the narrowing alone.
+            gained = set(uncovered_members(narrowed, members)) - set(
+                uncovered_members(patterns, members)
+            )
+            check(
+                f"{path.name}:{job_id}: narrowing its filter to {sample}/src/ reports "
+                f"the members it stops matching",
+                gained,
+                "the narrowing added no member to the unmatched set, so a filter "
+                "listing crate directories one at a time would pass this self-test",
+            )
+            check(
+                f"{path.name}:{job_id}: `{sample}/src/**` does not cover {sample}",
+                sample in gained,
+                "reading a `<crate>/src/**` entry as covering that crate would pass a "
+                "filter that skips a change to its Cargo.toml or its README",
+            )
+
+
+def documents_private_items(command: str) -> bool:
+    """Report whether one `cargo doc` command asks rustdoc to read private items.
+
+    Splits on whitespace rather than through shlex, because a `run:` script in
+    this repository holds shell quoting that shlex rejects mid-script, and a flag
+    never carries a quote of its own.
+    """
+    return DOCUMENT_PRIVATE_ITEMS_FLAG in command.split()
+
+
+def rustdoc_commands(doc: dict):
+    """Yield `(job_id, command)` for every `cargo doc` a workflow runs."""
+    for job_id, job in sorted((doc.get("jobs") or {}).items()):
+        for step in job.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            for line in logical_lines(step.get("run") or ""):
+                if line.split()[:2] == ["cargo", "doc"]:
+                    yield job_id, line
+
+
+def rustdoc_lint_level(root_document: dict) -> str | None:
+    """Return the level the root manifest's `[workspace.lints.rustdoc]` gives RUSTDOC_LINT.
+
+    Cargo accepts either `lint = "level"` or `lint = { level = "level", .. }`;
+    both spellings read to the level string. A manifest that does not name the
+    lint reads to None, which is rustdoc's default `warn` seen from the
+    workspace's end.
+    """
+    entry = (
+        root_document.get("workspace", {})
+        .get("lints", {})
+        .get("rustdoc", {})
+        .get(RUSTDOC_LINT)
+    )
+    if isinstance(entry, dict):
+        entry = entry.get("level")
+    return entry if isinstance(entry, str) else None
+
+
+def inherits_workspace_lints(member_document: dict) -> bool:
+    """Report whether a member manifest declares `[lints] workspace = true`."""
+    return member_document.get("lints", {}).get("workspace") is True
+
+
+def check_rustdoc_lint_reaches_every_member(root: Path | None = None) -> None:
+    """The workspace forbids the lint and every member inherits the table.
+
+    CRITERION: cargo applies `[workspace.lints]` to a package only through that
+    package's own `[lints] workspace = true`, so the lint's reach is the set of
+    members carrying that line. Before this check, one member of 26 declared
+    the lint in its lib.rs and job rust-doc exited 0 over 271 unresolved links
+    in the other crate directories. Reading the members out of the root
+    manifest means a crate added later is held to the lint the moment its
+    member entry lands.
+    """
+    root = (REPO if root is None else root).resolve()
+    root_document = tomllib.loads((root / "Cargo.toml").read_text())
+    level = rustdoc_lint_level(root_document)
+    check(
+        f"Cargo.toml: [workspace.lints.rustdoc] sets {RUSTDOC_LINT} to "
+        f"{RUSTDOC_LINT_LEVEL}",
+        level == RUSTDOC_LINT_LEVEL,
+        f"the root manifest gives rustdoc::{RUSTDOC_LINT} the level {level!r}, so "
+        f"a broken intra-doc link is an error in no member (a `deny` would let any "
+        f"member's `#![allow]` lower it back to a warning)",
+    )
+    for member in sorted(workspace_member_directories(root)):
+        member_document = tomllib.loads((root / member / "Cargo.toml").read_text())
+        check(
+            f"{member}/Cargo.toml: [lints] workspace = true",
+            inherits_workspace_lints(member_document),
+            f"the member does not inherit [workspace.lints], so rustdoc documents "
+            f"it under the default `warn` and both rustdoc jobs exit 0 over every "
+            f"intra-doc link it breaks",
+        )
+
+
+def check_rustdoc_lint_readers_detect_a_lowered_level() -> None:
+    """A lowered level and a member without the table flip the two predicates.
+
+    CRITERION: rustdoc_lint_level reads the level out of the manifest and
+    inherits_workspace_lints reads the boolean, so a manifest carrying `warn`,
+    a manifest naming no rustdoc table, and a member manifest without `[lints]`
+    each read as not held to the lint. Without this pair, a reader that always
+    returned the forbid level would leave check_rustdoc_lint_reaches_every_member
+    printing `ok` over a workspace that never set it.
+    """
+    lowered = {"workspace": {"lints": {"rustdoc": {RUSTDOC_LINT: "warn"}}}}
+    lowered_table = {
+        "workspace": {"lints": {"rustdoc": {RUSTDOC_LINT: {"level": "deny"}}}}
+    }
+    absent = {"workspace": {"lints": {"clippy": {"all": "warn"}}}}
+    for name, document, expected in (
+        ("a `warn` string reads as warn", lowered, "warn"),
+        ("a `{ level = \"deny\" }` table reads as deny", lowered_table, "deny"),
+        ("a manifest naming no rustdoc table reads as None", absent, None),
+    ):
+        check(
+            f"rustdoc_lint_level: {name}",
+            rustdoc_lint_level(document) == expected,
+            f"rustdoc_lint_level returned {rustdoc_lint_level(document)!r}, so it "
+            f"reads something other than the manifest's lint level",
+        )
+    for name, document in (
+        ("a member with no [lints] table", {"package": {"name": "x"}}),
+        ("a member setting [lints] workspace = false", {"lints": {"workspace": False}}),
+        ("a member declaring its own lints", {"lints": {"rustdoc": {RUSTDOC_LINT: "forbid"}}}),
+    ):
+        check(
+            f"inherits_workspace_lints: {name} -> not inherited",
+            not inherits_workspace_lints(document),
+            "inherits_workspace_lints returned True over a manifest carrying no "
+            "`[lints] workspace = true`, so it reads something other than that line",
+        )
+
+
+def check_rustdoc_documents_private_items(
+    documents: list[tuple[Path, dict]],
+) -> None:
+    """Every `cargo doc` command in every workflow documents private items.
+
+    CRITERION: rustdoc resolves an intra-doc link only inside an item it
+    documents. The workspace forbids `rustdoc::broken_intra_doc_links`
+    (check_rustdoc_lint_reaches_every_member holds that), and that level fires on
+    a link written in a private module only when the command passes
+    `--document-private-items`, so a `cargo doc` run without the flag reports
+    success over links it never read.
+    """
+    for path, doc in documents:
+        for job_id, command in rustdoc_commands(doc):
+            check(
+                f"{path.name}:{job_id}: {command[:58]}",
+                documents_private_items(command),
+                f"omits {DOCUMENT_PRIVATE_ITEMS_FLAG} — rustdoc reads no intra-doc "
+                f"link written in a private module without it, which is where all "
+                f"three links pull request #2274, the structured "
+                f"OutletErrorSurface change, broke lived",
+            )
+
+
+def check_private_items_detects_a_dropped_flag(
+    documents: list[tuple[Path, dict]],
+) -> None:
+    """Dropping the flag from a real command fails the check above.
+
+    CRITERION: documents_private_items reads the flag out of the command text,
+    so removing it flips that predicate. Without this pair, a predicate that
+    always returned True would leave check_rustdoc_documents_private_items
+    printing `ok` over every command in the repository.
+    """
+    for path, _ in documents:
+        doc = yaml.safe_load(path.read_text())
+        for job_id, command in rustdoc_commands(doc):
+            stripped = " ".join(
+                token
+                for token in command.split()
+                if token != DOCUMENT_PRIVATE_ITEMS_FLAG
+            )
+            check(
+                f"{path.name}:{job_id}: the flag removed -> the predicate reports it "
+                f"missing",
+                not documents_private_items(stripped),
+                "documents_private_items returned True over a command carrying no "
+                "--document-private-items, so it reads something other than the flag",
+            )
+
+
+def check_workspace_and_rustdoc_readers(documents: list[tuple[Path, dict]]) -> None:
+    """The two checks above read the jobs this file says they read.
+
+    CRITERION: each check asserts over a set it discovers from the workflows, and
+    a discovery returning nothing prints nothing. Comparing the discovered sets
+    against WORKSPACE_SCOPED_JOBS and RUSTDOC_JOBS turns an emptied iteration
+    into a named failure rather than into silence.
+    """
+    scoped = {
+        (path.name, job_id)
+        for path, doc in documents
+        for job_id, _keys, _patterns in workspace_scoped_jobs(doc)
+    }
+    check(
+        "the workspace-scope check reads every job WORKSPACE_SCOPED_JOBS names",
+        scoped == WORKSPACE_SCOPED_JOBS,
+        f"discovered {sorted(scoped)}, want {sorted(WORKSPACE_SCOPED_JOBS)} — a job "
+        f"this check no longer reads is a job whose filter nothing checks",
+    )
+    rustdoc = {
+        (path.name, job_id)
+        for path, doc in documents
+        for job_id, _command in rustdoc_commands(doc)
+    }
+    check(
+        "the private-items check reads every job RUSTDOC_JOBS names",
+        rustdoc == RUSTDOC_JOBS,
+        f"discovered {sorted(rustdoc)}, want {sorted(RUSTDOC_JOBS)} — a `cargo doc` "
+        f"this check no longer reads is a rustdoc run nothing checks",
+    )
 
 
 def check_path_dep_closures(jobs: dict) -> None:
@@ -1949,6 +2486,512 @@ def check_signing_guard(documents: list[tuple[Path, dict]]) -> None:
     )
 
 
+def cargo_doc_commands(doc: dict) -> list[tuple[str, str]]:
+    """Return (job_id, command) for every `cargo doc` a workflow's steps run."""
+    found = []
+    for job_id, job in sorted((doc.get("jobs") or {}).items()):
+        for step in job.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            for line in logical_lines(step.get("run") or ""):
+                if line.startswith("cargo doc ") or line == "cargo doc":
+                    found.append((job_id, line))
+    return found
+
+
+def command_flags(command: str) -> set[str]:
+    """Return a command's flags, each carrying its value when it takes one.
+
+    A flag written `--features a,b` and one written `--features=a,b` normalize
+    to the same members, and a comma-separated value splits into one member per
+    element, so a command enabling fewer features compares as a subset rather
+    than as a difference.
+    """
+    flags: set[str] = set()
+    pending: str | None = None
+    for token in split_command(command):
+        if pending is not None:
+            name, value = pending, token
+            pending = None
+        elif token in VALUE_FLAGS:
+            pending = token
+            continue
+        elif token.startswith("-"):
+            name, _, value = token.partition("=")
+        else:
+            continue
+        if not value:
+            flags.add(name)
+        else:
+            flags.update(f"{name}={element}" for element in value.split(","))
+    if pending is not None:
+        flags.add(pending)
+    return flags
+
+
+def required_rustdoc_flags(documents: list[tuple[Path, dict]]) -> set[str]:
+    """Return the flags every `cargo doc` in the required workflow passes."""
+    flags: set[str] = set()
+    for path, doc in documents:
+        if path == WORKFLOW:
+            for _, command in cargo_doc_commands(doc):
+                flags |= command_flags(command)
+    return flags
+
+
+def rustdoc_surface_gaps(
+    documents: list[tuple[Path, dict]], required: set[str]
+) -> list[tuple[Path, str, set[str]]]:
+    """Return each rustdoc outside the required workflow and the flags it adds.
+
+    A returned entry names a `cargo doc` command, and the flags it passes that
+    `required` does not carry. Each such flag enlarges what rustdoc resolves in
+    that command alone, so a diagnostic it produces reaches no required status
+    check.
+    """
+    gaps = []
+    for path, doc in documents:
+        if path == WORKFLOW:
+            continue
+        for job_id, command in cargo_doc_commands(doc):
+            gaps.append((path, job_id, command_flags(command) - required))
+    return gaps
+
+
+def check_required_rustdoc_surface(documents: list[tuple[Path, dict]]) -> None:
+    """The required check's rustdoc reads whatever any other workflow's reads.
+
+    THE CRITERION: a rustdoc diagnostic that any workflow in this repository
+    can produce, `ci` can produce. `ci` is the sole required status check on the
+    Default ruleset, so a diagnostic only an advisory workflow produces blocks
+    no merge, and a pull request carrying that diagnostic merges under a green
+    required check.
+
+    A `cargo doc` flag decides which items rustdoc resolves links on, so a flag
+    one command carries and the required check's command omits names a
+    diagnostic class the required check cannot produce. This check compares the
+    two flag sets rather than naming `--document-private-items`, so a flag added
+    to docs.yml later fails here until ci.yml carries it too.
+    """
+    required = required_rustdoc_flags(documents)
+    check(
+        f"{WORKFLOW.name} runs rustdoc",
+        bool(required),
+        "no `cargo doc` command — a required check running no rustdoc produces "
+        "no rustdoc diagnostic",
+    )
+    for path, job_id, missing in rustdoc_surface_gaps(documents, required):
+        check(
+            f"{path.name}:{job_id} rustdoc surface reaches {WORKFLOW.name}",
+            not missing,
+            f"{sorted(missing)} enlarge what rustdoc reads in a workflow the "
+            f"ruleset does not require, and nothing in `ci` reads it",
+        )
+
+
+def check_rustdoc_surface_detects_a_dropped_flag(
+    documents: list[tuple[Path, dict]],
+) -> None:
+    """Dropping a flag from the required rustdoc fails the check above.
+
+    CRITERION: rustdoc_surface_gaps reports a flag that an advisory workflow's
+    rustdoc passes and the required workflow's rustdoc does not. Dropping one
+    flag at a time from the required set proves the comparison runs over the
+    commands these workflows carry rather than over an empty set — a comparison
+    that read no command would report no gap and pass the check above, which is
+    the shape ci.yml carried while `--document-private-items` sat in docs.yml
+    alone.
+    """
+    required = required_rustdoc_flags(documents)
+    elsewhere = {
+        flag
+        for path, doc in documents
+        if path != WORKFLOW
+        for _, command in cargo_doc_commands(doc)
+        for flag in command_flags(command)
+    }
+    shared = sorted(required & elsewhere)
+    check(
+        "a rustdoc outside the required workflow shares a flag with it",
+        bool(shared),
+        "no shared flag — this mutation would drop nothing and report nothing",
+    )
+    # Read as a delta against the unmutated set, so that a gap these workflows
+    # already carry fails check_required_rustdoc_surface above and leaves this
+    # mutation reporting on the dropped flag alone.
+    baseline = {
+        missing_flag
+        for _, _, missing in rustdoc_surface_gaps(documents, required)
+        for missing_flag in missing
+    }
+    for flag in shared:
+        reported = {
+            missing_flag
+            for _, _, missing in rustdoc_surface_gaps(documents, required - {flag})
+            for missing_flag in missing
+        } - baseline
+        check(
+            f"dropping {flag} from {WORKFLOW.name}'s rustdoc reports it",
+            reported == {flag},
+            f"reported {sorted(reported)}, want [{flag!r}] — a required check "
+            f"omitting that flag would otherwise pass this self-test",
+        )
+
+
+def tracked_markdown_paths() -> list[str]:
+    """Return every Markdown file this repository tracks, repository-relative."""
+    proc = subprocess.run(
+        ["git", "ls-files", "-z", "--", "*.md"],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return sorted(name for name in proc.stdout.split("\0") if name)
+
+
+def fenced_shell_blocks(text: str) -> list[str]:
+    """Return the body of each fenced block whose label names a shell.
+
+    A fence opens on a line whose first three non-space characters are three
+    backticks followed by a language label, and closes on the next line opening
+    with three backticks. A block whose label names no shell — `rust`, `yaml`,
+    an empty label — returns nothing, because a reader does not run its contents.
+    The label is the first word after the backticks, so an attribute a renderer
+    accepts after it (```bash title="x") leaves the language readable.
+    """
+    blocks: list[str] = []
+    language: str | None = None
+    body: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            if language is None:
+                label = stripped[3:].strip().lower().split()
+                language = label[0] if label else ""
+            else:
+                if language in SHELL_FENCE_LANGUAGES:
+                    blocks.append("\n".join(body))
+                language, body = None, []
+            continue
+        if language is not None:
+            body.append(line)
+    return blocks
+
+
+def documented_rustdoc_commands() -> list[tuple[str, str]]:
+    """Return (path, command) for each `cargo doc` a Markdown shell block runs."""
+    found = []
+    for path in tracked_markdown_paths():
+        text = (REPO / path).read_text(encoding="utf-8")
+        if "cargo doc" not in text:
+            continue
+        for block in fenced_shell_blocks(text):
+            for line in logical_lines(block):
+                if line.startswith("cargo doc ") or line == "cargo doc":
+                    found.append((path, line))
+    return found
+
+
+def documented_rustdoc_gaps(
+    commands: list[tuple[str, str]], required: set[str]
+) -> list[tuple[str, str, set[str], set[str]]]:
+    """Return each documented rustdoc, the flags it drops, and the ones it adds.
+
+    A returned entry names a command, the required job's flags it omits, and the
+    `--features` members it passes that the required job does not. The first set
+    is what makes a green local run prove less than the merge waits on; the
+    second is what makes a red local run report a break the merge does not have.
+    """
+    gaps = []
+    for path, command in commands:
+        flags = command_flags(command)
+        extra_features = {
+            flag for flag in flags - required if flag.startswith(FEATURES_FLAG_PREFIX)
+        }
+        gaps.append((path, command, required - flags, extra_features))
+    return gaps
+
+
+def check_documented_rustdoc_reproduces_the_required_job(
+    documents: list[tuple[Path, dict]],
+) -> None:
+    """A `cargo doc` this repository documents reports what the merge waits on.
+
+    THE CRITERION: a developer who copies a `cargo doc` command out of a
+    Markdown shell block and runs it reads the diagnostics job `rust-doc` in
+    .github/workflows/ci.yml produces, and reads no others. `ci` is the sole
+    required status check on the Default ruleset, so that job's output is what
+    decides a merge, and a documented command reporting anything else sends the
+    developer after a break the merge does not have or hides one it does.
+    """
+    required = required_rustdoc_flags(documents)
+    commands = documented_rustdoc_commands()
+    carriers = {path for path, _ in commands}
+    check(
+        "every file DOCUMENTED_RUSTDOC_FILES names documents a rustdoc command",
+        carriers == DOCUMENTED_RUSTDOC_FILES,
+        f"found {sorted(carriers)}, want {sorted(DOCUMENTED_RUSTDOC_FILES)} — a "
+        f"documented `cargo doc` this scan no longer reads is a command nothing "
+        f"compares against {WORKFLOW.name}",
+    )
+    for path, command, missing, extra in documented_rustdoc_gaps(commands, required):
+        check(
+            f"{path} documents a rustdoc that reproduces {WORKFLOW.name}'s",
+            not missing and not extra,
+            f"{command!r} omits {sorted(missing)} and adds {sorted(extra)} — a "
+            f"developer running it reads a different diagnostic set than the one "
+            f"a merge waits on",
+        )
+
+
+def check_documented_rustdoc_detects_a_feature_drift(
+    documents: list[tuple[Path, dict]],
+) -> None:
+    """Perturbing the required flag set fails the check above.
+
+    CRITERION: documented_rustdoc_gaps reports a flag the required job passes
+    and a documented command omits, and reports a `--features` member the
+    documented command passes and the required job omits. Adding one flag to the
+    required set and removing one from it proves the comparison runs over the
+    commands these Markdown files carry rather than over an empty set — a
+    comparison reading no command reports no gap and passes the check above,
+    which is the shape every check in this file's docstring shares.
+    """
+    required = required_rustdoc_flags(documents)
+    commands = documented_rustdoc_commands()
+    check(
+        "the documented-rustdoc scan reads at least one command",
+        bool(commands),
+        "no `cargo doc` in any Markdown shell block — this mutation would "
+        "perturb nothing and report nothing",
+    )
+    invented = "--nonexistent-rustdoc-flag"
+    reported = {
+        flag
+        for _, _, missing, _ in documented_rustdoc_gaps(commands, required | {invented})
+        for flag in missing
+    }
+    check(
+        f"a required flag no documented command carries reports as {invented}",
+        reported == {invented},
+        f"reported {sorted(reported)}, want [{invented!r}] — a documented command "
+        f"omitting a required flag would otherwise pass the check above",
+    )
+    features = sorted(
+        flag for flag in required if flag.startswith(FEATURES_FLAG_PREFIX)
+    )
+    check(
+        f"{WORKFLOW.name}'s rustdoc passes a feature this mutation can withdraw",
+        bool(features),
+        "no `--features` member — this mutation would withdraw nothing",
+    )
+    for feature in features:
+        reported = {
+            flag
+            for _, _, _, extra in documented_rustdoc_gaps(
+                commands, required - {feature}
+            )
+            for flag in extra
+        }
+        check(
+            f"withdrawing {feature} from {WORKFLOW.name}'s rustdoc reports it",
+            reported == {feature},
+            f"reported {sorted(reported)}, want [{feature!r}] — a documented "
+            f"command enabling a feature the required job does not would "
+            f"otherwise pass the check above",
+        )
+
+
+def lines_outside_shell_blocks(text: str) -> list[tuple[int, str]]:
+    """Return (line number, text) for each Markdown line no shell block encloses.
+
+    A fence line returns nothing, and so does every line a fence this file's
+    shell set labels encloses, because documented_rustdoc_commands already reads
+    those. A fence labelled anything else keeps its body, so relabelling a
+    `cargo doc` block from ```bash to ```text moves the command into this
+    scan rather than out of every scan in this file.
+
+    A line ending in a backslash joins the line after it and reports under the
+    first line's number, because a shell command written across two Markdown
+    lines names its command on one and its flags on the next.
+    """
+    kept: list[tuple[int, str]] = []
+    language: str | None = None
+    pending: tuple[int, str] | None = None
+    for number, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            if language is None:
+                label = stripped[3:].strip().lower().split()
+                language = label[0] if label else ""
+            else:
+                language = None
+            continue
+        if language is not None and language in SHELL_FENCE_LANGUAGES:
+            continue
+        if pending is None:
+            start, joined = number, stripped
+        else:
+            start, joined = pending[0], f"{pending[1]} {stripped}"
+        if joined.endswith("\\"):
+            pending = (start, joined[:-1].rstrip())
+            continue
+        kept.append((start, joined))
+        pending = None
+    if pending is not None:
+        kept.append(pending)
+    return kept
+
+
+def rustdoc_enumerations_outside_shell_blocks(text: str) -> list[tuple[int, str]]:
+    """Return each line writing a `cargo doc` with `--features` outside a block."""
+    return [
+        (number, line)
+        for number, line in lines_outside_shell_blocks(text)
+        if "cargo doc" in line and FEATURES_FLAG in line
+    ]
+
+
+def unheld_rustdoc_enumerations() -> list[tuple[str, int, str]]:
+    """Return every rustdoc flag enumeration in Markdown that no check reads."""
+    found: list[tuple[str, int, str]] = []
+    for path in tracked_markdown_paths():
+        text = (REPO / path).read_text(encoding="utf-8")
+        if "cargo doc" not in text:
+            continue
+        for number, line in rustdoc_enumerations_outside_shell_blocks(text):
+            found.append((path, number, line))
+    return found
+
+
+def check_rustdoc_enumerations_sit_in_a_shell_block() -> None:
+    """Every rustdoc flag enumeration in Markdown sits where a check reads it.
+
+    THE CRITERION, stated at FEATURES_FLAG above: Markdown text writing out the
+    flag set job `rust-doc` in .github/workflows/ci.yml passes sits inside a
+    shell-labelled fenced block, which is the only place
+    check_documented_rustdoc_reproduces_the_required_job compares a documented
+    command against that job. An enumeration outside such a block reaches no
+    comparison, so a later edit to the required job's `--features` list leaves it
+    stating flags the merge no longer waits on while this file reports every
+    assertion passing.
+    """
+    unheld = unheld_rustdoc_enumerations()
+    check(
+        "every rustdoc `--features` enumeration in Markdown sits in a shell block",
+        not unheld,
+        "; ".join(f"{path}:{number} writes {line!r}" for path, number, line in unheld)
+        + " — a `cargo doc` naming `--features` outside a shell-labelled fence "
+        "reaches no comparison against the required job, so its flags drift while "
+        "this self-test stays green",
+    )
+
+
+def check_enumeration_scan_reads_the_text_it_is_given() -> None:
+    """Perturbing a document reports through the check above.
+
+    CRITERION: rustdoc_enumerations_outside_shell_blocks reports a `cargo doc`
+    written with `--features` in running text, in a table cell, in a fence
+    labelled for a language nobody runs, and across a backslash continuation,
+    and reports nothing for the same command inside a shell block. A scan whose
+    match never fires reports nothing on every document and leaves the check
+    above passing over zero lines — the zero-test defect this file's docstring
+    records. The scan reads the tree through tracked_markdown_paths, so this
+    check also asserts that iteration reaches a file naming `cargo doc`.
+    """
+    carriers = [
+        path
+        for path in tracked_markdown_paths()
+        if "cargo doc" in (REPO / path).read_text(encoding="utf-8")
+    ]
+    check(
+        "the enumeration scan reads at least one Markdown file naming `cargo doc`",
+        bool(carriers),
+        "no tracked Markdown file names `cargo doc` — the check above would "
+        "iterate nothing and report nothing",
+    )
+    command = (
+        "cargo doc --workspace --document-private-items --features scp-core/testing"
+    )
+    cases: list[tuple[str, str, list[int]]] = [
+        (
+            "running text naming a rustdoc with `--features` reports",
+            f"Generate with `{command}` before pushing.\n",
+            [1],
+        ),
+        (
+            "a table cell naming a rustdoc with `--features` reports",
+            f"| doc | ubuntu-latest | `{command}` |\n",
+            [1],
+        ),
+        (
+            "a rustdoc with `--features` in a fence naming no shell reports",
+            f"```text\n{command}\n```\n",
+            [2],
+        ),
+        (
+            "a rustdoc whose `--features` sits after a backslash reports",
+            "Run `cargo doc --workspace \\\n--features scp-core/testing`.\n",
+            [1],
+        ),
+        (
+            "the same rustdoc inside a shell block reports nothing",
+            f"```bash\n{command}\n```\n",
+            [],
+        ),
+        (
+            "a rustdoc naming no `--features` reports nothing",
+            "The job ran `cargo doc --workspace --document-private-items`.\n",
+            [],
+        ),
+    ]
+    for name, document, want in cases:
+        reported = rustdoc_enumerations_outside_shell_blocks(document)
+        got = [number for number, _ in reported]
+        check(
+            name,
+            got == want,
+            f"reported lines {got}, want {want} — {document!r}",
+        )
+
+
+def workflow_triggers(doc: dict) -> set[str]:
+    """Return the event names a workflow triggers on.
+
+    PyYAML resolves the unquoted key `on` to the boolean True, so a caller
+    reading `doc["on"]` reads nothing on every workflow in this repository.
+    """
+    node = doc.get(True, doc.get("on"))
+    if isinstance(node, (dict, list)):
+        return set(node)
+    return {node} if isinstance(node, str) else set()
+
+
+def check_merge_queue_triggers(documents: list[tuple[Path, dict]]) -> None:
+    """A workflow written to be required also runs on the merge_group event.
+
+    CRITERION: a merge queue evaluates every required status check against the
+    `merge_group` ref, so a workflow that never runs on that event reports no
+    check there and every queue entry waits on a status that never arrives.
+    INDICATOR that a workflow is written for that role: it skips its jobs
+    through a `dorny/paths-filter` output instead of failing them, which is the
+    shape that exists so a skipped job reports success to branch protection.
+    The header of .github/workflows/docs.yml states that reason in those words.
+    """
+    for path, doc in documents:
+        triggers = workflow_triggers(doc)
+        if "pull_request" not in triggers or not paths_filter_steps(doc):
+            continue
+        check(
+            f"{path.name} runs on merge_group",
+            "merge_group" in triggers,
+            f"triggers on {sorted(triggers)} — its jobs skip to a success status "
+            f"so branch protection can require them, and a required check that "
+            f"never runs on the merge_group ref holds every queue entry pending",
+        )
+
+
 def collect_pinned_nightlies(doc: dict) -> set[str]:
     """Return every date-pinned nightly a workflow's steps request."""
     pinned = set()
@@ -1965,9 +3008,18 @@ def collect_pinned_nightlies(doc: dict) -> set[str]:
 def main() -> int:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     jobs = workflow["jobs"]
+    # GitHub Actions runs a workflow file whose extension is `.yml` or `.yaml`,
+    # and scripts/check-toolchain-wiring.sh enumerates both. This glob read
+    # `.yml` alone, so a workflow written with the other spelling would have
+    # escaped every assertion below while both gates printed OK. No workflow
+    # here carries that spelling today, which is why widening the glob changes
+    # no result.
     documents = [
         (path, yaml.safe_load(path.read_text()))
-        for path in sorted((REPO / ".github/workflows").glob("*.yml"))
+        for path in sorted(
+            set((REPO / ".github/workflows").glob("*.yml"))
+            | set((REPO / ".github/workflows").glob("*.yaml"))
+        )
     ]
 
     print("timeout — every job in every workflow bounds its own runtime")
@@ -2012,6 +3064,16 @@ def main() -> int:
         f"fuzz run under another",
     )
 
+    print("doc-flag — the required check's rustdoc reads every other rustdoc's surface")
+    check_required_rustdoc_surface(documents)
+    check_rustdoc_surface_detects_a_dropped_flag(documents)
+
+    print("doc-command — a documented rustdoc reports what the merge waits on")
+    check_documented_rustdoc_reproduces_the_required_job(documents)
+    check_documented_rustdoc_detects_a_feature_drift(documents)
+    check_rustdoc_enumerations_sit_in_a_shell_block()
+    check_enumeration_scan_reads_the_text_it_is_given()
+
     print("win-shell — every `run:` step a Windows runner can execute names a shell")
     for path, doc in documents:
         check_windows_shell(path, doc)
@@ -2045,6 +3107,26 @@ def main() -> int:
     check_closure_reads_workspace_inheritance()
     check_resolution_manifests_reach_the_workspace()
     check_path_dep_closures(jobs)
+
+    print(
+        "workspace-scope — a filter gating a `--workspace` compile covers every member"
+    )
+    # Every workflow, not ci.yml alone: docs.yml's `rust-docs` runs
+    # `cargo doc --workspace` under a `docs` filter of its own, and that filter
+    # named eleven of the twenty-six members the root manifest lists.
+    for path, doc in documents:
+        check_workspace_scoped_filters(path, doc)
+    check_workspace_scope_detects_a_narrowed_filter(documents)
+
+    print("private-items — every `cargo doc` reads the links private modules write")
+    check_rustdoc_lint_reaches_every_member()
+    check_rustdoc_lint_readers_detect_a_lowered_level()
+    check_rustdoc_documents_private_items(documents)
+    check_private_items_detects_a_dropped_flag(documents)
+    check_workspace_and_rustdoc_readers(documents)
+
+    print("merge-queue — a workflow that skips to a success status runs in the queue")
+    check_merge_queue_triggers(documents)
 
     print("step-filter — a filter output gates a job, never a step")
     check_filter_outputs_gate_jobs(jobs)

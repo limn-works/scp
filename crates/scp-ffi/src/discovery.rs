@@ -190,7 +190,7 @@ pub fn py_discovery_normalize_address(address: &str) -> String {
 use scp_ffi_common::discovery::discovery_result_to_json;
 use scp_ffi_common::discovery::map_discovery_source;
 
-/// Converts a [`ContextDiscoveryResult`] into a Python dict.
+/// Converts a [`ContextDiscoveryResult`](scp_core::discovery::ContextDiscoveryResult) into a Python dict.
 ///
 /// Returns a dict with keys: `context_id`, `relay_urls`, `publisher_did`,
 /// `discovery_source`, `mode`, `metadata_summary`, `trust_level`,

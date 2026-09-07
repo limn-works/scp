@@ -88,7 +88,7 @@ use crate::increment_handle_count;
 /// Builds the shared [`FfiDhtClient`] for this process, **failing closed**.
 ///
 /// Delegates to the single cfg-gated [`scp_ffi_common::dht::build_ffi_dht_client`]
-/// (shared by all three bridges) and maps its [`DhtInitError`] to a napi error.
+/// (shared by all three bridges) and maps its [`DhtInitError`](scp_ffi_common::dht::DhtInitError) to a napi error.
 /// A shipped (non-`testing`) build constructs the real Mainline Pkarr client; a
 /// malformed gateway or a Mainline build failure surfaces as
 /// [`codes::IDENT_1058`] (dedicated DHT-init-failure code), never an in-memory
@@ -122,7 +122,7 @@ pub(crate) fn no_pre_rotation_backend() -> ScpNapiError {
 /// Builds a [`DidDht`] over the process-shared DHT client, for **minting**
 /// (`create`) and **resolution** alike.
 ///
-/// Both paths use the process-wide [`SHARED_DHT_CLIENT`](crate::runtime) (the
+/// Both paths use the process-wide `SHARED_DHT_CLIENT` in `crate::runtime` (the
 /// one `identity_create` published into) when it is initialized, and otherwise
 /// build the production client fail-closed via [`build_ffi_dht_client`]. Never
 /// substitutes an in-memory/no-op client on a shipped path. The returned method
@@ -236,7 +236,7 @@ pub(crate) fn ensure_did_resolver_initialized_on(
 /// the resolver's stale copy so the next resolve reads the fresh document.
 /// Best-effort: a no-op when no resolver cache is wired on this instance.
 ///
-/// Delegates to the shared [`BridgeInstanceCore::invalidate_resolver_cache`]
+/// Delegates to the shared [`CoreFields::invalidate_resolver_cache`](scp_ffi_common::bridge_instance::CoreFields::invalidate_resolver_cache)
 /// (the single implementation of the invalidation body, shared across bridges).
 ///
 /// Only reached from the `testing`-gated rotation / migration methods
@@ -348,7 +348,7 @@ impl fmt::Debug for OpaqueInMemoryKeyCustody {
 /// the custody's key material — dispatching through the enum so it works for both
 /// in-memory and callback custody.
 ///
-/// The DHT client is the process-wide [`SHARED_DHT_CLIENT`](crate::runtime) the
+/// The DHT client is the process-wide `SHARED_DHT_CLIENT` in `crate::runtime` the
 /// resolver reads from — NOT a fresh per-call client — so the re-published
 /// (higher-`seq`) document lands where DID resolution will see it and the retired
 /// key is rejected on the next resolve. Fails closed if the shared client is

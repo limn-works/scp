@@ -1108,7 +1108,7 @@ impl PerCallerRateLimit {
 
     /// Evicts all callers whose windows have expired.
     ///
-    /// Called periodically during [`check_and_increment`] to reclaim memory
+    /// Called periodically during [`Self::check_and_increment`] to reclaim memory
     /// from callers who are no longer active within the current window.
     #[allow(clippy::cast_possible_truncation)]
     fn evict_expired(&mut self, now: u64) {

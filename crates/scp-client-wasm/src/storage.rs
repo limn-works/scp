@@ -13,7 +13,7 @@
 //!
 //! [`scp_client::Storage`] is **synchronous** (the single-tab driver calls it
 //! inline under `&mut self`), but a browser's durable store (`IndexedDB`) is
-//! **asynchronous**. The injected [`JsStorage`] therefore MUST be a *synchronous
+//! **asynchronous**. The injected `JsStorage` therefore MUST be a *synchronous
 //! facade over an in-memory mirror*: on tab open the TypeScript SDK preloads the
 //! client's keyspace (the `scp-client/*` prefix) into an in-memory `Map`, serves
 //! `get`/`listKeys`/`set`/`delete` synchronously against that mirror, and
@@ -74,7 +74,7 @@
 //! # Single-thread soundness (the `Send + Sync` adaptation)
 //!
 //! [`scp_client::Storage`] requires `Send + Sync` (the driver holds it behind an
-//! `Arc`). A wasm-bindgen JS handle ([`JsStorage`]) is `!Send + !Sync`: a
+//! `Arc`). A wasm-bindgen JS handle (`JsStorage`) is `!Send + !Sync`: a
 //! `JsValue` is an index into the JS module's heap and is meaningless in any
 //! other agent's heap. The browser participant model is **single-threaded by
 //! construction** — one `ScpClient` per tab, driven by `&mut self` with no

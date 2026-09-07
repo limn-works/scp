@@ -136,7 +136,7 @@ fn coded_validation_error(msg: &str, code: &str) -> napi::Error {
 // Bridge functions
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`trust_query_score`].
+/// Per-bridge-instance implementation of [`Scp::trust_query_score`](crate::scp::Scp::trust_query_score).
 pub(crate) fn trust_query_score_on(
     bi: &NapiBridgeInstance,
     did: String,
@@ -468,7 +468,7 @@ pub(crate) fn check_capability_requirements_on(
 // aggregate_trust_input (§7.3)
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`aggregate_trust_input`].
+/// Per-bridge-instance implementation of [`Scp::aggregate_trust_input`](crate::scp::Scp::aggregate_trust_input).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn aggregate_trust_input_on(
     bi: &NapiBridgeInstance,
@@ -630,7 +630,7 @@ pub(crate) fn aggregate_trust_input_on(
 /// gathers the FULL event log + Merkle root for every other fact. Returns the
 /// flattened typed record so the SDK never re-aggregates.
 /// Builds a `ProtocolRepositoryTrustBridge` over the concrete backend behind a
-/// [`ProtocolRepoVariant`] arm and reads back the subject's verified
+/// [`ProtocolRepoVariant`](scp_ffi_common::bridge_runtime::ProtocolRepoVariant) arm and reads back the subject's verified
 /// attestations. Single source of truth for the per-backend
 /// attestation-sourcing path: both `ProtocolRepoVariant` arms route through this
 /// one generic body (mirroring the `PyO3` bridge's `run_verified_attestations`).

@@ -260,11 +260,11 @@ pub const ALL_CODES: [&str; 15] = [
 /// set-equate their slug coverage against this array, so a slug added to the
 /// registry without a matching fixture fails the conformance gate by
 /// construction (rather than passing green against a hand-copied list). The
-/// [`tests::all_slugs_lists_exactly_the_defined_slug_constants`] source-parse
+/// the `tests::all_slugs_lists_exactly_the_defined_slug_constants` unit test source-parse
 /// test asserts this array equals the set of `SLUG_*` constant definitions in
 /// this module, so a new `SLUG_*` constant that is not added here fails to
 /// build green. Every entry MUST resolve through [`slug_to_class`]
-/// ([`tests::all_slugs_resolve_through_slug_to_class`]).
+/// (the `tests::all_slugs_resolve_through_slug_to_class` unit test).
 pub const ALL_SLUGS: [&str; 69] = [
     // Protocol class (6100 + 6101).
     SLUG_PROTOCOL_VIOLATION,

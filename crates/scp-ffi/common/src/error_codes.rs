@@ -267,7 +267,7 @@ pub const IDENT_1057: &str = "SCP-IDENT-1057";
 /// Surfaced by all native bridges (`PyO3`, napi-rs, `UniFFI`) when the shipped
 /// Mainline Pkarr DHT client cannot be built — a malformed gateway URL or a
 /// Pkarr build failure (`DhtInitError` from
-/// [`scp_ffi_common::dht::build_ffi_dht_client`]). This is the fail-closed DHT
+/// [`crate::dht::build_ffi_dht_client`]). This is the fail-closed DHT
 /// path (ADR-062 §Decision 1 / spec §17.17.3): construction NEVER substitutes an
 /// in-memory or no-op client. Distinct from `IDENT_1001` (the generic /
 /// registry-miss code) so SDK consumers can tell a DHT-init failure apart from

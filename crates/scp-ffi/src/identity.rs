@@ -79,7 +79,7 @@ use scp_ffi_common::validate::MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID;
 /// closed**.
 ///
 /// Delegates to the single cfg-gated [`scp_ffi_common::dht::build_ffi_dht_client`]
-/// (shared by all three bridges) and maps its [`DhtInitError`] to a `ScpPyError`.
+/// (shared by all three bridges) and maps its [`DhtInitError`](scp_ffi_common::dht::DhtInitError) to a `ScpPyError`.
 /// A shipped (non-`testing`) build constructs the real Mainline Pkarr client; a
 /// malformed gateway or a Mainline build failure surfaces as the dedicated
 /// `IDENT_1058` DHT-init-failure code (distinct from the generic `IDENT_1001`),
@@ -283,8 +283,8 @@ async fn publish_to_resolver_dht_for(
 ///
 /// Rotation, agent-key, and migration operations re-publish a NEW DID document
 /// (a higher BEP44 sequence). That document MUST land in the per-instance
-/// resolver DHT client — the one [`IdentityBackedDidResolver`] reads from
-/// (seeded by [`set_resolver_dht_client`] / read via [`resolver_dht_client`]) —
+/// resolver DHT client — the one [`IdentityBackedDidResolver`](scp_ffi_common::IdentityBackedDidResolver) reads from
+/// (seeded by [`set_resolver_dht_client`](crate::runtime::set_resolver_dht_client) / read via [`resolver_dht_client`](crate::runtime::resolver_dht_client)) —
 /// so that subsequent DID resolution (UCAN validation, governance vote-signature
 /// verification) sees the rotated `#active` key and rejects signatures from the
 /// retired one. Publishing into a throwaway client would leave the resolver
@@ -447,7 +447,7 @@ impl PyIdentity {
     /// Returns the hex-encoded Ed25519 verifying-key bytes for the
     /// identity key (VM `#0`, the key that derives the DID), or `None`
     /// if this handle was loaded without live key material (e.g. via
-    /// [`py_identity_load`]).
+    /// [`PyScp::identity_load`](crate::scp::PyScp::identity_load)).
     ///
     /// Intended for cross-bridge parity assertions: under a deterministic
     /// `seed`, this value is byte-identical across every bridge
@@ -1007,7 +1007,7 @@ pub fn identity_verify_device_attestation(_did: &str, token_base64: &str) -> PyR
 /// Until #2335, this function returned `attestation.verify_signature(&caller_key).is_ok()`.
 /// That answered `true` for an attacker who supplied both an attestation and a
 /// key, because no step bound that key to an issuer's DID document. Callers
-/// move to [`PyScp::verify_identity_link_attestation`], which resolves and runs
+/// move to [`PyScp::verify_identity_link_attestation`](crate::scp::PyScp::verify_identity_link_attestation), which resolves and runs
 /// every §3.5.4 step.
 ///
 /// # Arguments
@@ -2121,7 +2121,7 @@ impl crate::scp::PyScp {
     ///
     /// Returns `true` if the identity was found and removed, `false` if the
     /// DID was not in the registry. Companion to
-    /// [`PyScp::identity_remove`] (which is unconditional), matching the
+    /// [`PyScp::identity_remove`](crate::scp::PyScp::identity_remove) (which is unconditional), matching the
     /// NAPI bridge's `identity_remove_if_present` semantics. Custody-agnostic
     /// registry teardown — available in production.
     #[pyo3(name = "identity_remove_if_present")]
