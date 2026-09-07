@@ -34,13 +34,14 @@ pub mod crypto {
     pub mod mls {
         // Synchronous MLS state machine (wasm-safe) from scp-mls.
         pub use scp_mls::{
-            InMemoryMlsProvider, credential, encrypt, epoch_grace, error, group, key_package,
-            ratchet, wrapping_extension,
+            InMemoryMlsProvider, credential, encrypt, epoch_grace, error, group,
+            keypackage_attestation, keypackage_mint, ratchet, wrapping_extension,
         };
         // Node-only async durable-storage bridge from scp-runtime.
         pub use scp_runtime::crypto::mls::{
-            MlsStorageBridge, MlsStorageBridgeError, NodeMlsFactory, ScpMlsProvider, backend,
-            production_backend, provider, storage, storage_adapter,
+            MlsStorageBridge, MlsStorageBridgeError, NodeMlsFactory, ScpMlsProvider,
+            attestation_signer, attestation_verification, backend, production_backend, provider,
+            storage, storage_adapter,
         };
     }
     pub mod sender_keys {

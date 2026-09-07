@@ -16,8 +16,9 @@ use openmls::prelude::*;
 use scp_core::crypto::mls::credential::ScpCredential;
 use scp_core::crypto::mls::encrypt::{decrypt, encrypt, serialize_ciphertext};
 use scp_core::crypto::mls::group::{
-    add_member, create_group, destroy_group, generate_key_package, join_group, remove_member,
+    add_member, create_group, destroy_group, join_group, remove_member,
 };
+use scp_core::crypto::mls::keypackage_mint::mint_key_package_for_testing;
 use scp_core::crypto::sender_keys::{
     NonceDedup, decrypt_sender_layer, encrypt_sender_layer, generate_sender_key,
     publish_sender_key_epoch_advance, send_block_notification, verify_block_notification,
@@ -31,6 +32,28 @@ use scp_did::SigningKeyId;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
+
+/// Mints one attested `KeyPackage` for `credential` (§9.7.1).
+///
+/// Every leaf now carries a signed `0xFF03` attestation, so a test cannot build
+/// one without a signing key. Each call takes a fresh key, which keeps the mints
+/// independent, and a fixed wrapping key, which these tests never compare across
+/// members.
+fn mint_kp(
+    credential: &ScpCredential,
+) -> (
+    openmls::prelude::KeyPackageBundle,
+    openmls_basic_credential::SignatureKeyPair,
+    scp_core::crypto::mls::InMemoryMlsProvider,
+) {
+    mint_key_package_for_testing(
+        credential,
+        &[0x5C; 32],
+        &scp_clock::SystemClock,
+        &ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng),
+    )
+    .expect("mint an attested KeyPackage")
+}
 
 // ---------------------------------------------------------------------------
 // 1. mls_create_group
@@ -74,8 +97,7 @@ async fn mls_add_member() {
         SigningKeyId::Active,
     )
     .unwrap();
-    let (key_package_bundle, _signer, _provider) =
-        generate_key_package(&member_cred, &scp_clock::SystemClock).unwrap();
+    let (key_package_bundle, _signer, _provider) = mint_kp(&member_cred);
 
     // Convert KeyPackageBundle to KeyPackageIn for add_member.
     let kp_bytes = key_package_bundle
@@ -114,8 +136,7 @@ async fn mls_join_group() {
         SigningKeyId::Active,
     )
     .unwrap();
-    let (key_package_bundle, signer, provider) =
-        generate_key_package(&member_cred, &scp_clock::SystemClock).unwrap();
+    let (key_package_bundle, signer, provider) = mint_kp(&member_cred);
 
     let kp_bytes = key_package_bundle
         .key_package()
@@ -153,8 +174,7 @@ async fn mls_remove_member() {
         SigningKeyId::Active,
     )
     .unwrap();
-    let (key_package_bundle, _signer, _provider) =
-        generate_key_package(&member_cred, &scp_clock::SystemClock).unwrap();
+    let (key_package_bundle, _signer, _provider) = mint_kp(&member_cred);
 
     let kp_bytes = key_package_bundle
         .key_package()
@@ -227,8 +247,7 @@ async fn mls_forward_secrecy() {
         ScpCredential::new("did:dht:z6MkBobFS".to_owned(), None, SigningKeyId::Active).unwrap();
 
     let mut alice_group = create_group(&alice_cred, &scp_clock::SystemClock).unwrap();
-    let (bob_kpb, bob_signer, bob_provider) =
-        generate_key_package(&bob_cred, &scp_clock::SystemClock).unwrap();
+    let (bob_kpb, bob_signer, bob_provider) = mint_kp(&bob_cred);
     let bob_kp_bytes = bob_kpb.key_package().tls_serialize_detached().unwrap();
     let bob_kp_in = KeyPackageIn::tls_deserialize(&mut bob_kp_bytes.as_slice()).unwrap();
     let add_result = add_member(&mut alice_group, bob_kp_in, &scp_clock::SystemClock).unwrap();
@@ -250,8 +269,7 @@ async fn mls_forward_secrecy() {
         let temp_cred =
             ScpCredential::new(format!("did:dht:z6MkTempFS{i}"), None, SigningKeyId::Active)
                 .unwrap();
-        let (temp_kpb, _signer, _provider) =
-            generate_key_package(&temp_cred, &scp_clock::SystemClock).unwrap();
+        let (temp_kpb, _signer, _provider) = mint_kp(&temp_cred);
         let kp_bytes = temp_kpb.key_package().tls_serialize_detached().unwrap();
         let kp_in = KeyPackageIn::tls_deserialize(&mut kp_bytes.as_slice()).unwrap();
         let result = add_member(&mut alice_group, kp_in, &scp_clock::SystemClock).unwrap();
@@ -633,8 +651,7 @@ async fn double_encryption_roundtrip() {
         SigningKeyId::Active,
     )
     .unwrap();
-    let (joiner_kp_bundle, joiner_signer, joiner_provider) =
-        generate_key_package(&joiner_cred, &scp_clock::SystemClock).unwrap();
+    let (joiner_kp_bundle, joiner_signer, joiner_provider) = mint_kp(&joiner_cred);
     let kp_bytes = joiner_kp_bundle
         .key_package()
         .tls_serialize_detached()
@@ -753,8 +770,7 @@ async fn mls_application_message_roundtrip() {
     let mut creator_group = create_group(&creator_cred, &scp_clock::SystemClock).unwrap();
 
     // Add joiner to group.
-    let (joiner_kpb, joiner_signer, joiner_provider) =
-        generate_key_package(&joiner_cred, &scp_clock::SystemClock).unwrap();
+    let (joiner_kpb, joiner_signer, joiner_provider) = mint_kp(&joiner_cred);
 
     let kp_bytes = joiner_kpb.key_package().tls_serialize_detached().unwrap();
     let kp_in = KeyPackageIn::tls_deserialize(&mut kp_bytes.as_slice()).unwrap();

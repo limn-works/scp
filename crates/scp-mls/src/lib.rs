@@ -29,7 +29,7 @@
 //!   carried in the MLS AAD (ADR-057).
 //! - [`encrypt`] — Application-message encrypt/decrypt over the MLS group.
 //! - [`ratchet`] — Commit processing and epoch advance.
-//! - [`key_package`] — Single-use `KeyPackage` buffer management.
+//! - [`keypackage_mint`] — Attested `KeyPackage` minting (§9.7.1).
 //! - [`lifetime`] — `KeyPackage` `Lifetime` minting/validation via the injected
 //!   [`scp_clock::Clock`] (ADR-057 Prereq-1).
 //! - [`wrapping_extension`] — `scp_wrapping_key` `LeafNode` extension helpers.
@@ -51,8 +51,8 @@ pub mod encrypt;
 pub mod epoch_grace;
 pub mod error;
 pub mod group;
-pub mod key_package;
 pub mod keypackage_attestation;
+pub mod keypackage_mint;
 pub mod lifetime;
 pub mod ratchet;
 pub mod snapshot;
@@ -68,14 +68,25 @@ pub use encrypt::{DecryptedContent, InboundChange};
 pub use error::MlsError;
 pub use keypackage_attestation::{
     AttestationLeafGroundTruth, AttestationResolutionVerifyError, AttestationTrigger,
-    AttestationVerifyError, KeyPackageAttestation, MAX_ATTESTATION_KEY_RESOLUTION_STALENESS,
-    MAX_KEYPACKAGE_ATTESTATION_LIFETIME, SCP_KEYPACKAGE_ATTESTATION_DOMAIN,
-    SCP_KEYPACKAGE_ATTESTATION_EXTENSION_TYPE, scp_capabilities_with_keypackage_attestation,
+    AttestationVerifyError, AttestedKeyPackage, KeyPackageAttestation,
+    MAX_ATTESTATION_KEY_RESOLUTION_STALENESS, MAX_KEYPACKAGE_ATTESTATION_LIFETIME,
+    SCP_KEYPACKAGE_ATTESTATION_DOMAIN, SCP_KEYPACKAGE_ATTESTATION_EXTENSION_TYPE,
+    read_attested_key_package, scp_capabilities_with_keypackage_attestation,
     verify_attestation_with_resolution,
+};
+pub use keypackage_mint::{PreparedKeyPackage, finish_key_package, prepare_key_package};
+
+// The one-call test mint. Gated on `testing` exactly as its definition is, so a
+// shipped artifact carries neither the re-export nor the function: production
+// reaches the identity key through `KeyCustody::sign` and takes the two-call
+// `prepare_key_package`/`finish_key_package` route.
+#[cfg(any(test, feature = "testing"))]
+pub use keypackage_mint::{
+    mint_key_package_for_testing, mint_non_conformant_key_package_for_testing,
 };
 
 // The MLS signing key pair appears in this crate's public op signatures
-// (`generate_key_package` returns it; `join_group` consumes it). Re-export it so
+// (`finish_key_package` returns it; `join_group` consumes it). Re-export it so
 // consumers — notably the in-browser participant driver (ADR-057) — can name
 // the type without taking a direct dependency on `openmls_basic_credential`.
 pub use context_extension::{
@@ -85,9 +96,8 @@ pub use context_extension::{
 pub use group::{
     AddMemberResult, RemoveMemberResult, SCP_CIPHERSUITE, ScpMlsGroup, add_member,
     add_member_with_convergent_timestamp, create_group, create_group_with_context,
-    create_group_with_wrapping_key, destroy_group, generate_key_package,
-    generate_key_package_with_context_params, generate_key_package_with_wrapping_key, join_group,
-    key_package_in_did, key_package_in_wrapping_key, remove_member,
+    create_group_with_wrapping_key, destroy_group, join_group, key_package_in_did,
+    key_package_in_wrapping_key, remove_member,
 };
 pub use lifetime::{
     KEY_PACKAGE_LIFETIME_MARGIN_SECS, KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS,

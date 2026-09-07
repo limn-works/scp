@@ -32,6 +32,8 @@ use sha2::{Digest, Sha256};
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
 use zeroize::Zeroizing;
 
+use super::attestation_signer::{DidDocumentResolver, KeyPackageAttestationSigner};
+use super::attestation_verification::{AttestationAddGroundTruth, verify_add_attestation};
 use super::backend::{
     AddMemberRaw, GeneratedKeyPackage, MlsBackend, RemoveMemberRaw, SignerState,
     ValidatedKeyPackage,
@@ -113,6 +115,13 @@ pub struct ProductionMlsBackend {
     /// shared `mls_storage`. When unset, `join_from_welcome` FAILS CLOSED (it
     /// does NOT skip the crypto-layer replay check).
     consumed_init_key_store: OnceLock<Arc<dyn OpenMlsStorageAdapter>>,
+    /// DID-document resolver for the §9.7.1 attestation current-key checks
+    /// (checks 1–2). `None` until
+    /// [`MlsBackend::set_attestation_resolver`] wires the bridge's canonical
+    /// resolver. When unset, `validate_key_package` FAILS CLOSED for every DID
+    /// that resolution covers — it does NOT admit a leaf whose attestation it
+    /// could not check.
+    attestation_resolver: OnceLock<Arc<dyn DidDocumentResolver>>,
     /// Serializes the consumed-init-key `retrieve → join → store` sequence in
     /// [`MlsBackend::join_from_welcome`] so two concurrent joins of the same
     /// init key cannot both pass the retrieve before either stores (a
@@ -136,6 +145,10 @@ impl std::fmt::Debug for ProductionMlsBackend {
             .field(
                 "consumed_init_key_store",
                 &self.consumed_init_key_store.get().is_some(),
+            )
+            .field(
+                "attestation_resolver",
+                &self.attestation_resolver.get().is_some(),
             )
             .field("join_gate", &"<tokio::sync::Mutex>")
             .finish()
@@ -163,6 +176,7 @@ impl ProductionMlsBackend {
         Self {
             clock,
             consumed_init_key_store: OnceLock::new(),
+            attestation_resolver: OnceLock::new(),
             join_gate,
         }
     }
@@ -503,6 +517,37 @@ impl MlsBackend for ProductionMlsBackend {
         })?;
         let credential_did = ScpCredential::from_bytes(basic.identity())?.did;
 
+        // §9.7.1 "Verification (MUST)": an Add introduces a leaf, so this is
+        // where that leaf's `scp_keypackage_attestation` (`0xFF03`) is checked
+        // against the signer's CURRENT DID document. Both admission paths —
+        // `execute_add_member` and `join_context` — reach a joiner's
+        // `KeyPackage` only through this method, so verifying here covers every
+        // Add without duplicating the check per caller.
+        //
+        // Fail-closed on every count: `read_attested_key_package` rejects a
+        // leaf carrying no attestation, and `verify_add_attestation` rejects a
+        // missing resolver, a resolution failure, a rotated-away key, and each
+        // of checks 3–13.
+        let attested = scp_mls::read_attested_key_package(&validated)?;
+        verify_add_attestation(
+            self.attestation_resolver.get().map(AsRef::as_ref),
+            clock,
+            &attested.attestation,
+            &AttestationAddGroundTruth {
+                credential: &attested.credential,
+                leaf_signature_key: &attested.leaf_signature_key,
+                leaf_encryption_key: &attested.leaf_encryption_key,
+                leaf_wrapping_key: &attested.leaf_wrapping_key,
+                leaf_lifetime_not_before: attested.leaf_lifetime_not_before,
+                leaf_lifetime_not_after: attested.leaf_lifetime_not_after,
+                kp_init_key: &attested.kp_init_key,
+            },
+        )
+        .await
+        .map_err(|e| {
+            MlsError::AddMemberFailed(format!("KeyPackage attestation rejected (§9.7.1): {e}"))
+        })?;
+
         // Re-serialize to return the canonical validated bytes. Functionally
         // equivalent to the input (OpenMLS does not mutate on validate), but
         // we construct via the validated type so downstream persistence is
@@ -514,38 +559,51 @@ impl MlsBackend for ProductionMlsBackend {
         })
     }
 
-    async fn generate_key_package(
+    async fn generate_attested_key_package(
         &self,
         credential: &ScpCredential,
-        wrapping_pubkey: Option<&[u8; 32]>,
+        wrapping_pubkey: &[u8; 32],
+        attestation_signer: &dyn KeyPackageAttestationSigner,
     ) -> Result<GeneratedKeyPackage, MlsError> {
-        // Every pooled KeyPackage must be joinable into an SCP *context* group,
-        // whose `group_context` carries the `scp_context_params` (`0xFF02`)
-        // extension. OpenMLS rejects (`valn0502`, RFC 9420 §12.1.8.2) an Add
-        // whose leaf does not declare support for every `group_context`
-        // extension present in the group — so the KP leaf MUST advertise the
-        // `0xFF02` capability regardless of whether a wrapping key is available.
-        //
-        // `generate_key_package_with_context_params` declares BOTH `0xFF01` +
-        // `0xFF02` *capabilities* unconditionally, and attaches the `0xFF01`
-        // wrapping-key *leaf extension* only when a key is present (§9.16.1).
-        // The capability is what `valn0502` requires (no key material); the
-        // leaf extension is the optional enhancement that lets other members
-        // HPKE-seal sender keys to this member. Passing `wrapping_pubkey`
-        // straight through therefore yields a context-joinable KP in BOTH
-        // cases: `Some` → full participant (declares `0xFF02`, carries the
-        // wrapping key); `None` → context-joinable but non-receiving until the
-        // identity publishes a wrapping key. A `None` KP is NOT downgraded to a
-        // wrapping-only (`0xFF01`-only) KeyPackage, which real MLS would reject
-        // from a context group.
+        // §9.7.1 check 10 requires the leaf credential and the attestation to
+        // name the SAME verification method, so reject a credential whose
+        // `signing_key_id` differs from the one this signer acts as, rather
+        // than minting a leaf whose own two halves disagree.
+        if credential.signing_key_id != attestation_signer.signing_key_id() {
+            return Err(MlsError::AttestationSignerUnavailable(format!(
+                "credential names verification method {} but the attestation signer acts as {}",
+                credential.signing_key_id,
+                attestation_signer.signing_key_id()
+            )));
+        }
+
+        // Phase 1 — generate the leaf key material and the unsigned
+        // attestation over it. The leaf declares all three SCP extension types
+        // (`0xFF01`, `0xFF02`, `0xFF03`), which `valn0502` (RFC 9420
+        // §12.1.8.2) requires of any leaf added to an SCP context group, and
+        // carries the `0xFF01` wrapping key the attestation binds (§9.5.2
+        // field 5).
         //
         // The injected `Clock` mints the KeyPackage `Lifetime` (ADR-057
-        // Prereq-1, #2026) — never wall-clock `SystemTime::now()`.
-        let (bundle, signer, provider) = group::generate_key_package_with_context_params(
-            credential,
-            wrapping_pubkey,
-            self.clock.as_ref(),
-        )?;
+        // Prereq-1) — never wall-clock `SystemTime::now()` — and the
+        // attestation's validity window reproduces that `Lifetime` exactly
+        // (§9.7.1 check 11).
+        let prepared =
+            scp_mls::prepare_key_package(credential, wrapping_pubkey, self.clock.as_ref())?;
+
+        // Phase 2 — the identity's `#active`/`#agent` custody key signs the
+        // 32-byte §9.5.1 hash. This is the single async signature ADR-057's
+        // 2026-08-01 amendment specifies: no raw key export, so a
+        // hardware-backed custody satisfies it.
+        let signature = attestation_signer
+            .sign_attestation(&prepared.attestation_signing_hash())
+            .await
+            .map_err(|e| MlsError::AttestationSignerUnavailable(e.to_string()))?;
+
+        // Phase 3 — build the published KeyPackage with the signed `0xFF03`
+        // extension in its leaf, rejecting any leaf whose keys differ from the
+        // ones the attestation binds.
+        let (bundle, signer, provider) = scp_mls::finish_key_package(prepared, signature)?;
 
         let kp_bytes = bundle.key_package().tls_serialize_detached().map_err(|e| {
             MlsError::KeyPackageGenerationFailed(format!("serializing key package: {e}"))
@@ -662,6 +720,13 @@ impl MlsBackend for ProductionMlsBackend {
         // wins). Production attaches exactly once via `with_providers`.
         let _ = self.consumed_init_key_store.set(store);
     }
+
+    fn set_attestation_resolver(&self, resolver: Arc<dyn DidDocumentResolver>) {
+        // Idempotent single set, matching `set_consumed_init_key_store`: the
+        // first resolver wins and production attaches exactly once via
+        // `with_providers`.
+        let _ = self.attestation_resolver.set(resolver);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -737,6 +802,22 @@ fn assert_groups_equivalent(left: &ScpMlsGroup, right: &ScpMlsGroup) -> Result<(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+
+    /// A fresh attestation signer for one mint, with the DID-document resolver
+    /// that names its verifying key installed on `backend`.
+    ///
+    /// §9.7.1 checks 1 and 2 resolve the signer's document to learn the key the
+    /// attestation must verify against, and `validate_key_package` fails closed
+    /// when no resolver is wired. Pairing the two here is what makes the check
+    /// read the key the mint actually signed with.
+    fn signer_for(
+        backend: &ProductionMlsBackend,
+    ) -> crate::crypto::mls::attestation_signer::TestAttestationSigner {
+        let (signer, resolver) =
+            crate::crypto::mls::attestation_signer::TestDidDocumentResolver::paired_with_signer();
+        backend.set_attestation_resolver(Arc::new(resolver));
+        signer
+    }
     use super::*;
     use crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter;
     use scp_clock::SystemClock;
@@ -779,7 +860,10 @@ mod tests {
         // Two inviter groups each add the SAME KeyPackage, producing two
         // distinct (cryptographically single-use) Welcomes for one init key.
         let kp_cred = test_credential("bob-race");
-        let kp_gen = backend.generate_key_package(&kp_cred, None).await.unwrap();
+        let kp_gen = backend
+            .generate_attested_key_package(&kp_cred, &[0x5C_u8; 32], &signer_for(&backend))
+            .await
+            .unwrap();
 
         let inviter_a = test_credential("alice-race-a");
         let mut grp_a = backend.create_group(&inviter_a, None).await.unwrap();
@@ -880,7 +964,10 @@ mod tests {
 
         // Bob generates a KP via the backend.
         let bob_cred = test_credential("bob-add");
-        let bob_gen = backend.generate_key_package(&bob_cred, None).await.unwrap();
+        let bob_gen = backend
+            .generate_attested_key_package(&bob_cred, &[0x5C_u8; 32], &signer_for(&backend))
+            .await
+            .unwrap();
 
         // Alice adds Bob via backend primitive.
         let added = backend
@@ -916,7 +1003,10 @@ mod tests {
         let alice_cred = test_credential("alice-enc");
         let bob_cred = test_credential("bob-enc");
         let mut alice_grp = backend.create_group(&alice_cred, None).await.unwrap();
-        let bob_gen = backend.generate_key_package(&bob_cred, None).await.unwrap();
+        let bob_gen = backend
+            .generate_attested_key_package(&bob_cred, &[0x5C_u8; 32], &signer_for(&backend))
+            .await
+            .unwrap();
         let added = backend
             .add_member_raw(&mut alice_grp, &bob_gen.key_package_bytes)
             .await
@@ -953,7 +1043,10 @@ mod tests {
         let alice_cred = test_credential("alice-rem");
         let bob_cred = test_credential("bob-rem");
         let mut alice_grp = backend.create_group(&alice_cred, None).await.unwrap();
-        let bob_gen = backend.generate_key_package(&bob_cred, None).await.unwrap();
+        let bob_gen = backend
+            .generate_attested_key_package(&bob_cred, &[0x5C_u8; 32], &signer_for(&backend))
+            .await
+            .unwrap();
         let _added = backend
             .add_member_raw(&mut alice_grp, &bob_gen.key_package_bytes)
             .await
@@ -997,7 +1090,10 @@ mod tests {
     async fn validate_key_package_accepts_valid_scp_kp() {
         let backend = ProductionMlsBackend::new(Arc::new(SystemClock));
         let bob_cred = test_credential("bob-val");
-        let bob_gen = backend.generate_key_package(&bob_cred, None).await.unwrap();
+        let bob_gen = backend
+            .generate_attested_key_package(&bob_cred, &[0x5C_u8; 32], &signer_for(&backend))
+            .await
+            .unwrap();
 
         let validated = backend
             .validate_key_package(&bob_gen.key_package_bytes, &SystemClock)
@@ -1038,7 +1134,10 @@ mod tests {
         // `clock` param is what drives the SCP hardened re-check below.
         let backend = ProductionMlsBackend::new(Arc::new(SystemClock));
         let cred = test_credential("carol-stateless");
-        let generated = backend.generate_key_package(&cred, None).await.unwrap();
+        let generated = backend
+            .generate_attested_key_package(&cred, &[0x5C_u8; 32], &signer_for(&backend))
+            .await
+            .unwrap();
 
         // Valid arm: clock at the real present → Ok(ValidatedKeyPackage).
         let validated = backend
@@ -1080,7 +1179,7 @@ mod tests {
             .await
             .unwrap();
         let bob_gen = backend
-            .generate_key_package(&bob_cred, Some(&wrap_pub))
+            .generate_attested_key_package(&bob_cred, &wrap_pub, &signer_for(&backend))
             .await
             .unwrap();
         let added = backend
@@ -1120,7 +1219,10 @@ mod tests {
         let alice_cred = test_credential("alice-wire");
         let bob_cred = test_credential("bob-wire");
         let mut alice_grp = backend.create_group(&alice_cred, None).await.unwrap();
-        let bob_gen = backend.generate_key_package(&bob_cred, None).await.unwrap();
+        let bob_gen = backend
+            .generate_attested_key_package(&bob_cred, &[0x5C_u8; 32], &signer_for(&backend))
+            .await
+            .unwrap();
         let added = backend
             .add_member_raw(&mut alice_grp, &bob_gen.key_package_bytes)
             .await
@@ -1206,7 +1308,7 @@ mod tests {
         let bob_cred = test_credential("bob-ctx");
         let bob_wrap = [0xB2u8; 32];
         let bob_gen = backend
-            .generate_key_package(&bob_cred, Some(&bob_wrap))
+            .generate_attested_key_package(&bob_cred, &bob_wrap, &signer_for(&backend))
             .await
             .unwrap();
 
@@ -1273,7 +1375,10 @@ mod tests {
         // Reserve-path KP: generated WITHOUT a wrapping key (the production
         // reserve path today, since supervisor `wrapping_keys` is unwired).
         let bob_cred = test_credential("bob-ctx-neg");
-        let bob_gen = backend.generate_key_package(&bob_cred, None).await.unwrap();
+        let bob_gen = backend
+            .generate_attested_key_package(&bob_cred, &[0x5C_u8; 32], &signer_for(&backend))
+            .await
+            .unwrap();
 
         // The Add SUCCEEDS: bob's leaf declares 0xFF02 (capability, no key
         // material required), satisfying valn0502 for the context group.

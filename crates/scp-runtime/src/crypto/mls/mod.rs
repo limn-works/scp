@@ -30,6 +30,7 @@ mod wrapping_extension_runtime_tests;
 // checks-1–2 seam lives in `scp_mls::verify_attestation_with_resolution`
 // (Layer A); this module resolves the signer DID and supplies the resolved
 // document + honest clock-stamped `resolved_at`.
+pub mod attestation_signer;
 pub mod attestation_verification;
 
 // Async durable-storage bridge — stays in scp-runtime (tokio-coupled, node-only).

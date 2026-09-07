@@ -825,18 +825,24 @@ pub fn verify_attestation_with_resolution(
     Ok(())
 }
 
-/// Builds [`Capabilities`] declaring both SCP `LeafNode` extension types.
+/// Builds the [`Capabilities`] every attested SCP leaf declares — all three SCP
+/// `LeafNode` extension types.
 ///
-/// Declares support for BOTH the `scp_wrapping_key` (`0xFF01`) and
-/// `scp_keypackage_attestation` (`0xFF03`) `LeafNode` extension types, in
-/// addition to the SCP ciphersuite defaults.
+/// Declares support for `scp_wrapping_key` (`0xFF01`), `scp_context_params`
+/// (`0xFF02`), and `scp_keypackage_attestation` (`0xFF03`), in addition to the
+/// SCP ciphersuite defaults.
 ///
-/// `OpenMLS` validates (`valn0107`) that any extension present on a `LeafNode`
-/// has its type listed in the node's capabilities. A real SCP leaf carries both
-/// `0xFF01` and `0xFF03`, so it must declare both. This is the superset that a
-/// later wiring slice will adopt at the leaf-creation sites; declaring an extra
-/// supported type that is not (yet) present is harmless. This slice does NOT
-/// change existing call sites — it is additive only.
+/// Two RFC 9420 rules make all three necessary on the same leaf.
+/// `valn0107` rejects a `LeafNode` carrying an extension its capabilities do
+/// not list, and an attested SCP leaf carries `0xFF01` and `0xFF03`.
+/// `valn0502` (§12.1.8.2) rejects an `Add` whose leaf does not declare every
+/// extension type the group's `group_context` carries, and every SCP context
+/// group commits `scp_context_params` (`0xFF02`, §5.13.3). A leaf declaring
+/// fewer than these three is therefore either unbuildable or unaddable.
+///
+/// [`prepare_key_package`](crate::keypackage_mint::prepare_key_package) and
+/// [`finish_key_package`](crate::keypackage_mint::finish_key_package) both use
+/// this set, so the probe build and the finished build declare identically.
 #[must_use]
 pub fn scp_capabilities_with_keypackage_attestation() -> Capabilities {
     Capabilities::new(
@@ -844,6 +850,7 @@ pub fn scp_capabilities_with_keypackage_attestation() -> Capabilities {
         None, // default ciphersuites
         Some(&[
             ExtensionType::Unknown(crate::wrapping_extension::SCP_WRAPPING_KEY_EXTENSION_TYPE),
+            ExtensionType::Unknown(scp_protocol::context::SCP_CONTEXT_EXTENSION_TYPE_ID),
             ExtensionType::Unknown(SCP_KEYPACKAGE_ATTESTATION_EXTENSION_TYPE),
         ]),
         None, // default proposals
@@ -854,6 +861,147 @@ pub fn scp_capabilities_with_keypackage_attestation() -> Capabilities {
 /// Constructs an [`MlsError::ExtensionError`] with the given message.
 fn ext_err(msg: impl Into<String>) -> MlsError {
     MlsError::ExtensionError(msg.into())
+}
+
+// ---------------------------------------------------------------------------
+// Reading a leaf's attested material
+// ---------------------------------------------------------------------------
+
+/// Everything §9.7.1's Add-time checks compare an attestation against, read off
+/// one validated `KeyPackage`.
+///
+/// The verifier needs the leaf's four public keys, its `Lifetime` bounds, and
+/// its `ScpCredential`, all taken from the **same** validated `KeyPackage` that
+/// carries the attestation. [`read_attested_key_package`] produces this in one
+/// pass so no caller re-parses the bytes and no caller pairs an attestation
+/// with a different leaf's keys.
+#[derive(Debug, Clone)]
+pub struct AttestedKeyPackage {
+    /// The attestation parsed out of the leaf's `0xFF03` extension.
+    pub attestation: KeyPackageAttestation,
+    /// The `ScpCredential` the leaf embeds (checks 9–10).
+    pub credential: ScpCredential,
+    /// The leaf's actual `signature_key` (check 4).
+    pub leaf_signature_key: [u8; PUBLIC_KEY_SIZE],
+    /// The leaf's actual ratchet-tree `encryption_key` (check 5).
+    pub leaf_encryption_key: [u8; PUBLIC_KEY_SIZE],
+    /// The value of the leaf's `scp_wrapping_key` (`0xFF01`) extension
+    /// (check 6).
+    pub leaf_wrapping_key: [u8; PUBLIC_KEY_SIZE],
+    /// The `KeyPackage`'s `init_key` (checks 7–8).
+    pub kp_init_key: [u8; PUBLIC_KEY_SIZE],
+    /// The leaf's `Lifetime.not_before` (check 11).
+    pub leaf_lifetime_not_before: u64,
+    /// The leaf's `Lifetime.not_after` (check 11).
+    pub leaf_lifetime_not_after: u64,
+}
+
+impl AttestedKeyPackage {
+    /// Borrows the fields as the trigger-general ground truth the pure verifier
+    /// takes, with the **Add** trigger carrying this `KeyPackage`'s `init_key`.
+    #[must_use]
+    pub const fn add_ground_truth(&self) -> AttestationLeafGroundTruth<'_> {
+        AttestationLeafGroundTruth {
+            credential: &self.credential,
+            leaf_signature_key: &self.leaf_signature_key,
+            leaf_encryption_key: &self.leaf_encryption_key,
+            leaf_wrapping_key: &self.leaf_wrapping_key,
+            leaf_lifetime_not_before: self.leaf_lifetime_not_before,
+            leaf_lifetime_not_after: self.leaf_lifetime_not_after,
+            trigger: AttestationTrigger::Add {
+                kp_init_key: &self.kp_init_key,
+            },
+        }
+    }
+}
+
+/// Reads the attestation and the leaf material it must match off a validated
+/// `KeyPackage` (§9.7.1 Add path).
+///
+/// Fails closed on a leaf that carries no `0xFF03` attestation and on a leaf
+/// that carries no `0xFF01` wrapping key: §9.7.1 rejects both, so this returns
+/// a typed error rather than a partially-populated value the caller might
+/// verify against nothing.
+///
+/// # Errors
+///
+/// Returns [`MlsError::ExtensionError`] when the `0xFF03` or `0xFF01` extension
+/// is absent or malformed, [`MlsError::CredentialSerializationFailed`] when the
+/// leaf credential is not an SCP credential, and
+/// [`MlsError::KeyPackageGenerationFailed`] when a public key is not 32 bytes.
+pub fn read_attested_key_package(key_package: &KeyPackage) -> Result<AttestedKeyPackage, MlsError> {
+    let leaf = key_package.leaf_node();
+
+    let attestation =
+        KeyPackageAttestation::extract_attestation(leaf.extensions())?.ok_or_else(|| {
+            ext_err(
+                "leaf carries no scp_keypackage_attestation (0xFF03) extension; §9.7.1 \
+                 rejects an unattested leaf on Add",
+            )
+        })?;
+
+    let leaf_wrapping_key = crate::wrapping_extension::extract_wrapping_key(leaf.extensions())?
+        .ok_or_else(|| {
+            ext_err(
+                "leaf carries no scp_wrapping_key (0xFF01) extension, so §9.7.1 check 6 has \
+                 nothing to compare the attestation against",
+            )
+        })?;
+
+    let basic = BasicCredential::try_from(leaf.credential().clone()).map_err(|e| {
+        MlsError::CredentialSerializationFailed(format!("extracting BasicCredential: {e}"))
+    })?;
+    let credential = ScpCredential::from_bytes(basic.identity())?;
+
+    let lifetime = key_package.life_time();
+
+    Ok(AttestedKeyPackage {
+        attestation,
+        credential,
+        leaf_signature_key: fixed_32(leaf.signature_key().as_slice(), "leaf signature_key")?,
+        leaf_encryption_key: leaf_encryption_key_bytes(leaf)?,
+        leaf_wrapping_key,
+        kp_init_key: fixed_32(
+            key_package.hpke_init_key().as_slice(),
+            "KeyPackage init_key",
+        )?,
+        leaf_lifetime_not_before: lifetime.not_before(),
+        leaf_lifetime_not_after: lifetime.not_after(),
+    })
+}
+
+/// Reads a `LeafNode`'s ratchet-tree `encryption_key` as raw bytes.
+///
+/// `openmls` 0.8.1 marks `EncryptionKey::as_slice` `pub(crate)`, so this goes
+/// through the type's TLS encoding — a `VLBytes`, which prefixes the key with
+/// its length — and takes the payload back off with the same codec.
+pub(crate) fn leaf_encryption_key_bytes(
+    leaf: &LeafNode,
+) -> Result<[u8; PUBLIC_KEY_SIZE], MlsError> {
+    use tls_codec::Serialize as _;
+
+    let encoded = leaf
+        .encryption_key()
+        .tls_serialize_detached()
+        .map_err(|e| {
+            MlsError::KeyPackageGenerationFailed(format!("serializing leaf encryption_key: {e}"))
+        })?;
+    let decoded =
+        <tls_codec::VLBytes as tls_codec::DeserializeBytes>::tls_deserialize_exact_bytes(&encoded)
+            .map_err(|e| {
+                MlsError::KeyPackageGenerationFailed(format!("decoding leaf encryption_key: {e}"))
+            })?;
+    fixed_32(decoded.as_slice(), "leaf encryption_key")
+}
+
+/// Converts a slice into a 32-byte array, naming the field in the error.
+pub(crate) fn fixed_32(bytes: &[u8], field: &str) -> Result<[u8; PUBLIC_KEY_SIZE], MlsError> {
+    <[u8; PUBLIC_KEY_SIZE]>::try_from(bytes).map_err(|_| {
+        MlsError::KeyPackageGenerationFailed(format!(
+            "{field} must be {PUBLIC_KEY_SIZE} bytes, got {}",
+            bytes.len()
+        ))
+    })
 }
 
 /// A minimal forward-only byte cursor for the strict `0xFF03` body parse.
@@ -1259,6 +1407,13 @@ mod tests {
                 crate::wrapping_extension::SCP_WRAPPING_KEY_EXTENSION_TYPE
             )),
             "capabilities must also list scp_wrapping_key (0xFF01)"
+        );
+        assert!(
+            caps.extensions().contains(&ExtensionType::Unknown(
+                scp_protocol::context::SCP_CONTEXT_EXTENSION_TYPE_ID
+            )),
+            "capabilities must also list scp_context_params (0xFF02), which RFC 9420 \
+             valn0502 requires of any leaf added to an SCP context group"
         );
     }
 

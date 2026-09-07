@@ -29,6 +29,7 @@ use super::{
 use crate::context::builder::{
     ContextCreationError, ContextTransportProvider, NotConfiguredTransportProvider,
 };
+use crate::crypto::mls::attestation_signer::KeyPackageAttestationSigner;
 use crate::crypto::mls::backend::{
     AddMemberRaw, GeneratedKeyPackage, MlsBackend, RemoveMemberRaw, SignerState,
     ValidatedKeyPackage,
@@ -77,6 +78,13 @@ fn in_memory_storage() -> Arc<dyn OpenMlsStorageAdapter> {
 /// Like [`in_memory_storage`] but also returns the inner [`InMemoryStorage`]
 /// handle so a test can call `list_keys` (the `OpenMlsStorageAdapter` trait has
 /// no list API; only the concrete inner store exposes one).
+/// A fresh attestation signer for one mint (§9.7.1). It reports `#active`,
+/// which every credential in this file names, because
+/// `generate_attested_key_package` rejects a persona mismatch before it mints.
+fn test_attestation_signer() -> crate::crypto::mls::attestation_signer::TestAttestationSigner {
+    crate::crypto::mls::attestation_signer::TestAttestationSigner::generate().0
+}
+
 fn in_memory_storage_with_inner() -> (Arc<dyn OpenMlsStorageAdapter>, Arc<InMemoryStorage>) {
     let inner = Arc::new(InMemoryStorage::new());
     let adapter: Arc<dyn OpenMlsStorageAdapter> =
@@ -88,13 +96,19 @@ fn deps_with(
     mls: Arc<dyn MlsBackend>,
     storage: Arc<dyn OpenMlsStorageAdapter>,
     transport: Arc<dyn ContextTransportProvider>,
+    attestation_signer: Option<Arc<dyn KeyPackageAttestationSigner>>,
 ) -> KeyPackageStoreDeps {
     KeyPackageStoreDeps {
+        attestation_signer,
         mls,
         mls_storage: storage,
         transport,
         clock: Arc::new(SystemClock) as Arc<dyn Clock>,
-        wrapping_pubkey: None,
+        // §9.5.2 field 5 binds the leaf's `scp_wrapping_key` into the
+        // attestation, so the actor refuses to mint without one. These fixtures
+        // exercise the reserve/consume bookkeeping around a pooled KeyPackage
+        // rather than the wrapping key itself, so one fixed value serves.
+        wrapping_pubkey: Some([0x5C; 32]),
     }
 }
 
@@ -126,7 +140,12 @@ async fn spawn_filled(
     let mls = backend_with_consumed_set(&storage);
     let (handle, join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(mls, Arc::clone(&storage), no_transport()),
+        deps_with(
+            mls,
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -197,7 +216,12 @@ async fn reserve_then_confirm_deletes_key_and_clears_reservation() {
     let mls = backend_with_consumed_set(&storage);
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(
+            Arc::clone(&mls),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -300,7 +324,12 @@ async fn double_confirm_of_same_reservation_rejected() {
     let mls = backend_with_consumed_set(&storage);
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(
+            Arc::clone(&mls),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -365,7 +394,10 @@ async fn second_join_same_init_key_rejected_at_backend() {
     // (two separate inviter groups both add the same KP). The first join
     // consumes the init key durably; the second must be rejected.
     let joiner = ScpCredential::new(alice().0, None, scp_did::SigningKeyId::Active).unwrap();
-    let generated = mls.generate_key_package(&joiner, None).await.unwrap();
+    let generated = mls
+        .generate_attested_key_package(&joiner, &[0x5C_u8; 32], &test_attestation_signer())
+        .await
+        .unwrap();
     let welcome_a = real_welcome_for(&mls, &generated.key_package_bytes).await;
     let welcome_b = real_welcome_for(&mls, &generated.key_package_bytes).await;
 
@@ -408,7 +440,10 @@ async fn join_without_consumed_store_fails_closed() {
     )));
 
     let joiner = ScpCredential::new(alice().0, None, scp_did::SigningKeyId::Active).unwrap();
-    let generated = mls.generate_key_package(&joiner, None).await.unwrap();
+    let generated = mls
+        .generate_attested_key_package(&joiner, &[0x5C_u8; 32], &test_attestation_signer())
+        .await
+        .unwrap();
     let welcome = real_welcome_for(&mls, &generated.key_package_bytes).await;
 
     let result = mls
@@ -434,9 +469,15 @@ async fn join_with_mismatched_public_bytes_rejected() {
     let mls = backend_with_consumed_set(&storage);
 
     let joiner = ScpCredential::new(alice().0, None, scp_did::SigningKeyId::Active).unwrap();
-    let generated = mls.generate_key_package(&joiner, None).await.unwrap();
+    let generated = mls
+        .generate_attested_key_package(&joiner, &[0x5C_u8; 32], &test_attestation_signer())
+        .await
+        .unwrap();
     // A DIFFERENT KP — its public bytes do not match `generated.signer_state`.
-    let other = mls.generate_key_package(&joiner, None).await.unwrap();
+    let other = mls
+        .generate_attested_key_package(&joiner, &[0x5C_u8; 32], &test_attestation_signer())
+        .await
+        .unwrap();
     let welcome = real_welcome_for(&mls, &generated.key_package_bytes).await;
 
     // Pass the welcome + signer-state for `generated`, but the PUBLIC bytes of
@@ -498,7 +539,12 @@ async fn reserve_when_empty_returns_typed_err_not_hang() {
     let failing: Arc<dyn MlsBackend> = Arc::new(FailingBackend::new(0));
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(failing, Arc::clone(&storage), no_transport()),
+        deps_with(
+            failing,
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
 
     let err = handle
@@ -522,7 +568,12 @@ async fn replenish_refills_to_min_and_reports_count() {
     let storage = in_memory_storage();
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(real_backend(), Arc::clone(&storage), no_transport()),
+        deps_with(
+            real_backend(),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
 
     let count = handle
@@ -580,7 +631,12 @@ async fn replenish_generate_failure_yields_typed_err_when_zero_generated() {
     let failing: Arc<dyn MlsBackend> = Arc::new(FailingBackend::new(0));
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(failing, Arc::clone(&storage), no_transport()),
+        deps_with(
+            failing,
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
 
     let err = handle
@@ -598,7 +654,12 @@ async fn replenish_partial_retain_returns_count_on_late_failure() {
     let failing: Arc<dyn MlsBackend> = Arc::new(FailingBackend::new(3));
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&failing), Arc::clone(&storage), no_transport()),
+        deps_with(
+            Arc::clone(&failing),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
 
     let _ = handle
@@ -630,7 +691,12 @@ async fn replenish_fails_closed_when_credential_absent() {
     let mls = backend_with_consumed_set(&storage);
     let (handle, _join) = KeyPackageStoreActor::spawn(
         malformed.clone(),
-        deps_with(mls, Arc::clone(&storage), no_transport()),
+        deps_with(
+            mls,
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
 
     let err = handle
@@ -674,7 +740,12 @@ async fn reserve_persist_failure_returns_kp_to_pool_and_errs() {
         Arc::new(SpawnBlockingStorageAdapter::new(Arc::clone(&faulty)));
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(real_backend(), Arc::clone(&storage), no_transport()),
+        deps_with(
+            real_backend(),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -729,7 +800,12 @@ async fn reserve_id_set_persist_failure_returns_kp_and_cleans_record() {
         Arc::new(SpawnBlockingStorageAdapter::new(Arc::clone(&faulty)));
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(real_backend(), Arc::clone(&storage), no_transport()),
+        deps_with(
+            real_backend(),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -794,7 +870,12 @@ async fn confirm_persist_failure_retains_reservation_and_errs() {
     let mls = backend_with_consumed_set(&storage);
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(
+            Arc::clone(&mls),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -856,7 +937,12 @@ async fn confirm_tombstone_failure_then_healed_retry_completes_consume_but_errs_
     let mls = backend_with_consumed_set(&storage);
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(
+            Arc::clone(&mls),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -958,7 +1044,12 @@ async fn confirm_reservation_record_delete_failure_eventually_reclaimed_no_orpha
     let mls = backend_with_consumed_set(&storage);
     let (handle, join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(
+            Arc::clone(&mls),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1038,7 +1129,12 @@ async fn confirm_reservation_record_delete_failure_eventually_reclaimed_no_orpha
     let mls2 = backend_with_consumed_set(&storage);
     let (handle2, _join2) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()),
+        deps_with(
+            Arc::clone(&mls2),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle2
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1085,7 +1181,12 @@ async fn confirm_tombstone_delete_failure_eventually_reclaimed_no_orphan() {
     let mls = backend_with_consumed_set(&storage);
     let (handle, join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(
+            Arc::clone(&mls),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1156,7 +1257,12 @@ async fn confirm_tombstone_delete_failure_eventually_reclaimed_no_orphan() {
     let mls2 = backend_with_consumed_set(&storage);
     let (handle2, _join2) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()),
+        deps_with(
+            Arc::clone(&mls2),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle2
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1198,7 +1304,12 @@ async fn gc_reservation_record_delete_failure_eventually_reclaimed_no_orphan() {
     let mls = backend_with_consumed_set(&storage);
     let (handle, join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(
+            Arc::clone(&mls),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1336,7 +1447,12 @@ async fn gc_tombstone_delete_failure_eventually_reclaimed_no_orphan() {
     let mls = backend_with_consumed_set(&storage);
     let (handle, join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(
+            Arc::clone(&mls),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1466,7 +1582,12 @@ async fn respawn_restores_reservation_as_reserved_not_pooled() {
 
     let (handle2, _join2) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(real_backend(), Arc::clone(&storage), no_transport()),
+        deps_with(
+            real_backend(),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle2
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1493,7 +1614,12 @@ async fn respawn_after_confirm_keeps_key_absent() {
     let mls = backend_with_consumed_set(&storage);
     let (handle, join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(
+            Arc::clone(&mls),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1521,7 +1647,12 @@ async fn respawn_after_confirm_keeps_key_absent() {
 
     let (handle2, _join2) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(real_backend(), Arc::clone(&storage), no_transport()),
+        deps_with(
+            real_backend(),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle2
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1585,7 +1716,12 @@ async fn consumed_kp_with_surviving_record_not_repooled_on_respawn() {
     // Respawn: reconcile must EXCLUDE the consumed ref from the pool.
     let (handle2, _join2) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(real_backend(), Arc::clone(&storage), no_transport()),
+        deps_with(
+            real_backend(),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle2
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1669,7 +1805,12 @@ async fn consumed_kp_with_surviving_record_and_lost_index_entry_reclaimed_on_dou
     let mls2 = backend_with_consumed_set(&storage);
     let (handle2, join2) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()),
+        deps_with(
+            Arc::clone(&mls2),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle2
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1700,7 +1841,12 @@ async fn consumed_kp_with_surviving_record_and_lost_index_entry_reclaimed_on_dou
     let mls3 = backend_with_consumed_set(&storage);
     let (handle3, _join3) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls3), Arc::clone(&storage), no_transport()),
+        deps_with(
+            Arc::clone(&mls3),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle3
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1792,7 +1938,12 @@ async fn gc_reclaims_consumed_tombstone_and_reservation_record_after_respawn() {
     let mls2 = backend_with_consumed_set(&storage);
     let (handle2, _join2) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()),
+        deps_with(
+            Arc::clone(&mls2),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle2
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1831,7 +1982,12 @@ async fn malformed_consumed_tombstone_reconciles_fail_closed_and_a2_still_reject
     let mls = backend_with_consumed_set(&storage);
     let (handle, join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(
+            Arc::clone(&mls),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1871,7 +2027,12 @@ async fn malformed_consumed_tombstone_reconciles_fail_closed_and_a2_still_reject
     let mls2 = backend_with_consumed_set(&storage);
     let (handle2, _join2) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()),
+        deps_with(
+            Arc::clone(&mls2),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let count = handle2
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1978,7 +2139,12 @@ async fn malformed_tombstone_recovers_consumed_ref_from_reservation_record() {
     let mls2 = backend_with_consumed_set(&storage);
     let (handle2, _join2) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()),
+        deps_with(
+            Arc::clone(&mls2),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     handle2
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -2034,7 +2200,12 @@ async fn confirm_replay_with_surviving_kp_record_errs_not_false_ok() {
     let mls = backend_with_consumed_set(&storage);
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(
+            Arc::clone(&mls),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -2163,7 +2334,12 @@ async fn consumed_precedence_overlapping_reservation_and_tombstone_not_restored(
     let mls2 = backend_with_consumed_set(&storage);
     let (handle2, _join2) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()),
+        deps_with(
+            Arc::clone(&mls2),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     handle2
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -2326,7 +2502,12 @@ async fn reserved_kp_with_lost_index_entry_restored_as_reserved_on_respawn() {
     let mls2 = backend_with_consumed_set(&storage);
     let (handle2, _join2) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()),
+        deps_with(
+            Arc::clone(&mls2),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle2
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -2412,7 +2593,12 @@ async fn pooled_kp_lost_index_replenishes_to_min_without_record_leak() {
     faulty.fail_prefix("scp-kp-index/");
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(real_backend(), Arc::clone(&storage), no_transport()),
+        deps_with(
+            real_backend(),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -2481,7 +2667,12 @@ async fn confirm_retry_with_different_welcome_completes_without_second_join() {
     let mls = backend_with_consumed_set(&storage);
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(
+            Arc::clone(&mls),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -2596,7 +2787,13 @@ async fn expired_reservation_is_swept_and_kp_burned() {
             mls_storage: Arc::clone(&storage),
             transport: no_transport(),
             clock: Arc::clone(&clock) as Arc<dyn Clock>,
-            wrapping_pubkey: None,
+            // §9.5.2 field 5 binds the leaf's `scp_wrapping_key` into the
+            // attestation, so the actor refuses to mint without one, and
+            // §9.7.1 makes it refuse without a signer.
+            wrapping_pubkey: Some([0x5C; 32]),
+            attestation_signer: Some(
+                Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>
+            ),
         };
         KeyPackageStoreActor::spawn(alice(), deps)
     };
@@ -2713,7 +2910,12 @@ async fn publish_emits_one_call_per_pooled_kp() {
     let transport: Arc<dyn ContextTransportProvider> = Arc::clone(&recorder) as _;
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(real_backend(), Arc::clone(&storage), transport),
+        deps_with(
+            real_backend(),
+            Arc::clone(&storage),
+            transport,
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -2749,7 +2951,12 @@ async fn publish_empty_pool_is_noop() {
     let empty_backend: Arc<dyn MlsBackend> = Arc::new(FailingBackend::new(0));
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(empty_backend, Arc::clone(&storage), transport),
+        deps_with(
+            empty_backend,
+            Arc::clone(&storage),
+            transport,
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
 
     handle
@@ -2768,7 +2975,12 @@ async fn publish_is_idempotent_and_errors_leave_ref_unmarked() {
     let transport: Arc<dyn ContextTransportProvider> = Arc::clone(&recorder) as _;
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(real_backend(), Arc::clone(&storage), transport),
+        deps_with(
+            real_backend(),
+            Arc::clone(&storage),
+            transport,
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -2839,7 +3051,12 @@ async fn fused_welcome_confirm_flow_joins_real_reserved_kp() {
     let mls = backend_with_consumed_set(&storage);
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(
+            Arc::clone(&mls),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -2928,7 +3145,12 @@ async fn confirm_with_bad_welcome_keeps_reservation_for_retry() {
     let mls = backend_with_consumed_set(&storage);
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(
+            Arc::clone(&mls),
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -3052,10 +3274,11 @@ impl MlsBackend for FailingBackend {
             .validate_key_package(key_package_bytes, clock)
             .await
     }
-    async fn generate_key_package(
+    async fn generate_attested_key_package(
         &self,
         credential: &ScpCredential,
-        wrapping_pubkey: Option<&[u8; 32]>,
+        wrapping_pubkey: &[u8; 32],
+        attestation_signer: &dyn crate::crypto::mls::attestation_signer::KeyPackageAttestationSigner,
     ) -> Result<GeneratedKeyPackage, MlsError> {
         loop {
             let cur = self.remaining.load(Ordering::Acquire);
@@ -3073,7 +3296,7 @@ impl MlsBackend for FailingBackend {
             }
         }
         self.inner
-            .generate_key_package(credential, wrapping_pubkey)
+            .generate_attested_key_package(credential, wrapping_pubkey, attestation_signer)
             .await
     }
     async fn join_from_welcome(
@@ -3366,7 +3589,12 @@ async fn reserve_any_replenishes_empty_pool_then_reserves() {
     let mls = backend_with_consumed_set(&storage);
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(mls, Arc::clone(&storage), no_transport()),
+        deps_with(
+            mls,
+            Arc::clone(&storage),
+            no_transport(),
+            Some(Arc::new(test_attestation_signer()) as Arc<dyn KeyPackageAttestationSigner>),
+        ),
     );
 
     let (_rid, public_bytes) = handle

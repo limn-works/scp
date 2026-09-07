@@ -29,6 +29,29 @@ pub enum ClientError {
     #[error("MLS wire codec error: {0}")]
     Codec(String),
 
+    /// This client cannot mint a `KeyPackage`, because it cannot reach the DID
+    /// `#active`/`#agent` key that signs the `KeyPackage` attestation
+    /// (§9.7.1).
+    ///
+    /// §9.7.1 binds an MLS leaf to its DID through an attestation the
+    /// identity's custody key signs, and every `Add` verifier rejects a leaf
+    /// that carries none. The in-browser driver holds only the ephemeral MLS
+    /// `SignatureKeyPair` in wasm memory — [`Signer`](crate::Signer) exposes
+    /// `did()` and `signing_key_id()` and no signing operation — so it has no
+    /// key to sign with. ADR-057's 2026-08-01 amendment records that a browser
+    /// client "joins with an attestation minted by a custody-capable surface"
+    /// and couples browser-side issuance to the on-device identity-custody work
+    /// of #1980.
+    ///
+    /// Returning this error is the honest state of that boundary: the driver
+    /// refuses to produce a `KeyPackage` no verifier can bind, rather than
+    /// producing an unattested one that every adder rejects.
+    #[error(
+        "this client cannot sign a KeyPackage attestation: no on-device \
+         #active/#agent key is reachable (§9.7.1; ADR-057 Amendment 2026-08-01)"
+    )]
+    AttestationSignerUnavailable,
+
     /// The requested context is not known to this client.
     #[error("unknown context: {0}")]
     UnknownContext(String),

@@ -88,10 +88,6 @@ pub enum MlsError {
         epoch: u64,
     },
 
-    /// The key package buffer is empty and cannot provide a key package.
-    #[error("key package buffer exhausted")]
-    KeyPackageBufferExhausted,
-
     /// The provided DID does not match the expected `did:dht:z...` format.
     #[error("invalid DID format: {0}")]
     InvalidDidFormat(String),
@@ -188,4 +184,27 @@ pub enum MlsError {
     /// wrong-size key into the derivation.
     #[error("pseudonym derivation failed: {0}")]
     PseudonymDerivationFailed(String),
+
+    /// No `#active`/`#agent` custody key was available to sign the
+    /// `KeyPackage` attestation, so no `KeyPackage` was minted (§9.7.1;
+    /// ADR-057 Amendment 2026-08-01).
+    ///
+    /// SCP binds an MLS leaf to its DID through an attestation the identity's
+    /// custody key signs. A caller that cannot reach that key gets this error
+    /// instead of an unattested `KeyPackage`: an unattested leaf carries a DID
+    /// string no verifier can check, and every `Add` verifier rejects it
+    /// (§9.7.1 "Fail-closed scope").
+    #[error("no attestation signer available: {0}")]
+    AttestationSignerUnavailable(String),
+
+    /// A minted `KeyPackage`'s leaf did not carry one of the four public keys
+    /// its attestation binds (§9.5.2 fields 2–5), so the `KeyPackage` was
+    /// discarded rather than published.
+    ///
+    /// Raised by
+    /// [`finish_key_package`](crate::keypackage_mint::finish_key_package),
+    /// which compares the finished leaf against the attestation before
+    /// returning it.
+    #[error("attestation does not bind the minted leaf: {0}")]
+    AttestationBindingMismatch(String),
 }

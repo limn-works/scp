@@ -43,6 +43,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use openmls::prelude::LeafNodeIndex;
 
+use super::attestation_signer::{DidDocumentResolver, KeyPackageAttestationSigner};
 use super::storage_adapter::OpenMlsStorageAdapter;
 use scp_clock::Clock;
 use scp_mls::credential::ScpCredential;
@@ -305,18 +306,35 @@ pub trait MlsBackend: Send + Sync {
         clock: &dyn Clock,
     ) -> Result<ValidatedKeyPackage, MlsError>;
 
-    /// Generates a fresh `KeyPackage` for `credential`, optionally with an
-    /// `scp_wrapping_key` `LeafNode` extension. Returns the TLS-serialized KP
-    /// bytes plus an opaque signer-state handle the caller retains to later
-    /// join a group from a Welcome addressed to this KP.
+    /// Generates a fresh `KeyPackage` for `credential` whose leaf carries a
+    /// signed `scp_keypackage_attestation` (`0xFF03`) extension binding the
+    /// leaf to `credential.did` (§9.7.1; ADR-057 Amendment 2026-08-01).
+    ///
+    /// Returns the TLS-serialized KP bytes plus an opaque signer-state handle
+    /// the caller retains to later join a group from a Welcome addressed to
+    /// this KP.
+    ///
+    /// `wrapping_pubkey` is required rather than optional: §9.5.2 field 5
+    /// binds the leaf's `scp_wrapping_key` (`0xFF01`) value, and §9.7.1
+    /// check 6 compares the attestation against it, so a leaf with no wrapping
+    /// key cannot carry a verifiable attestation.
+    ///
+    /// `attestation_signer` produces the one `#active`/`#agent` signature the
+    /// attestation carries. There is no unattested variant of this method: an
+    /// unattested leaf names a DID no verifier can check, and every `Add`
+    /// verifier rejects it (§9.7.1 "Fail-closed scope").
     ///
     /// # Errors
     ///
-    /// See [`MlsError`]. Side-effect-free on external state.
-    async fn generate_key_package(
+    /// See [`MlsError`]. Returns
+    /// [`MlsError::AttestationSignerUnavailable`](scp_mls::MlsError::AttestationSignerUnavailable)
+    /// when `attestation_signer` cannot sign. Side-effect-free on external
+    /// state.
+    async fn generate_attested_key_package(
         &self,
         credential: &ScpCredential,
-        wrapping_pubkey: Option<&[u8; 32]>,
+        wrapping_pubkey: &[u8; 32],
+        attestation_signer: &dyn KeyPackageAttestationSigner,
     ) -> Result<GeneratedKeyPackage, MlsError>;
 
     /// Joins a group from a TLS-serialized MLS Welcome message using the
@@ -372,4 +390,16 @@ pub trait MlsBackend: Send + Sync {
     /// crypto-layer set entirely; such a backend's own `join_from_welcome`
     /// defines its single-use policy.
     fn set_consumed_init_key_store(&self, _store: Arc<dyn OpenMlsStorageAdapter>) {}
+
+    /// Attach the DID-document resolver [`Self::validate_key_package`] uses for
+    /// the §9.7.1 attestation current-key checks (checks 1–2).
+    ///
+    /// Production wires the bridge's canonical resolver here (§3.10.4
+    /// dual-layer resolution) before any member is admitted. With no resolver
+    /// attached the production implementation's `validate_key_package` fails
+    /// closed on every DID that resolution covers, so a missing resolver
+    /// rejects joins rather than admitting unverified leaves. The default trait
+    /// implementation is a no-op, so a backend that admits no members (a test
+    /// mock) opts out.
+    fn set_attestation_resolver(&self, _resolver: Arc<dyn DidDocumentResolver>) {}
 }

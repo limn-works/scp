@@ -1061,6 +1061,7 @@ mod tests {
             Arc::new(crate::context::builder::NotConfiguredTransportProvider);
         let clock: Arc<dyn scp_clock::Clock> = Arc::new(scp_clock::SystemClock);
         let deps = KeyPackageStoreDeps {
+            attestation_signer: None,
             mls: Arc::clone(crypto.mls_backend()),
             mls_storage,
             transport,

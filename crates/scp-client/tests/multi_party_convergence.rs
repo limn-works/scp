@@ -588,13 +588,14 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
     // raw `scp-mls` group (a dev-dependency) — exactly the wire bytes a hostile or
     // out-of-scope committer could put on the wire — while BOB is a real
     // `ScpClient` whose `receive_message` is the unit under test.
+    use ed25519_dalek::SigningKey;
     use openmls::prelude::{BasicCredential, KeyPackageIn};
+    use rand::rngs::OsRng;
     use scp_did::SigningKeyId;
     use scp_mls::group::{
-        add_member, add_member_with_convergent_timestamp, create_group,
-        generate_key_package_with_wrapping_key, remove_member,
+        add_member, add_member_with_convergent_timestamp, create_group, remove_member,
     };
-    use scp_mls::{ScpCredential, SignatureKeyPair};
+    use scp_mls::{ScpCredential, SignatureKeyPair, mint_key_package_for_testing};
     use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 
     // The raw Alice group and Bob's client share a real-time base so every
@@ -640,8 +641,13 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
     // is rejected pre-merge (ADR-057 sender-key distribution INVARIANT 3) before it
     // can reach the remove scenario.
     let (carol_bundle, _carol_signer, _carol_provider): (_, SignatureKeyPair, _) =
-        generate_key_package_with_wrapping_key(&carol_cred, Some(&[0xCC_u8; 32]), &SystemClock)
-            .expect("carol key package");
+        mint_key_package_for_testing(
+            &carol_cred,
+            &[0xCC_u8; 32],
+            &SystemClock,
+            &SigningKey::generate(&mut OsRng),
+        )
+        .expect("carol key package");
     let carol_kp_in = KeyPackageIn::tls_deserialize(
         &mut &*carol_bundle
             .key_package()

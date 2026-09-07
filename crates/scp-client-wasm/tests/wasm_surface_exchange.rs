@@ -99,7 +99,7 @@ mod native_host {
     /// constructor uses. Returns the client and its connection id.
     fn new_party(relay: &Relay, did: &str, now_secs: u64) -> (WasmScpClient, ConnId) {
         let (conn, sink) = relay.connect();
-        let signer: Arc<dyn Signer> = Arc::new(LocalSigner::active(did));
+        let signer: Arc<dyn Signer> = Arc::new(LocalSigner::active_for_testing(did));
         let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
         let clock: Arc<dyn Clock> = Arc::new(TestClock::new(now_secs));
         let client = WasmScpClient::from_parts(signer, storage, clock, sink)
@@ -117,7 +117,7 @@ mod native_host {
         now_secs: u64,
     ) -> (WasmScpClient, ConnId) {
         let (conn, sink) = relay.connect();
-        let signer: Arc<dyn Signer> = Arc::new(LocalSigner::active(did));
+        let signer: Arc<dyn Signer> = Arc::new(LocalSigner::active_for_testing(did));
         let clock: Arc<dyn Clock> = Arc::new(TestClock::new(now_secs));
         let client = WasmScpClient::from_parts(signer, storage, clock, sink)
             .expect("construct/restore surface client");

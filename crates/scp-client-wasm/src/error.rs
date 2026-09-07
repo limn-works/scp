@@ -82,6 +82,11 @@ pub const fn error_code(err: &ClientError) -> &'static str {
         // catch-all does not share (see the registered-codes table in sdk-common.md).
         ClientError::Mls(_) => "SCP-CRYPTO-4041",
         // Sender-key (§9.16) and event-log are the other browser crypto layers.
+        // The driver reaches no #active/#agent key, so it refuses to mint a
+        // KeyPackage whose §9.7.1 attestation it cannot sign. Distinct from
+        // SCP-CRYPTO-4041 so a caller can tell "this build cannot join a
+        // context on its own" apart from a failed MLS operation.
+        ClientError::AttestationSignerUnavailable => "SCP-CRYPTO-4042",
         ClientError::SenderKey(_) => "SCP-CRYPTO-4020",
         ClientError::EventLog(_) => "SCP-CRYPTO-4030",
         // Wire (de)serialization of MLS objects is a validation failure on
@@ -205,6 +210,11 @@ mod tests {
                 MlsError::ConvergentTimestampMissing | MlsError::ConvergentTimestampMalformed(_),
             ) => "SCP-CRYPTO-4040",
             ClientError::Mls(_) => "SCP-CRYPTO-4041",
+            // The driver reaches no #active/#agent key, so it refuses to mint a
+            // KeyPackage whose §9.7.1 attestation it cannot sign. Distinct from
+            // SCP-CRYPTO-4041 so a caller can tell "this build cannot join a
+            // context on its own" apart from a failed MLS operation.
+            ClientError::AttestationSignerUnavailable => "SCP-CRYPTO-4042",
             ClientError::SenderKey(_) => "SCP-CRYPTO-4020",
             ClientError::EventLog(_) => "SCP-CRYPTO-4030",
             ClientError::Codec(_) => "SCP-VALID-7028",
@@ -249,7 +259,8 @@ mod tests {
             | ClientError::StorageBackend(_)
             | ClientError::StorageCorrupt(_)
             | ClientError::StorageIdentityMismatch(_)
-            | ClientError::ContextPoisoned { .. } => {}
+            | ClientError::ContextPoisoned { .. }
+            | ClientError::AttestationSignerUnavailable => {}
         }
         vec![
             // Both `Mls` sub-cases (distinct 4040) plus a generic `Mls` (4041).
@@ -280,6 +291,7 @@ mod tests {
             ClientError::ContextPoisoned {
                 context_id: "c".to_owned(),
             },
+            ClientError::AttestationSignerUnavailable,
         ]
     }
 

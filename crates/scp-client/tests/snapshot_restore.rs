@@ -78,7 +78,7 @@ fn client_over(relay: &Relay, did: &str, storage: Arc<dyn Storage>, now_secs: u6
 /// published ciphertext from the relay for delivery to a peer. Use this when the
 /// restored (or freshly built) client must SEND afterwards.
 fn party_over(relay: &Relay, did: &str, storage: Arc<dyn Storage>, now_secs: u64) -> Party {
-    let signer = Arc::new(LocalSigner::active(did));
+    let signer = Arc::new(LocalSigner::active_for_testing(did));
     let clock: Arc<dyn Clock> = Arc::new(TestClock::new(now_secs));
     relay.party_with(signer, storage, clock)
 }
@@ -544,7 +544,7 @@ fn persisted_single_context() -> Arc<dyn Storage> {
 /// Attempts to construct a client for `did` over `storage`, returning the error.
 /// (`ScpClient` is deliberately not `Debug`, so `expect_err` is unavailable.)
 fn expect_construction_error_as(did: &str, storage: Arc<dyn Storage>) -> ClientError {
-    let signer = Arc::new(LocalSigner::active(did));
+    let signer = Arc::new(LocalSigner::active_for_testing(did));
     let clock: Arc<dyn Clock> = Arc::new(TestClock::new(seed(200)));
     // The injected sink is irrelevant: restore-on-construct fails before any
     // frame is sent. A throwaway null sink satisfies the signature.

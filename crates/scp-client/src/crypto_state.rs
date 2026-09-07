@@ -893,14 +893,15 @@ impl ContextCryptoState {
 #[allow(clippy::panic)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
     use openmls::prelude::KeyPackageIn;
+    use rand::rngs::OsRng;
     use scp_clock::SystemClock;
     use scp_did::SigningKeyId;
     use scp_mls::group::{
-        add_member, add_member_with_convergent_timestamp, create_group, generate_key_package,
-        generate_key_package_with_wrapping_key, join_group,
+        add_member, add_member_with_convergent_timestamp, create_group, join_group,
     };
-    use scp_mls::{ScpCredential, SignatureKeyPair};
+    use scp_mls::{ScpCredential, SignatureKeyPair, mint_key_package_for_testing};
     use scp_protocol::context::pseudonym::{PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement};
     use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 
@@ -922,8 +923,13 @@ mod tests {
             create_group(&credential(ALICE), &SystemClock).unwrap(),
         );
 
-        let (bundle, signer, provider): (_, SignatureKeyPair, _) =
-            generate_key_package(&credential(BOB), &SystemClock).unwrap();
+        let (bundle, signer, provider): (_, SignatureKeyPair, _) = mint_key_package_for_testing(
+            &credential(BOB),
+            &[0x77; 32],
+            &SystemClock,
+            &SigningKey::generate(&mut OsRng),
+        )
+        .unwrap();
         let kp_bytes = bundle.key_package().tls_serialize_detached().unwrap();
         let kp_in = KeyPackageIn::tls_deserialize(&mut &*kp_bytes).unwrap();
         let result = add_member(&mut alice.mls_group, kp_in, &SystemClock).unwrap();
@@ -975,7 +981,13 @@ mod tests {
 
         // Carol joins as an existing member.
         let (carol_bundle, carol_signer, carol_provider): (_, SignatureKeyPair, _) =
-            generate_key_package(&credential(CAROL), &SystemClock).unwrap();
+            mint_key_package_for_testing(
+                &credential(CAROL),
+                &[0x77; 32],
+                &SystemClock,
+                &SigningKey::generate(&mut OsRng),
+            )
+            .unwrap();
         let carol_kp_in = KeyPackageIn::tls_deserialize(
             &mut &*carol_bundle.key_package().tls_serialize_detached().unwrap(),
         )
@@ -991,8 +1003,13 @@ mod tests {
         // (ADR-057 sender-key distribution INVARIANT 3).
         let bob_wk = [0xBB_u8; 32];
         let (bob_bundle, _bob_signer, _bob_provider): (_, SignatureKeyPair, _) =
-            generate_key_package_with_wrapping_key(&credential(BOB), Some(&bob_wk), &SystemClock)
-                .unwrap();
+            mint_key_package_for_testing(
+                &credential(BOB),
+                &bob_wk,
+                &SystemClock,
+                &SigningKey::generate(&mut OsRng),
+            )
+            .unwrap();
         let bob_kp_in = KeyPackageIn::tls_deserialize(
             &mut &*bob_bundle.key_package().tls_serialize_detached().unwrap(),
         )
@@ -1182,8 +1199,13 @@ mod tests {
             CTX,
             create_group(&credential(ALICE), &SystemClock).unwrap(),
         );
-        let (bundle, signer, provider): (_, SignatureKeyPair, _) =
-            generate_key_package(&credential(BOB), &SystemClock).unwrap();
+        let (bundle, signer, provider): (_, SignatureKeyPair, _) = mint_key_package_for_testing(
+            &credential(BOB),
+            &[0x77; 32],
+            &SystemClock,
+            &SigningKey::generate(&mut OsRng),
+        )
+        .unwrap();
         let kp_bytes = bundle.key_package().tls_serialize_detached().unwrap();
         let kp_in = KeyPackageIn::tls_deserialize(&mut &*kp_bytes).unwrap();
         let result = add_member(&mut alice.mls_group, kp_in, &SystemClock).unwrap();
@@ -1263,10 +1285,10 @@ mod tests {
     /// the in-tab distribution tests.
     #[allow(clippy::unwrap_used)]
     fn distribution_pair() -> (ContextCryptoState, ContextCryptoState) {
-        use scp_mls::group::{
-            add_member, create_group_with_wrapping_key, generate_key_package_with_wrapping_key,
-            join_group,
-        };
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        use scp_mls::group::{add_member, create_group_with_wrapping_key, join_group};
+        use scp_mls::mint_key_package_for_testing;
 
         let (alice_wpub, alice_wsec) = generate_wrapping_keypair();
         let alice_group =
@@ -1276,9 +1298,13 @@ mod tests {
             ContextCryptoState::from_group_with_wrapping(CTX, alice_group, alice_wpub, alice_wsec);
 
         let (bob_wpub, bob_wsec) = generate_wrapping_keypair();
-        let (bundle, signer, provider): (_, SignatureKeyPair, _) =
-            generate_key_package_with_wrapping_key(&credential(BOB), Some(&bob_wpub), &SystemClock)
-                .unwrap();
+        let (bundle, signer, provider): (_, SignatureKeyPair, _) = mint_key_package_for_testing(
+            &credential(BOB),
+            &bob_wpub,
+            &SystemClock,
+            &SigningKey::generate(&mut OsRng),
+        )
+        .unwrap();
         let kp_in = KeyPackageIn::tls_deserialize(
             &mut &*bundle.key_package().tls_serialize_detached().unwrap(),
         )

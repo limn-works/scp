@@ -42,8 +42,9 @@
 //! cosmetic: `OpenMLS` rejects an Add proposal (RFC 9420 §12.1.8.2, `valn0502`)
 //! unless the joiner's leaf supports *every* extension present in the group's
 //! `group_context`. A context-group joiner must therefore present a `KeyPackage`
-//! built by
-//! [`generate_key_package_with_context_params`](crate::group::generate_key_package_with_context_params),
+//! minted by
+//! [`prepare_key_package`](crate::keypackage_mint::prepare_key_package) and
+//! [`finish_key_package`](crate::keypackage_mint::finish_key_package),
 //! whose leaf declares `0xFF02`; a wrapping-key-only `KeyPackage` (which declares
 //! only `0xFF01`) is rejected. The creator's own leaf gets the declaration from
 //! [`create_group_with_context`](crate::group::create_group_with_context).
@@ -197,6 +198,10 @@ impl ScpMlsGroup {
 mod tests {
     use super::*;
 
+    use crate::keypackage_mint::mint_key_package_for_testing;
+    use ed25519_dalek::SigningKey;
+    use openmls_basic_credential::SignatureKeyPair;
+    use rand::rngs::OsRng;
     use scp_clock::SystemClock;
     use scp_did::DID;
     use scp_protocol::context::params::{CeilingPolicy, ContextMode};
@@ -336,8 +341,10 @@ mod tests {
     /// Regression for the OpenMLS `valn0502` requirement: a wrapping-key-only
     /// `KeyPackage` (leaf declares only `0xFF01`) cannot be added to a context
     /// group, because its leaf does not support the `0xFF02` `group_context`
-    /// extension. Joiners must use
-    /// [`generate_key_package_with_context_params`](crate::group::generate_key_package_with_context_params).
+    /// extension. Joiners must present a `KeyPackage` minted by
+    /// [`prepare_key_package`](crate::keypackage_mint::prepare_key_package) and
+    /// [`finish_key_package`](crate::keypackage_mint::finish_key_package), whose
+    /// leaf declares all three SCP extension types.
     #[test]
     fn wrapping_only_key_package_rejected_by_context_group() {
         let alice_cred = test_credential("alice");
@@ -352,15 +359,45 @@ mod tests {
         .unwrap();
 
         // Bob's key package declares only 0xFF01 (wrapping key), not 0xFF02.
+        // `mint_key_package_for_testing` cannot produce it: the mint declares
+        // all three SCP extension types unconditionally, which is exactly the
+        // property this test denies its fixture. The leaf is therefore built
+        // here directly, with the 0xFF01-only capability set and the 0xFF01
+        // wrapping-key leaf extension.
         let bob_cred = test_credential("bob");
         let bob_wrapping = [0xBB_u8; 32];
-        let (bob_kp, _bob_signer, _bob_provider) =
-            crate::group::generate_key_package_with_wrapping_key(
-                &bob_cred,
-                Some(&bob_wrapping),
-                &SystemClock,
+        let bob_provider = crate::InMemoryMlsProvider::default();
+        let bob_signer =
+            SignatureKeyPair::new(crate::group::SCP_CIPHERSUITE.signature_algorithm()).unwrap();
+        bob_signer.store(bob_provider.storage()).unwrap();
+        let bob_kp = KeyPackage::builder()
+            .leaf_node_capabilities(crate::wrapping_extension::scp_capabilities_with_wrapping_key())
+            .leaf_node_extensions(
+                Extensions::<LeafNode>::single(
+                    crate::wrapping_extension::make_wrapping_key_extension(&bob_wrapping),
+                )
+                .unwrap(),
+            )
+            .key_package_lifetime(crate::lifetime::key_package_lifetime(&SystemClock))
+            .build(
+                crate::group::SCP_CIPHERSUITE,
+                &bob_provider,
+                &bob_signer,
+                CredentialWithKey {
+                    credential: BasicCredential::new(bob_cred.to_bytes().unwrap()).into(),
+                    signature_key: bob_signer.to_public_vec().into(),
+                },
             )
             .unwrap();
+        assert!(
+            !bob_kp
+                .key_package()
+                .leaf_node()
+                .capabilities()
+                .extensions()
+                .contains(&ExtensionType::Unknown(SCP_CONTEXT_EXTENSION_TYPE_ID)),
+            "the fixture leaf must NOT declare 0xFF02, or the test proves nothing"
+        );
         let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
 
         match crate::group::add_member(&mut alice_group, bob_kp_in, &SystemClock) {
@@ -372,68 +409,50 @@ mod tests {
         }
     }
 
-    /// The leaf-level invariant behind the reserve / plain-join fix: a
-    /// `KeyPackage` from
-    /// [`generate_key_package_with_context_params`](crate::group::generate_key_package_with_context_params)
-    /// declares the `0xFF02` (`scp_context_params`) capability in BOTH the
-    /// `Some` and `None` wrapping-key cases — that capability is what `valn0502`
-    /// checks and what makes the KP addable to an encrypted context group. The
-    /// `0xFF01` wrapping-key LEAF extension is present only in the `Some` case;
-    /// declaring the `0xFF01` capability without carrying the leaf extension is
-    /// valid (`valn0107` constrains only the reverse).
+    /// The leaf-level invariant behind the reserve / plain-join fix: a minted
+    /// `KeyPackage` declares the `0xFF02` (`scp_context_params`) capability —
+    /// that capability is what `valn0502` checks and what makes the KP addable
+    /// to an encrypted context group — and carries the `0xFF01` wrapping-key
+    /// LEAF extension holding the key the caller passed. Two independently
+    /// minted `KeyPackage`s are checked, so the properties hold per mint rather
+    /// than for one lucky draw.
+    ///
+    /// The mint takes a required wrapping key (§9.5.2 field 5 binds the `0xFF01`
+    /// value into the attestation), so there is no wrapping-key-less minted leaf
+    /// to check. `mint_key_package_for_testing` replaced
+    /// `generate_key_package_with_context_params`, whose `None` arm produced a
+    /// leaf that declared `0xFF02` and carried no `0xFF01` extension.
     #[test]
-    fn context_params_key_package_declares_0xff02_capability_with_and_without_wrapping_key() {
-        // None: context-capable, but no wrapping-key leaf extension.
-        let cred_none = test_credential("kp-caps-none");
-        let (kp_none, _s, _p) =
-            crate::group::generate_key_package_with_context_params(&cred_none, None, &SystemClock)
-                .unwrap();
-        let caps_none = kp_none.key_package().leaf_node().capabilities();
-        assert!(
-            caps_none
-                .extensions()
-                .contains(&ExtensionType::Unknown(SCP_CONTEXT_EXTENSION_TYPE_ID)),
-            "a wrapping-key-less context KP MUST declare the 0xFF02 capability (valn0502)"
-        );
-        assert!(
-            caps_none
-                .extensions()
-                .contains(&ExtensionType::Unknown(SCP_WRAPPING_KEY_EXTENSION_TYPE)),
-            "the context KP declares the 0xFF01 capability unconditionally"
-        );
-        assert_eq!(
-            crate::wrapping_extension::extract_wrapping_key(
-                kp_none.key_package().leaf_node().extensions()
-            )
-            .unwrap(),
-            None,
-            "the None case carries NO 0xFF01 wrapping-key leaf extension"
-        );
-
-        // Some: context-capable AND carries the wrapping-key leaf extension.
-        let cred_some = test_credential("kp-caps-some");
-        let wrapping = [0x5A_u8; 32];
-        let (kp_some, _s2, _p2) = crate::group::generate_key_package_with_context_params(
-            &cred_some,
-            Some(&wrapping),
-            &SystemClock,
-        )
-        .unwrap();
-        let caps_some = kp_some.key_package().leaf_node().capabilities();
-        assert!(
-            caps_some
-                .extensions()
-                .contains(&ExtensionType::Unknown(SCP_CONTEXT_EXTENSION_TYPE_ID)),
-            "the wrapping-key context KP also declares the 0xFF02 capability"
-        );
-        assert_eq!(
-            crate::wrapping_extension::extract_wrapping_key(
-                kp_some.key_package().leaf_node().extensions()
-            )
-            .unwrap(),
-            Some(wrapping),
-            "the Some case carries the 0xFF01 wrapping-key leaf extension"
-        );
+    fn minted_key_package_declares_0xff02_capability_and_carries_its_wrapping_key() {
+        for (name, wrapping) in [
+            ("kp-caps-first", [0x5A_u8; 32]),
+            ("kp-caps-second", [0xA5_u8; 32]),
+        ] {
+            let cred = test_credential(name);
+            let att_key = SigningKey::generate(&mut OsRng);
+            let (kp, _s, _p) =
+                mint_key_package_for_testing(&cred, &wrapping, &SystemClock, &att_key).unwrap();
+            let caps = kp.key_package().leaf_node().capabilities();
+            assert!(
+                caps.extensions()
+                    .contains(&ExtensionType::Unknown(SCP_CONTEXT_EXTENSION_TYPE_ID)),
+                "a minted KP MUST declare the 0xFF02 capability (valn0502): {name}"
+            );
+            assert!(
+                caps.extensions()
+                    .contains(&ExtensionType::Unknown(SCP_WRAPPING_KEY_EXTENSION_TYPE)),
+                "a minted KP declares the 0xFF01 capability: {name}"
+            );
+            assert_eq!(
+                crate::wrapping_extension::extract_wrapping_key(
+                    kp.key_package().leaf_node().extensions()
+                )
+                .unwrap(),
+                Some(wrapping),
+                "a minted KP carries the 0xFF01 leaf extension holding the key it was minted with: \
+                 {name}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -459,13 +478,13 @@ mod tests {
 
         let bob_cred = test_credential("bob");
         let bob_wrapping = [0xBB_u8; 32];
-        let (bob_kp, bob_signer, bob_provider) =
-            crate::group::generate_key_package_with_context_params(
-                &bob_cred,
-                Some(&bob_wrapping),
-                &SystemClock,
-            )
-            .unwrap();
+        let (bob_kp, bob_signer, bob_provider) = mint_key_package_for_testing(
+            &bob_cred,
+            &bob_wrapping,
+            &SystemClock,
+            &SigningKey::generate(&mut OsRng),
+        )
+        .unwrap();
 
         let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
         let add_result =
@@ -519,13 +538,13 @@ mod tests {
         // Add Bob (epoch 1).
         let bob_cred = test_credential("bob");
         let bob_wrapping = [0xBB_u8; 32];
-        let (bob_kp, bob_signer, bob_provider) =
-            crate::group::generate_key_package_with_context_params(
-                &bob_cred,
-                Some(&bob_wrapping),
-                &SystemClock,
-            )
-            .unwrap();
+        let (bob_kp, bob_signer, bob_provider) = mint_key_package_for_testing(
+            &bob_cred,
+            &bob_wrapping,
+            &SystemClock,
+            &SigningKey::generate(&mut OsRng),
+        )
+        .unwrap();
         let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
         let add_bob = crate::group::add_member(&mut alice_group, bob_kp_in, &SystemClock).unwrap();
         let mut bob_group =
@@ -534,13 +553,13 @@ mod tests {
         // Add Carol (epoch 2) — a later commit distributed to existing members.
         let carol_cred = test_credential("carol");
         let carol_wrapping = [0xCC_u8; 32];
-        let (carol_kp, _carol_signer, _carol_provider) =
-            crate::group::generate_key_package_with_context_params(
-                &carol_cred,
-                Some(&carol_wrapping),
-                &SystemClock,
-            )
-            .unwrap();
+        let (carol_kp, _carol_signer, _carol_provider) = mint_key_package_for_testing(
+            &carol_cred,
+            &carol_wrapping,
+            &SystemClock,
+            &SigningKey::generate(&mut OsRng),
+        )
+        .unwrap();
         let carol_kp_in: KeyPackageIn = carol_kp.key_package().clone().into();
         let add_carol =
             crate::group::add_member(&mut alice_group, carol_kp_in, &SystemClock).unwrap();

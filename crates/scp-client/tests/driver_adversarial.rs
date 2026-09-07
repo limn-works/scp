@@ -815,7 +815,7 @@ fn failed_join_consumes_pending_and_recovers_only_via_reconstruct() {
     // Bob over a CALLER-SUPPLIED storage handle, shared with the reconstructed
     // client below (the reconstruct-from-durable recovery path ADR-057 T2).
     let bob_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-    let bob_signer = Arc::new(LocalSigner::active(BOB_DID));
+    let bob_signer = Arc::new(LocalSigner::active_for_testing(BOB_DID));
     let bob_clock: Arc<dyn Clock> = Arc::new(TestClock::new(base + 100));
     let mut bob = relay.party_with(bob_signer, Arc::clone(&bob_storage), bob_clock);
 
@@ -865,7 +865,7 @@ fn failed_join_consumes_pending_and_recovers_only_via_reconstruct() {
     // RECOVERY: a fresh client over Bob's SAME storage restores the still-durable
     // pending blob and the join now SUCCEEDS with the good Welcome.
     drop(bob);
-    let recovered_signer = Arc::new(LocalSigner::active(BOB_DID));
+    let recovered_signer = Arc::new(LocalSigner::active_for_testing(BOB_DID));
     let recovered_clock: Arc<dyn Clock> = Arc::new(TestClock::new(base + 150));
     let mut bob2 = relay.party_with(recovered_signer, Arc::clone(&bob_storage), recovered_clock);
     assert_eq!(

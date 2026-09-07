@@ -282,7 +282,7 @@ impl ScpMlsGroup {
 /// A serializable snapshot of unconsumed pending-join material, bound to the
 /// identity and context it belongs to.
 ///
-/// Between generating a `KeyPackage` ([`crate::group::generate_key_package`]) and
+/// Between generating a `KeyPackage` ([`crate::keypackage_mint::finish_key_package`]) and
 /// processing the resulting Welcome, a prospective member must retain the private
 /// half of that key package — the `OpenMLS` provider storage entries holding the
 /// HPKE init/encryption private keys, plus the MLS signer. Unlike
@@ -335,7 +335,7 @@ impl std::fmt::Debug for PendingJoinSnapshot {
 /// bound to `owner_did` and `context_id`.
 ///
 /// Captures a bare `(provider, signer)` pair from
-/// [`crate::group::generate_key_package`] into an opaque `MessagePack` blob
+/// [`crate::keypackage_mint::finish_key_package`] into an opaque `MessagePack` blob
 /// (§17.9.1, ADR-057 component 3), tagged with the owning identity and context so
 /// a swapped blob is detectable on restore. The inverse is [`restore_pending_join`].
 /// The intermediate snapshot's key material is zeroized before returning.
@@ -407,8 +407,11 @@ pub fn restore_pending_join(
 mod tests {
     use super::*;
     use crate::ScpCredential;
-    use crate::group::{add_member, create_group, generate_key_package, join_group};
+    use crate::group::{add_member, create_group, join_group};
+    use crate::keypackage_mint::mint_key_package_for_testing;
+    use ed25519_dalek::SigningKey;
     use openmls::prelude::KeyPackageIn;
+    use rand::rngs::OsRng;
     use scp_clock::SystemClock;
     use scp_did::SigningKeyId;
     use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
@@ -448,8 +451,13 @@ mod tests {
         // Alice creates a two-member group so the restored group can decrypt a
         // message a peer sent — proving the epoch secrets survived the snapshot.
         let mut alice = create_group(&credential(ALICE), &SystemClock).unwrap();
-        let (bundle, bob_signer, bob_provider) =
-            generate_key_package(&credential(BOB), &SystemClock).unwrap();
+        let (bundle, bob_signer, bob_provider) = mint_key_package_for_testing(
+            &credential(BOB),
+            &[0x77; 32],
+            &SystemClock,
+            &SigningKey::generate(&mut OsRng),
+        )
+        .unwrap();
         let kp_in = KeyPackageIn::tls_deserialize(
             &mut &*bundle.key_package().tls_serialize_detached().unwrap(),
         )
@@ -487,8 +495,13 @@ mod tests {
         // snapshots that pending material, then RESTORES it and uses the restored
         // pair to join a group Alice adds him to — proving the persisted pending
         // material carries the HPKE private keys the Welcome needs.
-        let (bundle, bob_signer, bob_provider) =
-            generate_key_package(&credential(BOB), &SystemClock).unwrap();
+        let (bundle, bob_signer, bob_provider) = mint_key_package_for_testing(
+            &credential(BOB),
+            &[0x77; 32],
+            &SystemClock,
+            &SigningKey::generate(&mut OsRng),
+        )
+        .unwrap();
 
         // Persist and restore Bob's pending-join material (bound to his DID + ctx).
         let blob =

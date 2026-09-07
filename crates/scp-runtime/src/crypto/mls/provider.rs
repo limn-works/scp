@@ -1267,7 +1267,7 @@ impl NodeMlsFactory {
 mod tests {
     use super::*;
     use scp_clock::SystemClock;
-    use scp_mls::group::generate_key_package;
+    use scp_mls::mint_key_package_for_testing;
     use tls_codec::Serialize as TlsSerializeTrait;
 
     const TEST_DID: &str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
@@ -1502,8 +1502,13 @@ mod tests {
             SigningKeyId::Active,
         )
         .unwrap();
-        let (bob_kp_bundle, _bob_signer, _bob_provider) =
-            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_provider) = mint_key_package_for_testing(
+            &bob_cred,
+            &[0x5C; 32],
+            &SystemClock,
+            &ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng),
+        )
+        .unwrap();
 
         // Serialize the key package to bytes.
         let kp_bytes = bob_kp_bundle
@@ -1538,8 +1543,13 @@ mod tests {
             SigningKeyId::Active,
         )
         .unwrap();
-        let (bob_kp_bundle, _bob_signer, _bob_provider) =
-            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_provider) = mint_key_package_for_testing(
+            &bob_cred,
+            &[0x5C; 32],
+            &SystemClock,
+            &ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng),
+        )
+        .unwrap();
         let kp_bytes = bob_kp_bundle
             .key_package()
             .tls_serialize_detached()
@@ -1603,8 +1613,13 @@ mod tests {
         // Add Bob on the actor-owned group.
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
         let bob_cred = ScpCredential::new(bob_did.to_string(), None, SigningKeyId::Active).unwrap();
-        let (bob_kp_bundle, _bob_signer, _bob_provider) =
-            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_provider) = mint_key_package_for_testing(
+            &bob_cred,
+            &[0x5C; 32],
+            &SystemClock,
+            &ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng),
+        )
+        .unwrap();
         let kp_bytes = bob_kp_bundle
             .key_package()
             .tls_serialize_detached()
