@@ -323,7 +323,7 @@ scp/
 │   │
 │   ├── scp-testing/           # Network simulation test harness (§16, dev-dependency)
 │   │   ├── clock.rs           # SimulatedClock (manual time control)
-│   │   ├── relay/             # InMemoryRelay, BlobStore, BehaviorMode, SubscriptionRegistry
+│   │   ├── relay/             # InMemoryRelay, BehaviorMode, SubscriptionRegistry
 │   │   ├── transport.rs       # InMemoryTransport (TransportAdapter over InMemoryRelay)
 │   │   ├── simulator/         # NetworkSimulator, SimulatedIdentity, NetworkTopology
 │   │   ├── builder.rs         # ScenarioBuilder (fluent API for test setup)
@@ -1094,7 +1094,7 @@ Test:
   • Context state persists across process restarts (SqliteStorage)
   • ProtocolRepository integration tests: lifecycle, nonces, event range queries (§17.13)
   • MlsStorageBridge tests (§16.13.8) gated against SqliteStorage
-  • All new Storage/BlobStore adapters pass conformance suites
+  • All new Storage/BlobStorage adapters pass conformance suites
   • Block enforcement: assert_block_enforced (§16.10.6) — sender key rotation
     prevents blocked identity from decrypting, other members unaffected
   • Broadcast mode: author publishes broadcast-key-encrypted content, subscriber

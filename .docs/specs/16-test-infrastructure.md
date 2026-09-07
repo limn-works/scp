@@ -31,7 +31,7 @@ crates/
       builder.rs             # ScenarioBuilder
       helpers.rs             # Test utility helpers
       test_adapter.rs        # Test adapter utilities
-      blob_store_tests.rs    # BlobStore conformance tests
+      blob_store_tests.rs    # BlobStorage conformance tests
       fullstack/             # Full-stack integration test harness
         mod.rs
         crypto.rs            # Crypto integration tests

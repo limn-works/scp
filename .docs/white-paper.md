@@ -726,7 +726,7 @@ Language bindings: Python (PyO3), Swift (UniFFI), Kotlin (UniFFI), TypeScript (n
 Conformance is enforced through Rust macros that generate test suites for trait implementations:
 
 - `storage_conformance!()` — Storage trait implementations (state persistence, 13 tests)
-- `blob_store_conformance!()` — BlobStore implementations (relay storage backends, 19 tests)
+- `blob_store_conformance!()` — BlobStorage implementations (relay storage backends, 19 tests)
 - `payment_adapter_conformance!()` — PaymentAdapter implementations (economic governance, 8 tests)
 
 Additional conformance suites are specified but not yet implemented for transport adapters, key custody, attestation stores, and push providers.
