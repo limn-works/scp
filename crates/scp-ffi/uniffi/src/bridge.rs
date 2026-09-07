@@ -19412,9 +19412,19 @@ mod tests {
 
         // `scpid_sign` ships un-severed. An externally-loaded handle carries no
         // `core_id`, so the real body declines with SCP-IDENT-1010.
+        // `spawn_blocking` because `scpid_sign_impl` reaches
+        // `runtime().block_on` once it resolves custody, and a `block_on` on a
+        // runtime worker thread panics.
         let challenge =
             scpid_challenge("https://relying.example".to_owned(), 60).expect("scpid_challenge");
-        match scp.scpid_sign(Arc::clone(&identity), "active".to_owned(), challenge, None) {
+        let signing_scp = Arc::clone(&scp);
+        let signing_identity = Arc::clone(&identity);
+        let signed = tokio::task::spawn_blocking(move || {
+            signing_scp.scpid_sign(signing_identity, "#active".to_owned(), challenge, None)
+        })
+        .await
+        .expect("spawn_blocking join");
+        match signed {
             Err(ScpError::Identity { code, .. }) => assert_eq!(
                 code,
                 codes::IDENT_1010,
