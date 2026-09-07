@@ -949,7 +949,11 @@ jobs:
           # The three lanes that run uniffi tests each enable
           # `scp-ffi-uniffi/testing`, which compiles every
           # `#[cfg(not(feature = "testing"))]` test out: job rust-test and job
-          # rust-doc in this file, and job conformance in release.yml.
+          # rust-doc in this file, and job conformance in release.yml. Until
+          # this step existed, this job built the bridge and tested nothing, so
+          # `identity_create_in_memory_rejected_without_feature` executed in no
+          # lane while build-matrix.yml shipped that bridge in an iOS
+          # XCFramework and an Android AAR at tag time.
           #
           # `--no-tests=fail` exits 4 rather than 0 when a feature flip selects
           # zero tests. `check_shipped_build_assertions_run` in
