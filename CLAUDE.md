@@ -156,10 +156,12 @@ line and an `**Indicators, not the criterion.**` line; the check fails when the
 directory matches no agent file, so an emptied directory reports a failure
 instead of passing over nothing),
 check-doc-citations.py (every `§N.M` citation in `.docs/standards/`,
-`.docs/lessons/`, `.claude/agents/` and CLAUDE.md names a heading its spec file
-contains, or carries the literal marker `[no such section]` on that same line,
-which exempts the one occurrence beside it and exempts no other occurrence in
-the file; the check holds no per-site allowlist),
+`.docs/lessons/`, `.claude/agents/`, `.docs/scaffold/`, `.docs/architecture.md`
+and CLAUDE.md names a heading its spec file contains, or carries the literal
+marker `[no such section]` directly after the reference, which exempts the one
+occurrence it follows and exempts no other occurrence, on that line or anywhere
+else in the file; the check holds no per-site allowlist. It decides whether the
+heading exists, never whether the section says what the citing sentence claims),
 pretooluse-enforcement-files.sh,
 CLAUDE.md (enforcement sections).
 When a check fails, fix the code that the check rejected. You may modify an enforcement file for exactly two reasons:

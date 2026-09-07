@@ -3,14 +3,16 @@
 
 CRITERION
     Every `§N.M` citation in a governing artifact names a heading that exists in
-    `.docs/specs/N-*.md`, or the citing line itself declares that the citation resolves
+    `.docs/specs/N-*.md`, or the citation itself declares that it resolves
     to nothing by carrying the literal marker `[no such section]` directly after the
-    reference on that same line. The marker exempts the one occurrence it sits beside
-    and exempts no other occurrence, including a second occurrence of the same reference
-    further down the same file, because a reader who reaches an unmarked occurrence sees
-    no marker and goes looking for a section the spec does not carry. A marker scoped to
-    the whole file would let one marker launder every unmarked twin in that file, which
-    is the per-site allowlist the section below refuses.
+    reference, separated from it by one space. The marker exempts the one occurrence
+    whose last character it follows, and exempts no other occurrence: not a second
+    occurrence of the same reference further down the file, and not a second occurrence
+    on the same line as the marker. A reader who reaches an unmarked occurrence sees no
+    marker and goes looking for a section the spec does not carry, whatever a different
+    occurrence elsewhere declares. A marker scoped to the line or to the file would let
+    one marker launder every unmarked twin in its range, which is the per-site allowlist
+    the section below refuses.
 
     `.docs/standards/concrete-prose.md` states both rules this check enforces: "Name the
     thing first, then give the identifier so the reader can find it", and write a dead
@@ -24,11 +26,21 @@ CRITERION
 
 WHAT THE CHECK READS
     The files that tell an agent how to write and how to work: `.docs/standards/`,
-    `.docs/lessons/`, `.claude/agents/`, and `CLAUDE.md`. A citation counts when its
-    leading number names a spec file — `§18.11.3` names
+    `.docs/lessons/`, `.claude/agents/`, `CLAUDE.md`, and the two build blueprints an
+    agent reads before it writes a crate — `.docs/scaffold/` and `.docs/architecture.md`.
+    A citation counts when its leading number names a spec file — `§18.11.3` names
     `.docs/specs/18-addressability-and-deployment.md`. A number that names no spec file
     is not an SCP spec citation, so the check skips it, and so are citations the line
     attributes to an outside document (RFC, ISO, BEP, an IETF draft).
+
+WHAT THE CHECK CANNOT DECIDE
+    Whether the cited section says what the citing sentence claims it says. Spec 10,
+    infrastructure and self-hosting, cited §16.4.1 of the test infrastructure spec for
+    the contract of a `BlobStore` trait; §16.4.1 heads "StoredBlob" and its body stated
+    that the in-memory relay defines no such trait. This check reported that pair green,
+    because §16.4.1 is a heading that exists. A reader repairs that defect by opening the
+    cited section, so do not read a green run as evidence that a citation points at the
+    right section.
 
 WHAT THE CHECK DOES NOT READ, AND WHY
     `.docs/specs/`, `.docs/adrs/`, `.docs/prds/`, and the dated plans and planning
@@ -47,13 +59,15 @@ USAGE
 
     --self-test builds a scratch tree holding one resolving citation, one dead citation,
     one dead citation carrying the marker, one RFC citation, one citation to a number
-    that names no spec file, and one file that marks a dead reference on its first line
-    and repeats that same reference unmarked on a later line. It then asserts the
-    scanner reports exactly the two unmarked dead citations. The repeated reference is
-    the case a file-wide marker test passes and a same-line marker test fails, so the
-    self-test goes red if anyone widens the marker back to the whole file. Run it before
-    the real scan: a scanner that reports nothing on a tree with a planted defect proves
-    nothing about the tree it scans next.
+    that names no spec file, one file that marks a dead reference on its first line and
+    repeats that same reference unmarked on a later line, and one file that marks a dead
+    reference and repeats it unmarked on that same line. It then asserts the scanner
+    reports exactly the three unmarked dead citations. The two repeats are the cases a
+    widened marker passes: a file-wide marker passes the later-line repeat, and a
+    line-wide marker passes the same-line repeat, so the self-test goes red if anyone
+    widens the marker past the occurrence it follows. Run it before the real scan: a
+    scanner that reports nothing on a tree with a planted defect proves nothing about
+    the tree it scans next.
 """
 
 from __future__ import annotations
@@ -74,8 +88,8 @@ FOREIGN = re.compile(
 MARKER = "[no such section]"
 
 # Positive scope: the artifacts that govern work in this repository.
-SCOPE_DIRS = (".docs/standards", ".docs/lessons", ".claude/agents")
-SCOPE_FILES = ("CLAUDE.md",)
+SCOPE_DIRS = (".docs/standards", ".docs/lessons", ".claude/agents", ".docs/scaffold")
+SCOPE_FILES = ("CLAUDE.md", ".docs/architecture.md")
 
 
 def spec_files(root: Path) -> dict[str, Path]:
@@ -132,7 +146,7 @@ def scan(root: Path) -> list[tuple[Path, int, str]]:
                     heading_cache[top] = headings(specs[top])
                 if ref in heading_cache[top]:
                     continue
-                if f"§{ref} {MARKER}" in line:
+                if line[match.end() :].startswith(f" {MARKER}"):
                     continue
                 failures.append((path, number, ref))
     return failures
@@ -163,6 +177,12 @@ SELF_TEST_TWIN = """The passage cites §18.11.13.2 [no such section], which no m
 A later paragraph repeats §18.11.13.2 and carries no marker of its own.
 """
 
+# One marked occurrence and one unmarked occurrence on a single line. A marker test
+# scoped to the citing line passes this; a marker test anchored to the occurrence the
+# marker follows reports the second occurrence.
+SELF_TEST_SAME_LINE = """The passage cites §18.11.13.2 [no such section], and the feed lives at §18.11.13.2.
+"""
+
 
 def self_test() -> int:
     """Prove the scanner reports a planted dead citation and nothing else."""
@@ -176,21 +196,25 @@ def self_test() -> int:
         (lessons / "good.md").write_text(SELF_TEST_GOOD)
         (lessons / "bad.md").write_text(SELF_TEST_BAD)
         (lessons / "twin.md").write_text(SELF_TEST_TWIN)
+        (lessons / "sameline.md").write_text(SELF_TEST_SAME_LINE)
 
         failures = scan(root)
         got = sorted((f.name, line, ref) for f, line, ref in failures)
-        want = [("bad.md", 1, "18.11.99"), ("twin.md", 2, "18.11.13.2")]
+        want = [
+            ("bad.md", 1, "18.11.99"),
+            ("sameline.md", 1, "18.11.13.2"),
+            ("twin.md", 2, "18.11.13.2"),
+        ]
         if got != want:
             print(f"SELF-TEST FAILED: expected {want}, scanner reported {got}")
             return 1
-    print(
-        "SELF-TEST PASSED: the scanner reports both planted dead citations, including"
-    )
-    print("  the unmarked repeat of a reference the same file marks one line earlier,")
+    print("SELF-TEST PASSED: the scanner reports all three planted dead citations,")
+    print("  including the unmarked repeat of a reference the same file marks one line")
+    print("  earlier and the unmarked repeat that shares a line with its own marker,")
     print(
         "  and skips a resolving citation, an RFC citation, a non-spec number, and the"
     )
-    print("  occurrence that carries the marker on its own line.")
+    print("  occurrence the marker directly follows.")
     return 0
 
 
