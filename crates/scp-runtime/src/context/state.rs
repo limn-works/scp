@@ -1912,38 +1912,69 @@ pub(crate) fn create_governance_engine(
 pub(crate) enum OutletRegistrySeed {
     /// The creator, inside `builder::create_context`, at genesis. No governance
     /// action has run yet, so the live registry equals `params.outlets` by
-    /// construction. `validate_params` has already bounded the count by
-    /// [`MAX_REGISTERED_OUTLETS`].
+    /// construction. `validate_params` has already run
+    /// [`validate_genesis_outlets`] over the declaration.
     GenesisDeclaration,
     /// A Welcome-joiner, inside `Supervisor::build_welcome_joiner_state`, at an
     /// arbitrary later epoch. This joiner has read no live registry, so it starts
-    /// empty and converges from the authenticated `OutletRegistered` /
-    /// `OutletRemoved` event-log leaves, which are the only record that carries
-    /// removals (§5.4: "silent outlet modification is not possible — any change is
-    /// visible to all context members"). Until those leaves replicate, every
-    /// registry read on the joiner finds nothing and the outlet-invocation paths
-    /// fail closed with `PermissionDenied`, which a caller can detect. Seeding
-    /// from `params.outlets` instead would answer those reads with a stale genesis
-    /// snapshot that cannot express a removal.
+    /// empty.
+    ///
+    /// **The joiner's registry stays empty, and no code closes the gap today.**
+    /// The record that could close it exists: the creator's
+    /// `OutletRegistered` leaves each carry an
+    /// `scp_protocol::context::outlets::OutletRegisteredEvent`, and each
+    /// `OutletRemoved` leaf carries an `OutletRemovedEvent`, so the two together
+    /// name every grant and every withdrawal (§5.4: "silent outlet modification
+    /// is not possible — any change is visible to all context members"). What
+    /// does not exist is a reader: no runtime path replays another member's
+    /// event log into `registered_outlets`, so a joiner's registry reads find
+    /// nothing for the life of the context, and the outlet-invocation paths fail
+    /// closed with `PermissionDenied` — a state the caller can detect, unlike a
+    /// registry that answers from a stale snapshot.
+    ///
+    /// Seeding from `params.outlets` instead would answer those reads from the
+    /// frozen genesis declaration, which records no removal governance made
+    /// after genesis, so a joiner would grant invocation authority the context
+    /// had already withdrawn. Failing closed on a grant the joiner cannot verify
+    /// beats granting one the context revoked, which is why this variant seeds
+    /// nothing rather than seeding the declaration (GitHub #2250).
     AwaitingLeafReplication,
 }
 
-/// Rejects a genesis outlet declaration larger than the per-context registry cap.
+/// Rejects a genesis outlet declaration that
+/// `scp_protocol::context::outlets::registry::register_outlet` would refuse.
 ///
 /// Both entrypoints that accept a `ContextParams` and reach
 /// [`fresh_governance_state`] call this: `builder::validate_params` for the
 /// creator's own parameters, and `Supervisor::spawn_actor_from_welcome`'s
 /// Precheck C for the creator-signed parameters a joiner receives from a peer.
-/// `governance_helpers::execute_register_outlet` enforces the same
-/// [`MAX_REGISTERED_OUTLETS`] bound on the runtime governance-registration path,
-/// so no path that puts an `OutletRegistration` into a context escapes the bound
+/// `governance_helpers::execute_register_outlet` runs the same
+/// [`MAX_REGISTERED_OUTLETS`] bound, the same
+/// `registry::validate_registration_content` call, and the same duplicate-id
+/// rejection on the runtime governance-registration path, so no path that puts
+/// an `OutletRegistration` into a context's live registry escapes the checks
 /// (GitHub #2250).
+///
+/// Three checks run here, in this order:
+/// 1. The per-context registry cap, [`MAX_REGISTERED_OUTLETS`].
+/// 2. `registry::validate_registration_content` on each declaration — the
+///    §5.4.2 Query cost floor, both JSON Schemas, the §6.2/§9.2.1 schema
+///    specificity floor, and the operator DID. Without this check the creator
+///    installs into the live authorization registry whatever `ContextParams`
+///    carried, and the FFI bridges' name-only outlet surface carried a
+///    fabricated operator DID and two empty schemas.
+/// 3. Uniqueness of `outlet_id` across the declaration. `OutletRegistry` is a
+///    map keyed by `outlet_id`, and `GovernanceState::registered_outlets` is a
+///    `Vec`, so a duplicate id in a genesis declaration would install two
+///    entries that the registry type itself cannot hold, and a later
+///    `execute_remove_outlet` would delete one of the two and leave the other
+///    answering invocations the context revoked.
 ///
 /// # Errors
 ///
-/// Returns [`ContextCreationError::CreationFailed`] when `outlets` holds more
-/// than [`MAX_REGISTERED_OUTLETS`] entries.
-pub(crate) fn validate_genesis_outlet_count(
+/// Returns [`ContextCreationError::CreationFailed`] naming the failed check and
+/// the outlet id it failed on.
+pub(crate) fn validate_genesis_outlets(
     outlets: &[OutletRegistration],
 ) -> Result<(), ContextCreationError> {
     if outlets.len() > MAX_REGISTERED_OUTLETS {
@@ -1951,6 +1982,24 @@ pub(crate) fn validate_genesis_outlet_count(
             "genesis outlet count {} exceeds the per-context limit of {MAX_REGISTERED_OUTLETS}",
             outlets.len(),
         )));
+    }
+
+    let mut seen: HashSet<&str> = HashSet::with_capacity(outlets.len());
+    for outlet in outlets {
+        scp_protocol::context::outlets::registry::validate_registration_content(outlet).map_err(
+            |e| {
+                ContextCreationError::CreationFailed(format!(
+                    "genesis outlet {:?} is not a registrable OutletRegistration: {e}",
+                    outlet.outlet_id,
+                ))
+            },
+        )?;
+        if !seen.insert(outlet.outlet_id.as_str()) {
+            return Err(ContextCreationError::CreationFailed(format!(
+                "genesis outlet id {:?} is declared more than once",
+                outlet.outlet_id,
+            )));
+        }
     }
     Ok(())
 }

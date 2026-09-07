@@ -824,15 +824,19 @@ fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
     // narrow). No structural constraint to enforce here.
 
     // §5.1/§5.12: outlets are declared at creation and the creator installs them
-    // into the live registry (GitHub #2020). Reject a genesis outlet set larger
-    // than the per-context registry cap, so the genesis-seeding path
-    // (`state::fresh_governance_state`) and the runtime governance-registration
-    // path (`governance_helpers::execute_register_outlet`) enforce the SAME
-    // `MAX_REGISTERED_OUTLETS` bound — no genesis bypass of the cap. A joiner
-    // receives its `params` from a peer rather than from this caller, so
-    // `Supervisor::spawn_actor_from_welcome`'s Precheck C calls the SAME
-    // validator on the creator-signed parameters (GitHub #2250).
-    crate::context::state::validate_genesis_outlet_count(&params.outlets)?;
+    // into the live registry (GitHub #2020). The creator therefore writes
+    // `params.outlets` straight into the live authorization registry, so every
+    // check `registry::register_outlet` applies to a governance-registered
+    // outlet must apply here too: the `MAX_REGISTERED_OUTLETS` cap, the §5.4.2
+    // Query cost floor, both JSON Schemas, the §6.2/§9.2.1 specificity floor,
+    // the operator DID, and `outlet_id` uniqueness.
+    // `state::validate_genesis_outlets` runs all of them, and
+    // `governance_helpers::execute_register_outlet` calls the same protocol
+    // validator, so neither install path admits a registration the other
+    // refuses. A joiner receives its `params` from a peer rather than from this
+    // caller, so `Supervisor::spawn_actor_from_welcome`'s Precheck C calls the
+    // SAME validator on the creator-signed parameters (GitHub #2250).
+    crate::context::state::validate_genesis_outlets(&params.outlets)?;
 
     // Validate memory scope is permitted for the context mode (§5.11).
     // Broadcast contexts only support MemoryScope::Full — Ephemeral and
@@ -1130,14 +1134,13 @@ pub async fn create_context(
     // modification is not possible — any change is visible to all context
     // members"). The corresponding live-registry seed happens in
     // `state::fresh_governance_state`, which seeds from `params.outlets` for THIS
-    // creator alone (`OutletRegistrySeed::GenesisDeclaration`); a Welcome-joiner
-    // builds its registry from these leaves once log replication lands (dormant
-    // today, exactly like the `ContextCreated` leaf) and never from
-    // `params.outlets`, because the frozen genesis declaration records no removal
-    // that governance made after genesis (GitHub #2250). `actor_did` is the
-    // creator (the genesis declarant), and every leaf carries the convergent
-    // creator-assigned `creation_timestamp_secs` (§7.3.1, §9.9.3). A failure
-    // rolls back the whole creation, exactly like the leaves above.
+    // creator alone (`OutletRegistrySeed::GenesisDeclaration`) — see
+    // `OutletRegistrySeed::AwaitingLeafReplication` for what a Welcome-joiner
+    // installs instead, and for the replication code that does not exist yet.
+    // `actor_did` is the creator (the genesis declarant), and every leaf carries
+    // the convergent creator-assigned `creation_timestamp_secs` (§7.3.1,
+    // §9.9.3). A failure rolls back the whole creation, exactly like the leaves
+    // above.
     //
     // NOTE (uniformity finding, GitHub #2020 requirement 3): neither this genesis
     // path NOR `execute_register_outlet` verifies an `OutletRegistration`'s
@@ -1146,33 +1149,54 @@ pub async fn create_context(
     // (both unverified); this genesis path introduces no bypass. Wiring signature
     // verification into BOTH paths is a separate, pre-existing gap.
     //
-    // The leaf is unparameterized (`EventPayload::default()`) — byte-for-byte the
-    // same append `execute_register_outlet` makes via `append_context_event`, so
-    // one leaf is emitted per genesis outlet without embedding the registration
-    // body (which is seeded into live state by `state::fresh_governance_state`).
-    for _outlet in &params.outlets {
-        if let Err(e) = event_log_provider
-            .append_event(
-                &id_bytes,
-                scp_event_log::EventType::OutletRegistered,
-                creator_did,
-                scp_event_log::EventPayload::default(),
-                creation_timestamp_secs,
-            )
-            .await
-        {
-            // #2148 F6: eagerly free the born-but-never-seeded crypto (signer
-            // freed, NOT zeroized — #82) before it drops on this rollback.
-            // `owned_crypto` is still live (returned to the caller on success at
-            // step 9), so it is the live owner here.
-            if let Some(mut owned) = owned_crypto {
-                owned.dispose_secrets();
-            }
-            receipt
-                .rollback(&id_bytes, transport, event_log_provider)
-                .await;
-            return Err(e);
+    // Each leaf carries the `OutletRegisteredEvent` for its own outlet, encoded
+    // by `scp_event_log::payload::encode_payload` — the same payload
+    // `execute_register_outlet` writes on the governance path. A leaf carrying
+    // `EventPayload::default()` would name no outlet, so a member reading the log
+    // could count registrations and never learn which outlets they registered
+    // (GitHub #2250).
+    let genesis_outlet_leaves: Result<(), ContextCreationError> = async {
+        for outlet in &params.outlets {
+            let event = scp_protocol::context::outlets::OutletRegisteredEvent {
+                outlet_id: outlet.outlet_id.clone(),
+                name: outlet.name.clone(),
+                description: outlet.description.clone(),
+                implementation_hash: outlet.implementation_hash,
+                operator_did: outlet.operator_did.clone(),
+                registrant_did: scp_did::DID(creator_did.to_owned()),
+                test_vector_count: outlet.test_vectors.len(),
+            };
+            let payload = scp_event_log::payload::encode_payload(&event).map_err(|e| {
+                ContextCreationError::CreationFailed(format!(
+                    "failed to encode the OutletRegistered payload for genesis outlet {:?}: {e}",
+                    outlet.outlet_id,
+                ))
+            })?;
+            event_log_provider
+                .append_event(
+                    &id_bytes,
+                    scp_event_log::EventType::OutletRegistered,
+                    creator_did,
+                    payload,
+                    creation_timestamp_secs,
+                )
+                .await?;
         }
+        Ok(())
+    }
+    .await;
+    if let Err(e) = genesis_outlet_leaves {
+        // #2148 F6: eagerly free the born-but-never-seeded crypto (signer
+        // freed, NOT zeroized — #82) before it drops on this rollback.
+        // `owned_crypto` is still live (returned to the caller on success at
+        // step 9), so it is the live owner here.
+        if let Some(mut owned) = owned_crypto {
+            owned.dispose_secrets();
+        }
+        receipt
+            .rollback(&id_bytes, transport, event_log_provider)
+            .await;
+        return Err(e);
     }
 
     // Step 9: Return the handle plus the owned crypto material (Encrypted
@@ -1453,8 +1477,13 @@ mod tests {
         );
     }
 
-    /// Builds a minimal valid [`OutletRegistration`] fixture for genesis-outlet
+    /// Builds a registrable [`OutletRegistration`] fixture for genesis-outlet
     /// tests (GitHub #2020).
+    ///
+    /// The schemas declare two properties each because
+    /// `state::validate_genesis_outlets` runs the §6.2/§9.2.1 specificity floor
+    /// (`MIN_SCHEMA_FIELDS == 2`) over every genesis declaration, so a fixture
+    /// with property-free schemas would be refused at creation.
     fn outlet_fixture(outlet_id: &str) -> scp_protocol::context::outlets::OutletRegistration {
         use scp_protocol::context::outlets::{OutletKind, OutletRegistration, OutletSchema};
         OutletRegistration {
@@ -1463,11 +1492,17 @@ mod tests {
             name: outlet_id.to_owned(),
             description: "genesis outlet fixture".to_owned(),
             schema: OutletSchema {
-                input_schema: serde_json::json!({"type": "object"}),
-                output_schema: serde_json::json!({"type": "object"}),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"lhs": {"type": "number"}, "rhs": {"type": "number"}}
+                }),
+                output_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"sum": {"type": "number"}, "carry": {"type": "boolean"}}
+                }),
                 aggregate_schema: None,
             },
-            implementation_hash: [0u8; 32],
+            implementation_hash: [7u8; 32],
             test_vectors: vec![],
             message_catalog: Vec::new(),
             operator_did: TEST_DID.into(),
@@ -1538,6 +1573,101 @@ mod tests {
                 "genesis outlet leaf carries the convergent creation timestamp"
             );
         }
+
+        // The leaves name WHICH outlets they registered. A leaf carrying
+        // `EventPayload::default()` passes every assertion above — two contexts
+        // with disjoint 2-outlet declarations would produce indistinguishable
+        // logs — so decode the payload and read the identities back out
+        // (GitHub #2250).
+        let mut registered: Vec<String> = outlet_leaves
+            .iter()
+            .map(|leaf| {
+                let event: scp_protocol::context::outlets::OutletRegisteredEvent =
+                    scp_event_log::payload::decode_payload(&leaf.payload)
+                        .expect("each OutletRegistered leaf carries a decodable payload");
+                assert_eq!(
+                    event.operator_did.0.as_str(),
+                    TEST_DID,
+                    "the leaf carries the declared operator DID"
+                );
+                assert_eq!(
+                    event.registrant_did.0.as_str(),
+                    TEST_DID,
+                    "the creator is the registrant of a genesis outlet"
+                );
+                assert_eq!(
+                    event.implementation_hash, [7u8; 32],
+                    "the leaf carries the declared implementation hash"
+                );
+                event.outlet_id
+            })
+            .collect();
+        registered.sort();
+        assert_eq!(
+            registered,
+            vec!["alpha".to_owned(), "beta".to_owned()],
+            "the leaves name the two declared outlets, so a reader learns which \
+             outlets the genesis declaration registered"
+        );
+    }
+
+    /// A genesis declaration carrying the FFI bridges' fabricated name-only
+    /// outlet — operator DID `did:key:placeholder`, two property-free schemas,
+    /// an all-zero implementation hash — is refused at creation, because the
+    /// creator installs `params.outlets` into the live authorization registry
+    /// and `registry::register_outlet` would refuse the same registration
+    /// (GitHub #2250).
+    #[test]
+    fn validate_params_rejects_a_genesis_outlet_registry_would_refuse() {
+        use scp_protocol::context::outlets::OutletSchema;
+
+        let mut degenerate = outlet_fixture("weather");
+        degenerate.schema = OutletSchema {
+            input_schema: serde_json::Value::Object(serde_json::Map::default()),
+            output_schema: serde_json::Value::Object(serde_json::Map::default()),
+            aggregate_schema: None,
+        };
+        let params = ContextParams {
+            outlets: vec![degenerate],
+            ..Default::default()
+        };
+        let err = validate_params(&params)
+            .expect_err("property-free schemas fail the §6.2/§9.2.1 specificity floor");
+        let message = err.to_string();
+        assert!(
+            message.contains("weather"),
+            "the refusal names the outlet it refused, got {message}"
+        );
+
+        // The operator DID is checked too, on a declaration whose schemas pass.
+        let mut bad_operator = outlet_fixture("weather");
+        bad_operator.operator_did = "not-a-did".into();
+        let params = ContextParams {
+            outlets: vec![bad_operator],
+            ..Default::default()
+        };
+        assert!(
+            validate_params(&params).is_err(),
+            "an operator DID that is not a DID must be refused at creation"
+        );
+    }
+
+    /// Two genesis outlets sharing one `outlet_id` are refused. `OutletRegistry`
+    /// is keyed by `outlet_id` and `GovernanceState::registered_outlets` is a
+    /// `Vec`, so a duplicate would install two entries under one id, and a later
+    /// removal would delete one and leave the other answering invocations the
+    /// context revoked (GitHub #2250).
+    #[test]
+    fn validate_params_rejects_duplicate_genesis_outlet_ids() {
+        let params = ContextParams {
+            outlets: vec![outlet_fixture("alpha"), outlet_fixture("alpha")],
+            ..Default::default()
+        };
+        let err = validate_params(&params).expect_err("a duplicate outlet id must be refused");
+        assert!(
+            err.to_string().contains("more than once"),
+            "the refusal names the duplication, got {err}"
+        );
     }
 
     /// The genesis path enforces the SAME `MAX_REGISTERED_OUTLETS` bound as the

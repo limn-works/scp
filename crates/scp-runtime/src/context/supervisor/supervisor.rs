@@ -13678,14 +13678,14 @@ impl Supervisor {
         scp_protocol::context::roles::CapabilityCeiling::new(params.ceiling.iter().cloned())
             .validate_entries()
             .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
-        // Genesis outlet-count bound (§5.9). `builder::validate_params` runs this
-        // on the creator's own parameters, and `create_context` is its only caller,
-        // so a joiner — whose `params` arrive from a peer — would otherwise accept
-        // an outlet declaration of any length and retain it in `handle` and in the
-        // persisted `context_params`. Call the SAME validator here, on the same
-        // `params`, so the bound holds on both sides of the invitation (GitHub
-        // #2250).
-        crate::context::state::validate_genesis_outlet_count(&params.outlets)
+        // Genesis outlet validation (§5.9, §5.4.2, §6.2). `builder::validate_params`
+        // runs this on the creator's own parameters, and `create_context` is its only
+        // caller, so a joiner — whose `params` arrive from a peer — would otherwise
+        // accept an outlet declaration of any length, carrying any schema and any
+        // operator DID, and retain it in `handle` and in the persisted
+        // `context_params`. Call the SAME validator here, on the same `params`, so
+        // the checks hold on both sides of the invitation (GitHub #2250).
+        crate::context::state::validate_genesis_outlets(&params.outlets)
             .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
 
         // Build the joiner's actor deps (crypto, transport, event log, KP store,
@@ -14197,9 +14197,13 @@ impl Supervisor {
                 Arc::clone(&deps.clock),
                 // A joiner arrives at an arbitrary later epoch, and `params` is the
                 // frozen genesis declaration, which records no outlet that
-                // governance removed after genesis. The joiner's registry therefore
-                // starts empty and converges from the authenticated
-                // `OutletRegistered`/`OutletRemoved` leaves (GitHub #2250).
+                // governance removed after genesis. The joiner's registry
+                // therefore starts empty and STAYS empty: the creator's
+                // `OutletRegistered`/`OutletRemoved` leaves carry the
+                // registrations and the removals, but no runtime path replays
+                // another member's log into `registered_outlets`, so outlet
+                // invocation on this joiner fails closed. See
+                // `OutletRegistrySeed::AwaitingLeafReplication` (GitHub #2250).
                 crate::context::state::OutletRegistrySeed::AwaitingLeafReplication,
             ),
             role_state,

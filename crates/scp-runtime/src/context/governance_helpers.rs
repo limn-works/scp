@@ -1807,17 +1807,75 @@ pub async fn execute_register_outlet(
             "registered outlet limit of {MAX_REGISTERED_OUTLETS} exceeded"
         )));
     }
+
+    // This helper pushes onto `registered_outlets` directly rather than calling
+    // `registry::register_outlet`, so it must run that function's registration
+    // checks itself or it installs into the live authorization registry a
+    // registration `register_outlet` would have refused: a Query outlet
+    // declaring a cost (§5.4.2), a malformed JSON Schema, a pair of schemas
+    // under the §6.2/§9.2.1 specificity floor, or an operator DID that is not a
+    // DID. `state::validate_genesis_outlets` calls the same protocol function on
+    // the genesis declaration, so the two install paths admit exactly the same
+    // registrations (GitHub #2250).
+    scp_protocol::context::outlets::registry::validate_registration_content(registration).map_err(
+        |e| {
+            ContextError::InvalidState(format!(
+                "outlet {:?} is not a registrable OutletRegistration: {e}",
+                registration.outlet_id,
+            ))
+        },
+    )?;
+
+    // `registered_outlets` is a `Vec`, so a duplicate id would install a second
+    // entry under an id the context already granted, and a later
+    // `execute_remove_outlet` would delete one of the two and leave the other
+    // answering invocations the context revoked. `registry::register_outlet`
+    // rejects a duplicate against its map; reject it against the vec here.
+    if cell
+        .governance
+        .registered_outlets
+        .iter()
+        .any(|existing| existing.outlet_id == registration.outlet_id)
+    {
+        return Err(ContextError::InvalidState(format!(
+            "outlet {:?} is already registered in this context",
+            registration.outlet_id,
+        )));
+    }
+
     cell.commit_class_c_best_effort(deps, context_id, |mut view| {
         view.governance_class_c_mut()
             .registered_outlets_mut()
             .push(registration.clone());
     })
     .await;
+
+    // The leaf names the outlet it registered. `EventPayload::default()` would
+    // name none, leaving a reader able to count registrations without learning
+    // which outlets they registered, and leaving the genesis path (which writes
+    // the same payload) and this path emitting indistinguishable leaves for
+    // different outlets (GitHub #2250).
+    let event = scp_protocol::context::outlets::OutletRegisteredEvent {
+        outlet_id: registration.outlet_id.clone(),
+        name: registration.name.clone(),
+        description: registration.description.clone(),
+        implementation_hash: registration.implementation_hash,
+        operator_did: registration.operator_did.clone(),
+        registrant_did: scp_did::DID(actor_did.to_owned()),
+        test_vector_count: registration.test_vectors.len(),
+    };
+    let payload = scp_event_log::payload::encode_payload(&event).map_err(|e| {
+        ContextError::EventLogFailed(format!(
+            "failed to encode the OutletRegistered payload for outlet {:?}: {e}",
+            registration.outlet_id,
+        ))
+    })?;
     deps.event_log
-        .append_context_event(
+        .append_context_event_with_payload(
             &context_id_bytes,
             scp_event_log::EventType::OutletRegistered,
             actor_did,
+            payload,
             timestamp_secs,
         )
         .await?;
@@ -1862,11 +1920,26 @@ pub async fn execute_remove_outlet(
         Ok(())
     })
     .await?;
+
+    // The leaf names the outlet whose invocation authority this removal
+    // withdrew. `EventPayload::default()` would name none, so a reader holding
+    // both the registration leaves and this removal leaf could not tell which
+    // registration the removal withdrew (GitHub #2250).
+    let event = scp_protocol::context::outlets::OutletRemovedEvent {
+        outlet_id: outlet_id.to_owned(),
+        remover_did: scp_did::DID(actor_did.to_owned()),
+    };
+    let payload = scp_event_log::payload::encode_payload(&event).map_err(|e| {
+        ContextError::EventLogFailed(format!(
+            "failed to encode the OutletRemoved payload for outlet {outlet_id:?}: {e}"
+        ))
+    })?;
     deps.event_log
-        .append_context_event(
+        .append_context_event_with_payload(
             &context_id_bytes,
             scp_event_log::EventType::OutletRemoved,
             actor_did,
+            payload,
             timestamp_secs,
         )
         .await?;

@@ -703,12 +703,23 @@ fn genesis_outlet(outlet_id: &str) -> scp_protocol::context::outlets::OutletRegi
         kind: OutletKind::Action,
         name: outlet_id.to_owned(),
         description: "genesis outlet fixture".to_owned(),
+        // Two properties per schema: Precheck C runs
+        // `state::validate_genesis_outlets`, which applies the §6.2/§9.2.1
+        // specificity floor (`MIN_SCHEMA_FIELDS == 2`) to every declaration a
+        // peer sends, so a property-free fixture would be refused before the
+        // count bound this file exercises.
         schema: OutletSchema {
-            input_schema: serde_json::json!({"type": "object"}),
-            output_schema: serde_json::json!({"type": "object"}),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"lhs": {"type": "number"}, "rhs": {"type": "number"}}
+            }),
+            output_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"sum": {"type": "number"}, "carry": {"type": "boolean"}}
+            }),
             aggregate_schema: None,
         },
-        implementation_hash: [0u8; 32],
+        implementation_hash: [7u8; 32],
         test_vectors: vec![],
         message_catalog: Vec::new(),
         operator_did: ALICE_DID.into(),
@@ -727,10 +738,11 @@ fn genesis_outlet(outlet_id: &str) -> scp_protocol::context::outlets::OutletRegi
 /// its registry from `params.outlets` would therefore re-install every outlet
 /// governance had already revoked, and registry membership authorizes — the
 /// cross-context saga rejects a `PrepareB` whose outlet id is absent from
-/// `registered_outlets`. The joiner instead starts empty and converges from the
-/// authenticated `OutletRegistered` / `OutletRemoved` leaves, which do carry
-/// removals, so an unreplicated registry read fails closed rather than granting
-/// revoked authority.
+/// `registered_outlets`. The joiner instead starts empty and stays empty: the
+/// creator's `OutletRegistered` / `OutletRemoved` leaves carry the grants and
+/// the withdrawals, but no runtime path replays another member's log into
+/// `registered_outlets`, so every registry read on this joiner fails closed
+/// rather than granting revoked authority.
 ///
 /// The registry is asserted on the joiner's persisted Class-S snapshot, which the
 /// spawn writes fail-closed BEFORE registering the actor, so it is a faithful read
@@ -759,9 +771,8 @@ async fn welcome_joiner_does_not_install_the_genesis_outlet_declaration() {
         .expect("the joiner persisted a Class-S snapshot before spawning");
     assert!(
         snapshot.registered_outlets.is_empty(),
-        "the joiner installs no outlet from the frozen genesis declaration; it \
-         converges from the authenticated leaves, which alone carry removals — \
-         found {:?}",
+        "the joiner installs no outlet from the frozen genesis declaration, \
+         which cannot express a removal governance already made — found {:?}",
         snapshot
             .registered_outlets
             .iter()
@@ -849,8 +860,19 @@ async fn over_cap_genesis_outlets_are_rejected_before_the_kp_consume() {
         .spawn_actor_from_welcome(bob.clone(), &bob_custody, &bob_handle, make_req(over_cap))
         .await
         .expect_err("an over-cap genesis outlet declaration must be refused on the joiner");
+    // `assert!(matches!(..))` + `let-else { return }` rather than a
+    // `match … => panic!()` catch-all, for the reason this file records at the
+    // `SenderKeyDistributionMessage` decode below: `check-handler-no-panic.sh`
+    // reads file contents, not the module graph, so it cannot see that
+    // `mod.rs` gates this file behind `#[cfg(test)]` and would read a `panic!`
+    // here as a production actor panic. The assert carries the diagnostic; the
+    // `else { return }` arm is the asserted-unreachable branch.
+    assert!(
+        matches!(err, crate::context::ContextError::CreationFailed(_)),
+        "expected CreationFailed for an over-cap outlet declaration, got {err:?}"
+    );
     let crate::context::ContextError::CreationFailed(message) = &err else {
-        panic!("expected CreationFailed for an over-cap outlet declaration, got {err:?}");
+        return;
     };
     assert!(
         message.contains("genesis outlet count"),
