@@ -2625,6 +2625,8 @@ def fenced_shell_blocks(text: str) -> list[str]:
     backticks followed by a language label, and closes on the next line opening
     with three backticks. A block whose label names no shell — `rust`, `yaml`,
     an empty label — returns nothing, because a reader does not run its contents.
+    The label is the first word after the backticks, so an attribute a renderer
+    accepts after it (```bash title="x") leaves the language readable.
     """
     blocks: list[str] = []
     language: str | None = None
@@ -2633,7 +2635,8 @@ def fenced_shell_blocks(text: str) -> list[str]:
         stripped = line.strip()
         if stripped.startswith("```"):
             if language is None:
-                language = stripped[3:].strip().lower()
+                label = stripped[3:].strip().lower().split()
+                language = label[0] if label else ""
             else:
                 if language in SHELL_FENCE_LANGUAGES:
                     blocks.append("\n".join(body))
@@ -2734,9 +2737,7 @@ def check_documented_rustdoc_detects_a_feature_drift(
     invented = "--nonexistent-rustdoc-flag"
     reported = {
         flag
-        for _, _, missing, _ in documented_rustdoc_gaps(
-            commands, required | {invented}
-        )
+        for _, _, missing, _ in documented_rustdoc_gaps(commands, required | {invented})
         for flag in missing
     }
     check(
@@ -2756,7 +2757,9 @@ def check_documented_rustdoc_detects_a_feature_drift(
     for feature in features:
         reported = {
             flag
-            for _, _, _, extra in documented_rustdoc_gaps(commands, required - {feature})
+            for _, _, _, extra in documented_rustdoc_gaps(
+                commands, required - {feature}
+            )
             for flag in extra
         }
         check(
