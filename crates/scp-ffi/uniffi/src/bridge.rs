@@ -19383,7 +19383,6 @@ mod tests {
         }
     }
 
-
     /// Every identity operation the callback-custody block below names must
     /// still COMPILE INTO a shipped (no-`testing`) library, and each must state
     /// its shipped outcome rather than vanish. Naming and calling each one here
@@ -19413,12 +19412,7 @@ mod tests {
         // `core_id`, so the real body declines with SCP-IDENT-1010.
         let challenge =
             scpid_challenge("https://relying.example".to_owned(), 60).expect("scpid_challenge");
-        match scp.scpid_sign(
-            Arc::clone(&identity),
-            "active".to_owned(),
-            challenge,
-            None,
-        ) {
+        match scp.scpid_sign(Arc::clone(&identity), "active".to_owned(), challenge, None) {
             Err(ScpError::Identity { code, .. }) => assert_eq!(
                 code,
                 codes::IDENT_1010,
