@@ -192,7 +192,7 @@ Simplified in-memory relay for testing. No WebSocket, no network I/O. Stores blo
 
 ### 16.4.1 StoredBlob
 
-Blobs are stored directly in the relay's internal `HashMap`. The in-memory relay does not implement the `BlobStorage` trait of §17.7 of the persistence and storage spec, because it manages its own storage inline.
+Blobs are stored directly in the relay's internal `HashMap`. The in-memory relay does not implement the `BlobStorage` trait, which §17.1 of the persistence and storage spec names in its relay storage stack, because the relay manages its own storage inline.
 
 ```rust
 /// scp-testing/src/relay/mod.rs
@@ -1256,8 +1256,9 @@ macro_rules! push_conformance {
 /// scp-testing/src/conformance/blob_store.rs
 
 /// Generates a test module verifying the `BlobStorage` trait contract
-/// (§17.7 of the persistence and storage spec, which specifies the trait and
-/// its full first-party adapter roster).
+/// (§17.11 of the persistence and storage spec, the extension points section,
+/// which states the 5 required methods, the 2 streaming methods that carry
+/// default implementations, and the 19 tests this macro generates).
 ///
 /// Usage:
 /// ```rust
@@ -1547,7 +1548,7 @@ Every simulation component maps to a specific protocol mechanism or threat:
 | `key_custody_conformance!()` | ADR-006 | KeyCustody contract |
 | `attestation_conformance!()` | ADR-006 | DeviceAttestation contract |
 | `push_conformance!()` | ADR-006 | Push contract |
-| `blob_store_conformance!()` | §17.7 | BlobStorage contract (5 methods, TTL, concurrent access) |
+| `blob_store_conformance!()` | §17.11 | BlobStorage contract (5 methods, TTL, concurrent access) |
 | `payment_adapter_conformance!()` | §19.2, §19.2.6 | PaymentAdapter contract (authorize/capture/void/verify/refund, error conditions) |
 | ProtocolRepository integration tests | §17.4, §17.13 | Protocol-layer persistence correctness |
 | MlsStorageBridge tests | §17.9 | OpenMLS state persistence through ProtocolRepository |
