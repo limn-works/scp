@@ -34,6 +34,18 @@ This is the RFC 8032 Section 7.1 Test Vector 1 keypair. Implementations that can
 
 This is the RFC 8032 Section 7.1 Test Vector 2 keypair.
 
+**Tertiary Ed25519 Seed (for three-key vectors):**
+```
+0xc5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7
+```
+
+**Tertiary Ed25519 Public Key (32 bytes):**
+```
+0xfc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025
+```
+
+This is the RFC 8032 Section 7.1 Test Vector 3 keypair. §25.9 Vector 20 and §25.25 Vector 38 both use this public key as an identity's `#agent` verification method, and §25.9 Vector 20 and §25.25 Vector 39 both use a secondary public key stated above as that identity's `#active` verification method.
+
 **X25519 Key Material (derived from Ed25519 keys for HPKE operations):**
 
 Implementations derive X25519 keys from Ed25519 keys per RFC 8032 and the birational map. The exact X25519 public keys depend on the implementation's Ed25519-to-X25519 conversion. Implementations SHOULD verify round-trip consistency: `x25519_from_ed25519(ed25519_keypair).public == expected_x25519_public`.
@@ -1109,3 +1121,109 @@ cargo test -p scp-testing --test conformance \
 ```
 
 The regenerator is `#[ignore]` by default so the default `cargo test` run does not write to disk. Fixture drift (live code changes that should but do not invalidate the JSON) is caught by `CONF-046`, which compares the on-disk file byte-for-byte to the generator's current output.
+
+## 25.25 Custody Violation and Counter-Attestation Signing Vectors (§9.5.2, §9.18.2)
+
+Domains: `"SCP-CUSTODY-VIOLATION-V1:"` and `"SCP-COUNTER-ATTESTATION-V1:"`.
+
+ADR-039, shared-DID human-agent identity model, makes a custody violation a permanent record that one verifier writes about a subject who never consented to it, and gives that subject a counter-attestation to publish beside it. Vector 38 and Vector 39 form one pair: Vector 38 is a violation record a verifier signs, and Vector 39 is a counter-attestation that record's subject signs against it. An implementer reproduces Vector 39's `violation_reference` only by reproducing Vector 38's canonical hash first, so this pair also pins §9.5.2's derivation rule, which binds one counter-claim to one violation record.
+
+Three §25.2 keys play three roles, and §25.9 Vector 20 already assigns two of them identically:
+
+| Key | §25.2 seed | Role in Vectors 38 and 39 |
+|-----|-----------|---------------------------|
+| Reference (primary) | `0x9d61b1…7f60` | Detecting verifier, who signs Vector 38's violation record |
+| Secondary | `0x4ccd08…a6fb` | Subject's `#active` verification method, which signs Vector 39's counter-attestation |
+| Tertiary | `0xc5aa8d…58f7` | Subject's `#agent` verification method, which produced whichever offending signature Vector 38 records as evidence |
+
+### Vector 38: Custody Violation Record Signature
+
+`signature_evidence` carries whichever offending signature a verification point observed. This vector fixes it as one Ed25519 signature, taken by that subject's `#agent` key (tertiary) over 19 ASCII bytes `did_document_update`, which any implementer reproduces from a tertiary seed alone.
+
+```
+Input:
+  signing key (verifier):  reference Ed25519 key (§25.2, seed 0x9d61b1…7f60)
+  subject_did:             "did:dht:z6MkCustodySubject"            (26 bytes)
+  timestamp:               1700000000
+  violation_tag:           0x00                                    (CategoryAViolation)
+  action:                  "did_document_update"                   (19 bytes)
+  signer_key_id:           "#agent"                                (6 bytes)
+  signature_evidence:      Ed25519_sign(tertiary key, b"did_document_update")   (64 bytes)
+                           c901da4cd2687a2115f83025f7a9e0db28269558848e88cf98c8714e8f50eaaf
+                           7c6f1c757d5a26b471a67b58d5f32d081e6de274031b0d128165c77fe8d9f60b
+  verifier_did:            "did:dht:z6MkCustodyVerifier"           (27 bytes)
+
+Canonical hash input (per §9.5.1 / §9.5.2 ScpCustodyViolationAttestation):
+  "SCP-CUSTODY-VIOLATION-V1:"                        (25 bytes, no length prefix)
+  || BE32(26) || "did:dht:z6MkCustodySubject"        (4 + 26 = 30 bytes — subject_did)
+  || BE64(1700000000)                                (8 bytes — timestamp)
+  || 0x00                                            (1 byte — violation_tag)
+  || BE32(19) || "did_document_update"               (4 + 19 = 23 bytes — action)
+  || BE32(6)  || "#agent"                            (4 + 6 = 10 bytes — signer_key_id)
+  || BE32(64) || signature_evidence                  (4 + 64 = 68 bytes)
+  || BE32(27) || "did:dht:z6MkCustodyVerifier"       (4 + 27 = 31 bytes — verifier_did)
+
+Total preimage: 25 + 30 + 8 + 1 + 23 + 10 + 68 + 31 = 196 bytes
+
+Preimage (hex, 196 bytes):
+  5343502d435553544f44592d56494f4c4154494f4e2d56313a
+  0000001a6469643a6468743a7a364d6b437573746f64795375626a656374
+  000000006553f100
+  00
+  000000136469645f646f63756d656e745f757064617465
+  00000006236167656e74
+  00000040
+  c901da4cd2687a2115f83025f7a9e0db28269558848e88cf98c8714e8f50eaaf
+  7c6f1c757d5a26b471a67b58d5f32d081e6de274031b0d128165c77fe8d9f60b
+  0000001b6469643a6468743a7a364d6b437573746f64795665726966696572
+
+Canonical hash SHA-256(preimage) (32 bytes):
+  f71802b4a211df2a354484e410e0a16ce4865b9fdbeed4e6a6eaaf930838725a
+
+Ed25519 verifier_signature over the 32-byte hash, reference key (64 bytes):
+  47feb109689697fe4a515e5e1b31e4ced02940e9a32d6ac2d4dbc5fec6294b59
+  7580dedfe98a0ffefb78123c3df81c6c6a1a8ebe0a22bcdc84f2910ce871560b
+```
+
+A verifier resolves `verifier_did` to reference public key `0xd75a98…511a` and checks `verifier_signature` against that canonical hash. Substituting `violation_tag = 0x01` while leaving all three payload fields unchanged moves that canonical hash, and §9.5.2 field 3 exists to guarantee exactly that.
+
+### Vector 39: Counter-Attestation Signature Against Vector 38
+
+`violation_reference` is Vector 38's canonical hash, per §9.5.2's derivation rule. It is encoded as 32 raw bytes with no length prefix, per §9.5.1's fixed-length field rule.
+
+```
+Input:
+  signing key (subject #active): secondary Ed25519 key (§25.2, seed 0x4ccd08…a6fb)
+  subject_did:                   "did:dht:z6MkCustodySubject"      (26 bytes)
+  violation_reference:           f71802b4a211df2a354484e410e0a16ce4865b9fdbeed4e6a6eaaf930838725a
+                                 (32 bytes — Vector 38 canonical hash)
+  explanation:                   "agent key compromised; rotated and republished"   (46 bytes)
+  timestamp:                     1700003600
+
+Canonical hash input (per §9.5.1 / §9.5.2 CounterAttestation):
+  "SCP-COUNTER-ATTESTATION-V1:"                      (27 bytes, no length prefix)
+  || BE32(26) || "did:dht:z6MkCustodySubject"        (4 + 26 = 30 bytes — subject_did)
+  || violation_reference                             (32 bytes, fixed-length, no length prefix)
+  || BE32(46) || "agent key compromised; rotated and republished"  (4 + 46 = 50 bytes)
+  || BE64(1700003600)                                (8 bytes — timestamp)
+
+Total preimage: 27 + 30 + 32 + 50 + 8 = 147 bytes
+
+Preimage (hex, 147 bytes):
+  5343502d434f554e5445522d4154544553544154494f4e2d56313a
+  0000001a6469643a6468743a7a364d6b437573746f64795375626a656374
+  f71802b4a211df2a354484e410e0a16ce4865b9fdbeed4e6a6eaaf930838725a
+  0000002e6167656e74206b657920636f6d70726f6d697365643b20726f746174656420616e642072657075626c6973686564
+  000000006553ff10
+
+Canonical hash SHA-256(preimage) (32 bytes):
+  7e12cde18598a11b6c270d756029e437d546c2231731f2b2add6ef41c1eb5af1
+
+Ed25519 signature over the 32-byte hash, secondary key (64 bytes):
+  c58f24edf7ffbea6cdf5a5bace97c4a49ca45a0f6338e0a75699b30c0d119176
+  2e07358be3084195f94365dc539b3047802b5ef27778a4807b13050474d31500
+```
+
+A verifier resolves `subject_did` to its `#active` verification method, secondary public key `0x3d4017…660c`, and checks `signature` against that canonical hash. Checking `signature` against tertiary public key `0xfc51cd…8025`, which is that same subject's `#agent`, fails, and that failure is how §9.5.2 enforces ADR-039 acceptance criterion 18 without a `signing_key_id` field inside a signed record.
+
+Ed25519 is deterministic (RFC 8032), so a conformant implementation reproduces both signatures byte-for-byte on every run. Both vectors are pinned from Rust in `crates/scp-protocol/src/trust/custody_violation.rs`, by tests named `vector_38_*` and `vector_39_*`.

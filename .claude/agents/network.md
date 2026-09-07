@@ -1,7 +1,6 @@
 ---
 name: network
 description: "Use this agent for API transport, authentication, sync, and offline handling. Spin up when integrating APIs, implementing auth flows, building sync functionality, or handling offline scenarios. For LLM intelligence (prompts, context, parsing), use the AI agent instead.\n\nExamples:\n- User: \"Connect to the API\"\n  Assistant: Uses network agent to implement endpoint and response handling.\n\n- User: \"Add user authentication\"\n  Assistant: Uses network agent to build auth flow with secure token storage.\n\n- User: \"Set up the streaming connection for AI\"\n  Assistant: Uses network agent to implement transport; AI agent handles prompt/response logic."
-model: opus
 color: red
 memory: project
 ---

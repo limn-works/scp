@@ -34,18 +34,43 @@ dependencies {
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
 }
 
-// Exclude RealFFITest from compilation when UniFFI bindings are not generated.
-// The test references `uniffi.scp.*` classes that only exist after running
-// `./scripts/generate-uniffi-kotlin.sh`. CI generates bindings before tests;
-// local dev can skip these tests safely.
+// Directory `generateUniffiBindings` writes the generated Kotlin bindings into.
+// `compileKotlin` depends on that task (see the bottom of this file), so every
+// compilation regenerates the bindings and no source-set exclusion is needed to
+// keep a `uniffi.scp.*` reference compiling. The exclusion that used to sit here
+// named `RealFFITest.kt`, a file the repository no longer contains, and it
+// gated on `listFiles()`, which lists only this directory's immediate children
+// while the generator writes `uniffi/scp/scp.kt` two levels down — so the
+// condition was already always false.
 val uniffiBindingsDir = file("src/main/kotlin/works/limn/scp/internal")
-val hasUniffiBindings = uniffiBindingsDir.exists() && uniffiBindingsDir.listFiles()?.any { it.extension == "kt" } == true
 
-if (!hasUniffiBindings) {
-    sourceSets.test {
-        kotlin.exclude("**/RealFFITest.kt")
-    }
-}
+// ---------------------------------------------------------------------------
+// Ordering against the generator
+// ---------------------------------------------------------------------------
+// `generateUniffiBindings` declares `uniffiBindingsDir` as its output, and that
+// directory sits inside `src/main/kotlin`, this project's own Kotlin source
+// root. Gradle fails any task that reads a directory another task declares as
+// output unless the two carry an ordering edge, so THE RULE IS: every task in
+// this project that reads a file under `src/main/kotlin` declares
+// `dependsOn("generateUniffiBindings")` or `mustRunAfter("generateUniffiBindings")`.
+// `checkUniffiBindingsOrdering` at the bottom of this file enforces the rule
+// against Gradle's task model, so a task added later is covered without anyone
+// editing a list of names.
+//
+// Which of the two edges a task takes follows from whether it consumes what the
+// generator writes:
+//   - `compileKotlin`, `sourcesJar` and `kotlinSourcesJar` compile and package
+//     the generated bindings, so they take `dependsOn` — those files must exist
+//     before the task runs, or the compiled classes and the published sources
+//     jar disagree about what the module contains.
+//   - detekt, ktlint and Dokka each drop the generated tree from their own
+//     inputs (see the `exclude`, `filter` and `suppressedFiles` calls below),
+//     so they take `mustRunAfter`: Gradle gets the ordering it asked for when
+//     both tasks are in one build, and nothing compiles Rust when they run
+//     alone. `dependsOn` would put a full `cargo build -p scp-ffi-uniffi` on
+//     the `kotlin-lint` job in `.github/workflows/ci.yml` and the
+//     `kotlin-docs` job in `.github/workflows/docs.yml`, neither of which
+//     installs a Rust toolchain or caches a cargo target directory.
 
 tasks.test {
     useJUnitPlatform()
@@ -89,7 +114,19 @@ detekt {
 //
 // detekt 1.23 deprecated the `build.excludes` YAML key, so the
 // exclusion lives on the Gradle task instead.
+//
+// detekt declares the whole main source tree as an input, so it falls under the
+// ordering rule stated above and takes the `mustRunAfter` edge: `./gradlew
+// detekt test` failed with an implicit-dependency validation error once the
+// generated bindings existed on disk.
+// `detektBaseline` reads the same tree under a different task type, so it takes
+// the same exclusion and the same edge; `withType<Detekt>` alone skips it.
 tasks.withType<io.gitlab.arturbosch.detekt.Detekt>().configureEach {
+    mustRunAfter("generateUniffiBindings")
+    exclude("**/internal/uniffi/**")
+}
+tasks.withType<io.gitlab.arturbosch.detekt.DetektCreateBaselineTask>().configureEach {
+    mustRunAfter("generateUniffiBindings")
     exclude("**/internal/uniffi/**")
 }
 
@@ -100,6 +137,49 @@ tasks.withType<io.gitlab.arturbosch.detekt.Detekt>().configureEach {
 ktlint {
     filter {
         exclude { element -> element.file.path.contains("/internal/uniffi/") }
+    }
+}
+
+// Every ktlint task reads the same main source tree detekt reads, so the
+// ordering rule stated above covers it too, and the `ktlint` filter above
+// drops the generated tree from every ktlint task — so `mustRunAfter`, for the
+// reason detekt uses it. Name-matching covers the check and format tasks the
+// plugin generates per source set (`runKtlintCheckOverMainSourceSet`,
+// `runKtlintFormatOverTestSourceSet`, and their siblings) without naming
+// each one.
+tasks.matching { it.name.startsWith("runKtlint") }.configureEach {
+    mustRunAfter("generateUniffiBindings")
+}
+
+// Dokka reads the main source tree to build the published Kotlin API reference,
+// so the ordering rule covers every Dokka task. `suppressedFiles` drops the
+// generated tree from the reference, because UniFFI emits public declarations
+// in package `uniffi.scp`: a `./gradlew build dokkaHtml` renders that package
+// into the reference, while `./gradlew dokkaHtml` alone leaves it out, and the
+// suppression makes both runs render the same API. The suppression is also what
+// leaves Dokka reading none of what the generator writes, which is what makes
+// `mustRunAfter` the right edge here.
+tasks.withType<org.jetbrains.dokka.gradle.AbstractDokkaTask>().configureEach {
+    mustRunAfter("generateUniffiBindings")
+}
+tasks.withType<org.jetbrains.dokka.gradle.AbstractDokkaLeafTask>().configureEach {
+    dokkaSourceSets.configureEach {
+        suppressedFiles.from(uniffiBindingsDir)
+    }
+}
+
+// `sourcesJar` packages `src/main/kotlin` into the published sources artifact,
+// generated bindings included, so it takes the `dependsOn` edge rather than an
+// ordering-only one: the sources jar that ships to Maven Central must carry the
+// sources for every class in the binary jar beside it, whatever else the build
+// happened to ask for. `java.withSourcesJar()` above registers the task, and
+// `.github/workflows/release.yml` reaches it through
+// `:scp-kt:publishMavenJavaPublicationToSonatypeStagingRepository`.
+// `kotlinSourcesJar`, which the Kotlin JVM plugin registers, packages the same
+// tree and takes the same edge for the same reason.
+listOf("sourcesJar", "kotlinSourcesJar").forEach { sourcesJarTask ->
+    tasks.named(sourcesJarTask) {
+        dependsOn("generateUniffiBindings")
     }
 }
 
@@ -149,6 +229,71 @@ tasks.register<Exec>("generateUniffiBindings") {
 // affinity check or API change. (Round-2 black-hat finding.)
 tasks.matching { it.name == "compileKotlin" }.configureEach {
     dependsOn("generateUniffiBindings")
+}
+
+// ---------------------------------------------------------------------------
+// Ordering gate
+// ---------------------------------------------------------------------------
+// Enforces the rule stated near the top of this file: every task in this
+// project that reads a file under `src/main/kotlin` reaches
+// `generateUniffiBindings` through `dependsOn`, or names it in `mustRunAfter`.
+// Gradle itself reports a violation only when both tasks land in one build and
+// the offending task actually executes, which is why `sourcesJar`,
+// `kotlinSourcesJar`, `detektBaseline` and the six Dokka tasks all shipped
+// without an edge — no CI job ran any of them beside the generator. This gate
+// reads the edges out of Gradle's task model instead, so it fails on a missing
+// edge whichever tasks the caller asked for, and a task added later is covered
+// without anyone editing a list of names.
+//
+// A task's inputs decide membership: any input file under `src/main/kotlin`
+// puts the task under the rule, because the generator's output directory sits
+// inside that root. The hand-written sources are always on disk, so the gate
+// reports the same set whether or not the generator has ever run.
+fun isOrderedAfter(consumer: Task, producer: Task): Boolean {
+    val visited = mutableSetOf<Task>()
+    val pending = ArrayDeque<Task>()
+    pending.addLast(consumer)
+    while (pending.isNotEmpty()) {
+        val current = pending.removeFirst()
+        if (!visited.add(current)) continue
+        if (current === producer) return true
+        if (current.mustRunAfter.getDependencies(current).contains(producer)) return true
+        pending.addAll(current.taskDependencies.getDependencies(current))
+    }
+    return false
+}
+
+tasks.register("checkUniffiBindingsOrdering") {
+    group = "verification"
+    description = "Assert every task reading src/main/kotlin is ordered after generateUniffiBindings"
+    notCompatibleWithConfigurationCache("Reads the ordering edges of every task in the project")
+    val kotlinSourceRoot = file("src/main/kotlin").toPath()
+    val projectTasks = tasks
+    val gateName = name
+    doLast {
+        val generator = projectTasks.getByName("generateUniffiBindings")
+        val unordered =
+            projectTasks
+                .filter { it.name != generator.name && it.name != gateName }
+                .filter { candidate ->
+                    candidate.inputs.files.files.any { it.toPath().startsWith(kotlinSourceRoot) }
+                }
+                .filterNot { isOrderedAfter(it, generator) }
+                .map { it.path }
+                .sorted()
+        require(unordered.isEmpty()) {
+            buildString {
+                appendLine("These tasks read src/main/kotlin without an ordering edge to generateUniffiBindings:")
+                unordered.forEach { appendLine("  $it") }
+                appendLine()
+                appendLine("Gradle fails such a task with an implicit-dependency validation error whenever")
+                appendLine("the generator shares its build. Add dependsOn(\"generateUniffiBindings\") when the")
+                appendLine("task consumes the generated bindings, or mustRunAfter(\"generateUniffiBindings\")")
+                appendLine("when the task drops them from its own inputs. The rule and the choice between")
+                appendLine("the two edges are stated at the top of scp-kt/build.gradle.kts.")
+            }
+        }
+    }
 }
 
 publishing {

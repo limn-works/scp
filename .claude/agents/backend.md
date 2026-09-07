@@ -1,7 +1,6 @@
 ---
 name: backend
 description: "Use this agent when designing or implementing backend systems, APIs, services, or server-side architecture. This includes creating new services from scratch, designing database schemas, implementing API endpoints, establishing service patterns, handling data flow architecture, or reviewing backend code for scalability and performance concerns. Particularly valuable for 0-1 builds where getting the foundation right matters.\n\nExamples:\n\n- User: \"I need to build a sync service\"\n  Assistant: Uses backend agent to design a solid, scalable sync service.\n\n- User: \"Add an endpoint that handles batch requests\"\n  Assistant: Uses backend agent to implement this properly.\n\n- User: \"How should I structure the data model for tracking progress?\"\n  Assistant: Uses backend agent to design this correctly from the start.\n\n- User: \"Can you review the repository implementation I just added?\"\n  Assistant: Uses backend agent to review for scalability patterns, error handling, and common backend pitfalls."
-model: opus
 color: purple
 memory: project
 ---

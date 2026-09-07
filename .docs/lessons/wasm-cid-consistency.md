@@ -1,6 +1,6 @@
 # WASM CID Consistency: Store and Check Must Hash the Same Input
 
-> **Resolved / ADR-055 (2026-06-29):** the WASM bridge was removed and `crates/scp-ffi/wasm/src/ucan.rs` no longer exists — the browser is a remote thin client, so there is no WASM-local CID reimplementation to drift. The specific defect below is historical. The general rule — store-CID and check-CID sites must hash the same canonical input — remains evergreen across the three remaining bridges (PyO3, NAPI, UniFFI) and the rest of the codebase.
+> **Resolved / ADR-055 (2026-06-29):** the WASM bridge was removed and `crates/scp-ffi/wasm/src/ucan.rs` no longer exists. ADR-057 later gave the browser an in-process client over `crates/scp-client-wasm`, which compiles the same `scp-protocol` code the native runtime compiles, so no browser-local CID reimplementation exists to drift. The specific defect below is historical. The general rule — store-CID and check-CID sites must hash the same canonical input — remains evergreen across the three remaining bridges (PyO3, NAPI, UniFFI) and the rest of the codebase.
 
 **Rule**: When a content-hash CID is stored in one function and checked in another, both sites must hash the same canonical input. This applies across the entire codebase but is especially fragile in the WASM bridge where scp-core's helper functions cannot be used.
 

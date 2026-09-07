@@ -1,20 +1,10 @@
-// ADR-049 §15: ContextCryptoProvider trait deleted; DemoCrypto
-// was a bespoke mock with `seal`/`open` overrides that bypassed encryption
-// for demo purposes. ADR-049 §15 introduces backend injection on
-// `NodeMlsFactory::with_backends`, which is the seam this file should
-// rewire to. The full rewire (every test scenario re-expressed via mock
-// `MlsBackend` / `HpkeBackend` impls and the real
-// `NodeMlsFactory::with_backends` constructor) is tracked alongside the
-// commit-12 deletion of `ContextManager`. Entire file is gated out until
-// the rewire lands.
-#![cfg(any())]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
     clippy::cast_possible_truncation,
-    // ADR-049 §15: lifecycle hoist inflates some test-path
-    // futures past clippy's 16 KB stack budget.
+    // The `application_layer_demo` full-stack futures (real MLS create → add →
+    // join → send → governance) exceed clippy's 16 KB stack budget.
     clippy::large_futures
 )]
 
@@ -140,7 +130,6 @@ impl KeyCustody for MlsGroupKeyCustody<'_> {
 // -------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "DemoCrypto mock impls the deleted ContextCryptoProvider trait; full file rewire to NodeMlsFactory::with_backends mock backends is tracked alongside the commit-12 deletion of ContextManager. File-level cfg(any()) gates compilation."]
 #[allow(clippy::too_many_lines)]
 async fn end_to_end_network_demo() {
     println!();
@@ -584,16 +573,31 @@ async fn end_to_end_network_demo() {
     }
     println!();
 
-    // Drain received messages.
-    let mut received_count = 0u32;
+    // Drain EXACTLY the 3 delivered messages (the relay drops #2, #4, #6). Each
+    // recv gets a generous timeout so scheduler jitter under CI parallelism can
+    // never truncate the count; a fixed 100ms inter-message gap could miscount a
+    // delayed in-memory delivery.
     let mut received_msgs = Vec::new();
-    while let Ok(Some(TransportEvent::Envelope(env))) =
-        tokio::time::timeout(std::time::Duration::from_millis(100), charlie_stream.next()).await
-    {
-        received_count += 1;
-        let content = String::from_utf8_lossy(&env.encrypted_blob);
-        received_msgs.push(content.to_string());
+    for _ in 0..3 {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), charlie_stream.next()).await {
+            Ok(Some(TransportEvent::Envelope(env))) => {
+                received_msgs.push(String::from_utf8_lossy(&env.encrypted_blob).to_string());
+            }
+            _ => panic!(
+                "suppressing relay must deliver 3 of 6 messages — only received {} before timeout",
+                received_msgs.len()
+            ),
+        }
     }
+    // No 4th message may arrive: the suppressed messages are dropped at send, so
+    // a short negative wait suffices to prove "exactly 3, no more".
+    let extra =
+        tokio::time::timeout(std::time::Duration::from_millis(500), charlie_stream.next()).await;
+    assert!(
+        matches!(extra, Err(_) | Ok(None)),
+        "suppressing relay must deliver exactly 3 of 6 messages — a 4th arrived"
+    );
+    let received_count = received_msgs.len() as u32;
 
     println!("  Results:");
     println!("    Sent:     {}", sent_ids.len());
@@ -641,8 +645,8 @@ async fn end_to_end_network_demo() {
     let msg1 = sub1_rx.recv().await.expect("sub1 should receive");
     let msg2 = sub2_rx.recv().await.expect("sub2 should receive");
 
-    println!("  Subscriber 1 received: {:02x?}", &msg1.data);
-    println!("  Subscriber 2 received: {:02x?}", &msg2.data);
+    println!("  Subscriber 1 received: {:02x?}", msg1.data);
+    println!("  Subscriber 2 received: {:02x?}", msg2.data);
     println!("  Data matches: {}", msg1.data == msg2.data);
     assert_ne!(
         msg1.data, msg2.data,
@@ -678,12 +682,24 @@ async fn end_to_end_network_demo() {
     println!("  Replaying relay: delivers each message 3x (1 + 2 replays)");
     println!("  Sent 1 message");
 
+    // Drain EXACTLY the 3 copies (1 original + 2 replays), each enqueued at
+    // store time. A generous per-item timeout absorbs CI scheduler jitter; a
+    // fixed 100ms gap could miscount a delayed in-memory delivery.
     let mut replay_received = 0u32;
-    while let Ok(Some(_)) =
-        tokio::time::timeout(std::time::Duration::from_millis(100), replay_rx.recv()).await
-    {
-        replay_received += 1;
+    for _ in 0..3 {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), replay_rx.recv()).await {
+            Ok(Some(_)) => replay_received += 1,
+            _ => panic!(
+                "replaying relay must deliver 3 copies — only received {replay_received} before timeout"
+            ),
+        }
     }
+    // No 4th copy may arrive.
+    let extra = tokio::time::timeout(std::time::Duration::from_millis(500), replay_rx.recv()).await;
+    assert!(
+        matches!(extra, Err(_) | Ok(None)),
+        "replaying relay must deliver exactly 3 copies — a 4th arrived"
+    );
     println!("  Received: {replay_received} copies");
     assert_eq!(
         replay_received, 3,
@@ -760,8 +776,10 @@ async fn end_to_end_network_demo() {
     println!("━━━ PHASE 10: Time Control & TTL Expiry ━━━━━━━━━━━━━━━━━━━━━");
     println!();
 
-    // Store a blob with 60s TTL in relay-alpha.
-    let ttl_relay = sim.relay("relay-alpha").unwrap().clone();
+    // Store a blob with 60s TTL in a FRESH relay so the expiry assertion is
+    // unambiguous — reusing `relay-alpha` would mix in the Phase-5 TTL=3600 blob
+    // and make "how many expired" depend on unrelated state.
+    let ttl_relay = Arc::new(Mutex::new(InMemoryRelay::new()));
     let ttl_transport = InMemoryTransport::with_clock(Arc::clone(&ttl_relay), {
         let c = Arc::clone(sim.clock());
         Arc::new(move || c.now_secs())
@@ -779,9 +797,13 @@ async fn end_to_end_network_demo() {
     let blobs_before = { ttl_relay.lock().unwrap().blob_count() };
     println!("  Stored blob with TTL=60s at t={}", sim.clock().now_secs());
     println!("  Blobs in relay: {blobs_before}");
+    assert_eq!(
+        blobs_before, 1,
+        "the fresh relay must hold exactly the one TTL=60 blob just stored"
+    );
     println!();
 
-    // Advance 30s — blob should still exist.
+    // Advance 30s (< TTL) — the blob must still exist and nothing expires.
     sim.advance_time(30);
     let expired_30 = {
         ttl_relay
@@ -792,10 +814,14 @@ async fn end_to_end_network_demo() {
     let blobs_at_30 = { ttl_relay.lock().unwrap().blob_count() };
     println!("  Advanced 30s → t={}", sim.clock().now_secs());
     println!("  Expired: {expired_30}, Remaining: {blobs_at_30}");
-    assert!(blobs_at_30 > 0, "blob should still exist at t+30s");
+    assert_eq!(
+        expired_30, 0,
+        "nothing may expire before the TTL=60 boundary"
+    );
+    assert_eq!(blobs_at_30, 1, "the blob must still exist at t+30s (< TTL)");
     println!();
 
-    // Advance another 61s — blob should be expired.
+    // Advance another 61s (t+91, > TTL=60) — the blob MUST now expire.
     sim.advance_time(61);
     let expired_91 = {
         ttl_relay
@@ -806,9 +832,14 @@ async fn end_to_end_network_demo() {
     let blobs_at_91 = { ttl_relay.lock().unwrap().blob_count() };
     println!("  Advanced 61s more → t={}", sim.clock().now_secs());
     println!("  Expired: {expired_91}, Remaining: {blobs_at_91}");
-    // Note: the first blob from Phase 5 had TTL=3600 and is also stored here.
-    // The TTL=60 blob should be expired. The TTL=3600 blob from phase 5 may or
-    // may not be expired depending on clock alignment.
+    assert_eq!(
+        expired_91, 1,
+        "the TTL=60 blob must be expired once the clock passes the boundary"
+    );
+    assert_eq!(
+        blobs_at_91, 0,
+        "the fresh relay must be empty after its only blob expired"
+    );
     println!();
 
     // =====================================================================
@@ -868,249 +899,42 @@ async fn end_to_end_network_demo() {
 }
 
 // =========================================================================
-// DEMO 2: Application Layer — ContextManager, Outlets, Governance
+// DEMO 2: Application Layer — Context, Membership, Messaging, Governance, Outlets
 // =========================================================================
-
-/// Mock crypto provider — returns payload as-is (no real encryption).
-/// The `ContextManager` pipeline, outlet system, governance engine, and role
-/// system are all 100% real. Only the MLS/sender-key operations are mocked.
-#[derive(Default)]
-struct DemoCrypto;
-
-impl scp_core::context::builder::ContextCryptoProvider for DemoCrypto {
-    fn validate_creator_identity(
-        &self,
-    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
-        Ok(())
-    }
-    fn create_mls_group(
-        &self,
-        _: &[u8; 32],
-    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
-        Ok(())
-    }
-    fn generate_sender_key(
-        &self,
-        _: &[u8; 32],
-    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
-        Ok(())
-    }
-    fn init_broadcast_key(
-        &self,
-        _: &[u8; 32],
-    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
-        Ok(())
-    }
-    fn destroy_mls_group(
-        &self,
-        _: &[u8; 32],
-    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
-        Ok(())
-    }
-    fn destroy_sender_key(
-        &self,
-        _: &[u8; 32],
-    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
-        Ok(())
-    }
-    fn validate_key_package(
-        &self,
-        _: &str,
-        _: Option<&[u8]>,
-    ) -> Result<(), scp_core::context::ContextError> {
-        Ok(())
-    }
-    fn add_member(
-        &self,
-        _: &[u8; 32],
-        _: &str,
-        _: Option<&[u8]>,
-    ) -> Result<scp_core::context::AddMemberOutput, scp_core::context::ContextError> {
-        Ok(scp_core::context::AddMemberOutput::default())
-    }
-    fn remove_member(
-        &self,
-        _: &[u8; 32],
-        _: &str,
-    ) -> Result<scp_core::context::RemoveMemberOutput, scp_core::context::ContextError> {
-        Ok(scp_core::context::RemoveMemberOutput::default())
-    }
-    fn distribute_sender_key(
-        &self,
-        _: &[u8; 32],
-        _: &str,
-    ) -> Result<(), scp_core::context::ContextError> {
-        Ok(())
-    }
-    fn remove_member_sender_key(
-        &self,
-        _: &[u8; 32],
-        _: &str,
-    ) -> Result<(), scp_core::context::ContextError> {
-        Ok(())
-    }
-
-    fn seal(
-        &self,
-        _context_id: &[u8; 32],
-        inner: &scp_core::envelope::inner::InnerEnvelope,
-        _routing_id: &[u8],
-        _blob_ttl: u32,
-    ) -> Result<Vec<u8>, scp_core::context::ContextError> {
-        // Mock: serialize inner envelope directly (no encryption).
-        rmp_serde::to_vec_named(inner)
-            .map_err(|e| scp_core::context::ContextError::CryptoFailed(format!("mock seal: {e}")))
-    }
-
-    fn open(
-        &self,
-        _context_id: &[u8; 32],
-        outer_bytes: &[u8],
-    ) -> Result<scp_core::context::builder::OpenResult, scp_core::context::ContextError> {
-        // Mock: deserialize directly as InnerEnvelope (no decryption).
-        let inner: scp_core::envelope::inner::InnerEnvelope = rmp_serde::from_slice(outer_bytes)
-            .map_err(|e| {
-                scp_core::context::ContextError::CryptoFailed(format!("mock open: {e}"))
-            })?;
-        let sender_did = inner.sender_did.clone();
-        Ok(scp_core::context::builder::OpenResult::Application(
-            Box::new(scp_core::context::builder::OpenedEnvelope {
-                inner,
-                sender_did,
-                // ADR-049 PR-4: mock open() has no live recv tracker; the
-                // follower mirror-forward drop is non-fatal.
-                receive_floor: scp_core::context::builder::ReceiveFloor {
-                    epoch: 0,
-                    sequence: 0,
-                },
-            }),
-        ))
-    }
-}
-
-/// Mock transport — captures sent messages.
-struct DemoTransport {
-    connected: std::sync::atomic::AtomicBool,
-    messages: std::sync::Mutex<Vec<Vec<u8>>>,
-}
-
-impl DemoTransport {
-    fn new() -> Self {
-        let t = Self {
-            connected: std::sync::atomic::AtomicBool::new(false),
-            messages: std::sync::Mutex::new(Vec::new()),
-        };
-        t.connected
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        t
-    }
-    #[allow(dead_code)]
-    fn sent_count(&self) -> usize {
-        self.messages.lock().unwrap().len()
-    }
-}
-
-impl scp_core::context::builder::ContextTransportProvider for DemoTransport {
-    fn is_connected(&self) -> bool {
-        self.connected.load(std::sync::atomic::Ordering::Relaxed)
-    }
-    fn publish_context(
-        &self,
-        _: &[u8; 32],
-        _: &scp_core::context::ContextParams,
-    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
-        Ok(())
-    }
-    fn delete_published(
-        &self,
-        _: &[u8; 32],
-    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
-        Ok(())
-    }
-    fn send_message(
-        &self,
-        _: &[u8; 32],
-        payload: &[u8],
-    ) -> Result<(), scp_core::context::ContextError> {
-        self.messages.lock().unwrap().push(payload.to_vec());
-        Ok(())
-    }
-}
-
-/// Mock event log — captures appended events.
-#[derive(Default)]
-struct DemoEventLog {
-    events: std::sync::Mutex<Vec<String>>,
-}
-
-// `unused_async`: `init_event_log` / `destroy_event_log` have no await because
-// they are no-op test doubles, but the ADR-049 Decision-7 async
-// `ContextEventLogProvider` trait requires the `async fn` signature.
-#[async_trait::async_trait]
-#[allow(clippy::unused_async)]
-impl scp_core::context::builder::ContextEventLogProvider for DemoEventLog {
-    async fn init_event_log(
-        &self,
-        _: &[u8; 32],
-    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
-        Ok(())
-    }
-    async fn append_event(
-        &self,
-        _: &[u8; 32],
-        event_type: scp_event_log::EventType,
-        _actor_did: &str,
-        _payload: scp_event_log::EventPayload,
-        _timestamp_secs: u64,
-    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
-        self.events.lock().unwrap().push(format!("{event_type:?}"));
-        Ok(())
-    }
-    async fn destroy_event_log(
-        &self,
-        _: &[u8; 32],
-    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
-        Ok(())
-    }
-}
-
-/// Deterministic key resolver for governance vote verification.
-fn demo_key_resolver() -> scp_core::context::governance::KeyResolver {
-    std::sync::Arc::new(
-        |did: &scp_did::DID, _kid: scp_did::SigningKeyId| -> Option<ed25519_dalek::VerifyingKey> {
-            use ed25519_dalek::SigningKey;
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            did.as_ref().hash(&mut hasher);
-            let h = hasher.finish();
-            let mut seed = [0u8; 32];
-            seed[..8].copy_from_slice(&h.to_le_bytes());
-            Some(SigningKey::from_bytes(&seed).verifying_key())
-        },
-    )
-}
-
-fn demo_signing_key(did: &scp_did::DID) -> ed25519_dalek::SigningKey {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    did.as_ref().hash(&mut hasher);
-    let h = hasher.finish();
-    let mut seed = [0u8; 32];
-    seed[..8].copy_from_slice(&h.to_le_bytes());
-    ed25519_dalek::SigningKey::from_bytes(&seed)
-}
+//
+// ADR-049 §15 deleted the old `ContextManager` + `ContextCryptoProvider` /
+// `ContextTransportProvider` / `ContextEventLogProvider` mock-provider
+// architecture and replaced it with the actor-per-context `Supervisor`. This
+// demo exercises the SAME application domains on the CURRENT architecture:
+//
+//   - context creation, multi-party membership, encrypted messaging, and
+//     governance run through the REAL `Supervisor` (real MLS crypto, real
+//     sender keys, real event log) via the `FullStackNetwork` harness — the
+//     exact substrate the enabled `fullstack.rs` tests drive;
+//   - outlet registration + invocation run through the free-function outlet API
+//     (`register_outlet` / `invoke_outlet_aggregating`) with a hand-built role
+//     state — the runtime-unit pattern used by `invoke.rs`'s own tests and by
+//     `outlet_stream_vectors_through_open_path.rs`.
 
 #[tokio::test]
-#[ignore = "DemoCrypto mock impls the deleted ContextCryptoProvider trait; full file rewire to NodeMlsFactory::with_backends mock backends is tracked alongside the commit-12 deletion of ContextManager. File-level cfg(any()) gates compilation."]
 #[allow(clippy::too_many_lines)]
 async fn application_layer_demo() {
-    use scp_core::context::manager::ContextManager;
-    use scp_core::context::membership::{ContextEvent, KeyPackage};
-    use scp_core::context::outlets::registry::{OutletRegistration, OutletRegistry, OutletSchema};
-    use scp_core::context::outlets::{invoke_outlet_aggregating, register_outlet};
-    use scp_core::context::roles::{CapabilityCeiling, ContextRoleState};
-    use scp_core::context::{Capability, ContextParams, ContextState, GovernanceAction};
+    use scp_core::context::governance::GovernanceAction;
+    use scp_core::context::outlets::OutletKind;
+    use scp_core::context::outlets::invoke::{OutletEconomyContext, invoke_outlet_aggregating};
+    use scp_core::context::outlets::registry::{
+        OutletRegistration, OutletRegistry, OutletSchema, register_outlet,
+    };
+    use scp_core::context::{
+        Capability, ContextHandle, ContextMode, ContextParams, ContextState, context_id_bytes,
+    };
     use scp_did::DID;
+    use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
+    use scp_testing::fullstack::FullStackNetwork;
+
+    const ALICE_DID: &str = "did:dht:z6MkAliceApp";
+    const BOB_DID: &str = "did:dht:z6MkBobApp";
+    const CHARLIE_DID: &str = "did:dht:z6MkCharlieApp";
 
     println!();
     println!("╔══════════════════════════════════════════════════════════════╗");
@@ -1119,59 +943,47 @@ async fn application_layer_demo() {
     println!();
 
     // =====================================================================
-    // PHASE 1: Context Creation
+    // PHASE 1: Context Creation (real Supervisor via FullStackNetwork)
     // =====================================================================
-    println!("━━━ PHASE 1: Context Creation via ContextManager ━━━━━━━━━━━━");
+    println!("━━━ PHASE 1: Context Creation via Supervisor ━━━━━━━━━━━━━━━━");
     println!();
 
-    let transport_for_manager: Box<dyn scp_core::context::builder::ContextTransportProvider> =
-        Box::new(DemoTransport::new());
+    let network = FullStackNetwork::new();
+    let alice = network.create_node(ALICE_DID);
+    let bob = network.create_node(BOB_DID);
+    let charlie = network.create_node(CHARLIE_DID);
 
-    // ADR-049 §15 — wrap with `attach_test_supervisor` so
-    // `ContextManager`'s messaging/governance/broadcast/economy
-    // forwarders can resolve their `Weak<Supervisor>` back-pointer.
-    let manager = scp_core::context::attach_test_supervisor(ContextManager::new(
-        Box::new(DemoCrypto),
-        transport_for_manager,
-        Box::new(DemoEventLog::default()),
-        demo_key_resolver(),
-    ));
-
-    let alice: DID = "did:dht:z6MkAliceApp".into();
-    let bob: DID = "did:dht:z6MkBobApp".into();
-    let charlie: DID = "did:dht:z6MkCharlieApp".into();
     let ctx_id = "ctx-app-demo";
+    let ctx_bytes = context_id_bytes(ctx_id);
 
+    // Encrypted context. The ceiling grants the admin the capabilities the demo
+    // exercises — membership, governance, and (for the outlet phase's mirrored
+    // ceiling) outlet register + call.
     let params = ContextParams {
+        mode: ContextMode::Encrypted,
         ceiling: vec![
-            Capability::new("messages:read").expect("known capability"),
-            Capability::new("messages:write").expect("known capability"),
-            Capability::new("outlet:register").expect("known capability"),
-            Capability::new("outlet:call:*").expect("known capability"),
-            Capability::new("role:assign").expect("known capability"),
-            Capability::new("member:remove").expect("known capability"),
-            Capability::new("governance:propose").expect("known capability"),
-            Capability::new("governance:vote").expect("known capability"),
-            Capability::new("context:close").expect("known capability"),
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::RoleAssign,
+            Capability::MemberInvite,
+            Capability::MemberRemove,
+            Capability::GovernancePropose,
+            Capability::GovernanceVote,
+            Capability::ContextClose,
+            Capability::OutletRegister,
+            Capability::OutletCallAll,
         ],
         ..ContextParams::default()
     };
 
     println!("  Creating context '{ctx_id}'...");
-    println!("  Creator:    {alice}");
+    println!("  Creator:    {ALICE_DID}");
     println!("  Mode:       {:?}", params.mode);
     println!("  Ceiling:    {} capabilities", params.ceiling.len());
-    for cap in &params.ceiling {
-        println!("    - {}", cap.name());
-    }
     println!();
 
-    let handle = manager
-        .create_context(ctx_id.to_owned(), params, alice.clone(), None)
-        .await
-        .unwrap();
+    let handle = alice.create_context(ctx_id, params).await.unwrap();
     let state = handle.state();
-
     println!("  Context created!");
     println!("    state:    {state:?}");
     println!("    context:  {}", handle.context_id());
@@ -1179,181 +991,215 @@ async fn application_layer_demo() {
     println!();
 
     // =====================================================================
-    // PHASE 2: Membership — Join & Verify
+    // PHASE 2: Membership — Add, Join & Verify (real MLS group)
     // =====================================================================
-    println!("━━━ PHASE 2: Membership — Join & Verify ━━━━━━━━━━━━━━━━━━━━━");
+    println!("━━━ PHASE 2: Membership — Add, Join & Verify ━━━━━━━━━━━━━━━━");
     println!();
 
-    let bob_kp = KeyPackage {
-        owner_did: bob.clone(),
-        mls_key_package_bytes: None,
-    };
-    manager
-        .join_context(&handle, bob_kp, None, None)
-        .await
-        .unwrap();
-    println!("  Bob joined context");
+    alice.add_member(&handle, BOB_DID).await.unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).await.unwrap();
+    println!("  Bob added + joined the context (real MLS Welcome)");
 
-    let charlie_kp = KeyPackage {
-        owner_did: charlie.clone(),
-        mls_key_package_bytes: None,
-    };
-    manager
-        .join_context(&handle, charlie_kp, None, None)
-        .await
-        .unwrap();
-    println!("  Charlie joined context");
+    alice.add_member(&handle, CHARLIE_DID).await.unwrap();
+    charlie.join_from_welcome(ctx_id, &ctx_bytes).await.unwrap();
+    println!("  Charlie added + joined the context (real MLS Welcome)");
 
-    let count = manager.member_count(ctx_id).await.unwrap();
-    let alice_is_member = manager.is_member(ctx_id, &alice).await;
-    let bob_is_member = manager.is_member(ctx_id, &bob).await;
-    let charlie_is_member = manager.is_member(ctx_id, &charlie).await;
+    let count = alice.manager.member_count(ctx_id).await;
+    let alice_is_member = alice.manager.is_member(ctx_id, ALICE_DID).await;
+    let bob_is_member = alice.manager.is_member(ctx_id, BOB_DID).await;
+    let charlie_is_member = alice.manager.is_member(ctx_id, CHARLIE_DID).await;
 
-    println!("  Member count: {count}");
+    println!("  Member count: {count:?}");
     println!("    Alice:   {alice_is_member}");
     println!("    Bob:     {bob_is_member}");
     println!("    Charlie: {charlie_is_member}");
-    assert_eq!(count, 3);
+    assert_eq!(count, Some(3));
     assert!(alice_is_member && bob_is_member && charlie_is_member);
     println!();
 
     // =====================================================================
-    // PHASE 3: Messaging
+    // PHASE 3: Messaging (real encryption; §9.10.4 per-member fan-out)
     // =====================================================================
-    println!("━━━ PHASE 3: Messaging via ContextManager ━━━━━━━━━━━━━━━━━━━");
+    println!("━━━ PHASE 3: Messaging via Supervisor ━━━━━━━━━━━━━━━━━━━━━━━");
     println!();
 
-    let msg1 = b"Hello everyone, Alice here!";
-    let msg2 = b"Bob here. Received your message.";
-    let msg3 = b"Charlie joining the conversation.";
-
-    let alice_sk = demo_signing_key(&alice);
-    manager
-        .send_message(
-            &handle,
-            &alice,
-            msg1,
-            scp_core::context::supervisor::MessageSigner::Active(&alice_sk),
-            None,
-            None,
-        )
+    // §9.10.4: an encrypted multi-member send fans the same MLS ciphertext out to
+    // each peer's per-member pseudonym routing ID — never the shared
+    // context_routing_id. Seed each peer's pseudonym or the send fails closed with
+    // PseudonymRegistryEmpty (mirrors `fullstack_three_party_group`).
+    let bob_pseudonym = [0x42u8; 32];
+    let charlie_pseudonym = [0x43u8; 32];
+    alice
+        .manager
+        .seed_peer_pseudonym(ctx_id, DID::from(BOB_DID), bob_pseudonym)
         .await
         .unwrap();
-    println!("  Alice sent:   \"{}\"", String::from_utf8_lossy(msg1));
-
-    let bob_sk = demo_signing_key(&bob);
-    manager
-        .send_message(
-            &handle,
-            &bob,
-            msg2,
-            scp_core::context::supervisor::MessageSigner::Active(&bob_sk),
-            None,
-            None,
-        )
+    alice
+        .manager
+        .seed_peer_pseudonym(ctx_id, DID::from(CHARLIE_DID), charlie_pseudonym)
         .await
         .unwrap();
-    println!("  Bob sent:     \"{}\"", String::from_utf8_lossy(msg2));
 
-    let charlie_sk = demo_signing_key(&charlie);
-    manager
-        .send_message(
-            &handle,
-            &charlie,
-            msg3,
-            scp_core::context::supervisor::MessageSigner::Active(&charlie_sk),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-    println!("  Charlie sent: \"{}\"", String::from_utf8_lossy(msg3));
-    println!();
+    let plaintext = b"Hello everyone, Alice here!";
+    alice.send_message(&handle, plaintext).await.unwrap();
+    println!("  Alice sent:   \"{}\"", String::from_utf8_lossy(plaintext));
 
-    // Drain events to see what happened.
-    let events = manager.drain_events(ctx_id).await;
-    let msg_events: Vec<_> = events
+    let sent = alice.take_sent_ciphertexts();
+    assert_eq!(sent.len(), 2, "fan-out must address both peer pseudonyms");
+    let bob_ciphertext = sent
         .iter()
-        .filter_map(|e| match e {
-            ContextEvent::MessageSent {
-                sender_did,
-                payload,
-                ..
-            } => Some((sender_did.clone(), payload.clone())),
-            _ => None,
-        })
-        .collect();
+        .find(|(rid, _)| rid == &bob_pseudonym)
+        .map(|(_, ct)| ct.clone())
+        .expect("a send addressed to Bob's pseudonym must exist");
+    let charlie_ciphertext = sent
+        .iter()
+        .find(|(rid, _)| rid == &charlie_pseudonym)
+        .map(|(_, ct)| ct.clone())
+        .expect("a send addressed to Charlie's pseudonym must exist");
 
+    let bob_decrypted = bob
+        .decrypt_message(ctx_id, &ctx_bytes, &bob_ciphertext, ALICE_DID)
+        .await
+        .unwrap();
+    assert_eq!(bob_decrypted.as_slice(), plaintext.as_slice());
     println!(
-        "  Events drained: {} total, {} messages",
-        events.len(),
-        msg_events.len()
+        "  Bob decrypted:     \"{}\"",
+        String::from_utf8_lossy(&bob_decrypted)
     );
-    for (sender_did, payload) in &msg_events {
-        println!(
-            "    [{sender_did}] \"{}\"",
-            String::from_utf8_lossy(payload)
-        );
-    }
-    assert_eq!(msg_events.len(), 3);
+
+    let charlie_decrypted = charlie
+        .decrypt_message(ctx_id, &ctx_bytes, &charlie_ciphertext, ALICE_DID)
+        .await
+        .unwrap();
+    assert_eq!(charlie_decrypted.as_slice(), plaintext.as_slice());
+    println!(
+        "  Charlie decrypted: \"{}\"",
+        String::from_utf8_lossy(&charlie_decrypted)
+    );
+
+    // Events prove membership + messaging were logged on Alice's side.
+    let events = alice.drain_events(ctx_id).await;
+    let joined = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                scp_core::context::membership::ContextEvent::MemberJoined { .. }
+            )
+        })
+        .count();
+    let messages = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                scp_core::context::membership::ContextEvent::MessageSent { .. }
+            )
+        })
+        .count();
+    println!("  Events: {joined} MemberJoined, {messages} MessageSent");
+    assert_eq!(joined, 2, "Bob and Charlie each logged a MemberJoined");
+    assert_eq!(messages, 1, "one application message was logged");
     println!();
 
     // =====================================================================
-    // PHASE 4: Outlet Registration
+    // PHASE 4: Governance — Propose & Auto-Execute (SingleAdmin engine)
     // =====================================================================
-    println!("━━━ PHASE 4: Outlet Registration ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("━━━ PHASE 4: Governance — Propose & Execute ━━━━━━━━━━━━━━━━━");
+    println!();
+    println!("  Governance model: SingleAdmin (Alice is admin)");
+    println!("  Proposing: RemoveMember(Charlie)");
     println!();
 
-    // Build the role state directly — ContextManager tracks this internally,
-    // but for the free-function outlet API we need to construct it.
-    let ceiling = CapabilityCeiling::new(vec![
-        Capability::new("messages:read").expect("known capability"),
-        Capability::new("messages:write").expect("known capability"),
-        Capability::new("outlet:register").expect("known capability"),
-        Capability::new("outlet:call:*").expect("known capability"),
-        Capability::new("role:assign").expect("known capability"),
-        Capability::new("member:remove").expect("known capability"),
-        Capability::new("governance:propose").expect("known capability"),
-        Capability::new("governance:vote").expect("known capability"),
-        Capability::new("context:close").expect("known capability"),
-    ]);
+    let proposal = alice
+        .propose_governance(
+            ctx_id,
+            GovernanceAction::RemoveMember {
+                did: DID::from(CHARLIE_DID),
+                reason: Some("demo: testing governance removal".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    // Removing Charlie broadcasts an epoch-advance MLS Commit to the remaining
+    // members; drain it so it does not pollute later assertions.
+    let _ = alice.take_sent_ciphertexts();
+
+    println!("  Proposal created & auto-executed (SingleAdmin):");
+    println!("    proposer: {}", proposal.proposer_did);
+    println!("    status:   {:?}", proposal.status);
+
+    let new_count = alice.manager.member_count(ctx_id).await;
+    let charlie_still_member = alice.manager.is_member(ctx_id, CHARLIE_DID).await;
+    println!("    member count: {new_count:?} (was Some(3))");
+    println!("    Charlie is member: {charlie_still_member}");
+    assert_eq!(new_count, Some(2));
+    assert!(!charlie_still_member);
+    println!();
+
+    // =====================================================================
+    // PHASE 5: Context Close (governance action)
+    // =====================================================================
+    println!("━━━ PHASE 5: Context Close ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!();
+
+    let close_proposal = alice
+        .propose_governance(ctx_id, GovernanceAction::CloseContext { reason: None })
+        .await
+        .unwrap();
+    println!("  Proposed & auto-executed: CloseContext");
+    println!("    status: {:?}", close_proposal.status);
+
+    let final_state = handle.state();
+    println!("  Context state: {final_state:?}");
+    assert!(
+        matches!(final_state, ContextState::Closing | ContextState::Closed),
+        "context should be closing or closed after CloseContext"
+    );
+    println!();
+
+    // =====================================================================
+    // PHASE 6: Outlet Registration & Invocation (free-function API)
+    // =====================================================================
+    println!("━━━ PHASE 6: Outlet Registration & Invocation ━━━━━━━━━━━━━━━");
+    println!();
+
+    // Build a role state directly (the runtime-unit pattern, mirroring
+    // `invoke.rs`'s own tests and `outlet_stream_vectors_through_open_path.rs`).
+    // The creator inherits the ceiling; bob/charlie are added as invokers with
+    // OutletCallAll so the §9.8.5 membership + capability gates clear.
+    let outlet_ctx = "ctx-outlet-demo";
     let mut role_state = ContextRoleState::new(
-        ctx_id,
-        alice.as_ref(),
-        ceiling,
+        outlet_ctx.to_owned(),
+        ALICE_DID,
+        default_ceiling(),
         vec![],
-        &scp_clock::SystemClock,
+        &scp_clock::TestClock::new(1_700_000_000),
     )
     .unwrap();
-
-    // Add Bob and Charlie as members with "member" role (OutletInvokeAll capability).
+    role_state.members.insert(ALICE_DID.to_owned());
     {
-        use scp_core::context::roles::assign_role;
-        role_state.members.insert(bob.as_ref().to_owned());
-        role_state.members.insert(charlie.as_ref().to_owned());
-        assign_role(
-            &mut role_state,
-            bob.as_ref(),
-            "member",
-            alice.as_ref(),
-            &scp_clock::SystemClock,
-        )
-        .unwrap();
-        assign_role(
-            &mut role_state,
-            charlie.as_ref(),
-            "member",
-            alice.as_ref(),
-            &scp_clock::SystemClock,
-        )
-        .unwrap();
+        let caps = role_state
+            .member_capabilities
+            .entry(ALICE_DID.to_owned())
+            .or_default();
+        caps.insert(Capability::OutletRegister);
+        caps.insert(Capability::OutletCallAll);
+    }
+    for invoker in [BOB_DID, CHARLIE_DID] {
+        role_state.members.insert(invoker.to_owned());
+        role_state
+            .member_capabilities
+            .entry(invoker.to_owned())
+            .or_default()
+            .insert(Capability::OutletCallAll);
     }
 
-    let mut outlet_registry = OutletRegistry::new();
+    let mut registry = OutletRegistry::new();
 
     let search_outlet = OutletRegistration {
         outlet_id: "search-web".to_owned(),
-        kind: scp_core::context::outlets::OutletKind::default(),
+        kind: OutletKind::default(),
         name: "Web Search".to_owned(),
         description: "Search the web for information".to_owned(),
         schema: OutletSchema {
@@ -1368,10 +1214,7 @@ async fn application_layer_demo() {
             output_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "results": {
-                        "type": "array",
-                        "items": { "type": "object" }
-                    },
+                    "results": { "type": "array", "items": { "type": "object" } },
                     "total": { "type": "integer" }
                 }
             }),
@@ -1379,40 +1222,20 @@ async fn application_layer_demo() {
         },
         implementation_hash: [0xAB; 32],
         test_vectors: vec![],
-        operator_did: alice.clone(),
+        operator_did: DID::from(ALICE_DID),
         cost: None,
         message_catalog: Vec::new(),
         registered_at: 1_700_000_000,
         signature: vec![],
     };
+    let (search_id, _reg_event) =
+        register_outlet(&mut registry, &role_state, search_outlet, ALICE_DID).unwrap();
+    println!("  Registered outlet: 'Web Search' (id={search_id})");
+    assert_eq!(registry.len(), 1);
 
-    println!("  Registering outlet: '{}'", search_outlet.name);
-    println!("    outlet_id:     {}", search_outlet.outlet_id);
-    println!("    operator:    {}", search_outlet.operator_did);
-    println!("    input:       query (string), max_results (integer)");
-    println!("    output:      results (array), total (integer)");
-
-    let (outlet_id, reg_event) = register_outlet(
-        &mut outlet_registry,
-        &role_state,
-        search_outlet,
-        alice.as_ref(),
-    )
-    .unwrap();
-
-    println!("  Registered! outlet_id = {outlet_id}");
-    println!(
-        "    event: outlet_id={}, registrant={}",
-        reg_event.outlet_id, reg_event.registrant_did
-    );
-    assert_eq!(outlet_registry.len(), 1);
-    println!("    registry size: {}", outlet_registry.len());
-    println!();
-
-    // Register a second outlet.
     let calc_outlet = OutletRegistration {
         outlet_id: "calculator".to_owned(),
-        kind: scp_core::context::outlets::OutletKind::default(),
+        kind: OutletKind::default(),
         name: "Calculator".to_owned(),
         description: "Perform arithmetic operations".to_owned(),
         schema: OutletSchema {
@@ -1435,53 +1258,40 @@ async fn application_layer_demo() {
         },
         implementation_hash: [0xCD; 32],
         test_vectors: vec![],
-        operator_did: alice.clone(),
+        operator_did: DID::from(ALICE_DID),
         cost: None,
         message_catalog: Vec::new(),
         registered_at: 1_700_000_001,
         signature: vec![],
     };
-
-    let (calc_id, _) = register_outlet(
-        &mut outlet_registry,
-        &role_state,
-        calc_outlet,
-        alice.as_ref(),
-    )
-    .unwrap();
+    let (calc_id, _) = register_outlet(&mut registry, &role_state, calc_outlet, ALICE_DID).unwrap();
     println!("  Registered outlet: 'Calculator' (id={calc_id})");
-    println!("    registry size: {}", outlet_registry.len());
-    assert_eq!(outlet_registry.len(), 2);
+    assert_eq!(registry.len(), 2);
     println!();
 
-    // =====================================================================
-    // PHASE 5: Outlet Invocation
-    // =====================================================================
-    println!("━━━ PHASE 5: Outlet Invocation ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!();
+    // A live handle for invocation (does NOT go through the actor — mirrors the
+    // runtime-unit invoke tests).
+    let outlet_handle = ContextHandle::new(outlet_ctx.to_owned(), ContextParams::default());
+    outlet_handle.transition_to(&ContextState::Active).unwrap();
 
+    // Invoke 'search-web' as Bob.
     let search_input = serde_json::json!({
         "query": "SCP protocol specification",
         "max_results": 5
     });
-
-    println!("  Invoking 'search-web' as Bob:");
-    println!("    input: {search_input}");
-
-    // The executor is a real async function that simulates the outlet.
+    println!("  Invoking 'search-web' as Bob: {search_input}");
     let (output, invoke_event, _consequences, _receipt) = invoke_outlet_aggregating(
-        &handle,
-        &outlet_registry,
+        &outlet_handle,
+        &registry,
         &role_state,
         &"search-web".to_owned(),
         search_input,
-        &bob,
+        &DID::from(BOB_DID),
         Some(5000),
-        |input| async move {
-            // Simulate a web search — this is the outlet's actual executor.
+        |input: serde_json::Value| async move {
             let query = input["query"].as_str().unwrap_or("unknown");
             let max = input["max_results"].as_u64().unwrap_or(10);
-            Ok(serde_json::json!({
+            Ok::<_, String>(serde_json::json!({
                 "results": [
                     {"title": format!("Result 1 for '{query}'"), "url": "https://example.com/1"},
                     {"title": format!("Result 2 for '{query}'"), "url": "https://example.com/2"},
@@ -1489,38 +1299,34 @@ async fn application_layer_demo() {
                 "total": std::cmp::min(max, 2)
             }))
         },
-        None::<&mut scp_core::context::outlets::invoke::OutletEconomyContext<'_>>,
+        None::<&mut OutletEconomyContext<'_>>,
         None,
     )
     .await
     .unwrap();
-
     println!("    output: {output}");
     println!(
-        "    event:  outlet={}, invoker={}, duration_ms={}",
-        invoke_event.outlet_id, invoke_event.invoker_did, invoke_event.execution_time_ms
+        "    event:  outlet={}, invoker={}",
+        invoke_event.outlet_id, invoke_event.invoker_did
     );
     assert_eq!(output["total"], 2);
-    println!();
+    assert_eq!(invoke_event.invoker_did, BOB_DID);
 
-    // Calculator invocation.
+    // Invoke 'calculator' as Charlie.
     let calc_input = serde_json::json!({
         "operation": "multiply",
         "operands": [6, 7]
     });
-
-    println!("  Invoking 'calculator' as Charlie:");
-    println!("    input: {calc_input}");
-
+    println!("  Invoking 'calculator' as Charlie: {calc_input}");
     let (calc_output, _, _consequences, _receipt) = invoke_outlet_aggregating(
-        &handle,
-        &outlet_registry,
+        &outlet_handle,
+        &registry,
         &role_state,
         &"calculator".to_owned(),
         calc_input,
-        &charlie,
+        &DID::from(CHARLIE_DID),
         None,
-        |input| async move {
+        |input: serde_json::Value| async move {
             let op = input["operation"].as_str().unwrap_or("add");
             let operands: Vec<f64> = input["operands"]
                 .as_array()
@@ -1533,94 +1339,16 @@ async fn application_layer_demo() {
                 "add" => operands.iter().sum::<f64>(),
                 _ => 0.0,
             };
-            Ok(serde_json::json!({
-                "result": result,
-                "operation": op
-            }))
+            Ok::<_, String>(serde_json::json!({ "result": result, "operation": op }))
         },
-        None::<&mut scp_core::context::outlets::invoke::OutletEconomyContext<'_>>,
+        None::<&mut OutletEconomyContext<'_>>,
         None,
     )
     .await
     .unwrap();
-
     println!("    output: {calc_output}");
     assert_eq!(calc_output["result"], 42.0);
     println!("    6 × 7 = {}", calc_output["result"]);
-    println!();
-
-    // =====================================================================
-    // PHASE 6: Governance — Propose & Execute
-    // =====================================================================
-    println!("━━━ PHASE 6: Governance — Propose & Execute ━━━━━━━━━━━━━━━━━");
-    println!();
-
-    // Use SingleAdmin engine — Alice (creator) is admin.
-    let alice_signing_key = demo_signing_key(&alice);
-
-    println!("  Governance model: SingleAdmin (Alice is admin)");
-    println!("  Proposing: RemoveMember(Charlie)");
-    println!();
-
-    // Propose via ContextManager.
-    let (proposal, gov_events, _) = manager
-        .propose_governance_action(
-            ctx_id,
-            &alice,
-            GovernanceAction::RemoveMember {
-                did: charlie.clone(),
-                reason: Some("demo: testing governance removal".to_owned()),
-            },
-            &alice_signing_key,
-        )
-        .await
-        .unwrap();
-
-    println!("  Proposal created & auto-executed (SingleAdmin):");
-    println!(
-        "    id:       {}...",
-        hex::encode(&proposal.proposal_id[..8])
-    );
-    println!("    proposer: {}", proposal.proposer_did);
-    println!("    status:   {:?}", proposal.status);
-    println!("    events:   {}", gov_events.len());
-    for event in &gov_events {
-        println!("      - {event:?}");
-    }
-
-    let new_count = manager.member_count(ctx_id).await.unwrap();
-    let charlie_still_member = manager.is_member(ctx_id, &charlie).await;
-    println!("    member count: {new_count} (was 3)");
-    println!("    Charlie is member: {charlie_still_member}");
-    assert_eq!(new_count, 2);
-    assert!(!charlie_still_member);
-    println!();
-
-    // =====================================================================
-    // PHASE 7: Context Close
-    // =====================================================================
-    println!("━━━ PHASE 7: Context Close ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!();
-
-    let (close_proposal, _, _) = manager
-        .propose_governance_action(
-            ctx_id,
-            &alice,
-            GovernanceAction::CloseContext { reason: None },
-            &alice_signing_key,
-        )
-        .await
-        .unwrap();
-
-    println!("  Proposed & auto-executed: CloseContext");
-    println!("    status: {:?}", close_proposal.status);
-
-    let final_state = handle.state();
-    println!("  Context state: {final_state:?}");
-    assert!(
-        matches!(final_state, ContextState::Closing | ContextState::Closed),
-        "context should be closing or closed"
-    );
     println!();
 
     // =====================================================================
@@ -1629,20 +1357,11 @@ async fn application_layer_demo() {
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║              APPLICATION LAYER DEMO COMPLETE               ║");
     println!("╠══════════════════════════════════════════════════════════════╣");
-    println!("║  Phases demonstrated:                                      ║");
-    println!("║    1. Context creation via ContextManager (real lifecycle)  ║");
-    println!("║    2. Membership: join, verify, member_count, is_member    ║");
-    println!("║    3. Messaging: send_message, drain_events                ║");
-    println!("║    4. Outlet registration (schema validation, capability ck) ║");
-    println!("║    5. Outlet invocation (real async executors, timeouts)     ║");
-    println!("║    6. Governance: propose + execute (SingleAdmin engine)   ║");
-    println!("║    7. Context close via governance action                  ║");
-    println!("║                                                            ║");
-    println!("║  What's real vs mocked:                                    ║");
-    println!("║    REAL: ContextManager, outlet registry, schema validation, ║");
-    println!("║          role system, capability checks, governance engine, ║");
-    println!("║          event log, membership state, context lifecycle    ║");
-    println!("║    MOCK: MLS group ops, sender key ops, relay transport    ║");
-    println!("║          (tested in demo 1 with real crypto)               ║");
+    println!("║  1. Context creation via real Supervisor (real MLS)        ║");
+    println!("║  2. Membership: add + join, member_count, is_member        ║");
+    println!("║  3. Messaging: real encryption, §9.10.4 fan-out, decrypt   ║");
+    println!("║  4. Governance: RemoveMember auto-executes (SingleAdmin)   ║");
+    println!("║  5. Context close via governance action                    ║");
+    println!("║  6. Outlet registration + invocation (schema + capability) ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
 }

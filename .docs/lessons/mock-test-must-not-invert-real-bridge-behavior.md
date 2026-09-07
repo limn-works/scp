@@ -1,33 +1,34 @@
 # A Mock Test That Inverts Real Behavior Is a Silent Future Blocker
 
-**Context**: `bindings/typescript/tests/identity-lifecycle.test.ts` asserted
-`migrated.did === identity.did` for `identityMigrate`. The NAPI bridge's actual behavior is
-the **opposite**: migration produces a *new* DID (the Rust `migrate_returns_new_did` test
-asserts the two DIDs differ, per spec §9.12). The TS test only passed because it is
-addon-gated and CI skips it when the native `.node` addon isn't built.
+**Problem**: `bindings/typescript/tests/identity-lifecycle.test.ts` asserted
+`migrated.did === identity.did` for `identityMigrate`. The bridge does the opposite:
+migration produces a new DID, which the Rust `migrate_returns_new_did` test asserts and
+§9.12 of the security-model spec requires. The mock stubbed the migrate return value to echo
+its input DID, and the assertion then compared the echo against the input, so the test
+exercised the mock rather than the bridge. The test passed only because CI skips it when the
+native addon is not built. The day the addon ships, that test fails on correct code and
+blocks the correct implementation.
 
-**Problem**: The mock stubbed the migrate return value to echo its input DID, then asserted
-the echoed value equalled the input. That assertion says **nothing** about real behavior —
-it tests the mock, not the bridge. Worse, it encodes the *wrong* semantics. The day the
-addon ships and the real bridge runs, this test will **fail on correct code** and block the
-correct implementation. A test that goes red when the system finally works is an anti-test.
+**Root cause**: mocking a return value to echo an input, then asserting the echo equals the
+input, is a tautology in the shape of a behavioral assertion. Nothing in it exercises the
+behavior it claims to check, so it can enshrine inverted semantics. Addon-gating then hides
+that from CI until the gate opens.
 
-**Root cause**: Mocking a return value to echo the input, then asserting the echo equals the
-input, is a tautology dressed as a behavioral assertion. It can lock in inverted semantics
-because nothing in the test ever exercised the behavior it claims to check. Addon-gating then
-hides the defect from CI until the gate opens.
+## Rules
 
-**Rule**:
-- Never mock a return value to echo an input and then assert the echoed value equals the
-  input. The assertion is vacuous and can enshrine wrong semantics.
-- A mock test's expected value must match what the **real** implementation produces. Before
-  writing the assertion, find the authoritative behavior (the Rust bridge test, the spec
-  section) and assert *that* — e.g. for migrate, `migrated.did !== identity.did` per §9.12.
-- Treat addon-gated / CI-skipped tests with extra suspicion: they are exactly where an
-  inverted assertion can sit undetected until it blocks correct work. Audit their assertions
-  against real behavior, don't assume "it passes" means "it's right."
+- **Never mock a return value to echo an input and then assert the echoed value equals the
+  input.** The assertion is vacuous, and it can record the wrong semantics as the expected
+  ones.
+- **A mock test's expected value must match what the real implementation produces.** Before
+  writing the assertion, find the authoritative behavior — the Rust bridge test, the spec
+  section — and assert that.
+- **Audit the assertions in addon-gated and CI-skipped tests against real behavior.** A test
+  that never runs is exactly where an inverted assertion sits undetected, and "it passes"
+  says nothing about it.
 
-Related: `.docs/lessons/typescript-sdk-bridge-patterns.md`,
-`.docs/lessons/napi-bridge-encoded-field-must-be-set.md`, and
-`.docs/lessons/fromhandle-must-surface-all-protocol-significant-fields.md` (same migrate path,
-TS wrapper drops a protocol-significant field).
+## See also
+
+- `.docs/lessons/typescript-sdk-bridge-patterns.md`
+- `.docs/lessons/napi-bridge-encoded-field-must-be-set.md`
+- `.docs/lessons/fromhandle-must-surface-all-protocol-significant-fields.md` — the same
+  migrate path, where the TypeScript wrapper drops a protocol-significant field.

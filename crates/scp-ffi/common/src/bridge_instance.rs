@@ -63,7 +63,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::PoisonError;
 use std::sync::RwLock;
+use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -112,6 +114,61 @@ pub const UNSET_INSTANCE_ID: u64 = 0;
 #[must_use]
 fn next_instance_id() -> u64 {
     INSTANCE_ID_COUNTER.fetch_add(1, Ordering::SeqCst)
+}
+
+/// A live component a bridge instance started, which borrows a resource that
+/// same instance owns and releases at shutdown.
+///
+/// # Why an instance tracks its borrowers
+///
+/// A bridge instance owns exactly one storage backend, chosen at construction
+/// (`SCP.with_storage({...})`). `start_node_local` hands a node a clone of that
+/// backend's `Arc`, so an instance and a node write through one handle.
+/// Each bridge's `bridge_specific_shutdown` then calls
+/// `ProtocolRepoVariant::close`, which reaches
+/// [`scp_platform::sqlite::SqliteStorage::close`] and drops an advisory
+/// `flock(2)` on `{dir}/scp.db.lock`. That lock is what stops a second process
+/// from opening one `SQLCipher` database while a first writer still holds it,
+/// so releasing it while a node keeps writing invites split-brain writes and
+/// WAL corruption (red-hat RED-1002).
+///
+/// [`CoreFields`] therefore records every borrower a node-start path produced,
+/// and [`CoreFields::stop_borrowers`] signals each live one to stop before any
+/// bridge releases anything. `scp_ffi_common::server::RunningNode` implements
+/// this trait; `scp_ffi_common::server::register_node` is a single canonical
+/// path that wraps a started node and registers it in one call.
+///
+/// # Weak references only
+///
+/// [`CoreFields`] stores [`Weak`], never [`Arc`], so a registry entry never
+/// keeps a node alive past its handle and a dropped node leaves nothing to
+/// leak. `stop_borrowers` skips whichever entries already died.
+pub trait InstanceBorrower: Send + Sync {
+    /// Signals this borrower to stop writing through whatever it borrowed.
+    ///
+    /// Must be idempotent, because a caller can invoke shutdown twice and a
+    /// borrower can also stop on its own.
+    fn stop(&self);
+
+    /// Reports whether this borrower already stopped.
+    fn stopped(&self) -> bool;
+}
+
+/// Registry backing [`CoreFields::register_borrower`] and
+/// [`CoreFields::stop_borrowers`].
+///
+/// `closed` turns a register-versus-shutdown race into a decided outcome
+/// instead of a lost registration: once [`CoreFields::stop_borrowers`] sets it,
+/// a later [`CoreFields::register_borrower`] stops its argument immediately
+/// rather than filing a `Weak` nothing will ever read.
+#[derive(Default)]
+struct BorrowerRegistry {
+    /// Set by [`CoreFields::stop_borrowers`]. Never cleared: shutdown is a
+    /// terminal transition.
+    closed: bool,
+    /// Live borrowers, pruned on every registration so an instance that starts
+    /// many nodes over its lifetime does not grow this vector without bound.
+    entries: Vec<Weak<dyn InstanceBorrower>>,
 }
 
 /// Maximum number of known contexts that can be registered in the discovery
@@ -525,6 +582,21 @@ pub struct CoreFields {
     /// overrides the default. Reads clone the `Arc` (cheap) so the lock is
     /// never held across the send.
     persona_source: RwLock<crate::persona::PersonaSource>,
+
+    // -----------------------------------------------------------------
+    // Storage borrowers — shutdown ordering (red-hat RED-1002)
+    // -----------------------------------------------------------------
+    /// Live components this instance started that borrow a resource this
+    /// instance owns — today, every node a bridge's `node_start_*` path
+    /// produced.
+    ///
+    /// [`BridgeInstanceCore::shutdown`] calls
+    /// [`stop_borrowers`](Self::stop_borrowers) before
+    /// [`BridgeInstanceCore::bridge_specific_shutdown`], so a node stops
+    /// writing before a bridge closes its `SQLCipher` handle and drops an
+    /// advisory `flock(2)`. See [`InstanceBorrower`] for why that order
+    /// matters.
+    borrowers: Mutex<BorrowerRegistry>,
 }
 
 impl Default for CoreFields {
@@ -579,6 +651,7 @@ impl CoreFields {
             scope_registries: Mutex::new(HashMap::new()),
             mcp_allowlist: Mutex::new(scp_mcp::allowlist::StdioAllowlist::new_with_defaults()),
             persona_source: RwLock::new(crate::persona::default_persona_source()),
+            borrowers: Mutex::new(BorrowerRegistry::default()),
         }
     }
 
@@ -664,6 +737,7 @@ impl CoreFields {
             scope_registries: Mutex::new(HashMap::new()),
             mcp_allowlist: Mutex::new(scp_mcp::allowlist::StdioAllowlist::new_with_defaults()),
             persona_source: RwLock::new(crate::persona::default_persona_source()),
+            borrowers: Mutex::new(BorrowerRegistry::default()),
         }
     }
 
@@ -1054,6 +1128,91 @@ impl CoreFields {
         }
     }
 
+    /// Records `borrower` as a live user of a resource this instance owns.
+    ///
+    /// Every bridge node-start path registers whatever node it produced, so
+    /// [`stop_borrowers`](Self::stop_borrowers) can stop that node before any
+    /// bridge releases a `SQLCipher` handle. [`InstanceBorrower`] states why
+    /// releasing first corrupts a database.
+    ///
+    /// Registration stores [`Weak`], so this call adds no ownership: a caller
+    /// that drops its node handle leaves a dead entry, which a later
+    /// registration prunes and which `stop_borrowers` skips.
+    ///
+    /// When [`stop_borrowers`](Self::stop_borrowers) already ran, this call
+    /// stops `borrower` immediately instead of filing an entry nothing will
+    /// read. That decides a race between a thread starting a node and a thread
+    /// shutting an instance down: whichever order those two take, `borrower`
+    /// ends up stopped.
+    ///
+    /// A poisoned registry `Mutex` is recovered via
+    /// [`PoisonError::into_inner`], matching
+    /// [`stop_borrowers`](Self::stop_borrowers): both critical sections only
+    /// push to, prune, or take a `Vec`, so a poisoned guard still protects an
+    /// intact registry, and skipping a registration would leave a node no
+    /// shutdown can reach.
+    pub fn register_borrower<B: InstanceBorrower + 'static>(&self, borrower: &Arc<B>) {
+        let closed = {
+            let mut registry = self
+                .borrowers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if registry.closed {
+                true
+            } else {
+                registry.entries.retain(|entry| entry.strong_count() > 0);
+                registry
+                    .entries
+                    .push(Arc::downgrade(borrower) as Weak<dyn InstanceBorrower>);
+                false
+            }
+        };
+        if closed {
+            borrower.stop();
+        }
+    }
+
+    /// Stops every live borrower this instance recorded, and refuses later
+    /// registrations by stopping them on arrival.
+    ///
+    /// [`BridgeInstanceCore::shutdown`] calls this first, so a node stops
+    /// writing before [`BridgeInstanceCore::bridge_specific_shutdown`] closes
+    /// a `SQLCipher` handle and drops an advisory `flock(2)`.
+    ///
+    /// Idempotent: a second call finds an empty entry list and stops nothing.
+    /// Logs how many borrowers a caller had left running, which tells an
+    /// operator whether `SCP.shutdown()` had nodes to stop or found them
+    /// already stopped.
+    /// Infallible: a poisoned `Mutex` is recovered via
+    /// [`PoisonError::into_inner`], because a shutdown that skipped this step
+    /// would leave a node writing to a closed database.
+    pub fn stop_borrowers(&self) {
+        let entries = {
+            let mut registry = self
+                .borrowers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            registry.closed = true;
+            std::mem::take(&mut registry.entries)
+        };
+        let mut still_running = 0usize;
+        for entry in entries {
+            if let Some(borrower) = entry.upgrade() {
+                if !borrower.stopped() {
+                    still_running += 1;
+                }
+                borrower.stop();
+            }
+        }
+        if still_running > 0 {
+            tracing::info!(
+                count = still_running,
+                "shutdown stopped borrowers that a caller left running, before \
+                 releasing what those borrowers write through"
+            );
+        }
+    }
+
     /// Suspends the bridge instance.
     ///
     /// - Disconnects the relay (clears transport)
@@ -1202,6 +1361,12 @@ impl CoreFields {
         if self.shutdown.swap(true, Ordering::SeqCst) {
             return; // Already shut down
         }
+        // Stop borrowers first, so every terminal transition of `CoreFields`
+        // ends borrowed writes — not only whichever transition
+        // [`BridgeInstanceCore::shutdown`] drives. This path clears registries
+        // and flushes persistence below, and a node writing through this
+        // instance's storage during that flush would race it.
+        self.stop_borrowers();
         // Fire the cancellation token so any tasks spawned under this
         // instance can exit cooperatively. Pending tasks inside `self.tasks`
         // are not drained here — the sync variant cannot await. Callers
@@ -1292,10 +1457,7 @@ impl CoreFields {
     /// Returns `true` if a transport manager has been set.
     #[must_use]
     pub fn has_transport(&self) -> bool {
-        self.transport
-            .read()
-            .ok()
-            .is_some_and(|guard| guard.is_some())
+        self.transport.read().is_ok_and(|guard| guard.is_some())
     }
 
     /// Returns this instance's transport selector for connect-time transparent
@@ -1399,10 +1561,7 @@ impl CoreFields {
     /// Returns `true` if any relay URL is currently registered.
     #[must_use]
     pub fn has_pending_relay_urls(&self) -> bool {
-        self.relay_urls
-            .lock()
-            .ok()
-            .is_some_and(|guard| !guard.is_empty())
+        self.relay_urls.lock().is_ok_and(|guard| !guard.is_empty())
     }
 
     /// Reconnects every pending relay URL registered via [`Self::add_relay_url`].
@@ -2629,11 +2788,23 @@ pub trait BridgeInstanceCore: Send + Sync {
     /// Async shutdown with a graceful deadline.
     ///
     /// Default implementation (landed in commit 6 of the actor-per-context
-    /// refactor, ADR-049 §11) drains the core's async tasks under the
-    /// supplied timeout, then delegates to
+    /// refactor, ADR-049 §11) stops every registered borrower, drains the
+    /// core's async tasks under the supplied timeout, then delegates to
     /// [`BridgeInstanceCore::bridge_specific_shutdown`] so per-bridge
     /// concrete structs can drop their typed registries (MCP registries,
     /// identity custody, etc.).
+    ///
+    /// # Borrower-stop runs first
+    ///
+    /// [`CoreFields::stop_borrowers`] runs before anything else, and this
+    /// ordering lives here rather than in each bridge so no bridge can drift
+    /// out of it. A node that `start_node_local` started writes through a
+    /// clone of this instance's storage `Arc`, while
+    /// `bridge_specific_shutdown` closes that same `SQLCipher` handle and
+    /// drops an advisory `flock(2)` on `{dir}/scp.db.lock`. Releasing that
+    /// lock while a node still writes invites split-brain writes and WAL
+    /// corruption (red-hat RED-1002), so every borrower stops first. See
+    /// [`InstanceBorrower`].
     ///
     /// `bridge_specific_shutdown` runs UNCONDITIONALLY — even when
     /// [`CoreFields::shutdown_core_async`] returns
@@ -2652,6 +2823,10 @@ pub trait BridgeInstanceCore: Send + Sync {
     ///
     /// Returns [`ShutdownError::AlreadyShutDown`] on a second call.
     async fn shutdown(&self, timeout: Duration) -> Result<ShutdownOutcome, ShutdownError> {
+        // Stop every borrower BEFORE any release: `bridge_specific_shutdown`
+        // closes this instance's `SQLCipher` handle, and a node started on
+        // that handle must not still be writing when it does.
+        self.core().stop_borrowers();
         let result = self.core().shutdown_core_async(timeout).await;
         self.bridge_specific_shutdown();
         result

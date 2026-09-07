@@ -293,6 +293,8 @@ Verification procedure depends on the attestation class (§3.5.0).
 3. **If fetch fails or DID is not present:** the attestation is unverified. Treat as if the attestation does not exist for trust evaluation. Do not cache a negative result — transient failures (rate limiting, DNS propagation delays) should not permanently invalidate an attestation.
 4. **If fetch succeeds and DID is present:** the attestation is verified. Cache the result.
 
+**Where an SCP SDK sits in this flow.** Step 2 belongs to the consumer, as §3.5.1 states for every Class 2 method ("a live external resource that consumers must verify themselves"). An SDK verification operation therefore takes that consumer's fetch outcome as a required input and performs every other step of this list itself. A consumer that fetched the resource and found the issuer's DID in it reports `confirmed`, and the operation returns a verdict. A consumer that fetched nothing reports `not_fetched`, and the operation raises the step-3 state — "unverified", distinct from "rejected" — so a consumer never records a rejection this section forbids caching. A consumer that reports `confirmed` without fetching anything states a falsehood about its own step 2; no SDK can detect that, which is why step 2 names the consumer as the party that performs it.
+
 **Verification cache:**
 
 - Consumer-side. Each consumer maintains its own cache of Reference attestation verification results.

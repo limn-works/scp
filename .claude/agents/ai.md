@@ -1,7 +1,6 @@
 ---
 name: ai
 description: "Use this agent for LLM interactions\u2014prompt construction, context management, response parsing, and model selection. Spin up when building prompts, managing conversation context, implementing structured outputs, or handling LLM-specific behavior.\n\nExamples:\n- User: \"Build a prompt for generating recommendations\"\n  Assistant: Uses ai agent to design prompt template and context strategy.\n\n- User: \"Parse the AI response into structured data\"\n  Assistant: Uses ai agent to implement response extraction and validation.\n\n- User: \"Handle context window limits for long conversations\"\n  Assistant: Uses ai agent to implement truncation and summarization strategy."
-model: opus
 color: red
 memory: project
 ---

@@ -34,14 +34,12 @@
 //!
 //! DID resolvers are constructed at FFI init, before any relay connection
 //! exists, so the transport is bound **after** the querier is built via
-//! [`bind`](TransportRelayQuerier::bind). Until a relay URL is bound, a query
-//! for it returns an empty candidate list (fail-closed) — the composer then
-//! falls through to the next relay and the DHT layer (§3.10.4). No lock is ever
-//! held across an `.await`: the adapter handle is cloned out under a short
-//! synchronous lock, which is then dropped before the query future runs.
+//! [`bind`](TransportRelayQuerier::bind) (see `BoundRelays` for the shared
+//! late-binding + locking discipline). Until a relay URL is bound, a query for
+//! it returns an empty candidate list (fail-closed) — the composer then falls
+//! through to the next relay and the DHT layer (§3.10.4).
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use scp_identity::IdentityError;
 use scp_identity::relay_querier::MAX_CANDIDATES_PER_RELAY;
@@ -49,29 +47,18 @@ use scp_identity::resolution::{RelayQuerier, RelayQueryRecord};
 use scp_protocol::envelope::did_record::DidRecordV1;
 use tracing::debug;
 
+use crate::native::BoundRelays;
 use crate::traits::{RoutingId, TransportAdapter};
 
 /// Production [`RelayQuerier`] that resolves DID records over a live transport.
 ///
-/// Holds a per-instance, late-bound map of `relay_url -> adapter`. Bindings are
-/// added as relay connections are established (see the module docs) and can be
-/// removed on disconnect. A query for an unbound relay URL fails closed with an
-/// empty candidate list.
-#[derive(Default)]
+/// A thin newtype over the shared late-bound `BoundRelays` set (the WRITE-half
+/// [`TransportRelayPublisher`](crate::native::TransportRelayPublisher) is the
+/// same shape over the same type). A query for an unbound relay URL fails closed
+/// with an empty candidate list.
+#[derive(Debug, Default)]
 pub struct TransportRelayQuerier {
-    /// Late-bound live transports, keyed by relay URL. Guarded by a synchronous
-    /// `RwLock` because every access is a brief clone-out; the lock is never
-    /// held across an `.await` (see the module docs).
-    relays: RwLock<HashMap<String, Arc<dyn TransportAdapter>>>,
-}
-
-impl std::fmt::Debug for TransportRelayQuerier {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let bound = self.relays.read().map_or(0, |m| m.len());
-        f.debug_struct("TransportRelayQuerier")
-            .field("bound_relays", &bound)
-            .finish()
-    }
+    relays: BoundRelays,
 }
 
 impl TransportRelayQuerier {
@@ -79,34 +66,21 @@ impl TransportRelayQuerier {
     /// [`bind`](Self::bind) once connections are established.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            relays: RwLock::new(HashMap::new()),
-        }
+        Self::default()
     }
 
     /// Late-binds a live transport adapter for a relay URL.
     ///
     /// Idempotent: a subsequent bind for the same URL replaces the prior
-    /// adapter. A poisoned lock is treated as "no binding possible" and the call
-    /// is a no-op (a query for the URL then fails closed).
+    /// adapter.
     pub fn bind(&self, relay_url: impl Into<String>, adapter: Arc<dyn TransportAdapter>) {
-        if let Ok(mut relays) = self.relays.write() {
-            relays.insert(relay_url.into(), adapter);
-        }
+        self.relays.bind(relay_url, adapter);
     }
 
     /// Removes the binding for a relay URL (e.g. on disconnect). Absent bindings
     /// are ignored.
     pub fn unbind(&self, relay_url: &str) {
-        if let Ok(mut relays) = self.relays.write() {
-            relays.remove(relay_url);
-        }
-    }
-
-    /// Returns the adapter bound for `relay_url`, cloned out under a short
-    /// synchronous lock so the guard never crosses an `.await`.
-    fn adapter_for(&self, relay_url: &str) -> Option<Arc<dyn TransportAdapter>> {
-        self.relays.read().ok()?.get(relay_url).cloned()
+        self.relays.unbind(relay_url);
     }
 }
 
@@ -121,7 +95,7 @@ impl RelayQuerier for TransportRelayQuerier {
         routing_id: &[u8; 32],
     ) -> impl Future<Output = Result<Vec<RelayQueryRecord>, IdentityError>> + Send {
         // Resolve the adapter synchronously and drop the lock before any await.
-        let adapter = self.adapter_for(relay_url);
+        let adapter = self.relays.get(relay_url);
         let routing_id = *routing_id;
         let relay_url = relay_url.to_owned();
 

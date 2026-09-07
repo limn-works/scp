@@ -761,10 +761,25 @@ mod tests {
     }
 
     #[test]
-    fn clear_transport_manager_without_transport_returns_err() {
-        // Clearing when no transport has been attached returns an error.
+    fn clear_transport_manager_without_transport_is_idempotent() {
+        // `BridgeInstanceCore::clear_transport` fails only on a poisoned
+        // lock, so clearing an instance that never attached a transport
+        // succeeds and leaves its slot empty. An earlier version bound that
+        // result to `_` under a name,
+        // `clear_transport_manager_without_transport_returns_err`, so it
+        // passed both when this call refused and when it succeeded, and its
+        // name stated an opposite of what this code does.
         let bi = NapiBridgeInstance::new_napi();
-        let _ = clear_transport_manager_on(&bi);
+        clear_transport_manager_on(&bi).expect("clearing an unattached transport manager succeeds");
+        assert!(
+            !has_transport_manager_on(&bi),
+            "clearing must leave no transport manager attached"
+        );
+        clear_transport_manager_on(&bi).expect("a second clear also succeeds");
+        assert!(
+            !has_transport_manager_on(&bi),
+            "a second clear must leave that slot empty too"
+        );
     }
 
     // Note: a populated transport manager requires a real adapter, which can

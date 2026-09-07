@@ -2,7 +2,6 @@
 name: sdk-coverage-verifier
 description: Verifies SDK capability matrix entries are public, callable, and semantically correct. Use when reviewing PRs that modify SDK code (bindings/) or the capability matrix (sdk-capability-matrix.json). NOT for routine use — invoke explicitly or via review roster when SDK surface changes.
 tools: [Read, Grep, Glob]
-model: sonnet
 ---
 
 # SDK Coverage Verifier

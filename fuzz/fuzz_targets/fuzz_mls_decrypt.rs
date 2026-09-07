@@ -30,7 +30,7 @@
 //! # CRITICAL: run with `-O` (debug-assertions OFF)
 //!
 //! This target validates the SHIPPED RELEASE path. It MUST be built with
-//! debug-assertions OFF, i.e. `cargo +nightly fuzz run fuzz_mls_decrypt -O …`.
+//! debug-assertions OFF, i.e. `cd fuzz && cargo fuzz run fuzz_mls_decrypt -O …`.
 //! Without `-O`, cargo-fuzz injects `-Cdebug-assertions`, openmls's
 //! `debug_assert!` fires on every tampered input, and the target reports a
 //! false crash on the very first tampered ciphertext. `[profile.release]

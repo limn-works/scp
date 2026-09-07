@@ -276,9 +276,14 @@ pub async fn health_handler(State(state): State<Arc<NodeState>>) -> impl IntoRes
 /// Returns an [`IdentityResponse`] with the node operator's DID string and
 /// full DID document.
 ///
+/// The document is read from the node's live state slot per request, so after a
+/// NAT tier change (§10.12.1) this reports the document the node currently
+/// stands behind. (No intra-doc link: the slot type is crate-private, like the
+/// `NodeState` field it lives on.)
+///
 /// See spec section 18.10.3.
 pub async fn identity_handler(State(state): State<Arc<NodeState>>) -> impl IntoResponse {
-    let document = serde_json::to_value(&state.did_document)
+    let document = serde_json::to_value(state.live_state.get().document)
         .unwrap_or_else(|_| serde_json::Value::String(state.did.clone()));
 
     (
@@ -608,7 +613,19 @@ mod tests {
     fn test_state(token: &str) -> Arc<NodeState> {
         Arc::new(NodeState {
             did: "did:dht:test123".to_owned(),
-            relay_url: "wss://localhost/scp/v1".to_owned(),
+            live_state: crate::LiveSlot::new(crate::NodePublishedState {
+                relay_url: "wss://localhost/scp/v1".to_owned(),
+                record: None,
+                document: scp_did::DidDocument {
+                    context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+                    id: "did:dht:test123".to_owned(),
+                    verification_method: vec![],
+                    authentication: vec![],
+                    assertion_method: vec![],
+                    also_known_as: vec![],
+                    service: vec![],
+                },
+            }),
             broadcast_contexts: RwLock::new(HashMap::new()),
             relay_addr: "127.0.0.1:9000".parse::<SocketAddr>().unwrap(),
             bridge_secret: zeroize::Zeroizing::new([0u8; 32]),
@@ -629,15 +646,6 @@ mod tests {
             ),
             tls_config: None,
             cert_resolver: None,
-            did_document: scp_did::DidDocument {
-                context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
-                id: "did:dht:test123".to_owned(),
-                verification_method: vec![],
-                authentication: vec![],
-                assertion_method: vec![],
-                also_known_as: vec![],
-                service: vec![],
-            },
             connection_tracker: scp_transport::relay::rate_limit::new_connection_tracker(),
             subscription_registry: scp_transport::relay::subscription::new_registry(),
             acme_challenges: None,

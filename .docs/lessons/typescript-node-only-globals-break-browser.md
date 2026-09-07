@@ -1,44 +1,42 @@
 # Node-Only Globals Silently Break Cross-Environment Code Paths
 
-**Date:** 2026-07-15
-**Source:** branch `fix/sdk-coverage-fail-closed-and-parity` — `bindings/typescript/src/trust.ts`
+**Problem**: TypeScript utility code compiled for cross-environment use references Node
+globals — `Buffer`, `process`, `setImmediate` — that the browser and edge runtimes do not
+provide, and referencing one throws `ReferenceError`. The compiler does not catch it:
+`Buffer` is a valid ambient type in any project carrying `@types/node`, so browser-only
+breakage passes `tsc` and every test that runs under Node or Bun.
 
-**Note:** As of ADR-055 (PR #1934), the `scp-ffi/wasm` bridge is removed and
-`bindings/typescript/` is NAPI-only (Node/Bun). The pattern documented here
-was a real bug found during development. The principle remains relevant for any
-TypeScript utility code intended to run cross-environment (e.g. shared helpers
-used in future browser-facing SDKs under ADR-057's shared-wasm model).
+`__extractFirstCapabilityUri` in `bindings/typescript/src/trust.ts` decoded a JWT payload
+with `Buffer.from(segment, "base64url").toString("utf8")` inside its own `try`/`catch`,
+which returned `null` on any error. In the browser every capability token therefore decoded
+to `null`, and `evaluateLayer1` reported all-false for every valid token — a verdict that
+reads as a legitimate result rather than a defect. Two amplifiers made it near-undetectable
+together: a Node-only global on a path that also runs in the browser, and a swallowing
+`try`/`catch` that converted the `ReferenceError` into a benign-looking return value.
 
-## The trap
+## Rules
 
-TypeScript utility code compiled for cross-environment use may reference Node globals —
-`Buffer`, `process`, `setImmediate` — that do **not** exist in the browser or edge
-runtimes. Referencing one throws `ReferenceError`. The compiler will not catch it:
-`Buffer` is a valid ambient type in a TypeScript project with `@types/node`, so
-browser-only breakage sails through `tsc` and through every test that happens to run
-under Node/Bun.
-
-## What happened
-
-`__extractFirstCapabilityUri` in `trust.ts` decoded the JWT payload with
-`Buffer.from(segment, "base64url").toString("utf8")`. In the browser, `Buffer` is
-undefined, so the call threw. The throw landed inside the function's own `try/catch`,
-which returned `null` on any error. So instead of crashing loudly, **every** capability
-token decoded to `null`, `evaluateLayer1` reported `ALL_LAYER1_FIELDS_FALSE` for every
-valid token, and Layer 1 was invisibly broken for all browser consumers — a false
-"all-invalid" trust verdict that looks like a legitimate result, not a bug.
-
-The two failure amplifiers, together, made this near-undetectable:
-1. **A Node-only global** referenced on a code path that also runs in the browser.
-2. **A swallowing `try/catch`** that converted the `ReferenceError` into a benign-looking
-   `null` return instead of surfacing it.
-
-## The fix pattern
-
-Feature-detect the global and fall back to Web-standard APIs:
+- **Treat `Buffer`, `process`, `setImmediate`, and every other Node global as absent on any
+  path intended to run cross-environment.** Feature-detect with
+  `typeof X !== "undefined"` and supply a Web-standard fallback: `atob`/`btoa`,
+  `TextEncoder`/`TextDecoder`, `crypto.subtle`, `queueMicrotask`.
+- **Grep every cross-environment file for `Buffer` and `process` before you ship it.** A
+  project carrying `@types/node` compiles both, so `tsc` reports nothing about the
+  `ReferenceError` the browser throws at runtime.
+- **Never let a `try`/`catch` swallow a `ReferenceError` into a fail-closed value.** A
+  missing global is a build or packaging defect, not a data-validity outcome, and folding it
+  into `null` or an all-false verdict hides the defect behind a plausible result.
+- **A Node-only test suite never exercises the browser branch, so make the test remove the
+  global.** Delete `globalThis.Buffer`, run the code, and restore it in a `finally`. Without
+  that test the fallback is dead code, and it regresses the moment someone rewrites it back
+  to `Buffer`. `bindings/typescript/tests/browser-fallback.test.ts` calls
+  `__extractFirstCapabilityUri` with `globalThis.Buffer` deleted, which is the only
+  execution the `atob` branch of `trust.ts` gets.
+- **Browser `atob` accepts standard base64 and not base64url**, so normalize `-` and `_` to
+  `+` and `/` and re-pad before decoding.
 
 ```ts
-function __decodeBase64UrlToUtf8(segment: string): string {
+function decodeBase64UrlToUtf8(segment: string): string {
   const b64 = segment.replace(/-/g, "+").replace(/_/g, "/");
   const pad = b64.length % 4 === 0 ? "" : "=".repeat(4 - (b64.length % 4));
   const normalized = b64 + pad;
@@ -51,25 +49,14 @@ function __decodeBase64UrlToUtf8(segment: string): string {
 }
 ```
 
-Note also that browser `atob` only accepts standard base64, not base64url — normalize
-`-`/`_` → `+`/`/` and re-pad before decoding.
-
-## Locking it in
-
-A Node-only test suite can never exercise the browser branch. Add a test that
-**temporarily removes `globalThis.Buffer`** (delete it, run the code, restore it in a
-`finally`) so the fallback path is actually executed under CI. Without this, the browser
-branch is dead code that regresses the moment someone "simplifies" it back to `Buffer`.
-
-## The rule
-
-- Treat `Buffer`, `process`, `setImmediate`, and any other Node global as **absent**
-  on any code path intended to run cross-environment. Feature-detect
-  (`typeof X !== "undefined"`) and provide a Web-standard fallback (`atob`/`btoa`,
-  `TextEncoder`/`TextDecoder`, `crypto.subtle`, `queueMicrotask`).
-- `@types/node` in the project makes these compile — the type checker is **not** a guard
-  against runtime `ReferenceError` in the browser. Grep for `Buffer`/`process` in any file
-  that runs cross-environment before shipping.
-- Never let a `try/catch` swallow a `ReferenceError` into a fail-closed value. A missing
-  global is a build/packaging defect, not a data-validity outcome — folding it into
-  `null`/all-false hides the defect behind a plausible verdict.
+**Scope**: these rules bind every file that more than one runtime compiles, and two files
+under `bindings/typescript/` are such files today. ADR-055, which removed the WASM bridge
+(`.docs/adrs/phase-4.md`), left the napi-rs bridge as the only in-process backend that
+package ships, but ADR-057, the in-browser client over shared MLS, then added the browser
+package `@limn-works/scp-ts-wasm` under `bindings/typescript-wasm/`, and that package
+bundles `bindings/typescript/src/errors.ts` at build time through the `@scp-core/errors`
+path alias `bindings/typescript-wasm/tsconfig.json` declares. A Node global added to
+`errors.ts` therefore throws inside `mapBridgeError`, which classifies every wasm-tier
+throw. `bindings/typescript/src/trust.ts` is the second file: its
+`__decodeBase64UrlToUtf8` declares a `globalThis.atob` branch for browsers, so the rules
+above govern it whether or not a consumer bundles that package for a browser today.

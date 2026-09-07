@@ -1,7 +1,6 @@
 # Optional strings at the FFI boundary: treat `Some("")` as `None`
 
-**Date:** 2026-04-14
-**Source:** PR #1637 — governance `reason` field empty-string rejection
+**Source:** governance `reason` field empty-string rejection
 
 ## The bug
 

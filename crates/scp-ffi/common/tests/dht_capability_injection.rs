@@ -196,7 +196,7 @@ async fn rotation_is_reflected_by_resolve_through_shared_resolver() {
     // wiring the node uses (build_shared_cache_key_resolver).
     let resolver = DualLayerResolver::new(
         Arc::new(NoOpRelayQuerier),
-        Arc::clone(did_dht.dht_client()),
+        did_dht.dht_client(),
         Arc::clone(did_dht.cache()),
         Vec::new(),
     );

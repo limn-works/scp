@@ -22,6 +22,33 @@ for f in $STAGED; do
   esac
 done
 
+# ── The compiler this shell resolves ──
+#
+# `rust-toolchain.toml` names the Rust version, and rustup applies it to every cargo
+# command run in this directory — unless `RUSTUP_TOOLCHAIN` is set in the environment,
+# which overrides the file entirely. A shell carrying that variable formats and lints on a
+# compiler the repository does not name, and a new release's lints then appear first in CI,
+# against code nobody changed. That is the outage
+# `.docs/lessons/pin-the-rust-toolchain-or-ci-drifts-from-local.md` records.
+#
+# `scripts/check-resolved-rustc.sh` holds the comparison, so this hook,
+# `scripts/check-toolchain-wiring.sh`, and `scripts/setup-toolchain.sh` all read one file's
+# answer.
+#
+# The check runs on every commit rather than only on a commit staging a `.rs` file. The
+# variable belongs to the shell, not to the staged set: a commit staging `Cargo.toml`,
+# `rust-toolchain.toml`, or a workflow changes how the workspace compiles and stages no
+# `.rs` file at all, and its author ran `cargo clippy` by hand before writing it.
+#
+# git runs a hook with the working tree's top level as the working directory, so the path
+# below is the same relative path every other command in this file uses.
+if ! RESOLVED_RUSTC=$(bash scripts/check-resolved-rustc.sh 2>&1); then
+  while IFS= read -r line; do
+    if [ -n "$line" ]; then echo "  ✗ $line" >&2; fi
+  done <<< "$RESOLVED_RUSTC"
+  exit 1
+fi
+
 # ── Auto-format (best-effort — failures don't block other languages) ──
 
 if $HAS_RUST; then

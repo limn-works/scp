@@ -33,8 +33,7 @@
 //! (RELAYRES-002 client re-verification is the guarantee).
 
 use scp_dht::verify_bep44_signature;
-use scp_identity::did_from_ed25519_public_key;
-use scp_identity::did_routing_id;
+use scp_identity::did_record_routing_id;
 use scp_protocol::envelope::did_record::DidRecordV1;
 
 /// The reason a blob that decoded as a [`DidRecordV1`] frame was nonetheless
@@ -124,8 +123,13 @@ pub fn classify_did_record_frame(routing_id: &[u8; 32], blob: &[u8]) -> DidRecor
 
     // Step 2 — DID→routing_id binding (a plain hash; runs BEFORE the signature).
     // Mirrors the control-plane BRIDGE_REGISTER check (§10.12.4).
-    let did_string = did_from_ed25519_public_key(frame.public_key());
-    let derived_routing_id = did_routing_id(&did_string);
+    //
+    // Derived through the shared `did_record_routing_id` (see its definition in
+    // `scp_identity::resolution` for the agreement invariant this admission
+    // check shares with the WRITE path). Unlike `classify_stored_frame`, the
+    // compare here is REAL: `routing_id` is the caller-supplied WIRE address, so
+    // a frame published at an address its key does not bind to is rejected.
+    let derived_routing_id = did_record_routing_id(&frame);
     if &derived_routing_id != routing_id {
         return DidRecordClass::Invalid(DidRecordRejection::BindingMismatch);
     }
@@ -191,6 +195,13 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
     use scp_dht::bep44_signable;
+    // Imported here, NOT via the production path: `routing_id_of_key` below is a
+    // deliberate independent ORACLE. It recomposes the expected routing_id from a
+    // raw verifying key (`did_from_ed25519_public_key` ∘ `did_routing_id`) rather
+    // than calling the production `did_record_routing_id`, so a bug in that
+    // helper's composition cannot make these tests vacuously pass by being wrong
+    // on both sides.
+    use scp_identity::{did_from_ed25519_public_key, did_routing_id};
 
     fn keypair(seed: u8) -> (VerifyingKey, SigningKey) {
         let sk = SigningKey::from_bytes(&[seed; 32]);

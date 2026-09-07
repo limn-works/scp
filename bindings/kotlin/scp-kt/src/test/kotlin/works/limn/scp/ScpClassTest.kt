@@ -11,7 +11,7 @@
 // every caller must construct `SCP()` explicitly.
 //
 // All tests require the compiled UniFFI cdylib; if the native library is not
-// loadable the suite skips via JUnit 5 assumptions, matching RealFFITest.
+// loadable the suite skips via JUnit 5 assumptions, matching PersistenceTest.
 //
 // Provenance: #1549 Phase 4 PR 3 / PR 4 (Kotlin slice). ADR-048.
 

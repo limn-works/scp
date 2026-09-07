@@ -1,8 +1,3 @@
-// ADR-049 §15: ContextCryptoProvider trait deleted. MockCrypto
-// here reimplements that trait for unit-test coverage of outlet economy
-// wiring. Rewiring to real `NodeMlsFactory` requires backend injection
-// File gated until then.
-#![cfg(any())]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -11,218 +6,199 @@
     clippy::too_many_lines
 )]
 
-//! C4 (#1606) — Bridge outlet-invoke economy wiring integration test.
+//! C4 (#1606) — outlet-invoke economy wiring integration test.
 //!
-//! Verifies that `ContextManager::invoke_outlet_with_economy` — the SINGLE
-//! entry point all 3 FFI bridges (PyO3, NAPI, UniFFI) now route
-//! through after the C4 fix — actually deducts per-invocation cost from
-//! the per-DID budget tracker, increments the per-DID velocity counter,
-//! returns the executor output, and produces a `OutletInvokedEvent` with
-//! the correct cost.
+//! Verifies that `Supervisor::invoke_outlet_with_economy` — the SINGLE
+//! non-streaming managed outlet-invoke entry all 3 FFI bridges route through —
+//! actually deducts per-invocation cost from the per-DID budget tracker,
+//! increments the per-DID velocity counter, returns the executor output, and
+//! produces an `OutletInvokedEvent` carrying the deducted cost.
 //!
-//! Before C4 the bridges bypassed this method entirely and outlets cost
-//! ZERO from a Python/Node/Swift/Kotlin client's perspective regardless
-//! of `EconomicPolicy`. The pipeline_wiring assertions cover the
-//! structural fact that the bridge outlet-invoke functions now CALL
-//! `invoke_outlet_with_economy`; this test covers the runtime semantics
-//! that the bridges' delegations now inherit.
+//! Before C4 the bridges bypassed this method entirely and outlets cost ZERO
+//! from a Python/Node/Swift/Kotlin client's perspective regardless of
+//! `EconomicPolicy`. The `pipeline_wiring` assertions cover the structural fact
+//! that the bridge outlet-invoke functions now CALL this method; this test
+//! covers the runtime semantics that their delegations inherit.
 //!
-//! The mock providers below mirror the pattern used in
-//! `e2e_context_manager.rs` and `messaging.rs`'s in-crate tests. Each
-//! integration test file is a separate compile unit so the mocks have
-//! to live here rather than in a shared module.
+//! ## ADR-049 note — post-actor-per-context rewiring
+//!
+//! The old `ContextManager` type + its `ContextCryptoProvider` mock and the
+//! `grant_budget_for_test` / `remaining_budget_for_test` / `velocity_for_test`
+//! manager hooks were deleted in ADR-049. This test now drives the actor-model
+//! `Supervisor` directly:
+//! * The context host is a real `Supervisor` built from a concrete
+//!   `NodeMlsFactory` (no mock crypto) via `Supervisor::with_providers`, with a
+//!   clock (required by `invoke_outlet_with_economy`) and NO payment adapter
+//!   (so a funded invocation produces no `PaymentReceipt`).
+//! * Budget is granted the real way — a governance `ApproveSpend` action, which
+//!   auto-executes for the SingleAdmin creator — because no out-of-crate budget
+//!   test hook exists.
+//! * Budget / velocity are read back through the public `dispatch_query`
+//!   mailbox commands `RemainingBudgetForTest` / `VelocityForTest`.
+//! * The budget-rejection test passes a spending UCAN carrying a covering
+//!   `SpendingCapability` (`max_per_action` ≥ cost). The only UCAN check that
+//!   runs before the budget gate is the pre-budget capability-field check
+//!   (`economy_pre_check` → `check_outlet_spending_capability` →
+//!   `check_spending_capability`), which validates capability FIELDS only —
+//!   presence for a paid action and the `max_per_action` per-action limit — and
+//!   NOT the Ed25519 signature. Cryptographic signature validation
+//!   (`validate_spending_ucan_or_error`) runs LATER, inside the Class-S commit
+//!   combinator that executes only AFTER the budget gate passes; on the
+//!   zero-budget path it is never reached (an empty-signature token with the
+//!   same covering capability facts would hit the budget gate too and produce
+//!   the same rejection). The UCAN is validly signed only for realism and parity
+//!   with the happy-path helper, not because the signature is load-bearing on
+//!   this path. The rejection surfaces as `SCP-OUTLET-6150
+//!   economic.budget-exceeded` (the canonical economic-class outlet code the
+//!   caller observes).
 
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use scp_core::context::builder::{
-    ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
+    ContextCreationError, ContextEventLogProvider, ContextTransportProvider,
 };
-use scp_core::context::governance::KeyResolver;
-use scp_core::context::manager::ContextManager;
+use scp_core::context::governance::{GovernanceAction, KeyResolver};
 use scp_core::context::outlets::OutletId;
 use scp_core::context::outlets::registry::{
     OutletRegistration, OutletRegistry, OutletSchema, OutletTestVector,
 };
-use scp_core::context::{
-    AddMemberOutput, Capability, ContextError, ContextParams, RemoveMemberOutput,
-};
+use scp_core::context::supervisor::Supervisor;
+use scp_core::context::{Capability, ContextParams, LocalTransportProvider};
+use scp_core::crypto::mls::provider::NodeMlsFactory;
+use scp_core::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
 use scp_core::economy::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 use scp_did::DID;
+use scp_platform::in_memory::InMemoryStorage;
+use scp_protocol::context::outlets::error_codes::{
+    CODE_ECONOMIC_FAULT, SLUG_ECONOMIC_BUDGET_EXCEEDED,
+};
+use scp_runtime::context::actor::commands::QueriesCommand;
 
 // ---------------------------------------------------------------------------
-// Mock providers — minimal implementations for ContextManager construction.
-// Mirror `crates/scp-testing/tests/integration/e2e_context_manager.rs`.
+// Host construction — a real `Supervisor` over a concrete `NodeMlsFactory`.
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
-struct MockCrypto;
-
-impl ContextCryptoProvider for MockCrypto {
-    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn create_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn generate_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn init_broadcast_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn destroy_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn destroy_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn validate_key_package(
-        &self,
-        _owner_did: &str,
-        _key_package_bytes: Option<&[u8]>,
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-    fn add_member(
-        &self,
-        _ctx_id: &[u8; 32],
-        _member_did: &str,
-        _key_package_bytes: Option<&[u8]>,
-    ) -> Result<AddMemberOutput, ContextError> {
-        Ok(AddMemberOutput::default())
-    }
-    fn remove_member(
-        &self,
-        _ctx_id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<RemoveMemberOutput, ContextError> {
-        Ok(RemoveMemberOutput::default())
-    }
-    fn distribute_sender_key(
-        &self,
-        _ctx_id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-    fn remove_member_sender_key(
-        &self,
-        _ctx_id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-    fn seal(
-        &self,
-        _context_id: &[u8; 32],
-        inner: &scp_core::envelope::inner::InnerEnvelope,
-        _routing_id: &[u8],
-        _blob_ttl: u32,
-    ) -> Result<Vec<u8>, ContextError> {
-        rmp_serde::to_vec_named(inner)
-            .map_err(|e| ContextError::CryptoFailed(format!("mock seal: {e}")))
-    }
-    fn open(
-        &self,
-        _context_id: &[u8; 32],
-        outer_bytes: &[u8],
-    ) -> Result<scp_core::context::builder::OpenResult, ContextError> {
-        let inner: scp_core::envelope::inner::InnerEnvelope = rmp_serde::from_slice(outer_bytes)
-            .map_err(|e| ContextError::CryptoFailed(format!("mock open: {e}")))?;
-        let sender_did = inner.sender_did.clone();
-        Ok(scp_core::context::builder::OpenResult::Application(
-            Box::new(scp_core::context::builder::OpenedEnvelope {
-                inner,
-                sender_did,
-                // ADR-049 PR-4: mock open() has no live recv tracker; the
-                // follower mirror-forward drop is non-fatal.
-                receive_floor: scp_core::context::builder::ReceiveFloor {
-                    epoch: 0,
-                    sequence: 0,
-                },
-            }),
-        ))
-    }
-}
-
-#[derive(Default)]
-struct MockTransport {
-    connected: AtomicBool,
-}
-
-impl MockTransport {
-    fn connected() -> Self {
-        let t = Self::default();
-        t.connected.store(true, Ordering::Relaxed);
-        t
-    }
-}
-
-#[async_trait::async_trait]
-impl ContextTransportProvider for MockTransport {
-    fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::Relaxed)
-    }
-    async fn publish_context(
-        &self,
-        _id: &[u8; 32],
-        _params: &ContextParams,
-    ) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    async fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    async fn send_message(
-        &self,
-        _ctx_id: &[u8; 32],
-        _encrypted_payload: &[u8],
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-}
-
-#[derive(Default)]
-struct MockEventLog {
-    events: Mutex<Vec<([u8; 32], String)>>,
-}
-
-// `unused_async`: `init_event_log` / `destroy_event_log` have no await because
-// they are no-op test doubles, but the ADR-049 Decision-7 async
-// `ContextEventLogProvider` trait requires the `async fn` signature.
+/// No-op event-log provider (mirrors `saga_bridge_bootstrap.rs`).
+struct NoOpEventLog;
+// `unused_async`: these no-op test-double methods have no await, but the
+// ADR-049 Decision-7 async `ContextEventLogProvider` trait requires the
+// `async fn` signature.
 #[async_trait::async_trait]
 #[allow(clippy::unused_async)]
-impl ContextEventLogProvider for MockEventLog {
-    async fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+impl ContextEventLogProvider for NoOpEventLog {
+    async fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
     async fn append_event(
         &self,
-        id: &[u8; 32],
-        event_type: scp_event_log::EventType,
-        _actor_did: &str,
-        _payload: scp_event_log::EventPayload,
+        _: &[u8; 32],
+        _: scp_event_log::EventType,
+        _: &str,
+        _: scp_event_log::EventPayload,
         _timestamp_secs: u64,
     ) -> Result<(), ContextCreationError> {
-        self.events
-            .lock()
-            .unwrap()
-            .push((*id, format!("{event_type:?}")));
         Ok(())
     }
-    async fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
 }
 
-fn noop_key_resolver() -> KeyResolver {
-    std::sync::Arc::new(|_did: &DID, _kid: scp_did::SigningKeyId| None)
+fn test_mls_storage() -> Arc<dyn OpenMlsStorageAdapter> {
+    Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
+        InMemoryStorage::new(),
+    )))
 }
 
-/// Derives a deterministic Ed25519 seed from a DID string by XOR-folding
-/// the DID bytes into a 32-byte array. Matches the algorithm used by
-/// the in-crate `mock_key_resolver` so signing and verification are consistent.
+/// Builds a real `Supervisor` with a concrete `NodeMlsFactory`, a clock (the
+/// `invoke_outlet_with_economy` path requires one), and NO payment adapter so a
+/// funded invocation yields no `PaymentReceipt`.
+fn build_supervisor(creator_did: &str, key_resolver: KeyResolver) -> Arc<Supervisor> {
+    Supervisor::with_providers(
+        Arc::new(NodeMlsFactory::new(
+            creator_did.to_owned(),
+            Arc::new(scp_clock::SystemClock),
+        )),
+        Box::new(LocalTransportProvider) as Box<dyn ContextTransportProvider>,
+        Box::new(NoOpEventLog) as Box<dyn ContextEventLogProvider>,
+        key_resolver,
+        None,                                   // persistence
+        None,                                   // payment_adapter -> no PaymentReceipt
+        None,                                   // event_tx
+        Some(Arc::new(scp_clock::SystemClock)), // clock (required by invoke_outlet_with_economy)
+        test_mls_storage(),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Budget / velocity accessors — the public `dispatch_query` mailbox commands.
+// ---------------------------------------------------------------------------
+
+async fn remaining_budget(sup: &Arc<Supervisor>, context_id: &str, did: &DID) -> Amount {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    sup.dispatch_query(QueriesCommand::RemainingBudgetForTest {
+        context_id: context_id.to_owned(),
+        member_did: did.clone(),
+        reply: tx,
+    })
+    .await
+    .expect("dispatch RemainingBudgetForTest");
+    rx.await.expect("budget reply").expect("budget ok")
+}
+
+async fn velocity(sup: &Arc<Supervisor>, context_id: &str, did: &DID, now_secs: u64) -> u64 {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    sup.dispatch_query(QueriesCommand::VelocityForTest {
+        context_id: context_id.to_owned(),
+        member_did: did.clone(),
+        now_secs,
+        reply: tx,
+    })
+    .await
+    .expect("dispatch VelocityForTest");
+    rx.await.expect("velocity reply").expect("velocity ok")
+}
+
+/// Grants `amount` of per-DID budget to `spender` through a governance
+/// `ApproveSpend` action, signed by the admin. Under the default SingleAdmin
+/// governance the creator/admin's proposal auto-approves and EXECUTES, so the
+/// grant lands in the actor's budget tracker — the real path a client uses
+/// (there is no out-of-crate budget test hook).
+async fn grant_budget(
+    sup: &Arc<Supervisor>,
+    context_id: &str,
+    admin: &DID,
+    admin_key: &ed25519_dalek::SigningKey,
+    spender: &DID,
+    amount: Amount,
+) {
+    let (_proposal, _events, execution) = sup
+        .propose_governance_action(
+            context_id,
+            admin,
+            GovernanceAction::ApproveSpend {
+                spender: spender.clone(),
+                amount,
+                purpose: "outlet-economy wiring test budget".to_owned(),
+            },
+            admin_key,
+        )
+        .await
+        .expect("ApproveSpend proposal");
+    assert!(
+        execution.is_some(),
+        "SingleAdmin ApproveSpend by the admin must auto-execute"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic key material — one Ed25519 key per DID so `mock_key_resolver`
+// resolves the same verifying key a governance proposal / spending UCAN is
+// signed under.
+// ---------------------------------------------------------------------------
+
+/// Derives a deterministic Ed25519 seed from a DID string by XOR-folding the
+/// DID bytes into a 32-byte array.
 fn did_to_seed(did: &DID) -> [u8; 32] {
     let mut s = [0u8; 32];
     let bytes = did.as_ref().as_bytes();
@@ -232,23 +208,22 @@ fn did_to_seed(did: &DID) -> [u8; 32] {
     s
 }
 
-/// Mock key resolver that returns a deterministic verifying key derived from
-/// the DID string. Used by happy-path tests that need real signature verification.
+/// Key resolver that returns the deterministic verifying key derived from the
+/// DID string — used for both governance-proposal signature validation and
+/// spending-UCAN signature validation.
 fn mock_key_resolver() -> KeyResolver {
-    std::sync::Arc::new(|did, _kid: scp_did::SigningKeyId| {
-        let seed = did_to_seed(did);
-        Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
+    Arc::new(|did: &DID, _kid: scp_did::SigningKeyId| {
+        Some(ed25519_dalek::SigningKey::from_bytes(&did_to_seed(did)).verifying_key())
     })
 }
 
-/// Returns the signing key corresponding to what `mock_key_resolver` resolves
-/// for the given DID. Used to produce tokens that pass end-to-end validation.
+/// The signing key `mock_key_resolver` resolves for `did`.
 fn signing_key_for_did(did: &DID) -> ed25519_dalek::SigningKey {
     ed25519_dalek::SigningKey::from_bytes(&did_to_seed(did))
 }
 
 // ---------------------------------------------------------------------------
-// Helpers — fixture builders.
+// Fixtures.
 // ---------------------------------------------------------------------------
 
 fn governance_params_with_outlets() -> ContextParams {
@@ -310,64 +285,10 @@ fn echo_outlet() -> OutletRegistration {
     }
 }
 
-/// Build a `UcanToken` carrying a `SpendingCapability` that comfortably
-/// covers any per-action cost the test will exercise. The signature
-/// field is empty because `economy_pre_check` only consults
-/// `payload.fct.spending_capability` for the AND-composition check.
-///
-/// Suitable ONLY for tests that assert rejection (budget exceeded, etc.)
-/// where the rejection happens before C1b signature validation. For happy-path
-/// invocations that must pass the full C1b pipeline, use `signed_spending_ucan_for`.
-fn dummy_spending_ucan() -> scp_core::crypto::ucan::UcanToken {
-    use scp_core::crypto::ucan::spending::{
-        Amount as SpendAmount, CurrencyCode as SpendCurrency, SpendingCapability,
-    };
-    use scp_core::crypto::ucan::{
-        Attenuation, UcanHeader, UcanPayload, UcanToken, nonce::generate_nonce,
-    };
-
-    let cap = SpendingCapability {
-        max_per_action: SpendAmount(1_000),
-        max_total: SpendAmount(10_000),
-        currency: SpendCurrency::from_code("USD").unwrap_or(SpendCurrency(*b"USD\0")),
-        time_window: std::time::Duration::from_hours(1),
-        allowed_adapters: vec![],
-    };
-    let mut fct = serde_json::Map::new();
-    fct.insert(
-        "spending_capability".to_owned(),
-        cap.to_fact_value().unwrap_or(serde_json::Value::Null),
-    );
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    UcanToken {
-        header: UcanHeader::new(),
-        payload: UcanPayload {
-            iss: "did:key:invoker".to_owned(),
-            aud: "did:key:test-context".to_owned(),
-            exp: now + 3600,
-            nbf: Some(now),
-            nnc: generate_nonce(&scp_clock::SystemClock),
-            att: vec![Attenuation {
-                with: "scp:spending:*".to_owned(),
-                can: "spend".to_owned(),
-            }],
-            prf: vec![],
-            fct: Some(serde_json::Value::Object(fct)),
-            nb: None,
-        },
-        signature: vec![],
-        encoded: "test.spending.ucan".to_owned(),
-    }
-}
-
-/// Build a fully-signed `UcanToken` bound to `actor_did` for happy-path tests
-/// that exercise the complete C1b validation pipeline (signature, iss/aud
-/// binding, expiry, nonce). The token is signed with the deterministic Ed25519
-/// key produced by `signing_key_for_did`, which `mock_key_resolver` resolves for
-/// the same DID.
+/// Builds a fully-signed `UcanToken` bound to `actor_did` that exercises the
+/// complete C1b validation pipeline (signature, iss/aud binding, expiry,
+/// nonce). Signed with the deterministic Ed25519 key `mock_key_resolver`
+/// resolves for the same DID.
 fn signed_spending_ucan_for(actor_did: &DID) -> scp_core::crypto::ucan::UcanToken {
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -436,38 +357,36 @@ fn signed_spending_ucan_for(actor_did: &DID) -> scp_core::crypto::ucan::UcanToke
 }
 
 // ---------------------------------------------------------------------------
-// Test 1: invoke_outlet_with_economy deducts budget and records velocity
+// Test 1: invoke_outlet_with_economy deducts budget and records velocity.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invoke_outlet_with_economy_deducts_budget_and_records_velocity() {
-    // C1b: happy-path invocations now require a fully signed spending UCAN
-    // bound to the invoker DID. Use mock_key_resolver so validate_spending_ucan_signed
-    // can resolve the verifying key, and signed_spending_ucan_for to produce a
-    // token signed by the matching private key.
-    // ADR-049 §15 — wrap with `attach_test_supervisor`.
-    let manager = scp_core::context::attach_test_supervisor(ContextManager::new(
-        Box::new(MockCrypto),
-        Box::new(MockTransport::connected()),
-        Box::new(MockEventLog::default()),
-        mock_key_resolver(),
-    ));
+    // The invoker is also the context creator/admin, so it inherits the full
+    // ceiling (including OutletCallAll) — the reserve-phase authorization gate
+    // clears — and can grant itself budget via SingleAdmin ApproveSpend.
+    let invoker = DID::from("did:dht:z6MkOutletEconomyInvoker");
+    let sup = build_supervisor(invoker.as_ref(), mock_key_resolver());
+    sup.register_local_did(invoker.clone()).await.unwrap();
 
-    let invoker = DID::from("did:key:invoker");
-    let context_id = "ctx-c4-outlet-economy".to_owned();
+    let context_id = "ctx-c4-outlet-economy";
     let mut params = governance_params_with_outlets();
     params.economic_policy = Some(priced_policy(7));
-
-    let _handle = manager
-        .create_context(context_id.clone(), params, invoker.clone(), None)
+    sup.create_context(context_id.to_owned(), params, invoker.clone(), None)
         .await
         .expect("create_context");
 
-    // Mirror an `ApproveSpend` governance proposal: grant the invoker
-    // a 1000 USD budget via the test-only hook added in PR #1606.
-    manager
-        .grant_budget_for_test(&context_id, &invoker, Amount::new(1_000))
-        .await;
+    // Grant the invoker a 1000 USD budget via governance ApproveSpend.
+    let admin_key = signing_key_for_did(&invoker);
+    grant_budget(
+        &sup,
+        context_id,
+        &invoker,
+        &admin_key,
+        &invoker,
+        Amount::new(1_000),
+    )
+    .await;
 
     let mut registry = OutletRegistry::new();
     registry.insert(echo_outlet());
@@ -475,24 +394,22 @@ async fn invoke_outlet_with_economy_deducts_budget_and_records_velocity() {
     // Fully signed UCAN bound to the invoker, matching mock_key_resolver.
     let spending_ucan = signed_spending_ucan_for(&invoker);
 
-    // Snapshot pre-call state.
-    let budget_before = manager
-        .remaining_budget_for_test(&context_id, &invoker)
-        .await;
-    let now_secs = std::time::SystemTime::now()
+    // Snapshot pre-call state. The baseline velocity is read with a pre-call
+    // anchor; the "after" read (below) re-anchors AFTER the invocation so the
+    // 60s sliding window is guaranteed to cover the entry the call records even
+    // if the invocation crossed a wall-clock second boundary — otherwise a stale
+    // pre-call anchor could flake the comparison.
+    let budget_before = remaining_budget(&sup, context_id, &invoker).await;
+    let now_secs_before = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let velocity_before = manager
-        .velocity_for_test(&context_id, &invoker, now_secs)
-        .await;
+    let velocity_before = velocity(&sup, context_id, &invoker, now_secs_before).await;
 
-    // THE CRITICAL CALL — exactly the path the 3 FFI bridges
-    // now route through after C4. The closure echoes the input back
-    // so we can also verify the executor is invoked.
-    let outcome = manager
+    // THE CRITICAL CALL — exactly the path the 3 FFI bridges route through.
+    let outcome = sup
         .invoke_outlet_with_economy(
-            &context_id,
+            context_id,
             &registry,
             &OutletId::from("echo"),
             serde_json::json!({"hello": "world"}),
@@ -500,25 +417,22 @@ async fn invoke_outlet_with_economy_deducts_budget_and_records_velocity() {
             Some(&spending_ucan),
             None,
             None,
-            None,
-            |input: serde_json::Value| async move { Ok(serde_json::json!({"echoed": input})) },
+            |input: serde_json::Value| async move {
+                Ok::<serde_json::Value, String>(serde_json::json!({"echoed": input}))
+            },
         )
         .await
-        .expect("invoke_outlet_with_economy must succeed for free-budget paid outlet");
+        .expect("invoke_outlet_with_economy must succeed for a funded paid outlet");
 
-    // Verify the executor ran and produced the expected output.
+    // The executor ran and produced the expected output.
     assert_eq!(
         outcome.output,
         serde_json::json!({"echoed": {"hello": "world"}}),
-        "executor output must round-trip through the manager"
+        "executor output must round-trip through the managed invoke"
     );
 
-    // Verify the budget was deducted by EXACTLY the policy cost.
-    // Before C4 the bridges bypassed this entirely; the budget would
-    // be unchanged from `budget_before`.
-    let budget_after = manager
-        .remaining_budget_for_test(&context_id, &invoker)
-        .await;
+    // The budget was deducted by EXACTLY the policy cost.
+    let budget_after = remaining_budget(&sup, context_id, &invoker).await;
     assert_eq!(
         budget_before.value() - budget_after.value(),
         7,
@@ -528,20 +442,26 @@ async fn invoke_outlet_with_economy_deducts_budget_and_records_velocity() {
         budget_after.value()
     );
 
-    // Verify velocity was recorded. Before C4 the bridges did not
-    // record velocity at all, so escalation never engaged.
-    let velocity_after = manager
-        .velocity_for_test(&context_id, &invoker, now_secs)
-        .await;
-    assert!(
-        velocity_after > velocity_before,
-        "invoke_outlet_with_economy must record one velocity entry per call \
+    // Velocity was recorded. Re-anchor AFTER the call so the sliding window
+    // covers the just-recorded entry regardless of second-boundary timing.
+    let now_secs_after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let velocity_after = velocity(&sup, context_id, &invoker, now_secs_after).await;
+    // `velocity_before` is provably 0: the only prior action was the governance
+    // `grant_budget` (ApproveSpend), which records no velocity entry. Assert the
+    // EXACT +1 so a "2 entries per call" regression is caught, not just >.
+    assert_eq!(
+        velocity_after,
+        velocity_before + 1,
+        "invoke_outlet_with_economy must record EXACTLY one velocity entry per call \
          (before={velocity_before}, after={velocity_after})"
     );
 
-    // Verify the OutletInvokedEvent carries the deducted cost.
+    // The OutletInvokedEvent carries the deducted cost, outlet, and invoker.
     assert_eq!(
-        outcome.event.cost.map(scp_core::economy::Amount::value),
+        outcome.event.cost.map(Amount::value),
         Some(7),
         "OutletInvokedEvent.cost must reflect the deducted per-invocation cost"
     );
@@ -554,55 +474,56 @@ async fn invoke_outlet_with_economy_deducts_budget_and_records_velocity() {
         "OutletInvokedEvent.invoker_did must match the invoker"
     );
 
-    // Sanity-check: no payment receipt was produced (no payment
-    // adapter configured → escrow capture is skipped).
+    // No payment adapter configured -> escrow capture is skipped.
     assert!(
         outcome.payment_receipt.is_none(),
-        "no PaymentAdapter configured → no PaymentReceipt expected"
+        "no PaymentAdapter configured -> no PaymentReceipt expected"
     );
 }
 
 // ---------------------------------------------------------------------------
-// Test 2: invoke_outlet_with_economy rejects insufficient budget
+// Test 2: invoke_outlet_with_economy rejects insufficient budget.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invoke_outlet_with_economy_rejects_insufficient_budget() {
-    // ADR-049 §15 — wrap with `attach_test_supervisor`.
-    let manager = scp_core::context::attach_test_supervisor(ContextManager::new(
-        Box::new(MockCrypto),
-        Box::new(MockTransport::connected()),
-        Box::new(MockEventLog::default()),
-        noop_key_resolver(),
-    ));
+    let invoker = DID::from("did:dht:z6MkOutletEconomyBroke");
+    let sup = build_supervisor(invoker.as_ref(), mock_key_resolver());
+    sup.register_local_did(invoker.clone()).await.unwrap();
 
-    let invoker = DID::from("did:key:invoker");
-    let context_id = "ctx-c4-budget-rejected".to_owned();
+    let context_id = "ctx-c4-budget-rejected";
     let mut params = governance_params_with_outlets();
     // Price the outlet above any granted budget.
     params.economic_policy = Some(priced_policy(100));
-
-    let _handle = manager
-        .create_context(context_id.clone(), params, invoker.clone(), None)
+    sup.create_context(context_id.to_owned(), params, invoker.clone(), None)
         .await
         .expect("create_context");
 
-    // Grant ZERO budget — the per-DID budget tracker has no entry for
-    // the invoker, so `has_budget` returns false and the pre-check
-    // must reject the invocation.
+    // Grant ZERO budget — the per-DID budget tracker has no entry for the
+    // invoker, so `has_budget` returns false and the pre-check must reject.
     let mut registry = OutletRegistry::new();
     registry.insert(echo_outlet());
-    let spending_ucan = dummy_spending_ucan();
 
-    let result = manager
+    // A UCAN carrying a covering SpendingCapability (max_per_action ≥ cost). The
+    // only UCAN check before the budget gate is the pre-budget capability-field
+    // check (check_spending_capability), which validates capability FIELDS —
+    // presence + max_per_action — NOT the Ed25519 signature. Signature
+    // validation runs later, inside the Class-S commit combinator that executes
+    // only after the budget gate passes, so it is never reached on this
+    // zero-budget path: it is the covering capability facts (not the signature)
+    // that let control reach the budget gate, and the rejection we assert is
+    // genuinely the budget gate. The token is validly signed only for realism /
+    // parity with the happy-path helper.
+    let spending_ucan = signed_spending_ucan_for(&invoker);
+
+    let result = sup
         .invoke_outlet_with_economy(
-            &context_id,
+            context_id,
             &registry,
             &OutletId::from("echo"),
             serde_json::json!({}),
             &invoker,
             Some(&spending_ucan),
-            None,
             None,
             None,
             |_input: serde_json::Value| async move {
@@ -613,23 +534,27 @@ async fn invoke_outlet_with_economy_rejects_insufficient_budget() {
 
     let err = result.expect_err("expected budget-exceeded rejection");
     let msg = format!("{err}");
+    // `invoke_outlet_with_economy` surfaces `InvocationError::BudgetExceeded`,
+    // which maps to the canonical economic-class outlet code `SCP-OUTLET-6150`
+    // with the discriminating slug `economic.budget-exceeded`. Assert BOTH: the
+    // code pins the error class and the slug pins the specific economic fault,
+    // so a regression to a non-economic error OR to a different economic
+    // sub-fault (e.g. insufficient-funds) is caught. (The inner `SCP-ECON-12010`
+    // "no budget" string is remapped and never surfaces here.)
     assert!(
-        msg.contains("SCP-ECON-12010") || msg.contains("budget exceeded"),
-        "expected SCP-ECON-12010 budget-exceeded error, got: {msg}"
+        msg.contains(CODE_ECONOMIC_FAULT) && msg.contains(SLUG_ECONOMIC_BUDGET_EXCEEDED),
+        "expected {CODE_ECONOMIC_FAULT} {SLUG_ECONOMIC_BUDGET_EXCEEDED} error, got: {msg}"
     );
 
-    // Velocity tracker must have been rolled back. The new test-only
-    // accessor reads `get_velocity` directly so we can prove the
-    // rollback happened.
+    // The velocity entry recorded during Phase-1 reserve must have been rolled
+    // back by the budget rejection.
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let velocity = manager
-        .velocity_for_test(&context_id, &invoker, now_secs)
-        .await;
+    let v = velocity(&sup, context_id, &invoker, now_secs).await;
     assert_eq!(
-        velocity, 0,
-        "Phase 1 budget rejection must roll back the velocity entry — got {velocity}"
+        v, 0,
+        "Phase-1 budget rejection must roll back the velocity entry — got {v}"
     );
 }

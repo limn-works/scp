@@ -1089,7 +1089,7 @@ impl NodeMlsFactory {
         // protection and are returned so the registry retains them.
         let had_epoch_map = !snapshot.sender_key_epochs.is_empty();
         let mut restored_sender_epochs: Vec<(String, u64)> =
-            snapshot.sender_key_epochs.drain(..).collect();
+            std::mem::take(&mut snapshot.sender_key_epochs);
 
         // Legacy-snapshot back-compat hardening: snapshots without a
         // `sender_key_epochs` field leave the map above empty. If

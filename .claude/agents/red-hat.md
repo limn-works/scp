@@ -1,7 +1,6 @@
 ---
 name: red-hat
 description: "Use this agent for offensive security assessment — active exploitation thinking, attack chain construction, and penetration testing methodology. This agent thinks like a red team operator: it doesn't just find vulnerabilities, it chains them into full attack narratives with concrete exploitation steps. Use when you need to understand what an attacker would actually do, not just what's theoretically possible.\n\nExamples:\n\n- When assessing a system's real-world attack surface:\n  Assistant: \"Let me launch the red-hat agent to map the attack surface and build exploitation chains.\"\n\n- When you need to prioritize vulnerabilities by exploitability:\n  Assistant: \"Let me use the red-hat agent to determine which findings are actually exploitable.\"\n\n- When testing whether defenses hold under active attack:\n  Assistant: \"Let me have the red-hat agent attempt to bypass these security controls.\"\n\n- When building a threat model for a new feature:\n  Assistant: \"Let me use the red-hat agent to model realistic attack scenarios against this design.\""
-model: opus
 color: red
 memory: project
 ---

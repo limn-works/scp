@@ -48,7 +48,7 @@ use scp_core::discovery::petnames::PetnameEvent;
 use scp_core::discovery::{DiscoveryQuery, normalize_address, parse_address};
 use scp_did::DID;
 
-use scp_ffi_common::petname_helpers::{self, LocalHandleQuerier, address_resolution_to_json};
+use scp_ffi_common::petname_helpers::{self, LocalHandleQuerier};
 
 use crate::error::ScpPyError;
 
@@ -1163,7 +1163,13 @@ impl crate::scp::PyScp {
     ///
     /// # Returns
     ///
-    /// A JSON string with an array of `AddressResolution` objects.
+    /// A JSON string holding one object with two keys: `resolutions` carries
+    /// the `AddressResolution` objects sorted by trust level, and
+    /// `unavailable_layers` names each layer this build could not query, with
+    /// the reason. A caller reads `unavailable_layers` before it acts on the
+    /// top-ranked resolution, because §22.8.2 of
+    /// `.docs/specs/22-human-readable-addressing.md` ranks by trust and an
+    /// unqueried higher-trust layer may hold a different binding.
     ///
     /// # Errors
     ///
@@ -1226,7 +1232,7 @@ impl crate::scp::PyScp {
         };
 
         let rt = crate::runtime()?;
-        let results = rt.block_on(async {
+        let outcome = rt.block_on(async {
             let mut resolver = scp_core::discovery::AddressResolver::new();
             let querier = LocalHandleQuerier::new(&bi.core);
             resolver
@@ -1241,14 +1247,16 @@ impl crate::scp::PyScp {
                 .await
                 .map_err(|e| ScpPyError::ValidationError {
                     message: format!("address resolution failed: {e}"),
-                    code: codes::VALID_7091.to_owned(),
+                    code: petname_helpers::address_resolution_error_code(&e).to_owned(),
                 })
         })?;
 
-        let json_results: Vec<serde_json::Value> =
-            results.iter().map(address_resolution_to_json).collect();
+        // §22.8.2 ranks results by trust level, so a caller reads
+        // `unavailable_layers` to learn which higher-trust layers this build
+        // never queried. Returning the resolution array alone would hide that.
+        let json_outcome = petname_helpers::address_resolution_outcome_to_json(&outcome);
 
-        serde_json::to_string(&json_results).map_err(|e| {
+        serde_json::to_string(&json_outcome).map_err(|e| {
             ScpPyError::ValidationError {
                 message: format!("failed to serialize address resolution results: {e}"),
                 code: codes::VALID_7092.to_owned(),
@@ -1674,11 +1682,104 @@ mod tests {
         scp.petname_set(owner, "did:dht:zAlice", "alice").unwrap();
 
         let result = scp.address_resolve(owner, "alice", None).unwrap();
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
-        assert!(!parsed.is_empty());
-        assert_eq!(parsed[0]["type"], "Identity");
-        assert_eq!(parsed[0]["did"], "did:dht:zAlice");
-        assert_eq!(parsed[0]["trust_level"]["kind"], "LocalPetname");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let resolutions = parsed["resolutions"].as_array().unwrap();
+        assert!(!resolutions.is_empty());
+        assert_eq!(resolutions[0]["type"], "Identity");
+        assert_eq!(resolutions[0]["did"], "did:dht:zAlice");
+        assert_eq!(resolutions[0]["trust_level"]["kind"], "LocalPetname");
+        // §22.8.2 step 1 stops at a petname hit, so no handle layer was
+        // queried and none reported unavailability.
+        assert_eq!(parsed["unavailable_layers"].as_array().unwrap().len(), 0);
+    }
+
+    /// A resolution that reaches the handle layers names every layer this
+    /// bridge cannot query, alongside whatever it found. `LocalHandleQuerier`
+    /// fetches no `.well-known/scp` document and invokes no
+    /// `attestation_lookup` outlet, so both layers report unavailable.
+    #[test]
+    fn address_resolve_names_the_layers_this_bridge_never_queried() {
+        let owner = "did:dht:zTestResolver2";
+        let ctx = "ctx-unavailable-layers";
+        reset_petname_map_for(owner);
+        reset_handle_registry_for(ctx);
+        crate::init_runtime().ok();
+        let scp = default_scp();
+        scp.handle_register(
+            ctx,
+            "alice",
+            r#"{"type": "identity", "did": "did:dht:zAlice"}"#,
+            "did:dht:zAlice",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = scp.address_resolve(owner, "alice", None).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+        let resolutions = parsed["resolutions"].as_array().unwrap();
+        assert_eq!(resolutions.len(), 1);
+        assert_eq!(resolutions[0]["did"], "did:dht:zAlice");
+        assert_eq!(
+            resolutions[0]["trust_level"]["kind"],
+            "HandleRegistryVerified"
+        );
+
+        // This bridge invokes no `attestation_lookup` outlet, so nobody read
+        // an attestation index. §22.8.2 step 2a queries one domain per
+        // configured domain and this bridge configures none, so nobody read a
+        // `.well-known/scp` document either. Both layers therefore appear
+        // here, which is what §22.8.2a requires: a caller acting on the
+        // handle-registry binding learns that two other layers went unread.
+        let unavailable = parsed["unavailable_layers"].as_array().unwrap();
+        let layers: Vec<&str> = unavailable
+            .iter()
+            .map(|entry| entry["layer"].as_str().unwrap())
+            .collect();
+        assert_eq!(unavailable.len(), 2, "got layers: {layers:?}");
+        assert!(layers.contains(&"Attestation"), "got layers: {layers:?}");
+        assert!(layers.contains(&"Domain"), "got layers: {layers:?}");
+
+        let attestation_reason = unavailable
+            .iter()
+            .find(|entry| entry["layer"] == "Attestation")
+            .and_then(|entry| entry["reason"].as_str())
+            .expect("the attestation entry carries a reason");
+        assert!(
+            attestation_reason.contains("attestation_lookup"),
+            "the reason must name the outlet this bridge never invokes: {attestation_reason}"
+        );
+
+        let domain_reason = unavailable
+            .iter()
+            .find(|entry| entry["layer"] == "Domain")
+            .and_then(|entry| entry["reason"].as_str())
+            .expect("the domain entry carries a reason");
+        assert!(
+            domain_reason.contains("no domain"),
+            "the reason must name the missing configuration: {domain_reason}"
+        );
+    }
+
+    /// A domain-scoped address reaches two layers, and this bridge queries
+    /// neither, so the typed error names both rather than reporting that no
+    /// DID registered that handle.
+    #[test]
+    fn address_resolve_domain_handle_reports_both_unqueried_layers() {
+        let owner = "did:dht:zTestResolver3";
+        reset_petname_map_for(owner);
+        crate::init_runtime().ok();
+        let scp = default_scp();
+
+        let error = scp
+            .address_resolve(owner, "alice@example.com", None)
+            .expect_err("this bridge queries neither the domain nor the attestation layer");
+        let message = error.to_string();
+        assert!(
+            message.contains("Domain") && message.contains("Attestation"),
+            "the error must name both layers that never answered: {message}"
+        );
     }
 
     // -- JSON conversion helper tests ----------------------------------------

@@ -1017,27 +1017,157 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // hex roundtrip (via hex crate, validates bridge_adapters integration)
+    // hex encode/decode — the bridge's own `crate::types::encode_hex` encoder
+    // and the `hex` crate's decoder
     // -----------------------------------------------------------------------
 
     #[test]
     fn hex_encode_decode_roundtrip() {
         let bytes = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
-        let encoded = hex::encode(bytes);
+        let encoded = crate::types::encode_hex(&bytes);
+        assert_eq!(
+            encoded, "0123456789abcdef",
+            "encode_hex must emit lowercase hex with two characters per byte"
+        );
         let decoded = hex::decode(&encoded).unwrap();
         assert_eq!(decoded, bytes);
     }
 
-    #[test]
-    fn hex_decode_rejects_odd_length() {
-        let result = hex::decode("abc");
-        assert!(result.is_err());
+    // -----------------------------------------------------------------------
+    // PyScp::ucan_revoke — one bridge operation Python SDK code calls
+    //
+    // Both tests call `PyScp::ucan_revoke` itself, so they fail if it stops
+    // passing its event logger, passes a wrong revoker DID, stops calling
+    // `revoke_ucan`, or drops its authorizer. NAPI carries a matching pair in
+    // `ucan_revoke_wiring`.
+    // -----------------------------------------------------------------------
+
+    /// Issuer and creator of whichever token both tests revoke.
+    const REVOKE_CREATOR_DID: &str = "did:dht:zCreator";
+
+    /// A DID that is neither issuer nor context creator, so
+    /// `BridgeRevocationAuthorizer` must reject it.
+    const REVOKE_OUTSIDER_DID: &str = "did:dht:zUnauthorized";
+
+    /// A token whose `iss` is [`REVOKE_CREATOR_DID`] and whose `aud` is a
+    /// member DID. `revoke_ucan` authorizes on those two DIDs and verifies no
+    /// signature, so a fixed encoding suffices here.
+    const REVOKE_TEST_TOKEN: &str = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsInVjdiI6IjAuMTAuMCJ9.\
+        eyJpc3MiOiJkaWQ6ZGh0OnpDcmVhdG9yIiwiYXVkIjoiZGlkOmRodDp6TWVtYmVyIiwiZXhwIjo5OTk5OTk5OTk5LCJubmMiOiIxNjk5OTk5MDAwMDAwLWFhYmJjY2RkMTEyMjMzNDQiLCJhdHQiOltdLCJwcmYiOltdfQ.\
+        dGVzdC1zaWduYXR1cmU";
+
+    /// Registers a context owned by [`REVOKE_CREATOR_DID`] on a fresh bridge
+    /// instance, and returns that instance with its context ID.
+    fn revocable_context() -> (crate::scp::PyScp, String) {
+        let scp = crate::scp::PyScp::new_in_memory_for_test();
+        let context_id = format!("ctx-revoke-{}", uuid::Uuid::new_v4());
+        crate::runtime::register_context(&scp.inner, &context_id, REVOKE_CREATOR_DID, &[])
+            .expect("register_context should succeed");
+        (scp, context_id)
+    }
+
+    /// Reads how many leaves a context's UCAN-registry event log holds.
+    fn revoke_event_count(scp: &crate::scp::PyScp, context_id: &str) -> u64 {
+        crate::runtime::with_context(&scp.inner, context_id, |rt| {
+            Ok(scp_event_log::tree::event_count(&rt.event_log))
+        })
+        .expect("this context must be registered in UCAN state registry")
+    }
+
+    /// Asks `BridgeRevocationChecker`, which `ucan_validate` reads, whether
+    /// a token carrying `token_cid` is revoked.
+    fn revoke_checker_reports_revoked(
+        scp: &crate::scp::PyScp,
+        context_id: &str,
+        token_cid: &str,
+    ) -> bool {
+        crate::runtime::with_context(&scp.inner, context_id, |rt| {
+            let checker = crate::bridge_adapters::BridgeRevocationChecker {
+                revocation_list: &rt.revocation_list,
+            };
+            Ok(checker.is_revoked(token_cid))
+        })
+        .expect("this context must be registered in UCAN state registry")
     }
 
     #[test]
-    fn hex_decode_rejects_non_hex() {
-        let result = hex::decode("gggg");
-        assert!(result.is_err());
+    fn ucan_revoke_marks_token_revoked_and_logs_event() {
+        let (scp, context_id) = revocable_context();
+        let events_before = revoke_event_count(&scp, &context_id);
+
+        scp.ucan_revoke(&context_id, REVOKE_TEST_TOKEN, REVOKE_CREATOR_DID)
+            .expect("ucan_revoke must accept a context creator as revoker");
+
+        let token_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(REVOKE_TEST_TOKEN);
+        assert!(
+            revoke_checker_reports_revoked(&scp, &context_id, &token_cid),
+            "a token revoked through PyScp::ucan_revoke must be reported as revoked by \
+             BridgeRevocationChecker, which ucan_validate reads"
+        );
+
+        let events_after = revoke_event_count(&scp, &context_id);
+        assert!(
+            events_after > events_before,
+            "ucan_revoke must append a TokenRevoked event: this log held {events_before} \
+             leaves before that call and {events_after} after"
+        );
+    }
+
+    #[test]
+    fn ucan_revoke_rejects_unauthorized_revoker() {
+        let (scp, context_id) = revocable_context();
+
+        let error = scp
+            .ucan_revoke(&context_id, REVOKE_TEST_TOKEN, REVOKE_OUTSIDER_DID)
+            .expect_err("ucan_revoke must reject a revoker it never authorized");
+
+        let message = error.to_string();
+        assert!(
+            message.contains(REVOKE_OUTSIDER_DID),
+            "this rejection must name whichever revoker it refused, got: {message}"
+        );
+
+        let token_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(REVOKE_TEST_TOKEN);
+        assert!(
+            !revoke_checker_reports_revoked(&scp, &context_id, &token_cid),
+            "a rejected revocation must leave its token unrevoked"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // BridgeDidResolver rejects malformed did:key hex
+    //
+    // Both cases drive `BridgeDidResolver::resolve_public_key`, one
+    // production entry point this bridge hands to UCAN validation. An earlier
+    // pair asserted on `hex::decode` directly, which pinned behaviour of a
+    // third-party crate and left every bridge symbol free to change.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bridge_did_resolver_rejects_odd_length_did_key_hex() {
+        let resolver = BridgeDidResolver;
+        // 63 hex characters cannot encode 32 bytes.
+        let did = format!("did:key:{}", "a".repeat(63));
+        let error = resolver
+            .resolve_public_key(&did)
+            .expect_err("an odd-length hex body must not resolve");
+        assert!(
+            matches!(error, CoreUcanError::MalformedToken(_)),
+            "expected MalformedToken, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn bridge_did_resolver_rejects_non_hex_did_key_body() {
+        let resolver = BridgeDidResolver;
+        let did = format!("did:key:{}", "g".repeat(64));
+        let error = resolver
+            .resolve_public_key(&did)
+            .expect_err("a body outside [0-9a-f] must not resolve");
+        assert!(
+            matches!(error, CoreUcanError::MalformedToken(_)),
+            "expected MalformedToken, got {error:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1051,10 +1181,17 @@ mod tests {
     #[test]
     fn ucan_evaluate_rejects_empty_presenting_agent_did() {
         let scp = crate::scp::PyScp::new_in_memory_for_test();
-        let result = scp.ucan_evaluate("ctx-1", "header.payload.sig", None, "   ", None);
+        let error = scp
+            .ucan_evaluate("ctx-1", "header.payload.sig", None, "   ", None)
+            .expect_err("ucan_evaluate must fail closed on an empty presenting_agent_did");
+        // Pin this rejection to `validate_did`, not to any later failure.
+        // With that DID gate deleted, this call would still fail — on a
+        // malformed token, or on an unregistered context — so a bare `is_err`
+        // assertion would certify a removed gate.
+        let message = error.to_string();
         assert!(
-            result.is_err(),
-            "ucan_evaluate must fail closed when presenting_agent_did is empty"
+            message.contains("DID must not be empty"),
+            "rejection must come from validate_did, got: {message}"
         );
     }
 
@@ -1069,11 +1206,16 @@ mod tests {
     #[test]
     fn ucan_validate_rejects_empty_presenting_agent_did() {
         let scp = crate::scp::PyScp::new_in_memory_for_test();
-        let result =
-            scp.ucan_validate("ctx-1", "header.payload.sig", "messages:write", "   ", None);
+        let error = scp
+            .ucan_validate("ctx-1", "header.payload.sig", "messages:write", "   ", None)
+            .expect_err("ucan_validate must fail closed on an empty presenting_agent_did");
+        // Pin this rejection to `validate_did` — see a sibling
+        // `ucan_evaluate` test for why a bare `is_err` assertion passes even
+        // with that gate deleted.
+        let message = error.to_string();
         assert!(
-            result.is_err(),
-            "ucan_validate must fail closed when presenting_agent_did is empty"
+            message.contains("DID must not be empty"),
+            "rejection must come from validate_did, got: {message}"
         );
     }
 }

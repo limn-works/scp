@@ -297,6 +297,7 @@ enforcement mechanism.)
 | `SCP-STORAGE-8001` | `scp-kt-android` `AndroidStorage` | Storage key not found |
 | `SCP-STORAGE-8002` | `scp-kt-android` `AndroidStorage` | Storage operation failed |
 | `SCP-STORAGE-8003` | `scp-kt-android` `AndroidStorage` | Key derivation failed |
+| `SCP-STORAGE-8004` | selection layer (all bridges) | Selected durable storage backend failed to open |
 | `SCP-STORAGE-8010` | `scp-client-wasm` (browser participant) | Injected `Storage` backend I/O fault (`get`/`put`/`delete`/`list_keys`) |
 | `SCP-STORAGE-8011` | `scp-client-wasm` (browser participant) | Corrupt snapshot — bad decode / unknown version / context-id-vs-key mismatch / §9.9.3 checkpoint mismatch |
 | `SCP-STORAGE-8012` | `scp-client-wasm` (browser participant) | Snapshot / pending-join blob belongs to a different identity (owner-DID mismatch) |
@@ -304,6 +305,17 @@ enforcement mechanism.)
 
 The browser participant codes (`8010-8013`) start at `8010` specifically to avoid
 colliding with the Android backend's `8001-8003`, which were allocated first.
+
+The selection layer owns `8000` and `8004`. `8000` reports that the caller named
+no storage backend; `8004` reports that the backend the caller did name failed to
+open — a wrong `SQLCipher` key or passphrase, an unwritable directory, a corrupt
+file, a salt-sidecar fail-closed condition, or a database another `SCP` instance
+already holds an advisory lock on. The `PyO3`, NAPI and `UniFFI` bridges all
+raise `8004` for that one condition. The second selection-layer code took `8004`
+rather than `8001` because the Android backend already owns `8001-8003`: an
+Android app links `AndroidStorage` and the `UniFFI` bridge into one process, so
+reusing `8001` would make one code string mean both "storage key not found" and
+"durable backend failed to open" inside that app.
 
 ### Registered SCP-ATTEST- codes
 
@@ -331,9 +343,9 @@ and are documented with their own features.
 
 | Code | Description |
 |------|-------------|
-| `SCP-IDENT-1017` | Operation requires retained signing custody (identity loaded externally with no retained custody, or handle is sign-only). Surfaced by handle-borne bridges for UCAN **mint** (NAPI + UniFFI), event-log **checkpoint** (NAPI + UniFFI), and **broadcast publish** (NAPI + UniFFI). UCAN **delegate** surfaces `SCP-IDENT-1017` on **UniFFI only**: NAPI resolves the delegator key from the identity registry and surfaces `SCP-IDENT-1001` on a registry miss (same structural reason as PyO3), so NAPI delegate does **not** surface `SCP-IDENT-1017`. |
+| `SCP-IDENT-1017` | Operation requires retained signing custody (identity loaded externally with no retained custody, or handle is sign-only). Surfaced by handle-borne bridges for UCAN **mint** (NAPI + UniFFI), event-log **checkpoint** (NAPI + UniFFI), and **broadcast publish** (NAPI + UniFFI). UCAN **delegate** surfaces `SCP-IDENT-1001`, not `SCP-IDENT-1017`, on every bridge: PyO3, NAPI, and UniFFI each read a delegator's key from their identity registry, because a delegation signs with a delegator's own key and never with a context creator's key, so a missing delegator is a registry miss. |
 
-**Cross-bridge note.** PyO3 surfaces the analogous failure as `SCP-IDENT-1001` (registry-based key resolution per ADR-048 §7 — a registered identity always retains custody, so the "registered-but-no-custody" condition cannot arise); NAPI's UCAN **delegate** path is registry-based for the same structural reason and surfaces `SCP-IDENT-1001` as well (see the table above). On all three bridges (PyO3, NAPI, and UniFFI → Swift / Kotlin / TS-via-NAPI), consumers that catch the `IdentityError` category are safe for the missing-custody condition; only code that switches on the exact code string must account for the per-bridge code splits described above.
+**Cross-bridge note.** PyO3 surfaces the analogous failure as `SCP-IDENT-1001` (registry-based key resolution per ADR-048 §7 — a registered identity always retains custody, so the "registered-but-no-custody" condition cannot arise); NAPI's and UniFFI's UCAN **delegate** paths are registry-based for that same structural reason and surface `SCP-IDENT-1001` as well (see that table above). On all three bridges (PyO3, NAPI, and UniFFI → Swift / Kotlin / TS-via-NAPI), consumers that catch the `IdentityError` category are safe for the missing-custody condition; only code that switches on the exact code string must account for the per-bridge code splits described above.
 
 ## Stub and Placeholder Policy
 
@@ -369,7 +381,7 @@ A stub is honest about its gap on its own path. It is a **separate, forbidden fa
 
 **Deferral boundary:** deferring the *real backend* to a tracked workstream (issue/RFC) is legitimate. Shipping a dev stand-in *for it* in the interim is not. The two are independent: sever the nullifier now (make it test-harness-only, fail closed in prod); build the real backend on its own schedule.
 
-**Mechanical enforcement:** the shipped-feature-graph prove-absence gate (per ADR-062 / spec §17.17) asserts `resolved-feature-set(artifact) ⊆ an allowlist of durability-only features` and admits **zero nullifier features — no exceptions**. There is no "documented," "tracked," or "legible" allowlisted nullifier edge; a tracked deferral of the real backend does not earn one. Durability-only in-memory arms (state-loss only, no nullified security property — e.g. in-memory storage/push) remain legitimate *explicitly-selected* runtime options and are the only in-memory constructs the allowlist admits. See spec §17.17 for the durability-only-vs-nullifier classification.
+**Mechanical enforcement:** the shipped-feature-graph prove-absence gate (per ADR-062 / spec §17.17) asserts `resolved-feature-set(artifact) ⊆ an allowlist of durability-only + real-backend features` and admits **zero nullifier features — no exceptions**. There is no "documented," "tracked," or "legible" allowlisted nullifier edge; a tracked deferral of the real backend does not earn one. Durability-only in-memory arms (state-loss only, no nullified security property — e.g. in-memory storage/push) remain legitimate *explicitly-selected* runtime options and are the only in-memory constructs the allowlist admits. See spec §17.17 for the durability-only-vs-nullifier classification.
 
 ## Async Patterns
 

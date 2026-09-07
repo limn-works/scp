@@ -1,7 +1,6 @@
 ---
 name: chronicler
 description: "Use this agent when significant code changes, architectural decisions, implementation learnings, or important context needs to be documented. Invoke after completing tasks, PRs, or agent runs that produce knowledge worth preserving. Also use when new permanent instructions are issued or core operational patterns emerge that should be reflected in CLAUDE.md.\n\nExamples:\n\n- After implementing a new repository pattern:\n  Assistant: \"Let me use the chronicler agent to document this implementation and any learnings.\"\n\n- After creating an ADR:\n  Assistant: \"Let me use the chronicler agent to ensure this decision is properly captured across our documentation.\"\n\n- When a permanent instruction is issued:\n  Assistant: \"Let me use the chronicler agent to update CLAUDE.md with this new standard.\"\n\n- When valuable implementation knowledge is discovered:\n  Assistant: \"Let me use the chronicler agent to document this behavior in our notes.\""
-model: opus
 color: yellow
 memory: project
 ---

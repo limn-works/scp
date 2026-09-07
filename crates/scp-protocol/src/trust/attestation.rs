@@ -19,8 +19,12 @@
 //! # Threshold Attestation
 //!
 //! [`check_threshold_attestation`] counts attestations of a given type from an
-//! attestor set and verifies independence: shared context memberships and mutual
-//! endorsements reduce the independence score.
+//! attestor set. It admits an attestor only after it binds that attestor's
+//! attestation to the subject DID and to the attestor's own issuer DID,
+//! verifies that attestation, and drops every repeat of a DID it already
+//! admitted (spec §7.3.5 rule 1). It then scores independence over the admitted
+//! set: shared context memberships and mutual endorsements reduce the
+//! independence score.
 //!
 //! See ADR-017 in `.docs/adrs/phase-4.md`.
 
@@ -586,7 +590,10 @@ pub struct ThresholdResult {
     /// Whether the threshold requirement is fully satisfied (count met and
     /// independence sufficient).
     pub met: bool,
-    /// Number of valid attestations found.
+    /// Number of distinct attestor DIDs that [`check_threshold_attestation`]
+    /// admitted: each one carries a verified attestation of the required type
+    /// that names the evaluated subject and its own DID as issuer, and each one
+    /// counts once however many copies the caller supplied.
     pub valid_count: u32,
     /// The required count (N).
     pub required_count: u32,
@@ -614,8 +621,11 @@ pub struct AttestorInfo {
     /// DIDs that this attestor has endorsed (mutual endorsements reduce
     /// independence).
     pub endorsements: HashSet<DID>,
-    /// The attestation provided by this attestor (if any). Only attestations
-    /// matching the required type are considered.
+    /// The attestation provided by this attestor (if any).
+    /// [`check_threshold_attestation`] counts this attestation only when its
+    /// `attestation_type` matches the requirement, its `subject` matches the
+    /// evaluated subject DID, its `issuer` equals the `did` field above, and
+    /// [`verify_attestation_with_revocation`] accepts it.
     pub attestation: Option<Attestation>,
 }
 
@@ -706,12 +716,29 @@ impl DidPublicKeyResolver for IdentityDidPublicKeyResolver {
 /// lists, or external revocation services. The trait is object-safe and
 /// designed for injection into [`verify_attestation`].
 ///
-/// See spec §7.4.1 (attestation verification).
+/// SECURITY (issuer scoping — a requirement on every implementation).
+/// An implementation MUST report a revocation only when the issuer that signed
+/// that revocation equals the `issuer` argument. §7.4.1 of
+/// `.docs/specs/07-trust-validation-and-capabilities.md` describes
+/// `Attestation.id` as a UUID v4 that an issuer chooses, and states no rule
+/// deriving that id from its issuer, so `attestation_id` alone identifies no
+/// issuer and two issuers can carry one id. An implementation that decides on
+/// `attestation_id` alone therefore lets an attacker suppress an honest issuer's
+/// attestation: the attacker mints a DID at no cost, signs a self-revoking
+/// attestation carrying the honest issuer's id, and every later verification of
+/// the honest issuer's attestation then reports a revocation. §7.4.4 grants a
+/// revocation to the issuer alone ("Only the issuer (`revoked_by == issuer`) can
+/// revoke an attestation"), and scoping each answer to one issuer is how an
+/// implementation of this trait keeps that grant.
+///
+/// See spec §7.4.1 (attestation verification) and §7.4.4 (revocation).
 pub trait AttestationRevocationChecker {
-    /// Checks if the attestation with the given ID has been revoked by the issuer.
+    /// Checks whether `issuer` revoked the attestation carrying `attestation_id`.
     ///
-    /// Returns `Some(revoked_at)` with the revocation timestamp (seconds) if the
-    /// attestation has been revoked, or `None` if the attestation is still active.
+    /// Returns `Some(revoked_at)` with the revocation timestamp (seconds) when
+    /// `issuer` revoked that attestation, or `None` when `issuer` did not. A
+    /// revocation that a DID other than `issuer` signed MUST yield `None` here,
+    /// per the issuer-scoping requirement on this trait.
     fn check_revocation(&self, attestation_id: &str, issuer: &DID) -> Option<u64>;
 }
 
@@ -1041,30 +1068,83 @@ pub fn check_attestation_freshness(
 // check_threshold_attestation
 // ---------------------------------------------------------------------------
 
+/// Everything [`check_threshold_attestation`] needs to count an attestor set.
+///
+/// Every field is required, so no caller can reach the counting logic without
+/// supplying a subject DID, a resolver, and a clock — the three inputs the
+/// admission rules below depend on. `revocation_checker` carries an explicit
+/// `Option` because a caller that holds no revocation list states that fact by
+/// writing `None`, rather than by omitting a field.
+pub struct ThresholdCheckInput<'a> {
+    /// The attestation type the requirement counts.
+    pub attestation_type: &'a AttestationType,
+
+    /// The DID that each counted attestation must name as its subject.
+    pub subject_did: &'a DID,
+
+    /// The candidate attestors, before deduplication and verification.
+    pub attestors: &'a [AttestorInfo],
+
+    /// The N-of-M requirement and its independence penalties.
+    pub requirement: &'a ThresholdRequirement,
+
+    /// Resolves each issuer DID to the Ed25519 public key that must have
+    /// signed that issuer's attestation.
+    pub resolver: &'a dyn DidPublicKeyResolver,
+
+    /// Supplies the current time, which decides attestation expiry.
+    pub clock: &'a dyn Clock,
+
+    /// Consults an external revocation list, when the caller holds one.
+    /// `None` restricts revocation checking to each attestation's own
+    /// `revocation_status` field.
+    pub revocation_checker: Option<&'a dyn AttestationRevocationChecker>,
+}
+
 /// Checks whether an N-of-M threshold attestation requirement is met.
 ///
-/// Counts attestations of the given type from the attestor set and verifies
-/// independence. Shared context memberships and mutual endorsements reduce
-/// the independence score.
+/// # Admission rules
+///
+/// This function admits an attestor into the count only when that attestor
+/// passes all five rules. It applies every rule itself, so no caller can skip
+/// one:
+///
+/// 1. The attestor carries an attestation whose `attestation_type` equals
+///    [`ThresholdCheckInput::attestation_type`].
+/// 2. That attestation names [`ThresholdCheckInput::subject_did`] as its
+///    `subject`, which stops an attacker from submitting endorsements written
+///    for some other DID.
+/// 3. That attestation names the attestor's own DID as its `issuer`, which
+///    stops an attacker from claiming an attestation that someone else issued.
+/// 4. [`verify_attestation_with_revocation`] accepts that attestation, so a
+///    forged signature, an expired attestation, and a revoked attestation each
+///    fall out of the count. Per the [`DidPublicKeyResolver`] totality
+///    invariant an `Err` is terminal, so this function discards the attestation
+///    instead of retrying.
+/// 5. No earlier-admitted attestor carries the same DID. Spec §7.3.5 rule 1
+///    (distinct DIDs) states that multiple attestations from one DID count as
+///    one attestation regardless of quantity, so N copies of one attestor yield
+///    `valid_count == 1`.
+///
+/// Rule 5 runs last so that a rejected copy never consumes the deduplication
+/// slot that its issuer's valid attestation needs.
 ///
 /// # Independence scoring
 ///
-/// For each pair of attestors that both have valid attestations, the algorithm
-/// counts:
+/// [`compute_independence_score`] then scores the admitted set, and only the
+/// admitted set. For each pair of admitted attestors the algorithm counts:
 /// - Shared context memberships (contexts both attestors belong to).
 /// - Mutual endorsements (attestor A endorsed B or B endorsed A).
 ///
-/// Each shared context reduces the pair's independence by a fixed penalty.
-/// Each mutual endorsement reduces it further. The overall independence score
-/// is the average pairwise independence across all valid attestor pairs.
+/// Each shared context reduces that pair's independence by a fixed penalty.
+/// Each mutual endorsement reduces it further. The reported independence score
+/// is the average pairwise independence across all admitted attestor pairs.
 ///
-/// See ADR-017 acceptance criterion 7.
+/// See ADR-017 acceptance criterion 7 and spec §7.3.5.
 #[must_use]
-pub fn check_threshold_attestation(
-    attestation_type: &AttestationType,
-    attestors: &[AttestorInfo],
-    requirement: &ThresholdRequirement,
-) -> ThresholdResult {
+pub fn check_threshold_attestation(input: &ThresholdCheckInput<'_>) -> ThresholdResult {
+    let requirement = input.requirement;
+
     // Defense-in-depth: validate requirement even though constructors enforce it.
     debug_assert!(
         requirement.validate().is_ok(),
@@ -1072,15 +1152,42 @@ pub fn check_threshold_attestation(
         requirement.validate()
     );
 
-    // Count valid attestations of the required type.
-    let valid_attestors: Vec<&AttestorInfo> = attestors
-        .iter()
-        .filter(|a| {
-            a.attestation
-                .as_ref()
-                .is_some_and(|att| &att.attestation_type == attestation_type)
-        })
-        .collect();
+    let mut seen_dids: HashSet<&DID> = HashSet::new();
+    let mut valid_attestors: Vec<&AttestorInfo> = Vec::new();
+
+    for attestor in input.attestors {
+        let Some(attestation) = attestor.attestation.as_ref() else {
+            continue;
+        };
+        // Rule 1: the attestation answers the requirement's type.
+        if &attestation.attestation_type != input.attestation_type {
+            continue;
+        }
+        // Rule 2: subject binding.
+        if &attestation.subject != input.subject_did {
+            continue;
+        }
+        // Rule 3: issuer binding.
+        if attestation.issuer != attestor.did {
+            continue;
+        }
+        // Rule 4: signature, evidence, expiry, and revocation.
+        if verify_attestation_with_revocation(
+            attestation,
+            input.resolver,
+            input.clock,
+            input.revocation_checker,
+        )
+        .is_err()
+        {
+            continue;
+        }
+        // Rule 5: spec §7.3.5 rule 1 — one DID contributes one attestation.
+        if !seen_dids.insert(&attestor.did) {
+            continue;
+        }
+        valid_attestors.push(attestor);
+    }
 
     let valid_count = u32::try_from(valid_attestors.len()).unwrap_or(u32::MAX);
 
@@ -1990,50 +2097,110 @@ mod tests {
         }
     }
 
-    fn make_simple_attestation(attestation_type: AttestationType, issuer: &str) -> Attestation {
-        Attestation {
-            id: format!("att-{issuer}"),
-            attestation_type,
-            issuer: issuer.into(),
-            subject: "did:key:subject".into(),
-            claim: serde_json::json!({}),
-            evidence: None,
-            issued_at: 1000,
-            expires_at: Some(2000),
-            renewal_interval: None,
-            revocation_status: RevocationStatus::Active,
-            signature: vec![0u8; 64],
-            renewed_at: None,
+    /// Holds the subject DID, the resolver, and the clock that every
+    /// `check_threshold_attestation` call needs, and signs each attestation
+    /// with a key it registers in that resolver.
+    struct ThresholdFixture {
+        resolver: TestResolver,
+        clock: TestClock,
+        subject: DID,
+    }
+
+    impl ThresholdFixture {
+        fn new() -> Self {
+            Self {
+                resolver: TestResolver::new(),
+                clock: TestClock::new(1500),
+                subject: DID::from("did:key:subject"),
+            }
+        }
+
+        /// Signs an attestation that `issuer` issues about the fixture's
+        /// subject, and registers `issuer`'s public key with the resolver.
+        fn signed_attestation(
+            &mut self,
+            attestation_type: AttestationType,
+            issuer: &str,
+        ) -> Attestation {
+            let subject = self.subject.clone();
+            self.signed_attestation_about(attestation_type, issuer, &subject)
+        }
+
+        /// Signs an attestation that `issuer` issues about `subject`, and
+        /// registers `issuer`'s public key with the resolver.
+        fn signed_attestation_about(
+            &mut self,
+            attestation_type: AttestationType,
+            issuer: &str,
+            subject: &DID,
+        ) -> Attestation {
+            let (signing_key, pubkey_bytes) = test_keypair();
+            self.resolver.add_key(issuer, pubkey_bytes);
+            let mut attestation = Attestation {
+                id: format!("att-{issuer}"),
+                attestation_type,
+                issuer: issuer.into(),
+                subject: subject.clone(),
+                claim: serde_json::json!({}),
+                evidence: None,
+                issued_at: 1000,
+                expires_at: Some(2000),
+                renewal_interval: None,
+                revocation_status: RevocationStatus::Active,
+                signature: vec![],
+                renewed_at: None,
+            };
+            let canonical = canonical_attestation_bytes(&attestation).unwrap();
+            attestation.signature = signing_key.sign(&canonical).to_bytes().to_vec();
+            attestation
+        }
+
+        fn input<'a>(
+            &'a self,
+            attestation_type: &'a AttestationType,
+            attestors: &'a [AttestorInfo],
+            requirement: &'a ThresholdRequirement,
+        ) -> ThresholdCheckInput<'a> {
+            ThresholdCheckInput {
+                attestation_type,
+                subject_did: &self.subject,
+                attestors,
+                requirement,
+                resolver: &self.resolver,
+                clock: &self.clock,
+                revocation_checker: None,
+            }
         }
     }
 
     #[test]
     fn threshold_met_with_sufficient_independent_attestors() {
         let att_type = AttestationType::Endorsement;
+        let mut fx = ThresholdFixture::new();
         let attestors = vec![
             make_attestor(
                 "did:key:a",
                 &["ctx-1"],
                 &[],
-                Some(make_simple_attestation(att_type.clone(), "did:key:a")),
+                Some(fx.signed_attestation(att_type.clone(), "did:key:a")),
             ),
             make_attestor(
                 "did:key:b",
                 &["ctx-2"],
                 &[],
-                Some(make_simple_attestation(att_type.clone(), "did:key:b")),
+                Some(fx.signed_attestation(att_type.clone(), "did:key:b")),
             ),
             make_attestor(
                 "did:key:c",
                 &["ctx-3"],
                 &[],
-                Some(make_simple_attestation(att_type.clone(), "did:key:c")),
+                Some(fx.signed_attestation(att_type.clone(), "did:key:c")),
             ),
         ];
 
         let requirement = ThresholdRequirement::new(2, 3, 0.5);
 
-        let result = check_threshold_attestation(&att_type, &attestors, &requirement);
+        let result = check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement));
         assert!(result.met, "threshold should be met: {result:?}");
         assert_eq!(result.valid_count, 3);
         assert!(
@@ -2046,16 +2213,17 @@ mod tests {
     #[test]
     fn threshold_not_met_with_insufficient_count() {
         let att_type = AttestationType::Endorsement;
+        let mut fx = ThresholdFixture::new();
         let attestors = vec![make_attestor(
             "did:key:a",
             &[],
             &[],
-            Some(make_simple_attestation(att_type.clone(), "did:key:a")),
+            Some(fx.signed_attestation(att_type.clone(), "did:key:a")),
         )];
 
         let requirement = ThresholdRequirement::new(3, 5, 0.5);
 
-        let result = check_threshold_attestation(&att_type, &attestors, &requirement);
+        let result = check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement));
         assert!(!result.met, "threshold should NOT be met: {result:?}");
         assert_eq!(result.valid_count, 1);
     }
@@ -2064,24 +2232,25 @@ mod tests {
     fn threshold_not_met_with_low_independence() {
         let att_type = AttestationType::Endorsement;
         // Two attestors that share many contexts and endorse each other.
+        let mut fx = ThresholdFixture::new();
         let attestors = vec![
             make_attestor(
                 "did:key:a",
                 &["ctx-1", "ctx-2", "ctx-3", "ctx-4", "ctx-5"],
                 &["did:key:b"],
-                Some(make_simple_attestation(att_type.clone(), "did:key:a")),
+                Some(fx.signed_attestation(att_type.clone(), "did:key:a")),
             ),
             make_attestor(
                 "did:key:b",
                 &["ctx-1", "ctx-2", "ctx-3", "ctx-4", "ctx-5"],
                 &["did:key:a"],
-                Some(make_simple_attestation(att_type.clone(), "did:key:b")),
+                Some(fx.signed_attestation(att_type.clone(), "did:key:b")),
             ),
         ];
 
         let requirement = ThresholdRequirement::new(2, 2, 0.5);
 
-        let result = check_threshold_attestation(&att_type, &attestors, &requirement);
+        let result = check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement));
         assert!(
             !result.met,
             "threshold should NOT be met due to low independence: {result:?}"
@@ -2100,20 +2269,22 @@ mod tests {
     fn threshold_ignores_wrong_attestation_type() {
         let required_type = AttestationType::Endorsement;
         let wrong_type = AttestationType::OutletIntegrity;
+        let mut fx = ThresholdFixture::new();
 
         let attestors = vec![
             make_attestor(
                 "did:key:a",
                 &[],
                 &[],
-                Some(make_simple_attestation(wrong_type, "did:key:a")),
+                Some(fx.signed_attestation(wrong_type, "did:key:a")),
             ),
             make_attestor("did:key:b", &[], &[], None),
         ];
 
         let requirement = ThresholdRequirement::new(1, 2, 0.5);
 
-        let result = check_threshold_attestation(&required_type, &attestors, &requirement);
+        let result =
+            check_threshold_attestation(&fx.input(&required_type, &attestors, &requirement));
         assert!(
             !result.met,
             "threshold should NOT be met (wrong type): {result:?}"
@@ -2124,16 +2295,17 @@ mod tests {
     #[test]
     fn threshold_single_attestor_has_full_independence() {
         let att_type = AttestationType::Endorsement;
+        let mut fx = ThresholdFixture::new();
         let attestors = vec![make_attestor(
             "did:key:a",
             &["ctx-1", "ctx-2"],
             &["did:key:b"],
-            Some(make_simple_attestation(att_type.clone(), "did:key:a")),
+            Some(fx.signed_attestation(att_type.clone(), "did:key:a")),
         )];
 
         let requirement = ThresholdRequirement::new(1, 1, 0.5);
 
-        let result = check_threshold_attestation(&att_type, &attestors, &requirement);
+        let result = check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement));
         assert!(
             result.met,
             "single attestor should meet threshold: {result:?}"
@@ -2148,24 +2320,25 @@ mod tests {
     fn independence_reduced_by_shared_contexts() {
         let att_type = AttestationType::Endorsement;
         // Two attestors sharing 3 contexts (0.3 penalty) and no endorsements.
+        let mut fx = ThresholdFixture::new();
         let attestors = vec![
             make_attestor(
                 "did:key:a",
                 &["ctx-1", "ctx-2", "ctx-3"],
                 &[],
-                Some(make_simple_attestation(att_type.clone(), "did:key:a")),
+                Some(fx.signed_attestation(att_type.clone(), "did:key:a")),
             ),
             make_attestor(
                 "did:key:b",
                 &["ctx-1", "ctx-2", "ctx-3", "ctx-4"],
                 &[],
-                Some(make_simple_attestation(att_type.clone(), "did:key:b")),
+                Some(fx.signed_attestation(att_type.clone(), "did:key:b")),
             ),
         ];
 
         let requirement = ThresholdRequirement::new(2, 2, 0.5);
 
-        let result = check_threshold_attestation(&att_type, &attestors, &requirement);
+        let result = check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement));
         assert!(result.met, "0.7 independence >= 0.5 threshold: {result:?}");
         // 3 shared contexts => 0.3 penalty. Independence = 0.7.
         assert!(
@@ -2179,24 +2352,25 @@ mod tests {
     fn independence_reduced_by_mutual_endorsements() {
         let att_type = AttestationType::Endorsement;
         // Two attestors with no shared contexts but mutual endorsements.
+        let mut fx = ThresholdFixture::new();
         let attestors = vec![
             make_attestor(
                 "did:key:a",
                 &[],
                 &["did:key:b"],
-                Some(make_simple_attestation(att_type.clone(), "did:key:a")),
+                Some(fx.signed_attestation(att_type.clone(), "did:key:a")),
             ),
             make_attestor(
                 "did:key:b",
                 &[],
                 &["did:key:a"],
-                Some(make_simple_attestation(att_type.clone(), "did:key:b")),
+                Some(fx.signed_attestation(att_type.clone(), "did:key:b")),
             ),
         ];
 
         let requirement = ThresholdRequirement::new(2, 2, 0.5);
 
-        let result = check_threshold_attestation(&att_type, &attestors, &requirement);
+        let result = check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement));
         // Mutual endorsements: A->B = -0.2, B->A = -0.2 => independence = 0.6.
         assert!(result.met, "0.6 >= 0.5: {result:?}");
         assert!(
@@ -2204,6 +2378,146 @@ mod tests {
             "expected ~0.6, got {}",
             result.independence_score
         );
+    }
+
+    #[test]
+    fn threshold_counts_repeated_did_once() {
+        // Spec §7.3.5 rule 1: multiple attestations from one DID count as one
+        // attestation regardless of quantity. Five copies of one endorser must
+        // not satisfy a 3-of-5 requirement.
+        let att_type = AttestationType::Endorsement;
+        let mut fx = ThresholdFixture::new();
+        let attestation = fx.signed_attestation(att_type.clone(), "did:key:a");
+        let attestors: Vec<AttestorInfo> = (0..5)
+            .map(|_| make_attestor("did:key:a", &["ctx-1"], &[], Some(attestation.clone())))
+            .collect();
+
+        let requirement = ThresholdRequirement::new(3, 5, 0.5);
+
+        let result = check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement));
+        assert_eq!(
+            result.valid_count, 1,
+            "five copies of one DID count once: {result:?}"
+        );
+        assert!(
+            !result.met,
+            "one distinct endorser does not satisfy a 3-of-5 requirement: {result:?}"
+        );
+    }
+
+    #[test]
+    fn threshold_rejects_attestation_naming_another_subject() {
+        // An endorsement written about some other DID must not count toward
+        // this subject's threshold.
+        let att_type = AttestationType::Endorsement;
+        let mut fx = ThresholdFixture::new();
+        let other_subject = DID::from("did:key:other-subject");
+        let attestors = vec![make_attestor(
+            "did:key:a",
+            &[],
+            &[],
+            Some(fx.signed_attestation_about(att_type.clone(), "did:key:a", &other_subject)),
+        )];
+
+        let requirement = ThresholdRequirement::new(1, 1, 0.5);
+
+        let result = check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement));
+        assert_eq!(
+            result.valid_count, 0,
+            "an endorsement of another subject must not count: {result:?}"
+        );
+        assert!(!result.met, "threshold must not be met: {result:?}");
+    }
+
+    #[test]
+    fn threshold_rejects_attestation_issued_by_another_did() {
+        // An attestor that carries someone else's attestation must not count:
+        // the issuer field has to name the attestor's own DID.
+        let att_type = AttestationType::Endorsement;
+        let mut fx = ThresholdFixture::new();
+        let attestors = vec![make_attestor(
+            "did:key:claimant",
+            &[],
+            &[],
+            Some(fx.signed_attestation(att_type.clone(), "did:key:real-issuer")),
+        )];
+
+        let requirement = ThresholdRequirement::new(1, 1, 0.5);
+
+        let result = check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement));
+        assert_eq!(
+            result.valid_count, 0,
+            "an attestation issued by another DID must not count: {result:?}"
+        );
+        assert!(!result.met, "threshold must not be met: {result:?}");
+    }
+
+    #[test]
+    fn threshold_rejects_forged_signature() {
+        // The attestation names the right type, subject, and issuer, but its
+        // signature does not verify against the issuer's resolved key.
+        let att_type = AttestationType::Endorsement;
+        let mut fx = ThresholdFixture::new();
+        let mut forged = fx.signed_attestation(att_type.clone(), "did:key:a");
+        forged.signature = vec![0u8; 64];
+        let attestors = vec![make_attestor("did:key:a", &[], &[], Some(forged))];
+
+        let requirement = ThresholdRequirement::new(1, 1, 0.5);
+
+        let result = check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement));
+        assert_eq!(
+            result.valid_count, 0,
+            "a forged signature must not count: {result:?}"
+        );
+        assert!(!result.met, "threshold must not be met: {result:?}");
+    }
+
+    #[test]
+    fn threshold_rejects_expired_attestation() {
+        // The clock sits past `expires_at`, so verification rejects the
+        // attestation and the count drops it.
+        let att_type = AttestationType::Endorsement;
+        let mut fx = ThresholdFixture::new();
+        fx.clock = TestClock::new(9000);
+        let attestors = vec![make_attestor(
+            "did:key:a",
+            &[],
+            &[],
+            Some(fx.signed_attestation(att_type.clone(), "did:key:a")),
+        )];
+
+        let requirement = ThresholdRequirement::new(1, 1, 0.5);
+
+        let result = check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement));
+        assert_eq!(
+            result.valid_count, 0,
+            "an expired attestation must not count: {result:?}"
+        );
+    }
+
+    #[test]
+    fn threshold_admits_valid_copy_after_rejected_copy_of_same_did() {
+        // Deduplication runs after verification, so a forged first copy does
+        // not consume the deduplication slot its issuer's valid attestation
+        // needs.
+        let att_type = AttestationType::Endorsement;
+        let mut fx = ThresholdFixture::new();
+        let valid = fx.signed_attestation(att_type.clone(), "did:key:a");
+        let mut forged = valid.clone();
+        forged.signature = vec![0u8; 64];
+        let attestors = vec![
+            make_attestor("did:key:a", &[], &[], Some(forged)),
+            make_attestor("did:key:a", &[], &[], Some(valid)),
+        ];
+
+        let requirement = ThresholdRequirement::new(1, 2, 0.5);
+
+        let result = check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement));
+        assert_eq!(
+            result.valid_count, 1,
+            "the valid copy must still count: {result:?}"
+        );
+        assert!(result.met, "1-of-2 threshold should be met: {result:?}");
     }
 
     // -------------------------------------------------------------------
@@ -2855,15 +3169,17 @@ mod tests {
         }
     }
 
-    /// A test revocation checker that only revokes a specific attestation ID.
+    /// A test revocation checker that revokes one attestation id issued by one
+    /// issuer, matching the issuer-scoping requirement this trait states.
     struct SelectiveRevokedChecker {
+        target_issuer: DID,
         target_id: String,
         revoked_at: u64,
     }
 
     impl AttestationRevocationChecker for SelectiveRevokedChecker {
-        fn check_revocation(&self, attestation_id: &str, _issuer: &DID) -> Option<u64> {
-            if attestation_id == self.target_id {
+        fn check_revocation(&self, attestation_id: &str, issuer: &DID) -> Option<u64> {
+            if attestation_id == self.target_id && *issuer == self.target_issuer {
                 Some(self.revoked_at)
             } else {
                 None
@@ -3005,6 +3321,7 @@ mod tests {
 
         // Checker targets a different attestation ID.
         let checker = SelectiveRevokedChecker {
+            target_issuer: DID::from("did:key:issuer"),
             target_id: "some-other-att-id".to_owned(),
             revoked_at: 999,
         };
@@ -3013,6 +3330,74 @@ mod tests {
         assert!(
             result.is_ok(),
             "expected Ok for non-targeted attestation, got {result:?}"
+        );
+    }
+
+    /// SECURITY (issuer scoping, issue #2335 finding 13).
+    /// `verify_attestation_with_revocation` hands a checker the attestation's own
+    /// `issuer`, so a checker that scopes a revocation to a different issuer
+    /// reports nothing. Passing an id without an issuer would let one issuer's
+    /// revocation suppress another issuer's attestation carrying that same id,
+    /// which the issuer-scoping requirement on `AttestationRevocationChecker`
+    /// forbids.
+    #[test]
+    fn revocation_checker_receives_the_attestations_own_issuer() {
+        let (signing_key, pubkey_bytes) = test_keypair();
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:issuer", pubkey_bytes);
+        let clock = TestClock::new(1000);
+
+        let attestation = make_signed_attestation(
+            &signing_key,
+            AttestationType::Endorsement,
+            "did:key:issuer",
+            "did:key:subject",
+            900,
+            Some(2000),
+            None,
+            None,
+        );
+
+        // Same attestation id, a DIFFERENT issuer: the checker must report
+        // nothing, which it can only do if it receives the issuer.
+        let foreign_issuer_checker = SelectiveRevokedChecker {
+            target_issuer: DID::from("did:key:someone-else"),
+            target_id: attestation.id.clone(),
+            revoked_at: 999,
+        };
+        let unaffected = verify_attestation_with_revocation(
+            &attestation,
+            &resolver,
+            &clock,
+            Some(&foreign_issuer_checker),
+        );
+        assert!(
+            unaffected.is_ok(),
+            "a revocation another issuer signed must not reject this attestation, got {unaffected:?}"
+        );
+
+        // Same attestation id, the attestation's OWN issuer: the checker reports
+        // a revocation, which proves the argument carries that issuer.
+        let own_issuer_checker = SelectiveRevokedChecker {
+            target_issuer: attestation.issuer.clone(),
+            target_id: attestation.id.clone(),
+            revoked_at: 999,
+        };
+        let rejected = verify_attestation_with_revocation(
+            &attestation,
+            &resolver,
+            &clock,
+            Some(&own_issuer_checker),
+        );
+        assert!(
+            matches!(
+                rejected,
+                Err(TrustError::AttestationRevoked {
+                    revoked_at: 999,
+                    ..
+                })
+            ),
+            "expected AttestationRevoked at 999, got {rejected:?}"
         );
     }
 

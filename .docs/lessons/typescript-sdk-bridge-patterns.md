@@ -1,6 +1,6 @@
 # TypeScript SDK Bridge Patterns
 
-> **ADR-055 (2026-06-29):** the WASM bridge was removed and the TypeScript SDK is now NAPI-only — the browser is served by a remote thin client, not an in-process WASM backend. The "WASM ambient module declarations" section and the WASM-deferral/`@limn-works/scp-ts-wasm` references below are historical (they describe the prior dual NAPI+WASM-fallback backend). The non-WASM TypeScript patterns in this lesson remain evergreen.
+> **ADR-055 (2026-06-29):** the WASM bridge was removed, so NAPI is the only in-process bridge `bindings/typescript/` carries. `detectBridge()` and `src/internal/wasm-types.d.ts` are gone from that package, so the "WASM ambient module declarations" and "Bridge runtime detection" sections below record the prior dual NAPI-plus-WASM-fallback backend rather than current code. ADR-057 then revised ADR-055's browser conclusion and gave the browser a separate package, `@limn-works/scp-ts-wasm` under `bindings/typescript-wasm/`, which runs shared protocol code in-tab over `crates/scp-client-wasm`. That package name is live, so the sections below name today's package under yesterday's architecture. The non-WASM TypeScript patterns in this lesson remain evergreen.
 
 Lessons from implementing `bindings/typescript/` (SCP-081).
 

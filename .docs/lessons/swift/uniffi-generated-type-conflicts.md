@@ -1,6 +1,5 @@
 # UniFFI-generated types conflict with hand-written Swift wrappers
 
-**Date:** 2026-02-27
 **Story:** SCP-103
 **Severity:** Blocking for `swift build`
 

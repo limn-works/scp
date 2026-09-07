@@ -1,6 +1,6 @@
 # Revocation state must be durable, authority-only-clearable, and enforced on EVERY access axis
 
-**Context:** #2088 / #2092 (broadcast read-ban, spec §5.14.4 / §5.14.8). Merged 2026-07-10.
+**Context:** the broadcast read-ban, §5.14.4 and §5.14.8 of the context spec, `05-contexts.md`.
 
 ## The invariant
 

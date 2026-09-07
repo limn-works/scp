@@ -1,7 +1,6 @@
 ---
 name: simplifier
 description: "Use this agent when you want to review code for unnecessary complexity, premature abstractions, performance issues, or violations of the DRY principle. This agent analyzes code and suggests simplifications while preserving exact functionality.\n\nExamples:\n\n- User just finished implementing a feature:\n  Assistant: \"I'll use the simplifier agent to review for unnecessary complexity and potential simplifications.\"\n\n- User notices a file that seems overcomplicated:\n  Assistant: \"Let me launch the simplifier agent to identify opportunities to reduce complexity.\"\n\n- Proactive use after seeing complex nested logic:\n  Assistant: \"Let me use the simplifier agent to identify any simplification opportunities.\""
-model: opus
 color: cyan
 memory: project
 ---

@@ -42,19 +42,21 @@ use scp_clock::Clock;
 use scp_dht::DhtClient;
 // `InMemoryDhtClient` is the §17.17.3 DHT nullifier. Since the cfg-gated DHT
 // construction is now hoisted into `scp_ffi_common::dht::build_ffi_dht_client`,
-// this bridge names the type only in its own unit tests, and every one of those
-// tests is `testing`-gated because the nullifier reaches no other build — hence
-// both gates (the `testing`-feature seam lives in scp-ffi-common now).
+// this bridge names the type only in its own unit tests. Every one of those
+// tests carries `#[cfg(feature = "testing")]`, so this import carries the same
+// gate: under a bare `test` gate it goes unused in the shipped configuration
+// that job rust-build-uniffi-production tests, which warns.
 #[cfg(all(test, feature = "testing"))]
 use scp_dht::InMemoryDhtClient;
 use scp_ffi_common::dht::FfiDhtClient;
-// `DidCache` / `DualLayerResolver` / `NoOpRelayQuerier` are named only by the
-// testing-gated DID-resolver-init and DHT-signer helpers (production create
-// fails closed before resolver init — ADR-062 §Decision 6).
-#[cfg(feature = "testing")]
+// `DidCache` / `DualLayerResolver` / `NoOpRelayQuerier` back
+// `ensure_did_resolver_initialized_on`, which every build reaches through
+// `Scp::identity_verify_link_attestation` (spec §3.5.4 step 1 resolves an
+// issuer's DID document) and a testing build also reaches through
+// identity-create (production create fails closed before resolver init —
+// ADR-062 §Decision 6).
 use scp_identity::DidCache;
 use scp_identity::IdentityError;
-#[cfg(feature = "testing")]
 use scp_identity::resolver::{DualLayerResolver, NoOpRelayQuerier};
 
 use scp_did::DidDocument as CoreDidDocument;
@@ -634,8 +636,12 @@ fn resolve_identity_custody(identity: &Identity) -> Option<Arc<UniffiKeyCustody>
 }
 
 /// Resolves the retained custody on a [`ContextHandle`] into a
-/// [`UniffiKeyCustody`] enum, for the production context ops that sign over it
-/// (`ucan_mint`, `ucan_delegate`).
+/// [`UniffiKeyCustody`] enum, for `ucan_mint`, which signs with a context
+/// creator's key and writes that creator's DID into `iss`.
+///
+/// `ucan_delegate` does NOT call this helper: a delegation signs with its own
+/// delegator's key, which [`ucan_delegate_impl`] reads from a DID-keyed
+/// identity custody registry instead.
 ///
 /// Resolution order mirrors [`resolve_identity_custody`] (and the handle's own
 /// `resolve_uniffi_signing_key` / `sign_export_snapshot_via_custody`): the
@@ -4317,32 +4323,35 @@ pub async fn identity_verify_device_attestation(
     identity_verify_device_attestation_impl(did, token_base64).await
 }
 
-/// Verifies the Ed25519 signature on an identity link attestation.
+/// Declines identity link attestation verification at module scope, fail
+/// closed (`SCP-IDENT-1060`).
 ///
-/// Signature verification is a pure function and does not require
-/// in-memory custody — only the issuer's Ed25519 public key. ADR-048 §1:
-/// pure helper, no per-instance state.
+/// This function was documented as a pure helper needing only an issuer's
+/// Ed25519 public key. GitHub issue #2335 finding 2 falsified that premise:
+/// spec §3.5.4 step 1 resolves an issuer's DID document and takes a signing key
+/// from it, so a key a caller supplies is an assertion to check rather than a
+/// source of truth. Checking it needs a per-instance DID resolver, and phase D
+/// (pull request #1695) deleted every process-wide default bridge instance, so
+/// a free function reaches none.
 ///
-/// See spec §3.5.1.
+/// Callers move to `Scp::identity_verify_link_attestation`, which resolves an
+/// issuer's document and runs every §3.5.4 step.
+///
+/// # Errors
+///
+/// Always returns `SCP-IDENT-1060`.
 #[uniffi::export]
 #[allow(clippy::needless_pass_by_value)]
 pub fn identity_verify_link_attestation(
     attestation_json: String,
     issuer_public_key_hex: String,
+    reference_proof: String,
 ) -> Result<bool, ScpError> {
-    use scp_core::identity::attestation::IdentityLinkAttestation;
-
-    let attestation: IdentityLinkAttestation =
-        serde_json::from_str(&attestation_json).map_err(|e| ScpError::Identity {
-            msg: format!("failed to parse attestation JSON: {e}"),
-            code: codes::IDENT_1044.to_owned(),
-        })?;
-
-    let pub_bytes = hex::decode(&issuer_public_key_hex).map_err(|e| ScpError::Identity {
-        msg: format!("invalid issuer_public_key_hex: {e}"),
-        code: codes::IDENT_1044.to_owned(),
-    })?;
-    Ok(attestation.verify_signature(&pub_bytes).is_ok())
+    let _ = (attestation_json, issuer_public_key_hex, reference_proof);
+    Err(ScpError::Identity {
+        msg: scp_ffi_common::attestation::LINK_VERIFY_REQUIRES_INSTANCE.to_owned(),
+        code: codes::IDENT_1060.to_owned(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -5605,35 +5614,55 @@ async fn ucan_mint_impl(
 }
 
 /// Inner implementation of [`ucan_delegate`].
+///
+/// Signs each delegation with that delegation's own delegator key, which this
+/// function reads from `bi`'s DID-keyed identity custody registry under
+/// `delegator_did`. It never signs with a context creator's key.
+///
+/// [`delegate_ucan`](scp_core::crypto::ucan::mint::delegate_ucan) writes
+/// `params.delegator_did` into a token's `iss` field and signs that token with
+/// `params.delegator_key`, so those two arguments must name one principal. An
+/// earlier revision passed `handle.signing_key` — a context creator's key — as
+/// `delegator_key` while passing a caller's `delegator_did`, which let a caller
+/// name principal A and obtain a token that principal B's key signed. `PyO3`'s
+/// bridge (`crates/scp-ffi/src/ucan.rs`) and napi's bridge
+/// (`crates/scp-ffi/napi/src/ucan.rs`) read both values from their own identity
+/// registries for that reason, and this function now matches them.
+///
+/// A `delegator_did` absent from `bi`'s registry fails closed with
+/// `SCP-IDENT-1001`, matching what `PyO3` and napi return for that same miss.
 async fn ucan_delegate_impl(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     handle: Arc<ContextHandle>,
     delegator_did: String,
     delegatee_did: String,
     parent_token: String,
     capabilities: Vec<String>,
 ) -> Result<Arc<UcanToken>, ScpError> {
+    // Read a delegator's own custody and active signing key out of this
+    // instance's registry, which every `identity_create*` path populates. A
+    // DashMap reference guard is not `Send`, so this clones both values out
+    // before a spawned task below awaits anything.
+    let (delegator_custody, delegator_key) = {
+        let entry = identity_custody_registry(bi)
+            .get(&delegator_did)
+            .ok_or_else(|| ScpError::Identity {
+                msg: format!(
+                    "UCAN delegation signs with a delegator's own key, and identity \
+                     '{delegator_did}' is not registered on this bridge instance — create it \
+                     via identityCreate / identityCreateWithCustody"
+                ),
+                code: codes::IDENT_1001.to_owned(),
+            })?;
+        let (custody, key) = entry.value();
+        (Arc::clone(custody), *key)
+    };
+
     runtime()
         .spawn(async move {
             use scp_core::crypto::ucan::Attenuation;
             use scp_core::crypto::ucan::mint::{DelegateParams, delegate_ucan};
             use scp_core::crypto::ucan::validate::parse_ucan;
-
-            // Resolve the retained key custody (callback first, then in-memory
-            // in testing builds) and the signing key from the
-            // context handle. Externally-loaded handles retain no custody and
-            // fail closed with SCP-IDENT-1017.
-            let custody = resolve_context_custody(&handle).ok_or_else(|| ScpError::Identity {
-                msg: "UCAN delegation requires retained signing custody — the context \
-                          creator identity has no retained custody (it was externally loaded)"
-                    .to_owned(),
-                code: codes::IDENT_1017.to_owned(),
-            })?;
-            let signing_key = handle.signing_key.ok_or_else(|| ScpError::Identity {
-                msg: "UCAN delegation requires retained signing custody — the context creator \
-                          identity has no active signing key"
-                    .to_owned(),
-                code: codes::IDENT_1017.to_owned(),
-            })?;
 
             // Parse the parent token.
             let parsed_parent = parse_ucan(&parent_token).map_err(|e| ScpError::Permission {
@@ -5677,7 +5706,7 @@ async fn ucan_delegate_impl(
             let params = DelegateParams {
                 parent_token: &parsed_parent,
                 delegator_did: &delegator_did,
-                delegator_key: &signing_key,
+                delegator_key: &delegator_key,
                 delegatee_did: &delegatee_did,
                 attenuated_capabilities: &attenuations,
                 lifetime_secs: 3600,
@@ -5687,7 +5716,7 @@ async fn ucan_delegate_impl(
                 ceiling,
             };
 
-            let token = delegate_ucan(&params, &*custody, &scp_clock::SystemClock)
+            let token = delegate_ucan(&params, &*delegator_custody, &scp_clock::SystemClock)
                 .await
                 .map_err(ScpError::from)?;
 
@@ -9434,10 +9463,16 @@ fn parse_observable_metrics(json: &str) -> Result<scp_core::economy::ObservableM
 /// [`crate::scp::Scp`] identity methods to keep "init on first use"
 /// semantics scoped to the owning instance.
 ///
-/// Only reached from the testing-gated identity-create paths (production create
-/// fails closed before resolver init — ADR-062 §Decision 6).
-#[cfg(feature = "testing")]
-fn ensure_did_resolver_initialized_on(
+/// Two callers reach this initializer. A testing-gated identity-create path
+/// calls it after minting (production create fails closed before resolver
+/// init — ADR-062 §Decision 6). `Scp::identity_verify_link_attestation` calls
+/// it on every build, because spec §3.5.4 step 1 resolves an issuer's DID
+/// document and a verifying instance need never have created an identity of
+/// its own. Body is production-safe on both paths: it builds a DHT client
+/// through `build_ffi_dht_client`, which constructs a real Mainline Pkarr
+/// client on a shipped build and fails closed rather than substituting an
+/// in-memory one (ADR-062 §Decision 1).
+pub(crate) fn ensure_did_resolver_initialized_on(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     handle: tokio::runtime::Handle,
 ) -> Result<(), ScpError> {
@@ -10013,6 +10048,99 @@ impl Scp {
         let before = entry.len();
         entry.retain(|a| a.id != attestation_id);
         entry.len() < before
+    }
+
+    /// Verifies an identity link attestation per spec §3.5.4.
+    ///
+    /// Acquires this instance's validating DID resolver, then hands every
+    /// remaining decision to the one shared flow all three bridges run,
+    /// `scp_ffi_common::attestation::verify_link_attestation`. That flow
+    /// resolves an issuer's DID document (§3.5.4 step 1), fails closed when
+    /// that document publishes an `AttestationRevocations` service endpoint
+    /// (§3.5.2), and runs structural validation, document-to-issuer binding,
+    /// signature under an `#active` or `#agent` key that document publishes
+    /// (steps 1–2), `revocation_status` (step 3), `expires_at` (step 4), and
+    /// evidence freshness (step 5, which degrades rather than rejects).
+    ///
+    /// A module-level `identity_verify_link_attestation` free function remains
+    /// exported and declines with `SCP-IDENT-1060`: it reaches no bridge
+    /// instance, so it cannot perform §3.5.4 step 1.
+    ///
+    /// # Arguments
+    ///
+    /// * `attestation_json` — JSON string of an `IdentityLinkAttestation`.
+    /// * `issuer_public_key_hex` — Hex-encoded 32-byte Ed25519 public key that
+    ///   a caller asserts belongs to this issuer. This method checks that
+    ///   assertion against an issuer's resolved DID document; it never uses
+    ///   this key as a substitute for that document.
+    /// * `reference_proof` — What this caller did about a class 2
+    ///   (`signed_post` / `dns_record`) proof resource, per spec §3.5.4 Class 2
+    ///   step 2. `"confirmed"` reports that this caller fetched the resource
+    ///   `evidence.proof` names and found this issuer's DID in it, which yields
+    ///   a `true` or a `false`. `"not_fetched"` reports that this caller
+    ///   fetched nothing, which raises `SCP-IDENT-1062` for a class 2
+    ///   attestation. A class 1 (`did_control`) attestation ignores this
+    ///   argument. Any other string raises `SCP-IDENT-1044`.
+    ///
+    /// # Returns
+    ///
+    /// `true` when §3.5.4 steps 1 through 5 pass and a key a caller named is
+    /// one an issuer's document publishes. `false` when a check rejects — a bad
+    /// signature, a revoked or expired attestation, or a key an issuer's
+    /// document does not publish. Stale evidence returns `true`, because
+    /// §3.5.4 step 5 degrades rather than rejects. Every rejection reason
+    /// reaches `tracing` at `info` level.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SCP-IDENT-1044` when the JSON or the hex key is malformed,
+    /// `SCP-IDENT-1060` when an issuer's DID document cannot be resolved,
+    /// `SCP-IDENT-1061` when an issuer publishes an attestation revocation
+    /// list this bridge does not fetch, and `SCP-IDENT-1062` for a Class 2
+    /// (`signed_post` / `dns_record`) attestation whose external proof
+    /// resource this bridge does not fetch. None of those four conditions is
+    /// reported as `false`, because `false` on this surface reads as "forged".
+    pub async fn identity_verify_link_attestation(
+        &self,
+        attestation_json: String,
+        issuer_public_key_hex: String,
+        reference_proof: String,
+    ) -> Result<bool, ScpError> {
+        use scp_ffi_common::attestation::LinkVerifyError;
+
+        /// Maps a shared-flow error onto this bridge's error type.
+        fn to_scp(e: &LinkVerifyError) -> ScpError {
+            ScpError::Identity {
+                msg: e.to_string(),
+                code: e.error_code().to_owned(),
+            }
+        }
+
+        let handle = runtime().handle().clone();
+        let bi = Arc::clone(&self.inner);
+        // `ensure_did_resolver_initialized_on` builds a real Mainline Pkarr
+        // client on a shipped build — a socket bind plus thread spawn — and
+        // this is an async fn, so that work would otherwise block a tokio
+        // worker.
+        let resolver = tokio::task::spawn_blocking(move || {
+            ensure_did_resolver_initialized_on(&bi, handle)?;
+            bi.did_resolver()
+                .ok_or_else(|| to_scp(&LinkVerifyError::ResolverUnavailable))
+        })
+        .await
+        .map_err(|e| ScpError::Identity {
+            msg: format!("tokio task join error while acquiring a DID resolver: {e}"),
+            code: codes::IDENT_1060.to_owned(),
+        })??;
+
+        scp_ffi_common::attestation::verify_link_attestation(
+            &*resolver,
+            &attestation_json,
+            &issuer_public_key_hex,
+            &reference_proof,
+        )
+        .await
+        .map_err(|e| to_scp(&e))
     }
 
     /// Removes a DID from this instance's SCP-side identity registry.
@@ -15794,6 +15922,10 @@ impl Scp {
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
+    ///
+    /// Signs each delegation with `delegator_did`'s own key, read from this
+    /// instance's identity custody registry. A `delegator_did` that this
+    /// instance has not registered returns `SCP-IDENT-1001`.
     pub async fn ucan_delegate(
         &self,
         handle: Arc<ContextHandle>,
@@ -15813,6 +15945,7 @@ impl Scp {
             validate_capability_uri(cap)?;
         }
         ucan_delegate_impl(
+            &self.inner,
             handle,
             delegator_did,
             delegatee_did,
@@ -18491,6 +18624,11 @@ impl Scp {
     // ----- Address resolution -----
 
     /// Per-instance equivalent of the free-function `address_resolve`.
+    ///
+    /// Returns a JSON object with two keys: `resolutions` holds the
+    /// `AddressResolution` objects sorted by trust level, and
+    /// `unavailable_layers` names each layer this build could not query,
+    /// with the reason.
     pub fn address_resolve(
         &self,
         owner_did: String,
@@ -18544,7 +18682,7 @@ impl Scp {
         };
 
         let handle = tokio::runtime::Handle::current();
-        let results = tokio::task::block_in_place(|| {
+        let outcome = tokio::task::block_in_place(|| {
             handle.block_on(async {
                 let mut resolver = scp_core::discovery::AddressResolver::new();
                 let querier = petname_helpers::LocalHandleQuerier::new(&bi.core);
@@ -18560,16 +18698,16 @@ impl Scp {
                     .await
                     .map_err(|e| ScpError::Validation {
                         msg: format!("address resolution failed: {e}"),
-                        code: codes::VALID_7091.to_owned(),
+                        code: petname_helpers::address_resolution_error_code(&e).to_owned(),
                     })
             })
         })?;
 
-        let json_results: Vec<serde_json::Value> = results
-            .iter()
-            .map(petname_helpers::address_resolution_to_json)
-            .collect();
-        serde_json::to_string(&json_results).map_err(|e| ScpError::Validation {
+        // §22.8.2 ranks results by trust level, so a caller reads
+        // `unavailable_layers` to learn which higher-trust layers this build
+        // never queried. Returning the resolution array alone would hide that.
+        let json_outcome = petname_helpers::address_resolution_outcome_to_json(&outcome);
+        serde_json::to_string(&json_outcome).map_err(|e| ScpError::Validation {
             msg: format!("failed to serialize address resolution results: {e}"),
             code: codes::VALID_7092.to_owned(),
         })
@@ -20617,11 +20755,13 @@ mod tests {
     fn test_identity_for(scp: &Arc<crate::scp::Scp>) -> Arc<Identity> {
         let instance_id = scp.instance_id();
         // Synthetic pre-rotation custody — never inspected by callers that
-        // only exercise non-migration paths. `Identity::pre_rotation_custody`
-        // exists only under `testing` (ADR-062, capability injection and
-        // prove-absent dev backends, §Decision 6), so a default-feature build
-        // of this crate's test target constructs the handle without it and
-        // never names the nullifier.
+        // only exercise non-migration paths, but the field is non-optional
+        // so the test handle has to provide something. `Identity` declares
+        // `pre_rotation_custody` `#[cfg(feature = "testing")]`, and
+        // `InMemoryPreRotationCustody` is a §17.17.2 nullifier that
+        // `scp-platform/testing` compiles, so both the binding and the field
+        // carry that gate: without it this helper fails to compile in the
+        // shipped configuration job rust-build-uniffi-production tests.
         #[cfg(feature = "testing")]
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
@@ -22198,6 +22338,14 @@ mod tests {
     /// type used by the bridge function via the global `DID_RESOLVER`. Uses a
     /// shared `InMemoryDhtClient` so the DID published during identity
     /// creation is visible to the verify resolver.
+    ///
+    /// Gated `#[cfg(feature = "testing")]` because `DidCache`,
+    /// `DualLayerResolver`, `NoOpRelayQuerier`, `InMemoryDhtClient`,
+    /// `InMemoryKeyCustody` and `InMemoryPreRotationCustody` all carry that
+    /// gate. Job rust-test enables `scp-ffi-uniffi/testing`, so this test runs
+    /// there exactly as it did before the gate; job
+    /// rust-build-uniffi-production compiles this file with `testing` off and
+    /// needs it skipped.
     #[cfg(feature = "testing")]
     #[tokio::test]
     async fn scpid_sign_verify_roundtrip_via_identity_backed_resolver() {
@@ -23980,6 +24128,11 @@ mod tests {
             bi: Arc::clone(&live.bi),
             rotation_event_json: None,
             pre_rotation_handle: live.pre_rotation_handle,
+            // `Identity` declares this field `#[cfg(feature = "testing")]`, so
+            // the initializer carries the same gate. Without it this test fails
+            // to compile in the shipped configuration job
+            // rust-build-uniffi-production tests.
+            #[cfg(feature = "testing")]
             pre_rotation_custody: Arc::clone(&live.pre_rotation_custody),
         });
 
@@ -24014,6 +24167,12 @@ mod tests {
     /// `DidDht::new()` regression in place, the `publish` below fails with the
     /// signer error and the test fails; with the fix it succeeds and the
     /// `#active` key changes while `#0` and the DID are preserved.
+    ///
+    /// Gated `#[cfg(feature = "testing")]` because `make_dht_with_signer`,
+    /// `InMemoryDhtClient` and `InMemoryPreRotationCustody` all carry that gate.
+    /// Job rust-test enables `scp-ffi-uniffi/testing`, so this test runs there
+    /// exactly as it did before the gate; job rust-build-uniffi-production
+    /// compiles this file with `testing` off and needs it skipped.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rotate_key_signer_is_wired_over_callback_custody() {
@@ -24345,20 +24504,58 @@ mod tests {
             .expect("UCAN signature must verify against the callback #active key");
     }
 
+    /// Registers a callback-custody identity for `did` on `scp`'s bridge
+    /// instance, mirroring what `identity_create_with_custody` records, and
+    /// returns that identity's `#active` verifying key so a test can check
+    /// which principal signed a token.
+    async fn register_callback_identity(
+        scp: &Arc<crate::scp::Scp>,
+        did: &str,
+    ) -> ed25519_dalek::VerifyingKey {
+        let callback_custody = Arc::new(CallbackKeyCustody::new(Box::new(ProdLikeCustody::new())));
+        let signing_key = callback_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("callback custody generates an Ed25519 #active key");
+        let public_key = callback_custody
+            .public_key(&signing_key)
+            .await
+            .expect("callback custody exposes the #active public key");
+        let pk_bytes: [u8; 32] = public_key
+            .into_bytes()
+            .try_into()
+            .expect("Ed25519 public key is 32 bytes");
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes)
+            .expect("custody public key is a valid Ed25519 verifying key");
+
+        register_identity_custody(
+            &scp.inner,
+            did,
+            &Arc::new(UniffiKeyCustody::Callback(callback_custody)),
+            signing_key,
+        )
+        .expect("registering a delegator identity must succeed");
+
+        verifying_key
+    }
+
     /// `ucan_delegate` must work over callback custody (production path): a child
-    /// token delegated from a callback-minted parent verifies against the same
-    /// `#active` public key. Pins that `ucan_delegate_impl` is un-gated and
-    /// resolves custody via `resolve_context_custody`.
+    /// token delegated from a callback-minted parent verifies against its
+    /// delegator identity's `#active` public key. Pins that
+    /// `ucan_delegate_impl` is un-gated and signs through whichever callback
+    /// custody an identity custody registry holds for that delegator.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ucan_delegate_works_over_callback_custody() {
         let scp = scp_test();
-        let (handle, verifying_key) = callback_context_handle(&scp).await;
+        let (handle, _creator_key) = callback_context_handle(&scp).await;
+        let delegator_did = "did:dht:z6MkCallbackDelegator";
+        let delegator_key = register_callback_identity(&scp, delegator_did).await;
 
         // Mint a parent token first (callback custody), then delegate from it —
-        // both must route through the callback signing path.
+        // both must route through a callback signing path.
         let parent = ucan_mint_impl(
             Arc::clone(&handle),
-            "did:dht:z6MkCallbackDelegator".to_owned(),
+            delegator_did.to_owned(),
             vec!["messages:write".to_owned()],
             None,
         )
@@ -24366,8 +24563,9 @@ mod tests {
         .expect("parent ucan_mint over callback custody must succeed");
 
         let child = ucan_delegate_impl(
+            &scp.inner,
             handle,
-            "did:dht:z6MkCallbackDelegator".to_owned(),
+            delegator_did.to_owned(),
             "did:dht:z6MkCallbackDelegatee".to_owned(),
             parent.encoded.clone(),
             vec!["messages:write".to_owned()],
@@ -24375,7 +24573,76 @@ mod tests {
         .await
         .expect("ucan_delegate over callback custody must succeed");
 
-        assert_encoded_ucan_signature_verifies(&child.encoded, &verifying_key);
+        assert_encoded_ucan_signature_verifies(&child.encoded, &delegator_key);
+    }
+
+    /// A delegation must carry the signature of whichever principal
+    /// `delegator_did` names, and must never carry a context creator's
+    /// signature in its place.
+    ///
+    /// `delegate_ucan` writes `delegator_did` into `iss` and signs with
+    /// `delegator_key`. An earlier revision of `ucan_delegate_impl` passed
+    /// `handle.signing_key` — a context creator's key — as `delegator_key`,
+    /// so a caller naming any DID received a token that claimed issuance by
+    /// that DID while a context creator's key had signed it. This test fails
+    /// against that revision on both assertions below.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_delegate_signs_with_delegator_key_not_context_creator_key() {
+        use base64::Engine;
+        use ed25519_dalek::Verifier;
+
+        let scp = scp_test();
+        let (handle, creator_key) = callback_context_handle(&scp).await;
+        let delegator_did = "did:dht:z6MkDistinctDelegator";
+        assert_ne!(
+            delegator_did, handle.creator_did,
+            "this test only means something when a delegator differs from a creator"
+        );
+        let delegator_key = register_callback_identity(&scp, delegator_did).await;
+
+        // A context creator mints a parent token whose audience is that
+        // delegator, which is what lets that delegator sub-delegate from it.
+        let parent = ucan_mint_impl(
+            Arc::clone(&handle),
+            delegator_did.to_owned(),
+            vec!["messages:write".to_owned()],
+            None,
+        )
+        .await
+        .expect("parent ucan_mint over callback custody must succeed");
+
+        let child = ucan_delegate_impl(
+            &scp.inner,
+            handle,
+            delegator_did.to_owned(),
+            "did:dht:z6MkDistinctDelegatee".to_owned(),
+            parent.encoded.clone(),
+            vec!["messages:write".to_owned()],
+        )
+        .await
+        .expect("ucan_delegate must succeed for a registered delegator");
+
+        assert_eq!(
+            child.data.issuer, delegator_did,
+            "a delegation names its delegator as its issuer"
+        );
+        // That delegator's key signed it.
+        assert_encoded_ucan_signature_verifies(&child.encoded, &delegator_key);
+
+        // That context creator's key did not sign it.
+        let (signing_input, sig_b64) = child
+            .encoded
+            .rsplit_once('.')
+            .expect("encoded UCAN has a signature segment");
+        let sig_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(sig_b64)
+            .expect("signature segment is base64url");
+        let sig =
+            ed25519_dalek::Signature::from_slice(&sig_bytes).expect("token signature is 64 bytes");
+        assert!(
+            creator_key.verify(signing_input.as_bytes(), &sig).is_err(),
+            "a delegation must not carry a context creator's signature"
+        );
     }
 
     /// `event_log_checkpoint` must work over callback custody (production path):
@@ -24458,9 +24725,10 @@ mod tests {
     // -----------------------------------------------------------------------
     // Checkpoint sender_did ↔ signing-identity binding
     //
-    // The UniFFI bridge has no DID-keyed identity registry, so the recorded
-    // `sender_did` is bound to the signing `Identity` explicitly inside
-    // `event_log_checkpoint_by_did_impl` (the `did != identity.did` guard).
+    // `event_log_checkpoint_by_did_impl` signs with whichever custody its
+    // `Identity` argument carries, and never with a custody it looks up by DID,
+    // so it binds a recorded `sender_did` to that `Identity` explicitly through
+    // its `did != identity.did` guard.
     // Without it a caller could record a checkpoint as signed by an arbitrary
     // DID while signing with an unrelated identity's key — a provenance
     // forgery. These tests pin that guard so a future re-order or removal of
@@ -24518,9 +24786,14 @@ mod tests {
     //
     // A context handle / identity that retains no custody (externally loaded:
     // `in_memory_custody`, `signing_key`, `callback_custody` all `None`) must
-    // reject UCAN mint, UCAN delegate, and event-log checkpoint with the
-    // canonical missing-signing-custody code — not an overloaded
-    // permission/nonce code.
+    // reject UCAN mint and event-log checkpoint with a canonical
+    // missing-signing-custody code — not an overloaded permission/nonce code.
+    //
+    // UCAN delegate sits outside this group: it signs with its own delegator's
+    // key, which it reads from an identity custody registry and never from a
+    // context handle, so its fail-closed code is a registry-miss
+    // `SCP-IDENT-1001` that PyO3 and napi also return (see
+    // `ucan_delegate_unregistered_delegator_returns_ident_1001`).
 
     #[tokio::test]
     async fn ucan_mint_without_retained_custody_returns_ident_1017() {
@@ -24544,27 +24817,33 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn ucan_delegate_without_retained_custody_returns_ident_1017() {
+    /// A `delegator_did` that this bridge instance never registered must fail
+    /// closed with `SCP-IDENT-1001`, matching what `PyO3`'s and napi's delegate
+    /// paths return for that same registry miss. A context handle carrying full
+    /// callback custody keeps a creator's key available throughout, so no
+    /// creator-key fallback can hide behind a missing key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_delegate_unregistered_delegator_returns_ident_1001() {
         let scp = scp_test();
-        let handle = test_handle_for(&scp);
+        let (handle, _creator_key) = callback_context_handle(&scp).await;
 
-        // The handle-borne custody check fires before any parent-token parsing.
+        // This delegator registry lookup fires before any parent-token parsing.
         let result = ucan_delegate_impl(
+            &scp.inner,
             handle,
-            "did:dht:z6MkDelegator".to_owned(),
+            "did:dht:z6MkUnregisteredDelegator".to_owned(),
             "did:dht:z6MkDelegatee".to_owned(),
             "header.payload.signature".to_owned(),
             vec!["messages:write".to_owned()],
         )
         .await;
         let Err(err) = result else {
-            panic!("delegate without retained custody must fail")
+            panic!("delegate for an unregistered delegator must fail")
         };
         let err_str = err.to_string();
         assert!(
-            err_str.contains(codes::IDENT_1017),
-            "expected SCP-IDENT-1017, got: {err_str}"
+            err_str.contains(codes::IDENT_1001),
+            "expected SCP-IDENT-1001, got: {err_str}"
         );
     }
 
@@ -25669,5 +25948,176 @@ mod tests {
                 other => panic!("expected SagaAborted (axis a), got {other:?}"),
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Identity link attestation verification (spec §3.5.4, issue #2335 #2)
+    // -----------------------------------------------------------------------
+
+    /// A module-scope free function reaches no bridge instance, so it cannot
+    /// perform §3.5.4 step 1 (resolve an issuer's DID document) and must
+    /// decline rather than verify a caller-supplied key against a
+    /// caller-supplied attestation.
+    #[test]
+    fn module_scope_link_verification_declines_fail_closed() {
+        let err = identity_verify_link_attestation(
+            "{}".to_owned(),
+            "00".repeat(32),
+            scp_ffi_common::attestation::REFERENCE_PROOF_NOT_FETCHED.to_owned(),
+        )
+        .expect_err("module-scope verification must decline");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(codes::IDENT_1060),
+            "module-scope verification must decline with SCP-IDENT-1060, got: {msg}"
+        );
+    }
+
+    /// A malformed argument is a caller error (`SCP-IDENT-1044`), reported
+    /// before any resolution attempt — never a `false` verdict, which would
+    /// say "forged" about an attestation nobody parsed.
+    #[test]
+    fn per_instance_link_verification_rejects_malformed_arguments() {
+        let scp = scp_test();
+        let err = runtime()
+            .block_on(scp.identity_verify_link_attestation(
+                "not json".to_owned(),
+                "00".repeat(32),
+                scp_ffi_common::attestation::REFERENCE_PROOF_NOT_FETCHED.to_owned(),
+            ))
+            .expect_err("malformed JSON must raise");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(codes::IDENT_1044),
+            "malformed attestation JSON must raise SCP-IDENT-1044, got: {msg}"
+        );
+    }
+
+    /// Mints a Class 1 (`oauth`) link attestation on a fresh identity and
+    /// returns an `Scp` bound to that identity's bridge instance, that
+    /// identity's attestation JSON, and its `#active` key as hex.
+    async fn minted_link_attestation() -> (Arc<crate::scp::Scp>, String, String) {
+        let scp = scp_test();
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("creating an identity must succeed");
+        let did = identity.did();
+        let attestation_json = scp
+            .identity_create_link_attestation(
+                Arc::clone(&identity),
+                "google.com".to_owned(),
+                "alice".to_owned(),
+                r#"{"provider":"google.com","subject_id":"12345","verified_at":1700000000}"#
+                    .to_owned(),
+                "oauth".to_owned(),
+                Some("12345".to_owned()),
+            )
+            .await
+            .expect("minting a link attestation must succeed");
+
+        // Read the `#active` key from the same resolver verification reads
+        // from, so this test names the key an issuer's document publishes
+        // rather than a key it reconstructed some other way.
+        ensure_did_resolver_initialized_on(&scp.inner, runtime().handle().clone())
+            .expect("resolver initialization must succeed");
+        let resolver = scp
+            .inner
+            .did_resolver()
+            .expect("a resolver must exist after initialization");
+        let issuer_document = scp_identity::resolver::DidResolver::resolve(&*resolver, &did)
+            .await
+            .expect("resolving a freshly created identity must not fault")
+            .expect("a freshly created identity must resolve");
+        let multibase = issuer_document
+            .document
+            .verification_method_by_fragment("active")
+            .expect("a DID document must publish an #active verification method")
+            .public_key_multibase
+            .clone();
+        let active_hex = hex::encode(
+            scp_did::decode_multibase_key(&multibase)
+                .expect("a freshly minted #active key must decode"),
+        );
+        (scp, attestation_json, active_hex)
+    }
+
+    #[test]
+    fn per_instance_link_verification_accepts_a_key_the_did_document_publishes() {
+        runtime().block_on(async {
+            let (scp, attestation_json, active_hex) = minted_link_attestation().await;
+            let verified = scp
+                .identity_verify_link_attestation(
+                    attestation_json,
+                    active_hex,
+                    scp_ffi_common::attestation::REFERENCE_PROOF_NOT_FETCHED.to_owned(),
+                )
+                .await
+                .expect("verification of a freshly minted attestation must not error");
+            assert!(
+                verified,
+                "an attestation signed by the #active key an issuer's DID document \
+                 publishes must verify (spec §3.5.4)"
+            );
+        });
+    }
+
+    /// Regression pin for GitHub issue #2335 finding 2, in the shape that
+    /// finding names: an attacker supplies BOTH an attestation and the key
+    /// that signs it, keeping an honest issuer's DID in the `issuer` field.
+    ///
+    /// A verifier that calls `attestation.verify_signature(caller_key)` and
+    /// returns that boolean answers `true` here, because the attacker's own
+    /// signature verifies under the attacker's own key. Taking the signing key
+    /// from an issuer's resolved DID document instead answers `false`, because
+    /// that document publishes neither the attacker's key at `#active` nor at
+    /// `#agent`.
+    ///
+    /// Passing a key nobody signed with does NOT exhibit that gap — a
+    /// signature check rejects it either way — so this test forges rather than
+    /// mutating a key.
+    #[test]
+    fn per_instance_link_verification_rejects_an_attacker_supplied_key_and_attestation() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        runtime().block_on(async {
+            let (scp, attestation_json, _active_hex) = minted_link_attestation().await;
+
+            // Forge: keep an honest issuer's DID, re-sign under an attacker's key.
+            let attacker = SigningKey::from_bytes(&[0x07; 32]);
+            let mut forged: scp_core::identity::attestation::IdentityLinkAttestation =
+                serde_json::from_str(&attestation_json).expect("minted attestation must parse");
+            forged.signature = Vec::new();
+            let canonical = forged
+                .canonical_signing_bytes()
+                .expect("canonical bytes must compute");
+            forged.signature = attacker.sign(&canonical).to_bytes().to_vec();
+            let forged_json = serde_json::to_string(&forged).expect("forgery must serialize");
+            let attacker_hex = hex::encode(attacker.verifying_key().to_bytes());
+
+            // The forgery is internally consistent: it verifies under the key
+            // an attacker supplies alongside it.
+            assert!(
+                forged
+                    .verify_signature(&attacker.verifying_key().to_bytes())
+                    .is_ok(),
+                "the forgery must verify under an attacker's own key, or this test \
+                 exercises nothing"
+            );
+
+            let verified = scp
+                .identity_verify_link_attestation(
+                    forged_json,
+                    attacker_hex,
+                    scp_ffi_common::attestation::REFERENCE_PROOF_NOT_FETCHED.to_owned(),
+                )
+                .await
+                .expect("verification of a forgery must not error");
+            assert!(
+                !verified,
+                "an attestation an attacker signed with a key an issuer's DID document \
+                 publishes at neither #active nor #agent must not verify (spec §3.5.4 step 1)"
+            );
+        });
     }
 }

@@ -64,16 +64,6 @@ ignore = [
     # soundness violation is unreachable in our code path. Awaiting
     # hpke-rs upstream upgrade.
     "RUSTSEC-2026-0097",
-    # rustls-webpki: URI name constraints incorrectly accepted + wildcard
-    # name constraints accepted. Transitive via rustls -> webpki. Awaiting
-    # upstream rustls-webpki patch.
-    "RUSTSEC-2026-0098",
-    "RUSTSEC-2026-0099",
-    # rustls-webpki: reachable panic in certificate revocation list parsing
-    # (0.103.10). Transitive via rustls -> webpki. Awaiting upstream
-    # rustls-webpki patch. Panic is reachable only when parsing attacker-
-    # controlled CRLs; SCP does not consume external CRLs today.
-    "RUSTSEC-2026-0104",
     # proc-macro-error2: unmaintained (fork of proc-macro-error, also
     # unmaintained). Build-time proc-macro support crate, transitive via
     # hax-lib-macros (the hax/F* verification toolchain pulled through the

@@ -1884,8 +1884,8 @@ SCP.Security.destroyContextKeys(
     attestationBlob: Data
   },
   method: .hardwareBacked | .softwareOnly,
-  trustLevel: .high                    // hardware-attested destruction
-            | .moderate                // software-only deletion
+  trustLevel: .high                    // hardware-attested destruction, platform proof verified
+            | .moderate                // software-only deletion, or a hardwareBacked method with no verified proof
             | .none,                   // no attestation available
   signature: Ed25519Signature          // signed by identity key, NOT the destroyed key
 }

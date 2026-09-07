@@ -538,6 +538,46 @@ Note: The `ProposalId` is the SHA-256 output (32 bytes). It is deterministic for
 
 Note: The Ed25519 signature is over `SHA-256("SCP-VOTE-V1:" || fields)`. The `proposal_id` binds the vote to a specific proposal, preventing cross-proposal replay. `VoteType` is serialized as compact JSON (equivalent to `json.dumps(separators=(',', ':'))` in Python).
 
+**ScpCustodyViolationAttestation** — domain: `"SCP-CUSTODY-VIOLATION-V1:"`
+
+ADR-039, shared-DID human-agent identity model, defines a custody violation at enforcement-stack layer 4 as a permanent record that one verifier writes about a subject who never consented to it. A reader must be able to establish which verifier wrote a given record, and must be able to detect a record that any other party altered after that verifier signed it. Fields 1 through 7 below feed one Ed25519 signature that carries both properties.
+
+| Order | Field | Encoding |
+|-------|-------|----------|
+| 1 | `subject_did` | 4-byte BE length + UTF-8 bytes |
+| 2 | `timestamp` | 8-byte BE u64 |
+| 3 | `violation_tag` | 1-byte U8 discriminator (`0x00` = `CategoryAViolation`, `0x01` = `AttestationMismatch`) |
+| 4 | `violation_field_1` | 4-byte BE length + bytes — `action` (UTF-8) when `violation_tag` is `0x00`, `claimed_custody` (UTF-8) when `violation_tag` is `0x01` |
+| 5 | `violation_field_2` | 4-byte BE length + bytes — `signer_key_id` (UTF-8 `"#active"` / `"#agent"`) when `violation_tag` is `0x00`, `observed_behavior` (UTF-8) when `violation_tag` is `0x01` |
+| 6 | `violation_field_3` | 4-byte BE length + raw bytes — `signature_evidence` when `violation_tag` is `0x00`, `attestation_evidence` when `violation_tag` is `0x01` |
+| 7 | `verifier_did` | 4-byte BE length + UTF-8 bytes |
+
+Note: `verifier_signature` is one field this preimage omits, and it is the only such field, so a party who alters `subject_did`, `timestamp`, any component of `violation`, or `verifier_did` moves this hash away from whatever value a stored `verifier_signature` covers, and a verifier then rejects that altered record. `violation_tag` at position 3 separates both variants: without `violation_tag`, a `CategoryAViolation` whose three variable-length fields carry the same bytes as an `AttestationMismatch` hashes identically, so a verifier's signature over one variant transfers to another. A verifier resolves `verifier_did` to its `#active` or `#agent` verification method and checks `verifier_signature` against `SHA-256("SCP-CUSTODY-VIOLATION-V1:" || fields)`. `verifier_signature` establishes who wrote a record. It does not establish that a recorded violation occurred, because that verifier alone chose what to write. A `CounterAttestation` carries this same 32-byte hash in its `violation_reference` field, specified below. §25.25 Vector 38 pins one known-answer preimage, its SHA-256, and an Ed25519 signature over that SHA-256 under §25.2's reference key.
+
+**CounterAttestation** — domain: `"SCP-COUNTER-ATTESTATION-V1:"`
+
+| Order | Field | Encoding |
+|-------|-------|----------|
+| 1 | `subject_did` | 4-byte BE length + UTF-8 bytes |
+| 2 | `violation_reference` | 32 bytes (fixed-size, no length prefix) — derivation stated below |
+| 3 | `explanation` | 4-byte BE length + UTF-8 bytes |
+| 4 | `timestamp` | 8-byte BE u64 |
+
+**`violation_reference` derivation (normative).** `violation_reference` MUST equal a `ScpCustodyViolationAttestation` signing hash, defined immediately above, computed over whichever record this counter-claim contests: `SHA-256("SCP-CUSTODY-VIOLATION-V1:" || fields 1..7)`. Any other 32-byte value names no record.
+
+A verifier that holds both records MUST reject a counter-attestation when either check fails:
+
+1. `counter.violation_reference != SHA-256("SCP-CUSTODY-VIOLATION-V1:" || violation fields 1..7)`.
+2. `counter.subject_did != violation.subject_did`.
+
+Check 1 gives two independent verifiers one answer to "does this counter-claim answer this violation record", which a free-form identifier could not give. Check 2 stops one subject from contesting a record naming a different subject.
+
+This derivation omits a violation record's `verifier_signature`, and that omission is deliberate. A verifier who signs one record's identical facts under a rotated key produces that identical reference, so a counter-claim a subject already published keeps pointing at that record instead of becoming orphaned. Two verifiers who record different facts — different `timestamp`, different `action`, different evidence bytes — produce different references, because fields 1 through 7 cover every recorded fact. This specification rejected one alternative, hashing a serialized record that includes `verifier_signature`: such a value separates two records only when one verifier signs identical facts under two keys, which is one claim, not two, and it would require a third domain separator plus a record serialization §9.5.1 does not define.
+
+An author computes `violation_reference` from a violation record it holds. An author that holds no violation record has nothing to contest and MUST NOT publish a counter-attestation.
+
+Note: ADR-039 assigns a counter-attestation signature to `#active` rather than `#agent`, so that publishing a counter-attestation demonstrates human involvement. This preimage carries no `signing_key_id` field, because a party that names its own fragment inside a record it also signs can name `#active` while signing with `#agent`. A verifier instead resolves `#active` from `subject_did`'s current DID document and checks `signature` against that key alone. A signature that only `#agent` produced then fails, which enforces ADR-039's assignment. A verifier that resolves `#agent` establishes agent authorization and establishes nothing about human involvement. §25.25 Vector 39 pins one known-answer preimage, its SHA-256, and an Ed25519 signature over that SHA-256 under §25.2's secondary key, taken against Vector 38's violation record.
+
 **UCAN signing:** EdDSA (Ed25519) per UCAN specification. The nonce field (`nnc`) is mandatory and must be unique per token issuance. This prevents UCAN token replay. UCAN token expiry (`exp`) MUST NOT exceed 24 hours (matching the nonce deduplication cache window in §9.8.2). Tokens with longer expiry could be replayed after nonce cache eviction. **UCAN revocation** is per-context via `RevocationList` — an append-only map of token CIDs to revocation states (Active, RevocationPending, Revoked). Revocations are distributed as MLS application messages to all context members. Revocation check is step 10 of the 11-step validation pipeline (ADR-016) and is performed on every capability exercise. The system is **fail-closed**: tokens in `RevocationPending` state (revocation initiated but not yet confirmed via MLS) are denied. See ADR-016 criterion 7 and `scp-core/crypto/ucan/revoke.rs` for the full specification.
 
 **UCAN CID computation.** UCAN tokens are identified by Content Identifiers (CIDs) in the `RevocationList` and in delegation chain `prf` references. CID computation MUST use the following parameters:
@@ -1381,7 +1421,7 @@ KeyDestructionAttestation {
   contextID:             String
   memberDID:             DID
   destroyedAt:           DateTime
-  platformAttestation:   PlatformAttestation?  // hardware-backed if available
+  platformAttestation:   PlatformAttestation?  // absent on a .softwareOnly record; a .hardwareBacked record rates as software-only without a verified one
   method:                .hardwareBacked | .softwareOnly
   signature:             Ed25519Signature       // signed by #0 (Identity Key) or #active (Active Signing Key); NOT #agent — agents cannot sign destruction attestations (ADR-039)
 }
@@ -1389,11 +1429,15 @@ KeyDestructionAttestation {
 
 4. Attestations are published to relays (outside the now-destroyed context). They are signed by the identity key so they remain verifiable after context keys are destroyed.
 
-**Trust levels for destruction claims:**
+**Trust levels for destruction claims.** Each level rates the method a consumer verified, never the method the record declared:
 
-- **Hardware-attested** (Secure Enclave / Keystore attestation): High confidence. The hardware claims the key is gone.
-- **Software-only** (`memset(0)` on key material in memory): Moderate confidence. Memory dumps, swap files, or crash logs may have retained the key.
+- **Hardware-attested** (Secure Enclave / Keystore attestation, where a verification of that attestation returns a pass): High confidence. The hardware claims the key is gone.
+- **Software-only** (`memset(0)` on key material in memory), and every record declaring `.hardwareBacked` that no verified `platformAttestation` accompanies: Moderate confidence. Memory dumps, swap files, or crash logs may have retained the key.
 - **No attestation** (member went offline before close): No confidence. The member may still have the key.
+
+**Ruling (2026-08-25): a hardware-backed declaration rates as software-only until a verified platform proof accompanies it.** Alec ruled that a hardware-backed declaration reads as software-backed unless a verified platform attestation proof accompanies it. §27.4.6 of the attestations spec quotes the three statements he wrote and names the binary an agent posed to him; the sentence before this one states what those statements decided and is not his wording. Answering that binary is also what keeps the High-versus-Moderate split above: the arm he rejected removed the rating and left `method` describing a setup. The three levels above carry his answer: a record's `method` field is the publisher's declaration and is not the input to the rating, and a consumer reaches High confidence only through a verification of the `platformAttestation` the same record carries. A record declaring `.softwareOnly` needs no proof and rates as Moderate. §27.4.6 of the attestations spec (`.docs/specs/27-attestations.md`) states the ruling in four clauses and gives the reasoning Alec used to reach it; this section states no reading rule beyond the level assignments above, so the two cannot drift apart on the rule's wording.
+
+No SCP implementation verifies a destruction `platformAttestation` today, and no artifact states the checks such a verification would run — open questions OQ-2 and OQ-29 of the attestations spec own that procedure. The shipped signing preimage also leaves `platformAttestation` outside the signed bytes, so a holder detaches the proof from the signature that binds `method`; open question OQ-8 of that spec asks a human whether the field enters the signed scope, and until it does, a verification of the proof establishes nothing about the declaration beside it. Every published `.hardwareBacked` record therefore rates as Moderate confidence today.
 
 The protocol provides the strongest guarantees the hardware supports and is explicit about where those guarantees end. This is consistent with the honest limitations acknowledged in §5.11.
 
@@ -1763,6 +1807,8 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash, sign
 | `"SCP-EPOCH-ADVANCE-V1:"` | SenderKeyEpochAdvance signing | §9.5.2 |
 | `"SCP-KEY-REQUEST-V1:"` | SenderKeyRequest signing | §9.5.2 |
 | `"SCP-ATTESTATION-V1:"` | Attestation signing | §9.5.2 |
+| `"SCP-CUSTODY-VIOLATION-V1:"` | `ScpCustodyViolationAttestation` signing — ADR-039 layer-4 custody-violation record, signed by its detecting verifier | §9.5.2 |
+| `"SCP-COUNTER-ATTESTATION-V1:"` | `CounterAttestation` signing — a subject's counter-claim against a custody-violation record, signed by that subject's `#active` key | §9.5.2 |
 | `"SCP-KEYPACKAGE-ATTESTATION-V1:"` | KeyPackage attestation (ephemeral MLS leaf key ↔ DID binding) signing | §9.5.2 |
 | `"SCP-PARTICIPATION-V1:"` | ParticipationProfile signing | §9.5.2 |
 | `"SCP-PARTICIPATION-PROFILE-V1:"` | ParticipationProfile canonical hash | §9.5.2 |

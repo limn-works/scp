@@ -75,7 +75,11 @@ for i in "${!FIXTURES[@]}"; do
         echo "FAIL [$name]: expected exit $expected_exit, got $actual_exit" >&2
         ok=0
     fi
-    if ! echo "$output" | grep -Fq -- "$expected_substr"; then
+    # `grep -F … >/dev/null`, never `grep -Fq`: under `set -o pipefail` (line 14)
+    # `grep -q` exits at its first match, `echo` dies of SIGPIPE and returns 141,
+    # and pipefail reports 141 — so a substring near a top of a long gate output
+    # reads as missing and this harness reports a false failure.
+    if ! echo "$output" | grep -F -- "$expected_substr" >/dev/null; then
         echo "FAIL [$name]: output missing expected substring: $expected_substr" >&2
         ok=0
     fi

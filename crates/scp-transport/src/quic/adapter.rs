@@ -30,6 +30,7 @@ use crate::quic::lifecycle::QuicLifecycleManager;
 use crate::quic::streams::{LENGTH_PREFIX_SIZE, MAX_FRAME_SIZE};
 use crate::subscription::{MAX_TRANSPORT_SUBSCRIPTIONS, TransportSubscriptionMap};
 use crate::traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};
+use scp_relay_client::relay_error_text;
 use scp_relay_client::{ClientMessage, RelayMessage};
 
 /// A boxed, pinned, `Send`-safe future -- the return type for all
@@ -363,9 +364,9 @@ impl TransportAdapter for QuicAdapter {
                     blob_id: Some(id), ..
                 } => Ok(BlobId::new(id)),
                 RelayMessage::Ok { blob_id: None, .. } => Ok(BlobId::from_sha256(&routing_id_vec)),
-                RelayMessage::Err { code, msg, .. } => Err(TransportError::SendFailed(format!(
-                    "relay error {code}: {msg}"
-                ))),
+                RelayMessage::Err { code, msg, .. } => {
+                    Err(TransportError::SendFailed(relay_error_text(code, &msg)))
+                }
                 _ => Err(TransportError::ProtocolError(
                     "unexpected response to PUBLISH".to_string(),
                 )),
@@ -455,7 +456,8 @@ impl TransportAdapter for QuicAdapter {
                 RelayMessage::Err { code, msg, .. } => {
                     let _ = send.finish();
                     return Err(TransportError::SubscriptionFailed(format!(
-                        "relay rejected subscription: {code}: {msg}"
+                        "relay rejected subscription: {}",
+                        relay_error_text(*code, msg)
                     )));
                 }
                 _ => {
@@ -593,9 +595,7 @@ impl TransportAdapter for QuicAdapter {
                         break;
                     }
                     RelayMessage::Err { code, msg, .. } => {
-                        return Err(TransportError::ProtocolError(format!(
-                            "relay error {code}: {msg}"
-                        )));
+                        return Err(TransportError::ProtocolError(relay_error_text(code, &msg)));
                     }
                     _ => {
                         // Skip unknown events.
@@ -638,9 +638,9 @@ impl TransportAdapter for QuicAdapter {
             let response = Self::read_relay_message(&mut recv).await?;
 
             match response {
-                RelayMessage::Err { code, msg, .. } => Err(TransportError::SendFailed(format!(
-                    "relay error {code}: {msg}"
-                ))),
+                RelayMessage::Err { code, msg, .. } => {
+                    Err(TransportError::SendFailed(relay_error_text(code, &msg)))
+                }
                 // Best-effort: treat all non-error responses as success.
                 _ => Ok(()),
             }
@@ -933,7 +933,7 @@ fn map_subscribe_relay_message(
             _ => None,
         },
         RelayMessage::Err { code, msg, .. } => Some(TransportEvent::Error(
-            TransportError::ProtocolError(format!("relay error {code}: {msg}")),
+            TransportError::ProtocolError(relay_error_text(code, &msg)),
         )),
         _ => None,
     }

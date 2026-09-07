@@ -1,9 +1,8 @@
 # Cryptographic Invariants Must Be Asserted On Every Bridge, Not Just Named in the Matrix
 
-> **ADR-055 (2026-06-29):** the WASM bridge was removed; the SCP-1717 incident narrative below references a fourth WASM/wasm-bindgen bridge (which happened to be the reference that re-asserted the invariant) as historical fact. There are now three bridges (PyO3, NAPI, UniFFI); the browser is a remote thin client. The rule — every cryptographic invariant must be re-asserted, in bytes, on every bridge that emits the artifact — remains evergreen across the three remaining bridges.
+> **Scope:** ADR-055, which removed the WASM bridge, left three bridges — PyO3, NAPI, and UniFFI. The passages below name a fourth wasm-bindgen bridge, which was the one that re-asserted the invariant. The rule binds the three that remain: the browser surface ADR-057 later added, `crates/scp-client-wasm`, emits no rotation event, so it emits no artifact this rule covers.
 
-**Date:** 2026-04-27
-**Source:** SCP-1717 — three native bridges (PyO3, NAPI, UniFFI) silently emitted invalid pre-rotation proofs because only the WASM bridge re-asserted the spec §3.7 `SHA-256(revealed_key) == commitment` invariant.
+**Source:** three native bridges silently emitted invalid pre-rotation proofs, because only the WASM bridge re-asserted the `SHA-256(revealed_key) == commitment` invariant that Pre-Rotation Key Custody, §9.7.4.1 of the security-model spec `09-security-model.md`, requires.
 
 ## Rule
 
@@ -40,7 +39,7 @@ assert_eq!(
 
 ## Reverse-direction parity
 
-Commit 753d461b2 also added `native_emitted_rotation_event_json_matches_wasm_encoding`: the native serde serialization of `DidRotationEvent` MUST be structurally identical to the WASM `encode_rotation_event_json` output, and WASM JSON MUST round-trip through the native struct. Generalizes: when two bridges encode the same wire type, parity must be tested in both directions, not just "WASM matches native" or "native matches WASM" — drift on either side breaks interop.
+The same fix added `native_emitted_rotation_event_json_matches_wasm_encoding`: the native serde serialization of `DidRotationEvent` MUST be structurally identical to the WASM `encode_rotation_event_json` output, and WASM JSON MUST round-trip through the native struct. Generalizes: when two bridges encode the same wire type, test parity in both directions, not only "WASM matches native" or "native matches WASM" — drift on either side breaks interop.
 
 ## Where to encode the rule
 
@@ -53,5 +52,5 @@ Add to `CLAUDE.md` Integration checklist as item 6:
 - `.docs/lessons/cross-bridge-canonical-naming.md` — covers name parity (necessary), this lesson covers byte parity (also necessary, complementary).
 - `.docs/lessons/pre-rotation-key-must-be-stored-at-creation.md` — covers the storage half of this specific bug (preimage lifetime). This lesson covers the test-coverage half.
 - ADR-003 §4b (`.docs/adrs/phase-1.md` lines 348-415) — the migrate operation contract.
-- spec §3.7 — the `SHA-256(revealed_key) == commitment` invariant.
+- Pre-Rotation Key Custody, §9.7.4.1 of `.docs/specs/09-security-model.md` — the `SHA-256(revealed_key) == commitment` invariant.
 - `scripts/bridge-aliases.json`, `crates/scp-testing/tests/integration/ffi_conformance.rs` — surface symmetry; do not validate behavioral parity.

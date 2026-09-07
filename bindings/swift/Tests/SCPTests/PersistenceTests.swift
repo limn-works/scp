@@ -87,7 +87,7 @@ final class PersistenceTests: XCTestCase {
     }
 
     /// Construction with a wrong key must surface a validation error
-    /// (SCP-VALID-7005) rather than silently succeeding with an empty
+    /// (SCP-STORAGE-8004) rather than silently succeeding with an empty
     /// in-memory instance — guards against silent downgrade where the
     /// caller would lose access to persisted state. The `UniFFI` bridge
     /// surfaces the `SQLCipher` key-mismatch as `ScpError` rather than
@@ -106,7 +106,21 @@ final class PersistenceTests: XCTestCase {
         XCTAssertThrowsError(
             try SCP.withStorage(sqliteDir: dir, key: wrongKey),
             "mismatched-key construction must throw, not silently fall back"
-        )
+        ) { error in
+            guard let scpError = error as? ScpError else {
+                XCTFail("expected ScpError, got \(error)")
+                return
+            }
+            // A rejected key is a storage-open failure, not a context failure.
+            // All three bridges report SCP-STORAGE-8004 for it, so this
+            // assertion also pins Swift to the Python and TypeScript answer.
+            switch scpError {
+            case let .Validation(_, code):
+                XCTAssertEqual(code, "SCP-STORAGE-8004")
+            default:
+                XCTFail("expected ScpError.Validation, got \(scpError)")
+            }
+        }
 
         // Third open with the correct key — must still succeed, proving
         // the failed mismatched-key attempt did not corrupt or truncate

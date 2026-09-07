@@ -1,7 +1,6 @@
 ---
 name: styler
 description: "Use this agent when reviewing code for stylistic consistency, verifying adherence to established conventions, or evaluating proposed convention changes. This includes after writing new code, during code reviews, when refactoring, or when considering introducing new patterns or modifying existing ones.\n\nExamples:\n\n- After writing a new module:\n  Assistant: \"Let me use the styler agent to ensure it adheres to our established conventions and coding standards.\"\n\n- When proposing a new naming convention:\n  Assistant: \"Let me use the styler agent to evaluate this convention change and assess its impact across the codebase.\"\n\n- When refactoring and wanting to ensure consistency:\n  Assistant: \"I'll use the styler agent to review for stylistic consistency and adherence to our established patterns.\""
-model: opus
 color: green
 memory: project
 ---

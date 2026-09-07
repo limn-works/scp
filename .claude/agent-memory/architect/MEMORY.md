@@ -1,5 +1,11 @@
 # Architect Memory
 
+## Index
+- [blockedBy = cannot START](decision_blockedby_cannot_start_not_cannot_finish.md) — express "cannot FINISH without" via description + downstream blockedBy, never by inverting an edge into a cycle.
+- [Phantom provenance: the issue number IS the PRD](finding_phantom_provenance_issue_number_is_the_prd.md) — a comment citing "#NNNN owns this" is not provenance until a STORY covers it; grep the artifact, not the number.
+- [Readiness gate vs observability accessor](decision_readiness_gate_vs_observability_accessor.md) — delete the GATE, keep the read-only count; schedule unconditionally + fail closed + backoff. Per-tick re-sampling is ALSO rejected.
+- [PRD/code desync after a mid-branch story rewrite](finding_prd_code_desync_after_story_rewrite.md) — re-run every AC grep against HEAD; never trust a story's premise or a reviewer's AC index.
+
 ## ADR Review Fixes (Feb 2026)
 10 HIGH-severity issues identified and fixed across Phase 1-3 ADRs:
 - ADR-001: Epoch key grace window (30s max, in-memory only)

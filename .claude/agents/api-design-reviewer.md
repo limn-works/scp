@@ -1,7 +1,6 @@
 ---
 name: api-design-reviewer
 description: "Use this agent to review public APIs, protocols, and interfaces for design quality \u2014 discoverability, misuse resistance, consistency, and developer experience. Invoke when new protocols are defined, public interfaces change, or new modules expose APIs to other layers.\n\nExamples:\n\n- After defining a new protocol or public interface:\n  Assistant: \"Let me launch the api-design-reviewer agent to evaluate whether this API is easy to use correctly and hard to misuse.\"\n\n- When refactoring a module's public surface:\n  Assistant: \"I'll use the api-design-reviewer agent to verify the refactored API maintains discoverability and consistency.\"\n\n- When adding a new repository, service, or module:\n  Assistant: \"Let me run the api-design-reviewer agent to check that the public API guides consumers to the happy path.\""
-model: opus
 color: green
 memory: project
 ---

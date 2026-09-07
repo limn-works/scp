@@ -7,9 +7,29 @@ on:
   workflow_dispatch:
     inputs:
       fuzz_time:
+        # A closed option list, not a free-text field. Two jobs below size their
+        # `timeout-minutes` from whatever an operator picks here, so an
+        # unbounded value would hand an operator an unbounded job budget and
+        # undo a per-job ceiling entirely. Every option divides evenly by 60, so
+        # each computed budget stays a whole number of minutes.
+        #
+        # GitHub validates a dispatch input against a definition on a default
+        # branch, never against whatever branch `--ref` names. Measured: with
+        # this list present on a feature branch but absent from main,
+        # `gh workflow run fuzz.yml --ref <branch> -f fuzz_time=99999` started
+        # run 31963800303 rather than failing. Do not read that as an argument
+        # for adding a redundant runtime check — bounding takes effect on merge,
+        # and scripts/tests/ci-gate fails if this list ever disappears.
         description: "Seconds per target"
+        type: choice
         default: "900"
         required: false
+        options:
+          - "300"
+          - "900"
+          - "1800"
+          - "3600"
+          - "7200"
 
 permissions:
   contents: read
@@ -19,13 +39,68 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # ── The nightly every job below compiles on ────────────────────────────────
+  # `fuzz/rust-toolchain.toml` names it, records why it is a dated nightly, and records
+  # what unpins it. This job reads the channel out of that file and no other step in this
+  # workflow repeats it, so the file and the workflow cannot disagree.
+  #
+  # Every job reaches the value through `dtolnay/rust-toolchain@master` plus a
+  # `toolchain:` input, rather than through the directory override `fuzz/README.md`
+  # documents, because these jobs run `cargo fuzz --fuzz-dir fuzz` from the repository
+  # root so that their corpus-cache paths and their command paths agree. The action
+  # publishes `master`, `stable`, `beta`, `nightly`, and a branch per released version,
+  # but no dated-nightly branch, so the `@nightly-<date>` ref these jobs used before
+  # never resolved and every scheduled run failed at setup.
+  toolchain:
+    name: Fuzz / read the pinned nightly
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      channel: ${{ steps.read.outputs.channel }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: read
+        run: |
+          channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
+            fuzz/rust-toolchain.toml | head -n 1)
+          if [ -z "$channel" ]; then
+            echo "fuzz/rust-toolchain.toml names no [toolchain] channel" >&2
+            exit 1
+          fi
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
   # ── Nightly: regression + corpus growth ────────────────────────────────────
   # Runs every night at 03:00 UTC. Tier 1 targets get 15 min each; Tier 2 get
   # 5 min each. All targets run in parallel. Corpus is cached per-target and
   # minimized after each run with cargo fuzz cmin.
   fuzz-nightly:
     name: Fuzz / ${{ matrix.target }}
+    needs: toolchain
     runs-on: ubuntu-latest
+    # Selected from `fuzz_time`, because step "Run fuzzer" hands that same input
+    # to libFuzzer as `-max_total_time`. A budget fixed above a scheduled run
+    # would cancel any dispatch asking for longer, so an operator picking 7200
+    # would lose a run that finished before per-job budgets existed.
+    #
+    # Selection, not arithmetic: GitHub expressions carry no `+`, `-`, `*` or
+    # `/` operator, so `seconds / 60 + overhead` cannot be written here.
+    # actionlint rejects it — "got unexpected character '/' while lexing
+    # expression". Each arm below therefore states a whole-minute budget equal
+    # to its option divided by 60, plus 30 minutes covering checkout, a nightly
+    # toolchain, `cargo install cargo-fuzz`, and a sanitizer build. A closed
+    # option list on `fuzz_time` is what keeps this chain total.
+    #
+    # A schedule supplies no input, so a final arm yields 45 — same budget a
+    # scheduled nightly ran under before, and what option "900" selects, that
+    # option being longest `matrix.time` below.
+    #
+    # scripts/tests/ci-gate asserts every option maps to an arm here.
+    timeout-minutes: >-
+      ${{ github.event.inputs.fuzz_time == '7200' && 150 ||
+      github.event.inputs.fuzz_time == '3600' && 90 ||
+      github.event.inputs.fuzz_time == '1800' && 60 ||
+      github.event.inputs.fuzz_time == '300' && 35 ||
+      45 }}
     if: github.event.schedule == '0 3 * * *' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
@@ -83,19 +158,14 @@ jobs:
 
       - uses: actions/checkout@v5
 
-      # TEMPORARY: pinned nightly. Recent nightlies (post-2026-05-03) tightened
-      # E0365 enforcement on glob re-exports, which fires on openmls 0.8.1's
-      # prelude — its trailing `pub use crate::ciphersuite::*` picks up the
-      # earlier `pub(crate) use signature::*` shadow and re-exports
-      # `Signature` / `SignContent` / `SignaturePublicKey` /
-      # `OpenMlsSignaturePublicKey` at insufficient visibility.
-      #
-      # Unpin to `@nightly` once openmls publishes a fixed prelude (likely
-      # 0.8.2 or 0.9) and `crates/scp-runtime` updates its dependency.
-      - uses: dtolnay/rust-toolchain@nightly-2026-05-03
+      # `fuzz/rust-toolchain.toml` names this channel and records why it is a dated
+      # nightly and what unpins it.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.toolchain.outputs.channel }}
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo +${{ needs.toolchain.outputs.channel }} install cargo-fuzz --locked
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -109,9 +179,15 @@ jobs:
           key: corpus-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: corpus-${{ matrix.target }}-
 
+      # Every `cargo fuzz` command below names its toolchain explicitly. These
+      # steps run from the repository root, where `rust-toolchain.toml` names a
+      # stable channel, and cargo-fuzz only runs on nightly. An explicit
+      # `+toolchain` sets RUSTUP_TOOLCHAIN for the command and everything it
+      # spawns, which overrides that file. The same convention already governs
+      # the fuzz-crate check in ci.yml.
       - name: Run fuzzer
         run: |
-          cargo fuzz run ${{ matrix.target }} \
+          cargo +${{ needs.toolchain.outputs.channel }} fuzz run ${{ matrix.target }} \
             --fuzz-dir fuzz \
             fuzz/corpus/${{ matrix.target }} \
             -- \
@@ -125,7 +201,7 @@ jobs:
       - name: Minimize corpus
         if: always()
         run: |
-          cargo fuzz cmin ${{ matrix.target }} \
+          cargo +${{ needs.toolchain.outputs.channel }} fuzz cmin ${{ matrix.target }} \
             --fuzz-dir fuzz \
             fuzz/corpus/${{ matrix.target }} \
             || true
@@ -157,7 +233,20 @@ jobs:
   # self-generates a valid frame to tamper.
   fuzz-mls-decrypt:
     name: Fuzz / fuzz_mls_decrypt (release, debug-assertions off)
+    needs: toolchain
     runs-on: ubuntu-latest
+    # Selected from `fuzz_time` for a reason spelled out above fuzz-nightly.
+    # Each arm states its option divided by 60, plus 25 minutes covering
+    # checkout, a nightly toolchain, `cargo install cargo-fuzz`, and a release
+    # build. A final arm yields 30, matching both option "300" and a scheduled
+    # run, since step "Run fuzzer (release, debug-assertions off)" falls back to
+    # 300 seconds when no input arrives.
+    timeout-minutes: >-
+      ${{ github.event.inputs.fuzz_time == '7200' && 145 ||
+      github.event.inputs.fuzz_time == '3600' && 85 ||
+      github.event.inputs.fuzz_time == '1800' && 55 ||
+      github.event.inputs.fuzz_time == '900' && 40 ||
+      30 }}
     if: github.event.schedule == '0 3 * * *' || github.event_name == 'workflow_dispatch'
     steps:
       - name: Free disk space
@@ -165,12 +254,14 @@ jobs:
 
       - uses: actions/checkout@v5
 
-      # TEMPORARY: pinned nightly (see the note in fuzz-nightly). Unpin once
-      # openmls publishes a fixed prelude and scp-runtime updates its dependency.
-      - uses: dtolnay/rust-toolchain@nightly-2026-05-03
+      # `fuzz/rust-toolchain.toml` names this channel and records why it is a dated
+      # nightly and what unpins it.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.toolchain.outputs.channel }}
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo +${{ needs.toolchain.outputs.channel }} install cargo-fuzz --locked
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -190,7 +281,7 @@ jobs:
         # openmls's decrypt `debug_assert!` and turn every tampered input into a
         # false crash.
         run: |
-          cargo fuzz run fuzz_mls_decrypt -O \
+          cargo +${{ needs.toolchain.outputs.channel }} fuzz run fuzz_mls_decrypt -O \
             --fuzz-dir fuzz \
             fuzz/corpus/fuzz_mls_decrypt \
             -- \
@@ -203,7 +294,7 @@ jobs:
       - name: Minimize corpus
         if: always()
         run: |
-          cargo fuzz cmin fuzz_mls_decrypt -O \
+          cargo +${{ needs.toolchain.outputs.channel }} fuzz cmin fuzz_mls_decrypt -O \
             --fuzz-dir fuzz \
             fuzz/corpus/fuzz_mls_decrypt \
             || true
@@ -223,14 +314,33 @@ jobs:
           path: fuzz/artifacts/fuzz_mls_decrypt/
           retention-days: 90
 
-  # ── Weekly deep-fuzz: Tier 1 targets, 2 hours each, with UBSan ────────────
+  # ── Weekly deep-fuzz: Tier 1 targets, 2 hours each ────────────────────────
   # Runs at 00:00 UTC every Saturday, or on workflow_dispatch. Only Tier 1
   # targets (highest trust-boundary exposure). Longer time budget surfaces
-  # deeper code paths. AddressSanitizer is cargo-fuzz default; UBSan is added
-  # via RUSTFLAGS to catch undefined behavior in dependency C code.
+  # deeper code paths. AddressSanitizer is cargo-fuzz's default and is what
+  # these jobs run.
+  #
+  # THIS JOB USED TO SET `RUSTFLAGS: -Zsanitizer=address,undefined`, AND THAT
+  # VALUE HAS NEVER BEEN LEGAL. rustc offers no `undefined` sanitizer; run
+  # 32634187570 recorded the compiler's own list —
+  #   error: incorrect value `address,undefined` for unstable option `sanitizer`
+  #   - comma separated list of sanitizers: `address`, `cfi`, `dataflow`,
+  #     `hwaddress`, `kcfi`, `kernel-address`, `kernel-hwaddress`, `leak`,
+  #     `memory`, `memtag`, `safestack`, `shadow-call-stack`, `thread`, or
+  #     'realtime' was expected
+  # — and every one of the six matrix jobs died at `cargo fuzz`'s first rustc
+  # invocation, before the fuzzer started. No deep-fuzz campaign has ever run.
+  # The line's comment also named rmp-serde and OpenMLS as the C code it would
+  # instrument, and both are pure Rust.
   fuzz-weekly:
     name: Deep Fuzz / ${{ matrix.target }}
+    needs: toolchain
     runs-on: ubuntu-latest
+    # Fixed, unlike two jobs above, because step "Run deep fuzzer" hardcodes
+    # `-max_total_time=7200` and never reads `fuzz_time`. 120 minutes of fuzzing
+    # plus 60 for checkout, a nightly toolchain, `cargo install cargo-fuzz`, and
+    # a combined ASan plus UBSan build.
+    timeout-minutes: 180
     if: github.event.schedule == '0 0 * * 6' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
@@ -260,19 +370,14 @@ jobs:
 
       - uses: actions/checkout@v5
 
-      # TEMPORARY: pinned nightly. Recent nightlies (post-2026-05-03) tightened
-      # E0365 enforcement on glob re-exports, which fires on openmls 0.8.1's
-      # prelude — its trailing `pub use crate::ciphersuite::*` picks up the
-      # earlier `pub(crate) use signature::*` shadow and re-exports
-      # `Signature` / `SignContent` / `SignaturePublicKey` /
-      # `OpenMlsSignaturePublicKey` at insufficient visibility.
-      #
-      # Unpin to `@nightly` once openmls publishes a fixed prelude (likely
-      # 0.8.2 or 0.9) and `crates/scp-runtime` updates its dependency.
-      - uses: dtolnay/rust-toolchain@nightly-2026-05-03
+      # `fuzz/rust-toolchain.toml` names this channel and records why it is a dated
+      # nightly and what unpins it.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.toolchain.outputs.channel }}
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo +${{ needs.toolchain.outputs.channel }} install cargo-fuzz --locked
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -286,16 +391,14 @@ jobs:
           key: corpus-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: corpus-${{ matrix.target }}-
 
-      - name: Run deep fuzzer (2 hours, ASan + UBSan)
-        # cargo-fuzz enables AddressSanitizer by default. UBSan is layered on top
-        # via RUSTFLAGS. Combined sanitizers catch both memory safety and undefined
-        # behavior in dependency C code (rmp-serde, OpenMLS, aws-lc-sys).
-        # If UBSan produces spurious errors from dependency C code, fall back to
-        # ASan alone by removing the RUSTFLAGS line.
-        env:
-          RUSTFLAGS: "-Zsanitizer=address,undefined"
+      - name: Run deep fuzzer (2 hours, AddressSanitizer)
+        # cargo-fuzz enables AddressSanitizer and its own coverage instrumentation
+        # through RUSTFLAGS it assembles itself. This step sets no RUSTFLAGS: a
+        # value set here is appended to cargo-fuzz's, and the value this step used
+        # to set named a sanitizer rustc does not have. The comment above the job
+        # records what the compiler reported.
         run: |
-          cargo fuzz run ${{ matrix.target }} \
+          cargo +${{ needs.toolchain.outputs.channel }} fuzz run ${{ matrix.target }} \
             --fuzz-dir fuzz \
             fuzz/corpus/${{ matrix.target }} \
             -- \
@@ -309,7 +412,7 @@ jobs:
       - name: Minimize corpus
         if: always()
         run: |
-          cargo fuzz cmin ${{ matrix.target }} \
+          cargo +${{ needs.toolchain.outputs.channel }} fuzz cmin ${{ matrix.target }} \
             --fuzz-dir fuzz \
             fuzz/corpus/${{ matrix.target }} \
             || true

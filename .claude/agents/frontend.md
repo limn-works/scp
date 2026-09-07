@@ -1,7 +1,6 @@
 ---
 name: frontend
 description: "Use this agent for UI views, components, design system, animations, and navigation. Spin up when building screens, UI components, interactions, animations, navigation flows, or any visual/interactive work.\n\nExamples:\n- User: \"Build a list screen\"\n  Assistant: Uses frontend agent to create the view with proper patterns.\n\n- User: \"Add a progress animation\"\n  Assistant: Uses frontend agent to implement the animation with proper timing.\n\n- User: \"Set up tab-based navigation\"\n  Assistant: Uses frontend agent to architect the navigation structure and routing."
-model: opus
 color: blue
 memory: project
 ---

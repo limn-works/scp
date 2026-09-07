@@ -160,27 +160,37 @@ public extension SCP {
         return try AttestationWire.parseAttestations(from: json)
     }
 
-    /// Verifies a link attestation's signature against the issuer's public key.
+    /// Verifies a link attestation per spec §3.5.4.
     ///
     /// Uses ``IdentityAttestation/rawJson`` when available for exact
     /// roundtrip fidelity. Falls back to re-serializing the attestation
     /// if ``rawJson`` is `nil`.
+    ///
+    /// `referenceProof` reports what this caller did about a class 2
+    /// (`signed_post` / `dns_record`) proof resource, per §3.5.4 Class 2
+    /// step 2: `"confirmed"` after fetching the resource `evidence.proof`
+    /// names and finding this issuer's DID in it, `"not_fetched"` after
+    /// fetching nothing.
     func verifyLinkAttestation(
         _ attestation: IdentityAttestation,
-        issuerPublicKeyHex: String
-    ) throws -> Bool {
+        issuerPublicKeyHex: String,
+        referenceProof: String
+    ) async throws -> Bool {
         let json: String
         if let raw = attestation.rawJson {
             json = raw
         } else {
             json = try AttestationWire.serializeAttestation(attestation)
         }
-        // identityVerifyLinkAttestation moved to a UniFFI-generated free
-        // top-level function under ADR-048 §1 — Ed25519 signature verification
-        // is a pure helper that does not require the tokio runtime.
-        return try identityVerifyLinkAttestation(
+        // Routes to ``SCP/identityVerifyLinkAttestation``, the per-instance
+        // method, because §3.5.4 step 1 resolves an issuer's DID document
+        // through this instance's resolver before any signature check. A
+        // UniFFI free function of that same name reaches no bridge instance
+        // and declines with `SCP-IDENT-1060` (GitHub issue #2335 finding 2).
+        return try await identityVerifyLinkAttestation(
             attestationJson: json,
-            issuerPublicKeyHex: issuerPublicKeyHex
+            issuerPublicKeyHex: issuerPublicKeyHex,
+            referenceProof: referenceProof
         )
     }
 }

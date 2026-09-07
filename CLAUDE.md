@@ -6,15 +6,15 @@ SCP is an open, ecosystem-agnostic infrastructure protocol — open infrastructu
 
 ### Protocol tenets
 
-- **Provenance everywhere.** All non-private data carries verifiable origin metadata. The absence of provenance is itself a signal.
+- **Provenance everywhere.** All non-private data carries verifiable origin metadata. When a record carries no provenance, that absence tells a reader something, so treat it as a signal rather than as missing information.
 - **Human accountability.** Every agent traces to a human DID through attestation chains. Behavioral records are durable.
-- **Context isolation.** All interaction within bounded contexts. Cross-context data flow is explicit and governed. The security boundary.
+- **Context isolation.** Every interaction happens inside a bounded context. A participant moves data across a context boundary only through an explicit, governed path. The context boundary is the security boundary.
 - **Encryption-as-access-control.** MLS group keys enforce membership. Relays are untrusted: access control is cryptographic (never relay-enforced) and clients verify every record independently, so correctness never depends on a relay. A relay MAY validate *public, self-certifying* records it stores (e.g. verify a DID document's BEP44 signature and keep the highest-seq copy) for availability/anti-suppression — defense-in-depth, never a trust dependency, and never applies to encrypted content. 'Untrusted,' not 'does zero validation,' is the invariant.
-- **Legibility before opt-in.** Context parameters visible before joining. Informed consent is mechanical.
-- **Protocol requires no operator.** Must work if Limn disappears tomorrow.
+- **Legibility before opt-in.** A prospective member reads a context's parameters before joining it, so the protocol makes informed consent mechanical.
+- **Protocol requires no operator.** The protocol must keep working if Limn shuts down tomorrow.
 - **Transport independence.** No structural coupling to any single transport.
 - **Agents are participants, not enforcers.** Same rules as any human-bound participant.
-- **Trust is contextual.** Function of identity, capability, context, and behavior — not binary.
+- **Trust is contextual.** A trust decision reads identity, capability, context, and behavior together. No participant is simply trusted or untrusted.
 
 ### Builder tenets
 
@@ -23,7 +23,7 @@ SCP is an open, ecosystem-agnostic infrastructure protocol — open infrastructu
 - **Simple over complex.** Never at the expense of functionality, security, or completeness.
 - **No deferral.** Everything gets specced and implemented now. Nothing is "v2" or "future."
 - **No stubs, no partial work.** Stubbing or partial implementations are forbidden. Only ever implement things to completion on the first pass.
-- **No dev/test-only stand-ins in production.** No construct that only works in test or development — an in-memory or no-op backend, an always-succeeds verifier/attestation, a non-resolving resolver, a hardcoded/placeholder/reconstructed-from-args value, a `#[cfg(test)]`/`testing`-gated type, a security nullifier — may EVER be reachable on a shipped production path to mask an unfinished real implementation or stub for prod. If the real backend isn't built, the capability **fails closed** (a typed error, or an honest protocol-supported absent state) — it does NOT silently fall back to the dev stand-in. Masking a missing production backend with a dev construct ships a *false guarantee*, which is strictly worse than the capability being honestly absent (absence is detectable; a nullifier lies). Deferring the *real backend* to a tracked workstream is allowed; shipping a stand-in for it in the meantime is not. Prove absence mechanically — the shipped-feature-graph ⊆-allowlist gate admits durability-only features and **zero nullifiers, no exceptions** (no "documented," "tracked," or "legible" allowlisted nullifier edge). See `.docs/specs/17-persistence-and-storage.md` §17.17 (capability selection / durability-vs-nullifier classification) and `.docs/standards/sdk-common.md` §Stub and Placeholder Policy.
+- **No dev/test-only stand-ins in production.** No construct that only works in test or development — an in-memory or no-op backend, an always-succeeds verifier/attestation, a non-resolving resolver, a hardcoded/placeholder/reconstructed-from-args value, a `#[cfg(test)]`/`testing`-gated type, a security nullifier — may EVER be reachable on a shipped production path to mask an unfinished real implementation or stub for prod. If the real backend isn't built, the capability **fails closed** (a typed error, or an honest protocol-supported absent state) — it does NOT silently fall back to the dev stand-in. Masking a missing production backend with a dev construct ships a *false guarantee*, which is strictly worse than the capability being honestly absent (absence is detectable; a nullifier lies). Deferring the *real backend* to a tracked workstream is allowed; shipping a stand-in for it in the meantime is not. Prove absence mechanically — the shipped-feature-graph ⊆-allowlist gate admits durability-only and real-backend features and **zero nullifiers, no exceptions** (no "documented," "tracked," or "legible" allowlisted nullifier edge). See `.docs/specs/17-persistence-and-storage.md` §17.17 (capability selection / durability-vs-nullifier classification) and `.docs/standards/sdk-common.md` §Stub and Placeholder Policy.
 - **Completeness is the baseline.** Every feature, every edge case, every acceptance criterion — implemented fully or not at all. Maximum breadth. Partial implementations are failures. Every struct field the spec defines must have a real value — never `None` when data exists elsewhere in the system. Never fabricate story references to justify gaps. Never create tracking issues instead of doing the work. Never call an incomplete implementation a "planned deferral." When a gap is caught, fix it immediately — do not rationalize it.
 - **Do the work. All of it.** When an issue has 10 acceptance criteria, implement all 10. Not 4 and call it "partial closing." Not 6 and argue the rest is "separate scope." Read every acceptance criterion as a literal checkbox. Verify every checkbox before reporting done. The plan defines scope — you do not get to reduce it. Subagents will cut corners, hardcode `None`, game string-search tests with dead references, and report success. You MUST verify their output against the actual acceptance criteria, not their self-reports. When you catch yourself thinking "this can be deferred" — that is the signal you are about to fail. Do. The. Work.
 - **You do not make scope decisions.** The plan makes scope decisions. The issues define acceptance criteria. Your job is mechanical execution: read the checklist, implement every line, verify every line. Known failure modes you WILL exhibit and MUST guard against:
@@ -40,7 +40,7 @@ SCP is an open, ecosystem-agnostic infrastructure protocol — open infrastructu
 - **No shortcuts.** No force unwraps, no placeholders, no "good enough."
 - **Provenance is paramount.** Every line traces to a documented decision. Chain: `.docs/` sources → `.docs/prds/` stories (or GitHub comments, feature-local artifacts). Before writing or changing code, read the full provenance chain — not summaries, not headers, the actual artifacts. Fresh agents must retrace full context quickly. Broken provenance is a bug.
 - **Always run CI locally before pushing.** Pushing lint, format, and test failures is a waste of CI minutes.
-- **Agent-first API design.** The SDK's primary author is an LLM. Optimize every public API for first-pass LLM authorability: one canonical pattern; flat named-field config objects over builders and typestate; enums over booleans for consequential choices; no silent security defaults; an identical shape across all language bindings. Typestate / phantom required-ordering a model can't track is a defect, not a safety feature — encode required choices as required fields. The measure: an agent writes correct code from the type signature plus one example, with no compile-retry loop. Enacted mechanically via `.docs/standards/construction.md` + a structural check (see ADR-052).
+- **Agent-first API design.** The SDK's primary author is an LLM. Optimize every public API for first-pass LLM authorability: one canonical pattern; flat named-field config objects over builders and typestate; enums over booleans for consequential choices; no silent security defaults; an identical shape across all language bindings. Typestate / phantom required-ordering a model can't track is a defect, not a safety feature — encode required choices as required fields. The measure: an agent writes correct code from the type signature plus one example, with no compile-retry loop. Enacted mechanically via `.docs/standards/construction.md` + a structural check (see ADR-052, the unified construction pattern).
 
 ## Tools
 
@@ -66,10 +66,26 @@ Artifacts (`.docs/`) are durable and versioned — the system of record. Vestige
 
 **Operating model:**
 - Humans steer. Agents execute. No human-written code; only human-driven specs.
-- Context is scarce — give agents a map, not a manual
-- Provenance must always be maintained and traced back. Read the actual source artifacts — specs, ADRs, PRDs, standards — before making changes. Skimming is not reading.
+- An agent's context window is small, so tell an agent where to look and let it read the artifact itself. Do not paste the artifact into the prompt.
+- Maintain provenance and trace every claim back to its source. Read the source artifacts themselves — specs, ADRs, PRDs, standards — before you change anything. Skimming an artifact does not count as reading it.
 - Be autonomous: infer from context, code, artifacts. Escalate only for genuine judgment calls.
-- Go deep on references. When a spec cites a section, read that section. When code references a story, read the story. When an ADR lists alternatives, understand why they were rejected. Surface-level understanding produces surface-level code.
+- Follow every reference. When a spec cites a section, read that section. When code references a story, read the story. When an ADR lists a rejected alternative, find out why its author rejected it. An agent who skims the sources writes code that matches the sources only on the surface.
+
+**Never resolve an open question yourself (MANDATORY):**
+- When you ask the human a question, wait for the human to answer it. Do not answer it yourself, and do not proceed on the answer you expected.
+- When the human answers part of what you asked, the rest stays open. A partial answer decides nothing about the parts it did not cover, so name what is still open instead of filling it in.
+- Never act on an implicit or assumed resolution while a conversation is running. Silence is not agreement. Moving to the next topic is not agreement. An answer that implies something is not a decision about that something.
+- A question is settled when both parties have stated the same resolution: you state the resolution explicitly, and the human confirms it. Until that happens the question stays open, and you say it is open rather than choosing an answer.
+- This rule governs open questions, not assigned work. It never licenses asking permission to do work the human already assigned — the autonomy rules still hold. Execute the assigned work, and stop at the question the human has not answered.
+
+**Never reclaim the human's words as your own by reframing them (MANDATORY — in conversation first, and in every artifact):**
+- When the human says "it's a sunny day", do not answer "yes, not a cloud in the sky". Those two statements are not the same: one allows clouds and the other forbids them. Answering that way swaps your claim in for theirs and attaches their agreement to yours.
+- Agree with what they said. When you have a further claim, say it separately and say that it is yours.
+- When the human states a rule, a finding, or a decision, record it with their meaning and their scope intact.
+- Quote them verbatim when they ask for a quote, not by default.
+- Paraphrasing their statement into your own register erodes the original information and presents your content as theirs, so your invention carries their authority.
+- Keep their general clause when they give one. Do not replace it with an enumeration you invented, and do not narrow it to the instance in front of you.
+- When you must add a word to make their statement usable, say that you added it.
 
 **Artifact flow (INVARIANT):**
 - The flow is strictly one-way: **plans → specs → ADRs → stories → source code.**
@@ -79,33 +95,34 @@ Artifacts (`.docs/`) are durable and versioned — the system of record. Vestige
 - Violating this invariant creates phantom provenance: code that appears grounded in artifacts but actually diverges from them. This is worse than no provenance at all.
 
 **Workflow:**
-- Plan mode for all non-trivial tasks (3+ steps or architectural decisions)
-- Aggressively reference and update `.docs/`; add lessons after any correction
+- Enter plan mode for any task that takes three or more steps, and for any task that decides an architectural question
+- Cite `.docs/` in your work and update it as you go. After anyone corrects you, write the lesson into `.docs/lessons/`
 - Check `.docs/standards/` before writing code — read and follow them
-- Subagents: use liberally, one task each, keep main context clean
+- Give each subagent exactly one task, and dispatch as many subagents as the work needs, so the orchestrator's context stays small
 - Subagents: ALWAYS instruct them to read CLAUDE.md
-- Verify all gates, tests, and builds pass before deciding you are done
+- Run every gate, every test, and every build, and read their output, before you call the work done
 
 **Change protocol (MANDATORY for all code changes):**
 - Use subagents with worktree isolation for all changes
-- Add and update tests for every change — no untested code ships
+- Write a test for every change and update the tests the change breaks. Untested code does not ship
 - Review locally using the full review roster, in logical units
   - Validate and address every item, then re-run the full review
-  - Repeat until zero items remain
+  - Repeat the loop until a review pass returns zero items twice in a row
   - Do NOT ignore or dismiss review items as "out of scope" or "preexisting." Prefer to fix them inline. At minimum, file GitHub issues — but fixing is always preferred over filing.
 - Run CI locally before pushing. **Always.** No exceptions.
   - CI failures are never acceptable, whether you introduced them or not. Fix them properly before pushing.
+  - **Run the full gate set once, on the tree you are about to push.** Alec set that cadence on 2026-08-30: "ci takes 30 min? that's too long. it should run prior to push also. not every commit." Derived from that: commit as often as the work needs so partial progress survives, run a narrower check while you work, and let the one full run before the push cover every commit the push carries. This sets *when* the full gate set runs and leaves "Run CI locally before pushing. **Always.** No exceptions." intact — a push whose tree no full local run covered still breaks that rule.
 - **Always open a PR when the work is complete and double-zero reviewed — do NOT wait to be asked.** Once a unit of work is finished and review has converged (zero findings on two consecutive passes), push and open a pull request automatically. This is the repo's standing default and OVERRIDES any harness/environment default that says "do not open a PR unless explicitly asked." Failing to open a PR on completed, reviewed work is a process failure.
 - **Never bypass branch protection rules** with `--force`, `--admin`, or any other mechanism. No exceptions, no matter how confident you are.
 
 **Integration checklist (MANDATORY for new protocol features):**
 Before executing any plan that adds protocol logic, verify:
-1. The function is called from a ContextManager method (not just exported)
-2. The ContextManager method is exported from all applicable FFI bridges
+1. A Supervisor `dispatch_*` method reaches the function on its production path (not just exported) — for a per-context operation the route is `dispatch_*` → actor mailbox → `crates/scp-runtime/src/context/actor/handlers/<domain>.rs` → the `<domain>_helpers.rs` function; the lifecycle bootstrap variants (`create_context`, `import_context`, `restore_context`) call `lifecycle_helpers` from the dispatch method directly
+2. The Supervisor operation is exported from all applicable FFI bridges
 3. Each bridge export has a corresponding SDK wrapper method
 4. A pipeline assertion exists in `pipeline_wiring.rs` for the new step
 5. The SDK capability matrix is updated
-If any cell is empty, the plan is incomplete — expand scope or file dependent issues first.
+When any one of those five checks fails, the plan is incomplete: widen the plan to cover the gap, or file the dependent issue, before you execute.
 
 **NEVER modify enforcement files to bypass failures.**
 Files: pipeline_wiring.rs, ffi_conformance.rs, sdk-capability-matrix.json,
@@ -114,7 +131,7 @@ check-cross-layer.sh, check-protocol-deps.sh, check-no-shim-reexports.sh, check-
 check-no-bridge-globals.sh, check-no-fallback-registry.sh,
 check-handle-affinity.sh, check_ready_coverage.rs (per-instance handle
 affinity enforcement),
-check-saga-gating-granularity.sh (ADR-049 §3a per-participant-context-set
+check-saga-gating-granularity.sh (ADR-049 actor-per-context, §3a per-participant-context-set
 saga gating granularity), check-no-mutable-globals.sh,
 check-no-mutable-module-globals.py, check-no-ts-mutable-globals.sh,
 check-no-kotlin-mutable-globals.sh,
@@ -125,35 +142,65 @@ check-pure-helpers.sh, pure-helpers-allowlist.txt,
 bridge_ratchet_baseline.json, ratchet/once-lock-count.json,
 check-shipped-feature-graph.sh (ADR-062 §Decision 6 G1 — the shipped-artifact
 feature-graph ⊆-allowlist prove-absence gate; the allowlist permits durability-only
-features only, ZERO nullifier exceptions),
+and real-backend features, ZERO nullifier exceptions),
+check-toolchain-wiring.sh (every container build asserts which compiler it resolved;
+the changes job of every paths-filtered workflow routes a pin change to every lane that
+compiles on it, and ci.yml routes every root-level file and every cargo configuration
+file to a lane or declares it unread; .mise.toml names no Rust version source; the
+compiler this shell resolves is the one rust-toolchain.toml names),
+check-resolved-rustc.sh (the fourth of those checks, which
+scripts/hooks/pre-commit and scripts/setup-toolchain.sh also run),
 pretooluse-enforcement-files.sh,
 CLAUDE.md (enforcement sections).
-If a check fails, fix the code. The only legitimate modifications are:
-- Adding NEW assertions/operations (expanding coverage)
-- Removing #[ignore] when a wiring PR lands (promoting to enforced)
-Weakening, removing, or exempting existing assertions requires human approval.
+When a check fails, fix the code that the check rejected. You may modify an enforcement file for exactly two reasons:
+- You are adding a new assertion or a new operation, which widens what the check covers
+- You are removing an `#[ignore]` because the wiring it waited on has landed, which promotes a dormant assertion to an enforced one
+A human must approve before you weaken an existing assertion, delete one, or exempt anything from one.
 
 **Architecture:**
-- Protocol-first design; inject through initializers; no singletons
-- APIs: self-evident, one happy path, optimized for LLM authorability (see the Agent-first API design tenet)
+- Define a protocol before you write the type that satisfies it. Inject every dependency through an initializer. Never reach for a singleton
+- Give every public API one happy path a reader can find from the type signature alone, and optimize that signature for an LLM author (see the Agent-first API design tenet)
 
 **PRD stories (MANDATORY):**
 - **Before creating, editing, or updating any story in `.docs/prds/`**, read `.docs/standards/prd.md` in full. No exceptions.
-- Every field in the standard is required. Every acceptance criterion must be machine-verifiable. Every source must trace to an actual heading in an actual file. Every dependency must be forward-only.
+- Fill every field the standard defines. Write every acceptance criterion so a machine can verify it. Point every source at a heading that exists in a file that exists. Point every dependency forward, never backward.
 - The artifact flow applies to stories: stories reference specs and ADRs, never the reverse. If a story can't cite a spec section or ADR, it needs one written first.
 - Run `python3 scripts/validate-prd.py` before committing PRD changes. CI enforces this.
-- Subagents creating stories must self-validate against the standard before returning. Two audits missed quality issues because no one checked their own output — that failure mode is why this standard exists.
+- A subagent that writes a story validates the story against the standard before it returns. Two audits shipped defective stories because neither audit checked its own output, and that failure is why this standard exists.
 
 **Stubs:**
 - Every stub must reference a PRD story ID (`// Stub — see SCP-NNN`)
-- Stories marked "done" must have zero stubs against their acceptance criteria
+- A story marked "done" carries zero stubs against its acceptance criteria
 - CI enforces: Rust (`clippy::todo/unimplemented = "deny"`), Kotlin (detekt `ForbiddenComment`), Python (ruff `FIX`), Swift (SwiftLint `todo`), TypeScript (ESLint `no-warning-comments`)
 - See `.docs/standards/sdk-common.md` §Stub and Placeholder Policy
 - **No dev/test-only stand-in may mask a missing production implementation (see the builder tenet).** A stub returns a documented, story-referenced gap on its own path; it does NOT reach for a test-only nullifier (in-memory custody/DHT/attestation, no-op verifier, placeholder value) to *appear* functional in production. Prod fails closed until the real backend lands. The prove-absence gate allowlists zero nullifiers — deferring a real backend to a tracked issue never authorizes shipping a stand-in for it.
 
+**Never write your extrapolation as the contract (MANDATORY for every spec clause, acceptance criterion, gate, standard, and agent prompt):**
+Mike Caulfield names this failure in "I finally understand why LLMs suck at writing prompts" (https://mikecaulfield.substack.com/p/i-finally-understand-why-llms-suck): a model asked to write a prompt "write[s] the intermediate prompt as the contract prompt." Two different things get written in the same authoritative register:
+- A **contract** states the criterion a reader applies to decide whether something qualifies.
+- An **intermediate extrapolation** is the operational detail a model invents so it can act on a request the contract states too vaguely: candidate indicators, search terms, surface features that often accompany the target.
+Caulfield asked a model to characterize the director Chris Columbus and got "warm, sentimental mainstream family entertainment; plucky kids and harried parents in cozy suburban or holiday settings; broad comic set-pieces softened by earnest heart and reassuring resolution." That paragraph reads as a definition, but it matched roughly one film in ten across continents and centuries, and the model itself later judged two of its three top matches indefensible. The paragraph lists things that often accompany a Columbus film. It never states what makes a film a Columbus film.
+- **Write the criterion, then label the indicators as indicators.** State what decides membership. Keep the operational detail you invented, because a reader needs it to act, but mark it as evidence that suggests the target rather than as the test that defines the target.
+- **Test every criterion you write by asking how many non-targets it admits.** When a criterion admits many things you did not mean, you wrote search candidates. Narrow the criterion, or demote the text to an indicator list under a criterion you then have to write.
+- **This failure produces a defect this repo already fights.** A denylist gate that chases one more spelling of a bypass is an indicator list presented as a criterion, which is why the "Guard against over-engineering" rule requires a positive whitelist closed by construction.
+
+**A stale restatement is not a contradiction (MANDATORY before you record a divergence or take a question to the human):**
+**The criterion:** two artifacts diverge only when you can write the sentence stating why both cannot be true. When you cannot write that sentence, you found a copy that drifted from its source, not a conflict of authority, and the Artifact flow invariant above names which copy is wrong.
+- **Quote both sides in full, then enumerate the cases each side covers.** A restatement usually drops a condition its source carried, which leaves the two texts agreeing everywhere except in the case the condition names. Name that case and resolve it against the governing artifact, or report no divergence.
+- **Indicators, not the test.** These shapes suggest a dropped condition rather than a conflict: a conditional sentence facing an absolute one, a general statement facing a narrow one, a table cell facing a paragraph, and a document facing the type the source code defines. An indicator tells you where to look; the criterion above decides.
+- **A grep for a name you invented proves nothing.** When a search for an identifier no author chose returns zero hits, that result establishes that the identifier is absent and establishes nothing about the capability. Read the type that owns the capability and read its field names.
+- **Search in this order before you ask the human: the shipped code, the human's prior words in this conversation, the persistent memory, and the plan of record.** A human's general statement usually decides a narrow question, and arrives in a shape that the question's wording does not match, so read each source for the rule that governs rather than for the question you typed.
+- **A worked example.** An agent read the Backing row of the key-properties table in ADR-039, the shared-DID human-agent identity model (`.docs/adrs/phase-1.md:1268`), read Enforcement Stack layer 1 (`.docs/adrs/phase-1.md:1296`), and reported the two as contradicting each other. `.docs/lessons/stale-restatement-is-not-a-contradiction.md` quotes both passages, names §3.2.1 of the identity spec as the artifact that governs them, and records the invented-identifier search that accompanied the report.
+
+**Prose (MANDATORY):** every sentence you write for a human reader follows `.docs/standards/concrete-prose.md`. Read that file before you write prose. It governs chat responses, specs, ADRs, PRD stories, commit bodies, pull-request descriptions, code comments, review findings, README text, and artifact copy.
+
 ### Toolchain
 
 All tools via [mise](https://mise.jdx.dev/) (see `.mise.toml`). **Never use npm or npx** — bun only for JS/TS. System `python3` is Xcode 3.9 — **do not use it**; use `python3.12`.
+
+**`rust-toolchain.toml` is the one place this repository names a Rust version.** Every other consumer derives the version from that file, so no two files can disagree: `cargo` and `rustup` read it natively, and rustup installs the channel, components, and targets it names on first use; `Dockerfile` and the container recipe in `templates/personal-relay/README.md` copy the file into the image before any cargo command, and their base tags name a Debian release and no Rust version. `fuzz/rust-toolchain.toml` names the nightly the standalone fuzz crate needs; run every fuzz command from inside `fuzz/` and rustup applies that file, so no command names the channel, and `.github/workflows/fuzz.yml` — whose commands run from the repository root — reads the channel out of the file in one job. To raise either version: edit `channel`, run the CI clippy command from the Orchestrator verification protocol below, and fix everything the new release reports in that same pull request. Never lower the pin to make a new lint disappear.
+
+**mise installs every tool except Rust, and `.mise.toml` names no Rust version.** mise exports one `RUSTUP_TOOLCHAIN` for the whole repository, and that variable overrides a toolchain file entirely, so it cannot give `fuzz/` a nightly while the workspace compiles on stable. rustup resolves both, per directory, and README.md lists rustup among the prerequisites. A `RUSTUP_TOOLCHAIN` exported into your shell from anywhere still overrides both files, so `scripts/check-resolved-rustc.sh` compares `rustc --version` against the pin, `scripts/check-toolchain-wiring.sh` and `scripts/hooks/pre-commit` and `scripts/setup-toolchain.sh` each run that comparison, and `fuzz/build.rs` fails the fuzz build when that crate resolves a compiler its own file does not name. **Every agent worktree under `.claude/worktrees/` sits inside the repository root, and mise loads a configuration file from every ancestor directory, so a stale `.mise.toml` in the shared checkout re-exports `RUSTUP_TOOLCHAIN` into every worktree beneath it.** `mise tool rust` names the file a value came from. `scripts/check-toolchain-wiring.sh` checks the four properties a derivation cannot supply: that every container build carries the ASSERT-PINNED-RUSTC block, which makes the build compare the compiler it resolved against the copied-in pin, since the base tag no longer names a compiler; that the `dorny/paths-filter` wiring of every workflow that guards a job with one — `.github/workflows/ci.yml` and `.github/workflows/docs.yml` today — routes a pin change to every lane that compiles on it, and that `ci.yml` routes every root-level file and every cargo configuration file to a lane or declares that no compile reads it, since the `ci` aggregator job counts a skipped job as a pass; that `.mise.toml`, parsed as TOML rather than matched line by line, gives its `tools` table no `rust` key and registers no `rust` idiomatic version file; and that the compiler this shell resolves is the version the pin names, which the first three cannot establish because all three read files and the variable is in the environment. See `.docs/lessons/pin-the-rust-toolchain-or-ci-drifts-from-local.md`, which records the merge-queue outage that a floating `@stable` caused.
 
 | Language | Location | Package Manager | Lint | Format | Test | Build |
 |----------|----------|----------------|------|--------|------|-------|
@@ -161,7 +208,7 @@ All tools via [mise](https://mise.jdx.dev/) (see `.mise.toml`). **Never use npm 
 | **Python** | `bindings/python/` | pip + maturin | `python3.12 -m ruff check .` | `python3.12 -m ruff format .` | `python3.12 -m pytest tests/ -v` | `maturin develop --release` |
 | **TypeScript** | `bindings/typescript/` | **bun** (not npm) | `bun run lint` (biome) | `bun run format` (biome) | `bun test` | `bun run build` (tsup) |
 | **Kotlin** | `bindings/kotlin/` | Gradle 8.x | `./gradlew detekt` | — | `./gradlew test` | `./gradlew assembleRelease` |
-| **Fuzzing** | `fuzz/` (standalone, not workspace) | cargo-fuzz (**nightly only**) | — | — | `cargo +nightly fuzz run <target> --fuzz-dir fuzz` | `cargo +nightly check --manifest-path fuzz/Cargo.toml` |
+| **Fuzzing** | `fuzz/` (standalone, not workspace) | cargo-fuzz (**nightly only**) | — | — | `cd fuzz && cargo fuzz run <target>` | `cd fuzz && cargo check` |
 
 **Language-specific gotchas:**
 
@@ -169,7 +216,7 @@ All tools via [mise](https://mise.jdx.dev/) (see `.mise.toml`). **Never use npm 
 - **Kotlin:** JDK 17 (zulu), Gradle 8.x, Kotlin 2.x — all via mise. Run `eval "$(mise env)"` first.
 - **TypeScript:** `bun run check` runs `tsc --noEmit` for type checking. Biome handles both lint and format.
 - **PRD validation:** `python3.12 scripts/validate-prd.py` — run before committing PRD changes.
-- **Fuzzing:** `fuzz/` is a standalone crate — never add it to root `Cargo.toml` members. All commands require `+nightly`. List targets: `cargo +nightly fuzz list --fuzz-dir fuzz`. See ADR-045 and `fuzz/README.md`.
+- **Fuzzing:** `fuzz/` is a standalone crate — never add it to root `Cargo.toml` members. Run every fuzz command from inside `fuzz/`: rustup applies the toolchain file of the directory a command runs in, and `fuzz/rust-toolchain.toml` names the nightly cargo-fuzz needs, so no command names a version. A command run from the repository root resolves the stable pin instead, and cargo-fuzz refuses to run on it. List targets: `cd fuzz && cargo fuzz list`. See ADR-045, the fuzzing infrastructure decision, and `fuzz/README.md`.
 
 ### Git
 
@@ -180,7 +227,10 @@ All tools via [mise](https://mise.jdx.dev/) (see `.mise.toml`). **Never use npm 
 - Always open a PR when work is complete and double-zero reviewed — do not wait to be asked (see the Change protocol). Opening the PR is part of finishing the work, not a separate step that requires permission.
 - Clean, linear history
 - Unexpected changes: back off, read, understand before acting. Never discard without understanding first
-- No stashing/branch switching unless 100% confident. No destructive git ops unless told to or integrated upstream
+- **NEVER run `git stash`** — no form, no reason, no exception. Not as a real step, not as inert filler, not chained behind a `;` in a compound command. There is no "confident enough" threshold that unlocks it
+- **NEVER run `git checkout <ref> -- <path>`.** To read another revision's version of a file, use `git show <rev>:<path>`. To actually restore one, do it deliberately — show the current content first, confirm the overwrite is intended, and only then write
+- Both bans are unconditional because both failures are SILENT: the working tree looks clean afterwards, so the destroyed work is either discovered hours later or misread as a genuine code finding when a grep returns baseline content
+- No branch switching unless 100% confident. No destructive git ops unless told to or integrated upstream
 
 ## Agents
 
@@ -191,6 +241,10 @@ Default review agents: @"black-hat (agent)", @"red-hat (agent)", @"white-hat (ag
 **Reviews are not rubber stamps.** Read every finding. If a reviewer flags something, understand the concern fully before dismissing it. Assume reviewers are right until you can prove otherwise with evidence from specs or code. Act on review feedback — don't acknowledge and move on. When a review surfaces a real issue, fix it and update the relevant artifacts.
 
 **Take every finding seriously.** Only dismiss things that are categorically, objectively false or truly non-issues. Even slight suggestions — defense in depth, cleanup, clarity, incorrect comments, spec gaps, learnings — if there's any merit to them at all, whether in literal content or in spirit, take them seriously and use them to improve the code. Don't dismiss things because they seem out of scope, are nits, or appear generally not actionable. Only dismiss things that are absolutely not actionable because they are wrong.
+
+**Review the class, not the instance.** Alec stated this rule on 2026-08-30: "when you find an issue in one section that's liable to exist in another, immediately check for it in every possible area. don't wait and allow churn. use findings to be a proactive reviewer; don't rely on checks and be purely reactive." Derived from the first sentence: a reviewer that finds a defect searches every other place the same defect can occur before writing the finding, and reports every site it found in one finding. The other two bridges, the other SDK wrappers, the other call sites, and the twin function one module over are where siblings usually sit; that list names where to look and does not bound what counts as a sibling site. A reviewer that reports one site gets one site fixed, and the next review round rediscovers the siblings after a full verification cycle has run. Alec's word for that cost is churn. A reviewer knows what the defect is the moment it reads the first site, and searching for the twins costs less then than in any later round. Derived from the second sentence: a check that passes says nothing about the sites the check does not read, so a reviewer looks for what no check covers instead of restating what the checks already caught. `.docs/lessons/review-the-class-not-the-instance.md` records two classes from pull request #2415, the custody-vocabulary branch: one changed error code left a stale assertion at three test sites and took three commits across three rounds to fix, and two production CI lanes ran no test code and took two commits three hours apart to fix.
+
+**Read to the frontier, then stop.** Alec's instruction quoted under "Review the class, not the instance" above directs a reviewer to expand its search and states no reading bound; this paragraph adds the bound because review rounds died at the 200k-token context limit before writing a verdict, and a bounded round finishes and reports. The criterion: a reviewer reads the diff, expands along the edges the change perturbs, and stops at every node whose observable contract the change leaves unchanged. The edge list names where to look and does not define the frontier: callers, when the change alters what a caller can observe; consumers of a changed value, because a wire format or a signed preimage is read wherever the bytes are consumed, not where the function is called; implementors of a changed trait; twin sites, only when a held finding points there. A held finding lifts the bound for the defect it names: "Review the class, not the instance" directs the reviewer to check every site where a found defect can occur, and the frontier bounds only the reading that no finding directs. A frontier that does not close within the reading budget is itself a finding — report "unbounded blast radius" — not a reading failure.
 
 **Guard against over-engineering and non-convergent enforcement.** Mechanical checks (gates, validators, linters) are defense-in-depth, not the primary guarantee. Before adding or growing one, confirm: (a) it is *sound and bounded* — closed by construction (a positive whitelist of permitted shapes), not an ever-expanding denylist chasing "one more spelling"; (b) it does not redundantly re-check, in weaker source-text/AST/runtime form, a property the type system or another compile-time/cryptographic mechanism already enforces soundly — such redundancy is negative value, not defense-in-depth; (c) its cost (lines, complexity, review cycles) is proportionate to its marginal benefit. **Review-pass count is a convergence signal:** if more than ~3 review passes on one artifact keep surfacing "a new spelling of the same bypass," the *approach* is non-convergent — stop and reframe, do not grind. The @"simplifier (agent)" is charged with flagging this class as a BLOCKER; take it as seriously as a correctness finding. See `.docs/lessons/ast-gate-checks-definition-not-name-resolution.md`.
 
@@ -234,6 +288,7 @@ The orchestrator never writes code. It manages execution, maintains plan alignme
 - Never say "done" without showing verification output.
 
 **Agent execution rules (MANDATORY):**
+- **Write every agent prompt as a contract, never as your recipe.** State what the agent must make true, and state how you will check it. Then, separately and labelled as such, give the recipe you would have followed: the files to read, the greps to run, the symbols to trace. An agent that receives only a recipe satisfies the recipe and reports success, which is how `let _ = function_name;` came to satisfy a string-search test while calling nothing. The same rule governs the standing agent definitions in `.claude/agents/`: each one states its verdict criterion, and its review dimensions serve that criterion as evidence rather than replacing it.
 - Every agent prompt must specify which branch to start from. Include: "Verify with `git log --oneline -3` that you see [expected commits]. If not, STOP."
 - Never checkout migration/feature branches on the main worktree. All branch work happens in worktrees. Main worktree stays on main.
 - When the plan says "delete X and import Y," agents MUST delete X and import Y. No excuses. "Different serde format," "different field types," "architectural mismatch" are NOT valid reasons to keep local reimplementations when there are zero consumers. The only valid reason is a compiler-level mechanical restriction.
@@ -278,13 +333,13 @@ crates/              # Rust workspace — the protocol core
 │   ├── uniffi/      #   UniFFI (Swift, Kotlin)
 │   └── napi/        #   napi-rs (Node.js/Bun → TypeScript)
 ├── scp-identity/    # Native DID subsystem — DID-method, resolution/publication/lifecycle
-├── scp-dht/         # Native DHT transport leaf — DhtClient/DhtRecord/InMemory/Pkarr + BEP44 helpers (ADR-057 T1c-a)
+├── scp-dht/         # Native DHT transport leaf — DhtClient/DhtRecord/InMemory/Pkarr + BEP44 helpers (ADR-057 in-browser client, task T1c-a)
 ├── scp-clock/       # Clock port (wall-clock time) — wasm-safe capability leaf
 ├── scp-crypto/      # Ed25519 signature verification — wasm-safe capability leaf
 ├── scp-did/         # DID data model (DID, SigningKeyId, DidDocument, proofs, attestation) — wasm-safe
-├── scp-mls/         # Synchronous MLS state machine — wasm-safe, shared by node + browser (ADR-057)
-├── scp-client/      # Single-threaded in-browser participant driver over scp-mls (ADR-057)
-├── scp-client-wasm/ # wasm-bindgen browser surface over scp-client (ADR-057)
+├── scp-mls/         # Synchronous MLS state machine — wasm-safe, shared by node + browser (ADR-057 in-browser client)
+├── scp-client/      # Single-threaded in-browser participant driver over scp-mls (ADR-057 in-browser client)
+├── scp-client-wasm/ # wasm-bindgen browser surface over scp-client (ADR-057 in-browser client)
 ├── scp-transport/   # Relay, adapters, blob storage
 ├── scp-node/        # Application node binary (relay + HTTP + identity)
 ├── scp-platform/    # Platform abstractions (KeyCustody, Storage, DeviceAttestation)
@@ -295,7 +350,7 @@ crates/              # Rust workspace — the protocol core
 
 bindings/            # Language SDK wrappers — the developer-facing API
 ├── python/          # scp_sdk package (wraps PyO3 bridge)
-├── typescript/      # @limn-works/scp-ts (wraps NAPI bridge; browser = in-browser SCP client over scp-client-wasm, keys on-device per ADR-057)
+├── typescript/      # @limn-works/scp-ts (wraps NAPI bridge; browser = in-browser SCP client over scp-client-wasm, keys on-device per ADR-057, the in-browser client)
 ├── swift/           # SCP Swift package (wraps UniFFI bridge)
 └── kotlin/          # scp-kt (wraps UniFFI bridge) — Android extensions
 ```

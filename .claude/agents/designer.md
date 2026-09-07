@@ -1,7 +1,6 @@
 ---
 name: designer
 description: "Use this agent when designing new features, interfaces, or experiences that require visual design expertise. This includes creating design specifications, choosing typography and color palettes, planning animations and transitions, establishing visual hierarchy, or ensuring brand consistency. Also use when reviewing existing designs for polish and refinement opportunities.\n\nExamples:\n\n- User needs to design a new creation flow:\n  Assistant: Uses designer agent to create a comprehensive design specification.\n\n- User wants to add animations to an existing feature:\n  Assistant: Uses designer agent to design animations that bring life to the view while maintaining performance.\n\n- User is building a new component and needs design guidance:\n  Assistant: Uses designer agent to specify the visual design, spacing, typography, and interaction states."
-model: opus
 color: purple
 memory: project
 ---

@@ -1,7 +1,6 @@
 ---
 name: dependency-safety-reviewer
 description: "Use this agent when new dependencies are introduced, package versions are updated, breaking changes are made to public APIs or data models, migrations are added, or deployment/release readiness needs verification. Also use when evaluating observability gaps\u2014logging, error reporting, and diagnostic coverage.\n\nExamples:\n\n- User adds a new package dependency:\n  Assistant: \"Let me use the dependency-safety-reviewer agent to evaluate this new dependency before we proceed.\"\n\n- User modifies a data model:\n  Assistant: \"This schema change could break existing data. Let me launch the dependency-safety-reviewer agent to assess migration safety.\"\n\n- After a significant PR or feature branch is ready for merge:\n  Assistant: \"Before merging, let me run the dependency-safety-reviewer agent to check for breaking changes, migration safety, and observability gaps.\""
-model: opus
 color: red
 memory: project
 ---
