@@ -395,7 +395,11 @@ cargo deny check
 # for ten days under a green required check; and until the workspace table
 # existed, `crates/scp-runtime/src/lib.rs` alone declared the lint, so that
 # same job exited 0 over 271 unresolved links in the other crate directories.
-cargo doc --workspace --no-deps --document-private-items
+# The `--features` list is the one job `rust-doc` passes: four intra-doc links
+# in `crates/scp-node` name items that exist only under those features, so a run
+# omitting the list exits 101 on an unmodified `main`.
+cargo doc --workspace --no-deps --document-private-items \
+  --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint
 ```
 
 ## CI Matrix
@@ -412,7 +416,7 @@ Every push to a PR branch. Target: < 3 minutes.
 | clippy | ubuntu-latest | `cargo clippy --workspace --all-targets -- -D warnings` |
 | test | ubuntu-latest, macos-latest | `cargo nextest run --workspace` |
 | build-release | ubuntu-latest, macos-latest, windows-latest | `cargo build --workspace --release` |
-| doc | ubuntu-latest | `cargo test --workspace --doc && cargo doc --workspace --no-deps --document-private-items` |
+| doc | ubuntu-latest | `cargo test --workspace --doc && cargo doc --workspace --no-deps --document-private-items --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint` |
 | deny | ubuntu-latest | `cargo deny check` |
 
 Unit tests and conformance macro suites (`transport_conformance!()`, `storage_conformance!()`, etc.) run as part of `cargo nextest run --workspace` against in-memory implementations.

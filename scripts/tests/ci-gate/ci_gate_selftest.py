@@ -141,6 +141,15 @@ nothing:
                is `forbid` because rustc lets a source-level `#![allow]` lower a
                `deny` and rejects an `allow` that contradicts a `forbid`, so no
                crate can reopen the hole from inside its own source.
+  doc-command  The `forbid` above made an unresolved link an error in every
+               member, and the three Markdown files that hand a developer a
+               `cargo doc` command to run — .docs/standards/rust.md,
+               .github/workflows/README.md and .docs/specs/21-documentation.md —
+               named that command without the six `--features` job rust-doc in
+               ci.yml passes. Four intra-doc links in crates/scp-node name items
+               those features gate, so every documented command exited 101 on an
+               unmodified `main`, naming a crate the developer's change never
+               touched, while the required job exited 0.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
@@ -311,6 +320,39 @@ WORKSPACE_SCOPED_JOBS = {
     ("docs.yml", "rust-docs"),
 }
 RUSTDOC_JOBS = {("ci.yml", "rust-doc"), ("docs.yml", "rust-docs")}
+
+# CRITERION for check_documented_rustdoc_reproduces_the_required_job: a `cargo
+# doc` line inside a shell-labelled fenced block of a tracked Markdown file is a
+# command this repository hands a developer to run, so that command and job
+# `rust-doc` in .github/workflows/ci.yml must report the same diagnostics. A
+# documented command breaks that in two directions. It omits a flag the required
+# job passes, and then a developer whose local run exits 0 has proven nothing
+# about the merge. Or its `--features` list differs from that job's, and then it
+# reports a break the merge does not have: `.docs/standards/rust.md` named the
+# command with no `--features` at all, four intra-doc links in crates/scp-node
+# resolve only under the six features that job enables, and the workspace
+# `forbid` this branch added turns each one into an error, so a developer who
+# ran the documented command on an unmodified `main` read exit 101 naming a
+# crate their change never touched. A flag outside `--features` that a
+# documented command adds and the required job omits — `--open` in
+# .docs/specs/21-documentation.md — decides what rustdoc does with output it
+# already produced rather than which links it resolves, so it changes no
+# diagnostic and this check permits it.
+SHELL_FENCE_LANGUAGES = {"bash", "sh", "shell", "console"}
+FEATURES_FLAG_PREFIX = "--features="
+
+# A FLOOR under that criterion, not the criterion itself. The scan iterates
+# whatever `git ls-files` returns, so a renamed file, a fence relabelled to a
+# language this set does not name, or a command rewritten into prose empties the
+# iteration and leaves this check printing nothing and failing nothing — the
+# zero-test defect this file's docstring records. These three paths carry such a
+# command today. Add an entry when a Markdown file gains one; remove one only
+# alongside the command it names.
+DOCUMENTED_RUSTDOC_FILES = {
+    ".docs/specs/21-documentation.md",
+    ".docs/standards/rust.md",
+    ".github/workflows/README.md",
+}
 
 # Rejects an empty signing-input set. Every release.yml job that uploads an
 # artifact whose name asserts a signature must run it before that upload.
@@ -2564,6 +2606,168 @@ def check_rustdoc_surface_detects_a_dropped_flag(
         )
 
 
+def tracked_markdown_paths() -> list[str]:
+    """Return every Markdown file this repository tracks, repository-relative."""
+    proc = subprocess.run(
+        ["git", "ls-files", "-z", "--", "*.md"],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return sorted(name for name in proc.stdout.split("\0") if name)
+
+
+def fenced_shell_blocks(text: str) -> list[str]:
+    """Return the body of each fenced block whose label names a shell.
+
+    A fence opens on a line whose first three non-space characters are three
+    backticks followed by a language label, and closes on the next line opening
+    with three backticks. A block whose label names no shell — `rust`, `yaml`,
+    an empty label — returns nothing, because a reader does not run its contents.
+    """
+    blocks: list[str] = []
+    language: str | None = None
+    body: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            if language is None:
+                language = stripped[3:].strip().lower()
+            else:
+                if language in SHELL_FENCE_LANGUAGES:
+                    blocks.append("\n".join(body))
+                language, body = None, []
+            continue
+        if language is not None:
+            body.append(line)
+    return blocks
+
+
+def documented_rustdoc_commands() -> list[tuple[str, str]]:
+    """Return (path, command) for each `cargo doc` a Markdown shell block runs."""
+    found = []
+    for path in tracked_markdown_paths():
+        text = (REPO / path).read_text(encoding="utf-8")
+        if "cargo doc" not in text:
+            continue
+        for block in fenced_shell_blocks(text):
+            for line in logical_lines(block):
+                if line.startswith("cargo doc ") or line == "cargo doc":
+                    found.append((path, line))
+    return found
+
+
+def documented_rustdoc_gaps(
+    commands: list[tuple[str, str]], required: set[str]
+) -> list[tuple[str, str, set[str], set[str]]]:
+    """Return each documented rustdoc, the flags it drops, and the ones it adds.
+
+    A returned entry names a command, the required job's flags it omits, and the
+    `--features` members it passes that the required job does not. The first set
+    is what makes a green local run prove less than the merge waits on; the
+    second is what makes a red local run report a break the merge does not have.
+    """
+    gaps = []
+    for path, command in commands:
+        flags = command_flags(command)
+        extra_features = {
+            flag for flag in flags - required if flag.startswith(FEATURES_FLAG_PREFIX)
+        }
+        gaps.append((path, command, required - flags, extra_features))
+    return gaps
+
+
+def check_documented_rustdoc_reproduces_the_required_job(
+    documents: list[tuple[Path, dict]],
+) -> None:
+    """A `cargo doc` this repository documents reports what the merge waits on.
+
+    THE CRITERION: a developer who copies a `cargo doc` command out of a
+    Markdown shell block and runs it reads the diagnostics job `rust-doc` in
+    .github/workflows/ci.yml produces, and reads no others. `ci` is the sole
+    required status check on the Default ruleset, so that job's output is what
+    decides a merge, and a documented command reporting anything else sends the
+    developer after a break the merge does not have or hides one it does.
+    """
+    required = required_rustdoc_flags(documents)
+    commands = documented_rustdoc_commands()
+    carriers = {path for path, _ in commands}
+    check(
+        "every file DOCUMENTED_RUSTDOC_FILES names documents a rustdoc command",
+        carriers == DOCUMENTED_RUSTDOC_FILES,
+        f"found {sorted(carriers)}, want {sorted(DOCUMENTED_RUSTDOC_FILES)} — a "
+        f"documented `cargo doc` this scan no longer reads is a command nothing "
+        f"compares against {WORKFLOW.name}",
+    )
+    for path, command, missing, extra in documented_rustdoc_gaps(commands, required):
+        check(
+            f"{path} documents a rustdoc that reproduces {WORKFLOW.name}'s",
+            not missing and not extra,
+            f"{command!r} omits {sorted(missing)} and adds {sorted(extra)} — a "
+            f"developer running it reads a different diagnostic set than the one "
+            f"a merge waits on",
+        )
+
+
+def check_documented_rustdoc_detects_a_feature_drift(
+    documents: list[tuple[Path, dict]],
+) -> None:
+    """Perturbing the required flag set fails the check above.
+
+    CRITERION: documented_rustdoc_gaps reports a flag the required job passes
+    and a documented command omits, and reports a `--features` member the
+    documented command passes and the required job omits. Adding one flag to the
+    required set and removing one from it proves the comparison runs over the
+    commands these Markdown files carry rather than over an empty set — a
+    comparison reading no command reports no gap and passes the check above,
+    which is the shape every check in this file's docstring shares.
+    """
+    required = required_rustdoc_flags(documents)
+    commands = documented_rustdoc_commands()
+    check(
+        "the documented-rustdoc scan reads at least one command",
+        bool(commands),
+        "no `cargo doc` in any Markdown shell block — this mutation would "
+        "perturb nothing and report nothing",
+    )
+    invented = "--nonexistent-rustdoc-flag"
+    reported = {
+        flag
+        for _, _, missing, _ in documented_rustdoc_gaps(
+            commands, required | {invented}
+        )
+        for flag in missing
+    }
+    check(
+        f"a required flag no documented command carries reports as {invented}",
+        reported == {invented},
+        f"reported {sorted(reported)}, want [{invented!r}] — a documented command "
+        f"omitting a required flag would otherwise pass the check above",
+    )
+    features = sorted(
+        flag for flag in required if flag.startswith(FEATURES_FLAG_PREFIX)
+    )
+    check(
+        f"{WORKFLOW.name}'s rustdoc passes a feature this mutation can withdraw",
+        bool(features),
+        "no `--features` member — this mutation would withdraw nothing",
+    )
+    for feature in features:
+        reported = {
+            flag
+            for _, _, _, extra in documented_rustdoc_gaps(commands, required - {feature})
+            for flag in extra
+        }
+        check(
+            f"withdrawing {feature} from {WORKFLOW.name}'s rustdoc reports it",
+            reported == {feature},
+            f"reported {sorted(reported)}, want [{feature!r}] — a documented "
+            f"command enabling a feature the required job does not would "
+            f"otherwise pass the check above",
+        )
+
+
 def workflow_triggers(doc: dict) -> set[str]:
     """Return the event names a workflow triggers on.
 
@@ -2675,6 +2879,10 @@ def main() -> int:
     print("doc-flag — the required check's rustdoc reads every other rustdoc's surface")
     check_required_rustdoc_surface(documents)
     check_rustdoc_surface_detects_a_dropped_flag(documents)
+
+    print("doc-command — a documented rustdoc reports what the merge waits on")
+    check_documented_rustdoc_reproduces_the_required_job(documents)
+    check_documented_rustdoc_detects_a_feature_drift(documents)
 
     print("win-shell — every `run:` step a Windows runner can execute names a shell")
     for path, doc in documents:

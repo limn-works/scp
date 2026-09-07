@@ -294,7 +294,7 @@ Not a replacement for `.docs/architecture.md` — a reading guide for it:
 
 ### 21.10.1 Requirements
 
-1. `cargo doc --workspace --no-deps` MUST produce warning-free output.
+1. The rustdoc command §21.10.2 names MUST produce diagnostic-free output. The root `Cargo.toml` sets `broken_intra_doc_links = "forbid"` under `[workspace.lints.rustdoc]`, so an unresolved intra-doc link is an error rather than a warning in every member that declares `[lints] workspace = true`.
 2. CI generates docs on each merge to `main` (`.github/workflows/docs.yml`).
 3. Docs published to GitHub Pages on each release tag.
 4. Cross-crate links resolve correctly in rustdoc output (scp-core -> scp-identity, etc.).
@@ -303,7 +303,7 @@ Not a replacement for `.docs/architecture.md` — a reading guide for it:
 ### 21.10.2 Rust (rustdoc)
 
 1. Add `#![doc = include_str!("../README.md")]` to each crate's `lib.rs` so the crate-level doc page shows the README.
-2. Generate with `cargo doc --workspace --no-deps --document-private-items`.
+2. Generate with `cargo doc --workspace --no-deps --document-private-items --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint`. Job `rust-doc` in `.github/workflows/ci.yml` runs that command and a merge waits on it, so every command this specification names carries the same flags: `--document-private-items` makes rustdoc resolve a link a private module writes, and the six features gate items that four intra-doc links in `crates/scp-node` name.
 3. Cross-crate links use `[`item`](crate_name::path::to::item)` syntax.
 4. The `docs.yml` CI workflow already builds rustdoc and uploads as artifact.
 5. On release tags, docs are deployed to GitHub Pages.
@@ -358,8 +358,9 @@ The `publish-docs` job in `docs.yml` handles aggregation and deployment. Rust, P
 Developers and agents can generate docs locally:
 
 ```bash
-# Rust
-cargo doc --workspace --no-deps --open
+# Rust. §21.10.2 gives the flags; `--open` adds a browser and no diagnostic.
+cargo doc --workspace --no-deps --document-private-items --open \
+  --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint
 
 # Python (requires sphinx, furo, sphinx-autodoc-typehints)
 cd bindings/python && sphinx-build -b html docs docs/_build/html

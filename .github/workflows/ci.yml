@@ -1682,7 +1682,7 @@ jobs:
   # script's reading of an `if:` condition. It also asserts structural properties
   # of these workflows that no single run can demonstrate. The docstring of
   # scripts/tests/ci-gate/ci_gate_selftest.py names every one of them and the
-  # defect each one closes; six of them, as examples: every job carries a
+  # defect each one closes; seven of them, as examples: every job carries a
   # timeout-minutes, every job is a dependency of `ci`, every
   # `dtolnay/rust-toolchain` step names a ref that action publishes, an `if:`
   # naming a filter output `changes` never published stops that gate rather than
@@ -1690,7 +1690,9 @@ jobs:
   # matches every member the root Cargo.toml lists, and a `cargo doc` command
   # passes `--document-private-items` so that rustdoc reads the intra-doc links
   # private modules write in every member the root Cargo.toml holds to
-  # `forbid(rustdoc::broken_intra_doc_links)`.
+  # `forbid(rustdoc::broken_intra_doc_links)`, and every `cargo doc` a tracked
+  # Markdown file hands a developer to run passes the flags job rust-doc below
+  # passes, so a developer's local run reports what this merge waits on.
   ci-workflow-selftest:
     needs: check-draft
     name: CI workflow / self-test
