@@ -144,11 +144,14 @@ check-shipped-feature-graph.sh (ADR-062 §Decision 6 G1 — the shipped-artifact
 feature-graph ⊆-allowlist prove-absence gate; the allowlist permits durability-only
 and real-backend features, ZERO nullifier exceptions),
 shipped-feature-graph-declared-rewritten-command-lines.txt (the rows that gate's
-third shipping-drift half compares every shipping-file command line against: a
-command line carrying a token spelled outside the characters cargo's own grammar
-uses — the whitelist that closes the test across every interpreter a `shell:` key
-or a Dockerfile `SHELL` instruction can name — is declared here with the reason
-its expansion selects no cargo feature, or the gate fails),
+third shipping-drift half compares every shipping-file line that reaches a process
+against. A line is declared here, with the reason it selects no cargo feature and
+changes nothing rustc compiles, when it carries a token spelled outside the
+characters cargo's own grammar uses — the whitelist that closes the test across
+every interpreter a `shell:` key or a Dockerfile `SHELL` instruction can name —
+when its command word is neither `cargo` nor `maturin`, the two programs whose
+argv the gate parses, or when it assigns an environment variable, which rustc and
+cargo read outside argv. An undeclared line fails the gate),
 check-toolchain-wiring.sh (every container build asserts which compiler it resolved;
 the changes job of every paths-filtered workflow routes a pin change to every lane that
 compiles on it, and ci.yml routes every root-level file and every cargo configuration

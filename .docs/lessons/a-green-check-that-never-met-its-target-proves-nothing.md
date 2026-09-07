@@ -139,16 +139,47 @@ rules separate them.
   `${{ env.MATURIN_ARGS }}` line inside an `args: >-` folded scalar, where the word `cargo`
   sits on no physical line. The set of spellings by which a command line reaches cargo
   without the bare token is open, so "the word `cargo` appears" was an indicator written as
-  the criterion. The repair asks the file's grammar, which is closed: `dockerfile_command_lines`
+  the criterion. The repair asks the file's grammar, which is closed: `dockerfile_lines_tagged`
   emits the argument of every RUN, CMD, ENTRYPOINT, SHELL, and HEALTHCHECK instruction,
-  every heredoc body line such an instruction opens, and every line whose first word is
-  none of the eighteen Dockerfile instructions; `workflow_command_lines` emits every
-  `run:`, `shell:`, and `with:` key and every line indented beneath it, whichever scalar
-  style the file uses; a shipping file neither reader claims fails the gate. Every command
-  line carrying a rewritten token is then declared, whether or not it names cargo, which
-  put two hundred and fifteen rows in `DECLARED_REWRITTEN_COMMAND_LINES` on the day the
-  reader landed: that count is the price of a criterion the reader can apply, and each
-  row names the program that receives the expansion instead of cargo.
+  every heredoc body line such an instruction opens, every ENV and ARG instruction, and
+  every line whose first word is none of the eighteen Dockerfile instructions;
+  `workflow_lines_tagged` emits every `run:`, `shell:`, `with:`, and `env:` key and every
+  line indented beneath it, whichever scalar style the file uses; a shipping file neither
+  reader claims fails the gate. Every command line carrying a rewritten token is then
+  declared, whether or not it names cargo, which put two hundred and fifteen rows in
+  `DECLARED_REWRITTEN_COMMAND_LINES` on the day the reader landed: that count is the price
+  of a criterion the reader can apply, and each row names the program that receives the
+  expansion instead of cargo.
+- **A YAML reader parses the mapping key; it does not match the physical line's text.** The
+  reader above matched the line prefixes `run:`, `shell:`, and `with:`, and YAML resolves
+  three other spellings to those same keys: a flow mapping (`- {shell: cmd, run: cargo
+  build --release -p scp-node %CARGO_FLAGS%}`), a quoted key (`- "run": …`), and a key with
+  whitespace before its colon (`- run : …`). A reviewer planted the first of those beside
+  the gate's own block-style `shell: cmd` fixture, which the gate fails on, and the flow
+  spelling returned `ok` with every declaration list empty, so the difference between a
+  caught nullifier and a shipped one was which of two equivalent spellings the author
+  wrote. `workflow_lines_tagged` now reads a plain or quoted key off the line and tags
+  every line it cannot parse as a key `unread`, which is the Dockerfile reader's own rule:
+  a line the reader cannot classify is one it cannot declare harmless. The same reader ran
+  over text `join_continued_lines` had already rewritten, and YAML gives a trailing
+  backslash no meaning outside a block scalar, so `- name: build x86_64 \` swallowed the
+  `run:` line beneath it and the reader saw one line whose key was `name`. A workflow file
+  is now tagged first and joined after, and the joiner joins two lines only when both carry
+  the same kind, which keeps a join inside one `run:` block.
+- **A build reads three inputs, and argv is one of them.** The reader above read the tokens
+  a shipping file spells and never read the program that receives them or the environment
+  it runs in. `RUN ./build-release.sh` carries no character outside the token whitelist,
+  and `COPY . .` already put every file of the repository into the image, so that script
+  can spell `--features scp-node/testing` where no reader looks. `ENV RUSTFLAGS=--cfg
+  feature=testing`, and the workflow `env:` spelling of it, carry none either, and rustc
+  reads `RUSTFLAGS` out of its environment rather than out of argv: `--cfg
+  feature="testing"` makes `#[cfg(feature = "testing")]` true in every crate the build
+  compiles — `crates/scp-platform/src/lib.rs` gates `InMemoryKeyCustody`,
+  `InMemoryDeviceAttestation`, and `InMemoryPreRotationCustody` on that cfg — while `cargo
+  tree -e features` prints no `scp-platform/testing` edge for the gate to reject. So half 3
+  now fails on a command word that is neither `cargo` nor `maturin`, the two programs whose
+  argv the gate parses, and on every environment assignment, and a value edit to a declared
+  assignment changes its row.
 - **Read a shared build cache everywhere, and write it only from a push to the default
   branch.** A cache written on a pull-request ref is readable only by that pull request,
   and it evicts entries from the budget every other cache step in the workflow shares.

@@ -376,23 +376,28 @@ cargo nextest run --no-tests=fail --release -p scp-testing -E 'test(conformance)
 EOF
 )"
 
-# Every command line of a SHIPPING_FILES file — a line whose text a Dockerfile
-# instruction or a workflow `run:`, `shell:`, or `with:` key hands to a process
-# (dockerfile_command_lines, workflow_command_lines) — that carries a token the
-# command interpreter the file selects, or GitHub's expression evaluator, may
-# rewrite before the process reads it
-# (shell_rewrites_token), normalized and joined the same way. The two token
-# readers classify the tokens the file spells, so a token spelled `$FLAGS` is
-# one they cannot classify, and it can expand to `--features scp-node/testing`,
-# or to the command word `cargo` itself. assert_shipping_invocations_are_gated
-# FAILS on such a line until a human declares it with the reason its expansion
-# selects no feature, and FAILS when a declared line no longer appears in any
-# shipping file.
+# Every line of a SHIPPING_FILES file that reaches a process — a line whose text
+# a Dockerfile instruction or a workflow `run:`, `shell:`, `with:`, or `env:`
+# key hands to one, plus every line the workflow reader parses no mapping key
+# from (dockerfile_lines_tagged, workflow_lines_tagged) — whose effect on the
+# build this gate cannot resolve, normalized and joined the same way. A line
+# qualifies when it carries a token the command interpreter the file selects, or
+# GitHub's expression evaluator, may rewrite before the process reads it
+# (shell_rewrites_token); when its command word is neither `cargo` nor `maturin`
+# so the program it names can run a cargo build no reader here sees; or when it
+# assigns an environment variable, which rustc and cargo read outside argv
+# (lines_whose_process_the_reader_cannot_name). The two token readers classify
+# the tokens the file spells, so a token spelled `$FLAGS` is one they cannot
+# classify, and it can expand to `--features scp-node/testing`, or to the
+# command word `cargo` itself. assert_shipping_invocations_are_gated FAILS on
+# such a line until a human declares it with the reason it selects no feature
+# and changes nothing rustc compiles, and FAILS when a declared line no longer
+# appears in any shipping file.
 #
 # The reader does not ask whether a line names cargo, because the spellings by
 # which a line reaches cargo without the bare word (`["cargo",`, `sh -c "cargo`,
 # a path, `;cargo`, a wrapper such as maturin, a variable in command position)
-# form an open set; see WHICH LINES REACH A COMMAND INTERPRETER. So every
+# form an open set; see WHICH LINES REACH A PROCESS, AND AS WHAT. So every
 # command line with an expansion is declared, and the declarations live in
 # scripts/shipped-feature-graph-declared-rewritten-command-lines.txt, grouped by
 # the step that owns each line, with the reason the expansion selects no cargo
@@ -1320,142 +1325,310 @@ shell_rewrites_token() {
 }
 
 # ---------------------------------------------------------------------------
-# WHICH LINES REACH A COMMAND INTERPRETER. The two token readers above read every
-# line of every shipping file, because a literal `--features` selects a feature
-# wherever it appears and reading a line that turns out to be prose costs one
-# declaration. The rewritten-token reader cannot do the same: a rewritten token
-# on a line that reaches no interpreter (a YAML `if:` expression, an `env:`
-# value) becomes argv of nothing, and every line of a workflow file carries one.
-# So the reader below answers one question per line from the FILE's grammar,
-# not from the line's words: does the instruction or key that owns this line
-# hand its text to a process? A Dockerfile instruction is one of the eighteen
-# the Dockerfile reference lists, and RUN, CMD, ENTRYPOINT, SHELL, HEALTHCHECK,
-# and ONBUILD hand their arguments to a shell or exec them directly; a workflow
-# step hands `run:` to a shell, `shell:` names the shell command itself, and
-# every value under `with:` is an input the named action receives, and
-# `PyO3/maturin-action` passes its `args` input to maturin, which passes
-# `--features` to cargo.
+# WHICH LINES REACH A PROCESS, AND AS WHAT. The two token readers above read
+# every line of every shipping file, because a literal `--features` selects a
+# feature wherever it appears and reading a line that turns out to be prose
+# costs one declaration. The readers below cannot do the same: a rewritten
+# token on a line that reaches no process (a YAML `if:` expression) becomes
+# argv of nothing, and every line of a workflow file carries one. So each
+# reader below answers, from the FILE's grammar and never from the line's
+# words, which of four kinds of input the line supplies, and emits the line
+# tagged with that kind, a tab, the command word the kind carries, a tab, and
+# the line as written:
 #
-# A revision that decided the question from the line's words — "one token is the
-# literal `cargo`" — vouched for `RUN ["cargo", "build", "--release", "-p",
-# "scp-node", "--features", "scp-node/testing"]` (the command word is
-# `["cargo",`), for `RUN sh -c "cargo build --release $FLAGS -p scp-node"`
-# (`"cargo`), for `RUN /usr/local/cargo/bin/cargo build $FLAGS` (a path), for
-# `RUN set -e;cargo build $FLAGS` and `RUN (cargo build $FLAGS)` (an operator
-# glued to the word), for `RUN maturin build $MATURIN_FLAGS` (a wrapper that
-# passes its flags to cargo), and for a `${{ env.MATURIN_ARGS }}` line inside an
-# `args: >-` folded scalar (the word `cargo` is on no physical line at all).
-# Every spelling by which a command line reaches cargo without the bare token
-# `cargo` is a spelling that predicate accepts, and the set of such spellings is
-# open: a variable in command position, a wrapper program, a path, an operator
-# with no space after it. The file's grammar is closed, so the reader decides by
-# it, and the cost is that every command line carrying a rewritten token needs a
-# declaration whether or not it names cargo. That is the price of a criterion the
-# reader can apply; the alternative was an indicator ("the word cargo appears")
-# written as the criterion.
+#   run    — a shell reads the line's text, after the instruction or key that
+#            owns the line, as a command. The tag carries the command word,
+#            which is empty when the key's value is a block indicator (`|`,
+#            `>-`) and the block's own lines carry the commands.
+#   arg    — the line's text becomes an argument of a process this reader does
+#            not name: a workflow `shell:` value, a `with:` input the named
+#            action receives (`PyO3/maturin-action` passes its `args` input to
+#            maturin, which passes `--features` to cargo), or a Dockerfile CMD,
+#            ENTRYPOINT, SHELL, or HEALTHCHECK argument.
+#   env    — the line assigns a name that every later process of the same build
+#            reads out of its environment: a workflow `env:` mapping entry, or
+#            a Dockerfile ENV or ARG instruction.
+#   unread — the reader cannot classify the line under the file's grammar, so
+#            it cannot prove the line reaches no process.
+#
+# THREE INPUTS DECIDE WHAT rustc COMPILES INTO A SHIPPED ARTIFACT, AND HALF 3
+# NAMES ALL THREE.
+#
+#   (i) The tokens the process receives. shell_rewrites_token reports a token
+#       spelled outside the characters cargo's own grammar uses, because the
+#       interpreter replaces it with text this file cannot compute.
+#
+#   (ii) The program that receives them. A `run`-kind line whose command word
+#       is neither `cargo` nor `maturin` runs a program whose own cargo
+#       invocations this gate never reads: `RUN ./build-release.sh` names a
+#       file `COPY . .` already put in the image, and that file can spell
+#       `--features scp-node/testing` where no reader looks. Every token of
+#       `RUN ./build-release.sh` sits inside the character whitelist, so
+#       condition (i) reports nothing about it. `cargo` and `maturin` are the
+#       two programs whose argv the flag reader, the package reader, and
+#       assert_wheel_feature_selection_is_gated parse, so they are the two
+#       command words this half accepts without a declaration.
+#
+#   (iii) The environment the process reads. rustc reads `RUSTFLAGS` out of its
+#       environment and never out of argv, and `--cfg feature="testing"` there
+#       makes `#[cfg(feature = "testing")]` true in every crate the build
+#       compiles — `crates/scp-platform/src/lib.rs` gates `InMemoryKeyCustody`,
+#       `InMemoryDeviceAttestation`, and `InMemoryPreRotationCustody` on that
+#       cfg — while `cargo tree -e features` prints no `scp-platform/testing`
+#       edge for run_gate to reject. cargo reads `CARGO_BUILD_RUSTFLAGS`,
+#       `CARGO_ENCODED_RUSTFLAGS`, and every other `CARGO_<SECTION>_<KEY>`
+#       config variable the same way. A revision that read only argv classified
+#       a workflow `env:` key and a Dockerfile `ENV` instruction as lines that
+#       reach no process, and both spellings shipped `scp-platform::testing`
+#       into scp-relay, scp-node, and the three FFI bridges under a passing
+#       gate. So every `env`-kind line needs a declaration naming what its
+#       assignment does, and a value edit to a declared line — `RUSTFLAGS: "-D
+#       warnings"` becoming `RUSTFLAGS: --cfg feature=testing` — changes the row
+#       and fails the gate.
+#
+# A revision that decided which lines reach a process from the line's words —
+# "one token is the literal `cargo`" — vouched for `RUN ["cargo", "build",
+# "--release", "-p", "scp-node", "--features", "scp-node/testing"]` (the command
+# word is `["cargo",`), for `RUN sh -c "cargo build --release $FLAGS -p
+# scp-node"` (`"cargo`), for `RUN /usr/local/cargo/bin/cargo build $FLAGS` (a
+# path), for `RUN set -e;cargo build $FLAGS` and `RUN (cargo build $FLAGS)` (an
+# operator glued to the word), for `RUN maturin build $MATURIN_FLAGS` (a wrapper
+# that passes its flags to cargo), and for a `${{ env.MATURIN_ARGS }}` line
+# inside an `args: >-` folded scalar (the word `cargo` is on no physical line at
+# all). Every spelling by which a command line reaches cargo without the bare
+# token `cargo` is a spelling that predicate accepts, and the set of such
+# spellings is open: a variable in command position, a wrapper program, a path,
+# an operator with no space after it. The file's grammar is closed, so the
+# readers decide by it, and the cost is that every command line carrying a
+# rewritten token, every command word outside the two the gate reads, and every
+# environment assignment needs a declaration. That is the price of a criterion
+# the reader can apply; the alternative was an indicator ("the word cargo
+# appears") written as the criterion.
+#
+# A WORKFLOW READER PARSES THE MAPPING KEY; IT DOES NOT MATCH LINE TEXT. A
+# revision that matched the physical-line prefixes `run:`, `shell:`, and `with:`
+# emitted nothing for `- {shell: cmd, run: cargo build --release -p scp-node
+# %CARGO_FLAGS%}` (YAML flow style), nothing for `- "run": cargo build $FLAGS`
+# (a quoted key, which YAML resolves to the same key), and nothing for `- run :
+# cargo build $FLAGS` (YAML allows whitespace before the colon). The block-style
+# spelling of the first of those is the fixture below that the gate fails on, so
+# the difference between a caught nullifier and a shipped one was which of two
+# equivalent YAML spellings the author wrote. workflow_lines_tagged therefore
+# parses a plain or quoted key off the line, and emits any line whose text it
+# cannot parse as a key as `unread`, because a line this reader cannot classify
+# is one it cannot declare harmless.
 # ---------------------------------------------------------------------------
 
-# dockerfile_command_lines <lines>
-#   Emit every line of <lines> (a Dockerfile, comments dropped and continuations
-#   joined) whose text reaches a process: the argument of a RUN, CMD, ENTRYPOINT,
-#   SHELL, or HEALTHCHECK instruction, the instruction an ONBUILD wraps, every
-#   line of a heredoc body such an instruction opens with `<<` (Dockerfile
-#   syntax 1.4 hands the body to the shell as a script), and every non-blank
-#   line whose first word is none of the eighteen instructions the Dockerfile
-#   reference lists, because a line this reader cannot classify is one it
-#   cannot declare harmless. FROM, LABEL, MAINTAINER, EXPOSE, ENV, ADD, COPY,
-#   VOLUME, USER, WORKDIR, ARG, and STOPSIGNAL set metadata or copy files and
-#   run nothing; an ENV or ARG value reaches a process only through a `$NAME`
-#   on a RUN line, which this reader emits and shell_rewrites_token reports.
-#   Exec form (`RUN ["cargo", "build"]`) is emitted as written, and its `[` and
-#   `"` characters are ones shell_rewrites_token reports, so an exec-form line
-#   needs a declaration until a human states what it runs.
-dockerfile_command_lines() {
-  local line first rest upper heredoc="" body_line
+# join_continued_tagged_lines <tagged-lines>
+#   Emit the tagged lines of <tagged-lines> with every line that ends in a
+#   backslash joined to the line after it WHEN both carry the same kind, under
+#   the rule join_continued_lines states: the backslash goes, the next line's
+#   leading whitespace goes, one space stands where the break was, and the
+#   joined line keeps the first line's kind and command word.
+#
+#   YAML gives a trailing backslash no meaning — inside a plain scalar it is a
+#   literal character, and inside a `run: |` block the SHELL that reads the
+#   block joins the line. So a workflow file is tagged first and joined after,
+#   and the equal-kind test keeps the join inside one block: two physical lines
+#   of one `run:` body join, while `- name: build x86_64 \` followed by `run:
+#   cargo build $FLAGS` does not. Joining a workflow file before tagging made
+#   those two lines one line whose key is `name`, so the reader emitted nothing
+#   for a `run:` key that reaches a shell. A Dockerfile is joined before
+#   tagging, because a Dockerfile backslash continues the instruction itself and
+#   the second physical line carries no instruction word to classify.
+join_continued_tagged_lines() {
+  local line cur_kind cur_word cur_line rest
+  local joined_kind="" joined_word="" joined="" continuing=0
+  while IFS= read -r line; do
+    cur_kind="${line%%$'\t'*}"
+    rest="${line#*$'\t'}"
+    cur_word="${rest%%$'\t'*}"
+    cur_line="${rest#*$'\t'}"
+    if (( continuing )) && [[ "$cur_kind" == "$joined_kind" ]]; then
+      cur_line="${cur_line#"${cur_line%%[![:space:]]*}"}"
+      joined="$joined $cur_line"
+    else
+      if (( continuing )); then
+        printf '%s\t%s\t%s\n' "$joined_kind" "$joined_word" "$joined"
+      fi
+      joined_kind="$cur_kind"
+      joined_word="$cur_word"
+      joined="$cur_line"
+    fi
+    if [[ "$joined" == *\\ ]]; then
+      joined="${joined%\\}"
+      joined="${joined%"${joined##*[![:space:]]}"}"
+      continuing=1
+      continue
+    fi
+    printf '%s\t%s\t%s\n' "$joined_kind" "$joined_word" "$joined"
+    continuing=0
+  done <<<"$1"
+  if (( continuing )); then
+    printf '%s\t%s\t%s\n' "$joined_kind" "$joined_word" "$joined"
+  fi
+}
+
+# dockerfile_lines_tagged <lines>
+#   Tag every line of <lines> (a Dockerfile, comments dropped and continuations
+#   joined) that supplies one of the four kinds of input above. RUN hands its
+#   argument to a shell, so a RUN line is `run` and its command word is the
+#   token after the instruction; CMD, ENTRYPOINT, SHELL, and HEALTHCHECK hand
+#   their arguments to a process the container runs rather than to this build,
+#   so they are `arg`; ENV and ARG name a value a later process reads, so they
+#   are `env`; every line of a heredoc body such an instruction opens with `<<`
+#   carries its opener's kind, because Dockerfile syntax 1.4 hands the body to
+#   the shell as a script. FROM, LABEL, MAINTAINER, EXPOSE, ADD, COPY, VOLUME,
+#   USER, WORKDIR, and STOPSIGNAL set metadata or copy files and hand text to no
+#   process, so this reader emits nothing for them. Every other non-blank line
+#   is `unread`, because a line whose first word is none of the eighteen
+#   instructions the Dockerfile reference lists is one this reader cannot
+#   classify. Exec form (`RUN ["cargo", "build"]`) is emitted as written, and
+#   its `[` and `"` characters are ones shell_rewrites_token reports, so an
+#   exec-form line needs a declaration until a human states what it runs.
+dockerfile_lines_tagged() {
+  local line first rest upper kind word heredoc="" heredoc_kind="" body_line
   while IFS= read -r line; do
     if [[ -n "$heredoc" ]]; then
-      printf '%s\n' "$line"
       body_line="${line#"${line%%[![:space:]]*}"}"
-      if [[ "${body_line%"${body_line##*[![:space:]]}"}" == "$heredoc" ]]; then heredoc=""; fi
+      word=""
+      if [[ "$heredoc_kind" == run ]]; then read -r word _ <<<"$body_line"; fi
+      printf '%s\t%s\t%s\n' "$heredoc_kind" "$word" "$line"
+      if [[ "${body_line%"${body_line##*[![:space:]]}"}" == "$heredoc" ]]; then
+        heredoc=""
+        heredoc_kind=""
+      fi
       continue
     fi
     if [[ -z "${line//[[:space:]]/}" ]]; then continue; fi
     read -r first rest <<<"$line"
     upper="$(printf '%s' "$first" | tr '[:lower:]' '[:upper:]')"
-    if [[ "$upper" == ONBUILD ]]; then
+    while [[ "$upper" == ONBUILD ]]; do
       read -r first rest <<<"$rest"
       upper="$(printf '%s' "$first" | tr '[:lower:]' '[:upper:]')"
-    fi
+    done
     case "$upper" in
-      FROM|LABEL|MAINTAINER|EXPOSE|ENV|ADD|COPY|VOLUME|USER|WORKDIR|ARG|STOPSIGNAL) ;;
-      *)
-        printf '%s\n' "$line"
-        if [[ "$line" =~ \<\<-?[\"\']?([A-Za-z_][A-Za-z0-9_]*) ]]; then
-          heredoc="${BASH_REMATCH[1]}"
-        fi ;;
+      FROM|LABEL|MAINTAINER|EXPOSE|ADD|COPY|VOLUME|USER|WORKDIR|STOPSIGNAL) continue ;;
+      ENV|ARG)                          kind="env" ;;
+      RUN)                              kind="run" ;;
+      CMD|ENTRYPOINT|SHELL|HEALTHCHECK) kind="arg" ;;
+      *)                                kind="unread" ;;
     esac
+    word=""
+    if [[ "$kind" == run ]]; then read -r word _ <<<"$rest"; fi
+    printf '%s\t%s\t%s\n' "$kind" "$word" "$line"
+    if [[ "$line" =~ \<\<-?[\"\']?([A-Za-z_][A-Za-z0-9_]*) ]]; then
+      heredoc="${BASH_REMATCH[1]}"
+      heredoc_kind="$kind"
+    fi
   done <<<"$1"
 }
 
-# workflow_command_lines <lines>
-#   Emit every line of <lines> (a GitHub Actions workflow, comments dropped and
-#   continuations joined) whose text reaches a process: a `run:` key and every
-#   line of its scalar, a `shell:` key and its scalar, and a `with:` key and
-#   every line beneath it. A scalar or a mapping beneath a key consists of the
-#   lines that follow it and are blank or indented deeper than the key's first
-#   character, whichever block style (`|`, `>-`, plain, or a nested mapping) the
-#   file uses, so a `$FLAGS` on the second physical line of an `args: >-` scalar
-#   is emitted with the first. A key written after a list dash (`- run: |`) is
-#   measured from the key, not the dash, so a sibling key at the key's own
-#   indentation ends the block. Every other key — `if:`, `env:`, `name:`,
-#   `uses:`, `needs:` — holds a value the runner evaluates and passes to no
-#   process, and an `env:` value reaches one only through a `$NAME` or
-#   `${{ env.NAME }}` on a line this reader emits.
-workflow_command_lines() {
-  local line stripped indent key_indent=-1 in_block=0 rest
+# workflow_lines_tagged <lines>
+#   Tag every line of <lines> (a GitHub Actions workflow, comments dropped)
+#   that supplies one of the four kinds of input above. The reader parses a
+#   block-mapping key off each line: it strips the line's indentation and every
+#   list indicator (`- `), then reads a plain key (`run:`, `run :`) or a quoted
+#   key (`"run":`, `'run':`), which YAML resolves to the same key. A `run:` key
+#   is `run` and carries the first token of its value as the command word; a
+#   `shell:` or `with:` key is `arg`; an `env:` key is `env`. A key this reader
+#   knows hands its value to no process — `if:`, `name:`, `uses:`, `needs:`,
+#   `runs-on:` — emits nothing. A line whose text parses as no key at all is
+#   `unread`: a YAML flow mapping (`- {run: cargo build %FLAGS%}`), a sequence
+#   scalar, a folded-scalar continuation. The scalar or mapping beneath an
+#   emitted key consists of the lines that follow it and are blank or indented
+#   deeper than the key's first character, whichever block style (`|`, `>-`,
+#   plain, or a nested mapping) the file uses, so a `$FLAGS` on the second
+#   physical line of an `args: >-` scalar is emitted with the first, and each
+#   line of a `run: |` body carries its own command word. A key written after a
+#   list dash is measured from the key, not the dash, so a sibling key at the
+#   key's own indentation ends the block.
+workflow_lines_tagged() {
+  local line stripped indent rest key value word kind="" key_indent=-1
   while IFS= read -r line; do
     stripped="${line#"${line%%[![:space:]]*}"}"
     indent=$(( ${#line} - ${#stripped} ))
-    if (( in_block )); then
+    if [[ -n "$kind" ]]; then
       if [[ -z "${stripped//[[:space:]]/}" ]] || (( indent > key_indent )); then
-        printf '%s\n' "$line"
+        word=""
+        if [[ "$kind" == run ]]; then read -r word _ <<<"$stripped"; fi
+        printf '%s\t%s\t%s\n' "$kind" "$word" "$line"
         continue
       fi
-      in_block=0
+      kind=""
     fi
+    if [[ -z "${stripped//[[:space:]]/}" ]]; then continue; fi
     rest="$stripped"
-    if [[ "$rest" == "- "* ]]; then
-      rest="${rest#- }"
+    while [[ "$rest" == "-" || "$rest" == "- "* ]]; do
+      rest="${rest#-}"
       rest="${rest#"${rest%%[![:space:]]*}"}"
-    fi
+    done
     key_indent=$(( ${#line} - ${#rest} ))
-    case "$rest" in
-      run:*|shell:*|with:*)
-        printf '%s\n' "$line"
-        in_block=1 ;;
+    if [[ "$rest" =~ ^([A-Za-z0-9_.-]+)[[:space:]]*:([[:space:]]|$) ]]; then
+      key="${BASH_REMATCH[1]}"
+    elif [[ "$rest" =~ ^\"([^\"]*)\"[[:space:]]*:([[:space:]]|$) ]]; then
+      key="${BASH_REMATCH[1]}"
+    elif [[ "$rest" =~ ^\'([^\']*)\'[[:space:]]*:([[:space:]]|$) ]]; then
+      key="${BASH_REMATCH[1]}"
+    else
+      printf 'unread\t\t%s\n' "$line"
+      continue
+    fi
+    case "$key" in
+      run)
+        value="${rest#*:}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        word=""
+        case "$value" in
+          ''|'|'*|'>'*) ;;
+          *) read -r word _ <<<"$value" ;;
+        esac
+        printf 'run\t%s\t%s\n' "$word" "$line"
+        kind="run" ;;
+      shell|with)
+        printf 'arg\t\t%s\n' "$line"
+        kind="arg" ;;
+      env)
+        # The `env:` key line itself assigns nothing — its mapping entries do,
+        # and each of those is tagged `env` by the block branch above. Tagging
+        # the key line `arg` still runs its own tokens through
+        # shell_rewrites_token, so a flow-style `env: {RUSTFLAGS: --cfg
+        # feature=testing}` is reported on its `{`.
+        printf 'arg\t\t%s\n' "$line"
+        kind="env" ;;
     esac
   done <<<"$1"
 }
 
-# command_lines_of_shipping_file <path>
-#   Emit the command lines of one shipping file, comments dropped and
-#   continuations joined, chosen by the reader its name selects: a file named
-#   `Dockerfile`, `Dockerfile.<x>`, or `<x>.Dockerfile` is read by
-#   dockerfile_command_lines, a `.yml` or `.yaml` file by
-#   workflow_command_lines. FAILS (non-zero, reason on stderr) on a name neither
+# tagged_lines_of_shipping_file <path>
+#   Emit the tagged lines of one shipping file, comments dropped, read by the
+#   reader its name selects: a file named `Dockerfile`, `Dockerfile.<x>`, or
+#   `<x>.Dockerfile` by dockerfile_lines_tagged, a `.yml` or `.yaml` file by
+#   workflow_lines_tagged. FAILS (non-zero, reason on stderr) on a name neither
 #   reader claims, because a shipping file whose grammar this gate does not read
-#   is one whose command lines it cannot classify.
-command_lines_of_shipping_file() {
+#   is one whose lines it cannot classify. A Dockerfile is joined before tagging
+#   and a workflow after it, for the reason join_continued_tagged_lines states.
+tagged_lines_of_shipping_file() {
   local path="$1" base text
   base="$(basename "$path")"
-  text="$(join_continued_lines "$(drop_comment_lines "$(cat "$path")")")"
+  text="$(drop_comment_lines "$(cat "$path")")"
   case "$base" in
-    Dockerfile|Dockerfile.*|*.Dockerfile) dockerfile_command_lines "$text" ;;
-    *.yml|*.yaml)                          workflow_command_lines "$text" ;;
+    Dockerfile|Dockerfile.*|*.Dockerfile)
+      dockerfile_lines_tagged "$(join_continued_lines "$text")" ;;
+    *.yml|*.yaml)
+      join_continued_tagged_lines "$(workflow_lines_tagged "$text")" ;;
     *)
       echo "no command-line reader claims the shipping file $path: it is neither a Dockerfile nor a workflow" >&2
       return 1 ;;
   esac
+}
+
+# untag_lines <tagged-lines>
+#   Emit the line of each tagged line, dropping its kind and command word. cut's
+#   default delimiter is a tab and `-f3-` keeps every field from the third on,
+#   so a line whose own text carries a tab survives whole.
+untag_lines() {
+  printf '%s\n' "$1" | sed -E '/^[[:space:]]*$/d' | cut -f3-
 }
 
 # command_lines_the_reader_cannot_compute <command-lines>
@@ -1464,7 +1637,7 @@ command_lines_of_shipping_file() {
 #   file spells, so a token the shell or the expression evaluator replaces is
 #   one they never saw, and it can be `--features scp-node/testing`, or the
 #   command word itself. The reader does not ask whether the line names cargo:
-#   see WHICH LINES REACH A COMMAND INTERPRETER above.
+#   see WHICH LINES REACH A PROCESS, AND AS WHAT above.
 command_lines_the_reader_cannot_compute() {
   local line tok
   while IFS= read -r line; do
@@ -1475,6 +1648,51 @@ command_lines_the_reader_cannot_compute() {
         break
       fi
     done
+  done <<<"$1"
+}
+
+# lines_whose_process_the_reader_cannot_name <tagged-lines>
+#   Emit the line of every tagged line whose input this gate cannot resolve for
+#   a reason the token whitelist does not cover:
+#
+#     a `run`-kind line whose command word is neither `cargo` nor `maturin`,
+#     because the program it names can run a cargo build this gate never reads
+#     (condition (ii) above), and
+#
+#     every `env`-kind line, because rustc and cargo read `RUSTFLAGS`,
+#     `CARGO_BUILD_RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, and every other
+#     `CARGO_<SECTION>_<KEY>` variable out of the environment and never out of
+#     argv (condition (iii) above).
+#
+#   A `run`-kind line with an empty command word carries a block indicator
+#   whose own lines this reader classifies one by one, and `|` and `>` sit
+#   outside the character whitelist, so command_lines_the_reader_cannot_compute
+#   reports the indicator line itself.
+#
+#   Splits each tagged line on its two tabs by parameter expansion, never with
+#   `read -r kind word text` under IFS=$'\t'. Tab is IFS whitespace, so `read`
+#   collapses the two adjacent tabs of a line whose command word is empty into
+#   one delimiter, which puts the line's text into the word variable and leaves
+#   the text variable empty. Under that reading every `env` line reported an
+#   empty string, so `RUSTFLAGS: --cfg feature=testing` — an assignment carrying
+#   no character outside the whitelist — passed this half undeclared.
+lines_whose_process_the_reader_cannot_name() {
+  local line kind rest word text
+  while IFS= read -r line; do
+    if [[ -z "${line//[[:space:]]/}" ]]; then continue; fi
+    kind="${line%%$'\t'*}"
+    rest="${line#*$'\t'}"
+    word="${rest%%$'\t'*}"
+    text="${rest#*$'\t'}"
+    case "$kind" in
+      run)
+        case "$word" in
+          ''|cargo|maturin) ;;
+          *) printf '%s\n' "$text" ;;
+        esac ;;
+      env)
+        printf '%s\n' "$text" ;;
+    esac
   done <<<"$1"
 }
 
@@ -1791,20 +2009,23 @@ assert_maturin_project_files_are_complete() {
 #        gate. Both readers classify the token the shell hands cargo, with one
 #        balanced pair of surrounding quotes removed (read_shell_tokens), so
 #        `"--features"` and `'-F'` are the flags they spell.
-#     3. Every command line of a shipping file — a line a Dockerfile RUN, CMD,
-#        ENTRYPOINT, SHELL, or HEALTHCHECK instruction, or a workflow `run:`,
-#        `shell:`, or `with:` key, hands to a process (dockerfile_command_lines,
-#        workflow_command_lines) — that carries a token the shell rewrites
-#        before the process reads it — a parameter or command substitution, a
-#        brace or filename expansion, a backslash escape, a quote the pair
-#        removal did not consume, or a GitHub `${{ … }}` expression
-#        (shell_rewrites_token) — appears verbatim in
+#     3. Every line of a shipping file that reaches a process — a line a
+#        Dockerfile RUN, CMD, ENTRYPOINT, SHELL, HEALTHCHECK, ENV, or ARG
+#        instruction, or a workflow `run:`, `shell:`, `with:`, or `env:` key,
+#        hands to one, plus every line the workflow reader parses no mapping key
+#        from (dockerfile_lines_tagged, workflow_lines_tagged) — that carries a
+#        token the shell rewrites before the process reads it — a parameter or
+#        command substitution, a brace or filename expansion, a backslash
+#        escape, a quote the pair removal did not consume, or a GitHub
+#        `${{ … }}` expression (shell_rewrites_token) — or whose command word is
+#        neither cargo nor maturin, or which assigns an environment variable
+#        (lines_whose_process_the_reader_cannot_name) — appears verbatim in
 #        DECLARED_REWRITTEN_COMMAND_LINES. Halves 1 and 2 classify the tokens
 #        the file spells, and a token such as `$FLAGS` can expand to a flag
 #        neither half saw, or to the command word cargo, so the gate cannot
 #        vouch for the line until a human states why the expansion selects no
 #        feature. Whether the line spells the word `cargo` decides nothing: see
-#        WHICH LINES REACH A COMMAND INTERPRETER.
+#        WHICH LINES REACH A PROCESS, AND AS WHAT.
 #
 #   All three halves fail CLOSED: a shipping file this function cannot read,
 #   or whose grammar no command-line reader claims, fails, and a package, a
@@ -1893,40 +2114,52 @@ $(printf '%s\n' "$dm_tree" | sed -E -n 's/^(scp-[a-z0-9-]+) v[0-9].*/\1/p')"
     return
   fi
 
-  # Half 3 — command lines carrying a token the shell rewrites before the
-  # process reads it. Each file is read by the reader its grammar selects, so
-  # only the lines an instruction or a run:/shell:/with: key hands to a process
-  # are candidates; a file no reader claims fails.
-  local command_lines="" file_lines rewritten_lines undeclared_rewritten stale_rewritten declared_rewritten
+  # Half 3 — lines a shipping file hands to a process whose input this gate
+  # cannot resolve: a token the interpreter rewrites before the process reads
+  # it, a command word naming a program whose own cargo invocations no reader
+  # sees, or an environment assignment rustc and cargo read outside argv. Each
+  # file is read by the reader its grammar selects, which tags every line with
+  # the kind of input it supplies; a file no reader claims fails.
+  local tagged_lines="" command_lines="" file_lines rewritten_lines undeclared_rewritten stale_rewritten declared_rewritten
   for file in "${SHIPPING_FILES[@]}"; do
-    if ! file_lines="$(command_lines_of_shipping_file "$file" 2>&1)"; then
+    if ! file_lines="$(tagged_lines_of_shipping_file "$file" 2>&1)"; then
       echo "   FAIL — cannot read the command lines of a shipping file:"
       printf '%s\n' "$file_lines" | sed 's/^/       /'
-      echo "          Add a reader for its grammar to command_lines_of_shipping_file, or remove the"
+      echo "          Add a reader for its grammar to tagged_lines_of_shipping_file, or remove the"
       echo "          file from SHIPPING_FILES with the reason it builds nothing."
       fixture_failures=$((fixture_failures + 1))
       return
     fi
-    command_lines="$command_lines
+    tagged_lines="$tagged_lines
 $file_lines"
   done
+  command_lines="$(untag_lines "$tagged_lines")"
   # The declaration list carries `#` grouping comments, which drop_comment_lines
   # removes before the comparison, exactly as it removes them from the files.
   declared_rewritten="$(normalize_shipping_lines "$(drop_comment_lines "$DECLARED_REWRITTEN_COMMAND_LINES")")"
-  rewritten_lines="$(normalize_shipping_lines "$(command_lines_the_reader_cannot_compute "$command_lines")")"
+  rewritten_lines="$(normalize_shipping_lines "$(command_lines_the_reader_cannot_compute "$command_lines")
+$(lines_whose_process_the_reader_cannot_name "$tagged_lines")")"
   undeclared_rewritten="$(comm -23 <(printf '%s\n' "$rewritten_lines" | sed -E '/^$/d' | sort -u) \
                                    <(printf '%s\n' "$declared_rewritten"))"
   if [[ -n "$undeclared_rewritten" ]]; then
-    echo "   FAIL — a shipping file hands a process a command line carrying a token spelled outside the characters cargo's own grammar uses, so the flag and package readers cannot classify what that process receives:"
+    echo "   FAIL — a shipping file hands a process a line whose effect on the build this gate cannot resolve, so the flag and package readers cannot classify what that process compiles:"
     printf '%s\n' "$undeclared_rewritten" | sed 's/^/       x /'
-    echo "          A token reaches the process as written only when it consists of A-Z a-z 0-9"
-    echo "          - _ . / : , = and +. Any other character can be an operator of whichever"
-    echo "          interpreter the file selects — bash's \$ or backtick, cmd's % or !, a quote"
-    echo "          the pair removal did not consume, a Dockerfile exec-form array, a \${{ … }}"
-    echo "          expression — and the text it produces can be a feature-selection flag, or"
-    echo "          the command word cargo. Spell the command in those characters, or declare"
-    echo "          the line in DECLARED_REWRITTEN_COMMAND_LINES with the reason its expansion"
-    echo "          selects no cargo feature."
+    echo "          A line qualifies for one of three reasons. (i) A token reaches the process"
+    echo "          as written only when it consists of A-Z a-z 0-9 - _ . / : , = and +. Any"
+    echo "          other character can be an operator of whichever interpreter the file"
+    echo "          selects — bash's \$ or backtick, cmd's % or !, a quote the pair removal did"
+    echo "          not consume, a Dockerfile exec-form array, a \${{ … }} expression — and the"
+    echo "          text it produces can be a feature-selection flag, or the command word cargo."
+    echo "          (ii) The line's command word is neither cargo nor maturin, the two programs"
+    echo "          whose argv this gate parses, so the program it names can run a cargo build"
+    echo "          no reader here sees. (iii) The line assigns an environment variable, and"
+    echo "          rustc reads RUSTFLAGS — and cargo reads CARGO_BUILD_RUSTFLAGS,"
+    echo "          CARGO_ENCODED_RUSTFLAGS, and every other CARGO_<SECTION>_<KEY> — out of the"
+    echo "          environment rather than out of argv, so --cfg feature=\"testing\" there"
+    echo "          compiles a nullifier that cargo tree prints no feature edge for."
+    echo "          Spell the command in those characters, or declare the line in"
+    echo "          DECLARED_REWRITTEN_COMMAND_LINES with the reason it selects no cargo"
+    echo "          feature and changes nothing rustc compiles."
     fixture_failures=$((fixture_failures + 1))
     return
   fi
@@ -2292,16 +2525,29 @@ TREE
     'cargo build --release $FLAGS -p scp-node' \
     'EOF' \
     'cargo build --release --features scp-node/testing')"
-  dockerfile_lines="$(dockerfile_command_lines "$dockerfile_probe")"
+  local dockerfile_tagged
+  dockerfile_tagged="$(dockerfile_lines_tagged "$dockerfile_probe")"
+  dockerfile_lines="$(untag_lines "$dockerfile_tagged")"
   for spelled in 'RUN cargo build --release -p scp-relay' 'run cargo build' 'ONBUILD RUN' 'CMD ["scp-relay"]' 'ENTRYPOINT [' 'HEALTHCHECK CMD' 'SHELL [' \
-                 'RUN <<EOF' 'cargo build --release $FLAGS -p scp-node' 'EOF' 'cargo build --release --features scp-node/testing'; do
+                 'RUN <<EOF' 'cargo build --release $FLAGS -p scp-node' 'EOF' 'cargo build --release --features scp-node/testing' \
+                 'ARG FLAGS' 'ENV RUST_LOG=info'; do
     printf '%s\n' "$dockerfile_lines" | grep -F -- "$spelled" >/dev/null; rc=$?
-    expect "(shipping-drift, dockerfile-lines) the Dockerfile line '$spelled' is READ as a command line" "PASS" "$rc"
+    expect "(shipping-drift, dockerfile-lines) the Dockerfile line '$spelled' is READ as a line that reaches a process" "PASS" "$rc"
   done
-  printf '%s\n' "$dockerfile_lines" | grep -E '^(FROM|ARG|ENV|COPY|WORKDIR|EXPOSE) ' >/dev/null; rc=$?
-  expect "(shipping-drift, dockerfile-lines) FROM, ARG, ENV, COPY, WORKDIR, and EXPOSE are NOT read as command lines" "FAIL" "$rc"
-  printf '%s\n' "$dockerfile_lines" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 11 >/dev/null; rc=$?
-  expect "(shipping-drift, dockerfile-lines) the seventeen-line Dockerfile yields exactly eleven command lines" "PASS" "$rc"
+  printf '%s\n' "$dockerfile_lines" | grep -E '^(FROM|COPY|WORKDIR|EXPOSE) ' >/dev/null; rc=$?
+  expect "(shipping-drift, dockerfile-lines) FROM, COPY, WORKDIR, and EXPOSE are NOT read, because they hand text to no process" "FAIL" "$rc"
+  printf '%s\n' "$dockerfile_tagged" | grep -xF "$(printf 'env\t\tARG FLAGS')" >/dev/null; rc=$?
+  expect "(shipping-drift, dockerfile-lines) ARG is tagged 'env', because its value reaches a later process" "PASS" "$rc"
+  printf '%s\n' "$dockerfile_tagged" | grep -xF "$(printf 'env\t\tENV RUST_LOG=info')" >/dev/null; rc=$?
+  expect "(shipping-drift, dockerfile-lines) ENV is tagged 'env', because rustc reads RUSTFLAGS out of the environment" "PASS" "$rc"
+  printf '%s\n' "$dockerfile_tagged" | grep -xF "$(printf 'run\tcargo\tRUN cargo build --release -p scp-relay')" >/dev/null; rc=$?
+  expect "(shipping-drift, dockerfile-lines) a RUN line is tagged 'run' and carries the command word after the instruction" "PASS" "$rc"
+  printf '%s\n' "$dockerfile_tagged" | grep -xF "$(printf 'arg\t\tCMD ["scp-relay"]')" >/dev/null; rc=$?
+  expect "(shipping-drift, dockerfile-lines) CMD is tagged 'arg', because the container runs it and this build does not" "PASS" "$rc"
+  printf '%s\n' "$dockerfile_tagged" | grep -xF "$(printf 'unread\t\tcargo build --release --features scp-node/testing')" >/dev/null; rc=$?
+  expect "(shipping-drift, dockerfile-lines) a line whose first word is no instruction is tagged 'unread'" "PASS" "$rc"
+  printf '%s\n' "$dockerfile_lines" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 13 >/dev/null; rc=$?
+  expect "(shipping-drift, dockerfile-lines) the seventeen-line Dockerfile yields exactly thirteen lines that reach a process" "PASS" "$rc"
 
   # (shipping-drift, workflow-lines) the workflow reader emits a run:, shell:,
   #     or with: key and every line beneath it — a literal block, a folded
@@ -2334,16 +2580,56 @@ TREE
     '        env:' \
     '          FLAGS: --features scp-node/testing' \
     '      - run: cargo build --release $FLAGS -p scp-node')"
-  workflow_lines="$(workflow_command_lines "$workflow_probe")"
+  local workflow_tagged
+  workflow_tagged="$(workflow_lines_tagged "$workflow_probe")"
+  workflow_lines="$(untag_lines "$workflow_tagged")"
   for spelled in 'with:' 'target: ${{ matrix.target }}' 'args: >-' '--release' '${{ env.MATURIN_ARGS }}' 'run: |' 'cargo build' '--release $FLAGS' 'shell: bash' \
-                 '- run: cargo build --release $FLAGS -p scp-node'; do
+                 '- run: cargo build --release $FLAGS -p scp-node' 'MATURIN_ARGS: --features scp-ffi/testing' 'FLAGS: --features scp-node/testing'; do
     printf '%s\n' "$workflow_lines" | grep -F -- "$spelled" >/dev/null; rc=$?
-    expect "(shipping-drift, workflow-lines) the workflow line '$spelled' is READ as a command line" "PASS" "$rc"
+    expect "(shipping-drift, workflow-lines) the workflow line '$spelled' is READ as a line that reaches a process" "PASS" "$rc"
   done
-  printf '%s\n' "$workflow_lines" | grep -E '^[[:space:]]*(- )?(name|on|env|if|uses|MATURIN_ARGS|FLAGS|jobs|build|steps):' >/dev/null; rc=$?
-  expect "(shipping-drift, workflow-lines) name:, on:, env:, if:, uses:, and the env values are NOT read as command lines" "FAIL" "$rc"
-  printf '%s\n' "$workflow_lines" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 10 >/dev/null; rc=$?
-  expect "(shipping-drift, workflow-lines) the twenty-two-line workflow yields exactly ten command lines" "PASS" "$rc"
+  printf '%s\n' "$workflow_lines" | grep -E '^[[:space:]]*(- )?(name|on|if|uses|jobs|build|steps):' >/dev/null; rc=$?
+  expect "(shipping-drift, workflow-lines) name:, on:, if:, uses:, jobs:, and steps: are NOT read, because the runner hands their values to no process" "FAIL" "$rc"
+  printf '%s\n' "$workflow_tagged" | grep -xF "$(printf 'env\t\t  MATURIN_ARGS: --features scp-ffi/testing')" >/dev/null; rc=$?
+  expect "(shipping-drift, workflow-lines) a mapping entry beneath env: is tagged 'env', because every later process of the job reads it" "PASS" "$rc"
+  printf '%s\n' "$workflow_tagged" | grep -xF "$(printf 'run\tcargo\t      - run: cargo build --release $FLAGS -p scp-node')" >/dev/null; rc=$?
+  expect "(shipping-drift, workflow-lines) a run: key after a list dash is tagged 'run' and carries the command word of its value" "PASS" "$rc"
+  printf '%s\n' "$workflow_tagged" | grep -xF "$(printf 'run\t\t        run: |')" >/dev/null; rc=$?
+  expect "(shipping-drift, workflow-lines) a run: key whose value is a block indicator carries no command word, because its block lines carry the commands" "PASS" "$rc"
+  printf '%s\n' "$workflow_tagged" | grep -xF "$(printf 'arg\t\t        with:')" >/dev/null; rc=$?
+  expect "(shipping-drift, workflow-lines) with: is tagged 'arg', because the named action receives its inputs" "PASS" "$rc"
+  printf '%s\n' "$workflow_lines" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 14 >/dev/null; rc=$?
+  expect "(shipping-drift, workflow-lines) the twenty-two-line workflow yields exactly fourteen lines that reach a process" "PASS" "$rc"
+
+  # (shipping-drift, workflow-keys) the reader parses the mapping key rather
+  #     than matching the physical line's text, so the YAML spellings that
+  #     resolve to the same key resolve to the same kind: a quoted key, a key
+  #     with whitespace before its colon, and a key inside a flow mapping,
+  #     which parses as no block key at all and is therefore `unread`.
+  local key_probe
+  key_probe="$(printf '%s\n' \
+    '      - "run": cargo build --release $FLAGS -p scp-node' \
+    '      - run : cargo build --release $FLAGS -p scp-node' \
+    "      - 'run': cargo build --release \$FLAGS -p scp-node" \
+    '      - {shell: cmd, run: cargo build --release -p scp-node %CARGO_FLAGS%}')"
+  workflow_lines_tagged "$key_probe" | grep -cE '^(run|unread)'"$(printf '\t')" | tr -d ' ' | grep -xF 4 >/dev/null; rc=$?
+  expect "(shipping-drift, workflow-keys) a quoted key, a spaced key, and a flow mapping each reach a reader, so none of the four passes unclassified" "PASS" "$rc"
+  workflow_lines_tagged "$key_probe" | grep -F 'unread' | grep -F '{shell: cmd, run:' >/dev/null; rc=$?
+  expect "(shipping-drift, workflow-keys) a flow-mapping step is tagged 'unread', because the reader parses no block key from it" "PASS" "$rc"
+
+  # (shipping-drift, yaml-continuation) YAML gives a trailing backslash no
+  #     meaning outside a block scalar, so a workflow file is tagged before it
+  #     is joined. Joining first made `- name: build \` and the `run:` line
+  #     under it one line whose key is `name`, and the reader emitted nothing
+  #     for a run: key that reaches a shell.
+  local continuation_probe
+  continuation_probe="$(printf '%s\n' \
+    '      - name: build x86_64 \' \
+    '        run: cargo build --release -p scp-node $FLAGS')"
+  join_continued_tagged_lines "$(workflow_lines_tagged "$continuation_probe")" | grep -F 'run: cargo build --release -p scp-node $FLAGS' >/dev/null; rc=$?
+  expect "(shipping-drift, yaml-continuation) a run: key under a line ending in a backslash is still READ" "PASS" "$rc"
+  join_continued_tagged_lines "$(workflow_lines_tagged "$continuation_probe")" | grep -F 'name: build x86_64' >/dev/null; rc=$?
+  expect "(shipping-drift, yaml-continuation) the name: line above it is still read as a key the runner hands to no process" "FAIL" "$rc"
   command_lines_the_reader_cannot_compute "$workflow_lines" | grep -xF '            ${{ env.MATURIN_ARGS }}' >/dev/null; rc=$?
   expect "(shipping-drift, workflow-lines) the folded-scalar line carrying only \${{ env.MATURIN_ARGS }} is REPORTED as rewritten" "PASS" "$rc"
   lines_carrying_cargo_feature_selection "$workflow_probe" | grep -F 'MATURIN_ARGS: --features scp-ffi/testing' >/dev/null; rc=$?
@@ -2478,12 +2764,109 @@ TREE
     DECLARED_NON_SHIPPING_PACKAGE_LINES=""; DECLARED_REWRITTEN_COMMAND_LINES=""
     assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
   expect "(shipping-drift, planted, interpreter) the assertion REJECTS an undeclared %CARGO_FLAGS% on a RUN line a Dockerfile SHELL instruction points at cmd" "FAIL" "$rc"
-  printf '%s\n' 'jobs:' '  wheel:' "    if: \${{ github.ref == 'refs/heads/main' }}" '    env:' '      FLAGS: ${{ inputs.flags }}' '    steps:' \
+  printf '%s\n' 'jobs:' '  wheel:' "    if: \${{ github.ref == 'refs/heads/main' }}" '    steps:' \
     '      - run: cargo build --release -p scp-node' > "$planted_yml"
   ( fixture_failures=0; SHIPPING_FILES=("$planted_yml"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
     DECLARED_NON_SHIPPING_PACKAGE_LINES=""; DECLARED_REWRITTEN_COMMAND_LINES=""
     assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
-  expect "(shipping-drift, planted, command-word) the assertion ACCEPTS a workflow whose only expansions sit under if: and env:, which reach no process" "PASS" "$rc"
+  expect "(shipping-drift, planted, command-word) the assertion ACCEPTS a workflow whose only expansion sits under if:, which the runner evaluates and hands to no process" "PASS" "$rc"
+
+  # (shipping-drift, planted, environment) rustc reads RUSTFLAGS out of its
+  #     environment and never out of argv, and `--cfg feature="testing"` there
+  #     makes `#[cfg(feature = "testing")]` true in every crate the build
+  #     compiles — crates/scp-platform/src/lib.rs gates InMemoryKeyCustody,
+  #     InMemoryDeviceAttestation, and InMemoryPreRotationCustody on that cfg —
+  #     while `cargo tree -e features` prints no scp-platform/testing edge for
+  #     run_gate to reject. A revision that read only argv classified a workflow
+  #     `env:` key and a Dockerfile `ENV` instruction as lines that reach no
+  #     process, and both spellings compiled scp-platform::testing into
+  #     scp-relay and scp-node under a passing gate. The unquoted spelling
+  #     carries no character outside the whitelist, so the environment tag is
+  #     what reports it.
+  printf '%s\n' 'jobs:' '  node:' '    env:' '      RUSTFLAGS: --cfg feature=testing' '    steps:' \
+    '      - run: cargo build --release -p scp-node' > "$planted_yml"
+  ( fixture_failures=0; SHIPPING_FILES=("$planted_yml"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+    DECLARED_NON_SHIPPING_PACKAGE_LINES=""; DECLARED_REWRITTEN_COMMAND_LINES=""
+    assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(shipping-drift, planted, environment) the assertion REJECTS an undeclared workflow env: RUSTFLAGS carrying --cfg feature=testing" "FAIL" "$rc"
+  ( fixture_failures=0; SHIPPING_FILES=("$planted_yml"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+    DECLARED_NON_SHIPPING_PACKAGE_LINES=""
+    DECLARED_REWRITTEN_COMMAND_LINES='RUSTFLAGS: --cfg feature=testing'
+    assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(shipping-drift, planted, environment) the assertion ACCEPTS that env: line once a human declares it, so a value edit changes the row" "PASS" "$rc"
+  for spelled in 'ENV RUSTFLAGS=--cfg feature=testing' \
+                 'ENV CARGO_BUILD_RUSTFLAGS=--cfg feature=testing' \
+                 'ENV CARGO_ENCODED_RUSTFLAGS=--cfg' \
+                 'ARG RUSTFLAGS=--cfg feature=testing'; do
+    printf '%s\n' 'FROM rust:slim-bookworm AS builder' "$spelled" \
+      'RUN cargo build --release -p scp-relay -p scp-node' > "$planted_file"
+    ( fixture_failures=0; SHIPPING_FILES=("$planted_file"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+      DECLARED_NON_SHIPPING_PACKAGE_LINES=""; DECLARED_REWRITTEN_COMMAND_LINES=""
+      assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+    expect "(shipping-drift, planted, environment) the assertion REJECTS the undeclared Dockerfile line: $spelled" "FAIL" "$rc"
+  done
+
+  # (shipping-drift, planted, program) `cargo` and `maturin` are the two
+  #     programs whose argv the flag reader, the package reader, and
+  #     assert_wheel_feature_selection_is_gated parse. `COPY . .` puts every
+  #     file of this repository into the image, so a RUN line naming a script
+  #     runs code this gate never reads, and that script can spell `--features
+  #     scp-node/testing` where no reader looks. Every token of `RUN
+  #     ./build-release.sh` sits inside the character whitelist, so the command
+  #     word is what reports it.
+  for spelled in 'RUN ./build-release.sh' 'RUN bash scripts/build.sh' 'RUN make release' \
+                 'RUN /usr/local/cargo/bin/cargo build --release -p scp-node' \
+                 'RUN env RUSTFLAGS=--cfg cargo build --release -p scp-node'; do
+    printf '%s\n' 'FROM rust:slim-bookworm AS builder' 'COPY . .' "$spelled" > "$planted_file"
+    ( fixture_failures=0; SHIPPING_FILES=("$planted_file"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+      DECLARED_NON_SHIPPING_PACKAGE_LINES=""; DECLARED_REWRITTEN_COMMAND_LINES=""
+      assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+    expect "(shipping-drift, planted, program) the assertion REJECTS the undeclared Dockerfile line: $spelled" "FAIL" "$rc"
+  done
+  printf '%s\n' 'jobs:' '  node:' '    steps:' '      - run: ./build-release.sh' > "$planted_yml"
+  ( fixture_failures=0; SHIPPING_FILES=("$planted_yml"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+    DECLARED_NON_SHIPPING_PACKAGE_LINES=""; DECLARED_REWRITTEN_COMMAND_LINES=""
+    assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(shipping-drift, planted, program) the assertion REJECTS a workflow run: step that runs a repository script this gate never reads" "FAIL" "$rc"
+  ( fixture_failures=0; SHIPPING_FILES=("$planted_yml"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+    DECLARED_NON_SHIPPING_PACKAGE_LINES=""
+    DECLARED_REWRITTEN_COMMAND_LINES='- run: ./build-release.sh'
+    assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(shipping-drift, planted, program) the assertion ACCEPTS that step once a human declares what the script runs" "PASS" "$rc"
+
+  # (shipping-drift, planted, yaml-key) YAML resolves a flow-mapping step, a
+  #     quoted key, and a key with whitespace before its colon to the same
+  #     `run:` key the block-style spelling resolves to. A revision that matched
+  #     the physical-line prefixes `run:`, `shell:`, and `with:` emitted nothing
+  #     for any of the three, so the difference between a caught nullifier and a
+  #     shipped one was which spelling the author wrote. The flow-mapping step
+  #     below is the block-style `shell: cmd` fixture above, rewritten in flow
+  #     style and nothing else.
+  printf '%s\n' 'jobs:' '  node:' '    steps:' \
+    '      - {shell: cmd, run: cargo build --release -p scp-node %CARGO_FLAGS%}' > "$planted_yml"
+  ( fixture_failures=0; SHIPPING_FILES=("$planted_yml"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+    DECLARED_NON_SHIPPING_PACKAGE_LINES=""; DECLARED_REWRITTEN_COMMAND_LINES=""
+    assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(shipping-drift, planted, yaml-key) the assertion REJECTS a flow-mapping step carrying an undeclared %CARGO_FLAGS%" "FAIL" "$rc"
+  printf '%s\n' 'jobs:' '  node:' '    steps:' \
+    '      - "run": cargo build --release -p scp-node $CARGO_FLAGS' > "$planted_yml"
+  ( fixture_failures=0; SHIPPING_FILES=("$planted_yml"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+    DECLARED_NON_SHIPPING_PACKAGE_LINES=""; DECLARED_REWRITTEN_COMMAND_LINES=""
+    assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(shipping-drift, planted, yaml-key) the assertion REJECTS a quoted run: key carrying an undeclared \$CARGO_FLAGS" "FAIL" "$rc"
+  printf '%s\n' 'jobs:' '  node:' '    steps:' \
+    '      - run : cargo build --release -p scp-node $CARGO_FLAGS' > "$planted_yml"
+  ( fixture_failures=0; SHIPPING_FILES=("$planted_yml"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+    DECLARED_NON_SHIPPING_PACKAGE_LINES=""; DECLARED_REWRITTEN_COMMAND_LINES=""
+    assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(shipping-drift, planted, yaml-key) the assertion REJECTS a run key spelled with whitespace before its colon carrying an undeclared \$CARGO_FLAGS" "FAIL" "$rc"
+  printf '%s\n' 'jobs:' '  node:' '    steps:' \
+    '      - name: Build node binary \' \
+    '        run: cargo build --release -p scp-node $CARGO_FLAGS' > "$planted_yml"
+  ( fixture_failures=0; SHIPPING_FILES=("$planted_yml"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
+    DECLARED_NON_SHIPPING_PACKAGE_LINES=""; DECLARED_REWRITTEN_COMMAND_LINES=""
+    assert_shipping_invocations_are_gated >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(shipping-drift, planted, yaml-key) the assertion REJECTS a run: key under a name: line ending in a backslash, which YAML joins to nothing" "FAIL" "$rc"
   planted_mk="$planted_dir/build.mk"
   printf '%s\n' 'all:' '	cargo build --release $(FLAGS) -p scp-node' > "$planted_mk"
   ( fixture_failures=0; SHIPPING_FILES=("$planted_mk"); DECLARED_SHIPPING_FEATURE_FLAG_LINES=""
