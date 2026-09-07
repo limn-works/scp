@@ -933,16 +933,22 @@ jobs:
           #     nullifier (ADR-062, capability injection and prove-absent dev
           #     backends, §Decision 6).
           #   shipped_build_reaches_every_callback_custody_identity_op
-          #     (same file) — `identity_load`, `scpid_sign`,
-          #     `identity_create_link_attestation`, `identity_remove*` and the
-          #     three agent-key ops each compile into a shipped library and
-          #     state their shipped outcome. Re-gating any of them on `testing`
+          #     (same file) — the fourteen identity operations a released
+          #     Swift/Kotlin SDK reaches over callback custody each compile
+          #     into a shipped library and state their shipped outcome:
+          #     `identity_load`, `scpid_sign`, `rotate_key`,
+          #     `identity_migrate`, `add_agent_key`, `rotate_agent_key`,
+          #     `remove_agent_key`, `identity_create_link_attestation`,
+          #     `identity_link_attestations`,
+          #     `identity_remove_link_attestation`, `event_log_checkpoint`,
+          #     `event_log_checkpoint_by_did`, `identity_remove_if_present`
+          #     and `identity_remove`. Re-gating any of them on `testing`
           #     stops this test target compiling.
           #
           # The four `ucan_*_over_callback_custody` tests carry no cfg gate and
           # need none: they build a `ContextHandle` directly rather than
-          # minting an identity, so they run their real bodies here. Until this
-          # filter named them they ran only in lanes that enable
+          # minting an identity, so they run their real bodies here. Until the
+          # second command below named them they ran only in lanes that enable
           # `scp-ffi-uniffi/testing`, which proves nothing about the mobile libs
           # build-matrix.yml ships at tag time.
           #
@@ -959,9 +965,21 @@ jobs:
           # zero tests. `check_shipped_build_assertions_run` in
           # scripts/tests/ci-gate/ci_gate_selftest.py rejects this workflow when
           # a `#[cfg(not(feature = "testing"))]` test this bridge defines is
-          # absent from the filter below.
+          # absent from both filters below.
+          #
+          # Two commands, not one union filterset, because nextest's `+` is a
+          # union: a single command naming the four cfg-gated assertions
+          # alongside the four un-gated `ucan_*` tests selects at least four
+          # tests in every feature configuration, so `--no-tests=fail` could
+          # never fire and the empty-selection tripwire would report nothing.
+          # The first command therefore names only tests that a `testing` flip
+          # deletes, which keeps a zero-test selection reachable; the second
+          # runs the un-gated `ucan_*` tests under a `--no-tests=fail` of their
+          # own, which fires if one of them is renamed out of the filter.
           cargo nextest run --no-tests=fail -p scp-ffi-uniffi --features server --lib \
-            -E 'test(identity_create_in_memory_rejected_without_feature) + test(parse_custody_method_rejects_in_memory_on_a_shipped_build) + test(identity_create_with_custody_fails_closed_without_pre_rotation_backend) + test(shipped_build_reaches_every_callback_custody_identity_op) + test(ucan_mint_works_over_callback_custody) + test(ucan_delegate_works_over_callback_custody) + test(ucan_delegate_signs_with_delegator_key_not_context_creator_key) + test(ucan_mint_without_retained_custody_returns_ident_1017)'
+            -E 'test(identity_create_in_memory_rejected_without_feature) + test(parse_custody_method_rejects_in_memory_on_a_shipped_build) + test(identity_create_with_custody_fails_closed_without_pre_rotation_backend) + test(shipped_build_reaches_every_callback_custody_identity_op)'
+          cargo nextest run --no-tests=fail -p scp-ffi-uniffi --features server --lib \
+            -E 'test(ucan_mint_works_over_callback_custody) + test(ucan_delegate_works_over_callback_custody) + test(ucan_delegate_signs_with_delegator_key_not_context_creator_key) + test(ucan_mint_without_retained_custody_returns_ident_1017)'
 
   rust-doc:
     needs: changes
