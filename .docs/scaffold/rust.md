@@ -44,7 +44,7 @@ crates/
       trait.rs              # ADR-005: TransportAdapter trait
       manager.rs            # ADR-012: Multi-transport routing
       native/               # ADR-004: SCP native relay
-        blob_store.rs       # BlobStore trait (§16.4.1) — relay storage abstraction
+        storage.rs          # BlobStorage trait (§17.7) — relay storage abstraction
   scp-testing/              # §16: Network simulation test harness (dev-dependency only)
     Cargo.toml
     src/
