@@ -11071,7 +11071,10 @@ impl Scp {
                 // for the id that only this path releases. So an absent actor
                 // and a closing or terminal state skip the dispatch and fall
                 // through to the release below; only a live non-active state
-                // (`Creating`, `MigratingOut`, `Poisoned`) refuses the close.
+                // (`Creating`, `MigratingOut`) refuses the close. A poisoned
+                // context (the crash watchdog despawned the actor and keeps only
+                // the sticky poison flag, ADR-049 §10) is a close that already
+                // happened, so it releases like an absent actor.
                 // `scp_core::context::ContextState` is the supervisor's own
                 // enum; the UniFFI-exported `ContextState` is a separate type,
                 // so this match names the core one explicitly.
@@ -11080,12 +11083,14 @@ impl Scp {
                     .read_live_context_state(&handle.context_id)
                     .await?
                 {
-                    // No actor answers (a completed TTL expiry), or the actor
-                    // reports a closing or terminal state (a peer's close, a
-                    // migration tombstone): the close already happened.
+                    // No actor answers (a completed TTL expiry), the supervisor
+                    // reports `Poisoned`, or the actor reports a closing or
+                    // terminal state (a peer's close, a migration tombstone):
+                    // the close already happened.
                     None
                     | Some(
-                        CoreContextState::Closing
+                        CoreContextState::Poisoned
+                        | CoreContextState::Closing
                         | CoreContextState::Closed
                         | CoreContextState::Expired
                         | CoreContextState::Tombstoned,
@@ -19606,6 +19611,60 @@ mod tests {
             *rt.block_on(handle.state.lock()),
             ContextState::Closed
         ));
+    }
+
+    /// A close of a poisoned context succeeds idempotently and releases the
+    /// bridge's per-context UCAN state.
+    ///
+    /// The crash watchdog poisons a context once its actor exhausts the
+    /// respawn budget (ADR-049 §10) and despawns the actor, so the supervisor
+    /// reports `Poisoned` from its sticky poison flag and no actor answers.
+    /// `clear_poison` is an operator action no bridge exports, so a close that
+    /// refused a poisoned context held the UCAN state for the life of the
+    /// process. Before this test existed, the close gate refused with
+    /// "cannot close context in Poisoned state".
+    #[test]
+    #[cfg(feature = "testing")]
+    fn close_of_a_poisoned_context_releases_bridge_state() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+        let context_id = handle.context_id();
+        assert!(scp.inner.with_ucan_state(&context_id, |_| ()).is_some());
+
+        let sup = Arc::clone(
+            scp.inner
+                .context_manager_or_error()
+                .expect("test supervisor must be attached"),
+        );
+        rt.block_on(sup.test_poison_context(&context_id));
+        assert_eq!(
+            rt.block_on(scp.inner.read_live_context_state(&context_id))
+                .expect("state read"),
+            Some(scp_core::context::ContextState::Poisoned),
+            "the fixture must leave the supervisor reporting Poisoned"
+        );
+
+        rt.block_on(scp.context_close(Arc::clone(&handle), Arc::clone(&identity)))
+            .expect("close of a poisoned context must succeed idempotently");
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_none(),
+            "close must release the per-context UCAN state"
+        );
+        assert!(matches!(
+            *rt.block_on(handle.state.lock()),
+            ContextState::Closed
+        ));
+
+        // A second close stays idempotent: no state to release, no error.
+        rt.block_on(scp.context_close(handle, identity))
+            .expect("a repeated close must stay idempotent");
     }
 
     /// Both cross-context outlet entry points gate each axis on that context's

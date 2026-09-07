@@ -5097,6 +5097,36 @@ impl Supervisor {
             .is_some_and(|w| w.is_poisoned())
     }
 
+    /// Test fixture: poisons `context_id` the way the crash watchdog does, so a
+    /// caller can observe a poisoned context without crashing an actor
+    /// [`CRASH_POISON_THRESHOLD`] times.
+    ///
+    /// The fixture records [`CRASH_POISON_THRESHOLD`] crashes at one instant
+    /// in the context's [`CrashWindow`], which sets the sticky `poisoned` flag,
+    /// and then despawns the actor, which is the state the watchdog leaves
+    /// behind once it stops respawning (ADR-049 §10). After this call
+    /// [`Self::read_context_state`] reports
+    /// [`ContextState::Poisoned`](scp_protocol::context::ContextState::Poisoned)
+    /// and [`Self::lookup`] finds no actor. A context with no actor poisons the
+    /// same way, because the watchdog's poison flag lives in `crash_windows`
+    /// and not on the actor.
+    ///
+    /// `testing`-gated: no production build compiles it, no FFI bridge exports
+    /// it, and only an in-process `Arc<Supervisor>` holder can call it.
+    #[cfg(feature = "testing")]
+    pub async fn test_poison_context(&self, context_id: &str) {
+        let now_ms = self.crash_now_ms("context_actor", context_id);
+        // Record every crash and drop the DashMap guard before the `.await`
+        // below (the workspace denies `await_holding_lock`).
+        {
+            let mut entry = self.crash_windows.entry(context_id.to_owned()).or_default();
+            for _ in 0..CRASH_POISON_THRESHOLD {
+                entry.record(now_ms);
+            }
+        }
+        self.despawn_actor(context_id).await;
+    }
+
     /// Map a per-context `lookup` miss to the right typed error (ADR-049
     /// §10). Three cases, in precedence order:
     ///

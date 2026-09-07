@@ -596,11 +596,23 @@ public actor Context {
     /// Always call `close()` when done with a context. `deinit` provides a
     /// safety net but should not be relied upon for timely cleanup.
     ///
+    /// A second `close()`, and a `close()` after ``leave()``, returns without
+    /// calling the bridge. Every other cached ``state`` reaches the bridge,
+    /// including ``ContextState/poisoned``: the initializer writes
+    /// ``ContextState/poisoned`` whenever ``ContextHandle/state()`` throws or
+    /// reports a string this SDK does not recognize, so refusing the close on
+    /// that value would strand the bridge's per-context UCAN state for the
+    /// life of the process — `close()` is the only path that releases it, and
+    /// no SDK method clears a poison. The bridge reads the supervisor actor
+    /// and decides: it releases that state for an absent, poisoned, closing,
+    /// or terminal supervisor state, and it throws for `creating` and
+    /// `migrating_out`. `deinit` already gates on the same flag.
+    ///
     /// - Throws: ``ScpError/Context(msg:code:)`` if the bridge close
     ///   operation fails.
     public func close() async throws {
-        guard state == .active else {
-            // Closing an already-closed context is idempotent — no error.
+        guard !didClose else {
+            // This actor already closed or left the context — no error.
             return
         }
         try await scp.contextClose(handle: handle, identity: identity)

@@ -548,6 +548,19 @@ struct ParsedContextParams {
     economic_policy: Option<String>,
 }
 
+/// `default_ceiling()` rendered as the `{resource}:{action}` capability strings
+/// a `context_create` caller supplies.
+///
+/// `parse_context_params` carries a caller's vocabulary to the shared
+/// `build_context_params` parser, so a default this bridge substitutes has to
+/// arrive in the same form a caller would have written.
+fn default_ceiling_strings() -> Vec<String> {
+    scp_core::context::roles::default_ceiling()
+        .iter()
+        .map(|cap| cap.name().into_owned())
+        .collect()
+}
+
 /// Parses the JSON context-parameters surface into a [`ParsedContextParams`].
 ///
 /// Delegates all validation and `ContextParams` construction to the shared
@@ -569,14 +582,44 @@ fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> 
     })?;
 
     let mode_str = params["mode"].as_str().unwrap_or("Encrypted").to_owned();
-    let ceiling: Vec<String> = params["ceiling"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
+    // ceiling: string[] (default: `default_ceiling()`).
+    //
+    // An absent key and a `null` value both mean "this caller declared no
+    // ceiling", and `default_ceiling`'s own doc comment states that every FFI
+    // bridge applies it "when no explicit ceiling is provided". A supplied
+    // array stands as written, so an empty array declares a ceiling that
+    // grants nothing rather than reading as an absent key — a caller that
+    // writes `ceiling: []` means a deny-all context and gets one. The
+    // supervisor installs this vector verbatim and every authorization gate
+    // reads the actor's ceiling, so this substitution is the only place an
+    // omitted declaration receives its default. Any other JSON type, and any
+    // non-string entry inside the array, is a malformed declaration and
+    // rejects, because dropping the entry would hand the caller a narrower
+    // ceiling than the one they wrote and hide the mistake behind a context
+    // that refuses the capability. `PyContextParams::from_py_dict` rejects the
+    // same two shapes through `extract::<Vec<String>>()`.
+    let ceiling: Vec<String> = match &params["ceiling"] {
+        serde_json::Value::Null => default_ceiling_strings(),
+        serde_json::Value::Array(entries) => entries
+            .iter()
+            .map(|entry| {
+                entry.as_str().map(str::to_owned).ok_or_else(|| {
+                    NapiError::from(ScpNapiError::Validation {
+                        message: format!("ceiling entries must be capability strings, got {entry}"),
+                        code: codes::VALID_7000.to_owned(),
+                    })
+                })
+            })
+            .collect::<napi::Result<Vec<String>>>()?,
+        other => {
+            return Err(NapiError::from(ScpNapiError::Validation {
+                message: format!(
+                    "ceiling must be an array of capability strings or omitted, got {other}"
+                ),
+                code: codes::VALID_7000.to_owned(),
+            }));
+        }
+    };
     let ceiling_policy = params["ceilingPolicy"]
         .as_str()
         .unwrap_or("immutable")
@@ -1614,24 +1657,28 @@ pub(crate) async fn context_close_on(
 
     // Read the supervisor, not the handle's cached string. A close is the one
     // lifecycle operation that stays valid after the supervisor took the
-    // context out of service on its own: a TTL expiry despawns the actor, and a
-    // peer's close moves the context to `Closing`. In both cases the close
-    // already happened, and this bridge still holds a `UcanContextState` for the
-    // id that only this path releases. So an absent actor and a closing or
-    // terminal state skip the dispatch and fall through to the release below;
-    // only a live non-active state (`Creating`, `MigratingOut`, `Poisoned`)
-    // refuses the close.
+    // context out of service on its own: a TTL expiry despawns the actor, the
+    // crash watchdog poisons the context and despawns the actor, and a peer's
+    // close moves the context to `Closing`. In every one of those cases the
+    // close already happened, and this bridge still holds a `UcanContextState`
+    // for the id that only this path releases. So an absent actor, a poisoned
+    // context, and a closing or terminal state skip the dispatch and fall
+    // through to the release below; only a live non-active state (`Creating`,
+    // `MigratingOut`) refuses the close.
     let close_already_happened =
         match crate::runtime::read_live_context_state(bi, &handle.context_id)
             .await
             .map_err(NapiError::from)?
         {
-            // No actor answers (a completed TTL expiry), or the actor reports a
-            // closing or terminal state (a peer's close, a migration tombstone):
-            // the close already happened.
+            // No actor answers (a completed TTL expiry), the supervisor reports
+            // `Poisoned` (the watchdog despawned the actor and keeps only the
+            // sticky poison flag, ADR-049 §10), or the actor reports a closing
+            // or terminal state (a peer's close, a migration tombstone): the
+            // close already happened.
             None
             | Some(
-                scp_core::context::ContextState::Closing
+                scp_core::context::ContextState::Poisoned
+                | scp_core::context::ContextState::Closing
                 | scp_core::context::ContextState::Closed
                 | scp_core::context::ContextState::Expired
                 | scp_core::context::ContextState::Tombstoned,
@@ -6627,6 +6674,158 @@ mod tests {
         super::context_close_on(&bi, &handle, creator.to_owned())
             .await
             .expect("a repeated close must stay idempotent");
+    }
+
+    /// A close of a poisoned context succeeds idempotently and releases the
+    /// bridge state for that id.
+    ///
+    /// The crash watchdog poisons a context once its actor exhausts the
+    /// respawn budget (ADR-049 §10) and despawns the actor, so the supervisor
+    /// reports `Poisoned` from its sticky poison flag and no actor answers.
+    /// `clear_poison` is an operator action no bridge exports, so a close that
+    /// refused a poisoned context held the `UcanContextState` for the life of
+    /// the process. Before this test existed, the close gate refused with
+    /// "cannot close context in 'poisoned' state".
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_of_a_poisoned_context_releases_bridge_state() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let ctx_id = format!("napi-close-poisoned-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiClosePoisoned";
+        crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator, &[]).await;
+        crate::runtime::register_test_context(&bi, &ctx_id);
+        assert!(crate::runtime::ucan_registry(&bi).contains_key(&ctx_id));
+
+        crate::runtime::supervisor(&bi)
+            .expect("supervisor")
+            .test_poison_context(&ctx_id)
+            .await;
+        assert_eq!(
+            crate::runtime::read_live_context_state(&bi, &ctx_id)
+                .await
+                .expect("state read"),
+            Some(scp_core::context::ContextState::Poisoned),
+            "the fixture must leave the supervisor reporting Poisoned"
+        );
+
+        let handle = active_handle_for(&bi, &ctx_id, creator);
+        super::context_close_on(&bi, &handle, creator.to_owned())
+            .await
+            .expect("close of a poisoned context must succeed idempotently");
+        assert!(
+            !crate::runtime::ucan_registry(&bi).contains_key(&ctx_id),
+            "close must release the bridge state for a poisoned context"
+        );
+        assert_eq!(handle.state().expect("state"), "closed");
+
+        // A second close stays idempotent: no state to release, no error.
+        super::context_close_on(&bi, &handle, creator.to_owned())
+            .await
+            .expect("a repeated close must stay idempotent");
+    }
+
+    // -------------------------------------------------------------------
+    // Ceiling: an absent declaration and an empty one are different
+    // -------------------------------------------------------------------
+
+    /// The capability names `default_ceiling()` carries, in the form a
+    /// `context_create` caller writes them.
+    fn default_ceiling_names() -> std::collections::HashSet<String> {
+        scp_core::context::roles::default_ceiling()
+            .iter()
+            .map(|cap| cap.name().into_owned())
+            .collect()
+    }
+
+    /// The capability names a parsed ceiling carries.
+    fn parsed_ceiling_names(params_json: &str) -> std::collections::HashSet<String> {
+        super::parse_context_params(params_json)
+            .expect("params must parse")
+            .core
+            .ceiling
+            .iter()
+            .map(|cap| cap.name().into_owned())
+            .collect()
+    }
+
+    /// An absent `ceiling` key resolves to `default_ceiling()`.
+    ///
+    /// `default_ceiling`'s doc comment says every FFI bridge applies it "when
+    /// no explicit ceiling is provided". Before this test existed the parser
+    /// read an absent key as an empty vector, the supervisor installed that
+    /// empty ceiling verbatim, and every mint, delegate, and validate on the
+    /// context refused every capability, while the same omission on the
+    /// `PyO3` bridge granted the eleven defaults.
+    #[test]
+    fn parse_context_params_resolves_an_absent_ceiling_to_default_ceiling() {
+        let actual = parsed_ceiling_names(r#"{"mode":"Encrypted"}"#);
+        assert_eq!(actual.len(), 11, "default_ceiling() carries 11 entries");
+        assert_eq!(actual, default_ceiling_names());
+    }
+
+    /// A `ceiling` key holding `null` declares no ceiling, the same as an
+    /// absent key.
+    #[test]
+    fn parse_context_params_resolves_a_null_ceiling_to_default_ceiling() {
+        let actual = parsed_ceiling_names(r#"{"mode":"Encrypted","ceiling":null}"#);
+        assert_eq!(actual, default_ceiling_names());
+    }
+
+    /// An empty `ceiling` array stands as written: a deny-all context.
+    #[test]
+    fn parse_context_params_keeps_an_empty_ceiling_empty() {
+        let parsed = super::parse_context_params(r#"{"mode":"Encrypted","ceiling":[]}"#)
+            .expect("params must parse");
+        assert!(
+            parsed.core.ceiling.is_empty(),
+            "an explicit [] grants nothing"
+        );
+        assert!(parsed.ceiling.is_empty());
+    }
+
+    /// A supplied `ceiling` array stands as written, with no default merged in.
+    #[test]
+    fn parse_context_params_keeps_a_supplied_ceiling_as_written() {
+        let actual = parsed_ceiling_names(r#"{"mode":"Encrypted","ceiling":["messages:write"]}"#);
+        assert_eq!(
+            actual,
+            std::iter::once("messages:write".to_owned()).collect::<std::collections::HashSet<_>>()
+        );
+    }
+
+    /// A `ceiling` value that is neither `null` nor an array is a malformed
+    /// declaration, so the parser rejects it instead of reading it as
+    /// deny-all or as absent.
+    #[test]
+    fn parse_context_params_rejects_a_non_array_ceiling() {
+        let err = super::parse_context_params(r#"{"mode":"Encrypted","ceiling":"messages:write"}"#)
+            .err()
+            .expect("a string ceiling must not parse");
+        assert!(
+            err.to_string().contains("ceiling must be"),
+            "parser reported: {err}"
+        );
+    }
+
+    /// A non-string entry inside the `ceiling` array rejects rather than
+    /// dropping out of the parsed ceiling.
+    ///
+    /// Dropping the entry would build a context whose ceiling is narrower than
+    /// the one the caller wrote, and every later mint, delegate, and validate
+    /// would refuse the missing capability with no record of the parse. The
+    /// `PyO3` bridge rejects the same shape through
+    /// `extract::<Vec<String>>()`.
+    #[test]
+    fn parse_context_params_rejects_a_non_string_ceiling_entry() {
+        let err =
+            super::parse_context_params(r#"{"mode":"Encrypted","ceiling":["messages:write",7]}"#)
+                .err()
+                .expect("a numeric ceiling entry must not parse");
+        assert!(
+            err.to_string().contains("ceiling entries must be"),
+            "parser reported: {err}"
+        );
     }
 
     /// A rejected direct-execute leaves context membership/role state unchanged

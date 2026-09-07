@@ -3260,7 +3260,7 @@ impl crate::scp::PyScp {
     /// # Errors
     ///
     /// Returns `RuntimeError` if the supervisor reports the context in a live
-    /// non-active state (`creating`, `migrating_out`, `poisoned`).
+    /// non-active state (`creating`, `migrating_out`).
     /// Returns `ContextError` if the caller lacks the `ContextClose` capability.
     #[pyo3(signature = (handle, identity_did))]
     pub fn context_close(&self, handle: &PyContextHandle, identity_did: &str) -> PyResult<()> {
@@ -3270,20 +3270,25 @@ impl crate::scp::PyScp {
         // Read the supervisor, not the handle's cached string. A close is the
         // one lifecycle operation that stays valid after the supervisor took
         // the context out of service on its own: a TTL expiry despawns the
-        // actor, and a peer's close moves the context to `Closing`. In both
-        // cases the close already happened, and this bridge still holds an
-        // `FfiBridgeState` for the id that only this path releases. So an
-        // absent actor and a closing or terminal state skip the dispatch and
-        // fall through to the release below; only a live non-active state
-        // (`Creating`, `MigratingOut`, `Poisoned`) refuses the close.
+        // actor, the crash watchdog poisons the context and despawns the
+        // actor, and a peer's close moves the context to `Closing`. In every
+        // one of those cases the close already happened, and this bridge
+        // still holds an `FfiBridgeState` for the id that only this path
+        // releases. So an absent actor, a poisoned context, and a closing or
+        // terminal state skip the dispatch and fall through to the release
+        // below; only a live non-active state (`Creating`, `MigratingOut`)
+        // refuses the close.
         let close_already_happened =
             match crate::runtime::read_live_context_state(bi, &handle.context_id)? {
-                // No actor answers (a completed TTL expiry), or the actor
-                // reports a closing or terminal state (a peer's close, a
-                // migration tombstone): the close already happened.
+                // No actor answers (a completed TTL expiry), the supervisor
+                // reports `Poisoned` (the watchdog despawned the actor and
+                // keeps only the sticky poison flag, ADR-049 §10), or the
+                // actor reports a closing or terminal state (a peer's close,
+                // a migration tombstone): the close already happened.
                 None
                 | Some(
-                    scp_core::context::ContextState::Closing
+                    scp_core::context::ContextState::Poisoned
+                    | scp_core::context::ContextState::Closing
                     | scp_core::context::ContextState::Closed
                     | scp_core::context::ContextState::Expired
                     | scp_core::context::ContextState::Tombstoned,
@@ -8006,6 +8011,57 @@ mod tests {
         assert!(
             !crate::runtime::ffi_state_registry(&bi).contains_key(&context_id),
             "close must release the bridge state for a despawned context"
+        );
+        assert_eq!(handle.state().expect("state"), "closed");
+
+        // A second close stays idempotent: no state to release, no error.
+        scp.context_close(&handle, creator)
+            .expect("a repeated close must stay idempotent");
+    }
+
+    /// A close of a poisoned context succeeds idempotently and releases the
+    /// bridge state for that id.
+    ///
+    /// The crash watchdog poisons a context once its actor exhausts the
+    /// respawn budget (ADR-049 §10) and despawns the actor, so the supervisor
+    /// reports `Poisoned` from its sticky poison flag and no actor answers.
+    /// `clear_poison` is an operator action no bridge exports, so a close that
+    /// refused a poisoned context held the `FfiBridgeState` for the life of
+    /// the process. Before this test existed, the close gate refused with
+    /// "cannot close context in 'poisoned' state".
+    #[test]
+    #[cfg(feature = "testing")]
+    fn close_of_a_poisoned_context_releases_bridge_state() {
+        crate::init_runtime().ok();
+        let bi = __bi();
+        let creator = "did:dht:z6MkPoisonedCloseCreator";
+        let context_id = format!("a4{}", "0".repeat(56));
+        crate::runtime::init_context_manager_for_test(&bi);
+        crate::runtime::register_context(&bi, &context_id, creator, &[])
+            .expect("fixture registration");
+        crate::runtime::create_supervisor_context_for_test(&bi, &context_id, creator, &[]);
+        assert!(crate::runtime::ffi_state_registry(&bi).contains_key(&context_id));
+
+        let sup = std::sync::Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+        crate::runtime()
+            .expect("tokio runtime")
+            .block_on(sup.test_poison_context(&context_id));
+        assert_eq!(
+            crate::runtime::read_live_context_state(&bi, &context_id).expect("state read"),
+            Some(scp_core::context::ContextState::Poisoned),
+            "the fixture must leave the supervisor reporting Poisoned"
+        );
+
+        let handle = active_handle_for(&bi, &context_id, creator);
+        let scp = crate::scp::PyScp {
+            inner: std::sync::Arc::clone(&bi),
+        };
+
+        scp.context_close(&handle, creator)
+            .expect("close of a poisoned context must succeed idempotently");
+        assert!(
+            !crate::runtime::ffi_state_registry(&bi).contains_key(&context_id),
+            "close must release the bridge state for a poisoned context"
         );
         assert_eq!(handle.state().expect("state"), "closed");
 

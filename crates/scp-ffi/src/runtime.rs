@@ -1771,16 +1771,20 @@ pub fn live_context_state(
     })
 }
 
-/// Reads a context's lifecycle state from that context's supervisor actor, and
-/// reports an absent actor as `None` instead of as an error.
+/// Reads a context's lifecycle state from that context's supervisor actor.
+///
+/// An absent actor reads as `None` instead of as an error. An absent actor the
+/// crash watchdog poisoned reads as `Some(Poisoned)`, because the supervisor
+/// keeps that flag outside the actor (ADR-049 §10).
 ///
 /// [`live_context_state`] is the gate form: it turns `None` into an error so a
 /// gate never admits an operation on an absent answer. `context_close` calls
 /// this form instead, because a close of a context whose actor the supervisor
-/// already despawned — a completed TTL expiry, an all-members-left teardown —
-/// is idempotent: the close already happened, and the bridge still has to
-/// release the [`FfiBridgeState`] it holds for that id. Refusing that close
-/// would leave the registry entry alive for the life of the process.
+/// already despawned — a completed TTL expiry, an all-members-left teardown, a
+/// watchdog poisoning — is idempotent: the close already happened, and the
+/// bridge still has to release the [`FfiBridgeState`] it holds for that id.
+/// Refusing that close would leave the registry entry alive for the life of
+/// the process.
 ///
 /// # Errors
 ///
