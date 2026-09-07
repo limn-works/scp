@@ -4,7 +4,9 @@
 # a line a Dockerfile RUN, CMD, ENTRYPOINT, SHELL, HEALTHCHECK, ENV, or ARG
 # instruction, or a workflow `run:`, `shell:`, `with:`, `env:`, `uses:`,
 # `container:`, `services:`, or `working-directory:` key, hands to one, plus
-# every line the workflow reader cannot parse as a mapping key at all — whose
+# every line the workflow reader cannot parse as a mapping key at all, plus
+# every workflow line whose key sits outside those seven, because a `${{ … }}`
+# expression substitutes such a key's value into a command string — whose
 # effect on the build the gate cannot resolve for one of four reasons:
 #
 #   (i) The line carries a token the command interpreter the file selects, or
@@ -55,7 +57,7 @@
 #
 # A `#` line is a grouping comment the gate drops before comparing. Each group
 # states the reason its lines select no cargo feature and change nothing rustc
-# compiles. Five reasons recur and are named once here:
+# compiles. Eight reasons recur and are named once here:
 #
 #   (R1) The line's command word is a literal program or shell builtin that is
 #        not cargo and not a program that passes its arguments to cargo (echo,
@@ -91,14 +93,35 @@
 #        and that action's own `action.yml` runs commands no reader here opens,
 #        which is reason (ii) for a program the workflow grammar rather than a
 #        shell selects. The row names what the action runs.
+#   (R8) The workflow reader parses a block-mapping key the runner reads itself
+#        and hands to no process, so it tags the line `value`. The runner still
+#        substitutes a `value`'s text into a command string wherever a
+#        `${{ … }}` expression names that value, and the shell then splits the
+#        substituted text on whitespace, so a `value` line carrying an option
+#        token (reason (iv)) or a character outside cargo's grammar (reason (i))
+#        needs a row. The row names the key, states what the runner does with
+#        the value, and states which expression context can name it.
 #
 # The cargo lines carry two expansions with their own reasons. `${{ matrix.target
-# }}` and `"$target"` follow `--target`, an option that takes exactly one value.
-# When the expansion produces a token that begins with `-`, cargo exits with
-# `"--target" takes a target architecture as an argument` and builds nothing;
-# any other token names a triple rustc has to know. Neither path selects a
-# feature, and run_gate resolves every triple at once with `--target all`, so
-# the triple's value changes no verdict. `"$pkg"` follows `-p` inside the
+# }}` and `"$target"` follow `--target`. GitHub substitutes an expression's text
+# into the command string and the shell then splits that string on whitespace,
+# so an expansion is not one token: the matrix value
+# `x86_64-unknown-linux-gnu --config=ci-flags.toml` reaches cargo as a triple
+# AND a second option, and an earlier revision of this file justified these rows
+# on the ground that `--target` takes exactly one value, which word splitting
+# falsifies. What holds instead is mechanical: workflow_lines_tagged tags every
+# matrix value line of these files `value`, so each one passes through condition
+# (i) — no character outside cargo's grammar — and condition (iv) — no option
+# token outside the whitelist — or carries a row here. A value that passes both
+# splits into words of which the first names a triple rustc has to know and
+# every later one is a positional argument `cargo build` rejects with
+# `unexpected argument`, so no split of it selects a feature or reaches rustc.
+# `"$target"` takes its four values from the `for target in
+# aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+# i686-linux-android; do` line of build-matrix.yml, which spells each triple
+# literally and which this file declares, so that expansion is one token by the
+# same argument. run_gate resolves every triple at once with `--target
+# all`, so the triple's value changes no verdict. `"$pkg"` follows `-p` inside the
 # `for pkg in scp-core scp-ffi scp-ffi-napi scp-ffi-uniffi; do` loop, and
 # packages_built_by_shipping_lines reads the four names from that `for` line,
 # so each package the expansion names is one the gate resolves. The `cargo test`
@@ -611,3 +634,106 @@ Release version (SemVer 2.0, e.g. 0.1.0). This is the scp-core
 # (R5) The second line of an `if:` expression, which the runner evaluates to
 # decide whether its step runs.
 matrix.target != 'aarch64-unknown-linux-gnu'
+# (R5) The second line of that same `version:` input `description:` block
+# scalar. Its every character sits inside the whitelist, so an earlier revision
+# that tested an `unread` line against the character whitelist alone reported
+# nothing about it while reporting the first line.
+version and becomes the shared major.minor for all SDKs.
+# (R5) Sequence scalars under a job's `needs:` key. Each names a job of the same
+# workflow, and the runner reads the list to order jobs and hands no entry to a
+# process.
+- rust
+- python-wheels
+- python-sdist
+- typescript-napi
+- swift-xcframework
+- kotlin-aar
+- cbindgen
+- publish-crates
+- publish-pypi
+- publish-npm
+- publish-maven
+- publish-spm
+# ===========================================================================
+# (R8) WORKFLOW KEYS THE RUNNER READS ITSELF. workflow_lines_tagged tags every
+# key outside its seven process-reaching keys `value`, because the runner
+# substitutes such a value's text into a command string wherever a `${{ … }}`
+# expression names it and the shell then splits that text into words. A `value`
+# line therefore passes conditions (i) and (iv) or carries a row here. Each
+# group below names the key and what the runner does with its value.
+# ---------------------------------------------------------------------------
+# (R8) `name:` labels a job or a step. The runner writes the value into its own
+# run log and into the checks API, and GitHub's expression contexts address a
+# job by its id and a step by its `id:`, so no expression names a `name:` value
+# and nothing substitutes one into a command. The four `${{ matrix.target }}`
+# labels put the triple into the job's displayed name for the same reason.
+- name: Build for iOS (arm64)
+- name: Build for iOS Simulator (arm64)
+- name: Build for iOS Simulator (x86_64)
+- name: Build for macOS (aarch64)
+- name: Build for macOS (x86_64)
+- name: Build shipped bridge artifacts (one package per invocation)
+- name: Install cross-compilation tools (aarch64-linux)
+- name: Run tests (native targets only)
+- name: Stage index.node (Unix)
+- name: Stage index.node (Windows)
+- name: Build @limn-works/scp-ts
+- name: Configure @limn-works npm scope
+- name: Download XCFramework zip (produced by publish-spm)
+- name: Publish @limn-works/scp-ts
+name: C ABI (${{ matrix.target }})
+name: Python wheel (${{ matrix.target }})
+name: Rust (${{ matrix.target }})
+name: TypeScript NAPI (${{ matrix.target }})
+name: "Dry-run summary"
+name: "Step 1: Conformance tests"
+name: "Step 2: Verify changelog"
+name: "Step 3: Create version tags"
+name: "Step 4: Build artifacts"
+name: "Step 5a: Apple codesigning"
+name: "Step 5b: Authenticode signing"
+name: "Step 5c: GPG sign Maven artifacts"
+name: "Step 6a: Publish to crates.io"
+name: "Step 6b: Publish to PyPI"
+name: "Step 6c: Publish to npm"
+name: "Step 6d: Publish to Maven Central"
+name: "Step 6f: Publish Swift Package (SPM)"
+name: "Step 7: GitHub Release"
+# (R8) `needs:` in flow style. Each entry names a job of the same workflow, the
+# runner reads the list to order jobs, and the `[` and `]` are the characters
+# outside the whitelist. The block-style spelling of the same key arrives as the
+# (R5) sequence scalars above.
+needs: [build]
+needs: [conformance, changelog]
+needs: [sign-apple, sign-windows, sign-maven]
+needs: [sign-apple]
+needs: [version-tags]
+# (R8) `if:` carries an expression the runner evaluates to true or false to
+# decide whether its job or step runs. The runner hands the expression to no
+# process, and the boolean it produces reaches no argv.
+if: >-
+if: runner.os != 'Windows'
+if: ${{ !inputs.dry-run }}
+if: ${{ inputs.dry-run }}
+# (R8) `description:` documents a `workflow_dispatch` input. The runner renders
+# it in the dispatch form, and no expression context names a description.
+description: >
+description: "Dry run — validate everything but skip publishing"
+description: "scp-core version (source of truth for all SDK versions)"
+# (R8) `runs-on:` selects the runner label the job's steps execute on. The
+# runner matches the value against its pool of machines and puts it on no argv.
+runs-on: ${{ matrix.runner }}
+# (R8) A job `outputs:` entry. `needs.<job>.outputs.<name>` names these two
+# values, so an expression can substitute them: `core-tag` forwards the git tag
+# the version-tags job's `tags` step wrote to $GITHUB_OUTPUT, and
+# `xcframework-zip` names the XCFramework archive the publish-spm job uploaded.
+# Both reach `gh release create`, `git push`, and `actions/download-artifact`,
+# and neither reaches a cargo invocation of these files.
+core-tag: ${{ steps.tags.outputs.core-tag }}
+xcframework-zip: ScpFFI-${{ inputs.version }}.xcframework.zip
+# (R8) `url:` under a job's `environment:` key. The runner shows the address in
+# the deployment record for the environment and hands it to no process.
+url: https://pypi.org/project/scp-python/${{ inputs.version }}/
+# (R8) A `permissions:` entry, which grants the job's GITHUB_TOKEN one scope.
+# The runner mints the token from the value; no process reads the line.
+id-token: write # Required for PyPI Trusted Publishers (OIDC)
