@@ -604,9 +604,12 @@ public actor Context {
     /// that value would strand the bridge's per-context UCAN state for the
     /// life of the process — `close()` is the only path that releases it, and
     /// no SDK method clears a poison. The bridge reads the supervisor actor
-    /// and decides: it releases that state for an absent, poisoned, closing,
-    /// or terminal supervisor state, and it throws for `creating` and
-    /// `migrating_out`. `deinit` already gates on the same flag.
+    /// and decides: it releases that state for an absent, poisoned, or
+    /// terminal supervisor state, and it throws for the live non-terminal
+    /// states `creating`, `closing`, and `migrating_out`. A `closing` context
+    /// sits in the §5.9 cooperative window, and the supervisor dispatch a
+    /// release would skip carries the only `context:close` capability check
+    /// the close path has. `deinit` already gates on the same flag.
     ///
     /// - Throws: ``ScpError/Context(msg:code:)`` if the bridge close
     ///   operation fails.

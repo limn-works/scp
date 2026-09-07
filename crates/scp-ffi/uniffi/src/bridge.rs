@@ -11064,17 +11064,35 @@ impl Scp {
 
                 // Read the supervisor, not the handle's cached state. A close
                 // is the one lifecycle operation that stays valid after the
-                // supervisor took the context out of service on its own: a TTL
-                // expiry despawns the actor, and a peer's close moves the
-                // context to `Closing`. In both cases the close already
-                // happened, and this bridge still holds per-context UCAN state
-                // for the id that only this path releases. So an absent actor
-                // and a closing or terminal state skip the dispatch and fall
-                // through to the release below; only a live non-active state
-                // (`Creating`, `MigratingOut`) refuses the close. A poisoned
+                // supervisor took the context out of service for good: a TTL
+                // expiry despawns the actor, a peer's finalized close leaves
+                // `Closed`, and a migration leaves `Tombstoned`. In every one
+                // of those cases the context is past its cooperative window,
+                // and this bridge still holds per-context UCAN state for the
+                // id that only this path releases. So an absent actor and a
+                // terminal state skip the dispatch and fall through to the
+                // release below; every live non-terminal state (`Creating`,
+                // `Closing`, `MigratingOut`) refuses the close. A poisoned
                 // context (the crash watchdog despawned the actor and keeps only
                 // the sticky poison flag, ADR-049 §10) is a close that already
                 // happened, so it releases like an absent actor.
+                //
+                // `Closing` refuses rather than skipping, because skipping it
+                // released the per-context UCAN state with no capability check
+                // at all: `ttl::close_context` is the only `ContextClose` check
+                // on this path, it runs inside the dispatch, and the skip is
+                // what removes the dispatch. `Closing` is not terminal —
+                // `ttl::close_context` drives `Active -> Closing` and the
+                // context stays there until a separate `FinalizeClose` command
+                // runs — so the §5.9 cooperative window is a live state in
+                // which the event log, the nonce tracker, and the revocation
+                // list this bridge holds for the id are still in use. A caller
+                // holding no `context:close` capability could destroy all of
+                // them, for every identity sharing this bridge instance, by
+                // calling close during that window. The release path out of
+                // `Closing` is `context_finalize_close`, which transitions the
+                // context to `Closed`; a close then sees `Closed` and releases.
+                //
                 // `scp_core::context::ContextState` is the supervisor's own
                 // enum; the UniFFI-exported `ContextState` is a separate type,
                 // so this match names the core one explicitly.
@@ -11084,18 +11102,30 @@ impl Scp {
                     .await?
                 {
                     // No actor answers (a completed TTL expiry), the supervisor
-                    // reports `Poisoned`, or the actor reports a closing or
-                    // terminal state (a peer's close, a migration tombstone):
+                    // reports `Poisoned`, or the actor reports a terminal state
+                    // (a finalized close, an expiry, a migration tombstone):
                     // the close already happened.
                     None
                     | Some(
                         CoreContextState::Poisoned
-                        | CoreContextState::Closing
                         | CoreContextState::Closed
                         | CoreContextState::Expired
                         | CoreContextState::Tombstoned,
                     ) => true,
                     Some(CoreContextState::Active) => false,
+                    // `Closing` names its own successor call, because "context
+                    // must be active" is unreachable from the closing window:
+                    // the window ends at `Closed`, never back at `Active`.
+                    Some(CoreContextState::Closing) => {
+                        return Err(ScpError::Context {
+                            msg: "cannot close context in Closing state — the context is inside \
+                                  its cooperative closing window; call context_finalize_close to \
+                                  reach Closed, then close to release this bridge's state for the \
+                                  context"
+                                .to_owned(),
+                            code: codes::CTX_2017.to_owned(),
+                        });
+                    }
                     Some(other) => {
                         return Err(ScpError::Context {
                             msg: format!(
@@ -19611,6 +19641,67 @@ mod tests {
             *rt.block_on(handle.state.lock()),
             ContextState::Closed
         ));
+    }
+
+    /// A close refuses a context the supervisor holds in its §5.9 cooperative
+    /// closing window, releases none of that context's UCAN state, and refuses
+    /// an identity that holds no `ContextClose` capability.
+    ///
+    /// `ttl::close_context` drives `Active` -> `Closing` and the context stays
+    /// there until a separate `FinalizeClose` command runs, so `Closing` is a
+    /// live non-terminal state in which the per-context UCAN state — the event
+    /// log, the nonce tracker, the revocation list — is still in use. Treating
+    /// `Closing` as "the close already happened" skipped the supervisor
+    /// dispatch, and that dispatch carries the only `ContextClose` check on
+    /// this path: any handle holder, including an identity holding no
+    /// `context:close` capability, then released that state for every identity
+    /// sharing the bridge instance.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn close_refuses_a_closing_context_and_keeps_its_bridge_state() {
+        let rt = runtime();
+        let scp = scp_test();
+        let creator = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed for the creator");
+        let outsider = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed for the outsider");
+
+        let params = ContextParams {
+            ceiling: vec![
+                "messages:read".to_owned(),
+                "messages:write".to_owned(),
+                "context:close".to_owned(),
+            ],
+            ..encrypted_join_test_params()
+        };
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&creator), params))
+            .expect("context_create should succeed");
+        let context_id = handle.context_id();
+
+        // The creator's authorized close drives the supervisor into the
+        // cooperative window and releases the UCAN state, so re-register it:
+        // this case asks what a close does to a LIVE entry, not an absent one.
+        rt.block_on(scp.context_close(Arc::clone(&handle), Arc::clone(&creator)))
+            .expect("the creator's close should succeed");
+        scp.inner.ensure_ucan_registered(&context_id);
+        assert_eq!(
+            rt.block_on(scp.inner.read_live_context_state(&context_id))
+                .expect("state read"),
+            Some(scp_core::context::ContextState::Closing),
+            "the creator's close must leave the supervisor inside the cooperative window"
+        );
+
+        let err = rt
+            .block_on(scp.context_close(Arc::clone(&handle), outsider))
+            .expect_err("close must refuse a context inside its closing window");
+        assert!(err.to_string().contains("Closing"), "close reported: {err}");
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_some(),
+            "a refused close must leave the per-context UCAN state registered"
+        );
     }
 
     /// A close of a poisoned context succeeds idempotently and releases the

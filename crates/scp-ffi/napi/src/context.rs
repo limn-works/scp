@@ -1657,14 +1657,29 @@ pub(crate) async fn context_close_on(
 
     // Read the supervisor, not the handle's cached string. A close is the one
     // lifecycle operation that stays valid after the supervisor took the
-    // context out of service on its own: a TTL expiry despawns the actor, the
-    // crash watchdog poisons the context and despawns the actor, and a peer's
-    // close moves the context to `Closing`. In every one of those cases the
-    // close already happened, and this bridge still holds a `UcanContextState`
-    // for the id that only this path releases. So an absent actor, a poisoned
-    // context, and a closing or terminal state skip the dispatch and fall
-    // through to the release below; only a live non-active state (`Creating`,
-    // `MigratingOut`) refuses the close.
+    // context out of service for good: a TTL expiry despawns the actor, the
+    // crash watchdog poisons the context and despawns the actor, a peer's
+    // finalized close leaves `Closed`, and a migration leaves `Tombstoned`.
+    // In every one of those cases the context is past its cooperative window,
+    // and this bridge still holds a `UcanContextState` for the id that only
+    // this path releases. So an absent actor and a terminal state skip the
+    // dispatch and fall through to the release below; every live non-terminal
+    // state (`Creating`, `Closing`, `MigratingOut`) refuses the close.
+    //
+    // `Closing` refuses rather than skipping, because skipping it released
+    // the `UcanContextState` with no capability check at all:
+    // `ttl::close_context` is the only `ContextClose` check on this path, it
+    // runs inside the dispatch, and the skip is what removes the dispatch.
+    // `Closing` is not terminal — `ttl::close_context` drives `Active ->
+    // Closing` and the context stays there until a separate `FinalizeClose`
+    // command runs — so the §5.9 cooperative window is a live state in which
+    // the outlet registry, the outlet handlers, the session store, the event
+    // log, the nonce tracker, and the revocation list this bridge holds for
+    // the id are still in use. A caller holding no `context:close` capability
+    // could destroy all of them, for every identity sharing this bridge
+    // instance, by calling close during that window. The release path out of
+    // `Closing` is `contextFinalizeClose`, which transitions the context to
+    // `Closed`; a close then sees `Closed` and releases.
     let close_already_happened =
         match crate::runtime::read_live_context_state(bi, &handle.context_id)
             .await
@@ -1672,18 +1687,30 @@ pub(crate) async fn context_close_on(
         {
             // No actor answers (a completed TTL expiry), the supervisor reports
             // `Poisoned` (the watchdog despawned the actor and keeps only the
-            // sticky poison flag, ADR-049 §10), or the actor reports a closing
-            // or terminal state (a peer's close, a migration tombstone): the
+            // sticky poison flag, ADR-049 §10), or the actor reports a terminal
+            // state (a finalized close, an expiry, a migration tombstone): the
             // close already happened.
             None
             | Some(
                 scp_core::context::ContextState::Poisoned
-                | scp_core::context::ContextState::Closing
                 | scp_core::context::ContextState::Closed
                 | scp_core::context::ContextState::Expired
                 | scp_core::context::ContextState::Tombstoned,
             ) => true,
             Some(scp_core::context::ContextState::Active) => false,
+            // `Closing` names its own successor call, because "context must be
+            // active" is unreachable from the closing window: the window ends
+            // at `Closed`, never back at `Active`.
+            Some(scp_core::context::ContextState::Closing) => {
+                return Err(ScpNapiError::Context {
+                    message: "cannot close context in 'closing' state -- the context is inside \
+                              its cooperative closing window; call contextFinalizeClose to reach \
+                              'closed', then close to release this bridge's state for the context"
+                        .to_owned(),
+                    code: codes::CTX_2017.to_owned(),
+                }
+                .into());
+            }
             Some(other) => {
                 return Err(ScpNapiError::Context {
                     message: format!(
@@ -6674,6 +6701,71 @@ mod tests {
         super::context_close_on(&bi, &handle, creator.to_owned())
             .await
             .expect("a repeated close must stay idempotent");
+    }
+
+    /// A close refuses a context the supervisor holds in its §5.9 cooperative
+    /// closing window, releases none of that context's bridge state, and
+    /// refuses a caller that holds no `ContextClose` capability.
+    ///
+    /// `ttl::close_context` drives `Active` -> `Closing` and the context stays
+    /// there until a separate `FinalizeClose` command runs, so `Closing` is a
+    /// live non-terminal state in which the `UcanContextState` — the outlet
+    /// registry, the outlet handlers, the session store, the event log, the
+    /// nonce tracker, the revocation list — is still in use. Treating
+    /// `Closing` as "the close already happened" skipped the supervisor
+    /// dispatch, and that dispatch carries the only `ContextClose` check on
+    /// this path: any handle holder, including an identity holding no
+    /// `context:close` capability, then released that state for every identity
+    /// sharing the bridge instance.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_refuses_a_closing_context_and_keeps_its_bridge_state() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = Arc::clone(&scp.inner);
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let params_json = serde_json::json!({
+            "ceiling": ["messages:read", "messages:write", "context:close"],
+            "memoryScope": "ephemeral",
+            "governance": "single_admin",
+        })
+        .to_string();
+        let handle = super::context_create_on(&bi, &identity, params_json)
+            .await
+            .expect("context_create should succeed");
+        let ctx_id = handle.context_id.clone();
+
+        // The creator's authorized close drives the supervisor into the
+        // cooperative window and releases the bridge state, so re-register the
+        // state: this case asks what a close does to a LIVE entry, not to an
+        // absent one.
+        super::context_close_on(&bi, &handle, identity.inner.did.clone())
+            .await
+            .expect("the creator's close should succeed");
+        crate::runtime::register_test_context(&bi, &ctx_id);
+        assert_eq!(
+            crate::runtime::read_live_context_state(&bi, &ctx_id)
+                .await
+                .expect("state read"),
+            Some(scp_core::context::ContextState::Closing),
+            "the creator's close must leave the supervisor inside the cooperative window"
+        );
+
+        let outsider = "did:key:z6MkNapiClosingWindowOutsider".to_owned();
+        let err = super::context_close_on(&bi, &handle, outsider)
+            .await
+            .expect_err("close must refuse a context inside its closing window");
+        assert!(
+            err.to_string()
+                .contains("cannot close context in 'closing'"),
+            "close reported: {err}"
+        );
+        assert!(
+            crate::runtime::ucan_registry(&bi).contains_key(&ctx_id),
+            "a refused close must leave the bridge state registered"
+        );
     }
 
     /// A close of a poisoned context succeeds idempotently and releases the
