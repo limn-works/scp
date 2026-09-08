@@ -28,7 +28,7 @@ BlobStorage trait (store/get/query/delete/purge_expired with routing_id + TTL)
 Backend adapter (SQLite, redb, PostgreSQL, S3-compatible, in-memory)
 ```
 
-The `BlobStore` trait (defined in `scp-transport/native/`) handles encrypted message blobs with routing metadata and time-to-live semantics. Relay operators choose a backend based on deployment scale.
+The `BlobStorage` trait (defined in `scp-transport/native/storage.rs`) handles encrypted message blobs with routing metadata and time-to-live semantics. Relay operators choose a backend based on deployment scale.
 
 ### Why Thin Trait + Thick Protocol Layer
 
@@ -563,7 +563,7 @@ A **custodial remote thin client** — the node holding the protocol engine, MLS
 
 ### PostgreSQL Is NOT First-Party for Client Storage
 
-The client SDK does not need Postgres — SQLite covers all native platforms including server-side agents. Server-side deployments wanting Postgres can implement the 6-method trait trivially. PostgreSQL IS first-party for `BlobStore` (relay storage) — see section 17.7.
+The client SDK does not need Postgres — SQLite covers all native platforms including server-side agents. Server-side deployments wanting Postgres can implement the 6-method trait trivially. PostgreSQL IS first-party for the `BlobStorage` trait (relay storage) — see section 17.7.
 
 ### FilesystemStorage
 
@@ -811,10 +811,10 @@ The following are explicitly named as "build your own" — not first-party, but 
 
 | Technology | Trait | Notes |
 |------------|-------|-------|
-| RocksDB | `BlobStore` | Best for extremely write-heavy relays. C++ dependency, heavy binary. |
-| LMDB (heed/heed3) | `Storage` or `BlobStore` | Best read performance. heed3 has encryption-at-rest. C dependency. |
-| MySQL/MariaDB | `BlobStore` | One sqlx feature flag away from the PostgreSQL adapter. |
-| Valkey (Redis fork, BSD-3) | -- | Cache layer in front of persistent BlobStore. Not a direct adapter. |
+| RocksDB | `BlobStorage` | Best for extremely write-heavy relays. C++ dependency, heavy binary. |
+| LMDB (heed/heed3) | `Storage` or `BlobStorage` | Best read performance. heed3 has encryption-at-rest. C dependency. |
+| MySQL/MariaDB | `BlobStorage` | One sqlx feature flag away from the PostgreSQL adapter. |
+| Valkey (Redis fork, BSD-3) | -- | Cache layer in front of a persistent `BlobStorage` backend. Not a direct adapter. |
 
 **Explicitly excluded:** sled (perpetual beta, unstable on-disk format), LevelDB (superseded by RocksDB), FoundationDB/TiKV (cluster-only, too heavy for protocol-level storage), DuckDB (OLAP, wrong use case), Redis (non-OSI license since 2024 — use Valkey instead).
 

@@ -5,6 +5,19 @@ color: red
 memory: project
 ---
 
+## Verdict criterion
+
+**Criterion:** Report an AI-layer change finished only after you have read the code that handles
+each way a model reply can fail — malformed output, a truncated stream, an exceeded token budget,
+a rate-limited retry — and confirmed that each path returns a typed error to its caller instead of
+a default, a placeholder, or a fabricated reply. Report it unfinished as soon as one response
+shape reaches a parser branch that does not handle it.
+
+**Indicators, not the criterion.** The ownership and responsibility lists below name where those
+paths live. They tell you where to look; the criterion above decides. Working every one of them
+does not satisfy the criterion, and a failure path that matches nothing below still has to return
+a typed error.
+
 # AI Agent
 
 **Role**: Intelligence layer for all LLM interactions—how to communicate with AI, not how to transport the data.
