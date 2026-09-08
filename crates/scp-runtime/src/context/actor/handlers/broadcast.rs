@@ -818,6 +818,18 @@ mod tests {
         admission: BroadcastAdmission,
         authors: &[&str],
     ) -> (ClassSCell, String) {
+        let (state, ctx_hex) = build_broadcast_state_with_authors(admission, authors);
+        (ClassSCell::new(state), ctx_hex)
+    }
+
+    /// The [`PerContextState`] behind [`build_broadcast_cell_with_authors`],
+    /// handed out BEFORE the [`ClassSCell`] wraps it so a test can seed a field
+    /// the cell exposes no `&mut` for — the governance engine, which
+    /// `execute_governance_action` reads the authoritative proposal from.
+    fn build_broadcast_state_with_authors(
+        admission: BroadcastAdmission,
+        authors: &[&str],
+    ) -> (PerContextState, String) {
         let ctx_bytes = [0x5b; 32];
         let mut state = PerContextState::new_for_test_broadcast(
             ctx_bytes,
@@ -859,7 +871,7 @@ mod tests {
             .transition_to(&ContextState::Active)
             .expect("activate");
 
-        (ClassSCell::new(state), ctx_hex)
+        (state, ctx_hex)
     }
 
     /// Convenience: an ACTIVE, GATED broadcast cell.
@@ -1703,15 +1715,15 @@ mod tests {
     // checkpoint position by N-1 for every invocation.
     // =======================================================================
 
-    /// Event log that fails `KeyEpochAdvance` appends from the
-    /// `fail_kea_from`-th one onward (0 = fail every KEA), and succeeds for
-    /// every other event type. This models the exact partial-progress shape the
-    /// governance KEA loops must signal: the anchor leaf lands, then a KEA leaf
-    /// mid-sequence does not.
+    /// Event log that fails the `fail_kea_at`-th `KeyEpochAdvance` append
+    /// (0-indexed) and succeeds for every other append. This models the exact
+    /// partial-progress shape the governance KEA loops must survive: the anchor
+    /// leaf lands, one KEA leaf mid-sequence does not, and the leaves after it
+    /// still must be attempted.
     struct KeaFailingEventLog {
         appended: Arc<AtomicUsize>,
         kea_seen: AtomicUsize,
-        fail_kea_from: usize,
+        fail_kea_at: usize,
     }
     #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for KeaFailingEventLog {
@@ -1731,7 +1743,7 @@ mod tests {
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             if event == scp_event_log::EventType::KeyEpochAdvance {
                 let seen = self.kea_seen.fetch_add(1, Ordering::SeqCst);
-                if seen >= self.fail_kea_from {
+                if seen == self.fail_kea_at {
                     return Err(
                         scp_protocol::context::builder::ContextCreationError::EventLogFailed(
                             "fixture: KeyEpochAdvance append deliberately fails".to_owned(),
@@ -1752,12 +1764,12 @@ mod tests {
 
     /// Swap `deps.event_log` for a [`KeaFailingEventLog`] and return the shared
     /// success-append counter.
-    fn inject_kea_failing_log(deps: &mut ActorDeps, fail_kea_from: usize) -> Arc<AtomicUsize> {
+    fn inject_kea_failing_log(deps: &mut ActorDeps, fail_kea_at: usize) -> Arc<AtomicUsize> {
         let appended = Arc::new(AtomicUsize::new(0));
         deps.event_log = Arc::new(KeaFailingEventLog {
             appended: Arc::clone(&appended),
             kea_seen: AtomicUsize::new(0),
-            fail_kea_from,
+            fail_kea_at,
         });
         appended
     }
@@ -1847,19 +1859,21 @@ mod tests {
         );
     }
 
-    /// `execute_rotate_content_keys` must SURFACE a `KeyEpochAdvance` append
-    /// failure instead of swallowing it, and must still credit the leaves that
-    /// landed before it.
+    /// `execute_rotate_content_keys` must RETURN `Ok` when a `KeyEpochAdvance`
+    /// append fails, must keep appending the remaining leaves, and must credit
+    /// exactly the leaves that landed.
     ///
-    /// This is durability-SIGNALLING, not fail-atomicity: the rotation and the
-    /// `ContentKeysRotated` anchor leaf are already durable when the loop runs,
-    /// so `Err` here means "the log is short some leaves", not "nothing
-    /// happened". The assertion pins exactly that: `Err` returned AND the
-    /// pre-failure leaves credited.
+    /// The rotation and the `ContentKeysRotated` anchor leaf are already durable
+    /// when the loop runs, so an `Err` here would not undo them — it would tell
+    /// `execute_governance_action` to remove the proposal id from
+    /// `executed_proposals`, re-arming replay of an action that advances every
+    /// author's epoch again (see
+    /// `key_epoch_advance_failure_keeps_executed_proposal_marker`).
     #[tokio::test]
-    async fn rotate_content_keys_surfaces_key_epoch_advance_append_failure() {
+    async fn rotate_content_keys_survives_key_epoch_advance_append_failure() {
         let (mut deps, _appends) = build_deps().await;
-        // Anchor leaf + first KEA succeed; the SECOND KEA (of three) fails.
+        // Anchor leaf + KEA #0 land; KEA #1 (of three) fails; KEA #2 must still
+        // be attempted and must land.
         let appends = inject_kea_failing_log(&mut deps, 1);
         let (mut cell, ctx_hex) =
             build_broadcast_cell_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
@@ -1875,26 +1889,28 @@ mod tests {
         .await;
 
         assert!(
-            matches!(result, Err(ContextError::EventLogFailed(_))),
-            "a KeyEpochAdvance append failure must reach the caller as \
-             EventLogFailed, not be swallowed into Ok(()); got {result:?}"
+            result.is_ok(),
+            "a KeyEpochAdvance append failure must NOT become the dispatch's \
+             error: `execute_governance_action` rolls back the executed-proposal \
+             replay marker on any dispatch error, and the rotation is already \
+             durable here; got {result:?}"
         );
         assert_eq!(
             appends.load(Ordering::SeqCst),
-            2,
-            "ContentKeysRotated + the first KeyEpochAdvance became durable"
+            3,
+            "ContentKeysRotated + KEA #0 + KEA #2 became durable — the loop must \
+             continue past the failed KEA #1 rather than abort on it"
         );
         assert_eq!(
-            cell.checkpoint_events_since, 2,
-            "the inline per-leaf bump must credit the leaves that landed \
-             (ContentKeysRotated + first KeyEpochAdvance) even though a later \
-             leaf failed — a coalesced end-of-loop bump would credit none"
+            cell.checkpoint_events_since, 3,
+            "the inline per-leaf bump must credit exactly the three leaves that \
+             landed and must not credit the failed one"
         );
     }
 
     /// `execute_revoke`'s governance-ban KeyEpochAdvance loop, same contract.
     #[tokio::test]
-    async fn revoke_surfaces_key_epoch_advance_append_failure() {
+    async fn revoke_survives_key_epoch_advance_append_failure() {
         use scp_protocol::context::governance::AccessScope;
 
         let (mut deps, _appends) = build_deps().await;
@@ -1908,7 +1924,8 @@ mod tests {
             "member".to_owned(),
             vec![],
         );
-        // AccessRevoked + first KEA succeed; the SECOND KEA (of three) fails.
+        // AccessRevoked + KEA #0 land; KEA #1 (of three) fails; KEA #2 must
+        // still be attempted and must land.
         let appends = inject_kea_failing_log(&mut deps, 1);
         reset_leaf_counter(&mut cell);
 
@@ -1923,19 +1940,119 @@ mod tests {
         .await;
 
         assert!(
-            matches!(result, Err(ContextError::EventLogFailed(_))),
-            "a KeyEpochAdvance append failure must reach the caller as \
-             EventLogFailed, not be swallowed; got {result:?}"
+            result.is_ok(),
+            "a KeyEpochAdvance append failure must NOT become the dispatch's \
+             error: the ban and every author-key rotation are already durable \
+             here, and `execute_governance_action` rolls back the \
+             executed-proposal replay marker on any dispatch error; got {result:?}"
         );
         assert_eq!(
             appends.load(Ordering::SeqCst),
-            2,
-            "AccessRevoked + the first KeyEpochAdvance became durable"
+            3,
+            "AccessRevoked + KEA #0 + KEA #2 became durable — the loop must \
+             continue past the failed KEA #1 rather than abort on it"
         );
         assert_eq!(
-            cell.checkpoint_events_since, 2,
-            "the inline per-leaf bump must credit AccessRevoked and the first \
-             KeyEpochAdvance even though a later leaf failed"
+            cell.checkpoint_events_since, 3,
+            "the inline per-leaf bump must credit exactly the three leaves that \
+             landed and must not credit the failed one"
+        );
+    }
+
+    /// THE REPLAY GATE. A `KeyEpochAdvance` append failure must leave the
+    /// proposal id in `executed_proposals`.
+    ///
+    /// `execute_governance_action` removes that id on ANY dispatch error and
+    /// persists the removal fail-closed, so a dispatch error raised after the
+    /// ban is durable lets a caller re-send the same proposal id.
+    /// `governance_ban_subscriber` has no already-banned early return: the second
+    /// run advances every author's epoch a second time and writes a second
+    /// `AccessRevoked` leaf, so this member's leaf count and Merkle root diverge
+    /// permanently from every member that applied the commit once (§9.9.3).
+    ///
+    /// This test drives the whole `execute_governance_action` path — engine
+    /// proposal, replay marker, dispatch, finalize — because the marker is the
+    /// thing under test and the helper-level tests above cannot observe it.
+    #[tokio::test]
+    async fn key_epoch_advance_failure_keeps_executed_proposal_marker() {
+        use scp_protocol::context::governance::{
+            AccessScope, GovernanceAction, GovernanceContext, GovernanceEngine, KeyResolver,
+            SingleAdminEngine,
+        };
+
+        let (mut deps, _appends) = build_deps().await;
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
+
+        // A SingleAdminEngine approves the admin's own proposal on submission,
+        // which is the cheapest way to hand `execute_governance_action` an
+        // engine-tracked `Approved` proposal. Its resolver must return the
+        // creator's key or the implicit admin vote fails verification.
+        let creator_vk = creator_key().verifying_key();
+        let resolver: KeyResolver = Arc::new(move |did: &DID, kid: SigningKeyId| {
+            if did.as_ref() == CREATOR_DID && kid == SigningKeyId::Active {
+                Some(creator_vk)
+            } else {
+                None
+            }
+        });
+        let mut engine = SingleAdminEngine::new(DID(CREATOR_DID.to_owned()), resolver);
+        let (proposal, _events) = engine
+            .propose(
+                &DID(CREATOR_DID.to_owned()),
+                GovernanceAction::RevokeAccess {
+                    did: DID(SUBSCRIBER_DID.to_owned()),
+                    access: AccessScope::Read,
+                },
+                &GovernanceContext {
+                    context_id: ctx_hex.clone(),
+                    members: vec![(DID(CREATOR_DID.to_owned()), "admin".to_owned())],
+                    admin_dids: vec![DID(CREATOR_DID.to_owned())],
+                    current_epoch: Some(0),
+                    now: 1_700_000_000,
+                },
+                &creator_key(),
+            )
+            .expect("single-admin propose approves immediately");
+        let proposal_id = proposal.proposal_id;
+        state.governance.engine = Box::new(engine);
+
+        let mut cell = ClassSCell::new(state);
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
+            .await
+            .expect("open subscribe");
+        cell.class_c_view().membership_class_c_mut().add_member(
+            DID(SUBSCRIBER_DID.to_owned()),
+            "member".to_owned(),
+            vec![],
+        );
+        // KEA #1 of three fails, after the ban and KEA #0 are durable.
+        let _appends = inject_kea_failing_log(&mut deps, 1);
+
+        let result = crate::context::governance_helpers::execute_governance_action(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &proposal_id,
+            Some(&DID(CREATOR_DID.to_owned())),
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "the revoke's effects all landed, so the action must report success; \
+             got {result:?}"
+        );
+        assert!(
+            cell.governance
+                .class_s
+                .executed_proposals
+                .contains_key(&proposal_id),
+            "the executed-proposal replay marker must survive a KeyEpochAdvance \
+             append failure — dropping it lets the same proposal id run \
+             `governance_ban_subscriber` a second time, advancing every author's \
+             epoch again and diverging this member's Merkle root (§9.9.3)"
         );
     }
 }

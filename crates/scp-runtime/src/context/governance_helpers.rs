@@ -988,44 +988,70 @@ pub async fn execute_revoke(
     // rotated by the governance ban. Each rotation advances by exactly 1, so
     // old_epoch = new_epoch.saturating_sub(1).
     //
-    // DURABILITY-SIGNALLING, NOT FAIL-ATOMIC. `?`-propagating an append failure
-    // rolls nothing back: by the time this loop runs, the ban and the key
-    // rotation are already durably persisted (the fail-closed
+    // THIS LOOP MUST NOT RETURN `Err`. `execute_governance_action` removes the
+    // proposal id from `executed_proposals` on ANY dispatch error and persists
+    // that removal fail-closed, which re-arms the replay gate for a proposal
+    // whose effects already landed. By the time this loop runs, the ban and
+    // every author-key rotation are durably persisted (the fail-closed
     // `commit_class_s_keep` above) and the `AccessRevoked` anchor leaf is
-    // already appended. A failure on leaf k of n returns `Err` while leaving
-    // leaves 0..k durable and leaves k..n absent, with no repair path. What `?`
-    // buys over the previous warn-and-continue is that the failure reaches the
-    // caller instead of being swallowed, giving operators a concrete error
-    // signal that the log is short some leaves — the same rationale as the
-    // GovernanceDeadlockRecovery companion leaf in
-    // `execute_reconfigure_governance`.
+    // appended, so an `Err` here would let a caller re-send the same proposal
+    // id: `governance_ban_subscriber` rotates every author unconditionally (it
+    // has no already-banned early return), so the second run advances every
+    // author's epoch a SECOND time and writes a second `AccessRevoked` leaf.
+    // This member would then hold more leaves, at a higher epoch, than every
+    // member that applied the commit once, and the §9.9.3 equal-count /
+    // equal-root test would fail on it permanently.
     //
-    // The counter is bumped INLINE after each successful append, never
-    // coalesced at the end, so the leaves that did land are still credited when
-    // a later one fails.
+    // The failure still reaches an operator: each miss logs at ERROR with the
+    // context, the author DID, and the underlying error. A log line is an
+    // honest signal that the log is short a leaf; an `Err` return is a false
+    // one, because it reports "the revoke did not happen" about a revoke that
+    // did happen.
     //
-    // Aborting here cannot skip the H7 sender-key rotation below: `rotated_authors`
-    // is non-empty only for a broadcast context, and `needs_sender_key_rotation`
-    // requires `broadcast_context.is_none()` — the two are mutually exclusive.
+    // The counter is bumped INLINE in the success arm, never coalesced at the
+    // end, so the leaves that did land are still credited when a later one
+    // fails.
     for rotation in &rotated_authors {
         let old_epoch = rotation.new_epoch.saturating_sub(1);
-        let payload = scp_event_log::payload::encode_payload(
+        match scp_event_log::payload::encode_payload(
             &scp_event_log::payload::KeyEpochAdvancePayload {
                 old_epoch,
                 new_epoch: rotation.new_epoch,
             },
-        )
-        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-        deps.event_log
-            .append_context_event_with_payload(
-                &context_id_bytes,
-                scp_event_log::EventType::KeyEpochAdvance,
-                rotation.author_did.as_str(),
-                payload,
-                timestamp_secs,
-            )
-            .await?;
-        *cell.class_c_view().checkpoint_events_since_mut() += 1;
+        ) {
+            Ok(payload) => {
+                if let Err(e) = deps
+                    .event_log
+                    .append_context_event_with_payload(
+                        &context_id_bytes,
+                        scp_event_log::EventType::KeyEpochAdvance,
+                        rotation.author_did.as_str(),
+                        payload,
+                        timestamp_secs,
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        context_id = %context_id,
+                        author_did = %rotation.author_did,
+                        error = %e,
+                        "KeyEpochAdvance event-log append failed after governance ban — \
+                         the event log is short one leaf for this author"
+                    );
+                } else {
+                    *cell.class_c_view().checkpoint_events_since_mut() += 1;
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    context_id = %context_id,
+                    author_did = %rotation.author_did,
+                    error = %e,
+                    "KeyEpochAdvance payload encode failed after governance ban — \
+                     the event log is short one leaf for this author"
+                );
+            }
+        }
     }
 
     // H7: Rotate sender key after write-side revocation.
@@ -3199,20 +3225,22 @@ pub async fn execute_rotate_content_keys(
     // and therefore the Merkle root — is identical on every member and across
     // replays.
     //
-    // DURABILITY-SIGNALLING, NOT FAIL-ATOMIC. `?`-propagating an append failure
-    // rolls nothing back: the rotation is already durably persisted (the
-    // fail-closed `commit_class_s_keep` above) and the `ContentKeysRotated`
-    // anchor leaf is already appended. A failure on leaf k of n returns `Err`
-    // while leaving leaves 0..k durable and leaves k..n absent, with no repair
-    // path. What `?` buys over the previous warn-and-continue is that the
-    // failure reaches the caller instead of being swallowed, giving operators a
-    // concrete error signal that the log is short some leaves — the same
-    // rationale as the GovernanceDeadlockRecovery companion leaf in
-    // `execute_reconfigure_governance`.
+    // THIS LOOP MUST NOT RETURN `Err`, for the reason spelled out at the
+    // matching loop in `execute_revoke`: `execute_governance_action` removes the
+    // proposal id from `executed_proposals` on ANY dispatch error and persists
+    // that removal fail-closed, so an `Err` raised after the rotation is durable
+    // re-arms replay of a non-idempotent action. `rotate_all_author_keys`
+    // advances every author unconditionally, so a replayed RotateContentKeys
+    // advances every epoch a second time and writes a second
+    // `ContentKeysRotated` leaf, which diverges this member's leaf count and
+    // Merkle root from every member that applied the commit once (§9.9.3).
     //
-    // The counter is bumped INLINE after each successful append, never coalesced
-    // at the end, so the leaves that did land are still credited when a later
-    // one fails.
+    // The failure still reaches an operator: each miss logs at ERROR with the
+    // context, the author DID, and the underlying error.
+    //
+    // The counter is bumped INLINE in the success arm, never coalesced at the
+    // end, so the leaves that did land are still credited when a later one
+    // fails.
     //
     // NOTE: `advance.timestamp` (milliseconds) is not used here — the event-log
     // append takes `timestamp_secs` directly. The ms field is carried by
@@ -3222,23 +3250,45 @@ pub async fn execute_rotate_content_keys(
     // increments by exactly 1 (pre-validated, sound by construction).
     for advance in &key_advances {
         let old_epoch = advance.new_epoch.saturating_sub(1);
-        let payload = scp_event_log::payload::encode_payload(
+        match scp_event_log::payload::encode_payload(
             &scp_event_log::payload::KeyEpochAdvancePayload {
                 old_epoch,
                 new_epoch: advance.new_epoch,
             },
-        )
-        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-        deps.event_log
-            .append_context_event_with_payload(
-                &context_id_bytes,
-                scp_event_log::EventType::KeyEpochAdvance,
-                advance.author_did.as_str(),
-                payload,
-                timestamp_secs,
-            )
-            .await?;
-        *cell.class_c_view().checkpoint_events_since_mut() += 1;
+        ) {
+            Ok(payload) => {
+                if let Err(e) = deps
+                    .event_log
+                    .append_context_event_with_payload(
+                        &context_id_bytes,
+                        scp_event_log::EventType::KeyEpochAdvance,
+                        advance.author_did.as_str(),
+                        payload,
+                        timestamp_secs,
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        context_id = %context_id,
+                        author_did = %advance.author_did,
+                        error = %e,
+                        "KeyEpochAdvance event-log append failed after RotateContentKeys — \
+                         the event log is short one leaf for this author"
+                    );
+                } else {
+                    *cell.class_c_view().checkpoint_events_since_mut() += 1;
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    context_id = %context_id,
+                    author_did = %advance.author_did,
+                    error = %e,
+                    "KeyEpochAdvance payload encode failed after RotateContentKeys — \
+                     the event log is short one leaf for this author"
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -3536,6 +3586,14 @@ pub async fn execute_approve_spend(
             timestamp_secs,
         )
         .await?;
+    // Class-C counter bump for the SpendApproved leaf, inline immediately after
+    // its `?`-append. The counter must track the true durable-leaf count
+    // (governance_logic.rs:156-158): `create_checkpoint_if_due_view`
+    // (queries_helpers.rs) gates BOTH §9.9.3 triggers on it — `events_since >=
+    // 50` and `events_since > 0 && elapsed >= 600` — so a context whose only
+    // governance traffic is ApproveSpend would never mint a checkpoint at all,
+    // and a mixed context drifts its checkpoint position by one leaf per grant.
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -6446,6 +6504,62 @@ mod commit_broadcast_retry_tests {
             .build_actor_deps(&DID(ADMIN.to_owned()))
             .await
             .expect("build_actor_deps")
+    }
+
+    /// `execute_approve_spend` appends one durable `SpendApproved` leaf, so
+    /// `checkpoint_events_since` must advance by one.
+    ///
+    /// `create_checkpoint_if_due_view` (queries_helpers.rs) gates BOTH §9.9.3
+    /// triggers on this counter — `events_since >= 50` and `events_since > 0 &&
+    /// elapsed >= 600` — so a context whose only governance traffic is
+    /// `ApproveSpend` would never mint a consistency checkpoint at all while its
+    /// log kept growing.
+    #[tokio::test]
+    async fn approve_spend_credits_its_durable_leaf() {
+        let deps = build_deps(
+            Box::new(RecordingTransport {
+                sends: Arc::new(AtomicUsize::new(0)),
+                fail: false,
+            }),
+            Box::new(CountingOkPersistence {
+                persists: Arc::new(AtomicUsize::new(0)),
+                last_snapshot: Arc::new(Mutex::new(None)),
+            }),
+        )
+        .await;
+        let mut state = fresh_state();
+        state
+            .handle
+            .transition_to(&scp_protocol::context::ContextState::Active)
+            .expect("activate");
+        state
+            .membership
+            .add_member(DID(TARGET.to_owned()), "member".to_owned(), vec![]);
+        let mut cell = ClassSCell::new(state);
+        *cell.class_c_view().checkpoint_events_since_mut() = 0;
+
+        super::execute_approve_spend(
+            &mut cell,
+            &deps,
+            &ctx_hex(),
+            &DID(TARGET.to_owned()),
+            scp_protocol::economy::types::Amount::new(500),
+            "test-purpose",
+            super::CommitMeta {
+                pid: [0x4e; 32],
+                actor_did: ADMIN,
+                timestamp_secs: 1_700_000_000,
+            },
+        )
+        .await
+        .expect("approve spend succeeds");
+
+        assert_eq!(
+            cell.checkpoint_events_since, 1,
+            "checkpoint_events_since must equal the durable-leaf count: the \
+             SpendApproved leaf. Crediting zero freezes both §9.9.3 checkpoint \
+             triggers, which read this counter"
+        );
     }
 
     /// `execute_reconfigure_governance` appends TWO durable leaves —
