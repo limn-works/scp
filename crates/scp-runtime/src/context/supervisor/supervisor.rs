@@ -19274,6 +19274,174 @@ mod tests {
         );
     }
 
+    /// Builds an `OutletRegistration` that
+    /// `OutletRegistration::validate_registrable` accepts: two properties on each
+    /// schema (the §6.2/§9.2.1 specificity floor is `MIN_SCHEMA_FIELDS == 2`), an
+    /// `Action` kind with no cost, and an operator DID that parses.
+    fn importable_outlet_fixture(
+        outlet_id: &str,
+    ) -> scp_protocol::context::outlets::OutletRegistration {
+        use scp_protocol::context::outlets::{OutletKind, OutletRegistration, OutletSchema};
+        OutletRegistration {
+            outlet_id: outlet_id.to_owned(),
+            kind: OutletKind::Action,
+            name: outlet_id.to_owned(),
+            description: "imported outlet fixture".to_owned(),
+            schema: OutletSchema {
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"lhs": {"type": "number"}, "rhs": {"type": "number"}}
+                }),
+                output_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"sum": {"type": "number"}, "carry": {"type": "boolean"}}
+                }),
+                aggregate_schema: None,
+            },
+            implementation_hash: [7u8; 32],
+            test_vectors: vec![],
+            message_catalog: Vec::new(),
+            operator_did: DID("did:dht:z6MkImportedOutletOperator".to_owned()),
+            cost: None,
+            registered_at: 0,
+            signature: Vec::new(),
+        }
+    }
+
+    /// Signs `snapshot` as `creator` and imports it, returning whatever
+    /// `Supervisor::import_context` returned. Every outlet-registry import test
+    /// below drives this one helper, so the only difference between them is the
+    /// `registered_outlets` vector the caller put on the snapshot.
+    async fn import_snapshot_signed_by_creator(
+        snapshot: crate::context::state::ContextSnapshot,
+        creator: &str,
+        ctx_id_bytes: &[u8; 32],
+    ) -> Result<crate::context::ContextHandle, ContextError> {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup = supervisor_with_clock_persistence_and_merkle_log(
+            clock_dyn,
+            Box::new(MapPersistence::default()),
+        );
+        let event_log_data =
+            create_event_log_data(ctx_id_bytes, &[scp_event_log::EventType::ContextCreated]).await;
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let export = crate::context::export_import::create_export(
+            snapshot,
+            event_log_data,
+            DID(creator.to_owned()),
+            crate::context::export_import::ExportScope::Full,
+            &scp_clock::SystemClock,
+            |hash: &[u8; 32]| Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes()),
+        )
+        .expect("build a valid signed full export");
+
+        sup.import_context(export, &verifying_key, None).await
+    }
+
+    /// The import path installs `export.snapshot.registered_outlets` into the
+    /// live `GovernanceState::registered_outlets`, which
+    /// `actor::handlers::saga::validate_input_specificity` reads as an
+    /// authorization grant. A creator-signed export carrying MORE than
+    /// `MAX_REGISTERED_OUTLETS` registrations must be refused, exactly as the
+    /// genesis path and `execute_register_outlet` refuse an over-cap set — the
+    /// snapshot signature authenticates the writer of those bytes and does not
+    /// establish that the registry is admissible (GitHub #2250).
+    #[tokio::test]
+    async fn import_rejects_an_over_cap_outlet_registry() {
+        let creator = "did:key:import-outlet-cap-creator";
+        let context_id = "import-outlet-cap-ctx";
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+        let mut snapshot = import_test_snapshot(context_id, creator);
+        snapshot.registered_outlets = (0..=crate::context::state::MAX_REGISTERED_OUTLETS)
+            .map(|i| importable_outlet_fixture(&format!("outlet-{i}")))
+            .collect();
+
+        let err = import_snapshot_signed_by_creator(snapshot, creator, &ctx_id_bytes)
+            .await
+            .expect_err("an over-cap imported outlet registry must be refused");
+        let ContextError::ImportRejected { reason } = &err else {
+            panic!("expected ImportRejected for an over-cap outlet registry, got {err:?}");
+        };
+        assert!(
+            reason.contains("imported outlet count"),
+            "the refusal names the imported outlet-count bound, got {reason}"
+        );
+    }
+
+    /// An imported registration that `register_outlet` would refuse — an
+    /// `operator_did` that is not a DID (§5.4.1) — must not reach the live
+    /// registry.
+    #[tokio::test]
+    async fn import_rejects_an_unregistrable_outlet() {
+        let creator = "did:key:import-outlet-operator-creator";
+        let context_id = "import-outlet-operator-ctx";
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+        let mut snapshot = import_test_snapshot(context_id, creator);
+        let mut hostile = importable_outlet_fixture("alpha");
+        hostile.operator_did = DID("not-a-did".to_owned());
+        snapshot.registered_outlets = vec![hostile];
+
+        let err = import_snapshot_signed_by_creator(snapshot, creator, &ctx_id_bytes)
+            .await
+            .expect_err("an unregistrable imported outlet must be refused");
+        let ContextError::ImportRejected { reason } = &err else {
+            panic!("expected ImportRejected for an unregistrable outlet, got {err:?}");
+        };
+        assert!(
+            reason.contains("is not a registrable OutletRegistration"),
+            "the refusal names the registration check, got {reason}"
+        );
+    }
+
+    /// Two imported registrations sharing one `outlet_id` must be refused:
+    /// `registered_outlets` is a `Vec`, so both would install, and a later
+    /// `execute_remove_outlet` would delete one and leave the other answering
+    /// invocations the context revoked.
+    #[tokio::test]
+    async fn import_rejects_duplicate_outlet_ids() {
+        let creator = "did:key:import-outlet-dup-creator";
+        let context_id = "import-outlet-dup-ctx";
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+        let mut snapshot = import_test_snapshot(context_id, creator);
+        snapshot.registered_outlets = vec![
+            importable_outlet_fixture("alpha"),
+            importable_outlet_fixture("alpha"),
+        ];
+
+        let err = import_snapshot_signed_by_creator(snapshot, creator, &ctx_id_bytes)
+            .await
+            .expect_err("a duplicate imported outlet id must be refused");
+        let ContextError::ImportRejected { reason } = &err else {
+            panic!("expected ImportRejected for a duplicate outlet id, got {err:?}");
+        };
+        assert!(
+            reason.contains("more than once"),
+            "the refusal names the duplication, got {reason}"
+        );
+    }
+
+    /// The control for the three rejections above: an imported registry of two
+    /// registrable outlets imports successfully, so the new check refuses
+    /// inadmissible registries rather than every registry.
+    #[tokio::test]
+    async fn import_accepts_a_registrable_outlet_registry() {
+        let creator = "did:key:import-outlet-ok-creator";
+        let context_id = "import-outlet-ok-ctx";
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+        let mut snapshot = import_test_snapshot(context_id, creator);
+        snapshot.registered_outlets = vec![
+            importable_outlet_fixture("alpha"),
+            importable_outlet_fixture("beta"),
+        ];
+
+        let _handle = import_snapshot_signed_by_creator(snapshot, creator, &ctx_id_bytes)
+            .await
+            .expect("an export carrying registrable outlets imports successfully");
+    }
+
     /// A validly-signed export whose ceiling carries a MALFORMED entry (spec
     /// §5.3.1.1) must be rejected with `ImportRejected`. A valid signature
     /// authenticates the ORIGIN, not the WELL-FORMEDNESS of the payload — so a

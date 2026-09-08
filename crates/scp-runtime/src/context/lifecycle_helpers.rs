@@ -2230,6 +2230,29 @@ pub async fn import_context(
             reason: format!("imported context ceiling has a malformed entry (spec §5.3.1.1): {e}"),
         })?;
 
+    // Outlet-registry validation on the IMPORTED registrations (§5.4.2, §6.2,
+    // §9.2.1, and the §5.9 per-context cap). `import_context` moves
+    // `export.snapshot.registered_outlets` into the live
+    // `GovernanceState::registered_outlets` below, and registry membership is an
+    // authorization grant: `actor::handlers::saga::validate_input_specificity`
+    // authorizes a cross-context `PrepareB` against exactly this vector. The
+    // snapshot signature authenticates who wrote those bytes and does not
+    // establish that they are well formed, which is the same reason the ceiling
+    // check above re-validates a signed ceiling. Without this call an export
+    // installs a registry `register_outlet` would refuse: more than
+    // `MAX_REGISTERED_OUTLETS` entries, an operator DID that is not a DID,
+    // schemas under the specificity floor, or two entries sharing one
+    // `outlet_id` — the last of which survives a later `execute_remove_outlet`
+    // and keeps answering invocations the context revoked. The creator's genesis
+    // path, the Welcome-joiner precheck, the restore path, and
+    // `execute_register_outlet` run the same checks, so every writer of the live
+    // registry admits the same registrations (GitHub #2250).
+    crate::context::state::validate_outlet_registry_set(
+        &export.snapshot.registered_outlets,
+        "imported",
+    )
+    .map_err(|reason| ContextError::ImportRejected { reason })?;
+
     // §9.10.4: the import path is encrypted-only. Every imported context is
     // re-homed with `broadcast_context: None`, `mode = Encrypted`, and a
     // pseudonymous routing axis (see the `import_routing` construction below).
@@ -3146,6 +3169,24 @@ pub async fn restore_context(
             ))
         })?;
     }
+
+    // Outlet-registry validation on the RESTORED registrations (§5.4.2, §6.2,
+    // §9.2.1, and the §5.9 per-context cap). `restore_context` moves
+    // `ctx_snapshot.registered_outlets` into the live
+    // `GovernanceState::registered_outlets` below, so a snapshot that an
+    // attacker edited on disk, or one an earlier build wrote before the genesis
+    // and governance paths ran these checks, would re-install on every process
+    // restart a registry `register_outlet` refuses. Rejecting the restore keeps
+    // the five writers of the live registry — genesis, the Welcome-joiner
+    // precheck, import, this path, and `execute_register_outlet` — admitting the
+    // same registrations (GitHub #2250).
+    crate::context::state::validate_outlet_registry_set(
+        &ctx_snapshot.registered_outlets,
+        "restored",
+    )
+    .map_err(|reason| {
+        ContextError::PersistenceFailed(format!("restore: outlet registry rejected: {reason}"))
+    })?;
 
     // ADR-049 Phase 2A finalization keystone: restore path may rehydrate
     // either an encrypted or a broadcast context — branch on whether the
@@ -4117,6 +4158,125 @@ mod restore_reconcile_tests {
             matches!(err, ContextError::PersistenceFailed(ref msg) if msg.contains("malformed")),
             "expected a PersistenceFailed citing the malformed ceiling, got {err:?}"
         );
+    }
+
+    /// Builds an `OutletRegistration` that
+    /// `OutletRegistration::validate_registrable` accepts: two properties on each
+    /// schema (the §6.2/§9.2.1 specificity floor is `MIN_SCHEMA_FIELDS == 2`), an
+    /// `Action` kind with no cost, and an operator DID that parses.
+    fn restorable_outlet_fixture(
+        outlet_id: &str,
+    ) -> scp_protocol::context::outlets::OutletRegistration {
+        use scp_protocol::context::outlets::{OutletKind, OutletRegistration, OutletSchema};
+        OutletRegistration {
+            outlet_id: outlet_id.to_owned(),
+            kind: OutletKind::Action,
+            name: outlet_id.to_owned(),
+            description: "restored outlet fixture".to_owned(),
+            schema: OutletSchema {
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"lhs": {"type": "number"}, "rhs": {"type": "number"}}
+                }),
+                output_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"sum": {"type": "number"}, "carry": {"type": "boolean"}}
+                }),
+                aggregate_schema: None,
+            },
+            implementation_hash: [7u8; 32],
+            test_vectors: vec![],
+            message_catalog: Vec::new(),
+            operator_did: DID("did:dht:z6MkRestoredOutletOperator".to_owned()),
+            cost: None,
+            registered_at: 0,
+            signature: Vec::new(),
+        }
+    }
+
+    /// Restore moves `ctx_snapshot.registered_outlets` into the live
+    /// `GovernanceState::registered_outlets`, which
+    /// `actor::handlers::saga::validate_input_specificity` reads as an
+    /// authorization grant, so a snapshot carrying MORE than
+    /// `MAX_REGISTERED_OUTLETS` registrations must fail closed rather than
+    /// re-install an over-cap registry on every process restart (GitHub #2250).
+    #[tokio::test]
+    async fn restore_rejects_an_over_cap_outlet_registry() {
+        let ctx_id = "restore-case-over-cap-outlets";
+        let (mut enc_snapshot, _) = harvest_snapshot(ctx_id, false).await;
+        let routing = enc_snapshot.routing.clone();
+        enc_snapshot.registered_outlets = (0..=crate::context::state::MAX_REGISTERED_OUTLETS)
+            .map(|i| restorable_outlet_fixture(&format!("outlet-{i}")))
+            .collect();
+        let err = restore_with(enc_snapshot, routing, None, ctx_id)
+            .await
+            .expect_err("an over-cap restored outlet registry must fail closed");
+        assert!(
+            matches!(err, ContextError::PersistenceFailed(ref msg)
+                if msg.contains("restored outlet count")),
+            "expected a PersistenceFailed citing the restored outlet-count bound, got {err:?}"
+        );
+    }
+
+    /// A persisted registration that `register_outlet` would refuse — an
+    /// `operator_did` that is not a DID (§5.4.1) — must not be rehydrated into
+    /// the live registry.
+    #[tokio::test]
+    async fn restore_rejects_an_unregistrable_outlet() {
+        let ctx_id = "restore-case-unregistrable-outlet";
+        let (mut enc_snapshot, _) = harvest_snapshot(ctx_id, false).await;
+        let routing = enc_snapshot.routing.clone();
+        let mut corrupt = restorable_outlet_fixture("alpha");
+        corrupt.operator_did = DID("not-a-did".to_owned());
+        enc_snapshot.registered_outlets = vec![corrupt];
+        let err = restore_with(enc_snapshot, routing, None, ctx_id)
+            .await
+            .expect_err("an unregistrable restored outlet must fail closed");
+        assert!(
+            matches!(err, ContextError::PersistenceFailed(ref msg)
+                if msg.contains("is not a registrable OutletRegistration")),
+            "expected a PersistenceFailed citing the registration check, got {err:?}"
+        );
+    }
+
+    /// Two persisted registrations sharing one `outlet_id` must fail closed:
+    /// `registered_outlets` is a `Vec`, so both would rehydrate, and a later
+    /// `execute_remove_outlet` would delete one and leave the other answering
+    /// invocations the context revoked.
+    #[tokio::test]
+    async fn restore_rejects_duplicate_outlet_ids() {
+        let ctx_id = "restore-case-duplicate-outlet-ids";
+        let (mut enc_snapshot, _) = harvest_snapshot(ctx_id, false).await;
+        let routing = enc_snapshot.routing.clone();
+        enc_snapshot.registered_outlets = vec![
+            restorable_outlet_fixture("alpha"),
+            restorable_outlet_fixture("alpha"),
+        ];
+        let err = restore_with(enc_snapshot, routing, None, ctx_id)
+            .await
+            .expect_err("a duplicate restored outlet id must fail closed");
+        assert!(
+            matches!(err, ContextError::PersistenceFailed(ref msg)
+                if msg.contains("more than once")),
+            "expected a PersistenceFailed citing the duplication, got {err:?}"
+        );
+    }
+
+    /// The control for the three rejections above: a snapshot carrying two
+    /// registrable outlets restores, so the new check refuses inadmissible
+    /// registries rather than every registry.
+    #[tokio::test]
+    async fn restore_accepts_a_registrable_outlet_registry() {
+        let ctx_id = "restore-case-registrable-outlets";
+        let (mut enc_snapshot, _) = harvest_snapshot(ctx_id, false).await;
+        let routing = enc_snapshot.routing.clone();
+        enc_snapshot.registered_outlets = vec![
+            restorable_outlet_fixture("alpha"),
+            restorable_outlet_fixture("beta"),
+        ];
+        restore_with(enc_snapshot, routing, None, ctx_id)
+            .await
+            .expect("a snapshot carrying registrable outlets must restore Ok");
     }
 
     // -----------------------------------------------------------------------

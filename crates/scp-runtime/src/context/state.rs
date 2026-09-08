@@ -1914,6 +1914,22 @@ pub(crate) enum OutletRegistrySeed {
     /// action has run yet, so the live registry equals `params.outlets` by
     /// construction. `validate_params` has already run
     /// [`validate_genesis_outlets`] over the declaration.
+    ///
+    /// **The creator holds grants that a Welcome-joiner does not.** A registry
+    /// entry authorizes invocation: `actor::handlers::saga::validate_input_specificity`
+    /// rejects a cross-context `PrepareB` whose outlet id is absent from
+    /// `registered_outlets` with SCP-SAGA-13016 `PermissionDenied`. The creator
+    /// seeds the genesis outlets and every joiner seeds none
+    /// ([`OutletRegistrySeed::AwaitingLeafReplication`]), so the same `PrepareB`
+    /// naming a genesis outlet proceeds on the creator's actor and is refused on
+    /// each joiner's actor, and the caller's result depends on which member of
+    /// the target context handled the request. §5.4 of the contexts spec states
+    /// that any outlet change is visible to all context members, which the
+    /// missing replication reader named on the other variant does not yet
+    /// deliver. Seeding the joiner from `params.outlets` would replace this
+    /// divergence with a joiner that grants an outlet governance already
+    /// revoked, so neither seed converges the two members: only a reader of the
+    /// creator's `OutletRegistered`/`OutletRemoved` leaves does (GitHub #2250).
     GenesisDeclaration,
     /// A Welcome-joiner, inside `Supervisor::build_welcome_joiner_state`, at an
     /// arbitrary later epoch. This joiner has read no live registry, so it starts
@@ -1941,34 +1957,91 @@ pub(crate) enum OutletRegistrySeed {
     AwaitingLeafReplication,
 }
 
-/// Rejects a genesis outlet declaration that
+/// Rejects an `OutletRegistration` set that
 /// `scp_protocol::context::outlets::registry::register_outlet` would refuse.
 ///
-/// Both entrypoints that accept a `ContextParams` and reach
-/// [`fresh_governance_state`] call this: `builder::validate_params` for the
-/// creator's own parameters, and `Supervisor::spawn_actor_from_welcome`'s
-/// Precheck C for the creator-signed parameters a joiner receives from a peer.
-/// `governance_helpers::execute_register_outlet` runs the same
-/// [`MAX_REGISTERED_OUTLETS`] bound, the same
-/// `OutletRegistration::validate_registrable` call, and the same duplicate-id
-/// rejection on the runtime governance-registration path, so no path that puts
-/// an `OutletRegistration` into a context's live registry escapes the checks
-/// (GitHub #2250).
+/// Every runtime path that installs a whole set of registrations into a
+/// context's live `GovernanceState::registered_outlets` calls this function.
+/// The rejection message opens with `origin`, so a reader of the error learns
+/// which set the caller refused:
+/// - `builder::validate_params` passes `"genesis"`, for the creator's own
+///   parameters.
+/// - `Supervisor::spawn_actor_from_welcome`'s Precheck C passes `"genesis"`, for
+///   the creator-signed parameters a joiner receives from a peer.
+/// - `lifecycle_helpers::import_context` passes `"imported"`, for the
+///   registrations a creator-signed `ContextExport` carries. The export
+///   signature authenticates the origin of those bytes and does not establish
+///   that they are well formed, so a non-conformant or hostile creator reaches
+///   the live registry through this path.
+/// - `lifecycle_helpers::restore_context` passes `"restored"`, for the
+///   registrations a persisted `ContextSnapshot` carries. A snapshot an earlier
+///   build wrote, or a snapshot an attacker edited on disk, reaches the live
+///   registry through this path on every process restart.
+///
+/// `governance_helpers::execute_register_outlet` installs ONE registration
+/// rather than a set, and runs the same three checks against the live registry:
+/// the [`MAX_REGISTERED_OUTLETS`] bound, `OutletRegistration::validate_registrable`,
+/// and a duplicate-`outlet_id` rejection. Those five paths are every writer of
+/// `GovernanceState::registered_outlets` the runtime has, so no path puts an
+/// `OutletRegistration` into a context's live registry without running the
+/// checks (GitHub #2250).
 ///
 /// Three checks run here, in this order:
 /// 1. The per-context registry cap, [`MAX_REGISTERED_OUTLETS`].
-/// 2. `OutletRegistration::validate_registrable` on each declaration — the
+/// 2. `OutletRegistration::validate_registrable` on each registration — the
 ///    §5.4.2 Query cost floor, both JSON Schemas, the §6.2/§9.2.1 schema
-///    specificity floor, and the operator DID. Without this check the creator
-///    installs into the live authorization registry whatever `ContextParams`
-///    carried, and the FFI bridges' name-only outlet surface carried a
-///    fabricated operator DID and two empty schemas.
-/// 3. Uniqueness of `outlet_id` across the declaration. `OutletRegistry` is a
-///    map keyed by `outlet_id`, and `GovernanceState::registered_outlets` is a
-///    `Vec`, so a duplicate id in a genesis declaration would install two
-///    entries that the registry type itself cannot hold, and a later
-///    `execute_remove_outlet` would delete one of the two and leave the other
-///    answering invocations the context revoked.
+///    specificity floor, and the operator DID. Without this check the caller
+///    installs into the live authorization registry whatever the parameters,
+///    the export, or the snapshot carried, and the FFI bridges' name-only outlet
+///    surface carried a fabricated operator DID and two empty schemas.
+/// 3. Uniqueness of `outlet_id` across the set. `OutletRegistry` is a map keyed
+///    by `outlet_id`, and `GovernanceState::registered_outlets` is a `Vec`, so a
+///    duplicate id would install two entries that the registry type itself
+///    cannot hold, and a later `execute_remove_outlet` would delete one of the
+///    two and leave the other answering invocations the context revoked.
+///
+/// # Errors
+///
+/// Returns the message naming the failed check and the outlet id it failed on.
+/// Each caller wraps that message in the error type its own path returns.
+pub(crate) fn validate_outlet_registry_set(
+    outlets: &[OutletRegistration],
+    origin: &str,
+) -> Result<(), String> {
+    if outlets.len() > MAX_REGISTERED_OUTLETS {
+        return Err(format!(
+            "{origin} outlet count {} exceeds the per-context limit of {MAX_REGISTERED_OUTLETS}",
+            outlets.len(),
+        ));
+    }
+
+    let mut seen: HashSet<&str> = HashSet::with_capacity(outlets.len());
+    for outlet in outlets {
+        outlet.validate_registrable().map_err(|e| {
+            format!(
+                "{origin} outlet {:?} is not a registrable OutletRegistration: {e}",
+                outlet.outlet_id,
+            )
+        })?;
+        if !seen.insert(outlet.outlet_id.as_str()) {
+            return Err(format!(
+                "{origin} outlet id {:?} is declared more than once",
+                outlet.outlet_id,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Rejects a genesis outlet declaration that
+/// `scp_protocol::context::outlets::registry::register_outlet` would refuse.
+///
+/// Calls [`validate_outlet_registry_set`] with the `"genesis"` origin, which is
+/// where the three checks and the reason each one exists are written down. Both
+/// entrypoints that accept a `ContextParams` and reach [`fresh_governance_state`]
+/// call this: `builder::validate_params` for the creator's own parameters, and
+/// `Supervisor::spawn_actor_from_welcome`'s Precheck C for the creator-signed
+/// parameters a joiner receives from a peer (GitHub #2250).
 ///
 /// # Errors
 ///
@@ -1977,29 +2050,7 @@ pub(crate) enum OutletRegistrySeed {
 pub(crate) fn validate_genesis_outlets(
     outlets: &[OutletRegistration],
 ) -> Result<(), ContextCreationError> {
-    if outlets.len() > MAX_REGISTERED_OUTLETS {
-        return Err(ContextCreationError::CreationFailed(format!(
-            "genesis outlet count {} exceeds the per-context limit of {MAX_REGISTERED_OUTLETS}",
-            outlets.len(),
-        )));
-    }
-
-    let mut seen: HashSet<&str> = HashSet::with_capacity(outlets.len());
-    for outlet in outlets {
-        outlet.validate_registrable().map_err(|e| {
-            ContextCreationError::CreationFailed(format!(
-                "genesis outlet {:?} is not a registrable OutletRegistration: {e}",
-                outlet.outlet_id,
-            ))
-        })?;
-        if !seen.insert(outlet.outlet_id.as_str()) {
-            return Err(ContextCreationError::CreationFailed(format!(
-                "genesis outlet id {:?} is declared more than once",
-                outlet.outlet_id,
-            )));
-        }
-    }
-    Ok(())
+    validate_outlet_registry_set(outlets, "genesis").map_err(ContextCreationError::CreationFailed)
 }
 
 /// Builds the fresh-context [`GovernanceState`] shared by BOTH the creator-side
