@@ -1950,14 +1950,14 @@ pub(crate) enum OutletRegistrySeed {
 /// Precheck C for the creator-signed parameters a joiner receives from a peer.
 /// `governance_helpers::execute_register_outlet` runs the same
 /// [`MAX_REGISTERED_OUTLETS`] bound, the same
-/// `registry::validate_registration_content` call, and the same duplicate-id
+/// `OutletRegistration::validate_registrable` call, and the same duplicate-id
 /// rejection on the runtime governance-registration path, so no path that puts
 /// an `OutletRegistration` into a context's live registry escapes the checks
 /// (GitHub #2250).
 ///
 /// Three checks run here, in this order:
 /// 1. The per-context registry cap, [`MAX_REGISTERED_OUTLETS`].
-/// 2. `registry::validate_registration_content` on each declaration — the
+/// 2. `OutletRegistration::validate_registrable` on each declaration — the
 ///    §5.4.2 Query cost floor, both JSON Schemas, the §6.2/§9.2.1 schema
 ///    specificity floor, and the operator DID. Without this check the creator
 ///    installs into the live authorization registry whatever `ContextParams`
@@ -1986,14 +1986,12 @@ pub(crate) fn validate_genesis_outlets(
 
     let mut seen: HashSet<&str> = HashSet::with_capacity(outlets.len());
     for outlet in outlets {
-        scp_protocol::context::outlets::registry::validate_registration_content(outlet).map_err(
-            |e| {
-                ContextCreationError::CreationFailed(format!(
-                    "genesis outlet {:?} is not a registrable OutletRegistration: {e}",
-                    outlet.outlet_id,
-                ))
-            },
-        )?;
+        outlet.validate_registrable().map_err(|e| {
+            ContextCreationError::CreationFailed(format!(
+                "genesis outlet {:?} is not a registrable OutletRegistration: {e}",
+                outlet.outlet_id,
+            ))
+        })?;
         if !seen.insert(outlet.outlet_id.as_str()) {
             return Err(ContextCreationError::CreationFailed(format!(
                 "genesis outlet id {:?} is declared more than once",

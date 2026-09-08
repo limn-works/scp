@@ -593,11 +593,10 @@ mod tests {
     /// registry.
     #[test]
     fn name_only_genesis_outlet_declaration_is_refused() {
-        let err = build_context_params(&CommonContextParams {
+        let err = build_err(&CommonContextParams {
             outlets: vec!["calculator".to_owned()],
             ..Default::default()
-        })
-        .expect_err("a name-only outlet declaration must be refused");
+        });
         assert!(
             err.contains("calculator"),
             "the refusal names the outlet it refused, got {err}"

@@ -1817,14 +1817,12 @@ pub async fn execute_register_outlet(
     // DID. `state::validate_genesis_outlets` calls the same protocol function on
     // the genesis declaration, so the two install paths admit exactly the same
     // registrations (GitHub #2250).
-    scp_protocol::context::outlets::registry::validate_registration_content(registration).map_err(
-        |e| {
-            ContextError::InvalidState(format!(
-                "outlet {:?} is not a registrable OutletRegistration: {e}",
-                registration.outlet_id,
-            ))
-        },
-    )?;
+    registration.validate_registrable().map_err(|e| {
+        ContextError::InvalidState(format!(
+            "outlet {:?} is not a registrable OutletRegistration: {e}",
+            registration.outlet_id,
+        ))
+    })?;
 
     // `registered_outlets` is a `Vec`, so a duplicate id would install a second
     // entry under an id the context already granted, and a later

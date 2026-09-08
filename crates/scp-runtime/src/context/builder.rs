@@ -1639,6 +1639,20 @@ mod tests {
             "the refusal names the outlet it refused, got {message}"
         );
 
+        // A structurally valid pair of schemas that declares fewer than two
+        // properties on both sides fails the specificity floor.
+        let mut under_floor = outlet_fixture("weather");
+        under_floor.schema.input_schema = serde_json::json!({"type": "object"});
+        under_floor.schema.output_schema = serde_json::json!({"type": "object"});
+        let params = ContextParams {
+            outlets: vec![under_floor],
+            ..Default::default()
+        };
+        assert!(
+            validate_params(&params).is_err(),
+            "schemas under the §6.2/§9.2.1 specificity floor must be refused at creation"
+        );
+
         // The operator DID is checked too, on a declaration whose schemas pass.
         let mut bad_operator = outlet_fixture("weather");
         bad_operator.operator_did = "not-a-did".into();
