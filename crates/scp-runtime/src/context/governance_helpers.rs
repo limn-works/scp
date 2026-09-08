@@ -6510,7 +6510,7 @@ mod commit_broadcast_retry_tests {
     /// `execute_approve_spend` appends one durable `SpendApproved` leaf, so
     /// `checkpoint_events_since` must advance by one.
     ///
-    /// `create_checkpoint_if_due_view` (queries_helpers.rs) gates BOTH §9.9.3
+    /// `create_checkpoint_if_due_view` (`queries_helpers.rs`) gates BOTH §9.9.3
     /// triggers on this counter — `events_since >= 50` and `events_since > 0 &&
     /// elapsed >= 600` — so a context whose only governance traffic is
     /// `ApproveSpend` would never mint a consistency checkpoint at all while its
