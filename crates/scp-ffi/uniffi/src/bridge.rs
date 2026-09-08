@@ -11101,10 +11101,14 @@ impl Scp {
                     .read_live_context_state(&handle.context_id)
                     .await?
                 {
-                    // No actor answers (a completed TTL expiry), the supervisor
-                    // reports `Poisoned`, or the actor reports a terminal state
-                    // (a finalized close, an expiry, a migration tombstone):
-                    // the close already happened.
+                    // The supervisor holds no actor for the id (a completed
+                    // TTL expiry), reports `Poisoned`, or the actor reports a
+                    // terminal state (a finalized close, an expiry, a migration
+                    // tombstone): the close already happened.
+                    // `read_live_context_state` reports an actor the supervisor
+                    // still holds but this bridge could not reach as an error
+                    // rather than as `None`, so a saturated or wedged actor
+                    // refuses the close instead of taking this arm.
                     None
                     | Some(
                         CoreContextState::Poisoned
@@ -19701,6 +19705,58 @@ mod tests {
         assert!(
             scp.inner.with_ucan_state(&context_id, |_| ()).is_some(),
             "a refused close must leave the per-context UCAN state registered"
+        );
+    }
+
+    /// A close refuses a context whose actor the supervisor still holds but
+    /// this bridge could not reach, and releases none of that context's
+    /// per-context UCAN state.
+    ///
+    /// `Supervisor::read_context_state` answered `None` both for a context the
+    /// supervisor holds no actor for and for an actor whose mailbox send
+    /// failed or whose reply never arrived, so a close reading that form
+    /// treated a saturated or wedged actor as proof that the close already
+    /// happened. It then skipped the `CloseContext` dispatch, which carries
+    /// the only `ContextClose` capability check on this path, released the
+    /// per-context UCAN state — the event log, the nonce tracker, the
+    /// revocation list — for every identity sharing the bridge instance, and
+    /// returned success while the supervisor still served the context as
+    /// `Active`.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn close_refuses_a_context_whose_actor_this_bridge_cannot_reach() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+        let context_id = handle.context_id();
+
+        let sup = Arc::clone(
+            scp.inner
+                .context_manager_or_error()
+                .expect("test supervisor must be attached"),
+        );
+        sup.test_make_actor_unreachable(&context_id);
+
+        let err = rt
+            .block_on(scp.context_close(Arc::clone(&handle), Arc::clone(&identity)))
+            .expect_err("a close must refuse a context whose actor did not answer");
+        assert!(
+            err.to_string().contains("SCP-CTX-2130"),
+            "the refusal must report the actor-busy code, got: {err}"
+        );
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_some(),
+            "a refused close must leave the per-context UCAN state registered"
+        );
+        assert!(
+            matches!(*rt.block_on(handle.state.lock()), ContextState::Active),
+            "a refused close must not write the handle's cached state"
         );
     }
 

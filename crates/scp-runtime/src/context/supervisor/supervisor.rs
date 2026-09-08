@@ -5127,6 +5127,31 @@ impl Supervisor {
         self.despawn_actor(context_id).await;
     }
 
+    /// Test fixture: registers an actor handle for `context_id` whose mailbox
+    /// no task drains, so a caller reaches the supervisor's registry and never
+    /// reaches an actor.
+    ///
+    /// The fixture builds a command channel, drops the receiving half, and
+    /// stores the sending half as `context_id`'s actor handle, replacing any
+    /// handle the id already had. Every later command send fails with
+    /// [`ContextError::ActorBusy`], which is the outcome a saturated mailbox
+    /// produces once
+    /// [`SEND_TIMEOUT`](crate::context::actor::SEND_TIMEOUT) elapses. After
+    /// this call [`Self::lookup`] finds an actor for the id,
+    /// [`Self::read_context_state_checked`] reports
+    /// [`ContextError::ActorBusy`], and [`Self::read_context_state`] reports
+    /// `None`.
+    ///
+    /// `testing`-gated: no production build compiles it, no FFI bridge exports
+    /// it, and only an in-process `Arc<Supervisor>` holder can call it.
+    #[cfg(feature = "testing")]
+    pub fn test_make_actor_unreachable(&self, context_id: &str) {
+        let (tx, rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        drop(rx);
+        self.actors
+            .insert(context_id.to_owned(), ContextActorHandle::from_sender(tx));
+    }
+
     /// Map a per-context `lookup` miss to the right typed error (ADR-049
     /// §10). Three cases, in precedence order:
     ///
@@ -10628,11 +10653,62 @@ impl Supervisor {
     /// makes that distinction without a `per-context-state Mutex`. A
     /// dropped reply or mailbox-send failure (actor shutting down)
     /// resolves to `None`, treated by callers as "no live context".
+    ///
+    /// This form collapses an unreachable actor into the same `None` a
+    /// never-registered context reports, so a caller that reads `None` as
+    /// "the context is gone" reads a saturated or wedged actor that way too.
+    /// A caller whose decision turns on that difference calls
+    /// [`Self::read_context_state_checked`], which reports an unreachable
+    /// actor as [`ContextError::ActorBusy`].
     #[must_use]
     pub async fn read_context_state(
         &self,
         context_id: &str,
     ) -> Option<scp_protocol::context::ContextState> {
+        // An unreachable actor answers `Err` here. Every caller of this form
+        // reads `None` as "no live Active context": the FFI lifecycle gates
+        // refuse the operation, the standing get-or-create falls through to
+        // its create step, and the reconnect sweep skips the id. None of them
+        // skips an authorization check on `None`, so folding the error into
+        // it grants nothing.
+        self.read_context_state_checked(context_id)
+            .await
+            .unwrap_or(None)
+    }
+
+    /// Reads the current lifecycle
+    /// [`ContextState`](scp_protocol::context::ContextState) for
+    /// `context_id` and reports an actor this call could not reach as an
+    /// error rather than as an absent actor.
+    ///
+    /// [`Self::read_context_state`] answers `None` for three different
+    /// outcomes: the supervisor holds no actor for the id, the mailbox send
+    /// failed or exceeded
+    /// [`SEND_TIMEOUT`](crate::context::actor::SEND_TIMEOUT), and the actor
+    /// accepted the command but did not answer within
+    /// [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT). A caller that
+    /// treats `None` as proof that the supervisor stopped serving the context
+    /// therefore draws that conclusion from a context whose actor is merely
+    /// saturated or wedged. `context_close` on the three FFI bridges draws
+    /// exactly that conclusion — it skips the `CloseContext` dispatch, which
+    /// carries the only `ContextClose` capability check on the path — so it
+    /// reads this form.
+    ///
+    /// `Ok(None)` means the supervisor holds no actor for `context_id` and no
+    /// sticky poison flag for it. `Ok(Some(state))` is the actor's own answer,
+    /// or [`ContextState::Poisoned`](scp_protocol::context::ContextState::Poisoned)
+    /// for a context the crash watchdog poisoned and despawned (ADR-049 §10).
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ActorBusy`] when an actor is registered for
+    ///   `context_id` and the mailbox send failed or timed out, or the actor
+    ///   did not answer within `REPLY_TIMEOUT`.
+    /// - Whatever error the `ReadContextState` handler itself returned.
+    pub async fn read_context_state_checked(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<scp_protocol::context::ContextState>, ContextError> {
         let Some(actor) = self.lookup(context_id) else {
             // No live actor. A poisoned context (ADR-049 §10) has been
             // despawned by the watchdog, so its state is no longer readable
@@ -10642,21 +10718,23 @@ impl Supervisor {
             // context as poisoned rather than as "unknown" (`None`).
             // An un-poisoned absent context stays `None` (genuinely unknown).
             if self.is_context_poisoned(context_id) {
-                return Some(scp_protocol::context::ContextState::Poisoned);
+                return Ok(Some(scp_protocol::context::ContextState::Poisoned));
             }
-            return None;
+            return Ok(None);
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = ContextCommand::Queries(QueriesCommand::ReadContextState {
             context_id: context_id.to_owned(),
             reply: tx,
         });
-        if Self::dispatch_via_mailbox(&actor, cmd).await.is_err() {
-            return None;
-        }
+        Self::dispatch_via_mailbox(&actor, cmd).await?;
         match bounded_reply_await(rx).await {
-            Ok(Ok(state)) => Some(state),
-            Ok(Err(_)) | Err(_) => None,
+            Ok(Ok(state)) => Ok(Some(state)),
+            Ok(Err(handler_error)) => Err(handler_error),
+            Err(reply_error) => Err(ContextError::ActorBusy(format!(
+                "context '{context_id}' has a live actor that did not answer a lifecycle-state \
+                 read ({reply_error:?}); the supervisor still serves this context"
+            ))),
         }
     }
 
@@ -22601,6 +22679,55 @@ mod tests {
         assert!(
             matches!(unknown, ContextError::ContextNotRegistered(_)),
             "an unknown context must still surface ContextNotRegistered, got {unknown:?}"
+        );
+    }
+
+    /// A registered actor this call cannot reach reads as `ActorBusy` from
+    /// [`Supervisor::read_context_state_checked`] and as `None` from
+    /// [`Supervisor::read_context_state`].
+    ///
+    /// The `Option` form collapses "the supervisor holds no actor for this id"
+    /// and "the supervisor holds an actor that did not answer" into one value.
+    /// `context_close` on the three FFI bridges reads `None` as proof that the
+    /// close already happened and skips the `CloseContext` dispatch, which
+    /// carries the only `ContextClose` capability check on that path, so it
+    /// reads the checked form instead. The `Option` form keeps its collapse
+    /// because no caller of that form reads `None` as an authorization.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreachable_actor_reads_as_actor_busy_not_as_an_absent_context() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+
+        let ctx_key = "ctx-unreachable-actor";
+        // A mailbox no task drains. `send_with_timeout` fails on it with
+        // `ActorBusy`, which is the error a saturated mailbox produces once
+        // `SEND_TIMEOUT` elapses and a wedged actor produces once
+        // `REPLY_TIMEOUT` elapses.
+        let (tx, rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        drop(rx);
+        sup.actors
+            .insert(ctx_key.to_owned(), ContextActorHandle::from_sender(tx));
+
+        let checked = sup.read_context_state_checked(ctx_key).await;
+        assert!(
+            matches!(checked, Err(ContextError::ActorBusy(_))),
+            "an actor the supervisor still holds but this call cannot reach must read as \
+             ActorBusy, got {checked:?}"
+        );
+        assert_eq!(
+            sup.read_context_state(ctx_key).await,
+            None,
+            "the Option form keeps folding an unreachable actor into None, which no caller of \
+             that form reads as an authorization"
+        );
+
+        // An id the supervisor holds no actor for still reads as absent, so
+        // the checked form did not turn every miss into an error.
+        let absent = sup.read_context_state_checked("never-existed").await;
+        assert!(
+            matches!(absent, Ok(None)),
+            "an id with no actor and no poison flag must read as Ok(None), got {absent:?}"
         );
     }
 

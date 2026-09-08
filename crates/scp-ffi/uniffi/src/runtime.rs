@@ -1039,18 +1039,32 @@ impl UniffiBridgeInstance {
     /// idempotent: the close already happened, and the bridge still has to
     /// release the per-context UCAN state it holds for that id.
     ///
+    /// An actor the supervisor still holds but this call could not reach — a
+    /// mailbox send that timed out against a saturated mailbox, or a wedged
+    /// actor that took longer than the reply timeout — reads as an error,
+    /// never as `Ok(None)`. `Supervisor::read_context_state` folds that
+    /// outcome into `None`; this method calls
+    /// `Supervisor::read_context_state_checked`, which keeps the two apart,
+    /// because `context_close` reads `None` as proof that the close already
+    /// happened and skips the supervisor dispatch that carries the only
+    /// `ContextClose` capability check.
+    ///
     /// # Errors
     ///
     /// Returns any error [`UniffiBridgeInstance::context_manager_or_error`]
-    /// returns. The state read itself reports an absent actor as `Ok(None)`,
-    /// never as an error, so a caller distinguishes "no actor serves this
-    /// context" from "this bridge cannot ask".
+    /// returns, and `ScpError::Context` when an actor serves `context_id` but
+    /// did not answer the state read. The state read reports an actor the
+    /// supervisor never held as `Ok(None)`, so a caller distinguishes "no
+    /// actor serves this context" from "this bridge could not get an answer".
     pub async fn read_live_context_state(
         &self,
         context_id: &str,
     ) -> Result<Option<scp_core::context::ContextState>, crate::ScpError> {
         let supervisor = self.context_manager_or_error()?;
-        Ok(supervisor.read_context_state(context_id).await)
+        supervisor
+            .read_context_state_checked(context_id)
+            .await
+            .map_err(crate::ScpError::from)
     }
 
     /// Refuses `verb` unless `context_id`'s supervisor actor reports `Active`.

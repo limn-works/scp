@@ -1773,9 +1773,18 @@ pub fn live_context_state(
 
 /// Reads a context's lifecycle state from that context's supervisor actor.
 ///
-/// An absent actor reads as `None` instead of as an error. An absent actor the
-/// crash watchdog poisoned reads as `Some(Poisoned)`, because the supervisor
-/// keeps that flag outside the actor (ADR-049 §10).
+/// `Ok(None)` means the supervisor holds no actor for `context_id`. An absent
+/// actor the crash watchdog poisoned reads as `Some(Poisoned)`, because the
+/// supervisor keeps that flag outside the actor (ADR-049 §10).
+///
+/// An actor the supervisor still holds but this call could not reach — a
+/// mailbox send that timed out against a saturated mailbox, or a wedged actor
+/// that took longer than the reply timeout — reads as an error, never as
+/// `Ok(None)`. `Supervisor::read_context_state` folds that outcome into
+/// `None`; this function calls `Supervisor::read_context_state_checked`, which
+/// keeps the two apart, because [`crate::context::PyScp::context_close`] reads
+/// `None` as proof that the close already happened and skips the supervisor
+/// dispatch that carries the only `ContextClose` capability check.
 ///
 /// [`live_context_state`] is the gate form: it turns `None` into an error so a
 /// gate never admits an operation on an absent answer. `context_close` calls
@@ -1788,15 +1797,17 @@ pub fn live_context_state(
 ///
 /// # Errors
 ///
-/// Returns `ScpPyError::ContextError` when the supervisor is unavailable or
-/// when the tokio bridge fails (see [`block_on_supervisor_query`]).
+/// Returns `ScpPyError::ContextError` when the supervisor is unavailable, when
+/// the tokio bridge fails (see [`block_on_supervisor_query`]), and when an
+/// actor serves `context_id` but did not answer the state read.
 pub fn read_live_context_state(
     bi: &PyBridgeInstance,
     context_id: &str,
 ) -> Result<Option<scp_core::context::ContextState>, ScpPyError> {
     let sup = Arc::clone(supervisor(bi)?);
     let ctx = context_id.to_owned();
-    block_on_supervisor_query(async move { sup.read_context_state(&ctx).await })
+    block_on_supervisor_query(async move { sup.read_context_state_checked(&ctx).await })?
+        .map_err(ScpPyError::from)
 }
 
 /// Reads a context's capability ceiling from that context's supervisor actor,

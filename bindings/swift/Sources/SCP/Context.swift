@@ -609,7 +609,11 @@ public actor Context {
     /// states `creating`, `closing`, and `migrating_out`. A `closing` context
     /// sits in the §5.9 cooperative window, and the supervisor dispatch a
     /// release would skip carries the only `context:close` capability check
-    /// the close path has. `deinit` already gates on the same flag.
+    /// the close path has. The bridge also throws when the supervisor still
+    /// holds an actor for the context and that actor did not answer the state
+    /// read, because an unanswered read is not evidence that the close already
+    /// happened; a caller retries that close. `deinit` already gates on the
+    /// same flag.
     ///
     /// - Throws: ``ScpError/Context(msg:code:)`` if the bridge close
     ///   operation fails.

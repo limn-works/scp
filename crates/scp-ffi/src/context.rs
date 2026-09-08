@@ -3264,6 +3264,10 @@ impl crate::scp::PyScp {
     /// context sits in the §5.9 cooperative window, which `finalize_close`
     /// ends; only after that transition to `closed` does a close release this
     /// bridge's state for the id.
+    /// Returns `ContextError` whose message carries `SCP-CTX-2130` if the
+    /// supervisor still holds an actor for the context and that actor did not
+    /// answer the state read: an unanswered read is not evidence that the
+    /// close already happened, so the call refuses and the caller retries it.
     /// Returns `ContextError` if the caller lacks the `ContextClose` capability.
     #[pyo3(signature = (handle, identity_did))]
     pub fn context_close(&self, handle: &PyContextHandle, identity_did: &str) -> PyResult<()> {
@@ -3299,11 +3303,15 @@ impl crate::scp::PyScp {
         // `Closed` and releases.
         let close_already_happened =
             match crate::runtime::read_live_context_state(bi, &handle.context_id)? {
-                // No actor answers (a completed TTL expiry), the supervisor
-                // reports `Poisoned` (the watchdog despawned the actor and
-                // keeps only the sticky poison flag, ADR-049 §10), or the
-                // actor reports a terminal state (a finalized close, an
+                // The supervisor holds no actor for the id (a completed TTL
+                // expiry), reports `Poisoned` (the watchdog despawned the
+                // actor and keeps only the sticky poison flag, ADR-049 §10),
+                // or the actor reports a terminal state (a finalized close, an
                 // expiry, a migration tombstone): the close already happened.
+                // `read_live_context_state` reports an actor the supervisor
+                // still holds but this bridge could not reach as an error
+                // rather than as `None`, so a saturated or wedged actor
+                // refuses the close instead of taking this arm.
                 None
                 | Some(
                     scp_core::context::ContextState::Poisoned
@@ -8098,6 +8106,58 @@ mod tests {
         // A second close stays idempotent: no state to release, no error.
         scp.context_close(&handle, creator)
             .expect("a repeated close must stay idempotent");
+    }
+
+    /// A close refuses a context whose actor the supervisor still holds but
+    /// this bridge could not reach, and releases none of that context's bridge
+    /// state.
+    ///
+    /// `Supervisor::read_context_state` answered `None` both for a context the
+    /// supervisor holds no actor for and for an actor whose mailbox send
+    /// failed or whose reply never arrived, so a close reading that form
+    /// treated a saturated or wedged actor as proof that the close already
+    /// happened. It then skipped the `CloseContext` dispatch, which carries
+    /// the only `ContextClose` capability check on this path, released the
+    /// `FfiBridgeState` — the outlet handlers, the receive-channel sender, the
+    /// event log, the nonce tracker, the revocation list — for every identity
+    /// sharing the bridge instance, and returned success while the supervisor
+    /// still served the context as `Active`.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn close_refuses_a_context_whose_actor_this_bridge_cannot_reach() {
+        crate::init_runtime().ok();
+        let bi = __bi();
+        let creator = "did:dht:z6MkUnreachableActorCreator";
+        let context_id = format!("a6{}", "0".repeat(56));
+        crate::runtime::init_context_manager_for_test(&bi);
+        crate::runtime::register_context(&bi, &context_id, creator, &[])
+            .expect("fixture registration");
+        crate::runtime::create_supervisor_context_for_test(&bi, &context_id, creator, &[]);
+
+        let sup = std::sync::Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+        sup.test_make_actor_unreachable(&context_id);
+
+        let handle = active_handle_for(&bi, &context_id, creator);
+        let scp = crate::scp::PyScp {
+            inner: std::sync::Arc::clone(&bi),
+        };
+
+        let err = scp
+            .context_close(&handle, creator)
+            .expect_err("a close must refuse a context whose actor did not answer");
+        assert!(
+            err.to_string().contains("SCP-CTX-2130"),
+            "the refusal must report the actor-busy code, got: {err}"
+        );
+        assert!(
+            crate::runtime::ffi_state_registry(&bi).contains_key(&context_id),
+            "a refused close must leave the bridge state registered"
+        );
+        assert_eq!(
+            *handle.state.lock().unwrap(),
+            "active",
+            "a refused close must not write the handle's cached string"
+        );
     }
 
     /// A close of a poisoned context succeeds idempotently and releases the
