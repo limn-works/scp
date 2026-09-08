@@ -999,8 +999,9 @@ pub async fn execute_revoke(
     // has no already-banned early return), so the second run advances every
     // author's epoch a SECOND time and writes a second `AccessRevoked` leaf.
     // This member would then hold more leaves, at a higher epoch, than every
-    // member that applied the commit once, and the §9.9.3 equal-count /
-    // equal-root test would fail on it permanently.
+    // member that applied the commit once, and its log would stay divergent, so
+    // its §9.9.3 consistency checkpoint would never again match an honest
+    // member's — a divergence §9.9.3 reads as equivocation.
     //
     // The failure still reaches an operator: each miss logs at ERROR with the
     // context, the author DID, and the underlying error. A log line is an

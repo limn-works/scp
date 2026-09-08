@@ -23,8 +23,10 @@ skips the rotation for an already-banned DID, so a second run advances every
 author's epoch a second time and appends a second `AccessRevoked` leaf.
 `rotate_all_author_keys` behaves the same way for `RotateContentKeys`. The
 member that retried then holds more leaves, at a higher epoch, than every member
-that applied the commit once, so the §9.9.3 equal-count / equal-root consistency
-test fails on it and keeps failing.
+that applied the commit once. Its log stays divergent from then on, so its
+`ConsistencyCheckpoint` never matches an honest member's: the count runs ahead,
+and at any count where the two coincide the Merkle roots differ, which §9.9.3
+reads as equivocation.
 
 ## How the branch introduced it
 

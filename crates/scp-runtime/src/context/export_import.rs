@@ -1725,8 +1725,10 @@ mod tests {
             banned_subscribers: banned,
         });
 
-        // The JCS bytes ARE the signed preimage (see `canonical_snapshot_hash`),
-        // so asserting on them asserts on the digest.
+        // `canonical_snapshot_hash` hashes the domain separator, then the scope
+        // tag byte, then exactly these JCS bytes. The two prefix values do not
+        // depend on set ordering, so asserting on the JCS bytes asserts on the
+        // ordering the digest commits to.
         let jcs = String::from_utf8(scp_protocol::jcs::to_vec(&snapshot).expect("JCS"))
             .expect("JCS output is UTF-8");
 
