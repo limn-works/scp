@@ -16,7 +16,7 @@ Two rewrites of the witness layer failed, and both failed at the same sentence �
 
 **The head-establishment repair.** The second design tried to close that hole by having the witness re-derive which head was the legitimate one before deciding whether to cosign. That is adjudication written as a repair. It gave the witness a fork-choice rule, which put the fork verdict in the witness layer, where a threshold of witnesses then decided the identity — and a corrupted threshold takes the identity outright.
 
-Alec settled the layer on 2026-09-10 with "watch and report as well", superseding the 2026-09-07 ruling that had made a threshold of witness cosignatures a condition of an event's acceptability. Under the settled model the root rule of §9.7.4.2 decides every fork, a cosignature is evidence a relying party may read for freshness, first contact, and equivocation detection, and no verdict, key-state derivation, rank, or gate depends on one.
+Alec settled the layer on 2026-09-10 with "watch and report as well", superseding the required-witnessing model of 2026-09-07 under which a threshold of witness cosignatures was a condition of an event's acceptability. The decision log records that he did not confirm the "required" half of that earlier model in his own words. Under the settled model the root rule of §9.7.4.2 decides every fork, a cosignature is evidence a relying party may read for freshness, first contact, and equivocation detection, and no verdict, key-state derivation, or rank depends on one.
 
 ## The fix
 

@@ -6,7 +6,7 @@ SCP identifiers are cryptographic — DIDs (`did:dht:z6Mk...`) and context IDs (
 
 The addressing layer adds a **resolution protocol** that accepts human-readable strings and returns DIDs or context IDs. It does not replace cryptographic identifiers, create a global namespace, or require centralized infrastructure. Handles are resolution hints — they narrow search. They never define identity.
 
-**Primary mechanism: context handles.** SCP-native, DNS-free, community-governed. This is where the spec's weight is. Contexts (§6.2.2B) already provide searchable registries — this section extends them with handle registration and lookup.
+**Primary mechanism: context handles.** SCP-native, DNS-free, community-governed. This is where the spec's weight is. Contexts (§6.2.2B [no such section]) already provide searchable registries — this section extends them with handle registration and lookup.
 
 **Local floor: petnames.** User-assigned names stored in identity private state (§3.7). Always work, zero infrastructure, zero governance. Petnames also close the disambiguation loop — when an unscoped query returns multiple candidates, the user's choice becomes a petname, resolving future ambiguity permanently.
 
@@ -56,7 +56,7 @@ AddressResolution:
   | Context   { context_id, relay_urls, mode, trust_level, resolution_path }
 ```
 
-Agent capabilities are not part of the addressing layer. A handle resolves to a DID; the DID document is the authoritative source for capabilities (`SCPCapabilities` service endpoint, §6.2.2A). A handle registry caching capabilities would be stale by design — capabilities change when agents are updated, and the DID document reflects the current state. Contexts already provide capability search via `agent_search` (§6.2.2B).
+Agent capabilities are not part of the addressing layer. A handle resolves to a DID; the DID document is the authoritative source for capabilities (`SCPCapabilities` service endpoint, §6.2.2A [no such section]). A handle registry caching capabilities would be stale by design — capabilities change when agents are updated, and the DID document reflects the current state. Contexts already provide capability search via `agent_search` (§6.2.2B [no such section]).
 
 ### 22.2.2 Normalization
 
@@ -84,7 +84,7 @@ translator-ja@global-services
 
 ### 22.3.1 Handle Outlets
 
-Contexts that support handles expose three additional standard outlet schemas alongside the existing `agent_search`/`agent_register`/`agent_deregister` outlets (§6.2.2B). These are conventions, not mandates — a context with discovery outlets opts into handle support by implementing these outlets.
+Contexts that support handles expose three additional standard outlet schemas alongside the existing `agent_search`/`agent_register`/`agent_deregister` outlets (§6.2.2B [no such section]). These are conventions, not mandates — a context with discovery outlets opts into handle support by implementing these outlets.
 
 ```
 handle_register(handle, target, metadata?) → confirmation
@@ -149,7 +149,7 @@ The `did` parameter in `handle_deregister` is explicit rather than inferred from
 
 **Ownership and verification.** The registrant's DID (authenticated via the DID-signed request) is the handle owner. Only the owner can update or deregister. All handle outlet requests MUST carry a DID signature over the request payload. Writers MUST verify the signature before processing. The event log entry for a registration includes the full signed request as payload, making verification replayable by any party with access to the event log. The ownership chain is: DID-signed request → writer verifies signature cryptographically → event log records the registration with the signed payload and owner DID.
 
-**DID-signature verification scheme.** Handle outlet requests use the same DID-authentication mechanism as context reader requests (§6.2.2B). The signature is constructed as follows:
+**DID-signature verification scheme.** Handle outlet requests use the same DID-authentication mechanism as context reader requests (§6.2.2B [no such section]). The signature is constructed as follows:
 
 1. **Canonical payload.** The request payload is serialized to canonical JSON (keys sorted lexicographically, no whitespace, no trailing commas). This produces a deterministic byte sequence regardless of JSON serialization library.
 2. **Signed content.** The signed bytes are: `"SCP-HANDLE-OUTLET-V1:" || outlet_name || ":" || canonical_json_bytes`, where `outlet_name` is one of `"handle_register"`, `"handle_lookup"`, `"handle_deregister"`, `"scope_register"`, `"scope_lookup"`, `"scope_deregister"`, and `||` denotes byte concatenation. The domain prefix `"SCP-HANDLE-OUTLET-V1:"` prevents cross-protocol signature reuse. Scope outlets sign with their own outlet name (e.g., `"scope_register"`), not the corresponding handle outlet name (`"handle_register"`). This maintains domain separation — a signature over a scope registration cannot be replayed as a handle registration, and vice versa.
@@ -165,7 +165,7 @@ The `did` parameter in `handle_deregister` is explicit rather than inferred from
    ```
 5. **Writer verification.** The writer resolves the `requester_did` via DID document, extracts the public key for `signing_key_id`, and verifies the P-256 signature over the reconstructed `signed_content`. If verification fails, the request is rejected with a `BRIDGE_NOT_AUTHORIZED` error. The writer MUST verify that the DID document is fresh (fetched within the last 300 seconds or cached with valid TTL).
 
-**Two-tier model.** Handle outlets follow the same two-tier architecture as existing discovery outlets (§6.2.2B). Writers (MLS members) process handle registrations. Readers (DID-authenticated, unbounded) perform handle lookups. Registration is a write operation processed by writers; lookup is a read operation available to all.
+**Two-tier model.** Handle outlets follow the same two-tier architecture as existing discovery outlets (§6.2.2B [no such section]). Writers (MLS members) process handle registrations. Readers (DID-authenticated, unbounded) perform handle lookups. Registration is a write operation processed by writers; lookup is a read operation available to all.
 
 **Instance scope.** Handle registries are **per-context within a single `SCP` instance** (ADR-048). Each `SCP` instance maintains its own in-process registry state keyed by context ID; two `SCP` instances in the same process do not share handle-registry storage. The authoritative registry lives inside each context (replicated via the context event log to all MLS members) — the `SCP`-instance-local registry is an in-memory materialized view of that context state. Cross-instance convergence happens through the context event log, not through any process-global cache. This clarification matches the existing semantics; it is not a semantic change.
 
@@ -795,7 +795,7 @@ This section tabulates the wire format for all discovery and addressing types th
 
 ### 22.11.1 Agent Registration and Search
 
-These types are the outlet call schemas for the standard context outlets defined in §6.2.2B.
+These types are the outlet call schemas for the standard context outlets defined in §6.2.2B [no such section].
 
 **`AgentSearchParams`** — Input for `agent_search` outlet.
 
@@ -1233,9 +1233,9 @@ The following outlet names are normative — independent implementations MUST us
 
 | Outlet Name | Direction | Spec Reference |
 |-----------|-----------|----------------|
-| `agent_search` | Reader (DID-authenticated query) | §6.2.2B |
-| `agent_register` | Writer (MLS member write) | §6.2.2B |
-| `agent_deregister` | Writer (MLS member write) | §6.2.2B |
+| `agent_search` | Reader (DID-authenticated query) | §6.2.2B [no such section] |
+| `agent_register` | Writer (MLS member write) | §6.2.2B [no such section] |
+| `agent_deregister` | Writer (MLS member write) | §6.2.2B [no such section] |
 | `handle_register` | Writer (MLS member write) | §22.3.1 |
 | `handle_lookup` | Reader (DID-authenticated query) | §22.3.1 |
 | `handle_deregister` | Writer (MLS member write) | §22.3.1 |
@@ -1248,7 +1248,7 @@ The following outlet names are normative — independent implementations MUST us
 
 | Service Type | Semantics | Spec Reference |
 |--------------|-----------|----------------|
-| `SCPCapabilities` | Agent capability URIs | §6.2.2A |
+| `SCPCapabilities` | Agent capability URIs | §6.2.2A [no such section] |
 | `SCPBroadcastContext` | Broadcast context advertisement | §5.14 |
 | `SCPRelay` | Relay endpoint URL | §18.3 |
 

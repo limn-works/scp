@@ -7,9 +7,9 @@ SCP's protocol layer — identity (§3), contexts (§5), relays (§10.4), encryp
 The core protocol path avoids HTTP entirely:
 
 ```
-DID (out-of-band exchange)
-  → DHT resolution (Mainline, self-certifying via BEP44)
-    → BEP44-signed relay list (in DID document SCPRelay entries)
+identifier (out-of-band exchange)
+  → key-event log replay over the SCP relay network (self-certifying: the identifier is the inception event's digest)
+    → service record signed by the designated operational key (its SCPRelay entries carry the relay list)
       → WebSocket connection (TLS 1.3, §9.13)
         → MLS end-to-end encryption (§9.7)
 ```
@@ -18,13 +18,13 @@ Every step in this chain is self-certifying or cryptographically verified. No HT
 
 `scp://` URIs are the direct-connection mechanism — a context ID plus relay URL, no HTTP intermediary. They are the canonical way to share a context reference out-of-band.
 
-`.well-known/scp` is an **optional web on-ramp** for the "I know a domain, nothing else" entry point. It is advisory only — HTTPS-dependent, not self-certifying. Clients MUST verify `.well-known/scp` data against DHT-resolved DID documents before trusting it (§18.3.2). Web clients (a browser — normally an in-tab client running the protocol itself with keys on-device per ADR-057, or optionally a remote custodial thin client to a server-side `scp-node`) use `.well-known/scp` to bridge from HTTP-land, then verify via DHT. This layering must be explicit: HTTP is the outermost, least-trusted discovery layer. The core protocol operates entirely without it.
+`.well-known/scp` is an **optional web on-ramp** for the "I know a domain, nothing else" entry point. It is advisory only — HTTPS-dependent, not self-certifying. Clients MUST verify `.well-known/scp` data against the operator's own verified service record before trusting it (§18.3.2). Web clients (a browser — normally an in-tab client running the protocol itself with keys on-device per ADR-057, or optionally a remote custodial thin client to a server-side `scp-node`) use `.well-known/scp` to bridge from HTTP-land, then verify via DHT. This layering must be explicit: HTTP is the outermost, least-trusted discovery layer. The core protocol operates entirely without it.
 
 The agent workstation tier (§10.2) is the primary deployment target for addressability. A dedicated always-on machine running builder agents is the natural host for SCP infrastructure: relay, identity, contexts, and HTTP serving are marginal additional load on hardware that's already running 24/7. The `ApplicationNode` (§18.6) is the SDK type that makes this deployment trivial.
 
 ## 18.2 DID Document Service Endpoints
 
-DID documents (§3.7) carry service endpoints that declare how to reach the identity's infrastructure. SCP defines specific service endpoint types for protocol operations.
+The **service record** (`03-identity.md` §3.10.13) carries the entries that declare how to reach the identity's infrastructure. SCP defines specific entry types for protocol operations, and this section names them; §3.10.13 owns the record's bytes, its signature, its address, and the rule a reader settles two copies by.
 
 ### 18.2.1 SCPRelay
 
@@ -40,16 +40,16 @@ The `SCPRelay` service endpoint type declares transport-layer relay URLs where t
 
 Properties:
 
-- **URL format:** `wss://<host>/scp/v1` — the canonical SCP relay WebSocket endpoint (ADR-004). TLS 1.3 required (§9.13). **Exception:** Self-hosted relays without a domain MAY use `ws://` with IP literal addresses when discovered via DHT-resolved DID documents (§10.12.7). The SDK MUST reject `ws://` URLs from `.well-known/scp` or any non-DHT source.
+- **URL format:** `wss://<host>/scp/v1` — the canonical SCP relay WebSocket endpoint (ADR-004). TLS 1.3 required (§9.13). **Exception:** Self-hosted relays without a domain MAY use `ws://` with IP literal addresses when the URL came from a verified service record (§10.12.7). The SDK MUST reject `ws://` URLs from `.well-known/scp` or any non-DHT source.
 - **Multiple entries allowed.** An identity MAY publish multiple `SCPRelay` entries for suppression resistance (§9.9.2, ADR-012). The recommended minimum is 3 relays.
-- **Self-certified via BEP44.** For did:dht identities, relay URLs in the DID document are signed as part of the BEP44 record (§9.6.3). Substituting a relay URL requires the identity's private key.
-- **Sequence number monotonicity.** Relay list updates follow the BEP44 sequence number rules (§9.6.3). Clients MUST reject DID documents with lower sequence numbers than previously observed.
+- **Signed by the designated operational key.** Relay URLs ride in the identity's service record, which the operational key its key state designates for that role signs (`03-identity.md` §3.10.13, §9.6.3). Substituting a relay URL therefore requires that key, and substituting the designation requires a threshold of the identity's standing root.
+- **Sequence number monotonicity.** Relay list updates ride the service record's own monotonic sequence, and a reader rejects a copy at a sequence lower than the highest it has accepted under the same designated key bytes (`03-identity.md` §3.10.13). The key-event log's sequence is a different number and orders a different record.
 
-When a peer resolves an identity's DID document, the `SCPRelay` entries tell them where to route encrypted envelopes destined for that identity. This is the primary relay discovery mechanism — out-of-band DID exchange leads to DHT resolution leads to relay URLs.
+When a peer resolves an identity's service record, the `SCPRelay` entries tell it where to route encrypted envelopes destined for that identity. This is the primary relay discovery mechanism: an out-of-band identifier exchange leads to a key-event log replay, which yields the designated key, which authenticates the service record and its relay URLs.
 
 ### 18.2.2 Existing Endpoint Types (Cross-Reference)
 
-SCP uses multiple DID document service endpoint types, each serving a distinct purpose:
+SCP uses multiple service-record entry types, each serving a distinct purpose:
 
 | Type | Purpose | Consumer | Spec Reference |
 |------|---------|----------|----------------|
@@ -67,93 +67,19 @@ SCP uses multiple DID document service endpoint types, each serving a distinct p
 - `SCPRelay` = **transport layer**. Where to send encrypted blobs. Consumed by `TransportManager`. Any SCP participant publishing to this identity routes through these URLs.
 - `SCPCapabilities` = **application layer**. What outlets and capabilities an agent offers. Consumed by the Discovery Engine. Agents looking for specific capabilities query these endpoints.
 
-A relay operator's DID document contains `SCPRelay` entries (where to connect). An agent's DID document may contain both `SCPRelay` entries (how to reach the agent) and `SCPCapabilities` entries (what the agent can do).
+A relay operator's service record contains `SCPRelay` entries (where to connect). An agent's service record may contain both `SCPRelay` entries (how to reach the agent) and `SCPCapabilities` entries (what the agent can do).
 
-### 18.2.2A DID Document Field-Level Schema
+### 18.2.2A The identity publishes no DID document
 
-SCP DID documents follow the W3C DID Core specification (v1.0) with SCP-specific verification methods and service endpoints. The canonical serialization is JSON (per did:dht spec). Two SDKs MUST produce byte-identical DID documents for the same identity state to ensure BEP44 signature verification.
+**A prior revision of this section carried a W3C DID Core field-level schema** — a `did:dht:<z-base-32(#0 public key)>` identifier, `#0`, `#active` and `#agent` verification methods, a Multikey `publicKeyMultibase` encoding, and a JSON Canonicalization Scheme serialization justified by BEP44 signature computation. **ADR-063, the inception-derived key-event-log identity substrate, removed every one of those.** The identifier is the inception event's digest and encodes no key (`09-security-model.md` §9.7.4.2 R13); ADR-063's retired clauses 3, 4 and 5 retire pkarr, BEP44, the Mainline DHT, the z-base-32 DID string and the three `did:dht:z` self-certification bindings; `09-security-model.md` §9.7.4.2's definitions give a human identity one operational role and no `#agent`; and `03-identity.md` §3.10.13 states that this protocol publishes no W3C DID Core JSON for an identity at all. This subsection is the deletion record and states no schema of its own.
 
-**Canonical DID document structure:**
-
-```json
-{
-  "@context": [
-    "https://www.w3.org/ns/did/v1",
-    "https://w3id.org/security/data-integrity/v2"
-  ],
-  "id": "did:dht:<z-base-32-encoded-public-key>",
-  "verificationMethod": [
-    {
-      "id": "did:dht:<key>#0",
-      "type": "Multikey",
-      "controller": "did:dht:<key>",
-      "publicKeyMultibase": "z<multibase-encoded-p256-public-key>"
-    },
-    {
-      "id": "did:dht:<key>#active",
-      "type": "Multikey",
-      "controller": "did:dht:<key>",
-      "publicKeyMultibase": "z<multibase-encoded-p256-public-key>"
-    },
-    {
-      "id": "did:dht:<key>#agent",
-      "type": "Multikey",
-      "controller": "did:dht:<key>",
-      "publicKeyMultibase": "z<multibase-encoded-p256-public-key>"
-    }
-  ],
-  "authentication": ["did:dht:<key>#active", "did:dht:<key>#agent"],
-  "assertionMethod": ["did:dht:<key>#active", "did:dht:<key>#agent"],
-  "capabilityDelegation": ["did:dht:<key>#0"],
-  "capabilityInvocation": ["did:dht:<key>#0", "did:dht:<key>#active"],
-  "service": [
-    {
-      "id": "#scp-relay-1",
-      "type": "SCPRelay",
-      "serviceEndpoint": "wss://relay.example.com/scp/v1"
-    },
-    {
-      "id": "#scp-private-state",
-      "type": "IdentityPrivateState",
-      "serviceEndpoint": ["wss://relay1.example.com/scp/v1", "wss://relay2.example.com/scp/v1"]
-    },
-    {
-      "id": "#scp-participation",
-      "type": "ParticipationStatements",
-      "serviceEndpoint": "https://relay.example.com/scp/v1/participation/<did>"
-    },
-    {
-      "id": "#scp-attestation-revocations",
-      "type": "AttestationRevocations",
-      "serviceEndpoint": "https://relay.example.com/scp/v1/revocations/<did>"
-    }
-  ]
-}
-```
-
-**Field constraints:**
-
-| Field | Required | Constraints |
-|-------|----------|-------------|
-| `@context` | Yes | MUST include the two URIs shown above, in order. |
-| `id` | Yes | MUST match `did:dht:<z-base-32(#0 public key)>`. |
-| `verificationMethod` | Yes | MUST include `#0` (Identity Key). MUST include `#active` (Active Signing Key). MAY include `#agent` (Agent Signing Key, optional per ADR-039). No other verification methods permitted. |
-| `verificationMethod[].publicKeyMultibase` | Yes | Multibase-encoded, multicodec-tagged compressed P-256 public key: base58btc (prefix `z`) over the multicodec identifier `p256-pub` (`0x1200`) followed by the 33-byte SEC1 compressed point (§9.5 of the security-model spec fixes the point encoding). |
-| `authentication` | Yes | MUST reference `#active`. MAY reference `#agent`. MUST NOT reference `#0`. |
-| `assertionMethod` | Yes | Same as `authentication`. |
-| `capabilityDelegation` | Yes | MUST reference only `#0`. |
-| `capabilityInvocation` | Yes | MUST reference `#0` and `#active`. |
-| `service` | Yes | At least one `SCPRelay` entry required. Other types optional. |
-| `service[].id` | Yes | Fragment identifier (e.g., `#scp-relay-1`). Unique within the document. |
-| `service[].type` | Yes | One of the types in §18.2.2. |
-
-**Canonical serialization rules:** JSON keys MUST be sorted lexicographically at every nesting level (RFC 8785 JSON Canonicalization Scheme). This ensures deterministic serialization for BEP44 signature computation. Whitespace: no extra whitespace (minified JSON). Unicode: NFC normalization.
+**What replaced it, and where each replaced thing lives.** Key material, each key's condition, the witness set and its interval, the delegator, and the designation of the operational key that signs the service record are fields of the key-event log, which a resolver replays under `09-security-model.md` §9.7.4.2 R2, R3 and R8. Transport and service metadata — every entry type §18.2.2 lists — are entries of the **service record**, whose fields, bytes, signature preimage, address and last-writer-wins rule `03-identity.md` §3.10.13 states, and which a reader authenticates by the two-step chain of `09-security-model.md` §9.6.3: the log authenticates the designated key, and the designated key authenticates the record.
 
 ### 18.2.3 Multiple Relay Entries
 
-An identity SHOULD publish at least 3 `SCPRelay` entries for suppression resistance (§9.9.2). `TransportManager` reads all `SCPRelay` entries from a resolved DID document and routes to all of them. The relay set partitioning logic (ADR-012) operates on top of the published relay list.
+An identity SHOULD publish at least 3 `SCPRelay` entries for suppression resistance (§9.9.2). `TransportManager` reads all `SCPRelay` entries from a verified service record and routes to all of them. The relay set partitioning logic (ADR-012) operates on top of the published relay list.
 
-Relay entries are ordered by preference (first entry = preferred relay). Clients SHOULD respect ordering when selecting a subset. When adding or removing relays, the identity updates its DID document and publishes with an incremented BEP44 sequence number. Peers that re-resolve the DID document discover the updated relay list.
+Relay entries are ordered by preference (first entry = preferred relay). Clients SHOULD respect ordering when selecting a subset. When adding or removing relays, the identity writes a fresh service record under the designated key at an incremented sequence and publishes it (`03-identity.md` §3.10.13). Peers that re-resolve the record discover the updated relay list, and no key event is appended and no root key is warmed.
 
 ## 18.3 .well-known/scp
 
@@ -164,7 +90,7 @@ An HTTP-accessible JSON document at `https://<domain>/.well-known/scp` that enab
 ```json
 {
   "version": 1,
-  "did": "did:dht:z6Mk...",
+  "did": "<the operator's identifier, in the textual form 09 §9.7.4.2 R13 defers>",
   "relay": "wss://relay.example.com/scp/v1",
   "contexts": [
     {
@@ -188,7 +114,7 @@ An HTTP-accessible JSON document at `https://<domain>/.well-known/scp` that enab
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `version` | integer | Yes | Protocol version. Currently `1`. |
-| `did` | string | Yes | The operator's DID (did:dht preferred). Enables partial verification via DHT resolution (§18.3.2). |
+| `did` | string | Yes | The operator's inception-derived identifier (`09-security-model.md` §9.7.4.2 R13). **This field's encoding is the identifier's textual form**, which R13 defers to a later revision of §9.7.4.2 along with the key-event preimage's field order; until that revision lands, two implementations agree on this field only where they agree on that form. Enables the verification chain of §18.3.2. |
 | `relay` | string | Yes | Primary relay URL (`wss://` scheme, `/scp/v1` path). |
 | `contexts` | array | No | Publicly listed contexts. See constraints below. |
 | `handles` | object | No | Map of local-part → resolution record for domain handles (§22.6.1). |
@@ -210,14 +136,14 @@ An HTTP-accessible JSON document at `https://<domain>/.well-known/scp` that enab
 **Verification chain:**
 
 1. Client reads `https://<domain>/.well-known/scp` → gets `did` + `relay` fields.
-2. Client resolves `did` via Mainline DHT (self-certifying, no HTTPS in this step).
-3. Client checks that the `relay` URL appears in the BEP44-signed DID document's `SCPRelay` service entries.
-4. **Match** → BEP44-grade assurance of relay URL. The `.well-known/scp` data is consistent with the self-certifying DID document.
-5. **Mismatch** → reject `.well-known/scp` data. The web document is inconsistent with the DHT-resolved identity.
+2. Client resolves that identifier's key-event log over the SCP relay network and verifies it under `09-security-model.md` §9.7.4.2 R2 and R3, which is self-certifying because the identifier is the inception event's digest, and reads the service-key designation out of the verified chain (§9.7.4.2 R8). No HTTPS enters this step.
+3. Client fetches that identifier's service record, verifies its signature against the designated key (`03-identity.md` §3.10.13, §9.6.3), and checks that the `relay` URL appears among the record's `SCPRelay` entries.
+4. **Match** → the relay URL carries the assurance of the designated key, and the `.well-known/scp` data is consistent with the self-certifying key-event log.
+5. **Mismatch** → reject the `.well-known/scp` data. The web document is inconsistent with the identity the relay network resolves.
 
 **Attack analysis:**
 
-- An attacker who controls DNS/CA can serve a fake `.well-known/scp` but **cannot forge the DHT-resolved DID document** without the identity's private key. The verification chain catches the discrepancy at step 5.
+- An attacker who controls DNS or the CA chain can serve a fake `.well-known/scp` but **cannot forge the key-event log or the service record** without the identity's root and its designated operational key. The verification chain catches the discrepancy at step 5.
 - Worst case without verification: the client connects to the wrong relay. Since the relay is a dumb pipe that cannot read MLS-encrypted content (§9.9.1), the impact is limited to availability (messages go to the wrong relay) rather than confidentiality. The math enforces access, not infrastructure.
 - Clients MUST perform the verification chain before trusting `.well-known/scp` data for any protocol operation. Clients that skip verification (e.g., displaying a domain's broadcast context list in a web UI) MUST indicate that the data is unverified.
 
@@ -231,7 +157,7 @@ An HTTP-accessible JSON document at `https://<domain>/.well-known/scp` that enab
 
 **What `.well-known/scp` MAY expose:**
 
-- Relay URLs (already public via DID document)
+- Relay URLs (already public via the service record)
 - Operator DID (already public)
 - Protocol version
 - Relay operator configuration (§18.3.3)
@@ -324,11 +250,11 @@ How a new identity learns its first relay. This closes the relay discovery open 
 
 ### 18.5.1 The Community Relay List and Bootstrap Priority Order
 
-**The community relay list is one shipped artifact, and this section defines it.** The SDK ships a fixed list of well-known community relays, identical in every language binding of one release. **Every entry declares three things: the relay's URL, the operator identity that runs it (the operator's 32-byte inception-derived identifier, `09-security-model.md` §9.7.4.2 R13), and whether the relay is free** (an entry with no `economic` field in `relay_config` is free). **An entry declares no cosigning key**, and a verifier reads the operator's cosigning key from that operator's own key-event log, which is the key the log's latest state-carrying event lists `current` in the `#active` role (`09-security-model.md` §9.7.4.3). An operator rotates that key on its own schedule while an entry changes only at a release boundary, so an entry carrying key bytes would name a retired key at every party running a release older than the rotation, and it would stand as a second authority over a key state the operator's own log already fixes. The list MUST carry at least one free entry, which is a protocol invariant that prevents economic gatekeeping of basic protocol operation (§19.8, §19.14). **A witness MUST NOT charge for cosigning, which is the companion invariant to that one**: a cosigned head is one of the two sources a peer corroborates an identity's head from (`09-security-model.md` §9.7.4.2 definitions), and a priced cosignature would put that source behind the economic layer and leave an identity that cannot pay corroborated only by peers able to reach two of these relays themselves. The free-entry invariant above is what keeps the other source free as well, so neither source is purchasable and §9.11's standing is not. Economic rules MAY price a witness's cadence and its availability guarantees; they MAY NOT price the act. Two entries declaring one operator identity are two relays under one operator, and a rule that counts independent sources counts them once. **The entries of a shipped release are established as independent parties at release**, and the release process admits no two entries whose declared operators are the same party. **Every entry carries a proof-of-control obligation.** The relay signs its served response under the operator identity its entry declares, and a resolver verifies that signature against the operator's own key-event log before it counts that relay as a source (`09-security-model.md` §9.7.4.2 R11 states what a resolver does with a relay that serves no such proof). An inception-derived identifier is a self-signed digest, so one party mints two of them at no cost and presents two entries under two operator identities; a floor that counted unproven operator fields would count that one party twice, and it would deliver its independence against nobody. These relays are not privileged: they are default suggestions a deployer overrides.
+**The community relay list is one shipped artifact, and this section defines it.** The SDK ships a fixed list of well-known community relays, identical in every language binding of one release. **Every entry declares three things: the relay's URL, the operator identity that runs it (the operator's 32-byte inception-derived identifier, `09-security-model.md` §9.7.4.2 R13), and whether the relay is free** (an entry with no `economic` field in `relay_config` is free). **An entry declares no cosigning key**, and a verifier reads the operator's cosigning key from that operator's own key-event log, which is the key the log's latest state-carrying event lists `current` in the `#active` role (`09-security-model.md` §9.7.4.3). An operator rotates that key on its own schedule while an entry changes only at a release boundary, so an entry carrying key bytes would name a retired key at every party running a release older than the rotation, and it would stand as a second authority over a key state the operator's own log already fixes. The list MUST carry at least one free entry, which is a protocol invariant that prevents economic gatekeeping of basic protocol operation (§19.8, §19.14). **An entry of this list MUST cosign free for the identities that designate it**, and that is an obligation this list's curation carries rather than a bar on every relay in the protocol. Economic rules MAY price a witness's cadence and its availability guarantees; an entry of this list MAY NOT price the act. **What pricing the act would cost, stated at its true size:** an identity that cannot pay produces no cosigned head, so the portable half of its corroboration is unavailable to a peer that did not read its head itself. It costs that identity no resolution, no key-state derivation, no admission and no grant, because no rule reads a cosignature (`09-security-model.md` §9.7.4.2 definitions). The 2026-09-07 reason for a wider prohibition — that charging for the act would make identity establishment a paid feature — rested on the required-witnessing ruling Alec superseded on 2026-09-10 with "watch and report as well", so this sentence states the obligation over the entries this list ships and no further. Two entries declaring one operator identity are two relays under one operator, and a rule that counts independent sources counts them once. **The entries of a shipped release are established as independent parties at release**, and the release process admits no two entries whose declared operators are the same party. **Every entry carries a proof-of-control obligation.** A relay this list names MUST answer a QUERY carrying a `proof_nonce` with a **relay proof of control** — the object `09-security-model.md` §9.7.4.3 defines, signed under the operator identity this entry declares, binding that nonce, the routing id queried, and the digest of the bytes served. A resolver verifies it by the five checks §9.7.4.3 states, resolving that operator's own chain under the non-recursive floor of `09-security-model.md` §9.7.4.2's definitions, before it counts that relay as a source (§9.7.4.2 R11 states what a resolver does with a relay that serves no such proof). An inception-derived identifier is a self-signed digest, so one party mints two of them at no cost and presents two entries under two operator identities; a floor that counted unproven operator fields would count that one party twice, and it would deliver its independence against nobody. These relays are not privileged: they are default suggestions a deployer overrides.
 
-**This artifact carries two roles, and this states what the second one decides and what it does not.** Beside the fallback set below, the list is the source of a relying party's **recognized operator set**: a party reads a cosigned head as evidence only where the cosigning operator sits on its own copy of this list (`09-security-model.md` §9.7.4.2 definitions, §9.7.4.3). **What that evidence decides is a standing and never a verdict, and it is one of two sources of that standing.** No rule of `09-security-model.md` §9.7.4.2 reads a cosignature, so an identity whose designated witnesses are absent from a party's copy still resolves at that party and still derives a key state there. **It also keeps its §9.11 standing there**, because that party's own read of the identity's head from two entries of this list under distinct declared operators is the second corroboration source and this list supplies that too. So an unlisted witness set costs an identity nothing a two-relay read does not restore. **Curation is therefore a security specification and not an editorial preference**, because this list is the source of both corroboration sources and of the fallback set a resolver reaches at all, and `09-security-model.md` §9.7.4.3 states plainly that a badly curated list is a supply-chain risk no protocol check covers. **Anti-self-witnessing is one of the properties curation carries, and no protocol check delivers it.** A relying party reads a cosigned head from any operator its own copy of this list carries, and `09-security-model.md` §9.7.4.2 R3's only mechanical bar is a witness set naming the subject identifier itself, which an operator identity never is. So a controller whose own operator identity sits on this list supplies its own freshness evidence at every default-configured party — and that reaches every entry's operator, the curator of this list included. **The curator MUST therefore keep an entry's operator identity off this list for any identity that operator's controller also witnesses through it**, and the release process that admits no two entries under one party is the same process that carries this obligation. Nothing in the protocol detects a breach of it. **The list is versioned with the SDK release that ships it**, so a party's recognized set changes with the SDK version it runs, and a party takes an added operator only from a release.
+**This artifact carries two roles, and this states what the second one decides and what it does not.** Beside the fallback set below, the list is the source of a relying party's **recognized operator set**: a party reads a cosigned head as evidence only where the cosigning operator sits on its own copy of this list (`09-security-model.md` §9.7.4.2 definitions, §9.7.4.3). **What that evidence decides is nothing.** No rule reads a cosignature — none in `09-security-model.md` §9.7.4.2 and none outside it — so an identity whose designated witnesses are absent from a party's copy still resolves at that party, still derives a key state there, and keeps its §9.11 standing there. A cosigned head is a fact that party records about the age of the head it holds, beside the second such fact this list also supplies: its own read of that head from two entries under distinct declared operators. **Curation is therefore a security specification and not an editorial preference**, because this list is the source of both corroboration sources and of the fallback set a resolver reaches at all, and `09-security-model.md` §9.7.4.3 states plainly that a badly curated list is a supply-chain risk no protocol check covers. **Anti-self-witnessing is one of the properties curation carries, and no protocol check delivers it.** A relying party reads a cosigned head from any operator its own copy of this list carries, and `09-security-model.md` §9.7.4.2 R3's only mechanical bar is a witness set naming the subject identifier itself, which an operator identity never is. So a controller whose own operator identity sits on this list supplies its own freshness evidence at every default-configured party — and that reaches every entry's operator, the curator of this list included. **The curator MUST therefore keep an entry's operator identity off this list for any identity that operator's controller also witnesses through it**, and the release process that admits no two entries under one party is the same process that carries this obligation. Nothing in the protocol detects a breach of it. **The list is versioned with the SDK release that ships it**, so a party's recognized set changes with the SDK version it runs, and a party takes an added operator only from a release.
 
-**No runtime removal channel exists, and this section states that rather than stating an obligation over one.** A party's recognized set changes at a release boundary and at no other moment. **The direction such a channel would have to run is settled and recorded here so a later revision does not re-decide it:** it subtracts only, because an addition widens the set of operators whose observations a party trusts while a party reviews a release before it runs it, so an operator added between releases would widen that party's trust basis past what it reviewed. That a forged removal is merely fail-closed does not make an unauthenticated channel acceptable: a removal subtracts an entry from both of this list's roles at once, so a forged one makes the receiving party discard that operator's cosigned heads **and** stop counting its relay toward the two-source read, and a removal of two entries leaves a victim uncorroborated at that party and closes its admission and grant gate there (`09-security-model.md` §9.11, §9.7.4.2 definitions) — an unauthenticated, targeted denial of one identity at one party. Until the paragraph below's channel is specified, an SDK implements no removal listener.
+**No runtime removal channel exists, and this section states that rather than stating an obligation over one.** A party's recognized set changes at a release boundary and at no other moment. **The direction such a channel would have to run is derived here, by the executor and not by a ruling, and recorded so a later revision reads the derivation rather than repeating it:** it subtracts only, because an addition widens the set of operators whose observations a party trusts while a party reviews a release before it runs it, so an operator added between releases would widen that party's trust basis past what it reviewed. That a forged removal is merely fail-closed does not make an unauthenticated channel acceptable: a removal subtracts an entry from both of this list's roles at once, so a forged one makes the receiving party discard that operator's cosigned heads **and** stop counting its relay toward the two-source read of R11's first-contact floor (`09-security-model.md` §9.7.4.2 R11), which is an unauthenticated way to push a party below that floor and deny it every first contact it has not already made. Until the paragraph below's channel is specified, an SDK implements no removal listener.
 
 **A party running a new release re-reads its held cosigned heads against the recognized set that release carries** (`09-security-model.md` §9.7.4.3), because that party reviewed the release before it ran it. No key state changes when it does, because none was derived from a cosignature.
 
@@ -347,7 +273,9 @@ Each priority level is tried in order. The first level that yields at least one 
 
 Community relays SHOULD support STUN service (§10.12.3) — this makes them available as NAT type detection endpoints for self-hosted relays behind residential NAT. They also serve as identity-resolution endpoints: identity owners MUST publish their key-event record and their service record to the community relays of their fallback set (`03-identity.md` §3.10.6), and resolvers query them on every first contact (`09-security-model.md` §9.7.4.2 R11). **A community relay entry is expected to witness**, because the SDK's default witness set for a new identity is drawn from this list (`09-security-model.md` §9.7.4.3), and an entry that declines to witness reduces the set every new identity of that release draws from, and therefore the portable corroboration those identities can offer a peer that did not read their head itself.
 
-**A deployment whose shipped list is empty holds every identity it resolves at `ContinuityStanding::Unresolved`** (`09-security-model.md` §9.11), and it does so because an empty list empties **both** corroboration sources at once: it recognizes no operator whose cosigned head it would read, and it names no two entries under distinct declared operators to read a head from itself (`09-security-model.md` §9.7.4.2 definitions). Its identities still resolve and still derive key state, because no verdict reads either source. An air-gapped deployment that carries this list keeps both: it reads cosigned heads its own relay mirrors, because a cosignature verifies offline, and it reads heads from the mirrored entries themselves.
+**A deployment whose shipped list is empty reaches no first contact**, because R11's floor takes two entries under distinct declared operators and an empty list carries none (`09-security-model.md` §9.7.4.2 R11); every first contact returns `Inconclusive{SingleSource}`, which §9.6.4 records as `ContinuityStanding::Unresolved`. An identity that deployment has already resolved keeps resolving, keeps deriving key state, and keeps its standing, because R11's floor binds a verifier holding no baseline. **An empty list also empties both corroboration sources**, which costs that deployment its freshness record and costs it no act (`09-security-model.md` §9.7.4.2 definitions, §9.11).
+
+**An air-gapped deployment keeps one corroboration source and loses the other, and loses no act with it.** It reads cosigned heads its own relay mirrors, because a cosignature verifies offline against the witness operator's own chain, and a mirrored head goes stale once it passes the staleness window. It reads no head under a relay proof of control from a mirrored entry, because the mirror cannot sign as the operator it mirrors (§9.7.4.3), so a mirrored entry counts toward no source and toward no R11 floor. A deployment in that state resolves every identity whose baseline it already holds, admits and grants exactly as a connected deployment does, and reaches no first contact for an identifier it has never seen.
 
 ### 18.5.2 Agent Deployment Case
 
@@ -355,18 +283,18 @@ An agent deploying via `ApplicationNode` (§18.6) follows a simplified bootstrap
 
 1. `ApplicationNode::builder().domain("example.com").build()` starts the relay server on the local machine.
 2. The relay URL is `wss://example.com/scp/v1` (derived from the configured domain).
-3. The identity's DID document is published with this relay URL as an `SCPRelay` entry.
+3. The identity publishes a service record carrying this relay URL as an `SCPRelay` entry, signed by the operational key its key state designates for that role (`03-identity.md` §3.10.13).
 4. `.well-known/scp` is generated and served at `https://example.com/.well-known/scp`.
 
-The agent's relay is self-hosted — no external relay discovery needed. Peers discover the agent's relay by resolving its DID document.
+The agent's relay is self-hosted — no external relay discovery needed. Peers discover the agent's relay by resolving its key-event log and then its service record.
 
 ### 18.5.3 Client Discovery Case
 
 A client that knows only a domain name (e.g., from a website or advertisement):
 
 1. Fetch `https://example.com/.well-known/scp` → get `did` + `relay`.
-2. Resolve `did` via DHT → get `SCPRelay` entries.
-3. Verify `relay` from step 1 appears in step 2 (§18.3.2).
+2. Resolve that identifier's key-event log over the SCP relay network, verify it (`09-security-model.md` §9.7.4.2 R2, R3), read the service-key designation (R8), then fetch and verify that identifier's service record and read its `SCPRelay` entries (`03-identity.md` §3.10.13).
+3. Verify `relay` from step 1 appears among the entries from step 2 (§18.3.2).
 4. Connect to the relay via WebSocket.
 5. Subscribe to broadcast contexts listed in `.well-known/scp` or inspect encrypted context metadata via `scp://` URIs.
 
@@ -376,7 +304,7 @@ A client that knows only a domain name (e.g., from a website or advertisement):
 
 `ApplicationNode` is NOT an HTTP framework. It exposes components (relay router, `.well-known` router, TLS configuration) that integrate with existing HTTP frameworks (axum, actix-web, etc.). Applications build their HTTP layer on top; `ApplicationNode` provides the SCP-specific pieces.
 
-When `.no_domain()` is set (§10.12.8), `ApplicationNode` skips ACME TLS provisioning, does not serve `.well-known/scp`, and instead probes NAT type via STUN to determine the appropriate reachability tier (UPnP, STUN hole punch, or relay bridge). The DID document is published with a `ws://` relay URL. This is the zero-config deployment path for self-hosted relays behind residential NAT.
+When `.no_domain()` is set (§10.12.8), `ApplicationNode` skips ACME TLS provisioning, does not serve `.well-known/scp`, and instead probes NAT type via STUN to determine the appropriate reachability tier (UPnP, STUN hole punch, or relay bridge). The service record is published with a `ws://` relay URL. This is the zero-config deployment path for self-hosted relays behind residential NAT.
 
 ### 18.6.1 Components
 
@@ -385,7 +313,7 @@ An `ApplicationNode` composes:
 | Component | Description |
 |-----------|-------------|
 | **SCP Relay** | A relay server listening at `wss://<domain>/scp/v1` (ADR-004). Handles PUBLISH, SUBSCRIBE, QUERY, DELETE for all contexts hosted on this node. |
-| **Identity** | A DID identity (§3) with `SCPRelay` service entries pointing to this node's relay URL. Published to DHT on startup. |
+| **Identity** | An inception-derived identity (§3) whose service record carries `SCPRelay` entries pointing to this node's relay URL. The key-event record and the service record are published to the relay network on startup (`03-identity.md` §3.10.5, §3.10.13). |
 | **Storage** | `ProtocolRepository` (§17.4) backed by `SqliteStorage` (§17.6). Stores identity state, context state, relay blobs, and TLS certificates. |
 | **HTTP Server** | Serves `.well-known/scp` (§18.3) and provides WebSocket upgrade at `/scp/v1`. Merges with application-provided routes. |
 | **TLS** | ACME-provisioned TLS certificates (§18.6.3). TLS 1.3 required (§9.13). |
@@ -455,7 +383,7 @@ impl<...> ApplicationNodeBuilder<K, D, S, Dom, Id> {
     /// 1. Initialize storage (create if needed)
     /// 2. Load or generate identity
     /// 3. Start relay server
-    /// 4. Publish DID document with SCPRelay entry
+    /// 4. Publish the service record with its SCPRelay entry
     /// 5. Provision TLS certificate via ACME (domain mode) or probe NAT (no-domain mode)
     pub async fn build(self) -> Result<ApplicationNode<S>, NodeError>;
 }
@@ -485,7 +413,7 @@ impl<...> ApplicationNodeBuilder<K, D, S, Dom, Id> {
 SCP does not have a federation protocol in the traditional sense (no homeserver-to-homeserver communication). Instead, federation emerges from three existing mechanisms:
 
 1. **Multi-relay publishing (ADR-012).** Messages are published to 3+ relays. Any relay in the set can deliver to any subscriber. This provides relay-level redundancy without relay-to-relay coordination.
-2. **DID-based relay discovery (§18.2).** Peers discover each other's relays by resolving DID documents. No central relay registry. Each identity declares its own relays.
+2. **Identifier-based relay discovery (§18.2).** Peers discover each other's relays by resolving each identity's key-event log and then its service record. No central relay registry. Each identity declares its own relays.
 3. **Transport independence.** Different participants in the same context can connect to different relays (or even different transport types). The `TransportManager` handles multi-relay fanout and deduplication transparently.
 
 **Cross-operator messaging** works without explicit federation:
@@ -500,7 +428,7 @@ Alice (relay: relay-a.com)     Bob (relay: relay-b.com)
          │     relay-b                  │
 ```
 
-Alice resolves Bob's DID document, discovers Bob's `SCPRelay` entries, and includes Bob's relays in her publish set for contexts they share. Bob does the same for Alice. No relay-to-relay protocol needed — the clients handle cross-relay routing through `TransportManager`.
+Alice resolves Bob's service record, discovers Bob's `SCPRelay` entries, and includes Bob's relays in her publish set for contexts they share. Bob does the same for Alice. No relay-to-relay protocol needed — the clients handle cross-relay routing through `TransportManager`.
 
 ## 18.8 Agent Deployment Flow
 
@@ -520,7 +448,7 @@ End-to-end deployment of an SCP-enabled agent on a dedicated machine:
    a. Creates SqliteStorage at default path
    b. Generates a new DID identity
    c. Starts relay server at wss://agent.example.com/scp/v1
-   d. Publishes DID document with SCPRelay entry to DHT
+   d. Publishes the key-event record and the service record, whose SCPRelay entry names this relay, to the relay network
    e. Provisions TLS certificate via ACME
    f. Serves .well-known/scp at https://agent.example.com/.well-known/scp
 
@@ -533,7 +461,7 @@ End-to-end deployment of an SCP-enabled agent on a dedicated machine:
 
 4. Other agents discover this agent:
    a. Via domain: fetch .well-known/scp → get DID → resolve → connect
-   b. Via DID: resolve DID document → get SCPRelay entries → connect
+   b. Via identifier: replay the key-event log → read the service-key designation → verify the service record → get SCPRelay entries → connect
    c. Via URI: parse scp://context/... → connect to relay → inspect metadata
 
 5. Steady state:
@@ -592,7 +520,7 @@ All endpoints are prefixed with `/scp/dev/v1/`.
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/scp/dev/v1/health` | Uptime, relay connection count, storage status |
-| `GET` | `/scp/dev/v1/identity` | DID string and DID document |
+| `GET` | `/scp/dev/v1/identity` | The identifier and the identity's current service record |
 | `GET` | `/scp/dev/v1/relay/status` | Bound address, active connections, blob count |
 | `GET` | `/scp/dev/v1/contexts` | List registered broadcast contexts |
 | `GET` | `/scp/dev/v1/contexts/:id` | Single context (id, name, mode, subscriber count) |
@@ -629,7 +557,7 @@ Request bodies are limited to **64 KiB**. Requests exceeding this limit are reje
 - **DNS rebinding protection.** The dev API validates the `Host` header on every request, rejecting any value that is not `localhost`, `127.0.0.1`, or `[::1]` (with optional port). This prevents DNS rebinding attacks where a malicious website resolves its domain to `127.0.0.1` and accesses the dev API through the browser. Non-matching Host headers receive `403 Forbidden`.
 - **Security response headers.** All dev API responses include `X-Content-Type-Options: nosniff` (prevents MIME sniffing), `Cache-Control: no-store` (prevents caching of sensitive diagnostics), and `X-Frame-Options: DENY` (prevents clickjacking via iframe embedding).
 - **CORS preflight rejection.** `OPTIONS` requests to the dev API are rejected with `403 Forbidden`. The dev API is localhost-only and must not be accessible cross-origin.
-- **No private key material** is exposed through any endpoint. The identity endpoint returns the DID string and DID document (public information).
+- **No private key material** is exposed through any endpoint. The identity endpoint returns the identifier and the service record (public information).
 - **No message content** is exposed. The relay status endpoint shows connection and blob counts, not blob contents.
 - **Request body limit.** POST request bodies are limited to 64 KiB to prevent unbounded memory allocation.
 - **Broadcast context limit.** A maximum of 1024 broadcast contexts may be registered per node. This prevents unbounded memory growth from registration floods via the dev API or SDK.

@@ -24,6 +24,7 @@ The output is deterministic: the same tree prints the same bytes on every run.
 
 from __future__ import annotations
 
+import base64
 import binascii
 import hashlib
 import hmac
@@ -322,29 +323,47 @@ def _bits2octets(data: bytes) -> bytes:
     return _int2octets(z2 if z2 >= 0 else z1)
 
 
+class Rfc6979Nonces:
+    """RFC 6979 §3.2 with HMAC-SHA256, over an already-computed digest.
+
+    RFC 6979 §3.2 step h continues the HMAC-DRBG from where the previous
+    candidate left off, so a signer that rejects a candidate draws the NEXT
+    one rather than re-running the derivation and drawing the same one again.
+    This is an iterator for that reason: re-calling a plain function would not
+    terminate on the r == 0 or s == 0 branches of `ecdsa_sign`.
+    """
+
+    def __init__(self, d: int, digest: bytes) -> None:
+        v = b"\x01" * 32
+        k = b"\x00" * 32
+        m = _int2octets(d) + _bits2octets(digest)
+        k = hmac_sha256(k, v + b"\x00" + m)
+        v = hmac_sha256(k, v)
+        k = hmac_sha256(k, v + b"\x01" + m)
+        self._k = k
+        self._v = hmac_sha256(k, v)
+
+    def __next__(self) -> int:
+        while True:
+            self._v = hmac_sha256(self._k, self._v)
+            candidate = _bits2int(self._v)
+            if 1 <= candidate <= N - 1:
+                return candidate
+            self._k = hmac_sha256(self._k, self._v + b"\x00")
+            self._v = hmac_sha256(self._k, self._v)
+
+
 def rfc6979_nonce(d: int, digest: bytes) -> int:
-    """RFC 6979 §3.2 with HMAC-SHA256, over an already-computed digest."""
-    v = b"\x01" * 32
-    k = b"\x00" * 32
-    m = _int2octets(d) + _bits2octets(digest)
-    k = hmac_sha256(k, v + b"\x00" + m)
-    v = hmac_sha256(k, v)
-    k = hmac_sha256(k, v + b"\x01" + m)
-    v = hmac_sha256(k, v)
-    while True:
-        v = hmac_sha256(k, v)
-        candidate = _bits2int(v)
-        if 1 <= candidate <= N - 1:
-            return candidate
-        k = hmac_sha256(k, v + b"\x00")
-        v = hmac_sha256(k, v)
+    """The first RFC 6979 candidate, which is the one every vector here uses."""
+    return next(Rfc6979Nonces(d, digest))
 
 
 def ecdsa_sign(d: int, digest: bytes, *, low_s: bool = True) -> bytes:
     """Signs a 32-byte digest, returning the 64-byte raw `r || s` form (§9.5)."""
     e = _bits2int(digest)
+    nonces = Rfc6979Nonces(d, digest)
     while True:
-        k = rfc6979_nonce(d, digest)
+        k = next(nonces)
         point = scalar_mult_jacobian(k, G)
         assert point is not None
         r = point[0] % N
@@ -1433,6 +1452,173 @@ def emit_custody_violation() -> None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# §25.26 Key-event signature slots, the cosigned head, and the relay proof
+# (§9.7.4.2 definitions, §9.7.4.3, §9.18.2)
+# ---------------------------------------------------------------------------
+
+# The inception event's own preimage is NOT reproduced here: §9.7.4.2 R13 defers
+# the key-event preimage's field order to a later revision, so no vector can pin
+# a layout that is not yet fixed. Every vector below takes that event's §9.5.1
+# preimage digest as a STATED INPUT and pins what the fixed rules derive from it:
+# the raw slot, the WebAuthn challenge, the assertion slot's byte layout, and the
+# message a verifier runs ECDSA over.
+INCEPTION_DIGEST = sha256(b"scp-25-key-event-vector-inception")
+
+WEBAUTHN_CHALLENGE_PREFIX = b"SCP-KEY-EVENT-V1:"
+WEBAUTHN_RP_ID = b"ctx.network"
+# Synthesized authenticatorData, in WebAuthn's own layout for an assertion:
+#   rpIdHash (32) || flags (1) || signCount (4 big-endian).
+# flags 0x05 sets user present (0x01) and user verified (0x04). §9.7.4.2's
+# definitions require the user-presence bit and read the user-verification bit
+# as information, so a conforming slot may carry 0x01 here instead.
+WEBAUTHN_FLAGS = 0x05
+WEBAUTHN_SIGN_COUNT = 0
+# Synthesized clientDataJSON: the exact byte string a browser serializes, with no
+# whitespace and the member order a conforming client emits. A verifier parses it
+# as RFC 8259 JSON and rejects a duplicate member name at any nesting level.
+WEBAUTHN_ORIGIN = "https://ctx.network"
+
+
+def b64url_nopad(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def webauthn_authenticator_data() -> bytes:
+    return (
+        sha256(WEBAUTHN_RP_ID)
+        + bytes([WEBAUTHN_FLAGS])
+        + WEBAUTHN_SIGN_COUNT.to_bytes(4, "big")
+    )
+
+
+def webauthn_client_data_json(challenge: bytes) -> bytes:
+    return (
+        '{"type":"webauthn.get","challenge":"'
+        + b64url_nopad(challenge)
+        + '","origin":"'
+        + WEBAUTHN_ORIGIN
+        + '","crossOrigin":false}'
+    ).encode()
+
+
+def emit_key_event_slots() -> None:
+    section("§25.26 Key-event signature slots")
+    emit_hex("vector_41.inception_preimage_digest", INCEPTION_DIGEST)
+
+    # --- Vector 41: an inception whose one root slot carries the raw form. ---
+    raw_sig = ecdsa_sign(REF_KEY_1.d, INCEPTION_DIGEST)
+    assert ecdsa_verify(REF_KEY_1.point, INCEPTION_DIGEST, raw_sig)
+    if _HAVE_CRYPTOGRAPHY:
+        _verify_with_cryptography(REF_KEY_1, INCEPTION_DIGEST, raw_sig, "vector_41")
+    assert int.from_bytes(raw_sig[32:], "big") * 2 <= N, "vector_41: high-s"
+    emit("vector_41.form", "0x01")
+    emit_hex("vector_41.root_key_compressed", REF_KEY_1.compressed)
+    emit("vector_41.slot_len", len(raw_sig))
+    emit_hex("vector_41.slot", raw_sig)
+
+    # --- Vector 42: an inception whose one root slot carries the assertion form. ---
+    challenge = WEBAUTHN_CHALLENGE_PREFIX + INCEPTION_DIGEST
+    auth_data = webauthn_authenticator_data()
+    client_data = webauthn_client_data_json(challenge)
+    signed_message = auth_data + sha256(client_data)
+    assertion_digest = sha256(signed_message)
+    assertion_sig = ecdsa_sign(REF_KEY_1.d, assertion_digest)
+    assert ecdsa_verify(REF_KEY_1.point, assertion_digest, assertion_sig)
+    if _HAVE_CRYPTOGRAPHY:
+        _verify_with_cryptography(
+            REF_KEY_1, assertion_digest, assertion_sig, "vector_42"
+        )
+    assert int.from_bytes(assertion_sig[32:], "big") * 2 <= N, "vector_42: high-s"
+    slot = (
+        u32(len(auth_data))
+        + auth_data
+        + u32(len(client_data))
+        + client_data
+        + assertion_sig
+    )
+    assert len(auth_data) <= 256, "vector_42: MAX_AUTHENTICATOR_DATA_BYTES"
+    assert len(client_data) <= 512, "vector_42: MAX_CLIENT_DATA_JSON_BYTES"
+    emit("vector_42.form", "0x02")
+    emit("vector_42.challenge_len", len(challenge))
+    emit_hex("vector_42.challenge", challenge)
+    emit("vector_42.challenge_b64url", b64url_nopad(challenge))
+    emit_hex("vector_42.rp_id_hash", sha256(WEBAUTHN_RP_ID))
+    emit("vector_42.authenticator_data_len", len(auth_data))
+    emit_hex("vector_42.authenticator_data", auth_data)
+    emit("vector_42.client_data_json_len", len(client_data))
+    emit("vector_42.client_data_json", client_data.decode())
+    emit_hex("vector_42.client_data_json_bytes", client_data)
+    emit_hex("vector_42.client_data_hash", sha256(client_data))
+    emit_hex("vector_42.signed_message", signed_message)
+    emit_hex("vector_42.ecdsa_digest", assertion_digest)
+    emit_hex("vector_42.signature", assertion_sig)
+    emit("vector_42.slot_len", len(slot))
+    emit_hex("vector_42.slot", slot)
+
+
+# --- §25.27 the cosigned head and the relay proof of control ---
+
+WITNESS_ID = sha256(b"scp-25-witness-operator")
+WITNESS_KEY_STATE_HEAD = sha256(b"scp-25-witness-key-state-head")
+SUBJECT_ID = sha256(b"scp-25-subject-identifier")
+COSIGN_OBSERVED_AT = 1_700_000_000
+RELAY_OPERATOR_ID = sha256(b"scp-25-relay-operator")
+RELAY_OPERATOR_KEY_STATE_HEAD = sha256(b"scp-25-relay-operator-key-state-head")
+RESOLVER_NONCE = sha256(b"scp-25-resolver-nonce")
+SERVED_VALUE_DIGEST = sha256(b"scp-25-served-blob-bytes")
+
+
+def emit_witness_and_relay_objects() -> None:
+    section("§25.27 Cosigned head and relay proof of control")
+
+    cosigned_fields = (
+        fixed_field(WITNESS_ID)
+        + fixed_field(WITNESS_KEY_STATE_HEAD)
+        + fixed_field(SUBJECT_ID)
+        + u64(7)
+        + fixed_field(INCEPTION_DIGEST)
+        + fixed_field(bytes(32))
+        + u64(COSIGN_OBSERVED_AT)
+    )
+    assert len(cosigned_fields) == 176, len(cosigned_fields)
+    emit_hex("vector_43.witness", WITNESS_ID)
+    emit_hex("vector_43.witness_key_state_head", WITNESS_KEY_STATE_HEAD)
+    emit_hex("vector_43.subject", SUBJECT_ID)
+    emit_hex("vector_43.event_digest", INCEPTION_DIGEST)
+    emit("vector_43.field_bytes", len(cosigned_fields))
+    digest = sign_and_emit(
+        "vector_43",
+        canonical_preimage("SCP-COSIGNED-HEAD-V1:", cosigned_fields),
+        REF_KEY_2,
+    )
+    emit("vector_43.object_bytes", len(cosigned_fields) + 64)
+    assert len(digest) == 32
+
+    routing_id = sha256(b"scp:did:" + SUBJECT_ID)
+    proof_fields = (
+        fixed_field(RELAY_OPERATOR_ID)
+        + fixed_field(RELAY_OPERATOR_KEY_STATE_HEAD)
+        + fixed_field(RESOLVER_NONCE)
+        + fixed_field(routing_id)
+        + fixed_field(SERVED_VALUE_DIGEST)
+        + u64(COSIGN_OBSERVED_AT)
+    )
+    assert len(proof_fields) == 168, len(proof_fields)
+    emit_hex("vector_44.operator", RELAY_OPERATOR_ID)
+    emit_hex("vector_44.operator_key_state_head", RELAY_OPERATOR_KEY_STATE_HEAD)
+    emit_hex("vector_44.nonce", RESOLVER_NONCE)
+    emit_hex("vector_44.routing_id", routing_id)
+    emit_hex("vector_44.value_digest", SERVED_VALUE_DIGEST)
+    emit("vector_44.field_bytes", len(proof_fields))
+    sign_and_emit(
+        "vector_44",
+        canonical_preimage("SCP-RELAY-PROOF-V1:", proof_fields),
+        REF_KEY_1,
+    )
+    emit("vector_44.object_bytes", len(proof_fields) + 64)
+
+
 def main() -> int:
     self_test()
     _LINES.append("SCP §25 test vectors — ECDSA on NIST P-256, RFC 6979, SHA-256")
@@ -1457,6 +1643,8 @@ def main() -> int:
     emit_trust_attestation()
     emit_keypackage_attestation()
     emit_custody_violation()
+    emit_key_event_slots()
+    emit_witness_and_relay_objects()
     print("\n".join(_LINES))
     return 0
 

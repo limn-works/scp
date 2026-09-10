@@ -38,7 +38,7 @@ Contexts can require specific capability levels for admission. "This context req
 
 ### 4.4.1 Agent Capability Metadata Schema
 
-The capability metadata profile published in a DID document's `SCPCapabilities` service endpoint (§6.2.2A, §18.2.2) uses the following structured format:
+The capability metadata profile published in a DID document's `SCPCapabilities` service endpoint (§6.2.2A [no such section], §18.2.2) uses the following structured format:
 
 ```json
 {

@@ -737,7 +737,7 @@ The exact sub-prefix structure follows OpenMLS's `StorageProvider` method signat
 - **Member wrapping keys** — per-member AES-256 keys for sender key wrapping
 - **Sender key epoch** — monotonic counter tracking sender key rotation
 
-Per ADR-049, this state is owned by the per-context actor (`PerContextState.mode`) — encrypted contexts carry an MLS+sender-key variant, broadcast contexts carry a per-author-key variant. The narrow backend traits `MlsBackend` and `HpkeBackend` (architecture.md §2.5.3) provide stateless primitives over this state; state serialization is an inherent concern of the state itself, not the trait.
+Per ADR-049, this state is owned by the per-context actor (`PerContextState.mode`) — encrypted contexts carry an MLS+sender-key variant, broadcast contexts carry a per-author-key variant. The narrow backend traits `MlsBackend` and `HpkeBackend` (architecture.md §2.5.3 [no such section]) provide stateless primitives over this state; state serialization is an inherent concern of the state itself, not the trait.
 
 Two inherent operations on the encrypted-mode state handle snapshot serialization atomically:
 

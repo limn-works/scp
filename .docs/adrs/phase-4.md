@@ -496,7 +496,7 @@ pub enum ProvenanceQuality {
 
 ### Context
 
-Spec §6.2.2 defines two-tier discovery: DID document capabilities (direct lookup, zero setup) and contexts with discovery outlets (searchable registries, community-operated). DID documents contain a `SCPCapabilities` service entry that lists an agent's capabilities — resolvable by anyone who knows the DID. These are standard SCP contexts with open join policies and standardized outlet schemas for search, registration, and deregistration. Two-tier membership (§6.2.2B) separates writers (MLS members, bounded) from readers (DID-authenticated, unbounded).
+Spec §6.2.2 defines two-tier discovery: DID document capabilities (direct lookup, zero setup) and contexts with discovery outlets (searchable registries, community-operated). DID documents contain a `SCPCapabilities` service entry that lists an agent's capabilities — resolvable by anyone who knows the DID. These are standard SCP contexts with open join policies and standardized outlet schemas for search, registration, and deregistration. Two-tier membership (§6.2.2B [no such section]) separates writers (MLS members, bounded) from readers (DID-authenticated, unbounded).
 
 ### Decision
 
@@ -566,7 +566,7 @@ pub struct DiscoveryBootstrap {
 }
 ```
 
-**Standard outlet schemas (conventions, not mandates — per §6.2.2B):**
+**Standard outlet schemas (conventions, not mandates — per §6.2.2B [no such section]):**
 
 ```
 agent_search(query) -> { results: [{ did, capabilities, participation_summary }] }

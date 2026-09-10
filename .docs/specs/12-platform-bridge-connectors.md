@@ -54,7 +54,7 @@ RegisterBridge {
   platform:        String,           // platform identifier (e.g., "discord", "slack", "x")
   mode:            BridgeMode,       // Relay | Puppet | API | Cooperative
   webhook_url:     Option<String>,   // for cooperative mode: platform's webhook receiver URL
-  platform_key:    Option<[u8; 32]>, // for cooperative mode: platform's P-256 public key
+  platform_key:    Option<[u8; 33]>, // for cooperative mode: platform's SEC1 compressed P-256 public key (09 §9.5)
   max_shadows:     u32,              // governance-configured shadow limit for this bridge
   metadata:        BridgeMetadata,   // display name, description, operator contact
 }

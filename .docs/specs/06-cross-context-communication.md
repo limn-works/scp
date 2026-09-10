@@ -235,7 +235,7 @@ Outlet interfaces (§6.2) work with broadcast contexts. A broadcast context can 
 
 **Mixed-mode nesting (§5.13).** Child contexts may have a different `ContextMode` than their parents. A Broadcast child of Encrypted parents enables public read access to curated content from a private group. An Encrypted child of Broadcast parents enables private discussion among subscribers. Ceiling inheritance, eligibility enforcement, and lifecycle coupling operate identically regardless of mode.
 
-**Discovery metadata.** When broadcast contexts register in contexts with discovery outlets (§6.2.2B), the registration metadata includes the context mode. Agents searching for broadcast feeds can filter by mode. DID document `SCPBroadcastContext` service endpoints (§5.14.11) provide direct lookup for broadcast contexts without context queries.
+**Discovery metadata.** When broadcast contexts register in contexts with discovery outlets (§6.2.2B [no such section]), the registration metadata includes the context mode. Agents searching for broadcast feeds can filter by mode. DID document `SCPBroadcastContext` service endpoints (§5.14.11) provide direct lookup for broadcast contexts without context queries.
 
 ### 6.2.4 Cross-Context Outlet Invocation Saga
 

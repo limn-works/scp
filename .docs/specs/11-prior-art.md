@@ -2,8 +2,8 @@
 
 | Component | Existing Standard/Technology | SCP Relationship |
 |---|---|---|
-| Identity | DID (W3C) | Build on directly |
-| Identity resolution | did:dht (BEP44 + Mainline DHT) | Build on directly; extend significantly (§3.10) |
+| Identity | Inception-derived self-certifying identifier over a key-event log (ADR-063) | Own construction; a W3C DID facade is deferred (§11.2.4) |
+| Identity resolution | Key-event log replay over the SCP relay network (§3.10) | Own construction; did:dht, BEP44 and the Mainline DHT are retired (§11.2.2) |
 | Capability tokens | UCAN | Build on directly |
 | Key custody | Passkeys, WebAuthn, Secure Enclave | Delegate custody to |
 | Group encryption | MLS (RFC 9420) | Build on directly |
@@ -137,74 +137,21 @@ Core properties:
 - **Sequence numbers:** BEP44 provides monotonically increasing sequence numbers for freshness. Higher sequence number = newer document.
 - **Gateways:** Optional HTTP gateways for resolution without a DHT client (did:dht Gateway specification).
 
-### 11.2.2 What SCP Takes from did:dht
+### 11.2.2 What SCP took from did:dht, and what it takes now
 
-SCP adopts the core self-certification property:
+**SCP took three things from did:dht and takes none of them today.** It took the `did:dht:<z-base-32>` DID string format, BEP44 self-certification of a DID document against the key the DID string encodes, and the Mainline DHT as a resolution backend. **ADR-063, the inception-derived key-event-log identity substrate, retired all three on 2026-08-30** (its retired clauses 1, 3, 4 and 5), and Alec superseded did:dht's Ed25519 with ECDSA on P-256 on 2026-09-10 (`09-security-model.md` §9.5). This subsection is the record of that removal and states no live SCP property.
 
-- **DID string format:** `did:dht:<z-base-32>` — identical to the did:dht specification.
-- **BEP44 self-certification:** DID document signature verification against the key encoded in the DID string. The storage backend is untrusted; trust derives from the cryptographic binding between DID and document.
-- **Mainline DHT as resolution backend:** SCP uses Mainline DHT as one resolution layer (§3.10.3).
-- **The identity key algorithm is no longer shared.** did:dht fixes Ed25519. SCP superseded Ed25519 on 2026-09-10 and every SCP key is now ECDSA on P-256 (`09-security-model.md` §9.5), so this property left the list of things SCP takes from did:dht on that date.
+**What SCP does instead, in one sentence per replaced thing.** The identifier is the SHA-256 digest of an identity's inception event and encodes no key, so a relying party verifies the identifier-to-inception binding from the inception bytes alone with no network call (`09-security-model.md` §9.7.4.2 R2, R13). Resolution replays the identity's append-only key-event log over the SCP relay network and derives the key state from the latest state-carrying event (`09-security-model.md` §9.7.4.2 R8); `18-addressability-and-deployment.md` §18.5.1 states that the Mainline DHT is not a resolution level and that no level resolves a DID document. Transport and service metadata ride in a separate owner-signed service record (`03-identity.md` §3.10.13), so SCP publishes no W3C DID Core JSON for an identity and the JSON-LD-versus-DNS-packet serialization question has no SCP answer.
 
-### 11.2.3 Where SCP Departs from did:dht
+### 11.2.3 What the comparison with did:dht is worth now
 
-SCP extends did:dht significantly. These extensions are additive — a standard did:dht resolver can still resolve SCP identities via DHT — but they represent a fundamentally different approach to identity resolution resilience and key management.
+**The two designs answer one question differently, and naming the difference is what this subsection is for.** did:dht resolves an identity by fetching one mutable record whose highest sequence number wins, and it binds the identifier to a key, so rotating that key renames the identity. SCP resolves an identity by replaying a log whose every event names its predecessor's digest, and it binds the identifier to an event, so every key on the chain rotates and the identifier does not change (`09-security-model.md` §9.7.4.2 R2). **Recovery is where the two diverge most:** did:dht has no pre-rotation construction, so a compromised key is a compromised identity, while SCP fixes a commitment to the next key in every establishment event and ranks two competing chains by the root rule of `09-security-model.md` §9.7.4.2 R6.
 
-**1. Dual-layer resolution (§3.10).** did:dht has one resolution path: Mainline DHT. SCP adds a second: SCP relays. DID documents are published as standard relay blobs (routing_id = `SHA-256("scp:did:" || did_string)`). Both layers are queried in parallel, first-valid-wins, BEP44 sequence numbers resolve conflicts. The anti-segmentation invariant (§3.10.6) makes dual-layer publishing a MUST, not a SHOULD.
+**SCP depends on no did:dht software, library, or infrastructure**, and did not before ADR-063 either: the `scp-identity` crate implemented its own encoding, signing and resolution throughout. What changed is that SCP no longer implements did:dht's constructions at all. TBD, the original did:dht creator, shut down in November 2024 and the specification moved to the Decentralized Identity Foundation; SCP's identity layer is unaffected by what happens to it there.
 
-This means SCP identities are resolvable even if:
-- The entire Mainline DHT is unreachable (relay layer serves)
-- All of an identity's SCP relays are down (DHT layer serves)
-- An attacker suppresses documents on one layer (the other layer serves)
+### 11.2.4 Why not `did:scp`
 
-An attacker must suppress a DID document on ALL relays AND ALL reachable DHT nodes to prevent resolution. This is a strictly harder attack than suppressing on either layer alone.
-
-**2. Multi-key verification method architecture (§3.9, ADR-039).** Standard did:dht uses a single Ed25519 keypair (the one encoded in the DID string) for everything — signing documents, authenticating, operating. SCP defines multiple verification methods per DID document:
-
-- **Identity Key (`#0`)** — the P-256 root key the inception event installs; the identifier is the inception event's digest, not an encoding of this key (`09-security-model.md` §9.7.4.2 R2, R13). Hardware-backed. Long-lived root of trust. Signs key events only — never day-to-day operations.
-- **Human Signing Key (`#active`)** — the human's operational key for protocol actions (signing inner envelopes, MLS operations, capability delegation). Hardware-backed. Rotatable without changing the DID. Published in the DID document, authorized by the Identity Key.
-- **Pre-Rotation Key** — the key whose commitment (`SHA-256` over its public key under a registered domain, `09-security-model.md` §9.7.4.2) the inception event and every reveal-authorized event fix. Revealing it, with its signature, authorizes a `CommitmentRollover` or a `RootRecovery`. An attacker who steals `#0` cannot produce either, because the commitment was fixed before the compromise and the pre-rotation private key resides in custody independent of the operational path (`09-security-model.md` §9.7.4.1 item 3a).
-- **Agent Signing Key (`#agent`)** — optional. A software-held P-256 key for the human's agent to perform protocol operations autonomously. Published in the DID document, authorized by the human via self-delegation UCAN (`iss == aud`, same DID, with `fct.scp_key_scope: "#agent"`). The agent key is independently rotatable and revocable without affecting the human's keys. When present, protocol messages carry a `signing_key_id` field identifying which verification method produced the signature.
-
-This separation of concerns (identity ≠ human signing ≠ agent signing ≠ rotation) is a significant security improvement over single-key DID methods. It provides: (a) recovery from key compromise without DID change, (b) custody separation between human and agent operations, and (c) structural action provenance — verifiers can determine whether a human or agent performed any given action by inspecting the `signing_key_id`, without trusting self-reported claims.
-
-**3. Protocol-level healing (§3.10.7).** When both resolution layers return valid documents with different sequence numbers, the resolver accepts the higher one and MAY re-publish the fresher document to the stale layer. The network self-heals — converging on the freshest document without central coordination. This is unique to SCP; standard did:dht has no concept of multi-layer resolution and therefore no healing protocol.
-
-**4. Relay-layer TTL decoupling.** did:dht's ~2 hour DHT expiry requires aggressive republishing. SCP's relay layer uses 7-day TTL with 6-day republish cycles. The two layers have complementary availability characteristics: DHT for immediate availability (millions of nodes, works from day one), relays for longer persistence (7-day TTL, lower republish overhead). The RepublishManager maintains both cycles independently.
-
-**5. JSON-LD DID document serialization.** Standard did:dht specifies DNS packet encoding (TXT/SRV records) within the 1000-byte BEP44 payload. SCP uses JSON-LD serialization for DID documents. On the relay layer, this removes the 1000-byte constraint entirely (relay blobs support 256KB), allowing richer DID documents with more attestations, service endpoints, and key material. On the DHT layer, the DNS packet encoding is still used for BEP44 compatibility — but the relay layer carries the full document.
-
-### 11.2.4 SCP's DID Implementation Independence
-
-SCP's identity layer is fully self-owned. The `scp-identity` crate implements:
-- P-256 key generation and management
-- z-base-32 encoding/decoding
-- BEP44 signature creation and verification
-- DID document construction and parsing
-- Dual-layer resolution via `DualLayerResolver`
-- DHT interaction via `DhtClient` trait (abstracted — not coupled to any specific DHT library)
-
-There is no dependency on any did:dht software, library, or infrastructure. SCP depends on ECDSA on P-256, a primitive every enclave, passkey provider, FIDO2 token, TPM, and browser WebCrypto implementation speaks (`09-security-model.md` §9.5), and on no did:dht tooling. ADR-063, the inception-derived identity key-event log, removed the BEP44 record, the Mainline publish loop, and the z-base-32 DID string, so the paragraphs above describe the identity model ADR-063 superseded and the two lists below record what the `scp-identity` crate implemented under it.
-
-This independence is important because:
-- TBD (the original did:dht creator) shut down in November 2024
-- The spec was transferred to DIF, where the community working group continues but with reduced momentum
-- If did:dht governance at DIF stalls or the spec diverges in an incompatible direction, SCP is unaffected — SCP's resolution is self-contained
-
-### 11.2.5 Why Not did:scp?
-
-Given SCP's significant departures from did:dht, a natural question is whether SCP should define its own DID method (`did:scp`). The answer is: **not yet**, for three reasons:
-
-1. **Interoperability.** The DID string format is identical to did:dht. A standard did:dht resolver can resolve SCP identities via Mainline DHT. They won't get the relay layer, three-key semantics, or protocol-level healing — but they get a valid DID document. Changing to `did:scp` would break this interoperability bridge.
-
-2. **SCP's extensions are additive, not contradictory.** Nothing SCP does violates the did:dht specification. SCP adds capabilities on top (dual resolution, multi-key verification methods, healing, agent signing keys). A did:dht-compliant resolver seeing an SCP identity just sees a standard did:dht identity with additional verification methods and service endpoints — all of which are valid DID document constructs that standard resolvers can parse (and ignore what they don't understand).
-
-3. **Cost of premature separation.** Defining a new DID method requires registration, documentation, resolver implementation by third parties. The benefit is namespace clarity. The cost is loss of DHT interoperability with the existing did:dht ecosystem. The cost currently outweighs the benefit.
-
-If did:dht governance at DIF collapses entirely, or if a future did:dht spec revision becomes incompatible with SCP's extensions, registering `did:scp` becomes warranted. The cost of method registration at that point is low — the identity layer is already self-contained.
-
----
-
+**A `did:scp` method facade over the key-event log is deferred, not rejected.** Alec ruled on 2026-08-30 — "punt, be ready, don't foreclose" — and ADR-063 records the ruling: SCP does not depend on a DID string, and the identifier's own textual form is what a later revision of `09-security-model.md` §9.7.4.2 fixes. The interoperability argument that once favored keeping the did:dht string is gone with the string, so the open question is whether a W3C DID Core facade buys SCP anything, and no artifact answers it yet.
 ## 11.3 GNUnet
 
 **GNUnet** (gnunet.org) is a framework for secure peer-to-peer networking, under active development since 2001. It is one of the longest-running decentralized protocol projects that prioritizes anonymity and censorship resistance as architectural fundamentals. The comparison with SCP is instructive precisely because the two protocols start from opposite premises — GNUnet minimizes identity to protect participants; SCP maximizes verifiable identity to establish trust — but converge on shared principles of infrastructure distrust and transport independence.
@@ -362,9 +309,9 @@ This interoperability layer means GNS can gradually coexist with DNS rather than
 | **Context-scoped identity** | No | Yes (pseudonym derivation per context, §9.10.2) |
 | **Standardization** | RFC 9498 (IETF) | did:dht spec (DIF) |
 
-**What GNS solves that SCP's DID layer does not:** Memorable naming through petnames and hierarchical delegation. Record encryption preventing observers from reading identity metadata. Zone enumeration prevention — no equivalent of crawling all DIDs in the DHT. DNS interoperability for gradual adoption. These are real gaps in SCP's identity model, accepted as trade-offs for global uniqueness, multi-key architecture, and W3C DID ecosystem compatibility.
+**What GNS solves that SCP's identity layer does not:** Memorable naming through petnames and hierarchical delegation. Record encryption preventing observers from reading identity metadata. Zone enumeration prevention — no equivalent of crawling all DIDs in the DHT. DNS interoperability for gradual adoption. These are real gaps in SCP's identity model, accepted as trade-offs for global uniqueness, multi-key architecture, and W3C DID ecosystem compatibility.
 
-**What SCP's DID layer solves that GNS does not:** Multi-key verification methods with custody separation (identity key, human signing key, agent signing key, pre-rotation). UCAN capability delegation chains. Identity attestation linking agents to humans. Context-scoped pseudonyms preventing cross-context correlation. Dual-layer resolution (DHT + relay) with protocol-level healing. The massive Mainline DHT network (millions of nodes vs GNUnet's hundreds). These reflect SCP's accountability-first design vs GNS's privacy-first design.
+**What SCP's identity layer solves that GNS does not:** A root set with a signing threshold, one operational role, and a pre-rotation commitment consumed by a reveal, each key in its own custody (`09-security-model.md` §9.7.4.2 definitions). UCAN capability delegation chains. Identity attestation linking agents to humans. Context-scoped pseudonyms preventing cross-context correlation. Dual-layer resolution (DHT + relay) with protocol-level healing. The massive Mainline DHT network (millions of nodes vs GNUnet's hundreds). These reflect SCP's accountability-first design vs GNS's privacy-first design.
 
 ### 11.3.6 Protocol Translation (VPN/PT)
 

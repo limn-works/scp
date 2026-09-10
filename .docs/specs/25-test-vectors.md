@@ -6,13 +6,13 @@ This section provides known-answer test vectors for all cryptographic constructi
 
 All byte values are lowercase hex with `0x` prefix unless otherwise noted. All integers are big-endian unless otherwise noted.
 
-**The generator.** `scripts/gen-test-vectors-p256.py` produces every keyed byte this section prints. Run it from the repository root:
+**The generator.** `scripts/gen-test-vectors-p256.py` produces every keyed byte this section prints, **except the bytes of §25.21, §25.22 and §25.24**, which come from the checked-in JSON fixtures those three sections name and which no script in this tree regenerates. Run it from the repository root:
 
 ```bash
 python3.12 scripts/gen-test-vectors-p256.py
 ```
 
-The script uses nothing outside the Python standard library. It implements P-256 field and point arithmetic, RFC 6979 deterministic ECDSA with SHA-256, low-`s` normalization, SEC1 point encoding, HKDF-SHA256, HMAC-SHA256, the §9.5.1 canonical hash construction, the RFC 6962 Merkle construction, and the MessagePack subset the SCP structures serializes into. Before it prints a byte it checks itself against four published known-answer tests: `SHA-256("")`, the RFC 6979 Appendix A.2.5 P-256 nonce and signature, RFC 5869 Appendix A.1 for HKDF-SHA256, and this section's own curve-independent `DataProvenance` hash (Vector 35). It computes every public key twice, by two scalar multiplications that share no arithmetic, and a third time through the `cryptography` package when that package imports; a mismatch raises before anything prints.
+The script uses nothing outside the Python standard library. It implements P-256 field and point arithmetic, RFC 6979 deterministic ECDSA with SHA-256, low-`s` normalization, SEC1 point encoding, HKDF-SHA256, HMAC-SHA256, unpadded base64url, the §9.5.1 canonical hash construction, the RFC 6962 Merkle construction, the WebAuthn `authenticatorData` and `clientDataJSON` synthesis §25.26 documents, and the MessagePack subset the SCP structures serializes into. Before it prints a byte it checks itself against four published known-answer tests: `SHA-256("")`, the RFC 6979 Appendix A.2.5 P-256 nonce and signature, RFC 5869 Appendix A.1 for HKDF-SHA256, and this section's own curve-independent `DataProvenance` hash (Vector 35). It computes every public key twice, by two scalar multiplications that share no arithmetic, and a third time through the `cryptography` package when that package imports; a mismatch raises before anything prints.
 
 **What a signature covers.** Every SCP signature in this section is an ECDSA signature over a 32-byte canonical hash, so the ECDSA message digest **is** that canonical hash and no second SHA-256 is applied to it. The vectors run RFC 6979 with `h1` set to that same 32-byte digest. §9.5 fixes RFC 6979 with SHA-256 for a software signer and does not state which value plays `h1` for a prehashed digest; these vectors take the digest itself, and an implementation that hashes the digest a second time reproduces none of the signature bytes below.
 
@@ -226,7 +226,7 @@ Verification vector:
   verdict:    accept
 ```
 
-## 25.5 Vote Signing Vectors (§6.4)
+## 25.5 Vote Signing Vectors (§6.4 [no such section])
 
 Domain: `"SCP-VOTE-V1:"`
 
@@ -663,7 +663,7 @@ Expected SHA-256:
 
 The domain separator is 13 ASCII bytes and the preimage is 89. Before 2026-09-10 this vector stated 14 and 90, so an implementer following §25.17 step 3 would have read a correct encoding as wrong. The claim hash is new here: §25.17 step 4 tells an implementer to compare each canonical byte sequence's SHA-256 against an expected hash, and this vector carried none.
 
-## 25.11 Proposal ID Vectors (§6.4)
+## 25.11 Proposal ID Vectors (§6.4 [no such section])
 
 Domain: `"SCP-PROPOSAL-V1:"`
 
@@ -920,7 +920,9 @@ To verify an implementation against these test vectors:
 
 4. **Hash verification.** Compute SHA-256 of each canonical byte sequence. Compare against the expected hash the vector prints.
 
-5. **Signature verification.** For signed structures, verify the printed 64-byte signature against the reference public key and the canonical hash, and confirm the verifier rejects the same signature with `s` replaced by `n − s` (§9.5's low-`s` rule). Then sign the canonical hash with your own signer and verify your own signature. A **software** signer MUST additionally reproduce the printed bytes exactly, because §9.5 requires it to derive the nonce under RFC 6979 with SHA-256 over that same digest. A **hardware** signer — Secure Enclave, passkey authenticator, HSM, smartcard — draws a random nonce, produces different bytes on every call, and conforms; its conformance check is the verification step and never a byte comparison.
+5. **Signature verification.** For signed structures, verify the printed 64-byte signature against the reference public key and the canonical hash, and confirm the verifier rejects the same signature with `s` replaced by `n − s` (§9.5's low-`s` rule). Then sign the canonical hash with your own signer and **verify the signature your signer produced against the same public key and the same hash**; a hardware signer's conformance check is that verification and never a comparison against the printed bytes. **Confirm as part of it that your signer emitted the low form**, because §9.5 obliges every signer to convert `(r, s)` to `(r, n − s)` when `s` exceeds half the group order and a substrate that returns the high form leaves that conversion to the code around it. A **software** signer MUST additionally reproduce the printed bytes exactly, because §9.5 requires it to derive the nonce under RFC 6979 with SHA-256 over that same digest.
+
+5a. **Point validation.** Confirm your parser rejects a 33-byte encoding whose leading byte is neither `0x02` nor `0x03`, rejects a 65-byte encoding whose leading byte is not `0x04`, rejects an encoding whose decoded point does not satisfy the P-256 curve equation, and rejects the point at infinity — before that point reaches any verification and before it reaches any key agreement (§9.5). §25.2's three reference public keys are the positive cases; negate the y-coordinate of the tertiary key's uncompressed form and flip its final byte to obtain an off-curve negative case.
 
 6. **Padding verification.** For each padding vector, construct the padded output and verify the total length matches the expected bucket size. Strip the padding and verify the original payload is recovered.
 
@@ -928,7 +930,7 @@ To verify an implementation against these test vectors:
 
 ## 25.18 Generating Reference Outputs
 
-`scripts/gen-test-vectors-p256.py` regenerates every value this section prints:
+`scripts/gen-test-vectors-p256.py` regenerates every value this section prints outside §25.21, §25.22 and §25.24, whose values live in the checked-in JSON fixtures those sections name:
 
 ```bash
 python3.12 scripts/gen-test-vectors-p256.py
@@ -1033,7 +1035,7 @@ Expected v2 pseudonym public key (epoch = 1, 33-byte compressed):
 
 These vectors pin the on-the-wire **pseudonym announcement** — the `MessagePack` payload a member broadcasts on the shared bootstrap channel to teach peers their per-context routing ID — and the pure §9.10.4 accept/reject classifier that both the native orchestrator and the in-browser client run over an inbound announcement. Because the announcement type and the classifier live in the wasm-safe `scp-protocol::context::pseudonym` module (ADR-057 T-1), native and `wasm32` MUST produce byte-identical wire bytes and identical accept/reject decisions.
 
-**Wire format.** `PseudonymAnnouncement` is serialized with `rmp_serde::to_vec_named` — a name-keyed `MessagePack` map with three fields, in declaration order: `tag` (string), `member_did` (string), `pseudonym` (32-byte `serde_bytes` binary). No `usize`, no float, no map-iteration order, so a fixed value re-encodes deterministically and target-independently.
+**Wire format.** `PseudonymAnnouncement` is serialized with `rmp_serde::to_vec_named` — a name-keyed `MessagePack` map with three fields, in declaration order: `tag` (string), `member_did` (string), `pseudonym` (32-byte `serde_bytes` binary). **The `pseudonym` field carries the 32-byte per-context pseudonym routing id**, `SHA-256("scp-pseudonym-routing-v1:" || context_pseudonym)` over the 33-byte compressed pseudonym public key (§9.10.4 of the security-model spec), and never the point itself; that is why it is 32 bytes and why the reserved-value comparisons below, against `[0;32]` and against the two other routing ids, compare values of one width. The `0x42 × 32` value this vector carries is an opaque fixture routing id and is not derived from Vectors 30 or 31. No `usize`, no float, no map-iteration order, so a fixed value re-encodes deterministically and target-independently.
 
 ```
 Input:
@@ -1280,7 +1282,7 @@ The fixture documents **12 known-input / known-output vectors**, each signed und
 | `expected_canonical_hash` | hex string | SHA-256 of `expected_preimage` (32 bytes / 64 hex). Equals the output of `compute_outlet_registration_canonical_bytes`. |
 | `expected_signature` | hex string | Signature over `expected_canonical_hash` (64 bytes / 128 hex). |
 | `operator_did` | string | The signing operator's DID (the same across all vectors for determinism). |
-| `operator_public_key` | hex string | The operator's verifying key (33 bytes / 66 hex under §9.5). |
+| `operator_public_key` | hex string | The operator's verifying key. §9.5 fixes 33 bytes / 66 hex for a P-256 verification key, and **the checked-in fixture carries 32 bytes**, because it was generated under the superseded Ed25519 curve as the sentence above this table states. A harness reads the width from the fixture it loads until that fixture is regenerated on P-256. |
 
 ### 25.24.1 Vector index
 
@@ -1335,6 +1337,8 @@ cargo test -p scp-testing --test conformance \
 The regenerator is `#[ignore]` by default so the default `cargo test` run does not write to disk. Fixture drift (live code changes that should but do not invalidate the JSON) is caught by `CONF-046`, which compares the on-disk file byte-for-byte to the generator's current output.
 
 ## 25.25 Custody Violation and Counter-Attestation Signing Vectors (§9.5.2, §9.18.2)
+
+**These two vectors cover a primitive Alec cut on 2026-08-25.** His Ruling 2 of that date axed the custody-violation record, the counter-attestation, and the relay trust penalty, and he reconfirmed it on 2026-08-31 ("keep CounterAttestation cut"). The structures survive in §9.5.2 of the security-model spec, in §27 of the attestations spec, and in the code, and their teardown belongs to the workstream that removes them rather than to this section. **These two vectors are removed with the primitive**, and a reader who finds them here reads them as conformance bytes for a structure the corpus still defines and not as evidence the primitive is live.
 
 Domains: `"SCP-CUSTODY-VIOLATION-V1:"` and `"SCP-COUNTER-ATTESTATION-V1:"`.
 
@@ -1441,3 +1445,157 @@ P-256 ECDSA signature over the 32-byte hash, secondary key (64 bytes):
 A verifier resolves `subject_did` to its `#active` verification method, the secondary compressed public key `0x0223702a…20aea`, and checks `signature` against that canonical hash. Checking `signature` against the tertiary public key `0x026fc652…1a670`, which produced the offending signature Vector 39 records as evidence, fails, and that failure is how §9.5.2 enforces ADR-039 acceptance criterion 18 without a `signing_key_id` field inside a signed record.
 
 Both signatures above come from a software signer, which §9.5 requires to derive its nonce under RFC 6979 with SHA-256, so a conformant software implementation reproduces both byte-for-byte. A hardware signer draws a random nonce and conforms by verification rather than by byte comparison (§25.17 step 5).
+
+## 25.26 Key-Event Signature Slot Vectors (§9.7.4.2 definitions, §9.5)
+
+**What these vectors pin, and what they deliberately do not.** §9.7.4.2 R13 defers the key-event preimage's field order to a later revision of that section, so no vector can pin an inception event's own bytes. **Each vector below therefore takes that event's §9.5.1 preimage digest as a stated input and pins everything the fixed rules derive from it**: the raw signature slot, the WebAuthn challenge construction, the assertion slot's byte layout, and the message a verifier runs ECDSA over. When R13's field order lands, these vectors gain a real digest in place of the stated one and every byte below them is unchanged.
+
+**The stated input.** The generator computes it as `SHA-256("scp-25-key-event-vector-inception")` so an implementer reproduces it from a printed ASCII string, and it stands in for a real inception event's preimage digest.
+
+```
+Inception event preimage digest D (32 bytes):
+  d83bf9ef3565ee4997d8c97cdadcb2bdbf631835ade56cf247577aa4f3d3357d
+```
+
+### Vector 41: an inception whose one root slot carries the raw form (`form = 0x01`)
+
+The root set is 1-of-1 and its member is §25.2's reference key. The slot is the 64-byte raw `r || s` signature over `D`, low-`s` normalized by the signer (§9.5).
+
+```
+Root-set member 0, 33-byte SEC1 compressed point:
+  033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027
+
+Signature form: 0x01
+Slot length: 64 bytes
+Slot:
+  83b296e9840e1d2123696ac8245e8f6dd0967f44a0756b3ee47e0a33a4687c9c
+  5967817a03e19baf7794cf4885226e2bd0d9051c6924db8d979f4db96badb3a4
+```
+
+### Vector 42: an inception whose one root slot carries the WebAuthn assertion form (`form = 0x02`)
+
+**The synthesis, stated so an implementer knows which bytes are WebAuthn's and which the generator chose.** No authenticator ran; the generator built `authenticatorData` and `clientDataJSON` in the layouts the Web Authentication specification fixes, and signed the message that specification defines. `authenticatorData` is `SHA-256(rpId) || flags || signCount`, with `rpId` the ASCII string `ctx.network`, `flags` `0x05` (user present, `0x01`, and user verified, `0x04`), and `signCount` a 4-byte big-endian zero; §9.7.4.2's definitions require the user-presence bit and read the user-verification bit as information, so a conforming slot may carry `0x01` in its place and every byte below it changes. `clientDataJSON` is the exact byte string with no whitespace, in the member order a conforming client emits, and a verifier parses it as RFC 8259 JSON and rejects a duplicate member name at any nesting level. The signing key is §25.2's reference key, and the generator derives its nonce under RFC 6979, which no real authenticator does — a real assertion carries a different signature over the same message and verifies identically.
+
+```
+Challenge bytes = "SCP-KEY-EVENT-V1:" || D  (17 + 32 = 49 bytes):
+  5343502d4b45592d4556454e542d56313a
+  d83bf9ef3565ee4997d8c97cdadcb2bdbf631835ade56cf247577aa4f3d3357d
+
+Challenge, unpadded base64url — the value clientDataJSON.challenge carries:
+  U0NQLUtFWS1FVkVOVC1WMTrYO_nvNWXuSZfYyXza3LK9v2MYNa3lbPJHV3qk89M1fQ
+
+SHA-256("ctx.network") — the rpIdHash inside authenticatorData (32 bytes):
+  aee39d05bf6e1cbe288aedd7ead156f1d67399382d7a110e8f6c495d11689d76
+
+authenticatorData (37 bytes):
+  aee39d05bf6e1cbe288aedd7ead156f1d67399382d7a110e8f6c495d11689d76
+  05
+  00000000
+
+clientDataJSON (155 bytes, as text):
+  {"type":"webauthn.get","challenge":"U0NQLUtFWS1FVkVOVC1WMTrYO_nvNWXuSZfYyXza3LK9v2MYNa3lbPJHV3qk89M1fQ","origin":"https://ctx.network","crossOrigin":false}
+
+SHA-256(clientDataJSON) (32 bytes):
+  28c97efe106bea1591eb7c6f7b93e0831b62018f3340eb7c57ffbb5fa8ea5d34
+
+Signed message = authenticatorData || SHA-256(clientDataJSON)  (69 bytes):
+  aee39d05bf6e1cbe288aedd7ead156f1d67399382d7a110e8f6c495d11689d76
+  0500000000
+  28c97efe106bea1591eb7c6f7b93e0831b62018f3340eb7c57ffbb5fa8ea5d34
+
+ECDSA-with-SHA-256 digest over that message (32 bytes):
+  d139b705d1c2b81a972fc76d5d14cb4f98170e330924d28c20959faeebdd2100
+
+Signature, 64 raw bytes (a WebAuthn authenticator emits DER; the SIGNER converts
+it to r || s and low-s normalizes it before it fills the slot, §9.5):
+  ad4eb52b9d6eb0dad260b334df27eb41586d0149021c362a0d42ea1961ec7a3a
+  25b4a68ee52571b30c71ca4c5e33a6ec1b8b843d1f1d654a6a1159228aa5b033
+
+Slot = BE32(37) || authenticatorData || BE32(155) || clientDataJSON || signature
+Slot length: 264 bytes  (4 + 37 + 4 + 155 + 64)
+Slot:
+  00000025
+  aee39d05bf6e1cbe288aedd7ead156f1d67399382d7a110e8f6c495d11689d760500000000
+  0000009b
+  7b2274797065223a22776562617574686e2e676574222c226368616c6c656e6765223a
+  2255304e514c55744657533146566b564f564331574d5472594f5f6e764e575875535a
+  665979587a61334c4b3976324d594e61336c62504a485633716b38394d316651222c22
+  6f726967696e223a2268747470733a2f2f6374782e6e6574776f726b222c2263726f73
+  734f726967696e223a66616c73657d
+  ad4eb52b9d6eb0dad260b334df27eb41586d0149021c362a0d42ea1961ec7a3a
+  25b4a68ee52571b30c71ca4c5e33a6ec1b8b843d1f1d654a6a1159228aa5b033
+```
+
+Both length prefixes sit inside their bounds: 37 is at most `MAX_AUTHENTICATOR_DATA_BYTES` (256) and 155 is at most `MAX_CLIENT_DATA_JSON_BYTES` (512), both of §9.18.17 of the security-model spec.
+
+**Conformance procedure for these two vectors.** Read the per-slot form out of the preimage's signature-form list, never off the wire. For `0x01`, verify 64 bytes against the root member over `D`. For `0x02`, split the slot at its two length prefixes, reject a length past its bound or past the field, parse `clientDataJSON` and reject a duplicate member name, check `type` equals `webauthn.get`, recompute the challenge from `D` and compare it against `challenge`, check the user-presence flag, then verify the trailing 64 bytes over `authenticatorData || SHA-256(clientDataJSON)`. Record the `rpIdHash` and the `origin` and draw no claim about the identity from either (§9.7.4.2 definitions).
+
+## 25.27 Cosigned Head and Relay Proof of Control Vectors (§9.7.4.3, §9.18.2)
+
+Both objects carry only fixed-width fields, so neither preimage takes a length prefix (§9.5.1).
+
+### Vector 43: a witness's first cosigned head for a subject
+
+`previous_cosigned_digest` is the all-zero placeholder, which is what a witness writes for its first cosigned head for a subject. The signer is §25.2's secondary key, standing for the witness operator's `#active`.
+
+```
+witness                  9d94df95bc0a13f1963f484414c320354c73c75bb86e96559e97765f5bc2d313
+witness_key_state_head   aaac5550de5f09d998e49ae75c5ed63483a43ad77c9252359914a6ce9b7bfe6f
+subject                  ca18d026141d3679ef7a4f2dece053f6a1ac12ec27ff782262b031df2c9c8617
+sequence                 7                     (0000000000000007)
+event_digest             d83bf9ef3565ee4997d8c97cdadcb2bdbf631835ade56cf247577aa4f3d3357d
+previous_cosigned_digest 00 × 32
+observed_at              1700000000            (000000006553f100)
+
+Field bytes: 176.  Preimage = "SCP-COSIGNED-HEAD-V1:" (21) || fields (176) = 197 bytes:
+  5343502d434f5349474e45442d484541442d56313a
+  9d94df95bc0a13f1963f484414c320354c73c75bb86e96559e97765f5bc2d313
+  aaac5550de5f09d998e49ae75c5ed63483a43ad77c9252359914a6ce9b7bfe6f
+  ca18d026141d3679ef7a4f2dece053f6a1ac12ec27ff782262b031df2c9c8617
+  0000000000000007
+  d83bf9ef3565ee4997d8c97cdadcb2bdbf631835ade56cf247577aa4f3d3357d
+  0000000000000000000000000000000000000000000000000000000000000000
+  000000006553f100
+
+Canonical hash SHA-256(preimage) (32 bytes):
+  7b3f87d26d25ee3c051ac8104c278d6f7a648ceeb255f1c6bf6ef339b7e09dcf
+
+P-256 ECDSA signature over that hash, secondary key (64 bytes):
+  10a59eca6eb91223526b952d9536a7b9880c17ed75e945d4813293b8adddbfda
+  7203b74044799e27064b833737d9ed7659c92fdd46ba872460c2f6d50f6db51c
+
+Object on the wire: 176 + 64 = 240 bytes.
+```
+
+### Vector 44: a relay proof of control over a served QUERY response
+
+`routing_id` is the real derivation over Vector 43's subject, `SHA-256("scp:did:" || subject)` (§9.7.4.2 R13), so an implementer exercises that step here. `nonce` is the value the resolver sent on its own QUERY, and `value_digest` is `SHA-256` over the blob bytes the response returned. The signer is §25.2's reference key, standing for the relay operator's `#active`.
+
+```
+operator                     c45b32c65d25b3d070929aa68fa4532f69fd5ab56fa15173be77d6c5c6d03c18
+operator_key_state_head      6e55fa9d97af2db9dd4388da60f22261cb1ec351db594e32725fcb6d1148e306
+nonce                        8c10b9bc0b5acdcfb85432747587fbbd8894bbad69f35de6dff46093513daac8
+routing_id                   ae61bfc789025a91fd81a498fca3d35cf22c32edc91c1a0a5dc9be0a7e8f9605
+value_digest                 0196912c8a2dc4e65d72608364a5c974a512ce1702679ecaf836695bf26df8ff
+observed_at                  1700000000            (000000006553f100)
+
+Field bytes: 168.  Preimage = "SCP-RELAY-PROOF-V1:" (19) || fields (168) = 187 bytes:
+  5343502d52454c41592d50524f4f462d56313a
+  c45b32c65d25b3d070929aa68fa4532f69fd5ab56fa15173be77d6c5c6d03c18
+  6e55fa9d97af2db9dd4388da60f22261cb1ec351db594e32725fcb6d1148e306
+  8c10b9bc0b5acdcfb85432747587fbbd8894bbad69f35de6dff46093513daac8
+  ae61bfc789025a91fd81a498fca3d35cf22c32edc91c1a0a5dc9be0a7e8f9605
+  0196912c8a2dc4e65d72608364a5c974a512ce1702679ecaf836695bf26df8ff
+  000000006553f100
+
+Canonical hash SHA-256(preimage) (32 bytes):
+  0e35b0fcd8331197c9f0b80be2f32c8da52ef7782464861f7720b7953308b315
+
+P-256 ECDSA signature over that hash, reference key (64 bytes):
+  1ded2b5e3295bc5121655e730dbf6c4b0b84011e38501360eb7aa57fafd59ee1
+  58b11c63dfab1b3120eb05fc7576d9b5530f81244dafcd5810e0f0c60c171264
+
+Object on the wire: 168 + 64 = 232 bytes.
+```
+
+A resolver checking this proof compares `nonce` against the nonce it sent, `routing_id` against the one it queried, `value_digest` against `SHA-256` over the bytes it received, and `observed_at` against its own clock inside §9.14's skew tolerance, then verifies the signature against the operator's `#active` key resolved by the non-recursive floor of §9.7.4.2's definitions (§9.7.4.3).
