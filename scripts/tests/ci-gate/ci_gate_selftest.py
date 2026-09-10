@@ -1946,15 +1946,19 @@ def owning_package(source: Path) -> str:
     raise SystemExit(f"{source}: no ancestor Cargo.toml declares a package")
 
 
-def shipped_build_assertions() -> dict[str, dict[str, Path]]:
-    """Return each package's shipped-build assertions, by test-function name.
+def package_test_functions() -> dict[str, dict[str, tuple[Path, bool]]]:
+    """Return every test function under crates/, by package and function name.
 
-    A shipped-build assertion is a function carrying both a test attribute and
-    SHIPPED_ONLY_ATTRIBUTE, in either order and with other attributes and
-    comment lines between them. Reads every `.rs` file under crates/, so a
-    package this repository adds later is scanned without editing this file.
+    Each entry maps a test-function name to its file and to whether the
+    function carries SHIPPED_ONLY_ATTRIBUTE, which is the attribute that
+    compiles the function into a build carrying no `testing` feature and out of
+    every other build. Reads attributes written one per line above the `fn`
+    they annotate, in either order and with other attributes and comment lines
+    between them, which is the layout `cargo fmt` produces. Reads every `.rs`
+    file under crates/, so a package this repository adds later is scanned
+    without editing this file.
     """
-    found: dict[str, dict[str, Path]] = {}
+    found: dict[str, dict[str, tuple[Path, bool]]] = {}
     for source in sorted((REPO / "crates").rglob("*.rs")):
         attributes: list[str] = []
         for line in source.read_text().splitlines():
@@ -1965,28 +1969,62 @@ def shipped_build_assertions() -> dict[str, dict[str, Path]]:
             if not stripped or stripped.startswith("//"):
                 continue
             name = RUST_FN_NAME.search(stripped)
-            if (
-                name
-                and any(TEST_ATTRIBUTE.match(a) for a in attributes)
-                and SHIPPED_ONLY_ATTRIBUTE in attributes
-            ):
+            if name and any(TEST_ATTRIBUTE.match(a) for a in attributes):
                 package = owning_package(source)
-                found.setdefault(package, {})[name.group(1)] = source
+                found.setdefault(package, {})[name.group(1)] = (
+                    source,
+                    SHIPPED_ONLY_ATTRIBUTE in attributes,
+                )
             attributes = []
     return found
 
 
+def shipped_build_assertions() -> dict[str, dict[str, Path]]:
+    """Return each package's shipped-build assertions, by test-function name.
+
+    A shipped-build assertion is a test function carrying
+    SHIPPED_ONLY_ATTRIBUTE. Filters package_test_functions above rather than
+    scanning again, so both readers agree on which functions are tests.
+    """
+    found: dict[str, dict[str, Path]] = {}
+    for package, tests in package_test_functions().items():
+        assertions = {
+            name: source for name, (source, shipped_only) in tests.items() if shipped_only
+        }
+        if assertions:
+            found[package] = assertions
+    return found
+
+
 def check_shipped_assertion_readers() -> None:
-    """Drive the three readers check_shipped_build_assertions_run rests on.
+    """Drive the four readers check_shipped_build_assertions_run rests on.
 
     That check decides whether a fail-closed proof executes anywhere, and it
     decides it by asking command_covers_package, filterset_patterns, and
-    command_selects about a command's tokens. A reader that answered "yes" to
-    every question would leave that check reporting success over work it did not
-    do, so each case below states an input whose answer is known and asserts the
-    reader returns it. The synthetic tokens are written here rather than read
-    from ci.yml, so a workflow edit cannot make a case vacuous.
+    command_selects about a command's tokens, and package_test_functions which
+    tests a package defines. A reader that answered "yes" to every question
+    would leave that check reporting success over work it did not do, so each
+    case below states an input whose answer is known and asserts the reader
+    returns it. The synthetic tokens are written here rather than read from
+    ci.yml, so a workflow edit cannot make a case vacuous.
     """
+    uniffi_tests = package_test_functions().get("scp-ffi-uniffi", {})
+    gated = uniffi_tests.get("shipped_build_reaches_every_callback_custody_identity_op")
+    ungated = uniffi_tests.get("ucan_mint_works_over_callback_custody")
+    check(
+        "package_test_functions marks a `cfg(not(testing))` test shipped-only",
+        gated is not None and gated[1],
+        "job rust-build-uniffi-production's first filterset names only tests a "
+        "`testing` flip deletes, and reading this one as surviving that flip "
+        "would let an un-gated test join that filterset unreported",
+    )
+    check(
+        "package_test_functions marks an un-gated test as surviving a flip",
+        ungated is not None and not ungated[1],
+        "this test carries no cfg attribute, so a reader that reported it "
+        "shipped-only would accept it in the filterset that must empty when "
+        "`testing` turns on",
+    )
     workspace = split_command("cargo nextest run --workspace")
     excluded = split_command("cargo nextest run --workspace --exclude scp-identity")
     named = split_command("cargo nextest run -p scp-node --lib")
@@ -2216,7 +2254,11 @@ def check_shipped_build_assertions_run(jobs: dict) -> None:
     shipped-build assertion today still gets a lane that would run one
     tomorrow. The second scans every `.rs` file under crates/ and requires each
     shipped-build assertion it finds to be SELECTED BY NAME by a command in the
-    job its package is paired with.
+    job its package is paired with. The third requires each such command that
+    carries a name filter to select shipped-build assertions ALONE, so that
+    turning `testing` on empties its selection and `--no-tests=fail` exits 4: a
+    filtered command that also selects a test surviving that flip exits 0 over
+    an empty set of proofs.
 
     The second check formerly skipped every package in
     NON_BRIDGE_SHIPPED_ASSERTION_LANES, asking only whether that table's job
@@ -2274,6 +2316,45 @@ def check_shipped_build_assertions_run(jobs: dict) -> None:
                 f'`#[cfg(not(feature = "testing"))]` test in {package} compiles '
                 f"in a lane that never executes it"
                 + ("; rejected: " + "; ".join(rejected) if rejected else ""),
+            )
+
+    # CRITERION: a command carrying a name filter and selecting a shipped-build
+    # assertion selects shipped-build assertions ALONE. `--no-tests=fail` fires
+    # only on an EMPTY selection, so a sibling that stays compiled when
+    # `testing` flips on keeps that command's selection non-empty, the run exits
+    # 0, and every fail-closed proof the command exists to run executed nowhere.
+    # Measured on this tree: adding four un-gated
+    # `ucan_*_over_callback_custody` tests to job
+    # rust-build-uniffi-production's one filterset made that command select at
+    # least four tests in every feature configuration.
+    #
+    # A command carrying NO name filter is outside this criterion, and job
+    # rust-build-pyo3-production's `cargo test -p scp-ffi-common` is one: it
+    # runs every test the package compiles, so no filter can be written that
+    # empties on a flip, and it claims no `--no-tests=fail` tripwire.
+    # command_unifies_testing above is what holds that command's build to
+    # `testing` off.
+    all_tests = package_test_functions()
+    for package, commands in sorted(executing.items()):
+        tests = all_tests.get(package, {})
+        for tokens in commands:
+            patterns, unmodelled = command_filters(tokens)
+            if not patterns or unmodelled:
+                continue
+            selected = {name for name in tests if command_selects(tokens, name)}
+            assertions_selected = sorted(n for n in selected if tests[n][1])
+            others = sorted(n for n in selected if not tests[n][1])
+            if not assertions_selected:
+                continue
+            check(
+                f"{package}: `{' '.join(tokens)[:58]}` empties on a `testing` flip",
+                not others,
+                f"it runs shipped-build assertions {assertions_selected} "
+                f"alongside {others}, which carry no "
+                f'`#[cfg(not(feature = "testing"))]`, so turning `testing` on '
+                f"deletes every assertion while those keep the selection "
+                f"non-empty and `--no-tests=fail` never fires; run them under a "
+                f"separate `cargo nextest run` instead",
             )
 
     for package, assertions in sorted(shipped_build_assertions().items()):

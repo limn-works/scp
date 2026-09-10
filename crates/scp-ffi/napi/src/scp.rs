@@ -696,9 +696,15 @@ impl Scp {
         //
         // This is a PRODUCTION path (not feature-gated): the identity registry
         // retains the caller's callback custody so later signing / event-log /
-        // SCPID operations reach it, mirroring the PyO3 reference bridge. The
-        // cold-storage `InMemoryPreRotationCustody` is a separate substrate for
-        // the pre-rotation key only (ADR-003 §4b). Sign / Diffie-Hellman /
+        // SCPID operations reach it, mirroring the PyO3 reference bridge.
+        // ADR-003, DID creation on did:dht, §4b puts the pre-rotation key in a
+        // substrate separate from that operational custody, and no such substrate
+        // ships: the tree's only `PreRotationCustody` implementation is the
+        // `testing`-gated `InMemoryPreRotationCustody` nullifier (ADR-062,
+        // capability injection and prove-absent dev backends, §Decision 6). A
+        // shipped build of this entry point therefore fails closed with
+        // `codes::IDENT_1059` below rather than minting a pre-rotation key at
+        // all. Sign / Diffie-Hellman /
         // pseudonym-derivation operations keep the caller's private keys in
         // custody (never imported into Rust) per ADR-006; the
         // `SigningKeyBytes`-based paths (UCAN mint, SCPID, event-log checkpoint,

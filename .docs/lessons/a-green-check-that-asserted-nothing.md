@@ -1,6 +1,6 @@
-# A Green Check That Asserted Nothing: Twelve Ways CI Reported Success Over Zero Work
+# A Green Check That Asserted Nothing: Fifteen Ways CI Reported Success Over Zero Work
 
-**Date:** 2026-08-16, extended 2026-08-17, 2026-08-22, 2026-08-25, 2026-08-31, 2026-09-01 and 2026-09-03
+**Date:** 2026-08-16, extended 2026-08-17, 2026-08-22, 2026-08-25, 2026-08-31, 2026-09-01, 2026-09-03 and 2026-09-07
 **Source:** branch `fix/ci-enforces-what-it-claims` — `.github/workflows/ci.yml`, `.github/workflows/fuzz.yml`, `.github/workflows/release.yml`, `scripts/check-cross-layer.sh`, `scripts/check-shipped-feature-graph.sh`
 
 ## Rule
@@ -10,7 +10,7 @@ fail on whichever defect it exists to catch, and keep that failure as a test. Ev
 defect below produced a green check while work behind it never ran, and every one passed
 review because a check *looked* like it was doing its job.
 
-## Fourteen failure shapes
+## Fifteen failure shapes
 
 **1. A command that treats "nothing matched" as success.** `cargo test -p scp-node --lib
 pre_rotation_severance` exits 0 when a filter selects no test. Two tests it named
@@ -311,6 +311,24 @@ taken with `default-features = true` even when `X` declares no `default` feature
 criterion is "which features does this artifact resolve", ask the resolver for its answer;
 do not reconstruct that answer from a rendering built for human reading.
 
+**15. A union filterset that disarms the `--no-tests=fail` tripwire it sits under.**
+Shape 1 above replaced `cargo test <filter>` with `cargo nextest run --no-tests=fail -E
+'test(name)'`, which exits 4 when its selection is empty. That tripwire fires on an EMPTY
+selection and on nothing else, so it survives only while every test the filterset names
+disappears together. Job rust-build-uniffi-production named four
+`#[cfg(not(feature = "testing"))]` assertions and four un-gated
+`ucan_*_over_callback_custody` tests in ONE `-E` expression joined by `+`, which is
+nextest's union operator. A dependency edge turning `scp-ffi-uniffi/testing` on deletes
+all four assertions and leaves all four `ucan_*` tests compiled, so nextest selects four
+tests, runs them, and the step exits 0 while every fail-closed proof it exists to run
+executed nowhere — the same green-over-zero-work verdict shape 1 removed, restored by a
+later edit to the same command. Run tests that vanish on a feature flip in their own
+`cargo nextest run`, and give the surviving tests a second invocation with its own
+`--no-tests=fail`. `check_shipped_build_assertions_run` in
+`scripts/tests/ci-gate/ci_gate_selftest.py` now reads every filtered command in a
+shipped-config lane, and fails the workflow when a command that selects a shipped-build
+assertion also selects a test that a `testing` flip leaves compiled.
+
 ## Tests holding these closed
 
 - `scripts/check-shipped-feature-graph.sh` — `assert_resolver_sees_own_feature_table_activation`
@@ -341,12 +359,16 @@ do not reconstruct that answer from a rendering built for human reading.
   both ends — that each of the three production-config bridge jobs runs a test command
   over its own package with that package's `testing` feature absent, that every
   `#[cfg(not(feature = "testing"))]` test under `crates/` is selected by name by a
-  command in the job its package is paired with, that the readers deciding that question
-  answer nine synthetic cases correctly — `--workspace` covers a member, `--exclude`
-  drops one, a `test()` predicate selects by substring, a renamed assertion falls out of
-  that filter, an unfiltered command selects everything, and a filterset carrying a
-  difference is refused rather than guessed at — that `command_unifies_testing` reads a
-  `testing` edge out of a four-crate fixture workspace in each spelling (a member's
+  command in the job its package is paired with, that every FILTERED command in such a
+  job selects shipped-build assertions alone, so a `testing` flip empties its selection
+  and `--no-tests=fail` exits 4, that the readers deciding those questions answer twelve
+  cases correctly — `--workspace` covers a member, `--exclude` drops one, a `test()`
+  predicate selects by substring, a renamed assertion falls out of that filter, an
+  unfiltered command selects everything, a filterset carrying a difference is refused
+  rather than guessed at, and `package_test_functions` separates a
+  `#[cfg(not(feature = "testing"))]` test from an un-gated one in this tree — that
+  `command_unifies_testing` reads a `testing` edge out of a four-crate fixture
+  workspace in each spelling (a member's
   normal dependency, an edge reached through a `-p` package's dependency closure, a self
   dev-dependency, an `--exclude`d member a selected member still compiles) and out of
   this repository's own `crates/scp-testing/Cargo.toml` against scp-identity, while
