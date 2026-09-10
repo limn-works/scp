@@ -2375,13 +2375,12 @@ where
         misdeclaration_sink,
         handler_panic_sink,
         None,
-        // `invoke_outlet` accepts `Option<Arc<dyn StreamSigner>>` for
-        // the inner pump's signing path (legacy test callers may pass
-        // `None`); the dispatch path always has a real signer, so wrap
-        // it in `Some` here. The outer pump path re-signs every chunk
-        // under the renumbered outer sequence with the non-optional
-        // signer in `SharedSessionState::operator_signer`.
-        Some(Arc::clone(&params.operator_signer)),
+        // `invoke_outlet` requires a non-optional `Arc<dyn StreamSigner>` for
+        // the inner pump's signing path — a stream that cannot sign its chunks
+        // must not open. The dispatch path always has a real signer. The outer
+        // pump path re-signs every chunk under the renumbered outer sequence
+        // with the signer in `SharedSessionState::operator_signer`.
+        Arc::clone(&params.operator_signer),
         params.identity.caveats_binding,
     )
     .await

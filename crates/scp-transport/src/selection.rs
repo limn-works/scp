@@ -8,14 +8,14 @@
 //! the same [`TransportAdapter`] surface and receive a `Box<dyn
 //! TransportAdapter>` regardless of which transport was selected — exactly
 //! like the browser-side WebTransport→WebSocket fallback in
-//! [`webtransport::fallback`](crate::webtransport::fallback), but for native
+//! `webtransport::fallback` (compiled under the `http3` feature), but for native
 //! QUIC.
 //!
 //! # Selection algorithm (spec §10.14.3 item 4)
 //!
 //! 1. If the relay's advertised transports include `"quic"` **and** the `quic`
 //!    cargo feature is enabled, probe QUIC with a **3-second timeout**. On a
-//!    successful handshake within the window, return the [`QuicAdapter`]. On
+//!    successful handshake within the window, return the `QuicAdapter`. On
 //!    failure or timeout, fall back to WebSocket *and remember the failure* so
 //!    QUIC is not re-probed for this relay until the next `.well-known/scp`
 //!    refresh.
@@ -162,7 +162,7 @@ impl TransportSelector {
     ///   failure since the last refresh).
     ///
     /// On a successful QUIC handshake within the 3-second probe window the
-    /// [`QuicAdapter`] is returned. On probe failure/timeout the selector
+    /// `QuicAdapter` is returned. On probe failure/timeout the selector
     /// records the failure (suppressing QUIC for this relay) and falls back to
     /// WebSocket. When QUIC is not eligible, WebSocket is used directly with no
     /// wasted probe.

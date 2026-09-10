@@ -62,7 +62,27 @@ Two P-256 keypairs carry every signature in this section. Both derive from a sta
 0x0423702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aead0992a08064d996d9268dc511c7430f3a4e614871d4a888b52a8dbecb56d6da6
 ```
 
-The two seeds are the byte strings RFC 8032 Section 7.1 gives as its first two test-vector seeds. SCP superseded Ed25519 on 2026-09-10 (§9.5 of the security-model spec), so the seeds no longer name an Ed25519 keypair and are retained only so this corpus's provenance stays legible across the change. An implementation that cannot reproduce either public key from its seed has a broken P-256 implementation, a broken HKDF, or a broken reading of the seed-to-scalar rule, and MUST NOT proceed with SCP interoperability testing.
+**Tertiary seed (32 bytes, for three-key vectors):**
+```
+0xc5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7
+```
+
+**Tertiary private scalar (32 bytes):**
+```
+0x55118deda48fbb900efe9692e644dc5971211c8d3dfcc50f117d842c6056be4f
+```
+
+**Tertiary public key, 33-byte SEC1 compressed point:**
+```
+0x026fc6523b7b1e22ff3fbce8740cfbb7cbc816501864bf40f683db69c860d1a670
+```
+
+**Tertiary public key, 65-byte SEC1 uncompressed point:**
+```
+0x046fc6523b7b1e22ff3fbce8740cfbb7cbc816501864bf40f683db69c860d1a6700192d543b6d5d6b3d7990f4463d2f0692bcb7bdbaf3b1ee8f4465dd888323df0
+```
+
+The three seeds are the byte strings RFC 8032 Section 7.1 gives as its first three test-vector seeds. §25.25 is the only section that uses the tertiary key. SCP superseded Ed25519 on 2026-09-10 (§9.5 of the security-model spec), so the seeds no longer name an Ed25519 keypair and are retained only so this corpus's provenance stays legible across the change. An implementation that cannot reproduce any one of the three public keys from its seed has a broken P-256 implementation, a broken HKDF, or a broken reading of the seed-to-scalar rule, and MUST NOT proceed with SCP interoperability testing.
 
 **The same P-256 keys serve ECDH for HPKE.** SCP's HPKE suite is DHKEM(P-256, HKDF-SHA256) (§9.5), so a key-agreement key on this curve is a P-256 key like any other. RFC 9180 §7.1 fixes its encoding as the 65-byte uncompressed SEC1 point, printed above beside the 33-byte compressed form that §9.5 fixes for signature verification. No separate key material stands between the two roles, and no birational map does either.
 
@@ -916,7 +936,7 @@ python3.12 scripts/gen-test-vectors-p256.py
 
 §25.1 states what the script implements and which published known-answer tests it checks itself against. A value printed above that the script does not reproduce is a defect in this section.
 
-**The Rust reference implementation still signs under the superseded curve.** `crates/scp-runtime/tests/test_vectors.rs`, `crates/scp-event-log/tests/test_vectors.rs`, and `crates/scp-crypto/src/pseudonym.rs` assert the Ed25519 values these vectors carried before 2026-09-10. SCP superseded Ed25519 on that date (§9.5 of the security-model spec) and the artifact flow puts the spec first, so this section is the authority for every byte above until those tests are ported to P-256. An implementer comparing against those Rust tests today reproduces the pre-2026-09-10 values, not the values above.
+**The Rust reference implementation still signs under the superseded curve.** `crates/scp-runtime/tests/test_vectors.rs`, `crates/scp-event-log/tests/test_vectors.rs`, `crates/scp-crypto/src/pseudonym.rs`, and the `vector_38_*` and `vector_39_*` tests of `crates/scp-protocol/src/trust/custody_violation.rs` assert the Ed25519 values these vectors carried before 2026-09-10; §25.25 renumbers that crate's two vectors to 39 and 40, because §25.9 already carries a Vector 38. SCP superseded Ed25519 on that date (§9.5 of the security-model spec) and the artifact flow puts the spec first, so this section is the authority for every byte above until those tests are ported to P-256. An implementer comparing against those Rust tests today reproduces the pre-2026-09-10 values, not the values above.
 
 Independent implementations SHOULD run the generator, compare its output against the values printed above, and then embed those outputs in their own test suites.
 
@@ -1313,3 +1333,111 @@ cargo test -p scp-testing --test conformance \
 ```
 
 The regenerator is `#[ignore]` by default so the default `cargo test` run does not write to disk. Fixture drift (live code changes that should but do not invalidate the JSON) is caught by `CONF-046`, which compares the on-disk file byte-for-byte to the generator's current output.
+
+## 25.25 Custody Violation and Counter-Attestation Signing Vectors (§9.5.2, §9.18.2)
+
+Domains: `"SCP-CUSTODY-VIOLATION-V1:"` and `"SCP-COUNTER-ATTESTATION-V1:"`.
+
+ADR-039, shared-DID human-agent identity model, makes a custody violation a permanent record that one verifier writes about a subject who never consented to it, and gives that subject a counter-attestation to publish beside it. Vector 39 and Vector 40 form one pair: Vector 39 is a violation record a verifier signs, and Vector 40 is a counter-attestation that record's subject signs against it. An implementer reproduces Vector 40's `violation_reference` only by reproducing Vector 39's canonical hash first, so this pair also pins §9.5.2's derivation rule, which binds one counter-claim to one violation record.
+
+Three §25.2 keys play three roles:
+
+| Key | §25.2 seed | Role in Vectors 39 and 40 |
+|-----|-----------|---------------------------|
+| Reference (primary) | `0x9d61b1…7f60` | Detecting verifier, who signs Vector 39's violation record |
+| Secondary | `0x4ccd08…a6fb` | Subject's `#active` verification method, which signs Vector 40's counter-attestation |
+| Tertiary | `0xc5aa8d…58f7` | The key that produced whichever offending signature Vector 39 records as evidence |
+
+**`signer_key_id` carries `"#agent"` because the shipped `SigningKeyId` type renders that string.** §9.7.4.2 of the security-model spec gives a human identity no `#agent` verification method after 2026-09-10, and §9.5.2 of that spec records that no section states which key a `CategoryAViolation` names once the offending signature comes from a delegated agent identity. These two vectors pin the byte layout and decide nothing about that value.
+
+### Vector 39: Custody Violation Record Signature
+
+`signature_evidence` carries whichever offending signature a verification point observed. This vector fixes it as one P-256 ECDSA signature, taken by the tertiary key over `SHA-256` of the 19 ASCII bytes `did_document_update`, which any implementer reproduces from the tertiary seed alone.
+
+```
+Input:
+  signing key (verifier):  reference P-256 key (§25.2, seed 0x9d61b1…7f60)
+  subject_did:             "did:dht:z6MkCustodySubject"            (26 bytes)
+  timestamp:               1700000000
+  violation_tag:           0x00                                    (CategoryAViolation)
+  action:                  "did_document_update"                   (19 bytes)
+  signer_key_id:           "#agent"                                (6 bytes)
+  signature_evidence:      ECDSA_P256(tertiary key, SHA-256("did_document_update"))   (64 bytes)
+                           6977b8b0fcf882f380adba071e028873b8cc5ee347f6391935894b4793cc3af2
+                           4023264e9934e7a68879af8c7e628d3fcc86c73ca88be89fbcbc44a73d6fa8c9
+  verifier_did:            "did:dht:z6MkCustodyVerifier"           (27 bytes)
+
+Canonical hash input (per §9.5.1 / §9.5.2 ScpCustodyViolationAttestation):
+  "SCP-CUSTODY-VIOLATION-V1:"                        (25 bytes, no length prefix)
+  || BE32(26) || "did:dht:z6MkCustodySubject"        (4 + 26 = 30 bytes — subject_did)
+  || BE64(1700000000)                                (8 bytes — timestamp)
+  || 0x00                                            (1 byte — violation_tag)
+  || BE32(19) || "did_document_update"               (4 + 19 = 23 bytes — action)
+  || BE32(6)  || "#agent"                            (4 + 6 = 10 bytes — signer_key_id)
+  || BE32(64) || signature_evidence                  (4 + 64 = 68 bytes)
+  || BE32(27) || "did:dht:z6MkCustodyVerifier"       (4 + 27 = 31 bytes — verifier_did)
+
+Total preimage: 25 + 30 + 8 + 1 + 23 + 10 + 68 + 31 = 196 bytes
+
+Preimage (hex, 196 bytes):
+  5343502d435553544f44592d56494f4c4154494f4e2d56313a
+  0000001a6469643a6468743a7a364d6b437573746f64795375626a656374
+  000000006553f100
+  00
+  000000136469645f646f63756d656e745f757064617465
+  00000006236167656e74
+  00000040
+  6977b8b0fcf882f380adba071e028873b8cc5ee347f6391935894b4793cc3af2
+  4023264e9934e7a68879af8c7e628d3fcc86c73ca88be89fbcbc44a73d6fa8c9
+  0000001b6469643a6468743a7a364d6b437573746f64795665726966696572
+
+Canonical hash SHA-256(preimage) (32 bytes):
+  ce7121ea1261034f5c2246b7fb0a442c7c7d0685d2e794d4ac9f1837db821ea4
+
+P-256 ECDSA verifier_signature over the 32-byte hash, reference key (64 bytes):
+  880a42f03e8da0126039bedbbe516fe424713ae1ba033ca78ab08fce67d73dd4
+  2bdce94e595f45dd4e7e309019c09f3247a88a7659df77b0d063ce707be6751d
+```
+
+A verifier resolves `verifier_did` to the reference compressed public key `0x033b1cac…f3027` and checks `verifier_signature` against that canonical hash. Substituting `violation_tag = 0x01` while leaving all three payload fields unchanged moves that canonical hash, and §9.5.2 field 3 exists to guarantee exactly that.
+
+### Vector 40: Counter-Attestation Signature Against Vector 39
+
+`violation_reference` is Vector 39's canonical hash, per §9.5.2's derivation rule. It is encoded as 32 raw bytes with no length prefix, per §9.5.1's fixed-length field rule.
+
+```
+Input:
+  signing key (subject #active): secondary P-256 key (§25.2, seed 0x4ccd08…a6fb)
+  subject_did:                   "did:dht:z6MkCustodySubject"      (26 bytes)
+  violation_reference:           ce7121ea1261034f5c2246b7fb0a442c7c7d0685d2e794d4ac9f1837db821ea4
+                                 (32 bytes — Vector 39 canonical hash)
+  explanation:                   "agent key compromised; rotated and republished"   (46 bytes)
+  timestamp:                     1700003600
+
+Canonical hash input (per §9.5.1 / §9.5.2 CounterAttestation):
+  "SCP-COUNTER-ATTESTATION-V1:"                      (27 bytes, no length prefix)
+  || BE32(26) || "did:dht:z6MkCustodySubject"        (4 + 26 = 30 bytes — subject_did)
+  || violation_reference                             (32 bytes, fixed-length, no length prefix)
+  || BE32(46) || "agent key compromised; rotated and republished"  (4 + 46 = 50 bytes)
+  || BE64(1700003600)                                (8 bytes — timestamp)
+
+Total preimage: 27 + 30 + 32 + 50 + 8 = 147 bytes
+
+Preimage (hex, 147 bytes):
+  5343502d434f554e5445522d4154544553544154494f4e2d56313a
+  0000001a6469643a6468743a7a364d6b437573746f64795375626a656374
+  ce7121ea1261034f5c2246b7fb0a442c7c7d0685d2e794d4ac9f1837db821ea4
+  0000002e6167656e74206b657920636f6d70726f6d697365643b20726f746174656420616e642072657075626c6973686564
+  000000006553ff10
+
+Canonical hash SHA-256(preimage) (32 bytes):
+  644f3a25ecc38ee3f34cb042f69740f6265ff13bc0f08c2948efa95af344319a
+
+P-256 ECDSA signature over the 32-byte hash, secondary key (64 bytes):
+  5de479e66ce67231ef0130d83e0d5d1a3b2f3f99efda78c0804f0c41f279a68d
+  2ee9ebabab1ea9e84cdf4b8d02f9feb77ffc0995acfb48ffcb59383791042408
+```
+
+A verifier resolves `subject_did` to its `#active` verification method, the secondary compressed public key `0x0223702a…20aea`, and checks `signature` against that canonical hash. Checking `signature` against the tertiary public key `0x026fc652…1a670`, which produced the offending signature Vector 39 records as evidence, fails, and that failure is how §9.5.2 enforces ADR-039 acceptance criterion 18 without a `signing_key_id` field inside a signed record.
+
+Both signatures above come from a software signer, which §9.5 requires to derive its nonce under RFC 6979 with SHA-256, so a conformant software implementation reproduces both byte-for-byte. A hardware signer draws a random nonce and conforms by verification rather than by byte comparison (§25.17 step 5).

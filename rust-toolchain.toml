@@ -4,10 +4,15 @@
 # WHO READS IT.
 #   - `cargo` and `rustup` read it natively for any command run inside this directory,
 #     and rustup installs the channel, components, and targets below on first use.
-#     `.mise.toml` names no Rust version and installs no Rust toolchain, so no
-#     `RUSTUP_TOOLCHAIN` comes between rustup and this file; the comment at the top of
-#     that file records why, which is that `fuzz/` resolves a different compiler and one
-#     exported variable cannot serve both directories.
+#     `.mise.toml` names no Rust version and installs no Rust toolchain, so mise puts no
+#     `RUSTUP_TOOLCHAIN` between rustup and this file; the comment at the top of that file
+#     records why, which is that `fuzz/` resolves a different compiler and one exported
+#     variable cannot serve both directories. A `RUSTUP_TOOLCHAIN` reaching a shell from
+#     any other source — a `.mise.toml` in a directory above this repository, a profile,
+#     another tool — still replaces this file entirely, so
+#     `scripts/check-resolved-rustc.sh` compares `rustc --version` against the channel
+#     below, and `scripts/check-toolchain-wiring.sh`, `scripts/hooks/pre-commit`, and
+#     `scripts/setup-toolchain.sh` each run that comparison.
 #   - `Dockerfile` copies this file into the builder image before any cargo command,
 #     so rustup inside the container resolves the same compiler. The image tag names
 #     a Debian release and no Rust version.

@@ -76,7 +76,7 @@ pub enum AdmissionError {
     /// in the sibling `verify_participation_requirements` — so a future
     /// core/runtime caller cannot bypass the subject-binding invariant.
     ///
-    /// [`ParticipationAdmissionError::EmptyExpectedSubject`]: crate::trust::ParticipationAdmissionError::EmptyExpectedSubject
+    /// [`ParticipationAdmissionError::EmptyExpectedSubject`]: crate::trust::participation::ParticipationAdmissionError::EmptyExpectedSubject
     #[error("subject_did must not be empty")]
     EmptySubjectDid,
 }

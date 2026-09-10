@@ -201,7 +201,7 @@ impl BoundRelays {
     ///
     /// The read accessors degrade poison to "nothing bound", which is the right
     /// fail-closed direction but the wrong *diagnosis*: a publisher whose map is
-    /// poisoned reports [`IdentityError::NoRelayBound`], and the republish loop
+    /// poisoned reports [`IdentityError::NoRelayBound`](scp_identity::IdentityError::NoRelayBound), and the republish loop
     /// deliberately rate-limits that variant to roughly one report every 12
     /// hours because it reads it as an unconfigured node no retry can heal. A
     /// poisoned map on a node that HAS relays configured is a fault, not a

@@ -267,7 +267,7 @@ pub const IDENT_1057: &str = "SCP-IDENT-1057";
 /// Surfaced by all native bridges (`PyO3`, napi-rs, `UniFFI`) when the shipped
 /// Mainline Pkarr DHT client cannot be built — a malformed gateway URL or a
 /// Pkarr build failure (`DhtInitError` from
-/// [`scp_ffi_common::dht::build_ffi_dht_client`]). This is the fail-closed DHT
+/// [`crate::dht::build_ffi_dht_client`]). This is the fail-closed DHT
 /// path (ADR-062 §Decision 1 / spec §17.17.3): construction NEVER substitutes an
 /// in-memory or no-op client. Distinct from `IDENT_1001` (the generic /
 /// registry-miss code) so SDK consumers can tell a DHT-init failure apart from
@@ -289,6 +289,78 @@ pub const IDENT_1058: &str = "SCP-IDENT-1058";
 /// pre-rotation backend is tracked by #1729 / RFC #2130; non-committing creation
 /// (Option A) is out of scope (Discussion #1553).
 pub const IDENT_1059: &str = "SCP-IDENT-1059";
+
+/// Identity-link attestation verification could not resolve an issuer's DID
+/// document, or ran on a surface that reaches no DID resolver (FAIL CLOSED).
+///
+/// Surfaced by all native bridges (`PyO3`, napi-rs, `UniFFI`). Spec §3.5.4
+/// step 1 makes resolution of an issuer's DID document a precondition of every
+/// later step, so a bridge that cannot resolve cannot decide whether an
+/// attestation is genuine. Reporting `false` would say "forged" about an
+/// attestation nobody checked, so a bridge raises this code instead. Two
+/// callers meet it:
+///
+/// 1. A per-instance `verify_link_attestation` whose resolver returned no
+///    document, or reported a network fault, for an issuer's DID.
+/// 2. A module-level `identity_verify_link_attestation` free function, which
+///    reaches no bridge instance and therefore no DID resolver at all (phase D,
+///    pull request #1695, deleted every process-wide default bridge instance).
+///    Every caller of that free function moves to a per-instance
+///    `verify_link_attestation` method on `SCP`.
+///
+/// Distinct from `IDENT_1006` (a DID resolution failure a caller asked for
+/// directly) so an SDK consumer can tell an attestation-verification
+/// precondition failure apart from a plain resolve call that failed.
+pub const IDENT_1060: &str = "SCP-IDENT-1060";
+
+/// Identity-link attestation verification found an issuer publishing an
+/// attestation revocation list that no bridge reads (FAIL CLOSED).
+///
+/// Spec §3.5.2 states: "Verifiers check revocation by resolving the issuer's
+/// DID document and looking for an `AttestationRevocations` service endpoint
+/// (§18.2.2). The endpoint returns a list of revoked attestation IDs." Spec
+/// §3.5.2 further states that the endpoint check "is ALWAYS required regardless
+/// of `revocation_status` value", because a holder who keeps an
+/// `Active`-signed copy replays it after an issuer revokes it. No bridge
+/// fetches that endpoint, so a bridge that resolves a document publishing one
+/// cannot conclude an attestation is unrevoked and raises this code instead of
+/// answering `true`.
+///
+/// A caller that meets this code fetches that endpoint itself, checks whether
+/// it lists this attestation's `id`, and decides. A caller cannot suppress this
+/// code by supplying different arguments, because an issuer's own DID document
+/// decides whether it applies.
+///
+/// Distinct from [`IDENT_1060`] (an issuer's document could not be resolved at
+/// all) so an SDK consumer can tell "no document" apart from "a document whose
+/// revocation list this bridge does not read".
+pub const IDENT_1061: &str = "SCP-IDENT-1061";
+
+/// Identity-link attestation verification reached a class 2 (Reference)
+/// attestation whose external proof resource nobody fetched (FAIL CLOSED).
+///
+/// Spec §3.5.4 Class 2 step 2 has a verifier fetch a `signed_post` URL or query
+/// a `dns_record` TXT record and confirm an issuer's DID appears in it. No
+/// bridge performs that fetch, so each bridge's verify method takes a
+/// `reference_proof` argument naming what a caller did about it. This code
+/// reports the `"not_fetched"` case: spec §3.5.4 Class 2 step 3 states the
+/// attestation "is unverified. Treat as if the attestation does not exist for
+/// trust evaluation. Do not cache a negative result." Answering `false` would
+/// hand a caller exactly that negative result, and a caller reads `false` on
+/// this surface as "this attestation is forged", so a bridge raises this code
+/// instead.
+///
+/// A caller that meets this code performs that fetch itself — HTTP GET for
+/// `signed_post`, DNS TXT lookup of `_scp-verify.<domain>` for `dns_record` —
+/// confirms an issuer's DID appears in what it fetched, and calls again with
+/// `reference_proof` reading `"confirmed"`, which yields a verdict. A caller
+/// whose fetch failed or found nothing keeps `"not_fetched"` and treats this
+/// code as "not yet verified" rather than caching a rejection.
+///
+/// Distinct from [`IDENT_1060`] and [`IDENT_1061`]: a signature already
+/// verified under a key an issuer's DID document publishes, so what remains
+/// unchecked is an external resource rather than an issuer's document.
+pub const IDENT_1062: &str = "SCP-IDENT-1062";
 
 // -------------------------------------------------------------------------
 // Context (SCP-CTX- 2000--2999)
@@ -1009,6 +1081,25 @@ pub const VALID_7133: &str = "SCP-VALID-7133";
 pub const VALID_7134: &str = "SCP-VALID-7134";
 /// Address resolution ambiguous error.
 pub const VALID_7135: &str = "SCP-VALID-7135";
+/// Address resolution reached no binding, and nobody read at least one
+/// layer's data.
+///
+/// The criterion, per §22.8.2a of
+/// `.docs/specs/22-human-readable-addressing.md`: resolution held no binding,
+/// and for at least one layer no read happened at all. `VALID_7091` reports
+/// the other case, where every consulted layer was read and none held a
+/// binding, so a caller reads `VALID_7136` as "capability absent" and
+/// `VALID_7091` as "binding absent". A caller retries `VALID_7136` against a
+/// deployment holding the missing capability; retrying `VALID_7091` anywhere
+/// returns the same answer.
+///
+/// Layers that go unread on these bridges, as evidence of what the criterion
+/// admits rather than as the criterion itself: attestation reverse-lookup
+/// (§22.5.1), because no bridge invokes an `attestation_lookup` outlet;
+/// `.well-known/scp` domain handles (§22.6.1), because no bridge performs that
+/// fetch and no bridge configures a domain; and a context handle registry this
+/// bridge instance does not hold.
+pub const VALID_7136: &str = "SCP-VALID-7136";
 /// Recovery or custody-migration concurrency cap reached.
 ///
 /// The NAPI bridge bounds concurrent `block_on` invocations to prevent libuv
@@ -1051,6 +1142,25 @@ pub const VALID_7403: &str = "SCP-VALID-7403";
 /// dict, the NAPI JSON-string factory) reject a missing selection at
 /// runtime with this code. No bridge silently defaults to in-memory.
 pub const STORAGE_8000: &str = "SCP-STORAGE-8000";
+
+/// The selected durable storage backend failed to open.
+///
+/// Returned when `SqliteStorage::new` or `SqliteStorage::with_passphrase`
+/// rejects the caller's selection: a wrong key or passphrase on an existing
+/// `SQLCipher` database, a directory the process cannot write, a corrupt
+/// file, a salt-sidecar fail-closed condition, or a second handle against a
+/// database another `SCP` instance already holds an advisory lock on.
+/// Spec §17.6 makes this terminal — no bridge downgrades to in-memory
+/// storage after it. All three bridges report this one code, so a caller
+/// reading a code learns the same thing whichever binding raised it.
+///
+/// The number is `8004`, not `8001`, because the `scp-kt-android`
+/// `AndroidStorage` backend already owns `8001`--`8003`
+/// (`.docs/standards/sdk-common.md` §Registered SCP-STORAGE- codes). An
+/// Android app links `AndroidStorage` and this bridge into one process, so
+/// reusing `8001` would make one code string mean both "storage key not
+/// found" and "durable backend failed to open" inside that app.
+pub const STORAGE_8004: &str = "SCP-STORAGE-8004";
 
 // -------------------------------------------------------------------------
 // Attestation (SCP-ATTEST- 9000--9999)

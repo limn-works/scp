@@ -1281,7 +1281,7 @@ pub struct ReliabilityScore {
 
 **Estimated functions:** ~15-18 public functions, ~10-12 internal helpers.
 
-**Testing.** The `scp-testing` crate (§16) provides `InMemoryTransport` — a `TransportAdapter` implementation backed by `InMemoryRelay` instances — enabling deterministic testing of `TransportManager` routing logic without network I/O. The `transport_conformance!()` macro (§16.12.1) verifies that every `TransportAdapter` implementation satisfies the trait contract; the `InMemoryTransport` is the reference, and the native relay adapter must pass the same suite. Multi-relay fault scenarios (suppression, equivocation, delay, replay) are tested via `BehaviorMode` configurations on `InMemoryRelay` (§16.4.4).
+**Testing.** The `scp-testing` crate (§16) provides `InMemoryTransport` — a `TransportAdapter` implementation backed by `InMemoryRelay` instances — enabling deterministic testing of `TransportManager` routing logic without network I/O. The `transport_conformance!()` macro (§16.12.1) verifies that every `TransportAdapter` implementation satisfies the trait contract; the `InMemoryTransport` is the reference, and the native relay adapter must pass the same suite. Multi-relay fault scenarios (suppression, equivocation, delay, replay) are tested via `BehaviorMode` configurations on `InMemoryRelay` (§16.4.3).
 
 ---
 

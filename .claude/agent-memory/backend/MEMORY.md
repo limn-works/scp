@@ -1,5 +1,7 @@
 # Backend Agent Memory (scoped)
 
+- [project-attestation-revocation-writer-2335](project_attestation_revocation_writer_2335.md) — #2335 finding 13: Alec chose "wire a writer" over "fail closed" for a per-context attestation revocation list; write gate + step-order dependency
+
 - [finding-cargo-deny-highest-version-only](finding_cargo_deny_highest_version_only.md) — cargo-deny flags only the HIGHEST version of a duplicated crate; a dep bump can green the gate while unsound copies still ship. Also: local cargo-deny 0.19 misses `unsound` advisories that CI's 0.20.2 catches
 - [project-encrypted-storage-seal-17-5](project_encrypted_storage_seal_17_5.md) — §17.5 seal: in-memory FFI door sealed via EncryptingAdapter+Node::start; start_node_local + 4 manifest edges BLOCKED on a human SQLCipher-vs-adapter call; ADR-052 §AC-9 test was a phantom claim — now real (compile_fail,E0277 doctests, pin the code + pair a positive control; nextest skips doctests)
 

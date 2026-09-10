@@ -242,6 +242,23 @@ fn_body() {
 # count — the tokens must appear in live code. The additional `return Err(`
 # requirement ensures a real early-return reject, not a discarded binding.
 # Returns 0 (present) or 1 (absent).
+#
+# Every probe below writes grep's output to /dev/null instead of passing grep a
+# -q flag. `set -o pipefail` (line 111) makes a pipeline report a last non-zero
+# exit status any stage returned. `grep -q` stops reading at its first match and
+# exits, which closes a pipe while `printf` is still writing; `printf` then dies
+# of SIGPIPE and returns 141, and pipefail hands 141 to `||`, which reads a token
+# grep FOUND as a token absent. Measured on this tree: a 194,118-byte function
+# body carrying `.contains(` on its second line returned 141 under `grep -Fq`
+# and 0 under `grep -F … >/dev/null`. A supervisor function long enough to pass
+# a 64 KB pipe buffer would therefore fail P3 and P4 while satisfying them, and
+# would pass P5 while violating it — a FAIL-OPEN read on the one probe whose
+# match means "regression present". Fixture (h) in self_test asserts every
+# verdict over a padded body, and assert_body_exceeds_pipe_buffer measures each
+# padded body the way its probe measures it, so the padding cannot silently stop
+# reaching grep. This function strips `//` tails BEFORE it opens the pipe, which
+# means comment padding buys it nothing; emit_pipe_buffer_padding therefore emits
+# live code lines.
 # ---------------------------------------------------------------------------
 has_overlap_reject_in_reserve() {
     local file="$1" body code
@@ -250,11 +267,11 @@ has_overlap_reject_in_reserve() {
     # Strip //-comment tails so tokens that appear ONLY in comments do not count
     # (a gutted reject with explanatory-comment-only tokens must NOT pass).
     code="$(printf '%s' "$body" | sed 's://.*$::')"
-    printf '%s' "$code" | grep -Fq -- '.contains(' || return 1
-    printf '%s' "$code" | grep -Fq -- 'SagaBusy' || return 1
-    printf '%s' "$code" | grep -Fq -- 'ActorBusy' || return 1
+    printf '%s' "$code" | grep -F -- '.contains(' >/dev/null || return 1
+    printf '%s' "$code" | grep -F -- 'SagaBusy' >/dev/null || return 1
+    printf '%s' "$code" | grep -F -- 'ActorBusy' >/dev/null || return 1
     # The reject must be a real early-return, not a discarded binding.
-    printf '%s' "$code" | grep -Eq -- 'return[[:space:]]+Err\(' || return 1
+    printf '%s' "$code" | grep -E -- 'return[[:space:]]+Err\(' >/dev/null || return 1
     return 0
 }
 
@@ -267,7 +284,7 @@ start_saga_calls_reserve() {
     local file="$1" body
     body="$(fn_body "$file" 'start_saga')"
     [[ -n "$body" ]] || return 1
-    printf '%s' "$body" | grep -Fq -- 'try_reserve_context_set(' || return 1
+    printf '%s' "$body" | grep -F -- 'try_reserve_context_set(' >/dev/null || return 1
     return 0
 }
 
@@ -285,7 +302,7 @@ extractor_has_no_standing_prefix() {
     # Absence of the function is a SEPARATE failure (P2); treat a missing body
     # as "clean" here so P5 does not double-count it.
     [[ -n "$body" ]] || return 0
-    if printf '%s' "$body" | grep -Eq -- '"standing-|generate_standing_context_id'; then
+    if printf '%s' "$body" | grep -E -- '"standing-|generate_standing_context_id' >/dev/null; then
         return 1
     fi
     return 0
@@ -445,6 +462,75 @@ run_check() {
     fi
 
     return "$fail"
+}
+
+# ---------------------------------------------------------------------------
+# PIPE-BUFFER PADDING (self-test only)
+#
+# PIPE_BUFFER_BYTES names the largest pipe buffer this gate has to defeat: Linux
+# sets a pipe to 65,536 bytes by default, and macOS grows one to the same size.
+# A writer that fills the buffer and keeps writing blocks until the reader drains
+# it, so a reader that exits early (`grep -q`) kills the writer with SIGPIPE and
+# `set -o pipefail` reports 141. A body SMALLER than the buffer never reaches that
+# state: the writer finishes, the reader exits 0, and the bug stays invisible.
+# Every fixture that means to prove the SIGPIPE property therefore has to exceed
+# this number AS THE PROBE MEASURES IT.
+#
+# emit_pipe_buffer_padding writes LIVE CODE lines, each carrying a `//` tail. Live
+# code is what has_overlap_reject_in_reserve measures, because that probe deletes
+# every `//` tail before it opens the pipe; a `//`-only padding line collapses to
+# four spaces and buys the fixture nothing. The `//` tail keeps the RAW body large
+# too, which is what start_saga_calls_reserve and extractor_has_no_standing_prefix
+# measure. Each line carries no brace (fn_body counts braces to find the body end),
+# no saga-guard field name and no instance-wide scalar type (scan_negative would
+# report a NEGHIT), and no `.contains(`, `SagaBusy`, `ActorBusy`, `return Err(`,
+# `try_reserve_context_set(` or `"standing-` token (a probe would read the padding
+# itself as the token it hunts).
+# ---------------------------------------------------------------------------
+PIPE_BUFFER_BYTES=65536
+PIPE_BUFFER_PAD_LINES=2000
+
+emit_pipe_buffer_padding() {
+    local pad_i
+    for ((pad_i = 0; pad_i < PIPE_BUFFER_PAD_LINES; pad_i++)); do
+        printf '    let _pad_%d: &str = "widen this body past a pipe buffer"; // pad %d\n' \
+            "$pad_i" "$pad_i"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# assert_body_exceeds_pipe_buffer <file> <fn-name> <strip|raw> <label> — 0 when
+# `fn <fn-name>`'s body in <file> exceeds PIPE_BUFFER_BYTES, 1 otherwise. Pass
+# `strip` to measure the body after the `//`-tail deletion that
+# has_overlap_reject_in_reserve performs, and `raw` to measure the bytes that
+# start_saga_calls_reserve and extractor_has_no_standing_prefix pipe.
+#
+# This assertion exists because a padded fixture asserts a VERDICT, and a verdict
+# assertion holds whether or not the padding reached the probe. Fixture (h) padded
+# `try_reserve_context_set` with 1200 `//` comment lines, has_overlap_reject_in_reserve
+# stripped them, and a 71,117-byte body reached grep as 6,227 bytes, so the fixture
+# passed with `grep -Fq` restored inside that probe — a fixture that could not fail.
+# The same body under emit_pipe_buffer_padding measures 150,007 bytes raw and 129,117
+# stripped. Measuring the size directly makes that regression name itself.
+# ---------------------------------------------------------------------------
+assert_body_exceeds_pipe_buffer() {
+    local file="$1" fn="$2" mode="$3" label="$4" body bytes
+    body="$(fn_body "$file" "$fn")"
+    if [[ "$mode" == "strip" ]]; then
+        body="$(printf '%s' "$body" | sed 's://.*$::')"
+    fi
+    bytes="$(printf '%s' "$body" | wc -c)"
+    bytes="${bytes//[[:space:]]/}"
+    if (( bytes > PIPE_BUFFER_BYTES )); then
+        return 0
+    fi
+    printf '%sSELF-TEST FAILED (%s)%s: `fn %s` reaches its probe as %s bytes, and a pipe\n' \
+        "$C_RED" "$label" "$C_RESET" "$fn" "$bytes" >&2
+    printf 'buffer holds %s, so this fixture never blocks the writer and never exercises\n' \
+        "$PIPE_BUFFER_BYTES" >&2
+    printf 'the SIGPIPE read-a-match-as-a-miss bug it claims to prove. Widen the padding\n' >&2
+    printf 'with emit_pipe_buffer_padding, whose lines survive the `//`-tail strip.\n' >&2
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -667,6 +753,132 @@ self_test() {
         printf 'dead — restore the comment-tail stripping and the early-return check.\n' >&2
         rc=1
     fi
+
+    # ---- fixture (h): a correct supervisor whose bodies pass a pipe buffer -> PASS.
+    # Every probe in has_overlap_reject_in_reserve, start_saga_calls_reserve and
+    # extractor_has_no_standing_prefix pipes a function body into grep under
+    # `set -o pipefail`. Under `grep -q`, grep exits at its first match, `printf`
+    # dies of SIGPIPE, and pipefail reports 141 — so a token near a top of a long
+    # body read as ABSENT. This fixture pads each of the three bodies past
+    # PIPE_BUFFER_BYTES, leaves every token on an early line, and asserts the gate
+    # still ACCEPTS it. Measured: a 194,118-byte body carrying `.contains(` on its
+    # second line returned 141 under `grep -Fq` and 0 under `grep -F … >/dev/null`.
+    #
+    # emit_pipe_buffer_padding writes LIVE CODE lines carrying a `//` tail, so the
+    # padding survives the comment strip in has_overlap_reject_in_reserve. Comment
+    # padding did not: that probe deletes every `//` tail before it opens the pipe,
+    # which collapsed a 71,117-byte body to 6,227 bytes, and 6,227 bytes never fill
+    # a pipe buffer. Fixture (h) then passed with `grep -Fq`
+    # restored inside has_overlap_reject_in_reserve — the fixture asserted a verdict
+    # it could not reach. assert_body_exceeds_pipe_buffer below pins the size
+    # property that the verdict assertion depends on, so a later edit that shrinks
+    # the padding, or a probe that strips it away, fails this self-test by name
+    # instead of passing silently.
+    local sup_h="$fixt/sup_h.rs"
+    {
+        printf 'struct Supervisor {\n'
+        printf '    reserved_saga_contexts: std::sync::Mutex<HashSet<String>>,\n'
+        printf '    spawn_generation: std::sync::atomic::AtomicU64,\n'
+        printf '}\n'
+        printf 'fn saga_participant_context_set(input: &SagaInput) -> Vec<String> {\n'
+        printf '    let out = vec![hex::encode(derive_standing_context_digest(a, b))];\n'
+        emit_pipe_buffer_padding
+        printf '    out\n'
+        printf '}\n'
+        printf 'fn try_reserve_context_set(&self, set: &[String]) -> Result<R, E> {\n'
+        printf '    if set.iter().find(|id| reserved.contains(*id)).is_some() {\n'
+        printf '        return Err(ContextError::ActorBusy("... SagaBusy".into()));\n'
+        printf '    }\n'
+        emit_pipe_buffer_padding
+        printf '    Ok(reservation)\n'
+        printf '}\n'
+        printf 'pub async fn start_saga(&self, input: SagaInput) -> Result<O, E> {\n'
+        printf '    let set = saga_participant_context_set(&input);\n'
+        printf '    let _r = self.try_reserve_context_set(&set)?;\n'
+        emit_pipe_buffer_padding
+        printf '    Ok(out)\n'
+        printf '}\n'
+    } > "$sup_h"
+    local ffi_h="$fixt/ffi_h"
+    mkdir -p "$ffi_h"
+    printf 'pub fn unrelated() {}\n' > "$ffi_h/exports.rs"
+
+    # Precondition: each body this fixture pads must reach grep as more bytes than
+    # a pipe buffer holds, measured the way the probe that reads it measures — the
+    # comment-stripped body for has_overlap_reject_in_reserve (P3), the raw body
+    # for start_saga_calls_reserve (P4) and extractor_has_no_standing_prefix (P5).
+    assert_body_exceeds_pipe_buffer "$sup_h" 'try_reserve_context_set' strip \
+        'h/P3 has_overlap_reject_in_reserve' || rc=1
+    assert_body_exceeds_pipe_buffer "$sup_h" 'start_saga' raw \
+        'h/P4 start_saga_calls_reserve' || rc=1
+    assert_body_exceeds_pipe_buffer "$sup_h" 'saga_participant_context_set' raw \
+        'h/P5 extractor_has_no_standing_prefix' || rc=1
+
+    if ! run_check "$sup_h" "$ffi_h" "self-test(h)" "$tests_ok" >/dev/null 2>&1; then
+        printf '%sSELF-TEST FAILED (h)%s: a supervisor satisfying every positive assertion\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'was rejected once its function bodies grew past a 64 KB pipe buffer, so this\n' >&2
+        printf 'gate reads a token grep found as a token absent. Replace every `grep -q`\n' >&2
+        printf 'inside a pipeline here with `grep … >/dev/null`, which reads its whole input.\n' >&2
+        rc=1
+    fi
+
+    # ---- fixtures (i) and (j): a `"standing-"` literal in the extractor -> FAIL.
+    # P5 carried no behavioral proof at all, and its probe is the one whose MATCH
+    # means "regression present", so a 141 from SIGPIPE reads as "clean" and lets
+    # a violating supervisor through. (i) plants the literal in a short body and
+    # (j) plants it on an early line of a body padded past 64 KB; both must be
+    # REJECTED. A failure of (i) alone means P5 is dead; a failure of (j) alone
+    # means P5's verdict depends on how long that body is.
+    local sup_name padded literal_line
+    literal_line='    vec![format!("standing-{}", hex::encode(digest))]'
+    for sup_name in i j; do
+        local sup_p="$fixt/sup_${sup_name}.rs"
+        [[ "$sup_name" == "j" ]] && padded=1 || padded=0
+        {
+            printf 'struct Supervisor {\n'
+            printf '    reserved_saga_contexts: std::sync::Mutex<HashSet<String>>,\n'
+            printf '    spawn_generation: std::sync::atomic::AtomicU64,\n'
+            printf '}\n'
+            printf 'fn saga_participant_context_set(input: &SagaInput) -> Vec<String> {\n'
+            printf '%s\n' "$literal_line"
+            if [[ "$padded" -eq 1 ]]; then
+                emit_pipe_buffer_padding
+            fi
+            printf '}\n'
+            printf 'fn try_reserve_context_set(&self, set: &[String]) -> Result<R, E> {\n'
+            printf '    if set.iter().find(|id| reserved.contains(*id)).is_some() {\n'
+            printf '        return Err(ContextError::ActorBusy("... SagaBusy".into()));\n'
+            printf '    }\n'
+            printf '    Ok(reservation)\n'
+            printf '}\n'
+            printf 'pub async fn start_saga(&self, input: SagaInput) -> Result<O, E> {\n'
+            printf '    let set = saga_participant_context_set(&input);\n'
+            printf '    let _r = self.try_reserve_context_set(&set)?;\n'
+            printf '    Ok(out)\n'
+            printf '}\n'
+        } > "$sup_p"
+        local ffi_p="$fixt/ffi_${sup_name}"
+        mkdir -p "$ffi_p"
+        printf 'pub fn unrelated() {}\n' > "$ffi_p/exports.rs"
+
+        # (j) exists to prove that P5's REJECT survives a body longer than a pipe
+        # buffer, so measure the bytes extractor_has_no_standing_prefix pipes —
+        # that probe reads the raw body, comment tails included.
+        if [[ "$padded" -eq 1 ]]; then
+            assert_body_exceeds_pipe_buffer "$sup_p" 'saga_participant_context_set' raw \
+                'j/P5 extractor_has_no_standing_prefix' || rc=1
+        fi
+
+        if run_check "$sup_p" "$ffi_p" "self-test($sup_name)" "$tests_ok" >/dev/null 2>&1; then
+            printf '%sSELF-TEST FAILED (%s)%s: an extractor emitting a `"standing-"`-prefixed\n' \
+                "$C_RED" "$sup_name" "$C_RESET" >&2
+            printf 'literal into the reserved set was wrongly ACCEPTED, so P5 does not reject\n' >&2
+            printf 'the FIX-1 regression it names — a reservation keyed on the DISPLAY id\n' >&2
+            printf 'rather than on the canonical raw digest.\n' >&2
+            rc=1
+        fi
+    done
 
     rm -rf "$fixt"
     return "$rc"

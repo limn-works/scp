@@ -435,6 +435,25 @@ impl WebhookDispatcher {
         self.targets.write().await.remove(target_id).is_some()
     }
 
+    /// Returns every registered target that `context_id` selects, paired with
+    /// its target ID.
+    ///
+    /// A target matches when its `context_ids` list contains `context_id`, or
+    /// when that list is empty, which subscribes it to every context.
+    /// [`Self::dispatch_event`] calls this and then delivers to what it
+    /// returns, so a test asserting on this function asserts on what dispatch
+    /// delivers to.
+    pub(crate) async fn matching_targets(&self, context_id: &str) -> Vec<(String, WebhookTarget)> {
+        let targets = self.targets.read().await;
+        targets
+            .iter()
+            .filter(|(_, t)| {
+                t.context_ids.is_empty() || t.context_ids.iter().any(|c| c == context_id)
+            })
+            .map(|(id, t)| (id.clone(), t.clone()))
+            .collect()
+    }
+
     /// Dispatches a context event to all registered targets that match
     /// the given `context_id`.
     ///
@@ -470,16 +489,7 @@ impl WebhookDispatcher {
 
         // Snapshot matching targets under the read lock, then release it
         // before doing any async I/O.
-        let matching: Vec<(String, WebhookTarget)> = {
-            let targets = self.targets.read().await;
-            targets
-                .iter()
-                .filter(|(_, t)| {
-                    t.context_ids.is_empty() || t.context_ids.iter().any(|c| c == context_id)
-                })
-                .map(|(id, t)| (id.clone(), t.clone()))
-                .collect()
-        };
+        let matching: Vec<(String, WebhookTarget)> = self.matching_targets(context_id).await;
 
         if matching.is_empty() {
             return;
@@ -1084,7 +1094,13 @@ mod tests {
     #[tokio::test]
     async fn dispatcher_dispatch_no_targets_is_noop() {
         let dispatcher = WebhookDispatcher::new();
-        // Should not panic or hang.
+        // An empty registry selects nobody, so dispatch has nowhere to
+        // deliver. An earlier version called `dispatch_event` and asserted
+        // nothing at all.
+        assert!(
+            dispatcher.matching_targets("ctx-1").await.is_empty(),
+            "an empty registry must select no delivery target"
+        );
         dispatcher
             .dispatch_event("ctx-1", "message.received", serde_json::json!({}))
             .await;
@@ -1119,17 +1135,35 @@ mod tests {
             )
             .await;
 
-        // Dispatching to ctx-1 should only match bridge-all (bridge-scoped
-        // is for ctx-2). The actual HTTP calls will fail (no server), but
-        // the dispatch function handles errors gracefully.
-        dispatcher
-            .dispatch_event("ctx-1", "message.received", serde_json::json!({}))
-            .await;
+        // `dispatch_event` delivers to exactly what `matching_targets`
+        // returns, so asserting on that selection asserts on delivery
+        // without standing up an HTTP server. An earlier version called
+        // `dispatch_event` twice and asserted nothing, so a selector that
+        // ignored `context_ids` entirely would have passed.
+        let ctx1: Vec<String> = dispatcher
+            .matching_targets("ctx-1")
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            ctx1,
+            vec!["bridge-all".to_owned()],
+            "ctx-1 selects only a target subscribed to every context"
+        );
 
-        // Dispatching to ctx-2 should match both.
-        dispatcher
-            .dispatch_event("ctx-2", "member.joined", serde_json::json!({}))
-            .await;
+        let mut ctx2: Vec<String> = dispatcher
+            .matching_targets("ctx-2")
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        ctx2.sort();
+        assert_eq!(
+            ctx2,
+            vec!["bridge-all".to_owned(), "bridge-scoped".to_owned()],
+            "ctx-2 selects both its scoped target and that all-contexts target"
+        );
     }
 
     #[tokio::test]

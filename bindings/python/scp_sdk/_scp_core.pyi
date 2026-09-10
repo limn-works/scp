@@ -652,6 +652,9 @@ class SCP:
     def identity_rotate_agent_key(self, identity: Any) -> Any: ...
     def identity_rotate_key(self, identity: Any) -> Any: ...
     def remove_identity_link_attestation(self, did: Any, attestation_id: Any) -> Any: ...
+    def verify_identity_link_attestation(
+        self, attestation_json: str, issuer_public_key_hex: str, reference_proof: str
+    ) -> bool: ...
 
     # -- MCP --
     def mcp_configure_stdio_allowlist(self, additional_binaries: list[str] = ...) -> None: ...
@@ -973,8 +976,15 @@ def scpid_challenge(audience: str, ttl_seconds: int) -> str: ...
 # -- identity (pure helpers, ADR-048 §1) --
 
 def identity_verify_device_attestation(_did: str, token_base64: str) -> bool: ...
+
+# Always raises `SCP-IDENT-1060`: spec §3.5.4 step 1 resolves an issuer's DID
+# document, and a module-level free function reaches no per-instance resolver.
+# Use `SCP.verify_identity_link_attestation` instead. ADR-048 §1 does not place
+# this function at module scope and does not authorize its decline — that
+# document names no identity-link verification operation. It sits here because
+# it kept a Python-visible name that predates GitHub issue #2335 finding 2.
 def py_verify_identity_link_attestation(
-    attestation_json: str, issuer_public_key_hex: str
+    attestation_json: str, issuer_public_key_hex: str, reference_proof: str
 ) -> bool: ...
 
 # -- provenance (pure helpers, ADR-048 §1) --

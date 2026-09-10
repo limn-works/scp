@@ -627,6 +627,9 @@ REF_SEED_1 = bytes.fromhex(
 REF_SEED_2 = bytes.fromhex(
     "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
 )
+REF_SEED_3 = bytes.fromhex(
+    "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7"
+)
 
 # The HKDF-Expand label §25.2 defines for its own fixtures. It names no
 # protocol object, so §9.18.2 registers no separator for it.
@@ -634,6 +637,7 @@ TEST_VECTOR_KEY_LABEL = b"SCP-TEST-VECTOR-KEY-V1"
 
 REF_KEY_1 = keypair_from_seed(REF_SEED_1, TEST_VECTOR_KEY_LABEL, "reference key")
 REF_KEY_2 = keypair_from_seed(REF_SEED_2, TEST_VECTOR_KEY_LABEL, "secondary key")
+REF_KEY_3 = keypair_from_seed(REF_SEED_3, TEST_VECTOR_KEY_LABEL, "tertiary key")
 
 
 def emit_reference_keys() -> None:
@@ -646,6 +650,10 @@ def emit_reference_keys() -> None:
     emit_hex("scalar_2", REF_KEY_2.private_bytes)
     emit_hex("public_2_compressed", REF_KEY_2.compressed)
     emit_hex("public_2_uncompressed", REF_KEY_2.uncompressed)
+    emit_hex("seed_3", REF_SEED_3)
+    emit_hex("scalar_3", REF_KEY_3.private_bytes)
+    emit_hex("public_3_compressed", REF_KEY_3.compressed)
+    emit_hex("public_3_uncompressed", REF_KEY_3.uncompressed)
 
 
 def sign_and_emit(label: str, preimage: bytes, key: KeyPair = REF_KEY_1) -> bytes:
@@ -1357,6 +1365,70 @@ def emit_keypackage_attestation() -> None:
 
 
 # ---------------------------------------------------------------------------
+# §25.25 Custody violation and counter-attestation (§9.5.2, §9.18.2)
+# ---------------------------------------------------------------------------
+
+CUSTODY_SUBJECT_DID = "did:dht:z6MkCustodySubject"
+CUSTODY_VERIFIER_DID = "did:dht:z6MkCustodyVerifier"
+CUSTODY_ACTION = b"did_document_update"
+CUSTODY_SIGNER_KEY_ID = "#agent"
+COUNTER_EXPLANATION = "agent key compromised; rotated and republished"
+
+
+def emit_custody_violation() -> None:
+    """Vectors 39 and 40 — one violation record and the counter-claim naming it."""
+    section("§25.25 Custody violation and counter-attestation")
+
+    # `signature_evidence` carries whichever offending signature a verification
+    # point observed. This vector fixes it as one P-256 ECDSA signature by the
+    # tertiary key over the 19 ASCII bytes of the offending action, which any
+    # implementer reproduces from the tertiary seed alone.
+    evidence_digest = sha256(CUSTODY_ACTION)
+    evidence = ecdsa_sign(REF_KEY_3.d, evidence_digest)
+    assert ecdsa_verify(REF_KEY_3.point, evidence_digest, evidence), (
+        "vector_39: the evidence signature does not verify under the tertiary key"
+    )
+    emit_hex("vector_39.signature_evidence", evidence)
+
+    violation_preimage = canonical_preimage(
+        "SCP-CUSTODY-VIOLATION-V1:",
+        var_field(CUSTODY_SUBJECT_DID),
+        u64(1_700_000_000),
+        u8(0x00),
+        var_field(CUSTODY_ACTION),
+        var_field(CUSTODY_SIGNER_KEY_ID),
+        var_field(evidence),
+        var_field(CUSTODY_VERIFIER_DID),
+    )
+    violation_hash = sign_and_emit("vector_39", violation_preimage)
+
+    # Field 3 exists so that one variant's bytes never hash to another's. The
+    # assertion below is the property, not an illustration of it.
+    mismatch_preimage = canonical_preimage(
+        "SCP-CUSTODY-VIOLATION-V1:",
+        var_field(CUSTODY_SUBJECT_DID),
+        u64(1_700_000_000),
+        u8(0x01),
+        var_field(CUSTODY_ACTION),
+        var_field(CUSTODY_SIGNER_KEY_ID),
+        var_field(evidence),
+        var_field(CUSTODY_VERIFIER_DID),
+    )
+    assert sha256(mismatch_preimage) != violation_hash, (
+        "vector_39: the variant tag does not separate the two variants"
+    )
+
+    counter_preimage = canonical_preimage(
+        "SCP-COUNTER-ATTESTATION-V1:",
+        var_field(CUSTODY_SUBJECT_DID),
+        fixed_field(violation_hash),
+        var_field(COUNTER_EXPLANATION),
+        u64(1_700_003_600),
+    )
+    sign_and_emit("vector_40", counter_preimage, REF_KEY_2)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1384,6 +1456,7 @@ def main() -> int:
     emit_pseudonym_announcement()
     emit_trust_attestation()
     emit_keypackage_attestation()
+    emit_custody_violation()
     print("\n".join(_LINES))
     return 0
 

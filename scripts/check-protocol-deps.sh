@@ -18,8 +18,20 @@ echo "Checking scp-protocol dependency tree..."
 #   2. check-protocol-sync.py: no async fn in production code (tree-sitter)
 #   3. WASM compilation: no tokio/openmls (they don't compile on wasm32)
 #   4. Clock trait: SystemTime access privatized in scp-clock
+#
+# `--target all` resolves the UNION of every target triple's dependency edges.
+# Without it cargo evaluates each `[target.'cfg(…)'.dependencies]` table against
+# the triple the runner compiles for and discards every edge whose cfg is false
+# there, so a `tokio` declared under `cfg(target_os = "ios")` would be absent
+# from the graph this check reads and this check would report success.
+# crates/scp-protocol/Cargo.toml already carries a
+# `[target.'cfg(target_arch = "wasm32")'.dependencies]` table, so the construct
+# that hides an edge is in use in the very crate this gate guards. The fixture
+# `assert_every_cargo_tree_resolves_every_target` in
+# scripts/check-shipped-feature-graph.sh asserts this flag across every shell
+# script under scripts/.
 banned="tokio|scp-platform|openmls"
-output=$(cargo tree -p scp-protocol --edges no-dev 2>&1) || { echo "ERROR: cargo tree failed: $output"; exit 1; }
+output=$(cargo tree -p scp-protocol --edges no-dev --target all 2>&1) || { echo "ERROR: cargo tree failed: $output"; exit 1; }
 matches=$(echo "$output" | grep -iE "$banned" || true)
 
 if [ -n "$matches" ]; then

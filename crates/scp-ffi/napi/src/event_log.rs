@@ -58,7 +58,7 @@ pub struct NapiProof {
 // Bridge functions
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`event_log_query`].
+/// Per-bridge-instance implementation of [`Scp::event_log_query`](crate::scp::Scp::event_log_query).
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub(crate) async fn event_log_query_on(
     bi: &NapiBridgeInstance,
@@ -217,7 +217,7 @@ pub(crate) async fn event_log_query_on(
     }
 }
 
-/// Per-bridge-instance implementation of [`event_log_verify`].
+/// Per-bridge-instance implementation of [`Scp::event_log_verify`](crate::scp::Scp::event_log_verify).
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 #[allow(clippy::too_many_lines)] // Proof generation with match arms is inherently verbose.
@@ -451,7 +451,7 @@ pub struct NapiCheckpoint {
     pub signature: String,
 }
 
-/// Per-bridge-instance implementation of [`event_log_checkpoint`].
+/// Per-bridge-instance implementation of [`Scp::event_log_checkpoint`](crate::scp::Scp::event_log_checkpoint).
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned types
 pub(crate) fn event_log_checkpoint_on(
     bi: &NapiBridgeInstance,
@@ -522,7 +522,7 @@ pub(crate) fn event_log_checkpoint_on(
     }
 }
 
-/// Per-bridge-instance implementation of [`event_log_checkpoint_by_did`].
+/// Per-bridge-instance implementation of [`Scp::event_log_checkpoint_by_did`](crate::scp::Scp::event_log_checkpoint_by_did).
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned types
 pub(crate) fn event_log_checkpoint_by_did_on(
     bi: &NapiBridgeInstance,

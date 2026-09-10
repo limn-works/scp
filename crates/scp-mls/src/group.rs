@@ -729,7 +729,7 @@ pub fn add_member(
 /// immediately before delegating. openmls folds that AAD into the Commit's
 /// `FramedContent.authenticated_data`, which is covered by the committer's leaf
 /// signature (and, under the `PURE_CIPHERTEXT` policy, the AEAD tag), so an
-/// existing member reading the value back from [`decrypt_with_membership_changes`]
+/// existing member reading the value back from [`decrypt_with_membership_changes`](crate::encrypt::decrypt_with_membership_changes)
 /// gets it authenticated — not trusted on the wire. The added member does not
 /// need the AAD: its copy of the timestamp already rides inside the replayed
 /// event log.

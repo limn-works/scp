@@ -294,7 +294,7 @@ Not a replacement for `.docs/architecture.md` — a reading guide for it:
 
 ### 21.10.1 Requirements
 
-1. `cargo doc --workspace --no-deps` MUST produce warning-free output.
+1. The rustdoc command that §21.10.2, Rust (rustdoc), names MUST produce diagnostic-free output. The root `Cargo.toml` sets `broken_intra_doc_links = "forbid"` under `[workspace.lints.rustdoc]`, so an unresolved intra-doc link is an error rather than a warning in every member that declares `[lints] workspace = true`.
 2. CI generates docs on each merge to `main` (`.github/workflows/docs.yml`).
 3. Docs published to GitHub Pages on each release tag.
 4. Cross-crate links resolve correctly in rustdoc output (scp-core -> scp-identity, etc.).
@@ -303,7 +303,13 @@ Not a replacement for `.docs/architecture.md` — a reading guide for it:
 ### 21.10.2 Rust (rustdoc)
 
 1. Add `#![doc = include_str!("../README.md")]` to each crate's `lib.rs` so the crate-level doc page shows the README.
-2. Generate with `cargo doc --workspace --no-deps --document-private-items`.
+2. Generate with the command below. Job `rust-doc` in `.github/workflows/ci.yml` runs that command and a merge waits on it, so every command this specification names carries the same flags: `--document-private-items` makes rustdoc resolve a link a private module writes, and the six features gate items that four intra-doc links in `crates/scp-node` name. A fenced shell block holds the command because `scripts/tests/ci-gate/ci_gate_selftest.py` compares a documented `cargo doc` against job `rust-doc` only where a shell block encloses it, so an inline copy of these flags goes stale under a green self-test.
+
+   ```bash
+   cargo doc --workspace --no-deps --document-private-items \
+     --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint
+   ```
+
 3. Cross-crate links use `[`item`](crate_name::path::to::item)` syntax.
 4. The `docs.yml` CI workflow already builds rustdoc and uploads as artifact.
 5. On release tags, docs are deployed to GitHub Pages.
@@ -358,8 +364,11 @@ The `publish-docs` job in `docs.yml` handles aggregation and deployment. Rust, P
 Developers and agents can generate docs locally:
 
 ```bash
-# Rust
-cargo doc --workspace --no-deps --open
+# Rust. §21.10.2, Rust (rustdoc), gives the flags and says why each one is
+# here. `--open` opens a browser over output rustdoc already wrote, so it
+# changes no diagnostic.
+cargo doc --workspace --no-deps --document-private-items --open \
+  --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint
 
 # Python (requires sphinx, furo, sphinx-autodoc-typehints)
 cd bindings/python && sphinx-build -b html docs docs/_build/html
@@ -380,7 +389,7 @@ cd bindings/kotlin && ./gradlew dokkaHtml
 - How to register with `TransportManager`
 
 ### Storage backend guide (docs/guides/storage-backends.md)
-- What the `Storage` trait and `BlobStore` trait require
+- What the `Storage` trait and `BlobStorage` trait require
 - How to implement (step by step)
 - How to test with conformance macros
 - Performance considerations

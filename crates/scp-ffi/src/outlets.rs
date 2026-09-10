@@ -148,7 +148,7 @@ impl PyOutletVerificationResult {
 
 /// The committed terminal of a §6.2.4 cross-context outlet-invocation saga.
 ///
-/// Returned by [`PyScp::outlet_invoke_cross_context_saga`] on a `Committed`
+/// Returned by [`PyScp::outlet_invoke_cross_context_saga`](crate::scp::PyScp::outlet_invoke_cross_context_saga) on a `Committed`
 /// terminal. Every NON-committed terminal raises a typed saga exception
 /// (`SagaAbortedError` / `SagaNeedsRepairError` / `SagaBusyError`) instead.
 ///
@@ -1220,7 +1220,7 @@ pub(crate) fn enforce_caller_principal_binding(
 
 /// Implements the §6.2.4 cross-context outlet-invocation saga export.
 ///
-/// See [`PyScp::outlet_invoke_cross_context_saga`] for the full contract. The
+/// See [`PyScp::outlet_invoke_cross_context_saga`](crate::scp::PyScp::outlet_invoke_cross_context_saga) for the full contract. The
 /// flow is, in order:
 ///
 /// 1. **Validate inputs** (well-formed ids/dids/outlet-id; the nonce decodes to
@@ -1652,7 +1652,7 @@ fn outlet_session_close_impl(
 /// The caller (admin of the source context) proposes sharing a specific outlet
 /// with a target context. The returned JSON contains the `OutletInterface` with
 /// `approved_by_source = true` and `approved_by_target = false`. The target
-/// context must call [`py_outlet_interface_accept`] to complete the handshake.
+/// context must call [`PyScp::outlet_interface_accept`](crate::scp::PyScp::outlet_interface_accept) to complete the handshake.
 ///
 /// # Arguments
 ///

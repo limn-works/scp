@@ -159,11 +159,17 @@ pub struct KeyDestructionAttestation {
 // DestructionMethod (§9.15)
 // ---------------------------------------------------------------------------
 
-/// Method used for key destruction, determining the trust level of the
-/// destruction claim.
+/// Method used for key destruction.
 ///
-/// See spec §9.15: hardware-backed provides high confidence; software-only
-/// provides moderate confidence.
+/// A value of this type reaches a consumer only as the output of
+/// [`PublishableKeyDestructionAttestation::verified_method`], which applies the
+/// clauses of §27.4.6 in `.docs/specs/27-attestations.md`. Those clauses state a
+/// human ruling of 2026-08-25, which that section quotes: a record declaring
+/// [`DestructionMethod::HardwareBacked`] reads as
+/// [`DestructionMethod::SoftwareOnly`] unless a platform attestation proof
+/// accompanies it and a verification of that proof returns a pass. §9.15 of the
+/// security spec assigns the confidence rating over the method a consumer
+/// verified, never the method a record declared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DestructionMethod {
     /// Key destruction is backed by a hardware security module (Secure
@@ -214,12 +220,18 @@ pub struct PlatformAttestation {
 /// verifiable after context keys are destroyed because it is bound to the
 /// identity key, not the context key material.
 ///
-/// Trust levels:
-/// - **Hardware-attested:** High confidence (hardware claims key is gone).
-/// - **Software-only:** Moderate confidence (memory zeroed, no hardware
-///   guarantee).
+/// Trust levels, per §9.15 of the security spec, which rates the method a
+/// consumer verified and never the method this record declared:
+/// - **Hardware-attested** (a verification of `platform_attestation` returned a
+///   pass): High confidence (hardware claims key is gone).
+/// - **Software-only**, and every record declaring `HardwareBacked` that no
+///   verified proof accompanies: Moderate confidence (memory zeroed, no
+///   hardware guarantee).
 /// - **No attestation:** Member went offline before close (not represented
 ///   here — the absence of an attestation IS the "no attestation" case).
+///
+/// Read the method through [`Self::verified_method`], which applies clauses 1
+/// through 3 of §27.4.6 in `.docs/specs/27-attestations.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishableKeyDestructionAttestation {
     /// The context for which keys were destroyed.
@@ -228,11 +240,24 @@ pub struct PublishableKeyDestructionAttestation {
     pub member_did: String,
     /// Unix timestamp (seconds) when keys were destroyed.
     pub destroyed_at: u64,
-    /// Platform-provided attestation, if hardware-backed destruction was
-    /// used. `None` for software-only destruction.
+    /// Platform attestation proof accompanying the declaration. `None` for
+    /// software-only destruction.
+    ///
+    /// A declaration naming [`DestructionMethod::HardwareBacked`] carries no
+    /// weight unless this proof is present and a verification of it returns a
+    /// pass (§27.4.6 of `.docs/specs/27-attestations.md`, clause 1). No SCP
+    /// implementation verifies this proof today, and open questions OQ-2 and
+    /// OQ-29 of that spec own the verification procedure and what a pass would
+    /// establish. [`Self::signing_payload`] does not cover this field, which is
+    /// contradiction C34 of the same spec and open question OQ-8.
     pub platform_attestation: Option<PlatformAttestation>,
-    /// The destruction method used.
-    pub method: DestructionMethod,
+    /// The destruction method the publisher declared.
+    ///
+    /// This is a declaration, not a finding. Read it through
+    /// [`Self::verified_method`], which applies the §27.4.6 clauses. The field
+    /// is crate-private so that no consumer can read the declared value in
+    /// place of the method those clauses produce.
+    pub(crate) method: DestructionMethod,
     /// Ed25519 signature over the attestation payload, signed by `#0`
     /// (Identity Key) or `#active` (Active Signing Key). NOT `#agent`
     /// per ADR-039 — agents cannot sign destruction attestations.
@@ -244,6 +269,60 @@ pub struct PublishableKeyDestructionAttestation {
 }
 
 impl PublishableKeyDestructionAttestation {
+    /// Builds a publishable destruction attestation from a member's own
+    /// destruction outcome.
+    ///
+    /// `method` is the declaration the publisher writes into the record. What a
+    /// consumer reads back is [`Self::verified_method`], not this argument.
+    #[must_use]
+    pub const fn new(
+        context_id: ContextId,
+        member_did: String,
+        destroyed_at: u64,
+        platform_attestation: Option<PlatformAttestation>,
+        method: DestructionMethod,
+        signature: Vec<u8>,
+    ) -> Self {
+        Self {
+            context_id,
+            member_did,
+            destroyed_at,
+            platform_attestation,
+            method,
+            signature,
+        }
+    }
+
+    /// The destruction method a consumer reads.
+    ///
+    /// Applies clauses 1 through 3 of §27.4.6 in
+    /// `.docs/specs/27-attestations.md` to the declared value: a record
+    /// declaring [`DestructionMethod::HardwareBacked`] reads as
+    /// [`DestructionMethod::SoftwareOnly`] unless a verification of the
+    /// accompanying `platform_attestation` returns a pass.
+    ///
+    /// Two answers stand between a declaration and a hardware reading, and this
+    /// function fails closed to [`DestructionMethod::SoftwareOnly`] until both
+    /// land. No SCP implementation verifies a `platform_attestation`, and no
+    /// artifact states the checks such a verification would run — open
+    /// questions OQ-2 and OQ-29. [`Self::signing_payload`] also leaves the proof
+    /// outside the signed bytes, so a holder detaches it from the signature that
+    /// binds `method`, and a verification of a detached proof establishes
+    /// nothing about the declaration beside it — contradiction C34 and open
+    /// question OQ-8, which a human decides.
+    #[must_use]
+    pub const fn verified_method(&self) -> DestructionMethod {
+        // Both declared variants map to `SoftwareOnly` today. The match names
+        // every variant rather than returning the constant, so a third variant
+        // fails this crate's build until a human states what clause 1 admits
+        // for it.
+        match self.method {
+            DestructionMethod::SoftwareOnly | DestructionMethod::HardwareBacked => {
+                DestructionMethod::SoftwareOnly
+            }
+        }
+    }
+
     /// Validates that the signature field is the correct length (64 bytes).
     #[must_use]
     pub const fn has_valid_signature_length(&self) -> bool {
@@ -997,7 +1076,10 @@ mod tests {
             signature: vec![0xFF; 64],
         };
         assert!(attestation.platform_attestation.is_none());
-        assert_eq!(attestation.method, DestructionMethod::SoftwareOnly);
+        assert_eq!(
+            attestation.verified_method(),
+            DestructionMethod::SoftwareOnly
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1045,5 +1127,89 @@ mod tests {
         assert!(metadata.participants.contains(&"did:dht:carol".to_owned()));
         // Creation time is preserved.
         assert_eq!(metadata.created_at, 1_700_000_000);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod destruction_reading_rule_tests {
+    //! §27.4.6 of `.docs/specs/27-attestations.md` quotes a human ruling of
+    //! 2026-08-25 and states it in four clauses: a hardware-backed declaration
+    //! reads as software-backed unless a verified platform attestation proof
+    //! accompanies it. No verification exists, and the signing preimage leaves
+    //! the proof outside the signed bytes, so every hardware declaration reads
+    //! as `SoftwareOnly`.
+
+    use super::{DestructionMethod, PlatformAttestation, PublishableKeyDestructionAttestation};
+
+    fn attestation(
+        method: DestructionMethod,
+        proof: Option<PlatformAttestation>,
+    ) -> PublishableKeyDestructionAttestation {
+        PublishableKeyDestructionAttestation::new(
+            "ctx-ruling".to_owned(),
+            "did:dht:alice".to_owned(),
+            1_700_000_000,
+            proof,
+            method,
+            vec![0xAA; 64],
+        )
+    }
+
+    #[test]
+    fn a_hardware_declaration_without_a_proof_reads_as_software_only() {
+        let a = attestation(DestructionMethod::HardwareBacked, None);
+        assert_eq!(a.verified_method(), DestructionMethod::SoftwareOnly);
+    }
+
+    #[test]
+    fn an_attached_but_unverified_proof_does_not_raise_the_reading() {
+        // Clause 1 admits a hardware reading only when a verification returns a
+        // pass. Attaching bytes is not a verification.
+        let proof = PlatformAttestation {
+            attestation_data: vec![0xAB; 64],
+            platform: "apple-secure-enclave".to_owned(),
+        };
+        let a = attestation(DestructionMethod::HardwareBacked, Some(proof));
+        assert_eq!(a.verified_method(), DestructionMethod::SoftwareOnly);
+    }
+
+    #[test]
+    fn a_software_declaration_reads_as_software_only_and_needs_no_proof() {
+        let a = attestation(DestructionMethod::SoftwareOnly, None);
+        assert_eq!(a.verified_method(), DestructionMethod::SoftwareOnly);
+    }
+
+    #[test]
+    fn the_signing_payload_still_covers_the_declared_method_and_not_the_proof() {
+        // Contradiction C34: the signature binds the declaration and leaves the
+        // proof detachable. This test pins the shipped scope so that a change to
+        // it is a deliberate answer to open question OQ-8, not a side effect.
+        let proof = PlatformAttestation {
+            attestation_data: vec![0xCD; 8],
+            platform: "android-keystore".to_owned(),
+        };
+        let with_proof = attestation(DestructionMethod::HardwareBacked, Some(proof));
+        let without_proof = attestation(DestructionMethod::HardwareBacked, None);
+        assert_eq!(
+            with_proof.signing_payload(),
+            without_proof.signing_payload()
+        );
+
+        let software = attestation(DestructionMethod::SoftwareOnly, None);
+        assert_ne!(without_proof.signing_payload(), software.signing_payload());
+    }
+
+    #[test]
+    fn the_declaration_still_round_trips_on_the_wire() {
+        // The gate governs what a consumer reads. It does not rewrite what a
+        // publisher wrote, because a republished record must carry the
+        // publisher's own declaration unchanged.
+        let a = attestation(DestructionMethod::HardwareBacked, None);
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(json.contains("HardwareBacked"));
+        let back: PublishableKeyDestructionAttestation = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, a);
+        assert_eq!(back.verified_method(), DestructionMethod::SoftwareOnly);
     }
 }

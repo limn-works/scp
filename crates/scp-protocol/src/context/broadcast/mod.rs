@@ -490,7 +490,7 @@ pub struct SealedBroadcastKey {
     pub enc: [u8; 32],
     /// HPKE ciphertext (sealed key || tag, exactly 48 bytes for a legitimate
     /// payload). Deserialized from attacker-supplied JSON, so the serde-level
-    /// [`serde_bounded_bytes`] cap rejects multi-gigabyte allocations before any
+    /// [`serde_bounded_bytes`](crate::serde_util::serde_bounded_bytes) cap rejects multi-gigabyte allocations before any
     /// crypto runs; the exact 48-byte gate is enforced fail-fast in
     /// [`open_broadcast_key`](crate::crypto::sender_keys::broadcast::open_broadcast_key).
     /// Stays a `Vec<u8>` (not `[u8; 48]`) to preserve the cross-SDK
