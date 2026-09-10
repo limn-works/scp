@@ -19,7 +19,7 @@ The identity layer abstracts custody. The user authenticates however they choose
 
 ### 3.2.1 Key Custody Migration Protocol
 
-Custody migration moves the operational signing capability from one custody provider to another (e.g., Secure Enclave to hardware security key, or passkey to self-managed key) without changing the identifier. The root set is unchanged by an operational-key custody migration; case 2 below is the one case in which the root itself changes.
+Custody migration moves the operational signing capability from one custody provider to another (for example a passkey to a FIDO2 token, or a secure element to a self-managed key) without changing the identifier. The root set is unchanged by an operational-key custody migration; case 2 below is the one case in which the root itself changes.
 
 **Two cases:**
 
@@ -31,12 +31,13 @@ Custody migration moves the operational signing capability from one custody prov
 
 ```
 1. INITIATE on target device:
-   a. Generate new Ed25519 keypair in target custody provider.
+   a. Generate a new P-256 keypair in the target custody provider.
    b. Create CustodyMigrationRequest:
-      - new_active_pubkey: [u8; 32]
+      - new_active_pubkey: [u8; 33]   # SEC1 compressed point (09 §9.5)
+      - key_algorithm: the one-byte discriminator of
+        `09-security-model.md` §9.7.4.2 definitions
       - custody_type: the custody-type enumeration of
         `09-security-model.md` §9.7.4.2 definitions, which fixes the values
-        and states which of them a root member may carry
       - requested_at: u64 (Unix timestamp)
 
 2. AUTHORIZE on a device holding a threshold of the standing root set:
@@ -78,19 +79,16 @@ Custody migration moves the operational signing capability from one custody prov
       as part of the migration transaction.
 
 5. DESTROY old key material:
-   a. After the KeyState is ESTABLISHED — the controller holds, for a
-      threshold of the identity's designated witnesses, a cosigned head at
-      or above that event, which it reads exactly as every relying party
-      does (09 §9.7.4.2 definitions, and R10's self-observation) — the old
-      #active private key is destroyed in the source custody provider. The
-      controller reaches that state by the witness submission §3.10.6's
-      publication invariant already requires of every publish cycle.
-      Propagation is NOT the gate. An event that reached every relay and no
-      witness derives no key state at any relying party, so every party
-      still resolves the OLD #active as current; a controller that
-      destroyed it at propagation would leave the identity unable to sign
-      anything anyone accepts, and unable to fix that, because a further
-      KeyState is pending for the same reason.
+   a. After the KeyState has reached CONFIRMED PUBLICATION — the controller
+      durably holds the signed event and at least one relay in the fallback
+      set has accepted it (09 §9.7.4.2 R10) — the old #active private key is
+      destroyed in the source custody provider. No cosignature gates this
+      step, because no rule of 09 §9.7.4.2 reads one: every party that
+      resolves the extended chain derives the new key state from it. What a
+      controller MUST NOT do is destroy the old key on a local signature
+      alone, because a party that never receives the event keeps resolving
+      the OLD #active as current, and the identity would then be unable to
+      sign anything that party accepts.
    b. Destruction is best-effort for HSM-backed keys (the HSM may not support
       explicit deletion, but the key becomes inaccessible once the device
       is decommissioned).
@@ -115,7 +113,7 @@ No seed phrases. Recovery uses social and device mechanisms:
 - **Social recovery:** Trusted contacts confirm your identity. After social recovery re-establishes key custody, the recovering device is enrolled as a new device (§3.7.2) and receives the PSK from any existing enrolled device. If no enrolled devices remain (all devices lost), PSK recovery requires re-keying: a new PSK is generated, existing private state history encrypted under the old PSK is permanently inaccessible (same forward-only property as §9.17.5), and the identity starts a fresh private state log.
 - **Platform-backed recovery:** If custody is delegated to Apple/Google, their recovery mechanisms apply. The PSK is stored in the platform's secure key store (Keychain, Keystore — §17.8) and may be recoverable through platform backup/restore mechanisms (e.g., iCloud Keychain sync, Google Cloud Key Vault). This provides a recovery path for the PSK that does not depend on another SCP device being available.
 
-**Every recovery path above ends at establishment, not at publication.** A recovery that re-establishes custody appends a key event, and that event takes effect at a relying party only once a threshold of the identity's designated witnesses has cosigned it (`09-security-model.md` §9.7.4.3), so the recovering device submits the event to the witness set and re-submits until the threshold is met. **Where the identity cannot reach the accountability threshold of its designated witnesses**, the controller waits out the freshness bound, at which point every relying party holds fewer than that many fresh cosignatures for it, and then signs a `RootRecovery` carrying a fresh witness set, which §9.7.4.3's escape establishes under the set that event itself carries at each party that also holds a baseline and an established event for the chain; every relying party sets `PendingReverify` on it and the exit is the out-of-band fingerprint comparison of `09-security-model.md` §9.11.
+**Every recovery path above ends at confirmed publication.** A recovery that re-establishes custody appends a key event, and that event takes effect at each relying party the moment that party resolves the extended chain, because no rule of `09-security-model.md` §9.7.4.2 reads a witness cosignature. The recovering device still submits the event to the identity's witness set, for a separate reason: **witnessing supplies the freshness evidence §9.11 reads**, and an identity whose adopted head carries no fresh cosigned head takes `ContinuityStanding::Unresolved` at every peer, which closes that section's admission and grant gate. A controller whose designated witnesses have gone silent replaces them with a `KeyState` naming a fresh set (`09-security-model.md` §9.7.4.2 R10), which spends no pre-rotation commitment. Every relying party sets `PendingReverify` on an observed `RootRecovery`, and the exit is the out-of-band fingerprint comparison of `09-security-model.md` §9.11.
 
 For new users with a single device and no SCP contacts, platform-backed recovery is the practical safety net. Social and device recovery grow in value over time as users add devices and build connections. Apps should prompt for trusted recovery contacts during onboarding — the same pattern Google and Apple use today.
 
@@ -247,7 +245,7 @@ Identity attestations use the attestation envelope defined in §7.4.1, with iden
     verifier_did:   Option<DID>, // DID of the verifier, if third-party verified (challenge_response only)
   },
   revocation_status: RevocationStatus, // Active or Revoked (§7.4.1). MUST be in signed scope.
-  signature:    Ed25519Signature,  // Signs §9.5.1 canonical hash (see Signature scope below), using issuer's #active key
+  signature:    P256Signature,     // 64 raw bytes; signs the §9.5.1 canonical hash (see Signature scope below), using issuer's #active key
 }
 ```
 
@@ -310,7 +308,7 @@ Verification procedure depends on the attestation class (§3.5.0).
 **Class 1 (Cryptographic) verification:**
 
 1. Resolve the issuer's key state (§3.10.4). Read the public key it lists `current` in the `#active` role.
-2. Verify the Ed25519 signature on the attestation envelope against the issuer's public key.
+2. Verify the P-256 signature on the attestation envelope against the issuer's public key.
 3. Check `revocation_status` is `Active`. If `Revoked`, reject.
 4. Check `expires_at` (if present). If expired, reject.
 5. Check freshness: if `evidence.verified_at` is older than the renewal interval for the verification method (§3.5.1), the attestation is stale. Stale attestations are degraded (reduced trust weight), not rejected outright.
@@ -373,7 +371,7 @@ When a bridge connector creates a shadow identity for an external platform parti
      attestation_id:    String,         // ID of the IdentityLinkAttestation
      attestation:       IdentityLinkAttestation, // Full attestation for verification
      timestamp:         u64,
-     signature:         Ed25519Signature, // Signs claimant_did || shadow_did || attestation_id || timestamp
+     signature:         P256Signature,    // Signs claimant_did || shadow_did || attestation_id || timestamp
    }
    ```
 
@@ -453,8 +451,8 @@ Context state handles multi-party social data. Identity private state handles si
 Identity
 ├── Public State
 │   ├── Key-event log (`09-security-model.md` §9.7.4.2 definitions)
-│   │   ├── #0 — Identity Key (Ed25519, root of trust, offline)
-│   │   ├── #active — Human Signing Key (Ed25519, hardware-backed)
+│   │   ├── #0 — Identity Key (P-256, root of trust, offline)
+│   │   ├── #active — Human Signing Key (P-256, hardware-backed)
 │   │   └── the designation of the key that signs the service record
 │   ├── Service record (§3.10.13) — relay list, private-state locations,
 │   │   broadcast advertisements, self-asserted capability URIs, pointers
@@ -473,12 +471,12 @@ Identity
 
 **The human identity's key state names one operational role, `#active`** (`09-security-model.md` §9.7.4.2 definitions). An agent is a separate identity with its own key-event log, which the human's log anchors by cooperative delegation, so no agent key appears in a human's identity: ADR-063, the key-event-log identity substrate, overturns the shared-DID `#agent` verification method of ADR-039, and ADR-064, the forthcoming specification of the cooperative-delegation events, states how a delegator anchors a delegate's establishment events. `09-security-model.md` §9.1 invariant 1 is the home of that model, and this spec cites it rather than restating it.
 
-**Encryption model.** Private state is encrypted with a dedicated symmetric **Private State Key (PSK)** — an AES-256 key used exclusively for identity private state encryption. The PSK is not derived from any signing key. Ed25519 keys are signing-only — they cannot be used for encryption. The PSK is generated independently and distributed to the identity owner's devices via HPKE (§3.7.2).
+**Encryption model.** Private state is encrypted with a dedicated symmetric **Private State Key (PSK)** — an AES-256 key used exclusively for identity private state encryption. The PSK is not derived from any signing key. An SCP signing key is an ECDSA key (`09-security-model.md` §9.5) and signs only — it never encrypts. The PSK is generated independently and distributed to the identity owner's devices via HPKE (§3.7.2).
 
 **Cryptographic specification:**
 
 - **Algorithm:** AES-256-GCM (RFC 5116).
-- **Key:** 32-byte random Private State Key (PSK), generated via CSPRNG (e.g., `OsRng`). The PSK is a raw symmetric key — it is not managed through `KeyCustody` (which handles asymmetric Ed25519/X25519 keys). One PSK per identity, shared across all enrolled devices.
+- **Key:** 32-byte random Private State Key (PSK), generated via CSPRNG (e.g., `OsRng`). The PSK is a raw symmetric key — it is not managed through `KeyCustody` (which handles asymmetric P-256 signing and HPKE keys). One PSK per identity, shared across all enrolled devices.
 - **Nonce:** 96-bit (12-byte) random nonce, generated per event via CSPRNG. Each event in the private state log gets a unique nonce. The nonce is stored alongside the ciphertext — it is not secret.
 - **AAD (Additional Authenticated Data):** `did || "scp-private-state-v1" || sequence_number` where `did` is the identity's DID string encoded as 4-byte big-endian length prefix + UTF-8 bytes (per §9.5.1 encoding rules), `"scp-private-state-v1"` is the domain separator as raw UTF-8 bytes (no length prefix — fixed per version), and `sequence_number` is the event's sequence number as 8-byte big-endian u64. AAD binding prevents: (a) ciphertext from one identity being replayed against another, (b) events being reordered within the log, (c) cross-protocol confusion with other AES-256-GCM uses in SCP.
 - **Domain separator:** `"scp-private-state-v1"`. Distinct from `"scp-sender-key-v1"` (§9.16.2), `"scp-access-key-v1"` (§9.17.1), and all other SCP domain separators.
@@ -656,7 +654,7 @@ All identity private state event types, organized by category:
 
 | Event type | Fields | Commutative | Notes |
 |-----------|--------|-------------|-------|
-| `EnrollDevice` | `device_id: String, device_x25519_pubkey: [u8; 32], device_name: String, enrolled_at: u64` | Yes | New device enrollment |
+| `EnrollDevice` | `device_id: String, device_hpke_pubkey: [u8; 65], device_name: String, enrolled_at: u64` | Yes | New device enrollment |
 | `UnenrollDevice` | `device_id: String, timestamp: u64` | Yes | Device removal |
 
 **Recovery contact events:**
@@ -672,16 +670,16 @@ For non-commutative events (same key/target modified from multiple devices), con
 
 Identity private state is encrypted with a single PSK shared across all of the identity owner's devices. The challenge: each device has its own hardware-backed keys that cannot be exported (§9.7.2), so the PSK must be distributed TO each device rather than derived FROM a shared secret.
 
-**Device enrollment model.** Each device generates a device-specific X25519 keypair via `KeyCustody::generate_keypair(KeyType::X25519)` at device enrollment time. This keypair is used exclusively for receiving HPKE-wrapped key material (PSK distribution, PSK rotation). The X25519 public key is published in the identity's device registry — an encrypted list within identity private state itself (bootstrapped during identity creation, see below).
+**Device enrollment model.** Each device generates a device-specific DHKEM(P-256) keypair via `KeyCustody::generate_keypair(KeyType::HpkeP256)` at device enrollment time. This keypair is used exclusively for receiving HPKE-wrapped key material (PSK distribution, PSK rotation). The HPKE public key is published in the identity's device registry — an encrypted list within identity private state itself (bootstrapped during identity creation, see below).
 
-**Why not derive from the Identity Key (#0)?** The Identity Key is Ed25519 (signing-only) and its private key "never [leaves] the secure element" (§9.7.2). While Ed25519-to-X25519 conversion is mathematically possible (RFC 7748, birational equivalence between Edwards and Montgomery curves), it requires access to the Ed25519 private key bytes — which hardware security modules (Secure Enclave, Android Keystore) do not export. A design that depends on Ed25519-to-X25519 conversion would fail on every hardware-backed key. The PSK is therefore an independent symmetric key, distributed via HPKE to device-specific X25519 keys that are software-managed through `KeyCustody`.
+**Why not derive from the Identity Key (#0)?** The root is a signing key held in a substrate that never exports it — a passkey by default (`09-security-model.md` §9.7.4.1 item 4) — so no code path can hand a device the private bytes an HPKE key would have to be derived from. A passkey and a secure element each sign and neither performs a Diffie-Hellman agreement on demand, so deriving an encryption key from the root is impossible where the root is held as SCP holds it by default. Each device therefore generates its own DHKEM(P-256) keypair for PSK distribution, and that keypair is device-local, rotatable, and revocable on device removal without touching any identity key.
 
 **Identity creation (first device):**
 
 1. Generate the PSK: 32 random bytes via CSPRNG.
-2. Generate a device-local X25519 keypair via `KeyCustody`.
+2. Generate a device-local DHKEM(P-256) keypair via `KeyCustody`.
 3. Store the PSK locally in the device's secure key store.
-4. Initialize the device registry in identity private state with this device's X25519 public key. The device registry is the first event in the private state log — it is encrypted with the PSK (which only this device holds at this point).
+4. Initialize the device registry in identity private state with this device's HPKE public key. The device registry is the first event in the private state log — it is encrypted with the PSK (which only this device holds at this point).
 5. Publish the encrypted private state to relays.
 
 **Adding a new device (device enrollment):**
@@ -689,31 +687,31 @@ Identity private state is encrypted with a single PSK shared across all of the i
 ```
 Existing device (Device A) enrolls new device (Device B):
 
-1. Device B generates an X25519 keypair via KeyCustody.
-2. Device B presents its X25519 public key to Device A.
+1. Device B generates a DHKEM(P-256) keypair via KeyCustody.
+2. Device B presents its HPKE public key to Device A.
    Transport: out-of-band (QR code, local network, NFC) or via
    a standing bilateral context (§5.12.4) between the human's devices.
 3. Device A verifies the enrollment request (user confirmation required).
-4. Device A wraps the PSK to Device B's X25519 public key via HPKE:
+4. Device A wraps the PSK to Device B's HPKE public key:
    enc, sealed_psk = HPKE-Seal(
      mode: Base,
-     kem: DHKEM(X25519, HKDF-SHA256),
+     kem: DHKEM(P-256, HKDF-SHA256),
      kdf: HKDF-SHA256,
      aead: AES-128-GCM,
-     recipient_pk: device_b_x25519_pubkey,
+     recipient_pk: device_b_hpke_pubkey,
      info: "scp-private-state-v1" || len(did) || did || "device-enroll",
      plaintext: psk
    )
 5. Device A sends (enc, sealed_psk) to Device B via the same channel.
-6. Device B opens the HPKE ciphertext using its X25519 private key,
+6. Device B opens the HPKE ciphertext using its HPKE private key,
    recovering the PSK.
 7. Device A appends a DeviceEnrolled event to the private state log:
-   DeviceEnrolled { device_x25519_pubkey, enrolled_at, enrolled_by_device }
+   DeviceEnrolled { device_hpke_pubkey, enrolled_at, enrolled_by_device }
    This event is encrypted with the PSK (readable by all enrolled devices).
 8. Device B can now decrypt and append to the private state event log.
 ```
 
-**HPKE suite.** Device enrollment and PSK distribution use DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM — the same HPKE suite as MLS (§9.5) and sender key distribution (§9.16.2). The `info` parameter includes the domain separator `"scp-private-state-v1"` concatenated with the DID and purpose string to prevent cross-protocol confusion with sender key HPKE (`"scp-sender-key-v1"`) or access key HPKE (`"scp-access-key-v1"`). The full `info` construction is `"scp-private-state-v1" || len(did) || did || purpose`, where `did` is preceded by a 4-byte big-endian unsigned length prefix (per §9.5.1 encoding rules) and `purpose` is a fixed-version UTF-8 string with no length prefix. The `aad` is empty (the `info` already binds the DID, and a fresh HPKE context — fresh encapsulation — is used per device, so there is no cross-recipient substitution surface).
+**HPKE suite.** Device enrollment and PSK distribution use DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-128-GCM — the same HPKE suite as MLS (§9.5) and sender key distribution (§9.16.2). The `info` parameter includes the domain separator `"scp-private-state-v1"` concatenated with the DID and purpose string to prevent cross-protocol confusion with sender key HPKE (`"scp-sender-key-v1"`) or access key HPKE (`"scp-access-key-v1"`). The full `info` construction is `"scp-private-state-v1" || len(did) || did || purpose`, where `did` is preceded by a 4-byte big-endian unsigned length prefix (per §9.5.1 encoding rules) and `purpose` is a fixed-version UTF-8 string with no length prefix. The `aad` is empty (the `info` already binds the DID, and a fresh HPKE context — fresh encapsulation — is used per device, so there is no cross-recipient substitution surface).
 
 **Purpose strings.** Two purposes are defined, distinguishing the two flows that wrap a PSK to a device key:
 
@@ -724,8 +722,8 @@ The purpose string binds each HPKE ciphertext to its flow, so a `device-enroll` 
 
 **Device removal:**
 
-1. An authorized device appends a `DeviceRemoved { device_x25519_pubkey, removed_at }` event to the private state log.
-2. The removing device rotates the PSK: generates a new PSK, re-wraps it via HPKE to all remaining enrolled devices' X25519 public keys, and appends a `PskRotated { wrapped_keys: Vec<(device_pubkey, hpke_ciphertext)> }` event.
+1. An authorized device appends a `DeviceRemoved { device_hpke_pubkey, removed_at }` event to the private state log.
+2. The removing device rotates the PSK: generates a new PSK, re-wraps it via HPKE to all remaining enrolled devices' HPKE public keys, and appends a `PskRotated { wrapped_keys: Vec<(device_pubkey, hpke_ciphertext)> }` event.
 3. Re-encryption of existing private state events proceeds incrementally under the new PSK (same as key rotation, §3.7 protocol-level constants).
 4. The removed device's cached PSK becomes useless for future events. Historical events encrypted under the old PSK are accessible only if the removed device retained the old PSK locally — the protocol cannot force deletion on an untrusted device (same honest limitation as §9.15).
 
@@ -735,14 +733,14 @@ The device registry is stored within identity private state as a sequence of `De
 
 ```
 DeviceEnrolled {
-    device_x25519_pubkey: [u8; 32],  // X25519 public key for HPKE
+    device_hpke_pubkey: [u8; 65],   // DHKEM(P-256) public key for HPKE
     enrolled_at: u64,                 // Unix timestamp (milliseconds)
-    enrolled_by_device: [u8; 32],     // X25519 pubkey of the enrolling device
+    enrolled_by_device: [u8; 65],     // HPKE pubkey of the enrolling device
     device_label: String,             // Human-readable label ("iPhone", "Laptop")
 }
 
 DeviceRemoved {
-    device_x25519_pubkey: [u8; 32],
+    device_hpke_pubkey: [u8; 65],
     removed_at: u64,
 }
 
@@ -752,7 +750,7 @@ PskRotated {
 }
 
 DeviceWrappedPsk {
-    device_x25519_pubkey: [u8; 32],
+    device_hpke_pubkey: [u8; 65],
     enc: Vec<u8>,           // HPKE encapsulated key
     sealed_psk: Vec<u8>,    // HPKE-sealed PSK
 }
@@ -760,9 +758,9 @@ DeviceWrappedPsk {
 
 **Bootstrap paradox resolution.** The device registry is itself encrypted with the PSK — so how does the first device read it? The first device generated the PSK (step 1 of identity creation) and holds it locally before any private state events exist. The first `DeviceEnrolled` event is encrypted with that PSK. Subsequent devices receive the PSK via HPKE before they need to read the log. There is no circular dependency: the PSK is always distributed out-of-band (HPKE to device key) before the device attempts to read PSK-encrypted events.
 
-**Interaction with trusted device recovery (§3.3).** When a user recovers their identity on a new device via trusted device recovery, the recovery flow includes PSK distribution: the trusted device wraps the current PSK to the new device's X25519 public key via the same HPKE enrollment protocol above. This is the same mechanism as adding a new device — recovery IS enrollment. The recovering device generates a fresh X25519 keypair, the trusted device wraps the PSK, and the new device gains access to the full private state history.
+**Interaction with trusted device recovery (§3.3).** When a user recovers their identity on a new device via trusted device recovery, the recovery flow includes PSK distribution: the trusted device wraps the current PSK to the new device's HPKE public key via the same enrollment protocol above. This is the same mechanism as adding a new device — recovery IS enrollment. The recovering device generates a fresh DHKEM(P-256) keypair, the trusted device wraps the PSK, and the new device gains access to the full private state history.
 
-**Interaction with key rotation (§9.12).** Step 6 of the compromise recovery protocol specifies "re-encrypt identity private state under the new key." With PSK-based encryption, this means: (a) generate a new PSK, (b) wrap the new PSK to all enrolled devices via HPKE, (c) append a `PskRotated` event, (d) re-encrypt existing events under the new PSK incrementally. If the compromise involved a device (device stolen), that device is removed first (device removal protocol above), and the PSK rotation excludes the compromised device's X25519 public key.
+**Interaction with key rotation (§9.12).** Step 6 of the compromise recovery protocol specifies "re-encrypt identity private state under the new key." With PSK-based encryption, this means: (a) generate a new PSK, (b) wrap the new PSK to all enrolled devices via HPKE, (c) append a `PskRotated` event, (d) re-encrypt existing events under the new PSK incrementally. If the compromise involved a device (device stolen), that device is removed first (device removal protocol above), and the PSK rotation excludes the compromised device's HPKE public key.
 
 **ProtocolRepository methods.** The `Storage` trait (§17) requires these additional methods for PSK and device management:
 
@@ -799,7 +797,7 @@ Identity keys follow a defined lifecycle: generation (in the substrates `09-secu
 
 DID resolution is the trust root for identity verification (§3.8). **The SCP relay network carries identity, and the protocol runs no second resolution layer.** An identity publishes its key-event log to SCP relays through the existing PUBLISH/QUERY operations (ADR-004), addressed by a deterministic `routing_id`. An SCP-native relay validates each key-event record blob it stores and keeps one slot per (routing id, divergent suffix) (§3.10.2, `09-security-model.md` §9.7.4.2 R9), which is what makes the relay layer suppression-resistant (§3.10.8); a foreign transport that cannot validate stores the record opaquely and stays correct through client-side verification.
 
-**Resolution delivers an established key state and not merely a verified chain.** The resolver recomputes the identifier from the chain's inception event and verifies every later event under the standing root (`09-security-model.md` §9.6.1, §9.7.4.2 R2 and R3), and it then derives the key state at its own established head — the highest position a threshold of witnesses it recognizes has cosigned (`09-security-model.md` §9.7.4.2 definitions, §9.7.4.3). A chain no event of which reached that threshold yields `Inconclusive{NotEstablished}` and no key state. Every relay is untrusted. Trust derives from the cryptographic binding between the identifier and the inception event that produced it, not from the infrastructure serving it. An SCP-native relay MAY additionally validate the records it stores (§3.10.2) — a validating relay verifies the chain and keeps one slot per divergent suffix, which resists suppression — but this is an availability property layered on top, never a trust dependency: the resolver re-verifies every record independently and accepts nothing on the relay's word (§3.10.4).
+**Resolution delivers a key state derived from a chain the resolver verified itself.** The resolver recomputes the identifier from the chain's inception event, verifies every later event under the standing root (`09-security-model.md` §9.6.1, §9.7.4.2 R2 and R3), settles any divergence under the root rule (§9.7.4.2 R6), and derives the key state from the latest state-carrying event at or before the head it adopted (§9.7.4.2 R8). **No witness cosignature gates any of those steps**; what a cosignature supplies is the freshness evidence §9.11's lapse standing reads (`09-security-model.md` §9.7.4.3). Every relay is untrusted. Trust derives from the cryptographic binding between the identifier and the inception event that produced it, not from the infrastructure serving it. An SCP-native relay MAY additionally validate the records it stores (§3.10.2) — a validating relay verifies the chain and keeps one slot per divergent suffix, which resists suppression — but this is an availability property layered on top, never a trust dependency: the resolver re-verifies every record independently and accepts nothing on the relay's word (§3.10.4).
 
 ### 3.10.1 Which Relays a Resolution Queries
 
@@ -809,11 +807,11 @@ A resolver queries two disjoint sets of relays, and it queries them in parallel:
 |-----------|------------------------------|----------------------|
 | The identity's own relays | the relay list the identity's service record carries (§3.10.13, `09-security-model.md` §9.6.3) | Only after the resolver holds that identity's service record |
 | The fallback set | any entry of the SDK-shipped community relay list of `18-addressability-and-deployment.md` §18.5.1 that the identity's service record does not name (`09-security-model.md` §9.7.4.2 definitions) | Day one |
-| The resolver's recognized witness set | the same shipped community relay list, read in its second role (`09-security-model.md` §9.7.4.2 definitions) | Day one |
+| The resolver's recognized operator set | the same shipped community relay list, read in its second role (`09-security-model.md` §9.7.4.2 definitions) | Day one |
 
-**One artifact fills the last two rows, and the two rows have different owners.** The fallback set is where a resolver fetches, which is a reachability property of the resolver's own query plan; the recognized witness set is whose cosignatures it counts, which is an acceptability property of its own policy. The subject's controller owns neither, and it owns the witness set its key state designates, which the resolver intersects with its recognized set (`09-security-model.md` §9.7.4.3).
+**One artifact fills the last two rows, and the two rows have different owners.** The fallback set is where a resolver fetches, which is a reachability property of its own query plan; the recognized operator set is whose cosigned heads it reads as evidence, which is a policy of its own. Neither decides whether a chain is valid or how a fork ranks (`09-security-model.md` §9.7.4.2 R6).
 
-A served chain is **valid** when it recomputes to the target identifier and every one of its events verifies under `09-security-model.md` §9.7.4.2 R2 and R3. Among valid chains the resolver takes the higher-sequence head where one chain is a prefix of the other, and settles two chains that diverge by fork precedence (§9.7.4.2 R6), which ranks only suffixes carrying an established event.
+A served chain is **valid** when it recomputes to the target identifier and every one of its events verifies under `09-security-model.md` §9.7.4.2 R2 and R3. Among valid chains the resolver takes the higher-sequence head where one chain is a prefix of the other, and settles two chains that diverge by fork precedence (§9.7.4.2 R6), which ranks every valid suffix and reads no cosignature.
 
 Parallel query means resolution latency is the latency of the fastest relay that answers. Once a resolver holds an accepted baseline for the identifier, it cancels the remaining queries as soon as one valid response arrives; a resolver holding none satisfies R11's first-contact floor before it ends the resolution.
 
@@ -875,9 +873,9 @@ QUERY {
 
 Slot-exclusivity is a relay **storage** behavior (the base relay stores multiple opaque blobs per `routing_id` with no per-`routing_id` cap, ADR-004). This spec section is authoritative for the behavior; the relay-storage mechanics (one slot per divergent suffix holding the longest chain, R9's write rule and its rank eviction, the storage-derived DELETE gate) are transcribed in the companion **ADR-004 "DID-Record Slot-Exclusivity" subsection**, whose own text still names the superseded sequence rule and the superseded frame name (implemented under #482 / SCP-RELAYRES-003). The threat-model conclusions — the flood-inert enumeration and the DELETE-rollback vector — are owned by §3.10.8; ADR-004 records how the relay storage layer realizes them.
 
-This mirrors, and extends to a stored public record, the exact check `BRIDGE_REGISTER` already performs on the control plane — Ed25519 signature + the same `SHA-256("scp:did:" || identifier_bytes) == routing_id` binding (§10.12.4). It is an **availability and anti-suppression measure, never a trust dependency** (see the client-verify property below).
+This mirrors, and extends to a stored public record, the exact check `BRIDGE_REGISTER` already performs on the control plane — a P-256 signature plus the same `SHA-256("scp:did:" || identifier_bytes) == routing_id` binding (§10.12.4). It is an **availability and anti-suppression measure, never a trust dependency** (see the client-verify property below).
 
-**A validating relay also stores the witness layer's two records, and a designated relay also witnesses.** Cosigned heads and conflict statements are stored at their own routing derivations, `SHA-256("scp:wit:" || subject_identifier_bytes)` and `SHA-256("scp:wcf:" || subject_identifier_bytes)` (`09-security-model.md` §9.7.4.2 R13), in the frames §9.10.12 states. A relay accepts such a record when three things hold, and it rejects it otherwise: the object's signature verifies against the key its witness operator's own key-event log lists `current` in the `#active` role at the position the object's `witness_key_state_head` names; **the object's `witness` names a member of the subject's standing witness set on a chain the relay itself holds for that subject** (`09-security-model.md` §9.7.4.2 definitions), so a relay holding no chain for a subject accepts no witness record for it; and the address is not already full for that (subject, witness) pair under the caps below. **The address is capped rather than left to grow.** A relay keeps at most one cosigned head per (subject, witness), replacing a stored one only with a strictly higher `sequence`, and at most `MAX_RETAINED_SUFFIXES` conflict statements per (subject, witness) (`09-security-model.md` §9.18.17), evicting the lowest `observed_at` beyond that — the same shape `09-security-model.md` §9.7.4.2 R9 gives a verifier, so both addresses hold at most `MAX_WITNESS_SET_SIZE` cosigned heads and `MAX_WITNESS_SET_SIZE × MAX_RETAINED_SUFFIXES` conflict statements per subject. **Both the filter and the cap are load-bearing and neither alone suffices.** Without the filter, any party that mints an identity — which costs it nothing — writes cosigned-head records for any subject whose identifier is public, and the honest objects a resolver needs are then buried under a page budget or a TTL eviction, which returns `Inconclusive{NotEstablished{…}}` and closes the admission and grant gate against the victim at every party (`09-security-model.md` §9.11); cosigning may never be priced, so no economic defense exists against it. Without the cap, a member of the standing set writes without bound. The slot-exclusivity rules above govern the key-event routing derivation and neither of these two. **A relay an identity's key state designates as a witness runs the five checks and holds the durable per-subject state `09-security-model.md` §9.7.4.3 states**, and this section restates neither.
+**A validating relay also stores the witness layer's two records, and a designated relay also witnesses.** Cosigned heads and conflict statements are stored at their own routing derivations, `SHA-256("scp:wit:" || subject_identifier_bytes)` and `SHA-256("scp:wcf:" || subject_identifier_bytes)` (`09-security-model.md` §9.7.4.2 R13), in the frames §9.10.12 states. A relay accepts such a record when three things hold, and it rejects it otherwise: the object's signature verifies against the key its witness operator's own key-event log lists `current` in the `#active` role at the position the object's `witness_key_state_head` names; **the object's `witness` names a member of the witness set the key state at that subject's head carries, on a chain the relay itself holds for that subject** (`09-security-model.md` §9.7.4.2 definitions), so a relay holding no chain for a subject accepts no witness record for it; and the address is not already full for that (subject, witness) pair under the caps below. **The address is capped rather than left to grow.** A relay keeps at most one cosigned head per (subject, witness), replacing a stored one only with a strictly higher `sequence`, and at most `MAX_RETAINED_SUFFIXES` conflict statements per (subject, witness) (`09-security-model.md` §9.18.17), evicting the lowest `observed_at` beyond that — the same shape `09-security-model.md` §9.7.4.2 R9 gives a verifier, so both addresses hold at most `MAX_WITNESS_SET_SIZE` cosigned heads and `MAX_WITNESS_SET_SIZE × MAX_RETAINED_SUFFIXES` conflict statements per subject. **Both the filter and the cap are load-bearing and neither alone suffices.** Without the filter, any party that mints an identity — which costs it nothing — writes cosigned-head records for any subject whose identifier is public, and the honest objects a resolver needs are then buried under a page budget or a TTL eviction, which drives the victim to `ContinuityStanding::Unresolved` at every party and closes each party's admission and grant gate against it (`09-security-model.md` §9.11); cosigning may never be priced, so no economic defense exists against it. Without the cap, a member of the standing set writes without bound. The slot-exclusivity rules above govern the key-event routing derivation and neither of these two. **A relay an identity's key state designates as a witness runs the one check and holds the durable per-subject state `09-security-model.md` §9.7.4.3 states**, and this section restates neither.
 
 **Relay-side validation is an OPTIONAL capability of SCP-native relays, and witnessing is a separate role a relay takes only where an identity designates it.** The protocol MUST NOT require a validating relay. Foreign transports and adapters (Nostr, Matrix, etc.) that cannot validate treat the frame as an opaque blob; resolution stays correct over them via client-side verification and multi-relay publishing. The suppression-resistance property of the relay layer (§3.10.8) is delivered by validating SCP-native relays; non-validating storage contributes availability only.
 
@@ -924,28 +922,21 @@ The full resolution sequence:
    a chain step 3 discarded; otherwise it returns `Inconclusive{SingleSource}`
    and adopts no head. A resolver holding an accepted baseline resolves
    against one relay, and this step does not apply to it.
-5a. QUERY SHA-256("scp:wit:" || identifier_bytes). A resolver at first
-   contact, and a resolver evaluating 09 §9.7.4.3's
-   witness-set-replacement escape, MUST issue that query to at least two entries of the community
-   relay list under distinct declared operators (09 §9.7.4.2 R11,
-   definitions) and returns `Inconclusive{SingleSource}` where it reaches
-   fewer, because one relay that serves the chain faithfully and serves
-   nothing at this address manufactures the appearance of a lapse; every
-   other resolver issues it to the relays it used above. Then
-   verify each cosigned head against the key its witness operator's own
-   key-event log lists `current` at the position the object names, discard
-   a cosignature whose witness the resolver's recognized set does not
-   carry, and compute the established head of the adopted chain — the
-   highest position a threshold of recognized witnesses cosigned
-   (09 §9.7.4.2 definitions, §9.7.4.3). Where no event of the chain is
-   established, return `Inconclusive{NotEstablished}` and adopt no key
-   state. Where an event is established but no cosigned head that
-   establishes it is fresh, the identity is lapsed: return the established
-   head and record stale witnessing as the standing (09 §9.11). A
-   direct-mode identity skips this step, because its threshold is zero and
-   its established head is its chain head.
+5a. QUERY SHA-256("scp:wit:" || identifier_bytes) and read the cosigned
+   heads it returns as evidence, never as a gate. Verify each head against
+   the key its witness operator's own key-event log lists `current` at the
+   position the object names, and discard one whose operator the
+   resolver's recognized set does not carry. **This step changes no
+   verdict of step 4**: where the adopted head carries a fresh cosigned
+   head the resolver records nothing further, and where it carries none
+   the resolver still returns the adopted head and records stale
+   witnessing as the identity's standing (09 §9.11). A resolver that
+   reaches no source at this address, or an identity that designates no
+   witnesses, lands in that same standing. An identity at first contact
+   still satisfies R11's two-relay floor over the CHAIN in step 5, which
+   is the floor that governs whether a head is adopted at all.
 6. Derive the key state from the latest state-carrying event at or before
-   the established head of the chain adopted in step 4 (09 §9.7.4.2 R8).
+   the head of the chain adopted in step 4 (09 §9.7.4.2 R8).
    Resolution yields key state; the identity's service record is resolved
    separately (§3.10.13).
 7. Cache result per §9.10.7 caching policy
@@ -986,10 +977,12 @@ On appending a key event to the log:
    before segment 1 would have segment 2 rejected; on a rejection the
    publisher re-sends from the last segment the relay acknowledged.
 4. Submit the new head to every relay the identity's own key state
-   designates as a witness, and re-submit until the accountability
-   threshold is met (09 §9.7.4.2 R10, §9.7.4.3). Until it is met the event
-   is pending at every relying party and takes effect nowhere. A
-   direct-mode identity has no witness set and skips this step.
+   designates as a witness, and re-submit until a cosigned head over that
+   head comes back (09 §9.7.4.2 R10, §9.7.4.3). **Submission gates
+   nothing**: the event takes effect at each relying party the moment that
+   party resolves the extended chain. What it buys is the freshness
+   evidence §9.11's lapse standing reads. An identity that designates no
+   witnesses skips this step and takes that standing at every peer.
 5. RepublishManager republishes the chain and the identity's service record
    (§3.10.13) to every one of those relays every 6 days (blob_ttl is 7 days,
    1-day margin).
@@ -1001,7 +994,7 @@ On appending a key event to the log:
 
 The risk the MUST forecloses: an identity that published only to relays of its own would be resolvable only by a party that already holds that identity's service record, because a first-contact reader knows no relay of that identity to query. Identities would partition into islands reachable by their existing contacts and by nobody else, and a stranger's first contact — the case §9.7.4.2 R11 governs — would fail for every identity that skipped the fallback set. The network would segment without anyone intending it.
 
-**The invariant extends to the witness set.** An identity that publishes its chain everywhere and submits it to no witness is unestablished at every relying party, which is the same island the paragraph above describes reached by a different route, so a publish cycle that met the accountability threshold at no witness MUST be reported to the caller as a failed publication on the same terms. RepublishManager publishes to both relay sets on every cycle (§3.10.5), and this section adds no mechanism of its own. A publish cycle that reached no relay in the fallback set MUST be reported to the caller as a failed publication, never as a success: an SDK that reported success would leave the controller believing its chain is resolvable by a stranger when no stranger can reach it, which is the segmentation this invariant forbids.
+**The invariant reaches the witness set differently, and this states the difference rather than restating the rule.** An identity that publishes its chain everywhere and submits it to no witness is still resolvable by every stranger, because no rule of `09-security-model.md` §9.7.4.2 reads a cosignature. What it loses is its §9.11 standing at every peer, which closes each peer's admission and grant gate against it. A publish cycle that reached no witness MUST therefore be reported to the caller as a **degraded** publication naming that consequence, and never as a plain success. RepublishManager publishes to both relay sets on every cycle (§3.10.5), and this section adds no mechanism of its own. A publish cycle that reached no relay in the fallback set MUST be reported to the caller as a failed publication, never as a success: an SDK that reported success would leave the controller believing its chain is resolvable by a stranger when no stranger can reach it, which is the segmentation this invariant forbids.
 
 ### 3.10.7 Version Resolution
 
@@ -1009,7 +1002,7 @@ The sequence number orders one key-event chain against its own prefixes, and it 
 
 A stale chain is detected by comparing the served head's sequence against the accepted head's (`09-security-model.md` §9.7.4.2 R12). A relay serving a stale chain is not malicious — it simply has not received the latest publish. The next republish cycle replaces it.
 
-When two relays return valid heads of the same chain at different sequence numbers, the higher sequence **among established heads** is authoritative, and the resolver's stored baseline is the established head rather than the chain head (`09-security-model.md` §9.7.4.2 R12): a head above it that a threshold of recognized witnesses has not cosigned is pending, and a resolver that adopted it would derive key state from a pending event, which R8 forbids. Heads of divergent chains are settled first by the fork-precedence rule (`09-security-model.md` §9.7.4.2 R6). The resolver SHOULD update its cache and MAY re-publish the winning head to the relay that returned the stale one (protocol-level healing).
+When two relays return valid heads of the same chain at different sequence numbers, the higher sequence is authoritative and becomes the resolver's stored baseline (`09-security-model.md` §9.7.4.2 R12). A cosignature enters neither comparison. Heads of divergent chains are settled first by the fork-precedence rule (`09-security-model.md` §9.7.4.2 R6). The resolver SHOULD update its cache and MAY re-publish the winning head to the relay that returned the stale one (protocol-level healing).
 
 ### 3.10.8 Security Analysis
 
@@ -1107,7 +1100,7 @@ An identity's key-event log carries key material, each key's condition, the witn
 
 **Where the record lives.** A service record is addressed at its own routing derivation, `svc_routing_id = SHA-256("scp:svc:" || identifier_bytes)` over the identifier's 32 raw digest bytes, registered in `09-security-model.md` §9.18.2. That address is distinct from the key-event record's `SHA-256("scp:did:" || identifier_bytes)` (`09-security-model.md` §9.7.4.2 R13), so one QUERY returns records of one kind and neither is ever decoded as the other.
 
-**Who signs it.** The record carries an Ed25519 signature by the operational key the identity's latest state-carrying key event designates for the service-record role, never by a root member. `09-security-model.md` §9.7.4.2 R3 rejects a state-carrying event whose designation names a key that same event does not list `current`, so the designated key is always a key the current key state lists. A reader verifies in two steps and never one: it verifies the key-event log under `09-security-model.md` §9.7.4.2 R2 and R3, reads the designation out of the verified chain, then verifies the record's signature against the designated key (`09-security-model.md` §9.6.3). **A reader holding no accepted service record for the identity applies R11's first-contact floor to the record** (`09-security-model.md` §9.7.4.2 R11) and returns `Inconclusive{SingleSource}` where it cannot meet it: a single relay can serve a genuine record truncated to an older sequence exactly as it can serve a truncated chain, and such a reader holds no high-water mark to compare against.
+**Who signs it.** The record carries a P-256 signature by the operational key the identity's latest state-carrying key event designates for the service-record role, never by a root member. `09-security-model.md` §9.7.4.2 R3 rejects a state-carrying event whose designation names a key that same event does not list `current`, so the designated key is always a key the current key state lists. A reader verifies in two steps and never one: it verifies the key-event log under `09-security-model.md` §9.7.4.2 R2 and R3, reads the designation out of the verified chain, then verifies the record's signature against the designated key (`09-security-model.md` §9.6.3). **A reader holding no accepted service record for the identity applies R11's first-contact floor to the record** (`09-security-model.md` §9.7.4.2 R11) and returns `Inconclusive{SingleSource}` where it cannot meet it: a single relay can serve a genuine record truncated to an older sequence exactly as it can serve a truncated chain, and such a reader holds no high-water mark to compare against.
 
 **How a reader settles two copies: last writer wins on the record's own sequence.** The record carries a monotonic sequence of its own, unrelated to the key-event log's sequence. The sequence is a `u64`, and **a reader rejects a record whose sequence is the maximum representable value**, so no writer can exhaust the space by writing one. **The high-water mark is keyed to the pair (identifier, the 32 public-key bytes the designation resolved to in the key state the reader adopted)** — never to the identifier alone, and never to the role name, which is `#active` for the life of every identity and would therefore reset the mark never. Among copies whose signature verifies under the currently designated key, a reader takes the highest sequence, and it rejects a copy at a sequence lower than the highest it has already accepted **under those same key bytes**. **The mark resets when the key state lists different bytes `current` in the designated role**, so a routine rotation resets it (§3.2.1 case 1) and the reader accepts the first record the new key signs at any sequence. The reset is sound because the key state that lists those bytes is root-signed (`09-security-model.md` §9.7.4.2 R3) and the old key's holder cannot produce one; a mark scoped to the identifier alone would let one record written at a high sequence by a briefly-held key block the controller's own recovery record forever. Plain sequence ordering is complete here, and the fork-precedence rule of `09-security-model.md` §9.7.4.2 R6 does not apply and MUST NOT be applied: a service record has no reveal-authorized event class, so no legitimate update ever lowers the sequence, and two signature-valid records at one sequence are the designated key's holder equivocating rather than a recovery superseding a fork. A reader that holds two such records rejects both and reports the identity's transport metadata as unresolved. **A reader holding a `Contested` verdict for the identity (`09-security-model.md` §9.7.4.2 R7) accepts no new service record for it**, because a contested identity has no adopted key state and therefore no authorized designation. **A contest now means that a threshold of the identity's designated witnesses cosigned two divergent heads** (`09-security-model.md` §9.7.4.3), so a reader in this state is routing for an identity whose named witness operators failed rather than for one whose keys merely diverged, and R7's verdict names those operators. **It keeps routing on the last record it accepted before it observed any event of a divergent suffix, and only while that record's designated key is `current` in the shared prefix's key state.** Where no record it holds meets both conditions, the reader routes on nothing and surfaces the identity as contested with unverified routing, which is visible and recoverable; where one does, it keeps routing on that record with the caching bound below suspended for that identity, and surfaces the identity as contested. Freezing on a record the divergence's author wrote would hand routing to whichever claimant published last before the reader noticed, and reporting every contested identity unroutable would let any party that contests an identity cut its transport.
 
@@ -1117,12 +1110,12 @@ An identity's key-event log carries key material, each key's condition, the witn
 
 **What an attacker holding the designated key can and cannot do.** It can substitute the relay list, so it can re-point traffic. **It cannot empty the fallback set of the two readers that would matter**: a first-contact resolver holds no accepted service record, so `09-security-model.md` §9.7.4.2's definitions give it the whole community relay list, and R10's ceremony floor excludes nothing the record names either. Re-pointing is fail-closed rather than a substitution of identity, because MLS group keys and not relay reachability enforce membership (`10-infrastructure-and-self-hosting.md` §10.5, encryption-as-access-control). **Which degrees do fail closed is a property of the shipped community relay list and not of any record**: a list carrying fewer than two entries under distinct declared operators fails R11's floor, and every first contact then returns `Inconclusive{SingleSource}`. The attacker cannot change a key, a key's condition, the witness set, or the designation itself, because a root signature covers each of those. **The controller's recovery is a key event designating a fresh service key, followed by a service record under it** (`09-security-model.md` §9.12), and it works at every reader because the new key's bytes reset the high-water mark. **Under a `Contested` verdict that recovery does not run**: a contested identity has no adopted key state, so a reader accepts no designation from either suffix, and an identity whose designated key was taken alongside its root has no routing recovery until the contest resolves.
 
-**What the witness layer covers, and what it leaves to this section.** A cosigned head carries the subject's service-record sequence and digest beside the log head, and a witness refuses to cosign a record whose sequence sits below the one its own last cosigned head names under the same designated key bytes (`09-security-model.md` §9.7.4.3, its fourth check). **A reader that holds a fresh cosigned head therefore holds a witness-attested floor on the record's sequence**, which is what the record's inheritance of the layer amounts to: a relay serving a genuine record truncated to an older sequence is caught by that floor as well as by the reader's own high-water mark. The floor is a floor and not a freshness proof: the record's own signature, its sequence, the first-contact floor above, and the caching bound above are what a reader verifies, and the witness attests only what sequence it held and when.
+**The witness layer covers the key-event log alone and covers this record not at all.** A cosigned head names a key-event head and carries no service-record field (`09-security-model.md` §9.7.4.3), because the watch-and-report ruling of 2026-09-10 gives a witness exactly one check and covering a second object would give it a second. What defends this record against a relay serving a genuine copy truncated to an older sequence is therefore stated here and nowhere else: the record's own signature under the designated key, its monotonic sequence read against the reader's own high-water mark, the first-contact floor above, and the caching bound above.
 
 
 ## 3.11 DID Authentication for External Services (SCPID)
 
-SCP identities can authenticate to services outside the protocol. A relying party — SCP-native or not — can verify that a request comes from the holder of a specific DID without joining a context, understanding MLS, or running SCP infrastructure. The only requirement is the ability to resolve an SCP identity's key-event log from an SCP relay and verify an Ed25519 signature.
+SCP identities can authenticate to services outside the protocol. A relying party — SCP-native or not — can verify that a request comes from the holder of a specific DID without joining a context, understanding MLS, or running SCP infrastructure. The only requirement is the ability to resolve an SCP identity's key-event log from an SCP relay and verify a P-256 signature.
 
 This is analogous to "Sign in with Ethereum" (EIP-4361) but simpler: no blockchain state, no gas, no wallet abstraction. The identity's key-event log is the identity provider, self-certifying because the identifier is the digest of its inception event (`09-security-model.md` §9.6.1).
 
@@ -1191,13 +1184,13 @@ ScpIdResponse {
     nonce:          [u8; 32], // Echo of the challenge nonce
     audience:       String,   // Echo of the challenge audience
     signed_at:      u64,      // Unix timestamp (ms) when the client signed
-    signature:      [u8; 64], // Ed25519 signature over the signed content
+    signature:      [u8; 64], // P-256 signature (r || s) over the signed content
 }
 ```
 
 **Signed content construction:**
 
-The signed content follows the §9.5.1 canonical hash construction: SHA-256 of domain-separated, length-prefixed fields. The Ed25519 signature is over the 32-byte hash, not the raw concatenation.
+The signed content follows the §9.5.1 canonical hash construction: SHA-256 of domain-separated, length-prefixed fields. The P-256 signature is over the 32-byte hash, not the raw concatenation.
 
 ```
 signed_bytes = SHA-256(
@@ -1208,7 +1201,7 @@ signed_bytes = SHA-256(
     || BE32(len(audience))         || audience          // audience URI, UTF-8
     || signed_at as u64 BE                              // 8 bytes, big-endian
 )
-signature = Ed25519_sign(private_key, signed_bytes)
+signature = P256_ECDSA_sign(private_key, signed_bytes)   // RFC 6979 nonce, low-s
 ```
 
 **SCPID signed content field order:**
@@ -1261,7 +1254,7 @@ The relying party verifies a response:
    `current`. Reject if not.
 9. Reconstruct signed_bytes from did, signing_key_id, nonce, audience,
    signed_at per §3.11.3 (SHA-256 of canonical concatenation).
-10. Verify the Ed25519 (PureEdDSA, RFC 8032 §5.1.6) signature over
+10. Verify the P-256 ECDSA signature (FIPS 186-5, low-`s` enforced) over
     signed_bytes using the extracted public key.
 11. If all checks pass: the request is authenticated as originating from
     the holder of the DID's signing_key_id verification method.
@@ -1340,7 +1333,7 @@ SCPID and context membership are independent authentication mechanisms for diffe
 | **Proves** | Control of a DID's signing key | Membership in an MLS group |
 | **Scope** | Per-request, stateless | Persistent, epoch-based |
 | **Use case** | HTTP APIs, webhooks, external services | Protocol operations within a context |
-| **Requires SCP SDK** | No (only DID resolution + Ed25519) | Yes (MLS, key packages, group state) |
+| **Requires SCP SDK** | No (only DID resolution + P-256 ECDSA) | Yes (MLS, key packages, group state) |
 | **Session state** | None (relying party's concern) | MLS epoch (protocol-managed) |
 
 An SCP-native app will typically use **context membership** for protocol operations (messaging, governance, outlet invocation) and **SCPID** for HTTP API endpoints (REST APIs, webhooks, OAuth callbacks) that need to authenticate requests from DID holders outside the MLS channel.
@@ -1368,7 +1361,7 @@ pub fn scpid_challenge(
 /// Sign an SCPID challenge using the specified verification method.
 ///
 /// Constructs signed_bytes per §3.11.3 (SHA-256 of canonical concatenation
-/// including did and signing_key_id), signs with Ed25519, returns the response.
+/// including did and signing_key_id), signs with P-256 ECDSA, returns the response.
 pub async fn scpid_sign(
     custody: &impl KeyCustody,
     signing_key: &KeyHandle,
@@ -1386,7 +1379,7 @@ pub async fn scpid_sign(
 /// Performs the full 11-step verification procedure (§3.11.4): nonce match,
 /// audience match, timestamp window, DID resolution, key extraction,
 /// signing_key_id constraint, authentication relationship check,
-/// signed_bytes reconstruction, Ed25519 signature verification.
+/// signed_bytes reconstruction, P-256 signature verification.
 ///
 /// The caller MUST ensure the challenge has not been previously consumed
 /// (single-use enforcement). The function checks the response against the
@@ -1407,7 +1400,7 @@ pub struct ScpIdAuthentication {
 **Non-SCP relying parties** can implement verification without the SCP SDK. The only dependencies are:
 1. An SCP relay QUERY client and the key-event-log verification of §9.6.1 (recompute the identifier, verify every event).
 2. SHA-256 (standard, available everywhere).
-3. An Ed25519 signature verifier (PureEdDSA per RFC 8032 §5.1.6).
+3. A P-256 ECDSA signature verifier (FIPS 186-5) that rejects a high-`s` signature.
 4. JSON parsing.
 
 This is intentional. SCPID is designed to be implementable by services that have no other relationship with SCP.
@@ -1418,10 +1411,10 @@ A service that wants to accept SCP DID authentication without running SCP softwa
 
 1. **Key-state resolution.** QUERY the identity's routing ID, `SHA-256("scp:did:" || identifier_bytes)`, on the SCP relays the identity's service record lists (§3.10.13) and on the community relays of §18.5.1; each stored blob is a key-event record frame (§9.10.12) whose `value` carries a segment of the identity's key-event log. Assemble the chain, recompute the identifier from its inception event, verify every event, and derive the key state from the latest state-carrying event (§9.6.1). A relying party that holds no prior chain for the identity reads two relays under distinct declared operators, one of them in the fallback set (`09-security-model.md` §9.7.4.2 R11). For SCPID verification, a resolved key state MUST be cached for no more than 300 seconds. The general §3.10.4 caching policy (24h/7d) does NOT apply to SCPID verification — authentication requires current key state.
 
-2. **Reading the key from the key state.** The key state lists every operational key by role and every key the chain ever installed with its condition (`09-security-model.md` §9.7.4.2 definitions). Match `signing_key_id` to the role the key state names, confirm the key state lists that key `current`, and read its raw 32-byte Ed25519 public key. A relying party parses no DID document and needs none: ADR-063 defers the `did:scp` facade and this protocol publishes no W3C DID Core JSON for an identity.
+2. **Reading the key from the key state.** The key state lists every operational key by role and every key the chain ever installed with its condition (`09-security-model.md` §9.7.4.2 definitions). Match `signing_key_id` to the role the key state names, confirm the key state lists that key `current`, and read its 33-byte SEC1 compressed P-256 public key. A relying party parses no DID document and needs none: ADR-063 defers the `did:scp` facade and this protocol publishes no W3C DID Core JSON for an identity.
 
-3. **Signature verification.** Reconstruct `signed_bytes` per §3.11.3: concatenate the domain separator `"SCP-DID-AUTH-V1:"`, length-prefixed `did`, length-prefixed `signing_key_id`, raw 32-byte `nonce`, length-prefixed `audience`, and 8-byte big-endian `signed_at`. Compute SHA-256 of the concatenation. Verify the Ed25519 signature (PureEdDSA, RFC 8032 §5.1.6) over the resulting 32-byte hash. Standard libraries: `ring`, `ed25519-dalek` (Rust), `tweetnacl` (JS), `pynacl` (Python), `Crypto.Sign` (Swift).
+3. **Signature verification.** Reconstruct `signed_bytes` per §3.11.3: concatenate the domain separator `"SCP-DID-AUTH-V1:"`, length-prefixed `did`, length-prefixed `signing_key_id`, raw 32-byte `nonce`, length-prefixed `audience`, and 8-byte big-endian `signed_at`. Compute SHA-256 of the concatenation. Verify the P-256 ECDSA signature over the resulting 32-byte hash, rejecting a high-`s` value (`09-security-model.md` §9.5). Standard libraries: `ring` and `p256` (Rust), the Web Crypto API's `ECDSA` with `P-256` (JS), `cryptography` (Python), and CryptoKit's `P256.Signing` (Swift).
 
 4. **Nonce management.** Store issued nonces with their `expires_at`. Reject duplicates. Prune expired entries. For distributed deployments, use a strongly-consistent store or HMAC-based nonce generation (§3.11.6).
 
-No SCP SDK, no MLS, and no context management. The verification path is: two relay QUERYs, the chain verification of §9.6.1, one JSON parse, one SHA-256, and one Ed25519 verify.
+No SCP SDK, no MLS, and no context management. The verification path is: two relay QUERYs, the chain verification of §9.6.1, one JSON parse, one SHA-256, and one P-256 verify.
