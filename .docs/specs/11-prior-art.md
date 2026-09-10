@@ -301,7 +301,7 @@ This interoperability layer means GNS can gradually coexist with DNS rather than
 | **Zone enumeration** | Prevented by construction (ZKDF) | Trivial (DID documents are public) |
 | **DHT** | R5N (censorship-resistant routing) | Mainline (millions of nodes, simpler routing) |
 | **Revocation** | Argon2id proof-of-work (~4 days) | BEP44 sequence number + TTL expiry |
-| **Multi-key architecture** | No (one keypair per zone) | Yes (#0, #active, #agent, pre-rotation) |
+| **Multi-key architecture** | No (one keypair per zone) | Yes (#0, #active, #agent, pre-rotation) **[Superseded 2026-09-10 — one operational role `#active`, no agent key; `09-security-model.md` §9.1 invariant 1]** |
 | **Capability delegation** | No | Yes (UCAN chains) |
 | **Attestation chains** | No | Yes (identity attestations to human accountability) |
 | **DNS interop** | Yes (GNS2DNS, DNS2GNS) | No |

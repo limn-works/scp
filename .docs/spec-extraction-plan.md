@@ -4,7 +4,7 @@
 
 **Date:** 2026-03-04
 
-Every section number below names the spec corpus as it stood on that date. The corpus has been renumbered since: §10.6 now heads "Content and Data Sovereignty" rather than the native relay protocol this plan classifies, and §10.6.1 [no such section] no longer resolves at all. Read the numbers below as a record of what the plan assessed, and read `.docs/specs/` for what a section holds today.
+Every section number below names the spec corpus as it stood on that date. Three citations below name a section the corpus no longer holds, and each one resolves to nothing for its own reason: §10.6 now heads "Content and Data Sovereignty" rather than the native relay protocol this plan classifies, and §10.6.1 [no such section] no longer resolves at all, both by renumbering; §3.10.3 [no such section], "Layer 2: Mainline DHT", resolves to nothing because ADR-063, the inception-derived key-event-log identity substrate, cut the Mainline DHT rather than renumbering it; and §9.6.2 [no such section], "did:web Mitigations", resolves to nothing because the same ADR cut did:web. Read the numbers below as a record of what the plan assessed, and read `.docs/specs/` for what a section holds today.
 
 ---
 
@@ -117,7 +117,7 @@ Every section of every current spec file, classified as:
 | §3.10 DID Resolution Layers | **P** | Dual-layer architecture — normative |
 | §3.10.1 Resolution Priority (table) | **P** | Priority semantics — normative |
 | §3.10.2 Layer 1: SCP Relay-Based Resolution | **P** | Routing ID derivation, PUBLISH/QUERY format — normative |
-| §3.10.3 Layer 2: Mainline DHT | **P** | Fallback role — normative |
+| §3.10.3 [no such section] Layer 2: Mainline DHT | **P** | Fallback role — normative |
 | §3.10.4 Resolution Protocol | **P** | Full resolution sequence — **critical normative content** |
 | §3.10.5 Publishing Protocol | **P** | Dual-layer publishing — normative |
 | §3.10.6 Anti-Segmentation Invariant | **P** | MUST publish to both — normative |
@@ -231,7 +231,7 @@ This is a P0 gap for the Identity document — the multi-key architecture and sh
 | §9.5 Security Boundaries (5 boundaries) | **P** | Protocol boundary, context, role, capability, trust — normative |
 | §9.6 DID Security | **P** | did:dht self-certification, BEP44, sequence numbers — normative |
 | §9.6.1 BEP44 Verification | **P** | Verification algorithm — **critical normative content** |
-| §9.6.2 did:web Mitigations | **P** | TOFU, TLS pinning — normative |
+| §9.6.2 [no such section] did:web Mitigations | **P** | TOFU, TLS pinning — normative |
 | §9.6.3 Relay List Authentication | **P** | NIP-65 pattern — normative |
 | §9.7 MLS Integration | **P** | Epoch management, key rotation, PCS — normative |
 | §9.7.1-4 MLS subsections | **P** | All MLS details — normative |

@@ -185,8 +185,9 @@ class AndroidKeyCustody : KeyCustodyProvider {
         //   cross-platform deterministic (pinned by §25.19 vectors).
         //
         // HARDWARE keys (Keystore TEE): private bytes are non-exportable, so
-        //   pseudonymSecret = SHA-256(TEE_sign("scp-pseudonym-secret-v1")) — a device-local
-        //   secret computed inside the TEE. Hardware pseudonyms are device-local BY DESIGN
+        //   pseudonymSecret = an associated 32-byte symmetric key generated inside the TEE at
+        //   generate_keypair — never SHA-256 over a signature, because an ECDSA hardware signer
+        //   draws its own nonce. Hardware pseudonyms are device-local BY DESIGN
         //   and are NOT expected to match other devices or the software vectors.
         val pseudonymSecret = derivePseudonymSecret(keyHandle)  // HKDF (software) or TEE-sign (hardware)
         val mac = Mac.getInstance("HmacSHA256").apply {
@@ -436,7 +437,7 @@ dependencies {
 6. **`AndroidKeyCustody.derivePseudonym(keyHandle, contextId)`:**
    - Computes `HMAC-SHA256(pseudonym_secret, contextId || "scp-pseudonym")`. Derives a P-256 keypair from the first 32 bytes through the seed-to-scalar step of §9.10.4 of the security-model spec.
    - Returns `PseudonymKeyHandle` with `custodyType = CustodyType.SOFTWARE` (the derived pseudonym keypair is always software-managed, even for a hardware identity key).
-   - **pseudonym_secret definition (IMPORTANT):** The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key — public key bytes are public and would be a membership-enumeration oracle (§9.10.4.A). For a **software** key (Bouncy Castle), `pseudonym_secret = HKDF-SHA256(p256_private_scalar, salt="scp-pseudonym-secret-v1", info="", len=32)`, byte-identical to Rust `derive_pseudonym_secret()`, so software pseudonyms are cross-platform deterministic (pinned by §25.19 vectors). For **hardware** keys (API 33+, Keystore TEE), private key bytes are non-exportable, so `pseudonym_secret = SHA-256(TEE_sign("scp-pseudonym-secret-v1"))` — a device-local secret computed inside the TEE. **Hardware pseudonyms are device-local by design** and are intentionally NOT identical across devices or to the software vectors; cross-device pseudonym identity is not a protocol requirement, since the TEE key never leaves the device. This matches ADR-006 acceptance criterion 6 (§9.10.4.A).
+   - **pseudonym_secret definition (IMPORTANT):** The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key — public key bytes are public and would be a membership-enumeration oracle (§9.10.4.A). For a **software** key (Bouncy Castle), `pseudonym_secret = HKDF-SHA256(p256_private_scalar, salt="scp-pseudonym-secret-v1", info="", len=32)`, byte-identical to Rust `derive_pseudonym_secret()`, so software pseudonyms are cross-platform deterministic (pinned by §25.19 vectors). For **hardware** keys (Keystore TEE), private key bytes are non-exportable, so `pseudonym_secret` is an associated 32-byte symmetric key generated inside the TEE at `generate_keypair` — a device-local secret, never `SHA-256` over a signature, because an ECDSA hardware signer draws its own nonce and would yield a different secret on every call (§9.5 of the security-model spec). **Hardware pseudonyms are device-local by design** and are intentionally NOT identical across devices or to the software vectors; cross-device pseudonym identity is not a protocol requirement, since the TEE key never leaves the device. This matches ADR-006 acceptance criterion 6 (§9.10.4.A).
 
 7. **`AndroidDeviceAttestation.attest(challenge, deviceId)`:**
    - Calls Play Integrity Standard API via `IntegrityManagerFactory.create(context).requestIntegrityToken(...)`.
@@ -1391,7 +1392,7 @@ When a member has been offline for more than 7 days, or when the epoch catch-up 
 
    **Anti-replay validation.** Because ResetRequest is not MLS-encrypted, it is visible to relays and any network observer. Without replay protection, an attacker who captures a valid ResetRequest can replay it to force-remove and re-add the member repeatedly, disrupting their session. The relay (or any recipient processing the request) MUST validate:
 
-   - **(a) Signature validity.** Verify the P-256 signature against the member's DID document (resolve `member_did`, check `#active` or `#agent` verification method).
+   - **(a) Signature validity.** Verify the P-256 signature against the member's DID document (resolve `member_did`, check `#active` or `#agent` verification method). **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`.docs/specs/00-open-questions.md`).]**
    - **(b) Timestamp freshness.** Reject requests where `|relay_clock - timestamp| > 30 seconds`. This matches the freshness window used for `AccessKeyRequest` (§9.17) and `SenderKeyRequest` (§9.16.2) validation. The 30-second window accommodates reasonable clock skew while limiting the replay window.
    - **(c) Nonce uniqueness.** Maintain a deduplication cache of `(member_did, nonce)` pairs with a 60-second TTL. Reject any request whose nonce has been seen within the TTL window. The 60-second TTL is 2x the freshness window, ensuring that even a request accepted at the edge of the 30-second window cannot be replayed after nonce eviction. Cache capacity: bounded at 10,000 entries with oldest-first eviction (matching the `NonceDedup` pattern used for `SenderKeyRequest` in `scp-core/crypto/sender_keys/key_protocol.rs`).
 
@@ -2428,7 +2429,7 @@ pub enum GovernanceModelConfig {
     /// M-of-N threshold approval. A fixed set of designated signers;
     /// a proposal passes when at least `threshold` of them approve.
     /// One DID = one vote regardless of signing key (ADR-039). A vote
-    /// signed by `#agent` counts the same as one signed by `#active`.
+    /// signed by `#agent` counts the same as one signed by `#active`. **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`.docs/specs/00-open-questions.md`).]**
     Threshold {
         /// The set of DIDs authorized to vote. These DIDs must hold
         /// the `GovernanceVote` capability.
@@ -2686,7 +2687,7 @@ Every proposal has a `voting_deadline = created_at + voting_window_secs`. The vo
 
 In single-admin governance, the context creator holds the root UCAN authority and delegates all capabilities. In multi-admin governance, UCAN authority is distributed:
 
-**Root UCAN issuer.** The context creator remains the root UCAN issuer. This is a cryptographic necessity — the UCAN delegation chain must have a single root of trust (ADR-009 step 4: "root token's `iss` is the context creator's DID"). The creator is not a privileged governor — they are the key ceremony initiator. One DID = one vote regardless of which signing key (`#active` or `#agent`) casts the vote (ADR-039). The governance engine deduplicates by DID, not by key.
+**Root UCAN issuer.** The context creator remains the root UCAN issuer. This is a cryptographic necessity — the UCAN delegation chain must have a single root of trust (ADR-009 step 4: "root token's `iss` is the context creator's DID"). The creator is not a privileged governor — they are the key ceremony initiator. One DID = one vote regardless of which signing key (`#active` or `#agent`) casts the vote (ADR-039). The governance engine deduplicates by DID, not by key. **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`.docs/specs/00-open-questions.md`).]**
 
 **Governance capability distribution.** At context creation, the creator mints `GovernancePropose` and `GovernanceVote` UCAN tokens for each DID that the governance model designates as a voter:
 
@@ -3140,7 +3141,7 @@ pub struct AccessKeyRequest {
     pub epoch: u64,
     pub timestamp: u64,  // Unix milliseconds; requests older than 30s are rejected
     pub wrapping_pubkey: HpkeP256PublicKey,  // Ephemeral, per-request
-    /// Which verification method signed: "#active" or "#agent" (ADR-039).
+    /// Which verification method signed: "#active" or "#agent" (ADR-039). **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`.docs/specs/00-open-questions.md`).]**
     pub signing_key_id: String,
     /// P-256 signature over: SHA-256(context_id || requester_did || signing_key_id || epoch || timestamp || wrapping_pubkey)
     /// using the requester's Active Signing Key or Agent Signing Key (ADR-039). Prevents replay and impersonation.
@@ -3165,7 +3166,7 @@ pub struct AccessKeyResponse {
 
 On receive:
 
-1. Look up own `member_id` (truncated DID hash) in `wrapped_ceks`. Note: the lookup is by DID, not by signing key — both `#active` and `#agent` operations on the same DID share the same access key (ADR-039).
+1. Look up own `member_id` (truncated DID hash) in `wrapped_ceks`. Note: the lookup is by DID, not by signing key — both `#active` and `#agent` operations on the same DID share the same access key (ADR-039). **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`.docs/specs/00-open-questions.md`).]**
 2. Unwrap the CEK with own access key using AES-256-KW.
 3. Decrypt the ciphertext with AES-256-GCM using the unwrapped CEK. The AEAD authentication tag verifies integrity.
 

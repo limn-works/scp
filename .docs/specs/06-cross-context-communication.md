@@ -140,7 +140,7 @@ Discovery is built from two complementary mechanisms: DID document capabilities 
 
 #### A. DID Document Capabilities
 
-Every agent MAY publish structured capabilities in their DID document's `service` array. These are resolved via did:dht — always available, 0-setup, no context required. Any agent that knows a DID can resolve the document and inspect capabilities directly.
+Every agent MAY publish structured capabilities in their DID document's `service` array. These are resolved via did:dht — always available, 0-setup, no context required. Any agent that knows a DID can resolve the document and inspect capabilities directly. **[Superseded 2026-09-10 — the protocol produces no DID document and uses no did:dht: ADR-063, the inception-derived key-event-log identity substrate, replaced both with the key-event log and the service record (`03-identity.md` §3.10.13). A verifier resolves `#active` from the key state the latest state-carrying event carries (`09-security-model.md` §9.7.4.2 R8).]**
 
 ```json
 {
@@ -192,15 +192,15 @@ These are conventions, not mandates — contexts with discovery outlets can add 
   1. **Entries are owned by their creator DID.** The DID that called `agent_register` is the entry owner, recorded at creation time.
   2. **Only the owner can update or delete their own entries.** Writers MUST verify that the DID signature on the update request matches the entry's owner DID before processing.
   3. **Context admins can update or delete any entry.** DIDs holding the `Admin` role in the context bypass ownership checks.
-  4. **Signature verification.** All update and delete requests MUST carry a valid signature from the requester's Active Signing Key (`#active`) or Agent Signing Key (`#agent`). Writers verify the signature against the requester's current DID document before processing.
+  4. **Signature verification.** All update and delete requests MUST carry a valid signature from the requester's Active Signing Key (`#active`) or Agent Signing Key (`#agent`). Writers verify the signature against the requester's current DID document before processing. **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`00-open-questions.md`).]**
   5. **Rejection on mismatch.** If the requester's DID does not match the entry owner and the requester is not a context admin, the request is rejected with an `OwnershipViolation` error. The rejection is logged in the Merkle event log.
 - **Consistency.** All writes are recorded in the Merkle event log. Readers can request inclusion proofs to verify their registration was recorded and to audit the registry's integrity.
 
 **Registration request authentication.** All registration, update, and deregistration requests from non-MLS readers are authenticated via DID-signed request envelopes. The authentication protocol:
 
-1. **Request signing.** The requester constructs a request payload containing the operation type (`register`, `update`, `deregister`), the entry data, and a freshness tuple `(timestamp, nonce)`. The payload is signed with the requester's Active Signing Key (`#active`) or Agent Signing Key (`#agent`), using the canonical hash construction (§9.5.1) with domain separator `"SCP-DISCOVERY-REQUEST-V1:"`. The signed preimage includes: `context_id || requester_did || operation_tag || entry_data_hash || nonce || timestamp`, where `entry_data_hash` is `SHA-256(serialized_entry_data)` and `nonce` is a 16-byte CSPRNG value.
+1. **Request signing.** The requester constructs a request payload containing the operation type (`register`, `update`, `deregister`), the entry data, and a freshness tuple `(timestamp, nonce)`. The payload is signed with the requester's Active Signing Key (`#active`) or Agent Signing Key (`#agent`), using the canonical hash construction (§9.5.1) with domain separator `"SCP-DISCOVERY-REQUEST-V1:"`. The signed preimage includes: `context_id || requester_did || operation_tag || entry_data_hash || nonce || timestamp`, where `entry_data_hash` is `SHA-256(serialized_entry_data)` and `nonce` is a 16-byte CSPRNG value. **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`00-open-questions.md`).]**
 
-2. **Signature verification.** Writers MUST resolve the requester's DID document and verify the P-256 signature against the `#active` or `#agent` verification method. If the DID document cannot be resolved or the signature is invalid, the request is rejected.
+2. **Signature verification.** Writers MUST resolve the requester's DID document and verify the P-256 signature against the `#active` or `#agent` verification method. If the DID document cannot be resolved or the signature is invalid, the request is rejected. **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`00-open-questions.md`).]**
 
 3. **Replay protection.** Writers MUST validate that the request timestamp is within 5 minutes of local time (consistent with §9.14 clock skew tolerance) and that the `nonce` has not been previously seen. Writers maintain a nonce deduplication cache with a 5-minute TTL, bounded at 10,000 entries with oldest-first eviction. Requests with expired timestamps or duplicate nonces are rejected.
 
@@ -223,7 +223,7 @@ These are conventions, not mandates — contexts with discovery outlets can add 
 
 **SDK unification.** The SDK provides a unified discovery API:
 
-- Searches local contact index (cache of previously resolved DID documents — instant)
+- Searches local contact index (cache of previously resolved DID documents — instant) **[Superseded 2026-09-10 — the protocol produces no DID document and uses no did:dht: ADR-063, the inception-derived key-event-log identity substrate, replaced both with the key-event log and the service record (`03-identity.md` §3.10.13). A verifier resolves `#active` from the key state the latest state-carrying event carries (`09-security-model.md` §9.7.4.2 R8).]**
 - Queries each known context (standard outlet calls)
 - Returns merged, deduplicated results ranked by relevance
 

@@ -17,9 +17,9 @@ It sits at a different level than MCP (Anthropic), WebMCP (Google+Microsoft), or
 **This paragraph is superseded, and the dated preface above states by what.** Every actor has a did:dht decentralized identifier rooted in an Ed25519 keypair. The DID string encodes the public key
 directly — making it self-certifying. Resolution uses BEP44 (Mainline DHT), so no centralized registry. Users never see keys; custody is delegated to Secure Enclave, passkeys, or platform accounts.
 
-The key hierarchy is:
-- Identity key (P-256) — derives the DID string, highest-security custody
-- Active signing key (P-256, rotatable) — MLS credentials, envelope signatures, UCAN issuance
+The key hierarchy is (**superseded with the paragraph above; the preface states by what**):
+- Identity key (Ed25519) — derives the DID string, highest-security custody
+- Active signing key (Ed25519, rotatable) — MLS credentials, envelope signatures, UCAN issuance
 - Pre-rotation commitment — SHA-256 of a pre-staged next key, held in cold storage for compromise recovery
 
 Identity private state (block lists, graph visibility policies, petnames, preferences) is encrypted to the owner's keys and replicated across relays as an append-only event log — the same

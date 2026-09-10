@@ -149,7 +149,7 @@ MCP (Model Context Protocol) defines how AI models connect to tools and data sou
 │                                                        │
 │  - Exposes context outlets as MCP tool schemas        │
 │  - Filters outlets by role + capability tokens          │
-│  - Signs with #active or #agent from human's DID      │
+│  - Signs with #active or #agent from human's DID      │ **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`00-open-questions.md`).]**
 │  - Encrypts/decrypts context envelopes                │
 │  - Surfaces context events as MCP resources           │
 └────────────────────┬─────────────────────────────────┘

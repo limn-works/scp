@@ -27,16 +27,16 @@ Each test specifies:
 
 ## 26.3 Identity Tests (§3, §4)
 
-### CONF-001: DID Creation with Required Verification Methods
+### CONF-001: Identity Inception under the Key-Event Log
 
 | Field | Value |
 |-------|-------|
 | **Layer** | Identity |
 | **Tier** | Core |
-| **Spec Sections** | §3.1, §3.2, ADR-039 |
+| **Spec Sections** | §3.1, §3.2, `09-security-model.md` §9.7.4.2 R2, R13, definitions |
 | **Preconditions** | None. |
-| **Steps** | 1. Generate P-256 keypair. 2. Create did:dht DID. 3. Build DID document with verification methods `#0` (root), `#active` (signing), `#agent` (agent signing). |
-| **Expected Outcome** | DID document contains exactly 3 verification methods with IDs `#0`, `#active`, `#agent`. All are Multikey. The DID string is the z-base-32 encoding of the `#0` public key. |
+| **Steps** | 1. Generate the root set's P-256 keypairs and the pre-rotation keypairs. 2. Compose the inception event under the preimage field order `09-security-model.md` §9.7.4.2's definitions fix, carrying the root set and its threshold, the first commitment list and next threshold, and the initial key state. 3. Sign it with a root signature verifying against the set it installs. 4. Compute the identifier as `SHA-256("SCP-KEL-ID-V1:" \|\| inception_signed_preimage)`. 5. Publish the key-event record frame at `SHA-256("scp:did:" \|\| identifier_bytes)`. |
+| **Expected Outcome** | The identifier recomputes from the served inception event under R2. The derived key state names one operational role `#active` and names no agent key. The identity resolves the moment its inception event is published, with no witness cosignature. **This test replaced the did:dht DID-document test on 2026-09-10**: ADR-063, the inception-derived key-event-log identity substrate, cut did:dht and cut the DID document, so no conforming implementation produces either. |
 
 ### CONF-002: DID Resolution and Self-Certification
 
@@ -68,7 +68,7 @@ Each test specifies:
 | **Tier** | Core |
 | **Spec Sections** | §4.2, ADR-039 |
 | **Preconditions** | Human DID and agent DID both created. |
-| **Steps** | 1. Create identity attestation binding agent DID to human DID. 2. Sign attestation with human's `#active` key. 3. Verify attestation signature. 4. Verify agent DID's `#agent` key matches the key in the attestation. |
+| **Steps** | 1. Create identity attestation binding agent DID to human DID. 2. Sign attestation with human's `#active` key. 3. Verify attestation signature. 4. Verify agent DID's `#agent` key matches the key in the attestation. **[Superseded 2026-09-10 — one operational role `#active`, no agent key; `09-security-model.md` §9.1 invariant 1]** |
 | **Expected Outcome** | Attestation is valid. Agent DID traces to human DID through the attestation chain. |
 
 ### CONF-005: Multi-Device (Same DID, Different Device Keys)

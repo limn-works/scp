@@ -1394,57 +1394,11 @@ CUSTODY_SIGNER_KEY_ID = "#agent"
 COUNTER_EXPLANATION = "agent key compromised; rotated and republished"
 
 
-def emit_custody_violation() -> None:
-    """Vectors 39 and 40 — one violation record and the counter-claim naming it."""
-    section("§25.25 Custody violation and counter-attestation")
+# §25.25's custody-violation and counter-attestation vectors were deleted on 2026-09-10.
+# The identity-substrate plan's §1 table marks both constructs CUT (Alec's 2026-08-25 Ruling 2,
+# reconfirmed 2026-08-31), and Track U4 owns the teardown of the §9.5.2 preimage tables and the
+# shipped code. Re-signing their preimages onto P-256 would have widened that teardown.
 
-    # `signature_evidence` carries whichever offending signature a verification
-    # point observed. This vector fixes it as one P-256 ECDSA signature by the
-    # tertiary key over the 19 ASCII bytes of the offending action, which any
-    # implementer reproduces from the tertiary seed alone.
-    evidence_digest = sha256(CUSTODY_ACTION)
-    evidence = ecdsa_sign(REF_KEY_3.d, evidence_digest)
-    assert ecdsa_verify(REF_KEY_3.point, evidence_digest, evidence), (
-        "vector_39: the evidence signature does not verify under the tertiary key"
-    )
-    emit_hex("vector_39.signature_evidence", evidence)
-
-    violation_preimage = canonical_preimage(
-        "SCP-CUSTODY-VIOLATION-V1:",
-        var_field(CUSTODY_SUBJECT_DID),
-        u64(1_700_000_000),
-        u8(0x00),
-        var_field(CUSTODY_ACTION),
-        var_field(CUSTODY_SIGNER_KEY_ID),
-        var_field(evidence),
-        var_field(CUSTODY_VERIFIER_DID),
-    )
-    violation_hash = sign_and_emit("vector_39", violation_preimage)
-
-    # Field 3 exists so that one variant's bytes never hash to another's. The
-    # assertion below is the property, not an illustration of it.
-    mismatch_preimage = canonical_preimage(
-        "SCP-CUSTODY-VIOLATION-V1:",
-        var_field(CUSTODY_SUBJECT_DID),
-        u64(1_700_000_000),
-        u8(0x01),
-        var_field(CUSTODY_ACTION),
-        var_field(CUSTODY_SIGNER_KEY_ID),
-        var_field(evidence),
-        var_field(CUSTODY_VERIFIER_DID),
-    )
-    assert sha256(mismatch_preimage) != violation_hash, (
-        "vector_39: the variant tag does not separate the two variants"
-    )
-
-    counter_preimage = canonical_preimage(
-        "SCP-COUNTER-ATTESTATION-V1:",
-        var_field(CUSTODY_SUBJECT_DID),
-        fixed_field(violation_hash),
-        var_field(COUNTER_EXPLANATION),
-        u64(1_700_003_600),
-    )
-    sign_and_emit("vector_40", counter_preimage, REF_KEY_2)
 
 
 # ---------------------------------------------------------------------------
@@ -1457,13 +1411,89 @@ def emit_custody_violation() -> None:
 # (§9.7.4.2 definitions, §9.7.4.3, §9.18.2)
 # ---------------------------------------------------------------------------
 
-# The inception event's own preimage is NOT reproduced here: §9.7.4.2 R13 defers
-# the key-event preimage's field order to a later revision, so no vector can pin
-# a layout that is not yet fixed. Every vector below takes that event's §9.5.1
-# preimage digest as a STATED INPUT and pins what the fixed rules derive from it:
-# the raw slot, the WebAuthn challenge, the assertion slot's byte layout, and the
-# message a verifier runs ECDSA over.
-INCEPTION_DIGEST = sha256(b"scp-25-key-event-vector-inception")
+# The inception event's preimage is built here, in the field order §9.7.4.2's
+# definitions fix. Vectors 41 and 42 pin its bytes, its digest, and the identifier
+# that digest derives, then pin the slot each signature form produces over it.
+
+KIND_INCEPTION = 0x01
+ROLE_ROOT = 0x01
+ROLE_ACTIVE = 0x02
+CONDITION_CURRENT = 0x01
+CUSTODY_PASSKEY = 0x01
+KEY_ALGORITHM_ECDSA_P256_SHA256 = 0x01
+CONTINUATION_COMMITMENT = 0x01
+PREROTATION_SEPARATOR = b"SCP-PREROTATION-COMMITMENT-V1:"
+KEL_EVENT_SEPARATOR = b"SCP-KEL-EVENT-V1:"
+KEL_ID_SEPARATOR = b"SCP-KEL-ID-V1:"
+ZERO32 = bytes(32)
+
+# The vector identity: a 1-of-1 root (§25.2's reference key), one #active key
+# (§25.2's secondary key), a 1-of-1 next set, one witness, and a one-hour
+# witnessing interval.
+VECTOR_WITNESS_OPERATOR = sha256(b"scp-25-witness-operator")
+VECTOR_WITNESSING_INTERVAL = 3600
+VECTOR_PREROTATION_POINT = REF_KEY_3.compressed
+
+
+def key_state_entry(point: bytes, role: int, condition: int) -> bytes:
+    """One 45-byte key-state entry, per §9.18.17's MAX_KEYS_PER_CHAIN arithmetic."""
+    entry = (
+        fixed_field(point)
+        + u8(role)
+        + u8(condition)
+        + u64(0)
+        + u8(CUSTODY_PASSKEY)
+        + u8(KEY_ALGORITHM_ECDSA_P256_SHA256)
+    )
+    assert len(entry) == 45, len(entry)
+    return entry
+
+
+def vector_key_state() -> bytes:
+    return (
+        u32(1)  # root threshold
+        + u32(2)  # key count
+        + key_state_entry(REF_KEY_1.compressed, ROLE_ROOT, CONDITION_CURRENT)
+        + key_state_entry(REF_KEY_2.compressed, ROLE_ACTIVE, CONDITION_CURRENT)
+        + u32(1)  # next-set count
+        + u8(KEY_ALGORITHM_ECDSA_P256_SHA256)
+        + u8(CUSTODY_PASSKEY)
+        + u32(1)  # witness-set count
+        + fixed_field(VECTOR_WITNESS_OPERATOR)
+        + u32(VECTOR_WITNESSING_INTERVAL)
+        + u8(ROLE_ACTIVE)  # service-key designation
+        + fixed_field(ZERO32)  # delegator: non-delegated
+    )
+
+
+def inception_preimage(form: int) -> bytes:
+    """The inception event's signed preimage, in §9.7.4.2's field order."""
+    commitment = sha256(PREROTATION_SEPARATOR + VECTOR_PREROTATION_POINT)
+    return (
+        KEL_EVENT_SEPARATOR
+        + u8(KIND_INCEPTION)  # 1. event_type
+        + fixed_field(ZERO32)  # 2. identifier placeholder
+        + u64(0)  # 3. sequence
+        + fixed_field(ZERO32)  # 4. predecessor placeholder
+        # 5. standing_root: the RootRecovery kind alone carries it
+        + u32(1) + u8(0)  # 6. signer index list of the one root group
+        + u32(1) + u8(form)  # 7. signature-form list of that group
+        # 8. revealed keys: the reveal-authorized kinds alone carry them
+        + u32(1) + fixed_field(REF_KEY_1.compressed) + u32(1)  # 9. installed root set + threshold
+        + vector_key_state()  # 10. key-state snapshot
+        # 11. key-event seals: the KeyState kind alone carries them
+        + u8(CONTINUATION_COMMITMENT)  # 12. continuation
+        + u32(1) + fixed_field(commitment) + u32(1)
+    )
+
+
+def identifier_of(preimage: bytes) -> bytes:
+    return sha256(KEL_ID_SEPARATOR + preimage)
+
+
+# Set by emit_key_event_slots(); §25.27's objects name Vector 41's event and identifier.
+INCEPTION_DIGEST = b""
+INCEPTION_IDENTIFIER = b""
 
 WEBAUTHN_CHALLENGE_PREFIX = b"SCP-KEY-EVENT-V1:"
 WEBAUTHN_RP_ID = b"ctx.network"
@@ -1503,22 +1533,42 @@ def webauthn_client_data_json(challenge: bytes) -> bytes:
 
 
 def emit_key_event_slots() -> None:
-    section("§25.26 Key-event signature slots")
-    emit_hex("vector_41.inception_preimage_digest", INCEPTION_DIGEST)
+    section("§25.26 Key-event preimage and signature slots")
 
     # --- Vector 41: an inception whose one root slot carries the raw form. ---
-    raw_sig = ecdsa_sign(REF_KEY_1.d, INCEPTION_DIGEST)
-    assert ecdsa_verify(REF_KEY_1.point, INCEPTION_DIGEST, raw_sig)
-    if _HAVE_CRYPTOGRAPHY:
-        _verify_with_cryptography(REF_KEY_1, INCEPTION_DIGEST, raw_sig, "vector_41")
-    assert int.from_bytes(raw_sig[32:], "big") * 2 <= N, "vector_41: high-s"
+    preimage_41 = inception_preimage(0x01)
+    digest_41 = sha256(preimage_41)
+    identifier_41 = identifier_of(preimage_41)
     emit("vector_41.form", "0x01")
     emit_hex("vector_41.root_key_compressed", REF_KEY_1.compressed)
+    emit_hex("vector_41.active_key_compressed", REF_KEY_2.compressed)
+    emit_hex("vector_41.prerotation_key_compressed", VECTOR_PREROTATION_POINT)
+    emit_hex(
+        "vector_41.prerotation_commitment",
+        sha256(PREROTATION_SEPARATOR + VECTOR_PREROTATION_POINT),
+    )
+    emit_hex("vector_41.witness_operator", VECTOR_WITNESS_OPERATOR)
+    emit("vector_41.witnessing_interval", VECTOR_WITNESSING_INTERVAL)
+    emit("vector_41.key_state_bytes", len(vector_key_state()))
+    emit("vector_41.preimage_len", len(preimage_41))
+    emit_hex("vector_41.preimage", preimage_41)
+    emit_hex("vector_41.preimage_digest", digest_41)
+    emit_hex("vector_41.identifier", identifier_41)
+    emit_hex("vector_41.routing_id", sha256(b"scp:did:" + identifier_41))
+    raw_sig = ecdsa_sign(REF_KEY_1.d, digest_41)
+    assert ecdsa_verify(REF_KEY_1.point, digest_41, raw_sig)
+    if _HAVE_CRYPTOGRAPHY:
+        _verify_with_cryptography(REF_KEY_1, digest_41, raw_sig, "vector_41")
+    assert int.from_bytes(raw_sig[32:], "big") * 2 <= N, "vector_41: high-s"
     emit("vector_41.slot_len", len(raw_sig))
     emit_hex("vector_41.slot", raw_sig)
 
     # --- Vector 42: an inception whose one root slot carries the assertion form. ---
-    challenge = WEBAUTHN_CHALLENGE_PREFIX + INCEPTION_DIGEST
+    preimage_42 = inception_preimage(0x02)
+    digest_42 = sha256(preimage_42)
+    identifier_42 = identifier_of(preimage_42)
+    assert preimage_42 != preimage_41, "the form list sits in the preimage"
+    challenge = WEBAUTHN_CHALLENGE_PREFIX + digest_42
     auth_data = webauthn_authenticator_data()
     client_data = webauthn_client_data_json(challenge)
     signed_message = auth_data + sha256(client_data)
@@ -1537,9 +1587,13 @@ def emit_key_event_slots() -> None:
         + client_data
         + assertion_sig
     )
-    assert len(auth_data) <= 256, "vector_42: MAX_AUTHENTICATOR_DATA_BYTES"
-    assert len(client_data) <= 512, "vector_42: MAX_CLIENT_DATA_JSON_BYTES"
+    assert 37 <= len(auth_data) <= 256, "vector_42: authenticatorData bounds"
+    assert 1 <= len(client_data) <= 512, "vector_42: MAX_CLIENT_DATA_JSON_BYTES"
     emit("vector_42.form", "0x02")
+    emit("vector_42.preimage_len", len(preimage_42))
+    emit_hex("vector_42.preimage", preimage_42)
+    emit_hex("vector_42.preimage_digest", digest_42)
+    emit_hex("vector_42.identifier", identifier_42)
     emit("vector_42.challenge_len", len(challenge))
     emit_hex("vector_42.challenge", challenge)
     emit("vector_42.challenge_b64url", b64url_nopad(challenge))
@@ -1556,6 +1610,10 @@ def emit_key_event_slots() -> None:
     emit("vector_42.slot_len", len(slot))
     emit_hex("vector_42.slot", slot)
 
+    global INCEPTION_DIGEST, INCEPTION_IDENTIFIER
+    INCEPTION_DIGEST = digest_41
+    INCEPTION_IDENTIFIER = identifier_41
+
 
 # --- §25.27 the cosigned head and the relay proof of control ---
 
@@ -1564,51 +1622,103 @@ WITNESS_KEY_STATE_HEAD = sha256(b"scp-25-witness-key-state-head")
 SUBJECT_ID = sha256(b"scp-25-subject-identifier")
 COSIGN_OBSERVED_AT = 1_700_000_000
 RELAY_OPERATOR_ID = sha256(b"scp-25-relay-operator")
-RELAY_OPERATOR_KEY_STATE_HEAD = sha256(b"scp-25-relay-operator-key-state-head")
 RESOLVER_NONCE = sha256(b"scp-25-resolver-nonce")
-SERVED_VALUE_DIGEST = sha256(b"scp-25-served-blob-bytes")
+SERVED_BLOB_A = b"scp-25-served-blob-a"
+SERVED_BLOB_B = b"scp-25-served-blob-bb"
+# §9.7.4.2 definitions: a 4-byte blob count, then each blob under §9.5.1's
+# variable-length rule, so one digest names one split of the bytes into blobs.
+SERVED_VALUE_DIGEST = sha256(u32(2) + var_field(SERVED_BLOB_A) + var_field(SERVED_BLOB_B))
 
 
 def emit_witness_and_relay_objects() -> None:
-    section("§25.27 Cosigned head and relay proof of control")
+    section("§25.27 Cosigned head, conflict statement, fault proof, relay proof")
 
-    cosigned_fields = (
+    subject = INCEPTION_IDENTIFIER
+    designating_digest = INCEPTION_DIGEST
+
+    def cosigned_head(label, sequence, event_digest, previous, observed_at, key=REF_KEY_2):
+        fields = (
+            fixed_field(WITNESS_ID)
+            + fixed_field(WITNESS_KEY_STATE_HEAD)
+            + fixed_field(subject)
+            + u64(sequence)
+            + fixed_field(event_digest)
+            + fixed_field(previous)
+            + u64(observed_at)
+        )
+        assert len(fields) == 176, len(fields)
+        assert previous != bytes(32), "previous_cosigned_digest is never zero"
+        emit_hex(f"{label}.witness", WITNESS_ID)
+        emit_hex(f"{label}.witness_key_state_head", WITNESS_KEY_STATE_HEAD)
+        emit_hex(f"{label}.subject", subject)
+        emit(f"{label}.sequence", sequence)
+        emit_hex(f"{label}.event_digest", event_digest)
+        emit_hex(f"{label}.previous_cosigned_digest", previous)
+        emit(f"{label}.observed_at", observed_at)
+        emit(f"{label}.field_bytes", len(fields))
+        digest = sign_and_emit(
+            label, canonical_preimage("SCP-COSIGNED-HEAD-V1:", fields), key
+        )
+        emit(f"{label}.object_bytes", len(fields) + 64)
+        return digest
+
+    # Vector 43: a witness's first cosigned head after seeding at the event that
+    # designated it. previous_cosigned_digest names that event, never zero.
+    cosigned_head("vector_43", 0, designating_digest, designating_digest, COSIGN_OBSERVED_AT)
+
+    # Vector 45: the conflict statement a witness emits when the one check fails.
+    held_digest = sha256(b"scp-25-conflict-held-event")
+    offered_digest = sha256(b"scp-25-conflict-offered-event")
+    conflict_fields = (
         fixed_field(WITNESS_ID)
         + fixed_field(WITNESS_KEY_STATE_HEAD)
-        + fixed_field(SUBJECT_ID)
+        + fixed_field(subject)
         + u64(7)
-        + fixed_field(INCEPTION_DIGEST)
-        + fixed_field(bytes(32))
+        + fixed_field(held_digest)
+        + u64(7)
+        + fixed_field(offered_digest)
         + u64(COSIGN_OBSERVED_AT)
     )
-    assert len(cosigned_fields) == 176, len(cosigned_fields)
-    emit_hex("vector_43.witness", WITNESS_ID)
-    emit_hex("vector_43.witness_key_state_head", WITNESS_KEY_STATE_HEAD)
-    emit_hex("vector_43.subject", SUBJECT_ID)
-    emit_hex("vector_43.event_digest", INCEPTION_DIGEST)
-    emit("vector_43.field_bytes", len(cosigned_fields))
-    digest = sign_and_emit(
-        "vector_43",
-        canonical_preimage("SCP-COSIGNED-HEAD-V1:", cosigned_fields),
+    assert len(conflict_fields) == 184, len(conflict_fields)
+    emit_hex("vector_45.witness", WITNESS_ID)
+    emit_hex("vector_45.subject", subject)
+    emit("vector_45.held_sequence", 7)
+    emit_hex("vector_45.held_digest", held_digest)
+    emit("vector_45.offered_sequence", 7)
+    emit_hex("vector_45.offered_digest", offered_digest)
+    emit("vector_45.field_bytes", len(conflict_fields))
+    sign_and_emit(
+        "vector_45",
+        canonical_preimage("SCP-WITNESS-CONFLICT-V1:", conflict_fields),
         REF_KEY_2,
     )
-    emit("vector_43.object_bytes", len(cosigned_fields) + 64)
-    assert len(digest) == 32
+    emit("vector_45.object_bytes", len(conflict_fields) + 64)
 
-    routing_id = sha256(b"scp:did:" + SUBJECT_ID)
+    # Vector 46: the two-heads fault proof — one witness, one subject, one
+    # non-zero previous_cosigned_digest, two different event_digests.
+    baseline = sha256(b"scp-25-fault-proof-baseline-head")
+    head_a = sha256(b"scp-25-fault-proof-successor-a")
+    head_b = sha256(b"scp-25-fault-proof-successor-b")
+    emit_hex("vector_46.shared_previous_cosigned_digest", baseline)
+    cosigned_head("vector_46a", 21, head_a, baseline, COSIGN_OBSERVED_AT)
+    cosigned_head("vector_46b", 21, head_b, baseline, COSIGN_OBSERVED_AT + 1)
+    assert head_a != head_b, "vector_46: the two heads must differ"
+
+    # Vector 44: the relay proof of control. It carries no key-state position:
+    # §9.7.1's attestation class reads the operator's latest current #active.
+    routing_id = sha256(b"scp:did:" + subject)
     proof_fields = (
         fixed_field(RELAY_OPERATOR_ID)
-        + fixed_field(RELAY_OPERATOR_KEY_STATE_HEAD)
         + fixed_field(RESOLVER_NONCE)
         + fixed_field(routing_id)
         + fixed_field(SERVED_VALUE_DIGEST)
         + u64(COSIGN_OBSERVED_AT)
     )
-    assert len(proof_fields) == 168, len(proof_fields)
+    assert len(proof_fields) == 136, len(proof_fields)
     emit_hex("vector_44.operator", RELAY_OPERATOR_ID)
-    emit_hex("vector_44.operator_key_state_head", RELAY_OPERATOR_KEY_STATE_HEAD)
     emit_hex("vector_44.nonce", RESOLVER_NONCE)
     emit_hex("vector_44.routing_id", routing_id)
+    emit_hex("vector_44.value_digest_input_blobs", SERVED_BLOB_A + SERVED_BLOB_B)
     emit_hex("vector_44.value_digest", SERVED_VALUE_DIGEST)
     emit("vector_44.field_bytes", len(proof_fields))
     sign_and_emit(
@@ -1642,7 +1752,6 @@ def main() -> int:
     emit_pseudonym_announcement()
     emit_trust_attestation()
     emit_keypackage_attestation()
-    emit_custody_violation()
     emit_key_event_slots()
     emit_witness_and_relay_objects()
     print("\n".join(_LINES))
