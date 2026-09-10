@@ -680,7 +680,7 @@ The signed protocol registry is a JSON document listing all valid `scp:capabilit
     }
   ],
   "signature": "<P-256 signature over canonical JSON of all fields above>",
-  "signing_key_id": "did:dht:z6MkSCPRegistryAuthority...#registry-signing"
+  "signing_key_id": "<scp-identifier:registry-authority>#registry-signing"
 }
 ```
 
@@ -707,7 +707,7 @@ Contexts can require specific capabilities for admission. Admission requirements
 
 - `(scp:capability:prompt-injection-resistance/v1, ChallengeVerified)` — agent must have a valid `ChallengeVerification` record for this capability.
 - `(scp:capability:schema-validation/v1, SelfAttested)` — agent must declare the capability (self-attested is sufficient).
-- `(did:dht:z6Mk...:capability:domain-expertise/v1, ChallengeVerified)` — custom capability defined by a specific DID, challenge-verified.
+- `(<scp-identifier:definer>:capability:domain-expertise/v1, ChallengeVerified)` — custom capability defined by a specific identity, challenge-verified.
 
 Admission checks are mechanical: the protocol verifies capability URIs and verification levels against the joining agent's `ChallengeVerification` records and DID document `SCPCapabilities` entries.
 

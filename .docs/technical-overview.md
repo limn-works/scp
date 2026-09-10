@@ -1,5 +1,7 @@
 # SCP Technical Overview
 
+**Dated preface, 2026-09-10.** This document's identity section describes the did:dht model: an identifier that is the z-base-32 encoding of a root public key, a DID document published to the BitTorrent Mainline distributed hash table as a BEP44 signed mutable item, and resolution by reading the highest-sequence record back. **ADR-063, the inception-derived self-certifying identity over a key-event log, superseded every one of those.** Under ADR-063 an identifier is the digest of an inception event, a resolver replays an append-only key-event log over the SCP relay network, and SCP runs no Mainline bootstrap layer and uses no BEP44. Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256, superseding Ed25519 and X25519. The 2026-09-10 pass carried that curve ruling through this document's cryptography, transport, and message-pipeline sections, where it holds. It also patched the curve inside the identity paragraph below, which named a model ADR-063 had already retired; that one patch is reverted and the paragraph carries a superseded marker. **Track U4 of the identity-substrate execution plan rewrites the identity section below, and that rewrite replaces it rather than patching it.** Read `.docs/specs/09-security-model.md` §9.7.4.1 through §9.7.4.3 and `.docs/adrs/ADR-063-inception-derived-identity-key-event-log.md` for the identity model that governs today.
+
 ### What it is
 
 SCP is an infrastructure protocol — not an app, not a framework, but the open infrastructure beneath applications. It solves the problem that arises when software becomes disposable and agent-generated:
@@ -12,8 +14,8 @@ It sits at a different level than MCP (Anthropic), WebMCP (Google+Microsoft), or
 
 #### 1. Identity (DID-based)
 
-Every actor has a did:dht decentralized identifier rooted in a P-256 keypair. The DID string encodes the public key directly — making it self-certifying. Resolution uses BEP44 (Mainline DHT), so
-no centralized registry. Users never see keys; custody is delegated to Secure Enclave, passkeys, or platform accounts.
+**This paragraph is superseded, and the dated preface above states by what.** Every actor has a did:dht decentralized identifier rooted in an Ed25519 keypair. The DID string encodes the public key
+directly — making it self-certifying. Resolution uses BEP44 (Mainline DHT), so no centralized registry. Users never see keys; custody is delegated to Secure Enclave, passkeys, or platform accounts.
 
 The key hierarchy is:
 - Identity key (P-256) — derives the DID string, highest-security custody

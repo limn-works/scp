@@ -5,6 +5,8 @@ Limn (limn.works)
 
 March 2026 — Preprint v0.1
 
+**Dated preface, 2026-09-10.** This document's identity section describes the did:dht model: an identifier that is the z-base-32 encoding of a root public key, a DID document published to the BitTorrent Mainline distributed hash table as a BEP44 signed mutable item, and resolution by reading the highest-sequence record back. **ADR-063, the inception-derived self-certifying identity over a key-event log, superseded every one of those.** Under ADR-063 an identifier is the digest of an inception event, a resolver replays an append-only key-event log over the SCP relay network, and SCP runs no Mainline bootstrap layer and uses no BEP44. Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256, superseding Ed25519 and X25519. The 2026-09-10 pass carried that curve ruling across the specification corpus and left this document untouched, so every Ed25519 and X25519 mention below names the superseded curve. **Track U4 of the identity-substrate execution plan rewrites the identity section below, and that rewrite replaces it rather than patching it.** Read `.docs/specs/09-security-model.md` §9.7.4.1 through §9.7.4.3 and `.docs/adrs/ADR-063-inception-derived-identity-key-event-log.md` for the identity model that governs today.
+
 ---
 
 ## Abstract

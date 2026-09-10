@@ -25,7 +25,9 @@ Build order: ADR-017 + ADR-019 (parallel, both depend on Phase 1-3) --> ADR-018 
 
 ## ADR-017: Trust Engine (Four-Layer Evaluation)
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amendment (2026-09-10 — trust-layer signature verification is ECDSA on P-256).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. The three signed structures this ADR defines carry `P256Signature` fields, its signature-verification step verifies an ECDSA signature on P-256 against the issuer's resolved public key, and its dependency list names the `p256` crate in place of an Ed25519 one. The four evaluation layers, their ordering, and the fail-closed direction are untouched.
 
 ### Context
 
@@ -633,7 +635,9 @@ agent_deregister(did) -> { removed }
 
 ## ADR-021: UniFFI Bridge Definitions
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amendment (2026-09-10 — the bridge's pseudonym derivation and Secure Enclave custody move to P-256).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. The pseudonym derivation this ADR's bridge exposes gains the seed-to-scalar step of §9.10.4 of the security-model spec, so its comment reads `P256_keygen(seed_to_scalar(seed[0..32]))`. The `KeyCustodyProvider` note states that the Swift implementation generates each P-256 key in the Secure Enclave, which the ruling made reachable and which ADR-025, the Apple platform adapter, carries in its own 2026-09-10 amendment. The UniFFI type mapping and the callback-interface shape are untouched.
 
 ### Context
 
@@ -1503,7 +1507,7 @@ SCP is pre-release: there are no deployed browser clients and no migration surfa
 
 **Delete the WASM bridge.** Remove `crates/scp-ffi/wasm/` in its entirety, along with its build, test, CI, and enforcement references. The FFI bridge set is now **three** bridges, all of which share the real engine: PyO3 (Python, reference), UniFFI (Swift, Kotlin), and NAPI (Node.js/Bun → TypeScript).
 
-> **Recovery / posterity.** The deleted bridge source is not lost — it remains in git history and the design rationale is preserved in ADR-034 above (kept under its supersession banner). The WASM bridge was last present at commit `1a3b41a5e^` (the parent of the removal commit `1a3b41a5e`, "remove the WASM bridge — Slice 1 foundation", PR #1934); recover the full tree with `git show 1a3b41a5e^:crates/scp-ffi/wasm/...` or `git checkout 1a3b41a5e^ -- crates/scp-ffi/wasm`.
+> **Recovery / posterity.** The deleted bridge source is not lost — it remains in git history and the design rationale is preserved in ADR-034 above (kept under its supersession banner). The removal landed in pull request #1934, "remove the WASM bridge — Slice 1 foundation", and the bridge was last present at that pull request's merge base. **This paragraph names no commit hash**, because a squash merge rewrites every hash a branch carried and a recorded hash then resolves to nothing; find the merge commit from pull request #1934 and read the tree at its first parent. Recover a file with `git show <that ref>:crates/scp-ffi/wasm/...`. Never recover one with `git checkout <ref> -- <path>`, which `CLAUDE.md` forbids because it overwrites the working tree silently.
 
 **The browser story is a remote thin client.** A browser client does not run the protocol engine in-process. It connects to a server-side `scp-node` over an RPC/WebSocket boundary and issues protocol operations remotely; the node holds the MLS group state, the actor/supervisor runtime, custody, and the event log. There is **no in-browser client-side MLS or protocol execution**. The TypeScript SDK's browser build is a remote-client transport to a node, not a second in-process engine; the in-process TypeScript path remains NAPI-only (server/Node.js/Bun runtimes).
 

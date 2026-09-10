@@ -28,7 +28,7 @@ Build order: ADR-003 + ADR-001 + ADR-006 (parallel, no deps) --> ADR-002 --> ADR
 
 **Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
 
-**Amendment (2026-09-10 — the single ciphersuite is RFC 9420 ciphersuite 2).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. His reason, which he accepted as a recommendation: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. The single ciphersuite this ADR fixes therefore moves from `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` to `MLS_128_DHKEMP256_AES128GCM_SHA256_P256`, RFC 9420 ciphersuite 2, and the Decision and Implementation text below names the new value. The no-negotiation rule is untouched: this ADR fixes one ciphersuite and the ruling changed which one. SCP is pre-release, so no migration code follows.
+**Amendment (2026-09-10 — the single ciphersuite is RFC 9420 ciphersuite 2).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. The single ciphersuite this ADR fixes therefore moves from `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` to `MLS_128_DHKEMP256_AES128GCM_SHA256_P256`, RFC 9420 ciphersuite 2, and the Decision and Implementation text below names the new value. The no-negotiation rule is untouched: this ADR fixes one ciphersuite and the ruling changed which one. SCP is pre-release, so no migration code follows.
 
 ### Context
 
@@ -135,7 +135,9 @@ Each function below must be implemented and tested:
 
 ## ADR-002: Envelope Creation, Signing, and Verification
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amendment (2026-09-10 — the envelope's inner signature is ECDSA on P-256).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. This ADR decided an Ed25519 inner signature and now decides a P-256 one: the construction is `P256_ECDSA_sign(SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash || signing_key_id))` over the same preimage, in the 64-byte raw `r || s` form of `09-security-model.md` §9.5, and the signing dependency names the `p256` crate in place of `ed25519-dalek`. The pseudonym derivation gains the seed-to-scalar step of §9.10.4 of the security-model spec, because P-256 has no analogue of the seed expansion RFC 8032 fixed for the superseded curve. The preimage's field order, the signature-inside-encryption placement, and the verification order are untouched: the ruling changed the algorithm and no part of the construction.
 
 ### Context
 
@@ -904,7 +906,7 @@ pub enum TransportEvent {
 
 **Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
 
-**Amendment (2026-09-10 — the `KeyCustody` key types are both P-256).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. His reason, which he accepted as a recommendation: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. The `KeyType` enum this ADR defines carried one variant per curve, `Ed25519` for signing and `X25519` for key agreement. Both variants now name P-256 keys and the enum distinguishes them by purpose rather than by curve: `P256Signing` and `P256Agreement`. Every method contract below reads the same way afterwards — `sign` rejects an agreement-only handle, `dh_agree` rejects a signing-only handle — because the split was always a purpose split and the curve names hid that. The pseudonym derivation gains the seed-to-scalar step of §9.10.4 of the security-model spec, because P-256 has no analogue of the seed expansion RFC 8032 fixed for the superseded curve. This ADR's adapter is the in-memory testing one, so no custody claim changes.
+**Amendment (2026-09-10 — the `KeyCustody` key types are both P-256).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. The `KeyType` enum this ADR defines carried one variant per curve, `Ed25519` for signing and `X25519` for key agreement. Both variants now name P-256 keys and the enum distinguishes them by purpose rather than by curve: `P256Signing` and `P256Agreement`. Every method contract below reads the same way afterwards — `sign` rejects an agreement-only handle, `dh_agree` rejects a signing-only handle — because the split was always a purpose split and the curve names hid that. The pseudonym derivation gains the seed-to-scalar step of §9.10.4 of the security-model spec, because P-256 has no analogue of the seed expansion RFC 8032 fixed for the superseded curve. This ADR's adapter is the in-memory testing one, so no custody claim changes.
 
 ### Context
 
@@ -1063,7 +1065,9 @@ pub trait Storage: Send + Sync {
 
 ## ADR-007: Sender-Side Key Layer
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amendment (2026-09-10 — every sender-key signature is ECDSA on P-256 and the HPKE suite is DHKEM(P-256)).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. Each signature this ADR defines — the `SenderKeyEpochAdvance`, the `SenderKeyRequest`, and the block record — is an ECDSA signature on P-256, and each `signature` field carries the type `P256Signature`. The HPKE suite that seals a sender key to a requester moves from DHKEM(X25519, HKDF-SHA256) to DHKEM(P-256, HKDF-SHA256), and the ephemeral wrapping keypair a requester generates is a DHKEM(P-256) keypair. The pull-based distribution model, the block-list check, and the `info` domain separation are untouched.
 
 ### Context
 
@@ -1237,8 +1241,10 @@ This test proves: identity works, encryption works, the envelope format works, s
 ## ADR-039: Shared-DID Human-Agent Identity Model
 
 **Date:** March 4, 2026
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
 **Extends:** ADR-003 (DID Creation)
+
+**Amendment (2026-09-10 — the three verification methods hold P-256 keys).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. The three verification methods this ADR defines — `#0`, `#active`, and `#agent` — held Ed25519 keys and now hold P-256 keys, so the key-continuity fingerprint under `"SCP-KEY-CONTINUITY-V1:"` carries 33-byte SEC1 compressed public keys in place of 32-byte ones. **A second ruling reaches this ADR's model rather than its curve, and this amendment does not carry it:** ADR-063, the inception-derived key-event-log identity substrate, overturns the shared-DID `#agent` verification method, and ADR-064, the forthcoming specification of the cooperative-delegation events, replaces it. The Track U2 revision of this ADR is where that supersession lands.
 
 ### Context
 

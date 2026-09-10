@@ -294,7 +294,9 @@ pub enum MemoryScope {
 
 ## ADR-009: Role Assignment and Capability Ceiling Enforcement
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amendment (2026-09-10 — UCAN validation verifies an ES256 signature).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. The UCAN signature this ADR's validation step verifies is an ECDSA signature on P-256 over `base64url(header).base64url(payload)`, so the UCAN algorithm this ADR assumes is ES256 in place of EdDSA. The `kid` resolution step, the role-assignment rules, and the capability-ceiling enforcement are untouched.
 
 ### Context
 
@@ -678,7 +680,9 @@ pub struct OutletSession {
 
 ## ADR-011: Verifiable Event Log (Merkle Tree)
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amendment (2026-09-10 — every event and checkpoint signature is ECDSA on P-256).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. Each `signature` field on this ADR's event and checkpoint structures carries the type `P256Signature`, and the sentence separating an event signature from every other signature in the protocol names P-256. The Merkle construction, the leaf hashing, the inclusion-proof shape, and the `signing_key_id` apparatus are untouched: the ruling changed the signature algorithm and no part of the tree.
 
 ### Context
 
@@ -1835,7 +1839,9 @@ Key design choices:
 
 > **Note:** ADR-052 is numbered non-sequentially (same convention as ADR-032/035/042). It lives in the Phase 2 document because its primary worked example is `ApplicationNode` construction (ADR-032, `scp-node`), but its scope is cross-cutting: it governs every developer-facing construction entry point across all five language SDKs.
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amendment (2026-09-10 — `BRIDGE_REGISTER` authentication is an ECDSA signature on P-256).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. The `BRIDGE_REGISTER` authentication this ADR's `BridgeRole` enum gates is an ECDSA signature on P-256. The unified construction pattern itself names no algorithm, so the ruling reaches one sentence of this ADR and no decision in it.
 
 ### Context
 

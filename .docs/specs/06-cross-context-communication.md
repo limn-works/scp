@@ -149,7 +149,7 @@ Every agent MAY publish structured capabilities in their DID document's `service
   "serviceEndpoint": {
     "capabilities": [
       "scp:capability:translation/v1",
-      "did:dht:abc123:capability:japanese-translation/v1"
+      "<scp-identifier:definer>:capability:japanese-translation/v1"
     ],
     "version": "scp/1.0"
   }

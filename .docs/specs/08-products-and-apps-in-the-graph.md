@@ -59,7 +59,7 @@ The capability declaration uses JSON Schema (MCP-compatible) with SCP-specific e
 ```json
 {
   "scp_version": "1.0",
-  "app_id": "did:dht:app_publisher_did",
+  "app_id": "<scp-identifier:app-publisher>",
   "app_name": "My App",
   "app_version": "2.1.0",
   "capabilities": [

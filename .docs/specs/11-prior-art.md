@@ -271,10 +271,10 @@ A DHT node storing GNS records sees only encrypted blobs keyed by opaque hashes.
 
 **Petname system and Zooko's triangle.** GNS makes an explicit choice in Zooko's triangle — the observation that naming systems can provide at most two of three properties:
 
-| Property | DNS | GNS | ENS | did:dht (SCP) |
+| Property | DNS | GNS | ENS | did:dht (the model SCP superseded) |
 |----------|-----|-----|-----|---------------|
 | **Secure** (not spoofable) | Weak (DNSSEC optional, CAs fallible) | Yes (ZKDF + self-certifying zones) | Yes (smart contract finality) | Yes (BEP44 self-certification) |
-| **Memorable** (human-readable) | Yes (example.com) | Yes (petnames: "Alice's blog") | Yes (vitalik.eth) | No (did:dht:z6Mk...) |
+| **Memorable** (human-readable) | Yes (example.com) | Yes (petnames: "Alice's blog") | Yes (vitalik.eth) | No (a z-base-32 key string) |
 | **Global** (unique, universal) | Yes (ICANN hierarchy) | No (petnames are local) | Yes (Ethereum global state) | Yes (DHT global key) |
 
 GNS chose secure + memorable, sacrificing global uniqueness. Names are meaningful only within a local trust context — Alice's "bob" is a petname she assigned and has no meaning to Carol. Hierarchical delegation (alice.bob.gnu means "look up 'alice' in the zone that 'bob' points to in the GNU zone") provides path-based navigation but not global resolution.

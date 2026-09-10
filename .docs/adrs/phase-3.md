@@ -665,7 +665,9 @@ Implement the MCP adapter as the `scp-mcp` crate (Rust) with a Python interface 
 
 ## ADR-016: UCAN Validation
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amendment (2026-09-10 — UCAN tokens are ES256 and the validation module verifies P-256).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. UCAN tokens are signed with ES256 in place of EdDSA, so this ADR's validation module verifies an ECDSA signature on P-256, its token `signature` field carries the type `P256Signature`, its issuing step signs with a P-256 key, and its library note names the `p256` crate in place of an Ed25519 one. The mandatory-nonce requirement, the delegation-chain walk, and the caveat-attenuation rules are untouched.
 
 ### Context
 
@@ -994,7 +996,9 @@ This test proves: pip install works without Rust, the 20-line agent works, async
 
 > **Note:** ADR-033 is numbered non-sequentially because it was added as a cross-cutting concern after the original phase numbering. It lives in the Phase 3 document because its scope (payment adapters, spending UCANs, economic policy) extends the UCAN and context systems specified in ADR-009/ADR-016. See also ADR-032 in phase-2.md.
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amendment (2026-09-10 — the governance signature is ECDSA on P-256).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. The `signature` field on this ADR's signed governance structure carries the type `P256Signature`. No other sentence of this ADR names a curve, so the ruling reaches its wire type and no decision in it.
 
 ### Context
 

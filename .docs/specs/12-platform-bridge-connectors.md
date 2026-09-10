@@ -23,7 +23,7 @@ A bridge connector is a registered protocol entity — distinct from agents, out
 │                  ┌─────────────────────────┐                      │
 │                  │    Bridge Connector      │                      │
 │                  │                          │                      │
-│                  │  Operator: did:dht:...   │ ← Accountable       │
+│                  │  Operator: <identifier>  │ ← Accountable       │
 │                  │  Platform: X (Twitter)   │   identity runs      │
 │                  │  Mode: relay | puppet    │   the bridge.        │
 │                  │  Provenance: marked      │                      │
@@ -140,7 +140,7 @@ Shadow identities differ from native SCP identities in critical ways:
 ```
   Before claiming:                   After claiming:
 
-  @dave_x (shadow)                   Dave·Agent (did:dht:xyz)
+  @dave_x (shadow)                   Dave·Agent (<scp-identifier:dave>)
   ├─ source: X Bridge                ├─ native SCP identity
   ├─ operator: bridge_did            ├─ attestation: @dave_x on X
   ├─ role: observer                  ├─ role: member (upgraded by governance)
@@ -346,7 +346,7 @@ The JWT payload contains:
 
 ```json
 {
-  "iss": "did:dht:z6MkOperator...",
+  "iss": "<scp-identifier:bridge-operator>",
   "aud": "https://platform.example.com",
   "iat": 1700000000,
   "exp": 1700003600,
@@ -483,7 +483,7 @@ Emit a message attributed to a shadow identity. The bridge node receives this, c
     "originating_platform": "discord",
     "bridge_mode": "Cooperative",
     "shadow_status": "Shadow",
-    "operator_did": "did:dht:z6MkOperator..."
+    "operator_did": "<scp-identifier:bridge-operator>"
   }
 }
 ```
@@ -555,7 +555,7 @@ Return bridge status and the shadow roster. This endpoint is called by context m
   "status": "Active",
   "platform": "discord",
   "mode": "Cooperative",
-  "operator_did": "did:dht:z6MkOperator...",
+  "operator_did": "<scp-identifier:bridge-operator>",
   "registered_at": 1700000000,
   "shadow_count": 3,
   "rate_limits": {

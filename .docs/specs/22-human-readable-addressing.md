@@ -2,9 +2,9 @@
 
 ## 22.1 Design Principles
 
-SCP identifiers are cryptographic — DIDs (`did:dht:z6Mk...`) and context IDs (hex-encoded hashes). These are canonical at the protocol level and will remain so. But cryptographic identifiers fail the verbal handoff: "join my app" or "find me at ___" requires something a human can say and an agent can resolve.
+SCP identifiers are cryptographic — an identity's identifier is the digest of its inception event (`09-security-model.md` §9.7.4.2 R13) and a context ID is a hex-encoded hash. These are canonical at the protocol level and will remain so. But cryptographic identifiers fail the verbal handoff: "join my app" or "find me at ___" requires something a human can say and an agent can resolve.
 
-The addressing layer adds a **resolution protocol** that accepts human-readable strings and returns DIDs or context IDs. It does not replace cryptographic identifiers, create a global namespace, or require centralized infrastructure. Handles are resolution hints — they narrow search. They never define identity.
+The addressing layer adds a **resolution protocol** that accepts human-readable strings and returns identity identifiers or context IDs. It does not replace cryptographic identifiers, create a global namespace, or require centralized infrastructure. Handles are resolution hints — they narrow search. They never define identity.
 
 **Primary mechanism: context handles.** SCP-native, DNS-free, community-governed. This is where the spec's weight is. Contexts (§6.2.2B [no such section]) already provide searchable registries — this section extends them with handle registration and lookup.
 
@@ -195,10 +195,11 @@ The SDK ships with a mapping of default `BootstrapContextEntry` values (§22.11.
    returned by scope_lookup. This verification is provided by MLS group joining —
    the GroupContext authenticates the context_id.
    Call handle_lookup("alice")
-7. Get result: Identity { did: "did:dht:z6MkAlice..." }
-8. Resolve DID via Mainline DHT (self-certifying, §9.6.1)
+7. Get result: Identity { did: "<scp-identifier:alice>" }
+8. Resolve the identifier by replaying its key-event log over the relay
+   network (self-certifying, `09-security-model.md` §9.7.4.2 R2)
 9. Return AddressResolution::Identity {
-     did: "did:dht:z6MkAlice...",
+     did: "<scp-identifier:alice>",
      trust_level: DiscoveryContextVerified,
      resolution_path: {
        layer: "DiscoveryContext",
@@ -384,7 +385,7 @@ SCP.AddressResolver.resolveContextPetname(name: "recipes") → ContextId?
 
 ## 22.5 Attestation-Backed Handles (External Identity Bridge)
 
-Identity attestations (§3.5) already bind external platform handles to DIDs — `@alice` on X → `did:dht:z6Mk...`. This binding is cryptographically signed, user-initiated, independently verifiable, and revocable. What's missing is a **reverse-lookup index**: given `@alice` on X, find the DID.
+Identity attestations (§3.5) already bind external platform handles to identity identifiers — `@alice` on X → `<scp-identifier:alice>`. This binding is cryptographically signed, user-initiated, independently verifiable, and revocable. What's missing is a **reverse-lookup index**: given `@alice` on X, find the DID.
 
 The addressing layer adds reverse-lookup as a discovery outlet, not a new protocol primitive. When a user creates an identity attestation, the SDK SHOULD (opt-out configurable) register the mapping in one or more contexts with discovery outlets that support attestation indexing.
 
@@ -472,12 +473,12 @@ The `.well-known/scp` document format (§18.3.1) is extended with an optional `h
 ```json
 {
   "version": 1,
-  "did": "did:dht:z6Mk...",
+  "did": "<the operator's identifier, in the textual form 09 §9.7.4.2 R13 defers>",
   "relay": "wss://relay.example.com/scp/v1",
   "handles": {
     "alice": {
       "type": "identity",
-      "did": "did:dht:z6MkAlice..."
+      "did": "<scp-identifier:alice>"
     },
     "recipes": {
       "type": "context",

@@ -31,7 +31,7 @@ Phase 1-5 ADRs
 
 **Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling) — see the amendment below.
 
-**Amendment (2026-09-10 — every SCP key is ECDSA on P-256).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. This ADR's Rationale called hardware-backed Ed25519 at API 33 and above "a direct win over Apple, where Secure Enclave's P-256 limitation forces software key storage". **That paragraph is withdrawn.** The gap it named came from SCP's own curve choice and not from either vendor's hardware: Apple's Secure Enclave performs P-256 operations, Android Keystore has held P-256 keys in the Trusted Execution Environment since API 23, and SCP signed with a curve only one of the two implemented. Under the ruling both adapters hold every SCP signing key in hardware, and ADR-025, the Apple platform adapter, carries the matching amendment. Two further consequences follow for this ADR. The Bouncy Castle software fallback for API levels 26 through 32 has nothing left to fall back from, because Keystore holds a P-256 signing key at every API level this SDK supports; it survives only for key agreement below API 31, which is the first level at which Keystore performs ECDH. And the root member is held by a passkey through the platform's credential provider (`09-security-model.md` §9.7.4.1 item 4), so `AndroidKeyCustody` neither generates nor stores it.
+**Amendment (2026-09-10 — every SCP key is ECDSA on P-256).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. This ADR's Rationale called hardware-backed Ed25519 at API 33 and above "a direct win over Apple, where Secure Enclave's P-256 limitation forces software key storage". **That paragraph is withdrawn.** The gap it named came from SCP's own curve choice and not from either vendor's hardware: Apple's Secure Enclave performs P-256 operations, Android Keystore has held P-256 keys in the Trusted Execution Environment since API 23, and SCP signed with a curve only one of the two implemented. Under the ruling both adapters hold every SCP signing key in hardware, and ADR-025, the Apple platform adapter, carries the matching amendment. Two further consequences follow for this ADR. The Bouncy Castle software fallback for API levels 26 through 32 has nothing left to fall back from, because Keystore holds a P-256 signing key at every API level this SDK supports; it survives only for key agreement below API 31, which is the first level at which Keystore performs ECDH. And the root member is held by a passkey through the platform's credential provider (`09-security-model.md` §9.7.4.1 item 4), so `AndroidKeyCustody` neither generates nor stores it.
 
 ### Context
 
@@ -1244,7 +1244,9 @@ dependencies {
 
 ## ADR-029: Offline/Sync Strategy
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amendment (2026-09-10 — queued-operation signatures are ECDSA on P-256).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. Each `signature` field on this ADR's queued-operation and reconciliation structures carries the type `P256Signature`, and its signature-validity check verifies an ECDSA signature on P-256 against the member's resolved verification method. The offline queue model, the three reconnection cases, and the relay backfill path are untouched.
 
 ### Context
 
@@ -1711,7 +1713,9 @@ QueueDrained {
 
 ## ADR-030: Event Log Pruning and Checkpointing
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amendment (2026-09-10 — the checkpoint signature is ECDSA on P-256).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. The checkpoint signature this ADR defines is an ECDSA signature on P-256 over the same `SHA-256(context_id || checkpoint_seq || …)` preimage, and both `signature` fields carry the type `P256Signature`. The pruning boundary, the checkpoint cadence, and the retention rule are untouched.
 
 ### Context
 
@@ -2286,7 +2290,9 @@ Checkpoint {
 
 ## ADR-031: Multi-Admin Governance Models
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amendment (2026-09-10 — the governance-proposal signature is ECDSA on P-256).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. The `signature` field on this ADR's governance-proposal structure carries the type `P256Signature`. The threshold models, the approval flow, and the admin-set rules are untouched.
 
 ### Context
 
@@ -3047,7 +3053,9 @@ GovernanceActionExecuted {
 
 ## ADR-038: Content Access Key Layer
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amendment (2026-09-10 — access-key distribution runs over DHKEM(P-256)).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. The access-key distribution moves from DHKEM(X25519, HKDF-SHA256) to DHKEM(P-256, HKDF-SHA256) under HPKE Base mode, the ephemeral wrapping keypair a requester generates is a DHKEM(P-256) keypair, and the request's `signature` field carries the type `P256Signature`. The pull-based model, the `info` and AAD constructions, and the per-epoch rotation are untouched.
 
 ### Context
 
@@ -3522,9 +3530,11 @@ The self-attestation model is acceptable for identity links specifically because
 
 ## ADR-045: Fuzzing Infrastructure
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
 **Date:** April 2026
 **PRs:** #1643 (initial 18 targets), #1644 (size-gate fixes), #1645 (CI workflows), #1652 (documentation follow-up)
+
+**Amendment (2026-09-10 — the deep fuzz targets build real P-256 keys).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. The two fuzz targets that build real key material — the T4 validation-depth tier and `fuzz_validate_ucan_deep.rs` — generate real P-256 keys in place of real Ed25519 ones. The target taxonomy, the tier gating, and the CI workflow routing are untouched.
 
 ### Context
 

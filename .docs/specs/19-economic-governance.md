@@ -528,7 +528,7 @@ Relay economics are SEPARATE from context economics — different trust model. R
       "per_publish": "10",
       "per_byte_stored": "1",
       "payment_adapters": ["x402", "lightning"],
-      "payee": "did:dht:z6Mk..."
+      "payee": "<scp-identifier:payee>"
     }
   }
 }

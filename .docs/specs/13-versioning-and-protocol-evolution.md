@@ -119,7 +119,7 @@ The `.well-known/scp` document (§18.3) already has a `version` field (currently
 {
   "version": 1,
   "protocol_version": "1.0",
-  "did": "did:dht:z6Mk...",
+  "did": "<the operator's identifier, in the textual form 09 §9.7.4.2 R13 defers>",
   "relay": "wss://relay.example.com/scp/v1",
   ...
 }

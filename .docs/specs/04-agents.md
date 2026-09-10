@@ -53,7 +53,7 @@ The capability metadata profile published in a DID document's `SCPCapabilities` 
     "challenge_verified": [
       {
         "capability": "scp:capability:prompt-injection-resistance/v1",
-        "verifier_did": "did:dht:z6MkVerifier...",
+        "verifier_did": "<scp-identifier:verifier>",
         "verified_at": 1700000000,
         "expires_at": 1702592000,
         "verification_id": "cv-abc123"
@@ -61,9 +61,9 @@ The capability metadata profile published in a DID document's `SCPCapabilities` 
     ],
     "custom": [
       {
-        "capability": "did:dht:z6MkDefiner...:capability:cooking-expertise/v1",
+        "capability": "<scp-identifier:definer>:capability:cooking-expertise/v1",
         "level": "challenge_verified",
-        "verifier_did": "did:dht:z6MkChef...",
+        "verifier_did": "<scp-identifier:chef>",
         "verified_at": 1700000000
       }
     ]

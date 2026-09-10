@@ -660,11 +660,11 @@ Returns the most recent messages in the broadcast context, decrypted and seriali
 ```json
 {
   "context_id": "<hex>",
-  "author_did": "did:dht:...",
+  "author_did": "<the author's identifier, in the textual form 09 §9.7.4.2 R13 defers>",
   "messages": [
     {
       "id": "<blob_id_hex>",
-      "author_did": "did:dht:...",
+      "author_did": "<the author's identifier, in the textual form 09 §9.7.4.2 R13 defers>",
       "key_epoch": 42,
       "published_at": "2025-01-15T10:30:00Z",
       "content": "<base64-encoded decrypted content>"
@@ -694,7 +694,7 @@ Returns a single decrypted message:
 ```json
 {
   "id": "<blob_id_hex>",
-  "author_did": "did:dht:...",
+  "author_did": "<the author's identifier, in the textual form 09 §9.7.4.2 R13 defers>",
   "key_epoch": 42,
   "published_at": "2025-01-15T10:30:00Z",
   "content": "<base64-encoded decrypted content>"
