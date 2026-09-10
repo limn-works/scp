@@ -26,7 +26,9 @@ Build order: ADR-003 + ADR-001 + ADR-006 (parallel, no deps) --> ADR-002 --> ADR
 
 ## ADR-001: MLS Wrapper (OpenMLS Integration)
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amendment (2026-09-10 — the single ciphersuite is RFC 9420 ciphersuite 2).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. His reason, which he accepted as a recommendation: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. The single ciphersuite this ADR fixes therefore moves from `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` to `MLS_128_DHKEMP256_AES128GCM_SHA256_P256`, RFC 9420 ciphersuite 2, and the Decision and Implementation text below names the new value. The no-negotiation rule is untouched: this ADR fixes one ciphersuite and the ruling changed which one. SCP is pre-release, so no migration code follows.
 
 ### Context
 
@@ -36,12 +38,12 @@ MLS was selected over Sender Keys (Signal protocol) because member removal cost 
 
 ### Decision
 
-Wrap OpenMLS as `scp-core/crypto/mls/` module. Single ciphersuite: `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`. No ciphersuite negotiation in v1 (spec section 9.5). The wrapper exposes SCP-specific operations and hides OpenMLS internals behind a clean interface.
+Wrap OpenMLS as `scp-core/crypto/mls/` module. Single ciphersuite: `MLS_128_DHKEMP256_AES128GCM_SHA256_P256`. No ciphersuite negotiation in v1 (spec section 9.5). The wrapper exposes SCP-specific operations and hides OpenMLS internals behind a clean interface.
 
 ### Rationale
 
 - **OpenMLS over mls-rs:** OpenMLS is the most mature MLS implementation in Rust (more production usage, more contributors). mls-rs (by Wire) is a viable fallback if OpenMLS proves insufficient.
-- **Single ciphersuite:** Eliminates downgrade attacks and simplifies implementation. X25519 for key exchange, AES-128-GCM for encryption, SHA-256 for hashing, Ed25519 for signing. This is MLS's recommended baseline ciphersuite.
+- **Single ciphersuite:** Eliminates downgrade attacks and simplifies implementation. P-256 ECDH for key exchange, AES-128-GCM for encryption, SHA-256 for hashing, ECDSA on P-256 for signing. This is MLS's recommended baseline ciphersuite.
 - **Wrapper, not fork:** SCP does not modify MLS behavior. The wrapper translates between SCP concepts (context, agent, epoch) and MLS concepts (group, member, epoch) per the mapping in spec section 9.7.1.
 
 ### Implementation
@@ -63,7 +65,7 @@ Each function below must be implemented and tested:
 
 1. **`create_group(creator_identity, credential) -> MlsGroup`**
    - Creates a new MLS group with one member (the creator).
-   - Sets ciphersuite to `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`.
+   - Sets ciphersuite to `MLS_128_DHKEMP256_AES128GCM_SHA256_P256`.
    - Returns a group handle that wraps the OpenMLS `MlsGroup`.
    - The credential contains the creator's DID and UCAN token (spec section 9.7.1).
 
@@ -162,7 +164,7 @@ Two-layer envelope format:
 - `payload` — the actual message content (after bucket padding, Decision 3)
 - `provenance` — origin metadata (spec section 7.7)
 
-**Inner signature:** `Ed25519_sign(SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash || signing_key_id))`
+**Inner signature:** `P256_ECDSA_sign(SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash || signing_key_id))`
 
 The `signing_key_id` field (ADR-039) identifies which verification method signed the envelope (e.g., `"#active"` or `"#agent"`). It is included in the signature preimage to bind the signature to the specific key, and stored as a field on `InnerEnvelope` so verifiers can resolve the correct public key from the sender's DID document.
 
@@ -174,13 +176,13 @@ The inner signature is included inside the encrypted blob. Relays never see it. 
 
 - **Minimal outer envelope:** Relays are dumb pipes. They route by `routing_id`, store for `blob_ttl`, and delete. They learn nothing about who sent the message, what context it belongs to (only the pseudonym), or what it contains. This is the core of Decision 2.
 - **Per-context pseudonyms:** `routing_id` is derived deterministically from the sender's identity key and context ID via HMAC-SHA256. Same identity + same context = same pseudonym. Different context = different pseudonym. Relays cannot link activity across contexts (Decision 7).
-- **Signature inside encryption:** Moving the Ed25519 signature inside the encrypted blob hides the signer's identity from relays. Group members verify after decryption. This is a departure from the original spec (which had an outer Ed25519 signature) — the updated design per Decision 2 eliminates outer sender identity exposure.
+- **Signature inside encryption:** Moving the P-256 signature inside the encrypted blob hides the signer's identity from relays. Group members verify after decryption. This is a departure from the original spec (which had an outer P-256 signature) — the updated design per Decision 2 eliminates outer sender identity exposure.
 - **Bucket padding:** Plaintext is padded to fixed buckets (256B, 1KB, 4KB, 16KB, 64KB, 256KB) before encryption (Decision 3). This prevents relays from correlating message types by size. **Processing order: hash original plaintext -> hash provenance -> sign (covering both hashes) -> pad to bucket boundary -> sender-key encrypt -> MLS encrypt.** Padding occurs after signing so the signature covers the real payload content, not padding bytes. Padding integrity is guaranteed by the AEAD authenticated encryption layers (AES-256-GCM sender key and MLS), not by the inner signature.
 
 ### Implementation
 
 - **Language:** Rust
-- **Signing:** Ed25519 via the `ed25519-dalek` crate (or via OpenMLS's signing primitives)
+- **Signing:** ECDSA on P-256 via the `p256` crate (or via OpenMLS's signing primitives), producing the 64-byte raw `r || s` form of `09-security-model.md` §9.5
 - **Hashing:** SHA-256 via the `sha2` crate
 - **Pseudonym derivation:** HMAC-SHA256 via the `hmac` and `sha2` crates
 - **Serialization:** `serde` with MessagePack via `rmp-serde`
@@ -199,14 +201,14 @@ The inner signature is included inside the encrypted blob. Relays never see it. 
    - Delegates to `key_custody.derive_pseudonym(identity_key_handle, context_id)`.
    - Deterministic: same identity key + same context_id always produces the same pseudonym keypair.
    - Different `context_id` produces a different, unlinkable pseudonym.
-   - Uses `HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")` then `Ed25519_keygen(seed[0..32])`, where `seed[0..32]` is interpreted as an RFC-8032 Ed25519 seed. The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key (using the public key would be a membership-enumeration oracle — see §9.10.4.A and ADR-027). For software custody, `pseudonym_secret = HKDF-SHA256(ed25519_private_seed, salt="scp-pseudonym-secret-v1")`, which is cross-platform deterministic. For hardware custody (Android Keystore TEE, Secure Enclave) the `pseudonym_secret` is a device-local value computed inside the secure boundary (the private key is non-exportable), so hardware pseudonyms are device-local by design. The resulting PseudonymKeypair is software-managed.
+   - Uses `HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")` then `P256_keygen(seed_to_scalar(seed[0..32]))`, where the seed-to-scalar step is the one §9.10.4 of the security-model spec fixes. The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key (using the public key would be a membership-enumeration oracle — see §9.10.4.A and ADR-027). For software custody, `pseudonym_secret = HKDF-SHA256(p256_private_scalar, salt="scp-pseudonym-secret-v1")`, which is cross-platform deterministic. For hardware custody (Android Keystore TEE, Secure Enclave) the `pseudonym_secret` is a device-local value computed inside the secure boundary (the private key is non-exportable), so hardware pseudonyms are device-local by design. The resulting PseudonymKeypair is software-managed.
    - The pseudonym keypair's public key is the routing identifier used in outer envelopes.
 
 2. **`create_inner_envelope(context_id, sender_did, epoch, generation, sequence, timestamp, payload, provenance, signing_key, signing_key_id) -> InnerEnvelope`**
    - The `signing_key_id` parameter (ADR-039) identifies which verification method is signing (e.g., `"#active"` or `"#agent"`). Stored on the `InnerEnvelope` for verifier key resolution.
    - Computes `payload_hash = SHA256(payload)` — hash of the original plaintext BEFORE padding. Enables content-addressing and deduplication by recipients.
    - Computes `provenance_hash = SHA256(serialize(provenance))` if present, or `SHA256(0x00)` if absent.
-   - Computes `signature = Ed25519_sign(SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash || signing_key_id))`.
+   - Computes `signature = P256_ECDSA_sign(SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash || signing_key_id))`.
    - Pads payload to next bucket boundary (256B, 1KB, 4KB, 16KB, 64KB, 256KB) AFTER signing.
    - Returns the complete inner envelope struct with all fields (including padded payload, `signing_key_id`) + signature.
 
@@ -229,7 +231,7 @@ The inner signature is included inside the encrypted blob. Relays never see it. 
    - Resolves the correct public key from the sender's DID document using `inner_envelope.signing_key_id` (ADR-039). For example, `signing_key_id: "#active"` resolves to the `#active` verification method, `"#agent"` resolves to `#agent`.
    - Computes `provenance_hash = SHA256(serialize(provenance))` if provenance is present, or `SHA256(0x00)` if absent.
    - Recomputes `SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash || signing_key_id)`.
-   - Verifies the Ed25519 signature against the resolved public key.
+   - Verifies the P-256 signature against the resolved public key.
    - A mismatch indicates either payload tampering, provenance tampering, or signing key mismatch — all MUST be rejected.
 
 7. **`strip_padding(padded_payload) -> Payload`**
@@ -743,7 +745,7 @@ This subsection is the companion ADR-004 storage-semantics update mandated by sp
 **Validation on PUBLISH (cheapest-first).** When a validating relay receives a PUBLISH whose blob **decodes as a `DidRecordV1` frame**, it runs, in order — the whole path behind the existing per-IP PUBLISH rate limit:
 
 1. **Structural decode** (`DidRecordV1::decode`, §9.10.12). A blob that does not decode is *not a candidate DID record* — it is an opaque blob governed only by the slot-exclusivity rule below.
-2. **DID→routing_id binding.** Confirm `SHA-256("scp:did:" || did(public_key)) == routing_id`, where `did(public_key)` is the `did:dht` string derived from the frame's `public_key` (§9.6.1). A plain hash — **cheaper than a signature verify, so it runs before step 3.** A frame whose `public_key` does not hash to its `routing_id` is rejected (`DID_RECORD_REJECTED`), and — because the binding precedes the signature — a mis-addressed frame **never costs an Ed25519 verify**. This mirrors, on the data plane, the exact check `BRIDGE_REGISTER` already performs on the control plane (§10.12.4).
+2. **DID→routing_id binding.** Confirm `SHA-256("scp:did:" || did(public_key)) == routing_id`, where `did(public_key)` is the `did:dht` string derived from the frame's `public_key` (§9.6.1). A plain hash — **cheaper than a signature verify, so it runs before step 3.** A frame whose `public_key` does not hash to its `routing_id` is rejected (`DID_RECORD_REJECTED`), and — because the binding precedes the signature — a mis-addressed frame **never costs a signature verify**. This mirrors, on the data plane, the exact check `BRIDGE_REGISTER` already performs on the control plane (§10.12.4).
 3. **BEP44 signature.** Only for a blob that passed 1–2, verify the BEP44 signature over `bencode(seq, value)` against the frame's `public_key` (§9.10.12). Failure → rejected.
 4. **Single highest-sequence slot.** For a frame that passed 1–3, keep a single slot per `routing_id`: reject a frame whose `seq` is `≤` the stored slot's `seq` **unless** an equal-`seq` frame is byte-identical to the stored record (an idempotent TTL refresh — permitted, no error, refreshes storage lifetime), and replace the slot only on a strictly-higher valid `seq`. Two records at equal `seq` that are *not* byte-identical is a conflict and is rejected (§3.10.4).
 
@@ -900,7 +902,9 @@ pub enum TransportEvent {
 
 ## ADR-006: Platform Abstraction (In-Memory Testing Adapter)
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amendment (2026-09-10 — the `KeyCustody` key types are both P-256).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. His reason, which he accepted as a recommendation: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. The `KeyType` enum this ADR defines carried one variant per curve, `Ed25519` for signing and `X25519` for key agreement. Both variants now name P-256 keys and the enum distinguishes them by purpose rather than by curve: `P256Signing` and `P256Agreement`. Every method contract below reads the same way afterwards — `sign` rejects an agreement-only handle, `dh_agree` rejects a signing-only handle — because the split was always a purpose split and the curve names hid that. The pseudonym derivation gains the seed-to-scalar step of §9.10.4 of the security-model spec, because P-256 has no analogue of the seed expansion RFC 8032 fixed for the superseded curve. This ADR's adapter is the in-memory testing one, so no custody claim changes.
 
 ### Context
 
@@ -921,7 +925,7 @@ Implement in-memory versions of all four platform traits: `KeyCustody`, `DeviceA
 - **Language:** Rust
 - **Crate:** `scp-platform`
 - **Module:** `scp-platform/testing/`
-- **Dependencies:** `ed25519-dalek` for key generation, `rand` for randomness (with seedable RNG for determinism)
+- **Dependencies:** `p256` for key generation, `rand` for randomness (with seedable RNG for determinism)
 
 ### Dependencies
 
@@ -930,12 +934,12 @@ None. This is foundational. The traits it implements are defined in `scp-platfor
 ### Acceptance Criteria
 
 1. **`InMemoryKeyCustody`**
-   - `generate_keypair(key_type) -> KeyHandle`: Generates an Ed25519 or X25519 keypair in memory. Returns an opaque handle (integer ID). Private key stored in an internal `HashMap<u64, SigningKey>` (Ed25519) or `HashMap<u64, StaticSecret>` (X25519).
-   - `sign(key_handle, data) -> Signature`: Signs data with the Ed25519 private key associated with the handle. Returns error for X25519 handles.
-   - `public_key(key_handle) -> PublicKey`: Returns the public key for a handle (Ed25519 or X25519).
+   - `generate_keypair(key_type) -> KeyHandle`: Generates a P-256 signing or P-256 agreement keypair in memory. Returns an opaque handle (integer ID). Private key stored in an internal `HashMap<u64, SigningKey>` (P-256 signing) or `HashMap<u64, SecretKey>` (P-256 agreement).
+   - `sign(key_handle, data) -> Signature`: Signs data with the P-256 private key associated with the handle. Returns error for agreement-only handles.
+   - `public_key(key_handle) -> PublicKey`: Returns the public key for a handle (signing or agreement).
    - `destroy_key(key_handle) -> ()`: Removes the private key from the internal map. Subsequent operations with this handle fail.
-   - `dh_agree(key_handle, peer_public) -> SharedSecret`: Performs X25519 ECDH. Returns error for Ed25519 handles.
-   - `derive_pseudonym(key_handle, context_id) -> PseudonymKeypair`: Computes `HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`, derives an Ed25519 keypair from the first 32 bytes of the HMAC output (interpreted as an RFC-8032 seed). Returns error for X25519 handles. The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key — using public key bytes would be a membership-enumeration oracle (§9.10.4.A). For software custody (InMemory, Apple software, Android software) `pseudonym_secret = HKDF-SHA256(ed25519_private_seed, salt="scp-pseudonym-secret-v1")`, which is cross-platform deterministic and pinned by §25.19 vectors. For hardware custody (Apple Secure Enclave, Android Keystore TEE API 33+) the private key is non-exportable, so `pseudonym_secret` is a device-local value computed inside the secure boundary (e.g. Android uses `SHA-256(TEE_sign("scp-pseudonym-secret-v1"))`); hardware pseudonyms are device-local by design. See `.docs/lessons/kotlin/android-tee-pseudonym-derivation.md`.
+   - `dh_agree(key_handle, peer_public) -> SharedSecret`: Performs P-256 ECDH. Returns error for signing-only handles.
+   - `derive_pseudonym(key_handle, context_id) -> PseudonymKeypair`: Computes `HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`, derives a P-256 keypair from the first 32 bytes of the HMAC output (interpreted as an RFC-8032 seed). Returns error for agreement-only handles. The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key — using public key bytes would be a membership-enumeration oracle (§9.10.4.A). For software custody (InMemory, Apple software, Android software) `pseudonym_secret = HKDF-SHA256(p256_private_scalar, salt="scp-pseudonym-secret-v1")`, which is cross-platform deterministic and pinned by §25.19 vectors. For hardware custody (Apple Secure Enclave, Android Keystore TEE API 33+) the private key is non-exportable, so `pseudonym_secret` is a device-local value computed inside the secure boundary (e.g. Android uses `SHA-256(TEE_sign("scp-pseudonym-secret-v1"))`); hardware pseudonyms are device-local by design. See `.docs/lessons/kotlin/android-tee-pseudonym-derivation.md`.
    - `custody_type(key_handle) -> CustodyType::InMemory`.
    - Optionally accepts a seed for deterministic key generation in tests.
 
@@ -963,20 +967,20 @@ None. This is foundational. The traits it implements are defined in `scp-platfor
 /// The type of cryptographic key managed by this handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyType {
-    /// Ed25519 signing key (identity key, pseudonym keys).
-    Ed25519,
-    /// X25519 key agreement key (HPKE wrapping keys).
-    X25519,
+    /// P-256 signing key (identity key, pseudonym keys).
+    P256Signing,
+    /// P-256 key agreement key (HPKE wrapping keys).
+    P256Agreement,
 }
 
 pub trait KeyCustody: Send + Sync {
     /// Generate a new keypair of the specified type.
-    /// Ed25519 keys may be hardware-backed. X25519 wrapping keys are
+    /// P-256 keys may be hardware-backed. DHKEM(P-256) wrapping keys are
     /// always software-managed but routed through KeyCustody for API consistency.
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError>;
 
-    /// Sign data with an Ed25519 key.
-    /// Returns an error if the key handle refers to an X25519 key.
+    /// Sign data with a P-256 key.
+    /// Returns an error if the key handle refers to an agreement-only key.
     async fn sign(&self, key: &KeyHandle, data: &[u8]) -> Result<Signature, PlatformError>;
 
     /// Return the public key for a handle.
@@ -985,21 +989,21 @@ pub trait KeyCustody: Send + Sync {
     /// Destroy key material. Subsequent operations with this handle fail.
     async fn destroy_key(&self, key: &KeyHandle) -> Result<(), PlatformError>;
 
-    /// Perform X25519 Diffie-Hellman key agreement.
+    /// Perform P-256 Diffie-Hellman key agreement.
     /// Returns the 32-byte shared secret. The private key never leaves
     /// the custody boundary (scalar multiplication happens inside the adapter).
-    /// Returns an error if the key handle refers to an Ed25519 key.
+    /// Returns an error if the key handle refers to a signing-only key.
     async fn dh_agree(&self, key: &KeyHandle, peer_public: &[u8; 32]) -> Result<SharedSecret, PlatformError>;
 
     /// Derive a deterministic, context-scoped pseudonym keypair.
     ///
     /// Algorithm:
     ///   1. seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")
-    ///   2. pseudonym_keypair = Ed25519_keygen(seed[0..32])   // seed is an RFC-8032 Ed25519 seed
+    ///   2. pseudonym_keypair = P256_keygen(seed_to_scalar(seed[0..32]))  // §9.10.4
     ///
     /// The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key — using
     /// public key bytes would be a membership-enumeration oracle (§9.10.4.A).
-    /// For SOFTWARE custody, pseudonym_secret = HKDF-SHA256(ed25519_private_seed,
+    /// For SOFTWARE custody, pseudonym_secret = HKDF-SHA256(p256_private_scalar,
     /// salt="scp-pseudonym-secret-v1"); this is cross-platform deterministic and pinned
     /// by §25.19 known-answer vectors. For HARDWARE custody (Android Keystore TEE API 33+,
     /// Apple Secure Enclave) the private key is non-exportable, so pseudonym_secret is a
@@ -1009,7 +1013,7 @@ pub trait KeyCustody: Send + Sync {
     /// See .docs/lessons/kotlin/android-tee-pseudonym-derivation.md.
     ///
     /// The returned PseudonymKeypair is always software-managed (derived output).
-    /// Returns an error if the key handle refers to an X25519 key.
+    /// Returns an error if the key handle refers to an agreement-only key.
     async fn derive_pseudonym(&self, key: &KeyHandle, context_id: &[u8]) -> Result<PseudonymKeypair, PlatformError>;
 
     /// The custody type for a given key handle.
@@ -1122,7 +1126,7 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
        pub sender_did: DID,
        pub epoch: u64,
        pub signer_key_ref: SigningKeyId,  // Which VM signed: Active or Agent (ADR-039)
-       pub signature: Ed25519Signature,  // Signs context_id || sender_did || signer_key_ref || "key_epoch" || epoch
+       pub signature: P256Signature,  // Signs context_id || sender_did || signer_key_ref || "key_epoch" || epoch
    }
 
    /// Request for a sender's current key at a specific epoch.
@@ -1131,8 +1135,8 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
        pub requester_did: DID,
        pub sender_did: DID,        // Whose key is being requested
        pub epoch: u64,
-       pub wrapping_pubkey: X25519PublicKey,
-       pub signature: Ed25519Signature,
+       pub wrapping_pubkey: HpkeP256PublicKey,
+       pub signature: P256Signature,
    }
 
    /// Response with HPKE-encrypted sender key.
@@ -1141,12 +1145,12 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
        pub sender_did: DID,
        pub epoch: u64,
        pub hpke_sealed_key: Vec<u8>,   // HPKE(requester_wrapping_pubkey, sender_key)
-       pub ephemeral_pubkey: X25519PublicKey,
+       pub ephemeral_pubkey: HpkeP256PublicKey,
    }
    ```
 
    **4a. `publish_sender_key_epoch_advance(key_custody, mls_group, context_id, sender_did, epoch) -> MlsMessage`**
-   - Constructs a `SenderKeyEpochAdvance` signed by the sender's Active Signing Key or Agent Signing Key (ADR-039): `Ed25519_sign(signing_key, SHA-256(context_id || sender_did || signer_key_ref || "key_epoch" || epoch))`. The `signer_key_ref` field records which verification method signed (e.g., `"#active"` or `"#agent"`).
+   - Constructs a `SenderKeyEpochAdvance` signed by the sender's Active Signing Key or Agent Signing Key (ADR-039): `P256_ECDSA_sign(signing_key, SHA-256(context_id || sender_did || signer_key_ref || "key_epoch" || epoch))`. The `signer_key_ref` field records which verification method signed (e.g., `"#active"` or `"#agent"`).
    - Sends as an MLS application message (broadcast to all group members). **O(1) cost** regardless of group size.
    - Recipients verify the signature and record the new epoch for this sender.
 
@@ -1154,11 +1158,11 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
    - Receives a `SenderKeyRequest` from another member.
    - Verifies the request signature against `requester_did`.
    - Checks block list: if `requester_did` is blocked, returns `None` (no response, the requester cannot obtain the key).
-   - If not blocked: seals the current sender key to the requester's `wrapping_pubkey` using HPKE Base mode (RFC 9180). Suite: DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. The `info` parameter provides domain separation: `"scp-sender-key-v1" || context_id || sender_did || epoch_bytes`. The `aad` parameter binds context: `context_id || sender_did || epoch_bytes`. The HPKE `enc` (encapsulated key) is transmitted as `ephemeral_pubkey` and `ct` (AEAD ciphertext) as `hpke_sealed_key` in the response. See §9.16.2 for the full HPKE specification.
+   - If not blocked: seals the current sender key to the requester's `wrapping_pubkey` using HPKE Base mode (RFC 9180). Suite: DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. The `info` parameter provides domain separation: `"scp-sender-key-v1" || context_id || sender_did || epoch_bytes`. The `aad` parameter binds context: `context_id || sender_did || epoch_bytes`. The HPKE `enc` (encapsulated key) is transmitted as `ephemeral_pubkey` and `ct` (AEAD ciphertext) as `hpke_sealed_key` in the response. See §9.16.2 for the full HPKE specification.
    - Returns `Some(MlsMessage)` containing the `SenderKeyResponse`, sent with `recipient_hint` to the requester. **O(1) cost per request.**
 
    **4c. `request_sender_key(key_custody, mls_group, sender_did, epoch) -> MlsMessage`**
-   - Constructs a `SenderKeyRequest` with a fresh ephemeral X25519 wrapping keypair.
+   - Constructs a `SenderKeyRequest` with a fresh ephemeral DHKEM(P-256) wrapping keypair.
    - Signs the request with the requester's Active Signing Key or Agent Signing Key (ADR-039).
    - Sends as an MLS application message with `recipient_hint` to the sender. **O(1) cost.**
 
@@ -1179,9 +1183,9 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
 6. **`send_block_notification(key_custody, mls_group, context_id, blocked_did, blocker_did) -> MlsMessage`**
    - Sends a signed block notification as an MLS application message.
    - The blocker signs the notification with their Active Signing Key or Agent Signing Key (ADR-039) to prevent forgery by other group members (MLS authenticates group membership, not individual identity within application messages).
-   - Signature payload: `Ed25519_sign(signing_key, SHA-256(context_id || "block" || blocker_did || blocked_did || signing_key_id || timestamp))`.
+   - Signature payload: `P256_ECDSA_sign(signing_key, SHA-256(context_id || "block" || blocker_did || blocked_did || signing_key_id || timestamp))`.
    - Message content: `{ "type": "block", "blocker": blocker_did, "blocked": blocked_did, "signing_key_id": signing_key_id, "timestamp": unix_ms, "signature": blocker_signature }`.
-   - **Verification on receipt:** The receiver MUST resolve the correct public key from the claimed blocker's DID document using the `signing_key_id` field (ADR-039), then verify the Ed25519 signature. Both `#active` and `#agent` are accepted. Discard without action if verification fails. Log the discarded notification for anomaly detection.
+   - **Verification on receipt:** The receiver MUST resolve the correct public key from the claimed blocker's DID document using the `signing_key_id` field (ADR-039), then verify the P-256 signature. Both `#active` and `#agent` are accepted. Discard without action if verification fails. Log the discarded notification for anomaly detection.
    - On successful verification, the blocked party's client automatically calls `rotate_sender_key_for_block` excluding the blocker.
    - The block event is recorded in the context event log (ADR-011) with `EventType::MemberBlocked { blocker, blocked, signature }`.
 
@@ -1254,9 +1258,9 @@ Human and agent share ONE DID with three verification methods:
 
 ```
 DidDocument.verification_method = [
-  #0      — Identity Key (Ed25519, hardware-backed, never rotates, derives DID)
-  #active — Human Signing Key (Ed25519, human's operational key)
-  #agent  — Agent Signing Key (Ed25519, agent software key, rotatable)
+  #0      — Identity Key (P-256, hardware-backed, never rotates, derives DID)
+  #active — Human Signing Key (P-256, human's operational key)
+  #agent  — Agent Signing Key (P-256, agent software key, rotatable)
 ]
 ```
 
@@ -1344,7 +1348,7 @@ Fingerprint computation (§9.11) updated to include all three verification metho
 ```
 fingerprint = SHA256("SCP-KEY-CONTINUITY-V1:" || len(did_a) || did_a || len(did_b) || did_b || a_identity_key || a_active_key || a_agent_key || b_identity_key || b_active_key || b_agent_key)
 ```
-Where `len()` is a 4-byte big-endian length prefix preventing concatenation ambiguity. The `"SCP-KEY-CONTINUITY-V1:"` domain separator prevents cross-protocol signature confusion. Agent key absence uses a domain-derived sentinel `SHA-256("SCP-ABSENT-AGENT-KEY")` instead of zero bytes to avoid collision with the Ed25519 identity point.
+Where `len()` is a 4-byte big-endian length prefix preventing concatenation ambiguity. The `"SCP-KEY-CONTINUITY-V1:"` domain separator prevents cross-protocol signature confusion. Agent key absence uses a domain-derived sentinel `SHA-256("SCP-ABSENT-AGENT-KEY")` instead of zero bytes, so the sentinel cannot collide with any encoding of a P-256 point.
 
 ### Governance
 

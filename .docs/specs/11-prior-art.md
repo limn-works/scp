@@ -47,7 +47,7 @@ Hypercore and SCP's event logs serve a structurally similar function: tamper-evi
 | Structure | Append-only log, Merkle tree | Append-only log, Merkle tree |
 | Hash function | BLAKE2b-256 | SHA-256 |
 | Tree shape | Flat in-order (Ogham tree) | Standard binary Merkle |
-| Signing | Ed25519, single writer per log | Ed25519, multi-writer per context (MLS-authenticated) |
+| Signing | Ed25519, single writer per log | ECDSA on P-256, multi-writer per context (MLS-authenticated) |
 | Verification | Sparse — verify any entry without full history | Proof-of-inclusion and proof-of-absence |
 | Multi-writer | Autobase (app-layer DAG linearization over single-writer cores) | Native via MLS group membership — the group key proves write authority |
 | Encryption | None at log level; transport-level only (Noise XX + ChaCha20-Poly1305) | MLS + sender-side AES-256-GCM at log level |
@@ -144,7 +144,7 @@ SCP adopts the core self-certification property:
 - **DID string format:** `did:dht:<z-base-32>` — identical to the did:dht specification.
 - **BEP44 self-certification:** DID document signature verification against the key encoded in the DID string. The storage backend is untrusted; trust derives from the cryptographic binding between DID and document.
 - **Mainline DHT as resolution backend:** SCP uses Mainline DHT as one resolution layer (§3.10.3).
-- **Ed25519 as the identity key algorithm:** Same as did:dht.
+- **The identity key algorithm is no longer shared.** did:dht fixes Ed25519. SCP superseded Ed25519 on 2026-09-10 and every SCP key is now ECDSA on P-256 (`09-security-model.md` §9.5), so this property left the list of things SCP takes from did:dht on that date.
 
 ### 11.2.3 Where SCP Departs from did:dht
 
@@ -161,10 +161,10 @@ An attacker must suppress a DID document on ALL relays AND ALL reachable DHT nod
 
 **2. Multi-key verification method architecture (§3.9, ADR-039).** Standard did:dht uses a single Ed25519 keypair (the one encoded in the DID string) for everything — signing documents, authenticating, operating. SCP defines multiple verification methods per DID document:
 
-- **Identity Key (`#0`)** — the Ed25519 root key the inception event installs; the identifier is the inception event's digest, not an encoding of this key (`09-security-model.md` §9.7.4.2 R2, R13). Hardware-backed. Long-lived root of trust. Signs key events only — never day-to-day operations.
+- **Identity Key (`#0`)** — the P-256 root key the inception event installs; the identifier is the inception event's digest, not an encoding of this key (`09-security-model.md` §9.7.4.2 R2, R13). Hardware-backed. Long-lived root of trust. Signs key events only — never day-to-day operations.
 - **Human Signing Key (`#active`)** — the human's operational key for protocol actions (signing inner envelopes, MLS operations, capability delegation). Hardware-backed. Rotatable without changing the DID. Published in the DID document, authorized by the Identity Key.
 - **Pre-Rotation Key** — the key whose commitment (`SHA-256` over its public key under a registered domain, `09-security-model.md` §9.7.4.2) the inception event and every reveal-authorized event fix. Revealing it, with its signature, authorizes a `CommitmentRollover` or a `RootRecovery`. An attacker who steals `#0` cannot produce either, because the commitment was fixed before the compromise and the pre-rotation private key resides in custody independent of the operational path (`09-security-model.md` §9.7.4.1 item 3a).
-- **Agent Signing Key (`#agent`)** — optional. A software-held Ed25519 key for the human's agent to perform protocol operations autonomously. Published in the DID document, authorized by the human via self-delegation UCAN (`iss == aud`, same DID, with `fct.scp_key_scope: "#agent"`). The agent key is independently rotatable and revocable without affecting the human's keys. When present, protocol messages carry a `signing_key_id` field identifying which verification method produced the signature.
+- **Agent Signing Key (`#agent`)** — optional. A software-held P-256 key for the human's agent to perform protocol operations autonomously. Published in the DID document, authorized by the human via self-delegation UCAN (`iss == aud`, same DID, with `fct.scp_key_scope: "#agent"`). The agent key is independently rotatable and revocable without affecting the human's keys. When present, protocol messages carry a `signing_key_id` field identifying which verification method produced the signature.
 
 This separation of concerns (identity ≠ human signing ≠ agent signing ≠ rotation) is a significant security improvement over single-key DID methods. It provides: (a) recovery from key compromise without DID change, (b) custody separation between human and agent operations, and (c) structural action provenance — verifiers can determine whether a human or agent performed any given action by inspecting the `signing_key_id`, without trusting self-reported claims.
 
@@ -177,14 +177,14 @@ This separation of concerns (identity ≠ human signing ≠ agent signing ≠ ro
 ### 11.2.4 SCP's DID Implementation Independence
 
 SCP's identity layer is fully self-owned. The `scp-identity` crate implements:
-- Ed25519 key generation and management
+- P-256 key generation and management
 - z-base-32 encoding/decoding
 - BEP44 signature creation and verification
 - DID document construction and parsing
 - Dual-layer resolution via `DualLayerResolver`
 - DHT interaction via `DhtClient` trait (abstracted — not coupled to any specific DHT library)
 
-There is no dependency on any did:dht software, library, or infrastructure beyond the Mainline DHT network itself. SCP depends on BEP44 (a BitTorrent standard) and Ed25519 (universal cryptographic primitive), not on did:dht tooling. The DID string format is a convention (z-base-32 encoding of a public key), not a library dependency.
+There is no dependency on any did:dht software, library, or infrastructure. SCP depends on ECDSA on P-256, a primitive every enclave, passkey provider, FIDO2 token, TPM, and browser WebCrypto implementation speaks (`09-security-model.md` §9.5), and on no did:dht tooling. ADR-063, the inception-derived identity key-event log, removed the BEP44 record, the Mainline publish loop, and the z-base-32 DID string, so the paragraphs above describe the identity model ADR-063 superseded and the two lists below record what the `scp-identity` crate implemented under it.
 
 This independence is important because:
 - TBD (the original did:dht creator) shut down in November 2024
@@ -347,7 +347,7 @@ This interoperability layer means GNS can gradually coexist with DNS rather than
 
 | Dimension | GNS (RFC 9498) | SCP DID (§3, §11.2) |
 |-----------|----------------|----------------------|
-| **Identifier** | Zone public key (Ed25519/ECDSA) | did:dht string (z-base-32 Ed25519) |
+| **Identifier** | Zone public key (Ed25519/ECDSA) | Inception-event digest (ADR-063, the inception-derived identity key-event log) |
 | **Naming** | Petnames (local, memorable, non-global) | DID strings (global, unmemorable, unique) |
 | **Hierarchical delegation** | Yes (label.zone chains) | No (flat namespace) |
 | **Record privacy** | Encrypted at rest (ZKDF + AES/XSalsa20) | Plaintext DID documents (readable by anyone) |
@@ -620,7 +620,7 @@ SCP's relay model applies the same provider-blind principle (see also §11.4.6 f
 |----------|---------------------|---------------|
 | **Confidentiality** | AES-128-CTR, key in client-held capability | MLS group key (AES-128-GCM), distributed via MLS key schedule |
 | **Integrity** | Merkle hash trees + SHA-256d, roots embedded in caps | MLS authenticated encryption (AEAD) + event log Merkle trees |
-| **Unforgeability** | RSA-2048 signatures (mutable files), content-hash binding (immutable) | Ed25519 signatures on MLS messages + UCAN chain verification |
+| **Unforgeability** | RSA-2048 signatures (mutable files), content-hash binding (immutable) | P-256 signatures on MLS messages + UCAN chain verification |
 | **Relay/server access** | Sees encrypted shares + storage index | Sees encrypted blobs + pseudonym-derived routing IDs |
 | **Key management** | Embedded in capability URIs (no separate key distribution) | MLS key schedule (ratcheting, forward secrecy, post-compromise security) |
 
@@ -739,7 +739,7 @@ Tahoe's immutable files are write-once: the capability is derived from the conte
 | Dimension | Tahoe Mutable Files | SCP Event Logs (§7.3.1) |
 |-----------|--------------------|--------------------|
 | **Mutability model** | Replace-in-place (latest version wins) | Append-only (events accumulate) |
-| **Signing** | RSA-2048 (single writer per file) | Ed25519 via MLS (multi-writer per context) |
+| **Signing** | RSA-2048 (single writer per file) | ECDSA on P-256 via MLS (multi-writer per context) |
 | **Multi-writer** | Discouraged — "Prime Coordination Directive" warns of corruption | Native — MLS group membership defines write authority |
 | **Versioning** | Sequence number (64-bit monotonic counter) | MLS epoch + generation + sequence triple |
 | **Conflict resolution** | Last-writer-wins (no CRDT, no merge) | Ordered by MLS epoch (no conflict — append-only) |
@@ -788,7 +788,7 @@ Three ideas flow directly from Tahoe-LAFS into SCP's design:
 
 2. **Provider-independent security.** The principle that infrastructure operators should have zero access to the data they handle. Tahoe applied this to file storage (servers cannot read files). SCP applies it to message delivery (relays cannot read messages). Same principle, different scope. In both cases, the client/participant performs all encryption and the infrastructure handles only opaque ciphertext.
 
-3. **The math enforces access, not the infrastructure.** Tahoe's entire security model derives from the hardness of AES, SHA-256, and RSA — not from trusting servers to enforce permissions. SCP's security model derives from the hardness of AES-128-GCM (MLS AEAD), SHA-256 (Merkle trees, storage indices), and Ed25519 (signatures, DID binding) — not from trusting relays or governance servers. Both protocols are designed so that a fully adversarial infrastructure cannot compromise confidentiality or integrity. Only availability is at risk.
+3. **The math enforces access, not the infrastructure.** Tahoe's entire security model derives from the hardness of AES, SHA-256, and RSA — not from trusting servers to enforce permissions. SCP's security model derives from the hardness of AES-128-GCM (MLS AEAD), SHA-256 (Merkle trees, storage indices), and ECDSA on P-256 (signatures, identity binding) — not from trusting relays or governance servers. Both protocols are designed so that a fully adversarial infrastructure cannot compromise confidentiality or integrity. Only availability is at risk.
 
 The intellectual lineage: object-capability theory (Dennis & Van Horn 1966) → E language (Mark Miller 1997) → Tahoe-LAFS (Wilcox-O'Hearn & Warner 2007) → UCAN (Fission/Brooklyn Zelenka 2021) → SCP. Each step adds structure: E added language-level enforcement; Tahoe added cryptographic enforcement for distributed storage; UCAN added delegation, attenuation, and identity binding; SCP added governance, group encryption, and context isolation.
 
@@ -844,7 +844,7 @@ Cjdns (2011, Caleb James DeLisle) and Yggdrasil (2017, Neil Alexander and Arceli
 
 The core parallel with SCP is self-certifying identity. In cjdns, a node's IPv6 address is the first 16 bytes of SHA-512(SHA-512(Curve25519 public key)), constrained to the `fc00::/8` prefix (addresses whose double-hash does not start with `0xFC` are discarded, requiring brute-force key generation). In Yggdrasil, addresses fall within the `0200::/7` range (deprecated IETF space repurposed to avoid collisions with `fc00::/7`), derived from SHA-512 of the node's public key (Curve25519 in v0.1-v0.3, Ed25519 since v0.4) with a compression scheme that encodes the number of leading one-bits as a prefix byte.
 
-SCP's `did:dht:<z-base-32-Ed25519-public-key>` follows the same principle: the identifier IS the public key, no registration authority required, collision-resistant by construction. The difference is representational — cjdns and Yggdrasil encode keys as IPv6 addresses (lossy truncation), SCP encodes them as DID strings (lossless z-base-32). All three systems achieve the same property: verifying an identity requires only the identifier itself.
+SCP applies the same principle one step removed: its identifier is the digest of the inception event, and that event fixes the root key set, so no registration authority assigns an identifier and a collision requires a SHA-256 collision (`09-security-model.md` §9.7.4.2 R2). The difference is what each identifier commits to. cjdns and Yggdrasil hash one public key and truncate the digest into an IPv6 address, so an identifier there names a key and cannot survive rotation of it. SCP hashes an event that names a key set and a pre-rotation commitment, so the identifier survives every later rotation the log records. All three systems reach the same property at first contact: a verifier checks an identity against the identifier alone.
 
 ### 11.6.2 Routing
 

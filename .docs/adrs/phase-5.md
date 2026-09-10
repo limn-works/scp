@@ -109,7 +109,7 @@ pub struct ClaimRequest {
     pub platform_handle: String,
     pub identity_attestation: Attestation,  // §3.5 attestation binding handle to DID
     pub timestamp: u64,
-    pub signature: Ed25519Signature,
+    pub signature: P256Signature,
 }
 
 // claim_shadow returns Result<ShadowClaimEvent, ClaimError>
@@ -324,21 +324,23 @@ WebRTC library integration is platform-specific (webrtc-rs for native, browser W
 
 ## ADR-025: Apple Platform Adapter
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling and the passkey root custody ruling) — see the amendment below.
+
+**Amendment (2026-09-10 — every SCP key is ECDSA on P-256, and root custody defaults to a passkey).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519, and that root custody defaults to a passkey (`09-security-model.md` §9.7.4.1 item 4). This ADR's Context named the Secure Enclave's P-256-only support as "the key constraint shaping this ADR" and called it "not a limitation the protocol can design around". That sentence inverted cause and effect: Apple fixed the hardware and SCP chose the curve. Nobody chose Ed25519 — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5, and no ADR, planning session, or issue argued it against an alternative. Issue #392, the Secure Enclave key-custody request, was closed by an agent on that curve mismatch and reopened by Alec, who wrote that the "design space was not explored… Needs full research and a proper design decision". The research never happened; the issue was rescoped to biometric gating and closed. Alec's reason for P-256, which he accepted as a recommendation: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Three consequences for this ADR, each written into the text below. The Secure Enclave now holds SCP operational signing keys on Apple platforms, so the Rationale's "Why Keychain … not Secure Enclave" argument is withdrawn. Acceptance criterion 8, which forbade `AppleKeyCustody` from generating or using a Secure Enclave key for SCP signing, is inverted and restated. The root member is held by a passkey through Apple's passkey provider, so no Keychain generic-password item holds it.
 
 ### Context
 
 SCP's platform adapter layer (ADR-006) defines four traits: `KeyCustody`, `DeviceAttestation`, `Push`, and `Storage`. Phase 1-2 provided in-memory implementations for testing. The Apple platform adapter provides production implementations for iOS and macOS using Apple's hardware security APIs.
 
-The key constraint shaping this ADR: **Apple's Secure Enclave only supports P-256 (NIST P-256 / secp256r1) key operations**. SCP uses Ed25519 for signing and X25519 for key agreement — neither is natively supported in the Secure Enclave. This is not a limitation the protocol can design around; it is a hardware constraint. The consequence is that SCP identity and signing keys on iOS/macOS are software-backed via the Apple Keychain. The Secure Enclave is used exclusively for App Attest device attestation (which uses a Secure Enclave-backed P-256 key internally via `DCAppAttestService`).
+**Apple's Secure Enclave performs P-256 key operations and no others**, and since the curve ruling of 2026-09-10 every SCP key is a P-256 key, so the enclave holds every SCP operational signing key on iOS and macOS. `AppleKeyCustody` generates each such key inside the enclave, and the private bytes never leave it. Until 2026-09-10 this ADR read the same hardware fact in the opposite direction: SCP signed with Ed25519 and agreed keys with X25519, the enclave supported neither, and this paragraph called that "not a limitation the protocol can design around". The curve was SCP's to choose and the amendment above records who chose it and when.
 
-This design is consistent with §17.8: "Secure Enclave only supports P-256; Ed25519 keys are software-backed in Keychain." Android takes a different path — the Android Keystore TEE supports Ed25519 natively as of API 33. The Apple adapter does not pretend to offer hardware-backed key custody; it offers well-protected software custody with hardware-backed device attestation.
+The root member follows a different substrate again: `09-security-model.md` §9.7.4.1 item 4 makes a passkey the default root custody, which on Apple platforms is the system passkey provider rather than a Keychain generic-password item or an enclave key this adapter creates. §17.8 of the persistence spec names the Secure Enclave and the passkey in its Apple row. Android reaches the same hardware floor from API 23 (ADR-027, the Android platform adapter).
 
 The UniFFI bridge (ADR-021) exposes platform traits as callback interfaces. Swift implementations of `KeyCustodyProvider`, `StorageProvider`, and `PushProvider` are passed into the Rust engine at initialization. This means the Apple adapter is implemented in Swift and bridged into Rust through UniFFI's callback interface mechanism — not as a Rust implementation of the traits.
 
 ### What This ADR Will Decide
 
-- Key custody implementation: Keychain item storage for Ed25519 and X25519 keys (software-backed) and why the Secure Enclave is not used for signing keys.
+- Key custody implementation: Secure Enclave key generation for P-256 operational signing keys, Keychain item storage for the material the enclave cannot hold, and the passkey provider for the root member.
 - Device attestation implementation: App Attest (`DCAppAttestService`) for hardware-backed device attestation on iOS/macOS.
 - Push notification implementation: APNs with opaque payloads per §10.7.
 - Storage implementation: SQLCipher with Keychain-protected key derivation + `NSFileProtectionCompleteUntilFirstUserAuthentication` on iOS.
@@ -350,7 +352,7 @@ The UniFFI bridge (ADR-021) exposes platform traits as callback interfaces. Swif
 
 Implement the Apple platform adapter in Swift (`bindings/swift/Sources/SCP/Platform/`) as four Swift classes conforming to the UniFFI callback interfaces defined in `scp.udl` (ADR-021). The adapter is injected into the Rust engine at SDK initialization via UniFFI callback interface binding.
 
-**Key custody:** `AppleKeyCustody` stores Ed25519 and X25519 key material in the Apple Keychain as generic password items with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` protection. Keys are tagged with a `scp.key.<key_id>` label and access group `$(AppIdentifierPrefix).dev.limn.scp`. The Secure Enclave is not used for Ed25519/X25519 keys — the hardware does not support these key types. Signing operations and DH agreement are performed in software using the key material retrieved from Keychain. Private key bytes are never passed across the Swift/Rust FFI boundary; all signing and key agreement operations happen entirely within the Swift `AppleKeyCustody` implementation.
+**Key custody:** `AppleKeyCustody` generates each P-256 operational signing key inside the Secure Enclave through `SecKeyCreateRandomKey` with `kSecAttrTokenIDSecureEnclave`, and the enclave performs every signature and every ECDH agreement on that key. The enclave never releases the private bytes, so no code path exports them and none crosses the Swift/Rust FFI boundary. The Keychain holds the enclave key references and the material the enclave cannot hold, as generic password items with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` protection, tagged with a `scp.key.<key_id>` label and access group `$(AppIdentifierPrefix).dev.limn.scp`. The root member is held by the system passkey provider and this class neither generates nor stores it.
 
 **Device attestation:** `AppleDeviceAttestation` uses `DCAppAttestService` (App Attest). A Secure Enclave-backed P-256 key is generated via `generateKey(completionHandler:)`. Attestations are requested via `attestKey(_:clientDataHash:completionHandler:)` where `clientDataHash` is `SHA-256(challenge || deviceID)`. Assertions are generated via `generateAssertion(_:clientData:completionHandler:)` for subsequent operations. The attestation token is forwarded to the SCP relay for server-side verification via Apple's attestation service endpoints. On simulator and in environments where App Attest is unavailable, the adapter falls back to a software-only attestation with `method: .softwareOnly`.
 
@@ -360,8 +362,8 @@ Implement the Apple platform adapter in Swift (`bindings/swift/Sources/SCP/Platf
 
 ### Rationale
 
-**Why Keychain for Ed25519/X25519, not Secure Enclave:**
-The Secure Enclave is a coprocessor that generates and uses P-256 keys internally. It does not accept Ed25519 or X25519 key material from software and does not expose operations on those key types. The Secure Enclave cannot be used for SCP's signing or key agreement operations. This is a permanent hardware constraint, not an Apple software policy. The Keychain provides software-backed storage for Ed25519/X25519 keys with OS-enforced access controls. This is the correct tool for this job.
+**Why the Secure Enclave holds the operational signing keys:**
+The Secure Enclave is a coprocessor that generates P-256 keys and performs signature and ECDH operations on them without releasing the private bytes. Every SCP key is a P-256 key since 2026-09-10, so the enclave holds each operational signing key and the strongest custody Apple offers is the one SCP uses. Until that ruling this section argued the reverse from the same hardware fact, because SCP then signed with a curve the enclave does not implement; the amendment at the head of this ADR records why that argument rested on a curve choice rather than on the hardware.
 
 **Why App Attest for device attestation (not manual P-256):**
 App Attest is Apple's supported API for hardware-backed device attestation. It uses a Secure Enclave-backed P-256 key under the hood and ties the attestation to the device, the app, and the Apple App Attest service. Using App Attest means the protocol gets Secure Enclave security for attestation without managing P-256 keys manually. The alternative — manual P-256 Secure Enclave key management for attestation — would require building and operating an attestation verification service from scratch. App Attest provides this at no infrastructure cost.
@@ -383,9 +385,9 @@ Silent push (`content-available: 1`) is the only APNs payload format that satisf
 **Amendment (2026-03-08, #392):** `AppleKeyCustody` supports optional biometric authentication (Face ID / Touch ID) gating for key access operations. This is controlled by the `BiometricPolicy` parameter at initialization time.
 
 **Why biometric gating, not Secure Enclave key custody:**
-Issue #392 originally requested Secure Enclave-backed key custody. Analysis confirmed that the Secure Enclave only supports P-256 (NIST P-256 / secp256r1) -- it cannot generate, import, or operate on Ed25519 or X25519 keys. This is a permanent hardware constraint. The current Keychain-backed architecture matches the industry standard used by Signal, WhatsApp, and every other Curve25519-based protocol on Apple platforms: software key storage in Keychain with the Secure Enclave used exclusively for device attestation (P-256).
+Issue #392, the Secure Enclave key-custody request, asked for enclave-backed key custody. An agent closed it on the finding that the enclave performs P-256 operations and cannot generate, import, or operate on an Ed25519 or X25519 key, and Alec reopened it for research that never happened. The curve ruling of 2026-09-10 removed the mismatch that closure rested on, and the Key-custody paragraph above now places every operational signing key in the enclave. This section survives because biometric gating is a separate control that outlives the curve change.
 
-**The biometric enhancement** adds a second factor: the Keychain protects key material at rest, and biometric authentication gates key access at use time. This is the maximum security achievable for Ed25519/X25519 keys on Apple hardware.
+**The biometric enhancement** adds a second factor: the enclave holds the key material, and biometric authentication gates each use of it. Signal and WhatsApp hold Curve25519 keys in the Keychain because their protocols use that curve, so the enclave cannot hold them; SCP reaches enclave custody because it uses the curve the enclave implements.
 
 **Policy options:**
 - `BiometricPolicy.none` (default): Keys use `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`. No biometric prompt. Background operations work while the device is locked. This is the existing behavior.
@@ -409,10 +411,10 @@ If the device has no biometric hardware (e.g., older iPads, Mac mini), `.biometr
 |-----|--------------------|--------------------|-----------------|
 | Signal | Keychain (Curve25519) | No (no attestation) | Optional (app lock) |
 | WhatsApp | Keychain (Curve25519) | No (no attestation) | Optional (app lock) |
-| SCP (`.none`) | Keychain (Ed25519/X25519) | Yes (App Attest P-256) | No |
-| SCP (`.required`) | Keychain (Ed25519/X25519) | Yes (App Attest P-256) | Yes (per-operation) |
+| SCP (`.none`) | Secure Enclave (P-256) | Yes (App Attest P-256) | No |
+| SCP (`.required`) | Secure Enclave (P-256) | Yes (App Attest P-256) | Yes (per-operation) |
 
-SCP with `.required` provides the strongest custody model achievable on Apple platforms for Curve25519 keys: Keychain encryption at rest + biometric gate at use time + hardware-backed device attestation via App Attest.
+SCP with `.required` provides the strongest custody model Apple platforms offer: the private key never leaves the Secure Enclave, a biometric gate stands in front of each use of it, and App Attest supplies hardware-backed device attestation.
 
 ### Implementation
 
@@ -435,7 +437,7 @@ SCP with `.required` provides the strongest custody model achievable on Apple pl
 **Key platform API usage:**
 
 ```swift
-// AppleKeyCustody — store a generated Ed25519 key
+// AppleKeyCustody — store the reference to a Secure Enclave P-256 key
 let query: [String: Any] = [
     kSecClass as String:            kSecClassGenericPassword,
     kSecAttrAccount as String:      "scp.key.\(keyId)",
@@ -481,7 +483,7 @@ When an ephemeral context closes, `AppleKeyCustody.destroyKey(keyId:)`:
 2. Confirms deletion by attempting retrieval — verifies `errSecItemNotFound` is returned.
 3. Returns `DestructionAttestation { method: .softwareOnly, confirmed: true }`.
 
-Note: The Secure Enclave-backed P-256 key used by App Attest cannot be independently attested as destroyed by the protocol — it is managed entirely by `DCAppAttestService` and not used for SCP message keys. For SCP's Ed25519/X25519 Keychain keys, destruction is software-only. The `KeyDestructionAttestation.method` field is set to `.softwareOnly` to be honest about this trust level per §9.15.
+Note: The Secure Enclave-backed P-256 key used by App Attest cannot be independently attested as destroyed by the protocol — it is managed entirely by `DCAppAttestService` and not used for SCP message keys. For an SCP P-256 key the enclave holds, `destroyKey` deletes the Keychain reference and the enclave discards the key with it, and this adapter reports the outcome it can observe. The `KeyDestructionAttestation.method` field is set to `.softwareOnly` to be honest about this trust level per §9.15.
 
 **Compromise recovery (§9.12):**
 
@@ -505,13 +507,13 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
 ### Acceptance Criteria
 
 1. **`AppleKeyCustody` — Keychain storage:**
-   - `generateKeypair(keyType: KeyType) -> KeyHandle`: Generates an Ed25519 or X25519 keypair. Private key bytes stored in Keychain with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`. Returns an opaque handle (UUID string). Fails with `PlatformError.keychainError(OSStatus)` on Keychain failure. Called four times during identity creation when agent delegation is enabled (ADR-039): Identity Key, Active Signing Key, Pre-Rotation Key, and Agent Signing Key. The Agent Signing Key is always software-held (Keychain, not Secure Enclave) since it is designed for autonomous agent operation.
-   - `sign(keyHandle: String, data: Data) -> Data`: Retrieves Ed25519 private key from Keychain, signs `data`, returns 64-byte signature. Returns `PlatformError.wrongKeyType` for X25519 handles.
-   - `publicKey(keyHandle: String) -> Data`: Returns the 32-byte public key for a handle. Derived from the stored private key bytes.
+   - `generateKeypair(keyType: KeyType) -> KeyHandle`: Generates a P-256 keypair in the Secure Enclave, stores the key reference in Keychain with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, and returns an opaque handle (UUID string). Fails with `PlatformError.keychainError(OSStatus)` on Keychain failure. Called during identity creation for the Active Signing Key, the pre-rotation key, and, when agent delegation is enabled (ADR-039, the shared-DID human-agent identity model), the Agent Signing Key. It is not called for the root member, which the system passkey provider holds (`09-security-model.md` §9.7.4.1 item 4).
+   - `sign(keyHandle: String, data: Data) -> Data`: Asks the Secure Enclave to sign `data` under the referenced P-256 key and returns the 64-byte raw `r || s` signature of `09-security-model.md` §9.5, with `s` in the low half of the group order. Returns `PlatformError.wrongKeyType` for a handle whose key type does not sign.
+   - `publicKey(keyHandle: String) -> Data`: Returns the 33-byte SEC1 compressed P-256 public key for a handle.
    - `destroyKey(keyHandle: String)`: Deletes the Keychain item. Verifies deletion by confirming `errSecItemNotFound` on re-fetch. Returns `PlatformError.destructionFailed` if the item persists.
-   - `dhAgree(keyHandle: String, peerPublic: Data) -> Data`: Performs X25519 ECDH. Returns the 32-byte shared secret. Private key never leaves the `AppleKeyCustody` implementation boundary. Returns `PlatformError.wrongKeyType` for Ed25519 handles.
-   - `derivePseudonym(keyHandle: String, contextId: Data) -> PseudonymKeypair`: Computes `HMAC-SHA256(pseudonym_secret, contextId || "scp-pseudonym")`, derives an Ed25519 keypair from the first 32 bytes (interpreted as an RFC-8032 seed). The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key — public key bytes would be a membership-enumeration oracle (§9.10.4.A). For software-backed Keychain keys, `pseudonym_secret = HKDF-SHA256(ed25519_private_seed, salt="scp-pseudonym-secret-v1")`, which is cross-platform deterministic and matches the §25.19 vectors. For Secure Enclave keys the private key is non-exportable, so `pseudonym_secret` is a device-local value computed inside the enclave; those pseudonyms are device-local by design. Returns `PlatformError.wrongKeyType` for X25519 handles.
-   - `custodyType(keyHandle: String) -> CustodyType`: Returns `CustodyType.keychain`.
+   - `dhAgree(keyHandle: String, peerPublic: Data) -> Data`: Performs P-256 ECDH inside the Secure Enclave and returns the 32-byte shared secret, which is the x-coordinate of the agreed point. The private key never leaves the enclave. Returns `PlatformError.wrongKeyType` for a handle whose key type does not agree.
+   - `derivePseudonym(keyHandle: String, contextId: Data) -> PseudonymKeypair`: Computes `HMAC-SHA256(pseudonym_secret, contextId || "scp-pseudonym")`, derives a P-256 keypair from the first 32 bytes through the seed-to-scalar step of §9.10.4 of the security-model spec. The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key — public key bytes would be a membership-enumeration oracle (§9.10.4.A). A Secure Enclave key is non-exportable, so `pseudonym_secret` is a device-local value the enclave computes and those pseudonyms are device-local by design; a software-held key derives `pseudonym_secret = HKDF-SHA256(p256_private_scalar, salt="scp-pseudonym-secret-v1")`, which is cross-platform deterministic and matches the §25.19 vectors. Returns `PlatformError.wrongKeyType` for a handle whose key type does not derive.
+   - `custodyType(keyHandle: String) -> CustodyType`: Returns `CustodyType.secureEnclave` for a key the enclave holds and `CustodyType.keychain` for one it does not.
 
 2. **`AppleKeyCustody` — Keychain access:**
    - All Keychain items use `kSecAttrAccessGroup: "\(appIdentifierPrefix).dev.limn.scp"`.
@@ -567,14 +569,16 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
 7. **Conformance test suite:**
    - All four providers pass the platform trait conformance macros defined in `scp-platform/testing/` (ADR-006): `key_custody_conformance!()`, `storage_conformance!()`, `attestation_conformance!()`, `push_conformance!()`.
    - Tests run on real devices (CI must include a physical iOS device lane for Keychain and App Attest tests). Simulator-only tests use `#if targetEnvironment(simulator)` fallback paths.
-   - `AppleKeyCustody` round-trip test: `generateKeypair(.ed25519)` → `sign(data)` → `publicKey()` → verify signature → `destroyKey()` → confirm re-fetch fails.
+   - `AppleKeyCustody` round-trip test: `generateKeypair(.p256Signing)` → `sign(data)` → `publicKey()` → verify signature → `destroyKey()` → confirm re-fetch fails.
    - `AppleStorage` round-trip test: `store(key, data)` → `retrieve(key)` → `listKeys(prefix)` → `delete(key)` → `exists(key) == false`.
    - `AppleDeviceAttestation` test on real device: `attest()` returns non-empty token. On simulator: returns software-only token without crashing.
    - `ApplePushProvider` test: `register()` returns a non-empty token string. `handleNotification` rejects non-opaque payloads.
 
-8. **No Secure Enclave signing key:**
-   - `AppleKeyCustody` MUST NOT generate or use Secure Enclave P-256 keys for SCP signing operations. Secure Enclave is used exclusively by `AppleDeviceAttestation` via `DCAppAttestService`.
-   - This constraint is enforced by never importing `SecKeyCreateRandomKey` with `kSecAttrTokenIDSecureEnclave` in `AppleKeyCustody.swift`.
+8. **Secure Enclave signing keys (inverted by the 2026-09-10 amendment):**
+   - `AppleKeyCustody` MUST generate every P-256 operational signing key in the Secure Enclave through `SecKeyCreateRandomKey` with `kSecAttrTokenIDSecureEnclave`, and MUST perform every signature and every ECDH agreement on such a key inside the enclave.
+   - `AppleKeyCustody` MUST expose no operation that returns private key bytes, because the enclave cannot produce them and a software fallback that could would defeat this criterion.
+   - `AppleKeyCustody` MUST NOT generate or store the root member. `09-security-model.md` §9.7.4.1 item 4 places the root in the system passkey provider.
+   - Until the 2026-09-10 curve ruling this criterion read the other way and forbade every enclave signing key. The amendment at the head of this ADR records the ruling and the reason.
 
 9. **Key destruction verification (§9.15):**
    - `destroyKey` verifies deletion before returning.
@@ -592,7 +596,7 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
 
 | File | Purpose |
 |------|---------|
-| `bindings/swift/Sources/SCP/Platform/AppleKeyCustody.swift` | `KeyCustodyProvider` — Keychain storage, Ed25519 signing, X25519 DH, pseudonym derivation, key destruction |
+| `bindings/swift/Sources/SCP/Platform/AppleKeyCustody.swift` | `KeyCustodyProvider` — Secure Enclave key generation, P-256 signing, P-256 ECDH, pseudonym derivation, key destruction |
 | `bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift` | `DeviceAttestationProvider` — App Attest key generation, attestation, assertion, simulator fallback |
 | `bindings/swift/Sources/SCP/Platform/ApplePushProvider.swift` | `PushProvider` — APNs registration, opaque silent push payload enforcement |
 | `bindings/swift/Sources/SCP/Platform/AppleStorage.swift` | `StorageProvider` — SQLCipher-encrypted SQLite, Keychain key derivation, `NSFileProtection` |

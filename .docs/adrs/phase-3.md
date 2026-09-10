@@ -675,7 +675,7 @@ Phase 2 (ADR-009) defined the role assignment and capability ceiling enforcement
 
 ### Decision
 
-Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, building on the ADR-009 foundation) with full exposure through the PyO3 bridge (ADR-013) to Python. The validation module handles: UCAN token parsing, Ed25519 signature chain verification, capability matching against context ceilings, nonce uniqueness enforcement, revocation checking, expiry verification, and attenuation chain verification. The Python SDK exposes validation as both an explicit API (`scp_sdk.ucan.validate()`) and an implicit enforcement layer (every `Context.send()`, `Context.invoke()`, etc. validates capabilities internally).
+Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, building on the ADR-009 foundation) with full exposure through the PyO3 bridge (ADR-013) to Python. The validation module handles: UCAN token parsing, P-256 signature chain verification, capability matching against context ceilings, nonce uniqueness enforcement, revocation checking, expiry verification, and attenuation chain verification. The Python SDK exposes validation as both an explicit API (`scp_sdk.ucan.validate()`) and an implicit enforcement layer (every `Context.send()`, `Context.invoke()`, etc. validates capabilities internally).
 
 ### Rationale
 
@@ -688,7 +688,7 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
 ### Implementation
 
 - **Language:** Rust
-- **Library:** `rs-ucan` crate (or `ucan` crate — must support UCAN 0.10+ with mandatory nonce field). If no crate supports mandatory nonces, implement UCAN parsing and validation directly using `serde_json`, `ed25519-dalek`, and `base64`. [Note: replaced by native impl in scp-core/src/crypto/ucan/]
+- **Library:** `rs-ucan` crate (or `ucan` crate — must support UCAN 0.10+ with mandatory nonce field). If no crate supports mandatory nonces, implement UCAN parsing and validation directly using `serde_json`, `p256`, and `base64`. [Note: replaced by native impl in scp-core/src/crypto/ucan/]
 - **Crate:** `scp-core`
 - **Module:** `scp-core/crypto/ucan/` (extends the ADR-009 structure)
 - **Nonce storage:** In-memory `HashSet<String>` per context with 24-hour pruning, backed by `scp-platform` Storage trait for persistence across restarts.
@@ -709,12 +709,12 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
    pub struct UcanToken {
        pub header: UcanHeader,
        pub payload: UcanPayload,
-       pub signature: Ed25519Signature,
+       pub signature: P256Signature,
        pub encoded: String,            // Original encoded token (for signature verification)
    }
 
    pub struct UcanHeader {
-       pub alg: String,                // "EdDSA"
+       pub alg: String,                // "ES256"
        pub typ: String,                // "JWT" (UCAN is JWT-based)
        pub ucv: String,                // UCAN version, "0.10.0"
        pub kid: Option<String>,        // Key ID per RFC 7515 (ADR-039): identifies the issuer's
@@ -743,7 +743,7 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
 
 2. **`validate_ucan(context, token, required_capability) -> Result<(), UcanError>`:**
    - **Step 1 — Parse:** Decode the JWT-format UCAN token. Reject malformed tokens.
-   - **Step 2 — Signature verification:** Verify the Ed25519 signature on the token. The signature covers `base64url(header).base64url(payload)`. If the header contains `kid` (ADR-039), resolve the correct public key from the issuer's DID document using that verification method ID. If `kid` is absent, default to `#active`. At every link in the delegation chain, the `kid` (if present) identifies which key signed that particular token.
+   - **Step 2 — Signature verification:** Verify the P-256 signature on the token. The signature covers `base64url(header).base64url(payload)`. If the header contains `kid` (ADR-039), resolve the correct public key from the issuer's DID document using that verification method ID. If `kid` is absent, default to `#active`. At every link in the delegation chain, the `kid` (if present) identifies which key signed that particular token.
    - **Step 3 — Chain verification:** For each proof CID in `prf`, resolve the parent UCAN, verify its signature, and verify the parent's `aud` matches this token's `iss` (delegation chain integrity). Recurse until reaching a root token (empty `prf`).
    - **Step 4 — Root issuer:** Verify the root token's `iss` is the context creator's DID. Agent keys (`#agent`) cannot issue root UCANs — root UCAN issuance requires `#active` (the human signing key). This ensures human accountability at the root of every delegation chain (ADR-039).
    - **Step 5 — Audience:** Verify the token's `aud` matches the presenting agent's DID. Self-delegation (`iss == aud`) is valid when the token's `fct` contains `scp_key_scope` (ADR-039), indicating key-scope delegation (e.g., `fct.scp_key_scope: "#agent"` delegates authority from the human's `#active` key to their own `#agent` key on the same DID).
@@ -760,7 +760,7 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
    - The `signing_key_ref` parameter (ADR-039) identifies which verification method to sign with (e.g., `"#active"` or `"#agent"`). This value is stored in the UCAN header as `kid`.
    - Generates a unique nonce in `{unix_millis}-{hex16}` format (Unix millisecond timestamp, hyphen, 16 random bytes hex-encoded). This matches the validation format in Step 9.
    - Constructs the `att` array from the `capabilities` list, scoped to the context: `"scp:ctx:{context_id}/{capability}"`.
-   - Signs with the issuer's Ed25519 key identified by `signing_key_ref`.
+   - Signs with the issuer's P-256 key identified by `signing_key_ref`.
    - Returns the signed token.
 
 4. **`delegate_ucan(parent_token, delegator, delegatee, attenuated_capabilities) -> UcanToken`:**
@@ -1180,7 +1180,7 @@ pub struct PaymentReceipt {
     pub adapter_id: String,
     pub adapter_proof: Vec<u8>,
     pub timestamp: u64,
-    pub signature: Ed25519Signature,
+    pub signature: P256Signature,
 }
 
 pub struct VerificationResult {

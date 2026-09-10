@@ -153,17 +153,17 @@ The `did` parameter in `handle_deregister` is explicit rather than inferred from
 
 1. **Canonical payload.** The request payload is serialized to canonical JSON (keys sorted lexicographically, no whitespace, no trailing commas). This produces a deterministic byte sequence regardless of JSON serialization library.
 2. **Signed content.** The signed bytes are: `"SCP-HANDLE-OUTLET-V1:" || outlet_name || ":" || canonical_json_bytes`, where `outlet_name` is one of `"handle_register"`, `"handle_lookup"`, `"handle_deregister"`, `"scope_register"`, `"scope_lookup"`, `"scope_deregister"`, and `||` denotes byte concatenation. The domain prefix `"SCP-HANDLE-OUTLET-V1:"` prevents cross-protocol signature reuse. Scope outlets sign with their own outlet name (e.g., `"scope_register"`), not the corresponding handle outlet name (`"handle_register"`). This maintains domain separation — a signature over a scope registration cannot be replayed as a handle registration, and vice versa.
-3. **Signature algorithm.** Ed25519 using the requester's `#active` signing key (or `#agent` key if the request is agent-initiated under a valid UCAN delegation).
+3. **Signature algorithm.** ECDSA on P-256 with SHA-256 (§9.5 of the security-model spec), using the requester's `#active` signing key (or `#agent` key if the request is agent-initiated under a valid UCAN delegation).
 4. **Transport.** The signature is carried as an additional field in the outlet call request envelope:
    ```
    {
      "input": { ... },                    // the outlet's input payload
      "requester_did": "<DID>",            // explicit for verification
-     "signature": "<base64url(Ed25519-sign(signing_key, signed_content))>",
+     "signature": "<base64url(P256-ECDSA-sign(signing_key, signed_content))>",
      "signing_key_id": "#active"          // which verification method signed
    }
    ```
-5. **Writer verification.** The writer resolves the `requester_did` via DID document, extracts the public key for `signing_key_id`, and verifies the Ed25519 signature over the reconstructed `signed_content`. If verification fails, the request is rejected with a `BRIDGE_NOT_AUTHORIZED` error. The writer MUST verify that the DID document is fresh (fetched within the last 300 seconds or cached with valid TTL).
+5. **Writer verification.** The writer resolves the `requester_did` via DID document, extracts the public key for `signing_key_id`, and verifies the P-256 signature over the reconstructed `signed_content`. If verification fails, the request is rejected with a `BRIDGE_NOT_AUTHORIZED` error. The writer MUST verify that the DID document is fresh (fetched within the last 300 seconds or cached with valid TTL).
 
 **Two-tier model.** Handle outlets follow the same two-tier architecture as existing discovery outlets (§6.2.2B). Writers (MLS members) process handle registrations. Readers (DID-authenticated, unbounded) perform handle lookups. Registration is a write operation processed by writers; lookup is a read operation available to all.
 
@@ -1074,7 +1074,7 @@ Admin removal via governance produces standard governance events (§5.9), not `S
 | `token` | `Vec<u8>` (serde_bytes) | Yes | Platform-specific device token. |
 | `contexts` | `Vec<String>` | Yes | Context IDs to receive notifications for. |
 | `timestamp` | `u64` | Yes | Unix timestamp (seconds). |
-| `signature` | `Vec<u8>` (64 bytes) | Yes | Ed25519 signature — see construction below. |
+| `signature` | `Vec<u8>` (64 bytes) | Yes | P-256 signature — see construction below. |
 
 **Signature construction.** Per §9.5.1 canonical signed structure format, the signed bytes are the concatenation: `"SCP-PUSH-REGISTER-V1:" || BE32(len(did_bytes)) || did_bytes || platform_tag (1 byte) || BE32(len(token_bytes)) || token_bytes || contexts_encoded || timestamp (8-byte BE u64)`, where `contexts_encoded` is each context ID string prefixed by its 4-byte big-endian length. All variable-length fields use `BE32(len())` prefixes to prevent boundary-shift collisions (§9.5.1). Registrations are idempotent; re-registering with the same token replaces the previous registration for the same DID + platform combination.
 
@@ -1085,7 +1085,7 @@ Admin removal via governance produces standard governance events (§5.9), not `S
 | `did` | `String` (DID) | Yes | Registrant's DID. |
 | `platform` | `PushPlatform` | Yes | Platform to deregister from. |
 | `timestamp` | `u64` | Yes | Unix timestamp (seconds). |
-| `signature` | `Vec<u8>` (64 bytes) | Yes | Ed25519 signature — see construction below. |
+| `signature` | `Vec<u8>` (64 bytes) | Yes | P-256 signature — see construction below. |
 
 **Signature construction.** Per §9.5.1 canonical signed structure format, the signed bytes are the concatenation: `"SCP-PUSH-DEREGISTER-V1:" || BE32(len(did_bytes)) || did_bytes || platform_tag (1 byte) || timestamp (8-byte BE u64)`. All variable-length fields use `BE32(len())` prefixes to prevent boundary-shift collisions (§9.5.1). The domain separator prevents replay of registration signatures as deregistrations and vice versa.
 

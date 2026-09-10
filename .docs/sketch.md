@@ -19,8 +19,8 @@ SCP.Identity.create(
   deviceAttestation: DeviceAttestation     // Apple App Attest / Google Play Integrity
 ) → Identity {
   did,
-  identityKey,          // Ed25519 — derives the DID string, highest-security custody (ADR-003)
-  activeSigningKey,     // Ed25519 — MLS credentials, envelope signatures, UCAN issuance (rotatable)
+  identityKey,          // P-256 — derives the DID string, highest-security custody (ADR-003)
+  activeSigningKey,     // P-256 — MLS credentials, envelope signatures, UCAN issuance (rotatable)
   preRotationCommitment, // SHA-256(pre-rotation key public) — cold/offline custody
   custodyMethod
 }
@@ -441,7 +441,7 @@ Subscribers register via DID-signed requests. Open broadcasts grant access on re
 SCP.Broadcast.subscribe(
   context: contextID,
   as: Identity,
-  wrappingPubkey: X25519PublicKey,          // for HPKE-sealed key delivery
+  wrappingPubkey: HpkeP256PublicKey,          // for HPKE-sealed key delivery
   ucan: UcanToken?                          // required for gated contexts
 ) → Subscription {
   contextID,
@@ -485,7 +485,7 @@ SCP.Broadcast.publish(
 }
 ```
 
-Send path: validate UCAN (`messagesWrite`) -> assign sequence -> generate nonce -> hash plaintext -> sign (Ed25519 over `context_id || sender_did || sequence || key_epoch || timestamp || nonce || content_hash || provenance_hash`) -> AES-256-GCM encrypt with author broadcast key -> wrap in OuterEnvelope -> relay PUBLISH.
+Send path: validate UCAN (`messagesWrite`) -> assign sequence -> generate nonce -> hash plaintext -> sign (ECDSA on P-256 over `context_id || sender_did || sequence || key_epoch || timestamp || nonce || content_hash || provenance_hash`) -> AES-256-GCM encrypt with author broadcast key -> wrap in OuterEnvelope -> relay PUBLISH.
 
 ### Broadcast Context: Receive (§5.14.5)
 
@@ -505,7 +505,7 @@ SCP.Broadcast.receive(
 }
 ```
 
-Receive path: transport receive -> dedup by blob hash -> deserialize -> verify Ed25519 signature -> decrypt with cached author broadcast key -> verify content_hash -> verify author UCAN -> replay check (sequence number) -> deliver.
+Receive path: transport receive -> dedup by blob hash -> deserialize -> verify P-256 signature -> decrypt with cached author broadcast key -> verify content_hash -> verify author UCAN -> replay check (sequence number) -> deliver.
 
 ### Broadcast Context: Rotate Key / Block (§5.14.2, §5.14.8)
 
@@ -1431,7 +1431,7 @@ No sender DID. No context ID. No timestamp. No signature. The relay is a dumb pi
 
 ```json
 {
-  "header": { "alg": "EdDSA", "typ": "JWT", "ucv": "0.10.0" },
+  "header": { "alg": "ES256", "typ": "JWT", "ucv": "0.10.0" },
   "payload": {
     "iss": "did:dht:z6MkpT...",
     "aud": "agent:z6MkpT:ctx:z6Mkq8...",
@@ -1744,9 +1744,9 @@ SCP.Identity.fetchKeyPackage(
   keyPackageID: String,
   did: DID,
   hpkeInitKey: PublicKey,             // HPKE init key for Welcome message encryption
-  signatureKey: PublicKey,            // Ed25519 key matching their DID
+  signatureKey: PublicKey,            // P-256 key matching their DID
   credential: MLSCredential,
-  signature: Ed25519Signature
+  signature: P256Signature
 }
 
 // Rotate KeyPackages (triggered by key rotation or depletion)
@@ -1772,7 +1772,7 @@ SCP.Relay.generateCheckpoint(
   merkleRoot: [UInt8; 32],
   epoch: UInt64,                      // current MLS epoch
   timestamp: DateTime,
-  signature: Ed25519Signature
+  signature: P256Signature
 }
 
 // Verify a received checkpoint against local state
@@ -1887,7 +1887,7 @@ SCP.Security.destroyContextKeys(
   trustLevel: .high                    // hardware-attested destruction
             | .moderate                // software-only deletion
             | .none,                   // no attestation available
-  signature: Ed25519Signature          // signed by identity key, NOT the destroyed key
+  signature: P256Signature          // signed by identity key, NOT the destroyed key
 }
 
 // Verify a destruction attestation from another member
@@ -1957,7 +1957,7 @@ SCP.Economy.paymentHistory(
   adapterId: String,
   adapterProof: Data,             // x402: tx hash, Lightning: preimage, SPL: tx sig
   timestamp: DateTime,
-  signature: Ed25519Signature     // signed by payer
+  signature: P256Signature     // signed by payer
 }]
 ```
 

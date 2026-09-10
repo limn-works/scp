@@ -47,7 +47,7 @@ Implement `scp-core/trust/` module. Participation records are computed locally f
 - **Language:** Rust
 - **Crate:** `scp-core`
 - **Module:** `scp-core/trust/`
-- **Dependencies:** `sha2` (hashing), `ed25519-dalek` (signature verification)
+- **Dependencies:** `sha2` (hashing), `p256` (signature verification)
 
 ### Dependencies
 
@@ -88,7 +88,7 @@ pub struct Attestation {
     pub expires_at: Option<u64>,
     pub renewal_interval: Option<Duration>,
     pub revocation_status: RevocationStatus,
-    pub signature: Ed25519Signature,
+    pub signature: P256Signature,
 }
 
 pub enum AttestationType {
@@ -109,7 +109,7 @@ pub struct ChallengeRequest {
     pub subject_did: DID,
     pub parameters: serde_json::Value,
     pub timeout: Duration,
-    pub signature: Ed25519Signature,
+    pub signature: P256Signature,
 }
 
 pub struct ChallengeResponse {
@@ -117,7 +117,7 @@ pub struct ChallengeResponse {
     pub responder_did: DID,
     pub result: serde_json::Value,
     pub completed_at: u64,
-    pub signature: Ed25519Signature,
+    pub signature: P256Signature,
 }
 
 pub struct ConsequenceRule {
@@ -163,7 +163,7 @@ pub struct TrustInput {
    - Pure computation — no side effects, no storage.
 
 3. **`verify_attestation(attestation) -> Result<(), TrustError>`**
-   - Verifies Ed25519 signature against issuer's public key (resolved via DID).
+   - Verifies P-256 signature against issuer's public key (resolved via DID).
    - Validates evidence per attestation type.
    - Checks expiry: rejects if `expires_at < now`.
    - Checks revocation: queries revocation status.
@@ -820,7 +820,7 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
 
         // Returns [pseudonym_public_key_bytes(32) || key_id_utf8_bytes].
         // Algorithm: seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym"),
-        // Ed25519_keygen(seed[0..32]). The HMAC key is the pseudonym_secret, NOT the
+        // P256_keygen(seed_to_scalar(seed[0..32])). The HMAC key is the pseudonym_secret, NOT the
         // public key: software derives it from the private seed via HKDF (cross-platform
         // deterministic); hardware TEE uses a device-local secret (§9.10.4.A).
         [Throws=ScpError]
@@ -867,7 +867,7 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
     };
     ```
 
-    - `KeyCustodyProvider`: Swift implementation wraps Keychain (Secure Enclave supports P-256 only; SCP uses Ed25519 — see ADR-025); Kotlin implementation wraps Android Keystore.
+    - `KeyCustodyProvider`: the Swift implementation generates each P-256 key in the Secure Enclave (ADR-025, the Apple platform adapter, as its 2026-09-10 amendment states); the Kotlin implementation wraps Android Keystore.
     - `StorageProvider`: Swift implementation wraps SQLCipher-encrypted SQLite with Keychain-protected key (ADR-025); Kotlin implementation wraps SQLCipher with Android Keystore-protected key (ADR-027).
     - `PushProvider`: Swift implementation wraps APNs; Kotlin implementation wraps FCM.
     - `DeviceAttestationProvider`: Swift implementation wraps `DCAppAttestService` (App Attest) on iOS/macOS; Kotlin implementation wraps Play Integrity API on Android. Used by ADR-025 (Apple Platform Adapter) and the Android adapter.

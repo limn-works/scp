@@ -177,7 +177,7 @@ OutletRegistration {
                                      // ≤ 1 KiB UTF-8. Covered by the V2 signature preimage via
                                      // `catalog_hash` (below).
   registered_at:    u64,             // Unix timestamp (seconds) of registration.
-  signature:        Ed25519Signature, // Operator DID signs the V2 canonical digest below.
+  signature:        P256Signature, // Operator DID signs the V2 canonical digest below.
 }
 
 OutletKind {
@@ -392,7 +392,7 @@ OutletStreamChunk {
   request_id:  [u8; 16],
   sequence:    u64,              // strictly monotonic per request_id, starting at 0
   payload:     ChunkPayload,
-  sig:         Ed25519Signature, // operator's signature; preimage below
+  sig:         P256Signature, // operator's signature; preimage below
 }
 
 ChunkPayload {
@@ -419,7 +419,7 @@ OutletStreamCredit {
   monotonic_seq: u64,                     // per-(request_id) monotonic grant counter,
                                           // starting at 0. Duplicates and regressions
                                           // are rejected as CreditReplay (§5.4.5).
-  sig:           Ed25519Signature,        // invoker's signature; preimage below
+  sig:           P256Signature,        // invoker's signature; preimage below
 }
 ```
 
@@ -469,7 +469,7 @@ This ordering closes the slot-burn DoS where a forged-`iss` open that fails UCAN
 
 See also the cross-context outlet invocation modes (§6.2.5) and the cross-context outlet invocation saga (§6.2.4; ADR-061), which govern these parameters at cross-context acceptance.
 
-**Per-chunk operator signature.** Every `OutletStreamChunk.sig` is the operator's Ed25519 signature over
+**Per-chunk operator signature.** Every `OutletStreamChunk.sig` is the operator's P-256 signature over
 
 ```
 SHA-256(
@@ -491,7 +491,7 @@ Per-chunk signing closes the **equivocation** gap: without per-chunk signatures,
 
 **Credit-based backpressure.** Each stream opens with `credit_window` chunks of headroom. The executor may emit up to that many Data/Progress chunks before it must wait for an `OutletStreamCredit` grant. End and Error are terminal and do NOT consume credit — an executor can always close a stream. The default window is `ContextParams::stream_window_default` (default 32). Consumers grant credit as they process chunks. A stream whose credit reaches zero and is not replenished within `stream_credit_stall_secs` (default 30) is cancelled with `OutletErrorClass::Execution::CreditStall`.
 
-**Credit grant signature.** Every `OutletStreamCredit` MUST carry the invoker's Ed25519 signature in `sig`, over the preimage:
+**Credit grant signature.** Every `OutletStreamCredit` MUST carry the invoker's P-256 signature in `sig`, over the preimage:
 
 ```
 SHA-256(
@@ -540,7 +540,7 @@ Mapping a teardown to `RevokedMidStream` would (a) write a false audit signal �
 
 **Cancellation and billing boundary.** The existing `OutletCancel` message cancels a stream by `request_id`. The executor-side framework handles `OutletCancel` receipt as follows: (1) it records `cancel_ack_seq = current emission cursor` (the next-to-emit sequence number, pinned at the moment of cancel arrival, so chunks already in flight at that sequence are NOT counted as billable above the cutoff); (2) it arms the `stream_cancel_ack_secs` timer (default 5s); (3) it emits exactly one terminal chunk (`End` or `Error { terminal: true }`) within the window — this terminal chunk is the **cancel-ack**, and its `sequence` is the authoritative **cancel-ack sequence** written into the event log; (4) on terminal chunk emission the framework flushes stream state (clears the pinning record from the stream table, releases escrow, releases the chain-depth slot). If the timer fires before the executor emits a terminal chunk, the framework forces the stream closed with `OutletErrorClass::Execution::CancelAckTimeout` (code `SCP-OUTLET-6135`, slug `execution.cancel-ack-timeout`) and writes its own terminal `Error { terminal: true }` chunk at the next-to-emit sequence. A receiver MAY ignore chunks with sequence greater than the cancel-ack sequence, but the executor MUST NOT emit Data/Progress chunks with sequence greater than the cancel-ack sequence.
 
-**Cancel signature (round 7 cancel-auth tightening).** Every streaming `OutletCancel` MUST carry the invoker's Ed25519 signature in `sig`, over the preimage:
+**Cancel signature (round 7 cancel-auth tightening).** Every streaming `OutletCancel` MUST carry the invoker's P-256 signature in `sig`, over the preimage:
 
 ```
 SHA-256(
@@ -823,11 +823,11 @@ MetadataRecord {
     timestamp:        u64,            // Unix milliseconds, informational (not used for ordering)
     structural:       StructuralMetadata,
     operational:      FilteredOperationalMetadata,  // Filtered by MetadataVisibilityPolicy
-    signature:        Ed25519Signature,
+    signature:        P256Signature,
 }
 
 Signature formula:
-Ed25519_sign(active_signing_key, SHA-256(
+P256_ECDSA_sign(active_signing_key, SHA-256(
     context_id || sequence || signer_did || timestamp || serialize(structural) || serialize(operational)
 ))
 ```
@@ -836,7 +836,7 @@ Ed25519_sign(active_signing_key, SHA-256(
 
 **Replay protection.** Consumers of metadata records (prospective members, relay caches, SDK metadata fetchers) MUST reject any metadata record with a `sequence` number less than or equal to the highest `sequence` they have previously observed for that `context_id`. This prevents a relay or network attacker from serving stale metadata to misrepresent a context's current state (e.g., showing a narrower ceiling that has since been expanded, or hiding a governance model change).
 
-**Signer verification.** A prospective member verifying a metadata record: (1) resolves the `signer_did` via DID resolution (§3), (2) extracts the `#active` verification method, (3) verifies the Ed25519 signature, (4) cannot independently verify that the signer is a current admin without joining (admin status is internal context state). The signature guarantees that the metadata was produced by the claimed DID; the `signer_did` being an admin is a social-layer assurance, not a cryptographic one. Once a member joins and has access to the membership roster and role assignments, they can retroactively verify that the signer held admin status at the time of signing.
+**Signer verification.** A prospective member verifying a metadata record: (1) resolves the `signer_did` via DID resolution (§3), (2) extracts the `#active` verification method, (3) verifies the P-256 signature, (4) cannot independently verify that the signer is a current admin without joining (admin status is internal context state). The signature guarantees that the metadata was produced by the claimed DID; the `signer_did` being an admin is a social-layer assurance, not a cryptographic one. Once a member joins and has access to the membership roster and role assignments, they can retroactively verify that the signer held admin status at the time of signing.
 
 **Staleness.** The protocol does not define a hard metadata TTL — metadata validity is determined by the `sequence` number, not by age. However, SDKs SHOULD re-fetch metadata before presenting it to a user for a join decision if the cached record is older than 5 minutes, as a defense-in-depth measure against stale cache attacks.
 
@@ -952,7 +952,7 @@ TTL extension is a governance action with additional consent requirements beyond
    TTLExtensionConsent {
      proposal_id: [u8; 32],     // Hash of the TTL extension proposal
      consented: bool,           // true = consent, false = reject
-     signature: Ed25519Signature,
+     signature: P256Signature,
    }
    ```
 4. **Consent deadline.** Members have 24 hours to respond. Members who do not respond within 24 hours are treated as having rejected the extension. This prevents indefinite extension of a context that a member expected to be temporary.
@@ -984,7 +984,7 @@ EphemeralDeletionRequest {
     close_event_hash: [u8; 32],  // Hash of the ContextClosed event in the Merkle log
     merkle_root: [u8; 32],       // Current Merkle root of the context's event log
   },
-  signature:    Ed25519Signature, // Signed by requester's #active or #agent key
+  signature:    P256Signature, // Signed by requester's #active or #agent key
 }
 ```
 
@@ -1254,7 +1254,7 @@ sdk.create_context(params: ContextParams {
 
 #### 5.12.3.1 InvitationBundle Wire Format
 
-The invitation bundle is the single-delivery package that enables zero-roundtrip context joining. It is serialized as MessagePack (§17.5) and encrypted to the invitee's public key (X25519, derived from their Ed25519 identity key via RFC 7748 birational mapping).
+The invitation bundle is the single-delivery package that enables zero-roundtrip context joining. It is serialized as MessagePack (§17.5) and encrypted to the invitee's `scp_wrapping_key` (`0xFF01`), the DHKEM(P-256) HPKE key its published KeyPackage carries (§9.5.2).
 
 ```
 InvitationBundle {
@@ -1280,7 +1280,7 @@ InvitationBundle {
                                           // fields are derived from context_params and MUST agree
                                           // with them; its operational fields carry runtime state
                                           // (member count, age, name) not present in context_params.
-  signature:          Ed25519Signature    // Creator signs all fields above (see Signature scope).
+  signature:          P256Signature    // Creator signs all fields above (see Signature scope).
 }
 
 InvitationKeyMaterial {
@@ -1308,18 +1308,18 @@ MetadataSnapshot {
 5. If accepted, install authority from the verified `context_params` and process `welcome_message` via MLS to join the group (Encrypted contexts) or initialize subscriber state (Broadcast contexts).
 6. Use `context_metadata_key` to derive the metadata routing ID for ongoing metadata retrieval.
 
-**HPKE encryption.** The serialized `InvitationBundle` (and, symmetrically, the `JoinResponse` of §5.12.3.2) is encrypted to the recipient with HPKE Base mode (RFC 9180) using the SCP HPKE suite (§9.5): DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. The recipient X25519 public key is derived from their Ed25519 identity key via RFC 7748 birational mapping. The HPKE `info` and `aad` parameters are:
+**HPKE encryption.** The serialized `InvitationBundle` (and, symmetrically, the `JoinResponse` of §5.12.3.2) is encrypted to the recipient with HPKE Base mode (RFC 9180) using the SCP HPKE suite (§9.5): DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. **The recipient key is the recipient's `scp_wrapping_key` (`0xFF01`) leaf extension value** — the stable DHKEM(P-256) HPKE key of §9.16.2, which the inviter reads from the KeyPackage it already fetched to build the Welcome, and which the joiner reads from the ratchet tree the Welcome delivered. No party derives an HPKE key from an identity key: §9.7.4.1 item 4 of the security-model spec holds the root in a substrate that signs and performs no Diffie-Hellman agreement, and P-256 offers no cross-algorithm mapping of the kind RFC 7748 defines for the superseded curve. The `scp_wrapping_key` carries a separate HPKE domain separator per protocol, so this use never collides with sender-key distribution (§9.16.2). The HPKE `info` and `aad` parameters are:
 
 ```
 info = "scp-invitation-v1" || len(context_id) || context_id || len(creator_did) || creator_did
 aad  = "scp-invitation-aad-v1" || len(context_id) || context_id || len(creator_did) || creator_did
 ```
 
-Where `context_id` and `creator_did` are UTF-8 bytes, each preceded by a 4-byte big-endian unsigned length prefix (`len(...)`) per the §9.5.1 encoding rules. The wire output is `(enc, ct)` where `enc` is the 32-byte HPKE encapsulated key and `ct` is the AEAD ciphertext-and-tag — the RFC 9180 KEM context binds `enc` into the key schedule (`kem_context = enc || pkRm`, RFC 9180 §4.1), so `enc` is NOT additionally carried in `aad`. The `"scp-invitation-v1"` / `"scp-invitation-aad-v1"` domain separators are distinct from sender-key (`"scp-sender-key-v1"`), access-key (`"scp-access-key-v1"`), broadcast-key (`"scp-broadcast-key-v1"`), and private-state (`"scp-private-state-v1"`) HPKE strings.
+Where `context_id` and `creator_did` are UTF-8 bytes, each preceded by a 4-byte big-endian unsigned length prefix (`len(...)`) per the §9.5.1 encoding rules. The wire output is `(enc, ct)` where `enc` is the 65-byte HPKE encapsulated key that RFC 9180 §7.1 fixes for DHKEM(P-256) and `ct` is the AEAD ciphertext-and-tag — the RFC 9180 KEM context binds `enc` into the key schedule (`kem_context = enc || pkRm`, RFC 9180 §4.1), so `enc` is NOT additionally carried in `aad`. The `"scp-invitation-v1"` / `"scp-invitation-aad-v1"` domain separators are distinct from sender-key (`"scp-sender-key-v1"`), access-key (`"scp-access-key-v1"`), broadcast-key (`"scp-broadcast-key-v1"`), and private-state (`"scp-private-state-v1"`) HPKE strings.
 
 #### 5.12.3.2 JoinResponse Wire Format
 
-After accepting an invitation bundle, the invitee sends a join response back to the creator via the relay. The response is serialized as MessagePack and encrypted to the creator's public key.
+After accepting an invitation bundle, the invitee sends a join response back to the creator via the relay. The response is serialized as MessagePack and encrypted to the creator's `scp_wrapping_key` (`0xFF01`) leaf extension value, which the joiner reads from the ratchet tree the Welcome delivered.
 
 ```
 JoinResponse {
@@ -1331,7 +1331,7 @@ JoinResponse {
                                         // (§9.16). Encrypted to the context's current
                                         // sender key distribution mechanism.
   timestamp:        u64                 // Unix timestamp (seconds) of the join.
-  signature:        Ed25519Signature    // Joiner signs all fields above with #active key.
+  signature:        P256Signature    // Joiner signs all fields above with #active key.
 }
 ```
 
@@ -1357,9 +1357,9 @@ Operation                              Time          Analogy
 ─────────────────────────────────────────────────────────────────
 Template params lookup                 <1μs          HashMap::get()
 MLS group init (2-member)              1-5ms         TLS handshake
-Sender key generation (HKDF+Ed25519)   <1ms          Key derivation
+Sender key generation (HKDF+P-256)   <1ms          Key derivation
 Event log init (empty Merkle tree)     <1ms          Allocate a buffer
-UCAN token minting (Ed25519 sign)      1-2ms         Sign a JWT
+UCAN token minting (ES256 sign)        1-2ms         Sign a JWT
 Pseudonym derivation (HMAC-SHA256)     <1ms          HMAC
 State persistence (serialize+write)    1-5ms         Write to keychain
 ─────────────────────────────────────────────────────────────────
@@ -1582,7 +1582,7 @@ Eligible pool for child: [Alice, Bob, Carol, Dave, Eve]
        attester_did: DID,                 // The governance-capable member signing this
        attested_at: u64,                  // Unix timestamp of attestation
        valid_until: u64,                  // Expiry (suggested: attested_at + 3600s)
-       signature: Ed25519Signature,       // Attester's signature over the above fields
+       signature: P256Signature,       // Attester's signature over the above fields
      }
      ```
 
@@ -1642,7 +1642,7 @@ ChildCreationProposal {
     parent_context_id:  ContextId,            // The parent publishing this proposal
     created_at:         u64,                  // Unix milliseconds
     expires_at:         u64,                  // Unix milliseconds (created_at + timeout)
-    approval_signature: Ed25519Signature,     // Governance approval signature (admin #active key)
+    approval_signature: P256Signature,     // Governance approval signature (admin #active key)
 }
 
 Matching hash (content-addressed):
@@ -1912,7 +1912,7 @@ Each author holds an AES-256-GCM broadcast key with a monotonic epoch counter. T
 
 **Key derivation:** New keys on rotation are freshly generated random 32-byte AES-256 keys (not HKDF-derived from a master secret). This provides key independence — compromise of one epoch's key reveals nothing about other epochs.
 
-**HPKE parameters for broadcast key distribution.** Broadcast key distribution uses HPKE Base mode (RFC 9180) with the same suite as sender key distribution (§9.16.2): DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. The `info` and `aad` parameters use a distinct domain separator:
+**HPKE parameters for broadcast key distribution.** Broadcast key distribution uses HPKE Base mode (RFC 9180) with the same suite as sender key distribution (§9.16.2): DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. The `info` and `aad` parameters use a distinct domain separator:
 
 ```
 info = "scp-broadcast-key-v1" || len(context_id) || context_id || len(author_did) || author_did || epoch_bytes
@@ -1933,10 +1933,10 @@ Subscribers register via DID-signed requests — the same pattern context reader
 ```rust
 pub struct SubscriberRegistration {
     pub subscriber_did: DID,
-    pub wrapping_pubkey: X25519PublicKey,
+    pub wrapping_pubkey: HpkeP256PublicKey,
     pub ucan: Option<UcanToken>,   // Required for gated contexts (messages:read UCAN)
     pub timestamp: u64,
-    pub signature: Ed25519Signature,
+    pub signature: P256Signature,
 }
 ```
 
@@ -1973,7 +1973,7 @@ pub struct BroadcastEnvelope {
     pub nonce: [u8; 12],                // AES-256-GCM nonce (random 12 bytes per message)
     pub encrypted_content: Vec<u8>,     // AES-256-GCM ciphertext || auth_tag
     pub provenance: Option<DataProvenance>,
-    pub signature: Ed25519Signature,
+    pub signature: P256Signature,
 }
 ```
 
@@ -1991,7 +1991,7 @@ Where `context_id` and `author_did` are UTF-8 bytes (4-byte BE length prefix + b
 
 **Signature formula:**
 ```
-Ed25519_sign(active_signing_key_or_agent_signing_key, SHA-256(
+P256_ECDSA_sign(active_signing_key_or_agent_signing_key, SHA-256(
     "SCP-BROADCAST-ENVELOPE-V1:" || version || len(context_id) || context_id || len(author_did) || author_did || sequence || key_epoch || timestamp || nonce || provenance_hash
 ))
 ```
@@ -2093,7 +2093,7 @@ Broadcast contexts are discoverable through four mechanisms:
 
 Relative to Encrypted contexts, Broadcast contexts have the following security property changes:
 
-**Retained:** Ed25519 authentication, content integrity (content_hash + signature), provenance, non-repudiation, UCAN authorization, event log, human accountability.
+**Retained:** P-256 authentication, content integrity (content_hash + signature), provenance, non-repudiation, UCAN authorization, event log, human accountability.
 
 **Changed:** Confidentiality via per-author broadcast key (not MLS). No MLS `membership_tag` (authentication is signature-only). No MLS forward secrecy (mitigated by key epoch rotation on block events). Public `routing_id` (SHA-256 of context_id, not HKDF-derived). Author identity visible to relays in the outer envelope (authors are public figures in a broadcast context — this is a feature, not a leak).
 
@@ -2242,7 +2242,7 @@ The bound-creator check (§9.7.1) requires **BOTH** the creator leaf's `ScpCrede
 
 **Anti-spam rate limit (normative).** B MUST rate-limit *inbound* standing-pair Welcomes **per initiator DID** on the consent gate — an ordinary per-peer cooldown, default **60 s**, hard floor **1 s** (a near-zero cooldown is non-conformant); operators surfacing approval prompts as interrupts SHOULD prefer the default. **Scope carve-out (gate-decidable).** The cooldown is evaluated at the consent gate using **only locally-available state**: a Welcome under a `derived_context_id` for which this node **already holds its own self-created group** is a convergence candidate and is **exempt** from the per-initiator cooldown (its authenticity is settled downstream by confirm-bound-creator + init-key single-use, which a forged variant fails before consuming an init key or destroying anything). **Disclosed cost of the exemption (honest):** a forged convergence-candidate Welcome under such an id is not free — confirm-bound-creator still performs one **DID resolution + signature verification** before rejecting it, and that work is **not** rate-limited by this cooldown. This is bounded because the exemption's precondition is that the victim **already holds a self-created group under that exact id**, which requires the victim to have itself initiated the pair — so an attacker cannot manufacture the precondition on an arbitrary victim (no self-created group under the id ⇒ the Welcome is a stranger/approval Welcome and IS cooldowned). **The precondition is not exotic, however (honest amplifier disclosure):** it is satisfied for **every real standing pair the victim has ever initiated**, and the `derived_context_id` is **publicly computable** from the two participant DIDs — so **any** party (not only the actual peer) who knows both DIDs can forge convergence-candidate Welcomes under such a known id, forcing the **un-throttled** confirm-bound-creator DID-resolution + signature-verification work for each. It remains a **bounded** DoS — exactly one DID-resolve + one signature-verify per Welcome, with **no amplification beyond that** (no join, no state change, no fan-out) — but the cost is real and is stated honestly rather than implying the precondition is hard to reach. **DID resolution is a NETWORK operation, not merely local CPU:** resolving `creator_did` is a DHT lookup (did:dht) or an HTTPS fetch (did:web), so an off-path party who knows both DIDs (the id is publicly computable) can force the victim into **outbound resolution traffic against a third party's DID host** — a bounded **reflected-resolution** vector, one resolution per forged Welcome (still no join / state-change / fan-out). All other inbound standing-pair Welcomes (no pre-existing self-created group under the id) are stranger/approval-prompt Welcomes and **ARE** subject to the per-initiator cooldown. Convergence is thus never gated on the inbound cooldown, and the carve-out needs no post-gate creator-binding to decide. This is not saga concurrency machinery. **Residual (honest, per §9.3):** the per-DID cooldown does not bound a **fresh-DID fleet** (many DIDs, one Welcome each). That fleet is an **approval-prompt-spam DoS, not an unauthorized-join flood**: the step-4(b) default-deny means each of N fresh strangers still requires explicit out-of-band approval, so the fleet yields at most N approval prompts, never N silent joins — bounded by the §9.3 per-identity minting cost each DID pays to become admissible. §9.3 defines no recipient-side inbound tier check, so this spec claims none and authors **no** new standalone limiter. There is **no** standing-pair-specific KeyPackage reservation: single-use is enforced at join (step 2); a stranger-add draining A's KeyPackage pool is the **general MLS KeyPackage-pool concern**, bounded by republication and §9.3.
 
-**Replica synchronization & authenticity.** Both members hold a replica of the one context, synchronized by **MLS** (epoch-ordered Commits + the bootstrapping Welcome) and the event-log RFC-6962 layer (§17) — no saga journal. Authenticity derives from MLS: B's Welcome processing cryptographically binds B into A's group, and this **MLS Welcome membership binding is the load-bearing A→B authenticity anchor in the interim** — sufficient on its own. The per-message Ed25519 InnerEnvelope signature is an additional anchor available once bidirectional send lands (Phase 2E); until then a Welcome-joined node cannot SEND, so no joiner-originated signed message exists yet. There is **no** signed creation receipt, **no** commitment journal, and **no** `secret_bearing` saga apparatus — MLS secrets live only in actor-local crypto-provider state.
+**Replica synchronization & authenticity.** Both members hold a replica of the one context, synchronized by **MLS** (epoch-ordered Commits + the bootstrapping Welcome) and the event-log RFC-6962 layer (§17) — no saga journal. Authenticity derives from MLS: B's Welcome processing cryptographically binds B into A's group, and this **MLS Welcome membership binding is the load-bearing A→B authenticity anchor in the interim** — sufficient on its own. The per-message P-256 InnerEnvelope signature is an additional anchor available once bidirectional send lands (Phase 2E); until then a Welcome-joined node cannot SEND, so no joiner-originated signed message exists yet. There is **no** signed creation receipt, **no** commitment journal, and **no** `secret_bearing` saga apparatus — MLS secrets live only in actor-local crypto-provider state.
 
 **Send-capability caveat — ALL Welcome-joiners (normative; single source of truth for send-gating).** Per ADR-049 §Follow-ups #1, **any party that obtains its replica via Welcome-join** — the non-initiating common-case peer AND the collision-losing `did_hi` — can join and **DECRYPT** but **cannot SEND** until the Phase-2E spawn-from-Welcome entrypoint lands. This is the most frequent path, not an edge case: a Welcome-joined `Ok` reflects *replica-created and decryptable* but **interim send-gated** until Phase-2E; A's (initiator) sends are unaffected. **This gating is security-relevant, not merely a feature gap:** a simultaneous-create collision is attacker-influenceable — a peer who is `did_lo` relative to a victim can deterministically race a create to push the victim (`did_hi`) onto this send-gated path. Bounded — the attacker must already be a consent-passed pair member, and the worst case is the victim being receive-but-not-send **in that one pair** until Phase-2E, never a cross-pair effect or key exposure. All other clauses that mention send-gating refer back here.
 

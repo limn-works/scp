@@ -79,27 +79,27 @@ SCP DID documents follow the W3C DID Core specification (v1.0) with SCP-specific
 {
   "@context": [
     "https://www.w3.org/ns/did/v1",
-    "https://w3id.org/security/suites/ed25519-2020/v1"
+    "https://w3id.org/security/data-integrity/v2"
   ],
   "id": "did:dht:<z-base-32-encoded-public-key>",
   "verificationMethod": [
     {
       "id": "did:dht:<key>#0",
-      "type": "Ed25519VerificationKey2020",
+      "type": "Multikey",
       "controller": "did:dht:<key>",
-      "publicKeyMultibase": "z<multibase-encoded-ed25519-public-key>"
+      "publicKeyMultibase": "z<multibase-encoded-p256-public-key>"
     },
     {
       "id": "did:dht:<key>#active",
-      "type": "Ed25519VerificationKey2020",
+      "type": "Multikey",
       "controller": "did:dht:<key>",
-      "publicKeyMultibase": "z<multibase-encoded-ed25519-public-key>"
+      "publicKeyMultibase": "z<multibase-encoded-p256-public-key>"
     },
     {
       "id": "did:dht:<key>#agent",
-      "type": "Ed25519VerificationKey2020",
+      "type": "Multikey",
       "controller": "did:dht:<key>",
-      "publicKeyMultibase": "z<multibase-encoded-ed25519-public-key>"
+      "publicKeyMultibase": "z<multibase-encoded-p256-public-key>"
     }
   ],
   "authentication": ["did:dht:<key>#active", "did:dht:<key>#agent"],
@@ -138,7 +138,7 @@ SCP DID documents follow the W3C DID Core specification (v1.0) with SCP-specific
 | `@context` | Yes | MUST include the two URIs shown above, in order. |
 | `id` | Yes | MUST match `did:dht:<z-base-32(#0 public key)>`. |
 | `verificationMethod` | Yes | MUST include `#0` (Identity Key). MUST include `#active` (Active Signing Key). MAY include `#agent` (Agent Signing Key, optional per ADR-039). No other verification methods permitted. |
-| `verificationMethod[].publicKeyMultibase` | Yes | Multibase-encoded Ed25519 public key (prefix `z` for base58btc). |
+| `verificationMethod[].publicKeyMultibase` | Yes | Multibase-encoded, multicodec-tagged compressed P-256 public key: base58btc (prefix `z`) over the multicodec identifier `p256-pub` (`0x1200`) followed by the 33-byte SEC1 compressed point (§9.5 of the security-model spec fixes the point encoding). |
 | `authentication` | Yes | MUST reference `#active`. MAY reference `#agent`. MUST NOT reference `#0`. |
 | `assertionMethod` | Yes | Same as `authentication`. |
 | `capabilityDelegation` | Yes | MUST reference only `#0`. |

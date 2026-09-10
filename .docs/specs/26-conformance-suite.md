@@ -35,8 +35,8 @@ Each test specifies:
 | **Tier** | Core |
 | **Spec Sections** | §3.1, §3.2, ADR-039 |
 | **Preconditions** | None. |
-| **Steps** | 1. Generate Ed25519 keypair. 2. Create did:dht DID. 3. Build DID document with verification methods `#0` (root), `#active` (signing), `#agent` (agent signing). |
-| **Expected Outcome** | DID document contains exactly 3 verification methods with IDs `#0`, `#active`, `#agent`. All are Ed25519VerificationKey2020. The DID string is the z-base-32 encoding of the `#0` public key. |
+| **Steps** | 1. Generate P-256 keypair. 2. Create did:dht DID. 3. Build DID document with verification methods `#0` (root), `#active` (signing), `#agent` (agent signing). |
+| **Expected Outcome** | DID document contains exactly 3 verification methods with IDs `#0`, `#active`, `#agent`. All are Multikey. The DID string is the z-base-32 encoding of the `#0` public key. |
 
 ### CONF-002: DID Resolution and Self-Certification
 
@@ -57,7 +57,7 @@ Each test specifies:
 | **Tier** | Core |
 | **Spec Sections** | §3.3, §9.11 |
 | **Preconditions** | DID with established `#active` key. Existing messages signed with old key. |
-| **Steps** | 1. Generate new Ed25519 keypair for `#active`. 2. Update DID document with new `#active` key. 3. Publish updated document with incremented sequence number. 4. Resolve DID again. 5. Verify old `#active` key is no longer in document. 6. Verify key continuity fingerprint changed. |
+| **Steps** | 1. Generate new P-256 keypair for `#active`. 2. Update DID document with new `#active` key. 3. Publish updated document with incremented sequence number. 4. Resolve DID again. 5. Verify old `#active` key is no longer in document. 6. Verify key continuity fingerprint changed. |
 | **Expected Outcome** | New DID document has new `#active` key. Old `#active` key is absent. Key continuity fingerprint (§9.11) reflects the change. Messages signed with old key still verify against the old key (retained by recipients). |
 
 ### CONF-004: Agent Binding (Human DID Attests Agent DID)
@@ -284,8 +284,8 @@ Each test specifies:
 | **Layer** | Trust |
 | **Tier** | Core |
 | **Spec Sections** | §7, §9.5 |
-| **Preconditions** | Issuer has Ed25519 keypair. |
-| **Steps** | 1. Construct UCAN token with: issuer, audience, capabilities, nonce, expiry. 2. Sign with Ed25519. 3. Verify signature. 4. Verify nonce freshness (within 5 min tolerance, §9.18.7). 5. Verify expiry < 24h (§9.18.7). |
+| **Preconditions** | Issuer has P-256 keypair. |
+| **Steps** | 1. Construct UCAN token with: issuer, audience, capabilities, nonce, expiry. 2. Sign with ES256 — ECDSA on P-256 with SHA-256. 3. Verify signature. 4. Verify nonce freshness (within 5 min tolerance, §9.18.7). 5. Verify expiry < 24h (§9.18.7). |
 | **Expected Outcome** | Token verifies. Nonce and expiry constraints pass. |
 
 ### CONF-024: UCAN Delegation Chain (A -> B -> C)

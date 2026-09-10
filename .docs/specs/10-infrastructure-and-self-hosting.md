@@ -112,7 +112,7 @@ EventLogCheckpoint {
   membership_snapshot: MembershipDigest, // SHA-256 hash of the sorted membership list at checkpoint time
   timestamp:        u64,          // Wall-clock time of checkpoint creation (best-effort)
   creator_did:      DID,          // DID of the member who created this checkpoint
-  signature:        Ed25519Signature,  // Signed by creator's signing key
+  signature:        P256Signature,  // Signed by creator's signing key
 }
 ```
 
@@ -389,7 +389,7 @@ PushRegistration {
   token:        String                    // platform-specific push token (APNs device token, FCM registration token, WebPush endpoint URL)
   contexts:     Vec<ContextId>            // contexts for which to receive push notifications (empty = all contexts on this relay)
   timestamp:    DateTime                  // registration time
-  signature:    Ed25519Signature          // signed by the DID's Active Signing Key (#active)
+  signature:    P256Signature          // signed by the DID's Active Signing Key (#active)
 }
 ```
 
@@ -413,7 +413,7 @@ PushDeregistration {
   did:          DID
   platform:     enum { APNS, FCM, WebPush }
   timestamp:    DateTime
-  signature:    Ed25519Signature          // signed by the DID's Active Signing Key (#active)
+  signature:    P256Signature          // signed by the DID's Active Signing Key (#active)
 }
 ```
 
@@ -437,7 +437,7 @@ While client-level coordination (read markers, notification dedup) is a client-s
 
 **Per-device MLS leaf nodes:**
 
-1. **Each device has its own MLS leaf.** A DID with N devices appears as N leaf nodes in every MLS group the DID participates in. Each device generates its own MLS leaf key (X25519) and maintains independent MLS epoch state.
+1. **Each device has its own MLS leaf.** A DID with N devices appears as N leaf nodes in every MLS group the DID participates in. Each device generates its own MLS leaf keys — the P-256 signature key that self-signs the leaf and the DHKEM(P-256) encryption key that receives path secrets (§9.5) — and maintains independent MLS epoch state.
 2. **Per-device KeyPackages.** Each device generates its own KeyPackages using an **ephemeral, context-scoped MLS leaf key**; each carries a **per-device KeyPackage attestation** (LeafNode extension `scp_keypackage_attestation`, §9.7.1) binding that leaf key to the DID, signed by the DID's Active Signing Key (`#active`). The KeyPackage's credential contains the DID (shared across devices) plus a `device_id` field (a random 16-byte identifier, stable per device) in the LeafNode extensions. This enables other members to distinguish leaf nodes belonging to the same DID.
 3. **Governance counting.** For governance purposes (voting, quorum, role assignment), a DID with N devices counts as ONE participant, not N. The governance engine deduplicates by DID — it does not matter how many leaf nodes a DID has. This prevents multi-device users from gaining disproportionate governance weight.
 4. **Sender key and access key sharing.** Sender keys (§9.16) and access keys (§9.17) are per-DID, not per-device. All devices for a DID share the same sender key and access key. When a device requests a sender key (§9.16.2), the key holder responds to the DID — any of the DID's devices can decrypt the response using the DID's wrapping key (which is also per-DID, stored in KeyCustody and synchronized across devices via identity private state, §3.7).
@@ -586,7 +586,7 @@ HOLE_PUNCH_REQUEST (peer → intermediary relay → self-hosted relay) {
   target_routing_id: [u8; 32],         // DID routing ID of the self-hosted relay
   nonce:             [u8; 16],         // Random nonce for replay prevention
   timestamp:         u64,             // Unix timestamp (ms)
-  signature:         Ed25519Signature, // Signs "SCP-HOLE-PUNCH-V1:" || requester_address || target_routing_id || nonce || timestamp
+  signature:         P256Signature, // Signs "SCP-HOLE-PUNCH-V1:" || requester_address || target_routing_id || nonce || timestamp
 }
 ```
 
@@ -596,7 +596,7 @@ HOLE_PUNCH_RESPONSE (self-hosted relay → intermediary relay → peer) {
   requester_did:     DID,              // Echo of requester DID
   nonce:             [u8; 16],         // Echo of request nonce
   timestamp:         u64,
-  signature:         Ed25519Signature, // Signs "SCP-HOLE-PUNCH-V1:" || responder_address || requester_did || nonce || timestamp
+  signature:         P256Signature, // Signs "SCP-HOLE-PUNCH-V1:" || responder_address || requester_did || nonce || timestamp
 }
 ```
 
@@ -634,8 +634,8 @@ Two operations support bridge relaying: `BRIDGE_REGISTER` (self-hosted relay →
 ```
 BRIDGE_REGISTER {
     routing_id: [u8; 32],            // Routing ID to register
-    public_key: [u8; 32],            // Ed25519 public key of the DID owner
-    signature: [u8; 64],             // Ed25519 signature (SCP-247, see below)
+    public_key: [u8; 32],            // P-256 public key of the DID owner
+    signature: [u8; 64],             // P-256 signature (SCP-247, see below)
     timestamp: u64,                  // Unix timestamp included in signed payload
     target_relay_hint: Option<String> // URL hint for reaching this relay directly
 }
@@ -671,13 +671,13 @@ The `source_routing_id` field is zeroed (`[0u8; 32]`) because the bridge operate
 
 **Authentication (SCP-247):**
 
-`BRIDGE_REGISTER` requires an Ed25519 ownership proof to prevent unauthorized routing ID claims. The signature covers the domain-separated payload `"SCP-BRIDGE-REGISTER-V1:" || routing_id || big-endian-u64(timestamp)` (63 bytes). The bridge verifies:
+`BRIDGE_REGISTER` requires a P-256 ownership proof to prevent unauthorized routing ID claims. The signature covers the domain-separated payload `"SCP-BRIDGE-REGISTER-V1:" || routing_id || big-endian-u64(timestamp)` (63 bytes). The bridge verifies:
 
-1. The Ed25519 signature is valid for the provided `public_key`.
+1. The P-256 signature is valid for the provided `public_key`.
 2. The DID derived from `public_key` maps to the claimed `routing_id` via `SHA-256("scp:did:" || did_string)` (§3.10.2).
 3. The `timestamp` is within 60 seconds of the server's current time (replay window).
 
-**Precedent for relay-side validation of public records.** `BRIDGE_REGISTER` establishes the pattern that a relay MAY perform a control-plane cryptographic check — verify an Ed25519 signature and confirm the `SHA-256("scp:did:" || did_string)` DID→routing_id binding — while remaining an untrusted, encrypted-content-blind data plane: `BRIDGE_DATA` payloads are forwarded opaquely, and the client re-verifies everything end-to-end regardless of the relay's acceptance. This same check extends from the control plane to a *stored public record*: an SCP-native relay MAY validate a DID-record blob it stores (verify the BEP44 signature and the DID→routing_id binding, keep a single highest-sequence slot; §3.10.2, §9.10.12) as an availability and anti-suppression measure. It is defense-in-depth, never a trust dependency — a relay that skips or botches this validation degrades availability only, and it never touches MLS-encrypted context content, which relays can neither read nor validate.
+**Precedent for relay-side validation of public records.** `BRIDGE_REGISTER` establishes the pattern that a relay MAY perform a control-plane cryptographic check — verify a P-256 signature and confirm the `SHA-256("scp:did:" || did_string)` DID→routing_id binding — while remaining an untrusted, encrypted-content-blind data plane: `BRIDGE_DATA` payloads are forwarded opaquely, and the client re-verifies everything end-to-end regardless of the relay's acceptance. This same check extends from the control plane to a *stored public record*: an SCP-native relay MAY validate a DID-record blob it stores (verify the BEP44 signature and the DID→routing_id binding, keep a single highest-sequence slot; §3.10.2, §9.10.12) as an availability and anti-suppression measure. It is defense-in-depth, never a trust dependency — a relay that skips or botches this validation degrades availability only, and it never touches MLS-encrypted context content, which relays can neither read nor validate.
 
 #### 10.12.4.1 Routing ID Derivation Disambiguation
 
@@ -696,7 +696,7 @@ The protocol uses two distinct routing ID derivation schemes for different purpo
 **Bridge establishment:**
 
 1. The self-hosted relay behind symmetric NAT connects outbound to a bridge relay (outbound connections are not blocked by NAT).
-2. The self-hosted relay registers its routing ID with the bridge via `BRIDGE_REGISTER`, proving DID ownership with an Ed25519 signature.
+2. The self-hosted relay registers its routing ID with the bridge via `BRIDGE_REGISTER`, proving DID ownership with a P-256 signature.
 3. The bridge relay accepts incoming connections from peers. Peers send `BRIDGE_DATA` to forward traffic to the registered self-hosted relay over the existing outbound connection.
 4. The self-hosted relay publishes the bridge relay's address in its DID document, annotated as a bridge: `wss://bridge-relay.example.com/scp/v1?bridge_target=<hex-routing-hint>`.
 5. When the self-hosted relay disconnects, the bridge deregisters all its routing IDs. Subsequent `BRIDGE_DATA` for those IDs returns `BRIDGE_TARGET_NOT_FOUND`.
@@ -842,7 +842,7 @@ The reachability tiers introduce attack surfaces beyond the standard relay threa
 | STUN hole punching + keepalive | Phase 2 | `scp-transport` | `stun-rs` or `webrtc-rs/stun` |
 | `.no_domain()` builder mode | Phase 2 | `scp-node` | `ApplicationNodeBuilder` extension |
 | `ws://` transport for DHT-discovered relays | Phase 2 | `scp-transport` | Enforcement: reject `ws://` from non-DHT sources |
-| Relay bridging (BRIDGE_REGISTER + BRIDGE_DATA) | Phase 3 | `scp-transport` | Wire operations, Ed25519-authenticated registration, transparent forwarding |
+| Relay bridging (BRIDGE_REGISTER + BRIDGE_DATA) | Phase 3 | `scp-transport` | Wire operations, P-256-authenticated registration, transparent forwarding |
 | STUN service on SCP relays | Phase 3 | `scp-transport` | Coexists with WebSocket endpoint |
 
 Phase 2 delivers the zero-config floor: a self-hosted relay behind most consumer NATs becomes reachable without any manual configuration. Phase 3 closes the remaining ~15% (symmetric NAT) with bridge relaying and adds STUN service to the relay fleet, making the network self-reinforcing. Domain-based deployment (Tier 4) is already specified in Phase 2 via §18.6.

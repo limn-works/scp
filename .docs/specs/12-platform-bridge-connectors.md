@@ -54,7 +54,7 @@ RegisterBridge {
   platform:        String,           // platform identifier (e.g., "discord", "slack", "x")
   mode:            BridgeMode,       // Relay | Puppet | API | Cooperative
   webhook_url:     Option<String>,   // for cooperative mode: platform's webhook receiver URL
-  platform_key:    Option<[u8; 32]>, // for cooperative mode: platform's Ed25519 public key
+  platform_key:    Option<[u8; 32]>, // for cooperative mode: platform's P-256 public key
   max_shadows:     u32,              // governance-configured shadow limit for this bridge
   metadata:        BridgeMetadata,   // display name, description, operator contact
 }
@@ -357,21 +357,21 @@ The JWT payload contains:
 
 The platform verifies the JWT signature against the operator's DID document (§3.2). Token lifetime SHOULD NOT exceed 1 hour. The platform MAY cache resolved DID documents with TTL.
 
-**JWT signing algorithm.** The JWT `alg` header MUST be `EdDSA` (RFC 8037) using Ed25519, consistent with the protocol's key infrastructure. SDKs MUST reject JWTs with any other algorithm.
+**JWT signing algorithm.** The JWT `alg` header MUST be `ES256` (RFC 7518) — ECDSA on P-256 with SHA-256 — which is the signature algorithm §9.5 of the security-model spec mandates for every SCP key. An SDK MUST reject a JWT whose header names any other algorithm.
 
 For webhook callbacks (platform to bridge node), the platform signs the request body with the following scheme:
 
 ```
-X-SCP-Signature: <base64url(Ed25519-sign(signing_key, canonical_payload))>
+X-SCP-Signature: <base64url(P256-ECDSA-sign(signing_key, canonical_payload))>
 X-SCP-Platform-Key-Id: <platform's signing key identifier>
 X-SCP-Timestamp: <Unix timestamp in seconds>
 ```
 
 **Canonical payload construction.** The signed payload is constructed as: `timestamp_bytes || raw_request_body_bytes`, where `timestamp_bytes` is the ASCII decimal representation of the `X-SCP-Timestamp` value. This prevents replay attacks — the bridge node MUST reject requests where `X-SCP-Timestamp` differs from the current time by more than 300 seconds (5 minutes).
 
-**Platform key registration mechanism.** The platform's Ed25519 public key is registered during bridge setup via the `RegisterBridge` governance action (§12.2.1), which includes an optional `platform_key: Option<[u8; 32]>` field. For cooperative mode, this field is REQUIRED. The key exchange flow:
+**Platform key registration mechanism.** The platform's P-256 public key is registered during bridge setup via the `RegisterBridge` governance action (§12.2.1), which includes an optional `platform_key: Option<[u8; 32]>` field. For cooperative mode, this field is REQUIRED. The key exchange flow:
 
-1. Before registration, the bridge operator and platform operator exchange the platform's Ed25519 public key out-of-band (e.g., via the platform's developer console, an API call to the platform, or manual configuration).
+1. Before registration, the bridge operator and platform operator exchange the platform's P-256 public key out-of-band (e.g., via the platform's developer console, an API call to the platform, or manual configuration).
 2. The bridge operator includes the `platform_key` in the `RegisterBridge` proposal.
 3. On governance approval, the bridge node stores the platform key associated with the bridge instance.
 4. All subsequent webhook requests from the platform are verified against this key.

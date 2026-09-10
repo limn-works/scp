@@ -72,7 +72,7 @@ Full 11-step UCAN validation (ADR-016 criterion 2) runs at **token presentation 
 The 11 validation steps are:
 
 1. Parse the JWT-format UCAN token
-2. Verify Ed25519 signature (resolving `kid` from DID document per ADR-039)
+2. Verify the P-256 signature (resolving `kid` from the DID document per ADR-039, the shared-DID human-agent identity model)
 3. Verify delegation chain integrity (`prf` chain, each parent's `aud` matches child's `iss`)
 4. Verify root issuer is the context creator's DID
 5. Verify audience matches the presenting agent's DID (self-delegation valid with `fct.scp_key_scope`)
@@ -254,7 +254,7 @@ ParticipationProfile {
     event_log_root: [u8; 32],         // Merkle root; convergent-derived facts verifiable against it (outlet_invocation_count is context-signed-only until ADR-051; attestation_count is a credential-layer fact and is NOT covered by this root)
     // NOTE: no context_id — this is the privacy guarantee
     signer_public_key: [u8; 32],      // context-specific signing key
-    signature: Ed25519Signature,       // over all signed fields above
+    signature: P256Signature,       // over all signed fields above
 }
 ```
 
@@ -269,13 +269,16 @@ participation_signing_seed = CSPRNG(32)          // generated once at context cr
 salt = SHA-256("SCP-PARTICIPATION-SIGNER-V1")    // fixed salt, 32 bytes
 info = "scp-participation-signer:" || context_id // context_id as UTF-8 bytes
 prk = HKDF-Extract(salt, participation_signing_seed)  // 32 bytes
-okm = HKDF-Expand(prk, info, 32)                // 32 bytes — Ed25519 seed
-signer_keypair = Ed25519::from_seed(okm)
+okm = HKDF-Expand(prk, info, 48)                // 48 bytes — seed-to-scalar input
+d = (int_from_be_bytes(okm) mod (n - 1)) + 1     // private scalar in [1, n - 1]
+signer_keypair = P256_keypair_from_scalar(d)     // ECDSA on P-256, §9.5 of the security spec
 ```
+
+The last two steps are the extra-random-bits seed-to-scalar method of FIPS 186-5 Appendix A.2.1, which §9.10.4 of the security-model spec (per-context pseudonyms) states in full and this spec follows without restating its reasoning. `n` is the order of the P-256 group. An implementation MUST NOT reduce a 32-byte expansion directly, because that biases the low-order scalars, and MUST NOT reject-and-retry, because two implementations that draw retries differently then derive different keys from one seed.
 
 The `signer_public_key` in the `ParticipationProfile` is the public half of this derived keypair. Each context produces a unique signing key deterministically from its seed, so verification is possible by anyone who receives the statement — but the verifier cannot reverse-derive the context ID from the public key (one-way derivation).
 
-**Seed custody and admin rotation.** The `participation_signing_seed` is stored encrypted in the context's governance state, wrapped to the current admin's `#0` identity key using HPKE (X25519-HKDF-SHA256, HKDF-SHA256, ChaCha20Poly1305) with info string `"scp-participation-seed-wrap:" || context_id`. During admin rotation, the outgoing admin MUST re-wrap the seed to the incoming admin's `#0` key and include the re-wrapped seed in the `AdminRotation` governance event. The incoming admin unwraps the seed and can then produce and sign participation statements. If the outgoing admin is unavailable (e.g., key compromise), the seed is lost and a new seed MUST be generated — this invalidates all prior statements from this context, which is the correct security behavior when admin continuity is broken.
+**Seed custody and admin rotation.** The `participation_signing_seed` is stored encrypted in the context's governance state, wrapped to the current admin's `scp_wrapping_key` (`0xFF01`) MLS leaf key using HPKE (DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-128-GCM) with info string `"scp-participation-seed-wrap:" || context_id`. The wrap names that leaf key and never the root: §9.7.4.1 item 4 of the security-model spec holds the root in a substrate that signs and performs no Diffie-Hellman agreement, so no party can wrap anything to a root member. During admin rotation, the outgoing admin MUST re-wrap the seed to the incoming admin's `scp_wrapping_key` and include the re-wrapped seed in the `AdminRotation` governance event. The incoming admin unwraps the seed and can then produce and sign participation statements. If the outgoing admin is unavailable (e.g., key compromise), the seed is lost and a new seed MUST be generated — this invalidates all prior statements from this context, which is the correct security behavior when admin continuity is broken.
 
 **Participation signing key rotation.** The `participation_signing_seed` itself can be rotated independently of admin rotation via the `RotateParticipationKey` governance action. This generates a new random seed, derives a new signing keypair, re-signs all outstanding participation statements with the new key, and publishes a `ParticipationKeyRotated` event containing the new `signer_public_key`. Verifiers who cached the old public key MUST accept both old and new keys for a 30-day overlap period (matching the statement `max_age_secs` default). After the overlap period, only the new key is valid for newly-signed statements. Historical statements signed with the old key remain valid if their `updated_at` predates the rotation event.
 
@@ -350,7 +353,7 @@ Agents opt into per-context attestations by allowing the context to publish part
 2. Joining agent sees the requirements in context metadata before opting in (legibility tenet — visible before join decision).
 3. Admitting context resolves the agent's DID document and finds the `ParticipationStatements` service endpoint.
 4. Admitting context fetches statements from the service endpoint.
-5. Admitting context verifies: (a) each statement's signed `subject_did` equals the DID of the agent being admitted — statements for any other subject are discarded before they can contribute to any threshold, freshness, or distinct-signer count (closing cross-subject participation-profile replay, where a victim's genuine high-standing profiles are presented to admit a different agent), (b) each statement's Ed25519 signature is valid over its fields, (c) signers are distinct (N different `signer_public_key` values — proving N independent contexts), (d) each required fact meets the required threshold, (e) each statement's `updated_at` is within `max_age_secs` of the current time, (f) statements span at least `min_contexts` distinct signers for each requirement.
+5. Admitting context verifies: (a) each statement's signed `subject_did` equals the DID of the agent being admitted — statements for any other subject are discarded before they can contribute to any threshold, freshness, or distinct-signer count (closing cross-subject participation-profile replay, where a victim's genuine high-standing profiles are presented to admit a different agent), (b) each statement's P-256 signature is valid over its fields, (c) signers are distinct (N different `signer_public_key` values — proving N independent contexts), (d) each required fact meets the required threshold, (e) each statement's `updated_at` is within `max_age_secs` of the current time, (f) statements span at least `min_contexts` distinct signers for each requirement.
 6. If any requirement is not met, admission is denied.
 
 All checks are mechanical — no judgment, no discretion, no governance vote. The admitting context verifies signed claims from distinct signers without ever learning which contexts produced them.
@@ -365,7 +368,7 @@ All checks are mechanical — no judgment, no discretion, no governance vote. Th
 **Tamper resistance:**
 
 - Agents CANNOT write, modify, or delete participation statements — contexts control the storage on their relays. The agent has no write access to the statement store.
-- Statements are signed by context-specific Ed25519 keys — the agent cannot forge them.
+- Statements are signed by context-specific P-256 keys — the agent cannot forge them.
 - Context-specific keys are derived with domain separation so they cannot be correlated across contexts by the verifier.
 
 **DDoS resistance:**
@@ -450,7 +453,7 @@ ChallengeVerification {
   timestamp:        u64,               // Unix timestamp of verification
   expires_at:       u64,               // verification validity period (MUST NOT exceed 90 days from timestamp)
   context_id:       Option<ContextId>, // context where challenge was administered (if applicable)
-  verifier_signature: Ed25519Signature // verifier signs all fields above
+  verifier_signature: P256Signature // verifier signs all fields above
 }
 ```
 
@@ -493,7 +496,7 @@ ChallengeVerification {
      challenge_id:    [u8; 32],        // matches the request
      results:         Vec<TestResult>,
      completed_at:    u64,             // Unix timestamp
-     subject_signature: Ed25519Signature // subject signs the response
+     subject_signature: P256Signature // subject signs the response
    }
 
    TestResult {
@@ -676,12 +679,12 @@ The signed protocol registry is a JSON document listing all valid `scp:capabilit
       "added_in_registry_version": "2026.1"
     }
   ],
-  "signature": "<Ed25519 signature over canonical JSON of all fields above>",
+  "signature": "<P-256 signature over canonical JSON of all fields above>",
   "signing_key_id": "did:dht:z6MkSCPRegistryAuthority...#registry-signing"
 }
 ```
 
-**Signing authority.** The registry is signed by the SCP protocol authority key — a dedicated Ed25519 key whose public key is hardcoded in every SDK build. The signing key is distinct from any identity key. The key is published in the protocol governance DID document (§14) and in the SDK source code. The signing key MUST be rotatable via the protocol governance process (§14). On rotation, the new key is published with a 90-day grace period during which both old and new signatures are accepted. The old key MUST be accepted for verification of registry versions published before the rotation event. After the 90-day grace period, the old key is no longer accepted for newly-fetched registry documents (but historical verification of previously-cached versions remains valid).
+**Signing authority.** The registry is signed by the SCP protocol authority key — a dedicated P-256 key whose public key is hardcoded in every SDK build. The signing key is distinct from any identity key. The key is published in the protocol governance DID document (§14) and in the SDK source code. The signing key MUST be rotatable via the protocol governance process (§14). On rotation, the new key is published with a 90-day grace period during which both old and new signatures are accepted. The old key MUST be accepted for verification of registry versions published before the rotation event. After the 90-day grace period, the old key is no longer accepted for newly-fetched registry documents (but historical verification of previously-cached versions remains valid).
 
 **Distribution.** The registry is distributed through four channels:
 1. **Bundled in SDK (REQUIRED).** Each SDK release MUST include the registry version current at release time. This is the cold-start source and the fallback when all network sources are unavailable. SDKs MUST operate correctly using only the bundled snapshot — network fetch is an update mechanism, not a boot dependency.
@@ -713,7 +716,7 @@ Admission checks are mechanical: the protocol verifies capability URIs and verif
 1. Context declares one or more `CapabilityRequirement` entries in `ContextParams` admission requirements — each pairs a capability URI with a required `VerificationLevel` (`SelfAttested` or `ChallengeVerified`).
 2. Joining agent sees the requirements in context metadata before opting in (legibility tenet — visible before join decision).
 3. Admitting context fetches the joining agent's self-attested capability URIs (`SCPCapabilities` entries) and `ChallengeVerification` records (from the subject's `SCPCapabilities` endpoint, §7.3.4).
-4. Admitting context verifies, for each requirement: (a) every candidate `ChallengeVerification`'s signed `subject_did` equals the DID of the agent being admitted AND its signed `context_id` equals the context being admitted to — a result minted for another subject or another context (or a context-agnostic result) is discarded before it can satisfy any requirement (closing cross-subject and cross-context challenge-result replay, where a genuine result issued for a different agent or context is presented to admit this one), (b) every candidate record's verifier Ed25519 signature is valid over its canonical bytes and the record is unexpired relative to the current clock (verify-on-use — an unauthentic or expired record is not considered), (c) a `SelfAttested` requirement is met when the capability URI appears among the agent's self-attested capabilities OR a valid `ChallengeVerification` with `passed == true` exists for it (challenge-verified implies self-attested), (d) a `ChallengeVerified` requirement is met only by a valid `ChallengeVerification` with `passed == true` for that capability.
+4. Admitting context verifies, for each requirement: (a) every candidate `ChallengeVerification`'s signed `subject_did` equals the DID of the agent being admitted AND its signed `context_id` equals the context being admitted to — a result minted for another subject or another context (or a context-agnostic result) is discarded before it can satisfy any requirement (closing cross-subject and cross-context challenge-result replay, where a genuine result issued for a different agent or context is presented to admit this one), (b) every candidate record's verifier P-256 signature is valid over its canonical bytes and the record is unexpired relative to the current clock (verify-on-use — an unauthentic or expired record is not considered), (c) a `SelfAttested` requirement is met when the capability URI appears among the agent's self-attested capabilities OR a valid `ChallengeVerification` with `passed == true` exists for it (challenge-verified implies self-attested), (d) a `ChallengeVerified` requirement is met only by a valid `ChallengeVerification` with `passed == true` for that capability.
 5. If any requirement is not met, admission is denied (`MissingCapability` for an absent self-attested capability, `VerificationRequired` for a challenge-verified capability lacking a valid record).
 
 Subject binding and context binding are enforced by the protocol (steps 4a–4b), mirroring the participation-admission sibling (§7.3.2.1): the admission primitive takes the DID of the agent being admitted (`subject_did`) and the context being admitted to (`context_id`), and discards any challenge result whose signed subject or context does not match. All checks are mechanical — no judgment, no discretion, no governance vote.
@@ -952,7 +955,7 @@ Attestation {
   expires:           u64? (optional Unix timestamp seconds)
   renewed_at:        u64? (timestamp of last renewal, if renewable)
   revocation_status: RevocationStatus
-  signature:         Ed25519Signature (issuer's cryptographic signature over all fields except itself)
+  signature:         P256Signature (issuer's cryptographic signature over all fields except itself)
 }
 ```
 

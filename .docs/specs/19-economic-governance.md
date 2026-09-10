@@ -446,11 +446,11 @@ pub struct PaymentReceipt {
                                       //   SPL: tx signature
     pub timestamp: u64,
     pub anchored: bool,               // false until ADR-051: per-payee ContextEvent, not a convergent Merkle leaf — consumers MUST NOT treat provenance as Merkle-proven
-    pub signature: Vec<u8>,           // Ed25519 signature by payer (see signature scope below)
+    pub signature: Vec<u8>,           // P-256 signature by payer (see signature scope below)
 }
 ```
 
-**PaymentReceipt signature scope.** The `signature` field is an Ed25519 signature by the payer's `#active` key (or `#agent` key if the agent initiated the payment under a spending UCAN) over the following canonical byte sequence:
+**PaymentReceipt signature scope.** The `signature` field is a P-256 signature by the payer's `#active` key (or `#agent` key if the agent initiated the payment under a spending UCAN) over the following canonical byte sequence:
 
 ```
 signed_payload = receipt_id (32 bytes)
@@ -777,7 +777,7 @@ This section tabulates the wire format for all economy protocol types that cross
 | `adapter_id` | `String` | Yes | Payment adapter used. |
 | `adapter_proof` | `Vec<u8>` (serde_bytes) | Yes | Adapter-specific payment proof. |
 | `timestamp` | `u64` | Yes | Unix timestamp (seconds) of payment. |
-| `signature` | `Vec<u8>` (64 bytes) | Yes | Ed25519 signature by payer over canonical receipt fields (§19.6). |
+| `signature` | `Vec<u8>` (64 bytes) | Yes | P-256 signature by payer over canonical receipt fields (§19.6). |
 
 **Receipt Signature Construction.** The receipt signature covers: `SHA-256("SCP-RECEIPT-V1:" || receipt_id || len(payer) || payer || len(payee) || payee || amount_BE || currency || action_type_tag || len(context_id) || context_id || len(adapter_id) || adapter_id || timestamp_BE)`. When `context_id` is absent, the sentinel `SHA-256(0x00)` (32 bytes) is used per §9.5.1.
 

@@ -106,9 +106,9 @@ Provenance Tagger: attach provenance metadata for cross-context data
     │
     ▼
 Inner Envelope Builder: sign inside encrypted payload
-    │  Sign: Ed25519 over SHA256(context_id || sender_did || epoch ||
+    │  Sign: ECDSA on P-256 over SHA256(context_id || sender_did || epoch ||
     │         generation || sequence || timestamp || payload_hash)
-    │           🔒 Ed25519 inner signature — member-only verifiable (§9.8.1)
+    │           🔒 P-256 inner signature — member-only verifiable (§9.8.1)
     │           🔒 Timestamp for replay bounds (§9.8.2)
     ▼
 Sender-Side Key Encrypt: AES-256-GCM with Alice's sender key (§9.16)
@@ -160,8 +160,8 @@ Bucket Unpad: strip padding to recover plaintext size
 Sender-Side Key Decrypt: AES-256-GCM with sender's cached key (§9.16)
     │
     ▼
-Inner Envelope Verify: verify Ed25519 signature over payload
-    │           🔒 Ed25519 inner signature — reject forged envelopes (§9.8.1)
+Inner Envelope Verify: verify P-256 signature over payload
+    │           🔒 P-256 inner signature — reject forged envelopes (§9.8.1)
     ▼
 UCAN Validator: verify sender's capability token
     │           🔒 UCAN signature chain + nonce validation (§9.5)
@@ -175,9 +175,9 @@ Context Manager: deliver to context, check provenance
 SDK Public API: callback/stream delivers "hello" to Bob's app
 ```
 
-**Security checkpoint count:** 14 independent verification steps protect each message in Encrypted mode. The two most critical are Ed25519 inner signature and MLS membership_tag — two independent integrity checks (identity key and MLS epoch secrets), both inside encryption, both member-only verifiable. Relays see only opaque blobs and cannot verify, forge, or inspect any message content or metadata.
+**Security checkpoint count:** 14 independent verification steps protect each message in Encrypted mode. The two most critical are P-256 inner signature and MLS membership_tag — two independent integrity checks (identity key and MLS epoch secrets), both inside encryption, both member-only verifiable. Relays see only opaque blobs and cannot verify, forge, or inspect any message content or metadata.
 
-**Broadcast mode (§5.14):** The message lifecycle differs — MLS Encrypt/Decrypt steps are replaced by per-author AES-256-GCM broadcast key encryption. There is no MLS membership_tag (authentication is signature-only via Ed25519). The routing_id is publicly derived as SHA-256(context_id) rather than HKDF-derived. Author identity is visible in the outer envelope (authors are public figures in broadcast contexts). See §5.14.5 for the BroadcastEnvelope format and send/receive paths.
+**Broadcast mode (§5.14):** The message lifecycle differs — MLS Encrypt/Decrypt steps are replaced by per-author AES-256-GCM broadcast key encryption. There is no MLS membership_tag (authentication is signature-only via the P-256 signature). The routing_id is publicly derived as SHA-256(context_id) rather than HKDF-derived. Author identity is visible in the outer envelope (authors are public figures in broadcast contexts). See §5.14.5 for the BroadcastEnvelope format and send/receive paths.
 
 ### 1.3 Data Flow: MCP Integration
 
@@ -280,7 +280,7 @@ scp/
 │   │
 │   ├── scp-clock/             # Clock port — wasm-safe capability leaf (Clock, SystemClock, TestClock)
 │   │
-│   ├── scp-crypto/            # Ed25519 verification — wasm-safe capability leaf
+│   ├── scp-crypto/            # P-256 signature verification — wasm-safe capability leaf
 │   │
 │   ├── scp-did/               # DID data model — wasm-safe (DID, SigningKeyId, DidDocument, proofs, attestation)
 │   │   ├── document.rs        # DidDocument, VerificationMethod, rotation/migration proofs, DidError
@@ -510,7 +510,7 @@ State:
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │  Crypto Layer                                                    │
-│  Ciphersuite: MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519     │
+│  Ciphersuite: MLS_128_DHKEMP256_AES128GCM_SHA256_P256          │
 │  Single ciphersuite for v1 — no negotiation (§9.5)              │
 │                                                                  │
 │  ┌──────────────────────┐  ┌──────────────────────┐            │
@@ -547,7 +547,7 @@ State:
 │  │   (for relay          │  │                      │            │
 │  │    consistency §9.9)  │  │ • create             │            │
 │  └──────────────────────┘  │ • parse              │            │
-│                             │ • sign (Ed25519 —    │            │
+│                             │ • sign (P-256 —    │            │
 │                             │   binds all fields)  │            │
 │                             │ • verify_signature   │            │
 │                             └──────────────────────┘            │
@@ -666,14 +666,14 @@ This section documents the layered dependency graph, every replaceable subsystem
 
 #### 2.5.1 Layered Dependency Graph
 
-Dependencies flow strictly upward. No crate may depend on a crate at a *higher* layer; intra-layer edges are permitted but must be acyclic. The Layer 0 capability leaves (`scp-clock`, `scp-crypto`, `scp-did`) are mutually independent — each depends only on external crates (`scp-did` on `ed25519-dalek` directly), so there are no intra-layer edges among them. Violations are compile errors (separate crates) or PR review failures (internal modules).
+Dependencies flow strictly upward. No crate may depend on a crate at a *higher* layer; intra-layer edges are permitted but must be acyclic. The Layer 0 capability leaves (`scp-clock`, `scp-crypto`, `scp-did`) are mutually independent — each depends only on external crates (`scp-did` on `p256` directly), so there are no intra-layer edges among them. Violations are compile errors (separate crates) or PR review failures (internal modules).
 
 ```
 Layer 0 ─ scp-clock                 Clock port (wall-clock time). Wasm-safe leaf.
-           │  scp-crypto             Ed25519 signature verification. Wasm-safe leaf.
+           │  scp-crypto             P-256 signature verification. Wasm-safe leaf.
            │  scp-did                DID data model (DID, SigningKeyId, DidDocument,
            │                          proofs, attestation). Wasm-safe leaf; deps =
-           │                          ed25519-dalek directly (no SCP deps).
+           │                          the `p256` crate directly (no SCP deps).
            │  scp-platform            Platform abstraction traits (KeyCustody, Storage,
            │                          DeviceAttestation, Push).
            │                          Zero SCP dependencies — leaf crates.
@@ -709,7 +709,7 @@ Layer 4 ─ scp-testing               Dev-dependency only. Network simulation ha
                                       Never imported by production code.
 ```
 
-**Completed extractions:** `scp-identity` and `scp-event-log` have been extracted from `scp-core` into standalone Layer 1 crates. `scp-protocol` (pure sync types) and `scp-runtime` (async orchestration) have been extracted from the original `scp-core`, which is now a thin facade re-exporting both. The former `scp-primitives` junk-drawer was dissolved into three single-responsibility wasm-safe capability leaves — `scp-clock` (the `Clock` port), `scp-crypto` (Ed25519 verification), and `scp-did` (the DID data model, which also absorbed the DID-document/attestation types that had been parked in `scp-protocol`) — per ADR-057's Amendment (no generality-tier crate: universality is not a domain). `scp-identity` keeps its native DID-method/resolution/lifecycle subsystem as one crate (the DID-**method** layer is not separable — `DidDht` is bidirectionally fused with the async, `scp-platform`-coupled identity types; see ADR-057 rejected alternative 5) and now imports the DID model from `scp-did`. The pure DHT **transport** layer, however, *was* separable and was extracted into the native `scp-dht` leaf (`DhtClient`/`DhtRecord`/`InMemoryDhtClient`/`PkarrDhtClient` + BEP44 helpers), a one-way `scp-identity` → `scp-dht` edge (ADR-057 T1c-a). The synchronous MLS state machine was lifted into the wasm-safe `scp-mls`, shared by the native runtime and the in-browser client (`scp-client` / `scp-client-wasm`), per ADR-057.
+**Completed extractions:** `scp-identity` and `scp-event-log` have been extracted from `scp-core` into standalone Layer 1 crates. `scp-protocol` (pure sync types) and `scp-runtime` (async orchestration) have been extracted from the original `scp-core`, which is now a thin facade re-exporting both. The former `scp-primitives` junk-drawer was dissolved into three single-responsibility wasm-safe capability leaves — `scp-clock` (the `Clock` port), `scp-crypto` (P-256 signature verification), and `scp-did` (the DID data model, which also absorbed the DID-document/attestation types that had been parked in `scp-protocol`) — per ADR-057's Amendment (no generality-tier crate: universality is not a domain). `scp-identity` keeps its native DID-method/resolution/lifecycle subsystem as one crate (the DID-**method** layer is not separable — `DidDht` is bidirectionally fused with the async, `scp-platform`-coupled identity types; see ADR-057 rejected alternative 5) and now imports the DID model from `scp-did`. The pure DHT **transport** layer, however, *was* separable and was extracted into the native `scp-dht` leaf (`DhtClient`/`DhtRecord`/`InMemoryDhtClient`/`PkarrDhtClient` + BEP44 helpers), a one-way `scp-identity` → `scp-dht` edge (ADR-057 T1c-a). The synchronous MLS state machine was lifted into the wasm-safe `scp-mls`, shared by the native runtime and the in-browser client (`scp-client` / `scp-client-wasm`), per ADR-057.
 
 #### 2.5.2 Replaceable Subsystems
 
@@ -740,8 +740,8 @@ Each replaceable trait imposes invariants that every implementation must uphold.
 **`KeyCustody`** (scp-platform) — `Send + Sync`, async methods.
 - Private key material never leaves the custody boundary. Callers receive opaque `KeyHandle` values.
 - `generate_keypair` returns a new handle; implementations may back this with hardware (Secure Enclave, Keystore) or software.
-- `sign` and `dh_agree` enforce `KeyType` correctness (Ed25519 for signing, X25519 for agreement). Wrong type returns `PlatformError::WrongKeyType`.
-- `derive_pseudonym` keys the HMAC with a private-derived `pseudonym_secret` (never the public key — that would be a membership-enumeration oracle): `HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")` seeded into Ed25519 keygen (RFC-8032 seed). Software custody derives `pseudonym_secret` via HKDF-SHA256 over the Ed25519 private seed and is cross-platform deterministic; hardware custody uses a device-local secret and is device-local by design. See spec §9.10.4.A (and ADR-006).
+- `sign` and `dh_agree` enforce `KeyType` correctness (P-256 signing keys for signing, P-256 agreement keys for agreement). Wrong type returns `PlatformError::WrongKeyType`.
+- `derive_pseudonym` keys the HMAC with a private-derived `pseudonym_secret` (never the public key — that would be a membership-enumeration oracle): `HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")` fed through the seed-to-scalar step of spec §9.10.4 into a P-256 keygen. Software custody derives `pseudonym_secret` via HKDF-SHA256 over the P-256 private scalar and is cross-platform deterministic; hardware custody uses a device-local secret and is device-local by design. See spec §9.10.4.A (and ADR-006).
 - `destroy_key` irrevocably removes material. Subsequent operations on the handle return `PlatformError::KeyNotFound`.
 
 **`Storage`** (scp-platform) — `Send + Sync`, async methods.
@@ -769,7 +769,7 @@ Each replaceable trait imposes invariants that every implementation must uphold.
 - Adapters map transport-specific semantics (WebSocket, Nostr relay, libp2p, etc.) onto this uniform interface.
 
 **`DidMethod`** (scp-core/identity) — `Send + Sync`, async methods.
-- `create` generates three Ed25519 keypairs (identity, active signing, pre-rotation) via the provided `KeyCustody`. Returns `ScpIdentity` + `DidDocument`.
+- `create` generates three P-256 keypairs (identity, active signing, pre-rotation) via the provided `KeyCustody`. Returns `ScpIdentity` + `DidDocument`.
 - `verify` is a local, synchronous self-certification check (z-base-32 decode + public key comparison).
 - `publish` and `resolve` perform network I/O against the underlying DID infrastructure.
 - `rotate` generates a new active signing key, updates the DID document, and publishes. The DID string does not change.
@@ -790,7 +790,7 @@ Each replaceable trait imposes invariants that every implementation must uphold.
 
 **`HpkeBackend`** (scp-runtime/crypto) — `Send + Sync`, async methods. Replaces the deleted `ContextCryptoProvider` HPKE surface.
 - Three methods: `seal`, `unseal`, `generate_wrapping_keypair`.
-- **RFC 9180 conformance required**, with the SCP HPKE suite (§9.5): KEM `DHKEM(X25519, HKDF-SHA256)` (0x0020), KDF `HKDF-SHA256` (0x0001), AEAD `AES-128-GCM` (0x0001).
+- **RFC 9180 conformance required**, with the SCP HPKE suite (§9.5): KEM `DHKEM(P-256, HKDF-SHA256)` (0x0010), KDF `HKDF-SHA256` (0x0001), AEAD `AES-128-GCM` (0x0001).
 - **AAD discipline.** Callers pass `info` bytes that act as the HPKE context-binding / AAD. The backend MUST pass `info` through to RFC 9180 unchanged — no implicit prefixing, no truncation.
 - **Randomness.** `seal` is randomized per RFC 9180 (nonce managed internally). `generate_wrapping_keypair` MUST use a cryptographically secure random source (OsRng or equivalent); deterministic key generation is not permitted.
 - **Cancellation.** All three methods are cancel-safe: they allocate and compute locally; cancellation before return drops transient buffers and produces no visible effect.
@@ -1181,7 +1181,7 @@ Build:
   • Reference app integration: quests as contexts, AI guide as agent
 
 Test:
-  • iOS app creates identity in Keychain (Secure Enclave supports P-256 only; SCP uses Ed25519)
+  • iOS app creates identity in the Secure Enclave (every SCP key is a P-256 key, ADR-025's 2026-09-10 amendment)
   • Apple platform conformance: key_custody_conformance!(), attestation_conformance!(),
     push_conformance!() pass for Keychain/App Attest/APNs adapters (§16.12.3-5)
   • Quest runs as SCP context
@@ -1312,7 +1312,7 @@ This is a hard requirement, not an aspiration. Every protocol mechanism must be 
 | DID method (fallback) | did:web | Contingency only if did:dht libraries prove unusable. Not a planned deployment. |
 | Group encryption | MLS (OpenMLS) | O(log n) removal, forward secrecy, clean key destruction. |
 | Transport | SCP native relay (canonical) + adapters | No dependency on any single transport. SCP native relay is simplest reference. Adapters: Nostr, Matrix, Holepunch/Hyperswarm, libp2p, WebSocket, WebRTC, QUIC, BLE, Tor, I2P, SSB, MQTT, NATS, ZeroMQ, Yggdrasil, cjdns. |
-| Capability tokens | UCAN (native impl) | Per-agent, per-context, per-capability, revocable. Native implementation using ed25519-dalek + serde_json. |
+| Capability tokens | UCAN (native impl) | Per-agent, per-context, per-capability, revocable. Native implementation using the `p256` crate + serde_json. |
 | Spec status | Ships with SDK, iterates | Don't wait for perfect spec. Working code first. |
 | Infrastructure owned | Almost nothing | did:dht uses Mainline DHT (existing). Everything else is existing or user-owned. |
 | MCP integration | SCP agent as MCP server | Every MCP-compatible model works with SCP. Zero model-side integration. |
