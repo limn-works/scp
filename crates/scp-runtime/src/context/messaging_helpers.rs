@@ -2579,10 +2579,9 @@ pub fn build_snapshot_for_persist(
 /// and the `for_query_shim` path do not). Returns `true` only when the export
 /// succeeded AND carries a non-empty blob.
 ///
-/// The sole caller is `Supervisor::spawn_actor_from_welcome` (test-only until
-/// the FFI follow-on slice wires a production consumer), hence `dead_code`.
+/// The sole caller is `Supervisor::spawn_actor_from_welcome`, which the FFI
+/// slice (pull request #2036) wired to production bridge consumers.
 #[must_use]
-#[allow(dead_code)]
 pub const fn welcome_snapshot_crypto_is_durable(export: &Result<Vec<u8>, ContextError>) -> bool {
     matches!(export, Ok(blob) if !blob.is_empty())
 }
