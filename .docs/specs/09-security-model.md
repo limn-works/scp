@@ -479,10 +479,10 @@ Note: the `KeyPackageAttestation` binds **all four** of the leaf's own public ke
 
 ```
 BE32(len(did)) || did
-  || leaf_signature_key                       (32 raw bytes, no length prefix)
-  || leaf_encryption_key                      (32 raw bytes, no length prefix)
-  || init_key                                 (32 raw bytes, no length prefix)
-  || wrapping_key                             (32 raw bytes, no length prefix)
+  || leaf_signature_key                       (65 raw bytes, no length prefix)
+  || leaf_encryption_key                      (65 raw bytes, no length prefix)
+  || init_key                                 (65 raw bytes, no length prefix)
+  || wrapping_key                             (65 raw bytes, no length prefix)
   || BE32(len(signing_key_id)) || signing_key_id
   || issued_at                                (8-byte BE u64)
   || expires_at                               (8-byte BE u64)

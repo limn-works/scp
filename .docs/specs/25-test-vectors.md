@@ -6,37 +6,65 @@ This section provides known-answer test vectors for all cryptographic constructi
 
 All byte values are lowercase hex with `0x` prefix unless otherwise noted. All integers are big-endian unless otherwise noted.
 
+**The generator.** `scripts/gen-test-vectors-p256.py` produces every keyed byte this section prints. Run it from the repository root:
+
+```bash
+python3.12 scripts/gen-test-vectors-p256.py
+```
+
+The script uses nothing outside the Python standard library. It implements P-256 field and point arithmetic, RFC 6979 deterministic ECDSA with SHA-256, low-`s` normalization, SEC1 point encoding, HKDF-SHA256, HMAC-SHA256, the §9.5.1 canonical hash construction, the RFC 6962 Merkle construction, and the MessagePack subset the SCP structures serializes into. Before it prints a byte it checks itself against four published known-answer tests: `SHA-256("")`, the RFC 6979 Appendix A.2.5 P-256 nonce and signature, RFC 5869 Appendix A.1 for HKDF-SHA256, and this section's own curve-independent `DataProvenance` hash (Vector 35). It computes every public key twice, by two scalar multiplications that share no arithmetic, and a third time through the `cryptography` package when that package imports; a mismatch raises before anything prints.
+
+**What a signature covers.** Every SCP signature in this section is an ECDSA signature over a 32-byte canonical hash, so the ECDSA message digest **is** that canonical hash and no second SHA-256 is applied to it. The vectors run RFC 6979 with `h1` set to that same 32-byte digest. §9.5 fixes RFC 6979 with SHA-256 for a software signer and does not state which value plays `h1` for a prehashed digest; these vectors take the digest itself, and an implementation that hashes the digest a second time reproduces none of the signature bytes below.
+
 ## 25.2 Reference Key Material
 
-The following Ed25519 keypair is used across all test vectors for consistency. Implementations SHOULD verify they can reproduce the public key from the private key as a sanity check.
+Two P-256 keypairs carry every signature in this section. Both derive from a stated 32-byte seed, so an implementer reproduces the private scalar and the public key from the seed alone.
 
-**Ed25519 Seed (32 bytes):**
+**Seed-to-scalar rule.** A seed becomes a private scalar by the extra-random-bits method of FIPS 186-5 Appendix A.2.1, which §9.10.4 of the security-model spec states in full: expand the seed to 48 bytes with HKDF-Expand-SHA256 under a label, read those bytes as a big-endian integer, reduce modulo `n − 1`, and add one. The label for these two fixtures is the ASCII string `"SCP-TEST-VECTOR-KEY-V1"`. It labels a test fixture and names no protocol object, so §9.18.2 of the security-model spec registers no separator for it.
+
+**Reference seed (32 bytes):**
 ```
 0x9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60
 ```
 
-**Ed25519 Public Key (32 bytes):**
+**Reference private scalar (32 bytes):**
 ```
-0xd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+0x6f0712104c3f61ba04526a822836d3f4a13be12e09a8c3c7586b2da0c795998b
 ```
 
-This is the RFC 8032 Section 7.1 Test Vector 1 keypair. Implementations that cannot reproduce this public key from the seed have a broken Ed25519 implementation and MUST NOT proceed with SCP interoperability testing.
+**Reference public key, 33-byte SEC1 compressed point (§9.5):**
+```
+0x033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027
+```
 
-**Secondary Ed25519 Seed (for two-party vectors):**
+**Reference public key, 65-byte SEC1 uncompressed point (RFC 9420 §5.1.2 and RFC 9180 §7.1 encodings):**
+```
+0x043b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027471695574e78728df503a0c21dd1da9f7b77252d8398527a1b2177c78224f051
+```
+
+**Secondary seed (32 bytes, for two-party vectors):**
 ```
 0x4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb
 ```
 
-**Secondary Ed25519 Public Key (32 bytes):**
+**Secondary private scalar (32 bytes):**
 ```
-0x3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c
+0x0fed5549df222a5cf0b537e423fbd60875c6fb2b334b381a0c0a6c89eae9ac6a
 ```
 
-This is the RFC 8032 Section 7.1 Test Vector 2 keypair.
+**Secondary public key, 33-byte SEC1 compressed point:**
+```
+0x0223702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aea
+```
 
-**X25519 Key Material (derived from Ed25519 keys for HPKE operations):**
+**Secondary public key, 65-byte SEC1 uncompressed point:**
+```
+0x0423702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aead0992a08064d996d9268dc511c7430f3a4e614871d4a888b52a8dbecb56d6da6
+```
 
-Implementations derive X25519 keys from Ed25519 keys per RFC 8032 and the birational map. The exact X25519 public keys depend on the implementation's Ed25519-to-X25519 conversion. Implementations SHOULD verify round-trip consistency: `x25519_from_ed25519(ed25519_keypair).public == expected_x25519_public`.
+The two seeds are the byte strings RFC 8032 Section 7.1 gives as its first two test-vector seeds. SCP superseded Ed25519 on 2026-09-10 (§9.5 of the security-model spec), so the seeds no longer name an Ed25519 keypair and are retained only so this corpus's provenance stays legible across the change. An implementation that cannot reproduce either public key from its seed has a broken P-256 implementation, a broken HKDF, or a broken reading of the seed-to-scalar rule, and MUST NOT proceed with SCP interoperability testing.
+
+**The same P-256 keys serve ECDH for HPKE.** SCP's HPKE suite is DHKEM(P-256, HKDF-SHA256) (§9.5), so a key-agreement key on this curve is a P-256 key like any other. RFC 9180 §7.1 fixes its encoding as the 65-byte uncompressed SEC1 point, printed above beside the 33-byte compressed form that §9.5 fixes for signature verification. No separate key material stands between the two roles, and no birational map does either.
 
 ## 25.3 Canonical Hash Construction Vectors
 
@@ -130,11 +158,25 @@ Canonical hash input (concatenated bytes):
 
 Total: 22 + 2 + 1 + 19 + 20 + 8 + 8 + 8 + 8 + 36 + 36 + 11 = 179 bytes
 
-Expected: SHA-256 of the above 179 bytes. Sign this hash with the reference Ed25519 key.
-The signature is 64 bytes. Verify with Ed25519-verify(public_key, hash, signature).
+Preimage (hex, 179 bytes):
+  5343502d494e4e45522d454e56454c4f50452d56313a0100000000000f746573742d636f6e746578742d3031000000106469643a6468743a7a364d6b54657374000000000000000100000000000000000000000000000000000000006553f10000000020b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9000000206e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d0000000723616374697665
+
+Canonical hash SHA-256(preimage) (32 bytes):
+  0xe3fe1d0310b5eb15de46f22afa1995735253ce07b9960acfbdc50901c4c04c32
+
+RFC 6979 signature over the canonical hash, reference key, 64-byte raw r || s:
+  0x1e71a01bc73549f3aafd387df0b1efc866fcb008a0af0aba0c714178aab23a073b2448f046955ba5baa61a2d41ff800dee49d03d8671586b0b710282d857e05f
+
+Verification vector:
+  public key: 0x033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027
+  digest:     the canonical hash above
+  signature:  the 64 bytes above
+  verdict:    accept
 ```
 
-Implementations MUST produce identical canonical hash bytes. The SHA-256 of those bytes is the value signed by Ed25519.
+Implementations MUST produce identical canonical hash bytes. The SHA-256 of those bytes is the value the P-256 key signs.
+
+**What an implementation matches.** A software signer that derives its nonce under RFC 6979 with SHA-256 (§9.5) reproduces the signature bytes above exactly, because RFC 6979 removes the nonce as a source of variation. A hardware signer — a Secure Enclave, a passkey authenticator, an HSM, a smartcard — draws a random nonce and therefore produces different `r` and `s` for this same preimage on every call. §9.5 states that such a signer conforms. A conformance check for a hardware signer therefore verifies its signature against the signer's public key and MUST NOT compare bytes against the value printed here. The verification vector above is the check that binds both signer classes.
 
 ### Vector 6: InnerEnvelope with Provenance
 
@@ -147,6 +189,21 @@ Input changes:
 Canonical hash input changes:
   Position 8 (provenance_hash): BE32(32) || 0xabcdef...
   (replaces the SHA-256(0x00) sentinel)
+
+Preimage (hex, 179 bytes):
+  5343502d494e4e45522d454e56454c4f50452d56313a0100000000000f746573742d636f6e746578742d3031000000106469643a6468743a7a364d6b54657374000000000000000100000000000000000000000000000000000000006553f10000000020b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde900000020abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567890000000723616374697665
+
+Canonical hash SHA-256(preimage) (32 bytes):
+  0x225dae627d1d452ef405c454f5360f3963aa0f7b0aa1e25fcd079c28899a0bac
+
+RFC 6979 signature over the canonical hash, reference key, 64-byte raw r || s:
+  0xd367c6babbc1c5f428a28b791b4315d6e48a03364b17d93a5539bc5481eac746226afabede6626a059cbbbf9de31a30d6137b9532cde98fdea84fe1c4ebfd77c
+
+Verification vector:
+  public key: 0x033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027
+  digest:     the canonical hash above
+  signature:  the 64 bytes above
+  verdict:    accept
 ```
 
 ## 25.5 Vote Signing Vectors (§6.4)
@@ -171,7 +228,20 @@ Canonical hash input (per §9.5.2 SignedVote):
 
 Total: 12 + 32 + 21 + 13 + 8 = 86 bytes
 
-Expected: SHA-256 of the 86 bytes. Sign with Ed25519.
+Preimage (hex, 86 bytes):
+  5343502d564f54452d56313a0102030405060708091011121314151617181920212223242526272829303132000000116469643a6468743a7a364d6b566f7465720000000922417070726f766522000000006553f100
+
+Canonical hash SHA-256(preimage) (32 bytes):
+  0x30a5f33bc023a00c7f2f3deafe20a9097d5e3ab1ac5d3155fecc7196f61a9713
+
+RFC 6979 signature over the canonical hash, reference key, 64-byte raw r || s:
+  0x6f6892475ccb7bbeba00223ff906ff4cd9a5d92fa6551b8944561c4f2d36fe296d4a622332cee863aee40b52e38e61a3e88b2fb0ae683770026a23a580777050
+
+Verification vector:
+  public key: 0x033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027
+  digest:     the canonical hash above
+  signature:  the 64 bytes above
+  verdict:    accept
 
 Note: vote_type is serialized as compact JSON via serde_json (no whitespace).
 VoteType::Approve → "\"Approve\"" (9 bytes). VoteType::Reject → "\"Reject\"" (8 bytes).
@@ -190,7 +260,7 @@ Input:
   member_did:       "did:dht:z6MkSync"
   last_known_epoch: 42
   reason:           "extended offline (8 days)" (ResetReason::ExtendedOffline { offline_duration_secs: 691200 } → Display string)
-  nonce:            0x0102030405060708091011121314151617 (16 bytes)
+  nonce:            0x01020304050607080910111213141516 (16 bytes)
   timestamp:        1700000000
 
 Canonical hash input (per §23.5.2, field order from code):
@@ -204,8 +274,23 @@ Canonical hash input (per §23.5.2, field order from code):
 
 Total: 21 + 21 + 20 + 8 + 29 + 16 + 8 = 123 bytes
 
-Expected: SHA-256 of 123 bytes. Sign with Ed25519.
+Preimage (hex, 123 bytes):
+  5343502d52455345542d524551554553542d56313a0000001173796e632d746573742d636f6e74657874000000106469643a6468743a7a364d6b53796e63000000000000002a00000019657874656e646564206f66666c696e6520283820646179732901020304050607080910111213141516000000006553f100
+
+Canonical hash SHA-256(preimage) (32 bytes):
+  0xbb28e647cd66832e23e8fa9570f3e05f938bab15c10b03488109d84c75eacefd
+
+RFC 6979 signature over the canonical hash, reference key, 64-byte raw r || s:
+  0x31489688422b7e418b1dcd66353b9f689ccdb2128470c57dd2295d59ed28d93f0206cb8496630ae70fd3a04e79ad65d4f53a9582dbd3d31a45a68550d420022c
+
+Verification vector:
+  public key: 0x033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027
+  digest:     the canonical hash above
+  signature:  the 64 bytes above
+  verdict:    accept
 ```
+
+The `nonce` above carries 16 bytes, which is the width the field list states and the width the 123-byte total assumes. Before 2026-09-10 this vector printed a 17-byte literal beside the label "16 bytes", so an implementer following §25.17 step 3 would have measured 124 bytes against a stated 123 and read a correct encoding as wrong.
 
 ## 25.7 Envelope Padding Vectors (§9.10)
 
@@ -360,73 +445,78 @@ Note: The vectors above use abstract `data` leaves to pin the RFC 6962 tree cons
 
 ### Vector 32: Typed-Leaf KAT (closed `EventType` taxonomy)
 
-Each leaf is `SHA-256(0x00 || rmp_serde(Event))` over a canonical `scp_event_log::Event` whose `event_type` is one of the closed 77-variant `EventType` taxonomy (ADR-011 AC1 + typed-event unification Amendment + the cross-context-saga event model — Amendment §6 added `CrossContextOutletInvoked` (tag 76) and spec §6.2.4 added `CrossContextDivergenceMarker` (tag 77)). The events are signed with a fixed Ed25519 key (RFC 8032 deterministic signatures), so the full-event MessagePack bytes — and therefore the leaf hashes — are reproducible across runs and implementations. Structured payloads are encoded with positional `rmp_serde::to_vec` of the per-variant payload struct (`scp_event_log::payload`); the two opaque payloads carry the documented `key=value;…` bytes shown.
+Each leaf is `SHA-256(0x00 || rmp_serde(Event))` over a canonical `scp_event_log::Event` whose `event_type` is one of the closed 77-variant `EventType` taxonomy (ADR-011 AC1 + typed-event unification Amendment + the cross-context-saga event model — Amendment §6 added `CrossContextOutletInvoked` (tag 76) and spec §6.2.4 added `CrossContextDivergenceMarker` (tag 77)). The events are signed with the §25.2 reference P-256 key under RFC 6979, so the full-event MessagePack bytes — and therefore the leaf hashes — are reproducible across runs and implementations. Structured payloads are encoded with positional `rmp_serde::to_vec` of the per-variant payload struct (`scp_event_log::payload`); the two opaque payloads carry the documented `key=value;…` bytes shown.
+
+**MessagePack layout of a signed `Event`.** The seven fields serialize positionally, so an implementer reproduces the bytes without reading Rust: a 7-element array holding the `EventType` variant **name** as a string, the actor DID as a string, the timestamp as an unsigned integer, the sequence as an unsigned integer, the one-element `EventPayload` array holding the payload as a MessagePack binary, the 32-byte `prev_hash` as a 32-element array of unsigned integers, and the 64-byte signature as a MessagePack binary. The signed value is `SHA-256("SCP-EVENT-V1:" || BE16(event_type_tag) || BE32(len(actor_did)) || actor_did || BE64(timestamp) || BE64(sequence) || BE32(len(payload)) || payload || prev_hash)`.
+
+**The actor DID is an opaque UTF-8 string here.** §9.7.4.2 R13 of the security-model spec fixes the identifier as `SHA-256("SCP-KEL-ID-V1:" || inception_signed_preimage)` and states that a later revision fixes the inception preimage's field order and the identifier's textual form. This vector therefore states its actor DID as a literal fixture string rather than deriving one from the signing key, and pins the typed-leaf preimage and the RFC 6962 root, which is what it exists to pin.
 
 ```
-Signing key seed (32 bytes): 0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
-Actor DID (did:dht:z<z-base-32(pubkey)>):
-  did:dht:zxg4icmwxh3kx1odasrjqtkcmw6eb9bj4h4k57i9yhqeozmer131y
-Context ID: "ctx-kat"
+Signing key: the §25.2 reference P-256 key (seed 0x9d61b1…7f60)
+Actor DID:   "did:dht:z6MkEventLogKat"
+Context ID:  "ctx-kat"
 
 Events (append order; each prev_hash = previous leaf hash, genesis = [0u8;32]):
 
-  seq 0  AppBound                 ts 1700000000
+  seq 0  AppBound                 ts 1700000000  tag 74
          payload = rmp(AppBoundPayload{ app_did:"did:key:app", app_name:"Scheduler",
                        app_version:"1.0.0", capabilities:["outlet:call:*"] })
-         leaf = 0xe0c0691d264ca38d086375a0274afb630e9bbb906f2e12e0112adf4d1b4fcd38
+         leaf = 0x1af68450213d8e584be72c8f573aa4ca10dd3a9b9fc465857a751a33a3aaca63
 
-  seq 1  SpendApproved            ts 1700000001
+  seq 1  SpendApproved            ts 1700000001  tag 65
          payload = rmp(SpendApprovedPayload{ spender:"did:key:agent", amount:5000,
                        purpose:"inference" })
-         leaf = 0xf2f973a4df60ef87abcb99dd1f3afcd537037cbd1aae6297582c52be3bd8e695
+         leaf = 0xb8654f49e00c329133f562666670b341ac2928d6e260ef7d31385dc60bb79fa1
 
-  seq 2  TtlExtended              ts 1700000002
+  seq 2  TtlExtended              ts 1700000002  tag 62
          payload = rmp(TtlExtendedPayload{ old_deadline_unix:1700000000,
                        new_deadline_unix:1800000000, proposal_id:[0xAB;32],
                        consenting_members:["did:key:a","did:key:b"] })
-         leaf = 0xccdbb8dfa15a7abff3fbd0c08efe45e99d9fc4cb5f042f8f7db5f9e36e3fb0b0
+         leaf = 0xe0c4fe4394c6befeaabfd65f829e31402c0cb570da352250204da7b8dd4d2026
 
-  seq 3  RecoveryEpochAdvanced    ts 1700000003
+  seq 3  RecoveryEpochAdvanced    ts 1700000003  tag 73
          payload = rmp(RecoveryEpochAdvancedPayload{ old_epoch:7, new_epoch:8 })
-         leaf = 0x7a1a91c33ddaa1a92c02f70a3f567f065bed48b578124a803c07dca2f9a47863
+         leaf = 0x7601b953cbdb0facc67e8d14534d2d867db1d3294ef1ebaf794c36b8387fb5e2
 
-  seq 4  ContextTombstoned        ts 1700000004
+  seq 4  ContextTombstoned        ts 1700000004  tag 60
          payload = rmp(ContextTombstonedPayload{ destination_id:"ctx-dest",
                        migration_proposal_id:[0xCD;32] })
-         leaf = 0x3848718f23aefaba0e47743e72f5ce3bcc3254bc09b4cb38c3f5c263c9c4dd8d
+         leaf = 0x3e4c5cb18baeed919c6285ee855f32b465ad8403484d90c5e4e7439e830ef341
 
-  seq 5  ConsequenceTriggered     ts 1700000005
+  seq 5  ConsequenceTriggered     ts 1700000005  tag 67
          payload = b"member_did=did:key:m;rule_index=2;trigger_kind=absence;action_type=suspend"
-         leaf = 0x7ea6b6a020d94e0850cb84410af43e69ecd1c945223cbf478356d93503724507
+         leaf = 0x65a70c03fe2c73563338f2ff54d2407babebede0f04feace8396a6d41165ee06
 
-  seq 6  CommitBroadcastSucceeded ts 1700000006
+  seq 6  CommitBroadcastSucceeded ts 1700000006  tag 71
          payload = b"operation=join;attempts=3"
-         leaf = 0x87e3cde25168f4af4328f010369313e28fde305dbc6f706be3392fdf7b8e7f3c
+         leaf = 0x1e317e79707690629bd4e34ad028e7afd8b0c1a6d1ecf8c274c8050938522108
 
-  seq 7  RoleAssigned             ts 1700000007
+  seq 7  RoleAssigned             ts 1700000007  tag 6
          payload = rmp(RoleAssignedPayload{ subject_did:"did:key:carol", role:"admin" })
-         leaf = 0x9455cca66b6528ff7061d27b70ddab795ffff1e790fc1f797f22e21687e5f449
+         leaf = 0xd2fcaa28f52acc06a9baa5dfcbd85cef2e56742eb03a9ec5fc3baf9b7af50426
 
-  seq 8  MemberJoined             ts 1700000008
+  seq 8  MemberJoined             ts 1700000008  tag 4
          payload = rmp(MembershipChangePayload{ subject_did:"did:key:dave",
                        role_name:"member" })
-         leaf = 0x28860f95688e8b0604db7349fd79deed13d3b9a10198a9623ea288a6eeea58f2
+         leaf = 0x6bcce39bd338159ac4044e4189d632a606067594c1390e7042cfc4e7b6a7f6e6
 
 RFC 6962 tree::root over the 9 leaves:
-  0x0c6f6a09ecdda29319880ca609060ec15aa8055ee9fbc85099e5f6e8b1ba4117
+  0x0696f04e8cb022c6c33b9fd066bb975da568898588119f94d1846939e3c83c40
 ```
+
+**Only a software signer reproduces these leaves.** Each leaf hashes the event's signature bytes, so the leaf hash inherits the RFC 6979 determinism of the signature. A hardware signer produces a different signature for the same canonical hash and therefore a different leaf and a different root, which is correct behavior and not a conformance failure. A conformance check for such a signer verifies each event's signature against the signer's public key and compares the root only against a tree it built from its own events.
 
 ### Vector 33: Checkpoint Root KAT (§23.16.1)
 
-A `ConsistencyCheckpoint` generated over the Vector 32 log MUST carry `merkle_root == tree::root` (the RFC 6962 root above), NOT a hash-chain head. The checkpoint canonical hash is `SHA-256("SCP-CHECKPOINT-V1:" || len(context_id) || context_id || len(sender_did) || sender_did || event_count_BE || merkle_root || epoch_tag || timestamp_BE)` where `epoch_tag = 0x01 || epoch_BE` for `Some(epoch)` (§23.16.1); the checkpoint signature is the actor's Ed25519 signature over that canonical hash. The canonical hash and signature depend on the checkpoint `timestamp` (wall clock) and so are not pinned here; the pinned, timestamp-independent invariant is:
+A `ConsistencyCheckpoint` generated over the Vector 32 log MUST carry `merkle_root == tree::root` (the RFC 6962 root above), NOT a hash-chain head. The checkpoint canonical hash is `SHA-256("SCP-CHECKPOINT-V1:" || len(context_id) || context_id || len(sender_did) || sender_did || event_count_BE || merkle_root || epoch_tag || timestamp_BE)` where `epoch_tag = 0x01 || epoch_BE` for `Some(epoch)` (§23.16.1); the checkpoint signature is the actor's P-256 signature over that canonical hash. The canonical hash and signature depend on the checkpoint `timestamp` (wall clock) and so are not pinned here; the pinned, timestamp-independent invariant is:
 
 ```
 checkpoint.merkle_root == tree::root (Vector 32)
-  = 0x0c6f6a09ecdda29319880ca609060ec15aa8055ee9fbc85099e5f6e8b1ba4117
+  = 0x0696f04e8cb022c6c33b9fd066bb975da568898588119f94d1846939e3c83c40
 checkpoint.event_count == 9
 ```
 
-Reference implementation and assertions: `crates/scp-event-log/tests/test_vectors.rs` (`vector_32_typed_leaf_and_checkpoint_kat`, `vector_33_checkpoint_root_equals_tree_root_kat`). Regenerate with `cargo test -p scp-event-log --test test_vectors -- --nocapture`.
+Regenerate both vectors with `python3.12 scripts/gen-test-vectors-p256.py` (§25.1). `crates/scp-event-log/tests/test_vectors.rs` asserts the pre-2026-09-10 Ed25519 values in `vector_32_typed_leaf_and_checkpoint_kat` and `vector_33_checkpoint_root_equals_tree_root_kat`; §25.18 states which artifact governs while that port is outstanding.
 
 ### Vector 35: `DataProvenance` -> `provenance_hash` KAT (§24.3.3)
 
@@ -461,32 +551,69 @@ Reference implementation and assertions: `crates/scp-protocol/src/crypto/sender_
 
 Domain: `"SCP-KEY-CONTINUITY-V1:"`
 
-### Vector 20: Full Fingerprint (All Three Keys Present)
+§9.11 states one construction and it is two-party: the fingerprint covers both parties' 32-byte identifiers, both root sets under the §9.5.1 repeated-field rule, and both `#active` keys. Every key in it is a 33-byte SEC1 compressed P-256 point (§9.5), which is fixed-length and therefore carries no length prefix.
+
+```
+fingerprint = SHA-256("SCP-KEY-CONTINUITY-V1:"
+                      || id_lo || BE32(count(lo_root)) || lo_root_members || lo_active
+                      || id_hi || BE32(count(hi_root)) || hi_root_members || hi_active)
+```
+
+`id_lo` is whichever of the two identifiers is lower under unsigned byte comparison, and its whole block comes first.
+
+**The identifiers below are stated constants.** §9.7.4.2 R13 makes an identifier `SHA-256("SCP-KEL-ID-V1:" || inception_signed_preimage)` and states that a later revision of that section fixes the inception preimage's field order. Until it does, no vector can derive an identifier, so these vectors state each one as the SHA-256 of a fixed ASCII string. The fingerprint construction consumes 32 opaque bytes, so a stated constant exercises it exactly as a derived identifier would.
+
+### Vector 20: Two-Party Fingerprint
+
+Party A carries a two-member root set; party B carries a one-member root set, which exercises §9.11's rule that a one-member set still carries its `BE32(1)` count.
 
 ```
 Input:
-  root_key (#0):    0xd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a (32 bytes)
-  active_key (#active): 0x3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c (32 bytes)
-  agent_key (#agent):   0xfc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025 (32 bytes)
+  identifier_a = SHA-256("SCP test vector identifier A")
+               = 0xbcdcea594dbb12037950ee2d0f356300ea8e37d9dfb01b87c6249033e871095e
+  identifier_b = SHA-256("SCP test vector identifier B")
+               = 0xf30cbaf928e7bd22a3d2f4aecf6573120a0cdddd8600aa685f61e7f72c78e856
 
-Fingerprint: SHA-256("SCP-KEY-CONTINUITY-V1:" || root_key || active_key || agent_key)
+  a_root_set (2 members, in the order the key state carries):
+    0x02542c432f5a8f756764e2f18c8125e5338e61ba1540057f8c6ee666b07c7aa8d1
+    0x02b945d8e097faded7a70e6c18134caf2a9521bc2b05af0becdf99adc9212789d0
+  a_active_key:
+    0x02e264c93973b59b7699221aff574dcde04a79347335c4f9c4a643c7525cd9b975
+
+  b_root_set (1 member):
+    0x02c4ed969c4a9e294576355bbeb14270e54b51bf6f00b6d1b587676fd0865ee8a8
+  b_active_key:
+    0x027a3f3aad1b66ab82d3d67a2e3af15f89f304c4b6369accc5715dda72d2800512
+
+Ordering: identifier_a < identifier_b, so party A's block comes first.
+
+Preimage (hex, 259 bytes):
+  5343502d4b45592d434f4e54494e554954592d56313abcdcea594dbb12037950ee2d0f356300ea8e37d9dfb01b87c6249033e871095e0000000202542c432f5a8f756764e2f18c8125e5338e61ba1540057f8c6ee666b07c7aa8d102b945d8e097faded7a70e6c18134caf2a9521bc2b05af0becdf99adc9212789d002e264c93973b59b7699221aff574dcde04a79347335c4f9c4a643c7525cd9b975f30cbaf928e7bd22a3d2f4aecf6573120a0cdddd8600aa685f61e7f72c78e8560000000102c4ed969c4a9e294576355bbeb14270e54b51bf6f00b6d1b587676fd0865ee8a8027a3f3aad1b66ab82d3d67a2e3af15f89f304c4b6369accc5715dda72d2800512
+
+Total: 22 + 32 + 4 + 33 + 33 + 33 + 32 + 4 + 33 + 33 = 259 bytes
+
+Fingerprint:
+  0xc6cdaa8eeb6d04798e308ee0f7c1ecdc29874f8f4411c7c9df921539ad975466
 ```
 
-### Vector 21: Fingerprint Without Agent Key
+Every key in the preimage is one of the five 33-byte points above, so substituting any single key changes the fingerprint. The five keypairs derive from the seeds `0x41×32`, `0x42×32`, `0x43×32`, `0x44×32`, and `0x45×32` under the §25.2 seed-to-scalar rule and its `"SCP-TEST-VECTOR-KEY-V1"` label.
+
+### Vector 38: Fingerprint Ordering Is Argument-Order Independent
+
+Two parties compute the fingerprint from opposite sides, so each supplies its own block first. §9.11 orders the blocks by the identifiers, never by who is computing, so both parties MUST reach the same value.
 
 ```
-Input:
-  root_key (#0):        (same as Vector 20)
-  active_key (#active): (same as Vector 20)
-  agent_key (#agent):   absent
+Input: Vector 20's inputs, with party B supplied first and party A second.
 
-Agent key sentinel: SHA-256("SCP-ABSENT-AGENT-KEY")
-                  = 0x... (32 bytes)
+Preimage: byte-identical to Vector 20's 259-byte preimage.
 
-Fingerprint: SHA-256("SCP-KEY-CONTINUITY-V1:" || root_key || active_key || sentinel)
+Fingerprint:
+  0xc6cdaa8eeb6d04798e308ee0f7c1ecdc29874f8f4411c7c9df921539ad975466
 ```
 
-The sentinel value MUST equal `SHA-256(b"SCP-ABSENT-AGENT-KEY")`. This is a domain-derived constant, not a magic number. Implementations MUST precompute this value and verify it matches their SHA-256 implementation.
+An implementation that concatenates the caller's own block first computes two different values for one honest pair and raises §9.11's maximum-severity MITM alert against an honest counterparty.
+
+**Vector 21 was deleted on 2026-09-10.** It pinned a fingerprint over `#0`, `#active`, and an absent `#agent` key standing in as `SHA-256("SCP-ABSENT-AGENT-KEY")`. §9.11's construction carries no `#agent` term and no sentinel of any kind, so the vector covered a construction the spec no longer states.
 
 ## 25.10 Claim Validation Vectors (§12.3)
 
@@ -502,14 +629,19 @@ Input:
   timestamp:    1700000000
 
 Canonical hash input:
-  "SCP-CLAIM-V1:"                              (14 bytes)
+  "SCP-CLAIM-V1:"                              (13 bytes)
   || BE32(20) || "shadow-alice-x-12345"         (4 + 20 = 24 bytes)
   || BE32(17) || "did:dht:z6MkClaim"           (4 + 17 = 21 bytes)
   || BE32(19) || "bridge-test-context"          (4 + 19 = 23 bytes)
   || BE64(1700000000)                           (8 bytes)
 
-Total: 14 + 24 + 21 + 23 + 8 = 90 bytes
+Total: 13 + 24 + 21 + 23 + 8 = 89 bytes
+
+Expected SHA-256:
+  0xf3469482bb1d91d18e7167d21666fad9476b0559625257589075df6ebca23642
 ```
+
+The domain separator is 13 ASCII bytes and the preimage is 89. Before 2026-09-10 this vector stated 14 and 90, so an implementer following §25.17 step 3 would have read a correct encoding as wrong. The claim hash is new here: §25.17 step 4 tells an implementer to compare each canonical byte sequence's SHA-256 against an expected hash, and this vector carried none.
 
 ## 25.11 Proposal ID Vectors (§6.4)
 
@@ -521,29 +653,34 @@ Domain: `"SCP-PROPOSAL-V1:"`
 Input:
   context_id:   "gov-proposal-context"
   proposer_did: "did:dht:z6MkProposer"
-  action_bytes: canonical JSON serialization of GovernanceAction (variable length)
-                Example: 0xdeadbeef01020304 (8 bytes, placeholder)
+  action_bytes: {"AddMember":{"did":"did:dht:z6MkNewMember","role":"member"}}
+                (61 bytes — the compact JSON of GovernanceAction::AddMember)
+                hex: 0x7b224164644d656d626572223a7b22646964223a226469643a6468743a7a364d6b4e65774d656d626572222c22726f6c65223a226d656d626572227d7d
   timestamp:    1700000000
 
 Canonical hash input (per §9.5.2 GovernanceProposal ID):
-  "SCP-PROPOSAL-V1:"                           (17 bytes)
+  "SCP-PROPOSAL-V1:"                           (16 bytes)
   || BE32(20) || "gov-proposal-context"         (4 + 20 = 24 bytes)
   || BE32(20) || "did:dht:z6MkProposer"        (4 + 20 = 24 bytes)
-  || BE32(8)  || action_bytes                   (4 + 8 = 12 bytes, length-prefixed)
+  || BE32(61) || action_bytes                   (4 + 61 = 65 bytes, length-prefixed)
   || BE64(1700000000)                           (8 bytes)
 
-Total: 17 + 24 + 24 + 12 + 8 = 85 bytes
+Total: 16 + 24 + 24 + 65 + 8 = 137 bytes
 
-Proposal ID: SHA-256 of the above 85 bytes.
+Preimage (hex, 137 bytes):
+  5343502d50524f504f53414c2d56313a00000014676f762d70726f706f73616c2d636f6e74657874000000146469643a6468743a7a364d6b50726f706f7365720000003d7b224164644d656d626572223a7b22646964223a226469643a6468743a7a364d6b4e65774d656d626572222c22726f6c65223a226d656d626572227d7d000000006553f100
+
+Proposal ID:
+  0xcd423e7b6272c9cfd25a6e636922bab94cc3c8df48a50bc649bb856cb5f25d65
 
 Note: action_bytes is the canonical JSON serialization of the GovernanceAction
 enum (compact, no whitespace — equivalent to serde_json::to_vec in Rust or
 json.dumps(separators=(',', ':')) in Python). JSON is used rather than
 MessagePack for cross-implementation determinism (see §9.5.2). Field order
-matches code: context_id, proposer_did, action_bytes, timestamp. The
-action_bytes placeholder above should be replaced with actual JSON output
-when generating §25.18 hex outputs.
+matches code: context_id, proposer_did, action_bytes, timestamp.
 ```
+
+Before 2026-09-10 this vector carried `0xdeadbeef01020304` labelled a placeholder, together with a note telling a later author to substitute real JSON. Those eight bytes are not a JSON serialization of any `GovernanceAction`, so the vector pinned no proposal ID and its stated 85-byte total measured a preimage no conforming producer builds. The `AddMember` action above is a real variant of the enum §9.5.2 names, stated literally, so this vector now derives from its own printed inputs. The domain separator is 16 ASCII bytes, not the 17 the vector previously stated.
 
 ## 25.12 HPKE Key Distribution Vectors
 
@@ -558,12 +695,15 @@ Input:
   epoch:      42
 
 Info string (concatenated bytes):
-  "scp-sender-key-v1"                     (18 bytes)
+  "scp-sender-key-v1"                     (17 bytes)
   || BE32(17) || "hpke-test-context"       (4 + 17 = 21 bytes)
   || BE32(18) || "did:dht:z6MkSender"     (4 + 18 = 22 bytes)
   || BE64(42)                              (8 bytes)
 
-Total: 18 + 21 + 22 + 8 = 69 bytes
+Total: 17 + 21 + 22 + 8 = 68 bytes
+
+Info string (hex, 68 bytes):
+  0x7363702d73656e6465722d6b65792d76310000001168706b652d746573742d636f6e74657874000000126469643a6468743a7a364d6b53656e646572000000000000002a
 ```
 
 Note: the sender key info string uses 4-byte BE length-prefixed context_id and sender_did fields, matching the access key info string structure. Length prefixes prevent boundary-shift collisions with adversarial inputs.
@@ -577,15 +717,22 @@ Input:
   epoch:      42
 
 Info string (concatenated bytes):
-  "scp-access-key-v1"                     (18 bytes)
+  "scp-access-key-v1"                     (17 bytes)
   || BE32(17) || "hpke-test-context"       (4 + 17 = 21 bytes)
   || BE32(18) || "did:dht:z6MkMember"     (4 + 18 = 22 bytes)
   || BE64(42)                              (8 bytes)
 
-Total: 18 + 21 + 22 + 8 = 69 bytes
+Total: 17 + 21 + 22 + 8 = 68 bytes
+
+Info string (hex, 68 bytes):
+  0x7363702d6163636573732d6b65792d76310000001168706b652d746573742d636f6e74657874000000126469643a6468743a7a364d6b4d656d626572000000000000002a
 ```
 
 Note: Both the sender key and access key info strings use 4-byte BE length-prefixed context_id and DID fields. Domain separation between the two is provided by distinct prefix strings (`"scp-sender-key-v1"` vs `"scp-access-key-v1"`), which ensures the two info strings can never collide even with adversarial inputs.
+
+Both prefixes are 17 ASCII bytes and both info strings are 68. Before 2026-09-10 these two vectors stated 18 and 69, so an implementer following §25.17 step 3 would have read a correct encoding as wrong.
+
+**Neither vector prints a KEM output.** These two vectors pin the `info` strings and the domain separation between them, which is what §9.16.2 and §9.17.1 fix. The KEM itself is DHKEM(P-256, HKDF-SHA256) with the encodings RFC 9180 §7.1 fixes, and RFC 9180 Appendix A.3 already publishes known-answer vectors for it, so no vector here restates them.
 
 ## 25.13 Attestation Signing Vectors (§3.5.2, §9.5.1)
 
@@ -619,13 +766,41 @@ Canonical hash input:
   || BE32(18)  || "did:dht:z6MkIssuer"        (4 + 18 = 22 bytes — subject)
   || BE64(1700000000)                          (8 bytes — issued_at)
   || SHA-256(0x00)                              (32 bytes, raw — no length prefix — absent expires_at sentinel)
-  || BE32(N_c) || msgpack(claim)               (4 + N_c bytes — claim as MessagePack)
-  || BE32(N_e) || msgpack(evidence)            (4 + N_e bytes — evidence as MessagePack)
-  || BE32(N_r) || msgpack(revocation_status)    (4 + N_r bytes — revocation_status as MessagePack)
+  || BE32(80)  || msgpack(claim)               (4 + 80 = 84 bytes — claim as MessagePack)
+  || BE32(110) || msgpack(evidence)            (4 + 110 = 114 bytes — evidence as MessagePack)
+  || BE32(7)   || msgpack(revocation_status)    (4 + 7 = 11 bytes — revocation_status as MessagePack)
 
-The exact byte count depends on the MessagePack encoding of the sub-structures.
-Compute the expected SHA-256 hash using the Rust reference implementation.
+Total: 33 + 11 + 17 + 22 + 22 + 8 + 32 + 84 + 114 + 11 = 354 bytes
+
+MessagePack sub-structures (name-keyed maps; a `None` field is omitted, so
+`platform_id` and `verifier_did` do not appear):
+
+  msgpack(claim), 80 bytes:
+    0x83a8706c6174666f726daa676f6f676c652e636f6daf706c6174666f726d5f68616e646c65af616c69636540676d61696c2e636f6da96c696e6b5f74797065b073656c665f6174746573746174696f6e
+
+  msgpack(evidence), 110 bytes:
+    0x83a66d6574686f64a56f61757468a570726f6f66d9477b2270726f7669646572223a22676f6f676c652e636f6d222c227375626a6563745f6964223a223132333435222c2276657269666965645f6174223a313730303030303030307dab76657269666965645f6174ce6553f100
+
+  msgpack(revocation_status), 7 bytes:
+    0xa6416374697665
+
+Preimage (hex, 354 bytes):
+  5343502d4944454e544954592d4c494e4b2d4154544553544154494f4e2d56313a000000076174742d3030310000000d6964656e746974795f6c696e6b000000126469643a6468743a7a364d6b497373756572000000126469643a6468743a7a364d6b497373756572000000006553f1006e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d0000005083a8706c6174666f726daa676f6f676c652e636f6daf706c6174666f726d5f68616e646c65af616c69636540676d61696c2e636f6da96c696e6b5f74797065b073656c665f6174746573746174696f6e0000006e83a66d6574686f64a56f61757468a570726f6f66d9477b2270726f7669646572223a22676f6f676c652e636f6d222c227375626a6563745f6964223a223132333435222c2276657269666965645f6174223a313730303030303030307dab76657269666965645f6174ce6553f10000000007a6416374697665
+
+Canonical hash SHA-256(preimage) (32 bytes):
+  0xf96d0d2c24da118b3e31f20fc082e1b0c23daa0114d9b747eddbc16339924927
+
+RFC 6979 signature over the canonical hash, reference key, 64-byte raw r || s:
+  0xe66d1b5884fc5f58ed627e49aac5db247d5c2129e0411e0a2154b9f603ffe94c05a358e3a31b20f28656741a36f90adb500a75261cb9725526f9fe7b2b54550f
+
+Verification vector:
+  public key: 0x033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027
+  digest:     the canonical hash above
+  signature:  the 64 bytes above
+  verdict:    accept
 ```
+
+A software signer under RFC 6979 reproduces those signature bytes; a hardware signer produces different bytes over the same canonical hash and is checked against the verification vector instead (§25.4 states the rule once and this vector follows it). Before 2026-09-10 this vector printed no hash at all and told the reader to compute one from the Rust reference implementation, so it pinned nothing an independent implementer could check.
 
 ## 25.14 Pseudonymization Vectors (§24.3.5)
 
@@ -719,13 +894,13 @@ To verify an implementation against these test vectors:
 
 1. **SHA-256 sanity check.** Compute `SHA-256("")` and verify it equals `0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`. If this fails, the SHA-256 implementation is broken.
 
-2. **Ed25519 sanity check.** Load the reference seed (§25.2) and derive the public key. Verify it matches the expected public key. If this fails, the Ed25519 implementation is broken.
+2. **P-256 sanity check.** Load the reference seed (§25.2), derive the private scalar under the seed-to-scalar rule, and derive the public key. Verify both against the values §25.2 prints. If either fails, the P-256 implementation, the HKDF, or the reading of the seed-to-scalar rule is broken.
 
 3. **Encoding verification.** For each vector, construct the canonical byte sequence from the specified inputs using the encoding rules in §9.5.1. Compare the byte sequence length against the expected total. If lengths differ, the encoding is wrong.
 
-4. **Hash verification.** Compute SHA-256 of each canonical byte sequence. Compare against the expected hash (run against the Rust reference implementation to obtain expected hashes).
+4. **Hash verification.** Compute SHA-256 of each canonical byte sequence. Compare against the expected hash the vector prints.
 
-5. **Signature verification.** For signed structures, sign the hash with the reference Ed25519 key and verify the signature. Then verify with Ed25519-verify. Both operations must succeed.
+5. **Signature verification.** For signed structures, verify the printed 64-byte signature against the reference public key and the canonical hash, and confirm the verifier rejects the same signature with `s` replaced by `n − s` (§9.5's low-`s` rule). Then sign the canonical hash with your own signer and verify your own signature. A **software** signer MUST additionally reproduce the printed bytes exactly, because §9.5 requires it to derive the nonce under RFC 6979 with SHA-256 over that same digest. A **hardware** signer — Secure Enclave, passkey authenticator, HSM, smartcard — draws a random nonce, produces different bytes on every call, and conforms; its conformance check is the verification step and never a byte comparison.
 
 6. **Padding verification.** For each padding vector, construct the padded output and verify the total length matches the expected bucket size. Strip the padding and verify the original payload is recovered.
 
@@ -733,16 +908,17 @@ To verify an implementation against these test vectors:
 
 ## 25.18 Generating Reference Outputs
 
-The Rust reference implementation can generate exact expected outputs for all vectors. Run the test vector generation tool:
+`scripts/gen-test-vectors-p256.py` regenerates every value this section prints:
 
 ```bash
-cargo test -p scp-runtime --test test_vectors -- --nocapture
-cargo test -p scp-event-log --test test_vectors -- --nocapture
+python3.12 scripts/gen-test-vectors-p256.py
 ```
 
-The test vector generation test is defined in `crates/scp-runtime/tests/test_vectors.rs` and `crates/scp-event-log/tests/test_vectors.rs`. These tests print hex-encoded intermediate and final values for each vector defined above.
+§25.1 states what the script implements and which published known-answer tests it checks itself against. A value printed above that the script does not reproduce is a defect in this section.
 
-Independent implementations SHOULD run these tests against the Rust implementation to obtain the expected outputs, then embed those outputs in their own test suites.
+**The Rust reference implementation still signs under the superseded curve.** `crates/scp-runtime/tests/test_vectors.rs`, `crates/scp-event-log/tests/test_vectors.rs`, and `crates/scp-crypto/src/pseudonym.rs` assert the Ed25519 values these vectors carried before 2026-09-10. SCP superseded Ed25519 on that date (§9.5 of the security-model spec) and the artifact flow puts the spec first, so this section is the authority for every byte above until those tests are ported to P-256. An implementer comparing against those Rust tests today reproduces the pre-2026-09-10 values, not the values above.
+
+Independent implementations SHOULD run the generator, compare its output against the values printed above, and then embed those outputs in their own test suites.
 
 ## 25.19 Per-Context Pseudonym Derivation Vectors (§9.10.4, §9.10.4.A, §9.10.4.1)
 
@@ -751,8 +927,11 @@ These vectors pin the **software-custody** per-context pseudonym keypair derivat
 Derivation recipe (all implementations agree):
 
 ```
+identity_scalar = the 32-byte P-256 private scalar (§25.2 states how a seed
+                  becomes one; §9.10.4.A names this value as the HKDF input)
+
 pseudonym_secret = HKDF-SHA256(
-  ikm  = ed25519_private_seed_bytes (32 bytes),
+  ikm  = identity_scalar (32 bytes),
   salt = "scp-pseudonym-secret-v1",
   info = "",                                   (empty)
   len  = 32
@@ -764,48 +943,71 @@ context_seed_v1 = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")
 # v2 (rotatable, BE64 epoch):
 context_seed_v2 = HMAC-SHA256(pseudonym_secret, context_id || BE64(epoch) || "scp-pseudonym-v2")
 
-pseudonym_public_key = Ed25519_keygen(context_seed[0..32]).public_key
+# seed-to-scalar (FIPS 186-5 A.2.1, extra random bits — §9.10.4):
+scalar_input = HKDF-Expand-SHA256(context_seed, "SCP-PSEUDONYM-P256-V1", 48)
+d            = (int(scalar_input) mod (n - 1)) + 1
+pseudonym_public_key = P256_keypair_from_scalar(d).public_key   (33-byte compressed)
 ```
 
-The 32-byte `context_seed` is interpreted as an **RFC-8032 Ed25519 seed** (fed to the standard key expansion: SHA-512 of the seed, then clamp the lower half to form the scalar), NOT as a pre-clamped scalar. The HMAC `data` is plain concatenation with NO length prefixes — these are fixed-format internal inputs, and the domain-separator suffix (`"scp-pseudonym"` vs `"scp-pseudonym-v2"`) plus the fixed 8-byte BE64 epoch make the encoding unambiguous.
+The 32-byte `context_seed` is the HKDF-Expand input of the seed-to-scalar rule, never a scalar in its own right: §9.10.4 forbids reducing it directly, which biases the low-order scalars, and forbids reject-and-retry, which makes the derivation diverge across implementations that draw retries differently. The HMAC `data` is plain concatenation with NO length prefixes — these are fixed-format internal inputs, and the domain-separator suffix (`"scp-pseudonym"` vs `"scp-pseudonym-v2"`) plus the fixed 8-byte BE64 epoch make the encoding unambiguous.
+
+The two vectors below take a 32-byte identity **seed** as their stated input and turn it into the identity scalar by the §25.2 rule, so each vector derives from bytes it prints.
 
 ### Vector 30: Pseudonym Derivation — identity seed 0x01×32
 
 ```
 Input:
-  ed25519_private_seed:  0x0101010101010101010101010101010101010101010101010101010101010101
+  identity_seed:         0x0101010101010101010101010101010101010101010101010101010101010101
   context_id:            "context-alpha"  (0x636f6e746578742d616c706861, 13 bytes)
   epoch (v2):            1
 
+Identity scalar (§25.2 seed-to-scalar, label "SCP-TEST-VECTOR-KEY-V1"):
+  0x32c69e4a096fadd1a8d0a21e0a97f124d5c4c8c5b15b96027beadb91c2f3ec64
+
 Expected pseudonym_secret:
-  0x27456a3dd24ed5813b2645f0ee001f57760c49b9117b93c8fa98e4129d36a643
+  0xb88e781bb954a6681abc9016f8f69939f0e624311aeaa7e8f1b145857f58de82
 
-Expected v1 pseudonym public key:
-  0xfddc04882a48aa39888f6dbec622f9c5aa6f06b2e40820a69a2e0e89b5f09ac2
+Expected context_seed_v1:
+  0x47ea801c24e8a4d577f04837eca0674fbbf160127fa2d1a4bb1420150b0a048b
 
-Expected v2 pseudonym public key (epoch = 1):
-  0x43e50a947c4b2be44f871e309c7edc64afaf4207b9a589c9b01f61c01158090f
+Expected v1 pseudonym public key (33-byte compressed):
+  0x0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72
+
+Expected context_seed_v2 (epoch = 1):
+  0x6ab63aa150992ff032f6963c31dc9f5a8bd4e9518516f9fbd3bea7bc07f64b38
+
+Expected v2 pseudonym public key (epoch = 1, 33-byte compressed):
+  0x0276c50b92dacbe6ae1a3761d007b7fe75016a4c076f214694c95d13162ff24479
 ```
 
 ### Vector 31: Pseudonym Derivation — identity seed 0x9d,0x01..0x1f
 
 ```
 Input:
-  ed25519_private_seed:  0x9d0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+  identity_seed:         0x9d0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
   context_id:            "context-alpha"  (0x636f6e746578742d616c706861, 13 bytes)
   epoch (v2):            1
 
+Identity scalar (§25.2 seed-to-scalar, label "SCP-TEST-VECTOR-KEY-V1"):
+  0x65d56a863d03d31ea15ade82f677058d5bbe53afedc6ff7d2b8846aa25a1bc2b
+
 Expected pseudonym_secret:
-  0xa586191a1ab6cd3efe45697b3510ee1edac8c54a7f27863546b6e0333e20d690
+  0x17ef25ad3e5be8adad38c4c5a1c68d3daca80015e81bdcae2ae8940645774739
 
-Expected v1 pseudonym public key:
-  0xff6e2e909a008318f97bb2c26c1d787ceb9aa2996f746766335e10ba7e2213cc
+Expected context_seed_v1:
+  0x5157d14a2362044199ba88d66d6a52a4bfbe0598ebe921c5fb9c362d3bebaedd
 
-Expected v2 pseudonym public key (epoch = 1):
-  0xedd47319719e2350d1db9488e0189f2405267d7dc243489cfd9aa6f3ac3fc639
+Expected v1 pseudonym public key (33-byte compressed):
+  0x0239f7c3213f3567183fd2fcf7aec6c884bc70e0e694c42053284a4b5ebef4fe2d
+
+Expected context_seed_v2 (epoch = 1):
+  0x8133a9d716dcbe729b1f447ac0efccf3795e8bf28da2db4744090d0316ead730
+
+Expected v2 pseudonym public key (epoch = 1, 33-byte compressed):
+  0x037967cfe8d3111cdd72288ea3f444c15b710300323162fec63ca9036af73754e3
 ```
 
-These vectors are mechanically enforced by the Rust known-answer test `derive_pseudonym_keypair_known_answer_vectors` in `crates/scp-crypto/src/pseudonym.rs` (the wasm-safe home of the derivation, ADR-057 Option A), and cross-checked for native/`wasm32` byte-parity by `pseudonym_derivation_matches_golden_vectors` in `crates/scp-client-wasm/tests/pseudonym_derivation_cross_target_kat.rs`.
+`derive_pseudonym_keypair_known_answer_vectors` in `crates/scp-crypto/src/pseudonym.rs` (the wasm-safe home of the derivation, ADR-057 Option A) and `pseudonym_derivation_matches_golden_vectors` in `crates/scp-client-wasm/tests/pseudonym_derivation_cross_target_kat.rs` assert the pre-2026-09-10 Ed25519 values; §25.18 states which artifact governs while that port is outstanding. The native/`wasm32` byte-parity obligation those two tests carry is unchanged — only the curve and the key width changed.
 
 ### Vector 36: `PseudonymAnnouncement` wire format + classifier decisions (§9.10.4)
 
@@ -885,17 +1087,29 @@ Canonical hash input:
 
 Total: 19 + 17 + 2 + 22 + 23 + 31 + 32 + 8 + 32 + 11 = 197 bytes
 
+Preimage (hex, 197 bytes):
+  5343502d4154544553544154494f4e2d56313a0000000d6174742d74727573742d3030310004000000126469643a6468743a7a364d6b497373756572000000136469643a6468743a7a364d6b5375626a6563740000001b7b226c6576656c223a22676f6c64222c2273636f7265223a34327d6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d000000006553f1006e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d00000007a6416374697665
+
 Expected SHA-256 (= canonical_attestation_bytes output):
   0x6d07c76821a2ae4dd830ca117aa9fd8e30232cca72459a4d129432f56d87a08c
+
+RFC 6979 signature over the canonical hash, reference key, 64-byte raw r || s:
+  0x767f500caf5ecbc3e2d9f73376a16a36cb68c5d32c9c4be48cd5aae7b8615174589cb95e07ed2c6027c0a21a260cd90605ab2598f3cc96dce2d437dcfa530647
+
+Verification vector:
+  public key: 0x033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027
+  digest:     the canonical hash above
+  signature:  the 64 bytes above
+  verdict:    accept
 ```
 
-The Ed25519 signature is computed over the 32-byte canonical hash. Sign with the reference key (§25.2) and verify per §25.17 step 5; Ed25519 is deterministic, so the reference implementation reproduces the same signature bytes on every run.
+The P-256 signature is computed over the 32-byte canonical hash. Sign with the reference key (§25.2) and verify per §25.17 step 5. The preimage carries no key material, so the canonical hash above is unchanged from the value this vector pinned before SCP superseded Ed25519 on 2026-09-10; only the signature is new.
 
-This vector is mechanically enforced by `vector_34_trust_attestation_signature` in `crates/scp-runtime/tests/test_vectors.rs`, which pins the expected hash, reconstructs the preimage byte-for-byte, and verifies the signed attestation through the production `verify_attestation` path.
+`vector_34_trust_attestation_signature` in `crates/scp-runtime/tests/test_vectors.rs` pins the expected hash, reconstructs the preimage byte-for-byte, and verifies a signed attestation through the production `verify_attestation` path. Its hash assertion still holds; its signature path is Ed25519 and §25.18 states which artifact governs while that port is outstanding.
 
 ## 25.21 Outlet Streaming Conformance Vectors (§5.4.5)
 
-Progressive-output (streaming) outlet invocation (§5.4.5, ADR-061) is exercised by a shared set of 7 scenario vectors that pin the observable behaviour of a stream end-to-end: the ordered chunk transcript, the credit-grant timing, the cancellation billing boundary, and the terminal status recorded in the `OutletInvokedEvent` (`StreamTerminalStatus`, §5.4.5 "Event log shape"). Unlike the cryptographic known-answer vectors above, these are **behavioural** vectors — they carry payload *descriptors*, not literal signed wire bytes. Every chunk signature (`OutletStreamChunk.sig`) and every `caveats_binding` is **recomputed** by the harness at replay time under the §25.2 reference operator key (RFC 8032 §7.1 Test Vector 1, seed `0x9d61…7f60`), because the operator signature preimage (`SCP-OUTLET-CHUNK-SIG-V1:`, §5.4.5) binds the per-stream `request_id`, `sequence`, and `caveats_binding`, none of which are fixed until the stream is opened.
+Progressive-output (streaming) outlet invocation (§5.4.5, ADR-061) is exercised by a shared set of 7 scenario vectors that pin the observable behavior of a stream end-to-end: the ordered chunk transcript, the credit-grant timing, the cancellation billing boundary, and the terminal status recorded in the `OutletInvokedEvent` (`StreamTerminalStatus`, §5.4.5 "Event log shape"). Unlike the cryptographic known-answer vectors above, these are **behavioral** vectors — they carry payload *descriptors*, not literal signed wire bytes. Every chunk signature (`OutletStreamChunk.sig`) and every `caveats_binding` is **recomputed** by the harness at replay time under the §25.2 reference operator key (the P-256 key derived from seed `0x9d61…7f60`), because the operator signature preimage (`SCP-OUTLET-CHUNK-SIG-V1:`, §5.4.5) binds the per-stream `request_id`, `sequence`, and `caveats_binding`, none of which are fixed until the stream is opened.
 
 The canonical vector file is `tests/conformance/vectors/outlet_stream_vectors.json` (top-level `{version, vectors:[7]}`). The four language SDKs consume the **same** JSON so the drain-side chunk decoding, credit granting, cancellation, and terminal-status mapping match the Rust core byte-for-byte across bindings.
 
@@ -938,13 +1152,13 @@ Because the PyO3/NAPI/UniFFI handler-registration seam produces a single aggrega
 
 The **transactional-streaming** corner of the outlet taxonomy (ADR-061 *streaming saga*; §6.2.4 cross-context outlet invocation saga; §6.2.5 outlet invocation modes) is exercised by a set of **6 scenario vectors** that pin the observable artifacts of a cross-context stream: the sealed RFC-6962 `stream_manifest_hash` (§5.4.5 chunk manifest; a fixed 32 bytes regardless of stream length, ADR-061), the self-verifying `SCP-XCTX-STREAM-RECEIPT-V1` receipt over that root (`crates/scp-protocol/src/context/outlets/cross_context_saga.rs`), the atomic dual event-log join, the receive-side gap terminal, and the aggregate-schema terminal. This complements the same-context §25.21 set (`§5.4.5` progressive output), which does not exercise the saga's seal/receipt/dual-log artifacts.
 
-The canonical vector file is `tests/conformance/vectors/outlet_streaming_saga_vectors.json` (top-level `{version, vectors:[6]}`, each entry a `{name, spec}` envelope). Every chunk signature and every `caveats_binding` is **recomputed** at replay time under the §25.2 reference operator key (RFC 8032 §7.1 Test Vector 1, seed `0x9d61…7f60`); the receipt round-trip KAT signs under that same §25.2 seed so its preimage and Ed25519 signature are byte-exact and checked in.
+The canonical vector file is `tests/conformance/vectors/outlet_streaming_saga_vectors.json` (top-level `{version, vectors:[6]}`, each entry a `{name, spec}` envelope). Every chunk signature and every `caveats_binding` is **recomputed** at replay time under the §25.2 reference operator key (the P-256 key derived from seed `0x9d61…7f60`); the receipt round-trip KAT signs under that same §25.2 seed so its preimage and signature are byte-exact and checked in. That fixture was generated before SCP superseded Ed25519 on 2026-09-10 and still carries Ed25519 signature bytes; §25.18 states which artifact governs while that port is outstanding.
 
 ### Scenario matrix
 
 | Vector | Scenario | Pinned artifact | Terminal / code |
 |--------|----------|-----------------|-----------------|
-| `stream_receipt_kat` | Fixed 9-field `SCP-XCTX-STREAM-RECEIPT-V1` input → byte-exact preimage + deterministic Ed25519 signature; `verify()` accepts, every single-field mutation rejects | `expected_preimage_hex` (32 B), `expected_signature_hex` (64 B) | — |
+| `stream_receipt_kat` | Fixed 9-field `SCP-XCTX-STREAM-RECEIPT-V1` input → byte-exact preimage + deterministic signature; `verify()` accepts, every single-field mutation rejects | `expected_preimage_hex` (32 B), `expected_signature_hex` (64 B) | — |
 | `seal_phase` | A sealed chunk sequence reaches Committed at seal-close with a non-zero manifest root and a verifiable receipt (§6.2.5) | `expected_stream_manifest_hash` | `Ok` |
 | `xctx_10_chunk` | A 10-chunk A→B stream; the target `OutletInvoked` and caller `CrossContextOutletInvoked` dual-log leaves carry the IDENTICAL root (§6.2.4 dual event-log) | `expected_stream_manifest_hash` + `dual_log_identity` | `Ok` |
 | `truncated_close` | A mid-stream crash after chunk 5 of 10 seals the durable PREFIX; the receipt is over the truncated (prefix) root, distinct from the full-stream root; escrow settles at the prefix `billed_count`; the outlet exec fn is invoked exactly once (§17.16.4 recovery) | `expected_prefix_manifest_hash` (≠ `expected_full_manifest_hash`), `billed_count`, `exec_invocations` | `Ok` (truncated) |
@@ -972,18 +1186,20 @@ Domain: `"SCP-KEYPACKAGE-ATTESTATION-V1:"`
 
 ### Vector 37: KeyPackage Attestation Signature + `0xFF03` Extension Body
 
-The `KeyPackageAttestation` (§9.5.2) binds **all four** of the leaf's public keys — the ephemeral MLS leaf `signature_key` (Ed25519), and three **distinct** X25519 HPKE keys: the LeafNode ratchet-tree `encryption_key`, the KeyPackage `init_key` (the Welcome-seal key), and the `scp_wrapping_key` (`0xFF01`) extension `wrapping_key` — to a DID. It is **context-agnostic** — eight fields, no `context_id`. The canonical hash uses the §9.5.1 construction; the Ed25519 signature is computed over the 32-byte hash with the reference key (§25.2). The `scp_keypackage_attestation` (`0xFF03`) LeafNode extension body is the eight fields in preimage order (deterministic length-prefixed binary — NOT MessagePack/JCS) followed by the raw 64-byte signature.
+The `KeyPackageAttestation` (§9.5.2) binds **all four** of the leaf's public keys — the ephemeral MLS leaf `signature_key`, and three **distinct** DHKEM(P-256) HPKE keys: the LeafNode ratchet-tree `encryption_key`, the KeyPackage `init_key` (the Welcome-seal key), and the `scp_wrapping_key` (`0xFF01`) extension `wrapping_key` — to a DID. It is **context-agnostic** — eight fields, no `context_id`. All four are 65-byte uncompressed SEC1 P-256 points, in the encodings RFC 9420 §5.1.2 and RFC 9180 §7.1 fix and §9.5.2 states in place. The canonical hash uses the §9.5.1 construction; the P-256 signature is computed over the 32-byte hash with the reference key (§25.2). The `scp_keypackage_attestation` (`0xFF03`) LeafNode extension body is the eight fields in preimage order (deterministic length-prefixed binary — NOT MessagePack/JCS) followed by the raw 64-byte signature.
 
-This vector is fully regenerable from the inputs below. `leaf_signature_key` reuses the §25.2 secondary Ed25519 public key as a fixed, documented 32-byte value standing in for the ephemeral leaf `signature_key` being bound. The three X25519 public keys are each obtained by loading a **fixed, documented 32-byte seed** as a raw X25519 private scalar (`X25519PrivateKey.from_private_bytes(seed).public_key()`), yielding three distinct keys standing in for the leaf's distinct HPKE keys: `leaf_encryption_key` from the §25.2 **secondary Ed25519 seed** (`0x4ccd08…a6fb`); `init_key` from the fixed seed `0x11×32`; `wrapping_key` from the fixed seed `0x22×32`. These are distinct keys by construction — `init_key != encryption_key` (RFC 9420: the Welcome's `EncryptedGroupSecrets` is HPKE-sealed to the KeyPackage `init_key`, NOT the LeafNode `encryption_key`), and `wrapping_key` is the separate §9.16 sender-key wrapping key.
+This vector is fully regenerable from the inputs below. `leaf_signature_key` is the §25.2 secondary key in its uncompressed form, standing in for the ephemeral leaf `signature_key` being bound. The three HPKE keys each derive from a **fixed, documented 32-byte seed** under the §25.2 seed-to-scalar rule: `leaf_encryption_key` from `0x33×32`, `init_key` from `0x11×32`, `wrapping_key` from `0x22×32`. These are distinct keys by construction — `init_key != encryption_key` (RFC 9420: the Welcome's `EncryptedGroupSecrets` is HPKE-sealed to the KeyPackage `init_key`, NOT the LeafNode `encryption_key`), and `wrapping_key` is the separate §9.16 sender-key wrapping key.
+
+Before 2026-09-10 the `leaf_encryption_key` seed was the §25.2 secondary seed. On P-256 that seed yields the same scalar as `leaf_signature_key`, which would make two of the four bound keys identical and destroy the distinctness this vector exists to demonstrate, so `leaf_encryption_key` now carries its own seed `0x33×32`.
 
 ```
 Input:
-  signing key:         reference Ed25519 key (§25.2, seed 0x9d61b1…7f60)
+  signing key:         reference P-256 key (§25.2, seed 0x9d61b1…7f60)
   did:                 "did:dht:z6MkLeafAttest"                (22 bytes)
-  leaf_signature_key:  0x3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c   (32 bytes, §25.2 secondary Ed25519 public key)
-  leaf_encryption_key: 0xb6c6192e66300f4bbb4e3d870bfd02e416154ebb06661a70a84ea376244b3c20   (32 bytes, X25519 public from §25.2 secondary seed 0x4ccd08…a6fb as X25519 scalar — LeafNode ratchet-tree HPKE key)
-  init_key:            0x7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13   (32 bytes, X25519 public from fixed seed 0x11×32 as X25519 scalar — KeyPackage Welcome-seal HPKE key)
-  wrapping_key:        0x0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20   (32 bytes, X25519 public from fixed seed 0x22×32 as X25519 scalar — scp_wrapping_key 0xFF01 §9.16 sender-key wrapping key)
+  leaf_signature_key:  0x0423702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aead0992a08064d996d9268dc511c7430f3a4e614871d4a888b52a8dbecb56d6da6   (65 bytes, §25.2 secondary public key, uncompressed)
+  leaf_encryption_key: 0x04bb9fe4749210aad657fb3937fa97a0d79c976c442c54176ccce88477e1b32f304661cb77defd365843a4d43584afc760fed0d9a889d9cb3dd155986b446f4550   (65 bytes, from fixed seed 0x33×32 — LeafNode ratchet-tree HPKE key)
+  init_key:            0x041f75a6a31cc4516a2eb0b28511c45160b976b44e8c31ec377b0c2cb67b05f0ad3195794c4fc38b105bd5f5e1239a3c73feb58bd815cbfd2fe049c084f7f88a8a   (65 bytes, from fixed seed 0x11×32 — KeyPackage Welcome-seal HPKE key)
+  wrapping_key:        0x04ff08966117691da4f3f0a3bbc4a63cab7193008d316127821b1e09b9e2aef925eaa5de2932cc294a2cc58f36e31a9a245f67404ad14d142d0e423901aa44cac3   (65 bytes, from fixed seed 0x22×32 — scp_wrapping_key 0xFF01 §9.16 sender-key wrapping key)
   signing_key_id:      "#active"                               (7 bytes)
   issued_at:           1700000000                              (== leaf Lifetime.not_before)
   expires_at:          1700086400                              (== leaf Lifetime.not_after; issued_at + 86400)
@@ -991,49 +1207,37 @@ Input:
 Canonical hash input (per §9.5.1 / §9.5.2 KeyPackageAttestation):
   "SCP-KEYPACKAGE-ATTESTATION-V1:"                 (30 bytes, no length prefix)
   || BE32(22) || "did:dht:z6MkLeafAttest"          (4 + 22 = 26 bytes — did)
-  || leaf_signature_key                            (32 bytes, fixed-length, no length prefix)
-  || leaf_encryption_key                           (32 bytes, fixed-length, no length prefix)
-  || init_key                                      (32 bytes, fixed-length, no length prefix)
-  || wrapping_key                                  (32 bytes, fixed-length, no length prefix)
+  || leaf_signature_key                            (65 bytes, fixed-length, no length prefix)
+  || leaf_encryption_key                           (65 bytes, fixed-length, no length prefix)
+  || init_key                                      (65 bytes, fixed-length, no length prefix)
+  || wrapping_key                                  (65 bytes, fixed-length, no length prefix)
   || BE32(7)  || "#active"                         (4 + 7 = 11 bytes — signing_key_id)
   || BE64(1700000000)                              (8 bytes — issued_at)
   || BE64(1700086400)                              (8 bytes — expires_at)
 
-Total preimage: 30 + 26 + 32 + 32 + 32 + 32 + 11 + 8 + 8 = 211 bytes
+Total preimage: 30 + 26 + 65 + 65 + 65 + 65 + 11 + 8 + 8 = 343 bytes
 
-Preimage (hex, 211 bytes):
-  5343502d4b45595041434b4147452d4154544553544154494f4e2d56313a
-  000000166469643a6468743a7a364d6b4c656166417474657374
-  3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c
-  b6c6192e66300f4bbb4e3d870bfd02e416154ebb06661a70a84ea376244b3c20
-  7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13
-  0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20
-  0000000723616374697665
-  000000006553f100
-  0000000065554280
+Preimage (hex, 343 bytes):
+  0x5343502d4b45595041434b4147452d4154544553544154494f4e2d56313a000000166469643a6468743a7a364d6b4c6561664174746573740423702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aead0992a08064d996d9268dc511c7430f3a4e614871d4a888b52a8dbecb56d6da604bb9fe4749210aad657fb3937fa97a0d79c976c442c54176ccce88477e1b32f304661cb77defd365843a4d43584afc760fed0d9a889d9cb3dd155986b446f4550041f75a6a31cc4516a2eb0b28511c45160b976b44e8c31ec377b0c2cb67b05f0ad3195794c4fc38b105bd5f5e1239a3c73feb58bd815cbfd2fe049c084f7f88a8a04ff08966117691da4f3f0a3bbc4a63cab7193008d316127821b1e09b9e2aef925eaa5de2932cc294a2cc58f36e31a9a245f67404ad14d142d0e423901aa44cac30000000723616374697665000000006553f1000000000065554280
 
 Canonical hash SHA-256(preimage) (32 bytes):
-  50cf61db5a97e0ddbd762de07e107684dfd0f00cfe53bad2750a70103ac38957
+  0xb57dafbe5f12cf5d83a0b90e7fd4df9bea53a22e96f80a75a7d844c63041ae71
 
-Ed25519 signature over the 32-byte hash, reference key (64 bytes):
-  fcf01ea58941c9e88acc14ef1ada7d00ac4c0239c75655160fc5b248ee0299e0
-  18526235bc9b6d2a3efa37ab8db5d86b45b58deb5ad24540229d2804052e3509
+RFC 6979 signature over the canonical hash, reference key, 64-byte raw r || s:
+  0x308c4e5612215e13119b098ac3318a40c0fb393fefea4a65b40c56e38740829e2a94359e5f99476aba4ace58db8fc8c6b39eaf31673d1c81800ce2e972ad69ac
 
 scp_keypackage_attestation (0xFF03) extension body = 8 fields in preimage order
-(NO domain separator) || 64-byte signature (181 + 64 = 245 bytes):
-  000000166469643a6468743a7a364d6b4c656166417474657374
-  3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c
-  b6c6192e66300f4bbb4e3d870bfd02e416154ebb06661a70a84ea376244b3c20
-  7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13
-  0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20
-  0000000723616374697665
-  000000006553f100
-  0000000065554280
-  fcf01ea58941c9e88acc14ef1ada7d00ac4c0239c75655160fc5b248ee0299e0
-  18526235bc9b6d2a3efa37ab8db5d86b45b58deb5ad24540229d2804052e3509
+(NO domain separator) || 64-byte signature (313 + 64 = 377 bytes):
+  0x000000166469643a6468743a7a364d6b4c6561664174746573740423702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aead0992a08064d996d9268dc511c7430f3a4e614871d4a888b52a8dbecb56d6da604bb9fe4749210aad657fb3937fa97a0d79c976c442c54176ccce88477e1b32f304661cb77defd365843a4d43584afc760fed0d9a889d9cb3dd155986b446f4550041f75a6a31cc4516a2eb0b28511c45160b976b44e8c31ec377b0c2cb67b05f0ad3195794c4fc38b105bd5f5e1239a3c73feb58bd815cbfd2fe049c084f7f88a8a04ff08966117691da4f3f0a3bbc4a63cab7193008d316127821b1e09b9e2aef925eaa5de2932cc294a2cc58f36e31a9a245f67404ad14d142d0e423901aa44cac30000000723616374697665000000006553f1000000000065554280308c4e5612215e13119b098ac3318a40c0fb393fefea4a65b40c56e38740829e2a94359e5f99476aba4ace58db8fc8c6b39eaf31673d1c81800ce2e972ad69ac
+
+Verification vector:
+  public key: 0x033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027
+  digest:     the canonical hash above
+  signature:  the 64 bytes above
+  verdict:    accept
 ```
 
-Ed25519 is deterministic (RFC 8032), so the reference implementation reproduces these exact signature bytes on every run. Verify with Ed25519-verify(reference_public_key, hash, signature) per §25.17 step 5. Note the extension body omits the domain separator (present only in the signed preimage) and shares the eight fields byte-for-byte with the preimage's post-domain portion.
+A software signer under RFC 6979 reproduces these exact signature bytes on every run; a hardware signer produces different bytes and is checked against the verification vector instead (§25.4). Note the extension body omits the domain separator (present only in the signed preimage) and shares the eight fields byte-for-byte with the preimage's post-domain portion.
 
 ## 25.24 Outlet Registration V2 Vectors (§5.4.1)
 
@@ -1045,7 +1249,7 @@ The canonical conformance fixture lives at:
 tests/conformance/vectors/outlet_registration_v2.json
 ```
 
-The fixture documents **12 known-input / known-output vectors**, each signed under the RFC 8032 §7.1 Test Vector 1 Ed25519 keypair (§25.2 reference key material). Every entry carries:
+The fixture documents **12 known-input / known-output vectors**, each signed under the §25.2 reference keypair. The checked-in fixture was generated before SCP superseded Ed25519 on 2026-09-10 and still carries Ed25519 keys and signatures; §25.18 states which artifact governs while that port is outstanding. Every entry carries:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -1054,9 +1258,9 @@ The fixture documents **12 known-input / known-output vectors**, each signed und
 | `input` | object | The `OutletRegistration` field set (excluding `signature`). |
 | `expected_preimage` | hex string | Raw byte sequence fed into SHA-256, beginning `"SCP-OUTLET-REGISTRATION-V2:"`. |
 | `expected_canonical_hash` | hex string | SHA-256 of `expected_preimage` (32 bytes / 64 hex). Equals the output of `compute_outlet_registration_canonical_bytes`. |
-| `expected_signature` | hex string | Ed25519 signature over `expected_canonical_hash` (64 bytes / 128 hex). |
+| `expected_signature` | hex string | Signature over `expected_canonical_hash` (64 bytes / 128 hex). |
 | `operator_did` | string | The signing operator's DID (the same across all vectors for determinism). |
-| `operator_public_key` | hex string | The operator's Ed25519 verifying key (32 bytes / 64 hex). |
+| `operator_public_key` | hex string | The operator's verifying key (33 bytes / 66 hex under §9.5). |
 
 ### 25.24.1 Vector index
 
@@ -1089,7 +1293,7 @@ Conformance test `CONF-045` enforces that for every entry `v1_canonical_hash != 
 
 ### 25.24.3 Conformance procedure
 
-The conformance suite validates the vectors against the **Rust core only** — `scp_protocol::context::outlets::registry::compute_outlet_registration_canonical_bytes` + `verify_outlet_registration_signature` + direct Ed25519 verification. It does **not** exercise the FFI bridges: the live per-bridge registration-signature scheme is currently unwired — `register_outlet` (registry.rs) neither computes nor verifies a registration signature, and the PyO3 / NAPI / UniFFI bridges construct `OutletRegistration { signature: vec![] }`. Wiring the §5.4.1 registration signature through production `register_outlet` and each bridge (so a vector is sign-verifiable via each FFI bridge) is tracked in **#2229**; the WASM bridge is genuinely N/A per ADR-057. The suite:
+The conformance suite validates the vectors against the **Rust core only** — `scp_protocol::context::outlets::registry::compute_outlet_registration_canonical_bytes` + `verify_outlet_registration_signature` + direct signature verification. It does **not** exercise the FFI bridges: the live per-bridge registration-signature scheme is currently unwired — `register_outlet` (registry.rs) neither computes nor verifies a registration signature, and the PyO3 / NAPI / UniFFI bridges construct `OutletRegistration { signature: vec![] }`. Wiring the §5.4.1 registration signature through production `register_outlet` and each bridge (so a vector is sign-verifiable via each FFI bridge) is tracked in **#2229**; the WASM bridge is genuinely N/A per ADR-057. The suite:
 
 ```bash
 cargo test -p scp-testing --test conformance \
@@ -1099,7 +1303,7 @@ cargo test -p scp-testing --test conformance \
   conf_046_outlet_registration_v2_matches_generator -- --nocapture
 ```
 
-Independent implementations SHOULD parse `outlet_registration_v2.json`, reconstruct each registration from `input`, recompute the V2 preimage byte-for-byte, verify SHA-256 matches `expected_canonical_hash`, and verify the Ed25519 signature against `operator_public_key`. Implementers MUST also confirm that `v1_preimage` for each rejection-corpus entry produces a hash distinct from the matching `v2_canonical_hash`.
+Independent implementations SHOULD parse `outlet_registration_v2.json`, reconstruct each registration from `input`, recompute the V2 preimage byte-for-byte, verify SHA-256 matches `expected_canonical_hash`, and verify the signature against `operator_public_key`. Implementers MUST also confirm that `v1_preimage` for each rejection-corpus entry produces a hash distinct from the matching `v2_canonical_hash`.
 
 ### 25.24.4 Regenerating the fixture
 
