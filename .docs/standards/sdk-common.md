@@ -8,7 +8,7 @@ All SDKs implement the same error hierarchy. Language-specific idioms (exception
 
 ```
 ScpError (root)
-├── IdentityError        — DID creation, resolution, key rotation failures
+├── IdentityError        — Identity creation, resolution, key rotation failures
 ├── ContextError         — Context lifecycle (create, join, leave, close) failures
 ├── UcanPermissionError  — UCAN capability validation failures (avoids shadowing `builtins.PermissionError` in Python and the global `PermissionError` in TypeScript)
 ├── CryptoError          — Encryption, decryption, signature failures
@@ -74,8 +74,8 @@ holds `13050-13099`, so the two layers never contend for the same number.
 | Code | Layer | Condition |
 |------|-------|-----------|
 | `SCP-SAGA-13000` | protocol | Canonical preimage construction exceeded the length-prefix ceiling |
-| `SCP-SAGA-13001` | protocol | Ed25519 saga signature failed verification |
-| `SCP-SAGA-13002` | protocol | Malformed Ed25519 verifying key |
+| `SCP-SAGA-13001` | protocol | P-256 saga signature failed verification |
+| `SCP-SAGA-13002` | protocol | Malformed P-256 verifying key |
 | `SCP-SAGA-13010` | handler | Caller lacks `outlet:interface` capability (outbound) |
 | `SCP-SAGA-13011` | handler | Caller not in outbound `allowed_callers` |
 | `SCP-SAGA-13012` | handler | `ucan_proof_id` not resolvable in target proof store |
@@ -300,7 +300,7 @@ enforcement mechanism.)
 | `SCP-STORAGE-8004` | selection layer (all bridges) | Selected durable storage backend failed to open |
 | `SCP-STORAGE-8010` | `scp-client-wasm` (browser participant) | Injected `Storage` backend I/O fault (`get`/`put`/`delete`/`list_keys`) |
 | `SCP-STORAGE-8011` | `scp-client-wasm` (browser participant) | Corrupt snapshot — bad decode / unknown version / context-id-vs-key mismatch / §9.9.3 checkpoint mismatch |
-| `SCP-STORAGE-8012` | `scp-client-wasm` (browser participant) | Snapshot / pending-join blob belongs to a different identity (owner-DID mismatch) |
+| `SCP-STORAGE-8012` | `scp-client-wasm` (browser participant) | Snapshot / pending-join blob belongs to a different identity (owner-identifier mismatch) |
 | `SCP-STORAGE-8013` | `scp-client-wasm` (browser participant) | Context poisoned — a persist failed after the in-memory ratchet advanced; reconstruct from the last durable snapshot |
 
 The browser participant codes (`8010-8013`) start at `8010` specifically to avoid
@@ -331,7 +331,7 @@ reusing `8001` would make one code string mean both "storage key not found" and
 | `SCP-ATTEST-9015` | Attestation JSON bytes are not valid UTF-8 |
 | `SCP-ATTEST-9016` | Attestation list JSON bytes are not valid UTF-8 |
 | `SCP-ATTEST-9017` | Failed to re-serialize attestation to UTF-8 JSON |
-| `SCP-ATTEST-9018` | Cryptographic-class verification method not verifiable via browser fetch |
+| `SCP-ATTEST-9018` | Cryptographic-class attestation not verifiable via browser fetch |
 
 ### SCP-IDENT-1017 and its cross-bridge contract
 
@@ -373,7 +373,7 @@ All languages: PR review must verify that any function described as a stub in co
 
 A stub is honest about its gap on its own path. It is a **separate, forbidden failure** for a stub — or any production code path — to reach for a **dev/test-only construct** to *appear* functional in production. Prohibited on every shipped path:
 
-- A **security nullifier** — in-memory/plaintext key custody, an always-succeeds attestation or certificate verifier, a non-resolving or in-memory DID/DHT resolver, an in-memory pre-rotation recovery custody — used because the real backend isn't built yet.
+- A **security nullifier** — in-memory/plaintext key custody, an always-succeeds attestation or certificate verifier, a non-resolving or in-memory identity resolver, an in-memory pre-rotation recovery custody — used because the real backend isn't built yet.
 - A **`#[cfg(test)]`- or `testing`-feature-gated type**, an in-memory/no-op adapter, or a `*::testing::*` construct constructed on a production create/run path.
 - A **placeholder value** — hardcoded default, empty result, `None`/`null`/`""`, or a value reconstructed from arguments — standing in for data that a real implementation would produce.
 
@@ -477,28 +477,28 @@ let ctx = sdk.create_context(ContextConfig {
     ttl: Some(Duration::from_secs(300)),
     ..ContextConfig::defaults(ContextCreation::Template {
         template: Template::BilateralEphemeral,
-        peer: Some(bob_did.clone()),
+        peer: Some(bob_identifier.clone()),
     })
 }).await?;
 
 // Python
 ctx = await sdk.create_context(
     template="bilateral-ephemeral",
-    peer=bob_did,
+    peer=bob_identifier,
     ttl=timedelta(minutes=5),
 )
 
 // TypeScript
 const ctx = await sdk.createContext({
     template: "bilateral-ephemeral",
-    peer: bobDid,
+    peer: bobIdentifier,
     ttl: { minutes: 5 },
 });
 
 // Swift
 let ctx = try await sdk.createContext(
     template: .bilateralEphemeral,
-    peer: bobDID,
+    peer: bobIdentifier,
     ttl: .minutes(5)
 )
 ```
@@ -523,7 +523,7 @@ let ctx = sdk.create_context(ContextConfig {
 
 ### Bilateral shorthand
 
-For bilateral templates (`bilateral-ephemeral`, `bilateral-persistent`, `coordination`), the SDK accepts a peer DID and handles the invitation internally:
+For bilateral templates (`bilateral-ephemeral`, `bilateral-persistent`, `coordination`), the SDK accepts a peer identifier and handles the invitation internally:
 
 1. Creates the context (MLS group, sender key, event log)
 2. Bundles context metadata + MLS Welcome message into a single transport delivery
@@ -576,7 +576,7 @@ Standing bilateral contexts serve as the real-time communication primitive (spec
 
 ```
 // Rust — get or create a standing context with a peer
-let channel = sdk.standing_context(&bob_did).await?;
+let channel = sdk.standing_context(&bob_identifier).await?;
 // Returns existing bilateral-persistent context if one exists,
 // creates one if not. Idempotent.
 
@@ -588,26 +588,26 @@ let channel = sdk.standing_context(&bob_did).await?;
 channel.send("Are you available for the 3pm sync?").await?;
 
 // Python
-channel = await sdk.standing_context(bob_did)
+channel = await sdk.standing_context(bob_identifier)
 # initiator-side send (succeeds); the *peer's* Welcome-joined send
 # fails-closed until Phase-2E (spec §5.15.8)
 await channel.send("Are you available for the 3pm sync?")
 
 // Swift
-let channel = try await sdk.standingContext(with: bobDID)
+let channel = try await sdk.standingContext(with: bobIdentifier)
 // initiator-side send (succeeds); the *peer's* Welcome-joined send
 // fails-closed until Phase-2E (spec §5.15.8)
 try await channel.send("Are you available for the 3pm sync?")
 
 // TypeScript — NOTE: the return shape MUST NOT add a `created: bool` /
 // `peer_joined` discriminant; it is identical to every other binding.
-const channel = await sdk.standingContext(bobDid);
+const channel = await sdk.standingContext(bobIdentifier);
 // initiator-side send (succeeds); the *peer's* Welcome-joined send
 // fails-closed until Phase-2E (spec §5.15.8)
 await channel.send("Are you available for the 3pm sync?");
 
 // Kotlin
-val channel = sdk.standingContext(bobDid)
+val channel = sdk.standingContext(bobIdentifier)
 // initiator-side send (succeeds); the *peer's* Welcome-joined send
 // fails-closed until Phase-2E (spec §5.15.8)
 channel.send("Are you available for the 3pm sync?")
@@ -615,7 +615,7 @@ channel.send("Are you available for the 3pm sync?")
 
 **Semantics of `standing_context`** (see spec §5.15.8 for the normative contract):
 
-1. Check local state for an existing `bilateral-persistent` context with this peer DID.
+1. Check local state for an existing `bilateral-persistent` context with this peer identifier.
 2. If found and `Active`, return it. Zero network cost — instant.
 3. If not found, create one (`bilateral-persistent` template), dispatch the Welcome, return the handle. First message queues until the peer joins.
 4. If a prior handle was reaped or never joined, it is transparently **auto-revived** under the deterministic `derived_context_id` (spec §5.15.8, ADR-049 §10) — *not* a fresh create. A dangling/reaped handle never surfaces an error.
