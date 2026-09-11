@@ -372,7 +372,7 @@ The seal mechanism uses a `pub(crate)` supertrait (`Sealed`) that external code 
 
 `EncryptingAdapter<S: Storage>` (defined in `scp-platform/src/encrypting_adapter.rs`) wraps any `Storage` implementation with per-value AES-256-GCM encryption, making it satisfy the sealed `EncryptedStorage` bound without requiring the inner backend to encrypt natively.
 
-**Key management:** The adapter is initialized with a 32-byte AES-256 key wrapped in `Zeroizing<[u8; 32]>` (cleared on drop). For ephemeral/FFI usage, the key is generated via `OsRng`. For persistent usage, the key should be derived from identity key material (see §17.6 SQLCipher key derivation).
+**Key management:** The adapter is initialized with a 32-byte AES-256 key wrapped in `Zeroizing<[u8; 32]>` (cleared on drop). For ephemeral/FFI usage, the key is generated via `OsRng`. For persistent usage, the key derives from the database key (see §17.6 SQLCipher key derivation).
 
 **Wire format:** Each stored value is:
 
@@ -468,24 +468,24 @@ CREATE TABLE kv (
 
 `WITHOUT ROWID` uses a clustered index on the primary key, which is optimal for KV workloads (no secondary rowid lookup). WAL mode enables concurrent readers with one writer. The schema is intentionally minimal — all structure lives in the key convention, not the table schema.
 
-**SQLCipher key derivation.** The SQLCipher encryption key is derived from identity key material using HKDF-SHA-256 (RFC 5869), NOT used directly as a signing key:
+**SQLCipher key derivation.** The SQLCipher encryption key is derived from a dedicated database key using HKDF-SHA-256 (RFC 5869), NOT used directly as a signing key:
 
 ```
-ikm  = identity_key_private_bytes          // 32 bytes, #0 Identity Key from platform key custody
+ikm  = database_key_bytes                  // 32 bytes, generated in platform key custody
 salt = SHA-256("SCP-SQLCIPHER-KEY-V1")     // fixed salt, 32 bytes
-info = "scp-sqlcipher:" || did             // DID as UTF-8 bytes — binds key to specific identity
+info = "scp-sqlcipher:" || identifier      // 32 digest bytes — binds key to one identity
 prk  = HKDF-Extract(salt, ikm)            // 32 bytes
 okm  = HKDF-Expand(prk, info, 32)         // 32 bytes — SQLCipher PRAGMA key
 derived_key = hex_encode(okm)             // 64 hex characters, passed via raw-key syntax (x'..')
 ```
 
-The `ikm` is the raw private key bytes of the `#0` Identity Key, retrieved from platform key custody (iOS Keychain, Android Keystore, macOS Keychain, or OS keyring). The HKDF domain separation (`"SCP-SQLCIPHER-KEY-V1"`) ensures the derived key is distinct from any signing key, preventing cross-protocol attacks. The DID in the `info` parameter binds the database to a specific identity — databases for different identities on the same device use different encryption keys.
+The `ikm` is a 32-byte database key platform key custody generates (iOS Keychain, Android Keystore, macOS Keychain, or OS keyring), and is never a root member's private key, which its default passkey custody does not export (`09-security-model.md` §9.7.4.1 item 4). The HKDF domain separation (`"SCP-SQLCIPHER-KEY-V1"`) ensures the derived key is distinct from any signing key, preventing cross-protocol attacks. The identifier in the `info` parameter binds the database to one identity — databases for different identities on the same device use different encryption keys.
 
-This HKDF-from-identity-key derivation is the **raw-key mode**: the caller supplies 32 bytes of key material (the `#0` identity key bytes) and the SQLCipher PRAGMA key is derived deterministically from them. Raw-key mode is the default and is unchanged by the passphrase mode defined below.
+This derivation is the **raw-key mode**: the caller supplies the 32 database-key bytes and the SQLCipher PRAGMA key is derived deterministically from them. Raw-key mode is the default and is unchanged by the passphrase mode defined below.
 
 #### Passphrase Key-Derivation Mode
 
-Some SDK callers supply a human-chosen passphrase rather than raw key material (for example, a CLI or desktop deployment with no platform key custody and no `#0` identity key available at database-open time). For these callers, the SQLCipher PRAGMA key MAY instead be derived from a passphrase using **Argon2id**. The caller selects exactly one derivation mode: raw-key (above) or passphrase. The two modes are mutually exclusive — supplying both is a validation error.
+Some SDK callers supply a human-chosen passphrase rather than raw key material (for example, a CLI or desktop deployment with no platform key custody and no database key available at database-open time). For these callers, the SQLCipher PRAGMA key MAY instead be derived from a passphrase using **Argon2id**. The caller selects exactly one derivation mode: raw-key (above) or passphrase. The two modes are mutually exclusive — supplying both is a validation error.
 
 Passphrase derivation MUST use the following parameters, which are NORMATIVE and MUST be identical to the platform key-custody Argon2id parameters (§17.8, `FileKeyCustody`):
 
@@ -1034,7 +1034,7 @@ Identity resolution (`03-identity.md` §3.10) — reading an identity's key-even
 **SCP-CAPSEL-8013 — An in-memory identity-resolution backend or relay record store is a security nullifier, categorically more dangerous than in-memory storage.** Such a backend preserves the self-certification of any key-event record it happens to hold — the resolver still recomputes the identifier from the inception event and verifies every event (`09-security-model.md` §9.6.1) — but **reachability and freshness are network properties**, and an in-memory backend destroys both: a publish reaches no peer, and a resolve sees no peer's writes. Under it, publishing a key event silently no-ops — a rotation or a `Compromised{from: N}` assertion (`09-security-model.md` §9.7.1) lands in a process-local map no other resolver ever consults. The harm is twofold and precise:
 
 - **Silent false success.** The SDK reports a successful publish while no relay received the record. The identity spec's anti-segmentation invariant makes publication to the identity's own relays and to the bootstrap fallback set a MUST and requires a cycle that reached no fallback relay to be reported to the caller as a failed publication (`03-identity.md` §3.10); an in-memory arm reports the opposite, so the controller believes a chain is resolvable that no stranger can reach. The nullifier is the *silence*, not the reduced reach.
-- **Loss of the suppression resistance the relay layer supplies.** Against real relays an attacker must suppress the chain on ALL of an identity's own relays AND on the fallback set, because a resolver reads both, and a first-contact resolver that reaches fewer than two independent relays returns `Inconclusive{SingleSource}` rather than a key state (`09-security-model.md` §9.7.4.2 R11). An in-memory arm contributes nothing to that redundancy: it presents one process-local source as though it were the network, so a resolver reads a stale-or-absent key state that still verifies by signature and a first contact never learns it had one source.
+- **Loss of the suppression resistance the relay layer supplies.** Against real relays an attacker must suppress the chain on ALL of an identity's own relays AND on the fallback set, because a resolver reads both, and a first contact that does not meet R11's floor returns `Inconclusive{SingleSource}` rather than a key state (`09-security-model.md` §9.7.4.2 R11). An in-memory arm contributes nothing to that redundancy: it presents one process-local source as though it were the network, so a resolver reads a stale-or-absent key state that still verifies by signature and a first contact never learns it had one source.
 
 Because its publish reports success while doing nothing and its resolve contributes no freshness, an in-memory identity-resolution arm fails **open**. That is the sharp contrast with in-memory storage (§17.6), which fails **closed**: a restarted node with lost state cannot silently present a false guarantee, it simply has no state. An in-memory identity-resolution arm is therefore a **security nullifier**, not a durability-only affordance, and is governed by SCP-CAPSEL-8012 (provably absent from shipped production artifacts), not SCP-CAPSEL-8011.
 
