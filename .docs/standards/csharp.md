@@ -26,7 +26,7 @@ NRT is enabled project-wide (`<Nullable>enable</Nullable>`). All reference types
 
 ```csharp
 public record Message(
-    string SenderDid,
+    byte[] SenderIdentifier,
     byte[] Content,
     long Timestamp,
     long Sequence,
@@ -68,10 +68,11 @@ await ctx.SendAsync(payload);
 public class IdentityTests
 {
     [Fact]
-    public async Task CreateAsync_ReturnsIdentityWithValidDid()
+    public async Task CreateAsync_ReturnsIdentityWith32ByteIdentifier()
     {
         var identity = await Identity.CreateAsync(custody: "in_memory");
-        identity.Did.Should().StartWith("did:dht:");
+        // 09-security-model.md §9.7.4.2 R13
+        identity.Identifier.Should().HaveCount(32);
     }
 
     [Fact]
