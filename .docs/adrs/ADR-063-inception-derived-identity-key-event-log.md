@@ -219,9 +219,9 @@ Each rule below is KERI's, and the SCP section that carries it cites KERI and re
 
 ADR-003, DID creation over did:dht, is the durable in-repository basis this record supersedes, and its body stays in `.docs/adrs/phase-1.md` as the historical record. ADR-055, remove the WASM bridge, in `.docs/adrs/phase-4.md`, is the supersession precedent.
 
-ADR-064, cooperative delegation, extends this record with the human-to-agent trace. Alec confirmed delegation on 2026-08-30, overturning the shared-DID agent verification method: separate delegated identities anchored by a seal in the human's key-event log, with sub-delegation leaf-only for identity and unlimited for authority through UCAN attenuation. KERI states the mechanism under `spec-body` §Cooperative Delegation and §Delegated Event Live-attacks.
+ADR-039, the shared-DID human-agent identity model, flips to `Superseded by ADR-063` on 2026-08-30 and keeps its body as the historical record, because the shared identity it decided is the structure this record replaces. ADR-064, cooperative delegation, extends this record with the human-to-agent trace and is the artifact that writes the replacing model. Alec confirmed delegation on 2026-08-30, overturning the shared-DID agent verification method: separate delegated identities anchored by a seal in the human's key-event log, with sub-delegation leaf-only for identity and unlimited for authority through UCAN attenuation. KERI states the mechanism under `spec-body` §Cooperative Delegation and §Delegated Event Live-attacks.
 
-ADR-057, in-browser SCP clients over a shared MLS crate, rests on did:dht resolution in its body and moves onto the key-state model this record settles.
+ADR-057, in-browser SCP clients over a shared MLS crate, rested on did:dht resolution in its body and now rests on the key-state model this record settles: its attestation-freshness bound reads the log's own rollback rule, and its production-method whitelist reads one identity backend.
 
 ADR-054, pre-rotation key custody substrate isolation, and RFC #2130, pre-rotation recovery custody, are the Proposed realization of the independent pre-rotation custody this record depends on. The dependency is the specification rule in `09-security-model.md` §9.7.4.1, not that Proposed realization.
 

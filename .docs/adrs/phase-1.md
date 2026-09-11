@@ -686,7 +686,7 @@ Every message is a MessagePack map with a required `op` field (string) plus oper
 
 #### Error Codes
 
-**Client errors (4xxx):** `4000` INVALID_MESSAGE, `4001` UNKNOWN_OP, `4002` MISSING_FIELD, `4003` INVALID_FIELD, `4010` BLOB_TOO_LARGE, `4011` TTL_TOO_LONG, `4012` LIMIT_EXCEEDED, `4020` RATE_LIMITED, `4021` TOO_MANY_SUBSCRIPTIONS, `4040` DID_RECORD_REJECTED (a validating SCP-native relay rejected an operation at a DID-domain `routing_id`: a PUBLISH of a frame that failed the DID→routing_id binding or BEP44 signature, a non-superseding `seq`, any non-frame / wrong-binding / invalid-signature blob published to a slot-claimed `routing_id`, or a DELETE of the current slot blob — see the DID-Record Slot-Exclusivity subsection).
+**Client errors (4xxx):** `4000` INVALID_MESSAGE, `4001` UNKNOWN_OP, `4002` MISSING_FIELD, `4003` INVALID_FIELD, `4010` BLOB_TOO_LARGE, `4011` TTL_TOO_LONG, `4012` LIMIT_EXCEEDED, `4020` RATE_LIMITED, `4021` TOO_MANY_SUBSCRIPTIONS, `4040` DID_RECORD_REJECTED (a validating SCP-native relay rejected an operation at an identity-domain `routing_id`: a PUBLISH of a frame that failed the identifier-to-routing-id binding or chain verification, a non-superseding slot placement, any blob published to a slot-claimed `routing_id` that is not a frame passing the four validation steps, or a DELETE of a stored frame whose chain verifies — see the Key-Event-Record Slot-Exclusivity subsection. **Amended 2026-09-10:** the code's name carries the retired DID-record vocabulary, and this ADR names the wire constant as it ships rather than inventing one).
 
 **Server errors (5xxx):** `5000` INTERNAL_ERROR, `5001` STORAGE_FULL, `5002` SHUTTING_DOWN.
 
