@@ -2140,10 +2140,14 @@ pub async fn execute_extend_ttl(
         drop(member_dids);
         // The rejection leaf landed and is credited here, which advances the
         // cell's `mutation_epoch`, so `execute_governance_action` keeps this
-        // proposal's replay marker: a rejected attempt consumes the proposal,
-        // and the members submit a new ExtendTtl proposal once consent is
-        // unanimous. Re-executing the same id would append a second
-        // `TtlExtensionRejected` leaf per attempt.
+        // proposal's replay marker: a rejected attempt consumes the proposal
+        // (§5.10.1 step 6 of the contexts spec: the extension fails and the
+        // original TTL remains), and the members submit a new ExtendTtl
+        // proposal once consent is unanimous. Re-executing the same id would
+        // append a second `TtlExtensionRejected` leaf per attempt. The `Err`
+        // also keeps `execute_governance_action` from running finalize, so no
+        // `GovernanceActionExecuted` leaf records an extension that did not
+        // happen.
         *cell.class_c_view().checkpoint_events_since_mut() += 1;
         return Err(ContextError::PermissionDenied(format!(
             "TTL extension requires unanimous consent — {missing_len} of {member_count} members have not approved",
@@ -5786,15 +5790,22 @@ pub async fn execute_governance_action(
     //   - epoch advanced ⇒ a mutation or a credited leaf landed before the error
     //     (the canonical case: a fail-closed `commit_class_s_keep` persisted a
     //     ban and the anchor-leaf append that follows it failed). Keep the
-    //     marker and run finalize below as if the dispatch had returned `Ok`,
-    //     because the action DID execute; then surface the error so the caller
-    //     learns that a leaf or a follow-on step did not land. Dropping the
-    //     marker here would let the same proposal id run the helper again and
-    //     re-apply a non-idempotent effect (`governance_ban_subscriber` and
-    //     `rotate_all_author_keys` advance every author's epoch a second time),
-    //     which diverges this member's log from every member that applied the
-    //     commit once — a divergence §9.9.3 of the security-model spec reads as
-    //     equivocation.
+    //     marker, persist it fail-closed, and surface the error. Finalize does
+    //     NOT run on this path: `finalize_governance_action` appends the
+    //     `GovernanceActionExecuted` leaf, emits the executed event, and drops
+    //     the proposal from `approved_proposals`, and each of those asserts a
+    //     completed action, while the helper reported failure. An advanced
+    //     epoch does not prove the action's effect landed — `execute_extend_ttl`
+    //     credits its `TtlExtensionRejected` leaf and then returns
+    //     `PermissionDenied` with the TTL unchanged — so a finalize here would
+    //     write an executed record for a rejected extension. The marker stays
+    //     because dropping it would let the same proposal id run the helper
+    //     again and re-apply a non-idempotent effect (`governance_ban_subscriber`
+    //     and `rotate_all_author_keys` advance every author's epoch a second
+    //     time; a rejected TTL extension appends a second `TtlExtensionRejected`
+    //     leaf), which diverges this member's log from every member that ran
+    //     the helper once — a divergence §9.9.3 of the security-model spec reads
+    //     as equivocation.
     // The marker's own `begin_class_s` above already advanced the epoch, so the
     // baseline is read after it.
     let epoch_before_dispatch = cell.mutation_epoch();
@@ -5836,11 +5847,13 @@ pub async fn execute_governance_action(
                 context_id,
                 proposal_id = %hex::encode(proposal.proposal_id),
                 error = %e,
-                "governance dispatch failed AFTER an effect landed (the cell's \
-                 mutation epoch advanced); the executed-proposal replay marker is \
-                 kept and the proposal is finalized so the same id cannot re-run \
-                 a non-idempotent action. The caller sees this error; the effect \
-                 that landed is not undone."
+                "governance dispatch failed AFTER a mutation or a leaf landed \
+                 (the cell's mutation epoch advanced); the executed-proposal \
+                 replay marker is kept and persisted so the same id cannot re-run \
+                 a non-idempotent action, and finalize is skipped so no \
+                 GovernanceActionExecuted leaf asserts an action the helper \
+                 reported as failed. The caller sees this error; the effect that \
+                 landed is not undone."
             );
             Err(e)
         }
@@ -5848,19 +5861,17 @@ pub async fn execute_governance_action(
 
     // STRENGTHENING (ADR-049 §9, authorized): `finalize_governance_action`'s
     // own persist was best-effort; the executed-marker durability now rides the
-    // token's FAIL-CLOSED `commit` instead. `finalize_governance_action` is a
-    // Class-C body reached through the token's `discharge_with` ClassSMut view
-    // (`rest_mut()`), so it runs and is then persisted FAIL-CLOSED by the SINGLE
-    // deferred persist the token owed — no whole-state `state_mut`. On a finalize
-    // error the persist STILL runs (keep-direction — the executed marker stays
-    // set and must persist) and `discharge_with` surfaces the finalize error.
-    // Deferred fail-closed discharge with an ASYNC finalize body (ADR-049
-    // Decision 7): `finalize_governance_action` appends to the async
-    // `EventLogPersistence`-backed Merkle log while mutating the state,
-    // interleaved, so it runs inside the RAII `begin_discharge` guard (which hands
-    // out the `ClassSMut` view held across the finalize awaits) rather than a
-    // synchronous `discharge_with` closure. Keep-direction: the SINGLE persist runs
-    // REGARDLESS of the finalize result; the finalize error is surfaced after.
+    // token's FAIL-CLOSED persist instead. On `Ok`, `finalize_governance_action`
+    // is a Class-C body reached through the RAII `begin_discharge` guard's
+    // ClassSMut view (`rest_mut()`), so it runs and is then persisted FAIL-CLOSED
+    // by the SINGLE deferred persist the token owed — no whole-state `state_mut`.
+    // On a finalize error the persist STILL runs (keep-direction — the executed
+    // marker stays set and must persist) and the finalize error is surfaced
+    // after. The guard replaces a synchronous `discharge_with` closure because
+    // finalize appends to the async `EventLogPersistence`-backed Merkle log while
+    // mutating the state, interleaved (ADR-049 Decision 7). On a post-effect
+    // `Err`, the token's read-only `commit` persists the kept marker and finalize
+    // does not run (see the replay-marker contract above).
     discharge_and_order_governance_action(
         token,
         cell,
@@ -5873,23 +5884,47 @@ pub async fn execute_governance_action(
     .await
 }
 
-/// Runs the discharge tail of `execute_governance_action`: finalize inside the
-/// RAII `begin_discharge` guard, the single fail-closed persist that runs
-/// REGARDLESS of the finalize result (keep-direction), and then the ordering of
-/// the three results. A post-effect dispatch error is returned first, then a
-/// finalize error, then a persist error. A finalize error that the dispatch
-/// error shadows is logged here because nothing else reports it;
-/// `commit_fail_closed` logs its own failure inside
-/// `persist_snapshot_fail_closed`.
+/// Runs the discharge tail of `execute_governance_action`.
+///
+/// On a dispatch `Ok`: finalize inside the RAII `begin_discharge` guard, then
+/// the single fail-closed persist that runs REGARDLESS of the finalize result
+/// (keep-direction), then the ordering of the two results — a finalize error
+/// first, then a persist error.
+///
+/// On a post-effect dispatch `Err` (the cell's `mutation_epoch` advanced, so
+/// the caller kept the replay marker): the token's read-only `commit` persists
+/// the kept marker fail-closed, finalize does NOT run, and the dispatch error is
+/// returned. `finalize_governance_action` appends the `GovernanceActionExecuted`
+/// leaf, emits the executed event, and removes the proposal from
+/// `approved_proposals`; each of those records a completed action, and the
+/// helper reported that the action did not complete. A persist error on this
+/// path is logged here because the dispatch error is the one returned;
+/// `persist_snapshot_fail_closed` logs the same failure at its own site.
 async fn discharge_and_order_governance_action(
     token: crate::context::actor::class_s::ClassSCommitToken,
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposal: &GovernanceProposal,
-    executor_did: Option<&DID>,
+    executor_did: &DID,
     dispatch_outcome: Result<GovernanceActionResult, ContextError>,
 ) -> Result<GovernanceActionResult, ContextError> {
+    let result = match dispatch_outcome {
+        Ok(result) => result,
+        Err(dispatch_err) => {
+            if let Err(persist_err) = token.commit(cell, deps, context_id).await {
+                tracing::error!(
+                    context_id,
+                    proposal_id = %hex::encode(proposal.proposal_id),
+                    error = %persist_err,
+                    "the fail-closed persist of the kept executed-proposal replay \
+                     marker failed after a post-effect dispatch error; the \
+                     dispatch error is returned and this one is logged only"
+                );
+            }
+            return Err(dispatch_err);
+        }
+    };
     let mut discharge = token.begin_discharge(cell);
     let finalize_result = finalize_governance_action(
         discharge.view().rest_mut(),
@@ -5900,21 +5935,6 @@ async fn discharge_and_order_governance_action(
     )
     .await;
     let persist_result = discharge.commit_fail_closed(deps, context_id).await;
-    let result = match dispatch_outcome {
-        Ok(result) => result,
-        Err(dispatch_err) => {
-            if let Err(finalize_err) = &finalize_result {
-                tracing::error!(
-                    context_id,
-                    proposal_id = %hex::encode(proposal.proposal_id),
-                    error = %finalize_err,
-                    "finalize_governance_action failed after a post-effect dispatch \
-                     error; the dispatch error is returned and this one is logged only"
-                );
-            }
-            return Err(dispatch_err);
-        }
-    };
     finalize_result?;
     persist_result?;
     Ok(result)

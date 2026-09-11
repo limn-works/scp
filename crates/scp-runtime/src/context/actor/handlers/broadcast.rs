@@ -2174,6 +2174,14 @@ mod tests {
             "a dispatch error raised AFTER the keep-commit must keep the replay marker"
         );
         let landed_after_first = appends.load(Ordering::SeqCst);
+        assert_eq!(
+            landed_after_first, 0,
+            "`AccessRevoked` is the first append `execute_revoke` makes and it \
+             failed, so nothing else may land: a `GovernanceActionExecuted` leaf \
+             here would record as completed an action the helper reported as \
+             failed, so `execute_governance_action` must not run finalize on a \
+             post-effect dispatch error"
+        );
 
         let second = crate::context::governance_helpers::execute_governance_action(
             &mut cell,
@@ -2251,6 +2259,104 @@ mod tests {
             appends.load(Ordering::SeqCst),
             0,
             "a rejected reset appends nothing on either attempt"
+        );
+    }
+
+    /// A rejected TTL extension is the one dispatch that advances the cell's
+    /// `mutation_epoch` without applying a governance effect: `execute_extend_ttl`
+    /// appends and credits a `TtlExtensionRejected` leaf, then returns
+    /// `PermissionDenied` with the TTL unchanged. `execute_governance_action`
+    /// keeps the replay marker (a retry would append a second rejection leaf on
+    /// this member only, which §9.9.3 of the security-model spec reads as
+    /// equivocation) and must NOT run finalize: a `GovernanceActionExecuted`
+    /// leaf, the executed event, and the removal from `approved_proposals` each
+    /// record an extension that §5.10.1 step 6 of the contexts spec says failed.
+    /// Before the fix, finalize ran on every post-effect error, so the log
+    /// carried `TtlExtensionRejected` followed by `GovernanceActionExecuted` for
+    /// the same proposal id.
+    #[tokio::test]
+    async fn unanimity_rejected_extend_ttl_keeps_marker_and_appends_no_executed_leaf() {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let (deps, appends) = build_deps().await;
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        let proposal_id = seed_approved_proposal(
+            &mut state,
+            &ctx_hex,
+            GovernanceAction::ExtendTtl {
+                additional_secs: 3_600,
+            },
+        );
+        let mut cell = ClassSCell::new(state);
+        // A member the single-admin proposal carries no approval for, so the
+        // unanimity check finds one consent missing.
+        cell.class_c_view().membership_class_c_mut().add_member(
+            DID(SUBSCRIBER_DID.to_owned()),
+            "member".to_owned(),
+            vec![],
+        );
+        appends.store(0, Ordering::SeqCst);
+        reset_leaf_counter(&mut cell);
+
+        let first = crate::context::governance_helpers::execute_governance_action(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &proposal_id,
+            Some(&DID(CREATOR_DID.to_owned())),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                &first,
+                Err(ContextError::PermissionDenied(msg)) if msg.contains("unanimous consent")
+            ),
+            "the unanimity rejection must reach the caller unchanged; got {first:?}"
+        );
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            1,
+            "exactly the `TtlExtensionRejected` leaf lands: a second leaf would be \
+             the `GovernanceActionExecuted` leaf finalize appends, which records \
+             an extension that did not happen"
+        );
+        assert_eq!(
+            cell.checkpoint_events_since, 1,
+            "the rejection leaf is credited once and the executed leaf never lands"
+        );
+        assert!(
+            cell.governance
+                .class_s
+                .executed_proposals
+                .contains_key(&proposal_id),
+            "a rejected attempt consumes the proposal: the replay marker stays"
+        );
+
+        let second = crate::context::governance_helpers::execute_governance_action(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &proposal_id,
+            Some(&DID(CREATOR_DID.to_owned())),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                &second,
+                Err(ContextError::PermissionDenied(msg)) if msg.contains("already been executed")
+            ),
+            "the same proposal id must be refused as already executed; got {second:?}"
+        );
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            1,
+            "the refused replay appends nothing: a second `TtlExtensionRejected` \
+             leaf on this member alone would diverge its Merkle root"
         );
     }
 

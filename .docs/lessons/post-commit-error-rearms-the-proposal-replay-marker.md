@@ -75,13 +75,21 @@ credits `checkpoint_events_since` through `class_c_view`.
 `execute_governance_action` reads the epoch after it has marked the proposal
 executed and before it dispatches. On a dispatch error it reads the epoch
 again. An unchanged epoch proves the helper applied nothing, so the marker is
-removed and the proposal stays retryable. A changed epoch means an effect
-landed, so the marker stays, finalize runs as it would after `Ok`, and the
+removed and the proposal stays retryable. A changed epoch means a mutation or
+a leaf landed, so the marker stays and its persist runs fail-closed, and the
 dispatch error reaches the caller with an ERROR log naming the context and the
-proposal. `key_epoch_advance_failure_keeps_executed_proposal_marker`,
-`anchor_leaf_failure_after_commit_keeps_marker_and_blocks_re_execution`, and
-`pre_effect_dispatch_error_drops_marker_so_the_proposal_is_retryable` in
-`crates/scp-runtime/src/context/actor/handlers/broadcast.rs` pin the three
+proposal. `finalize_governance_action` does not run on that path. It appends
+the `GovernanceActionExecuted` leaf, emits the executed event, and removes the
+proposal from `approved_proposals`, and each of those records a completed
+action; the helper reported that the action did not complete. A changed epoch
+also does not prove that the action's effect landed: `execute_extend_ttl`
+credits its `TtlExtensionRejected` leaf and then returns `PermissionDenied`
+with the TTL unchanged, so a finalize on the error path wrote an executed
+record for a rejected extension. `key_epoch_advance_failure_keeps_executed_proposal_marker`,
+`anchor_leaf_failure_after_commit_keeps_marker_and_blocks_re_execution`,
+`pre_effect_dispatch_error_drops_marker_so_the_proposal_is_retryable`, and
+`unanimity_rejected_extend_ttl_keeps_marker_and_appends_no_executed_leaf` in
+`crates/scp-runtime/src/context/actor/handlers/broadcast.rs` pin the four
 outcomes.
 
 One consequence a helper author must know: a helper that records a per-attempt
