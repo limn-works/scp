@@ -2,7 +2,7 @@
 
 | Component | Existing Standard/Technology | SCP Relationship |
 |---|---|---|
-| Identity | Inception-derived self-certifying identifier over a key-event log (ADR-063) | Own construction; a W3C DID facade is deferred (§11.2.4) |
+| Identity | KERI, Key Event Receipt Infrastructure | Modelled on; ADR-063 states what SCP adopts, adapts and owns (§11.2.5). A W3C DID facade is deferred (§11.2.4) |
 | Identity resolution | Key-event log replay over the SCP relay network (§3.10) | Own construction; did:dht, BEP44 and the Mainline DHT are retired (§11.2.2) |
 | Capability tokens | UCAN | Build on directly |
 | Key custody | Passkeys, WebAuthn, Secure Enclave | Delegate custody to |
@@ -152,6 +152,12 @@ Core properties:
 ### 11.2.4 Why not `did:scp`
 
 **A `did:scp` method facade over the key-event log is deferred, not rejected.** Alec ruled on 2026-08-30 — "punt, be ready, don't foreclose" — and ADR-063 records the ruling: SCP does not depend on a DID string, and the identifier's own textual form is what a later revision of `09-security-model.md` §9.7.4.2 fixes. The interoperability argument that once favored keeping the did:dht string is gone with the string, so the open question is whether a W3C DID Core facade buys SCP anything, and no artifact answers it yet.
+### 11.2.5 KERI, the model for the key-event log
+
+**KERI is the protocol SCP's identity substrate is modelled on, and ADR-063 carries the comparison.** KERI — Key Event Receipt Infrastructure — establishes control authority over a self-certifying identifier by replaying that identifier's own append-only log of key events, with no registry, no ledger, and no dependency on any other infrastructure. ADR-063, the inception-derived key-event-log identity substrate, states in its "Relationship to KERI" section what SCP adopts as KERI states it, what SCP adapts and why, and what SCP owns because KERI does not reach it. This subsection cites that section and restates none of it.
+
+**What the comparison is worth here.** did:dht answered the identity question with one mutable record on a public distributed hash table; KERI answers it with a log a verifier replays end to end. SCP took the second answer, so the artifact that records SCP's departures from KERI — fork precedence by the root rather than by first observation, a witness that watches and reports rather than gating, and an MLS coupling KERI has no analog for — is the one artifact a reader comparing the two should open. Alec set the working rule on 2026-09-02: KERI is the model, and SCP builds on it rather than forcing itself into it.
+
 ## 11.3 GNUnet
 
 **GNUnet** (gnunet.org) is a framework for secure peer-to-peer networking, under active development since 2001. It is one of the longest-running decentralized protocol projects that prioritizes anonymity and censorship resistance as architectural fundamentals. The comparison with SCP is instructive precisely because the two protocols start from opposite premises — GNUnet minimizes identity to protect participants; SCP maximizes verifiable identity to establish trust — but converge on shared principles of infrastructure distrust and transport independence.
@@ -187,7 +193,7 @@ GNUnet's identity model is built around **anonymity as a fundamental right**:
 |-----------|--------|-----|
 | **Design goal** | Anonymity — knowing who is the threat | Accountability — verifiable provenance is the feature |
 | **Identity** | Disposable egos, no cross-context linkage by design | Persistent DIDs, attestation chains to human accountability |
-| **Naming** | Petnames (local, non-unique, no authority) | DID documents (global, self-certifying, dual-layer resolution) |
+| **Naming** | Petnames (local, non-unique, no authority) | Inception-derived identifiers (global, self-certifying, resolved by log replay) |
 | **Provenance** | Anti-goal (enables surveillance) | Protocol tenet (absence of provenance is a signal) |
 | **Agent model** | No concept of AI agents as participants | Agents are first-class, same rules as humans, UCAN-bounded |
 
@@ -204,7 +210,7 @@ GNUnet's DHT, R5N (Randomized Recursive Routing for Restricted-Route Networks), 
 - **Censorship resistance:** Randomized initial routing + repeated queries contacting different network subsets yields ~80-90% GET retrieval with 10% randomly-placed malicious peers in a 2025-node small-world topology (Evans & Grothoff 2011, Fig. 3).
 - **IETF standardization:** draft-schanzen-r5n-07.
 
-**Comparison with Mainline DHT (used by did:dht):** Mainline uses purely greedy Kademlia routing — simpler, faster, but with no path recording, no on-path validation, and no structural censorship resistance. R5N's random walk phase and path validation are meaningful improvements for adversarial environments. SCP's dual-layer resolution (§3.10) — Mainline DHT + SCP relays — mitigates some of these risks through redundancy rather than routing-level resistance.
+**Comparison with Mainline DHT (used by did:dht):** Mainline uses purely greedy Kademlia routing — simpler, faster, but with no path recording, no on-path validation, and no structural censorship resistance. R5N's random walk phase and path validation are meaningful improvements for adversarial environments. SCP publishes an identity's chain to the identity's own relays and to the fallback set, and a first contact reads two distinctly-operated community relays (`09-security-model.md` §9.7.4.2 R11), so SCP mitigates some of these risks through redundancy rather than routing-level resistance.
 
 ### 11.3.4 NAT Traversal: GNUnet's Infrastructure-Free Approach
 
@@ -279,7 +285,7 @@ A DHT node storing GNS records sees only encrypted blobs keyed by opaque hashes.
 
 GNS chose secure + memorable, sacrificing global uniqueness. Names are meaningful only within a local trust context — Alice's "bob" is a petname she assigned and has no meaning to Carol. Hierarchical delegation (alice.bob.gnu means "look up 'alice' in the zone that 'bob' points to in the GNU zone") provides path-based navigation but not global resolution.
 
-SCP chose secure + global, sacrificing memorability. did:dht identifiers are cryptographic strings that no human will remember, but they resolve identically for every resolver worldwide. SCP compensates with display names in DID documents and context-level naming — but the identifiers themselves are opaque.
+SCP chose secure + global, sacrificing memorability. An SCP identifier is the digest of an inception event, which no human will remember, and it resolves identically for every resolver worldwide. SCP compensates with context-level naming and the human-readable addressing of §22 — the identifiers themselves are opaque.
 
 ENS arguably achieves all three by accepting the trade-off of requiring a blockchain (Ethereum) as global state — introducing infrastructure dependency that both GNS and SCP reject.
 
@@ -297,21 +303,21 @@ This interoperability layer means GNS can gradually coexist with DNS rather than
 | **Identifier** | Zone public key (Ed25519/ECDSA) | Inception-event digest (ADR-063, the inception-derived identity key-event log) |
 | **Naming** | Petnames (local, memorable, non-global) | DID strings (global, unmemorable, unique) |
 | **Hierarchical delegation** | Yes (label.zone chains) | No (flat namespace) |
-| **Record privacy** | Encrypted at rest (ZKDF + AES/XSalsa20) | Plaintext DID documents (readable by anyone) |
-| **Zone enumeration** | Prevented by construction (ZKDF) | Trivial (DID documents are public) |
-| **DHT** | R5N (censorship-resistant routing) | Mainline (millions of nodes, simpler routing) |
-| **Revocation** | Argon2id proof-of-work (~4 days) | BEP44 sequence number + TTL expiry |
-| **Multi-key architecture** | No (one keypair per zone) | Yes (#0, #active, #agent, pre-rotation) **[Superseded 2026-09-10 — one operational role `#active`, no agent key; `09-security-model.md` §9.1 invariant 1]** |
+| **Record privacy** | Encrypted at rest (ZKDF + AES/XSalsa20) | Key events and service records are public by construction (`09-security-model.md` §9.7.4.2) |
+| **Zone enumeration** | Prevented by construction (ZKDF) | Trivial: a key-event log is public |
+| **DHT** | R5N (censorship-resistant routing) | None; the SCP relay network carries identity (`03-identity.md` §3.10) |
+| **Revocation** | Argon2id proof-of-work (~4 days) | A root-asserted key condition in the log (`09-security-model.md` §9.7.1) |
+| **Multi-key architecture** | No (one keypair per zone) | Yes: a threshold root set, one operational role `#active`, and a pre-rotation commitment (`09-security-model.md` §9.7.4.2 definitions) |
 | **Capability delegation** | No | Yes (UCAN chains) |
 | **Attestation chains** | No | Yes (identity attestations to human accountability) |
 | **DNS interop** | Yes (GNS2DNS, DNS2GNS) | No |
-| **W3C DID compliance** | Via did:gns (LSD-0005) | Native (did:dht is a registered DID method) |
+| **W3C DID compliance** | Via did:gns (LSD-0005) | None; a `did:scp` facade is deferred (ADR-063) |
 | **Context-scoped identity** | No | Yes (pseudonym derivation per context, §9.10.2) |
 | **Standardization** | RFC 9498 (IETF) | did:dht spec (DIF) |
 
 **What GNS solves that SCP's identity layer does not:** Memorable naming through petnames and hierarchical delegation. Record encryption preventing observers from reading identity metadata. Zone enumeration prevention — no equivalent of crawling all DIDs in the DHT. DNS interoperability for gradual adoption. These are real gaps in SCP's identity model, accepted as trade-offs for global uniqueness, multi-key architecture, and W3C DID ecosystem compatibility.
 
-**What SCP's identity layer solves that GNS does not:** A root set with a signing threshold, one operational role, and a pre-rotation commitment consumed by a reveal, each key in its own custody (`09-security-model.md` §9.7.4.2 definitions). UCAN capability delegation chains. Identity attestation linking agents to humans. Context-scoped pseudonyms preventing cross-context correlation. Dual-layer resolution (DHT + relay) with protocol-level healing. The massive Mainline DHT network (millions of nodes vs GNUnet's hundreds). These reflect SCP's accountability-first design vs GNS's privacy-first design.
+**What SCP's identity layer solves that GNS does not:** A root set with a signing threshold, one operational role, and a pre-rotation commitment consumed by a reveal, each key in its own custody (`09-security-model.md` §9.7.4.2 definitions). UCAN capability delegation chains. Identity attestation linking agents to humans. Context-scoped pseudonyms preventing cross-context correlation. Resolution by log replay over the SCP relay network, where a verifier checks every event itself and depends on no relay for correctness (`03-identity.md` §3.10.2). These reflect SCP's accountability-first design vs GNS's privacy-first design.
 
 ### 11.3.6 Protocol Translation (VPN/PT)
 
@@ -349,7 +355,7 @@ GNUnet's communicator model offers one lesson SCP has already partially adopted:
 - **Infrastructure distrust.** Both protocols treat all infrastructure as potentially adversarial. GNUnet encrypts at every layer because any hop might be compromised. SCP encrypts at the message layer (MLS) and treats relays as untrusted dumb pipes. Different mechanisms, same principle.
 - **Relay as native transport.** GNUnet's DV routing makes relaying an inherent transport property. SCP's Tier 3 bridge relay serves the same function — when direct connection fails, relay forwarding is a seamless fallback, not an external service.
 - **NAT as first-class problem.** Both protocols treat NAT traversal as a core protocol concern, not an application-layer afterthought. GNUnet's multiple traversal mechanisms and SCP's 4-tier reachability strategy both reflect this.
-- **DHT for peer discovery.** Both use DHT-based discovery (R5N vs Mainline) as a decentralized alternative to centralized registries.
+- **Decentralized discovery.** GNUnet discovers peers through the R5N distributed hash table; SCP discovers them through its own relay network and the shipped community relay list (§18.5.1). Both refuse a centralized registry.
 
 ### 11.3.9 Why SCP Does Not Adopt GNUnet's Approach
 
@@ -365,7 +371,7 @@ GNUnet's communicator model offers one lesson SCP has already partially adopted:
 
 GNUnet's **probabilistic burst NAT traversal** technique — backchannel-coordinated simultaneous multi-port connection attempts — could improve SCP's Tier 2 coverage for symmetric NATs without introducing STUN/TURN infrastructure dependency. See discussion #1380 for ongoing evaluation.
 
-R5N's **randomized routing** and **path recording** offer censorship resistance properties that standard Mainline DHT lacks. If state-level DID resolution suppression becomes a practical threat, R5N's techniques could inform a more resilient resolution fallback alongside SCP's existing dual-layer approach (§3.10).
+R5N's **randomized routing** and **path recording** offer censorship resistance properties that standard Mainline DHT lacks. If state-level suppression of identity resolution becomes a practical threat, R5N's techniques could inform a more resilient fallback alongside SCP's relay fallback set (§3.10).
 
 ### 11.3.11 References
 
@@ -486,7 +492,7 @@ Freenet's storage model has a striking structural parallel with SCP's relay mode
 |-----------|-------------------|-----------|
 | What is stored | Encrypted content blocks (32 KB CHK, 1 KB SSK) | Encrypted MLS messages and relay blobs (up to 256 KB) |
 | Who decides storage | Network demand (automatic caching) | Explicit publish by context members |
-| Storage duration | Demand-driven LRU; unpopular content expires | TTL-based (7 days for DID documents); context-governed for messages |
+| Storage duration | Demand-driven LRU; unpopular content expires | A validating relay never expires a key-event record (`03-identity.md` §3.10.5); context-governed for messages |
 | Provider can read content | No (encrypted with key not available to node) | No (MLS-encrypted; relay has no group key) |
 | Provider can identify content | Partially (key is visible; content is not) | Partially (routing_id is visible; content is not) |
 | Plausible deniability | Yes — design goal | Not a goal — relays are service providers, not anonymous participants |
@@ -498,7 +504,7 @@ The structural similarity — infrastructure that stores encrypted data it canno
 
 1. **Provider-blind storage.** The proof that distributed systems can operate reliably when storage providers cannot inspect what they store. Freenet demonstrated this at scale starting in 2000; SCP's relay model (§10) applies the same principle with different motivation (access control rather than deniability).
 
-2. **Content-addressed integrity verification.** CHKs — where the hash of the content IS the address — established that any intermediary can verify data integrity without being able to read the data. SCP uses content-addressed hashing for event log integrity (Merkle trees), DID document verification (BEP44 self-certification), and blob integrity in relay storage.
+2. **Content-addressed integrity verification.** CHKs — where the hash of the content IS the address — established that any intermediary can verify data integrity without being able to read the data. SCP uses content-addressed hashing for event log integrity (Merkle trees), for the identifier itself, which is the digest of an identity's inception event (`09-security-model.md` §9.7.4.2 R2), and for blob integrity in relay storage.
 
 3. **Distributed encrypted storage works at scale.** Freenet has operated continuously since 2000 with thousands of nodes, proving that encrypted distributed storage is not merely theoretical. This is an existence proof SCP relies on — not in architecture, but in confidence that the category of "provider-blind storage" is viable at scale.
 
@@ -712,7 +718,7 @@ Server selection uses consistent permutation: `HASH(storage_index + nodeid)` sor
 
 | Dimension | Tahoe-LAFS Grid | SCP Relay + Node Architecture |
 |-----------|----------------|------------------------------|
-| **Discovery** | Introducer (centralized roster) | DHT + relay layer + DID document service endpoints (§3.10, §18) |
+| **Discovery** | Introducer (centralized roster) | The SCP relay network, the shipped community relay list, and the identity's own service record (§3.10, §18) |
 | **Infrastructure role** | Storage servers — store shares, serve shares, nothing else | Relays — receive blobs, deliver blobs, nothing else |
 | **Client role** | All crypto + erasure coding + share management | All crypto + MLS + governance + capability validation |
 | **Topology** | Bi-clique (every client → every server) | Subscription-based (participants subscribe to routing IDs on relays) |
@@ -813,7 +819,7 @@ SCP encrypts at a different layer: MLS (RFC 9420) provides group encryption at t
 
 ### 11.6.4 What SCP Borrows
 
-**Self-certifying addresses as identity primitive.** The proof that public-key-derived addressing works at scale — cjdns's Hyperboria network operated with hundreds of globally-distributed nodes — validated the core assumption behind `did:dht`. If a mesh network can function with no address authority, a protocol can function with no identity authority.
+**Self-certifying addresses as identity primitive.** The proof that public-key-derived addressing works at scale — cjdns's Hyperboria network operated with hundreds of globally-distributed nodes — validated the core assumption behind a self-certifying identifier. If a mesh network can function with no address authority, a protocol can function with no identity authority.
 
 **Encrypted-by-default as the only mode.** Both cjdns and Yggdrasil made unencrypted communication impossible by construction. SCP follows the same principle with MLS: there is no plaintext mode. Encryption is not a feature to enable; it is the only way the protocol operates.
 
@@ -823,7 +829,7 @@ Cjdns and Yggdrasil are network-layer protocols — they replace IP routing with
 
 - **No governance.** Neither protocol has any concept of permissions, roles, capabilities, or governed interaction spaces. Any node that knows a destination address can send to it. SCP: contexts enforce membership, governance engines enforce rules, UCANs enforce capabilities (§5, §7).
 - **No group encryption.** Both provide point-to-point encrypted channels. Neither has multi-party group encryption with forward secrecy and post-compromise security. SCP: MLS groups are the fundamental communication primitive.
-- **Identity is an address, not a document.** A cjdns/Yggdrasil address proves key ownership. An SCP DID resolves to a document with multiple verification methods, attestation chains, service endpoints, and agent delegation — identity as a rich, evolving structure rather than a static hash (§3, §11.2).
+- **Identity is an address, not a history.** A cjdns/Yggdrasil address proves key ownership and says nothing more. An SCP identifier resolves by replaying an append-only key-event log that carries a threshold root set, each key's condition, the pre-rotation commitment, the witness set and the delegator — identity as an evolving, auditable structure rather than a static hash (§3, §11.2).
 - **Transport substrate, not alternative.** SCP lists Yggdrasil/cjdns as Tier 2 transport adapters (§10.5). Their globally-routable encrypted IPv6 space could serve as infrastructure-independent transport for SCP relays — especially valuable in scenarios where conventional internet routing is unreliable or surveilled. The adapter mapping is thin: SCP relay connections use the mesh network's IPv6 addresses instead of public IPs, inheriting NAT traversal and encryption for free.
 
 ### 11.6.6 References
@@ -839,7 +845,7 @@ Cjdns and Yggdrasil are network-layer protocols — they replace IP routing with
 
 No existing protocol combines all of the following. This is SCP's novel contribution:
 
-- **Identity:** Dual-layer DID resolution with protocol-level self-healing; multi-key architecture with pre-rotation commitments and optional agent signing keys; shared-DID human-agent pairs with structural action provenance (`signing_key_id` distinguishes human vs agent signatures without trusting self-reported claims)
+- **Identity:** an inception-derived identifier resolved by replaying a key-event log; a threshold root set separate from the rotating operational key, with a pre-rotation commitment every establishment event re-fixes; and human-agent pairs as two identities, where the human's log anchors the agent's and the signing identity carries the provenance (`09-security-model.md` §9.1 invariant 1)
 - **Capability:** UCAN-based authorization with delegation chains, time-bounding, and revocation; context-level economic governance with spending UCANs
 - **Encryption:** MLS group keys as the membership mechanism (encryption-as-access-control); sender-side key layers enabling per-sender blocking without group disruption
 - **Governance:** 30 governance action types with pluggable engines; context-bound participation rules enforced cryptographically
