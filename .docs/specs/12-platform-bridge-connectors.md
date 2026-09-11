@@ -329,7 +329,7 @@ This section specifies the concrete HTTP API that a cooperating external platfor
 
 - **Platform implements, bridge node consumes.** The platform exposes these endpoints. The bridge node calls them and also exposes a webhook receiver for platform-initiated events. The platform never calls SCP directly.
 - **Minimal surface area.** Six endpoints. No SCP-specific data structures leak into the platform's API — all SCP envelope construction, sender key encryption (§12.6.1), and provenance marking happen on the bridge node.
-- **Authentication via DID-signed tokens.** The bridge operator's DID signs bearer tokens used for all requests. The platform validates signatures against the operator's published DID document.
+- **Authentication via DID-signed tokens.** The bridge operator's DID signs bearer tokens used for all requests. The platform verifies each signature against that operator's `current` `#active` key (§12.10.2).
 - **Idempotent where possible.** Shadow creation and deletion are idempotent to tolerate retries.
 - **JSON over HTTPS.** All requests and responses use `Content-Type: application/json`. TLS 1.3 required per §9.13.
 - **Versioned.** All paths are prefixed with `/v1/`. Future breaking changes increment the version prefix.
@@ -355,7 +355,7 @@ The JWT payload contains:
 }
 ```
 
-The platform verifies the JWT signature against the operator's DID document (§3.2). Token lifetime SHOULD NOT exceed 1 hour. The platform MAY cache resolved DID documents with TTL.
+The platform verifies the JWT signature against the operator's `current` `#active` key (`03-identity.md` §3.10.4). Token lifetime SHOULD NOT exceed 1 hour. The platform MAY cache a resolved key state (§9.10.7).
 
 **JWT signing algorithm.** The JWT `alg` header MUST be `ES256` (RFC 7518) — ECDSA on P-256 with SHA-256 — which is the signature algorithm §9.5 of the security-model spec mandates for every SCP key. An SDK MUST reject a JWT whose header names any other algorithm.
 
@@ -765,7 +765,7 @@ Bridge credentials pass through five phases:
 
 1. **Provision.** The user authorizes the bridge to act on their behalf on the external platform. The authorization mechanism is platform-specific: OAuth Authorization Code flow, API key generation, manual token entry, etc. The bridge operator initiates this flow; the user completes it.
 
-2. **Store.** Credentials are encrypted at rest and stored in isolation from the operator's SCP identity keys. The credential encryption key MUST NOT be derived from the `#active` signing key, because `#active` rotates (software key, periodic rotation per §3.4) — rotation would silently invalidate all encrypted credentials. Instead, the credential encryption key is a random 32-byte value generated once per bridge instance at provisioning time and stored within the custody boundary (alongside `pseudonym_secret` and other non-exportable secrets per §3.7). This is the `bridge_credential_key`.
+2. **Store.** Credentials are encrypted at rest and stored in isolation from the operator's SCP identity keys. The credential encryption key MUST NOT be derived from the `#active` signing key, because a rotation of `#active` (`03-identity.md` §3.2.1) would silently invalidate every encrypted credential. Instead, the credential encryption key is a random 32-byte value generated once per bridge instance at provisioning time and stored within the custody boundary (alongside `pseudonym_secret` and other non-exportable secrets per §3.7). This is the `bridge_credential_key`.
 
    The `bridge_credential_key` is generated and stored as follows:
    ```
@@ -787,7 +787,7 @@ Bridge credentials pass through five phases:
 
    Encryption algorithm: AES-256-GCM. Nonce: 12 bytes, randomly generated per encryption operation via CSPRNG. The nonce is prepended to the ciphertext. Authentication tag: 16 bytes, appended to the ciphertext. Stored format: `nonce (12 bytes) || ciphertext || tag (16 bytes)`.
 
-   This design avoids coupling credential encryption to any key that rotates (`#active`) or that hardware custody may prevent exporting (`#0`). The `bridge_credential_key` is a standalone secret with the same lifecycle as the bridge instance — created at provisioning, destroyed at revocation (Phase 5).
+   This design couples credential encryption to no identity key, because `#active` rotates and a root member's default passkey custody exports no private key (`09-security-model.md` §9.7.4.1 item 4). The `bridge_credential_key` is a standalone secret with the same lifecycle as the bridge instance — created at provisioning, destroyed at revocation (Phase 5).
 
    Credentials MUST be stored separately from the operator's SCP identity keys — the credential store is a distinct storage domain under `bridge/{bridge_id}/credential/{credential_type}` in `ProtocolRepository`, not a field on the bridge entity.
 
