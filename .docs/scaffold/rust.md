@@ -24,11 +24,11 @@ crates/
         mod.rs              # ProtocolRepository struct, StoreError, StoredValue<T>
         context.rs          # Context state, params, membership, sender keys
         event_log.rs        # Event log persistence, tree nodes, roots
-        identity.rs         # Identity documents, private state, TOFU, DID cache
+        identity.rs         # Key-event logs, private state, TOFU, resolution cache
         nonce.rs            # UCAN nonce tracking, pruning
         tools.rs            # Tool registration, sessions
         transport.rs        # Relay scores, key packages
-      identity/             # ADR-003: DID creation
+      identity/             # ADR-063: key-event log
       envelope/             # ADR-002: Envelope format
         broadcast.rs        # BroadcastEnvelope variant (§5.14.5)
       context/              # ADR-008: Context lifecycle
@@ -151,9 +151,8 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-pkarr = "5"
-z-base-32 = "0.1"
+p256 = { version = "0.13", features = ["ecdsa"] }
+hpke-rs = "0.6"
 sha2 = "0.10"
 hkdf = "0.12"
 aes-gcm = "0.10"
@@ -170,7 +169,7 @@ redb = "2"
 | Crate | Version | Used in | Purpose |
 |-------|---------|---------|---------|
 | `openmls` | latest stable | scp-core | MLS implementation (ADR-001) |
-| `ed25519-dalek` | 2.x | scp-core, scp-platform | Ed25519 signing/verification |
+| `p256` | 0.13.x | scp-core, scp-platform | ECDSA P-256 signing and verification (ADR-063) |
 | `sha2` | 0.10.x | scp-core | SHA-256 hashing (envelopes, event log) |
 | `hkdf` | 0.12.x | scp-core | HKDF pseudonym derivation (ADR-002) |
 | `aes-gcm` | 0.10.x | scp-core | AES-256-GCM sender key encryption (ADR-007) |
@@ -181,8 +180,7 @@ redb = "2"
 | `rmp-serde` | latest | scp-core, scp-transport | MessagePack binary serialization (envelopes, relay protocol, ProtocolRepository §17.5) |
 | `rusqlite` | latest, `bundled-sqlcipher` feature | scp-platform, scp-transport | SQLite storage: `SqliteStorage` (§17.6), `SqliteBlobStore` (§17.7). Bundled SQLCipher for encryption at rest. |
 | `redb` | latest stable (v3+ on-disk format) | scp-transport | `RedbBlobStore` (§17.7) — pure Rust B-tree DB for medium relay deployments |
-| `pkarr` | 5.0.3+ | scp-core | did:dht identity — BEP44 signed mutable items, DNS packets, Mainline DHT publish/resolve (ADR-003) |
-| `z-base-32` | latest | scp-core | z-base-32 encoding for did:dht identifiers (ADR-003) |
+| `hpke-rs` | 0.6.x | scp-core | HPKE under DHKEM(P-256, HKDF-SHA256) (ADR-063) |
 | `thiserror` | 2.x | all crates | Error type derivation |
 | `futures` | 0.3.x | scp-transport | Stream combinators |
 | `tracing` | 0.1.x | all crates | Structured logging |
