@@ -7,9 +7,9 @@ an actor's identity *owns* it. It is minted once per actor at spawn time inside
 `Supervisor::build_actor_deps`, held **by value** in `ActorDeps`, and passed **by
 reference** (`&OwnedIdentityDid`) to the `SupervisorHandle` methods that touch
 per-identity state. There is no `&DID`-keyed surface an actor can reach — the only
-identity an actor can read is the one that owns it. This is how cross-identity isolation
-(ADR-049 §5, spec §9.4.1) is enforced: not by runtime checks, but by making the wrong
-thing unconstructible.
+identity an actor can read is the one that owns it. The compiler enforces cross-identity isolation
+(ADR-049 §5, spec §9.4.1) by making the wrong thing unconstructible, rather than by a
+runtime check.
 
 ## Why it is unforgeable — and why there is no CI gate
 
@@ -23,7 +23,7 @@ rides on **two type-system facts**, not on a scanner:
    is possible outside the module either.
 
 The struct's *name* is `pub(in crate::context)` (wider than the constructor) so that
-`ActorDeps` can hold it and handlers can take a `&`. That widening is safe precisely
+`ActorDeps` can hold it and handlers can take a `&`. That widening is safe
 because (1) + (2) make **nameable ≠ constructible**: actor code can hold or borrow a
 token, but has no path to *mint* one. The struct must never be `pub`/`pub(crate)`.
 
@@ -40,9 +40,8 @@ This capability deliberately has **no bespoke source-text CI gate**. The residua
 an insider editing this one file — but that same insider could edit a scanner or its CI
 wiring, so a scanner adds *zero* marginal security over the type system, two module lints
 (`#![deny(unsafe_code)]` and `#![deny(non_local_definitions)]` in `supervisor/mod.rs`), and
-review of a tiny frozen file. That full reasoning — including why a 6,000-line scanner over
-this exact type was built and then deleted — is
-`ast-gate-checks-definition-not-name-resolution.md`. This lesson is its concrete
+review of a tiny frozen file. `ast-gate-checks-definition-not-name-resolution.md` carries that reasoning,
+including why a 6,000-line scanner over this type was built and then deleted. This lesson is its concrete
 capability; that lesson is the general rule.
 
 ## Cross-refs
