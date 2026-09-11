@@ -22,6 +22,8 @@ Build order: ADR-023 + ADR-024 (parallel, both depend on Phase 1-4) --> ADR-025 
 
 **Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
 
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, overturned ADR-039's shared-identity `#agent` method, so a bridge operator holds no second key on its own identity. `09-security-model.md` §9.1 invariant 1 states the replacing model and records that its delegation anchor is unspecified, so the bridge signs under the operator's `#active` key until that anchor lands.
+
 **Amendment (2026-09-10 — the connector signature is ECDSA on P-256).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. The `signature` field on this ADR's signed connector structure carries the type `P256Signature`. No other sentence of this ADR names a curve, so the ruling reaches its wire type and no decision in it.
 
 ### Context
@@ -30,7 +32,7 @@ Spec §12 comprehensively specifies bridge architecture. Bridges are protocol en
 
 ### Decision
 
-Implement bridge support in `scp-core/bridge/`. Bridge connector as registered protocol entity with accountable operator DID. The bridge operator signs bridge protocol messages with the `#agent` verification method on the operator's DID (ADR-039), allowing automated bridge operation without exposing the operator's `#active` key to the bridge software. Shadow identities as restricted participants (observer default). Four operating modes (Relay, Puppet, Api, Cooperative). All bridged content carries full provenance chain. Shadow claiming via identity attestation (§3.5) is one-way and irreversible.
+Implement bridge support in `scp-core/bridge/`. Bridge connector as registered protocol entity with accountable operator DID. The bridge operator signs bridge protocol messages with its `#active` key, because a human identity's key state names one operational role and names no agent key. Shadow identities as restricted participants (observer default). Four operating modes (Relay, Puppet, Api, Cooperative). All bridged content carries full provenance chain. Shadow claiming via identity attestation (§3.5) is one-way and irreversible.
 
 ### Rationale
 
@@ -612,6 +614,8 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
 
 **Status:** Decided
 
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, retired the DID document and the `did:dht` identifier form. Resolution returns a key state, and an identifier's textual form is a later revision's concern, which `09-security-model.md` §9.7.4.2 R13 defers, so no example here prints one.
+
 ### Context
 
 The UniFFI bridge (ADR-021) generates raw Swift bindings from the Rust protocol engine. While functional, the generated surface is not idiomatic Swift — it lacks actor isolation, `AsyncSequence` streams, the `@Observable` macro, and the ergonomic patterns Swift developers expect. The Apple platform adapter (ADR-025) provides the `KeyCustody`, `PushProvider`, `Storage`, and `DeviceAttestationProvider` implementations injected into the Rust engine via UniFFI callback interfaces.
@@ -790,7 +794,7 @@ public actor SCPIdentity {
         return SCPIdentity(handle: handle)
     }
 
-    /// Resolve another identity's DID document.
+    /// Resolve another identity's key state.
     public func resolve(did: String) async throws -> DIDDocument {
         let record = try await identity_resolve(did: did)
         return DIDDocument(from: record)
@@ -1004,7 +1008,7 @@ public nonisolated struct OutletDefinition: Sendable {
     public let implementationHash: Data?
 }
 
-/// A DID document resolved from the DID network.
+/// A key state resolved from an identity's key-event log.
 public nonisolated struct DIDDocument: Sendable {
     public let did: String
     public let verificationMethods: [VerificationMethod]
@@ -1108,7 +1112,7 @@ private func makeMessageStream(handle: ContextHandle) -> AsyncStream<Message> {
    All three commands exit 0 with zero warnings at `SWIFT_STRICT_CONCURRENCY=complete`.
 
 2. **`SCP.create()` factory:**
-   - `await SCP.create(custody: .platform)` returns an `SCP` actor with a valid `identity.did` starting with `"did:dht:"`.
+   - `await SCP.create(custody: .platform)` returns an `SCP` actor with a valid `identity.did`.
    - `await SCP.create(custody: .inMemory)` returns an `SCP` actor with a software-backed identity (for testing).
    - `SCP.create()` calls `ApplePlatformAdapter.make()` when `custody == .platform` and injects all four providers.
 
@@ -1117,7 +1121,7 @@ private func makeMessageStream(handle: ContextHandle) -> AsyncStream<Message> {
    ```swift
    let scp = try await SCP.create(custody: .inMemory)
    let identity = scp.identity
-   #expect(await identity.did.hasPrefix("did:dht:"))
+   #expect(await !identity.did.isEmpty)
    #expect(await identity.custodyType == "in_memory")
 
    let doc = try await identity.resolve(did: await identity.did)
