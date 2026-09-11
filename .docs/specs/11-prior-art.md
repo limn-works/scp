@@ -3,7 +3,7 @@
 | Component | Existing Standard/Technology | SCP Relationship |
 |---|---|---|
 | Identity | KERI, Key Event Receipt Infrastructure | Modelled on; ADR-063 states what SCP adopts, adapts and owns (§11.2.5). A W3C DID facade is deferred (§11.2.4) |
-| Identity resolution | Key-event log replay over the SCP relay network (§3.10) | Own construction; did:dht, BEP44 and the Mainline DHT are retired (§11.2.2) |
+| Identity resolution | Key-event log replay over the SCP relay network (§3.10) | Own construction (§11.2.2) |
 | Capability tokens | UCAN | Build on directly |
 | Key custody | Passkeys, WebAuthn, Secure Enclave | Delegate custody to |
 | Group encryption | MLS (RFC 9420) | Build on directly |
@@ -28,7 +28,7 @@ The Dat Protocol (2013) is the direct ancestor of the Hypercore stack described 
 
 **Original motivation: scientific data sharing.** Max Ogden created Dat in August 2013 to solve how scientists collaborate on versioned datasets without centralized infrastructure. Funded by the Knight Foundation and Sloan Foundation (2014-2017), stewardship moved to Code for Science and Society (501(c)(3), incorporated May 2017). The project was published in *Scientific Data* (Nature portfolio, 2018) — an unusual level of academic legitimacy for a P2P protocol.
 
-**Technical primitives.** Dat introduced several ideas that survived into Hypercore. Data archives were append-only logs signed with Ed25519 keypairs, verified via Merkle trees. The on-disk format, SLEEP (Syncable Ledger of Exact Events Protocol), used fixed-size entries with 32-byte headers — a compact representation that Hypercore later refined. Discovery keys — BLAKE2b-256 keyed hashes (key=public key, message='HYPERCORE') — allowed peers to find each other on the DHT without exposing the actual read key to the network, a privacy-by-default design. Dat DNS (DEP-0005) mapped human-readable domain names to cryptographic archive addresses via DNS TXT records or `/.well-known/dat` HTTPS endpoints, foreshadowing the kind of DNS-bridged discovery that SCP's DID resolution uses (§3.10).
+**Technical primitives.** Dat introduced several ideas that survived into Hypercore. Data archives were append-only logs signed with Ed25519 keypairs, verified via Merkle trees. The on-disk format, SLEEP (Syncable Ledger of Exact Events Protocol), used fixed-size entries with 32-byte headers — a compact representation that Hypercore later refined. Discovery keys — BLAKE2b-256 keyed hashes (key=public key, message='HYPERCORE') — allowed peers to find each other on the DHT without exposing the actual read key to the network, a privacy-by-default design. Dat DNS (DEP-0005) mapped human-readable domain names to cryptographic archive addresses via DNS TXT records or `/.well-known/dat` HTTPS endpoints, foreshadowing the kind of DNS-bridged discovery that SCP's identity resolution uses (§3.10).
 
 **The Beaker Browser.** Paul Frazee's Beaker Browser (2016-2022) was Dat's most visible consumer application — an Electron-based browser natively handling `dat://` URLs, enabling one-click website creation and peer-to-peer hosting. Archived in December 2022 after concluding the pure P2P browser model lacked product-market fit; the maintainer moved to Bluesky. It demonstrated both the promise and the sustainability challenges of building a full browser-embedded P2P stack.
 
@@ -95,7 +95,7 @@ SCP chose MLS for three reasons: (1) O(log n) scaling makes large contexts viabl
 **Different:**
 
 - **Transport coupling.** Hyperswarm IS the transport — Kademlia DHT discovery, UDP hole punching, Noise XX handshake, all tightly integrated. SCP is transport-agnostic (17 adapters, §10.5). Hyperswarm could be one SCP adapter. SCP's design never depends on it.
-- **Trust model.** Holepunch: trust whoever has the public key of a Hypercore feed. No governance, no capabilities, no accountability chains. SCP: DID + UCAN + context governance + participation records (§3, §4, §5.3, §7).
+- **Trust model.** Holepunch: trust whoever has the public key of a Hypercore feed. No governance, no capabilities, no accountability chains. SCP: identity + UCAN + context governance + participation records (§3, §4, §5.3, §7).
 - **Group membership.** MLS in SCP enforces membership cryptographically — you cannot read messages without the group key. Hyperswarm: app-level access control.
 - **Context isolation.** SCP's security boundary (§5). No Hyperswarm or Hypercore equivalent. There is no concept of bounded, governed interaction spaces with cryptographic boundaries.
 - **Offline/async delivery.** Hypercore requires synchronous peer connections (at least intermittently) — if no peer is online, you wait. SCP's relay architecture provides store-and-forward async delivery. You send a message even if the recipient is offline. Relays buffer with three-tier degradation (§23).
@@ -141,7 +141,7 @@ Core properties:
 
 **SCP took three things from did:dht and takes none of them today.** It took the `did:dht:<z-base-32>` DID string format, BEP44 self-certification of a DID document against the key the DID string encodes, and the Mainline DHT as a resolution backend. **ADR-063, the inception-derived key-event-log identity substrate, retired all three on 2026-08-30** (its retired clauses 1, 3, 4 and 5), and Alec superseded did:dht's Ed25519 with ECDSA on P-256 on 2026-09-10 (`09-security-model.md` §9.5). This subsection is the record of that removal and states no live SCP property.
 
-**What SCP does instead, in one sentence per replaced thing.** The identifier is the SHA-256 digest of an identity's inception event and encodes no key, so a relying party verifies the identifier-to-inception binding from the inception bytes alone with no network call (`09-security-model.md` §9.7.4.2 R2, R13). Resolution replays the identity's append-only key-event log over the SCP relay network and derives the key state from the latest state-carrying event (`09-security-model.md` §9.7.4.2 R8); `18-addressability-and-deployment.md` §18.5.1 states that the Mainline DHT is not a resolution level and that no level resolves a DID document. Transport and service metadata ride in a separate owner-signed service record (`03-identity.md` §3.10.13), so SCP publishes no W3C DID Core JSON for an identity and the JSON-LD-versus-DNS-packet serialization question has no SCP answer.
+**What SCP does instead, in one sentence per replaced thing.** The identifier is the SHA-256 digest of an identity's inception event and encodes no key, so a relying party verifies the identifier-to-inception binding from the inception bytes alone with no network call (`09-security-model.md` §9.7.4.2 R2, R13). Resolution replays the identity's append-only key-event log over the SCP relay network and derives the key state from the latest state-carrying event (`09-security-model.md` §9.7.4.2 R8), and no resolution level reads the Mainline DHT (`18-addressability-and-deployment.md` §18.5.1). Transport and service metadata ride in a separate owner-signed service record (`03-identity.md` §3.10.13), so SCP publishes no W3C DID Core JSON for an identity and the JSON-LD-versus-DNS-packet serialization question has no SCP answer.
 
 ### 11.2.3 What the comparison with did:dht is worth now
 
@@ -192,7 +192,7 @@ GNUnet's identity model is built around **anonymity as a fundamental right**:
 | Dimension | GNUnet | SCP |
 |-----------|--------|-----|
 | **Design goal** | Anonymity — knowing who is the threat | Accountability — verifiable provenance is the feature |
-| **Identity** | Disposable egos, no cross-context linkage by design | Persistent DIDs, attestation chains to human accountability |
+| **Identity** | Disposable egos, no cross-context linkage by design | Persistent identifiers, attestation chains to human accountability |
 | **Naming** | Petnames (local, non-unique, no authority) | Inception-derived identifiers (global, self-certifying, resolved by log replay) |
 | **Provenance** | Anti-goal (enables surveillance) | Protocol tenet (absence of provenance is a signal) |
 | **Agent model** | No concept of AI agents as participants | Agents are first-class, same rules as humans, UCAN-bounded |
@@ -251,7 +251,7 @@ SCP's 4-tier strategy is more structured and production-oriented. GNUnet's proba
 
 ### 11.3.5 GNS (GNU Name System)
 
-GNS is GNUnet's censorship-resistant, decentralized naming system — a replacement for DNS that eliminates hierarchical authority and prevents zone enumeration by construction. Standardized as RFC 9498 (November 2023), it is the most formally specified component of the GNUnet ecosystem and the most directly comparable to SCP's DID-based identity resolution.
+GNS is GNUnet's censorship-resistant, decentralized naming system — a replacement for DNS that eliminates hierarchical authority and prevents zone enumeration by construction. Standardized as RFC 9498 (November 2023), it is the most formally specified component of the GNUnet ecosystem and the most directly comparable to SCP's identity resolution.
 
 **Core construction: Zone Key Derivation Function (ZKDF).** Each GNS zone is controlled by a single keypair (Ed25519 or ECDSA). The zone's public key serves as its identifier — analogous to how a did:dht DID string IS the public key. The critical innovation is per-label key blinding via ZKDF (RFC 9498 §7):
 
@@ -273,11 +273,11 @@ This means an observer who sees a DHT query for `SHA-512(derived_key)` cannot de
 | **PKEY** (ECDSA) | AES-256-CTR | HKDF-SHA256 from ECDH(zone_private_key, derived_public_key) |
 | **EDKEY** (EdDSA) | XSalsa20-Poly1305 | HKDF-SHA512 from zone key + label |
 
-A DHT node storing GNS records sees only encrypted blobs keyed by opaque hashes. It cannot read the records, determine the zone they belong to, or enumerate other records in the zone. This is a stronger privacy property than any DID method provides — DID documents are readable by anyone who knows the DID string.
+A DHT node storing GNS records sees only encrypted blobs keyed by opaque hashes. It cannot read the records, determine the zone they belong to, or enumerate other records in the zone. This is a stronger privacy property than SCP's identity layer provides, because an identity's key-event log and its service record are public by construction (`09-security-model.md` §9.7.4.2).
 
 **Petname system and Zooko's triangle.** GNS makes an explicit choice in Zooko's triangle — the observation that naming systems can provide at most two of three properties:
 
-| Property | DNS | GNS | ENS | did:dht (the model SCP superseded) |
+| Property | DNS | GNS | ENS | did:dht |
 |----------|-----|-----|-----|---------------|
 | **Secure** (not spoofable) | Weak (DNSSEC optional, CAs fallible) | Yes (ZKDF + self-certifying zones) | Yes (smart contract finality) | Yes (BEP44 self-certification) |
 | **Memorable** (human-readable) | Yes (example.com) | Yes (petnames: "Alice's blog") | Yes (vitalik.eth) | No (a z-base-32 key string) |
@@ -294,14 +294,14 @@ ENS arguably achieves all three by accepting the trade-off of requiring a blockc
 - **GNS2DNS** records delegate a GNS label to a DNS name, allowing GNS zones to reference DNS infrastructure (`www.alice.gnu → www.example.com via DNS`)
 - **DNS2GNS** requires configuring a DNS nameserver to forward queries to a GNS resolver, enabling DNS clients to reach GNS zones
 
-This interoperability layer means GNS can gradually coexist with DNS rather than requiring wholesale replacement. SCP has no equivalent bridge — DID resolution and DNS resolution are entirely separate systems with no cross-protocol delegation mechanism.
+This interoperability layer means GNS can gradually coexist with DNS rather than requiring wholesale replacement. SCP has no equivalent bridge: SCP identity resolution and DNS resolution are separate systems with no cross-protocol delegation mechanism.
 
-**Comparison: GNS vs SCP DID resolution**
+**Comparison: GNS vs SCP identity resolution**
 
-| Dimension | GNS (RFC 9498) | SCP DID (§3, §11.2) |
+| Dimension | GNS (RFC 9498) | SCP identity (§3, §11.2) |
 |-----------|----------------|----------------------|
 | **Identifier** | Zone public key (Ed25519/ECDSA) | Inception-event digest (ADR-063, the inception-derived identity key-event log) |
-| **Naming** | Petnames (local, memorable, non-global) | DID strings (global, unmemorable, unique) |
+| **Naming** | Petnames (local, memorable, non-global) | Identifiers (global, unmemorable, unique) |
 | **Hierarchical delegation** | Yes (label.zone chains) | No (flat namespace) |
 | **Record privacy** | Encrypted at rest (ZKDF + AES/XSalsa20) | Key events and service records are public by construction (`09-security-model.md` §9.7.4.2) |
 | **Zone enumeration** | Prevented by construction (ZKDF) | Trivial: a key-event log is public |
@@ -313,9 +313,9 @@ This interoperability layer means GNS can gradually coexist with DNS rather than
 | **DNS interop** | Yes (GNS2DNS, DNS2GNS) | No |
 | **W3C DID compliance** | Via did:gns (LSD-0005) | None; a `did:scp` facade is deferred (ADR-063) |
 | **Context-scoped identity** | No | Yes (pseudonym derivation per context, §9.10.2) |
-| **Standardization** | RFC 9498 (IETF) | did:dht spec (DIF) |
+| **Standardization** | RFC 9498 (IETF) | None; ADR-063, the inception-derived key-event-log identity substrate, is the specification |
 
-**What GNS solves that SCP's identity layer does not:** Memorable naming through petnames and hierarchical delegation. Record encryption preventing observers from reading identity metadata. Zone enumeration prevention — no equivalent of crawling all DIDs in the DHT. DNS interoperability for gradual adoption. These are real gaps in SCP's identity model, accepted as trade-offs for global uniqueness, multi-key architecture, and W3C DID ecosystem compatibility.
+**What GNS solves that SCP's identity layer does not:** Memorable naming through petnames and hierarchical delegation. Record encryption preventing observers from reading identity metadata. Zone enumeration prevention — no equivalent of enumerating every key-event log the relay network carries. DNS interoperability for gradual adoption. These are real gaps in SCP's identity model, accepted as trade-offs for global uniqueness and the multi-key architecture.
 
 **What SCP's identity layer solves that GNS does not:** A root set with a signing threshold, one operational role, and a pre-rotation commitment consumed by a reveal, each key in its own custody (`09-security-model.md` §9.7.4.2 definitions). UCAN capability delegation chains. Identity attestation linking agents to humans. Context-scoped pseudonyms preventing cross-context correlation. Resolution by log replay over the SCP relay network, where a verifier checks every event itself and depends on no relay for correctness (`03-identity.md` §3.10.2). These reflect SCP's accountability-first design vs GNS's privacy-first design.
 
@@ -330,7 +330,7 @@ GNUnet's approach uses three cooperating daemons (VPN service, DNS service, prot
 | **Abstraction layer** | IP (packets via TUN device) | Messages (trait with send/subscribe/query) |
 | **Application modification** | None required (transparent DNS-ALG) | Required (must use SCP SDK) |
 | **Exit/relay model** | Any peer can be exit node (DHT-announced) | Dedicated relay servers (untrusted, store-and-forward) |
-| **Naming integration** | GNS VPN records unify naming + transport | Separate concerns: DID resolution independent of transport |
+| **Naming integration** | GNS VPN records unify naming + transport | Separate concerns: identity resolution independent of transport |
 | **Fault isolation** | Per-communicator process isolation | In-process (trait implementations share process) |
 | **Scope** | Full network stack replacement | Message delivery only |
 
@@ -610,19 +610,19 @@ Both Tahoe-LAFS and SCP use capability-based authorization where the bearer toke
 | Dimension | Tahoe-LAFS Capabilities | SCP UCAN Tokens |
 |-----------|------------------------|-----------------|
 | **Representation** | Cryptographic URI string (`URI:CHK:...`, `URI:SSK:...`) | Signed JWT (JSON Web Token with `ucv`, `iss`, `aud`, `att`, `exp` fields) |
-| **What it encodes** | Encryption key + content hash (location + identification) | Issuer DID + audience DID + capability set + expiration + proofs |
-| **Bearer semantics** | Pure bearer — anyone with the URI string has access | Audience-bound — only the `aud` DID can exercise the capability |
-| **Identity binding** | None — capabilities are anonymous | DID-bound — issuer and audience are cryptographically identified |
+| **What it encodes** | Encryption key + content hash (location + identification) | Issuer + audience + capability set + expiration + proofs |
+| **Bearer semantics** | Pure bearer — anyone with the URI string has access | Audience-bound — only the `aud` identity can exercise the capability |
+| **Identity binding** | None — capabilities are anonymous | Identity-bound — issuer and audience are cryptographically identified |
 | **Delegation** | None — you share the cap string, granting full access at that level | Native — `prf` (proof) field chains delegations; each link is a signed JWT |
 | **Attenuation** | One direction only: write → read → verify (diminishing) | Arbitrary: any capability subset, custom resources, narrower scope |
 | **Time-bounding** | None — caps are permanent while the data exists | Native — `exp` (expiration) and `nbf` (not-before) fields |
 | **Revocation** | Impossible — the cap is the key, and you cannot un-share a key | Revocation records (§7.3) checked at verification time |
 | **Scope** | Single file or directory | Context-scoped: `scp:ctx:{context_id}/{resource}:{action}` |
 | **Governance** | None — no concept of rules governing capability exercise | Full governance model: 30 action types, pluggable engines (§5.9) |
-| **Accountability** | None — caps are anonymous, no audit trail of who used them | Full — every action signed by a DID, recorded in event logs |
+| **Accountability** | None — caps are anonymous, no audit trail of who used them | Full — every action signed by an identity, recorded in event logs |
 | **Composability** | File-level only | Protocol-wide: identity + capability + context + governance |
 
-**The fundamental divergence:** Tahoe capabilities are static and anonymous. Once you have a read-cap, you have read access forever, and no one can tell who is reading. UCAN tokens are dynamic and identified. They expire, they can be revoked, they chain through identified delegators, and every exercise is attributable to a specific DID.
+**The fundamental divergence:** Tahoe capabilities are static and anonymous. Once you have a read-cap, you have read access forever, and no one can tell who is reading. UCAN tokens are dynamic and identified. They expire, they can be revoked, they chain through identified delegators, and every exercise is attributable to one identity.
 
 This reflects the different problem domains. Tahoe secures data at rest — files on a grid. The threat model is the storage provider reading or modifying your files. Anonymity is a feature: the cap proves you are authorized without revealing who you are. SCP secures interaction — communication within governed contexts. The threat model includes unauthorized agents, capability escalation, and unattributable actions. Identity is a feature: the UCAN proves both that you are authorized AND who you are.
 
@@ -634,14 +634,14 @@ SCP's choice of UCAN over established authorization frameworks reflects the prot
 
 | Dimension | OAuth 2.0 | GNAP | Macaroons | UCAN (SCP) |
 |-----------|-----------|------|-----------|------------|
-| **Centralization** | Authorization server required | Grant server required | Minting authority required | Fully decentralized — any DID can issue |
+| **Centralization** | Authorization server required | Grant server required | Minting authority required | Fully decentralized — any identity can issue |
 | **Bearer semantics** | Token opaque to client; server validates | Token opaque; server validates | Bearer token with embedded caveats | Bearer token with embedded capabilities |
 | **Delegation** | No native delegation (requires token exchange extension) | Structured grant lifecycle, server-mediated | Contextual caveats can attenuate; third-party caveats delegate verification | Native chained delegation via `prf` field; each link is a signed JWT |
-| **Identity binding** | Client ID (application-level, not user-level) | Instance identity (ephemeral) | None — pure bearer | DID-bound — issuer and audience are cryptographically identified |
+| **Identity binding** | Client ID (application-level, not user-level) | Instance identity (ephemeral) | None — pure bearer | Identity-bound — issuer and audience are cryptographically identified |
 | **Offline verification** | No — requires token introspection or server-signed JWT | No — requires grant server | Partial — first-party caveats are offline; third-party caveats require the third party | Full — signature chain is self-contained and verifiable without any server |
 | **Revocation** | Server-side (revoke at authorization server) | Server-side (revoke at grant server) | Third-party caveat expiration | Protocol-level revocation records (§7.3), checked at verification time |
 
-OAuth and GNAP require a central authorization server, violating SCP's "protocol requires no operator" tenet. Macaroons offer decentralized attenuation but lack identity binding — a macaroon proves "someone was authorized," not "this DID was authorized." UCAN uniquely combines decentralized issuance, identity binding, offline verification, and chained delegation — the properties SCP needs for DID-to-DID capability delegation across contexts without any central authority.
+OAuth and GNAP require a central authorization server, violating SCP's "protocol requires no operator" tenet. Macaroons offer decentralized attenuation but lack identity binding — a macaroon proves "someone was authorized," not "this identity was authorized." UCAN uniquely combines decentralized issuance, identity binding, offline verification, and chained delegation — the properties SCP needs for identity-to-identity capability delegation across contexts without any central authority.
 
 ### 11.5.4 Erasure Coding and Redundancy
 
@@ -731,13 +731,13 @@ Both architectures share the principle that infrastructure nodes (storage server
 
 ### 11.5.8 Zooko's Triangle
 
-Zooko Wilcox-O'Hearn, the co-creator of Tahoe-LAFS, is also the originator of Zooko's triangle (2001). The full analysis of this naming trilemma — with a comparison table across DNS, GNS, ENS, and SCP — appears in §11.3.5. The relevant connection here is biographical: the same person who identified the fundamental naming problem also built Tahoe-LAFS, which sidesteps it entirely. Tahoe capabilities occupy the "secure + decentralized" edge — cryptographic strings that no human will memorize, but unforgeable and authority-free. SCP's DID approach makes the same trade-off, compensating with display names and context-level naming at higher layers.
+Zooko Wilcox-O'Hearn, the co-creator of Tahoe-LAFS, is also the originator of Zooko's triangle (2001). The full analysis of this naming trilemma — with a comparison table across DNS, GNS, ENS, and SCP — appears in §11.3.5. The relevant connection here is biographical: the same person who identified the fundamental naming problem also built Tahoe-LAFS, which sidesteps it entirely. Tahoe capabilities occupy the "secure + decentralized" edge — cryptographic strings that no human will memorize, but unforgeable and authority-free. SCP's identifier makes the same trade-off, compensating with display names and context-level naming at higher layers.
 
 ### 11.5.9 What SCP Borrows Conceptually
 
 Three ideas flow directly from Tahoe-LAFS into SCP's design:
 
-1. **Capability-based authorization without ACLs.** Tahoe proved that distributed systems can enforce access control using cryptographic bearer tokens rather than identity lookups or server-side permission lists. This is the foundation of SCP's UCAN model. The conceptual step from Tahoe caps to UCANs is: add identity binding (issuer/audience DIDs), add delegation chains (proof fields), add time-bounding (expiration), add revocation, add governance. But the core insight — the token IS the authorization, verified by cryptography not by asking a server — originates in this tradition.
+1. **Capability-based authorization without ACLs.** Tahoe proved that distributed systems can enforce access control using cryptographic bearer tokens rather than identity lookups or server-side permission lists. This is the foundation of SCP's UCAN model. The conceptual step from Tahoe caps to UCANs is: add identity binding (issuer and audience identifiers), add delegation chains (proof fields), add time-bounding (expiration), add revocation, add governance. But the core insight — the token IS the authorization, verified by cryptography not by asking a server — originates in this tradition.
 
 2. **Provider-independent security.** The principle that infrastructure operators should have zero access to the data they handle. Tahoe applied this to file storage (servers cannot read files). SCP applies it to message delivery (relays cannot read messages). Same principle, different scope. In both cases, the client/participant performs all encryption and the infrastructure handles only opaque ciphertext.
 
@@ -754,7 +754,7 @@ Despite the shared intellectual heritage, Tahoe-LAFS and SCP solve fundamentally
 | **Domain** | File storage (data at rest) | Communication (data in motion within governed contexts) | Storage is static; communication is dynamic with evolving group membership |
 | **Capability lifecycle** | Permanent — a cap grants access as long as the data exists | Time-bounded — UCANs expire, can be revoked, are governance-scoped | Communication requires temporal control; file access is typically permanent |
 | **Capability delegation** | None — share the URI string, that's it | Native — delegation chains with attenuation at each link | Communication requires scoped, auditable delegation; file sharing is simpler |
-| **Identity** | None — capabilities are anonymous bearer tokens | Core — every action traces to a DID, attestation chains to human accountability | Storage can be anonymous; communication in governed contexts requires accountability |
+| **Identity** | None — capabilities are anonymous bearer tokens | Core — every action traces to an identity, attestation chains to human accountability | Storage can be anonymous; communication in governed contexts requires accountability |
 | **Group communication** | None — Tahoe is single-user or share-the-cap | Native — MLS groups with add/remove/update, forward secrecy, post-compromise security | File storage does not require real-time group membership management |
 | **Governance** | None — no concept of rules, roles, or permissions beyond read/write/verify | 30 governance action types, pluggable engines, capability ceilings (§5.9) | File storage is ungoverned; collaborative communication requires governance |
 | **Forward secrecy** | None — static encryption keys per file | Yes — MLS key ratcheting per epoch | Static files do not benefit from key ratcheting; communication sessions do |
