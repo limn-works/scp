@@ -4,7 +4,7 @@
 
 Self-hosting is a first-class deployment model, not an afterthought. But "self-hosting" means different things at different layers, and the protocol should be honest about which layers are easy and which are hard.
 
-What the protocol guarantees: **no infrastructure operator owns your identity, your relationships, or your social graph.** These live on your device, bound to your DID, portable across any infrastructure. This is the non-negotiable.
+What the protocol guarantees: **no infrastructure operator owns your identity, your relationships, or your social graph.** These live on your device, bound to your identifier, portable across any infrastructure. This is the non-negotiable.
 
 What the protocol provides but doesn't trivialize: **relay and storage infrastructure.** Running your own relay is simpler than running a Matrix homeserver, but it's still a server. Managed infrastructure exists for this layer — not as a lock-in mechanism, but because reliable message delivery and media hosting have real operational costs. The protocol ensures that managed infrastructure is substitutable, not that it's unnecessary.
 
@@ -51,7 +51,7 @@ This changes relay economics fundamentally. The question is not "who pays for re
 
 The protocol must function correctly at every point on this spectrum. A phone-only user and a user with dedicated infrastructure are both first-class participants. The protocol cannot assume persistent connectivity, stable IP addresses, or server-grade resources.
 
-The critical difference from Matrix: in Matrix, your homeserver owns your identity (`@user:server`). If it dies, you're in trouble. In SCP, your DID is self-sovereign. If your relay dies, you switch relays. If your device dies, you recover your identity through social/device recovery (§3.3). No infrastructure operator holds your identity hostage. This — not the elimination of servers — is the real structural advantage.
+The critical difference from Matrix: in Matrix, your homeserver owns your identity (`@user:server`). If it dies, you're in trouble. In SCP, your identity is self-sovereign. If your relay dies, you switch relays. If your device dies, you recover your identity through social/device recovery (§3.3). No infrastructure operator holds your identity hostage. This — not the elimination of servers — is the real structural advantage.
 
 ## 10.3 Minimal Protocol State
 
@@ -111,7 +111,7 @@ EventLogCheckpoint {
   event_count:      u64,          // Total events in this checkpoint interval
   membership_snapshot: MembershipDigest, // SHA-256 hash of the sorted membership list at checkpoint time
   timestamp:        u64,          // Wall-clock time of checkpoint creation (best-effort)
-  creator_did:      DID,          // DID of the member who created this checkpoint
+  creator_did:      Identifier,   // the member who created this checkpoint
   signature:        P256Signature,  // Signed by creator's signing key
 }
 ```
@@ -151,7 +151,7 @@ Devices that aren't always online need relays for message delivery. Relays hold 
 **Design goals:**
 
 - **Protocol-unaware.** Relays don't interpret protocol semantics. They store and forward encrypted blobs. This keeps relay implementation simple and prevents relay operators from gaining protocol-level influence.
-- **Substitutable.** Switching relays requires no identity change, no context migration, no social disruption. Identity is DID-based, not relay-based. This is the key structural difference from Matrix homeservers.
+- **Substitutable.** Switching relays requires no identity change, no context migration, no social disruption. Identity rests on the key-event log, not on a relay. This is the key structural difference from Matrix homeservers.
 - **Untrusted for content.** Relays see encrypted payloads. They cannot read content, inspect membership, or understand context semantics. A malicious relay can delay or drop messages; it cannot compromise confidentiality or integrity.
 
 **Honest constraints:**
@@ -159,7 +159,7 @@ Devices that aren't always online need relays for message delivery. Relays hold 
 - **Metadata exposure.** Traffic analysis is powerful even with encrypted payloads. The protocol provides layered metadata privacy protections: minimal outer envelopes with per-context pseudonyms, fixed bucket padding, persistent connections, constant-rate cover traffic, and relay set partitioning. (See §9.9.1 for the formal relay threat model — what relays CAN and CANNOT do — and §9.10 for the complete metadata privacy architecture.)
 - **Relay discovery.** If Alice wants to reach Bob, she needs to know Bob's relay. If Bob switches relays, Alice needs to discover the new one. This requires either a centralized directory (defeats the purpose), a distributed discovery mechanism (adds complexity and latency), or multi-relay registration (Bob publishes to several relays, Alice checks all of them). Nostr's experience: users publish a relay list, clients check multiple relays. Workable but not seamless. Relay list authentication is specified in §9.6.3 — NIP-65 signed events prevent relay list substitution attacks.
 - **Operational complexity.** A production relay needs reliable delivery, ordering, deduplication, rate limiting, and abuse prevention. "Simple message queue" undersells this. A reference implementation should exist, but running it reliably is a server operations task — not "install an app" level.
-- **Gravitational pull.** In theory relays are commodity. In practice, network effects apply to infrastructure. Nostr shows this: a few popular relays handle most traffic. The protocol can't prevent this concentration, but DID-based identity ensures it doesn't create lock-in — popular relay dies, users switch, identity survives. The agent workstation trend (§10.2) may significantly weaken centralization pressure — if most users run their own always-on node, personal relays become the default rather than the exception.
+- **Gravitational pull.** In theory relays are commodity. In practice, network effects apply to infrastructure. Nostr shows this: a few popular relays handle most traffic. The protocol can't prevent this concentration, but key-event-log identity ensures it doesn't create lock-in — popular relay dies, users switch, identity survives. The agent workstation trend (§10.2) may significantly weaken centralization pressure — if most users run their own always-on node, personal relays become the default rather than the exception.
 
 **Self-hosting:** Running a personal relay is feasible for technical users. It requires a stable address, TLS, and uptime commitment. This is meaningfully simpler than running a Matrix homeserver (no state resolution, no federation protocol, no room DAG) but it is still a server. The protocol should ship a reference relay that minimizes operational burden, but should not claim self-hosting is effortless.
 
@@ -173,7 +173,7 @@ The SCP SDK owns all protocol logic — contexts, agents, trust, capabilities, g
 
 The SDK provides a **transport abstraction layer**: a defined interface contract between protocol logic and delivery infrastructure. The abstraction specifies what properties the transport must provide (encrypted envelope delivery, offline store-and-forward, context-scoped subscription, relay discovery) without specifying how the transport implements them.
 
-Below the abstraction, **transport bindings** adapt SCP's requirements to specific delivery infrastructure. The SDK ships at least one reference binding. The binding is responsible for encoding SCP envelopes into the transport's native format, managing transport connections, and mapping SCP identities to transport-native identities (e.g., DID to Nostr npub).
+Below the abstraction, **transport bindings** adapt SCP's requirements to specific delivery infrastructure. The SDK ships at least one reference binding. The binding is responsible for encoding SCP envelopes into the transport's native format, managing transport connections, and mapping SCP identities to transport-native identities (an SCP identifier to a Nostr npub, for one).
 
 **What SCP specifies for transport:**
 
@@ -183,7 +183,7 @@ Below the abstraction, **transport bindings** adapt SCP's requirements to specif
 - Reference relay implementation (SCP ships this — a minimal relay for self-hosters)
 - Transport adapter implementations organized by specification depth (§10.5.1). Tier 1 bindings are fully specified with wire mappings and conformance requirements. Tier 2 bindings have documented TransportAdapter mappings. Tier 3 bindings are feasibility-confirmed.
 
-The SCP native relay is the canonical reference — the simplest possible thing that satisfies SCP's transport needs: accept encrypted blobs, store them, forward to subscribers by context ID and/or recipient DID, respond with delivery receipts, honor deletion requests. All other adapters map the transport abstraction to their respective protocols.
+The SCP native relay is the canonical reference — the simplest possible thing that satisfies SCP's transport needs: accept encrypted blobs, store them, forward to subscribers by context ID and/or recipient identifier, respond with delivery receipts, honor deletion requests. All other adapters map the transport abstraction to their respective protocols.
 
 **What SCP does not specify:**
 
@@ -199,7 +199,7 @@ The SCP native relay is the canonical reference — the simplest possible thing 
 
 **Encryption-as-access-control.** Context access control is enforced through encryption, not through relay logic. Specifically, each context maps to one MLS group (§9.7.1); the MLS group key material is the access credential. All context events are encrypted with the current MLS epoch secrets before reaching the transport layer. Relays store and forward opaque blobs — they cannot read content, verify membership, or enforce roles. Key distribution is membership. Member removal triggers MLS Remove Commit + epoch advancement — the removed member does not possess the new epoch's key material and physically cannot decrypt subsequent messages. This keeps the relay layer genuinely protocol-unaware and makes any encrypted-blob-capable relay — including existing Nostr relays — usable as SCP transport without modification.
 
-**Blocking uses a separate sender-side key layer, not MLS group membership.** DID-to-DID blocking (§3.6) is a unilateral, per-relationship action — it does not require group coordination and does not affect the blocked party's membership in the context. When Alice blocks Dave, Alice rotates her personal sender key and redistributes it to all context members except Dave. Dave physically cannot decrypt Alice's future messages. Dave remains an MLS group member and can still decrypt messages from other members.
+**Blocking uses a separate sender-side key layer, not MLS group membership.** Identity-to-identity blocking (§3.6) is a unilateral, per-relationship action — it does not require group coordination and does not affect the blocked party's membership in the context. When Alice blocks Dave, Alice rotates her personal sender key and redistributes it to all context members except Dave. Dave physically cannot decrypt Alice's future messages. Dave remains an MLS group member and can still decrypt messages from other members.
 
 This is architecturally distinct from member removal, which IS a group action: MLS Remove Commit advances the entire group to a new epoch, and the removed member loses access to ALL future messages from ALL members. Blocking and removal serve different purposes and use different cryptographic mechanisms:
 
@@ -370,7 +370,7 @@ Deployment spectrum for content/data:
 
 Mobile devices need push notifications. On iOS the only mechanism is APNs (Apple Push Notification service). On Android, FCM (Firebase Cloud Messaging). Both are platform-mediated — Apple and Google are in the delivery path.
 
-**Push notification opacity is mandatory.** Push payloads MUST contain a wake signal and nothing else. No context ID, no sender DID, no message preview, no metadata of any kind. The device wakes, connects to relays, pulls encrypted envelopes, and decrypts locally. Apple/Google learn only that the device received a notification at a specific time.
+**Push notification opacity is mandatory.** Push payloads MUST contain a wake signal and nothing else. No context ID, no sender identifier, no message preview, no metadata of any kind. The device wakes, connects to relays, pulls encrypted envelopes, and decrypts locally. Apple/Google learn only that the device received a notification at a specific time.
 
 - **Push payloads are fully opaque.** The push payload contains exactly one piece of information: "wake up." No sender, no context, no count, no preview. The SCP agent on the device connects to its relay set and pulls all pending envelopes.
 - **The push service knows timing, not content or source.** Apple/Google learn when a device received a notification. They cannot determine which context, which sender, or even whether the notification corresponds to one message or many.
@@ -384,12 +384,12 @@ Clients register for push notifications with relays via the following wire proto
 
 ```
 PushRegistration {
-  did:          DID                       // the registering identity
+  did:          Identifier                // the registering identity
   platform:     enum { APNS, FCM, WebPush }  // push service platform
   token:        String                    // platform-specific push token (APNs device token, FCM registration token, WebPush endpoint URL)
   contexts:     Vec<ContextId>            // contexts for which to receive push notifications (empty = all contexts on this relay)
   timestamp:    DateTime                  // registration time
-  signature:    P256Signature          // signed by the DID's Active Signing Key (#active)
+  signature:    P256Signature          // signed by the identity's Active Signing Key (#active)
 }
 ```
 
@@ -397,29 +397,29 @@ The signature covers `did || platform (1-byte tag: 0x01=APNS, 0x02=FCM, 0x03=Web
 
 **Registration flow:**
 
-1. The client generates a `PushRegistration` message and signs it with the DID's Active Signing Key.
+1. The client generates a `PushRegistration` message and signs it with the identity's Active Signing Key.
 2. The client sends the `PushRegistration` to the relay via a PUBLISH operation (ADR-004) with a reserved `routing_id` of `SHA-256("scp-push-registration" || relay_url)`.
 3. The relay verifies the signature against the key the identity's key state lists `current` in the `#active` role, resolved by replaying that identity's key-event log (`09-security-model.md` §9.7.4.2 R2, R3, R8). Invalid signatures are rejected.
-4. The relay stores the registration, associating the push token with the DID and the listed context routing IDs.
-5. On new message arrival for a registered context (matching the routing IDs the DID subscribes to), the relay sends an opaque push notification to the registered token. The push payload is exactly `{ "scp": 1 }` — a wake signal with no content, no context, no sender, no metadata.
+4. The relay stores the registration, associating the push token with the identifier and the listed context routing IDs.
+5. On new message arrival for a registered context (matching the routing IDs the identity subscribes to), the relay sends an opaque push notification to the registered token. The push payload is exactly `{ "scp": 1 }` — a wake signal with no content, no context, no sender, no metadata.
 6. The relay MUST rate-limit push notifications to at most one push per 30 seconds per device token to prevent push notification flooding.
 
-**Token refresh:** When the platform issues a new push token (e.g., APNs token rotation), the client sends a new `PushRegistration` with the updated token. The relay replaces the previous registration for that DID + platform combination. Registrations are idempotent — re-registering with the same token is a no-op.
+**Token refresh:** When the platform issues a new push token (e.g., APNs token rotation), the client sends a new `PushRegistration` with the updated token. The relay replaces the previous registration for that identity and platform. Registrations are idempotent — re-registering with the same token is a no-op.
 
 **PushDeregistration message:**
 
 ```
 PushDeregistration {
-  did:          DID
+  did:          Identifier
   platform:     enum { APNS, FCM, WebPush }
   timestamp:    DateTime
-  signature:    P256Signature          // signed by the DID's Active Signing Key (#active)
+  signature:    P256Signature          // signed by the identity's Active Signing Key (#active)
 }
 ```
 
-The client sends a `PushDeregistration` to explicitly remove its push registration. The relay deletes the stored registration for the DID + platform combination. Implicit deregistration occurs when the relay observes push delivery failures (invalid token responses from APNs/FCM) — the relay MUST remove registrations after 3 consecutive delivery failures for the same token.
+The client sends a `PushDeregistration` to explicitly remove its push registration. The relay deletes the stored registration for that identity and platform. Implicit deregistration occurs when the relay observes push delivery failures (invalid token responses from APNs/FCM) — the relay MUST remove registrations after 3 consecutive delivery failures for the same token.
 
-**Relay-side storage:** Push registrations are stored in the relay's local state (not in the protocol's encrypted state). The relay operator can see which DIDs have registered for push and their platform tokens — this is an accepted tradeoff, equivalent to any push notification service. The push token itself does not reveal which contexts the DID participates in beyond the routing IDs the DID subscribes to (which the relay already knows from SUBSCRIBE operations).
+**Relay-side storage:** Push registrations are stored in the relay's local state (not in the protocol's encrypted state). The relay operator can see which identities have registered for push and their platform tokens — this is an accepted tradeoff, equivalent to any push notification service. The push token itself does not reveal which contexts the identity participates in beyond the routing IDs it subscribes to (which the relay already knows from SUBSCRIBE operations).
 
 ## 10.8 Multi-Device
 
@@ -437,17 +437,16 @@ While client-level coordination (read markers, notification dedup) is a client-s
 
 **Per-device MLS leaf nodes:**
 
-1. **Each device has its own MLS leaf.** A DID with N devices appears as N leaf nodes in every MLS group the DID participates in. Each device generates its own MLS leaf keys — the P-256 signature key that self-signs the leaf and the DHKEM(P-256) encryption key that receives path secrets (§9.5) — and maintains independent MLS epoch state.
-2. **Per-device KeyPackages.** Each device generates its own KeyPackages using an **ephemeral, context-scoped MLS leaf key**; each carries a **per-device KeyPackage attestation** (LeafNode extension `scp_keypackage_attestation`, §9.7.1) binding that leaf key to the DID, signed by the DID's Active Signing Key (`#active`). The KeyPackage's credential contains the DID (shared across devices) plus a `device_id` field (a random 16-byte identifier, stable per device) in the LeafNode extensions. This enables other members to distinguish leaf nodes belonging to the same DID.
-3. **Governance counting.** For governance purposes (voting, quorum, role assignment), a DID with N devices counts as ONE participant, not N. The governance engine deduplicates by DID — it does not matter how many leaf nodes a DID has. This prevents multi-device users from gaining disproportionate governance weight.
-4. **Sender key and access key sharing.** Sender keys (§9.16) and access keys (§9.17) are per-DID, not per-device. All devices for a DID share the same sender key and access key. When a device requests a sender key (§9.16.2), the key holder responds to the DID — any of the DID's devices can decrypt the response using the DID's wrapping key (which is also per-DID, stored in KeyCustody and synchronized across devices via identity private state, §3.7).
+1. **Each device has its own MLS leaf.** An identity with N devices appears as N leaf nodes in every MLS group it participates in. Each device generates its own MLS leaf keys — the P-256 signature key that self-signs the leaf and the DHKEM(P-256) encryption key that receives path secrets (§9.5) — and maintains independent MLS epoch state.
+2. **Per-device KeyPackages.** Each device generates its own KeyPackages using an **ephemeral, context-scoped MLS leaf key**; each carries a **per-device KeyPackage attestation** (LeafNode extension `scp_keypackage_attestation`, §9.7.1) binding that leaf key to the identity, signed by that identity's Active Signing Key (`#active`). The KeyPackage's credential carries the identifier (shared across devices) plus a `device_id` field (a random 16-byte identifier, stable per device) in the LeafNode extensions. This enables other members to distinguish leaf nodes belonging to one identity.
+3. **Governance counting.** For governance purposes (voting, quorum, role assignment), an identity with N devices counts as ONE participant, not N. The governance engine deduplicates by identifier — it does not matter how many leaf nodes an identity has. This prevents multi-device users from gaining disproportionate governance weight.
+4. **Sender key and access key sharing.** Sender keys (§9.16) and access keys (§9.17) are per-identity, not per-device. All devices of one identity share the same sender key and access key. When a device requests a sender key (§9.16.2), the key holder responds to the identity — any of its devices can decrypt the response using that identity's wrapping key (which is also per-identity, stored in KeyCustody and synchronized across devices via identity private state, §3.7).
 
-**Device list management:**
+**Device list management.** An identity's device list is its MLS group state: the leaf nodes the group holds. The service record carries no device roster (`03-identity.md` §3.10.13, `18-addressability-and-deployment.md` §18.2.2A), so a party reads the device list from a group it belongs to and from nowhere before it joins.
 
-5. **Device list in the service record.** The service record MAY include a `devices` entry listing active device IDs (`03-identity.md` §3.10.13). This is informational — group members use MLS group state (which leaf nodes exist) as the authoritative device list for a DID. The `devices` endpoint enables pre-join device enumeration (e.g., to determine how many KeyPackages to fetch when adding a new member).
-6. **Adding a new device.** When a user adds a new device: (a) the new device generates an MLS leaf key and publishes KeyPackages to relays, (b) an existing device (which is already a group member) sends an MLS Add proposal for the new device's KeyPackage in each active context, (c) the group processes the Add via a Commit, and the new device receives a Welcome message. The existing device coordinates this — the new device cannot add itself because it is not yet a group member.
-7. **Removing a device.** When a device is decommissioned: (a) an existing device or context admin sends an MLS Remove proposal for the departing device's leaf node, (b) the group processes the Remove via a Commit, advancing the epoch and revoking the removed device's access to future messages. If the removed device was the last device for a DID, the DID is effectively removed from the group.
-8. **Device limit.** A single DID MUST NOT have more than 10 active devices in any single MLS group. This bounds the leaf node overhead per participant. SDKs MUST reject Add proposals that would exceed this limit.
+5. **Adding a new device.** When a user adds a new device: (a) the new device generates an MLS leaf key and publishes KeyPackages to relays, (b) an existing device (which is already a group member) sends an MLS Add proposal for the new device's KeyPackage in each active context, (c) the group processes the Add via a Commit, and the new device receives a Welcome message. The existing device coordinates this — the new device cannot add itself because it is not yet a group member.
+6. **Removing a device.** When a device is decommissioned: (a) an existing device or context admin sends an MLS Remove proposal for the departing device's leaf node, (b) the group processes the Remove via a Commit, advancing the epoch and revoking the removed device's access to future messages. If the removed device was the identity's last, that identity is effectively removed from the group.
+7. **Device limit.** A single identity MUST NOT have more than 10 active devices in any single MLS group. This bounds the leaf node overhead per participant. SDKs MUST reject Add proposals that would exceed this limit.
 
 ## 10.9 Real-Time and Async
 
@@ -482,7 +481,7 @@ This separation means contexts can support voice/video calls without the protoco
 
 Managed infrastructure and media/content hosting are the probable revenue surfaces. Heavy content (video, large files, real-time streams) has real storage and bandwidth costs. The protocol works either way — self-hosters shoulder their own costs, managed infrastructure shoulders it for a fee. The point is the choice exists and the protocol doesn't prefer either.
 
-Relay economics are the responsibility of app builders and relay operators. The protocol defines what relays do, not who runs them or how they're funded. Community-operated relays, paid relay services, app-bundled relay infrastructure, and self-hosted relays are all valid. The protocol ensures none of them create lock-in (DID identity, substitutable relays). In practice, app developers who build on SCP are expected to provision relay infrastructure for their users — the same way app developers today provision API servers, databases, and CDNs. There is no assumption of free community relay infrastructure at the protocol level; a protocol foundation may eventually provide shared infrastructure, but this is not a dependency.
+Relay economics are the responsibility of app builders and relay operators. The protocol defines what relays do, not who runs them or how they're funded. Community-operated relays, paid relay services, app-bundled relay infrastructure, and self-hosted relays are all valid. The protocol ensures none of them create lock-in: the identity is the participant's own, and relays are substitutable. In practice, app developers who build on SCP are expected to provision relay infrastructure for their users — the same way app developers today provision API servers, databases, and CDNs. There is no assumption of free community relay infrastructure at the protocol level; a protocol foundation may eventually provide shared infrastructure, but this is not a dependency.
 
 **Relay monetization protocol.** §19.8 specifies the protocol-level relay economic config: per-publish and per-byte-stored pricing advertised in `.well-known/scp` `relay_config` (§18.3.3), compatible payment adapters, and the `PaymentAdapter` trait (§19.2) for settlement. Relay selection in `TransportManager` (ADR-012) uses cost as a criterion alongside reliability and latency. Free relays MUST always exist in the bootstrap relay list (§18.5) — economic gatekeeping of basic protocol operation is a protocol violation.
 
@@ -581,9 +580,9 @@ For address-restricted and port-restricted NATs, both the self-hosted relay and 
 
 ```
 HOLE_PUNCH_REQUEST (peer → intermediary relay → self-hosted relay) {
-  requester_did:     DID,              // DID of the connecting peer
+  requester_did:     Identifier,       // the connecting peer
   requester_address: SocketAddr,       // Peer's STUN-discovered external address
-  target_routing_id: [u8; 32],         // DID routing ID of the self-hosted relay
+  target_routing_id: [u8; 32],         // routing ID of the self-hosted relay
   nonce:             [u8; 16],         // Random nonce for replay prevention
   timestamp:         u64,             // Unix timestamp (ms)
   signature:         P256Signature, // Signs "SCP-HOLE-PUNCH-V1:" || requester_address || target_routing_id || nonce || timestamp
@@ -593,7 +592,7 @@ HOLE_PUNCH_REQUEST (peer → intermediary relay → self-hosted relay) {
 ```
 HOLE_PUNCH_RESPONSE (self-hosted relay → intermediary relay → peer) {
   responder_address: SocketAddr,       // Self-hosted relay's STUN-discovered external address
-  requester_did:     DID,              // Echo of requester DID
+  requester_did:     Identifier,       // echo of the requester
   nonce:             [u8; 16],         // Echo of request nonce
   timestamp:         u64,
   signature:         P256Signature, // Signs "SCP-HOLE-PUNCH-V1:" || responder_address || requester_did || nonce || timestamp
@@ -674,7 +673,7 @@ The `source_routing_id` field is zeroed (`[0u8; 32]`) because the bridge operate
 `BRIDGE_REGISTER` requires a P-256 ownership proof to prevent unauthorized routing ID claims. The signature covers the domain-separated payload `"SCP-BRIDGE-REGISTER-V1:" || identifier || public_key || routing_id || big-endian-u64(timestamp)` (129 bytes): the registrant's 32-byte inception-derived identifier (`09-security-model.md` §9.7.4.2 R13), its 33-byte SEC1 compressed public key, the 32-byte routing id, and the timestamp. **The preimage binds `public_key` and `identifier`** so that the signed bytes name the claimant; a preimage over the routing id and the timestamp alone is a signature any party makes under any key it chose, and it narrows the claimant to nobody. The bridge verifies:
 
 1. The P-256 signature is valid for the provided `public_key`.
-2. `SHA-256("scp:did:" || identifier)` equals the claimed `routing_id` (`09-security-model.md` §9.7.4.2 R13), **and** `public_key` is the key that identifier's key-event log lists `current` in the `#active` role, resolved and verified under `09-security-model.md` §9.7.4.2 R2, R3 and R8. **No function maps a public key to an identifier**, because the identifier is the inception event's digest and encodes no key (R13), so the registrant supplies the identifier and the bridge recomputes the routing id from it; ADR-063's retired clause 5 removed the `did:dht:z` binding that a key-to-identifier derivation would have rested on.
+2. `SHA-256("scp:did:" || identifier)` equals the claimed `routing_id` (`09-security-model.md` §9.7.4.2 R13), **and** `public_key` is the key that identifier's key-event log lists `current` in the `#active` role, resolved and verified under `09-security-model.md` §9.7.4.2 R2, R3 and R8. **No function maps a public key to an identifier**, because the identifier is the inception event's digest and encodes no key (R13), so the registrant supplies the identifier and the bridge recomputes the routing id from it.
 3. The `timestamp` is within 60 seconds of the server's current time (replay window).
 
 **Precedent for relay-side validation of public records.** `BRIDGE_REGISTER` establishes the pattern that a relay MAY perform a control-plane cryptographic check — verify a P-256 signature, replay a key-event log, and confirm the `SHA-256("scp:did:" || identifier)` identifier-to-routing-id binding — while remaining an untrusted, encrypted-content-blind data plane: `BRIDGE_DATA` payloads are forwarded opaquely, and the client re-verifies everything end-to-end regardless of the relay's acceptance. This same check extends from the control plane to a *stored public record*: an SCP-native relay MAY validate a key-event record frame it stores, under the four steps of `03-identity.md` §3.10.2 — structural decode, the identifier-to-routing-id binding check, chain verification, and slot placement under `09-security-model.md` §9.7.4.2 R9 — as an availability and anti-suppression measure. It is defense-in-depth, never a trust dependency — a relay that skips or botches this validation degrades availability only, and it never touches MLS-encrypted context content, which relays can neither read nor validate.
@@ -685,18 +684,18 @@ The protocol uses two distinct routing ID derivation schemes for different purpo
 
 | Routing ID type | Derivation | Purpose | Used by |
 |----------------|------------|---------|---------|
-| **Identity routing ID** | `SHA-256("scp:did:" \|\| identifier)` over the identifier's 32 raw digest bytes (`09-security-model.md` §9.7.4.2 R13) | Identity-level routing — locating an identity's relay presence. Used for bridge registration, directed messages outside context scope, and relay discovery. | `BRIDGE_REGISTER` (§10.12.4), relay SUBSCRIBE for DID-level messages |
+| **Identity routing ID** | `SHA-256("scp:did:" \|\| identifier)` over the identifier's 32 raw digest bytes (`09-security-model.md` §9.7.4.2 R13) | Identity-level routing — locating an identity's relay presence. Used for bridge registration, directed messages outside context scope, and relay discovery. | `BRIDGE_REGISTER` (§10.12.4), relay SUBSCRIBE for identity-level messages |
 | **Context pseudonym** | `HMAC-SHA256(pseudonym_secret, context_id \|\| "scp-pseudonym")` | Context-level routing — routing messages within a specific context. Unlinkable across contexts. Never publicly derivable (§9.10.4.A). | Context message delivery, relay SUBSCRIBE for context messages |
 | **Metadata routing ID** | `HMAC-SHA256(context_metadata_key, context_id \|\| "scp-metadata-v2")` | Context metadata retrieval — pre-join inspection of context parameters. | Relay QUERY for context metadata (§9.10.4.B) |
 
-**Key distinction:** DID routing IDs are publicly derivable by design — any party that knows a DID can compute the routing ID to send messages to that DID. Context pseudonyms are NOT publicly derivable — they require the pseudonym secret (§9.10.4.A), which is private key material. These serve fundamentally different privacy goals.
+**Key distinction:** identity routing IDs are publicly derivable by design — any party that knows an identifier can compute its routing ID and send messages to it. Context pseudonyms are NOT publicly derivable — they require the pseudonym secret (§9.10.4.A), which is private key material. These serve fundamentally different privacy goals.
 
 **Wire-level disambiguation:** The `routing_id` field in relay operations (`PUBLISH`, `SUBSCRIBE`, `BRIDGE_REGISTER`, etc.) is an opaque `[u8; 32]`. The relay does not know or care which derivation produced it. The SDK is responsible for using the correct derivation for each operation.
 
 **Bridge establishment:**
 
 1. The self-hosted relay behind symmetric NAT connects outbound to a bridge relay (outbound connections are not blocked by NAT).
-2. The self-hosted relay registers its routing ID with the bridge via `BRIDGE_REGISTER`, proving DID ownership with a P-256 signature.
+2. The self-hosted relay registers its routing ID with the bridge via `BRIDGE_REGISTER`, proving control of its identifier with a P-256 signature.
 3. The bridge relay accepts incoming connections from peers. Peers send `BRIDGE_DATA` to forward traffic to the registered self-hosted relay over the existing outbound connection.
 4. The self-hosted relay publishes the bridge relay's address in its service record, annotated as a bridge: `wss://bridge-relay.example.com/scp/v1?bridge_target=<hex-routing-hint>`.
 5. When the self-hosted relay disconnects, the bridge deregisters all its routing IDs. Subsequent `BRIDGE_DATA` for those IDs returns `BRIDGE_TARGET_NOT_FOUND`.
@@ -767,7 +766,7 @@ Tiers 1 and 2 use `ws://` with raw IP addresses — these are the zero-config, n
 
 1. Detecting the change (periodic STUN re-probe, UPnP lease renewal response, network interface change event).
 2. Writing a fresh service record at an incremented sequence carrying the new `SCPRelay` entries, signed by the designated operational key (`03-identity.md` §3.10.13). The relay list is not key state and no key event is appended, so the root set stays cold across every address change.
-3. Republishing that record to the SCP relays of the identity's fallback set. There is no second layer: `18-addressability-and-deployment.md` §18.5.1 states that the Mainline DHT is not a resolution level.
+3. Republishing that record to the SCP relays of the identity's fallback set. There is no second layer (`18-addressability-and-deployment.md` §18.5.1).
 
 Peers that fail to connect to a stale relay address re-resolve the identity's service record immediately. Multi-relay publishing (§18.7) provides availability during address transitions — if the self-hosted relay publishes to external relays in addition to advertising its own address, messages accumulate on external relays while the self-hosted relay's address updates propagate.
 
@@ -849,7 +848,7 @@ Phase 2 delivers the zero-config floor: a self-hosted relay behind most consumer
 
 ### 10.12.11 Self-Hosted Website Surface
 
-The `scp-node` reference binary exposes a `--self-host` mode that hosts a single static website entirely on SCP (the operator's home page IS the public endpoint). The website is published as broadcast content (per-author AES-256-GCM, §9.16), decrypted by the origin node, and served to ordinary web browsers over HTTP from the node's own HTTP surface. This is a distinct surface from the relay WebSocket transport governed by §10.12.6 and §10.12.7: §10.12.6 specifies the transport for SCP-protocol clients that resolve a `ws://` relay URL from a verified key-event log; the website surface serves vanilla browsers that have neither MLS nor a DID-document trust anchor.
+The `scp-node` reference binary exposes a `--self-host` mode that hosts a single static website entirely on SCP (the operator's home page IS the public endpoint). The website is published as broadcast content (per-author AES-256-GCM, §9.16), decrypted by the origin node, and served to ordinary web browsers over HTTP from the node's own HTTP surface. This is a distinct surface from the relay WebSocket transport governed by §10.12.6 and §10.12.7: §10.12.6 specifies the transport for SCP-protocol clients that resolve a `ws://` relay URL from a verified key-event log; the website surface serves vanilla browsers that have neither MLS nor a key-event-log trust anchor.
 
 **Origin-root mount.** In `--self-host` mode the single deployed context is served at the origin root, not only at the canonical `/scp/broadcast/<routing_id>/site/<path>` projection path. `GET /` returns the site's configured `index_path`; `GET /<path>` returns the corresponding site asset. On an exact-path miss the handler applies standard clean-URL resolution against the in-memory path index: an extensionless `<path>` resolves to `<path>.html`, and a directory-style `<path>/` (or `<path>`) resolves to `<path>/index.html`; every candidate is validated through `ContentPath` (so traversal is still rejected) and only a genuine miss returns 404. This is required for browser correctness: an `index.html` referencing root-absolute assets (`/style.css`, `/app.js`) issues those requests at the origin root, which must resolve to the deployed site. The origin-root mount reuses the same content handler as the canonical projection path, so `ContentPath` traversal protection, decryption, `ETag`, `Cache-Control`, and CSP apply identically; it routes only to the single designated default site and never re-exposes the relay upgrade (`/scp/v1`) or bridge routes (`/v1/scp/bridge/*`), which are not mounted on the self-host public surface.
 
@@ -1056,11 +1055,11 @@ These trade-offs are acceptable because constrained devices typically operate be
 
 A `scp-node` is **pure infrastructure**: a relay (§10.4), an identity service (key-event log replay and record publication over the relay network), and an HTTP projection surface (§10.12.11). A node **never participates in a context as itself.** It stores and forwards opaque encrypted blobs (§10.4 — relays are protocol-unaware), it resolves and publishes key-event records and service records, and it serves projected broadcast content over HTTP; it does not join contexts, create MLS groups, or sign protocol messages in its own right. This is the same boundary §10.2 draws ("no server *owns* you"), §10.4 draws ("relays cannot read content, inspect membership, or understand context semantics"), §10.5 draws ("the SDK owns all protocol logic; transport is not the product"), and §10.12.6 draws (the relay authenticates nothing at the transport level — MLS is the confidentiality boundary).
 
-**Participation is exclusively an SDK participant client bound to a DID.** All protocol participation — joining a context, creating an MLS group, publishing content, casting and verifying governance votes — is performed by an SDK participant client (a `Supervisor`/`ContextManager`) that holds custody, is bound to a DID, and runs the full protocol pipeline, including the real, document-derived key resolver used to verify vote signatures against each voter's published verification method. There is one participant engine; a node is never a second, special kind of participant. A participant constructed without a real resolver (for example, a resolver that returns `None` for every lookup) is not a complete participant and MUST NOT be shipped.
+**Participation is exclusively an SDK participant client bound to an identity.** All protocol participation — joining a context, creating an MLS group, publishing content, casting and verifying governance votes — is performed by an SDK participant client (a `Supervisor`/`ContextManager`) that holds custody, is bound to an identity, and runs the full protocol pipeline, including the real `IdentityBackend::resolve` path that derives each voter's key state from its key-event log (`03-identity.md` §3.10.4) before it verifies that voter's signature. There is one participant engine; a node is never a second, special kind of participant. A participant constructed without a real resolver (for example, a resolver that returns `None` for every lookup) is not a complete participant and MUST NOT be shipped.
 
 A participant has **two deployment shapes** relative to a node:
 
-- **Bundled (co-located).** The participant client runs **inside the node process** as a single binary. Custody and key material never cross a process boundary. The participant reaches the node's relay over the in-process loopback socket (`ws://127.0.0.1:<relay_port>/scp/v1`, resolved as `RelayUrlSource::DhtResolved`), authenticating with the node's internal bridge bearer token. Communication is via the loopback relay — the participant publishes encrypted envelopes onto the relay's blob storage and the node's projection scans that same storage — not via a directly shared blob backend, so the bundled binary exercises the same publish path as any external participant.
+- **Bundled (co-located).** The participant client runs **inside the node process** as a single binary. Custody and key material never cross a process boundary. The participant reaches the node's relay over the in-process loopback socket (`ws://127.0.0.1:<relay_port>/scp/v1`), authenticating with the node's internal bridge bearer token. Communication is via the loopback relay — the participant publishes encrypted envelopes onto the relay's blob storage and the node's projection scans that same storage — not via a directly shared blob backend, so the bundled binary exercises the same publish path as any external participant.
 
 - **External (separate process).** The participant client runs in **its own process** and connects to a node's relay over the socket: loopback when on the same box, `wss://` when off-host (the transport-security rules of §10.12.5/§10.12.6 apply to the off-host case). It **brings its own custody**. **Access control for an external participant is cryptographic, not transport-level**: the relay is a protocol-unaware dumb pipe (§10.4), and the participant's authority to read or write context content is enforced by MLS group membership and UCAN capabilities (encryption-as-access-control), exactly as for any participant. External participants reach `/scp/v1` over the node's existing TLS-terminated **Full** public surface — there is no dedicated listener mode, toggle, admission token, or pre-shared secret; relays are anonymous, DHT-auto-discovered dumb pipes that participants do not hand-pick, so reachability is governed entirely by the public-surface selection (§10.12.11), the bind address, and the TLS mode (§10.12.6), exactly as for any client of the relay. Abuse prevention for an open `wss://` relay — a spam, denial-of-service, and storage-abuse vector — is provided by the relay's existing rate limiting and abuse controls (§10.4) together with relay economics (§19.8 Relay Monetization, including `rate_limit_publish`), which satisfy §10.4's "rate limiting and abuse prevention" requirement without an allowlist that is at odds with the anonymous-relay model. Enabling external participants does not expose the dev/control or bridge endpoints, which remain loopback-only: the read-only self-host public surface never mounts `/scp/v1` or `/v1/scp/bridge/*` (§10.12.11 "Origin-root mount").
 
