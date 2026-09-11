@@ -496,20 +496,22 @@ pub enum ProvenanceQuality {
 
 **Status:** Decided
 
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, retired the DID document. An agent's self-asserted capability URIs are `SCPCapabilities` entries of its service record, which its designated operational key signs (`03-identity.md` §3.10.13), and a resolver reaches that record by the identity resolution of §3.10.4 rather than by a DID-method lookup.
+
 ### Context
 
-Spec §6.2.2 defines two-tier discovery: DID document capabilities (direct lookup, zero setup) and contexts with discovery outlets (searchable registries, community-operated). DID documents contain a `SCPCapabilities` service entry that lists an agent's capabilities — resolvable by anyone who knows the DID. These are standard SCP contexts with open join policies and standardized outlet schemas for search, registration, and deregistration. Two-tier membership (§6.2.2B [no such section]) separates writers (MLS members, bounded) from readers (DID-authenticated, unbounded).
+Spec §6.2.2 defines two-tier discovery: service-record capabilities (direct lookup, zero setup) and contexts with discovery outlets (searchable registries, community-operated). A service record contains a `SCPCapabilities` entry that lists an agent's capabilities — resolvable by anyone who knows the identifier. These are standard SCP contexts with open join policies and standardized outlet schemas for search, registration, and deregistration. Two-tier membership (§6.2.2B [no such section]) separates writers (MLS members, bounded) from readers (DID-authenticated, unbounded).
 
 ### Decision
 
-Implement `scp-core/discovery/` module. DID document capability resolution via did:dht (ADR-003). Contexts with discovery outlets as standard SCP contexts with standardized outlet schemas. Two-tier membership: writer (MLS, bounded at 500) + reader (DID-authenticated, unbounded). SDK provides unified search that merges local cache, DID resolution, and context queries.
+Implement `scp-core/discovery/` module. Service-record capability resolution over the identity resolution of `03-identity.md` §3.10.4. Contexts with discovery outlets as standard SCP contexts with standardized outlet schemas. Two-tier membership: writer (MLS, bounded at 500) + reader (DID-authenticated, unbounded). SDK provides unified search that merges local cache, DID resolution, and context queries.
 
 ### Rationale
 
 - **Two-tier membership over MLS-only:** MLS groups have practical size limits (~500 members for acceptable performance). Contexts may serve thousands of readers. Separating writers (who process registrations as MLS application messages) from readers (who query via outlet endpoints without MLS join) scales discovery beyond MLS group limits.
-- **DID document capabilities over central registry:** Any agent can publish capabilities in their DID document — zero setup, zero registration, zero dependency on contexts with discovery outlets. Contexts add searchability for agents that don't know each other's DIDs.
+- **Service-record capabilities over central registry:** Any agent can publish capabilities in its own service record — zero setup, zero registration, zero dependency on contexts with discovery outlets. Contexts add searchability for agents that do not know each other's identifiers.
 - **Standard schemas as conventions, not mandates:** The `agent_search`, `agent_register`, `agent_deregister` schemas are conventions that contexts with discovery outlets follow for interoperability. Custom outlets (reputation scoring, category browsing, geographic filtering) are allowed beyond the standard set.
-- **Bootstrap defaults as DNS root analogues:** SDK ships with configurable default bootstrap context IDs, analogous to DNS root servers. Users can add custom contexts with discovery outlets. If defaults are unreachable, direct DID resolution still works.
+- **Bootstrap defaults as DNS root analogues:** SDK ships with configurable default bootstrap context IDs, analogous to DNS root servers. Users can add custom contexts with discovery outlets. If defaults are unreachable, direct identity resolution still works.
 
 ### Implementation
 
@@ -519,7 +521,7 @@ Implement `scp-core/discovery/` module. DID document capability resolution via d
 
 ### Dependencies
 
-- **ADR-003 (DID):** DID document resolution for capability lookup. `SCPCapabilities` service extraction.
+- **ADR-063 (identity substrate):** service-record resolution for capability lookup, and `SCPCapabilities` entry extraction.
 - **ADR-010 (Outlet Registration/Invocation):** Contexts use standard outlet schemas. Registration/search are outlet invocations.
 - **ADR-008 (Context Lifecycle):** These are standard SCP contexts with specific configuration.
 
@@ -528,7 +530,7 @@ Implement `scp-core/discovery/` module. DID document capability resolution via d
 1. **Key types:**
 
 ```rust
-/// Capability entry from a DID document service array.
+/// Capability entry from a service record.
 pub struct CapabilityEntry {
     pub did: DID,
     pub capabilities: Vec<String>,
@@ -576,8 +578,8 @@ agent_register(did, capabilities, metadata) -> { registered, entry_id }
 agent_deregister(did) -> { removed }
 ```
 
-2. **DID document capability resolution:**
-   - `resolve_capabilities(did) -> Result<CapabilityEntry, DiscoveryError>`: Resolve DID via did:dht, extract `SCPCapabilities` from service array, cache in local contact index. Resolution returns all verification methods including the optional `#agent` VM (ADR-039), enabling callers to determine whether a DID has agent delegation enabled.
+2. **Service-record capability resolution:**
+   - `resolve_capabilities(did) -> Result<CapabilityEntry, DiscoveryError>`: Resolve the identity, extract `SCPCapabilities` from its service record, cache in the local contact index. Resolution also returns the key state, whose one operational role is `#active`, so a caller reads which key signs for that identity and nothing about delegation enabled.
 
 3. **Context standard outlets:**
    - `agent_search`, `agent_register`, `agent_deregister` implemented per schema.
@@ -624,7 +626,7 @@ agent_deregister(did) -> { removed }
 | File | Purpose |
 |------|---------|
 | `mod.rs` | Module root, `DiscoveryQuery`, `DiscoveryResult`, re-exports |
-| `did_capabilities.rs` | `resolve_capabilities`, DID document `SCPCapabilities` extraction, local contact cache |
+| `did_capabilities.rs` | `resolve_capabilities`, service-record `SCPCapabilities` extraction, local contact cache |
 | `context.rs` | Context standard outlet implementations (`agent_search`, `agent_register`, `agent_deregister`) |
 | `search.rs` | `unified_search`, result merging, deduplication, ranking |
 | `bootstrap.rs` | `DiscoveryBootstrap`, default context configuration, auto-query logic |
@@ -636,6 +638,8 @@ agent_deregister(did) -> { removed }
 ## ADR-021: UniFFI Bridge Definitions
 
 **Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, retired the DID document and overturned ADR-039's shared-identity `#agent` method. An identity carries a root set, one operational key, and a pre-rotation commitment; resolution returns a key state rather than a document (`09-security-model.md` §9.1 invariant 1, `03-identity.md` §3.10.4).
 
 **Amendment (2026-09-10 — the bridge's pseudonym derivation and Secure Enclave custody move to P-256).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. The pseudonym derivation this ADR's bridge exposes gains the seed-to-scalar step of §9.10.4 of the security-model spec, so its comment reads `P256_keygen(seed_to_scalar(seed[0..32]))`. The `KeyCustodyProvider` note states that the Swift implementation generates each P-256 key in the Secure Enclave, which the ruling made reachable and which ADR-025, the Apple platform adapter, carries in its own 2026-09-10 amendment. The UniFFI type mapping and the callback-interface shape are untouched.
 
@@ -704,10 +708,10 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
    async fn identity_resolve(did: String) -> Result<DIDDocument, ScpError> { ... }
    ```
 
-   - `identity_create(custody) -> Identity` — creates a new DID identity with up to four keypairs (Identity Key, Active Signing Key, Pre-Rotation Key, and optionally Agent Signing Key per ADR-039). `custody` is a string: `"platform"`, `"in_memory"`.
+   - `identity_create(custody) -> Identity` — creates a new identity with a root set, an Active Signing Key, and a Pre-Rotation Key. `custody` is a string: `"platform"`, `"in_memory"`.
    - `identity_load(did) -> Identity` — loads an existing identity from storage.
-   - `identity_resolve(did) -> DIDDocument` — resolves a DID to its document. The returned `DIDDocument` includes all verification methods: `#0`, `#active`, and optionally `#agent` (ADR-039).
-   - `Identity` is an opaque object interface exposing: `did() -> String`, `custody_type() -> String`, `rotateActiveKey() -> Identity`, `rotateAgentKey() -> Identity` (ADR-039 — separate rotation for `#active` and `#agent` keys).
+   - `identity_resolve(did) -> DIDDocument` — resolves an identifier to its key state. The key state names the standing root, the one operational role `#active`, and each member of the next set.
+   - `Identity` is an opaque object interface exposing: `did() -> String`, `custody_type() -> String`, `rotateActiveKey() -> Identity`, `rotateAgentKey() -> Identity`. No rule stands behind the agent-key rotation, because a human identity's key state names no agent key.
 
 3. **Context bridge functions:**
 
@@ -817,8 +821,8 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
     // the public key (public key would be a membership-enumeration oracle, §9.10.4.A).
     // Software custody derives pseudonym_secret from the private seed via HKDF
     // (cross-platform deterministic); hardware TEE uses a device-local secret.
-    // identity_create_platform() accepts a KeyCustodyProvider and creates a
-    // did:dht identity using it; the adapter must be retained on the Identity
+    // identity_create_platform() accepts a KeyCustodyProvider and creates an
+    // identity using it; the adapter must be retained on the Identity
     // handle struct for subsequent crypto operations (context creation, signing).
     callback interface KeyCustodyProvider {
         [Throws=ScpError]
@@ -1549,13 +1553,15 @@ This is the only structural shape that respects the "one implementation" invaria
 
 **Status:** Decided
 
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, retired the DID document. A self-asserted capability URI is an `SCPCapabilities` entry of the declaring identity's service record (`03-identity.md` §3.10.13), and the identity-scoped custom namespace resolves through the identity resolution of §3.10.4.
+
 ### Context
 
 The protocol specifies agent capability metadata in §4.4 and challenge-response verification in §7.3.4. The existing implementation has two problems:
 
-1. **Fragmented identifier space.** `ChallengeType` in `scp-core/trust/challenge.rs` defines three hardcoded enum variants (`PromptInjectionResistance`, `SchemaValidation`, `RateLimitCompliance`) plus `Custom(String)` — but there is no structure to custom strings, no namespace authority, and no way to distinguish protocol-defined capabilities from user-defined ones. `CapabilityEntry` in `scp-core/discovery/did_capabilities.rs` uses unstructured `Vec<String>` for capability names with the `scp:capabilities:` prefix for DID document service endpoints — a different format from `ChallengeType`. These two systems describe the same concept (agent capabilities) with incompatible identifiers.
+1. **Fragmented identifier space.** `ChallengeType` in `scp-core/trust/challenge.rs` defines three hardcoded enum variants (`PromptInjectionResistance`, `SchemaValidation`, `RateLimitCompliance`) plus `Custom(String)` — but there is no structure to custom strings, no namespace authority, and no way to distinguish protocol-defined capabilities from user-defined ones. `CapabilityEntry` in `scp-core/discovery/did_capabilities.rs` uses unstructured `Vec<String>` for capability names with the `scp:capabilities:` prefix for service-record entries — a different format from `ChallengeType`. These two systems describe the same concept (agent capabilities) with incompatible identifiers.
 
-2. **No anti-spoofing.** Any agent can declare any capability string in its DID document. There is no reserved namespace for protocol-defined capabilities, no mechanism to reject unknown protocol-scoped URIs, and no way to distinguish a self-attested claim from a challenge-verified capability at the identifier level.
+2. **No anti-spoofing.** Any agent can declare any capability string in its service record. There is no reserved namespace for protocol-defined capabilities, no mechanism to reject unknown protocol-scoped URIs, and no way to distinguish a self-attested claim from a challenge-verified capability at the identifier level.
 
 The challenge suite standards open question (00-open-questions.md) identified these gaps. The design decision resolves them with a structured URI namespace, a signed protocol registry, and clear authority boundaries.
 
@@ -1604,10 +1610,10 @@ Protocol-level feature flags for node roles. Not challenge-testable — these de
 
 **Anti-spoofing model:**
 
-- Declaring a URI in a DID document = self-attested claim (anyone can do this).
+- Declaring a URI in a service record = self-attested claim (anyone can do this).
 - Having a signed `ChallengeVerification` record = challenge-verified (can't fake verifier's signature).
 - `scp:capability:*` prefix is reserved. SDKs reject unknown `scp:capability:*` URIs at parse time.
-- Custom capabilities use DID-scoped namespace — authority is the definer's identity.
+- Custom capabilities use an identity-scoped namespace — authority is the definer's identity.
 
 ### Rationale
 
@@ -1637,8 +1643,8 @@ Protocol-level feature flags for node roles. Not challenge-testable — these de
 ### Dependencies
 
 - **ADR-017 (Trust Engine):** Challenge-response protocol that verifies capabilities.
-- **ADR-020 (Outlet-Interface Discovery):** DID document capability advertising that uses the URI format.
-- **ADR-003 (DID Creation):** DID-scoped custom capabilities require DID resolution.
+- **ADR-020 (Outlet-Interface Discovery):** service-record capability advertising that uses the URI format.
+- **ADR-063 (identity substrate):** identity-scoped custom capabilities require identity resolution.
 - **ADR-008 (Context Lifecycle):** Context admission requirements reference capability URIs.
 
 ### Acceptance Criteria
@@ -1649,9 +1655,9 @@ Protocol-level feature flags for node roles. Not challenge-testable — these de
 
 3. **`ChallengeType` unification:** existing `PromptInjectionResistance` maps to `scp:capability:prompt-injection-resistance/v1`, `SchemaValidation` maps to `scp:capability:schema-validation/v1`, `RateLimitCompliance` maps to `scp:capability:rate-limit-compliance/v1`. `Custom(String)` is replaced by `Uri(CapabilityUri)` which must be a valid DID-scoped or protocol-scoped URI.
 
-4. **`CapabilityEntry` update:** `capabilities: Vec<String>` becomes `capabilities: Vec<CapabilityUri>` where `CapabilityUri` is the validated URI type. DID document service endpoint parsing validates URIs.
+4. **`CapabilityEntry` update:** `capabilities: Vec<String>` becomes `capabilities: Vec<CapabilityUri>` where `CapabilityUri` is the validated URI type. Service-record entry parsing validates URIs.
 
-5. **SDK validation:** `validate_capability_uri(uri) -> Result<CapabilityUri, CapabilityError>` rejects unknown `scp:capability:*` URIs, accepts known protocol URIs and all valid DID-scoped URIs.
+5. **SDK validation:** `validate_capability_uri(uri) -> Result<CapabilityUri, CapabilityError>` rejects unknown `scp:capability:*` URIs, accepts known protocol URIs and all valid identity-scoped URIs.
 
 6. **Context admission integration:** admission requirements can specify `required_capabilities: Vec<(CapabilityUri, VerificationLevel)>` where `VerificationLevel` is `SelfAttested` or `ChallengeVerified`.
 
