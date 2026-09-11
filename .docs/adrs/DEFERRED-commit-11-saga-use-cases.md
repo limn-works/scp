@@ -115,7 +115,7 @@ context but not the cross-context forwarding path:
 
 **What needs specification.**
 - A new envelope type (e.g. `CrossContextOutletInvoke`) with fields:
-  caller context ID, caller DID, target outlet registration ID, input
+  caller context ID, caller identifier, target outlet registration ID, input
   JSON, optional UCAN proof reference.
 - The transport leg: does the caller serialize and send via
   `send_message` to the target context, or does a dedicated
@@ -141,8 +141,8 @@ supervisor-side (FFI bridges invoke it inline).
 not fully specify the "hosting handshake" — the flow where a
 subscriber requests that a host context relay broadcasts from a
 broadcast context:
-- Subscriber → host key-exchange frames (is it ECIES on host's
-  X25519 key, or an MLS handshake).
+- Subscriber → host key-exchange frames (HPKE to the host's key,
+  or an MLS handshake).
 - Host config negotiation (rate limits, max subscribers, forwarding
   policy).
 - The §5.14.2 step-4 transport: how the host signals its willingness
@@ -350,7 +350,7 @@ downstream PR):
 - **Gap 4 — Migration CustodyHandover envelope → RESOLVED-AS-WITHDRAWN.**
   The operation **does not exist.** Cross-identity custody handover
   (transferring a context's `mls_group_state` + `sender_key_material`
-  to a *different* DID) fails on three independent grounds: (1) no use
+  to a *different* identity) fails on three independent grounds: (1) no use
   case survives — every cross-identity custody scenario is an MLS
   Update, remove-and-re-add, Welcome (join), or the §7.3.2.1's
   "Seed custody and admin rotation" paragraph (HPKE seed re-wrap),
