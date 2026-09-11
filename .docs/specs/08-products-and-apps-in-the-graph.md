@@ -149,7 +149,7 @@ MCP (Model Context Protocol) defines how AI models connect to tools and data sou
 │                                                        │
 │  - Exposes context outlets as MCP tool schemas        │
 │  - Filters outlets by role + capability tokens          │
-│  - Signs with #active or #agent from human's DID      │ **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`00-open-questions.md`).]**
+│  - Signs with the #active key of its own identity     │
 │  - Encrypts/decrypts context envelopes                │
 │  - Surfaces context events as MCP resources           │
 └────────────────────┬─────────────────────────────────┘
@@ -159,6 +159,8 @@ MCP (Model Context Protocol) defines how AI models connect to tools and data sou
 │  SCP Context [outlets, roles, members, governance]      │
 └──────────────────────────────────────────────────────┘
 ```
+
+**Which key the agent signs with.** An agent signs under the `#active` key of its own delegated identity, whose key-event log the human's log anchors (`09-security-model.md` §9.1 invariant 1). That delegation model is unspecified as of 2026-09-10 (`00-open-questions.md`).
 
 The SCP agent is a translation layer: an MCP server from the model's perspective, an SCP protocol participant from the network's perspective. This separation has several consequences:
 
