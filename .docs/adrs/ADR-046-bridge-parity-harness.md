@@ -148,9 +148,15 @@ every bridge, routed to a deterministic RNG behind `#[cfg(feature =
 
 **MVP decision**: use **shape-only comparators** (regex / ignore) for
 crypto-generated identifiers on `identity_create_deterministic` and
-`sign_message`. The DID must match `did:dht:z[1-9a-km-np-zA-HJ-NP-Z]+`,
-the verifying key must be 32-byte base64, the signature must be 64-byte
-base64 — but we do not require cross-bridge byte equality.
+`sign_message`. The identifier must be a non-empty string, the verifying
+key must be a 33-byte base64 SEC1 compressed P-256 point, the signature
+must be 64-byte base64 — but we do not require cross-bridge byte equality.
+**Amended 2026-09-10:** the comparator pinned the regex
+`did:dht:z[1-9a-km-np-zA-HJ-NP-Z]+` and a 32-byte key. ADR-063,
+inception-derived self-certifying identity over a key-event log, retired
+the `did:dht` identifier form, and `09-security-model.md` §9.7.4.2 R13
+defers the identifier's textual form, so no shape assertion can pin one.
+The key width follows the P-256 ruling of `09-security-model.md` §9.5.
 
 This trades off a class of findings (bit-exact crypto divergence) for
 shipping the harness now. When a bridge-wide `seed` parameter lands, flip
