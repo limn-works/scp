@@ -81,9 +81,9 @@ All keys follow `{namespace}/{entity_id}/{sub_key}` with `/` as the hierarchy se
 _meta/schema_version
 scp/identity
 
-identity/{did}/document
+identity/{did}/key_event_log
+identity/{did}/service_record
 identity/{did}/active_signing_key
-identity/{did}/agent_signing_key
 identity/{did}/private_state/{seq:020d}
 identity/{did}/block_list_events
 identity/{did}/adapter_credentials/{adapter_id}
@@ -126,7 +126,7 @@ context/{context_id}/spending_ucan/{token_id}
 wrapping_key/{context_id}/{did}/public
 wrapping_key/{context_id}/{did}/secret
 
-did_cache/{did}
+key_event_log_cache/{did}
 tofu/{did}
 key_package/{sha256_hex(relay_url)}/{index}
 relay_score/{sha256_hex(relay_url)}
@@ -138,7 +138,7 @@ tls/private_key
 mls/{context_id}/...
 ```
 
-**Identity bootstrap key.** The `scp/identity` key stores a `StoredValue<PersistedIdentity>` containing the node's `ScpIdentity` and `DidDocument`. This is a top-level singleton key (no entity ID) because it is read during identity bootstrap before any DID is known. Written via the `Storage` trait directly, not through `ProtocolRepository` domain methods (see §17.4 for the exception rationale).
+**Identity bootstrap key.** The `scp/identity` key stores a `StoredValue<PersistedIdentity>` for the node's own identity. This is a top-level singleton key (no entity ID) because it is read during identity bootstrap before any DID is known. Written via the `Storage` trait directly, not through `ProtocolRepository` domain methods (see §17.4 for the exception rationale).
 
 **Zero-padded sequences.** Event sequence numbers and private state sequence numbers use `:020d` formatting (20-digit zero-padded decimal). This ensures lexicographic ordering matches numeric ordering, enabling efficient range queries via `list_keys`. Example: event 42 is stored at `context/{id}/event/00000000000000000042`.
 
@@ -230,10 +230,10 @@ impl<S: Storage> ProtocolRepository<S> {
     pub async fn load_merkle_event_log_entries(&self, context_id: &str) -> Result<Option<Vec<EventLogEntry>>, StoreError>;
     pub async fn delete_merkle_event_log_entries(&self, context_id: &str) -> Result<(), StoreError>;
 
-    // --- DID cache ---
-    pub async fn cache_did_document(&self, did: &DID, doc: &[u8], expires_at: u64) -> Result<(), StoreError>;
+    // --- Resolved key-event-log cache ---
+    pub async fn cache_key_event_log(&self, did: &DID, log: &[u8], expires_at: u64) -> Result<(), StoreError>;
     // `now` parameter enables testable expiry checks without hidden clock dependencies.
-    pub async fn load_cached_did_document(&self, did: &DID, now: u64) -> Result<Option<Vec<u8>>, StoreError>;
+    pub async fn load_cached_key_event_log(&self, did: &DID, now: u64) -> Result<Option<Vec<u8>>, StoreError>;
 
     // --- TOFU records ---
     pub async fn store_tofu_record(&self, did: &DID, record: &[u8]) -> Result<(), StoreError>;
@@ -255,8 +255,10 @@ impl<S: Storage> ProtocolRepository<S> {
     pub async fn list_relay_scores(&self) -> Result<Vec<(String, Vec<u8>)>, StoreError>;
 
     // --- Identity ---
-    pub async fn store_identity_document(&self, did: &DID, doc: &[u8]) -> Result<(), StoreError>;
-    pub async fn load_identity_document(&self, did: &DID) -> Result<Option<Vec<u8>>, StoreError>;
+    pub async fn store_key_event_log(&self, did: &DID, log: &[u8]) -> Result<(), StoreError>;
+    pub async fn load_key_event_log(&self, did: &DID) -> Result<Option<Vec<u8>>, StoreError>;
+    pub async fn store_service_record(&self, did: &DID, record: &[u8]) -> Result<(), StoreError>;
+    pub async fn load_service_record(&self, did: &DID) -> Result<Option<Vec<u8>>, StoreError>;
     pub async fn store_identity_private_state(&self, did: &DID, seq: u64, state: &[u8]) -> Result<(), StoreError>;
     pub async fn load_identity_private_state(&self, did: &DID, seq: u64) -> Result<Option<Vec<u8>>, StoreError>;
 
@@ -306,7 +308,7 @@ scp-core/src/store/
     mod.rs          # ProtocolRepository struct, StoreError type, re-exports
     context.rs      # Context state, params, membership, sender keys
     event_log.rs    # Event log persistence, tree nodes, roots
-    identity.rs     # Identity documents, private state, TOFU, DID cache
+    identity.rs     # Key-event logs, service records, private state, TOFU, resolved-log cache
     nonce.rs        # UCAN nonce tracking, pruning
     tls.rs          # TLS certificate chain + private key (§18.6.3)
     outlets.rs        # Outlet registration, sessions
@@ -1052,4 +1054,4 @@ A relay an identity designates as a witness keeps, per subject it has ever cosig
 
 **The arm fails open**, so SCP-CAPSEL-8012 governs it — provably absent from a shipped production artifact — rather than SCP-CAPSEL-8011, and the shipped-feature-graph gate of ADR-062, capability injection, therefore sees the witness store as a classified capability.
 
-**Re-seeding is the rule `09-security-model.md` §9.7.4.3 states, and this section states no second one.** A witness that lost its store re-seeds from its own previously published cosigned heads and, finding none of its own, seeds from the subject's chain at the latest event whose key state names it. **Neither case rescues an in-memory arm.** An arm that starts empty on every restart holds no head of its own to fetch, so every restart takes the second case and seeds from whatever chain the requester offered; it then refuses nothing, and the next requester offering a divergent chain is seeded afresh and cosigned too. A durable arm carries its own floor across a restart and refuses that second chain.
+**Re-seeding is the rule `09-security-model.md` §9.7.4.3 states, and neither seeding case rescues an in-memory arm.** An arm that starts empty on every restart holds no cosigned head of its own, so every restart seeds it from whatever chain the requester offered; it then refuses nothing, and the next requester offering a divergent chain is seeded afresh and cosigned too. A durable arm carries its own floor across a restart and refuses that second chain.
