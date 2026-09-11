@@ -474,15 +474,15 @@ The `subscribe()` implementation wraps the relay's `mpsc::UnboundedReceiver<Rela
 
 ## 16.6 SimulatedIdentity
 
-Wraps identity primitives (DID, key custody, storage, protocol repository) into a single container for convenient test setup. Does NOT create real MLS groups, transport connections, or sender key stores — those are complex and should be used directly in integration tests. This is a lightweight identity container, not a full participant harness.
+Wraps identity primitives (the identifier, key custody, storage, protocol repository) into a single container for convenient test setup. Does NOT create real MLS groups, transport connections, or sender key stores — those are complex and should be used directly in integration tests. This is a lightweight identity container, not a full participant harness.
 
 ```rust
 /// scp-testing/src/simulator/identity.rs
 
 /// A test identity with custody, storage, and protocol repository pre-wired.
 pub struct SimulatedIdentity {
-    /// The DID for this identity.
-    did: DID,
+    /// This identity's identifier.
+    did: Identifier,
     /// Key custody provider.
     custody: Arc<InMemoryKeyCustody>,
     /// Direct storage access for tests.
@@ -499,13 +499,13 @@ impl SimulatedIdentity {
     /// separately for direct test access.
     pub fn new(
         label: impl Into<String>,
-        did: DID,
+        did: Identifier,
         custody: Arc<InMemoryKeyCustody>,
         storage: InMemoryStorage,
     ) -> Self;
 
-    /// Returns a reference to this identity's DID.
-    pub const fn did(&self) -> &DID;
+    /// Returns a reference to this identity's identifier.
+    pub const fn did(&self) -> &Identifier;
 
     /// Returns the human-readable label for this identity.
     pub fn label(&self) -> &str;
@@ -530,7 +530,7 @@ Maps identities to reachable relays. Supports dynamic partitioning and per-link 
 
 /// Network topology configuration.
 pub struct NetworkTopology {
-    /// Map from identity DID to set of reachable relay names.
+    /// Map from identity identifier to set of reachable relay names.
     reachability: RwLock<HashMap<String, HashSet<String>>>,
     /// Per-link configuration (identity, relay) -> LinkConfig.
     link_configs: RwLock<HashMap<(String, String), LinkConfig>>,
@@ -595,7 +595,7 @@ pub struct NetworkSimulator {
     pub clock: Arc<SimulatedClock>,
     /// Named relays.
     pub relays: HashMap<String, Arc<InMemoryRelay>>,
-    /// Simulated identities, keyed by DID.
+    /// Simulated identities, keyed by identifier.
     pub identities: HashMap<String, SimulatedIdentity>,
     /// Network topology.
     pub topology: NetworkTopology,
@@ -614,7 +614,7 @@ impl NetworkSimulator {
     /// Get a relay by name.
     pub fn relay(&self, name: &str) -> Option<&Arc<InMemoryRelay>>;
 
-    /// Get a simulated identity by DID.
+    /// Get a simulated identity by identifier.
     pub fn identity(&self, did: &str) -> Option<&SimulatedIdentity>;
 
     /// Get a mutable reference to a simulated identity.
@@ -1452,7 +1452,7 @@ Meta-tests that verify the simulation framework is correct before trusting it fo
 | `builder_creates_contexts` | All specified contexts have MLS groups with correct members |
 | `builder_distributes_sender_keys` | All context members have sender keys for all other members |
 | `builder_full_mesh_connects_all` | `full_mesh()` connects every identity to every relay |
-| `builder_deterministic_with_same_seed` | Same seed produces identical simulator state (DID strings, key material) |
+| `builder_deterministic_with_same_seed` | Same seed produces identical simulator state (identifiers, key material) |
 
 ### 16.13.6 Determinism
 
@@ -1519,7 +1519,7 @@ All preset scenarios (§16.11) are meta-tested: each builds successfully, produc
 | `preset_five_party_group_builds` | `five_party_group` returns a simulator with 5 identities, correct MLS epoch |
 | `preset_suppression_scenario_builds` | `suppression_scenario` returns a simulator with suppressing relay behavior |
 | `preset_equivocation_scenario_builds` | `equivocation_scenario` returns a simulator with equivocating relay behavior |
-| `preset_scenarios_deterministic` | Each preset called twice with same seed produces identical DID strings and relay state |
+| `preset_scenarios_deterministic` | Each preset called twice with same seed produces identical identifiers and relay state |
 
 ## 16.14 Cross-Reference Map
 
