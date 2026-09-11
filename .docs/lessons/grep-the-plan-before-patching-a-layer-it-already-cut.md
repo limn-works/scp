@@ -6,12 +6,12 @@
 ## What happened
 
 The identity-substrate plan settled two rows before pass 7 began: it axed the Mainline DHT
-resolution layer, and it cut did:web. Passes 7 and 8 kept both alive in the two specs and
+resolution layer and cut did:web. Passes 7 and 8 kept both alive in the two specs and
 patched them. Pass 7 scoped the DHT layer's store as an availability path, pass 8 gave the
 DHT layer a signed head-pointer record with a 1000-byte bound, both passes carried a
 `DhtMode::Disabled` branch through the first-contact rule, and pass 8 wrote a did:web exit
 for the key-continuity standing. Across review rounds 5 and 6, twelve reviewer findings
-argued about a layer the plan had already removed. Pass 9 deleted every one of those
+argued about a layer the plan had removed. Pass 9 deleted every one of those
 sentences.
 
 ## The cause
