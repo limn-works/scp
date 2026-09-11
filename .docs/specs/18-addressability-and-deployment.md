@@ -44,7 +44,7 @@ An `SCPRelay` entry declares a transport-layer relay URL where the identity's SC
 
 When a peer resolves an identity's service record, the `SCPRelay` entries tell it where to route encrypted envelopes for that identity. An out-of-band identifier exchange leads to a key-event log replay, which yields the designated key, which authenticates the record and its relay URLs.
 
-### 18.2.2 The Entry Types
+### 18.2.2 Existing Endpoint Types (Cross-Reference)
 
 | Type | Purpose | Consumer | Reference |
 |------|---------|----------|-----------|

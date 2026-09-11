@@ -7818,7 +7818,7 @@
       "sources": [
         {
           "file": ".docs/specs/18-addressability-and-deployment.md",
-          "section": "## 18.2 DID Document Service Endpoints"
+          "section": "## 18.2 Service Record Entry Types"
         },
         {
           "file": ".docs/specs/03-identity.md",
@@ -7875,7 +7875,7 @@
       "sources": [
         {
           "file": ".docs/specs/18-addressability-and-deployment.md",
-          "section": "## 18.2 DID Document Service Endpoints"
+          "section": "## 18.2 Service Record Entry Types"
         },
         {
           "file": ".docs/specs/18-addressability-and-deployment.md",
