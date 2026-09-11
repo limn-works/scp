@@ -1,6 +1,6 @@
 {
   "project": "scp",
-  "description": "Relay reachability (NAT traversal, zero-config self-hosting) and DID resolution layers (SCP relay-based + Mainline DHT fallback).",
+  "description": "Relay reachability (NAT traversal, zero-config self-hosting) and identity resolution over the SCP relay network.",
   "gates": [
     {
       "id": "gate-reachability-1",
@@ -18,7 +18,7 @@
     },
     {
       "id": "gate-reachability-2",
-      "name": "DID Resolution Layers",
+      "name": "Identity Resolution",
       "priority": "P1",
       "status": "done",
       "stories": [
@@ -146,9 +146,9 @@
         "crates/scp-transport/src/relay/connection.rs",
         "crates/scp-transport/src/relay/mod.rs"
       ],
-      "description": "Extend the relay WebSocket transport to accept ws:// (plaintext) connections for relay URLs obtained from DHT-resolved DID documents (§10.12.6). The SDK MUST reject ws:// relay URLs obtained from .well-known/scp or any non-DHT source. MLS provides the confidentiality boundary; TLS on a dumb pipe is defense-in-depth, not the security layer. This enables self-hosted relays behind NAT with no domain to be reachable without requiring TLS certificates.",
+      "description": "Extend the relay WebSocket transport to accept ws:// (plaintext) connections for relay URLs from a resolved service record (§10.12.6). The SDK MUST reject ws:// relay URLs obtained from .well-known/scp or any other source. MLS provides the confidentiality boundary; TLS on a dumb pipe is defense-in-depth, not the security layer. This enables self-hosted relays behind NAT with no domain to be reachable without requiring TLS certificates.",
       "acceptanceCriteria": [
-        "WebSocket transport connects to ws:// URLs when source is DHT-resolved DID document",
+        "WebSocket transport connects to ws:// URLs sourced from a resolved service record",
         "SDK rejects ws:// URLs when source is .well-known/scp (returns error, does not connect)",
         "SDK rejects ws:// URLs when source is explicit configuration without DHT verification",
         "wss:// URLs continue to work for all sources (no regression)",
@@ -190,7 +190,7 @@
       "files": [
         "crates/scp-node/src/lib.rs"
       ],
-      "description": "Add .no_domain() to ApplicationNodeBuilder (§10.12.8). When set: skip ACME TLS provisioning, probe NAT type via STUN, attempt UPnP (Tier 1), fallback to STUN address (Tier 2), register with bridge (Tier 3), publish DID document with ws:// relay URL, do NOT serve .well-known/scp. Also adds .stun_server() and .bridge_relay() builder methods for override configuration. This is the zero-config deployment path for self-hosted relays behind residential NAT.",
+      "description": "Add .no_domain() to ApplicationNodeBuilder (§10.12.8). When set: skip ACME TLS provisioning, probe NAT type via STUN, attempt UPnP (Tier 1), fallback to STUN address (Tier 2), register with bridge (Tier 3), publish the service record with a ws:// relay URL, do NOT serve .well-known/scp. Also adds .stun_server() and .bridge_relay() builder methods for override configuration. This is the zero-config deployment path for self-hosted relays behind residential NAT.",
       "acceptanceCriteria": [
         ".no_domain() method exists on ApplicationNodeBuilder and sets zero-config NAT-traversed mode",
         ".stun_server(url) method exists and overrides the default STUN endpoint",
@@ -198,7 +198,7 @@
         "When .no_domain() is set, ACME TLS provisioning is skipped entirely",
         "When .no_domain() is set, .well-known/scp is NOT served",
         "When .no_domain() is set, NAT type is probed via STUN on build()",
-        "When .no_domain() is set, DID document is published with ws:// relay URL",
+        "When .no_domain() is set, the service record carries a ws:// relay URL",
         "When .domain() is set and succeeds, wss:// is used (existing behavior, no regression)",
         "When .domain() is set and fails (DNS/ACME), automatic fallthrough to Tiers 1-3",
         "Unit test: .no_domain() build skips TLS and publishes ws:// URL",
@@ -209,7 +209,7 @@
         "Add ReachabilityMode enum (Domain, NoDomain) to builder state",
         "Implement NAT probing integration in build() when NoDomain is set",
         "Implement domain fallthrough logic: attempt ACME, on failure switch to NoDomain path",
-        "Publish DID document with ws:// relay URL for NoDomain mode",
+        "Publish the service record with a ws:// relay URL for NoDomain mode",
         "Suppress .well-known/scp route when NoDomain is set",
         "Add tests for both modes and fallthrough"
       ],
@@ -259,7 +259,7 @@
         "Implement bridge proxy logic: bidirectional blob forwarding without inspection",
         "Add supports_bridge configuration to relay server config",
         "Implement bridge discovery and failover in SDK transport layer",
-        "Add bridge_relay field to DID document relay URL encoding (Tier 3 format)",
+        "Add bridge_relay field to the service-record relay URL encoding (Tier 3 format)",
         "Add unit and integration tests"
       ],
       "blockedBy": [
@@ -275,7 +275,7 @@
         "phase": 3,
         "crate": "scp-transport"
       },
-      "result": "Implemented BRIDGE relay operation with bidirectional blob proxying, supports_bridge config, and bridge discovery/failover (88e4aaa). Wired BridgeRegistry into RelayServer: handle_bridge_register with Ed25519 auth, handle_bridge_data with transparent forwarding, connection cleanup on disconnect, 6 integration tests. Closes #271."
+      "result": "Implemented BRIDGE relay operation with bidirectional blob proxying, supports_bridge config, and bridge discovery/failover (88e4aaa). Wired BridgeRegistry into RelayServer: handle_bridge_register with signature auth, handle_bridge_data with transparent forwarding, connection cleanup on disconnect, 6 integration tests. Closes #271."
     },
     {
       "id": "SCP-237",
@@ -327,19 +327,19 @@
       "files": [
         "crates/scp-identity/src/resolution.rs"
       ],
-      "description": "Implement the did_routing_id derivation (§3.10.2): SHA-256(\"scp:did:\" || did_string). The \"scp:did:\" domain separator prevents collision with context routing IDs (HMAC-SHA256(identity_key, context_id) per §5.7.1) and broadcast routing IDs (SHA-256(context_id) per §5.14). This is a pure function with no dependencies — the building block for relay-based DID resolution.",
+      "description": "Implement the did_routing_id derivation (§3.10.2): SHA-256(\"scp:did:\" || did_string). The \"scp:did:\" domain separator prevents collision with context routing IDs (HMAC-SHA256(identity_key, context_id) per §5.7.1) and broadcast routing IDs (SHA-256(context_id) per §5.14). This is a pure function with no dependencies — the building block for relay-based identity resolution.",
       "acceptanceCriteria": [
         "did_routing_id(did_string) returns SHA-256(\"scp:did:\" || did_string) as 32 bytes",
         "Domain separator is exactly \"scp:did:\" (prevents collision with context and broadcast routing IDs)",
         "Function is pure: no I/O, no state, deterministic output for same input",
-        "Unit test: known DID string produces expected routing ID (golden test vector)",
-        "Unit test: different DID strings produce different routing IDs (no collision)",
+        "Unit test: a known identifier produces the expected routing ID (golden vector)",
+        "Unit test: different identifiers produce different routing IDs (no collision)",
         "Unit test: routing ID does not collide with context routing ID derivation for same input bytes"
       ],
       "actionItems": [
         "Add resolution submodule to scp-core/src/identity/",
         "Implement did_routing_id as pub fn did_routing_id(did: &str) -> [u8; 32]",
-        "Add golden test vector (precomputed SHA-256 for a known DID string)",
+        "Add golden test vector (precomputed SHA-256 for a known identifier)",
         "Add collision resistance tests against context and broadcast routing ID derivations"
       ],
       "blockedBy": [],
@@ -357,7 +357,7 @@
     },
     {
       "id": "SCP-239",
-      "title": "Implement DID document PUBLISH to SCP relays via RepublishManager",
+      "title": "Implement key-event record PUBLISH to SCP relays via RepublishManager",
       "gate": "gate-reachability-2",
       "priority": "P0",
       "severity": "critical",
@@ -366,11 +366,11 @@
         "crates/scp-identity/src/resolution.rs",
         "crates/scp-identity/src/republish.rs"
       ],
-      "description": "Extend RepublishManager to publish DID documents to SCP relays using existing PUBLISH operation (§3.10.5). DID documents are published as standard blobs with routing_id = did_routing_id(did_string) and blob_ttl = 604800 (7 days). Identity owners SHOULD publish to their own relays plus bootstrap relays. RepublishManager schedules relay republishing on a 6-day cycle (1-day margin before TTL expiry). Publishing to both SCP relays and Mainline DHT is a MUST per the anti-segmentation invariant (§3.10.6).",
+      "description": "Extend RepublishManager to publish key-event records to SCP relays over the PUBLISH operation (§3.10.5). Each record is published as a raw relay blob with routing_id = did_routing_id(did_string) and blob_ttl = 604800 (7 days). Identity owners SHOULD publish to their own relays plus bootstrap relays. RepublishManager schedules relay republishing on a 6-day cycle (1-day margin before TTL expiry). The anti-segmentation invariant (§3.10.6) requires publishing to the identity's own relays and the bootstrap fallback set.",
       "acceptanceCriteria": [
-        "DID document PUBLISH uses routing_id = did_routing_id(did_string)",
-        "DID document PUBLISH uses blob_ttl = 604800 (7 days)",
-        "DID document blob contains BEP44-signed DID document bytes",
+        "The record PUBLISH uses routing_id = did_routing_id(did_string)",
+        "The record PUBLISH uses blob_ttl = 604800 (7 days)",
+        "The blob contains the key-event record frame bytes",
         "RepublishManager schedules relay republishing on a 6-day cycle",
         "RepublishManager publishes to identity's own relays AND bootstrap relays",
         "DHT publishing continues unchanged (anti-segmentation invariant: both layers MUST be published to)",
@@ -379,7 +379,7 @@
         "Unit test: republish timer fires at 6-day interval"
       ],
       "actionItems": [
-        "Add relay-based DID document publishing to RepublishManager",
+        "Add relay-based key-event record publishing to RepublishManager",
         "Implement 6-day republish cycle for relay layer (separate from 2-hour DHT cycle)",
         "Publish to own relays + bootstrap relays on each cycle",
         "Add anti-segmentation guard: warn if either layer is disabled",
@@ -402,11 +402,11 @@
         "phase": 2,
         "crate": "scp-core"
       },
-      "result": "Extended RepublishManager with relay-based DID document publishing. 6-day cycle, own+bootstrap relays, anti-segmentation guard. Commit b5ce707."
+      "result": "Extended RepublishManager with relay-based key-event record publishing. 6-day cycle, own+bootstrap relays, anti-segmentation guard. Commit b5ce707."
     },
     {
       "id": "SCP-240",
-      "title": "Implement DID document QUERY from SCP relays",
+      "title": "Implement key-event record QUERY from SCP relays",
       "gate": "gate-reachability-2",
       "priority": "P0",
       "severity": "critical",
@@ -414,22 +414,22 @@
       "files": [
         "crates/scp-identity/src/resolution.rs"
       ],
-      "description": "Implement relay-based DID document resolution using existing QUERY operation (§3.10.4). Resolver computes did_routing_id, queries known SCP relays (identity's relays if known, else bootstrap relays), verifies BEP44 signature against the public key encoded in the DID string, and checks seq >= last_known_seq. This is the relay layer of the dual-layer resolution protocol. Cache results per §9.10.7 (24h active, 7d inactive).",
+      "description": "Implement relay-based identity resolution over the QUERY operation (§3.10.4). The resolver computes did_routing_id, queries known SCP relays (its own if known, else bootstrap relays), verifies the key-event chain each record carries, and checks seq >= last_known_seq. This is the relay resolution path. Cache results per §9.10.7 (24h active, 7d inactive).",
       "acceptanceCriteria": [
         "QUERY operation sent with routing_id = did_routing_id(did_string) and limit = 1",
-        "Response blob parsed as BEP44-signed DID document",
-        "BEP44 signature verified against public key extracted from DID string (z-base-32 decode)",
-        "Sequence number checked: reject if seq < last_known_seq for this DID",
-        "Resolved DID document cached with 24h active / 7d inactive TTL",
+        "Response blob parsed as a key-event record",
+        "The resolver verifies the record's key-event chain before it reads any key",
+        "Sequence number checked: reject if seq < last_known_seq for this identifier",
+        "Resolved key state cached with 24h active / 7d inactive TTL",
         "Queries sent to identity's known relays first, then bootstrap relays",
-        "Unit test: valid BEP44-signed document is accepted and cached",
-        "Unit test: document with invalid signature is rejected",
+        "Unit test: a verifying record is accepted and cached",
+        "Unit test: a record failing chain verification is rejected",
         "Unit test: document with lower sequence number than cached is rejected"
       ],
       "actionItems": [
-        "Implement relay_resolve function: compute did_routing_id, QUERY relay, verify BEP44, check seq",
-        "Add BEP44 signature verification against DID-embedded public key",
-        "Add sequence number tracking per DID (last_known_seq)",
+        "Implement relay_resolve function: compute did_routing_id, QUERY relay, verify the chain, check seq",
+        "Add key-event chain verification for each returned record",
+        "Add sequence number tracking per identifier (last_known_seq)",
         "Add caching layer with configurable TTLs (24h active, 7d inactive)",
         "Add relay selection logic: known relays first, bootstrap fallback",
         "Add tests for valid, invalid-sig, and stale-seq cases"
@@ -451,7 +451,7 @@
         "phase": 2,
         "crate": "scp-core"
       },
-      "result": "Implemented DID relay QUERY resolution with BEP44 signature verification, seq number tracking, and caching (24h/7d TTL). Commit e9a37ac."
+      "result": "Implemented relay QUERY resolution with chain verification, seq number tracking, and caching (24h/7d TTL). Commit e9a37ac."
     },
     {
       "id": "SCP-241",
@@ -463,7 +463,7 @@
       "files": [
         "crates/scp-identity/src/resolver.rs"
       ],
-      "description": "Implement the DidResolver trait (§3.10.10) that composes relay QUERY with DhtClient::resolve() for parallel dual-layer resolution. Both layers are queried in parallel via tokio::join! with per-layer 10-second timeouts. Valid means BEP44 signature verifies AND sequence number >= last known cached sequence. When both return valid documents, highest sequence number wins. On a tie, relay is preferred (lower latency). ResolutionSource enum tracks whether the result came from an SCP relay, Mainline DHT, or cache.",
+      "description": "Implement the DidResolver trait (§3.10.10) that composes relay QUERY with DhtClient::resolve() for parallel dual-layer resolution. Both layers are queried in parallel via tokio::join! with per-layer 10-second timeouts. Valid means the record's chain verifies and its sequence is at least the last cached sequence. When both return valid documents, highest sequence number wins. On a tie, relay is preferred (lower latency). ResolutionSource enum tracks whether the result came from an SCP relay, Mainline DHT, or cache.",
       "acceptanceCriteria": [
         "DidResolver trait defined with resolve(&self, did: &str) -> Result<Option<ResolvedDidDocument>>",
         "ResolvedDidDocument contains document, seq, and source fields",
@@ -517,7 +517,7 @@
         "crates/scp-node/src/lib.rs",
         "crates/scp-transport/src/nat/mod.rs"
       ],
-      "description": "After obtaining an external address via UPnP (Tier 1, §10.12.2 step 4) or STUN (Tier 2, §10.12.3), the SDK must perform a reachability self-test before publishing the address in the DID document. If the self-test fails, the mapping is considered unreliable and the SDK falls through to the next tier. Currently, the tier selection algorithm publishes the address without verification. This story adds the self-test probe.",
+      "description": "After obtaining an external address via UPnP (Tier 1, §10.12.2 step 4) or STUN (Tier 2, §10.12.3), the SDK must perform a reachability self-test before publishing the address in the service record. If the self-test fails, the mapping is considered unreliable and the SDK falls through to the next tier. Currently, the tier selection algorithm publishes the address without verification. This story adds the self-test probe.",
       "acceptanceCriteria": [
         "After Tier 1 UPnP mapping, a self-test probe verifies external reachability before publishing",
         "After Tier 2 STUN hole punch, a self-test probe verifies external reachability before publishing",
@@ -565,19 +565,19 @@
         "crates/scp-node/src/lib.rs",
         "crates/scp-transport/src/nat/mod.rs"
       ],
-      "description": "The SDK must re-evaluate the reachability tier periodically (recommended: every 30 minutes per §10.12.1) and on network change events. Tier changes trigger DID document updates with the new relay address. Currently the tier is selected once at startup and never re-evaluated. This story adds the periodic re-evaluation loop.",
+      "description": "The SDK must re-evaluate the reachability tier periodically (recommended: every 30 minutes per §10.12.1) and on network change events. Tier changes trigger service record updates carrying the new relay address. Currently the tier is selected once at startup and never re-evaluated. This story adds the periodic re-evaluation loop.",
       "acceptanceCriteria": [
         "A background task re-evaluates the reachability tier every 30 minutes",
-        "Tier change triggers DID document update with the new relay address",
+        "Tier change triggers a service record update carrying the new relay address",
         "Tier change is logged at INFO level (§10.12.1)",
         "Network change events (IP change, interface up/down) trigger immediate re-evaluation",
-        "Unit test: tier change after 30 minutes triggers DID document republish",
+        "Unit test: tier change after 30 minutes triggers service record republish",
         "Unit test: network event triggers immediate re-evaluation"
       ],
       "actionItems": [
         "Add periodic tier re-evaluation loop in ApplicationNode",
         "Implement NatTierChange event emission on tier change",
-        "Wire DID document republish on tier change",
+        "Wire service record republish on tier change",
         "Add network change event detection (platform-specific)",
         "Add tests for periodic and event-triggered re-evaluation"
       ],
@@ -594,7 +594,7 @@
         "phase": 3,
         "crate": "scp-node"
       },
-      "result": "TierReEvalHandle with 30-min background loop, tier_change_rx channel for DID republish trigger. NetworkChangeDetector trait + ChannelNetworkChangeDetector for immediate re-eval on network events. Platform-injectable via ApplicationNodeBuilder::network_detector(). Tests: tier_reeval_handle_notifies_on_tier_change, network_change_triggers_immediate_reeval."
+      "result": "TierReEvalHandle with 30-min background loop, tier_change_rx channel for service-record republish trigger. NetworkChangeDetector trait + ChannelNetworkChangeDetector for immediate re-eval on network events. Platform-injectable via ApplicationNodeBuilder::network_detector(). Tests: tier_reeval_handle_notifies_on_tier_change, network_change_triggers_immediate_reeval."
     },
     {
       "id": "SCP-244",
@@ -643,7 +643,7 @@
     },
     {
       "id": "SCP-245",
-      "title": "Implement protocol-level healing of stale DID documents across resolution layers",
+      "title": "Implement protocol-level healing of stale key-event records across resolution layers",
       "gate": "gate-reachability-2",
       "priority": "P1",
       "severity": "major",
@@ -696,7 +696,7 @@
       "description": "The AcmeProvider module exists in scp-node/src/tls.rs but is never called from the domain build path in ApplicationNodeBuilder.build(). When .domain() is set, the builder should invoke AcmeProvider to provision a TLS certificate via Let's Encrypt before starting the relay listener. Currently the code has a comment noting ACME is not yet integrated (§10.12.8 ADR-032 AC 7). This story wires the existing module into the build path.",
       "acceptanceCriteria": [
         "When .domain() is set, AcmeProvider is invoked during build() to provision TLS",
-        "ACME challenge success results in wss:// relay URL in DID document",
+        "ACME challenge success puts a wss:// relay URL in the service record",
         "ACME challenge failure triggers fallthrough to no_domain behavior (§10.12.8)",
         "AcmeProvider uses the email from .acme_email() builder method",
         "Unit test: ACME success produces wss:// relay URL",
@@ -735,11 +735,11 @@
         "crates/scp-transport/src/relay/bridge.rs",
         "crates/scp-transport/src/native/server.rs"
       ],
-      "description": "BRIDGE_REGISTER currently accepts any routing_id without authentication (§10.12.4). An attacker can register arbitrary routing IDs and intercept traffic meant for the legitimate self-hosted relay. This story adds signature-based authentication: the BRIDGE_REGISTER message must include an Ed25519 signature proving the sender owns the DID that maps to the claimed routing_id. The bridge relay verifies the signature before accepting the registration.",
+      "description": "BRIDGE_REGISTER currently accepts any routing_id without authentication (§10.12.4). An attacker can register arbitrary routing IDs and intercept traffic meant for the legitimate self-hosted relay. This story adds signature-based authentication: the BRIDGE_REGISTER message must include a signature proving the sender owns the identifier that maps to the claimed routing_id. The bridge relay verifies the signature before accepting the registration.",
       "acceptanceCriteria": [
-        "BRIDGE_REGISTER requires an Ed25519 signature proving ownership of routing_id's DID",
+        "BRIDGE_REGISTER requires a signature proving ownership of the routing_id's identifier",
         "Bridge relay rejects BRIDGE_REGISTER with missing or invalid signature",
-        "Bridge relay rejects BRIDGE_REGISTER where signature DID does not map to claimed routing_id",
+        "Bridge relay rejects BRIDGE_REGISTER where the signing identifier does not map to the claimed routing_id",
         "Signature covers routing_id || timestamp to prevent replay attacks",
         "Timestamp must be within 60 seconds of server time (replay window)",
         "Unit test: valid signature accepted, registration succeeds",
@@ -766,7 +766,7 @@
         "phase": 3,
         "crate": "scp-transport"
       },
-      "result": "Ed25519 signature verification for BRIDGE_REGISTER: domain-separated payload SCP-BRIDGE-REGISTER-V1: || routing_id || timestamp, 60s replay window, routing ID ownership validation via did_routing_id derivation. Tests: valid_signature_accepted, invalid_signature_rejected, expired_timestamp_rejected."
+      "result": "Signature verification for BRIDGE_REGISTER: domain-separated payload SCP-BRIDGE-REGISTER-V1: || routing_id || timestamp, 60s replay window, routing ID ownership validation via did_routing_id derivation. Tests: valid_signature_accepted, invalid_signature_rejected, expired_timestamp_rejected."
     }
   ]
 }
