@@ -72,7 +72,7 @@
 │  ┌────────────────────────────────────────────────────────────┐    │
 │  │  INFRASTRUCTURE (not owned — existing)                      │    │
 │  │                                                             │    │
-│  │  SCP relays │ Nostr relays │ Mainline DHT │ APNs/FCM       │    │
+│  │  SCP relays │ Nostr relays │ APNs/FCM                     │    │
 │  │  Hyperswarm │ libp2p nodes │ Matrix homeservers             │    │
 │  └────────────────────────────────────────────────────────────┘    │
 │                                                                    │
@@ -272,9 +272,9 @@ scp/
 │   │
 │   ├── scp-core/              # Facade re-exporting scp-protocol + scp-runtime
 │   │
-│   ├── scp-identity/          # Native DID subsystem — DID-method (DidDht), resolution/publication, lifecycle
+│   ├── scp-identity/          # Native identity subsystem — key-event log, resolution/publication, lifecycle
 │   │
-│   ├── scp-dht/               # Native DHT transport leaf — DhtClient/DhtRecord/InMemory/Pkarr + BEP44 helpers (ADR-057 T1c-a)
+│   ├── scp-dht/               # Retired DHT transport leaf — the substrate resolves over SCP relays, not a DHT
 │   │
 │   ├── scp-event-log/         # Merkle event log
 │   │
@@ -282,8 +282,8 @@ scp/
 │   │
 │   ├── scp-crypto/            # P-256 signature verification — wasm-safe capability leaf
 │   │
-│   ├── scp-did/               # DID data model — wasm-safe (DID, SigningKeyId, DidDocument, proofs, attestation)
-│   │   ├── document.rs        # DidDocument, VerificationMethod, rotation/migration proofs, DidError
+│   ├── scp-did/               # Identity data model — wasm-safe (identifier, SigningKeyId, key state, attestation)
+│   │   ├── document.rs        # Retired document types; the key state replaces them
 │   │   └── attestation.rs     # Key-custody / identity-link attestation types
 │   │
 │   ├── scp-mls/               # Synchronous MLS state machine — wasm-safe, shared by node + browser (ADR-057)
@@ -436,10 +436,10 @@ State:
 
 ```
 Responsibilities:
-  • DID creation (did:dht primary, did:web fallback only) **[Superseded 2026-09-10 — the protocol produces no DID document and uses no did:dht: ADR-063, the inception-derived key-event-log identity substrate, replaced both with the key-event log and the service record (`03-identity.md` §3.10.13). A verifier resolves `#active` from the key state the latest state-carrying event carries (`09-security-model.md` §9.7.4.2 R8).]**
-  • DID resolution with security verification (§9.6)
-    - did:dht: self-certification check (BEP44 signature + sequence number) **[Superseded 2026-09-10 — the protocol produces no DID document and uses no did:dht: ADR-063, the inception-derived key-event-log identity substrate, replaced both with the key-event log and the service record (`03-identity.md` §3.10.13). A verifier resolves `#active` from the key state the latest state-carrying event carries (`09-security-model.md` §9.7.4.2 R8).]**
-    - did:web: TLS pinning + TOFU key recording + key change alerts
+  • Identity inception — compose and publish the inception event, whose digest is the identifier (`09-security-model.md` §9.7.4.2 R2, R13)
+  • Resolution with security verification (§9.6)
+    - Replay the key-event log, recompute the identifier, derive the key state (`09-security-model.md` §9.7.4.2 R2, R8)
+    - Apply the relay proof of control's five checks and R11's first-contact floor
   • Key rotation (triggers MLS Update in all active contexts — §9.7.4)
   • Key Continuity Verification — safety numbers (§9.11)
   • Compromise recovery flow orchestration (§9.12)
@@ -451,10 +451,10 @@ Responsibilities:
 Depends on:
   • Platform Adapter (key custody — Secure Enclave / Keystore)
   • Crypto Layer (signing, key derivation, MLS KeyPackage generation)
-  • Transport Adapter (DID document publication, KeyPackage distribution)
+  • Transport Adapter (key-event record and service-record publication, KeyPackage distribution)
 
 State:
-  • Local DID document
+  • Local key-event log and service record
   • Key handles (never raw keys — always via platform adapter)
   • TOFU key records — first-seen keys for contacts (§9.6.4)
   • Verification records — which contacts have been verified out-of-band (§9.11)
@@ -488,19 +488,19 @@ State:
 
 ```
 Responsibilities:
-  • DID document capability resolution — resolve capabilities from DID service arrays **[Superseded 2026-09-10 — the protocol produces no DID document and uses no did:dht: ADR-063, the inception-derived key-event-log identity substrate, replaced both with the key-event log and the service record (`03-identity.md` §3.10.13). A verifier resolves `#active` from the key state the latest state-carrying event carries (`09-security-model.md` §9.7.4.2 R8).]**
+  • Capability resolution — read an identity's self-asserted capability URIs from its service record (`03-identity.md` §3.10.13)
   • Context management — join/leave contexts with discovery tools, bootstrap defaults
   • Unified search — merge results from local contacts and contexts with discovery tools
   • Agent registration/deregistration in contexts with discovery tools
-  • Local contact index — cache of resolved DID documents for instant lookup **[Superseded 2026-09-10 — the protocol produces no DID document and uses no did:dht: ADR-063, the inception-derived key-event-log identity substrate, replaced both with the key-event log and the service record (`03-identity.md` §3.10.13). A verifier resolves `#active` from the key state the latest state-carrying event carries (`09-security-model.md` §9.7.4.2 R8).]**
+  • Local contact index — cache of resolved key states and service records for instant lookup
 
 Depends on:
   • Context Manager (contexts with discovery tools are standard contexts — join, outlet invocation)
-  • Identity Manager (DID resolution for capability lookup, DID document updates)
-  • Transport Adapter (DID document publication)
+  • Identity Manager (resolution for capability lookup, service-record writes)
+  • Transport Adapter (service-record publication)
 
 State:
-  • Local contact index (cached DID documents, TTL-based refresh)
+  • Local contact index (cached key states and service records, bounded refresh)
   • Known bootstrap context IDs (defaults + user-added)
   • Registration state per context
 ```
@@ -671,8 +671,8 @@ Dependencies flow strictly upward. No crate may depend on a crate at a *higher* 
 ```
 Layer 0 ─ scp-clock                 Clock port (wall-clock time). Wasm-safe leaf.
            │  scp-crypto             P-256 signature verification. Wasm-safe leaf.
-           │  scp-did                DID data model (DID, SigningKeyId, DidDocument,
-           │                          proofs, attestation). Wasm-safe leaf; deps =
+           │  scp-did                Identity data model (identifier, SigningKeyId, key state,
+           │                          attestation). Wasm-safe leaf; deps =
            │                          the `p256` crate directly (no SCP deps).
            │  scp-platform            Platform abstraction traits (KeyCustody, Storage,
            │                          DeviceAttestation, Push).
@@ -681,12 +681,11 @@ Layer 0 ─ scp-clock                 Clock port (wall-clock time). Wasm-safe le
 Layer 1 ─ scp-protocol              Pure sync protocol types (no tokio, wasm32-compatible).
            │  scp-runtime             Async orchestration (Supervisor + per-context actors, MLS, providers; ADR-049).
            │  scp-core                Facade re-exporting scp-protocol + scp-runtime.
-           │  scp-identity            Native DID subsystem — DID-method (DidDht), resolution/publication,
-           │                          lifecycle; imports the DID model from scp-did and the DHT
-           │                          transport from scp-dht.
-           │  scp-dht                  Native DHT transport leaf — DhtClient/DhtRecord/InMemory/Pkarr
-           │                          + BEP44 helpers + DhtError; no SCP deps (one-way
-           │                          scp-identity → scp-dht edge; ADR-057 T1c-a).
+           │  scp-identity            Native identity subsystem — key-event log composition,
+           │                          resolution and publication over the SCP relay network;
+           │                          imports the identity model from scp-did.
+           │  scp-dht                  Retired DHT transport leaf. The substrate resolves an
+           │                          identity over SCP relays, so no resolution path reads it.
            │  scp-event-log           Merkle event log.
            │  scp-mls                 Synchronous MLS state machine (wasm-safe; ADR-057).
            │  scp-client              In-browser participant driver over scp-mls (ADR-057).
@@ -709,7 +708,7 @@ Layer 4 ─ scp-testing               Dev-dependency only. Network simulation ha
                                       Never imported by production code.
 ```
 
-**Completed extractions:** `scp-identity` and `scp-event-log` have been extracted from `scp-core` into standalone Layer 1 crates. `scp-protocol` (pure sync types) and `scp-runtime` (async orchestration) have been extracted from the original `scp-core`, which is now a thin facade re-exporting both. The former `scp-primitives` junk-drawer was dissolved into three single-responsibility wasm-safe capability leaves — `scp-clock` (the `Clock` port), `scp-crypto` (P-256 signature verification), and `scp-did` (the DID data model, which also absorbed the DID-document/attestation types that had been parked in `scp-protocol`) — per ADR-057's Amendment (no generality-tier crate: universality is not a domain). `scp-identity` keeps its native DID-method/resolution/lifecycle subsystem as one crate (the DID-**method** layer is not separable — `DidDht` is bidirectionally fused with the async, `scp-platform`-coupled identity types; see ADR-057 rejected alternative 5) and now imports the DID model from `scp-did`. The pure DHT **transport** layer, however, *was* separable and was extracted into the native `scp-dht` leaf (`DhtClient`/`DhtRecord`/`InMemoryDhtClient`/`PkarrDhtClient` + BEP44 helpers), a one-way `scp-identity` → `scp-dht` edge (ADR-057 T1c-a). The synchronous MLS state machine was lifted into the wasm-safe `scp-mls`, shared by the native runtime and the in-browser client (`scp-client` / `scp-client-wasm`), per ADR-057.
+**Completed extractions:** `scp-identity` and `scp-event-log` have been extracted from `scp-core` into standalone Layer 1 crates. `scp-protocol` (pure sync types) and `scp-runtime` (async orchestration) have been extracted from the original `scp-core`, which is now a thin facade re-exporting both. The former `scp-primitives` junk-drawer was dissolved into three single-responsibility wasm-safe capability leaves — `scp-clock` (the `Clock` port), `scp-crypto` (P-256 signature verification), and `scp-did` (the identity data model, which also absorbed the document and attestation types that had been parked in `scp-protocol`) — per ADR-057's Amendment (no generality-tier crate: universality is not a domain). `scp-identity` keeps its native resolution and lifecycle subsystem as one crate, because the identity-**backend** layer is bidirectionally fused with the async, `scp-platform`-coupled identity types (ADR-057 rejected alternative 5), and it imports the identity model from `scp-did`. The DHT **transport** layer was separable and sits in the native `scp-dht` leaf behind a one-way edge (ADR-057 T1c-a); ADR-063 retired the resolution path that read it, so no identity operation reaches that leaf. The synchronous MLS state machine was lifted into the wasm-safe `scp-mls`, shared by the native runtime and the in-browser client (`scp-client` / `scp-client-wasm`), per ADR-057.
 
 #### 2.5.2 Replaceable Subsystems
 
@@ -722,8 +721,7 @@ Every subsystem in the table below is injected through a trait. Callers never co
 | Device attestation | `DeviceAttestation` | `scp-platform/src/traits.rs` | Full | Nothing — App Attest, Play Integrity, synthetic for testing. |
 | Push notifications | `Push` | `scp-platform/src/traits.rs` | Full | Nothing — APNs, FCM, synthetic. |
 | Transport | `TransportAdapter` | `scp-transport/src/traits.rs` | Full | Nothing — native relay, Nostr, Matrix, Hyperswarm, libp2p, WebSocket, WebRTC, custom. |
-| DID method | `DidMethod` | `scp-identity/src/lib.rs` | Full | Nothing — did:dht (primary), did:web (fallback), or custom method. **[Superseded 2026-09-10 — no DID document, no did:dht; `09-security-model.md` §9.7.4.2 R8]** |
-| DHT client | `DhtClient` | `crates/scp-dht/src/dht_client/` | Full | Nothing — pkarr (production), in-memory (testing), or custom BEP44 client. |
+| Identity backend | `IdentityBackend` | `scp-identity/src/lib.rs` | Full | Nothing — the seam ADR-063 names, behind which the key-event-log implementation sits and a `did:scp` facade could later sit. |
 | MLS primitives | `MlsBackend` | `scp-runtime/src/crypto/mls/` | Partial | MLS is protocol-fundamental; the OpenMLS implementation is swappable but any replacement must implement RFC 9420 with the SCP ciphersuite. |
 | HPKE primitives | `HpkeBackend` | `scp-runtime/src/crypto/` | Full | Nothing — any RFC 9180 implementation with the SCP suite. |
 | OpenMLS storage | `OpenMlsStorageAdapter` | `scp-runtime/src/crypto/mls/storage.rs` | None — internal to the OpenMLS `MlsBackend` | Not intended for replacement; swapping this only makes sense if the OpenMLS-based `MlsBackend` itself is replaced. |
@@ -768,16 +766,11 @@ Each replaceable trait imposes invariants that every implementation must uphold.
 - `delete` is best-effort — untrusted transports may ignore it.
 - Adapters map transport-specific semantics (WebSocket, Nostr relay, libp2p, etc.) onto this uniform interface.
 
-**`DidMethod`** (scp-core/identity) — `Send + Sync`, async methods.
-- `create` generates three P-256 keypairs (identity, active signing, pre-rotation) via the provided `KeyCustody`. Returns `ScpIdentity` + `DidDocument`.
-- `verify` is a local, synchronous self-certification check (z-base-32 decode + public key comparison).
-- `publish` and `resolve` perform network I/O against the underlying DID infrastructure.
-- `rotate` generates a new active signing key, updates the DID document, and publishes. The DID string does not change.
-
-**`DhtClient`** (scp-core/identity) — `Send + Sync`, async methods.
-- Abstracts BEP44 signed mutable item operations on a DHT.
-- `publish` enforces monotonic sequence number semantics — a publish with `seq` less than or equal to the existing sequence is a no-op.
-- `resolve` returns `Option<DhtRecord>` (value bytes + signature + sequence number).
+**`IdentityBackend`** (scp-identity) — `Send + Sync`, async methods. ADR-063 names the seam.
+- `create` composes the inception event, which fixes the root set, the first pre-rotation commitment and the initial key state, and returns the identity whose identifier is that event's digest (`09-security-model.md` §9.7.4.2 R2, R13).
+- `verify` is a local, synchronous check: recompute the identifier from the inception event's signed preimage and compare (R2).
+- `publish` and `resolve` perform network I/O against the SCP relay network — the key-event record at the identifier's routing id, and the service record at its own (`03-identity.md` §3.10.5, §3.10.13).
+- `rotate` composes a `KeyState` event listing the new operational key `current` and the old one `Superseded`, signed by the standing root. The identifier does not change (`03-identity.md` §3.2.1 case 1).
 
 **`MlsBackend`** (scp-runtime/crypto/mls) — `Send + Sync`, async methods (via `#[async_trait]`). Replaces the deleted `ContextCryptoProvider` (ADR-049).
 - Stateless MLS primitives: `create_group`, `add_member_raw`, `remove_member_raw`, `encrypt`, `decrypt`, `process_commit`, `advance_epoch`, `validate_key_package`, `generate_key_package`, `join_from_welcome`.
@@ -839,7 +832,7 @@ These rules must not be violated. They are enforced by the crate dependency grap
 
 2. **scp-platform has zero protocol knowledge.** It defines four platform abstraction traits and their supporting types. It must never import from scp-core, scp-transport, or any other protocol crate.
 
-3. **Identity module must never import from context module.** Identity is foundational — it creates DIDs, manages keys, and resolves DID documents. It must not depend on context lifecycle, membership, or governance. The reverse dependency (context depends on identity) is correct. **[Superseded 2026-09-10 — the protocol produces no DID document and uses no did:dht: ADR-063, the inception-derived key-event-log identity substrate, replaced both with the key-event log and the service record (`03-identity.md` §3.10.13). A verifier resolves `#active` from the key state the latest state-carrying event carries (`09-security-model.md` §9.7.4.2 R8).]**
+3. **Identity module must never import from context module.** Identity is foundational — it composes inception events, manages keys, and derives a key state from a key-event log. It must not depend on context lifecycle, membership, or governance. The reverse dependency (context depends on identity) is correct.
 
 4. **Event log module must never import from context, crypto, or identity.** The event log is a standalone Merkle tree data structure. It stores hashes of events — it does not interpret them. Any protocol-level meaning is the caller's responsibility.
 
@@ -1037,7 +1030,7 @@ Go, C#, and Java SDKs are not currently implemented. The scaffolding directories
 Build:
   • scp-core/crypto/ — MLS wrapper (OpenMLS), UCAN (native implementation)
   • scp-core/envelope/ — SCP envelope creation, signing, verification
-  • scp-core/identity/ — DID creation (did:dht) **[Superseded 2026-09-10 — the protocol produces no DID document and uses no did:dht: ADR-063, the inception-derived key-event-log identity substrate, replaced both with the key-event log and the service record (`03-identity.md` §3.10.13). A verifier resolves `#active` from the key state the latest state-carrying event carries (`09-security-model.md` §9.7.4.2 R8).]**
+  • scp-core/identity/ — identity inception and key-event log composition (`09-security-model.md` §9.7.4.2)
   • scp-core/clock.rs — Clock trait + SystemClock (§16.3)
   • scp-transport/native/ — SCP native relay adapter (single relay)
   • scp-transport/native/storage.rs — BlobStorage trait (§17.1)
@@ -1269,7 +1262,7 @@ This is a hard requirement, not an aspiration. Every protocol mechanism must be 
 | Infrastructure | Who runs it | Why it works without Limn |
 |---|---|---|
 | Transport relays | Users, communities, anyone | SCP native relay is trivially self-hostable. Existing infrastructure (Nostr relays, Hyperswarm, libp2p, Matrix homeservers) also works. Multiple transports, no single dependency. |
-| DID resolution | Mainline DHT (existing) | did:dht resolves via BitTorrent's Mainline DHT — millions of existing nodes. No server to operate. Self-certifying. **[Superseded 2026-09-10 — no DID document, no did:dht; `09-security-model.md` §9.7.4.2 R8]** |
+| Identity resolution | The SCP relay network and the shipped community relay list | Every relay is substitutable and untrusted, and the SDK ships a fixed list of relays under distinct operators (§18.5.1). A verifier recomputes the identifier from the inception bytes, so correctness rests on no relay. |
 | SDK packages | PyPI, npm, crates.io | Standard open-source package distribution. Forkable. |
 | Key storage | User devices | Secure Enclave, Android Keystore, WebCrypto. On-device. |
 
@@ -1278,11 +1271,11 @@ This is a hard requirement, not an aspiration. Every protocol mechanism must be 
 | Non-infrastructure | Why |
 |---|---|
 | Central relay | No privileged relay. All relays are substitutable and untrusted. |
-| User database | DIDs are self-sovereign. No registry of users. |
+| User database | An identifier is the digest of an inception event its holder composed. No registry of users. |
 | Key server | Keys are in hardware security modules on user devices. |
 | Application server | Apps are client-side. SDK handles everything. |
-| Identity provider | DIDs are self-issued. No sign-up, no approval. |
-| Certificate authority | did:dht is self-certifying. No CA chain. **[Superseded 2026-09-10 — no DID document, no did:dht; `09-security-model.md` §9.7.4.2 R8]** |
+| Identity provider | Identities are self-issued. No sign-up, no approval. |
+| Certificate authority | The identifier is the digest of the inception event that fixes the root set, so the binding is self-certifying. No CA chain. |
 
 ---
 
@@ -1292,7 +1285,7 @@ This is a hard requirement, not an aspiration. Every protocol mechanism must be 
 |---|---|---|---|
 | OpenMLS immaturity | Medium | High | OpenMLS is the most mature MLS library in Rust but may have edge cases. Fallback: mls-rs. Both are active. |
 | PyO3 async complexity | Medium | Medium | Rust async (tokio) ↔ Python async (asyncio) bridging is tricky. Mitigate with synchronous Python API as fallback. |
-| did:dht library gaps | Medium | Medium | did:dht is the primary method. If libraries hit a wall, did:web is the contingency fallback (not a planned path). SDK abstracts the DID method so the fallback is transparent to apps. **[Superseded 2026-09-10 — no DID document, no did:dht; `09-security-model.md` §9.7.4.2 R8]** |
+| Key-event-log implementation | Medium | High | SCP writes its own byte layouts under the canonical hash construction rather than adopting an external encoding, so no third-party library gates it. The risk is byte divergence between bindings, which the known-answer vectors of `25-test-vectors.md` §25.26 pin. |
 | Browser key custody | Low | Medium | Browser clients run the protocol in-tab over shared `scp-mls` code (ADR-057), so keys are on-device: the browser uses WebCrypto-backed custody (non-extractable keys) and holds its own MLS state and event log, rather than a server-side `scp-node` holding them. There is no browser Secure Enclave, so on-device key protection rests on the WebCrypto/IndexedDB substrate; a remote custodial thin client (node-held keys) remains an opt-in secondary mode. |
 | Transport adapter availability | Low | Low | SCP native relay is canonical and purpose-built. Multiple adapter options (Nostr, Hyperswarm, libp2p, Matrix, etc.) provide redundancy. No single-transport dependency. |
 | MLS group state sync (offline) | High | High | Offline members accumulate pending proposals. Extended offline (days) may require group state reset. This is the hardest unsolved problem. |
@@ -1308,13 +1301,13 @@ This is a hard requirement, not an aspiration. Every protocol mechanism must be 
 | Second binding | TypeScript (napi-rs) | Node/Bun in-process; browser = in-tab client over shared scp-mls, keys on-device (ADR-057). |
 | Third binding | Swift (UniFFI) | iOS/macOS apps. |
 | Core language | Rust | Crypto libraries, performance, cross-platform via FFI. |
-| DID method (primary) | did:dht | Self-certifying, decentralized, key rotation, no server dependency. No migration path. **[Superseded 2026-09-10 — no DID document, no did:dht; `09-security-model.md` §9.7.4.2 R8]** |
-| DID method (fallback) | did:web | Contingency only if did:dht libraries prove unusable. Not a planned deployment. **[Superseded 2026-09-10 — no DID document, no did:dht; `09-security-model.md` §9.7.4.2 R8]** |
+| Identity substrate | Inception-derived identifier over a key-event log (ADR-063) | Self-certifying, decentralized, rotation without rename, no server dependency. Modelled on KERI. |
+| Identity seam | `IdentityBackend` | A `did:scp` facade stays optional and unbuilt behind it, foreclosed by nothing (ADR-063). |
 | Group encryption | MLS (OpenMLS) | O(log n) removal, forward secrecy, clean key destruction. |
 | Transport | SCP native relay (canonical) + adapters | No dependency on any single transport. SCP native relay is simplest reference. Adapters: Nostr, Matrix, Holepunch/Hyperswarm, libp2p, WebSocket, WebRTC, QUIC, BLE, Tor, I2P, SSB, MQTT, NATS, ZeroMQ, Yggdrasil, cjdns. |
 | Capability tokens | UCAN (native impl) | Per-agent, per-context, per-capability, revocable. Native implementation using the `p256` crate + serde_json. |
 | Spec status | Ships with SDK, iterates | Don't wait for perfect spec. Working code first. |
-| Infrastructure owned | Almost nothing | did:dht uses Mainline DHT (existing). Everything else is existing or user-owned. **[Superseded 2026-09-10 — no DID document, no did:dht; `09-security-model.md` §9.7.4.2 R8]** |
+| Infrastructure owned | Almost nothing | Identity resolves over SCP relays, which anyone self-hosts. Everything else is existing or user-owned. |
 | MCP integration | SCP agent as MCP server | Every MCP-compatible model works with SCP. Zero model-side integration. |
 
 ---
@@ -1324,7 +1317,7 @@ This is a hard requirement, not an aspiration. Every protocol mechanism must be 
 - **Specific API signatures.** See sketch.md for API surfaces (§1–§14) and security APIs (§16).
 - **Protocol semantics.** See .docs/specs/ for the full protocol design.
 - **Cryptographic security model.** See .docs/specs/ 09 §9.5–§9.15 for the full security specification (MITM prevention, replay prevention, relay threat model, key lifecycle, forward secrecy, PCS, compromise recovery). See planning-session-05.md for the security design rationale.
-- **Technology selection rationale.** See planning-session-04.md for why MLS over Sender Keys, why did:dht, etc. **[Superseded 2026-09-10 — the protocol produces no DID document and uses no did:dht: ADR-063, the inception-derived key-event-log identity substrate, replaced both with the key-event log and the service record (`03-identity.md` §3.10.13). A verifier resolves `#active` from the key state the latest state-carrying event carries (`09-security-model.md` §9.7.4.2 R8).]**
+- **Technology selection rationale.** See planning-session-04.md for why MLS over Sender Keys. Its identity-method rationale is superseded by ADR-063, the inception-derived key-event-log identity substrate.
 - **Context extension design.** See planning-session-03.md for the Moltbook analysis and context extension design (TTL, memory scope, templates).
 - **Adapter trait definitions.** See planning-session-04.md for full Rust trait definitions.
 - **Deployment operations.** Undesigned. Needed before launch. (Governance is designed — see ADR-031, GovernanceEngine trait with SingleAdmin, Threshold, Majority, and Unanimity models.)
