@@ -199,7 +199,7 @@ SDK Public API: callback/stream delivers "hello" to Bob's app
 │  │  mcp.tools.call() → route to SCP context + tool   │       │
 │  │                                                    │       │
 │  │  Invisible to model:                               │       │
-│  │  • DID authentication                              │       │
+│  │  • Identity authentication                         │       │
 │  │  • UCAN capability validation                      │       │
 │  │  • MLS encryption                                  │       │
 │  │  • Transport routing                               │       │
@@ -231,7 +231,7 @@ Browser-based SCP agent
          │
          ├──── UCP (Universal Commerce Protocol)
          │     Agent transacts on behalf of human.
-         │     SCP provides: identity (DID), trust evaluation of merchant,
+         │     SCP provides: identity, trust evaluation of merchant,
          │     capability ceiling (spending limits), audit trail (event log)
          │
          └──── MCP (local tools)
@@ -239,7 +239,7 @@ Browser-based SCP agent
                SCP provides: same identity, trust, audit.
 ```
 
-SCP doesn't implement MCP, WebMCP, or UCP. It wraps them with identity, trust, and accountability. An agent using UCP to buy something does so with an SCP DID, under UCAN capability constraints (spending limit), and the transaction is recorded in the context event log.
+SCP doesn't implement MCP, WebMCP, or UCP. It wraps them with identity, trust, and accountability. An agent using UCP to buy something does so with an SCP identity, under UCAN capability constraints (spending limit), and the transaction is recorded in the context event log.
 
 ---
 
@@ -272,9 +272,10 @@ scp/
 │   │
 │   ├── scp-core/              # Facade re-exporting scp-protocol + scp-runtime
 │   │
-│   ├── scp-identity/          # Native identity subsystem — key-event log, resolution/publication, lifecycle
+│   ├── scp-identity/          # Native identity subsystem — key-event log, publication, lifecycle;
+│   │                          #   IdentityBackend::resolve is the one resolution entry point (03-identity.md §3.10.10)
 │   │
-│   ├── scp-dht/               # Retired DHT transport leaf — the substrate resolves over SCP relays, not a DHT
+│   ├── scp-dht/               # Retired DHT transport leaf — no resolution path reads it
 │   │
 │   ├── scp-event-log/         # Merkle event log
 │   │
@@ -403,7 +404,7 @@ Depends on:
 State:
   • All protocol state flows through ProtocolRepository to Storage:
     context state, membership, sender keys, event logs, nonces,
-    DID cache, TOFU records, outlets, sessions, relay scores, identity
+    key-state cache, TOFU records, outlets, sessions, relay scores, identity
 ```
 
 **Context Manager** — the central coordinator:
@@ -421,7 +422,7 @@ Responsibilities:
 
 Depends on:
   • Crypto Layer (MLS group management, UCAN validation)
-  • Identity Manager (DID resolution, agent instantiation)
+  • Identity Manager (key-state resolution, agent instantiation)
   • Transport Adapter (envelope delivery)
   • Event Log (append events, generate proofs)
   • ProtocolRepository (context state persistence — §17.4)
@@ -554,10 +555,10 @@ State:
 │                                                                  │
 │  MLS ↔ SCP concept mapping (§9.7.1):                            │
 │    MLS Group       = SCP Context                                 │
-│    MLS Member      = SCP Agent (DID + context role)              │
+│    MLS Member      = SCP Agent (identifier + context role)       │
 │    MLS Epoch       = SCP Context epoch                           │
 │    MLS DS          = SCP relay(s) — explicitly untrusted         │
-│    MLS AS          = DID resolution + UCAN validation            │
+│    MLS AS          = key-state resolution + UCAN validation      │
 │    MLS KeyPackage  = Pre-key bundle for offline member addition  │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
@@ -567,12 +568,12 @@ State:
 - One MLS group per SCP context in Encrypted mode (1:1 mapping)
 - Forward secrecy: SDK MUST delete old epoch keys after Commit (§9.7.2)
 - Post-compromise security: SDK MUST issue periodic MLS Updates, recommended every 24 hours (§9.7.3)
-- Key lifecycle: generation (HSM-backed), distribution (KeyPackages on relays), rotation (DID update → MLS Update in all contexts), destruction (platform-attested, §9.15)
+- Key lifecycle: generation (HSM-backed), distribution (KeyPackages on relays), rotation (a key event → MLS Update in all contexts), destruction (platform-attested, §9.15)
 - Broadcast mode (§5.14) does NOT use MLS — it substitutes per-author AES-256-GCM broadcast keys with a pull-based key distribution protocol (identical to sender keys §9.16.2). Broadcast contexts have no MLS group, no forward secrecy (mitigated by epoch rotation on block events), and public routing_id = SHA-256(context_id).
 
 **Security Module responsibilities (§9.8–§9.12):**
 - Three-layer replay prevention: MLS generation numbers + hash dedup (10K cache) + timestamp bounds (5-min tolerance)
-- Key Continuity Verification: Signal-style safety numbers for DID verification (§9.11)
+- Key Continuity Verification: Signal-style safety numbers for identifier verification (§9.11)
 - Relay Consistency Protocol: periodic Merkle root comparison for equivocation detection (§9.9.3)
 - Compromise recovery: ordered key rotation across all contexts (§9.12)
 - Ephemeral key destruction with platform attestation (§9.15)
@@ -660,7 +661,7 @@ Contexts can form parent-child relationships (spec §5.13, ADR-008). A child con
 
 ### 2.5 Abstraction Boundaries and Replaceable Subsystems
 
-SCP's architecture is built on trait-based dependency injection. Every external capability — key custody, storage, transport, DID resolution, event log persistence, crypto operations, payments — is abstracted behind a Rust trait. Production and testing implementations share identical API surfaces. Any implementation can be replaced without touching calling code.
+SCP's architecture is built on trait-based dependency injection. Every external capability — key custody, storage, transport, key-state resolution, event log persistence, crypto operations, payments — is abstracted behind a Rust trait. Production and testing implementations share identical API surfaces. Any implementation can be replaced without touching calling code.
 
 This section documents the layered dependency graph, every replaceable subsystem, the trait contracts they must uphold, and the architectural invariants that must never be violated.
 
@@ -684,8 +685,7 @@ Layer 1 ─ scp-protocol              Pure sync protocol types (no tokio, wasm32
            │  scp-identity            Native identity subsystem — key-event log composition,
            │                          resolution and publication over the SCP relay network;
            │                          imports the identity model from scp-did.
-           │  scp-dht                  Retired DHT transport leaf. The substrate resolves an
-           │                          identity over SCP relays, so no resolution path reads it.
+           │  scp-dht                  Retired DHT transport leaf; no resolution path reads it.
            │  scp-event-log           Merkle event log.
            │  scp-mls                 Synchronous MLS state machine (wasm-safe; ADR-057).
            │  scp-client              In-browser participant driver over scp-mls (ADR-057).
@@ -708,7 +708,7 @@ Layer 4 ─ scp-testing               Dev-dependency only. Network simulation ha
                                       Never imported by production code.
 ```
 
-**Completed extractions:** `scp-identity` and `scp-event-log` have been extracted from `scp-core` into standalone Layer 1 crates. `scp-protocol` (pure sync types) and `scp-runtime` (async orchestration) have been extracted from the original `scp-core`, which is now a thin facade re-exporting both. The former `scp-primitives` junk-drawer was dissolved into three single-responsibility wasm-safe capability leaves — `scp-clock` (the `Clock` port), `scp-crypto` (P-256 signature verification), and `scp-did` (the identity data model, which also absorbed the document and attestation types that had been parked in `scp-protocol`) — per ADR-057's Amendment (no generality-tier crate: universality is not a domain). `scp-identity` keeps its native resolution and lifecycle subsystem as one crate, because the identity-**backend** layer is bidirectionally fused with the async, `scp-platform`-coupled identity types (ADR-057 rejected alternative 5), and it imports the identity model from `scp-did`. The DHT **transport** layer was separable and sits in the native `scp-dht` leaf behind a one-way edge (ADR-057 T1c-a); ADR-063 retired the resolution path that read it, so no identity operation reaches that leaf. The synchronous MLS state machine was lifted into the wasm-safe `scp-mls`, shared by the native runtime and the in-browser client (`scp-client` / `scp-client-wasm`), per ADR-057.
+**Completed extractions:** `scp-identity` and `scp-event-log` have been extracted from `scp-core` into standalone Layer 1 crates. `scp-protocol` (pure sync types) and `scp-runtime` (async orchestration) have been extracted from the original `scp-core`, which is now a thin facade re-exporting both. The former `scp-primitives` junk-drawer was dissolved into three single-responsibility wasm-safe capability leaves — `scp-clock` (the `Clock` port), `scp-crypto` (P-256 signature verification), and `scp-did` (the identity data model, which also absorbed the document and attestation types that had been parked in `scp-protocol`) — per ADR-057's Amendment (no generality-tier crate: universality is not a domain). `scp-identity` keeps its native resolution and lifecycle subsystem as one crate, because the identity-**backend** layer is bidirectionally fused with the async, `scp-platform`-coupled identity types (ADR-057 rejected alternative 5), and it imports the identity model from `scp-did`. The DHT **transport** layer was separable and sits in the native `scp-dht` leaf behind a one-way edge (ADR-057 T1c-a), and ADR-063 retired the resolution path that read it. The synchronous MLS state machine was lifted into the wasm-safe `scp-mls`, shared by the native runtime and the in-browser client (`scp-client` / `scp-client-wasm`), per ADR-057.
 
 #### 2.5.2 Replaceable Subsystems
 
@@ -721,7 +721,7 @@ Every subsystem in the table below is injected through a trait. Callers never co
 | Device attestation | `DeviceAttestation` | `scp-platform/src/traits.rs` | Full | Nothing — App Attest, Play Integrity, synthetic for testing. |
 | Push notifications | `Push` | `scp-platform/src/traits.rs` | Full | Nothing — APNs, FCM, synthetic. |
 | Transport | `TransportAdapter` | `scp-transport/src/traits.rs` | Full | Nothing — native relay, Nostr, Matrix, Hyperswarm, libp2p, WebSocket, WebRTC, custom. |
-| Identity backend | `IdentityBackend` | `scp-identity/src/lib.rs` | Full | Nothing — the seam ADR-063 names, behind which the key-event-log implementation sits and a `did:scp` facade could later sit. |
+| Identity backend | `IdentityBackend` | `scp-identity/src/lib.rs` | Full | Nothing — the seam ADR-063 names, behind which the key-event-log implementation sits. |
 | MLS primitives | `MlsBackend` | `scp-runtime/src/crypto/mls/` | Partial | MLS is protocol-fundamental; the OpenMLS implementation is swappable but any replacement must implement RFC 9420 with the SCP ciphersuite. |
 | HPKE primitives | `HpkeBackend` | `scp-runtime/src/crypto/` | Full | Nothing — any RFC 9180 implementation with the SCP suite. |
 | OpenMLS storage | `OpenMlsStorageAdapter` | `scp-runtime/src/crypto/mls/storage.rs` | None — internal to the OpenMLS `MlsBackend` | Not intended for replacement; swapping this only makes sense if the OpenMLS-based `MlsBackend` itself is replaced. |
@@ -769,7 +769,8 @@ Each replaceable trait imposes invariants that every implementation must uphold.
 **`IdentityBackend`** (scp-identity) — `Send + Sync`, async methods. ADR-063 names the seam.
 - `create` composes the inception event, which fixes the root set, the first pre-rotation commitment and the initial key state, and returns the identity whose identifier is that event's digest (`09-security-model.md` §9.7.4.2 R2, R13).
 - `verify` is a local, synchronous check: recompute the identifier from the inception event's signed preimage and compare (R2).
-- `publish` and `resolve` perform network I/O against the SCP relay network — the key-event record at the identifier's routing id, and the service record at its own (`03-identity.md` §3.10.5, §3.10.13).
+- `resolve` is the protocol's one resolution entry point: it takes the identifier's 32 raw digest bytes and returns a `ResolutionOutcome` (`03-identity.md` §3.10.10).
+- `publish` writes the key-event record at the identifier's routing id and the service record at its own (`03-identity.md` §3.10.5, §3.10.13).
 - `rotate` composes a `KeyState` event listing the new operational key `current` and the old one `Superseded`, signed by the standing root. The identifier does not change (`03-identity.md` §3.2.1 case 1).
 
 **`MlsBackend`** (scp-runtime/crypto/mls) — `Send + Sync`, async methods (via `#[async_trait]`). Replaces the deleted `ContextCryptoProvider` (ADR-049).
