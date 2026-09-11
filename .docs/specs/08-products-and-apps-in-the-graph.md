@@ -2,7 +2,7 @@
 
 ## 8.1 Apps in the Protocol
 
-An app is not a protocol entity. It has no DID, is not an agent, and is not a context. The protocol has no `App` type.
+An app is not a protocol entity. It has no identifier, is not an agent, and is not a context. The protocol has no `App` type.
 
 What people experience as "an app" is a composite: a context (or set of contexts) + its members + its data + the backend, hosting, and relays that support it. The client is just the visible surface. The app's identity is the whole gestalt — the community, the infrastructure, the accumulated state. This is a philosophical identity, not a codified one. The protocol doesn't need to model it because the constituent parts (contexts, members, outlets, data, capability declarations) are already first-class. The app emerges from their composition.
 
@@ -93,7 +93,7 @@ The capability declaration uses JSON Schema (MCP-compatible) with SCP-specific e
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `scp_version` | string | Yes | SCP protocol version this declaration targets. Format: `"MAJOR.MINOR"`. SDKs MUST support declarations with the same MAJOR version and any MINOR version <= current. |
-| `app_id` | DID | Yes | DID of the app publisher. Used for trust evaluation and revocation. |
+| `app_id` | 32 bytes | Yes | The app publisher's identifier. Used for trust evaluation and revocation. |
 | `app_name` | string | Yes | Human-readable app name. Maximum 128 UTF-8 bytes. |
 | `app_version` | string | Yes | App version. SemVer format (`MAJOR.MINOR.PATCH`). |
 | `capabilities` | array | Yes | List of requested capabilities. Each entry specifies a resource URI and actions. Minimum 1 entry, maximum 64 entries. |
@@ -160,11 +160,11 @@ MCP (Model Context Protocol) defines how AI models connect to tools and data sou
 └──────────────────────────────────────────────────────┘
 ```
 
-**Which key the agent signs with.** An agent signs under the `#active` key of its own delegated identity, whose key-event log the human's log anchors (`09-security-model.md` §9.1 invariant 1). That delegation model is unspecified as of 2026-09-10 (`00-open-questions.md`).
+**Which key the agent signs with.** An agent signs under the `#active` key of its own delegated identity (`09-security-model.md` §9.1 invariant 1).
 
 The SCP agent is a translation layer: an MCP server from the model's perspective, an SCP protocol participant from the network's perspective. This separation has several consequences:
 
-**Any MCP-compatible model participates in SCP without modification.** The model doesn't need to know about DIDs, capability tokens, encryption, or context governance. It sees tools. "Send a message" is a tool call. "Read recent messages" is a tool call. "Invoke the scheduling tool" is a tool call. The agent handles everything SCP-specific.
+**Any MCP-compatible model participates in SCP without modification.** The model doesn't need to know about identifiers, capability tokens, encryption, or context governance. It sees tools. "Send a message" is a tool call. "Read recent messages" is a tool call. "Invoke the scheduling tool" is a tool call. The agent handles everything SCP-specific.
 
 **SCP outlet schemas should use MCP's format.** If SCP defines its outlet interface using MCP-compatible JSON schemas, then SCP context outlets are natively MCP-compatible with zero translation. The agent passes outlet schemas through directly. This is a concrete design decision: SCP outlet definitions should be a superset of MCP tool definitions, adding SCP-specific metadata (context scope, capability requirements, provenance) while keeping the core schema MCP-compatible.
 
