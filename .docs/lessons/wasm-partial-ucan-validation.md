@@ -4,14 +4,14 @@
 
 **Rule**: When a validation pipeline is partially implemented due to platform constraints, the docstring must accurately describe what IS checked, not claim full validation. False documentation of security properties is worse than no documentation.
 
-**Context (SCP-218)**: The WASM bridge `ucan_validate` docstring claimed "Performs full UCAN validation: signature verification, time bounds checking, delegation chain traversal, attenuation enforcement, nonce replay detection, and capability matching." In reality, the implementation performs: JWT format check, base64/JSON decode, expiry check, capability string match, and revocation check. Missing: Ed25519 signature verification, delegation chain traversal, root issuer check, audience DID validation, attenuation enforcement, ceiling check, nonce replay detection.
+**Context (SCP-218)**: The WASM bridge `ucan_validate` docstring claimed "Performs full UCAN validation: signature verification, time bounds checking, delegation chain traversal, attenuation enforcement, nonce replay detection, and capability matching." In reality, the implementation performs: JWT format check, base64/JSON decode, expiry check, capability string match, and revocation check. Missing: signature verification, delegation chain traversal, root issuer check, audience validation, attenuation enforcement, ceiling check, nonce replay detection.
 
 **Why scp-core validation cannot be used in WASM**: `scp-core` depends on `tokio = { features = ["full"] }` which requires a multi-thread runtime. `wasm32-unknown-unknown` cannot compile this. The WASM bridge must re-implement validation logic using only WASM-compatible crates.
 
 **What full WASM validation requires**:
-- Ed25519 signature verification: requires `JsKeyCustody` wiring (SCP-214 analog for WASM) — WebCrypto API via injected JS callback
+- Signature verification: requires `JsKeyCustody` wiring (SCP-214 analog for WASM) — WebCrypto API via injected JS callback
 - Nonce replay detection: each `PerContextState` already has `revoked_tokens: HashSet<String>`; a nonce set can be added
-- Audience validation: check `payload["aud"]` against the presenting identity DID (parameter already available)
+- Audience validation: check `payload["aud"]` against the presenting identity's identifier (parameter already available)
 - Ceiling check: read the ceiling from the per-context role state (`role_state.ceiling()`). (Historically this described a flat `ceiling_strings: HashSet<String>` field on the per-context state; that field has since been removed — the ceiling now lives inside the shared `ContextRoleState`.)
 - Delegation chain: requires proof token resolution — possible with in-memory HashMap, matching PyO3 bridge pattern
 
