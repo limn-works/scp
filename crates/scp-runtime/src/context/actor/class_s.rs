@@ -2700,6 +2700,19 @@ pub(crate) struct ClassSCell {
     /// [`Self::clear_committed_reservation_idempotent`]). There is no `state_mut`
     /// escape hatch and no `DerefMut`.
     state: PerContextState,
+    /// Number of mutable views this cell has handed out over `state` since
+    /// construction (ADR-049 §9). Every combinator, token discharge, and view
+    /// accessor that constructs a [`ClassSMut`] or [`ClassCMut`] over `state`
+    /// advances it at the point where a mutation can have been applied, so a
+    /// caller that reads [`Self::mutation_epoch`] before a fallible sequence and
+    /// compares after it learns whether that sequence can have touched the
+    /// state. `execute_governance_action` reads it to decide what a dispatch
+    /// error means: an unchanged epoch proves the helper applied no effect, so
+    /// the proposal's replay marker can be dropped and the proposal retried; a
+    /// changed epoch means a retry would re-apply an effect, so the marker
+    /// stays. In-memory only: never persisted, never part of a snapshot, and
+    /// reset to zero on every respawn.
+    mutation_epoch: u64,
 }
 
 impl Deref for ClassSCell {
@@ -2716,7 +2729,18 @@ impl Deref for ClassSCell {
 impl ClassSCell {
     /// Wrap an owned [`PerContextState`].
     pub(crate) const fn new(state: PerContextState) -> Self {
-        Self { state }
+        Self {
+            state,
+            mutation_epoch: 0,
+        }
+    }
+
+    /// The count of mutable views handed out over the wrapped state so far.
+    /// Two reads that return the same value prove that no [`ClassSMut`] and no
+    /// [`ClassCMut`] was constructed between them, so no mutation can have
+    /// been applied to the state in that interval. See the field doc.
+    pub(crate) const fn mutation_epoch(&self) -> u64 {
+        self.mutation_epoch
     }
 
     /// Unwrap, returning the owned [`PerContextState`]. Used at ownership
@@ -2745,11 +2769,16 @@ impl ClassSCell {
         &mut self,
         saga_id: &crate::context::supervisor::saga_journal::SagaId,
     ) -> bool {
-        self.state
+        let removed = self
+            .state
             .class_s
             .xctx_caller_reservations
             .remove(saga_id)
-            .is_some()
+            .is_some();
+        if removed {
+            self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+        }
+        removed
     }
 
     /// Set the monotonic generation counter directly (test fixtures only).
@@ -2760,6 +2789,7 @@ impl ClassSCell {
     #[cfg(test)]
     pub(crate) const fn set_generation_for_test(&mut self, g: u64) {
         self.state.generation = g;
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
     }
 
     /// Mutate Class-S state through a [`ClassSMut`] view and persist
@@ -2796,6 +2826,9 @@ impl ClassSCell {
         f: impl FnOnce(ClassSMut) -> Result<T, ContextError>,
     ) -> Result<T, ContextError> {
         let value = f(ClassSMut::new(&mut self.state))?;
+        // Keep-direction: the mutation stays in memory whether or not the
+        // persist lands, so it counts from here.
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         persist_state_fail_closed(&self.state, deps, context_id)
             .await
             .map(|()| value)
@@ -2859,7 +2892,12 @@ impl ClassSCell {
         let gov_snap = self.state.governance.class_s.snapshot();
         let value = f(ClassSMut::new(&mut self.state))?;
         match persist_state_fail_closed(&self.state, deps, context_id).await {
-            Ok(()) => Ok(value),
+            Ok(()) => {
+                // Restore-direction: only a persisted mutation survives, so
+                // only the persisted arm counts.
+                self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+                Ok(value)
+            }
             Err(persist_err) => {
                 self.restore_class_s(class_s_snap, gov_snap, deps);
                 Err(persist_err)
@@ -2928,7 +2966,13 @@ impl ClassSCell {
         let gov_snap = self.state.governance.class_s.snapshot();
         let (value, external) = f(ClassSMut::new(&mut self.state))?;
         match persist_state_fail_closed(&self.state, deps, context_id).await {
-            Ok(()) => Ok(value),
+            Ok(()) => {
+                // Restore-direction: only the persisted arm counts (the failure
+                // arm restores the Class-S state and compensates the external
+                // effect, so nothing of `f` survives it).
+                self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+                Ok(value)
+            }
             Err(persist_err) => {
                 self.restore_class_s(class_s_snap, gov_snap, deps);
                 compensate(external, ClassCMut::new(&mut self.state), deps).await;
@@ -3010,6 +3054,8 @@ impl ClassSCell {
         // No Class-S snapshot: keep-direction leaves the Class-S mutation in
         // place on persist failure, so there is nothing to restore.
         let (value, external) = f(ClassSMut::new(&mut self.state))?;
+        // Keep-direction: the Class-S mutation stays in memory on either arm.
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         match persist_state_fail_closed(&self.state, deps, context_id).await {
             Ok(()) => Ok(value),
             Err(persist_err) => {
@@ -3097,6 +3143,9 @@ impl ClassSCell {
                 durability_diverged: false,
                 err,
             })?;
+        // `f` mutated the state; the restore arm below re-persists a rolled-back
+        // state, but the interval still handed out a mutable view, so it counts.
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         persist_state_fail_closed(&self.state, deps, context_id)
             .await
             .map_err(|err| {
@@ -3146,6 +3195,7 @@ impl ClassSCell {
         f: impl FnOnce(ClassCMut),
     ) {
         f(ClassCMut::new(&mut self.state));
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         persist_state_best_effort(&self.state, deps, context_id).await;
     }
 
@@ -3184,6 +3234,7 @@ impl ClassSCell {
     /// mutator), so no fail-closed-requiring transition can escape unpersisted.
     ///
     pub(crate) const fn class_c_view(&mut self) -> ClassCMut<'_> {
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         ClassCMut::new(&mut self.state)
     }
 
@@ -3256,6 +3307,8 @@ impl ClassSCell {
         // deliberately NOT snapshotted — keep-direction has nothing to restore).
         let restore_snap = snapshot_restore_field(&self.state.class_s);
         let value = f(ClassSMut::new(&mut self.state))?;
+        // Keep-direction for the kept field: it stays in memory on either arm.
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         match persist_state_fail_closed(&self.state, deps, context_id).await {
             Ok(()) => Ok(value),
             Err(persist_err) => {
@@ -3328,6 +3381,7 @@ impl ClassSCell {
         f: impl FnOnce(ClassSMut) -> Result<T, ContextError>,
     ) -> Result<(T, ClassSCommitToken), ContextError> {
         let value = f(ClassSMut::new(&mut self.state))?;
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         Ok((value, ClassSCommitToken::new(context_id)))
     }
 
@@ -3362,6 +3416,9 @@ impl ClassSCell {
         f: impl FnOnce(ClassSMut) -> Result<(T, bool), ContextError>,
     ) -> Result<(T, Option<ClassSCommitToken>), ContextError> {
         let (value, did_mutate) = f(ClassSMut::new(&mut self.state))?;
+        if did_mutate {
+            self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+        }
         let token = if did_mutate {
             Some(ClassSCommitToken::new(context_id))
         } else {
@@ -3618,6 +3675,7 @@ impl ClassSCommitToken {
         // `f`'s result (keep-direction: a partial mutation `f` left must be made
         // durable; un-doing it is the unsafe direction).
         let f_result = f(ClassSMut::new(&mut cell.state));
+        cell.mutation_epoch = cell.mutation_epoch.wrapping_add(1);
         self.consumed = true;
         // The SINGLE deferred fail-closed persist, routed through the shared
         // [`persist_state_fail_closed`] helper so the keep-direction/fail-closed
@@ -3660,6 +3718,7 @@ impl ClassSCommitToken {
     /// (e.g. the finalize body panics), the owned token's `Drop` obligation fires,
     /// exactly as an un-committed `ClassSCommitToken` would.
     pub(crate) const fn begin_discharge(self, cell: &mut ClassSCell) -> ClassSDischargeGuard<'_> {
+        cell.mutation_epoch = cell.mutation_epoch.wrapping_add(1);
         ClassSDischargeGuard {
             token: self,
             state: &mut cell.state,
@@ -4644,8 +4703,11 @@ mod tests {
         //   bodies own the fail-closed persist), to roll a Class-S sub-struct back to
         //   a pre-`f` snapshot when that persist FAILED — by construction always
         //   wrapped by a persisting combinator, never a standalone mutation entry.
-        const KNOWN_SAFE: [&str; 6] = [
+        // - `mutation_epoch` — a `&self` reader of the view hand-out counter; it
+        //   holds no `&mut` at all, so it can perform no mutation of any class.
+        const KNOWN_SAFE: [&str; 7] = [
             "into_inner",
+            "mutation_epoch",
             "class_c_view",
             "commit_class_c_best_effort",
             "clear_committed_reservation_idempotent",
@@ -7792,6 +7854,205 @@ impl ClassSCell
         assert_eq!(
             pending.new_capabilities, new_ceiling,
             "staged pending modification carries the proposed capabilities verbatim"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // `mutation_epoch` — the view hand-out counter `execute_governance_action`
+    // reads to tell a pre-effect dispatch error from a post-effect one.
+    // -----------------------------------------------------------------------
+
+    /// A fresh cell starts at zero, and `Deref` reads advance nothing: two
+    /// equal reads must prove that no mutable view was constructed between them.
+    #[test]
+    fn mutation_epoch_starts_at_zero_and_reads_hold_it() {
+        let cell = ClassSCell::new(fresh_state(0x90));
+        assert_eq!(cell.mutation_epoch(), 0, "fresh cell starts at epoch 0");
+        let _ = cell.members.len();
+        let _ = cell.governance.class_s.threshold_value;
+        assert_eq!(
+            cell.mutation_epoch(),
+            0,
+            "immutable reads through `Deref` construct no view and advance nothing"
+        );
+    }
+
+    /// `class_c_view` hands out a mutable view, so it advances the epoch once
+    /// per hand-out — the counter cannot see which field the view touched, so
+    /// the hand-out itself is the event.
+    #[test]
+    fn mutation_epoch_advances_once_per_class_c_view() {
+        let mut cell = ClassSCell::new(fresh_state(0x91));
+        {
+            let mut view = cell.class_c_view();
+            view.members_mut()
+                .insert(DID("did:example:epoch-member".to_owned()));
+        }
+        assert_eq!(cell.mutation_epoch(), 1, "one hand-out, one advance");
+        *cell.class_c_view().checkpoint_events_since_mut() += 1;
+        assert_eq!(
+            cell.mutation_epoch(),
+            2,
+            "a leaf credit through the view is a hand-out too: a landed leaf that \
+             a helper credits advances the epoch"
+        );
+    }
+
+    /// Keep-direction: the mutation stays in memory whether or not the persist
+    /// lands, so `commit_class_s_keep` advances the epoch on the persist-failure
+    /// arm as well. A dispatch error after this combinator must keep the
+    /// replay marker.
+    #[tokio::test]
+    async fn mutation_epoch_advances_on_keep_even_when_persist_fails() {
+        let deps = build_deps(Box::new(FailPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x92));
+        let ctx = ctx_hex(0x92);
+
+        let result = cell
+            .commit_class_s_keep(&deps, &ctx, |mut view| {
+                view.governance_class_s_mut().threshold_value = 7;
+                Ok(())
+            })
+            .await;
+
+        assert!(
+            matches!(result, Err(ContextError::PersistenceFailed(_))),
+            "persist failure surfaces; got {result:?}"
+        );
+        assert_eq!(
+            cell.governance.class_s.threshold_value, 7,
+            "keep-direction retains the mutation"
+        );
+        assert_eq!(
+            cell.mutation_epoch(),
+            1,
+            "the retained mutation counts even though the persist failed"
+        );
+    }
+
+    /// A closure that rejects before mutating hands nothing durable out, so the
+    /// epoch holds: a dispatch error raised by a helper's own pre-check must
+    /// leave the proposal retryable.
+    #[tokio::test]
+    async fn mutation_epoch_holds_when_the_closure_rejects() {
+        let deps = build_deps(Box::new(OkPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x93));
+        let ctx = ctx_hex(0x93);
+
+        let result = cell
+            .commit_class_s_keep(&deps, &ctx, |_view| {
+                Err::<(), _>(ContextError::PermissionDenied("rejected".into()))
+            })
+            .await;
+
+        assert!(
+            matches!(result, Err(ContextError::PermissionDenied(_))),
+            "the closure's rejection surfaces; got {result:?}"
+        );
+        assert_eq!(
+            cell.mutation_epoch(),
+            0,
+            "a rejected closure applied nothing, so the epoch holds"
+        );
+    }
+
+    /// Restore-direction: `commit_class_s_restore` rolls the Class-S state back
+    /// on persist failure, so nothing of `f` survives and the epoch holds; on a
+    /// landed persist the mutation survives and the epoch advances.
+    #[tokio::test]
+    async fn mutation_epoch_follows_the_restore_combinators_outcome() {
+        let failing = build_deps(Box::new(FailPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x94));
+        let ctx = ctx_hex(0x94);
+
+        let result = cell
+            .commit_class_s_restore(&failing, &ctx, |mut view| {
+                view.governance_class_s_mut().threshold_value = 7;
+                Ok(())
+            })
+            .await;
+        assert!(
+            matches!(result, Err(ContextError::PersistenceFailed(_))),
+            "persist failure surfaces; got {result:?}"
+        );
+        assert_eq!(
+            cell.governance.class_s.threshold_value, 0,
+            "restore-direction rolled the mutation back"
+        );
+        assert_eq!(
+            cell.mutation_epoch(),
+            0,
+            "a rolled-back mutation leaves no effect, so the epoch holds"
+        );
+
+        let ok = build_deps(Box::new(OkPersistence)).await;
+        cell.commit_class_s_restore(&ok, &ctx, |mut view| {
+            view.governance_class_s_mut().threshold_value = 9;
+            Ok(())
+        })
+        .await
+        .expect("persist lands");
+        assert_eq!(
+            cell.mutation_epoch(),
+            1,
+            "a persisted restore-direction mutation counts once"
+        );
+    }
+
+    /// `commit_class_c_best_effort` applies a Class-C mutation in memory and
+    /// advances the epoch once, regardless of the best-effort persist.
+    #[tokio::test]
+    async fn mutation_epoch_advances_on_commit_class_c_best_effort() {
+        let deps = build_deps(Box::new(FailPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x95));
+        let ctx = ctx_hex(0x95);
+
+        cell.commit_class_c_best_effort(&deps, &ctx, |mut view| {
+            view.members_mut()
+                .insert(DID("did:example:best-effort-member".to_owned()));
+        })
+        .await;
+
+        assert_eq!(
+            cell.mutation_epoch(),
+            1,
+            "the in-memory Class-C mutation counts even when its best-effort persist fails"
+        );
+    }
+
+    /// The deferred-persist token flow advances the epoch at `begin_class_s`
+    /// (the early mutation) and again at `discharge_with` (the final mutation),
+    /// so `execute_governance_action` reads its baseline AFTER its own
+    /// `begin_class_s` and before the dispatch.
+    #[tokio::test]
+    async fn mutation_epoch_advances_at_begin_and_at_discharge() {
+        let deps = build_deps(Box::new(OkPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x96));
+        let ctx = ctx_hex(0x96);
+
+        let ((), token) = cell
+            .begin_class_s(&ctx, |mut view| {
+                view.governance_class_s_mut().threshold_value = 3;
+                Ok(())
+            })
+            .expect("begin");
+        assert_eq!(
+            cell.mutation_epoch(),
+            1,
+            "the early mutation counts at begin"
+        );
+
+        token
+            .discharge_with(&mut cell, &deps, &ctx, |mut view| {
+                view.governance_class_s_mut().threshold_value = 4;
+                Ok(())
+            })
+            .await
+            .expect("discharge");
+        assert_eq!(
+            cell.mutation_epoch(),
+            2,
+            "the discharge mutation counts once more"
         );
     }
 }

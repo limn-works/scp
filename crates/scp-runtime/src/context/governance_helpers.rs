@@ -988,20 +988,21 @@ pub async fn execute_revoke(
     // rotated by the governance ban. Each rotation advances by exactly 1, so
     // old_epoch = new_epoch.saturating_sub(1).
     //
-    // THIS LOOP MUST NOT RETURN `Err`. `execute_governance_action` removes the
-    // proposal id from `executed_proposals` on ANY dispatch error and persists
-    // that removal fail-closed, which re-arms the replay gate for a proposal
-    // whose effects already landed. By the time this loop runs, the ban and
-    // every author-key rotation are durably persisted (the fail-closed
+    // THIS LOOP MUST NOT RETURN `Err`. By the time it runs, the ban and every
+    // author-key rotation are durably persisted (the fail-closed
     // `commit_class_s_keep` above) and the `AccessRevoked` anchor leaf is
-    // appended, so an `Err` here would let a caller re-send the same proposal
-    // id: `governance_ban_subscriber` rotates every author unconditionally (it
-    // has no already-banned early return), so the second run advances every
-    // author's epoch a SECOND time and writes a second `AccessRevoked` leaf.
-    // This member would then hold more leaves, at a higher epoch, than every
-    // member that applied the commit once, and its log would stay divergent, so
-    // its §9.9.3 consistency checkpoint would never again match an honest
-    // member's — a divergence §9.9.3 reads as equivocation.
+    // appended, so an `Err` here would tell the caller that a revoke which
+    // landed did not land. `execute_governance_action` keeps the proposal's
+    // replay marker whenever the cell's `mutation_epoch` advanced during
+    // dispatch, so the `Err` would not re-arm replay; it would only misreport
+    // the outcome and skip the remaining authors' leaves.
+    // `governance_ban_subscriber` rotates every author unconditionally (it has
+    // no already-banned early return), which is why a replayed RevokeAccess
+    // would advance every author's epoch a SECOND time, write a second
+    // `AccessRevoked` leaf, and leave this member's log divergent from every
+    // member that applied the commit once — a divergence §9.9.3 reads as
+    // equivocation. The epoch rule in `execute_governance_action` closes that
+    // replay for every helper in this file.
     //
     // The failure still reaches an operator: each miss logs at ERROR with the
     // context, the author DID, and the underlying error. A log line is an
@@ -2137,6 +2138,12 @@ pub async fn execute_extend_ttl(
         // `member_dids()`) before taking the Class-C view.
         drop(missing);
         drop(member_dids);
+        // The rejection leaf landed and is credited here, which advances the
+        // cell's `mutation_epoch`, so `execute_governance_action` keeps this
+        // proposal's replay marker: a rejected attempt consumes the proposal,
+        // and the members submit a new ExtendTtl proposal once consent is
+        // unanimous. Re-executing the same id would append a second
+        // `TtlExtensionRejected` leaf per attempt.
         *cell.class_c_view().checkpoint_events_since_mut() += 1;
         return Err(ContextError::PermissionDenied(format!(
             "TTL extension requires unanimous consent — {missing_len} of {member_count} members have not approved",
@@ -2158,7 +2165,12 @@ pub async fn execute_extend_ttl(
     // stamps the leaf with the committer-assigned `timestamp_secs`
     // (`proposal.created_at`). A context whose log yields no convergent deadline
     // has no TTL to extend ⇒ no-op, no leaf. The append is best-effort/fail-safe
-    // (a lost leaf re-derives the shorter un-extended base on restore).
+    // (a lost leaf re-derives the shorter un-extended base on restore). The
+    // combinator credits `checkpoint_events_since` itself, in the one arm where
+    // the `TtlExtended` leaf landed, so this helper credits nothing: three of
+    // the combinator's paths (no convergent deadline, payload encode failure,
+    // append failure) append no leaf, and an unconditional credit here would
+    // run the §9.9.3 checkpoint position one leaf ahead of the log on each.
     crate::context::ttl_close_helpers::extend_ttl_deadline_and_record(
         cell,
         deps.event_log.as_ref(),
@@ -2174,7 +2186,6 @@ pub async fn execute_extend_ttl(
     .await;
 
     crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id).await;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -2675,12 +2686,14 @@ pub async fn execute_reset_member(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    {
-        let mut view = cell.class_c_view();
-        require_active(view.handle_mut())?;
-        if !view.membership_class_c_mut().contains(did.as_ref()) {
-            return Err(ContextError::MemberNotFound(did.to_string()));
-        }
+    // Read-only pre-checks through `Deref`. A rejected proposal must reach
+    // `execute_governance_action` with the cell's `mutation_epoch` unchanged,
+    // so that it drops the replay marker and the proposal can be retried; a
+    // `class_c_view()` here would advance the epoch and pin the marker for a
+    // proposal that applied nothing.
+    require_active(&cell.handle)?;
+    if !cell.membership.member_dids().any(|member| member == did) {
+        return Err(ContextError::MemberNotFound(did.to_string()));
     }
 
     // Member reset = leave + immediately re-join (ADR-029 §Tier 3).
@@ -3227,14 +3240,14 @@ pub async fn execute_rotate_content_keys(
     // replays.
     //
     // THIS LOOP MUST NOT RETURN `Err`, for the reason spelled out at the
-    // matching loop in `execute_revoke`: `execute_governance_action` removes the
-    // proposal id from `executed_proposals` on ANY dispatch error and persists
-    // that removal fail-closed, so an `Err` raised after the rotation is durable
-    // re-arms replay of a non-idempotent action. `rotate_all_author_keys`
-    // advances every author unconditionally, so a replayed RotateContentKeys
-    // advances every epoch a second time and writes a second
-    // `ContentKeysRotated` leaf, which diverges this member's leaf count and
-    // Merkle root from every member that applied the commit once (§9.9.3).
+    // matching loop in `execute_revoke`: the rotation and the
+    // `ContentKeysRotated` anchor leaf are already durable, so an `Err` here
+    // would misreport a rotation that landed and skip the remaining authors'
+    // leaves. `execute_governance_action` keeps the replay marker on a
+    // post-effect error (the cell's `mutation_epoch` advanced), so the `Err`
+    // would not re-arm replay of `rotate_all_author_keys`, which advances every
+    // author unconditionally and would otherwise advance every epoch a second
+    // time and write a second `ContentKeysRotated` leaf (§9.9.3 divergence).
     //
     // The failure still reaches an operator: each miss logs at ERROR with the
     // context, the author DID, and the underlying error.
@@ -5762,7 +5775,30 @@ pub async fn execute_governance_action(
         Ok(())
     })?;
 
-    let result = match dispatch_governance_action(
+    // The replay-marker contract for a dispatch error. Every `execute_*` helper
+    // applies its effect through a `ClassSCell` combinator or view, and the
+    // cell advances `mutation_epoch` at each such hand-out, so the epoch read
+    // here and re-read on `Err` tells the two failure classes apart without a
+    // per-helper tag:
+    //   - epoch unchanged ⇒ the helper applied nothing (a permission check, an
+    //     MLS failure, a pre-commit encode error). Drop the marker, persist the
+    //     removal fail-closed, and surface the error: the proposal is retryable.
+    //   - epoch advanced ⇒ a mutation or a credited leaf landed before the error
+    //     (the canonical case: a fail-closed `commit_class_s_keep` persisted a
+    //     ban and the anchor-leaf append that follows it failed). Keep the
+    //     marker and run finalize below as if the dispatch had returned `Ok`,
+    //     because the action DID execute; then surface the error so the caller
+    //     learns that a leaf or a follow-on step did not land. Dropping the
+    //     marker here would let the same proposal id run the helper again and
+    //     re-apply a non-idempotent effect (`governance_ban_subscriber` and
+    //     `rotate_all_author_keys` advance every author's epoch a second time),
+    //     which diverges this member's log from every member that applied the
+    //     commit once — a divergence §9.9.3 of the security-model spec reads as
+    //     equivocation.
+    // The marker's own `begin_class_s` above already advanced the epoch, so the
+    // baseline is read after it.
+    let epoch_before_dispatch = cell.mutation_epoch();
+    let dispatch_outcome = match dispatch_governance_action(
         cell,
         deps,
         context_id,
@@ -5772,18 +5808,19 @@ pub async fn execute_governance_action(
     )
     .await
     {
-        Ok(r) => r,
-        Err(e) => {
-            // Roll back the executed marker on dispatch failure so the proposal
-            // can be retried (e.g. after a transient crypto error). The removal
-            // is itself a Class-S transition that must be durable fail-closed
-            // (keep-direction: a crash must not resurrect the marker and block
-            // the retry). It is staged through the deferred-persist token's own
-            // ClassSMut flow — `discharge_with` runs the removal closure
-            // (`ClassSMut::governance_class_s_mut().executed_proposals.remove`)
-            // and then performs the SINGLE fail-closed persist the token already
-            // owed, so the removed-marker state is what lands durably (no
-            // `state_mut`, exactly one persist — the one the token deferred).
+        Ok(r) => Ok(r),
+        Err(e) if cell.mutation_epoch() == epoch_before_dispatch => {
+            // Roll back the executed marker: the dispatch applied no effect, so
+            // the proposal can be retried (e.g. after a transient crypto error).
+            // The removal is itself a Class-S transition that must be durable
+            // fail-closed (keep-direction: a crash must not resurrect the marker
+            // and block the retry). It is staged through the deferred-persist
+            // token's own ClassSMut flow — `discharge_with` runs the removal
+            // closure (`ClassSMut::governance_class_s_mut().executed_proposals
+            // .remove`) and then performs the SINGLE fail-closed persist the
+            // token already owed, so the removed-marker state is what lands
+            // durably (no `state_mut`, exactly one persist — the one the token
+            // deferred).
             token
                 .discharge_with(cell, deps, context_id, |mut view| {
                     view.governance_class_s_mut()
@@ -5793,6 +5830,19 @@ pub async fn execute_governance_action(
                 })
                 .await?;
             return Err(e);
+        }
+        Err(e) => {
+            tracing::error!(
+                context_id,
+                proposal_id = %hex::encode(proposal.proposal_id),
+                error = %e,
+                "governance dispatch failed AFTER an effect landed (the cell's \
+                 mutation epoch advanced); the executed-proposal replay marker is \
+                 kept and the proposal is finalized so the same id cannot re-run \
+                 a non-idempotent action. The caller sees this error; the effect \
+                 that landed is not undone."
+            );
+            Err(e)
         }
     };
 
@@ -5824,6 +5874,10 @@ pub async fn execute_governance_action(
     // result. Error priority matches the former `discharge_with` `match`: a
     // finalize error is surfaced BEFORE a persist error when both fail.
     let persist_result = discharge.commit_fail_closed(deps, context_id).await;
+    // Error priority: a post-effect dispatch error is the primary fact, then a
+    // finalize error, then a persist error. The persist has already run
+    // regardless of all three (keep-direction).
+    let result = dispatch_outcome?;
     finalize_result?;
     persist_result?;
 

@@ -548,7 +548,16 @@ pub async fn extend_ttl_deadline_and_record(
         ),
     };
 
-    // Append the `TtlExtended` leaf (best-effort / fail-safe).
+    // Append the `TtlExtended` leaf (best-effort / fail-safe). This combinator
+    // is the one place that knows whether the leaf landed, so it credits
+    // `checkpoint_events_since` itself, in the success arm only: neither caller
+    // (`execute_extend_ttl`, `reset_ttl_timer`) credits the leaf. The counter
+    // must equal the durable leaf count, because `create_checkpoint_if_due_view`
+    // gates both §9.9.3 consistency-checkpoint triggers on it; a credit for a
+    // leaf that did not land (no convergent deadline, encode failure, append
+    // failure) would mint this member's checkpoint one position early, and a
+    // landed leaf with no credit would leave a reset-only context never
+    // reaching `events_since > 0`.
     match scp_event_log::payload::encode_payload(&scp_event_log::payload::TtlExtendedPayload {
         old_deadline_unix: old_dl,
         new_deadline_unix: new_dl,
@@ -556,7 +565,7 @@ pub async fn extend_ttl_deadline_and_record(
         consenting_members,
     }) {
         Ok(payload) => {
-            if let Err(e) = event_log
+            match event_log
                 .append_context_event_with_payload(
                     context_id_bytes,
                     scp_event_log::EventType::TtlExtended,
@@ -566,12 +575,15 @@ pub async fn extend_ttl_deadline_and_record(
                 )
                 .await
             {
-                tracing::warn!(
+                Ok(()) => {
+                    *cell.class_c_view().checkpoint_events_since_mut() += 1;
+                }
+                Err(e) => tracing::warn!(
                     error = %e,
                     "extend_ttl_deadline_and_record: failed to append TtlExtended leaf; the \
                      extension lives only in the runtime scalar and a later restore re-derives \
                      the shorter un-extended base (fail-safe)"
-                );
+                ),
             }
         }
         Err(e) => tracing::warn!(

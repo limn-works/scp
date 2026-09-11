@@ -1722,8 +1722,11 @@ mod tests {
     /// still must be attempted.
     struct KeaFailingEventLog {
         appended: Arc<AtomicUsize>,
+        /// Appends of `fail_type` seen so far; the `fail_at`-th one fails.
         kea_seen: AtomicUsize,
         fail_kea_at: usize,
+        /// The event type whose `fail_at`-th append fails.
+        fail_type: scp_event_log::EventType,
     }
     #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for KeaFailingEventLog {
@@ -1741,12 +1744,12 @@ mod tests {
             _payload: scp_event_log::EventPayload,
             _timestamp_secs: u64,
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
-            if event == scp_event_log::EventType::KeyEpochAdvance {
+            if event == self.fail_type {
                 let seen = self.kea_seen.fetch_add(1, Ordering::SeqCst);
                 if seen == self.fail_kea_at {
                     return Err(
                         scp_protocol::context::builder::ContextCreationError::EventLogFailed(
-                            "fixture: KeyEpochAdvance append deliberately fails".to_owned(),
+                            format!("fixture: {event:?} append deliberately fails"),
                         ),
                     );
                 }
@@ -1765,13 +1768,64 @@ mod tests {
     /// Swap `deps.event_log` for a [`KeaFailingEventLog`] and return the shared
     /// success-append counter.
     fn inject_kea_failing_log(deps: &mut ActorDeps, fail_kea_at: usize) -> Arc<AtomicUsize> {
+        inject_failing_log(deps, scp_event_log::EventType::KeyEpochAdvance, fail_kea_at)
+    }
+
+    /// Replace `deps.event_log` with a log whose `fail_at`-th append of
+    /// `fail_type` fails and every other append lands; returns the landed count.
+    fn inject_failing_log(
+        deps: &mut ActorDeps,
+        fail_type: scp_event_log::EventType,
+        fail_at: usize,
+    ) -> Arc<AtomicUsize> {
         let appended = Arc::new(AtomicUsize::new(0));
         deps.event_log = Arc::new(KeaFailingEventLog {
             appended: Arc::clone(&appended),
             kea_seen: AtomicUsize::new(0),
-            fail_kea_at,
+            fail_kea_at: fail_at,
+            fail_type,
         });
         appended
+    }
+
+    /// An engine-tracked, `Approved` proposal for `action`, seeded into `state`
+    /// so `execute_governance_action` can read it. A `SingleAdminEngine`
+    /// approves the admin's own proposal on submission; its resolver returns the
+    /// creator's key so the implicit admin vote verifies.
+    fn seed_approved_proposal(
+        state: &mut PerContextState,
+        ctx_hex: &str,
+        action: scp_protocol::context::governance::GovernanceAction,
+    ) -> scp_protocol::context::governance::ProposalId {
+        use scp_protocol::context::governance::{
+            GovernanceContext, GovernanceEngine, KeyResolver, SingleAdminEngine,
+        };
+        let creator_vk = creator_key().verifying_key();
+        let resolver: KeyResolver = Arc::new(move |did: &DID, kid: SigningKeyId| {
+            if did.as_ref() == CREATOR_DID && kid == SigningKeyId::Active {
+                Some(creator_vk)
+            } else {
+                None
+            }
+        });
+        let mut engine = SingleAdminEngine::new(DID(CREATOR_DID.to_owned()), resolver);
+        let (proposal, _events) = engine
+            .propose(
+                &DID(CREATOR_DID.to_owned()),
+                action,
+                &GovernanceContext {
+                    context_id: ctx_hex.to_owned(),
+                    members: vec![(DID(CREATOR_DID.to_owned()), "admin".to_owned())],
+                    admin_dids: vec![DID(CREATOR_DID.to_owned())],
+                    current_epoch: Some(0),
+                    now: 1_700_000_000,
+                },
+                &creator_key(),
+            )
+            .expect("single-admin propose approves immediately");
+        let proposal_id = proposal.proposal_id;
+        state.governance.engine = Box::new(engine);
+        proposal_id
     }
 
     /// Three authors, deliberately not in sorted insertion order.
@@ -2053,6 +2107,245 @@ mod tests {
              append failure — dropping it lets the same proposal id run \
              `governance_ban_subscriber` a second time, advancing every author's \
              epoch again and diverging this member's Merkle root (§9.9.3)"
+        );
+    }
+
+    /// THE CLASS GATE. The anchor-leaf append that follows a helper's
+    /// fail-closed `commit_class_s_keep` fails, so the helper returns `Err`
+    /// after the ban and every author-key rotation are durable. The replay
+    /// marker must survive that error: `execute_governance_action` reads the
+    /// cell's `mutation_epoch` before and after dispatch, the keep-commit
+    /// advanced it, and so the error is classified as post-effect. A second
+    /// execute of the same proposal id must be refused as already executed and
+    /// must append nothing.
+    ///
+    /// Before the epoch rule, this exact sequence removed the marker and let a
+    /// retry run `governance_ban_subscriber` again, which advances every
+    /// author's epoch a second time (§9.9.3 divergence). The same shape sits at
+    /// the anchor leaf of every other `execute_*` helper in
+    /// `governance_helpers.rs`; the rule closes them all at the one caller.
+    #[tokio::test]
+    async fn anchor_leaf_failure_after_commit_keeps_marker_and_blocks_re_execution() {
+        use scp_protocol::context::governance::{AccessScope, GovernanceAction};
+
+        let (mut deps, _appends) = build_deps().await;
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
+        let proposal_id = seed_approved_proposal(
+            &mut state,
+            &ctx_hex,
+            GovernanceAction::RevokeAccess {
+                did: DID(SUBSCRIBER_DID.to_owned()),
+                access: AccessScope::Read,
+            },
+        );
+        let mut cell = ClassSCell::new(state);
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
+            .await
+            .expect("open subscribe");
+        cell.class_c_view().membership_class_c_mut().add_member(
+            DID(SUBSCRIBER_DID.to_owned()),
+            "member".to_owned(),
+            vec![],
+        );
+        // The first `AccessRevoked` append fails — after `commit_class_s_keep`
+        // has persisted the ban and rotated every author.
+        let appends = inject_failing_log(&mut deps, scp_event_log::EventType::AccessRevoked, 0);
+
+        let first = crate::context::governance_helpers::execute_governance_action(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &proposal_id,
+            Some(&DID(CREATOR_DID.to_owned())),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(first, Err(ContextError::EventLogFailed(_))),
+            "the anchor-leaf append failure must reach the caller unchanged; got {first:?}"
+        );
+        assert!(
+            cell.governance
+                .class_s
+                .executed_proposals
+                .contains_key(&proposal_id),
+            "a dispatch error raised AFTER the keep-commit must keep the replay marker"
+        );
+        let landed_after_first = appends.load(Ordering::SeqCst);
+
+        let second = crate::context::governance_helpers::execute_governance_action(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &proposal_id,
+            Some(&DID(CREATOR_DID.to_owned())),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                &second,
+                Err(ContextError::PermissionDenied(msg)) if msg.contains("already been executed")
+            ),
+            "the same proposal id must be refused as already executed; got {second:?}"
+        );
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            landed_after_first,
+            "the refused replay must append no leaf: a second run would rotate \
+             every author again and write a second AccessRevoked leaf"
+        );
+    }
+
+    /// A dispatch error raised BEFORE any effect must drop the replay marker so
+    /// the proposal stays retryable. `execute_reset_member` rejects a
+    /// non-member through `Deref` reads only, so the cell's `mutation_epoch` is
+    /// unchanged across the dispatch and `execute_governance_action` classifies
+    /// the error as pre-effect.
+    #[tokio::test]
+    async fn pre_effect_dispatch_error_drops_marker_so_the_proposal_is_retryable() {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let (deps, appends) = build_deps().await;
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
+        let proposal_id = seed_approved_proposal(
+            &mut state,
+            &ctx_hex,
+            GovernanceAction::ResetMember {
+                did: DID("did:example:never-a-member".to_owned()),
+                reason: "fixture".to_owned(),
+            },
+        );
+        let mut cell = ClassSCell::new(state);
+        appends.store(0, Ordering::SeqCst);
+
+        for attempt in 0..2 {
+            let result = crate::context::governance_helpers::execute_governance_action(
+                &mut cell,
+                &deps,
+                &ctx_hex,
+                &proposal_id,
+                Some(&DID(CREATOR_DID.to_owned())),
+                None,
+            )
+            .await;
+            assert!(
+                matches!(result, Err(ContextError::MemberNotFound(_))),
+                "attempt {attempt}: the helper's own pre-check must surface, not \
+                 an already-executed refusal; got {result:?}"
+            );
+            assert!(
+                !cell
+                    .governance
+                    .class_s
+                    .executed_proposals
+                    .contains_key(&proposal_id),
+                "attempt {attempt}: a pre-effect error must drop the replay marker"
+            );
+        }
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            0,
+            "a rejected reset appends nothing on either attempt"
+        );
+    }
+
+    /// `execute_extend_ttl` must credit `checkpoint_events_since` only when
+    /// the `TtlExtended` leaf landed. A broadcast fixture has
+    /// `params.ttl == None`, so `extend_ttl_deadline_and_record` derives no
+    /// convergent deadline, appends no leaf, and the helper must credit zero;
+    /// before the fix the helper credited one unconditionally.
+    #[tokio::test]
+    async fn extend_ttl_credits_nothing_when_no_leaf_lands() {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let (deps, appends) = build_deps().await;
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        let proposal_id = seed_approved_proposal(
+            &mut state,
+            &ctx_hex,
+            GovernanceAction::ExtendTtl {
+                additional_secs: 3_600,
+            },
+        );
+        let approvals = state
+            .governance
+            .engine
+            .get_proposal(&proposal_id)
+            .expect("engine tracks the proposal")
+            .approvals
+            .clone();
+        let mut cell = ClassSCell::new(state);
+        appends.store(0, Ordering::SeqCst);
+        reset_leaf_counter(&mut cell);
+
+        crate::context::governance_helpers::execute_extend_ttl(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            3_600,
+            &approvals,
+            commit_meta(0xc3),
+        )
+        .await
+        .expect("a no-TTL context extends as a no-op");
+
+        assert_eq!(appends.load(Ordering::SeqCst), 0, "no leaf landed");
+        assert_eq!(
+            cell.checkpoint_events_since, 0,
+            "no leaf landed, so nothing is credited: an unconditional credit would \
+             mint the §9.9.3 checkpoint one position early"
+        );
+    }
+
+    /// The bilateral twin: `reset_ttl_timer` appends a real `TtlExtended`
+    /// leaf on a context that has a TTL and must credit it, so a reset-only
+    /// context reaches `events_since > 0` and mints its checkpoint. The credit
+    /// lives in `extend_ttl_deadline_and_record`, the one place that knows
+    /// whether the leaf landed, so both callers see the same accounting.
+    #[tokio::test]
+    async fn reset_ttl_timer_credits_the_landed_ttl_extended_leaf() {
+        let (deps, appends) = build_deps().await;
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        // Give the context a TTL so the combinator derives a convergent
+        // deadline (`creation + ttl` over an empty log) and appends the leaf.
+        state.handle = crate::context::ContextHandle::new(
+            ctx_hex.clone(),
+            scp_protocol::context::ContextParams {
+                ttl: Some(std::time::Duration::from_secs(3_600)),
+                ..Default::default()
+            },
+        );
+        state
+            .handle
+            .transition_to(&ContextState::Active)
+            .expect("activate");
+        let mut cell = ClassSCell::new(state);
+        appends.store(0, Ordering::SeqCst);
+        reset_leaf_counter(&mut cell);
+
+        crate::context::ttl_close_helpers::reset_ttl_timer(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            std::time::Duration::from_secs(600),
+        )
+        .await;
+
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            1,
+            "the reset appends exactly one TtlExtended leaf"
+        );
+        assert_eq!(
+            cell.checkpoint_events_since, 1,
+            "the landed TtlExtended leaf must be credited by the combinator"
         );
     }
 }
