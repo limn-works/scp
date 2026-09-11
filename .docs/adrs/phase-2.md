@@ -1360,7 +1360,7 @@ Implement a complete addressability and deployment layer as specified in §18:
 ### Rationale
 
 - **SCPRelay vs SCPCapabilities:** Different consumers, different purposes. TransportManager needs relay URLs (transport). Discovery Engine needs capability schemas (application). Conflating them forces both consumers to parse the same entry and filter. Separate types are cleaner.
-- **`.well-known/scp` is advisory, not trusted:** HTTPS-dependent discovery cannot provide the self-certifying guarantee a replayed key-event log gives. Making the trust boundary explicit prevents false confidence. The verification chain (§18.3.2) gives that assurance when performed.
+- **`.well-known/scp` is advisory, not trusted:** decision item 2 states why, and §18.3.2 states the verification chain that closes the gap.
 - **Context URIs are discovery-only:** Embedding key material in URIs creates a shareable key — anyone with the URI could derive access. MLS membership is a separate, governed flow. URIs point to metadata for inspection, not access.
 - **`ApplicationNode` is composition, not framework:** Prescribing an HTTP framework locks out existing ecosystems. Exposing axum Routers lets applications compose SCP infrastructure into their existing server architecture.
 - **ACME HTTP-01 needs port 80:** This is the simplest path for most deployments. DNS-01 alternative covers environments without port 80 access (NAT, shared hosting).
