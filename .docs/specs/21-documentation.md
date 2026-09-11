@@ -39,9 +39,6 @@ An agent with no prior context should be able to visit the SCP repository, under
 
 | Category | Current | Target | Priority |
 |---|---|---|---|
-| ~~Getting started guide~~ | ~~None~~ | ~~`GETTING-STARTED.md`~~ | Done |
-| ~~Testing guide~~ | ~~Commands in standards only~~ | ~~`TESTING.md`~~ | Done |
-| ~~Contributing guide~~ | ~~None~~ | ~~`CONTRIBUTING.md`~~ | Done |
 | Example applications | Pseudocode only | Runnable examples per language | P0 |
 | FFI crate READMEs | In progress | `crates/scp-ffi/{src,napi,uniffi}/README.md` | P1 |
 | Inline doc coverage | 82% | 100% | P1 |
@@ -172,7 +169,7 @@ Each binding directory gets a README answering:
 
 Minimal, runnable examples in each target language demonstrating:
 
-1. **Identity creation** — Create a DID, inspect it
+1. **Identity creation** — Create an identity, inspect it
 2. **Context creation** — Create a context with governance parameters
 3. **Message exchange** — Two participants send and receive encrypted messages
 4. **Outlet invocation** — Register and invoke an outlet within a context
@@ -284,7 +281,7 @@ Binding documentation SHOULD reference the corresponding Rust type/function and 
 
 Not a replacement for `.docs/architecture.md` — a reading guide for it:
 
-1. **Start here** — The 5 concepts you need (contexts, DIDs, UCANs, MLS, relays)
+1. **Start here** — The 5 concepts you need (contexts, identifiers, UCANs, MLS, relays)
 2. **Crate map** — Which crate does what, dependency graph, where to find things
 3. **Reading order** — Suggested path through specs and ADRs
 4. **Key flows** — Context creation, message send, outlet invocation (simplified, with file references)
@@ -467,13 +464,13 @@ Each template is a complete, running application that demonstrates a real use ca
 | `templates/chat/` | Python | Two-party encrypted chat (Python CLI) |
 | `templates/agent-tool-provider/` | Python | Agent exposing outlets via SCP context with MCP bridge |
 | `templates/collaborative-workspace/` | TypeScript | Multi-party context with roles, outlets, and governance |
-| `templates/personal-relay/` | Rust | Self-hosted relay with automatic TLS and DID publishing |
+| `templates/personal-relay/` | Rust | Self-hosted relay with automatic TLS and key-event-record publishing |
 | `templates/broadcast-feed/` | Python | Broadcast context (§5.14) with subscriber management |
 | `templates/cross-context-bridge/` | Rust | Outlet interface bridging two contexts (§6.2) |
 
 > A functional two-party **browser** chat template (`templates/chat/typescript/`) is
 > forthcoming under **#2187**, once relay-mediated invitation-join is available in the
-> wasm tier (its §9.7.1 DID-VM KeyPackage binding). Until then, `scaffolds/typescript-web/`
+> wasm tier (`09-security-model.md` §9.7.1). Until then, `scaffolds/typescript-web/`
 > demonstrates the single-tab in-browser client (ADR-057). No TypeScript chat template
 > exists yet — the row is intentionally absent rather than phantom.
 
@@ -522,7 +519,7 @@ This requires that every protocol-level behavior is specified with enough precis
 
 | Area | Spec Coverage | Status |
 |------|---------------|--------|
-| Identity (DID, keys, migration) | §3, §9.5, §9.11, §9.12 | Complete |
+| Identity (identifier, keys, migration) | §3, §9.5, §9.11, §9.12 | Complete |
 | Contexts (creation, lifecycle, params) | §5 | Complete |
 | Cross-context communication | §6 | Complete |
 | Trust and capabilities (UCAN, attestations) | §7, §9.8 | Complete |
