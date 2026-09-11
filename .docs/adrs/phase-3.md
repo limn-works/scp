@@ -96,7 +96,7 @@ Implement the FFI bridge in `crates/scp-ffi/src/` using PyO3 and maturin. The br
    - `py_identity_load(did) -> PyIdentity` — loads an existing identity from storage.
    - `py_identity_resolve(did) -> PyDIDDocument` — resolves a DID to its document.
    - `py_identity_rotate_active_key(identity) -> PyIdentity` — rotates the identity's Active Signing Key (`#active`).
-   - `py_identity_rotate_agent_key(identity) -> PyIdentity` — rotates (or provisions) the identity's Agent Signing Key (`#agent`). See ADR-039. **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`.docs/specs/00-open-questions.md`).]**
+   - `py_identity_rotate_agent_key(identity) -> PyIdentity` — rotates the identity's Agent Signing Key. **Amended 2026-09-10:** ADR-063, inception-derived self-certifying identity over a key-event log, overturned the shared-identity `#agent` method this export rotates, and a human identity's key state now names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1). No rule stands behind the export.
 
 3. **Context bridge functions:**
    - `py_context_create(identity, params) -> PyContextHandle` — creates a context. `params` is a Python dict converted to `ContextParams`.
@@ -249,7 +249,7 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
            ...
 
        async def resolve(self, did: str) -> "DIDDocument":
-           """Resolve another identity's DID document."""
+           """Resolve another identity's key state."""
            ...
    ```
 
@@ -667,6 +667,8 @@ Implement the MCP adapter as the `scp-mcp` crate (Rust) with a Python interface 
 
 **Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
 
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, retired the DID document and overturned ADR-039's shared-identity `#agent` method. A verifier resolves an issuer's public key from that issuer's key state, a `kid` names the one operational role `#active`, and a human delegates to its agent's own identifier rather than to a second key on its own (`09-security-model.md` §9.1 invariant 1, `03-identity.md` §3.10.4).
+
 **Amendment (2026-09-10 — UCAN tokens are ES256 and the validation module verifies P-256).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. UCAN tokens are signed with ES256 in place of EdDSA, so this ADR's validation module verifies an ECDSA signature on P-256, its token `signature` field carries the type `P256Signature`, its issuing step signs with a P-256 key, and its library note names the `p256` crate in place of an Ed25519 one. The mandatory-nonce requirement, the delegation-chain walk, and the caveat-attenuation rules are untouched.
 
 ### Context
@@ -719,11 +721,10 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
        pub alg: String,                // "ES256"
        pub typ: String,                // "JWT" (UCAN is JWT-based)
        pub ucv: String,                // UCAN version, "0.10.0"
-       pub kid: Option<String>,        // Key ID per RFC 7515 (ADR-039): identifies the issuer's
-                                       // verification method (e.g., "#active", "#agent"). When **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`.docs/specs/00-open-questions.md`).]**
-                                       // present, verifiers resolve the public key from the
-                                       // issuer's DID document using this VM ID. When absent,
-                                       // defaults to "#active".
+       pub kid: Option<String>,        // Key ID per RFC 7515: names the issuer's operational
+                                       // role, "#active". When present, verifiers resolve the
+                                       // public key from the issuer's key state under that
+                                       // role. When absent, defaults to "#active".
    }
 
    pub struct UcanPayload {
@@ -745,10 +746,10 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
 
 2. **`validate_ucan(context, token, required_capability) -> Result<(), UcanError>`:**
    - **Step 1 — Parse:** Decode the JWT-format UCAN token. Reject malformed tokens.
-   - **Step 2 — Signature verification:** Verify the P-256 signature on the token. The signature covers `base64url(header).base64url(payload)`. If the header contains `kid` (ADR-039), resolve the correct public key from the issuer's DID document using that verification method ID. If `kid` is absent, default to `#active`. At every link in the delegation chain, the `kid` (if present) identifies which key signed that particular token.
+   - **Step 2 — Signature verification:** Verify the P-256 signature on the token. The signature covers `base64url(header).base64url(payload)`. If the header contains `kid`, resolve the public key from the issuer's key state under the operational role it names. If `kid` is absent, default to `#active`. At every link in the delegation chain, the `kid` (if present) identifies which key signed that particular token.
    - **Step 3 — Chain verification:** For each proof CID in `prf`, resolve the parent UCAN, verify its signature, and verify the parent's `aud` matches this token's `iss` (delegation chain integrity). Recurse until reaching a root token (empty `prf`).
-   - **Step 4 — Root issuer:** Verify the root token's `iss` is the context creator's DID. Agent keys (`#agent`) cannot issue root UCANs — root UCAN issuance requires `#active` (the human signing key). This ensures human accountability at the root of every delegation chain (ADR-039). **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`.docs/specs/00-open-questions.md`).]**
-   - **Step 5 — Audience:** Verify the token's `aud` matches the presenting agent's DID. Self-delegation (`iss == aud`) is valid when the token's `fct` contains `scp_key_scope` (ADR-039), indicating key-scope delegation (e.g., `fct.scp_key_scope: "#agent"` delegates authority from the human's `#active` key to their own `#agent` key on the same DID). **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`.docs/specs/00-open-questions.md`).]**
+   - **Step 4 — Root issuer:** Verify the root token's `iss` is the context creator's identifier. This ensures human accountability at the root of every delegation chain.
+   - **Step 5 — Audience:** Verify the token's `aud` matches the presenting agent's identifier. A human delegates to its agent by issuing to that agent's own identifier, so `iss == aud` carries no key scope.
    - **Step 6 — Capability match:** Verify the token's `att` includes the `required_capability`. Capability matching supports wildcards (`scp:ctx:*/messages:write` matches any context).
    - **Step 7 — Attenuation:** Verify each delegation in the chain narrows or preserves capabilities (never widens). A child token cannot grant capabilities its parent does not have.
    - **Step 8 — Ceiling:** Verify every capability the token grants is within the context's immutable capability ceiling — not only the invoked capability. The token's entire attestation set (`att`) is checked; a token carrying any out-of-ceiling attestation is rejected even if the invoked capability is itself within the ceiling.
@@ -759,7 +760,7 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
 
 3. **`mint_ucan(issuer, audience, capabilities, context_id, expiry, signing_key_ref) -> UcanToken`:**
    - Creates a new UCAN token.
-   - The `signing_key_ref` parameter (ADR-039) identifies which verification method to sign with (e.g., `"#active"` or `"#agent"`). This value is stored in the UCAN header as `kid`. **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`.docs/specs/00-open-questions.md`).]**
+   - The `signing_key_ref` parameter names the operational role to sign with, `"#active"`. This value is stored in the UCAN header as `kid`.
    - Generates a unique nonce in `{unix_millis}-{hex16}` format (Unix millisecond timestamp, hyphen, 16 random bytes hex-encoded). This matches the validation format in Step 9.
    - Constructs the `att` array from the `capabilities` list, scoped to the context: `"scp:ctx:{context_id}/{capability}"`.
    - Signs with the issuer's P-256 key identified by `signing_key_ref`.
@@ -1012,7 +1013,7 @@ No existing standard combines UCAN delegation chains with payment semantics. L40
 
 1. **Payment adapter trait** following the transport adapter pattern (ADR-005): `PaymentAdapter` with `authorize`, `capture`, `void`, `verify`, `refund` methods. `AdapterCapabilities` struct declares supported features. `payment_adapter_conformance!()` macro validates implementations. `TestAdapter` in-memory reference ships with SDK.
 
-2. **Spending UCAN** as new capability type: `SpendingCapability` with `max_per_action`, `max_total`, `currency`, `time_window`, `allowed_adapters`. AND-composed with action UCANs — both required for paid actions. Standard UCAN attenuation and revocation rules apply. Agents sign spending UCANs with `#agent` via self-delegation: `iss == aud` with `fct.scp_key_scope: "#agent"` (ADR-039). This allows agents to authorize spending within delegated limits without requiring the human's `#active` key for each transaction. **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`.docs/specs/00-open-questions.md`).]**
+2. **Spending UCAN** as new capability type: `SpendingCapability` with `max_per_action`, `max_total`, `currency`, `time_window`, `allowed_adapters`. AND-composed with action UCANs — both required for paid actions. Standard UCAN attenuation and revocation rules apply. An agent signs a spending UCAN with the `#active` key of its own identity, under a UCAN the human issued to that identifier, so the agent authorizes spending within delegated limits without the human's key for each transaction. **Amended 2026-09-10:** ADR-063, inception-derived self-certifying identity over a key-event log, overturned the shared-identity self-delegation this bullet described (`09-security-model.md` §9.1 invariant 1).
 
 3. **Formula-based dynamic pricing** (EIP-1559-inspired): `PricingFormula` with `base_cost`, `variables` (linear/step), `cap`, `floor`. Observable metrics: `ContextMessageRate`, `MemberCount`, `RelayQueueDepth`, `TimeOfDay`, `SenderVelocity`, `StorageUsage`. Both sides evaluate independently — deterministic, no oracle.
 
