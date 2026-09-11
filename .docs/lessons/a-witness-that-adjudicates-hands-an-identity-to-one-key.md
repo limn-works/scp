@@ -2,9 +2,7 @@
 
 ## The criterion
 
-A witness runs **one** check and never adjudicates. The check is mechanical: does the presented event sit on the head this witness last cosigned for this subject. The witness cosigns where it does and refuses where it does not, and it forms no view about which of two chains is the right one.
-
-Where a legitimate event genuinely does not extend that head — a recovery is the case that matters — it reaches witnesses by **naming a fresh set**, never by a rule that teaches the old witnesses to say yes to a non-extension. `09-security-model.md` §9.7.4.3 states both halves: the one check, and the fresh-set path a recovery takes.
+`09-security-model.md` §9.7.4.3, the witness and watcher layer, states the one check a witness runs and states the fresh-set path a recovery takes. A witness never adjudicates between two chains.
 
 The test to apply to any proposed witness rule: does it ask the witness to decide something. A rule that lets a witness accept an event outside its one check has made the witness an adjudicator, whatever the rule is called.
 
@@ -16,12 +14,12 @@ Two rewrites of the witness layer failed, and both failed at the same sentence �
 
 **The head-establishment repair.** The second design tried to close that hole by having the witness re-derive which head was the legitimate one before deciding whether to cosign. That is adjudication written as a repair. It gave the witness a fork-choice rule, which put the fork verdict in the witness layer, where a threshold of witnesses then decided the identity — and a corrupted threshold takes the identity outright.
 
-Alec settled the layer on 2026-09-10 with "watch and report as well", superseding the required-witnessing model of 2026-09-07 under which a threshold of witness cosignatures was a condition of an event's acceptability. The decision log records that he did not confirm the "required" half of that earlier model in his own words. Under the settled model the root rule of §9.7.4.2 decides every fork, a cosignature is evidence a relying party may read for freshness, first contact, and equivocation detection, and no verdict, key-state derivation, or rank depends on one.
+Alec settled the layer on 2026-09-10 with "watch and report as well", superseding the required-witnessing model of 2026-09-07 under which a threshold of witness cosignatures was a condition of an event's acceptability. The decision log records that he did not confirm the "required" half of that earlier model in his own words. `09-security-model.md` §9.7.4.3 states the settled model.
 
 ## The fix
 
-**Name a fresh set; never write a smarter witness.** The recovery event names new witnesses. Those witnesses hold no last-cosigned head for the subject, so the one check has nothing to fail against, and they cosign the recovered chain without any rule that weakens the check for anyone else. The outgoing witnesses go on refusing the recovered suffix, which is the correct behaviour: they are reporting, truthfully, that the chain they were watching did not continue.
+**Name a fresh set; never write a smarter witness.** `09-security-model.md` §9.7.4.3, the witness and watcher layer, states the path a recovery takes to a fresh witness set. The outgoing witnesses go on refusing the recovered suffix, and they report truthfully that the chain they were watching did not continue.
 
-**Keep the fork verdict out of the layer.** §9.7.4.3 enumerates what the layer produces — the cosigned head, the one check, the conflict statement, and the fresh-set path — and a conflict statement says a fork exists and says nothing about which side to take. The root rule settles it.
+**Keep the fork verdict out of the layer.** §9.7.4.3 enumerates what the layer produces, and the root rule of `09-security-model.md` §9.7.4.2, root-authority recovery and fork precedence, settles every fork.
 
 **Read a proposed `MAY` as an adjudication in disguise.** Both failed designs were expressible as a permissive clause: a witness *may* accept a superseding event, a witness *may* re-derive the head. A permission to accept something the one check rejects is the whole defect, whatever its modal verb.
