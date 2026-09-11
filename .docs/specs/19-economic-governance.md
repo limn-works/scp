@@ -10,7 +10,7 @@ Machine payments are a rate limit that generates money. This is the modern reali
 - **Micropayments fix this:** $0.001 costs $0.001 regardless of attacker resources. No computational shortcut. No economy of scale for abuse.
 - **x402, L402, Stripe machine payments (2025):** Production implementations of this principle — machine-to-machine payment at API call granularity.
 
-SCP's existing primitives (DIDs, UCANs, contexts, governance, transport adapters) compose into an economic layer. The protocol defines the trait, structures, and integration points; implementations connect to real payment rails (x402, Lightning, Stripe, SPL tokens).
+SCP's existing primitives (identifiers, UCANs, contexts, governance, transport adapters) compose into an economic layer. The protocol defines the trait, structures, and integration points; implementations connect to real payment rails (x402, Lightning, Stripe, SPL tokens).
 
 **Three independent levels of economic policy:**
 
@@ -32,7 +32,7 @@ SCP's existing primitives (DIDs, UCANs, contexts, governance, transport adapters
 | Integration points with contexts/relays/outlets | Adapter-specific licensing/compliance |
 | Conformance tests | — |
 
-**Novel contribution:** No existing standard combines UCAN delegation chains with payment semantics. L402/Macaroons have spending caveats but not DID-based delegation. ILP/GNAP has payment authorization but not capability-chain attenuation. SCP bridges both — spending-scoped UCAN capabilities at the intersection of UCAN delegation chains, L402/Macaroon spending caveats, and ILP streaming models.
+**Novel contribution:** No existing standard combines UCAN delegation chains with payment semantics. L402/Macaroons have spending caveats and no delegation between identities. ILP/GNAP has payment authorization but not capability-chain attenuation. SCP bridges both — spending-scoped UCAN capabilities at the intersection of UCAN delegation chains, L402/Macaroon spending caveats, and ILP streaming models.
 
 ### 19.1.1 Core Economic Types
 
@@ -101,8 +101,8 @@ pub trait PaymentAdapter: Send + Sync {
 
     async fn authorize(
         &self,
-        payer: &DID,
-        payee: &DID,
+        payer: &Identifier,
+        payee: &Identifier,
         amount: Amount,
         currency: CurrencyCode,
         metadata: PaymentMetadata,
@@ -153,8 +153,8 @@ pub struct PaymentMetadata {
 /// Returned by `authorize()`, consumed by `capture()` or `void()`.
 pub struct PaymentAuthorization {
     pub auth_id: [u8; 32],
-    pub payer: DID,
-    pub payee: DID,
+    pub payer: Identifier,
+    pub payee: Identifier,
     pub amount: Amount,
     pub currency: CurrencyCode,
     pub adapter_id: String,
@@ -205,7 +205,7 @@ The critical flow — how payment interleaves with SCP actions:
 ```
 1. Agent SDK evaluates cost (economic policy + pricing formula + observable metrics)
 2. Agent SDK verifies spending UCAN covers this cost
-3. Agent SDK calls adapter.authorize(payer_did, payee_did, amount, currency, metadata)
+3. Agent SDK calls adapter.authorize(payer, payee, amount, currency, metadata)
 4. PaymentAuthorization attached to action envelope (inside encrypted payload)
 5. Receiving side verifies authorization via its own adapter instance (adapter.verify)
 6. Action is processed (message delivered, outlet invoked, etc.)
@@ -306,7 +306,7 @@ pub struct EconomicPolicy {
     pub cost_schedule: CostSchedule,
     pub payment_adapters: Vec<PaymentAdapterRef>,  // accepted payment methods
     pub pricing_formula: Option<PricingFormula>,    // for dynamic pricing (§19.4)
-    pub payee: DID,                                // who receives payments
+    pub payee: Identifier,                         // who receives payments
 }
 
 pub struct CostSchedule {
@@ -319,7 +319,7 @@ pub struct CostSchedule {
 }
 ```
 
-**Outlet-level costs**: declared in outlet registration (§5.4), additive with context costs. An outlet calling an external API can pass through its cost. Outlet costs carry their own payee DID (may differ from context payee).
+**Outlet-level costs**: declared in outlet registration (§5.4), additive with context costs. An outlet calling an external API can pass through its cost. Outlet costs carry their own payee identifier, which may differ from the context payee.
 
 **Relay-level costs**: declared in `.well-known/scp` `relay_config` (§18.3.3 extension). Separate economic relationship from in-context pricing — relay charges for transport, context charges for participation.
 
@@ -365,7 +365,7 @@ pub enum PricingMetric {
     TimeOfDay,             // UTC hour (0-23), enables off-peak pricing (measurement: current UTC
                            // hour truncated to integer. No window — point-in-time.)
     SenderVelocity,        // sender's messages in sliding window (measurement: count of MessageSent
-                           // events by the specific sender DID within the last 60 seconds, measured
+                           // events by that one sender within the last 60 seconds, measured
                            // LOCALLY per instance — pricing is enforced at authorize() against the
                            // payer's local ledger; there is no convergent velocity clock (ADR-051 §6).
                            // Window: trailing 60-second sliding window, evaluated at action time.)
@@ -397,9 +397,6 @@ pub struct CostInsufficient {
 - Max change per evaluation period: configurable (e.g., 12.5% like EIP-1559)
 
 ## 19.5 Spending Capability (UCAN Extension)
-
-Novel contribution — no existing standard combines UCAN delegation chains with payment semantics. L402/Macaroons have spending caveats but not DID-based delegation. ILP/GNAP has payment authorization but not capability-chain attenuation. SCP bridges both.
-
 ```rust
 /// UCAN capability for spending authorization.
 /// Resource URI: "scp:spending:{context_id}" or "scp:spending:*"
@@ -414,7 +411,7 @@ pub struct SpendingCapability {
 
 **`time_window` semantics.** The `time_window` is a rolling window measured from the current time backwards. The running total is the sum of all `PaymentReceipt.amount` values for receipts with `timestamp >= (now - time_window.as_secs())`. The window rolls forward continuously — old receipts age out as time passes. The window starts at UCAN issuance time (not at first spend).
 
-**Enforcement location.** `max_total` is enforced by the **payer's SDK** as a self-imposed spending limit. The payer SDK maintains a local spending ledger: a list of `(receipt_id, amount, timestamp)` tuples stored under `identity/{did}/spending_ledger/{ucan_token_id}/` in `ProtocolRepository`. Before each `authorize()` call, the SDK sums receipts within `time_window` and rejects if `running_total + new_amount > max_total` with a `SpendingLimitExceeded` error. Payees do NOT enforce `max_total` — they cannot know the payer's total spending across all payees. This is a deliberate design choice: `SpendingCapability` is a self-governance mechanism for the human delegating spending authority to their agent, not a protocol-enforced global limit. The human trusts their own SDK to enforce the limit honestly. A compromised SDK that ignores the limit can overspend, but the blast radius is bounded by the UCAN's 24-hour expiry (§9.5) and the adapter's balance.
+**Enforcement location.** `max_total` is enforced by the **payer's SDK** as a self-imposed spending limit. The payer SDK maintains a local spending ledger: a list of `(receipt_id, amount, timestamp)` tuples stored under `identity/{identifier}/spending_ledger/{ucan_token_id}/` in `ProtocolRepository`. Before each `authorize()` call, the SDK sums receipts within `time_window` and rejects if `running_total + new_amount > max_total` with a `SpendingLimitExceeded` error. Payees do NOT enforce `max_total` — they cannot know the payer's total spending across all payees. This is a deliberate design choice: `SpendingCapability` is a self-governance mechanism for the human delegating spending authority to their agent, not a protocol-enforced global limit. The human trusts their own SDK to enforce the limit honestly. A compromised SDK that ignores the limit can overspend, but the blast radius is bounded by the UCAN's 24-hour expiry (§9.5) and the adapter's balance.
 
 **AND composition:** Action UCAN + spending UCAN both required for paid actions. Agent with `messages:write` but no spending UCAN cannot send paid messages. Agent with spending UCAN but no `messages:write` cannot spend on messages. Both capabilities are independently verified before any paid action proceeds.
 
@@ -433,8 +430,8 @@ Every paid action generates a `PaymentReceipt` provenance record (§7.7). `Payme
 ```rust
 pub struct PaymentReceipt {
     pub receipt_id: [u8; 32],
-    pub payer: DID,
-    pub payee: DID,
+    pub payer: Identifier,
+    pub payee: Identifier,
     pub amount: Amount,
     pub currency: CurrencyCode,
     pub action_type: PaidActionType,
@@ -454,8 +451,8 @@ pub struct PaymentReceipt {
 
 ```
 signed_payload = receipt_id (32 bytes)
-              || payer_did (UTF-8 bytes, length-prefixed with u16 big-endian)
-              || payee_did (UTF-8 bytes, length-prefixed with u16 big-endian)
+              || payer_did (the payer's identifier)
+              || payee_did (the payee's identifier)
               || amount (u64 big-endian, 8 bytes)
               || currency (4 bytes, raw CurrencyCode)
               || action_type (u8: 0=MessageSend, 1=OutletCall, 2=ContextJoin,
@@ -464,6 +461,8 @@ signed_payload = receipt_id (32 bytes)
               || adapter_id (UTF-8 bytes, length-prefixed with u16 big-endian)
               || timestamp (u64 big-endian, 8 bytes)
 ```
+
+The two identifier fields wait on the identifier's textual form (`09-security-model.md` §9.5.2).
 
 The `adapter_proof` field is deliberately excluded from the signature scope — it is adapter-specific opaque data that may not be available at signing time (e.g., Lightning preimage is revealed after payment, not before). Verification of payment integrity uses `adapter.verify(receipt)` against the payment rail; the payer's signature proves the payer authorized this specific payment.
 
@@ -540,7 +539,7 @@ Relay economics are SEPARATE from context economics — different trust model. R
 
 **Payment flow:** Agent evaluates relay config (visible before connecting) → selects compatible adapter → authorizes per-action → relay verifies + captures.
 
-**Free relays MUST exist.** Bootstrap relay list (§18.5, priority level 5) MUST include free relays. Self-hosted relays (§10.2, §10.4), community relays, and bundled relays remain free. Economic config is optional. Absence = free.
+**Free relays MUST exist.** The bootstrap relay list (`18-addressability-and-deployment.md` §18.5.1, priority level 5) MUST include free relays. Self-hosted relays (§10.2, §10.4), community relays, and bundled relays remain free. Economic config is optional. Absence = free.
 
 **Relay selection:** `TransportManager` (ADR-012) already selects by reliability + latency. Economic governance adds cost as a third criterion. Market pressure: agents prefer cheaper relays, creating competition.
 
@@ -599,15 +598,15 @@ SCP.Identity.configureAdapter(adapter) → ()
 
 **Economic DoS:** Many small payments consuming processing time. Mitigation: per-join minimum viable amount, rate limits checked BEFORE payment verification (§9.2.1). The protocol validates action rate limits before engaging the payment adapter, so payment processing never amplifies a rate-limited attack.
 
-**Payment adapter trust:** Malicious adapter could falsify receipts. Mitigation: `verify()` checks against the payment rail (on-chain state, preimage hash), not the adapter's word. Receipts are signed by the payer's DID key — adapter cannot forge the payer's signature.
+**Payment adapter trust:** Malicious adapter could falsify receipts. Mitigation: `verify()` checks against the payment rail (on-chain state, preimage hash), not the adapter's word. Receipts are signed by the payer's `#active` key, and the adapter cannot forge the payer's signature.
 
 **Spending UCAN theft:** a compromised agent identity spends up to `max_total` within `time_window`. Mitigation: 24-hour maximum expiry (§9.5), independent revocation (§7.4.4), conservative limits. The UCAN's constraints bound the blast radius, and the agent's own identifier carries the actions rather than the human's, because an agent is a separate identity (`09-security-model.md` §9.1 invariant 1).
 
-**Privacy:** Payment adapter sees transaction metadata but not context content. For context-level payments, payment data is inside the encrypted envelope — the adapter sees amount and DIDs but not what the payment is for. For relay-level payments, the adapter sees the relay operation but not the encrypted content. For maximum privacy, Lightning's onion routing or local-only adapters.
+**Privacy:** Payment adapter sees transaction metadata but not context content. For context-level payments, payment data is inside the encrypted envelope — the adapter sees amount and identifiers but not what the payment is for. For relay-level payments, the adapter sees the relay operation but not the encrypted content. For maximum privacy, Lightning's onion routing or local-only adapters.
 
 **Relay trust:** Paid relays remain untrusted — they see opaque blobs. Relay payment is for transport, not content access. Encryption-as-access-control (§9) unchanged. A relay that charges for storage cannot read what it stores.
 
-**Payment-as-gatekeeper risk:** If ALL relays require payment, free users are excluded. Mitigation: free relays MUST exist in the bootstrap relay list (§18.5). This is a protocol invariant, not a suggestion. The fallback relay list shipped with the SDK MUST include at least one free relay.
+**Payment-as-gatekeeper risk:** If ALL relays require payment, free users are excluded. Mitigation: free relays MUST exist in the bootstrap relay list (`18-addressability-and-deployment.md` §18.5.1). This is a protocol invariant, not a suggestion. The fallback relay list shipped with the SDK MUST include at least one free relay.
 
 ## 19.13 Phase Integration
 
@@ -624,7 +623,7 @@ Community payment adapters (x402, Lightning, SPL, Stripe) are **Phase 4+** — e
 5. **Payment adapters are substitutable — no single rail privileged.** The `PaymentAdapter` trait treats all payment rails equally. Protocol correctness does not depend on any specific adapter.
 6. **Economic policy mutable by default, optional immutability lock is voluntary.** Unlike ceiling policy (immutable by default), economic policy is governed by default. Creators may voluntarily lock pricing at creation.
 7. **Payment data inside encrypted envelope — relays never see payment metadata** for context-level economics. Relay-level payments are visible to the relay (necessary for relay to verify) but not to other relays or contexts.
-8. **Free relays MUST always exist in bootstrap list.** The SDK's fallback relay list (§18.5) MUST include free relays. This is a protocol invariant that prevents economic gatekeeping of basic protocol operation.
+8. **Free relays MUST always exist in bootstrap list.** The SDK's fallback relay list (`18-addressability-and-deployment.md` §18.5.1) MUST include free relays. This is a protocol invariant that prevents economic gatekeeping of basic protocol operation.
 9. **Auto-accept never applies to paid contexts.** No auto-accept policy configuration (§5.12.2) can override this. Agents never silently incur costs.
 
 ## 19.15 Wire Format Tables
@@ -737,7 +736,7 @@ This section tabulates the wire format for all economy protocol types that cross
 | `cost_schedule` | `CostSchedule` | Yes | Per-action cost table. |
 | `payment_adapters` | `Vec<String>` | Yes | Accepted payment adapter IDs. |
 | `pricing_formula` | `PricingFormula` | No | Dynamic pricing. If absent, `cost_schedule` alone determines costs. |
-| `payee` | `String` (DID) | Yes | DID that receives payments. |
+| `payee` | identifier | Yes | Who receives payments. |
 
 ### 19.15.5 Payment Authorization and Receipt
 
@@ -754,8 +753,8 @@ This section tabulates the wire format for all economy protocol types that cross
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
 | `auth_id` | `[u8; 32]` | Yes | Unique authorization identifier. |
-| `payer` | `String` (DID) | Yes | DID authorizing the payment. |
-| `payee` | `String` (DID) | Yes | DID receiving the payment. |
+| `payer` | identifier | Yes | Who authorizes the payment. |
+| `payee` | identifier | Yes | Who receives the payment. |
 | `amount` | `Amount` (u64) | Yes | Authorized amount. |
 | `currency` | `CurrencyCode` ([u8; 4]) | Yes | Currency. |
 | `adapter_id` | `String` | Yes | Payment adapter handling the transaction. |
@@ -768,8 +767,8 @@ This section tabulates the wire format for all economy protocol types that cross
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
 | `receipt_id` | `[u8; 32]` | Yes | Unique receipt identifier. |
-| `payer` | `String` (DID) | Yes | DID that paid. |
-| `payee` | `String` (DID) | Yes | DID that received payment. |
+| `payer` | identifier | Yes | Who paid. |
+| `payee` | identifier | Yes | Who received payment. |
 | `amount` | `Amount` (u64) | Yes | Amount paid. |
 | `currency` | `CurrencyCode` ([u8; 4]) | Yes | Currency. |
 | `action_type` | `PaidActionType` | Yes | What action was paid for. |
