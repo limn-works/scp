@@ -45,6 +45,38 @@ succeeds. It needs a routing ID (derived from the context ID or provided by the 
 the active relay URL (from `runtime::get_relay_connection` URL tracking). The `KnownContext`
 struct is already defined; the wiring just needs to happen at the right call site.
 
+## Second occurrence, outside the FFI layer (2026-08-17)
+
+`crates/scp-node/src/bridge_auth.rs` repeated this shape at a different layer. A
+`StorageBridgeLookup` held every registered bridge, every operator DID document, and every
+platform webhook key that §12.10.2 authentication reads. Its three writers —
+`register_bridge`, `register_did_document`, `register_webhook_key` — had call sites only past
+`#[cfg(test)]`. Both node build paths constructed that store and hydrated it from storage, which
+held nothing, so a shipped node answered `BRIDGE_NOT_AUTHORIZED` (401) to every bridge request
+forever. Twenty-seven tests covering per-bridge and per-context scope rules all passed, because
+each one seeded that store directly and none of them ran a registration through a node.
+
+Two things generalize from this second occurrence:
+
+1. **A store is not FFI-specific.** Apply the invariant to any read-side cache or registry
+   an authorization decision consults, whatever layer holds it.
+2. **A 401-on-everything failure looks like correct fail-closed behaviour.** Nothing logs an
+   error, nothing panics, and every negative test still passes. Ask instead which production
+   call makes an authorized request succeed, and require a test that performs it.
+
+The fix made `admit_registration` the one entry point that writes a connector and gave it two
+production callers: `ApplicationNode::register_bridge`, which an embedder calls, and
+`ApplicationNode::admit_bridge_registrations`, which the shipped `scp-node` binary calls at
+startup when `SCP_NODE_BRIDGE_REGISTRATIONS` names a file of operator-supplied approvals.
+`crates/scp-node/tests/bridge_registration_wiring.rs` requires 401 before that call and 200
+after it.
+
+A third lesson came out of a review of that first fix. Moving a writer from `#[cfg(test)]` to a
+`pub` method is not the same as wiring it: a public method whose only callers are tests leaves a
+shipped binary in the same state the original defect described. Ask which shipped entry point —
+a binary's `main`, a request handler, a startup sequence — reaches that writer, and name it.
+"Callable from outside the crate" is not an answer.
+
 ## Related
 
 - `context_ids_for_member` reads `CONTEXT_REGISTRY`, which IS populated from `py_context_create`.

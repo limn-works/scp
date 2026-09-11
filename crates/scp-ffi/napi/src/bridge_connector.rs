@@ -130,6 +130,7 @@ pub fn bridge_evaluate_trust(
         status: BridgeStatus::Active,
         registration_context: String::new(),
         registered_at: 0,
+        max_shadows: 10_000,
     };
 
     let shadow = ShadowIdentity {
@@ -154,6 +155,11 @@ pub fn bridge_evaluate_trust(
 /// The `governance_did` must differ from `operator_did` — self-approval is
 /// forbidden per ADR-023.
 ///
+/// Cooperative mode (spec §12.2.1) requires both `platform_key` and
+/// `platform_key_id`; every other mode rejects both. `platform_key_id` is what
+/// a platform sends in `X-SCP-Platform-Key-Id` on a webhook request, and every
+/// webhook signature covers it (spec §12.10.2).
+///
 /// # Errors
 ///
 /// Returns a validation error if `operator_did` or `governance_did` is not a
@@ -161,7 +167,9 @@ pub fn bridge_evaluate_trust(
 /// structure, method not lowercase alphanumeric, or contains control
 /// characters), or if `mode` is not a recognized bridge mode.
 /// Returns a context error if the governance DID matches the operator DID
-/// (self-approval) or if registration fails.
+/// (self-approval), if a cooperative registration omits `platform_key` or
+/// `platform_key_id`, if a non-cooperative registration carries either one, or
+/// if registration fails.
 #[napi]
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 pub fn bridge_register(
@@ -172,6 +180,7 @@ pub fn bridge_register(
     mode: String,
     webhook_url: Option<String>,
     platform_key: Option<Vec<u8>>,
+    platform_key_id: Option<String>,
     max_shadows: Option<u32>,
     metadata_display_name: Option<String>,
     metadata_description: Option<String>,
@@ -211,6 +220,7 @@ pub fn bridge_register(
         self_hosted: false,
         webhook_url,
         platform_key: parsed_platform_key,
+        platform_key_id,
         max_shadows: max_shadows.unwrap_or(10_000),
         metadata: BridgeRegistrationMetadata {
             display_name: metadata_display_name.unwrap_or_default(),
@@ -227,7 +237,7 @@ pub fn bridge_register(
     })?;
 
     let approver_did: scp_did::DID = governance_did.into();
-    let (connector, _approval_event) =
+    let (approved, _approval_event) =
         approve_registration(&mut registry, &bridge_id, &approver_did, 0).map_err(|e| {
             napi::Error::from(ScpNapiError::Context {
                 message: format!("bridge approval failed: {e}"),
@@ -236,7 +246,7 @@ pub fn bridge_register(
         })?;
 
     Ok(NapiBridgeRegistration {
-        bridge_id: connector.bridge_id,
+        bridge_id: approved.into_parts().0.bridge_id,
         operator_did,
         platform,
         mode,
@@ -619,6 +629,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(result.status, "active");
@@ -636,6 +647,7 @@ mod tests {
             "did:key:operator".to_owned(),
             "discord".to_owned(),
             "relay".to_owned(),
+            None,
             None,
             None,
             None,
@@ -661,6 +673,7 @@ mod tests {
             "cooperative".to_owned(),
             Some("https://example.com/webhook".to_owned()),
             Some(vec![42u8; 32]),
+            Some("platform-key-1".to_owned()),
             Some(500),
             Some("My Discord Bridge".to_owned()),
             Some("Bridges #general channel".to_owned()),
@@ -680,6 +693,7 @@ mod tests {
             "cooperative".to_owned(),
             None,
             Some(vec![42u8; 16]), // wrong length
+            Some("platform-key-1".to_owned()),
             None,
             None,
             None,

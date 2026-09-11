@@ -38,6 +38,11 @@ scp-transport = { path = "../scp-transport", version = "=0.1.0-beta.2", features
 # `scp-platform/testing` via this crate's own `testing` feature only.
 scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.2", features = ["software_platform", "in-memory-storage", "sqlite", "file", "encrypting"] }
 arc-swap = { workspace = true }
+# `BridgeLookup::resolve_did_document` performs a DHT resolution, so it is
+# async, and the bridge routers hold that trait as `Arc<dyn BridgeLookup>`.
+# An `async fn` in a trait is not dyn-compatible, so the trait boxes its
+# futures through `async-trait`.
+async-trait = { workspace = true }
 axum = { workspace = true, features = ["ws"] }
 ed25519-dalek = { workspace = true }
 instant-acme = "0.8"
