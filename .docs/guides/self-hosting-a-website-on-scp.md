@@ -14,7 +14,9 @@ For concrete public-deployment recipes (direct IP / tunnel / reverse proxy), see
 >
 > **Provenance:** specs `§10 Infrastructure & Self-Hosting`
 > (`.docs/specs/10-infrastructure-and-self-hosting.md`) and
-> `§18 Addressability & Deployment` (`.docs/specs/18-addressability-and-deployment.md`).
+> `§18 Addressability & Deployment` (`.docs/specs/18-addressability-and-deployment.md`),
+> whose §18.5.1, the community relay list and bootstrap priority order, states how a
+> client reaches an identity it has never resolved.
 > Ground truth in this doc was established by direct code audit (file:line cited
 > inline) on 2026-06-13.
 
@@ -97,22 +99,20 @@ Three addressing paths, none requiring DNS-as-central-authority:
 | Path | Who can use it | DNS? | Notes |
 |------|----------------|------|-------|
 | **Raw public IP:port** | any browser, today | none | `https://<public-ip>:<port>/` (origin-root mount; the canonical `…/scp/broadcast/<rid>/site/<path>` route also works). The self-host surface serves **self-signed HTTPS (TLS 1.3) by default** (§10.12.11) with a SAN for the external IP, so raw-IP HTTPS matches; browsers show a one-time cert warning. The routing_id route is registered unconditionally and ignores the `Host` header. Plaintext `http://` is an opt-out via `SCP_NODE_SELF_HOST_PLAINTEXT=1`. |
-| **`did:dht`** | SCP-aware clients | none | Real BitTorrent **Mainline DHT** publish via the `mainline` v6 crate, BEP44 signed mutable items (`crates/scp-dht/src/dht_client/pkarr_client.rs:233` publish / `:293` resolve). Gated behind the `production-dht` feature. No central authority in the publish path; the optional HTTP gateway is a signature-verified resolve-only fallback, empty by default. |
+| **Identity resolution** | SCP-aware clients | none | The SCP relay network carries an identity's key-event log and service record. A client resolves through `IdentityBackend::resolve`, which takes the identity's 32 raw digest bytes. |
 | **Virtual host** (`Host:` header → routing_id) | any browser | needs DNS | Convenience only; out of scope for the DNS-free goal. |
 
 ### Known addressing gaps (honest)
 
-- **The published DID document carries only relay endpoints — there is *no*
-  HTTP/site service-endpoint type** (`SCPRelay` and `SCPBroadcastContext` are the
-  network endpoint types in the closed set at
-  `crates/scp-identity/src/document.rs`; both point at relay URLs, not an origin
-  HTTP `IP:port`; no `SCPSite`/`SCPHttp` exists). So a client
-  **cannot today discover the website's `IP:port` from `did:dht` alone** — it
+- **The service record carries only relay endpoints — there is *no* HTTP/site
+  service-endpoint type** (`SCPRelay` and `SCPBroadcastContext` both point at relay
+  URLs, not an origin HTTP `IP:port`; no `SCPSite`/`SCPHttp` exists). So a client
+  **cannot today discover the website's `IP:port` by resolving the identity** — it
   learns the relay, not the site. Closing the loop needs a new service-endpoint
   type. *(Tracked in §6.)*
-- **No DANE/cert-fingerprint-over-DID.** Only local TOFU relay pinning exists
-  (`crates/scp-transport/src/native/cert_pin.rs`). A self-signed node cert can't
-  be verified against a DID-published fingerprint yet.
+- **No DANE and no cert fingerprint in the service record.** Only local TOFU relay
+  pinning exists (`crates/scp-transport/src/native/cert_pin.rs`). A self-signed node
+  cert cannot be verified against a published fingerprint yet.
 - **PyO3/NAPI client `identity_resolve` use `InMemoryDhtClient`** (resolve against
   an empty in-process map, not the network). Only the node binary and the UniFFI
   per-instance production build hit the real DHT.
@@ -132,8 +132,7 @@ not the internal relay port (see `fn build_no_domain_inner`, `crates/scp-node/sr
   the HTTP port → the website becomes reachable, no manual port-forward.
 - **Tier 2 — STUN** (RFC 8489, `crates/scp-transport/src/nat/mod.rs`): discovers
   the external `IP:port`, classifies NAT type, self-tests reachability, then
-  publishes `ws://<external-ip>:<port>/scp/v1` into the DID document on the real
-  Mainline DHT.
+  publishes `ws://<external-ip>:<port>/scp/v1` into the identity's service record.
 - **Tier 3 — bridge relay reverse-tunnel** (symmetric-NAT fallback): **not wired
   node-side**, and the bridge only forwards relay blob frames, never HTTP.
 
@@ -168,8 +167,8 @@ the TCP HTTP mapping) is a Phase-2, spec-touching (§10.12.2) fix.
 
 The Tier-3 bridge relay is mis-framed in the code as merely a *symmetric-NAT
 fallback*. It is actually the answer to the biggest self-hosting footgun (§3,
-IP-doxing): if a node is reachable via a **neutral public bridge's IP**, the DID
-resolves to the bridge and the operator's **home IP never enters the DHT**. So the
+IP-doxing): if a node is reachable via a **neutral public bridge's IP**, the
+identity's service record names the bridge, not the operator's **home IP**. So the
 safe-by-default posture for non-experts is: **default = reachable via a bridge
 relay (home IP private); direct home-IP exposure = explicit power-user opt-in**
 (faster, fully decentralized, but consciously publishing your IP). Phase 1 builds
@@ -207,8 +206,8 @@ future work.
    serve time — the node's external/LAN IP, so raw-IP HTTPS presents a matching
    SAN. Browsers show a one-time untrusted-certificate warning (expected for the
    no-DNS model). Rationale: §10.12.6's "self-signed certs provide no trust
-   benefit" applies to SCP-protocol peers (who authenticate the relay via the
-   self-certifying DID document), **not** to web browsers — which can only speak
+   benefit" applies to SCP-protocol peers (who authenticate the relay through the
+   identity's service record), **not** to web browsers — which can only speak
    HTTP or HTTPS, and whose HTTPS-Only modes (e.g. Safari) refuse to open
    `http://` origins. Plaintext is an explicit opt-out via
    `SCP_NODE_SELF_HOST_PLAINTEXT=1` (restores `http://` on the self-host surface;
@@ -268,7 +267,7 @@ via `host_site_until`, plus **PRD stories** (validate with
 **Security posture = implementation requirements (not optional):**
 self-host is **opt-in only** (`--self-host` flag / `SCP_NODE_SELF_HOST=1`, never a
 default; `upnp` stays a non-default cargo feature); a **loud, legible startup log**
-("opening TCP <port> to the public internet; home IP <x> now publicly bound to DID
+("opening TCP <port> to the public internet; home IP <x> now publicly bound to identity
 <y>"); **clean teardown** releases the mapping on shutdown; dev/bridge endpoints
 stay **loopback-only** (verify, don't assume); IP-doxing and the self-signed-cert
 (no-CA) posture stated explicitly (the self-host surface serves self-signed HTTPS
@@ -284,8 +283,8 @@ home line doesn't have. Honest, not fixable from here.
 **Phase 1 — Minimal viable self-host (cone-NAT, this machine):** ✅ implemented
 - Build path with `production-dht` + `upnp` features.
 - The `scp-node --self-host` binary mode builds `HostSiteConfig { reach: Reach::NatTraversal, tls, dht, … }` and calls `host_site_until`:
-  probes NAT → NAT-PMP-maps the HTTP port → STUN-confirms → publishes `did:dht` to
-  Mainline. Serves self-signed HTTPS by default (§10.12.11);
+  probes NAT → NAT-PMP-maps the HTTP port → STUN-confirms → publishes the node's
+  address. Serves self-signed HTTPS by default (§10.12.11);
   `SCP_NODE_SELF_HOST_PLAINTEXT=1` opts out to plaintext for a DNS-free stress test.
 - Create a broadcast context; publish `index.html`/CSS/JS as encrypted assets;
   `enable_broadcast_projection_with_site`; `commit_deploy`.
@@ -299,16 +298,17 @@ home line doesn't have. Honest, not fixable from here.
 - Liveness/auto-remap on IP change; clean shutdown releases the mapping.
 
 **Phase 3 — Close the DNS-free addressing loop (protocol work):**
-- New DID-document **site service endpoint** so a client can resolve
-  `did:dht` → the site's `IP:port` (not just the relay).
-- (Optional) cert-fingerprint-over-DID for CA-less self-signed TLS verification.
+- New **site service endpoint** in the service record so a client resolving an
+  identity reaches the site's `IP:port`.
+- (Optional) a service-record cert fingerprint for CA-less self-signed TLS
+  verification.
 
 **Phase 4 — TLS without a central CA:**
 - ✅ Self-signed TLS (TLS 1.3) on the self-host path is the default
   (§10.12.11); the node is its own CA, with SANs for `localhost`/`127.0.0.1`/the
   external IP. Plaintext is the explicit `SCP_NODE_SELF_HOST_PLAINTEXT=1` opt-out.
-- (Future) DID-fingerprint pinning over the self-signed cert (bind the cert
-  fingerprint into the BEP44-signed DID document) so an SCP-aware client can verify
+- (Future) fingerprint pinning over the self-signed cert (bind the cert
+  fingerprint into the signed service record) so an SCP-aware client can verify
   it without a CA — §10.12.11 "Future: CA-less authentication."
 
 ---
@@ -323,7 +323,7 @@ home line doesn't have. Honest, not fixable from here.
 - [x] NAT-PMP/UPnP lease renewal wired into the `--self-host` node path (§3.4) —
       renews at 50% of the gateway-reported TTL, retries on failure, released on
       shutdown.
-- [ ] DID document lacks an HTTP/site service-endpoint type (§2 gaps).
+- [ ] The service record lacks an HTTP/site service-endpoint type (§2 gaps).
 - [ ] Tier-3 bridge reverse-tunnel not wired node-side; bridge can't carry HTTP
       (blocks symmetric-NAT hosts — does **not** block this cone-NAT host).
 - [ ] Move NAT/UPnP/STUN probe scripts into the repo as a reusable diagnostic.
@@ -334,7 +334,7 @@ home line doesn't have. Honest, not fixable from here.
 
 - **2026-06-13** — Established full ground truth via code audit (7 parallel
   agents). Confirmed the broadcast/site-projection architecture, the HTTP-only
-  serving path, real Mainline-DHT `did:dht` publishing, and the host-side
+  serving path, identity publishing, and the host-side
   NAT-traversal tiers + their gaps. Probed the host: **cone NAT + NAT-PMP
   supported** → public self-hosting with no port-forward is achievable here.
   Created this guide.
@@ -347,7 +347,7 @@ home line doesn't have. Honest, not fixable from here.
   `docs/self-host-binary-prd`) per the step-ordered plan below; the agent prompts
   are fully specified. After build + full-roster review + local CI (`--features
   upnp`), the only remaining step is the operator-consented live run (opens TCP
-  8443 via NAT-PMP, publishes did:dht). Verify public reachability from OFF this
+  8443 via NAT-PMP, publishes the node's address). Verify public reachability from OFF this
   network (phone on cellular / external box) — home routers often don't hairpin.
 - **2026-06-13** — Produced code-verified Phase 1 plan. Key resolutions:
   **no new ADR** (mechanism already specced §10.12 + ADR-032/035/042); the binary
@@ -372,7 +372,7 @@ home line doesn't have. Honest, not fixable from here.
   self-host serves self-signed HTTPS (TLS 1.3) by default with plaintext opt-out
   (`SCP_NODE_SELF_HOST_PLAINTEXT=1`) per §10.12.11; the `scp-node --self-host`
   binary mode selects `no_domain()` (§3 gap #2 / §6 resolved); origin-root mount
-  (`/` → index) per §10.12.11; the self-host DID is stable across restarts
+  (`/` → index) per §10.12.11; the self-host identity is stable across restarts
   (load-or-create via `ApplicationNodeBuilder::identity_with_storage()`,
   `crates/scp-node/src/main.rs`); `SCP_NODE_SELF_HOST_NO_NAT=1` skips the STUN
   probe behind a tunnel/proxy; NAT-PMP/UPnP lease renews at 50% TTL.
@@ -386,7 +386,7 @@ home line doesn't have. Honest, not fixable from here.
   `crates/scp-node/examples/website.rs` (`cargo run -p scp-node --example
   website`). The library default is **fail-safe**: `DhtMode::Memory` publishes
   nothing; public hosting is a deliberate `DhtMode::Production` opt-in (which
-  publishes the host's address bound to its DID to the DHT — the same IP-to-
+  publishes the host's address bound to its identity — the same IP-to-
   identity disclosure the binary gates behind `--self-host` + its banner). No new
   protocol logic, specs, ADRs, or enforcement/capability-matrix changes — a
   packaging/ergonomics refactor of the already-shipped self-host flow.
