@@ -11,7 +11,7 @@ pseudonym_keypair = P256_keypair_from_scalar(seed_to_scalar(seed))   // §9.10.4
 The HMAC key is the 32-byte `pseudonym_secret`, **never the public key**. How the
 `pseudonym_secret` is obtained differs by custody type:
 
-- **Software custody** (Rust `InMemory`/`File`/`SQLite`, Android Bouncy Castle API 26-32,
+- **Software custody** (Rust `InMemory`/`File`/`SQLite`, Android Bouncy Castle,
   Apple software Keychain, WASM/JS WebCrypto):
   `pseudonym_secret = HKDF-SHA256(ikm = p256_private_scalar, salt = "scp-pseudonym-secret-v1", info = "", len = 32)`.
   This is byte-identical across every platform, so software pseudonyms are **cross-platform
@@ -19,17 +19,14 @@ The HMAC key is the 32-byte `pseudonym_secret`, **never the public key**. How th
   `derive_pseudonym_keypair()` in `crates/scp-crypto/src/pseudonym.rs`. Known-answer
   vectors are pinned in `.docs/specs/25-test-vectors.md` §25.19.
 
-- **Hardware custody** (Android Keystore TEE API 33+, Apple Secure Enclave, HSM):
+- **Hardware custody** (Android Keystore TEE, Apple Secure Enclave, HSM):
   the private key bytes are **non-exportable** — they never leave the secure boundary. The
   `pseudonym_secret` is therefore a **device-local** value computed inside the boundary.
   It is an associated 32-byte symmetric key the boundary generates at `generate_keypair` and
-  holds inside itself. **Superseded 2026-09-10:** this file previously named
-  `SHA-256(TEE_sign("scp-pseudonym-secret-v1"))` and gave RFC 8032's deterministic Ed25519
-  nonce as the reason it reproduced. Alec's P-256 ruling of 2026-09-10 replaced Ed25519 with
-  ECDSA, an ECDSA hardware signer draws its own nonce, and a signature-derived secret would
-  therefore differ on every call and move the member's routing id on every launch. Hardware
-  pseudonyms are **device-local by design** and are intentionally NOT identical across devices
-  or to the software vectors.
+  holds inside itself. An ECDSA hardware signer draws its own nonce, so a secret derived from
+  a signature would differ on every call and move the member's routing id on every launch.
+  Hardware pseudonyms are **device-local by design** and are intentionally NOT identical
+  across devices or to the software vectors.
 
 ## Why NOT the public key
 
