@@ -493,7 +493,7 @@
       "sources": [
         {
           "file": ".docs/specs/03-identity.md",
-          "section": "### 3.10.10 DidResolver Trait"
+          "section": "### 3.10.10 IdentityBackend, the Resolution Trait"
         },
         {
           "file": ".docs/specs/03-identity.md",
