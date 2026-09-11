@@ -501,6 +501,8 @@ bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/ 
 
 **Status:** Decided
 
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, retired the DID document and the `did:dht` identifier form. Resolution returns a key state, and `09-security-model.md` §9.7.4.2 R13 defers the identifier's textual form, so no example here prints one.
+
 ### Context
 
 The UniFFI bridge (ADR-021) generates raw Kotlin bindings from the Rust protocol engine. While functional, the generated surface is not idiomatic Kotlin — it lacks coroutine suspension, `Flow<T>` streams, Android lifecycle awareness, Jetpack Compose integration, and the ergonomic patterns Kotlin developers expect. The Android platform adapter (ADR-027) provides the `KeyCustody`, `PushProvider`, `Storage`, and `DeviceAttestationProvider` implementations injected into the Rust engine via UniFFI callback interfaces.
@@ -720,7 +722,7 @@ class Identity internal constructor(internal val handle: IdentityHandle) {
         }
     }
 
-    /** Resolve another identity's DID document. */
+    /** Resolve another identity's key state. */
     suspend fun resolve(did: String): DIDDocument = withContext(Dispatchers.IO) {
         DIDDocument.fromRecord(NativeLib.identityResolve(did))
     }
@@ -731,7 +733,7 @@ class Identity internal constructor(internal val handle: IdentityHandle) {
     }
 }
 
-/** A resolved DID document. */
+/** A key state resolved from an identity's key-event log. */
 data class DIDDocument(
     val did: String,
     val verificationMethods: List<VerificationMethod>,
@@ -1096,7 +1098,7 @@ dependencies {
    Both commands exit 0. Zero ktlint violations. Zero detekt findings.
 
 2. **`Scp.create()` factory:**
-   - `Scp.create(custody = "in_memory")` returns an `Scp` instance with `identity.did` starting with `"did:dht:"`.
+   - `Scp.create(custody = "in_memory")` returns an `Scp` instance with a non-empty `identity.did`.
    - `Scp.create(custody = "platform", platformAdapter = AndroidPlatformAdapter.make(context))` returns an `Scp` instance with hardware-backed identity on API 33+.
    - `Scp.create()` with an unknown custody string throws `IdentityException` with code `"SCP-IDENT-1001"`.
 
@@ -1104,7 +1106,7 @@ dependencies {
 
    ```kotlin
    val scp = Scp.create(custody = "in_memory")
-   assertTrue(scp.identity.did.startsWith("did:dht:"))
+   assertTrue(scp.identity.did.isNotEmpty())
    assertEquals("in_memory", scp.identity.custodyType)
 
    val doc = scp.identity.resolve(scp.identity.did)
@@ -1246,6 +1248,8 @@ dependencies {
 ## ADR-029: Offline/Sync Strategy
 
 **Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, retired the DID document and overturned ADR-039's shared-identity `#agent` method. A verifier resolves a member's key from that member's key state, which names one operational role (`09-security-model.md` §9.1 invariant 1, `03-identity.md` §3.10.4).
 
 **Amendment (2026-09-10 — queued-operation signatures are ECDSA on P-256).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. Each `signature` field on this ADR's queued-operation and reconciliation structures carries the type `P256Signature`, and its signature-validity check verifies an ECDSA signature on P-256 against the member's resolved verification method. The offline queue model, the three reconnection cases, and the relay backfill path are untouched.
 
@@ -1392,7 +1396,7 @@ When a member has been offline for more than 7 days, or when the epoch catch-up 
 
    **Anti-replay validation.** Because ResetRequest is not MLS-encrypted, it is visible to relays and any network observer. Without replay protection, an attacker who captures a valid ResetRequest can replay it to force-remove and re-add the member repeatedly, disrupting their session. The relay (or any recipient processing the request) MUST validate:
 
-   - **(a) Signature validity.** Verify the P-256 signature against the member's DID document (resolve `member_did`, check `#active` or `#agent` verification method). **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`.docs/specs/00-open-questions.md`).]**
+   - **(a) Signature validity.** Verify the P-256 signature against the key the member's key state lists `current` in the `#active` role (resolve `member_did`, derive the key state).
    - **(b) Timestamp freshness.** Reject requests where `|relay_clock - timestamp| > 30 seconds`. This matches the freshness window used for `AccessKeyRequest` (§9.17) and `SenderKeyRequest` (§9.16.2) validation. The 30-second window accommodates reasonable clock skew while limiting the replay window.
    - **(c) Nonce uniqueness.** Maintain a deduplication cache of `(member_did, nonce)` pairs with a 60-second TTL. Reject any request whose nonce has been seen within the TTL window. The 60-second TTL is 2x the freshness window, ensuring that even a request accepted at the edge of the 30-second window cannot be replayed after nonce eviction. Cache capacity: bounded at 10,000 entries with oldest-first eviction (matching the `NonceDedup` pattern used for `SenderKeyRequest` in `scp-core/crypto/sender_keys/key_protocol.rs`).
 
@@ -2293,6 +2297,8 @@ Checkpoint {
 
 **Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
 
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, overturned ADR-039's shared-identity `#agent` method, so one identity holds one operational key and the one-identity-one-vote rule no longer has two keys to deduplicate across (`09-security-model.md` §9.1 invariant 1).
+
 **Amendment (2026-09-10 — the governance-proposal signature is ECDSA on P-256).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. The `signature` field on this ADR's governance-proposal structure carries the type `P256Signature`. The threshold models, the approval flow, and the admin-set rules are untouched.
 
 ### Context
@@ -2429,7 +2435,7 @@ pub enum GovernanceModelConfig {
     /// M-of-N threshold approval. A fixed set of designated signers;
     /// a proposal passes when at least `threshold` of them approve.
     /// One DID = one vote regardless of signing key (ADR-039). A vote
-    /// signed by `#agent` counts the same as one signed by `#active`. **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`.docs/specs/00-open-questions.md`).]**
+    /// carries the weight of the identity that signed it and not of a key.
     Threshold {
         /// The set of DIDs authorized to vote. These DIDs must hold
         /// the `GovernanceVote` capability.
@@ -2687,7 +2693,7 @@ Every proposal has a `voting_deadline = created_at + voting_window_secs`. The vo
 
 In single-admin governance, the context creator holds the root UCAN authority and delegates all capabilities. In multi-admin governance, UCAN authority is distributed:
 
-**Root UCAN issuer.** The context creator remains the root UCAN issuer. This is a cryptographic necessity — the UCAN delegation chain must have a single root of trust (ADR-009 step 4: "root token's `iss` is the context creator's DID"). The creator is not a privileged governor — they are the key ceremony initiator. One DID = one vote regardless of which signing key (`#active` or `#agent`) casts the vote (ADR-039). The governance engine deduplicates by DID, not by key. **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`.docs/specs/00-open-questions.md`).]**
+**Root UCAN issuer.** The context creator remains the root UCAN issuer. This is a cryptographic necessity — the UCAN delegation chain must have a single root of trust (ADR-009 step 4: "root token's `iss` is the context creator's DID"). The creator is not a privileged governor — they are the key ceremony initiator. One identity = one vote. The governance engine deduplicates by identifier, not by key.
 
 **Governance capability distribution.** At context creation, the creator mints `GovernancePropose` and `GovernanceVote` UCAN tokens for each DID that the governance model designates as a voter:
 
@@ -3056,6 +3062,8 @@ GovernanceActionExecuted {
 
 **Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
 
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, overturned ADR-039's shared-identity `#agent` method, so an identity holds one operational key and the access-key lookup has one key to find (`09-security-model.md` §9.1 invariant 1).
+
 **Amendment (2026-09-10 — access-key distribution runs over DHKEM(P-256)).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. The access-key distribution moves from DHKEM(X25519, HKDF-SHA256) to DHKEM(P-256, HKDF-SHA256) under HPKE Base mode, the ephemeral wrapping keypair a requester generates is a DHKEM(P-256) keypair, and the request's `signature` field carries the type `P256Signature`. The pull-based model, the `info` and AAD constructions, and the per-epoch rotation are untouched.
 
 ### Context
@@ -3141,7 +3149,7 @@ pub struct AccessKeyRequest {
     pub epoch: u64,
     pub timestamp: u64,  // Unix milliseconds; requests older than 30s are rejected
     pub wrapping_pubkey: HpkeP256PublicKey,  // Ephemeral, per-request
-    /// Which verification method signed: "#active" or "#agent" (ADR-039). **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`.docs/specs/00-open-questions.md`).]**
+    /// Which operational role signed: "#active".
     pub signing_key_id: String,
     /// P-256 signature over: SHA-256(context_id || requester_did || signing_key_id || epoch || timestamp || wrapping_pubkey)
     /// using the requester's Active Signing Key or Agent Signing Key (ADR-039). Prevents replay and impersonation.
@@ -3166,7 +3174,7 @@ pub struct AccessKeyResponse {
 
 On receive:
 
-1. Look up own `member_id` (truncated DID hash) in `wrapped_ceks`. Note: the lookup is by DID, not by signing key — both `#active` and `#agent` operations on the same DID share the same access key (ADR-039). **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`.docs/specs/00-open-questions.md`).]**
+1. Look up own `member_id` (truncated identifier hash) in `wrapped_ceks`. Note: the lookup is by identifier and not by signing key, so every operation an identity performs shares one access key.
 2. Unwrap the CEK with own access key using AES-256-KW.
 3. Decrypt the ciphertext with AES-256-GCM using the unwrapped CEK. The AEAD authentication tag verifies integrity.
 
@@ -3380,6 +3388,8 @@ The access key is destroyed on Full revocation and not archived. Re-wrapping his
 
 **Status:** Decided
 
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, removed the Mainline distributed hash table, so the republish interval a BEP44 expiry fixed is no longer a protocol constant, and the identity layer republishes its key-event log and its service record to relays instead (`03-identity.md` §3.10.5).
+
 ### Context
 
 The Protocol Constants Registry (§9.18) promoted many implementation defaults to protocol-level constants. Constants like `MAX_SEQUENTIAL_COMMITS`, `RECONNECTION_TIMEOUT`, `SENDER_KEY_TIMEOUT`, `RECONNECTION_DEDUP_WINDOW`, and the nesting depth ceiling have no security or correctness basis for their specific values. The session cap default of 5 was a placeholder. The relay blob TTL is the relay operator's business. Several timeouts are hardware-dependent.
@@ -3394,7 +3404,6 @@ Reclassify protocol constants into three tiers:
 
 | Constant | Value | Rationale |
 |----------|-------|-----------|
-| `DHT_REPUBLISH_INTERVAL` | 7200s | BEP44 constraint, not SCP's choice. |
 | `SENDER_KEY_GRACE` | 30s | ADR-001 criterion 6: "not configurable — it bounds the forward secrecy window." Explicit decision not to make configurable. |
 | `BUCKET_SIZES` | [256, 1024, 4096, 16384, 65536, 262144] | Interop requirement — implementations MUST use identical bucket sizes, otherwise relays distinguish implementations by ciphertext size, defeating padding. |
 | Cryptographic primitives | (§9.18.1) | Algorithm choices are protocol-level. |
@@ -3427,7 +3436,7 @@ Reclassify protocol constants into three tiers:
 
 3. `MAX_NESTING_DEPTH` is removed as a protocol ceiling. Same rationale as chain depth — nesting costs are borne by participants, not the protocol. Contexts may set their own limit via `ContextParams::max_nesting_depth`.
 
-4. `DID_DOCUMENT_BLOB_TTL_SECS` (resolver.rs:344) is intentionally independent from `RELAY_BLOB_TTL_SECS`. It is the identity-layer publication TTL for DID documents, used by the healing publisher, and remains unchanged.
+4. `DID_DOCUMENT_BLOB_TTL_SECS` (resolver.rs:344) is intentionally independent from `RELAY_BLOB_TTL_SECS`. It is the identity layer's own publication TTL, used by the healing publisher, and remains unchanged. A validating relay retains a key-event record and never expires one (`03-identity.md` §3.10.5), so the TTL binds the service record alone.
 
 ### Migration
 
@@ -3460,6 +3469,8 @@ No protocol versioning mechanism is required for this change set.
 
 **Status:** Decided
 
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, retired the DID document, so an identity-link attestation is published as an entry of the identity's service record (`03-identity.md` §3.5.3 and §3.10.13).
+
 ### Context
 
 Identity link attestations (§3.5) bind external platform identities to SCP DIDs. The original spec treated all attestation verification methods uniformly: OAuth, signed posts, DNS records, and challenge-response all shared the same trust model. In practice, these methods have fundamentally different trust properties:
@@ -3473,7 +3484,7 @@ The original §3.5.2 defined two alternative `proof` formats for OAuth attestati
 2. **Token expiry mismatch.** JWTs expire (typically in 1 hour). An attestation containing an expired JWT requires verifiers to either (a) accept expired JWTs (defeating the purpose of JWT expiry), or (b) reject the attestation after 1 hour (defeating the purpose of attestations).
 3. **Verification requires JWKS.** Verifiers must fetch the OIDC provider's JWKS to validate the JWT. This creates a runtime dependency on external infrastructure for attestation verification.
 
-Additionally, the original spec did not define how attestations are published in DID documents, leaving discovery underspecified.
+Additionally, the original spec did not define how attestations are published, leaving discovery underspecified.
 
 ### Decision
 
@@ -3487,7 +3498,7 @@ Additionally, the original spec did not define how attestations are published in
 
 **Provider registry.** Seven initial providers: `github.com` (Class 2), `x.com` (Class 2), `google.com` (Class 1), `apple.com` (Class 1), `microsoft.com` (Class 1), `mastodon:<instance>` (Class 2), `dns` (Class 2). New providers by spec amendment only.
 
-**DID document service entries.** Type `ScpIdentityLinkAttestation`. Fragment `attestation-<platform>--<index>`. Max 10 per DID document.
+**Service-record entries.** Type `ScpIdentityLinkAttestation`. Fragment `attestation-<platform>--<index>`. Max 10 per service record.
 
 **`revocation_status` in signed scope.** The `revocation_status` field replaces the separate `revocation` object in the wire format. It is included in the signature scope, preventing replay of revoked attestations as active.
 
@@ -3520,7 +3531,7 @@ The self-attestation model is acceptable for identity links specifically because
 1. §3.5.0 defines Class 1 (Cryptographic) and Class 2 (Reference) with verification method mapping.
 2. §3.5.1 defines the provider registry with 7 initial providers, platform value conventions, and creation flows for each class.
 3. §3.5.2 wire format includes `revocation_status` in the signature scope (replaces separate `revocation` object).
-4. §3.5.3 defines `ScpIdentityLinkAttestation` DID document service entry format with fragment naming convention and max-10 limit.
+4. §3.5.3 defines the `ScpIdentityLinkAttestation` service-record entry format with its fragment naming convention and max-10 limit.
 5. §3.5.4 defines class-specific verification procedures: Class 1 (signature-only), Class 2 (signature + proof fetch). Verification cache specified with 1-hour TTL.
 6. §3.5.6 documents security properties: no PII, self-attestation scope limits, zero-trust for unverified Reference attestations, revocation replay prevention.
 7. No new `AttestationType` variant introduced — class is derived from `evidence.method`.
