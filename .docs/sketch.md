@@ -10,32 +10,35 @@
 
 ### Create Identity
 
-First launch. User never sees keys. Device attestation proves real device.
+First launch.
 
 ```
 SCP.Identity.create(
-  custody: .secureEnclave | .passkey | .platform(apple|google) | .selfManaged,
-  recovery: [.trustedDevice, .socialRecovery, .platformBacked],
-  deviceAttestation: DeviceAttestation     // Apple App Attest / Google Play Integrity
+  rootSet: [CustodyType],        // one root key per entry, generated in that substrate
+  rootThreshold: Int,
+  nextSet: [CustodyType],        // one pre-rotation key per entry, committed by digest
+  nextThreshold: Int,
+  witnessSet: [Identifier],      // relay operators that cosign the head
+  witnessingInterval: Duration,
+  deviceAttestation: DeviceAttestation?
 ) → Identity {
-  did,
-  identityKey,          // P-256 — derives the DID string, highest-security custody (ADR-003)
-  activeSigningKey,     // P-256 — MLS credentials, envelope signatures, UCAN issuance (rotatable)
-  preRotationCommitment, // SHA-256(pre-rotation key public) — cold/offline custody
-  custodyMethod
+  identifier: [UInt8; 32],
+  keyState: KeyState
 }
 ```
 
-Device attestation binds one DID to one physical device. Sybil resistance starts here — creating identities costs the price of a device.
+The inception event installs every field above. The identifier is `SHA-256("SCP-KEL-ID-V1:" ‖ that event's signed preimage)`, so it encodes no key and never changes (`09-security-model.md` §9.7.4.2 R13, §9.11). Creation fails closed where no substrate holds a pre-rotation key independently of operational custody (§9.7.4.1 item 3a). §9.18.17 bounds each set.
+
+Device attestation is one trust signal a context MAY weight (`09-security-model.md` §9.3).
 
 ### Authenticate
 
-Resolves any auth method to a DID.
+Resolves any auth method to an identifier.
 
 ```
 SCP.Identity.authenticate(
   method: .passkey | .biometric | .platformSSO
-) → AuthenticatedSession { did, sessionToken }
+) → AuthenticatedSession { identifier, sessionToken }
 ```
 
 ### Link Existing Identity
@@ -44,9 +47,9 @@ Optional. Convenience, not source of truth.
 
 ```
 SCP.Identity.link(
-  did: myDID,
+  identifier: myIdentifier,
   platform: .apple(token) | .google(token) | .github(token)
-) → LinkedIdentity { did, linkedPlatforms[] }
+) → LinkedIdentity { identifier, linkedPlatforms[] }
 ```
 
 ### Recovery
@@ -54,21 +57,21 @@ SCP.Identity.link(
 ```
 SCP.Identity.recover(
   method: .trustedDevice(approvalFromDeviceID)
-        | .social(approvals: [DID])
+        | .social(approvals: [Identifier])
         | .platform(apple|google)
 ) → Identity
 ```
 
 ### Identity Attestations (§3.5)
 
-Cryptographic proofs binding external platform identities to your DID. Makes bridging trustworthy and social graph import possible.
+Cryptographic proofs binding external platform identities to your identifier. Makes bridging trustworthy and social graph import possible.
 
 ```
-// Create an attestation linking your X handle to your DID
+// Create an attestation linking your X handle to your identifier
 SCP.Attestation.create(
   type: .identityLink,
-  issuer: myDID,
-  subject: myDID,
+  issuer: myIdentifier,
+  subject: myIdentifier,
   claim: { platform: "x", handle: "@alice" },
   evidence: .oauth(token) | .signedPost(url) | .dns(record)
 ) → Attestation { id, type, issuer, subject, claim, evidence, signature }
@@ -96,17 +99,17 @@ Encrypted personal data — block lists, preferences, graph policies. Stored on 
 ```
 // Write to your private state (append-only event log)
 SCP.PrivateState.write(
-  did: myDID,
-  event: .block(did: daveDID)
-       | .mute(did: carolDID)
-       | .grantGraphVisibility(to: bobDID, scope: .thisContext(contextID))
+  identifier: myIdentifier,
+  event: .block(identifier: daveIdentifier)
+       | .mute(identifier: carolIdentifier)
+       | .grantGraphVisibility(to: bobIdentifier, scope: .thisContext(contextID))
        | .setPreference(key: "notifications", value: .minimal)
-       | .annotate(did: bobDID, note: "Met at cooking class")
+       | .annotate(identifier: bobIdentifier, note: "Met at cooking class")
 ) → void
 
 // Read current state (computed from event log)
 SCP.PrivateState.read(
-  did: myDID,
+  identifier: myIdentifier,
   query: .blockList | .muteList | .graphPolicies | .preferences | .all
 ) → PrivateStateView { ... }
 
@@ -121,11 +124,11 @@ Not a stored data structure. The social graph is computed from context membershi
 ```
 // Query your own social graph (assembled from contexts you're in)
 SCP.SocialGraph.query(
-  did: myDID,
-  filter: .allConnections | .sharedContexts(with: bobDID) | .contextMembers(contextID)
+  identifier: myIdentifier,
+  filter: .allConnections | .sharedContexts(with: bobIdentifier) | .contextMembers(contextID)
 ) → SocialGraphView {
   connections: [{
-    did: DID,
+    identifier: Identifier,
     sharedContexts: Int,
     roles: [Role],
     // strength derived from shared participation
@@ -134,8 +137,8 @@ SCP.SocialGraph.query(
 
 // Grant someone visibility into your graph
 SCP.SocialGraph.grantVisibility(
-  from: myDID,
-  to: bobDID,
+  from: myIdentifier,
+  to: bobIdentifier,
   scope: .fullContextList
        | .specificContext(contextID)
        | .connectionCount
@@ -144,8 +147,8 @@ SCP.SocialGraph.grantVisibility(
 
 // Query someone else's graph (requires their grant)
 SCP.SocialGraph.query(
-  did: bobDID,
-  asRequestor: myDID,
+  identifier: bobIdentifier,
+  asRequestor: myIdentifier,
   token: visibilityToken
 ) → SocialGraphView   // scoped to what the grant allows
 ```
@@ -169,10 +172,10 @@ SCP.Context.create(
           | .groupDiscussion        // messages + invite, full memory, optional TTL
           | .publicBroadcast        // broadcast mode, auto-granted subscriber reads, optional TTL
           | .gatedBroadcast,        // broadcast mode, admin-issued subscriber reads, optional TTL
-  peer: DID?,                       // for bilateral templates — handles invitation internally
+  peer: Identifier?,                       // for bilateral templates — handles invitation internally
   ttl: Duration?,                   // required for some templates, optional for others
   outlets: [OutletDefinition]?      // only for templates that allow outlets (coordination)
-) → Context { contextID, creatorDID, templateID, ceiling, roles, governance, ttl?, memoryScope }
+) → Context { contextID, creatorIdentifier, templateID, ceiling, roles, governance, ttl?, memoryScope }
 ```
 
 For bilateral templates, the SDK bundles context metadata + MLS Welcome message into a single transport delivery. The peer receives everything needed to evaluate and join in one message. With auto-accept (§5.12.2), the join is fully autonomous — no human delay.
@@ -185,7 +188,7 @@ SCP.Context.create(
   creator: Identity,
   ceiling: [Capability],           // max permissions this context can ever grant
   governance: .singleAdmin
-            | .multiSig(threshold: Int, admins: [DID])
+            | .multiSig(threshold: Int, admins: [Identifier])
             | .consensus
             | .custom(GovernanceModel),
   outlets: [OutletDefinition],
@@ -213,7 +216,7 @@ SCP.Context.create(
     description: String,
     public: Bool                   // discoverable vs invite-only
   }
-) → Context { contextID, creatorDID, ceiling, roles, governance, ttl?, memoryScope }
+) → Context { contextID, creatorIdentifier, ceiling, roles, governance, ttl?, memoryScope }
 ```
 
 TTL and memory scope are optional. When omitted, TTL defaults to none (context persists until manually closed) and memory scope defaults to `.full`.
@@ -267,7 +270,7 @@ Members must be in at least one parent to join the child. Eligibility is continu
 //   all bindings.
 SCP.Context.standingContext(
   identity: Identity,
-  peer: DID
+  peer: Identifier
 ) → Context { contextID, peer, template: .bilateralPersistent }
 ```
 
@@ -281,7 +284,7 @@ SCP.Context.setAutoAcceptPolicy(
   identity: Identity,
   policy: AutoAcceptPolicy {
     template: TemplateID,            // which template(s) to auto-accept
-    from: .knownDID([DID]),          // explicit operator allowlist — the only auto-accept trigger
+    from: .knownIdentifier([Identifier]),          // explicit operator allowlist — the only auto-accept trigger
     maxTTL: Duration?,               // optional cap
     rateLimit: Rate?                 // max auto-accepts per time window
   }
@@ -307,7 +310,7 @@ SCP.Context.inspect(
   governance: GovernanceModel,
   admissionRequirements: AdmissionRequirements?,
   consequenceRules: [ConsequenceRule]?,
-  creator: DID,
+  creator: Identifier,
   memberCount: Int,
   age: Date,
   ttl: Duration?,                  // time-to-live if set (§5.10)
@@ -324,7 +327,7 @@ SCP.Context.inspect(
     age: Date,
     governanceConfig: ParentGovernanceConfig   // what authority this parent has
   }]?,
-  eligibilityBasis: [contextID]?   // which parent(s) the inspecting DID would join through
+  eligibilityBasis: [contextID]?   // which parent(s) the inspecting identity would join through
 }
 ```
 
@@ -336,7 +339,7 @@ SCP.Context.join(
   as: Identity,
   agentMetadata: AgentCapabilityProfile,
   attestations: [Attestation]?    // present attestations if context requires them
-) → Membership { contextID, did, role, capabilityTokens[] }
+) → Membership { contextID, identifier, role, capabilityTokens[] }
 ```
 
 Returns the role assigned (non-negotiable) and UCAN tokens scoped to this context. Admission requirements are checked mechanically — missing attestations or insufficient history = denied.
@@ -357,13 +360,13 @@ Governance action. Requires admin role or governance approval. The invitee's Key
 ```
 SCP.Context.addMember(
   context: contextID,
-  identity: DID,                     // DID of the member to add
+  identity: Identifier,                     // identifier of the member to add
   role: String,                      // role to assign (must exist in context's role map)
   as: Identity,                      // must have admin role or governance authority
   attestations: [Attestation]?       // optional attestations on behalf of the invitee
 ) → MembershipResult {
   contextID: ContextId,
-  memberDID: DID,
+  memberIdentifier: Identifier,
   role: String,
   capabilityTokens: [UCANToken],     // UCAN tokens scoped to this context and role
   eventID: EventID                   // MemberJoined event in the event log
@@ -379,13 +382,13 @@ Governance action. Requires admin role or governance approval.
 ```
 SCP.Context.removeMember(
   context: contextID,
-  target: DID,
+  target: Identifier,
   as: Identity,                    // must have admin role or governance authority
   reason: String?                  // recorded in event log
 ) → void
 ```
 
-Removal triggers MLS group key rotation — the removed member loses cryptographic access to all future content. Distinct from blocking (which is personal, DID-to-DID, sender-key-based).
+Removal triggers MLS group key rotation — the removed member loses cryptographic access to all future content. Distinct from blocking (which is personal, identity-to-identity, sender-key-based).
 
 ### List
 
@@ -435,7 +438,7 @@ SCP.Context.createBroadcast(
 
 ### Broadcast Context: Subscribe (§5.14.3)
 
-Subscribers register via DID-signed requests. Open broadcasts grant access on registration; gated broadcasts require a `messagesRead` UCAN from the context admin.
+Subscribers register with `#active`-signed requests. Open broadcasts grant access on registration; gated broadcasts require a `messagesRead` UCAN from the context admin.
 
 ```
 SCP.Broadcast.subscribe(
@@ -446,7 +449,7 @@ SCP.Broadcast.subscribe(
 ) → Subscription {
   contextID,
   role: "subscriber",
-  authors: [{ did: DID, keyEpoch: u64 }]   // current author key epochs
+  authors: [{ identifier: Identifier, keyEpoch: u64 }]   // current author key epochs
 }
 ```
 
@@ -457,11 +460,11 @@ Pull-based key distribution. Subscriber requests a specific author's broadcast k
 ```
 SCP.Broadcast.requestKey(
   context: contextID,
-  authorDid: DID,
+  authorIdentifier: Identifier,
   epoch: u64,
   as: Identity
 ) → BroadcastKey {
-  authorDid: DID,
+  authorIdentifier: Identifier,
   epoch: u64,
   key: AES256Key                            // HPKE-sealed with subscriber's wrapping pubkey
 }
@@ -493,9 +496,9 @@ Send path: validate UCAN (`messagesWrite`) -> assign sequence -> generate nonce 
 SCP.Broadcast.receive(
   context: contextID,
   as: Identity,
-  filter: .all | .byAuthor(DID)
+  filter: .all | .byAuthor(Identifier)
 ) → AsyncStream<BroadcastMessage> {
-  senderDid: DID,
+  senderIdentifier: Identifier,
   sequence: u64,
   keyEpoch: u64,
   content: Data,
@@ -514,7 +517,7 @@ On block, the author increments their key epoch and generates a new broadcast ke
 ```
 SCP.Broadcast.block(
   context: contextID,
-  targetDid: DID,
+  targetIdentifier: Identifier,
   as: Identity                              // must be the author
 ) → BlockResult {
   newKeyEpoch: u64                          // epoch advanced automatically on block
@@ -522,7 +525,7 @@ SCP.Broadcast.block(
 
 SCP.Broadcast.unblock(
   context: contextID,
-  targetDid: DID,
+  targetIdentifier: Identifier,
   as: Identity
 ) → void
 // Unblocked subscriber can request the current key on next pull
@@ -547,13 +550,13 @@ SCP.Agent.register(
     },
     challengeVerified: [{          // tested and passed
       capability: String,
-      verifiedBy: DID,
+      verifiedBy: Identifier,
       verifiedAt: Date,
       challengeSuite: String
     }],
     version: String
   }
-) → AgentInstance { agentID, contextID, did, role, tokens[] }
+) → AgentInstance { agentID, contextID, identifier, role, tokens[] }
 ```
 
 ### Agent Actions
@@ -577,7 +580,7 @@ agent.invoke(
 agent.read(
   resource: .members | .messages(since:) | .outletList | .metadata
          | .eventLog(since:)       // verifiable event history
-         | .behavioralRecord(did:) // behavioral facts for a member
+         | .behavioralRecord(identifier:) // behavioral facts for a member
 ) → Resource
 ```
 
@@ -628,7 +631,7 @@ SCP.Outlet.define(
     input: { query: "Is butter dairy?" },
     expectedOutput: { answer: "Yes, butter is a dairy product.", sources: [] }
   }],
-  operator: DID                    // who's accountable for this outlet
+  operator: Identifier                    // who's accountable for this outlet
 )
 ```
 
@@ -659,7 +662,7 @@ SCP.Outlet.verify(
   testsPassed: Int,
   implementationHashMatches: Bool,
   verifiedAt: Date,
-  verifiedBy: DID
+  verifiedBy: Identifier
 }
 ```
 
@@ -740,7 +743,7 @@ SCP.OutletInterface.revoke(
   reason: String?                    // recorded in event log
 ) → OutletInterfaceRevocationResult {
   interfaceID: InterfaceID,
-  revokedBy: DID,
+  revokedBy: Identifier,
   revokedAt: Timestamp,
   terminatedSessions: Int,           // count of active sessions terminated
   eventID: EventID                   // InterfaceRevoked event in the event log
@@ -785,9 +788,9 @@ SCP.Capability.revokeAll(
   context: contextID
 ) → void
 
-// Nuclear: revoke all capabilities for a DID across all contexts
+// Nuclear: revoke all capabilities for an identifier across all contexts
 SCP.Capability.revokeIdentity(
-  did: DID
+  identifier: Identifier
 ) → void
 ```
 
@@ -798,7 +801,7 @@ When your agent encounters another agent. Returns data from all four validation 
 ```
 SCP.Trust.evaluate(
   subject: AgentPresentation {
-    did: DID,
+    identifier: Identifier,
     agentProof: Signature,
     capabilityTokens: [UCANToken],
     agentMetadata: AgentCapabilityProfile
@@ -832,13 +835,13 @@ SCP.Trust.evaluate(
     signatureValid: Bool,
     evidenceValid: Bool?,
     fresh: Bool,                   // within renewal interval
-    issuer: DID,
+    issuer: Identifier,
     claim: Claim
   }],
 
   // Layer 4: Trust Evaluation inputs (for agent judgment)
   endorsements: [{
-    from: DID,
+    from: Identifier,
     capability: String,
     endorserBehavioralRecord: BehavioralSummary
   }],
@@ -863,8 +866,8 @@ SCP.Attestation.create(
   type: .identityLink | .capabilityDelegation | .outletIntegrity
       | .agentCapability | .endorsement | .roleAssignment
       | .contextEndorsement,
-  issuer: DID,
-  subject: DID | OutletID | ContextID,
+  issuer: Identifier,
+  subject: Identifier | OutletID | ContextID,
   claim: TypeSpecificClaim,
   evidence: TypeSpecificEvidence?,
   expiry: Date?,
@@ -903,7 +906,7 @@ SCP.Governance.propose(
         | .removeOutlet(outletName)
         | .modifyRole(name, [Capability])
         | .addRole(name, [Capability])
-        | .removeMember(DID)
+        | .removeMember(Identifier)
         | .changeGovernance(GovernanceModel)
         | .addBridge(BridgeDefinition)
         | .removeBridge(bridgeID)
@@ -934,7 +937,7 @@ Bring external platform participants into an SCP context.
 ```
 SCP.Bridge.register(
   context: contextID,
-  operator: DID,                   // accountable identity running the bridge
+  operator: Identifier,                   // accountable identity running the bridge
   platform: "x" | "facebook" | "whatsapp" | "discord" | ...,
   mode: .relay | .puppet | .api | .cooperative
 ) → BridgeInstance { bridgeID, contextID, operator, platform, mode }
@@ -949,7 +952,7 @@ External platform users represented in SCP contexts.
 SCP.Bridge.createShadow(
   bridge: bridgeID,
   externalIdentity: { platform: "x", handle: "@dave" },
-  attributedBy: bridgeOperatorDID
+  attributedBy: bridgeOperatorIdentifier
 ) → ShadowIdentity {
   shadowID, platform, handle, bridgeID,
   role: "observer",               // restricted by default
@@ -959,10 +962,10 @@ SCP.Bridge.createShadow(
 // External user later claims their shadow with an identity attestation
 SCP.Bridge.claimShadow(
   shadowID: shadowID,
-  claimant: DID,
+  claimant: Identifier,
   attestation: Attestation        // identity_link matching the shadow's platform handle
 ) → Result<ShadowClaimEvent, ClaimError>
-// On success: shadow retired, history attributed to claimant DID
+// On success: shadow retired, history attributed to the claimant's identifier
 // On error: ClaimError (HandleMismatch, AttestationInvalid, AlreadyClaimed, ShadowNotFound)
 ```
 
@@ -977,9 +980,9 @@ BridgedMessage {
   provenance: {
     source: .bridge(bridgeID),
     platform: "x",
-    operator: DID,
+    operator: Identifier,
     mode: .relay,
-    attribution: .shadow(shadowID) | .claimed(DID),
+    attribution: .shadow(shadowID) | .claimed(Identifier),
     trustLevel: .native | .nativeBridged | .claimedShadow | .unclaimedShadow
   }
 }
@@ -1046,7 +1049,7 @@ mcp.tools.call("context_a/guide_assistant", { query: "butter substitute" })
 // - Resolves context_a → contextID
 // - Validates capability token
 // - Encrypts the call with context key
-// - Signs with DID
+// - Signs with the `#active` key
 // - Routes through transport
 // - Decrypts response
 // - Returns plain result to model
@@ -1077,7 +1080,7 @@ SCP.EventLog.query(
   context: contextID,
   filter: .all
         | .since(Date)
-        | .byActor(DID)
+        | .byActor(Identifier)
         | .byType(.message | .outletInvocation | .membershipChange | .roleChange
                   | .governanceAction | .outletMutation | .consequenceTriggered)
 ) → EventStream { events: [VerifiableEvent], merkleRoot: Hash }
@@ -1085,9 +1088,9 @@ SCP.EventLog.query(
 // Verify a specific claim against the log
 SCP.EventLog.verify(
   context: contextID,
-  claim: .memberNeverEjected(did: carolDID)
+  claim: .memberNeverEjected(identifier: carolIdentifier)
        | .ceilingUnchangedSince(date)
-       | .outletRegisteredBy(outlet: "recipe_assistant", operator: DID)
+       | .outletRegisteredBy(outlet: "recipe_assistant", operator: Identifier)
        | .eventExists(eventID)
 ) → Proof { valid: Bool, merkleProof: MerkleProof }
 ```
@@ -1117,7 +1120,7 @@ let quest = try await SCP.Context.create(
 // 2. The app's AI guide agent joins with "guide" role
 try await SCP.Context.addMember(
   context: quest.contextID,
-  identity: guideAgent,          // App operator's institutional DID
+  identity: guideAgent,          // App operator's institutional identity
   role: "guide"
 )
 
@@ -1179,7 +1182,7 @@ let app = try await SCP.App.declare(
 // 1. Alice registers an X bridge in her quest context
 let bridge = try await SCP.Bridge.register(
   context: quest.contextID,
-  operator: alice.did,           // Alice runs the bridge
+  operator: alice.identifier,           // Alice runs the bridge
   platform: "x",
   mode: .relay
 )
@@ -1188,40 +1191,40 @@ let bridge = try await SCP.Bridge.register(
 let daveShadow = try await SCP.Bridge.createShadow(
   bridge: bridge.bridgeID,
   externalIdentity: { platform: "x", handle: "@dave_cooks" },
-  attributedBy: alice.did
+  attributedBy: alice.identifier
 )
 // Dave appears in context as observer, bridged provenance
 
 // 3. Dave later joins SCP and claims his shadow
 let claimResult = try await SCP.Bridge.claimShadow(
   shadowID: daveShadow.shadowID,
-  claimant: dave.did,
-  attestation: daveXAttestation  // proves @dave_cooks is dave.did
+  claimant: dave.identifier,
+  attestation: daveXAttestation  // proves @dave_cooks is dave.identifier
 )
-// Shadow retired. Dave's historical bridged messages now attributed to his DID.
+// Shadow retired. Dave's historical bridged messages now attributed to his identifier.
 ```
 
 ### Blocking: Cryptographic, Identity-Level
 
 ```swift
-// Dave is spamming. Alice blocks at identity level (DID-to-DID).
+// Dave is spamming. Alice blocks at identity level (identity-to-identity).
 
 // 1. Block Dave — cryptographically enforced via group encryption
 try await SCP.PrivateState.write(
-  did: alice.did,
-  event: .block(did: dave.did)
+  identifier: alice.identifier,
+  event: .block(identifier: dave.identifier)
 )
 // The protocol rotates Alice's encryption keys in every shared context
 // and redistributes them to all members except Dave.
 // Dave physically cannot decrypt Alice's future messages.
 // Alice's protocol view no longer includes Dave's content.
-// Block is DID-to-DID: applies across ALL shared contexts.
+// Block is identity-to-identity: applies across ALL shared contexts.
 // Block survives device changes (stored in identity private state).
 
 // 2. Optionally, also remove Dave from context (governance action)
 try await SCP.Context.removeMember(
   context: aliceQuest,
-  did: dave.did
+  identifier: dave.identifier
 )
 // Removal is a separate governance action — context key rotation
 // excludes Dave from all future context content, not just Alice's.
@@ -1231,7 +1234,7 @@ try await SCP.Context.removeMember(
 // This is behavioral data, not a network-wide ban
 ```
 
-Blocking and removal are distinct operations sharing the same cryptographic infrastructure (group key rotation). Block is personal and DID-to-DID — it affects only the blocker's content visibility. Removal is a governance action affecting the entire context.
+Blocking and removal are distinct operations sharing the same cryptographic infrastructure (group key rotation). Block is personal and identity-to-identity — it affects only the blocker's content visibility. Removal is a governance action affecting the entire context.
 
 **Muting** is separate: unidirectional, non-cryptographic. Alice mutes Carol; Alice stops seeing Carol's content, but Carol is unaffected. Muting is a protocol rule enforced in the SDK — no key rotation needed because the muter is not adversarial against themselves.
 
@@ -1271,7 +1274,7 @@ SCP.Media.initiate(
   context: contextID,
   as: Identity,
   capabilities: [.voice] | [.voice, .video] | [.screenShare],
-  participants: [DID]?   // nil = all context members
+  participants: [Identifier]?   // nil = all context members
 ) → MediaSession {
   sessionID: string,
   mediaKeys: MediaKeyMaterial,  // MLS-exported keying material
@@ -1348,7 +1351,7 @@ The outer envelope is minimal by design (spec §9.10.2). The relay sees only:
 - **ttl** — seconds until the relay should delete this blob.
 - **blob** — the encrypted payload. Everything else is inside.
 
-No sender DID. No context ID. No timestamp. No signature. The relay is a dumb pipe.
+No sender identifier. No context ID. No timestamp. No signature. The relay is a dumb pipe.
 
 ### Decrypted Payload (what members see after MLS + sender-key decryption)
 
@@ -1357,7 +1360,7 @@ No sender DID. No context ID. No timestamp. No signature. The relay is a dumb pi
   "type": "agent_action",
   "context_id": "ctx:z6Mkq8...",
   "from": {
-    "did": "<identifier:alice>",
+    "identifier": "<scp-identifier:alice>",
     "pseudonym": "z4K9xR...",
     "agent_id": "agent:z6Mkf5rG:ctx:z6Mkq8...",
     "capability_token": "eyJhbGciOiJFZERTQSIs..."
@@ -1388,7 +1391,7 @@ No sender DID. No context ID. No timestamp. No signature. The relay is a dumb pi
   "ceiling": ["messaging", "media", "outlet_invocation", "progress_tracking"],
   "governance": {
     "model": "single_admin",
-    "admin": "<identifier:operator>"
+    "admin": "<scp-identifier:operator>"
   },
   "roles": {
     "admin": { "capabilities": ["*"] },
@@ -1403,7 +1406,7 @@ No sender DID. No context ID. No timestamp. No signature. The relay is a dumb pi
       "output_schema": { "type": "object", "properties": { "answer": { "type": "string" } } },
       "required_role": "member",
       "implementation_hash": "sha256:abc123...",
-      "operator": "<identifier:operator>",
+      "operator": "<scp-identifier:operator>",
       "test_vectors": 3
     }
   ],
@@ -1414,7 +1417,7 @@ No sender DID. No context ID. No timestamp. No signature. The relay is a dumb pi
     { "trigger": "message_velocity > 50/min", "action": "capability_suspension", "duration": "1h" }
   ],
   "bridges": [
-    { "platform": "x", "mode": "relay", "operator": "<identifier:operator>", "shadows": 12 }
+    { "platform": "x", "mode": "relay", "operator": "<scp-identifier:operator>", "shadows": 12 }
   ],
   "ttl": null,
   "memory_scope": "full",
@@ -1423,7 +1426,7 @@ No sender DID. No context ID. No timestamp. No signature. The relay is a dumb pi
   "parents": null,
   "members": 47,
   "created": "2026-01-20T10:00:00Z",
-  "creator": "<identifier:operator>"
+  "creator": "<scp-identifier:operator>"
 }
 ```
 
@@ -1433,7 +1436,7 @@ No sender DID. No context ID. No timestamp. No signature. The relay is a dumb pi
 {
   "header": { "alg": "ES256", "typ": "JWT", "ucv": "0.10.0" },
   "payload": {
-    "iss": "<identifier:operator>",
+    "iss": "<scp-identifier:operator>",
     "aud": "agent:z6MkpT:ctx:z6Mkq8...",
     "att": [
       { "with": "scp:ctx:z6Mkq8/outlets/recipe_assistant", "can": "invoke" },
@@ -1453,8 +1456,8 @@ No sender DID. No context ID. No timestamp. No signature. The relay is a dumb pi
 {
   "id": "att:z6Mk...",
   "type": "identity_link",
-  "issuer": "<identifier:alice>",
-  "subject": "<identifier:alice>",
+  "issuer": "<scp-identifier:alice>",
+  "subject": "<scp-identifier:alice>",
   "claim": {
     "platform": "x",
     "handle": "@alice",
@@ -1467,7 +1470,7 @@ No sender DID. No context ID. No timestamp. No signature. The relay is a dumb pi
   "issued_at": "2026-02-14T12:00:00Z",
   "expires": "2026-03-14T12:00:00Z",
   "renewed_at": null,
-  "revocation": "<identifier:alice>/revocations",
+  "revocation": "<scp-identifier:alice>/revocations",
   "signature": "..."
 }
 ```
@@ -1481,7 +1484,7 @@ Attached to data crossing context boundaries:
   "provenance": {
     "source_context": "ctx:z6Mkq8...",
     "source_type": "ephemeral",
-    "counterparties": ["<identifier:operator>"],
+    "counterparties": ["<scp-identifier:operator>"],
     "purpose": "Scheduling discussion",
     "discovery_method": {
       "type": "shared_context",
@@ -1509,7 +1512,7 @@ DataProvenance {
   sourceType: .persistent            // source context still exists with full content
             | .ephemeral             // source context keys destroyed
             | .summary,             // source context summarized, keys destroyed
-  counterparties: [DID],             // who was in the source interaction
+  counterparties: [Identifier],             // who was in the source interaction
   purpose: String,                   // declared purpose of source context
   discoveryMethod: .sharedContext(contextID)
                  | .registry(registryContextID)
@@ -1550,7 +1553,7 @@ agent.send(
   provenance: DataProvenance {
     sourceContext: previousContextWithBob,
     sourceType: .ephemeral,          // that context's keys were destroyed
-    counterparties: [bob.did],
+    counterparties: [bob.identifier],
     purpose: "Scheduling discussion",
     discoveryMethod: .sharedContext(cookingQuestID),
     age: .hours(3),
@@ -1593,7 +1596,7 @@ SCP.Discovery.search(
     minHistory: Int?               // minimum context participation count
   }
 ) → [DiscoveryResult] {
-  did: DID,
+  identifier: Identifier,
   capabilities: [String],          // from the service record + registry metadata
   behavioralSummary: BehavioralSummary?,
   source: .localContact            // cached key state and service record
@@ -1604,10 +1607,10 @@ SCP.Discovery.search(
 
 ### Registration
 
-Agents register in contexts with discovery tools via DID-authenticated requests to tool endpoints. Registration does not require MLS group membership — registrants are readers, not writers (see spec §6.2.2 two-tier model).
+Agents register in contexts with discovery tools via `#active`-signed requests to tool endpoints. Registration does not require MLS group membership — registrants are readers, not writers (see spec §6.2.2 two-tier model).
 
 ```
-// Register in a context with discovery tools (reader-tier, DID-authenticated)
+// Register in a context with discovery tools (reader-tier, `#active`-signed)
 SCP.Discovery.register(
   context: contextID,              // the context to register in
   identity: Identity,
@@ -1618,7 +1621,7 @@ SCP.Discovery.register(
   }
 ) → RegistrationResult { registered: Bool, entryID: String }
 
-// Remove registration (reader-tier, DID-authenticated)
+// Remove registration (reader-tier, `#active`-signed)
 SCP.Discovery.deregister(
   context: contextID,
   identity: Identity
@@ -1654,7 +1657,7 @@ SCP.Discovery.addContext(
 Implementation specifics that require Tier 1/Tier 2 design work:
 
 - **~~Context key management.~~** ✅ **Resolved.** MLS (RFC 9420) selected. One MLS group per context. Full specification in .docs/specs/ §9.7 (MLS integration), §9.5 (cryptographic primitives), §9.8 (message security). Security APIs in §16 below.
-- **~~Identity substrate selection.~~** ✅ **Resolved.** ADR-063 selects an inception-derived identifier over a key-event log, modelled on KERI: the identifier is the digest of the inception event, a resolver replays the log over the SCP relay network, and rotation changes no identifier. See .docs/specs/ §9.6 and §9.7.4.2 for the security properties.
+- **~~Identity substrate selection.~~** ✅ **Resolved.** ADR-063, the inception-derived key-event-log identity substrate, decides it, and `09-security-model.md` §9.7.4.2 states the rules.
 - **~~Transport abstraction interface.~~** ✅ **Resolved.** ADR-005 specifies the `TransportAdapter` trait (send, subscribe, unsubscribe, query, delete). Envelope format specified in .docs/specs/ §9.10.2 (minimal outer envelope).
 - **~~SCP native relay protocol.~~** ✅ **Resolved.** ADR-004 specifies the relay: PUBLISH/SUBSCRIBE/UNSUBSCRIBE over WebSocket, blob TTL enforcement, recipient_hint for directed delivery.
 - **~~Sender-side key layer protocol (§9.16).~~** ✅ **Resolved.** Full specification in .docs/specs/ §9.16 (5 subsections). ADR-007 specifies implementation. AES-256-GCM sender keys, HPKE-wrapped per-recipient distribution using stable wrapping keypairs, block protocol, forward secrecy interaction.
@@ -1681,27 +1684,26 @@ Security-related APIs that surface the cryptographic security model defined in .
 
 ### Key Continuity Verification (§9.11)
 
-Signal-style safety numbers for DID verification. Enables out-of-band verification that the DID you have for someone is really theirs.
+Signal-style safety numbers. A person compares the fingerprint out of band to verify an identifier against the root set its key state names (`09-security-model.md` §9.11).
 
 ```
-// Generate a verification fingerprint for a DID pair
 SCP.Identity.verifyKeyContinuity(
-  myDID: DID,
-  theirDID: DID
+  myIdentifier: Identifier,
+  theirIdentifier: Identifier
 ) → KeyContinuityFingerprint {
-  fingerprint: [UInt8; 32],           // SHA256(sort(did_a, did_b) || pubkey_a || pubkey_b)
+  // Preimage, fixed by 09-security-model.md §9.11: "SCP-KEY-CONTINUITY-V1:", then per
+  // party the identifier, the root-set count, the root-set members and the `#active`
+  // key, the two parties ordered by unsigned byte comparison of their identifiers.
+  fingerprint: [UInt8; 32],
   displayMnemonic: [String; 12],      // 12-word mnemonic for voice/in-person comparison
   displayNumeric: String,             // 60-digit numeric code
   qrPayload: Data,                    // QR code payload for camera-based comparison
-  theirKeyFirstSeen: Date,            // TOFU record
-  previouslyVerified: Bool,           // was this pair verified before?
-  keyChanged: Bool                    // has their key changed since last verification?
+  standing: ContinuityStanding
 }
 
-// Record successful out-of-band verification
 SCP.Identity.recordVerification(
-  myDID: DID,
-  theirDID: DID,
+  myIdentifier: Identifier,
+  theirIdentifier: Identifier,
   method: .inPerson | .voiceCall | .videoCall | .qrCode | .other(String)
 ) → VerificationRecord {
   verifiedAt: Date,
@@ -1709,20 +1711,18 @@ SCP.Identity.recordVerification(
   fingerprintAtVerification: [UInt8; 32]
 }
 
-// Check verification status with another identity
 SCP.Identity.verificationStatus(
-  myDID: DID,
-  theirDID: DID
+  myIdentifier: Identifier,
+  theirIdentifier: Identifier
 ) → VerificationStatus {
-  verified: Bool,
+  standing: ContinuityStanding,       // `Verified`, `PendingReverify`, or `Unresolved`
   verifiedAt: Date?,
   method: VerificationMethod?,
-  keyChangedSinceVerification: Bool,  // true = re-verification needed
-  trustLevel: .verified | .tofu | .unknown
+  rootInstallDigest: [UInt8; 32]
 }
 ```
 
-Key change alerts: when a contact's key state lists a different key `current`, the SDK triggers a key-change callback. If the pair was previously verified, the UI SHOULD present a prominent warning (analogous to Signal's "safety number changed" alert).
+`09-security-model.md` §9.11 states when each standing applies, which acts it withholds, and what the SDK does when an identifier's recorded root-install digest stops matching the resolved chain's.
 
 ### KeyPackage Management (§9.7.4)
 
@@ -1731,27 +1731,27 @@ MLS KeyPackages are pre-key bundles that enable offline member addition to conte
 ```
 // Publish KeyPackages to relays for offline discovery
 SCP.Identity.publishKeyPackages(
-  did: DID,
+  identifier: Identifier,
   count: Int = 10,                    // buffer size — recommended 10
   relays: [RelayURL]?                 // default: identity's relay list
 ) → [KeyPackageID]
 
-// Fetch a KeyPackage for a DID (used when adding them to a context)
+// Fetch a KeyPackage for an identifier (used when adding them to a context)
 SCP.Identity.fetchKeyPackage(
-  for: DID,
+  for: Identifier,
   fromRelay: RelayURL?                // default: their relay list
 ) → KeyPackage? {
   keyPackageID: String,
-  did: DID,
+  identifier: Identifier,
   hpkeInitKey: PublicKey,             // HPKE init key for Welcome message encryption
-  signatureKey: PublicKey,            // P-256 key matching their DID
+  signatureKey: PublicKey,            // the key their key state lists `current` in `#active`
   credential: MLSCredential,
   signature: P256Signature
 }
 
 // Rotate KeyPackages (triggered by key rotation or depletion)
 SCP.Identity.rotateKeyPackages(
-  did: DID,
+  identifier: Identifier,
   reason: .keyRotation | .depletion | .periodic
 ) → [KeyPackageID]
 ```
@@ -1764,10 +1764,10 @@ Periodic checkpoints for detecting relay equivocation.
 // Generate a consistency checkpoint for a context
 SCP.Relay.generateCheckpoint(
   context: contextID,
-  senderDID: DID
+  senderIdentifier: Identifier
 ) → ConsistencyCheckpoint {
   contextID: String,
-  senderDID: DID,
+  senderIdentifier: Identifier,
   eventCount: UInt64,
   merkleRoot: [UInt8; 32],
   epoch: UInt64,                      // current MLS epoch
@@ -1798,7 +1798,7 @@ SCP.Relay.verifyCheckpoint(
 SCP.Relay.onConsistencyAlert(
   handler: (ConsistencyAlert) → void
 )
-// ConsistencyAlert { contextID, divergentMembers: [(DID, DivergenceReport)], relayURL }
+// ConsistencyAlert { contextID, divergentMembers: [(Identifier, DivergenceReport)], relayURL }
 ```
 
 Checkpoints are sent as encrypted MLS application messages at a recommended interval of every 50 events or 10 minutes (whichever comes first). Any divergence between any two honest members detects equivocation — this is not a majority vote.
@@ -1810,13 +1810,14 @@ Ordered recovery protocol for key compromise scenarios.
 ```
 // Initiate compromise recovery — ordered sequence of operations
 SCP.Identity.initiateRecovery(
-  did: DID,
+  identifier: Identifier,
   reason: .keyCompromise | .deviceLoss | .preventive,
   recoveryMethod: .trustedDevice(approvalFromDeviceID)
-                | .social(approvals: [DID])
+                | .social(approvals: [Identifier])
                 | .platform(apple | google)
 ) → RecoveryResult {
-  newDID: DID?,                        // new DID if key rotation changes the DID
+  head: [UInt8; 32],                   // the recovery event the chain now ends at;
+                                       // the identifier never changes (09 §9.11)
   keyRotated: Bool,
   mlsUpdatesIssued: Int,               // number of contexts updated (PCS)
   ucansRevoked: Int,
@@ -1828,12 +1829,12 @@ SCP.Identity.initiateRecovery(
 
 // Rotate all cryptographic material across all contexts
 SCP.Identity.rotateAllKeys(
-  did: DID
+  identifier: Identifier
 ) → KeyRotationResult {
   newPublicKey: PublicKey,
   contextsUpdated: [contextID],        // MLS Update issued in each
   keyPackagesPublished: Int,
-  previousKeyRevoked: Bool
+  previousKeyCondition: .Superseded | .Retired | .Compromised   // 09 §9.7.4.2
 }
 ```
 
@@ -1859,7 +1860,7 @@ SCP.Security.deduplicationStats(
   context: contextID
 ) → DeduplicationStats {
   hashCacheSize: Int,                  // current entries in hash cache (max 10K)
-  sequenceState: [(DID, UInt64)],      // per-sender expected-next sequence
+  sequenceState: [(Identifier, UInt64)],      // per-sender expected-next sequence
   gapsDetected: Int,                   // total sequence gaps (possible suppression)
   duplicatesRejected: Int
 }
@@ -1873,10 +1874,10 @@ Verification that ephemeral context keys were actually destroyed.
 // Destroy keys for a context (triggered by TTL expiry or manual close with ephemeral scope)
 SCP.Security.destroyContextKeys(
   context: contextID,
-  did: DID
+  identifier: Identifier
 ) → KeyDestructionAttestation {
   contextID: String,
-  memberDID: DID,
+  memberIdentifier: Identifier,
   destroyedAt: DateTime,
   platformAttestation: PlatformAttestation? {
     platform: .secureEnclave | .androidKeystore | .tpm,
@@ -1940,16 +1941,16 @@ Retrieve payment receipts from a context's event log.
 SCP.Economy.paymentHistory(
   context: ContextID,
   filter: PaymentFilter? {
-    payer: DID?,
-    payee: DID?,
+    payer: Identifier?,
+    payee: Identifier?,
     actionType: PaidActionType?,
     since: DateTime?,
     limit: Int?                    // default: 50
   }
 ) → [PaymentReceipt {
   receiptId: [u8; 32],
-  payer: DID,
-  payee: DID,
+  payer: Identifier,
+  payee: Identifier,
   amount: Amount,
   currency: CurrencyCode,
   actionType: PaidActionType,
@@ -1967,7 +1968,7 @@ Mint a spending capability UCAN for an agent.
 
 ```
 SCP.Identity.grantSpending(
-  agent: DID,
+  agent: Identifier,
   context: ContextID?,              // None = wildcard "scp:spending:*", Some = "scp:spending:{contextId}"
   capability: SpendingCapability {
     maxPerAction: Amount,          // max single-action spend
@@ -1981,7 +1982,7 @@ SCP.Identity.grantSpending(
   encoded: String,                 // JWT-encoded UCAN
   resource: "scp:spending:{contextId}" | "scp:spending:*",
   capability: SpendingCapability,
-  chain: [DID]                     // delegation chain (human → agent)
+  chain: [Identifier]                     // delegation chain (human → agent)
 }
 ```
 
@@ -2032,7 +2033,7 @@ SCP.Context.create(
       },
       paymentAdapters: [PaymentAdapterRef],
       pricingFormula: PricingFormula?,
-      payee: DID
+      payee: Identifier
     }
   }
 ) → Context
