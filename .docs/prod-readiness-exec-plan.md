@@ -5,7 +5,7 @@
 A functioning SCP network means two or more nodes can:
 
 1. Start and discover each other via relay
-2. Create and resolve DIDs (with device attestation where available)
+2. Create and resolve identities (with device attestation where available)
 3. Create contexts with governance policies
 4. Join/leave contexts with MLS-backed encryption
 5. Exchange encrypted messages end-to-end through SDK bindings
@@ -36,7 +36,7 @@ Every capability above must work through at least one SDK binding (Python).
 **Remaining gaps (14 items):**
 - #302: scp-node still hardcodes InMemory providers
 - #324: MLS max_past_epochs still 0
-- #336: No DHT/relay-based context discovery
+- #336: No relay-based context discovery
 - #342: scp-relay hardcodes in_memory blob storage
 - #347: Deserialization size limits only in sync reorder buffer (not general envelope)
 - #373, #375, #376: Spec gaps (invitation bundle, bucket size, app sandboxing)
@@ -64,7 +64,7 @@ Every capability above must work through at least one SDK binding (Python).
 |-----|---------|-------------|------|------|------------|
 | content-access.json | 10 (SCP-CAC-001–010) | 0 | 0 | Block list, access keys, CEK wrapping, state destruction | #309, #356, Phase 0 S-A (canonical serialization for key wrapping AAD) |
 | governance-integration.json | 8 (SCP-267–274) | 0 | 0 | GovernanceEngine wiring, proposal lifecycle, conflict detection, cosignatures | #356 (ContextManager), #320 (actions) |
-| capability-registry.json | 7 (SCP-ACR-001–007) | 0 | 0 | URI parser, challenge unification, DID capabilities, admission | — (independent) |
+| capability-registry.json | 7 (SCP-ACR-001–007) | 0 | 0 | URI parser, challenge unification, identity capabilities, admission | — (independent) |
 | bridge-cooperative.json | 13 (SCP-BCH-001–013) | 0 | 0 | Auth, endpoints, webhook, credential lifecycle, sender key encryption | **Phase 0 S-D** (bridge MLS model) |
 | participation-admission.json | 6 (SCP-BA-001–006) | 0 | 0 | Types, context integration, blind verification, FFI, production | Phase 0 S-A (canonical serialization for profiles) |
 | main.json | 9 | 3 | 173 | Kotlin SDK, FFI wiring, signaling | #356 (FFI), #306/#307 (bridges) |
@@ -206,7 +206,7 @@ Issues with wrong file names, section numbers, or ADR locations in their bodies.
 |---|---|---|
 | #299 | §5.8, §6.1 | §5.14.3 (subscriber registration), §6.2 |
 | #300 | §5.3, §6.1 | §5.2 (context creation), §6.2 |
-| #310 | §3.4 | §3.10 (DID resolution) |
+| #310 | §3.4 | §3.10 (identity resolution) |
 | #311 | §3.3 | §3.10.1 (parallel resolution) |
 | #313 | §9.9b | §9.8.2(b) (replay protection) |
 | #315 | §9.12 for mnemonic | §9.11 (key continuity fingerprints) |
@@ -232,7 +232,7 @@ These blocking relationships exist per the execution plan but are not declared i
 - #320 → #339, #320 → #340 (governance enforcement needs governance actions)
 
 **Phase 4 serial chain:**
-- #327 → #310 → #311 (DID sequence → production DHT → resolver unification)
+- #327 → #310 → #311 (sequence persistence → production client → resolver unification)
 
 **Phase 6 MLS chain:**
 - #333 → #324 → #314 → #309 → #317
@@ -349,7 +349,7 @@ Additional review fixes (81185a1): deny_unknown_fields on 4 sender key wire type
 
 ### Phase 4: Identity Infrastructure (parallel with Phases 2-3) — COMPLETE
 
-**Lane A** — #327 (BEP44 sequence persistence) — **COMPLETE** → cc5eff1. #310 (PkarrDhtClient) — **COMPLETE** → 59f18b2 + review fix 04c2281. #311 (DID resolver unification) — **COMPLETE** → 6b2885e + review fix fbf0577
+**Lane A** — #327 (sequence persistence) — **COMPLETE** → cc5eff1. #310 (publication client) — **COMPLETE** → 59f18b2 + review fix 04c2281. #311 (resolver unification) — **COMPLETE** → 6b2885e + review fix fbf0577
 **Lane B** — #315 (BIP-39 mnemonic) — **COMPLETE** → 7e61bb3. #325 (TOFU + cert pinning) — **COMPLETE** → 225c862 + review fix 1bd9403
 
 ### Phase 5: Core Infrastructure (CRITICAL PATH) — COMPLETE
@@ -419,7 +419,7 @@ SCP-267 → SCP-268 → SCP-269 → SCP-270 → SCP-271 → SCP-272 → SCP-273 
 **Lane A:** SCP-227 — **COMPLETE** (subscriber registration, blocking, integration — multiple commits). #335 closed by Phase 5 bridge rewrites.
 **Lane B:** #337 — **COMPLETE** → 9180dd5. #334 — **COMPLETE** → f78ceb4b (economic governance, spending UCANs).
 **Lane C:** #318 — **COMPLETE** → 91317fc. #330 — **COMPLETE** → 032cb41.
-**Lane D:** #316 (compromise recovery) — **COMPLETE** → b225bd12 + de42d1f3 (RecoveryBackend trait, CompromiseRecoveryOrchestrator). #323 (platform key custody) — **COMPLETE** (FileKeyCustody with Argon2id+AES). #391 (FileKeyCustody) — **COMPLETE**. #392 (Apple Secure Enclave) — **NOT STARTED**. #393 (Android Keystore) — **COMPLETE** (AndroidKeyCustody.kt with TEE Ed25519).
+**Lane D:** #316 (compromise recovery) — **COMPLETE** → b225bd12 + de42d1f3 (RecoveryBackend trait, CompromiseRecoveryOrchestrator). #323 (platform key custody) — **COMPLETE** (FileKeyCustody with Argon2id+AES). #391 (FileKeyCustody) — **COMPLETE**. #392 (Apple Secure Enclave) — **NOT STARTED**. #393 (Android Keystore) — **COMPLETE** (AndroidKeyCustody.kt with TEE-backed keys).
 **Lane E:** #302 — **NOT COMPLETE** (scp-node still hardcodes InMemoryKeyCustody, InMemoryDhtClient, InMemoryStorage). #305 — **COMPLETE** → 1dc533b (ACME key_auth fixed on worktree). #342 — **NOT COMPLETE** (relay still hardcodes BlobStorageBackend::in_memory()).
 
 ### Phase 9: SDK Bindings (depends on Phase 5) — COMPLETE
