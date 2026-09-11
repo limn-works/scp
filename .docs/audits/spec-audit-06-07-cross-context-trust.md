@@ -77,17 +77,17 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 - **Why it matters**: Without defined failure semantics, callers cannot distinguish between "session expired," "session never existed," and "outlet context unreachable" -- leading to incorrect retry logic.
 - **Severity**: MEDIUM
 
-### [6.2.2A] DID Document Capabilities -- No Schema for `SCPCapabilities`
+### [6.2.2A] Service-Record Capabilities -- No Schema for `SCPCapabilities`
 - **Category**: Missing wire format details
 - **Location**: Section 6.2.2A (lines 65-78)
 - **What's missing**: The example shows a JSON structure with `"capabilities": ["translation", "japanese", "english"]` and `"version": "scp/1.0"`. But there is no normative schema. Are these freeform strings or must they be URIs from the capability namespace (Section 7.3.4.1)? The example uses plain keywords ("translation"), not URIs. This contradicts Section 7.3.4.1 which defines a structured URI format. Maximum number of capabilities? Maximum string length per capability? Is `"version": "scp/1.0"` the protocol version or the capability version?
-- **Why it matters**: Without a normative schema, DID document capabilities are unparseable by conformant implementations. The conflict between freeform strings (example) and structured URIs (Section 7.3.4.1) creates ambiguity about what values are valid.
+- **Why it matters**: Without a normative schema, service-record capabilities are unparseable by conformant implementations. The conflict between freeform strings (example) and structured URIs (Section 7.3.4.1) creates ambiguity about what values are valid.
 - **Severity**: MEDIUM
 
 ### [6.2.2B] Standard Outlet Schemas -- No Error Responses
 - **Category**: Undefined error/failure behavior
 - **Location**: Section 6.2.2B (lines 88-101)
-- **What's missing**: The standard discovery outlet schemas (`agent_search`, `agent_register`, `agent_deregister`) define input and output for success cases only. What does the response look like when: search finds no results? Registration is rejected by governance? The DID is already registered? The DID to deregister is not found? The caller lacks write permission? Rate limit exceeded? What error codes are returned?
+- **What's missing**: The standard discovery outlet schemas (`agent_search`, `agent_register`, `agent_deregister`) define input and output for success cases only. What does the response look like when: search finds no results? Registration is rejected by governance? The identity is already registered? The identity to deregister is not found? The caller lacks write permission? Rate limit exceeded? What error codes are returned?
 - **Why it matters**: Without specified error responses, SDK implementations will return different error structures, making cross-SDK discovery interoperability fragile.
 - **Severity**: MEDIUM
 
@@ -101,7 +101,7 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 ### [6.2.2B] Self-Service Update Authentication
 - **Category**: Security-relevant omissions
 - **Location**: Section 6.2.2B (line 109)
-- **What's missing**: "Writers verify the DID signature matches the entry owner and process the update." But what prevents a writer from updating or deleting entries that do not belong to them? The spec says the writer "processes" the request but does not specify that writers are constrained from modifying entries owned by other DIDs. Is there a governance check? Is there an entry-level permission model? Can a malicious writer delete all registry entries?
+- **What's missing**: "Writers verify the signature matches the entry owner and process the update." But what prevents a writer from updating or deleting entries that do not belong to them? The spec says the writer "processes" the request but does not specify that writers are constrained from modifying entries owned by other identities. Is there a governance check? Is there an entry-level permission model? Can a malicious writer delete all registry entries?
 - **Why it matters**: A single compromised writer could corrupt the entire discovery registry. The spec needs to specify that writers can only process authorized modifications to entries, not arbitrary ones.
 - **Severity**: HIGH
 
@@ -175,7 +175,7 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 ### [7.3.2] Participation Record Computation Algorithm Not Specified
 - **Category**: Underspecified algorithms
 - **Location**: Section 7.3.2 (lines 88-101)
-- **What's missing**: "it is computed by any agent from the set of context logs they can access" -- but the computation algorithm is not specified. How does an agent aggregate facts across multiple contexts? Is deduplication required (same DID in multiple roles in the same context)? How are "number of contexts participated in, with duration" computed when context boundaries are not always visible (ephemeral contexts with destroyed logs)? How is "endorsement accuracy" measured -- what constitutes a correct vs. incorrect endorsement?
+- **What's missing**: "it is computed by any agent from the set of context logs they can access" -- but the computation algorithm is not specified. How does an agent aggregate facts across multiple contexts? Is deduplication required (same identity in multiple roles in the same context)? How are "number of contexts participated in, with duration" computed when context boundaries are not always visible (ephemeral contexts with destroyed logs)? How is "endorsement accuracy" measured -- what constitutes a correct vs. incorrect endorsement?
 - **Why it matters**: Participation records are the primary input to Layer 2 evaluation. If different agents compute different records from the same data, the "validation replaces trust" claim breaks down.
 - **Severity**: HIGH
 
@@ -193,11 +193,11 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 - **Why it matters**: This key is the trust anchor for participation verification. Incorrect derivation enables forgery; incompatible derivation prevents cross-implementation verification.
 - **Severity**: HIGH
 
-### [7.3.2.1] ParticipationStatements Service Endpoint Missing from DID Document Spec
+### [7.3.2.1] ParticipationStatements Entry Missing from the Service Record Spec
 - **Category**: Cross-reference inconsistencies
 - **Location**: Section 7.3.2.1 (line 169) vs. Section 18.2.2
-- **What's missing**: Section 7.3.2.1 defines a `ParticipationStatements` DID document service endpoint type. Section 18.2.2 is the authoritative cross-reference table of all DID document service endpoint types. `ParticipationStatements` is NOT listed in the table at Section 18.2.2. The table lists `SCPRelay`, `SCPCapabilities`, `IdentityPrivateState`, `PreRotationCommitment`, and `SCPBroadcastContext` -- but not `ParticipationStatements`.
-- **Why it matters**: An implementor reading Section 18.2.2 as the canonical reference for DID document service endpoints will not implement `ParticipationStatements`. The participation admission flow (Section 7.3.2.1, step 3) depends on this endpoint existing.
+- **What's missing**: Section 7.3.2.1 defines a `ParticipationStatements` service-record entry type. Section 18.2.2 is the authoritative cross-reference table of all service-record entry types. `ParticipationStatements` is NOT listed in the table at Section 18.2.2. The table lists `SCPRelay`, `SCPCapabilities`, `IdentityPrivateState`, `PreRotationCommitment`, and `SCPBroadcastContext` -- but not `ParticipationStatements`.
+- **Why it matters**: An implementor reading Section 18.2.2 as the canonical reference for service-record entries will not implement `ParticipationStatements`. The participation admission flow (Section 7.3.2.1, step 3) depends on this endpoint existing.
 - **Severity**: HIGH
 
 ### [7.3.2.1] ParticipationStatements Service Endpoint Format Undefined
@@ -210,14 +210,14 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 ### [7.3.2.1] Colluding Contexts Can Forge Independent Participation
 - **Category**: Security-relevant omissions
 - **Location**: Section 7.3.2.1 (lines 181, 188)
-- **What's missing**: The verification flow checks for "distinct signers (N different `signer_public_key` values -- proving N independent contexts)." But a single operator running N contexts produces N distinct context-specific signing keys. The spec acknowledges this implicitly by saying distinct keys prove "N independent contexts" -- but they do not prove *independence*. They prove N different contexts, which could all be operated by the same entity. The `min_contexts` requirement is trivially spoofable by a Sybil attacker who creates N cheap contexts and generates participation profiles for their own DID in each.
+- **What's missing**: The verification flow checks for "distinct signers (N different `signer_public_key` values -- proving N independent contexts)." But a single operator running N contexts produces N distinct context-specific signing keys. The spec acknowledges this implicitly by saying distinct keys prove "N independent contexts" -- but they do not prove *independence*. They prove N different contexts, which could all be operated by the same entity. The `min_contexts` requirement is trivially spoofable by a Sybil attacker who creates N cheap contexts and generates participation profiles for their own identity in each.
 - **Why it matters**: Participation admission requirements are presented as a security mechanism that "pushes admission from Layer 4 (trust) into Layer 2 (participation validation)." But if a single operator can satisfy arbitrary participation requirements by running puppet contexts, the mechanism provides false assurance.
 - **Severity**: HIGH
 
 ### [7.3.2.1] Opt-In Mechanism Not Specified
 - **Category**: Underspecified algorithms
 - **Location**: Section 7.3.2.1 (line 173)
-- **What's missing**: "Agents opt into per-context attestations by allowing the context to publish participation statements about them." The opt-in mechanism is not specified. Is it a flag in the join request? A separate governance action? A DID document entry? Can it be changed after joining? If an agent opts out after opting in, are existing statements deleted? What is the wire format of the opt-in signal?
+- **What's missing**: "Agents opt into per-context attestations by allowing the context to publish participation statements about them." The opt-in mechanism is not specified. Is it a flag in the join request? A separate governance action? A service-record entry? Can it be changed after joining? If an agent opts out after opting in, are existing statements deleted? What is the wire format of the opt-in signal?
 - **Why it matters**: The opt-in is the privacy control for participation data. Without a specified mechanism, implementations will implement it differently, creating inconsistent privacy guarantees.
 - **Severity**: MEDIUM
 
@@ -238,7 +238,7 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 ### [7.3.4] ChallengeVerification Record Format Not Specified
 - **Category**: Missing wire format details
 - **Location**: Section 7.3.4 (lines 251-263) and Section 7.3.4.2 (line 298)
-- **What's missing**: "A signed `ChallengeVerification` record demonstrates that a specific verifier tested the capability." The `ChallengeVerification` record format is never defined. What fields does it contain? Verifier DID? Subject DID? Capability URI? Timestamp? Expiry? Challenge suite version? Results? Where is it stored? DID document? Context log? Separate endpoint? How is it fetched for admission checks?
+- **What's missing**: "A signed `ChallengeVerification` record demonstrates that a specific verifier tested the capability." The `ChallengeVerification` record format is never defined. What fields does it contain? Verifier identity? Subject identity? Capability URI? Timestamp? Expiry? Challenge suite version? Results? Where is it stored? Service record? Context log? Separate endpoint? How is it fetched for admission checks?
 - **Why it matters**: ChallengeVerification records are the mechanism for distinguishing self-attested from challenge-verified capabilities. Without a defined format, admission checks (Section 7.3.4.4) cannot verify challenge records from other implementations.
 - **Severity**: HIGH
 
@@ -294,14 +294,14 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 ### [7.4.1] Attestation Envelope `id` Field Format Not Specified
 - **Category**: Missing wire format details
 - **Location**: Section 7.4.1 (line 426)
-- **What's missing**: The attestation envelope includes `id: unique identifier`. Format? UUID v4? Content hash? DID-derived? The uniqueness scope (globally unique? per-issuer?) is unspecified. This matters for revocation (you revoke by `id`) and deduplication.
+- **What's missing**: The attestation envelope includes `id: unique identifier`. Format? UUID v4? Content hash? Identifier-derived? The uniqueness scope (globally unique? per-issuer?) is unspecified. This matters for revocation (you revoke by `id`) and deduplication.
 - **Why it matters**: Without a specified ID format, revocation references may not resolve across implementations.
 - **Severity**: MEDIUM
 
 ### [7.4.1] Attestation Envelope `revocation` Field Format Not Specified
 - **Category**: Missing wire format details
 - **Location**: Section 7.4.1 (line 437)
-- **What's missing**: `revocation: how to check if revoked` -- this is a description, not a format. Is it a URL? A DID document entry path? A Merkle log reference? The attestation envelope claims to tell verifiers how to check revocation, but the format of the revocation reference is unspecified. Section 7.4.4 says it could be "endpoint, DID document entry, or Merkle log reference" but does not specify how the verifier knows which type it is or how to parse each.
+- **What's missing**: `revocation: how to check if revoked` -- this is a description, not a format. Is it a URL? A service-record entry path? A Merkle log reference? The attestation envelope claims to tell verifiers how to check revocation, but the format of the revocation reference is unspecified. Section 7.4.4 names an endpoint, a service-record entry, or a Merkle log reference, but does not specify how the verifier knows which type it is or how to parse each.
 - **Why it matters**: Revocation checking is a MUST for attestation verification. An unspecified revocation reference format means verifiers cannot check revocation for attestations created by other implementations.
 - **Severity**: HIGH
 
@@ -343,8 +343,8 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 ### [7.7.1] DataProvenance `counterparties` Privacy Leak
 - **Category**: Security-relevant omissions
 - **Location**: Section 7.7.1 (line 515)
-- **What's missing**: `counterparties: [DID]` lists all DIDs in the source interaction. When data flows through an outlet call from Context A to Context B, Context B's members see the full DID list of Context A's participants. This reveals Context A's membership to Context B. The spec does not analyze this privacy implication or provide a mechanism to redact counterparties.
-- **Why it matters**: Counterparty revelation violates context isolation expectations. A member of a private context might not consent to their DID being revealed in provenance records to unknown contexts.
+- **What's missing**: `counterparties` lists every identity in the source interaction. When data flows through an outlet call from Context A to Context B, Context B's members see the full participant list of Context A. This reveals Context A's membership to Context B. The spec does not analyze this privacy implication or provide a mechanism to redact counterparties.
+- **Why it matters**: Counterparty revelation violates context isolation expectations. A member of a private context might not consent to their identity being revealed in provenance records to unknown contexts.
 - **Severity**: HIGH
 
 ### [7.7] No Provenance Record Integrity Protection
@@ -371,8 +371,8 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 - **Severity**: HIGH
 
 ### Capability Namespace Conflict
-- **Location**: 06 line 74 (DID doc capabilities as freeform strings) vs. 07 line 268 (structured URI format)
-- **Issue**: DID document `SCPCapabilities` example uses freeform strings ("translation", "japanese") while Section 7.3.4.1 mandates structured URIs (`scp:capability:*/v1` or `did:*:capability:*/v1`). These are incompatible formats.
+- **Location**: 06 line 74 (service-record capabilities as freeform strings) vs. 07 line 268 (structured URI format)
+- **Issue**: The service-record `SCPCapabilities` example uses freeform strings ("translation", "japanese") while Section 7.3.4.1 mandates structured URIs (`scp:capability:*/v1`). These are incompatible formats.
 - **Severity**: MEDIUM
 
 ### RFC 2119 Language Sparse
