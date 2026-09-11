@@ -1944,7 +1944,7 @@ The current implementation **violates** this boundary. `crates/scp-node/src/self
 
 **A node is pure infrastructure and NEVER participates in a context as itself.** A node is: a relay (§10.4), an identity service, and an HTTP projection surface (§10.12.11). It holds custody and resolves DIDs, but it does not join contexts, create MLS groups, or sign protocol messages in its own right.
 
-**All participation is performed by an SDK participant client (a `Supervisor`/`ContextManager`) bound to a DID.** There is one participant engine. A participant brings custody, a DID, and the full protocol pipeline — including the **real, document-derived `KeyResolver`** that extracts a voter's verification-method key from their resolved DID document, keyed by the requested `SigningKeyId`. A participant constructed with a `|_, _| None` resolver is incomplete by the completeness baseline (CLAUDE.md) and is forbidden.
+**All participation is performed by an SDK participant client (a `Supervisor`/`ContextManager`) bound to a DID.** There is one participant engine. A participant brings custody, a DID, and the full protocol pipeline — including the **real, log-derived `KeyResolver`** that extracts a voter's signing key from their resolved key state, keyed by the requested `SigningKeyId` (`03-identity.md` §3.10.4). A participant constructed with a `|_, _| None` resolver is incomplete by the completeness baseline (CLAUDE.md) and is forbidden.
 
 There are **two deployment shapes** for a participant relative to a node:
 
