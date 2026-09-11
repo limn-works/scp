@@ -94,7 +94,7 @@
 
 - **Category**: Missing constants/defaults
 - **Location**: Section 9.3
-- **What's missing**: "New identities start with limited capabilities -- restricted context creation, limited participation slots, constrained outlet invocation rates. Capacity grows through participation history, participation records, and time." No concrete defaults for any of these limits. How many contexts can a new identity create? What is the initial participation slot count? What outlet invocation rate applies to a brand-new DID? How does capacity grow -- linearly, logarithmically? What are the thresholds? The open-questions file says this is resolved and "scoring is not protocol-level" but the protocol specifies earned capacity as a defense mechanism with zero concrete parameters.
+- **What's missing**: "New identities start with limited capabilities -- restricted context creation, limited participation slots, constrained outlet invocation rates. Capacity grows through participation history, participation records, and time." No concrete defaults for any of these limits. How many contexts can a new identity create? What is the initial participation slot count? What outlet invocation rate applies to a brand-new identity? How does capacity grow -- linearly, logarithmically? What are the thresholds? The open-questions file says this is resolved and "scoring is not protocol-level" but the protocol specifies earned capacity as a defense mechanism with zero concrete parameters.
 - **Why it matters**: Without protocol-level defaults, a new deployment has zero Sybil resistance at Layer 1. Every implementation must invent its own thresholds, making the security guarantee non-uniform and the interoperability story broken (context A says "you need 30 days of history" using its custom formula; context B says "you need 5 contexts" using a different formula -- neither can validate the other's claim). The spec delegates to "product-layer" but provides no protocol-level floor.
 - **Severity**: HIGH
 
@@ -124,7 +124,7 @@
 
 - **Category**: Missing constants/defaults
 - **Location**: Section 9.2.1, item 6 (line 101)
-- **What's missing**: "The SDK rate-limits inbound invitations per source DID and globally." No per-DID rate. No global rate. No queue depth limit ("queued with decreasing priority" -- but how deep is the queue?). No specification of the priority decay function.
+- **What's missing**: "The SDK rate-limits inbound invitations per source identity and globally." No per-identity rate. No global rate. No queue depth limit ("queued with decreasing priority" -- but how deep is the queue?). No specification of the priority decay function.
 - **Why it matters**: Without concrete rate limits, the human coordination bottleneck defense described in the same section is advisory only.
 - **Severity**: MEDIUM
 
@@ -190,14 +190,14 @@
 
 ---
 
-### [9.10.4] Pseudonym Derivation Uses Ed25519 keygen From Non-Key-Material
+### [9.10.4] Pseudonym Derivation Uses Keygen From Non-Key-Material
 
 - **Category**: Security-relevant omissions
 - **Location**: Section 9.10.4 (line 549-552)
-- **What's missing**: `context_seed = HMAC-SHA256(identity_key_material, context_id || "scp-pseudonym")` then `context_keypair = Ed25519_keygen(context_seed[0..32])`. The spec uses an HMAC output (a PRF output) as seed material for Ed25519 key generation. This is fine for pseudonym derivation, but the spec says "identity_key_material" without defining what this is. Is it the Ed25519 private key bytes? The public key bytes? An HSM-derived key handle? Line 560 says "For software keys, the HMAC uses the raw Ed25519 public key bytes" -- but public key bytes as HMAC key material for pseudonym derivation means anyone with the public key (everyone) can derive the pseudonym. The pseudonym is then not a secret -- it is publicly computable from (public_key, context_id).
-- **Why it matters**: If the pseudonym is derivable from the public key, any party who knows both the DID and the context_id can compute the pseudonym. This means: (1) a relay that knows a DID and suspects a context_id can verify membership by computing the pseudonym and checking subscriptions, and (2) cross-context correlation is broken only if the context_id is secret, but context_ids are referenced in metadata routing (`SHA-256(context_id || "scp-metadata")` per line 561). The spec says pseudonyms are "unlinkable across contexts" -- but they are fully linkable if you know the context_id.
+- **What's missing**: `context_seed = HMAC-SHA256(identity_key_material, context_id || "scp-pseudonym")` then a keypair generated over `context_seed[0..32]`. The spec uses an HMAC output (a PRF output) as seed material for key generation. This is fine for pseudonym derivation, but the spec says "identity_key_material" without defining what this is. Is it the private key bytes? The public key bytes? An HSM-derived key handle? Line 560 keys the HMAC for software keys with the raw public key bytes -- but public key bytes as HMAC key material for pseudonym derivation means anyone with the public key (everyone) can derive the pseudonym. The pseudonym is then not a secret -- it is publicly computable from (public_key, context_id).
+- **Why it matters**: If the pseudonym is derivable from the public key, any party who knows both the identifier and the context_id can compute the pseudonym. This means: (1) a relay that knows an identifier and suspects a context_id can verify membership by computing the pseudonym and checking subscriptions, and (2) cross-context correlation is broken only if the context_id is secret, but context_ids are referenced in metadata routing (`SHA-256(context_id || "scp-metadata")` per line 561). The spec says pseudonyms are "unlinkable across contexts" -- but they are fully linkable if you know the context_id.
 - **Severity**: HIGH
-- **Resolution (later)**: Accepted and fixed. `identity_key_material` is now the 32-byte `pseudonym_secret`, NOT the public key. Software custody derives it via `HKDF-SHA256(ed25519_private_seed, salt="scp-pseudonym-secret-v1")` (cross-platform deterministic); hardware custody uses a device-local secret. The unkeyed `SHA-256(context_id || "scp-metadata")` metadata routing ID was likewise replaced by the keyed `HMAC-SHA256(context_metadata_key, ...)` form. See spec §9.10.4.A, §9.10.4.B, and KAT vectors §25.19. Line references (549-552, 560, 561) are from the spec revision at audit time and have since shifted. Preserved as historical record.
+- **Resolution (later)**: Accepted and fixed. `identity_key_material` is now the 32-byte `pseudonym_secret`, NOT the public key. Software custody derives it via `HKDF-SHA256(private_seed, salt="scp-pseudonym-secret-v1")` (cross-platform deterministic); hardware custody uses a device-local secret. The unkeyed `SHA-256(context_id || "scp-metadata")` metadata routing ID was likewise replaced by the keyed `HMAC-SHA256(context_metadata_key, ...)` form. See spec §9.10.4.A, §9.10.4.B, and KAT vectors §25.19. Line references (549-552, 560, 561) are from the spec revision at audit time and have since shifted. Preserved as historical record.
 
 ---
 
@@ -205,8 +205,8 @@
 
 - **Category**: Security-relevant omissions
 - **Location**: Section 9.10.4 (line 561)
-- **What's missing**: `metadata_routing_id = SHA-256(context_id || "scp-metadata")` -- this is publicly derivable from `context_id`. Anyone who knows a context_id can query relays for its metadata without being a member. Combined with the previous finding (pseudonyms derivable from public key + context_id), this means a relay operator who knows a context_id can compute the pseudonym for every known DID and check which ones are subscribed. The spec acknowledges relay metadata visibility but not this specific enumeration attack.
-- **Why it matters**: An attacker who knows (or guesses) a context_id can enumerate which DIDs are members by computing pseudonyms for all known DIDs and checking which routing_ids have active subscriptions. This is a membership oracle.
+- **What's missing**: `metadata_routing_id = SHA-256(context_id || "scp-metadata")` -- this is publicly derivable from `context_id`. Anyone who knows a context_id can query relays for its metadata without being a member. Combined with the previous finding (pseudonyms derivable from public key + context_id), this means a relay operator who knows a context_id can compute the pseudonym for every known identity and check which ones are subscribed. The spec acknowledges relay metadata visibility but not this specific enumeration attack.
+- **Why it matters**: An attacker who knows (or guesses) a context_id can enumerate which identities are members by computing pseudonyms for all known identities and checking which routing_ids have active subscriptions. This is a membership oracle.
 - **Severity**: HIGH
 - **Resolution (later)**: Addressed by the keyed metadata-routing-id derivation. The routing id is now `HMAC-SHA256(context_metadata_key, ...)` (spec §9.10.4.B) and is no longer computable from `context_id` alone. Preserved as historical record.
 
@@ -246,7 +246,7 @@
 
 - **Category**: Undefined error/failure behavior
 - **Location**: Section 9.12 (line 709)
-- **What's missing**: The step ordering section says "failure in one context does not block recovery in other contexts" and "The SDK retries failed contexts independently" -- but no retry limit, no retry backoff interval, no maximum recovery time, and no specification for what happens if step 1 (key rotation) succeeds but step 3 (UCAN revocation) fails permanently. Are there partially-recovered states that are valid? Can a DID be in a state where the key is rotated but old UCANs are still active in some contexts?
+- **What's missing**: The step ordering section says "failure in one context does not block recovery in other contexts" and "The SDK retries failed contexts independently" -- but no retry limit, no retry backoff interval, no maximum recovery time, and no specification for what happens if step 1 (key rotation) succeeds but step 3 (UCAN revocation) fails permanently. Are there partially-recovered states that are valid? Can an identity be in a state where the key is rotated but old UCANs are still active in some contexts?
 - **Why it matters**: Partial recovery is a real scenario (device goes offline mid-recovery, relay is unreachable for one context). The protocol must define what "partially recovered" means and whether it is safe.
 - **Severity**: MEDIUM
 
@@ -400,7 +400,7 @@
 
 - **Category**: Missing edge cases
 - **Location**: Section 10.12.1 (line 379)
-- **What's missing**: "The SDK re-evaluates periodically (recommended: every 30 minutes) and on network change events." What happens during tier transition? If the relay is serving connections via Tier 1 (UPnP) and the SDK decides to switch to Tier 2 (STUN), there is a window where the DID document has been updated but peers are still connecting to the old address. No specification of how to drain connections before tier change. No specification of whether the old tier continues serving during DID document propagation delay.
+- **What's missing**: "The SDK re-evaluates periodically (recommended: every 30 minutes) and on network change events." What happens during tier transition? If the relay is serving connections via Tier 1 (UPnP) and the SDK decides to switch to Tier 2 (STUN), there is a window where the service record has been updated but peers are still connecting to the old address. No specification of how to drain connections before tier change. No specification of whether the old tier continues serving during service-record propagation delay.
 - **Why it matters**: Tier transitions cause message loss during the propagation window. Peers connecting to the stale address will fail, and the relay has no way to redirect them because the old port mapping may already be released.
 - **Severity**: MEDIUM
 
@@ -410,7 +410,7 @@
 
 - **Category**: Underspecified algorithms
 - **Location**: Section 10.12.3 (line 426)
-- **What's missing**: "Connection coordination: A peer resolving the self-hosted relay's DID document obtains the external address. For restricted NATs, the self-hosted relay must initiate a packet exchange with each connecting peer. The relay periodically sends keepalive packets to peers that have announced their intent to connect (via a coordination message through an intermediary relay)." No specification of this coordination message format. No specification of "intent to connect" signaling. No specification of which intermediary relay handles coordination. No specification of what happens if the intermediary relay is down.
+- **What's missing**: "Connection coordination: A peer resolving the self-hosted relay's service record obtains the external address. For restricted NATs, the self-hosted relay must initiate a packet exchange with each connecting peer. The relay periodically sends keepalive packets to peers that have announced their intent to connect (via a coordination message through an intermediary relay)." No specification of this coordination message format. No specification of "intent to connect" signaling. No specification of which intermediary relay handles coordination. No specification of what happens if the intermediary relay is down.
 - **Why it matters**: STUN hole punching for restricted NATs requires mutual packet exchange. Without a coordination protocol, peers behind restricted NATs cannot connect to self-hosted relays behind restricted NATs (both sides need to send first). The spec identifies the need but provides no wire format.
 - **Severity**: HIGH
 
@@ -430,7 +430,7 @@
 
 - **Category**: Security-relevant omissions
 - **Location**: Section 10.12.4 (line 491)
-- **What's missing**: The BRIDGE_REGISTER signature includes a timestamp with a 60-second replay window. But: there is no nonce. An attacker who captures a valid BRIDGE_REGISTER can replay it within 60 seconds to re-register the routing_id on a different bridge relay, hijacking traffic. The Ed25519 signature prevents forgery but not replay. The spec says "The timestamp is within 60 seconds of the server's current time" -- but server clock skew is not addressed. Two bridge relays with 30 seconds of clock drift effectively double the replay window.
+- **What's missing**: The BRIDGE_REGISTER signature includes a timestamp with a 60-second replay window. But: there is no nonce. An attacker who captures a valid BRIDGE_REGISTER can replay it within 60 seconds to re-register the routing_id on a different bridge relay, hijacking traffic. The signature prevents forgery but not replay. The spec says "The timestamp is within 60 seconds of the server's current time" -- but server clock skew is not addressed. Two bridge relays with 30 seconds of clock drift effectively double the replay window.
 - **Why it matters**: Replay of BRIDGE_REGISTER allows traffic hijacking within the 60-second window. A nonce or monotonic sequence number would close this.
 - **Severity**: MEDIUM
 
@@ -530,7 +530,7 @@
 
 - **Category**: Security-relevant omissions
 - **Location**: Section 10.12.4 (line 490)
-- **What's missing**: The bridge verifies that the DID maps to the claimed routing_id via `SHA-256("scp:did:" || did_string)`. But this is a DID-to-routing_id derivation, not the context pseudonym derivation in section 9.10.4 (which uses HMAC-SHA256). These are two different derivation functions for routing_id -- the bridge uses `SHA-256("scp:did:" || did_string)` while the context pseudonym system uses `HMAC-SHA256(identity_key_material, context_id || "scp-pseudonym")`. Which one does the self-hosted relay actually use for its relay routing?
+- **What's missing**: The bridge verifies that the identifier maps to the claimed routing_id via `SHA-256("scp:did:" || identifier_bytes)`, while section 9.10.4 derives a context pseudonym with `HMAC-SHA256(identity_key_material, context_id || "scp-pseudonym")`. Which one does the self-hosted relay actually use for its relay routing?
 - **Why it matters**: Two different routing_id derivation schemes are specified in different sections. If the bridge validates using one scheme but the relay publishes using the other, registration will always fail.
 - **Severity**: HIGH
 
@@ -623,15 +623,15 @@ Total findings: **1 CRITICAL, 16 HIGH, 18 MEDIUM, 5 LOW**.
 ### [9.10.4] Pseudonyms Are Publicly Derivable
 - **Category**: Security-relevant omission
 - **Location**: `09-security-model.md` line 560
-- **What's missing**: "For software keys, the HMAC uses the raw Ed25519 public key bytes." The public key is... public. Anyone with the DID and the context_id can compute `HMAC-SHA256(public_key_bytes, context_id || "scp-pseudonym")` and derive the pseudonym. The spec claims pseudonyms are "unlinkable across contexts" -- but they are fully linkable if you know the context_id.
-- **Why it matters**: A relay operator who knows a context_id can test every known DID against it by computing pseudonyms and checking active subscriptions. Combined with the metadata routing_id (`SHA-256(context_id || "scp-metadata")`) which is also publicly derivable, this enables a membership enumeration oracle.
+- **What's missing**: For software keys the spec keys the HMAC with the raw public key bytes. The public key is... public. Anyone with the identifier and the context_id can compute `HMAC-SHA256(public_key_bytes, context_id || "scp-pseudonym")` and derive the pseudonym. The spec claims pseudonyms are "unlinkable across contexts" -- but they are fully linkable if you know the context_id.
+- **Why it matters**: A relay operator who knows a context_id can test every known identity against it by computing pseudonyms and checking active subscriptions. Combined with the metadata routing_id (`SHA-256(context_id || "scp-metadata")`) which is also publicly derivable, this enables a membership enumeration oracle.
 - **Severity**: HIGH
-- **Resolution (later)**: Rejected the public-key-as-HMAC-key approach. Spec §9.10.4.A now keys the HMAC with a private-derived `pseudonym_secret` (software custody: `HKDF-SHA256` over the Ed25519 private seed, cross-platform deterministic; hardware custody: device-local secret), never the public key -- closing the enumeration oracle. Line references are from the audit-time spec revision and have since shifted. See spec §9.10.4.A and KAT vectors §25.19. Preserved as historical record.
+- **Resolution (later)**: Rejected the public-key-as-HMAC-key approach. Spec §9.10.4.A now keys the HMAC with a private-derived `pseudonym_secret` (software custody: `HKDF-SHA256` over the private seed, cross-platform deterministic; hardware custody: device-local secret), never the public key -- closing the enumeration oracle. Line references are from the audit-time spec revision and have since shifted. See spec §9.10.4.A and KAT vectors §25.19. Preserved as historical record.
 
 ### [9.10.4] Metadata Routing ID Enables Membership Enumeration
 - **Category**: Security-relevant omission
 - **Location**: `09-security-model.md` line 561
-- **What's missing**: `metadata_routing_id = SHA-256(context_id || "scp-metadata")` is publicly derivable from context_id. Combined with publicly derivable pseudonyms (above), enables enumeration of which DIDs are members of a context.
+- **What's missing**: `metadata_routing_id = SHA-256(context_id || "scp-metadata")` is publicly derivable from context_id. Combined with publicly derivable pseudonyms (above), enables enumeration of which identities are members of a context.
 - **Why it matters**: Any party knowing a context_id can query relays for membership presence. The context_id itself may be guessable or leaked through other protocol interactions.
 - **Severity**: HIGH
 - **Resolution (later)**: The unkeyed `SHA-256(context_id || "scp-metadata")` routing id was replaced by the keyed `HMAC-SHA256(context_metadata_key, ...)` form (spec §9.10.4.B), which is not publicly derivable, closing the enumeration vector. Preserved as historical record.
@@ -695,9 +695,10 @@ Total findings: **1 CRITICAL, 16 HIGH, 18 MEDIUM, 5 LOW**.
 ### [10.12.4.1 / 9.10.4] Two Different Routing ID Derivation Schemes
 - **Category**: Cross-reference inconsistency
 - **Location**: `10-infrastructure-and-self-hosting.md` line 490 vs `09-security-model.md` line 549
-- **What's missing**: Bridge registration uses `SHA-256("scp:did:" || did_string)` for routing_id derivation. Context pseudonym system uses `HMAC-SHA256(identity_key_material, context_id || "scp-pseudonym")`. These are two different functions that the spec calls "routing_id" in different contexts. No clear specification of which one applies where.
+- **What's missing**: Bridge registration and the context pseudonym system each derive a value the spec calls "routing_id", by two different functions, and no section says which one applies where.
 - **Why it matters**: If the bridge validates using one scheme but the relay publishes using the other, bridge registration fails. An implementor reading both sections needs disambiguation.
 - **Severity**: HIGH
+- **Resolution (later)**: Rule R13 of `09-security-model.md` §9.7.4.2 is the one home of the identity routing derivations, which this finding cites and does not restate.
 
 ### [10.14.2] QUIC 0-RTT Replay for PUBLISH
 - **Category**: Security-relevant omission
@@ -748,7 +749,7 @@ Total findings: **1 CRITICAL, 16 HIGH, 18 MEDIUM, 5 LOW**.
 ### [9.2.1] Invitation Rate Limit Defaults Missing
 - **Category**: Missing constants/defaults
 - **Location**: `09-security-model.md` line 101
-- **What's missing**: No per-DID rate, no global rate, no queue depth limit, no priority decay function for the invitation rate limiter.
+- **What's missing**: No per-identity rate, no global rate, no queue depth limit, no priority decay function for the invitation rate limiter.
 - **Why it matters**: Human coordination bottleneck defense is advisory without concrete limits.
 - **Severity**: MEDIUM
 
@@ -839,7 +840,7 @@ Total findings: **1 CRITICAL, 16 HIGH, 18 MEDIUM, 5 LOW**.
 ### [9.17.3] member_id Collision in Large Contexts
 - **Category**: Missing edge cases
 - **Location**: `09-security-model.md` line 951
-- **What's missing**: 8-byte truncated DID hash has birthday collision probability ~0.3% at 10M members. No collision resolution mechanism specified.
+- **What's missing**: An 8-byte truncated identifier hash has birthday collision probability ~0.3% at 10M members. No collision resolution mechanism specified.
 - **Why it matters**: In broadcast contexts with millions of subscribers, collisions will cause decryption failures.
 - **Severity**: MEDIUM
 
@@ -860,7 +861,7 @@ Total findings: **1 CRITICAL, 16 HIGH, 18 MEDIUM, 5 LOW**.
 ### [10.12.1] NAT Tier Transition Has No Connection Draining
 - **Category**: Missing edge cases
 - **Location**: `10-infrastructure-and-self-hosting.md` line 379
-- **What's missing**: No specification of how to drain connections during tier transition. No overlap period while DID document propagates.
+- **What's missing**: No specification of how to drain connections during tier transition. No overlap period while the service record propagates.
 - **Why it matters**: Tier transitions cause message loss during propagation window.
 - **Severity**: MEDIUM
 
