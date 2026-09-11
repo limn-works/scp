@@ -305,7 +305,7 @@ Each Tier 2 adapter documents how `TransportAdapter`'s 5 methods (`send`, `subsc
 **Tor** (onion-routed transport)
 - All 5 methods → delegate to underlying adapter (WebSocket or QUIC) routed through Tor.
 - **Connection model:** SOCKS5 proxy to Tor circuit. WebSocket-over-Tor or QUIC-over-Tor (experimental). Relay can run as Tor hidden service (.onion address).
-- **Constraints:** High latency (total circuit RTT typically 200–600ms for 3-hop circuits; hidden service connections use 6 hops — client 3 + service 3 to rendezvous — approximately doubling latency). No UDP (Tor is TCP-only — QUIC requires experimental Tor UDP support). Cover traffic less useful (Tor provides some traffic analysis resistance at the network layer, though not immune to timing correlation). Relay .onion address replaces DNS — DID document uses `.onion` URL.
+- **Constraints:** High latency (total circuit RTT typically 200–600ms for 3-hop circuits; hidden service connections use 6 hops — client 3 + service 3 to rendezvous — approximately doubling latency). No UDP (Tor is TCP-only — QUIC requires experimental Tor UDP support). Cover traffic less useful (Tor provides some traffic analysis resistance at the network layer, though not immune to timing correlation). Relay .onion address replaces DNS — the service record's `SCPRelay` entry carries the `.onion` URL.
 
 **I2P** (invisible internet protocol)
 - All 5 methods → delegate to underlying adapter routed through I2P.
@@ -750,7 +750,7 @@ Operators concerned about metadata exposure to network intermediaries can:
 - Route relay traffic through a VPN or Tor.
 - Use a bridge relay with `wss://` (Tier 3 always uses `wss://` because the bridge relay has a domain).
 
-### 10.12.7 DID Document Relay URL Encoding
+### 10.12.7 Service-Record Relay URL Encoding
 
 Each reachability tier produces a different relay URL format for the service record's `SCPRelay` entries (§18.2.1):
 
@@ -766,10 +766,10 @@ Tiers 1 and 2 use `ws://` with raw IP addresses — these are the zero-config, n
 **Address change handling.** Residential IP addresses change (ISP DHCP lease renewal, router reboot). UPnP port mappings may be reassigned. STUN-discovered addresses shift when NAT mappings expire and reform. The `RepublishManager` handles address changes by:
 
 1. Detecting the change (periodic STUN re-probe, UPnP lease renewal response, network interface change event).
-2. Composing a `KeyState` event carrying the new relay list, signed by the standing root (`09-security-model.md` §9.7.4.2 R3), because the relay list is key state and no other event may change it.
-3. Republishing under §3.10.5 of the identity spec: the extended chain and the service record, both to the SCP relays of the identity's fallback set. There is no second layer: `18-addressability-and-deployment.md` §18.5.1 states that the Mainline DHT is not a resolution level and that no level resolves a DID document.
+2. Writing a fresh service record at an incremented sequence carrying the new `SCPRelay` entries, signed by the designated operational key (`03-identity.md` §3.10.13). The relay list is not key state and no key event is appended, so the root set stays cold across every address change.
+3. Republishing that record to the SCP relays of the identity's fallback set. There is no second layer: `18-addressability-and-deployment.md` §18.5.1 states that the Mainline DHT is not a resolution level.
 
-Peers that fail to connect to a stale relay address re-resolve the identity's key-event log immediately. Multi-relay publishing (§18.7) provides availability during address transitions — if the self-hosted relay publishes to external relays in addition to advertising its own address, messages accumulate on external relays while the self-hosted relay's address updates propagate.
+Peers that fail to connect to a stale relay address re-resolve the identity's service record immediately. Multi-relay publishing (§18.7) provides availability during address transitions — if the self-hosted relay publishes to external relays in addition to advertising its own address, messages accumulate on external relays while the self-hosted relay's address updates propagate.
 
 ### 10.12.8 ApplicationNode Integration
 
