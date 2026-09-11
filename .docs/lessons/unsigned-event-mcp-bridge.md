@@ -2,7 +2,7 @@
 
 ## Problem
 
-`FfiBridgeProvider::invoke_tool` in `crates/scp-ffi/src/mcp.rs` emits `OutletInvokedEvent` entries per ADR-010 criterion 3. These events are appended to the Merkle event log via `append_unsigned_event` — a variant that skips Ed25519 signature verification — because the signing key material is not accessible in the sync execution context.
+`FfiBridgeProvider::invoke_tool` in `crates/scp-ffi/src/mcp.rs` emits `OutletInvokedEvent` entries per ADR-010 criterion 3. These events are appended to the Merkle event log via `append_unsigned_event` — a variant that skips signature verification — because the signing key material is not accessible in the sync execution context.
 
 The root cause is a runtime constraint: `ContextProvider::invoke_tool` is called synchronously from within the tokio runtime. The `KeyCustody` signing trait is async. Calling `tokio::runtime::Runtime::block_on()` from inside a tokio worker thread panics with "Cannot block the current thread from within a runtime." There is no safe way to bridge from sync to async in this context without a dedicated signing thread or channel.
 
