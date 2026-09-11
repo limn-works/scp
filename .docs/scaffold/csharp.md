@@ -12,7 +12,7 @@ bindings/csharp/
   src/
     Limn.Scp/
       Limn.Scp.csproj
-      Identity.cs                # Identity class, DIDDocument
+      Identity.cs                # Identity class
       Context.cs                 # Context class, Membership, IAsyncDisposable
       Tools.cs                   # ToolDefinition, TestVector records
       Trust.cs                   # EvaluateTrustAsync(), TrustEvaluation
@@ -72,10 +72,10 @@ internal static partial class NativeLib
     [LibraryImport(LibName, EntryPoint = "scp_identity_free")]
     internal static partial void IdentityFree(nint handle);
 
-    [LibraryImport(LibName, EntryPoint = "scp_identity_did", StringMarshalling = StringMarshalling.Utf8)]
-    internal static partial int IdentityDid(
+    [LibraryImport(LibName, EntryPoint = "scp_identity_identifier")]
+    internal static partial int IdentityIdentifier(
         nint handle,
-        out nint didString);
+        Span<byte> identifier);
 
     [LibraryImport(LibName, EntryPoint = "scp_string_free")]
     internal static partial void StringFree(nint s);
@@ -161,7 +161,7 @@ public sealed class Identity : IAsyncDisposable
 {
     private readonly IdentityHandle _handle;
 
-    public string Did => NativeLib.GetDid(_handle);
+    public byte[] Identifier => NativeLib.GetIdentifier(_handle);
     public string CustodyType => NativeLib.GetCustodyType(_handle);
 
     public static async Task<Identity> CreateAsync(string custody = "platform")
@@ -219,7 +219,7 @@ public sealed class Context : IAsyncDisposable
 
 ```csharp
 public record Message(
-    string SenderDid,
+    byte[] SenderIdentifier,
     byte[] Content,
     long Timestamp,
     long Sequence,
@@ -232,7 +232,7 @@ public record ToolDefinition(
     string Description,
     Dictionary<string, object> InputSchema,
     Dictionary<string, object> OutputSchema,
-    string Operator,
+    byte[] Operator,
     IReadOnlyList<TestVector>? TestVectors = null,
     byte[]? ImplementationHash = null
 );
