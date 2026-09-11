@@ -4,14 +4,14 @@
 
 ## Problem
 
-The PyO3 FFI bridge (`crates/scp-ffi/src/runtime.rs`) uses process-global static registries (`OnceLock<DashMap<...>>`) for context state, known-context discovery metadata, relay connections, and identity routing secrets. In multi-tenant deployments (e.g., a Django or FastAPI server serving multiple SCP users in the same process), all tenants share these registries. Tenant A's context IDs, identity DIDs, and routing secrets are accessible to Tenant B.
+The PyO3 FFI bridge (`crates/scp-ffi/src/runtime.rs`) uses process-global static registries (`OnceLock<DashMap<...>>`) for context state, known-context discovery metadata, relay connections, and identity routing secrets. In a multi-tenant deployment (a Django or FastAPI server serving multiple SCP users in one process), all tenants share these registries. Tenant A's context IDs, identifiers, and routing secrets are accessible to Tenant B.
 
 ## Affected Statics
 
 - `CONTEXT_REGISTRY` — maps context IDs to `ContextRuntime` (outlet registries, event logs, role state, UCAN state)
-- `KNOWN_CONTEXTS` — maps context IDs to `KnownContext` (routing IDs, relay URLs, member DIDs)
+- `KNOWN_CONTEXTS` — maps context IDs to `KnownContext` (routing IDs, relay URLs, member identifiers)
 - `RELAY_CONNECTION` — single shared relay adapter
-- `IDENTITY_ROUTING_SECRETS` (inside `get_or_create_routing_secret`) — maps identity DIDs to 32-byte secrets
+- `IDENTITY_ROUTING_SECRETS` (inside `get_or_create_routing_secret`) — maps identifiers to 32-byte secrets
 
 ## Why Only PyO3
 
@@ -20,9 +20,9 @@ The NAPI (Node.js) and UniFFI (Swift/Kotlin) bridges use per-instance opaque han
 ## Impact
 
 - **Cross-tenant context leakage**: Tenant A can access Tenant B's contexts by guessing or enumerating context IDs.
-- **Cross-tenant identity leakage**: Routing secrets derived for one tenant's DID are shared with all tenants.
+- **Cross-tenant identity leakage**: Routing secrets derived for one tenant's identifier are shared with all tenants.
 - **Single relay connection**: Only one relay connection exists process-wide. The last tenant to connect wins.
-- **No isolation guarantees**: The protocol's context isolation principle (tenet #3) is violated at the FFI boundary.
+- **No isolation guarantees**: the FFI boundary breaks the protocol's context-isolation tenet.
 
 ## Mitigation (Current)
 
