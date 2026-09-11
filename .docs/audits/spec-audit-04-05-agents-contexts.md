@@ -17,28 +17,14 @@ The core pattern throughout: **the spec describes what should happen but not how
 ### [4.2] Institutional Agent Key Governance Undefined
 - **Category**: Underspecified algorithms
 - **Location**: §4.2, line 12
-- **What's missing**: Institutional agents are described as "bound to multiple humans through shared governance (multi-sig, elected operators, organizational hierarchy)" and noted as "structurally identical to personal agents." But how does multi-sig key control work for a single `#agent` verification method? A verification method is one key. If multiple humans share governance, do they hold key shares? Is there a threshold signature scheme? Who controls the private key? The spec says "the difference is in who holds the keys and how revocation/control works" but never specifies either of those differences.
+- **What's missing**: Institutional agents are described as "bound to multiple humans through shared governance (multi-sig, elected operators, organizational hierarchy)" and noted as "structurally identical to personal agents." But how does multi-sig key control work for a single agent signing key? An operational role is one key. If multiple humans share governance, do they hold key shares? Is there a threshold signature scheme? Who controls the private key? The spec says "the difference is in who holds the keys and how revocation/control works" but never specifies either of those differences.
 - **Why it matters**: An implementor building institutional agent support has zero guidance on the key management model. This is a security-critical gap: if the intent is that institutions use a single private key with an operational key management process (e.g., HSM with M-of-N unlock), that needs to be stated. If the intent is threshold ECDSA/EdDSA, that's a significantly different implementation.
 - **Severity**: HIGH
-
-### [4.2] Maximum Number of `#agent` Verification Methods
-- **Category**: Missing constants/defaults
-- **Location**: §4.2-4.3, lines 11-16
-- **What's missing**: §4.2 says "at most one `#agent` verification method." §4.3 says "exactly one `#agent` verification method." Which is it? Can a DID document have zero `#agent` VMs (human-only, no agent)? The minimum viable agent discussion (§4.5 line 43) suggests yes, but §4.3 says "exactly one." If zero is valid, verifiers need to handle the absent-agent case.
-- **Why it matters**: DID document validators need a definitive rule: reject DID documents with 0 `#agent`? Or only reject >1? The ADR-039 memory note says "optional" and references a "domain-derived sentinel for absent agent key" — but this isn't stated in §4 at all. The spec file and the ADR disagree or at least don't cross-reference.
-- **Severity**: MEDIUM
-
-### [4.3] DID Document Rejection Criteria Not Specified
-- **Category**: Missing conformance criteria
-- **Location**: §4.3, line 16
-- **What's missing**: "Verifiers reject DID documents with multiple `#agent` VMs." What does "reject" mean in protocol terms? Is this a hard parse error? A validation failure? Does it poison the DID entirely, or just prevent the DID from joining contexts? What error is returned? What happens if a DID document that was previously valid adds a second `#agent` VM through a DID update — do existing context memberships become invalid?
-- **Why it matters**: Without specifying the failure mode, implementors will handle this inconsistently. Some will silently ignore extra VMs, some will hard-fail. The interoperability consequence is that a DID valid on one implementation may be invalid on another.
-- **Severity**: MEDIUM
 
 ### [4.4] Agent Capability Metadata Schema Undefined
 - **Category**: Missing wire format details
 - **Location**: §4.4, lines 24-29
-- **What's missing**: The spec says capability metadata is "a standardized profile" but §4 never defines the schema. It distinguishes self-attested from challenge-verified capabilities and says "contexts can require specific capability levels for admission" but does not define: the serialization format of capability metadata, where it's stored (DID document service endpoint? context metadata?), how admission checks are performed mechanically, or the structure of a challenge-verification record. The cross-reference to §7.3.4 provides more detail on challenge suites but still doesn't give a wire format for the capability metadata itself as stored in the DID document.
+- **What's missing**: The spec says capability metadata is "a standardized profile" but §4 never defines the schema. It distinguishes self-attested from challenge-verified capabilities and says "contexts can require specific capability levels for admission" but does not define: the serialization format of capability metadata, where it's stored (service record? context metadata?), how admission checks are performed mechanically, or the structure of a challenge-verification record. The cross-reference to §7.3.4 provides more detail on challenge suites but still doesn't give a wire format for the capability metadata itself as stored in the service record.
 - **Why it matters**: This is not implementable from §4 alone. An implementor would need to read §7.3.4 and ADR-041, which provide partial answers — but even those don't give a complete serialized capability profile structure.
 - **Severity**: HIGH
 
@@ -48,13 +34,6 @@ The core pattern throughout: **the spec describes what should happen but not how
 - **What's missing**: "The protocol defines standard challenge suites for common capabilities (prompt injection resistance, schema validation, rate limit compliance, content formatting)." These are named but not defined. What are the test cases? What constitutes passing? What is the format of a challenge request and response? §7.3.4 in the trust spec says they exist but doesn't define them either.
 - **Why it matters**: If challenge suites are protocol-level (which §7.3.4 implies by reserving the `scp:capability:` namespace), they need actual test vectors. Without them, "challenge-verified" has no meaning — any verifier can define any tests and call the results "challenge-verified."
 - **Severity**: HIGH
-
-### [4.5] Human vs. Agent Signing Ambiguity for Same Operation
-- **Category**: Ambiguous state transitions
-- **Location**: §4.5, lines 37-38
-- **What's missing**: "Messages signed with `#active` are human-direct; messages signed with `#agent` are agent-autonomous." Are there operations where ONLY `#active` is valid? Or ONLY `#agent`? The spec says "the human can always act directly through `#active`" which implies `#active` can do everything `#agent` can. But can `#agent` do everything `#active` can? ADR-039 defines permission categories A/B/C with some operations restricted to `#0` only — but §4 doesn't reference this framework at all.
-- **Why it matters**: Without clear rules about which signing key is valid for which operations, verifiers cannot correctly reject unauthorized actions. A compromised agent key should not be able to perform identity-layer operations (permission category A), but §4 doesn't state this.
-- **Severity**: MEDIUM
 
 ### [4.7] Context Isolation Enforcement Mechanism Not Specified
 - **Category**: Missing conformance criteria
@@ -66,8 +45,8 @@ The core pattern throughout: **the spec describes what should happen but not how
 ### [4.8] Context Participation Limits Completely Open
 - **Category**: Missing constants/defaults
 - **Location**: §4.8, lines 67-69
-- **What's missing**: "The number of contexts a person can participate in may be an earned resource" and references an open question. But there's no maximum, no default, no rate limit on context joins. Without any limit, an attacker with one DID can join unlimited contexts and consume unlimited relay resources. Even if scoring is "product layer," the protocol needs a hard upper bound or relay-enforced rate limit.
-- **Why it matters**: Relay resource exhaustion. A single DID subscribing to thousands of contexts creates storage and bandwidth obligations at the relay. The spec defers this entirely to §0 open questions and calls it Phase 2+, but it's a production DoS vector.
+- **What's missing**: "The number of contexts a person can participate in may be an earned resource" and references an open question. But there's no maximum, no default, no rate limit on context joins. Without any limit, an attacker with one identity can join unlimited contexts and consume unlimited relay resources. Even if scoring is "product layer," the protocol needs a hard upper bound or relay-enforced rate limit.
+- **Why it matters**: Relay resource exhaustion. A single identity subscribing to thousands of contexts creates storage and bandwidth obligations at the relay. The spec defers this entirely to §0 open questions and calls it Phase 2+, but it's a production DoS vector.
 - **Severity**: MEDIUM
 
 ### [4.6] Builder Agent Definition Has No Protocol Surface
@@ -112,7 +91,7 @@ The core pattern throughout: **the spec describes what should happen but not how
 ### [5.4] Outlet Registration Wire Format Not Defined
 - **Category**: Missing wire format details
 - **Location**: §5.4, lines 55-63
-- **What's missing**: Outlet registrations list 5 fields (schema, implementation hash, test vectors, operator DID, cost metadata) but don't specify: the serialization format for outlet registrations, the schema for test vectors (what structure? how are inputs and outputs represented?), the hash algorithm for implementation hash, how cost metadata is serialized, or the maximum size of an outlet registration.
+- **What's missing**: Outlet registrations list 5 fields (schema, implementation hash, test vectors, operator identity, cost metadata) but don't specify: the serialization format for outlet registrations, the schema for test vectors (what structure? how are inputs and outputs represented?), the hash algorithm for implementation hash, how cost metadata is serialized, or the maximum size of an outlet registration.
 - **Why it matters**: Outlets are a core protocol primitive. Two implementations serializing outlet registrations differently would produce different implementation hashes and different event log entries.
 - **Severity**: HIGH
 
@@ -147,7 +126,7 @@ The core pattern throughout: **the spec describes what should happen but not how
 ### [5.7] Metadata Signing Key and Freshness Not Specified
 - **Category**: Security-relevant omissions
 - **Location**: §5.7.1, lines 110-122
-- **What's missing**: "The metadata record is signed by a current context admin." Which key? The admin's `#active`? `#agent`? The MLS signing key? Is there a metadata-specific signing key? What is the metadata record format (serialization)? How does a prospective member verify that the signer is a "current context admin" without being a member? How stale can metadata be before it's considered invalid? There's no TTL or freshness requirement on metadata records.
+- **What's missing**: "The metadata record is signed by a current context admin." Which key? The admin's `#active`? The MLS signing key? Is there a metadata-specific signing key? What is the metadata record format (serialization)? How does a prospective member verify that the signer is a "current context admin" without being a member? How stale can metadata be before it's considered invalid? There's no TTL or freshness requirement on metadata records.
 - **Why it matters**: Without freshness requirements, a relay could serve stale metadata indefinitely. A context that has since changed its governance or ceiling would be misrepresented. Without key specification, signature verification is unimplementable.
 - **Severity**: HIGH
 
@@ -231,7 +210,7 @@ The core pattern throughout: **the spec describes what should happen but not how
 ### [5.12.2] Auto-Accept TrustRequirement `discovery_context` Undefined
 - **Category**: Underspecified algorithms
 - **Location**: §5.12.2, lines 335-338
-- **What's missing**: `discovery_context // DID is registered in a context with discovery outlets I trust`. What makes a context with discovery outlets "trusted"? Is trust in a context with discovery outlets itself governed by auto-accept policies (circular)? How does the SDK evaluate this criterion at invitation-processing time — does it query the context? Cache context membership? What if the context is offline?
+- **What's missing**: `discovery_context // the identity is registered in a context with discovery outlets I trust`. What makes a context with discovery outlets "trusted"? Is trust in a context with discovery outlets itself governed by auto-accept policies (circular)? How does the SDK evaluate this criterion at invitation-processing time — does it query the context? Cache context membership? What if the context is offline?
 - **Why it matters**: This is a potentially expensive runtime check (querying an external context) in the fast path of invitation processing. If the context is unreachable, does the auto-accept fail closed (reject) or fail open (prompt)?
 - **Severity**: LOW
 
@@ -447,9 +426,9 @@ The core pattern throughout: **the spec describes what should happen but not how
 |----------|-------|
 | CRITICAL | 4 |
 | HIGH | 16 |
-| MEDIUM | 20 |
+| MEDIUM | 17 |
 | LOW | 8 |
-| **Total** | **48** |
+| **Total** | **45** |
 
 **CRITICAL findings (must be resolved before implementation can interoperate):**
 1. Context state machine not specified in §5
