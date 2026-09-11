@@ -11,12 +11,12 @@ The protocol is designed for a world where:
 
 ## Core Principles
 
-1. **Identity.** Every actor has a cryptographically verifiable identity (DID). Actions trace to identities. Identities trace to humans.
+1. **Identity.** Every actor has a cryptographically verifiable identity: the digest of the actor's inception event, which a verifier confirms by replaying that actor's key-event log (`09-security-model.md` §9.7.4.2 R2 and R13). Actions trace to identities. Identities trace to humans.
 2. **Context isolation.** All interaction happens within contexts. Agents are separate instances per context. Cross-context data flow is explicit and governed.
 3. **Provenance.** All non-private data carries verifiable origin metadata. Every message, outlet output, attestation, and cross-context data transfer is traceable to its source. Provenance is not a feature — it is a foundational property of every protocol action. The absence of provenance on data is itself a signal ("this has no verified origin"). Provenance enables Sybil detection, governance enforcement, trust evaluation, and accountability.
 4. **Encryption-as-access-control.** Context membership is enforced cryptographically. If you don't have the key, you can't read the data. No relay or intermediary enforces access — the math does.
 5. **Legibility before opt-in.** Every context's parameters — ceiling, governance, roles, outlets, TTL, memory scope — are visible before you join. No hidden terms.
-6. **Human accountability.** Every agent can be traced structurally — agent key (`#agent`) lives inside the human's DID document, making accountability structural rather than inferential (ADR-039). The protocol provides the mechanism; contexts decide the requirement. Unattested DIDs are valid protocol participants. Contexts requiring verified-human attestation enforce traceability. Participation records attach to DIDs and are durable — actions have consequences that persist across contexts. **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`00-open-questions.md`).]**
+6. **Human accountability.** Every agent traces structurally to a human, because an agent is a separate identity whose key-event log the human's log anchors by cooperative delegation (`09-security-model.md` §9.1 invariant 1). Accountability is structural rather than inferential. The protocol provides the mechanism; contexts decide the requirement. Unattested identities are valid protocol participants, and a context requiring verified-human attestation enforces traceability. Participation records attach to identities and are durable, so actions carry consequences that persist across contexts.
 
 ## Strategy: SDK-First, Not App-First
 
