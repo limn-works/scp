@@ -1,23 +1,23 @@
 # Android Software Key Persistence — EncryptedSharedPreferences Required
 
-**Problem**: Android Keystore does not support Ed25519 on API 26-32, so `AndroidKeyCustody`
-generates software Ed25519 keys with Bouncy Castle. These keys must survive process death.
-On Android, processes are killed routinely by the OS for memory pressure or when the device
-restarts.
+**Problem**: where `AndroidKeyCustody` holds a key in software rather than in the Android
+Keystore, that key must survive process death. Android kills processes routinely for memory
+pressure, and the device restarts.
 
-A naive implementation stores software keys only in a `ConcurrentHashMap` in-memory. This passes
-all JVM unit tests but silently loses all API 26-32 identity keys when the process dies. The next
-`SCP.create()` call generates a brand-new identity key, producing a different DID. The user
-effectively loses their SCP identity without any error.
+A naive implementation stores software keys only in an in-memory `ConcurrentHashMap`. This
+passes every JVM unit test and silently loses each software-held identity key when the process
+dies. The next `SCP.create()` call generates a new identity key under a new identifier, so the
+user loses their SCP identity with no error.
 
 **Correct pattern**:
-- On `generateSoftwareEd25519` / `generateSoftwareX25519`: serialize the Bouncy Castle key pair
-  and write it to `EncryptedSharedPreferences` (Jetpack Security) under key `scp.key.<id>`.
-- On `AndroidKeyCustody` init: scan all `scp.key.*` entries in EncryptedSharedPreferences and
+- On generating a software key: serialize the Bouncy Castle key pair and write it to
+  `EncryptedSharedPreferences` (Jetpack Security) under `scp.key.<id>`.
+- On `AndroidKeyCustody` init: scan every `scp.key.*` entry in EncryptedSharedPreferences and
   re-populate `softwareKeys` from them.
-- On `destroySoftwareKey`: remove from `softwareKeys` AND delete from EncryptedSharedPreferences.
-- On `destroySoftwareKey` verification: check EncryptedSharedPreferences absence, not just
-  ConcurrentHashMap absence.
+- On destroying a software key: remove it from `softwareKeys` AND delete it from
+  EncryptedSharedPreferences.
+- When verifying a destroy: check EncryptedSharedPreferences absence, not `ConcurrentHashMap`
+  absence alone.
 
 **Side effect**: `AndroidKeyCustody` must accept an Android `Context` constructor parameter
 (the other three providers already do). Update `AndroidPlatformAdapter.make()` to pass context
