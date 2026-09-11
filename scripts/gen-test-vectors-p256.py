@@ -1,8 +1,8 @@
 #!/usr/bin/env python3.12
 """Regenerates every keyed value printed in `.docs/specs/25-test-vectors.md`.
 
-SCP superseded Ed25519 with ECDSA on NIST P-256 on 2026-09-10
-(`.docs/specs/09-security-model.md` §9.5). This script is the authority for
+`.docs/specs/09-security-model.md` §9.5 mandates ECDSA on NIST P-256 with
+SHA-256 for every SCP signature, from 2026-09-10. This script is the authority for
 every byte §25 prints that depends on a key or a signature. It implements
 P-256 field and point arithmetic, RFC 6979 deterministic ECDSA with SHA-256,
 low-`s` normalization, SEC1 point encoding, HKDF-SHA256, HMAC-SHA256, the
@@ -637,9 +637,9 @@ def self_test() -> None:
 # §25.2 Reference key material
 # ---------------------------------------------------------------------------
 
-# The two 32-byte seeds SCP's test vectors have carried since the Ed25519 era.
-# They are retained so the corpus's provenance stays legible; under P-256 they
-# are inputs to the seed-to-scalar rule below and nothing more.
+# The two 32-byte seeds SCP's test vectors have carried since before the curve
+# change of §9.5. They are retained so the corpus's provenance stays legible,
+# and they are inputs to the seed-to-scalar rule below and nothing more.
 REF_SEED_1 = bytes.fromhex(
     "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
 )
@@ -724,7 +724,7 @@ if _HAVE_CRYPTOGRAPHY:
 def emit_canonical_encoding() -> None:
     section("§25.3 Canonical hash construction")
     emit_hex("vector_1.domain_separator", b"SCP-INNER-ENVELOPE-V1:")
-    emit_hex("vector_2.var_field", var_field("did:dht:z6MkTest"))
+    emit_hex("vector_2.var_field", var_field("#active"))
     emit_hex("vector_3.u64", u64(1_700_000_000))
     emit_hex("vector_4.absent_sentinel", ABSENT_SENTINEL)
 
@@ -1387,13 +1387,6 @@ def emit_keypackage_attestation() -> None:
 # §25.25 Custody violation and counter-attestation (§9.5.2, §9.18.2)
 # ---------------------------------------------------------------------------
 
-CUSTODY_SUBJECT_DID = "did:dht:z6MkCustodySubject"
-CUSTODY_VERIFIER_DID = "did:dht:z6MkCustodyVerifier"
-CUSTODY_ACTION = b"did_document_update"
-CUSTODY_SIGNER_KEY_ID = "#agent"
-COUNTER_EXPLANATION = "agent key compromised; rotated and republished"
-
-
 # §25.25's custody-violation and counter-attestation vectors were deleted on 2026-09-10.
 # The identity-substrate plan's §1 table marks both constructs CUT (Alec's 2026-08-25 Ruling 2,
 # reconfirmed 2026-08-31), and Track U4 owns the teardown of the §9.5.2 preimage tables and the
@@ -1449,24 +1442,32 @@ def key_state_entry(point: bytes, role: int, condition: int) -> bytes:
 
 
 def vector_key_state() -> bytes:
+    """The key-state snapshot, in the order §9.7.4.2's definitions fix.
+
+    The snapshot carries no next-set entry: each committed member's custody
+    type and key algorithm travel beside the commitment they describe, in the
+    continuation field of the commitment-fixing event.
+    """
     return (
         u32(1)  # root threshold
         + u32(2)  # key count
         + key_state_entry(REF_KEY_1.compressed, ROLE_ROOT, CONDITION_CURRENT)
         + key_state_entry(REF_KEY_2.compressed, ROLE_ACTIVE, CONDITION_CURRENT)
-        + u32(1)  # next-set count
-        + u8(CUSTODY_PASSKEY)  # the entry is custody_type then key_algorithm
-        + u8(KEY_ALGORITHM_ECDSA_P256_SHA256)
         + u32(1)  # witness-set count
         + fixed_field(VECTOR_WITNESS_OPERATOR)
         + u32(VECTOR_WITNESSING_INTERVAL)
-        + u8(ROLE_ACTIVE)  # service-key designation
+        + u8(ROLE_ACTIVE)  # service-key role discriminator
         + fixed_field(ZERO32)  # delegator: non-delegated
     )
 
 
 def inception_preimage(form: int) -> bytes:
-    """The inception event's signed preimage, in §9.7.4.2's field order."""
+    """The inception event's signed preimage, in §9.7.4.2's field order.
+
+    Every kind carries all twelve fields. A field this kind does not carry is
+    present with the sentinel §9.7.4.2's definitions fix: one `0x00` byte for
+    `standing_root`, and `BE32(0)` for a count-prefixed list.
+    """
     commitment = sha256(PREROTATION_SEPARATOR + VECTOR_PREROTATION_POINT)
     return (
         KEL_EVENT_SEPARATOR
@@ -1474,20 +1475,22 @@ def inception_preimage(form: int) -> bytes:
         + fixed_field(ZERO32)  # 2. identifier placeholder
         + u64(0)  # 3. sequence
         + fixed_field(ZERO32)  # 4. predecessor placeholder
-        # 5. standing_root: the RootRecovery kind alone carries it
+        + u8(0)  # 5. standing_root: sentinel, the RootRecovery kind carries it
         + u32(1)
         + u8(0)  # 6. signer index list of the one root group
         + u32(1)
         + u8(form)  # 7. signature-form list of that group
-        # 8. revealed keys: the reveal-authorized kinds alone carry them
+        + u32(0)  # 8. revealed keys: sentinel, a reveal carries them
         + u32(1)
         + fixed_field(REF_KEY_1.compressed)
         + u32(1)  # 9. installed root set + threshold
         + vector_key_state()  # 10. key-state snapshot
-        # 11. key-event seals: the KeyState kind alone carries them
+        + u32(0)  # 11. key-event seals: sentinel, a KeyState carries them
         + u8(CONTINUATION_COMMITMENT)  # 12. continuation
         + u32(1)
         + fixed_field(commitment)
+        + u8(CUSTODY_PASSKEY)  # the committed member's custody type
+        + u8(KEY_ALGORITHM_ECDSA_P256_SHA256)  # and its key algorithm
         + u32(1)
     )
 
@@ -1636,7 +1639,7 @@ SERVED_VALUE_DIGEST = sha256(
 
 
 def emit_witness_and_relay_objects() -> None:
-    section("§25.27 Cosigned head, conflict statement, fault proof, relay proof")
+    section("§25.27 Witness objects, relay proof, community relay list")
 
     subject = INCEPTION_IDENTIFIER
     designating_digest = INCEPTION_DIGEST
@@ -1672,6 +1675,31 @@ def emit_witness_and_relay_objects() -> None:
     cosigned_head(
         "vector_43", 0, designating_digest, designating_digest, COSIGN_OBSERVED_AT
     )
+
+    # Vector 44: the relay proof of control. It carries no key-state position:
+    # a non-transferable operator key has no position to name.
+    routing_id = sha256(b"scp:did:" + subject)
+    proof_fields = (
+        fixed_field(RELAY_OPERATOR_ID)
+        + fixed_field(RESOLVER_NONCE)
+        + fixed_field(routing_id)
+        + fixed_field(SERVED_VALUE_DIGEST)
+        + u64(COSIGN_OBSERVED_AT)
+    )
+    assert len(proof_fields) == 136, len(proof_fields)
+    emit_hex("vector_44.operator", RELAY_OPERATOR_ID)
+    emit_hex("vector_44.nonce", RESOLVER_NONCE)
+    emit_hex("vector_44.routing_id", routing_id)
+    emit_hex("vector_44.value_digest_input_blobs", SERVED_BLOB_A + SERVED_BLOB_B)
+    emit_hex("vector_44.value_digest", SERVED_VALUE_DIGEST)
+    emit("vector_44.observed_at", COSIGN_OBSERVED_AT)
+    emit("vector_44.field_bytes", len(proof_fields))
+    sign_and_emit(
+        "vector_44",
+        canonical_preimage("SCP-RELAY-PROOF-V1:", proof_fields),
+        REF_KEY_1,
+    )
+    emit("vector_44.object_bytes", len(proof_fields) + 64)
 
     # Vector 45: the conflict statement a witness emits when the one check fails.
     held_digest = sha256(b"scp-25-conflict-held-event")
@@ -1710,30 +1738,66 @@ def emit_witness_and_relay_objects() -> None:
     cosigned_head("vector_46b", 21, head_b, baseline, COSIGN_OBSERVED_AT + 1)
     assert head_a != head_b, "vector_46: the two heads must differ"
 
-    # Vector 44: the relay proof of control. It carries no key-state position:
-    # §9.7.1's attestation class reads the operator's latest current #active.
-    routing_id = sha256(b"scp:did:" + subject)
-    proof_fields = (
-        fixed_field(RELAY_OPERATOR_ID)
-        + fixed_field(RESOLVER_NONCE)
-        + fixed_field(routing_id)
-        + fixed_field(SERVED_VALUE_DIGEST)
-        + u64(COSIGN_OBSERVED_AT)
+    emit_community_relay_list()
+
+
+# --- §25.27 Vector 49: the shipped community relay list ---
+
+# `18-addressability-and-deployment.md` §18.5.1 fixes the artifact: one JSON
+# document named `community-relays.json`, holding a JSON array of entries, each
+# an object with four members — `operator`, `key`, `url` and `free`. The two
+# entries below are a fixture: the operators are digests of stated ASCII labels
+# and the keys are §25.2's reference and secondary keys.
+RELAY_LIST_FILE_NAME = "community-relays.json"
+RELAY_LIST_ENTRIES = [
+    (
+        sha256(b"scp-25-relay-operator"),
+        REF_KEY_1.compressed,
+        "wss://relay.example.com/scp/v1",
+        True,
+    ),
+    (
+        sha256(b"scp-25-witness-operator"),
+        REF_KEY_2.compressed,
+        "wss://relay2.example.com/scp/v1",
+        False,
+    ),
+]
+
+
+def community_relay_list_bytes() -> bytes:
+    """The document's bytes: one JSON array, no insignificant whitespace.
+
+    Member order is the order §18.5.1 lists: `operator`, `key`, `url`, `free`.
+    A 32-byte identifier and a 33-byte SEC1 compressed point each print as
+    lowercase hexadecimal, which §18.5.1 fixes for `key`.
+    """
+    entries = ",".join(
+        '{{"operator":"{}","key":"{}","url":"{}","free":{}}}'.format(
+            operator.hex(), key.hex(), url, "true" if free else "false"
+        )
+        for operator, key, url, free in RELAY_LIST_ENTRIES
     )
-    assert len(proof_fields) == 136, len(proof_fields)
-    emit_hex("vector_44.operator", RELAY_OPERATOR_ID)
-    emit_hex("vector_44.nonce", RESOLVER_NONCE)
-    emit_hex("vector_44.routing_id", routing_id)
-    emit_hex("vector_44.value_digest_input_blobs", SERVED_BLOB_A + SERVED_BLOB_B)
-    emit_hex("vector_44.value_digest", SERVED_VALUE_DIGEST)
-    emit("vector_44.observed_at", COSIGN_OBSERVED_AT)
-    emit("vector_44.field_bytes", len(proof_fields))
-    sign_and_emit(
-        "vector_44",
-        canonical_preimage("SCP-RELAY-PROOF-V1:", proof_fields),
-        REF_KEY_1,
-    )
-    emit("vector_44.object_bytes", len(proof_fields) + 64)
+    return ("[" + entries + "]").encode()
+
+
+def emit_community_relay_list() -> None:
+    document = community_relay_list_bytes()
+    emit("vector_49.file_name", RELAY_LIST_FILE_NAME)
+    emit("vector_49.entry_count", len(RELAY_LIST_ENTRIES))
+    for index, (operator, key, url, free) in enumerate(RELAY_LIST_ENTRIES):
+        emit_hex(f"vector_49.entry_{index}.operator", operator)
+        emit_hex(f"vector_49.entry_{index}.key", key)
+        emit(f"vector_49.entry_{index}.url", url)
+        emit(f"vector_49.entry_{index}.free", "true" if free else "false")
+    assert any(free for *_, free in RELAY_LIST_ENTRIES), "§18.5.1: one free entry"
+    assert len({operator for operator, *_ in RELAY_LIST_ENTRIES}) == len(
+        RELAY_LIST_ENTRIES
+    ), "§18.5.1: no two entries declare one operator"
+    emit("vector_49.document_len", len(document))
+    emit("vector_49.document", document.decode())
+    emit_hex("vector_49.document_bytes", document)
+    emit_hex("vector_49.document_sha256", sha256(document))
 
 
 # ---------------------------------------------------------------------------
