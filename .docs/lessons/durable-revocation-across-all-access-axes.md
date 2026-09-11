@@ -4,16 +4,16 @@
 
 ## The invariant
 
-A revocation/ban is a **downward-authorization transition**. For it to actually hold, three properties must ALL be true, and each was initially missing on at least one path:
+A revocation/ban is a **downward-authorization transition**. For it to hold, three properties must ALL be true, and each was initially missing on at least one path:
 
-1. **It must not live on state the revoked party can clear.** The first implementation recorded the ban on the membership-scoped `read_exclusion_list` — which a banned member's own `leave` clears as normal membership hygiene (§5.6.1/§5.9). A banned DID could therefore **launder the ban by self-leaving** and replay a retained UCAN. Fix: a separate durable `banned_subscribers` record on `BroadcastContext`, cleared ONLY by an authority `RestoreAccess`, persisted **fail-closed** in the snapshot (`#[serde(default)]` for back-compat). Rule of thumb: *revocation records must not be co-located with, or clearable by, the same lifecycle the revoked party controls.*
+1. **It must not live on state the revoked party can clear.** The first implementation recorded the ban on the membership-scoped `read_exclusion_list` — which a banned member's own `leave` clears as normal membership hygiene (§5.6.1/§5.9). A banned member could therefore **launder the ban by self-leaving** and replay a retained UCAN. Fix: a separate durable `banned_subscribers` record on `BroadcastContext`, cleared ONLY by an authority `RestoreAccess`, persisted **fail-closed** in the snapshot (`#[serde(default)]` for back-compat). *Revocation records must not be co-located with, or clearable by, the same lifecycle the revoked party controls.*
 
 2. **It must be enforced on every path to the protected resource — not just the obvious gate.** A single "can't subscribe" gate is insufficient. A read-ban must be checked on ALL of:
    - **admission** (new subscribe chokepoint),
    - **key-request serve** (before the author/roster grant — a banned non-subscriber can still *ask* for keys),
    - **already-cached material** (a ban must **rotate every author's key** to a fresh epoch so a pre-ban-cached key can't decrypt post-ban content — forward secrecy, §9.5),
    - **durability + reversibility** (recorded for EVERY read-revoked member, subscriber or not; survives self-leave AND admin-remove; cleared only by `RestoreAccess`).
-   Enumerate the access axes FIRST (like a coverage matrix); a gate on one axis is a false sense of security while the others leak.
+   Enumerate the access axes FIRST, as a coverage matrix; a gate on one axis gives false assurance while the others leak.
 
 3. **Recorded even for parties who never "used" the resource.** The ban must be recorded for a read-revoked member who was never a subscriber — otherwise the "rotate keys on ban" step is skipped (no subscriber → nothing rotated) and a later subscribe leaks.
 
