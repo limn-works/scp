@@ -8,7 +8,7 @@ Build blueprint for the SCP monorepo: crate organization, FFI strategy, cross-la
 
 ```
 crates/
-  scp-core/           # Protocol engine (MLS, DID, envelope, context, UCAN, event log)
+  scp-core/           # Protocol engine
   scp-transport/      # Transport abstraction + native relay + adapters
   scp-platform/       # Platform adapters (key custody, attestation, push, storage)
   scp-mcp/            # MCP adapter (JSON-RPC server/client)
@@ -27,9 +27,9 @@ bindings/
 
 | Crate | Role | Key dependencies |
 |-------|------|------------------|
-| `scp-core` | All protocol logic: MLS wrapper, DID, envelope, context lifecycle, UCAN, event log, sender keys | openmls, ed25519-dalek, sha2, hkdf, aes-gcm, serde, thiserror |
+| `scp-core` | All protocol logic: MLS wrapper, identity, envelope, context lifecycle, UCAN, event log, sender keys | openmls, p256, hpke-rs, sha2, hkdf, aes-gcm, serde, thiserror |
 | `scp-transport` | Transport trait + adapters. Native relay server/client. Multi-transport routing | tokio, tokio-tungstenite, futures |
-| `scp-platform` | Platform abstraction traits + in-memory testing adapters | ed25519-dalek, rand |
+| `scp-platform` | Platform abstraction traits + in-memory testing adapters | p256, rand |
 | `scp-mcp` | MCP JSON-RPC server/client for tool exposition | serde_json, tokio, axum |
 | `crates/scp-ffi/*` | Language-specific FFI bridges. Thin translation layers only — zero protocol logic | pyo3, uniffi, napi-rs |
 
@@ -151,7 +151,7 @@ Tests are defined as JSON fixtures:
   "operation": "identity_create",
   "input": { "custody": "in_memory" },
   "expected": {
-    "did_prefix": "did:dht:",
+    "identifier_len": 32,
     "custody_type": "in_memory"
   }
 }
