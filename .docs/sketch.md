@@ -1357,7 +1357,7 @@ No sender DID. No context ID. No timestamp. No signature. The relay is a dumb pi
   "type": "agent_action",
   "context_id": "ctx:z6Mkq8...",
   "from": {
-    "did": "did:dht:z6Mkf5rG...",
+    "did": "<identifier:alice>",
     "pseudonym": "z4K9xR...",
     "agent_id": "agent:z6Mkf5rG:ctx:z6Mkq8...",
     "capability_token": "eyJhbGciOiJFZERTQSIs..."
@@ -1388,7 +1388,7 @@ No sender DID. No context ID. No timestamp. No signature. The relay is a dumb pi
   "ceiling": ["messaging", "media", "outlet_invocation", "progress_tracking"],
   "governance": {
     "model": "single_admin",
-    "admin": "did:dht:z6MkpT..."
+    "admin": "<identifier:operator>"
   },
   "roles": {
     "admin": { "capabilities": ["*"] },
@@ -1403,7 +1403,7 @@ No sender DID. No context ID. No timestamp. No signature. The relay is a dumb pi
       "output_schema": { "type": "object", "properties": { "answer": { "type": "string" } } },
       "required_role": "member",
       "implementation_hash": "sha256:abc123...",
-      "operator": "did:dht:z6MkpT...",
+      "operator": "<identifier:operator>",
       "test_vectors": 3
     }
   ],
@@ -1414,7 +1414,7 @@ No sender DID. No context ID. No timestamp. No signature. The relay is a dumb pi
     { "trigger": "message_velocity > 50/min", "action": "capability_suspension", "duration": "1h" }
   ],
   "bridges": [
-    { "platform": "x", "mode": "relay", "operator": "did:dht:z6MkpT...", "shadows": 12 }
+    { "platform": "x", "mode": "relay", "operator": "<identifier:operator>", "shadows": 12 }
   ],
   "ttl": null,
   "memory_scope": "full",
@@ -1423,7 +1423,7 @@ No sender DID. No context ID. No timestamp. No signature. The relay is a dumb pi
   "parents": null,
   "members": 47,
   "created": "2026-01-20T10:00:00Z",
-  "creator": "did:dht:z6MkpT..."
+  "creator": "<identifier:operator>"
 }
 ```
 
@@ -1433,7 +1433,7 @@ No sender DID. No context ID. No timestamp. No signature. The relay is a dumb pi
 {
   "header": { "alg": "ES256", "typ": "JWT", "ucv": "0.10.0" },
   "payload": {
-    "iss": "did:dht:z6MkpT...",
+    "iss": "<identifier:operator>",
     "aud": "agent:z6MkpT:ctx:z6Mkq8...",
     "att": [
       { "with": "scp:ctx:z6Mkq8/outlets/recipe_assistant", "can": "invoke" },
@@ -1453,8 +1453,8 @@ No sender DID. No context ID. No timestamp. No signature. The relay is a dumb pi
 {
   "id": "att:z6Mk...",
   "type": "identity_link",
-  "issuer": "did:dht:z6Mkf5rG...",
-  "subject": "did:dht:z6Mkf5rG...",
+  "issuer": "<identifier:alice>",
+  "subject": "<identifier:alice>",
   "claim": {
     "platform": "x",
     "handle": "@alice",
@@ -1467,7 +1467,7 @@ No sender DID. No context ID. No timestamp. No signature. The relay is a dumb pi
   "issued_at": "2026-02-14T12:00:00Z",
   "expires": "2026-03-14T12:00:00Z",
   "renewed_at": null,
-  "revocation": "did:dht:z6Mkf5rG.../revocations",
+  "revocation": "<identifier:alice>/revocations",
   "signature": "..."
 }
 ```
@@ -1481,7 +1481,7 @@ Attached to data crossing context boundaries:
   "provenance": {
     "source_context": "ctx:z6Mkq8...",
     "source_type": "ephemeral",
-    "counterparties": ["did:dht:z6MkpT..."],
+    "counterparties": ["<identifier:operator>"],
     "purpose": "Scheduling discussion",
     "discovery_method": {
       "type": "shared_context",
@@ -1594,9 +1594,9 @@ SCP.Discovery.search(
   }
 ) → [DiscoveryResult] {
   did: DID,
-  capabilities: [String],          // from DID document + registry metadata
+  capabilities: [String],          // from the service record + registry metadata
   behavioralSummary: BehavioralSummary?,
-  source: .localContact            // cached DID document
+  source: .localContact            // cached key state and service record
         | .discoveryContext(contextID),
   provenance: DataProvenance        // where the result came from
 }
@@ -1624,7 +1624,7 @@ SCP.Discovery.deregister(
   identity: Identity
 ) → void
 
-// Update DID document capabilities (published via did:dht)
+// Update the service record's capability URIs (03-identity.md §3.10.13)
 SCP.Discovery.publishCapabilities(
   identity: Identity,
   capabilities: [String],
@@ -1654,7 +1654,7 @@ SCP.Discovery.addContext(
 Implementation specifics that require Tier 1/Tier 2 design work:
 
 - **~~Context key management.~~** ✅ **Resolved.** MLS (RFC 9420) selected. One MLS group per context. Full specification in .docs/specs/ §9.7 (MLS integration), §9.5 (cryptographic primitives), §9.8 (message security). Security APIs in §16 below.
-- **~~DID method selection.~~** ✅ **Resolved.** did:dht selected as primary method (self-certifying, key rotation via DID document versioning). did:web exists as contingency fallback only if did:dht libraries prove unusable — not a planned deployment path. See .docs/specs/ §9.6 for security properties of each.
+- **~~Identity substrate selection.~~** ✅ **Resolved.** ADR-063 selects an inception-derived identifier over a key-event log, modelled on KERI: the identifier is the digest of the inception event, a resolver replays the log over the SCP relay network, and rotation changes no identifier. See .docs/specs/ §9.6 and §9.7.4.2 for the security properties.
 - **~~Transport abstraction interface.~~** ✅ **Resolved.** ADR-005 specifies the `TransportAdapter` trait (send, subscribe, unsubscribe, query, delete). Envelope format specified in .docs/specs/ §9.10.2 (minimal outer envelope).
 - **~~SCP native relay protocol.~~** ✅ **Resolved.** ADR-004 specifies the relay: PUBLISH/SUBSCRIBE/UNSUBSCRIBE over WebSocket, blob TTL enforcement, recipient_hint for directed delivery.
 - **~~Sender-side key layer protocol (§9.16).~~** ✅ **Resolved.** Full specification in .docs/specs/ §9.16 (5 subsections). ADR-007 specifies implementation. AES-256-GCM sender keys, HPKE-wrapped per-recipient distribution using stable wrapping keypairs, block protocol, forward secrecy interaction.
@@ -1722,7 +1722,7 @@ SCP.Identity.verificationStatus(
 }
 ```
 
-Key change alerts: when a contact's DID document updates with a new key, the SDK triggers a key-change callback. If the pair was previously verified, the UI SHOULD present a prominent warning (analogous to Signal's "safety number changed" alert).
+Key change alerts: when a contact's key state lists a different key `current`, the SDK triggers a key-change callback. If the pair was previously verified, the UI SHOULD present a prominent warning (analogous to Signal's "safety number changed" alert).
 
 ### KeyPackage Management (§9.7.4)
 
