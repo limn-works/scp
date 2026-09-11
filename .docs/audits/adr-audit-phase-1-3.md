@@ -6,7 +6,7 @@
 
 The SCP ADR corpus across Phases 1--3 (19 ADRs total) is unusually thorough for a project at this stage. Most ADRs include concrete Rust type definitions, file-level scope estimates, acceptance criteria, and integration tests. The quality is well above the typical "we decided X" ADR pattern.
 
-That said, a line-by-line read reveals 47 distinct specification gaps. The most concerning are in three categories: (1) security-critical constructions where the ADR specifies the happy path but leaves adversarial behavior underspecified, (2) cross-ADR seams where assumptions in one ADR contradict or do not compose cleanly with another, and (3) missing defaults and operational parameters that an implementer would need to invent on the spot. None are architectural showstoppers -- the design is sound -- but several could produce interoperability failures or security weaknesses if implemented without additional specification.
+That said, a line-by-line read reveals 44 distinct specification gaps. The most concerning are in three categories: (1) security-critical constructions where the ADR specifies the happy path but leaves adversarial behavior underspecified, (2) cross-ADR seams where assumptions in one ADR contradict or do not compose cleanly with another, and (3) missing defaults and operational parameters that an implementer would need to invent on the spot. None are architectural showstoppers -- the design is sound -- but several could produce interoperability failures or security weaknesses if implemented without additional specification.
 
 ---
 
@@ -24,7 +24,7 @@ That said, a line-by-line read reveals 47 distinct specification gaps. The most 
 
 - **Category**: Underspecified interfaces
 - **Location**: ADR-001, Acceptance Criterion 8 (phase-1.md:106-107)
-- **What's missing**: "The SDK must maintain a buffer of at least 10 unused KeyPackages per identity. Replenished when buffer drops below 5." Where are KeyPackages published? How does a prospective adder obtain them? The ADR says "pre-published" but never specifies the publication channel. Are they stored on the relay? In the DID document? A separate KeyPackage server? The MLS spec (RFC 9420) intentionally leaves this to the application, and SCP must specify it.
+- **What's missing**: "The SDK must maintain a buffer of at least 10 unused KeyPackages per identity. Replenished when buffer drops below 5." Where are KeyPackages published? How does a prospective adder obtain them? The ADR says "pre-published" but never specifies the publication channel. Are they stored on the relay? A separate KeyPackage server? The MLS spec (RFC 9420) intentionally leaves this to the application, and SCP must specify it.
 - **Why it matters**: Without a KeyPackage distribution mechanism, offline member addition (a core MLS feature) is impossible. Every implementer will do something different.
 - **Severity**: HIGH
 
@@ -64,26 +64,10 @@ That said, a line-by-line read reveals 47 distinct specification gaps. The most 
 
 - **Category**: Missing security analysis
 - **Location**: ADR-002, Acceptance Criterion 1 (phase-1.md:202); ADR-006 (phase-1.md:803, 860-873)
-- **What's missing**: `HMAC-SHA256(ed25519_public_key_bytes, context_id || "scp-pseudonym")` uses the *public* key as the HMAC key. This was changed from private key for Android Keystore compatibility (ADR-027 amendment). The security analysis of this change is missing from the ADR. Since the HMAC key is public, any party that knows the DID can compute the pseudonym for any context_id. This means a relay that knows a user's DID can precompute all their pseudonyms and link activity across contexts -- exactly the attack pseudonyms are supposed to prevent.
-- **Why it matters**: The entire metadata privacy architecture (Decisions 2, 7, and 10) rests on pseudonym unlinkability. If the HMAC key is the public key, pseudonyms are unlinkable only if the DID is unknown to the relay. But DID resolution is public (Mainline DHT). A relay operator can resolve DIDs and compute pseudonyms, completely defeating the privacy goal. This is a fundamental design tension introduced by the Android Keystore constraint that requires explicit analysis.
+- **What's missing**: `HMAC-SHA256(public_key_bytes, context_id || "scp-pseudonym")` uses the *public* key as the HMAC key. This was changed from private key for Android Keystore compatibility (ADR-027 amendment). The security analysis of this change is missing from the ADR. Since the HMAC key is public, any party that knows the identifier can compute the pseudonym for any context_id. This means a relay that knows a user's identifier can precompute all their pseudonyms and link activity across contexts -- exactly the attack pseudonyms are supposed to prevent.
+- **Why it matters**: The entire metadata privacy architecture (Decisions 2, 7, and 10) rests on pseudonym unlinkability. If the HMAC key is the public key, pseudonyms are unlinkable only if the identifier is unknown to the relay. But identifier resolution is public. A relay operator can resolve identifiers and compute pseudonyms, completely defeating the privacy goal. This is a fundamental design tension introduced by the Android Keystore constraint that requires explicit analysis.
 - **Severity**: CRITICAL
-- **Resolution (later)**: Accepted and fixed. The public-key-as-HMAC-key approach was rejected. Pseudonym derivation now uses a `pseudonym_secret` that is NOT publicly derivable: software custody derives it via `HKDF-SHA256(ed25519_private_seed, salt="scp-pseudonym-secret-v1")` (cross-platform deterministic); hardware custody uses a device-local secret inside the TEE (device-local by design, since the key is non-exportable). See spec §9.10.4.A, ADR-027 (phase-6), and KAT vectors in §25.19. This finding is preserved as the historical record that drove the fix.
-
-### [ADR-003] DID Document Size vs. BEP44 Payload Limit
-
-- **Category**: Scope gaps
-- **Location**: ADR-003 (phase-1.md:260-275); ADR-039 (phase-1.md:1138)
-- **What's missing**: ADR-039 acknowledges "DID documents are already ~1,140 bytes with 2 VMs (BEP44 v1 payload limit is 1,000 bytes, requiring bencode packing)." The DID document already exceeds the BEP44 v1 payload limit. With 3 VMs (#0, #active, #agent), retired keys (up to 2 active + 2 agent = 4 retired), relay service entries, PreRotationCommitment, and ScpKeyCustodyAttestation, the document could easily reach 2-3KB. How does this fit in BEP44? Is compression used? Multi-record splitting? The ADR does not address this.
-- **Why it matters**: If the DID document does not fit in a single BEP44 record, the entire did:dht publication mechanism breaks. This is a hard technical constraint that needs a concrete solution.
-- **Severity**: HIGH
-
-### [ADR-003] DHT Republishing Interval vs. Expiry Window Mismatch
-
-- **Category**: Missing defaults
-- **Location**: ADR-003, Acceptance Criterion 2 (phase-1.md:313)
-- **What's missing**: "Republish interval: Every 2 hours. This is well within typical DHT record expiry windows (which vary by implementation but are generally 1-2 hours for Mainline DHT BEP44 items)." If expiry is "generally 1-2 hours" and republish is every 2 hours, the DID could be unreachable for up to 1 hour between expiry and republish. The ADR acknowledges the overlap but does not specify what happens to operations that require DID resolution during the gap (UCAN validation, MLS credential verification).
-- **Why it matters**: A 1-hour unreachability window for a DID means all identity-dependent operations for that DID fail during the window. For active contexts with multiple members, this is a liveness issue.
-- **Severity**: MEDIUM
+- **Resolution (later)**: Accepted and fixed. The public-key-as-HMAC-key approach was rejected. Pseudonym derivation now uses a `pseudonym_secret` that is NOT publicly derivable: software custody derives it via `HKDF-SHA256(private_seed, salt="scp-pseudonym-secret-v1")` (cross-platform deterministic); hardware custody uses a device-local secret inside the TEE (device-local by design, since the key is non-exportable). See spec §9.10.4.A, ADR-027 (phase-6), and KAT vectors in §25.19. This finding is preserved as the historical record that drove the fix.
 
 ### [ADR-003] Resolution Cache TTL Conflict
 
@@ -161,7 +145,7 @@ That said, a line-by-line read reveals 47 distinct specification gaps. The most 
 
 - **Category**: Missing security analysis
 - **Location**: ADR-007, Acceptance Criterion 4c (phase-1.md:1021-1024)
-- **What's missing**: `SenderKeyRequest` includes `requester_did`, `sender_did`, `epoch`, `wrapping_pubkey`, and `signature`, but the signature preimage is not defined. Looking at `SenderKeyEpochAdvance` (Criterion 4a), it signs `context_id || sender_did || signer_key_ref || "key_epoch" || epoch`. But `SenderKeyRequest` does not show its signature preimage. Without context_id binding, a request from Context A could be replayed to obtain the sender key from Context B if the sender uses the same DID in both.
+- **What's missing**: `SenderKeyRequest` includes `requester_did`, `sender_did`, `epoch`, `wrapping_pubkey`, and `signature`, but the signature preimage is not defined. Looking at `SenderKeyEpochAdvance` (Criterion 4a), it signs `context_id || sender_did || signer_key_ref || "key_epoch" || epoch`. But `SenderKeyRequest` does not show its signature preimage. Without context_id binding, a request from Context A could be replayed to obtain the sender key from Context B if the sender uses the same identifier in both.
 - **Why it matters**: Cross-context sender key theft through request replay would allow a member of Context A to decrypt messages in Context B without being a member. This is noted in my memory as a known gap pattern.
 - **Severity**: HIGH
 
@@ -169,7 +153,7 @@ That said, a line-by-line read reveals 47 distinct specification gaps. The most 
 
 - **Category**: Decisions without implementation guidance
 - **Location**: ADR-007, Acceptance Criterion 4b (phase-1.md:1018)
-- **What's missing**: "HPKE assembly: (1) generate ephemeral X25519 keypair, (2) ECDH between ephemeral secret and requester wrapping pubkey, (3) HKDF to derive encryption key, (4) AES-128-GCM encrypt the sender key." This is an informal description of what should be a precise HPKE mode (RFC 9180). Which HPKE mode (Base, Auth, PSK, AuthPSK)? Which KDF (HKDF-SHA256)? What is the HKDF `info` parameter? What is the HPKE `aad`? The ADR mentions "HPKE domain separation: 'scp-access-key-v1' vs 'scp-sender-key-v1'" in the project memory but these strings do not appear in the ADR itself.
+- **What's missing**: "HPKE assembly: (1) generate ephemeral P-256 keypair, (2) ECDH between ephemeral secret and requester wrapping pubkey, (3) HKDF to derive encryption key, (4) AES-128-GCM encrypt the sender key." This is an informal description of what should be a precise HPKE mode (RFC 9180). Which HPKE mode (Base, Auth, PSK, AuthPSK)? Which KDF (HKDF-SHA256)? What is the HKDF `info` parameter? What is the HPKE `aad`? The ADR mentions "HPKE domain separation: 'scp-access-key-v1' vs 'scp-sender-key-v1'" in the project memory but these strings do not appear in the ADR itself.
 - **Why it matters**: Ambiguous HPKE construction leads to interoperability failures between implementations. Two implementations using different HPKE modes or KDF parameters will produce incompatible ciphertexts.
 - **Severity**: HIGH
 
@@ -265,7 +249,7 @@ That said, a line-by-line read reveals 47 distinct specification gaps. The most 
 
 - **Category**: Missing security analysis
 - **Location**: ADR-011, Acceptance Criterion 8 (phase-2.md:843-844)
-- **What's missing**: `compare_checkpoint(local_log, remote_checkpoint)` "Compares a received checkpoint against local state." The function signature does not include a mechanism to verify the remote checkpoint's signature against the sender's DID. Without signature verification, a relay or compromised member could forge a checkpoint to trigger false equivocation alerts. This is noted in my memory notes but the ADR does not address it.
+- **What's missing**: `compare_checkpoint(local_log, remote_checkpoint)` "Compares a received checkpoint against local state." The function signature does not include a mechanism to verify the remote checkpoint's signature against the sender's identifier. Without signature verification, a relay or compromised member could forge a checkpoint to trigger false equivocation alerts. This is noted in my memory notes but the ADR does not address it.
 - **Why it matters**: False equivocation alerts are a DoS vector against the consensus mechanism. A relay that forges checkpoints with divergent roots can cause members to distrust each other.
 - **Severity**: HIGH
 
@@ -369,7 +353,7 @@ That said, a line-by-line read reveals 47 distinct specification gaps. The most 
 
 - **Category**: Missing security analysis
 - **Location**: ADR-032 (phase-2.md:1031, 1039)
-- **What's missing**: ".well-known/scp is advisory, not trusted" but it is also in the relay bootstrap priority chain: "explicit config -> DID document -> .well-known/scp -> peer discovery -> fallback list." For first-time users who have not configured any relays and have not resolved any DIDs, `.well-known/scp` may be their only bootstrap path. But it is served over HTTPS, which means a TLS MitM (compromised CA, corporate proxy) can direct the client to a malicious relay. The verification chain (BEP44 comparison) is mentioned but not mandatory before using the relay.
+- **What's missing**: ".well-known/scp is advisory, not trusted" but it is also in the relay bootstrap priority chain: "explicit config -> service record -> .well-known/scp -> peer discovery -> fallback list." For first-time users who have not configured any relays and have not resolved any identifiers, `.well-known/scp` may be their only bootstrap path. But it is served over HTTPS, which means a TLS MitM (compromised CA, corporate proxy) can direct the client to a malicious relay. The verification chain is mentioned but not mandatory before using the relay.
 - **Why it matters**: The bootstrap path is the most sensitive moment -- the client has no established trust and must rely on the first relay it connects to. If `.well-known/scp` is the bootstrap path and is not verified before use, a network attacker controls the client's relay.
 - **Severity**: MEDIUM
 
@@ -385,7 +369,7 @@ That said, a line-by-line read reveals 47 distinct specification gaps. The most 
 
 - **Category**: Decisions without implementation guidance
 - **Location**: ADR-033, SpendingCapability (phase-3.md:1159-1165)
-- **What's missing**: `SpendingCapability` has `max_total` and `time_window` fields. This implies cumulative spending tracking per agent per time window. But no state type, storage mechanism, or reset logic is specified. Where is cumulative spending tracked? Is it per-context? Per-DID globally? What happens when the time window rolls over -- is it a sliding window or a fixed window? Who enforces the limit -- the payer SDK, the payee, or both?
+- **What's missing**: `SpendingCapability` has `max_total` and `time_window` fields. This implies cumulative spending tracking per agent per time window. But no state type, storage mechanism, or reset logic is specified. Where is cumulative spending tracked? Is it per-context? Per identity globally? What happens when the time window rolls over -- is it a sliding window or a fixed window? Who enforces the limit -- the payer SDK, the payee, or both?
 - **Why it matters**: Without specified tracking state, spending limits are unenforceable. An agent could make N payments of max_per_action within a time_window, exceeding max_total because no one tracks the cumulative amount.
 - **Severity**: HIGH
 
@@ -429,19 +413,11 @@ That said, a line-by-line read reveals 47 distinct specification gaps. The most 
 - **Why it matters**: The UDP/DTLS adapter cannot implement the core `TransportAdapter` trait as defined. Either the trait needs an optional subscribe method, or the conformance tests need to be adapter-specific.
 - **Severity**: MEDIUM
 
-### [ADR-039] One Agent Per DID Is Not Enforced in Multi-Device Scenarios
-
-- **Category**: Missing security analysis
-- **Location**: ADR-039 (phase-1.md:1136)
-- **What's missing**: "Exactly one #agent verification method per DID document. Verifiers reject documents with multiple #agent VMs." But what about a human running agents on multiple devices? The same DID can have its `#agent` key used by different agent software instances on different machines. The ADR constrains the key count (one `#agent` VM in the document) but not the instance count (how many agent runtimes hold the software key). A compromised agent key on one device compromises all devices using that key.
-- **Why it matters**: The shared-DID model means agent key compromise is a single point of failure across all devices. The ADR does not discuss multi-device scenarios or key isolation between agent instances.
-- **Severity**: MEDIUM
-
 ### [ADR-039] Custody Attestation Verification Is Not Mandatory
 
 - **Category**: Scope gaps
 - **Location**: ADR-039, Enforcement Layer 4 (phase-1.md:1164-1165)
-- **What's missing**: "Absence of attestation is itself a signal." But the ADR does not specify what the signal means. Is a DID without attestation trusted less? Trusted the same? Blocked from certain operations? The attestation layer is defined but its enforcement is left to "trust function (section 7.1)" without specifying how the trust function should weight attestation presence.
+- **What's missing**: "Absence of attestation is itself a signal." But the ADR does not specify what the signal means. Is an identity without attestation trusted less? Trusted the same? Blocked from certain operations? The attestation layer is defined but its enforcement is left to "trust function (section 7.1)" without specifying how the trust function should weight attestation presence.
 - **Why it matters**: If attestation is optional and has no defined impact on trust scoring, no one will implement it. It becomes theater rather than security.
 - **Severity**: LOW
 
@@ -459,7 +435,7 @@ That said, a line-by-line read reveals 47 distinct specification gaps. The most 
 
 ### Pseudonym Security Model Is Fundamentally Weakened
 
-The ADR-027 amendment changed pseudonym derivation from private-key HMAC to public-key HMAC. This change cascades through ADR-002 (routing), ADR-008 (broadcast routing), ADR-012 (relay set partitioning), and all metadata privacy decisions. The entire metadata privacy architecture assumes pseudonyms are unlinkable to DIDs -- but with a public HMAC key, any party that knows the DID (which is public) can compute the pseudonym. This requires either accepting the privacy degradation or redesigning pseudonym derivation (e.g., using a separate software-managed pseudonym seed).
+The ADR-027 amendment changed pseudonym derivation from private-key HMAC to public-key HMAC. This change cascades through ADR-002 (routing), ADR-008 (broadcast routing), ADR-012 (relay set partitioning), and all metadata privacy decisions. The entire metadata privacy architecture assumes pseudonyms are unlinkable to identifiers -- but with a public HMAC key, any party that knows the identifier (which is public) can compute the pseudonym. This requires either accepting the privacy degradation or redesigning pseudonym derivation (e.g., using a separate software-managed pseudonym seed).
 
 - **Resolution (later)**: The public-key-as-HMAC-key approach was rejected; spec §9.10.4.A now keys the HMAC with a private-derived `pseudonym_secret` (software custody derives it via HKDF-SHA256, hardware custody uses a device-local secret), restoring unlinkability.
 
@@ -469,7 +445,7 @@ ADR-009 and ADR-016 both claim to be normative for nonce format, and they specif
 
 ### Cross-Context Communication Has No Transport Specification
 
-ADR-010's cross-context outlet interfaces and ADR-003's DID rotation events both need to send messages between different MLS groups. Neither ADR specifies the transport mechanism for cross-group communication. This is a fundamental architectural gap -- the protocol defines intra-context communication thoroughly but cross-context communication is hand-waved.
+ADR-010's cross-context outlet interfaces and ADR-003's identity rotation events both need to send messages between different MLS groups. Neither ADR specifies the transport mechanism for cross-group communication. This is a fundamental architectural gap -- the protocol defines intra-context communication thoroughly but cross-context communication is hand-waved.
 
 ### The CeilingPolicy::Governed vs. Immutable Ceiling Contradiction
 
@@ -482,10 +458,10 @@ ADR-008 introduces `CeilingPolicy::Governed` while ADR-009 repeatedly asserts ce
 | Severity | Count |
 |----------|-------|
 | CRITICAL | 3 |
-| HIGH | 10 |
-| MEDIUM | 22 |
+| HIGH | 9 |
+| MEDIUM | 20 |
 | LOW | 12 |
-| **Total** | **47** |
+| **Total** | **44** |
 
 **CRITICAL findings** (must be resolved before implementation):
 1. Inner envelope signature preimage has no canonical encoding or length prefixes
@@ -496,14 +472,13 @@ ADR-008 introduces `CeilingPolicy::Governed` while ADR-009 repeatedly asserts ce
 **HIGH findings** (significant risk if not addressed):
 1. KeyPackage distribution mechanism undefined
 2. EpochGraceStore crash-recovery semantics not specified
-3. DID document exceeds BEP44 payload limit
-4. Relay storage abuse with no authentication
-5. No deserialization size limits on wire format strings
-6. SenderKeyRequest signature does not bind to context_id
-7. HPKE construction is informal (no RFC 9180 mode specified)
-8. Ceiling immutability contradicts CeilingPolicy::Governed
-9. Nonce format duplicated and conflicting between ADR-009/016
-10. UCAN CID computation not specified
-11. Cross-context outlet interface has no key exchange/transport
-12. SpendingCapability tracking state not specified
-13. Consistency checkpoint does not verify remote signature
+3. Relay storage abuse with no authentication
+4. No deserialization size limits on wire format strings
+5. SenderKeyRequest signature does not bind to context_id
+6. HPKE construction is informal (no RFC 9180 mode specified)
+7. Ceiling immutability contradicts CeilingPolicy::Governed
+8. Nonce format duplicated and conflicting between ADR-009/016
+9. UCAN CID computation not specified
+10. Cross-context outlet interface has no key exchange/transport
+11. SpendingCapability tracking state not specified
+12. Consistency checkpoint does not verify remote signature
