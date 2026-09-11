@@ -10,13 +10,13 @@ The addressing layer adds a **resolution protocol** that accepts human-readable 
 
 **Local floor: petnames.** User-assigned names stored in identity private state (§3.7). Always work, zero infrastructure, zero governance. Petnames also close the disambiguation loop — when an unscoped query returns multiple candidates, the user's choice becomes a petname, resolving future ambiguity permanently.
 
-**External identity bridge: attestation-backed handles.** Identity attestations (§3.5) already bind external platform handles (`@alice` on X) to DIDs. This section adds a reverse-lookup index so agents can resolve external handles to DIDs.
+**External identity bridge: attestation-backed handles.** Identity attestations (§3.5) already bind external platform handles (`@alice` on X) to identifiers. This section adds a reverse-lookup index so agents can resolve external handles to identifiers.
 
 **Web compatibility extension: domain handles.** For organizations and individuals who already have domains, `.well-known/scp` (§18.3) is extended with a handles map. This is the same role `.well-known/scp` already plays — an optional web on-ramp, not self-certifying, not required. Not a protocol pillar.
 
 **Graceful degradation.** Petnames always work (zero infrastructure). Context handles work with SCP infrastructure only. Attestation handles work if external platforms exist. Domain handles work if DNS exists. Each is independently useful; none is required. Remove any layer and the rest continue functioning.
 
-**Historical context.** Zooko's triangle (2001) identified tensions between human-readable, decentralized, and secure naming. Modern systems — AT Protocol's domain handles, blockchain naming (ENS, Handshake), Nostr's NIP-05 — demonstrate that the tradeoffs are more nuanced than a strict trilemma, depending on trust model and infrastructure assumptions. SCP's layered approach sidesteps the framing entirely: different resolution paths make different tradeoffs, the protocol carries explicit trust metadata on every resolution result, and the DID remains canonical regardless of which path was used to find it.
+**Historical context.** Zooko's triangle (2001) identified tensions between human-readable, decentralized, and secure naming. Modern systems — AT Protocol's domain handles, blockchain naming (ENS, Handshake), Nostr's NIP-05 — demonstrate that the tradeoffs are more nuanced than a strict trilemma, depending on trust model and infrastructure assumptions. SCP's layered approach sidesteps the framing entirely: different resolution paths make different tradeoffs, the protocol carries explicit trust metadata on every resolution result, and the identifier remains canonical regardless of which path was used to find it.
 
 ## 22.2 Address Format
 
@@ -45,7 +45,7 @@ All SCP human-readable addresses use a single canonical text format:
 
 Two address types share the same format:
 
-- **Identity addresses** resolve to a DID.
+- **Identity addresses** resolve to an identifier.
 - **Context addresses** resolve to a context ID + relay URLs.
 
 The `local-part` does not encode which type it is. Resolution determines the type. The address `recipes@cooking-community` might resolve to a context, an identity, or both. The resolver returns typed results:
@@ -102,7 +102,7 @@ handle_register(handle, target, metadata?) → confirmation
   }
 
   HandleTarget:
-    | Identity  { did: DID }
+    | Identity  { did: Identifier }
     | Context   { context_id: hex, relay_urls: [url] }
 ```
 
@@ -119,7 +119,7 @@ handle_lookup(handle, type_filter?) → results
   HandleResult:                    // sum type matching HandleTarget
     | Identity  {
         handle:        string,
-        did:           DID,
+        did:           Identifier,
         registered_at: timestamp,
         metadata:      object
       }
@@ -136,20 +136,20 @@ handle_lookup(handle, type_filter?) → results
 handle_deregister(handle, did) → removal
   input:  {
     handle: string,       // the local-part to deregister
-    did:    DID            // registrant's DID (must match owner)
+    did:    Identifier     // registrant's identifier (must match owner)
   }
   output: { removed: bool }
 ```
 
-The `did` parameter in `handle_deregister` is explicit rather than inferred from the request signature — this ensures the outlet schema is self-documenting and the DID-to-handle ownership check is visible in the interface. Writers verify the DID-signed request signature matches the provided DID and that the DID owns the handle.
+The `did` parameter in `handle_deregister` is explicit rather than inferred from the request signature — this ensures the outlet schema is self-documenting and the identity-to-handle ownership check is visible in the interface. Writers verify that the request signature matches the provided identifier and that the identifier owns the handle.
 
-**Uniqueness.** A context with discovery outlets enforces handle uniqueness within its own namespace. `handle_register` returns `{ status: "conflict" }` when another DID already holds the requested handle. The handle uniqueness constraint applies per local-part: there can be at most one `alice` in a given context, regardless of target type. Governance determines conflict resolution policy (first-come-first-served, admin-arbitrated, etc.).
+**Uniqueness.** A context with discovery outlets enforces handle uniqueness within its own namespace. `handle_register` returns `{ status: "conflict" }` when another identity already holds the requested handle. The handle uniqueness constraint applies per local-part: there can be at most one `alice` in a given context, regardless of target type. Governance determines conflict resolution policy (first-come-first-served, admin-arbitrated, etc.).
 
 **Capacity limits.** `HandleRegistry` implementations SHOULD enforce a `max_entries` limit (recommended default: 10,000) to prevent resource exhaustion. Registrations that would exceed the limit return `{ status: "capacity_exceeded" }`. This matches the `ScopeRegistry` capacity model (§22.3.5).
 
-**Ownership and verification.** The registrant's DID (authenticated via the DID-signed request) is the handle owner. Only the owner can update or deregister. All handle outlet requests MUST carry a DID signature over the request payload. Writers MUST verify the signature before processing. The event log entry for a registration includes the full signed request as payload, making verification replayable by any party with access to the event log. The ownership chain is: DID-signed request → writer verifies signature cryptographically → event log records the registration with the signed payload and owner DID.
+**Ownership and verification.** The registrant's identity (authenticated via the signed request) is the handle owner. Only the owner can update or deregister. All handle outlet requests MUST carry the registrant's `#active` signature over the request payload. Writers MUST verify the signature before processing. The event log entry for a registration includes the full signed request as payload, making verification replayable by any party with access to the event log. The ownership chain is: identity-signed request → writer verifies signature cryptographically → event log records the registration with the signed payload and owner identifier.
 
-**DID-signature verification scheme.** Handle outlet requests use the same DID-authentication mechanism as context reader requests (§6.2.2B [no such section]). The signature is constructed as follows:
+**Signature verification scheme.** Handle outlet requests use the same identity-authentication mechanism as context reader requests (§6.2.2B [no such section]). The signature is constructed as follows:
 
 1. **Canonical payload.** The request payload is serialized to canonical JSON (keys sorted lexicographically, no whitespace, no trailing commas). This produces a deterministic byte sequence regardless of JSON serialization library.
 2. **Signed content.** The signed bytes are: `"SCP-HANDLE-OUTLET-V1:" || outlet_name || ":" || canonical_json_bytes`, where `outlet_name` is one of `"handle_register"`, `"handle_lookup"`, `"handle_deregister"`, `"scope_register"`, `"scope_lookup"`, `"scope_deregister"`, and `||` denotes byte concatenation. The domain prefix `"SCP-HANDLE-OUTLET-V1:"` prevents cross-protocol signature reuse. Scope outlets sign with their own outlet name (e.g., `"scope_register"`), not the corresponding handle outlet name (`"handle_register"`). This maintains domain separation — a signature over a scope registration cannot be replayed as a handle registration, and vice versa.
@@ -158,14 +158,14 @@ The `did` parameter in `handle_deregister` is explicit rather than inferred from
    ```
    {
      "input": { ... },                    // the outlet's input payload
-     "requester_did": "<DID>",            // explicit for verification
+     "requester_did": "<scp-identifier:requester>", // explicit for verification
      "signature": "<base64url(P256-ECDSA-sign(signing_key, signed_content))>",
      "signing_key_id": "#active"          // which verification method signed
    }
    ```
 5. **Writer verification.** The writer derives the `requester_did`'s key state by replaying its key-event log (`03-identity.md` §3.10.4), takes the key that state names in the `signing_key_id` role, and verifies the P-256 signature over the reconstructed `signed_content`. If verification fails, the request is rejected with a `BRIDGE_NOT_AUTHORIZED` error. The writer MUST hold a key state resolved within the last 300 seconds or cached under a valid bound (§9.10.7).
 
-**Two-tier model.** Handle outlets follow the same two-tier architecture as existing discovery outlets (§6.2.2B [no such section]). Writers (MLS members) process handle registrations. Readers (DID-authenticated, unbounded) perform handle lookups. Registration is a write operation processed by writers; lookup is a read operation available to all.
+**Two-tier model.** Handle outlets follow the same two-tier architecture as existing discovery outlets (§6.2.2B [no such section]). Writers (MLS members) process handle registrations. Readers (identity-authenticated, unbounded) perform handle lookups. Registration is a write operation processed by writers; lookup is a read operation available to all.
 
 **Instance scope.** Handle registries are **per-context within a single `SCP` instance** (ADR-048). Each `SCP` instance maintains its own in-process registry state keyed by context ID; two `SCP` instances in the same process do not share handle-registry storage. The authoritative registry lives inside each context (replicated via the context event log to all MLS members) — the `SCP`-instance-local registry is an in-memory materialized view of that context state. Cross-instance convergence happens through the context event log, not through any process-global cache. This clarification matches the existing semantics; it is not a semantic change.
 
@@ -223,7 +223,7 @@ Template: "scp:template/handle-registry"
   roles:
     admin:       all capabilities + memberInvite, roleAssign
     registrar:   messagesWrite, outletInvokeAll      // processes registrations
-    reader:      messagesRead                      // DID-authenticated readers (unbounded)
+    reader:      messagesRead                      // identity-authenticated readers (unbounded)
   governance:    single-admin
   memory_scope:  full
   outlets:         handle_register, handle_lookup, handle_deregister,
@@ -243,11 +243,11 @@ Scope outlets provide protocol-level registration of scope names — the mapping
 // All scope types are independent structs
 ScopeRegisterParams   { name: String, target: ScopeTarget, metadata: Option<ScopeMetadata> }
 ScopeLookupParams     { name: String }
-ScopeDeregisterParams { name: String, did: DID }
+ScopeDeregisterParams { name: String, did: Identifier }
 ScopeRegisterResult   { status: ScopeRegisterStatus, entry_id: Option<String> }
 ScopeLookupResult     { results: Vec<ScopeEntry> }
 ScopeDeregisterResult { removed: bool }
-ScopeEntry            { name: String, target: ScopeTarget, owner_did: DID, registered_at: u64, metadata: ScopeMetadata, entry_id: String }
+ScopeEntry            { name: String, target: ScopeTarget, owner_did: Identifier, registered_at: u64, metadata: ScopeMetadata, entry_id: String }
 ScopeMetadata         { description: Option<String>, tags: Option<Vec<String>> }
 ScopeTarget           { context_id: String, relay_urls: Vec<String> }
 ScopeRegisterStatus   :: Registered | Conflict | Updated
@@ -255,7 +255,7 @@ ScopeRegisterStatus   :: Registered | Conflict | Updated
 
 Callers always use the `Scope*` names. The independent struct definitions reflect the conceptual separation at the type level — no scope type shares a definition with any handle type.
 
-**Separate storage.** `ScopeRegistry` is its own struct with its own `HashMap<String, ScopeEntry>`. It is NOT a `HandleRegistry` instance. Scope entries and handle entries never share storage. A context that supports both scope outlets and handle outlets has two registries — one `ScopeRegistry` for scope-to-context mappings and one `HandleRegistry` for name-to-DID/context mappings. This eliminates cross-type namespace collision by construction.
+**Separate storage.** `ScopeRegistry` is its own struct with its own `HashMap<String, ScopeEntry>`. It is NOT a `HandleRegistry` instance. Scope entries and handle entries never share storage. A context that supports both scope outlets and handle outlets has two registries — one `ScopeRegistry` for scope-to-context mappings and one `HandleRegistry` for name-to-identifier/context mappings. This eliminates cross-type namespace collision by construction.
 
 **Scope outlets (operate on `ScopeRegistry`):**
 
@@ -313,21 +313,21 @@ scope_lookup(params: ScopeLookupParams) → ScopeLookupResult
 scope_deregister(params: ScopeDeregisterParams) → ScopeDeregisterResult
   input:  ScopeDeregisterParams {
     name: string,              // scope name to deregister
-    did:  DID                  // must match entry owner (verified via transport auth)
+    did:  Identifier           // must match entry owner (verified via transport auth)
   }
   output: ScopeDeregisterResult  // { removed: bool }
 
   Removes from ScopeRegistry with scope name validation.
   Admin-level scope entry removal is a governance action processed through the context's
   governance engine (§5.9), not through the `scope_deregister` outlet. The governance engine
-  can remove any entry regardless of owner DID, logged as a governance action in the event log.
+  can remove any entry regardless of owner, logged as a governance action in the event log.
 ```
 
 **Resolution flow — two-hop address resolution.** See §22.3.3 for the complete resolution flow. Steps 4-5 use `scope_lookup` on bootstrap context(s) to resolve the scope name to a context ID (the "phone book for namespaces" hop). Step 6 uses `handle_lookup` within the resolved context (the "phone book for participants" hop). The SDK ships Limn's context ID in bootstrap defaults, providing the initial scope registry. Apps can add additional scope registries via configuration.
 
-**Hosting model.** Any context can host scope outlets. A context with scope outlets is not a special type — it is a context that happens to have `scope_register`, `scope_lookup`, and `scope_deregister` in its outlet set. A single context can combine scope outlets with handle outlets, agent outlets, and any other outlets. A context that supports both has two registries: a `ScopeRegistry` for scope-to-context mappings and a `HandleRegistry` for name-to-DID mappings. These registries are independent — entries in one do not affect the other. For example, Limn's bootstrap context can serve as both a scope registry (mapping scope names to context IDs) and a handle registry (mapping participant names to DIDs) simultaneously, with each backed by its own storage.
+**Hosting model.** Any context can host scope outlets. A context with scope outlets is not a special type — it is a context that happens to have `scope_register`, `scope_lookup`, and `scope_deregister` in its outlet set. A single context can combine scope outlets with handle outlets, agent outlets, and any other outlets. A context that supports both has two registries: a `ScopeRegistry` for scope-to-context mappings and a `HandleRegistry` for name-to-identifier mappings. These registries are independent — entries in one do not affect the other. For example, Limn's bootstrap context can serve as both a scope registry (mapping scope names to context IDs) and a handle registry (mapping participant names to identifiers) simultaneously, with each backed by its own storage.
 
-**Authorization.** Scope registration follows the same two-tier model as handle registration (§22.3.1): writers (MLS members) process registrations, readers (DID-authenticated) perform lookups. Governance of the hosting context controls who can register scopes. There is no protocol-level verification that the registrant has any relationship to the target context — see ADR-043 Security Considerations for the rationale and threat analysis.
+**Authorization.** Scope registration follows the same two-tier model as handle registration (§22.3.1): writers (MLS members) process registrations, readers (identity-authenticated) perform lookups. Governance of the hosting context controls who can register scopes. There is no protocol-level verification that the registrant has any relationship to the target context — see ADR-043 Security Considerations for the rationale and threat analysis.
 
 **Event types.** Scope operations produce scope-specific event types in the context event log: `ScopeRegistered { name, context_id, relay_urls, owner_did, entry_id, metadata, timestamp }`, `ScopeUpdated { name, context_id, relay_urls, owner_did, entry_id, metadata, timestamp }`, and `ScopeDeregistered { name, owner_did, entry_id, timestamp }`. Admin removal via governance produces standard governance events (§5.9), not scope event variants. See §22.11.2a for the wire format tables.
 
@@ -345,12 +345,12 @@ Petnames are locally-assigned names for contacts and contexts. They are private,
 
 **Format:** Any string the user chooses. Not protocol-scoped, not shareable, not governed.
 
-**Storage:** Identity private state (§3.7). Petnames are personal annotations — the same infrastructure that stores block/mute lists, graph visibility policies, and notes on other DIDs. New event types for the identity private state event log:
+**Storage:** Identity private state (§3.7). Petnames are personal annotations — the same infrastructure that stores block/mute lists, graph visibility policies, and notes on other identities. New event types for the identity private state event log:
 
 ```
 PrivateStateEvent:
-  | SetPetname          { did: DID, name: string }
-  | RemovePetname       { did: DID }
+  | SetPetname          { did: Identifier, name: string }
+  | RemovePetname       { did: Identifier }
   | SetContextPetname   { context_id: ContextId, name: string }
   | RemoveContextPetname { context_id: ContextId }
 ```
@@ -363,9 +363,9 @@ Petnames sync across devices via the identity private state event log (§3.7). S
 
 **Trust level:** `LocalPetname` — maximum personal trust (the user set it), zero shareability.
 
-**Conflict within petnames.** A user can assign the same petname to multiple DIDs (e.g., two contacts both named "bob"). The resolver flags this as ambiguous and presents both. The user can differentiate by editing petnames ("work-bob", "gym-bob"). This is a local UX concern, not a protocol problem.
+**Conflict within petnames.** A user can assign the same petname to multiple identities (two contacts both named "bob", for one). The resolver flags this as ambiguous and presents both. The user can differentiate by editing petnames ("work-bob", "gym-bob"). This is a local UX concern, not a protocol problem.
 
-**Instance scope.** The petname resolution cache is **per-identity within a single `SCP` instance** (ADR-048). The authoritative petname state lives in the identity's private state event log (§3.7) and is not process-global. Two `SCP` instances holding the same identity converge via the identity private state sync protocol (§3.7.2), not via a shared in-process cache. A single `SCP` instance may hold multiple identities; each identity has its own petname view keyed by owning DID. This clarification codifies existing semantics — the process-global petname cache in pre-ADR-048 implementations was an implementation detail, not a protocol requirement.
+**Instance scope.** The petname resolution cache is **per-identity within a single `SCP` instance** (ADR-048). The authoritative petname state lives in the identity's private state event log (§3.7) and is not process-global. Two `SCP` instances holding the same identity converge via the identity private state sync protocol (§3.7.2), not via a shared in-process cache. A single `SCP` instance may hold multiple identities; each identity has its own petname view keyed by owning identifier. This clarification codifies existing semantics — the process-global petname cache in pre-ADR-048 implementations was an implementation detail, not a protocol requirement.
 
 ### 22.4.1 SDK Surface
 
@@ -379,13 +379,13 @@ SCP.PrivateState.write(
 )
 
 // Petname lookup (local, instant)
-SCP.AddressResolver.resolvePetname(name: "alice") → DID?
+SCP.AddressResolver.resolvePetname(name: "alice") → Identifier?
 SCP.AddressResolver.resolveContextPetname(name: "recipes") → ContextId?
 ```
 
 ## 22.5 Attestation-Backed Handles (External Identity Bridge)
 
-Identity attestations (§3.5) already bind external platform handles to identity identifiers — `@alice` on X → `<scp-identifier:alice>`. This binding is cryptographically signed, user-initiated, independently verifiable, and revocable. What's missing is a **reverse-lookup index**: given `@alice` on X, find the DID.
+Identity attestations (§3.5) already bind external platform handles to identity identifiers — `@alice` on X → `<scp-identifier:alice>`. This binding is cryptographically signed, user-initiated, independently verifiable, and revocable. What's missing is a **reverse-lookup index**: given `@alice` on X, find the identifier.
 
 The addressing layer adds reverse-lookup as a discovery outlet, not a new protocol primitive. When a user creates an identity attestation, the SDK SHOULD (opt-out configurable) register the mapping in one or more contexts with discovery outlets that support attestation indexing.
 
@@ -412,7 +412,7 @@ attestation_lookup(platform, handle) → results
   }
   output: {
     results: [{
-      did:             DID,
+      did:             Identifier,
       attestation_id:  string,
       platform:        string,
       handle:          string,
@@ -423,7 +423,7 @@ attestation_lookup(platform, handle) → results
   }
 ```
 
-Multiple results are possible if multiple DIDs claim the same platform handle (one legitimate, others potentially fraudulent). The `verified_via` and `last_verified` fields help consumers evaluate freshness and strength. Results marked `stale: true` have not been re-verified within the renewal interval.
+Multiple results are possible if multiple identities claim the same platform handle (one legitimate, others potentially fraudulent). The `verified_via` and `last_verified` fields help consumers evaluate freshness and strength. Results marked `stale: true` have not been re-verified within the renewal interval.
 
 ### 22.5.2 Auto-Registration
 
@@ -431,7 +431,7 @@ When a user creates an identity attestation (§3.5), the SDK SHOULD register the
 
 1. User creates attestation: `SCP.Attestation.create(type: .identityLink, claim: { platform: "x", handle: "@alice_cooks" }, ...)`
 2. SDK discovers which known contexts with discovery outlets support `attestation_lookup`.
-3. SDK registers the mapping in each via a DID-authenticated request.
+3. SDK registers the mapping in each via an identity-authenticated request.
 4. Writers in the context verify the attestation before recording it.
 
 The context's governance determines what verification is required before a mapping is accepted. A permissive registry might accept any signed attestation. A strict registry might require challenge-verified attestation with recent verification timestamp.
@@ -445,13 +445,13 @@ The context's governance determines what verification is required before a mappi
    - Otherwise: platform = "*" (search all)
 3. Query known contexts with discovery outlets that support attestation_lookup
 4. For each: attestation_lookup(platform: platform, handle: "alice_cooks")
-5. Merge results, deduplicate by DID
+5. Merge results, deduplicate by identifier
 6. For each result, verify attestation is still valid (not revoked, not stale)
 7. Resolve each identifier by replaying its key-event log (03-identity.md 3.10.4)
 8. Return results with trust_level: AttestationVerified
 ```
 
-**Trust level:** `AttestationVerified` — the binding is cryptographically signed by the DID holder and verified against the external platform. Trust depends on: (a) the attestation being valid and fresh, (b) the external platform identity being legitimate (the platform's problem, not SCP's).
+**Trust level:** `AttestationVerified` — the binding is cryptographically signed by the identity and verified against the external platform. Trust depends on: (a) the attestation being valid and fresh, (b) the external platform identity being legitimate (the platform's problem, not SCP's).
 
 ## 22.6 Domain Handles (Web Compatibility Extension)
 
@@ -502,14 +502,14 @@ The `.well-known/scp` document format (§18.3.1) is extended with an optional `h
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `type` | string | Yes | `"identity"` or `"context"`. |
-| `did` | string | Conditional | DID. Required for `identity` type. |
+| `did` | identifier | Conditional | The identifier. Required for `identity` type. |
 | `context_id` | string | Conditional | Hex-encoded context ID. Required for `context` type. |
 | `relay` | string | No | Override relay URL for context types. Defaults to document-level `relay`. |
 
 **Constraints:**
 
 - Handle keys must match the address format (§22.2): `[a-z0-9._-]`, max 64 chars.
-- Only broadcast context IDs may appear in `context` type handles (same privacy constraint as the existing `contexts` field — encrypted context IDs MUST NOT appear, §9.10). Identity handles are unrestricted — DIDs are public by design.
+- Only broadcast context IDs may appear in `context` type handles (same privacy constraint as the existing `contexts` field — encrypted context IDs MUST NOT appear, §9.10). Identity handles are unrestricted — identifiers are public by design.
 - Domain operators control their namespace. The handles map is managed by whoever controls the domain's `.well-known/scp` file.
 
 ### 22.6.2 Resolution Flow
@@ -543,9 +543,9 @@ Every resolution result carries a trust level indicating the strength and source
 
 ```
 TrustLevel:
-  | DirectExchange              // DID exchanged out-of-band, verified by the user
+  | DirectExchange              // identifier exchanged out-of-band, verified by the user
   | LocalPetname                // user-assigned, maximum personal trust
-  | MultiLayerCorroborated {    // multiple resolution paths agree on the same DID
+  | MultiLayerCorroborated {    // multiple resolution paths agree on the same identifier
       sources: [ResolutionPath] // which paths corroborated
     }
   | DomainVerified              // HTTPS-dependent, domain operator controls binding
@@ -555,9 +555,9 @@ TrustLevel:
 
 Trust levels are not strictly ordered — their relative strength is context-dependent. `DomainVerified` is stronger than `DiscoveryContextVerified` in some threat models (established domain with TLS history) and weaker in others (DNS seizure risk). The SDK exposes trust levels to consumers (agents, client UI); consumers decide what's sufficient for their operation.
 
-**`MultiLayerCorroborated`** indicates that multiple resolution paths agree on the same DID. The `sources` field records which paths corroborated, enabling consumers to evaluate the independence of the corroboration. **Caveat:** corroboration across layers is only as strong as the independence of those layers. An attacker who controls a domain, a context with discovery outlets, and an attestation can fake corroboration across all three cheaply. Consumers SHOULD evaluate the diversity of corroboration sources (e.g., a domain + an attestation from a major platform + an established context is meaningfully harder to fake than a domain + a self-operated context). The SDK SHOULD flag `MultiLayerCorroborated` results where all non-petname sources share a common operator or were registered within a short time window.
+**`MultiLayerCorroborated`** indicates that multiple resolution paths agree on the same identifier. The `sources` field records which paths corroborated, enabling consumers to evaluate the independence of the corroboration. **Caveat:** corroboration across layers is only as strong as the independence of those layers. An attacker who controls a domain, a context with discovery outlets, and an attestation can fake corroboration across all three cheaply. Consumers SHOULD evaluate the diversity of corroboration sources (e.g., a domain + an attestation from a major platform + an established context is meaningfully harder to fake than a domain + a self-operated context). The SDK SHOULD flag `MultiLayerCorroborated` results where all non-petname sources share a common operator or were registered within a short time window.
 
-**`Ambiguous` is a resolution outcome, not a trust level.** When multiple resolution paths find different DIDs for the same handle, the resolver returns multiple `AddressResolution` results — each with its own trust level — rather than a single result tagged `Ambiguous`. The resolver's return type (`Vec<AddressResolution>`) naturally represents this: a single result means unambiguous resolution; multiple results mean the consumer must disambiguate (§22.8.3).
+**`Ambiguous` is a resolution outcome, not a trust level.** When multiple resolution paths find different identifiers for the same handle, the resolver returns multiple `AddressResolution` results — each with its own trust level — rather than a single result tagged `Ambiguous`. The resolver's return type (`Vec<AddressResolution>`) naturally represents this: a single result means unambiguous resolution; multiple results mean the consumer must disambiguate (§22.8.3).
 
 Each `AddressResolution` also carries a `ResolutionPath` — structured metadata recording which layer resolved the address, what source was used, and when. This is provenance for the resolution itself.
 
@@ -603,7 +603,7 @@ When the address has no scope (`alice` or `@alice`), the resolver searches all p
    LayerUnavailable too, and the resolver records it without issuing a query
    (§22.8.2a)
 
-3. Collect results, deduplicate by DID. Collect each distinct
+3. Collect results, deduplicate by identifier. Collect each distinct
    LayerUnavailable once, comparing layer AND reason
 
 4. Evaluate:
@@ -611,10 +611,10 @@ When the address has no scope (`alice` or `@alice`), the resolver searches all p
       AddressError::NotFound
    a'. No results, nobody read at least one layer →
       AddressError::LayersUnavailable { address, layers }
-   b. One DID found via single path → return with that path's trust level
-   c. One DID found via multiple paths → return with trust_level:
+   b. One identifier found via single path → return with that path's trust level
+   c. One identifier found via multiple paths → return with trust_level:
       MultiLayerCorroborated { sources: [all agreeing paths] }
-   d. Multiple DIDs found → return all as separate AddressResolution entries,
+   d. Multiple identifiers found → return all as separate AddressResolution entries,
       each with its own trust level. Client presents options (§22.8.3)
 
 5. Return AddressResolutionOutcome { resolutions, unavailable_layers } —
@@ -645,11 +645,11 @@ The two failure modes carry different error codes at the SDK boundary. `SCP-VALI
 
 **Cross-scope: not a collision.** `alice@example.com` and `alice@cooking-community` may be different people. These are different addresses — like `alice@gmail.com` and `alice@yahoo.com` in email. No disambiguation needed.
 
-**Unscoped addresses: the only place collisions occur.** When the resolver searches all paths and finds different DIDs from different sources, it returns multiple `AddressResolution` entries, each with its own trust level. The client presents the options:
+**Unscoped addresses: the only place collisions occur.** When the resolver searches all paths and finds different identifiers from different sources, it returns multiple `AddressResolution` entries, each with its own trust level. The client presents the options:
 
 > "Did you mean alice@cooking-community (Alice Chen) or alice@example.com (Alice Smith)?"
 
-The user selects one. **The SDK auto-creates a petname** binding `alice` → the selected DID. Next time the user types `alice`, it resolves instantly via petname. The collision is resolved once, permanently (locally).
+The user selects one. **The SDK auto-creates a petname** binding `alice` → the selected identifier. Next time the user types `alice`, it resolves instantly via petname. The collision is resolved once, permanently (locally).
 
 The protocol does not prevent name collisions — it surfaces them transparently and resolves them through user choice. This is why it does not need a central namespace or consensus mechanism.
 
@@ -733,8 +733,8 @@ New event types for the identity private state event log (§3.7):
 PrivateStateEvent:
   // ... existing events (block, mute, grantGraphVisibility, etc.) ...
 
-  | SetPetname            { did: DID, name: string }
-  | RemovePetname         { did: DID }
+  | SetPetname            { did: Identifier, name: string }
+  | RemovePetname         { did: Identifier }
   | SetContextPetname     { context_id: ContextId, name: string }
   | RemoveContextPetname  { context_id: ContextId }
 ```
@@ -760,22 +760,22 @@ A malicious actor registers a handle that resembles a legitimate one (homoglyph 
 Protocol defenses:
 - **Trust levels** on every resolution result. Clients SHOULD warn on first-contact resolutions and low-trust handles.
 - **MultiLayerCorroborated** raises the bar — requires controlling multiple independent resolution sources. But see the caveat in §22.7: corroboration is only as strong as the independence of the sources.
-- **DID is canonical.** The worst case of spoofing is connecting to the wrong DID. Since MLS encryption is keyed to specific DIDs (§9.7), messages intended for the legitimate party cannot be read by the spoofed identity.
+- **The identifier is canonical.** The worst case of spoofing is connecting to the wrong identity. Since MLS encryption is keyed to specific identities (§9.7), messages intended for the legitimate party cannot be read by the spoofed identity.
 
 ### 22.10.3 Stale Handles
 
-A handle that previously pointed to one DID now points to another (domain transfer, handle re-registration, revoked attestation).
+A handle that previously pointed to one identity now points to another (domain transfer, handle re-registration, revoked attestation).
 
 Protocol defenses:
-- **Resolution cache tracks history.** A handle whose target DID changed since last resolution triggers a warning.
-- **DID is canonical.** If a user has previously communicated with a DID via a handle, the SDK tracks the DID, not the handle. Handle re-resolution is only needed for new contacts.
+- **Resolution cache tracks history.** A handle whose target identity changed since last resolution triggers a warning.
+- **The identifier is canonical.** If a user has previously communicated with an identity via a handle, the SDK tracks the identifier, not the handle. Handle re-resolution is only needed for new contacts.
 - **Attestation freshness.** Attestation-backed handles carry `last_verified` timestamps. Results past the renewal interval are marked `stale: true`.
 
 ### 22.10.4 Privacy
 
 **Petnames.** Fully private. Encrypted in identity private state (§3.7). No external visibility.
 
-**Context handles.** Handle registrations are visible to the context (writers see all registrations, readers can query). Handle lookups are DID-authenticated — the context sees who queries what. This is an inherent property of any registry. Registration is opt-in per context, withdrawable via `handle_deregister`.
+**Context handles.** Handle registrations are visible to the context (writers see all registrations, readers can query). Handle lookups are identity-authenticated — the context sees who queries what. This is an inherent property of any registry. Registration is opt-in per context, withdrawable via `handle_deregister`.
 
 **Attestation handles.** Attestation existence is public (published for discovery). The reverse-lookup query is a discovery outlet call with the same privacy properties as handle lookups.
 
@@ -783,7 +783,7 @@ Protocol defenses:
 
 ### 22.10.5 Query Surveillance
 
-Context handle lookups and attestation lookups are DID-authenticated outlet calls. This means context writers can observe every lookup — who searched for whom, when, how often. This is a structural property of any registry model and is not unique to SCP, but it bears explicit acknowledgment.
+Context handle lookups and attestation lookups are identity-authenticated outlet calls. This means context writers can observe every lookup — who searched for whom, when, how often. This is a structural property of any registry model and is not unique to SCP, but it bears explicit acknowledgment.
 
 Mitigations:
 - **Multiple contexts with discovery outlets.** Users can distribute their lookups across multiple registries, preventing any single registry from seeing the full query pattern.
@@ -818,7 +818,7 @@ These types are the outlet call schemas for the standard context outlets defined
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
-| `did` | `String` (DID) | Yes | The agent's DID to register. |
+| `did` | identifier | Yes | The agent to register. |
 | `capabilities` | `Vec<String>` | Yes | Capability URIs the agent supports. |
 | `metadata` | `Map<String, Value>` | Yes | Arbitrary metadata (description, tags, etc.). May be empty. |
 
@@ -833,7 +833,7 @@ These types are the outlet call schemas for the standard context outlets defined
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
-| `did` | `String` (DID) | Yes | DID to deregister. Must match the authenticated requester. |
+| `did` | identifier | Yes | Who to deregister. Must match the authenticated requester. |
 
 **`AgentDeregisterResult`** — Output from `agent_deregister` outlet.
 
@@ -845,7 +845,7 @@ These types are the outlet call schemas for the standard context outlets defined
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
-| `did` | `String` (DID) | Yes | The registered agent's DID. |
+| `did` | identifier | Yes | The registered agent. |
 | `capabilities` | `Vec<String>` | Yes | Capability URIs. |
 | `metadata` | `Map<String, Value>` | Yes | Registration metadata. |
 | `entry_id` | `String` | Yes | Unique entry identifier. |
@@ -864,7 +864,7 @@ These types are the outlet call schemas for the standard context outlets defined
 | Variant | Serde Tag | Semantics |
 |---------|-----------|-----------|
 | `Writer` | `"Writer"` | MLS group member. Can process registrations and writes. |
-| `Reader` | `"Reader"` | DID-authenticated. Can query but not modify. Unbounded membership. |
+| `Reader` | `"Reader"` | Identity-authenticated. Can query but not modify. Unbounded membership. |
 
 ### 22.11.2 Handle Registration and Lookup
 
@@ -888,8 +888,8 @@ These types are the outlet call schemas for the standard context outlets defined
 | Variant | Serde Tag | Semantics |
 |---------|-----------|-----------|
 | `Registered` | `"registered"` | Handle registered successfully. |
-| `Conflict` | `"conflict"` | Another DID already holds this handle. |
-| `OwnershipMismatch` | `"ownership_mismatch"` | Requester DID does not match handle owner. |
+| `Conflict` | `"conflict"` | Another identity already holds this handle. |
+| `OwnershipMismatch` | `"ownership_mismatch"` | The requester is not the handle owner. |
 | `CapacityExceeded` | `"capacity_exceeded"` | Registry is at capacity (default limit: 10,000). |
 
 **`HandleMetadata`** — Optional descriptive metadata for handles.
@@ -925,7 +925,7 @@ These types are the outlet call schemas for the standard context outlets defined
 |-------|------|----------|-----------|
 | `handle` | `String` | Yes | The local-part. |
 | `target` | `HandleTarget` | Yes | What the handle points to. |
-| `owner_did` | `String` (DID) | Yes | DID of the handle owner. |
+| `owner_did` | identifier | Yes | The handle owner. |
 | `registered_at` | `u64` | Yes | Unix timestamp (seconds). |
 | `metadata` | `HandleMetadata` | Yes | Descriptive metadata. May have all fields absent. |
 | `entry_id` | `String` | Yes | Unique entry identifier. |
@@ -935,7 +935,7 @@ These types are the outlet call schemas for the standard context outlets defined
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
 | `handle` | `String` | Yes | The local-part to deregister. |
-| `did` | `String` (DID) | Yes | Must match the handle owner. |
+| `did` | identifier | Yes | Must match the handle owner. |
 
 **`HandleDeregisterResult`** — Output from `handle_deregister` outlet.
 
@@ -947,7 +947,7 @@ These types are the outlet call schemas for the standard context outlets defined
 
 | Variant | Tag | Fields | Semantics |
 |---------|-----|--------|-----------|
-| `Identity` | `"Identity"` | `did: String` | Handle points to a DID. |
+| `Identity` | `"Identity"` | `did: Identifier` | Handle points to an identity. |
 | `Context` | `"Context"` | `context_id: String`, `relay_urls: Vec<String>` | Handle points to a context. |
 
 ### 22.11.2a Scope Registration and Lookup
@@ -974,7 +974,7 @@ Scope outlets use independent structs for all types (see §22.3.5, ADR-043). All
 | Variant | Serde Tag | Semantics |
 |---------|-----------|-----------|
 | `Registered` | `"registered"` | Scope registered successfully. |
-| `Conflict` | `"conflict"` | Another DID already holds this scope name. |
+| `Conflict` | `"conflict"` | Another identity already holds this scope name. |
 | `Updated` | `"updated"` | Same-owner re-registration atomically updated the existing entry (target/metadata changed). |
 
 **`ScopeMetadata`** — Optional descriptive metadata for scopes.
@@ -1002,7 +1002,7 @@ Scope outlets use independent structs for all types (see §22.3.5, ADR-043). All
 |-------|------|----------|-----------|
 | `name` | `String` | Yes | The scope name. |
 | `target` | `ScopeTarget` | Yes | Context the scope points to. |
-| `owner_did` | `String` (DID) | Yes | DID of the scope entry owner. |
+| `owner_did` | identifier | Yes | The scope entry owner. |
 | `registered_at` | `u64` | Yes | Unix timestamp (seconds). |
 | `metadata` | `ScopeMetadata` | Yes | Descriptive metadata. May have all fields absent. |
 | `entry_id` | `String` | Yes | Unique entry identifier. |
@@ -1012,7 +1012,7 @@ Scope outlets use independent structs for all types (see §22.3.5, ADR-043). All
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
 | `name` | `String` | Yes | Scope name to deregister. |
-| `did` | `String` (DID) | Yes | Must match the scope entry owner. |
+| `did` | identifier | Yes | Must match the scope entry owner. |
 
 **`ScopeDeregisterResult`** — Output from `scope_deregister` outlet.
 
@@ -1043,14 +1043,14 @@ Admin removal via governance produces standard governance events (§5.9), not `S
 
 | Variant | Serde Tag | Semantics |
 |---------|-----------|-----------|
-| `Identity` | `"Identity"` | Address resolves to a DID. |
+| `Identity` | `"Identity"` | Address resolves to an identity. |
 | `Context` | `"Context"` | Address resolves to a context ID + relay URLs. |
 
 **`AddressResolution`** — Tagged enum for resolution results.
 
 | Variant | Tag | Fields | Semantics |
 |---------|-----|--------|-----------|
-| `Identity` | `"Identity"` | `did: String`, `trust_level: TrustLevel`, `resolution_path: ResolutionPath` | Resolved to a DID. |
+| `Identity` | `"Identity"` | `did: String`, `trust_level: TrustLevel`, `resolution_path: ResolutionPath` | Resolved to an identity. |
 | `Context` | `"Context"` | `context_id: String`, `relay_urls: Vec<String>`, `mode: String`, `trust_level: TrustLevel`, `resolution_path: ResolutionPath` | Resolved to a context. `mode` is `"encrypted"` or `"broadcast"`. |
 
 **`AddressResolutionOutcome`** — What one resolution found, plus which layers nobody read. The value `AddressResolver.resolve` returns (§22.8.2a).
@@ -1071,7 +1071,7 @@ Admin removal via governance produces standard governance events (§5.9), not `S
 
 | Variant | Tag | Fields | Semantics |
 |---------|-----|--------|-----------|
-| `DirectExchange` | `"DirectExchange"` | — | DID exchanged out-of-band and verified. Highest personal trust. |
+| `DirectExchange` | `"DirectExchange"` | — | Identifier exchanged out-of-band and verified. Highest personal trust. |
 | `LocalPetname` | `"LocalPetname"` | — | User-assigned name. Maximum personal trust, zero shareability. |
 | `MultiLayerCorroborated` | `"MultiLayerCorroborated"` | `sources: Vec<ResolutionPath>` | Multiple independent resolution paths agree. |
 | `DomainVerified` | `"DomainVerified"` | — | Resolved via `.well-known/scp`. HTTPS-dependent. |
@@ -1122,20 +1122,20 @@ Admin removal via governance produces standard governance events (§5.9), not `S
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
-| `did` | `String` (DID) | Yes | Registrant's DID. |
+| `did` | identifier | Yes | The registrant. |
 | `platform` | `PushPlatform` | Yes | Target push platform. |
 | `token` | `Vec<u8>` (serde_bytes) | Yes | Platform-specific device token. |
 | `contexts` | `Vec<String>` | Yes | Context IDs to receive notifications for. |
 | `timestamp` | `u64` | Yes | Unix timestamp (seconds). |
 | `signature` | `Vec<u8>` (64 bytes) | Yes | P-256 signature — see construction below. |
 
-**Signature construction.** Per §9.5.1 canonical signed structure format, the signed bytes are the concatenation: `"SCP-PUSH-REGISTER-V1:" || BE32(len(did_bytes)) || did_bytes || platform_tag (1 byte) || BE32(len(token_bytes)) || token_bytes || contexts_encoded || timestamp (8-byte BE u64)`, where `contexts_encoded` is each context ID string prefixed by its 4-byte big-endian length. All variable-length fields use `BE32(len())` prefixes to prevent boundary-shift collisions (§9.5.1). Registrations are idempotent; re-registering with the same token replaces the previous registration for the same DID + platform combination.
+**Signature construction.** Per §9.5.1 canonical signed structure format, the signed bytes are the concatenation: `"SCP-PUSH-REGISTER-V1:" || BE32(len(did_bytes)) || did_bytes || platform_tag (1 byte) || BE32(len(token_bytes)) || token_bytes || contexts_encoded || timestamp (8-byte BE u64)`, where `contexts_encoded` is each context ID string prefixed by its 4-byte big-endian length. All variable-length fields use `BE32(len())` prefixes to prevent boundary-shift collisions (§9.5.1). Registrations are idempotent; re-registering with the same token replaces the previous registration for that identity and platform.
 
 **`PushDeregistration`** — Removes push notification registration.
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
-| `did` | `String` (DID) | Yes | Registrant's DID. |
+| `did` | identifier | Yes | The registrant. |
 | `platform` | `PushPlatform` | Yes | Platform to deregister from. |
 | `timestamp` | `u64` | Yes | Unix timestamp (seconds). |
 | `signature` | `Vec<u8>` (64 bytes) | Yes | P-256 signature — see construction below. |
@@ -1150,18 +1150,18 @@ These events are appended to the identity private state event log (§3.7). They 
 
 | Variant | Tag | Fields | Semantics |
 |---------|-----|--------|-----------|
-| `SetPetname` | `"SetPetname"` | `did: String`, `name: String` | Assign a local name to a DID. |
-| `RemovePetname` | `"RemovePetname"` | `did: String` | Remove a DID's local name. |
+| `SetPetname` | `"SetPetname"` | `did: Identifier`, `name: String` | Assign a local name to an identity. |
+| `RemovePetname` | `"RemovePetname"` | `did: Identifier` | Remove an identity's local name. |
 | `SetContextPetname` | `"SetContextPetname"` | `context_id: String`, `name: String` | Assign a local name to a context. |
 | `RemoveContextPetname` | `"RemoveContextPetname"` | `context_id: String` | Remove a context's local name. |
 
 ### 22.11.6 Capability and Context Discovery
 
-**`CapabilityEntry`** — A resolved DID's capabilities.
+**`CapabilityEntry`** — A resolved identity's capabilities.
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
-| `did` | `String` (DID) | Yes | The capability holder's DID. |
+| `did` | identifier | Yes | The capability holder. |
 | `capabilities` | `Vec<String>` | Yes | The self-asserted capability URIs of the identity's service record. |
 | `service_endpoints` | `Vec<String>` | Yes | The endpoint URLs the identity's service record carries. |
 | `resolved_at` | `u64` | Yes | Unix timestamp (seconds) at which the service record resolved. |
@@ -1172,7 +1172,7 @@ These events are appended to the identity private state event log (§3.7). They 
 |-------|------|----------|-----------|
 | `context_id` | `String` | Yes | Hex-encoded context ID. |
 | `relay_urls` | `Vec<String>` | Yes | Relay URLs serving this context. |
-| `publisher_did` | `String` (DID) | Yes | DID that published the context. |
+| `publisher_did` | identifier | Yes | Who published the context. |
 | `discovery_source` | `ContextDiscoverySource` | Yes | How the context was discovered. |
 | `mode` | `String` | Yes | Context mode: `"broadcast"`. |
 | `metadata_summary` | `Map<String, Value>` | Yes | Subset of context metadata visible pre-join. |
@@ -1190,19 +1190,19 @@ These events are appended to the identity private state event log (§3.7). They 
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
-| `default_contexts` | `Vec<BootstrapContextEntry>` | Yes | SDK default bootstrap contexts with creator DID verification. Replaces the former `default_context_ids: Vec<String>`. |
+| `default_contexts` | `Vec<BootstrapContextEntry>` | Yes | SDK default bootstrap contexts with creator verification. Replaces the former `default_context_ids: Vec<String>`. |
 | `auto_query_on_identity_creation` | `bool` | Yes | Whether to auto-query contexts with discovery outlets on first identity creation. |
-| `custom_contexts` | `Vec<BootstrapContextEntry>` | Yes | User-added contexts with creator DID verification. May be empty. Replaces the former `custom_context_ids: Vec<String>`. |
+| `custom_contexts` | `Vec<BootstrapContextEntry>` | Yes | User-added contexts with creator verification. May be empty. Replaces the former `custom_context_ids: Vec<String>`. |
 | `fallback_to_did_resolution` | `bool` | Yes | Whether to fall back to reading capability URIs from the identity's service record. |
 
-**`BootstrapContextEntry`** — A bootstrap context with expected creator DID for post-join verification. The `expected_creator_did` field enables the SDK to verify that the context it joined was actually created by the expected operator, defending against context ID substitution attacks (§22.13.2).
+**`BootstrapContextEntry`** — A bootstrap context with an expected creator for post-join verification. The `expected_creator_did` field enables the SDK to verify that the context it joined was actually created by the expected operator, defending against context ID substitution attacks (§22.13.2).
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
 | `context_id` | `String` | Yes | The bootstrap context's ID (hex-encoded). |
-| `expected_creator_did` | `String` (DID) | Yes | The DID of the expected context creator. SDK MUST verify this matches the actual context creator after joining (§22.13.2). |
+| `expected_creator_did` | identifier | Yes | The expected context creator. SDK MUST verify this matches the actual context creator after joining (§22.13.2). |
 
-**`DiscoveryBootstrap` — SUPERSEDED.** The `DiscoveryBootstrap` struct (a simple `{ default_context_ids: Vec<ContextId> }`) is superseded by `BootstrapConfig`. `DiscoveryBootstrap` predates the two-context bootstrap model and lacks creator DID verification, custom context support, auto-query configuration, and fallback policy. New code MUST use `BootstrapConfig` with `BootstrapContextEntry` entries. `DiscoveryBootstrap` remains in the codebase only for backward compatibility and SHOULD be removed when all consumers have migrated to `BootstrapConfig`.
+**`DiscoveryBootstrap` — SUPERSEDED.** The `DiscoveryBootstrap` struct (a simple `{ default_context_ids: Vec<ContextId> }`) is superseded by `BootstrapConfig`. `DiscoveryBootstrap` predates the two-context bootstrap model and lacks creator verification, custom context support, auto-query configuration, and fallback policy. New code MUST use `BootstrapConfig` with `BootstrapContextEntry` entries. `DiscoveryBootstrap` remains in the codebase only for backward compatibility and SHOULD be removed when all consumers have migrated to `BootstrapConfig`.
 
 **`DiscoveryQuery`** — Parameters for multi-source discovery search.
 
@@ -1223,7 +1223,7 @@ These events are appended to the identity private state event log (§3.7). They 
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
-| `did` | `String` (DID) | Yes | The discovered agent's DID. |
+| `did` | identifier | Yes | The discovered agent. |
 | `capabilities` | `Vec<String>` | Yes | Capability URIs. |
 | `participation_summary` | `Map<String, Value>` | Yes | Participation profile summary. |
 | `provenance` | `DataProvenance` | Yes | Provenance metadata (§24). |
@@ -1235,15 +1235,15 @@ The following outlet names are normative — independent implementations MUST us
 
 | Outlet Name | Direction | Spec Reference |
 |-----------|-----------|----------------|
-| `agent_search` | Reader (DID-authenticated query) | §6.2.2B [no such section] |
+| `agent_search` | Reader (identity-authenticated query) | §6.2.2B [no such section] |
 | `agent_register` | Writer (MLS member write) | §6.2.2B [no such section] |
 | `agent_deregister` | Writer (MLS member write) | §6.2.2B [no such section] |
 | `handle_register` | Writer (MLS member write) | §22.3.1 |
-| `handle_lookup` | Reader (DID-authenticated query) | §22.3.1 |
+| `handle_lookup` | Reader (identity-authenticated query) | §22.3.1 |
 | `handle_deregister` | Writer (MLS member write) | §22.3.1 |
-| `attestation_lookup` | Reader (DID-authenticated query) | §22.5.1 |
+| `attestation_lookup` | Reader (identity-authenticated query) | §22.5.1 |
 | `scope_register` | Writer (MLS member write) | §22.3.5 |
-| `scope_lookup` | Reader (DID-authenticated query) | §22.3.5 |
+| `scope_lookup` | Reader (identity-authenticated query) | §22.3.5 |
 | `scope_deregister` | Writer (MLS member write) | §22.3.5 |
 
 ### 22.11.8 Service-Record Entry Types
@@ -1262,7 +1262,7 @@ Phase assignments for addressing components are tracked in `.docs/architecture.m
 
 ## 22.13 Bootstrap Context Governance
 
-The SDK ships with two bootstrap contexts that serve as the initial scope registries and handle registries for the SCP network. Both are standard SCP contexts — no special type, no special template, no protocol-level privileges. They use the existing `scp:template/handle-registry` template (§22.3.4) with different admission policies. If both bootstrap contexts are removed from a client's configuration, scoped resolution (`alice@cooking-community`) stops working, but everything else — direct DID resolution, petnames, domain handles, attestation handles, context creation, MLS encryption — continues to function.
+The SDK ships with two bootstrap contexts that serve as the initial scope registries and handle registries for the SCP network. Both are standard SCP contexts — no special type, no special template, no protocol-level privileges. They use the existing `scp:template/handle-registry` template (§22.3.4) with different admission policies. If both bootstrap contexts are removed from a client's configuration, scoped resolution (`alice@cooking-community`) stops working, but everything else — direct identity resolution, petnames, domain handles, attestation handles, context creation, MLS encryption — continues to function.
 
 ### 22.13.1 Two Bootstrap Contexts
 
@@ -1276,24 +1276,24 @@ The SDK ships with two bootstrap contexts that serve as the initial scope regist
 
 **Both are standard SCP contexts.** They are not special-cased in the protocol. They use the same `scp:template/handle-registry` template, the same scope outlets, the same handle outlets, the same governance engine, and the same event log as any other context with discovery outlets. Their only distinction is their configuration: which `ContextSybilPolicy` governs admission and whether endorsement independence is enabled. A third-party could stand up an additional bootstrap context with its own policy and add it to clients' `BootstrapConfig` via `custom_contexts` — the protocol supports this by design.
 
-### 22.13.2 BootstrapContextEntry and Creator DID Verification
+### 22.13.2 BootstrapContextEntry and Creator Verification
 
 The `BootstrapConfig` wire format (§22.11.6) uses `BootstrapContextEntry` instead of bare context ID strings. Each entry pairs a `context_id` with an `expected_creator_did`:
 
 ```
 BootstrapContextEntry {
   context_id:           ContextId,      // hex-encoded context ID
-  expected_creator_did: DID             // DID of the expected context creator
+  expected_creator_did: Identifier      // the expected context creator
 }
 ```
 
-`ContextId` and `DID` are wire-format `String` values, as shown in §22.11.6.
+`ContextId` is a wire-format `String` value, and an identifier's own wire form waits on `09-security-model.md` §9.7.4.2 R13.
 
-**Post-join verification.** After the SDK joins a bootstrap context via MLS group join, it MUST verify that the context's creator DID matches the `expected_creator_did` from the `BootstrapContextEntry`. The creator DID is available from the context's event log (the first event in any context is the creation event, signed by the creator's DID). If the creator DID does not match, the SDK MUST leave the context and treat the entry as failed — the context may have been substituted by an attacker.
+**Post-join verification.** After the SDK joins a bootstrap context via MLS group join, it MUST verify that the context's creator matches the `expected_creator_did` from the `BootstrapContextEntry`. The creator is available from the context's event log (the first event in any context is the creation event, which the creator signed). If the creator does not match, the SDK MUST leave the context and treat the entry as failed — the context may have been substituted by an attacker.
 
-**Threat model.** Without creator DID verification, an attacker who can influence bootstrap configuration (e.g., via a compromised SDK distribution or a man-in-the-middle on configuration delivery) could substitute a legitimate bootstrap context ID with an attacker-controlled context. The attacker's context would serve malicious scope and handle mappings — resolving `alice@cooking-community` to an attacker-controlled DID. The `expected_creator_did` field makes this attack detectable: the attacker would need to forge the context creator's DID signature on the creation event, which requires the creator's private key.
+**Threat model.** Without creator verification, an attacker who can influence bootstrap configuration (e.g., via a compromised SDK distribution or a man-in-the-middle on configuration delivery) could substitute a legitimate bootstrap context ID with an attacker-controlled context. The attacker's context would serve malicious scope and handle mappings — resolving `alice@cooking-community` to an attacker-controlled identity. The `expected_creator_did` field makes this attack detectable: the attacker would need to forge the context creator's signature on the creation event, which requires the creator's private key.
 
-**Threat model limitation.** Creator DID verification defends against context ID substitution by external attackers. It does not defend against a compromised or malicious operator. Protection against operator misbehavior relies on governance, event log auditability, and the ability to remove a bootstrap context from `BootstrapConfig`.
+**Threat model limitation.** Creator verification defends against context ID substitution by external attackers. It does not defend against a compromised or malicious operator. Protection against operator misbehavior relies on governance, event log auditability, and the ability to remove a bootstrap context from `BootstrapConfig`.
 
 **Migration from bare context IDs.** The former `default_context_ids: Vec<String>` and `custom_context_ids: Vec<String>` fields in `BootstrapConfig` are replaced by `default_contexts: Vec<BootstrapContextEntry>` and `custom_contexts: Vec<BootstrapContextEntry>` respectively. This is a breaking wire format change. The `DiscoveryBootstrap` struct (§22.11.6) is superseded entirely — it predates `BootstrapConfig` and lacks all post-§22.3.5 features.
 
@@ -1301,12 +1301,12 @@ BootstrapContextEntry {
 
 The Verified bootstrap context requires endorsement independence checking as part of its `ContextSybilPolicy::high_trust()` admission policy. This is a normative requirement. The existing `evaluate_sybil_resistance` does not currently call `check_threshold_attestation` for endorsement independence. Implementations MUST add this wiring. §9.3 already describes independent endorsements as a trust signal, and the `check_threshold_attestation` function (ADR-017 acceptance criterion 7) already implements pairwise independence scoring via `ThresholdRequirement` — the missing piece is the integration point.
 
-**What endorsement independence means.** When evaluating whether a DID meets the `high_trust()` admission threshold, the endorsements signal category requires that endorsing DIDs are independently trustworthy — not colluding. `check_threshold_attestation` computes a pairwise independence score for all endorsers by counting shared context memberships and mutual endorsements as independence penalties (`ThresholdRequirement.shared_context_penalty`, `ThresholdRequirement.mutual_endorsement_penalty`). The average pairwise independence must meet `ThresholdRequirement.independence_threshold`. This prevents a Sybil operator from creating a ring of mutually-endorsing identities to pass endorsement requirements.
+**What endorsement independence means.** When evaluating whether an identity meets the `high_trust()` admission threshold, the endorsements signal category requires that endorsing identities are independently trustworthy — not colluding. `check_threshold_attestation` computes a pairwise independence score for all endorsers by counting shared context memberships and mutual endorsements as independence penalties (`ThresholdRequirement.shared_context_penalty`, `ThresholdRequirement.mutual_endorsement_penalty`). The average pairwise independence must meet `ThresholdRequirement.independence_threshold`. This prevents a Sybil operator from creating a ring of mutually-endorsing identities to pass endorsement requirements.
 
 **Wiring into `evaluate_sybil_resistance`.** The `evaluate_sybil_resistance` function (§9.3) currently checks signal breadth, weighted strength, per-category requirements, and device attestation. For the Verified bootstrap context, the admission flow MUST additionally invoke `check_threshold_attestation` on the Endorsements signal category when the policy requires endorsements. Specifically:
 
 1. If the `ContextSybilPolicy` includes a `RequiredSignal` for `TrustSignalCategory::Endorsement`, the admission evaluator MUST:
-   a. Collect the endorsing DIDs from the candidate's endorsement attestations.
+   a. Collect the endorsing identities from the candidate's endorsement attestations.
    b. Gather the `AttestorInfo` for each endorser (shared contexts, mutual endorsements).
    c. Call `check_threshold_attestation` with the policy's `ThresholdRequirement`.
    d. Reject admission if the independence threshold is not met.
