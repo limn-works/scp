@@ -2,9 +2,9 @@
 
 **Status:** Accepted 2026-08-30, the day Alec settled the identity form and delegated the choice of a freshness anchor. He confirmed the witness and watcher layer in scope on 2026-08-31. Five later rulings by Alec changed decisions this record already carried, and one executor call rewrote a sixth. Each amendment sits beside the decision it changed, with its date. Accepted records that the identity model is settled and not that the code exists.
 
-**Supersedes:** ADR-003, DID creation over did:dht. ADR-003 flips to `Superseded by ADR-063` and keeps its body as the historical record.
+**Supersedes:** ADR-003, DID creation over did:dht, and ADR-039, the shared-DID human-agent identity model. Each flips to `Superseded by ADR-063` and keeps its body as the historical record.
 
-This record states the decisions and the reasons for them. The rules live in the specifications, and each decision below names the section that carries its rule. A reader who wants a rule opens that section. A reader who wants the reason finds it here.
+This record states the decisions and the reasons for them. The rules live in the specifications, and each decision below names the section that carries its rule.
 
 ## Context
 
@@ -44,17 +44,17 @@ SCP's identity is an inception-derived self-certifying identifier over an append
 
 **An identity's root may hold several members.** Alec set the shape on 2026-09-03: "if we can support orgs we should." An identity that several officers jointly control, none of them able to act alone, is therefore in scope from the first event, because the identifier is the inception event's digest and the inception event fixes the root set's shape. The member cap is SCP's own, and `09-security-model.md` §9.18.17 carries it.
 
-**A key's standing is a root-asserted condition, not an absence.** The vocabulary is `current`, `Superseded`, `Retired`, and `Compromised{from: N}`, and `09-security-model.md` §9.7.1 states what each one licenses. Alec settled the four values, and the audit that restored them on 2026-09-05 found a same-day collapse to one condition that had let the security specification overrule this Accepted record and the plan of record's settled row, which the artifact-flow invariant forbids.
+**A key's standing is a root-asserted condition, not an absence.** The vocabulary is `current`, `Superseded`, `Retired`, and `Compromised{from: N}`, and `09-security-model.md` §9.7.1 states what each one licenses. Alec settled the distinct root authority this vocabulary describes on 2026-08-30: "yes keep #0 as root we like this design so far". The 2026-09-05 entry is an audit rather than a ruling: it restored the four values after a same-day collapse to one condition had let the security specification overrule this Accepted record and the plan of record's settled row, which the artifact-flow invariant forbids.
 
 **A content signature and an attestation read a key's standing differently.** A content signature verifies against a retired key, and an attestation verifies against the current key alone. Alec's ruling predates this redesign as ADR-003's asymmetry and is unchanged, and `09-security-model.md` §9.7.1 states the boundary that separates the two. **Amended 2026-09-10.** This record previously carried a compromise carve-out and a causally-concurrent fail-closed arm, both written before the security specification adopted an epoch boundary. The orchestrator rewrote the text to that model, which closes the open question this record carried about how a compromise position maps onto a per-context anchor.
 
 ### The curve and the root's custody
 
-**Every SCP key is an ECDSA key on NIST P-256 with SHA-256.** Alec ruled on 2026-09-10: "ok p256 then". **Amended 2026-09-10**, superseding Ed25519. The reason the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every trusted platform module, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. The protocol mandates one ciphersuite for version 1, with no negotiation and no fallback, and `09-security-model.md` §9.5 states the suite, the signature encoding, and the point-validation obligation a verifier carries.
+**Every SCP key is an ECDSA key on NIST P-256 with SHA-256.** Alec ruled on 2026-09-10: "ok p256 then". **Amended 2026-09-10**, superseding Ed25519. The protocol mandates one ciphersuite for version 1, with no negotiation and no fallback. `09-security-model.md` §9.5 states the suite, the signature encoding, the point-validation obligation a verifier carries, and the reason the orchestrator recommended this curve and Alec accepted it.
 
-**Root custody defaults to a passkey.** Alec named the substrate on 2026-09-10, "a passkey in your apple passwords or similar", and typed the domain rule the same day: "roots would get created under a universal identifier by default like ctx.network". **Amended 2026-09-10.** A passkey's private key is non-exportable, which is what moves the default off a key the controller can copy. The consequence for the log is that a root signature may be a WebAuthn assertion rather than a raw signature, and `09-security-model.md` §9.7.4.2's definitions state both slot layouts and the checks a verifier runs on an assertion.
+**Root custody defaults to a passkey.** Alec named the substrate on 2026-09-10, "a passkey in your apple passwords or similar", and typed the domain rule the same day: "roots would get created under a universal identifier by default like ctx.network". **Amended 2026-09-10.** The consequence for the log is that a root signature may be a WebAuthn assertion rather than a raw signature. `09-security-model.md` §9.7.4.1 item 4 states why a non-exportable substrate is what the default turns on, and §9.7.4.2's definitions state both slot layouts and the checks a verifier runs on an assertion.
 
-**Self custody of a key the controller can copy leaves the consumer profile.** Alec ruled on 2026-09-10 that self custody "is writing down a key, yes" and is "not a concern". The three copyable methods therefore sit on the headless profile alone, and `09-security-model.md` §9.7.4.1 item 4 states which method conforms on which profile.
+**Self custody of a key the controller can copy leaves the consumer profile.** Alec ruled on 2026-09-10 that self custody "is writing down a key, yes" and is "not a concern". `09-security-model.md` §9.7.4.1 item 4 states which method conforms on which profile and why the three copyable methods sit on the headless profile alone.
 
 **The root credential and the pre-rotation credential share one platform account by default.** Alec chose that default on 2026-09-10 from two options the orchestrator put to him: keep the two together and tell the user. **Amended 2026-09-10.** The identity-substrate decision log records the ruling as prose and records no reason from Alec. The default places the identity's root authority and its recovery authority behind one authentication factor, so the same section requires the SDK to state the co-residence at custody selection and to offer a separated pre-rotation credential.
 
@@ -62,9 +62,9 @@ SCP's identity is an inception-derived self-certifying identifier over an append
 
 ### Fork precedence
 
-**The root decides a fork.** Where a verifier holds two valid chains for one identity, the root authority behind each chain decides between them, and the order in which the verifier saw the two decides nothing. Alec ruled it on 2026-09-07: "Root wins sounds like a good solution." **Amended 2026-09-07**, replacing an ordering by first observation. `09-security-model.md` §9.7.4.2 R6 states the ranking a verifier applies, and R7 states what an equal rank means.
+**The root decides a fork.** Where a verifier holds two valid chains for one identity, the root authority behind each chain decides between them, and the order in which the verifier saw the two decides nothing. Alec ruled it on 2026-09-07: "Root wins sounds like a good solution." `09-security-model.md` §9.7.4.2 R6 states the ranking a verifier applies, and R7 states what an equal rank means.
 
-**A root signature counts at the standing the shared prefix fixed, and not at the standing the claimant's own event installs.** Alec gave the reason on 2026-09-07: "If an attacker has the root, it's GG. What would you gain by trying to optimize against that case?" Reading the later standing would let every claimant satisfy the test against a root its own event installed, which would make the test decide nothing. The pin exists so that two honest verifiers holding the same two chains reach the same verdict, and §9.7.4.2 R6 fixes what rank reads.
+**A root signature counts at the standing the shared prefix fixed, and not at the standing the claimant's own event installs.** Alec gave the reason on 2026-09-07: "If an attacker has the root, it's GG. What would you gain by trying to optimize against that case?" §9.7.4.2 R6 fixes what rank reads and states why reading the later standing would make the test decide nothing.
 
 ### Freshness and the witness layer
 
@@ -74,9 +74,9 @@ SCP's identity is an inception-derived self-certifying identifier over an append
 
 **Witnesses are relays.** Alec asked on 2026-08-31, "witness policy essentialy has the same machinery as identity relays then?" The layer reuses the relay infrastructure, the identity-to-relay association, the application management, and the shipped-default machinery SCP already runs for transport, and adds a cosigned head, two key-state fields, and the comparison a watcher runs.
 
-**A witness watches and reports, and decides nothing.** Alec ruled it on 2026-09-10: "watch and report as well". **Amended 2026-09-10.** His reason, as the decision log records it: the residual the earlier required-witnessing model rested on, a lost root together with a leaked copy of a spent pre-rotation key, does not arise for a user who keeps the default passkey custody. The asymmetry was stated to him before he ruled: moving from required to watch-and-report later is a relaxation, and moving the other way is a flag day. No rule of `09-security-model.md` §9.7.4.2 reads a cosignature, and §9.7.4.3 states the one check a witness runs and the two objects it produces.
+**A witness watches and reports, and decides nothing.** Alec ruled it on 2026-09-10: "watch and report as well". **Amended 2026-09-10.** No rule of `09-security-model.md` §9.7.4.2 reads a cosignature. §9.7.4.3 states the one check a witness runs, the two objects it produces, and the residual this ruling leaves standing.
 
-**The superseded required model was the orchestrator's design call and not Alec's.** He asked on 2026-09-08, "So root, witness required, witness decides?", and the orchestrator answered "root decides, witnesses required, witnesses never decide". He never confirmed the required half in his own words. He had already stated the general correction on 2026-09-06: "I said B because you presented as an option that solves the problem not because it was something specific that I wanted. You gave me some options. I chose one."
+**The superseded required model was the orchestrator's design call and not Alec's.** `09-security-model.md` §9.7.4.3 carries the exchange that establishes the attribution. He had stated the general correction on 2026-09-06: "I said B because you presented as an option that solves the problem not because it was something specific that I wanted. You gave me some options. I chose one."
 
 **Operator independence is not enforceable, and the specification says so in those terms.** Alec asked on 2026-09-07: "those ownership requirements are unenforceable arent they?" They are not. What is mechanical is a local set-membership test against the shipped list together with proof of control of the declared operator identity, which `09-security-model.md` §9.7.4.2's definitions state. Keeping one operator off the list for an identity it also witnesses is a curation obligation the list's curator carries, and a badly curated list is a supply-chain risk of the class a compromised browser root store belongs to. The obligation to state that unenforceability in the specification is this record's own drafting requirement and not Alec's words.
 
@@ -180,17 +180,15 @@ Each rule below is KERI's, and the SCP section that carries it cites KERI and re
 
 ## Consequences
 
-**The specification corpus moves before the code.** The rewrite runs in dependency order: the security model's identity core, then this record, then the identity, addressability, sync, persistence, and test-vector specifications, then the sections that only restate them, then the technical overview and the white paper. One writer at a time, each fact in one place, every other site citing it.
+**The specification corpus moves before the code**, and each fact lands in one place with every other site citing it.
 
-**The code follows in one order: the curve, then the key-event log and resolution, then the relays, then the SDK surfaces.** The curve slice carries a build constraint found on 2026-09-10: every core function that takes a raw signing key has to take a signer instead, and every key-export accessor has to leave the custody adapters and all three bridges, because hardware custody on the governance path is impossible until then.
+**The curve slice carries a build constraint:** every core function that takes a raw signing key has to take a signer instead, and every key-export accessor has to leave the custody adapters and all three bridges, because hardware custody on the governance path is impossible until then.
 
-**The work lands on a stack and not on main.** The branch `docs/adr-063-kel-identity-substrate` is the integration base, code slices stack on it, main is merged in regularly, and the stack merges to main when the specifications and the code agree. Alec ruled it on 2026-09-10, "yes, we need a stack", because the specifications cannot land on main ahead of the code: "other agents will organically encounter the discrepancy while working on unrelated things".
-
-**Six items are tracked outside the specification corpus**, each in the plan of record's tracked-items table.
+**Six items are tracked outside the specification corpus.**
 
 1. **The delegation model** waits on ADR-064, cooperative delegation, and until it lands a verifier rejects every chain naming a delegator.
 2. **The identifier's textual form** waits on a later revision of `09-security-model.md` §9.7.4.2 R13, and no derivation the protocol performs waits with it.
-3. **The key-event seal's fate, and the two non-compromise retired conditions.** Whether the seal survives, and whether those two conditions collapse into one, are upstream questions for the next draft of this record. No specification pass decides either, and this draft decides neither.
+3. **The two non-compromise retired conditions.** Whether `Superseded` and `Retired` collapse into one condition is an upstream question for the next draft of this record, and no specification pass decides it. **The key-event seal's fate is closed and this draft closes it:** the seal ships, at fixed position 11 of the key-event preimage, with no live reader, because adding the field later would bump the separator's version suffix and invalidate every signature made under the old one.
 4. **The ripple sweep** covers the stale sites outside the four core homes, in three classes: the agent verification method, the DID document, and did:dht with the Mainline distributed hash table.
 5. **What leaves the specification corpus for the relay plan**: the curator's removal obligation, the curation criterion, the pricing prohibition on an entry's cosigning, the out-of-cycle-release proposal, portability across several vendors' applications, and the record that Limn operates public relays.
 6. **The stack and the shape of the fresh write** are settled and wait on nothing.
@@ -225,6 +223,4 @@ ADR-057, in-browser SCP clients over a shared MLS crate, rested on did:dht resol
 
 ADR-054, pre-rotation key custody substrate isolation, and RFC #2130, pre-rotation recovery custody, are the Proposed realization of the independent pre-rotation custody this record depends on. The dependency is the specification rule in `09-security-model.md` §9.7.4.1, not that Proposed realization.
 
-The security model specification carries the rules this record decides: the ciphersuite and the canonical construction in `09-security-model.md` §9.5 and §9.5.1, pre-rotation custody in §9.7.4.1, the log's validity and precedence rules in §9.7.4.2, the witness and watcher layer in §9.7.4.3, key continuity in §9.11, and the log's constants in §9.18.17. The identity specification carries resolution and the service record in `03-identity.md` §3.10, and the addressability specification carries the community relay list in `18-addressability-and-deployment.md` §18.5.1.
-
-The working plan of record is the identity-substrate plan at `/Users/alec/.claude/plans/identity-substrate-plan.md`, whose §1 states every rule this record decides and whose §2 states the sequence. The dated reasoning and the verbatim quote record sit in the identity-substrate decision log beside it.
+Each decision above names the specification section that carries its rule, and no second index of those pointers stands here.
