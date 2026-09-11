@@ -69,7 +69,7 @@ Each test specifies:
 | **Spec Sections** | `09-security-model.md` §9.1 invariants 1 and 4, §9.7.4.2 R3, `00-open-questions.md` |
 | **Preconditions** | A human identity and a second identity whose inception event names the human as its delegator. |
 | **Steps** | 1. Publish both chains. 2. Resolve the second identity. |
-| **Expected Outcome** | R3 rejects every chain whose delegator field is nonzero, so the second identity does not resolve and signs no autonomous action. The delegation model is unspecified as of 2026-09-10 (`00-open-questions.md`), and this test asserts the fail-closed rejection that stands until it lands. |
+| **Expected Outcome** | R3 rejects every chain whose delegator field is nonzero, so the second identity does not resolve and signs no autonomous action. This test asserts the fail-closed rejection that stands until the delegation model lands (`00-open-questions.md`). |
 
 ### CONF-005: Multi-Device (One Identity, Different Device Leaf Keys)
 
@@ -91,7 +91,7 @@ Each test specifies:
 | **Layer** | Context |
 | **Tier** | Core |
 | **Spec Sections** | §5.1, §9.7 |
-| **Preconditions** | Creator has a DID. Relay is available. |
+| **Preconditions** | Creator has an identity. Relay is available. |
 | **Steps** | 1. Create context with parameters (name, mode: encrypted, ceiling, governance model). 2. Initialize MLS group with creator as sole member. 3. Publish context metadata to relay. |
 | **Expected Outcome** | Context ID is derived from initial parameters. MLS group is established. Context metadata is retrievable from relay. Creator holds the only MLS leaf node. |
 
@@ -102,7 +102,7 @@ Each test specifies:
 | **Layer** | Context |
 | **Tier** | Core |
 | **Spec Sections** | §5.3, §9.7 |
-| **Preconditions** | Context exists with at least one member. Invitee has a DID. |
+| **Preconditions** | Context exists with at least one member. Invitee has an identity. |
 | **Steps** | 1. Existing member generates invitation (MLS KeyPackage fetch + Add proposal). 2. Invitee receives Welcome message. 3. Invitee processes Welcome and joins MLS group. 4. Invitee can decrypt messages sent after joining. |
 | **Expected Outcome** | Invitee is a member of the MLS group. Invitee can decrypt new messages. Invitee cannot decrypt messages sent before joining (forward secrecy). |
 
@@ -295,7 +295,7 @@ Each test specifies:
 | **Layer** | Trust |
 | **Tier** | Full |
 | **Spec Sections** | §7 |
-| **Preconditions** | Three DIDs: A (root), B (delegate), C (sub-delegate). |
+| **Preconditions** | Three identities: A (root), B (delegate), C (sub-delegate). |
 | **Steps** | 1. A issues UCAN to B with capability X. 2. B issues UCAN to C with capability X (or subset). 3. C presents token. 4. Verifier validates full chain: C's token → B's token → A's authority. |
 | **Expected Outcome** | Chain validates. Each link's signature verifies. Capability attenuation is correct. |
 
@@ -317,7 +317,7 @@ Each test specifies:
 | **Layer** | Trust |
 | **Tier** | Full |
 | **Spec Sections** | §7 |
-| **Preconditions** | DID A has capabilities [read, write, admin]. |
+| **Preconditions** | Identity A has capabilities [read, write, admin]. |
 | **Steps** | 1. A delegates [read, write] to B (subset). 2. B attempts to delegate [read, write, admin] to C (superset — should fail). 3. B delegates [read] to C (further attenuation — should succeed). |
 | **Expected Outcome** | Step 2 fails — cannot delegate capabilities not held. Step 3 succeeds — attenuation is valid. |
 
@@ -366,8 +366,8 @@ Each test specifies:
 | **Tier** | Full |
 | **Spec Sections** | §22.3.1, §22.11 |
 | **Preconditions** | Context exists with handle support. |
-| **Steps** | 1. Register handle `alice` pointing to DID via `handle_register`. 2. Look up `alice` via `handle_lookup`. 3. Verify result contains the correct DID and metadata. 4. Attempt to register `alice` again from different DID — expect conflict. |
-| **Expected Outcome** | Registration succeeds. Lookup returns correct DID. Duplicate registration returns `conflict`. |
+| **Steps** | 1. Register handle `alice` pointing to an identifier via `handle_register`. 2. Look up `alice` via `handle_lookup`. 3. Verify the result carries that identifier and its metadata. 4. Register `alice` again from a second identifier — expect conflict. |
+| **Expected Outcome** | Registration succeeds. Lookup returns the registered identifier. Duplicate registration returns `conflict`. |
 
 ### CONF-031: Agent Capability Registration and Search
 
@@ -481,7 +481,7 @@ Each test specifies:
 | **Layer** | Interop |
 | **Tier** | Core |
 | **Spec Sections** | §5.3, §9.7 |
-| **Preconditions** | Implementation A created context. Implementation B has a DID. |
+| **Preconditions** | Implementation A created context. Implementation B has an identity. |
 | **Steps** | 1. A generates MLS Welcome for B. 2. B processes Welcome (MLS KeyPackage, group info). 3. B joins MLS group. 4. B sends a message. 5. A decrypts B's message. |
 | **Expected Outcome** | Cross-implementation MLS interop works. Welcome processing succeeds. Group state converges. |
 
