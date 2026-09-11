@@ -93,9 +93,10 @@ import { describe, expect, it } from "bun:test";
 import { Identity } from "../src/index.js";
 
 describe("Identity", () => {
-  it("creates identity with valid DID", async () => {
+  it("creates an identity with a 32-byte identifier", async () => {
     const identity = await Identity.create({ custody: "in_memory" });
-    expect(identity.did).toMatch(/^did:dht:/);
+    // 09-security-model.md §9.7.4.2 R13
+    expect(identity.identifier).toHaveLength(32);
   });
 
   it("rejects invalid custody type", async () => {
