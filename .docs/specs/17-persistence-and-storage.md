@@ -657,33 +657,29 @@ The `BlobStorage` trait provides streaming variants of `store` and `get` for bac
 
 ## 17.8 Platform-Specific Key Custody
 
-Key custody is NOT part of this spec — it is the existing `KeyCustody` trait (ADR-006). Referenced here for completeness of the persistence picture:
+Key custody is the `KeyCustody` trait ADR-006 defines, named here for completeness of the persistence picture. Its backend selection is mandatory, fails closed, and is never defaulted (§17.17). Its in-memory arm holds plaintext keys, so it is a **security nullifier** rather than a durability-only affordance and must be provably absent from a shipped production artifact (SCP-CAPSEL-8012, realized by ADR-062, capability injection).
 
-Key custody is a provider capability governed by the general capability-selection principle (§17.17): the backend selection is mandatory and fails closed (SCP-CAPSEL-8000/8001) and the runtime never defaults it (SCP-CAPSEL-8002). Its in-memory arm (`InMemoryKeyCustody`, plaintext keys) is a **security nullifier**, not a durability-only affordance, and so must be provably absent from shipped production artifacts (SCP-CAPSEL-8012) — the realization is downstream in ADR-062.
-
-| Platform | Key Storage | Key Types | Notes |
+| Platform | Key storage | Key types | Notes |
 |----------|-------------|-----------|-------|
-| iOS/macOS | Secure Enclave for a signing key; a passkey in the platform provider for a root or pre-rotation key; Apple Keychain for HPKE keys | P-256 signing, DHKEM(P-256) | **The Secure Enclave holds a P-256 key in hardware, and a passkey is the default custody of a root-set member and of a pre-rotation key** (`09-security-model.md` §9.7.4.1 item 4). The enclave performs signing and ECDH and never exports the private key. An HPKE keypair whose agreement the enclave cannot perform is software-backed in Keychain |
-| Android | Android Keystore (TEE-backed) for a signing key; a passkey through the platform provider for a root or pre-rotation key | P-256 signing, DHKEM(P-256) | The Keystore has held P-256 in hardware since API 23, so no API-level floor applies. StrongBox available but dramatically slow — opt-in only |
-| Browser | WebCrypto + IndexedDB (non-extractable CryptoKey); WebAuthn for a root or pre-rotation key | P-256 signing (ECDSA), DHKEM(P-256) | WebCrypto has supported `ECDSA` over `P-256` in every current browser since before SCP existed. Ephemeral in incognito |
-| Python/Node/Server | Software keys in SQLCipher-encrypted SQLite, or an HSM under a separate principal | P-256 signing, DHKEM(P-256) | The headless profile has no passkey API, so `09-security-model.md` §9.7.4.1 item 4's headless table governs its pre-rotation custody |
-| Testing | `InMemoryKeyCustody` | P-256 signing, DHKEM(P-256) | Already defined (ADR-006) |
+| iOS and macOS | the Secure Enclave for a signing key; a passkey in the platform provider for a root or pre-rotation key; the Keychain for HPKE keys | P-256 signing, DHKEM(P-256) | The enclave holds a P-256 key in hardware, signs, performs key agreement, and exports no private key. A passkey is the default custody of a root-set member and of a pre-rotation key (`09-security-model.md` §9.7.4.1 item 4). An HPKE keypair the enclave cannot agree on is software-backed in the Keychain |
+| Android | the Keystore for a signing key; a passkey through the platform provider for a root or pre-rotation key | P-256 signing, DHKEM(P-256) | The Keystore has held P-256 in hardware since API 23, so no API-level floor applies. StrongBox is available, dramatically slower, and opt-in |
+| Browser | WebCrypto with IndexedDB, holding a non-extractable key; WebAuthn for a root or pre-rotation key | P-256 signing, DHKEM(P-256) | Every current browser supports ECDSA over P-256. Storage is ephemeral in a private window |
+| Python, Node, and server hosts | software keys in SQLCipher-encrypted SQLite, or an HSM under a separate principal | P-256 signing, DHKEM(P-256) | The headless profile exposes no passkey API, so the headless table of `09-security-model.md` §9.7.4.1 item 4 governs its pre-rotation custody |
+| Testing | `InMemoryKeyCustody` | P-256 signing, DHKEM(P-256) | Defined in ADR-006, barred from a shipped artifact above |
 
 ### FileKeyCustody Argon2id Parameters
 
-The software-key custody backend for non-HSM platforms (`FileKeyCustody`, the universal fallback used by the Python/Node/Server row above) derives an AES-256 wrapping key from a passphrase using Argon2id. Its parameters are the canonical Argon2id parameterization for the codebase and MUST be:
+`FileKeyCustody`, the software-key backend behind the headless row above, derives an AES-256 wrapping key from a passphrase with Argon2id. **A single Argon2id parameterization is REQUIRED across the codebase**, and an implementation MUST NOT define a second, divergent parameter set: two parameterizations derive two keys from one passphrase, so one of them cannot decrypt what the other wrote. The SQLCipher passphrase key-derivation mode of §17.6 draws from the same parameter source.
 
 ```
 algorithm  = Argon2id
-version    = 0x13                              // Argon2 v1.3
-m_cost     = 65536                             // 65536 KiB = 64 MiB memory
-t_cost     = 3                                 // 3 iterations
-p_cost     = 1                                 // parallelism = 1
-output_len = 32                                // 32-byte derived key
-salt       = per-file 16-byte salt             // generated once, persisted with the custody file
+version    = 0x13                    // Argon2 v1.3
+m_cost     = 65536                   // 65536 KiB = 64 MiB memory
+t_cost     = 3                       // 3 iterations
+p_cost     = 1                       // parallelism = 1
+output_len = 32                      // 32-byte derived key
+salt       = per-file 16-byte salt   // generated once, persisted with the custody file
 ```
-
-These are the same parameters the SQLCipher passphrase key-derivation mode (§17.6) MUST use. A single Argon2id parameterization is REQUIRED across the codebase: both the `FileKeyCustody` passphrase-to-wrapping-key derivation and the SQLCipher passphrase-to-PRAGMA-key derivation MUST draw from one shared parameter source. Implementations MUST NOT define a second, divergent Argon2id parameter set.
 
 ## 17.9 OpenMLS StorageProvider Bridge
 
@@ -1047,11 +1043,13 @@ This is the determination the general rule exists to force. Two capabilities can
 
 ### 17.17.4 The Witness's Per-Subject Store Is an Instance — and Its In-Memory Arm Is a Nullifier
 
-A relay an identity designates as a witness keeps, per subject it has ever cosigned, the subject identifier, the sequence and event digest of its own last cosigned head, that head's preimage digest, and its `observed_at`, for at most `MAX_SUBJECTS_PER_WITNESS` subjects (`09-security-model.md` §9.7.4.3, §9.18.17). That store is a provider capability, so its backend selection is governed by §17.17.1 exactly as storage is.
+A relay an identity designates as a witness keeps, per subject it has ever cosigned, the subject identifier, the sequence and event digest of its own last cosigned head, that head's preimage digest, and its `observed_at`, for at most `MAX_SUBJECTS_PER_WITNESS` subjects (`09-security-model.md` §9.7.4.3, §9.18.17). That store is a provider capability, so §17.17.1 governs its backend selection exactly as it governs storage.
 
-**SCP-CAPSEL-8014 — An in-memory witness per-subject store is a security nullifier.** The store is the input to the one check that carries the witness layer's security property: a witness refuses to cosign a chain that does not carry the head it last cosigned. A witness that lost that record and cosigns anyway signs a fork, so the arm keeps producing signatures while those signatures stop meaning what they claim: a cosigned head asserts that this witness saw this chain extend everything it previously cosigned, and a witness on an empty store asserts that without having checked it. The harm has the same two parts SCP-CAPSEL-8013 names for identity resolution:
+**SCP-CAPSEL-8014 — an in-memory witness per-subject store is a security nullifier.** The store is the input to the one check that carries the witness layer's security property: a witness refuses to cosign a chain that does not carry the head it last cosigned. A witness that lost that record and cosigns anyway signs a fork, so the arm keeps producing signatures while those signatures stop meaning what they claim. The harm has the two parts SCP-CAPSEL-8013 names for identity resolution:
 
-- **Silent false success.** The witness answers a cosigning request and the requester receives a valid signature, so nothing in the exchange reports that the consistency check ran against an empty store. The nullifier is the silence, exactly as it is there.
-- **Loss of the equivocation evidence the layer supplies.** Against a witness with a durable store, a party that forks a subject's chain below a cosigned head is refused and a conflict statement records the attempt. Against a witness whose store restarts empty, that party waits for a restart and offers its fork, which the witness seeds from and cosigns, so no conflict statement records the attempt and the equivocation evidence the layer exists to supply is never produced.
+- **Silent false success.** The requester receives a valid signature and nothing in the exchange reports that the check ran against an empty store. The nullifier is the silence.
+- **Loss of the equivocation evidence the layer supplies.** Against a durable store a party that forks a subject's chain below a cosigned head is refused and a conflict statement records the attempt; against a store that restarts empty that party waits for a restart, and no conflict statement records anything.
 
-The arm therefore fails **open** and is governed by SCP-CAPSEL-8012, provably absent from shipped production artifacts, rather than by SCP-CAPSEL-8011. `09-security-model.md` §9.7.4.3 states what a witness holding no baseline does, and this section restates none of it: on a store loss the witness fetches the subject's `scp:wit:` address, keeps only heads whose `witness` field is itself, and seeds from the highest-sequence one; finding none of its own it seeds from the subject's own chain, at the latest event whose key state names it. **Neither case rescues an in-memory arm, and the reason is sharper than a suppression story.** An arm that starts empty on every restart holds no head of its own to fetch, so every restart takes the second case and seeds from whatever chain the requester offered. It then refuses nothing: it cosigns the offered chain, and the next requester offering a divergent chain is seeded afresh and cosigned too. A durable arm carries its own floor across a restart and refuses the second chain. The shipped-feature-graph gate of ADR-062 therefore sees the witness store as a classified capability.
+**The arm fails open**, so SCP-CAPSEL-8012 governs it — provably absent from a shipped production artifact — rather than SCP-CAPSEL-8011, and the shipped-feature-graph gate of ADR-062, capability injection, therefore sees the witness store as a classified capability.
+
+**Re-seeding is the rule `09-security-model.md` §9.7.4.3 states, and this section states no second one.** A witness that lost its store re-seeds from its own previously published cosigned heads and, finding none of its own, seeds from the subject's chain at the latest event whose key state names it. **Neither case rescues an in-memory arm.** An arm that starts empty on every restart holds no head of its own to fetch, so every restart takes the second case and seeds from whatever chain the requester offered; it then refuses nothing, and the next requester offering a divergent chain is seeded afresh and cosigned too. A durable arm carries its own floor across a restart and refuses that second chain.
