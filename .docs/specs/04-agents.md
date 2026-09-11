@@ -75,13 +75,13 @@ An identity publishes its capability metadata profile among the self-asserted ca
 | `self_attested` | array of URI strings | No | Capability URIs (§7.3.4.1) that the agent claims but has not been challenge-verified for. |
 | `challenge_verified` | array of objects | No | Capabilities with `ChallengeVerification` records. |
 | `challenge_verified[].capability` | URI string | Yes | The capability URI that was verified. |
-| `challenge_verified[].verifier_did` | DID | Yes | DID of the verifier who issued the challenge. |
+| `challenge_verified[].verifier_did` | Identifier | Yes | The verifier who issued the challenge (§7.3.4). |
 | `challenge_verified[].verified_at` | u64 | Yes | Unix timestamp (seconds) of the verification. |
 | `challenge_verified[].expires_at` | u64 | No | Expiry timestamp. If absent, the verification does not expire but may become stale per renewal intervals (§7.3.6). |
 | `challenge_verified[].verification_id` | string | Yes | Unique identifier for the `ChallengeVerification` record (§7.3.4). |
-| `custom` | array of objects | No | DID-scoped custom capabilities (§7.3.4.1). |
+| `custom` | array of objects | No | Identifier-scoped custom capabilities (§7.3.4.1). |
 
-Capability URIs in `self_attested` MUST conform to the capability URI namespace rules (§7.3.4.1). Protocol-scoped URIs (`scp:capability:*`) MUST be present in the signed protocol registry. DID-scoped URIs follow the `did:{method}:{id}:capability:{name}/v{n}` format. Freeform strings (e.g., bare keywords like `"translation"`) are NOT valid — all capabilities use structured URIs.
+Capability URIs in `self_attested` MUST conform to §7.3.4.1's namespace rules, which print no identifier-scoped URI. Protocol-scoped URIs (`scp:capability:*`) MUST be present in the signed protocol registry. A freeform string such as `"translation"` is NOT valid, because every capability uses a structured URI.
 
 ## 4.5 The Human-Agent Pair
 
