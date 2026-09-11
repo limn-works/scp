@@ -21,21 +21,7 @@ Every top-level wire structure includes a `version` field as its first serialize
 
 The `version` field is added as the first field in the signed structure (§9.5.2). The domain separator is unchanged — the version is data within the structure, not part of the domain separator. The domain separator version suffix (e.g., `"SCP-INNER-ENVELOPE-V1:"`) tracks structural layout changes independently; the `version` field inside the structure tracks protocol semantics.
 
-**Updated signed structure:**
-
-| Order | Field | Encoding |
-|-------|-------|----------|
-| 1 | `version` | 2-byte BE u16 |
-| 2 | `message_type` | 1-byte U8 discriminator (0x00=Content, 0x01=Signaling, 0x02=KeyDistribution) |
-| 3 | `context_id` | 4-byte BE length + UTF-8 bytes |
-| 4 | `sender_did` | 4-byte BE length + UTF-8 bytes |
-| 5 | `epoch` | 8-byte BE u64 |
-| 6 | `generation_number` | 8-byte BE u64 |
-| 7 | `sequence_number` | 8-byte BE u64 |
-| 8 | `timestamp` | 8-byte BE u64 |
-| 9 | `payload_hash` | 4-byte BE length + 32 bytes |
-| 10 | `provenance_hash` | 4-byte BE length + 32 bytes (or `SHA-256(0x00)` sentinel if absent) |
-| 11 | `signing_key_id` | 4-byte BE length + UTF-8 bytes |
+**Updated signed structure:** `version` takes order 1 and `message_type` takes order 2. `09-security-model.md` §9.5.2 states every field of this structure and its encoding.
 
 Adding `version` as field 1 and `message_type` as field 2 changes the field positions of all subsequent fields, which changes the signed bytes. This is intentional — both fields are part of the signature commitment. The `message_type` discriminator byte prevents type-flipping attacks where an adversary replays a message under a different type semantics (#290). The domain separator is `"SCP-INNER-ENVELOPE-V1:"` for the initial protocol version (v1). Future protocol versions will increment the domain separator (e.g., `V2`) when the signed structure changes.
 
@@ -43,19 +29,7 @@ The `InnerEnvelope` MessagePack serialization includes `version` as the first ma
 
 ### 13.2.2 BroadcastEnvelope
 
-Same pattern. The `version` field is the first field in the signed structure:
-
-| Order | Field | Encoding |
-|-------|-------|----------|
-| 1 | `version` | 2-byte BE u16 |
-| 2 | `context_id` | 4-byte BE length + UTF-8 bytes |
-| 3 | `sender_did` | 4-byte BE length + UTF-8 bytes |
-| 4 | `signing_key_id` | 4-byte BE length + UTF-8 bytes |
-| 5 | `sequence` | 8-byte BE u64 |
-| 6 | `key_epoch` | 8-byte BE u64 |
-| 7 | `timestamp` | 8-byte BE u64 |
-| 8 | `content_hash` | 32 bytes (SHA-256 of original plaintext) |
-| 9 | `provenance_hash` | 32 bytes (SHA-256 of serialized provenance, or `SHA-256(0x00)` if absent) |
+Same pattern. The `version` field takes order 1 in the signed structure, and `09-security-model.md` §9.5.2 states every other field and its encoding.
 
 Domain separator increments to `"SCP-BROADCAST-ENVELOPE-V2:"`.
 
@@ -203,7 +177,7 @@ Unknown `attestation_type` tags (§9.5.2) MUST be preserved in storage and forwa
 
 ### 13.5.4 Unknown Capability URIs
 
-The capability URI namespace (ADR-041) is self-versioning — each capability includes `/v{N}`. Unknown `scp:capability:*` URIs MUST be rejected by SDKs (existing ADR-041 rule — this prevents capability spoofing). Unknown `scp:system:*` URIs MUST be ignored. DID-scoped custom capabilities are always accepted (authority is the definer's DID, not the protocol).
+The capability URI namespace (ADR-041) is self-versioning — each capability includes `/v{N}`. Unknown `scp:capability:*` URIs MUST be rejected by SDKs (existing ADR-041 rule — this prevents capability spoofing). Unknown `scp:system:*` URIs MUST be ignored. An identifier-scoped custom capability is always accepted, because its definer carries the authority for it and the protocol does not.
 
 ### 13.5.5 Unknown Context Modes
 
@@ -254,7 +228,7 @@ scp:ext:{kebab-case-name}/v{integer}
 
 Examples: `scp:ext:broadcast-projection/v1`, `scp:ext:media-signaling/v1`, `scp:ext:coap-transport/v1`.
 
-The `scp:ext:` prefix is reserved for protocol-defined extensions. Third-party extensions use DID-scoped URIs: `did:{method}:{id}:ext:{name}/v{integer}`.
+The `scp:ext:` prefix is reserved for protocol-defined extensions. A third-party extension uses a URI scoped to its definer's identifier, and this spec prints no such URI because `09-security-model.md` §9.7.4.2 R13 defers the identifier's textual form.
 
 ### 13.7.2 Extension Advertisement
 
