@@ -33,14 +33,11 @@ only if the Backing row asserts one custody model for `#active` on every platfor
 the row asserts that is a question about which artifact governs, and the agent reported a
 contradiction without asking it.
 
-**2. What governs.** The identity spec governs both passages. §3.2.1 states that custody
-migration moves the operational signing capability from one custody provider to another
-without changing the DID string (`.docs/specs/03-identity.md:22`), names `#active` as the
-key that case 1 migrates (`.docs/specs/03-identity.md:26`), and enumerates the providers
-that the `#active` migration targets: `target_custody_type: enum { SecureEnclave,
-AndroidKeystore, HardwareKey, Passkey, Software }` (`.docs/specs/03-identity.md:30` for the
-case-1 heading, `.docs/specs/03-identity.md:37` for the enum). `#active` custody therefore
-varies per identity and changes over an identity's life, so the Backing row asserts no
+**2. What governs.** The identity spec governs both passages. The key custody migration
+protocol, §3.2.1 of `03-identity.md`, states that custody migration moves the operational
+signing capability from one custody provider to another and that the identifier does not
+change, and its case 1 names `#active` as the key that migration replaces. `#active` custody
+therefore varies per identity and changes over an identity's life, so the Backing row asserts no
 fixed custody model for `#active`, and the row and layer 1 do not contradict each other.
 
 **3. The invented names.** The agent searched the repository for `identity_key_custody`,
