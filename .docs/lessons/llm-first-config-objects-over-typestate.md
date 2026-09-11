@@ -57,22 +57,21 @@ divergence. Nothing is lost; legibility is gained.
 must be preserved:
 
 1. **Providers stay typed enum-selectors — never `dyn`.** `KeyCustody`, `Storage`,
-   and `DidMethod` use return-position `impl Trait` in trait (RPITIT) and are **not
+   and the identity seam use return-position `impl Trait` in trait (RPITIT) and are **not
    object-safe**: `Arc<dyn Storage>` does not compile. The config object carries
    providers as enum-selectors or concrete types, never trait objects. Boxing them
-   would also put `async-trait` allocation on storage-read/sign hot paths,
-   regressing the ADR-049 lock-free-read invariant. If a future session "simplifies"
-   by reaching for `Arc<dyn Storage>`, the compiler will reject it — that rejection
-   is the constraint, not a bug to work around.
+   would put `async-trait` allocation on storage-read/sign hot paths,
+   regressing the ADR-049 lock-free-read invariant. If a future session reaches for
+   `Arc<dyn Storage>`, the compiler rejects it, and that rejection is the constraint
+   rather than a bug to work around.
 
 2. **The `EncryptedStorage` seal stays a compile-time guarantee.** `EncryptedStorage`
    is a sealed trait; production construction requires `S: EncryptedStorage`, and the
    testing path is feature-gated to accept any `Storage`. This is "production cannot
-   persist plaintext," enforced at compile time (not by convention). The unified
+   persist plaintext," enforced at compile time rather than by convention. The unified
    pattern preserves it as the `start` / `start_for_testing` **trait-bound split** —
-   the *one* allowed exception to "one greppable constructor" (M5). It is backed by a
-   structural test that the unencrypted path is unreachable from the production
-   constructor. Demoting this seal to a runtime check to get a single unconditional
+   the *one* allowed exception to "one greppable constructor" (M5). A structural test backs it: the unencrypted path is unreachable
+   from the production constructor. Demoting this seal to a runtime check to get a single unconditional
    `start()` is explicitly rejected (ADR-052 Rejected Alternatives): flatness never
    buys down a compile-time security guarantee.
 
