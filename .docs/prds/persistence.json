@@ -1,6 +1,6 @@
 {
   "project": "scp",
-  "description": "Persistence and storage layer for SCP. Covers serialization prerequisites, ProtocolRepository modules (event_log, nonce refactor, transport, sender keys, DID cache/TOFU, economic governance), Migratable trait and schema versioning, ContextPersistence trait and manager wiring, storage conformance macros, production storage adapters (SQLite, Filesystem), BlobStore adapters (SQLite, redb, PostgreSQL, S3-compatible), MLS StorageProvider bridge, platform-specific adapters (Android, iOS, CombinedNode, SyncableStorage, LocalBlobCache, relay state), and end-to-end integration tests. SyncableStorage and LocalBlobCache are PRD-originated designs implementing the deployment patterns described in section 17.1, not directly specified in a dedicated spec section.",
+  "description": "Persistence and storage layer for SCP. Covers serialization prerequisites, ProtocolRepository modules (event_log, nonce refactor, transport, sender keys, did_cache/TOFU, economic governance), Migratable trait and schema versioning, ContextPersistence trait and manager wiring, storage conformance macros, production storage adapters (SQLite, Filesystem), BlobStore adapters (SQLite, redb, PostgreSQL, S3-compatible), MLS StorageProvider bridge, platform-specific adapters (Android, iOS, CombinedNode, SyncableStorage, LocalBlobCache, relay state), and end-to-end integration tests. SyncableStorage and LocalBlobCache are PRD-originated designs implementing the deployment patterns described in section 17.1, not directly specified in a dedicated spec section.",
   "gates": [
     {
       "id": "gate-persist-0",
@@ -305,7 +305,7 @@
       "actionItems": [
         "Add sender key method signatures to the existing context.rs store module",
         "Implement `store_sender_key` and `load_sender_key` with key path `context/{context_id}/sender_key/{did}`",
-        "Implement `list_sender_keys` using `list_keys` with sender_key prefix and parsing DID from key suffix",
+        "Implement `list_sender_keys` using `list_keys` with sender_key prefix, parsing the identifier from the key suffix",
         "Implement `remove_sender_key` using `delete` with the constructed key path",
         "Write unit tests for all 4 methods"
       ],
@@ -339,7 +339,7 @@
       "files": [
         "crates/scp-core/src/store/identity.rs"
       ],
-      "description": "Add 4 missing methods to the existing `store/identity.rs` module per section 17.4: `cache_did_document`, `load_cached_did_document` (keys: `did_cache/{did}`), `store_tofu_record`, `load_tofu_record` (keys: `tofu/{did}`). DID cache stores documents with an `expires_at` timestamp. TOFU records store first-seen trust-on-first-use binding data.",
+      "description": "Add 4 missing methods to the existing `store/identity.rs` module per section 17.4: `cache_did_document`, `load_cached_did_document` (keys: `did_cache/{did}`), `store_tofu_record`, `load_tofu_record` (keys: `tofu/{did}`). Each cached document carries an `expires_at` timestamp. TOFU records store first-seen trust-on-first-use binding data.",
       "acceptanceCriteria": [
         "`cache_did_document(did, doc, expires_at)` stores document bytes and expiry timestamp under `did_cache/{did}`",
         "`load_cached_did_document(did, now: u64)` returns document bytes if `now < expires_at`, returns None if expired or missing (caller provides current time for testability)",
@@ -1171,7 +1171,7 @@
         "crates/scp-platform/src/android/storage.rs",
         "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidStorage.kt"
       ],
-      "description": "Implement Android storage adapter per sections 17.6 and 17.8. Rust side wraps trait; Kotlin side uses `net.zetetic:sqlcipher-android`. Encryption key derived from Android Keystore TEE-backed AES-256 key. Schema matches SqliteStorage. Database in app's `getNoBackupFilesDir()`.",
+      "description": "Implement the Android storage adapter per \u00a717.6, \u00a717.8 and \u00a717.17. The Rust side wraps the Storage trait; the Kotlin side uses `net.zetetic:sqlcipher-android`.",
       "acceptanceCriteria": [
         "`AndroidStorage` Kotlin class implements Storage interface via UniFFI callback using `net.zetetic:sqlcipher-android`",
         "Encryption key derived from Android Keystore TEE-backed AES-256 key",
@@ -1198,6 +1198,10 @@
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
           "section": "## 17.8 Platform-Specific Key Custody"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### 17.17.1 Selection Requirements"
         }
       ],
       "details": {
@@ -1217,7 +1221,7 @@
         "crates/scp-platform/src/apple/storage.rs",
         "bindings/swift/Sources/SCP/Platform/AppleStorage.swift"
       ],
-      "description": "Implement Apple storage adapter per sections 17.6 and 17.8. Rust module uses `rusqlite` with `bundled-sqlcipher`. Encryption key stored in Apple Keychain (kSecClassGenericPassword). `NSFileProtectionCompleteUntilFirstUserAuthentication` on database file. Swift binding is thin UniFFI wrapper.",
+      "description": "Implement the Apple storage adapter per \u00a717.6, \u00a717.8 and \u00a717.17. The Rust module uses `rusqlite` with `bundled-sqlcipher`.",
       "acceptanceCriteria": [
         "`AppleStorage` Rust struct using `rusqlite` with `bundled-sqlcipher`; encryption key from Apple Keychain via `kSecClassGenericPassword` item",
         "`NSFileProtectionCompleteUntilFirstUserAuthentication` applied to database file; first-run generates Keychain key if absent",
@@ -1244,6 +1248,10 @@
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
           "section": "## 17.8 Platform-Specific Key Custody"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### 17.17.1 Selection Requirements"
         }
       ],
       "details": {
@@ -1638,13 +1646,13 @@
         "Test: event_log range query returns correct ordered subset across append/load_range",
         "Test: nonce replay rejected after check_and_record_nonce; prune removes only expired nonces",
         "Test: membership store/load/list/remove roundtrip; sender_key store/load/list/remove roundtrip",
-        "Test: DID cache returns None after expiry; TOFU record roundtrip",
+        "Test: did_cache returns None after expiry; TOFU record roundtrip",
         "Test: relay_score list returns all stored scores; MLS group state roundtrip and context isolation",
         "`cargo test -p scp-testing` passes"
       ],
       "actionItems": [
         "Create parameterized test helpers that run each module test against InMemory and SqliteStorage",
-        "Implement event_log, nonce, membership, sender_key, DID cache, TOFU, relay_score, and MLS integration tests",
+        "Implement event_log, nonce, membership, sender_key, did_cache, TOFU, relay_score, and MLS integration tests",
         "Verify each test exercises the full ProtocolRepository -> Storage -> Backend path"
       ],
       "blockedBy": [
