@@ -10,7 +10,7 @@
 
 The question was: **how does SCP prevent man-in-the-middle attacks, message forgery, and replay attacks?**
 
-The honest answer before this session: the spec had strong local security (MLS encryption, UCAN tokens, Merkle logs, Ed25519 signatures) but significant gaps in global security — the defenses that protect the protocol across trust boundaries. Section 9 covered application-layer threats (spoofing, poisoning, Sybil) but did not address cryptographic protocol security.
+The honest answer before this session: the spec had strong local security (MLS encryption, UCAN tokens, Merkle logs, envelope signatures) but significant gaps in global security — the defenses that protect the protocol across trust boundaries. Section 9 covered application-layer threats (spoofing, poisoning, Sybil) but did not address cryptographic protocol security.
 
 ---
 
@@ -20,7 +20,7 @@ The honest answer before this session: the spec had strong local security (MLS e
 
 | Attack Class | Before This Session |
 |---|---|
-| MITM on DID resolution | Not addressed. No specification of how Alice verifies she has Bob's real public key. |
+| MITM on identity resolution | Not addressed. No specification of how Alice verifies she has Bob's real public key. |
 | MITM on relay discovery | Not addressed. No specification of how relay lists are authenticated. |
 | MITM on key exchange | Partially addressed. MLS handles group key distribution, but the spec didn't document the mapping between MLS concepts and SCP concepts. |
 | Replay attacks | Not addressed. No nonce, timestamp validation, or deduplication mechanism specified. |
@@ -36,7 +36,7 @@ The honest answer before this session: the spec had strong local security (MLS e
 - **Encryption-as-access-control** (§10.5) — solid architecture. Relays are protocol-unaware, all access control is cryptographic.
 - **UCAN capability tokens** — cryptographic delegation chains, per-capability revocation.
 - **Merkle event logs** — append-only, signed, verifiable. Good foundation for integrity.
-- **Ed25519 signatures** — on all protocol actions. Good foundation for non-repudiation.
+- **Envelope signatures** — on all protocol actions. Good foundation for non-repudiation.
 - **Sybil resistance** (§9.3) — three-layer defense (device attestation, earned capacity, context-level thresholds).
 - **13 identified threat vectors** (§9.2) — comprehensive application-layer threat analysis.
 
@@ -56,13 +56,13 @@ MLS is not just "group encryption." It's a complete secure group messaging proto
 
 **Transcript consistency.** TreeSync ensures all members agree on group state (membership, epoch, ratchet tree). Fork detection is built in — if two members have inconsistent group states, MLS's consistency checks will detect it.
 
-**Per-message authentication.** MLS PrivateMessage format includes a membership_tag HMAC that proves the sender is a group member with the correct epoch secrets. This is an inner authentication independent of SCP's outer Ed25519 envelope signature.
+**Per-message authentication.** MLS PrivateMessage format includes a membership_tag HMAC that proves the sender is a group member with the correct epoch secrets. This is an inner authentication independent of SCP's outer envelope signature.
 
 **Generation numbers.** Per-sender incrementing counter. Recipients can detect message gaps (possible suppression) and reject messages with already-seen generation numbers (exact replays).
 
 ### Properties MLS does NOT provide:
 
-**DID verification.** MLS delegates identity verification to an "Authentication Service" (AS). In SCP, the AS is DID resolution + UCAN validation. MLS trusts whatever the AS says — if the AS is wrong (compromised DID resolution), MLS can't help.
+**Identity verification.** MLS delegates identity verification to an "Authentication Service" (AS). In SCP, the AS is identity resolution and UCAN validation. MLS trusts whatever the AS says — if the AS is wrong (compromised identity resolution), MLS can't help.
 
 **Relay honesty.** MLS's "Delivery Service" (DS) is explicitly untrusted for content but can suppress messages, delay delivery, or serve different views to different members. MLS has no mechanism to detect these attacks.
 
@@ -72,19 +72,13 @@ MLS is not just "group encryption." It's a complete secure group messaging proto
 
 ---
 
-## 3. What did:dht Provides
+## 3. What Self-Certification Provides
 
-The single most important security property of did:dht: **self-certification.**
+The single most important security property of the identity layer: **self-certification.**
 
-The DID string itself is the z-base-32 encoding of the Ed25519 public key. When Alice resolves Bob's DID, she gets a DID document from the Mainline DHT. She verifies the document by:
-1. Checking that the BEP44 record is signed by the key embedded in the DID
-2. Checking the sequence number (prevents stale records)
+The session rested that property on `did:dht`, whose identifier encoded the public key. The inception-derived key-event-log identity substrate replaced that method and keeps the property: an identity's identifier is the digest of its inception event, so a verifier replays the append-only key-event log starting from the inception event that identifier names. No trusted third party. No certificate authority. No DNS.
 
-If the verification passes, Alice knows the DID document is authentic. No trusted third party. No certificate authority. No DNS. The DID IS the public key, so there's nothing for a MITM to substitute.
-
-**The question shifts from "is this the right key?" to "is this the right DID?"** — which is an out-of-band verification problem. This is where Key Continuity Verification (safety numbers) comes in.
-
-**did:web does NOT have this property.** The server resolving did:web can serve any DID document. DNS hijacking, server compromise, or CA compromise all enable MITM. This is the fundamental reason did:web is a v1 stepping stone, not the target method.
+**The question shifts from "is this the right key?" to "is this the right identifier?"** — which is an out-of-band verification problem. This is where Key Continuity Verification (safety numbers) comes in.
 
 ---
 
@@ -102,11 +96,11 @@ This structure makes it clear where each defense lives and what it depends on. I
 
 **Decision: single ciphersuite for v1.**
 
-- Ed25519 for all signatures (RFC 8032)
-- MLS ciphersuite: MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519
-- HPKE (RFC 9180) for DID-to-DID encryption: DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM
+- ECDSA on NIST P-256 with SHA-256 for all signatures (FIPS 186-5)
+- MLS ciphersuite: MLS_128_DHKEMP256_AES128GCM_SHA256_P256
+- HPKE for identity-to-identity encryption: DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-128-GCM
 - SHA-256 for Merkle trees (Certificate Transparency style, RFC 6962)
-- Envelope signature binds all fields: `SHA256(context_id || sender_did || epoch || generation || timestamp || payload_hash)`
+- Envelope signature binds all fields: `SHA256(context_id || sender_identifier || epoch || generation || timestamp || payload_hash)`
 
 **Rationale for single ciphersuite:** Ciphersuite negotiation adds complexity and attack surface (downgrade attacks). For v1, one ciphersuite means every implementation uses the same algorithms. Future versions may add negotiation.
 
@@ -114,29 +108,27 @@ This structure makes it clear where each defense lives and what it depends on. I
 
 **Key decisions:**
 
-- did:dht is self-certifying → MITM on DID resolution is impossible given the correct DID
-- did:web requires TOFU + TLS pinning + key change alerts (v1 stepping stone only)
-- Relay lists are signed (NIP-65 events signed by DID-derived Nostr key) → relay list substitution requires the identity's private key
-- Key Continuity Verification (Mechanism 1) provides Signal-style safety numbers for out-of-band DID verification
-- First-contact trust model: TOFU for did:web, self-certifying verification for did:dht
+- The identifier binds the inception event → MITM on identity resolution is impossible given the correct identifier
+- Relay lists are signed (NIP-65 events signed by the identity-derived Nostr key) → relay list substitution requires the identity's private key
+- Key Continuity Verification (Mechanism 1) provides Signal-style safety numbers for out-of-band identifier verification
 
 ### Layer 2: Group Key Management
 
 **Key decisions:**
 
 - One MLS group per SCP context (1:1 mapping)
-- MLS Authentication Service = DID resolution + UCAN validation (no separate trusted server)
+- MLS Authentication Service = identity resolution and UCAN validation (no separate trusted server)
 - MLS Delivery Service = Nostr relay(s) (explicitly untrusted)
 - SDK MUST delete old epoch keys after Commit (forward secrecy enforcement)
 - SDK MUST issue periodic MLS Updates (PCS enforcement, recommended every 24 hours)
 - KeyPackages (pre-key bundles) published to relays for offline member addition
-- DID key rotation triggers MLS Update in all active contexts
+- Identity key rotation triggers MLS Update in all active contexts
 
 ### Layer 3: Message Security
 
 **Key decisions:**
 
-- Two independent integrity checks: Ed25519 outer signature (verifiable by anyone) + MLS membership_tag HMAC (verifiable only by group members)
+- Two independent integrity checks: outer envelope signature (verifiable by anyone) + MLS membership_tag HMAC (verifiable only by group members)
 - Three-layer replay prevention: MLS generation numbers + hash-based deduplication + timestamp bounds
 - 5-minute clock skew tolerance (generous enough for real devices, tight enough to limit replay windows)
 - Per-sender SCP sequence numbers (distinct from MLS generation numbers) for suppression detection
@@ -156,7 +148,7 @@ This structure makes it clear where each defense lives and what it depends on. I
 
 **Key decisions:**
 
-- Honest documentation of what's exposed (sender DID, context ID, timestamps, sizes)
+- Honest documentation of what's exposed (sender identifier, context ID, timestamps, sizes)
 - Cross-context key isolation (separate MLS groups, independent key material)
 - Mixnet/cover traffic/PIR explicitly out of scope for v1
 - Identity key signs but never directly encrypts group content (limits side-channel impact)
@@ -167,11 +159,11 @@ This structure makes it clear where each defense lives and what it depends on. I
 
 ### Mechanism 1: Key Continuity Verification
 
-**Problem:** Even with self-certifying DIDs, how does Alice know the DID she has for Bob is really Bob's and not an attacker's?
+**Problem:** Even with self-certifying identifiers, how does Alice know the identifier she has for Bob is really Bob's and not an attacker's?
 
 **Solution:** Safety number style verification. Compute `SHA256(sort(alice_did, bob_did) || alice_pubkey || bob_pubkey)`. Display as 12-word mnemonic or 60-digit number. Compare out-of-band (in person, voice call).
 
-**Key change detection:** TOFU records key on first encounter. Any change triggers alert + invalidates previous verification. Legitimate changes (rotation, recovery) are distinguishable because the new DID document is signed by the old key (authorization chain).
+**Key change detection:** TOFU records key on first encounter. Any change triggers alert + invalidates previous verification. Legitimate changes (rotation, recovery) are distinguishable because they appear as signed events in the identity's key-event log.
 
 ### Mechanism 2: Relay Consistency Protocol
 
@@ -207,11 +199,11 @@ This structure makes it clear where each defense lives and what it depends on. I
 
 ## 6. Subtle Attacks Analyzed
 
-### Proposal MITM (relay + compromised DID resolution)
+### Proposal MITM (relay + compromised identity resolution)
 
-Attack: Relay intercepts proposal + attacker MITM's Bob's DID resolution → attacker decrypts proposal, modifies, re-encrypts to Bob.
+Attack: Relay intercepts proposal + attacker MITM's Bob's identity resolution → attacker decrypts proposal, modifies, re-encrypts to Bob.
 
-Defense: For did:dht, DID resolution MITM is impossible (self-certifying). For did:web, TLS pinning + TOFU limits the window. Key Continuity Verification eliminates the attack post-verification.
+Defense: identity resolution MITM is impossible, because the identifier binds the inception event. Key Continuity Verification eliminates the attack post-verification.
 
 ### Selective relay suppression (suppress removal events)
 
@@ -245,9 +237,9 @@ Defense: Each context is a separate MLS group with independent key material. Ide
 **Decision:** One ciphersuite. No negotiation.
 **Rationale:** Negotiation adds complexity and downgrade attack surface. All implementations use the same algorithms. Revisit in v2.
 
-### MLS Authentication Service = DID Verification
+### MLS Authentication Service = Identity Verification
 **Decision:** No separate trusted AS server. SCP's identity layer IS the AS.
-**Rationale:** Adding a centralized AS would undermine SCP's decentralized architecture. DID self-certification (did:dht) provides the trust root without any server.
+**Rationale:** Adding a centralized AS would undermine SCP's decentralized architecture. The identifier binding the inception event provides the trust root without any server.
 
 ### Relay Consistency via Checkpoints, Not Consensus
 **Decision:** Periodic Merkle root comparison, not distributed consensus (Raft/PBFT).
@@ -280,8 +272,8 @@ Defense: Each context is a separate MLS group with independent key material. Ide
 ### MLS Selection (Planning Session 04)
 This session specifies HOW MLS integrates with SCP. Planning session 04 chose MLS; this session maps MLS concepts to SCP concepts, specifies SDK requirements for forward secrecy and PCS, and defines the key lifecycle.
 
-### did:dht Selection (Planning Session 04)
-did:dht's self-certification property is the foundation of Layer 1. This session makes explicit why did:dht was chosen over did:web for the target method: self-certification eliminates the largest class of MITM attacks.
+### Identity Method Selection (Planning Session 04)
+Self-certification is the foundation of Layer 1. Session 04 chose a self-certifying method because self-certification eliminates the largest class of MITM attacks, and the inception-derived key-event-log identity substrate keeps that property.
 
 ### Nostr Transport (Planning Session 04)
 Nostr's signed events (NIP-65 relay lists) provide relay list authentication. NIP-42 relay authentication is supported but not required. The multi-relay strategy builds on Nostr's existing relay pool architecture.
@@ -296,8 +288,7 @@ Layer 2 (Group Key Management) specifies the cryptographic mechanics behind encr
 
 ## 10. What This Session Did Not Cover
 
-- **Specific DID:DHT library evaluation.** The security properties of did:dht are specified; the library choice is unresolved.
 - **MLS interoperability testing.** OpenMLS is chosen (planning session 04), but conformance testing with other MLS implementations is future work.
-- **Formal security proofs.** MLS has published formal analyses (ETK, TreeSync). SCP's composition of MLS + DID + UCAN + Merkle logs has not been formally analyzed.
-- **Quantum resistance.** The selected ciphersuite (X25519, Ed25519) is not quantum-resistant. Post-quantum migration is a future concern, likely addressable by ciphersuite upgrade.
+- **Formal security proofs.** MLS has published formal analyses (ETK, TreeSync). SCP's composition of MLS, identity, UCAN and Merkle logs has not been formally analyzed.
+- **Quantum resistance.** The selected ciphersuite (P-256) is not quantum-resistant. Post-quantum migration is a future concern, likely addressable by ciphersuite upgrade.
 - **Side-channel attacks on mobile devices.** Secure Enclave / Android Keystore provide hardware protection, but timing attacks and power analysis are device-specific concerns outside protocol scope.
