@@ -1,7 +1,5 @@
 # SCP Technical Overview
 
-**Dated preface, 2026-09-10.** This document's identity section describes the did:dht model: an identifier that is the z-base-32 encoding of a root public key, a DID document published to the BitTorrent Mainline distributed hash table as a BEP44 signed mutable item, and resolution by reading the highest-sequence record back. **ADR-063, the inception-derived self-certifying identity over a key-event log, superseded every one of those.** Under ADR-063 an identifier is the digest of an inception event, a resolver replays an append-only key-event log over the SCP relay network, and SCP runs no Mainline bootstrap layer and uses no BEP44. Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256, superseding Ed25519 and X25519. The 2026-09-10 pass carried that curve ruling through this document's cryptography, transport, and message-pipeline sections, where it holds. It also patched the curve inside the identity paragraph below, which named a model ADR-063 had already retired; that one patch is reverted and the paragraph carries a superseded marker. **Track U4 of the identity-substrate execution plan rewrites the identity section below, and that rewrite replaces it rather than patching it.** Read `.docs/specs/09-security-model.md` §9.7.4.1 through §9.7.4.3 and `.docs/adrs/ADR-063-inception-derived-identity-key-event-log.md` for the identity model that governs today.
-
 ### What it is
 
 SCP is an infrastructure protocol — not an app, not a framework, but the open infrastructure beneath applications. It solves the problem that arises when software becomes disposable and agent-generated:
@@ -12,15 +10,23 @@ It sits at a different level than MCP (Anthropic), WebMCP (Google+Microsoft), or
 
 ### The five pillars
 
-#### 1. Identity (DID-based)
+#### 1. Identity (an inception-derived key-event log)
 
-**This paragraph is superseded, and the dated preface above states by what.** Every actor has a did:dht decentralized identifier rooted in an Ed25519 keypair. The DID string encodes the public key
-directly — making it self-certifying. Resolution uses BEP44 (Mainline DHT), so no centralized registry. Users never see keys; custody is delegated to Secure Enclave, passkeys, or platform accounts.
+An actor's identifier is the digest of its own inception event, so the identifier authenticates the log rather than a registry authenticating the identifier. A verifier derives the current key state by replaying an append-only key-event log whose every event binds its predecessor's digest (`.docs/specs/09-security-model.md` §9.7.4.2). ADR-063, inception-derived self-certifying identity over a key-event log, states why.
 
-The key hierarchy is (**superseded with the paragraph above; the preface states by what**):
-- Identity key (Ed25519) — derives the DID string, highest-security custody
-- Active signing key (Ed25519, rotatable) — MLS credentials, envelope signatures, UCAN issuance
-- Pre-rotation commitment — SHA-256 of a pre-staged next key, held in cold storage for compromise recovery
+Two authorities sign:
+- **The root** — at most 16 public keys with a signing threshold, so one person runs a 1-of-1 root and an organization runs a threshold its officers jointly satisfy. It signs establishment events and nothing else, which keeps it cold (§9.7.4.2 R3, §9.18.17).
+- **The Active Signing Key** (`#active`) — the one operational key: inner envelopes, MLS credentials, UCAN issuance, the service record. An event the root signs retires it, and the identifier does not change.
+
+Every establishment event commits to the digests of the next root keys before anyone uses them, so a thief holding the current root cannot rotate the identity away. Rotating takes the **pre-rotation** private key, which lives in a substrate the daily operational path cannot reach. Where no such substrate exists, the SDK fails closed (§9.7.4.1).
+
+**The root decides a fork.** Given two valid chains for one identifier, a verifier ranks them by the root authority behind each, and arrival order decides nothing (§9.7.4.2 R6, R7).
+
+**Witnesses watch and report.** An identity designates relays to cosign its log head. A witness runs one check, then signs or refuses, and adjudicates nothing. Its cosigned heads and conflict statements are evidence of equivocation, and no validity rule reads a cosignature, so an identity is usable the moment it publishes its inception event (§9.7.4.3).
+
+**One ciphersuite, ECDSA on NIST P-256 with SHA-256**, no negotiation and no fallback (§9.5). Root custody defaults to a passkey, whose private key no code path exports, so the person manages no key material (§9.7.4.1 item 4).
+
+**Relays carry the log.** A resolver queries the identity's own relays and a fallback set from the community relay list the SDK ships, and every relay a first contact reads proves control of its declared operator identity (`.docs/specs/03-identity.md` §3.10.1, §3.10.4). Transport and service metadata live in a separately signed service record, so a relay-endpoint change appends no key event (§3.10.13). An identity publishes no DID document (`.docs/specs/18-addressability-and-deployment.md` §18.2.2A).
 
 Identity private state (block lists, graph visibility policies, petnames, preferences) is encrypted to the owner's keys and replicated across relays as an append-only event log — the same
 infrastructure as context state, but membership of one.
@@ -150,8 +156,8 @@ crates/
 
 - **Contexts, not channels.** A context is a governed, encrypted, auditable space with its own key material, Merkle log, and outlet surface. It's the security boundary, lifecycle boundary, and governance
 boundary all in one.
-- **Encryption IS access control.** No relay or server enforces membership — the math does. Relays are untrusted: clients verify everything cryptographically and never rely on a relay for access control or correctness. A relay may validate *public, self-certifying* records (e.g. DID documents) to resist suppression, but is never trusted to — and never reads encrypted content.
-- **No operator required.** If Limn disappears tomorrow, SCP works exactly as designed. DID resolution via DHT, relays are commodity storage, governance is per-context.
+- **Encryption IS access control.** No relay or server enforces membership — the math does. Relays are untrusted: clients verify everything cryptographically and never rely on a relay for access control or correctness. A relay may validate a *public, self-certifying* key-event frame, whose chain verifies against its own bytes (`.docs/specs/03-identity.md` §3.10.2), to resist suppression, but is never trusted to, and never reads encrypted content.
+- **No operator required.** If Limn disappears tomorrow, SCP works exactly as designed. Identity resolution replays a log any relay can serve, relays are commodity storage, and governance is per-context.
 - **Provenance everywhere.** Not a feature — a core protocol property. Every message, outlet output, attestation, and cross-context transfer is traceable.
 - **Human accountability.** Every agent chains back to a human DID. The protocol provides the mechanism; contexts decide the requirement.
 - **Trust decays into validation.** New identities require trust. Established identities are validated by behavioral records from Merkle-verified event logs. The system gets more secure over time.
@@ -178,16 +184,16 @@ Every SCP context is exactly one MLS group. The mapping is 1:1:
 | Group | Context | One MLS group per context |
 | Member (LeafNode) | Agent in context | One leaf per agent |
 | Epoch | Context epoch | Increments on membership change or key update |
-| LeafNode credential | DID + UCAN | MLS credential field holds the member's DID and context-scoped UCAN |
+| LeafNode credential | Identifier + UCAN | MLS credential field holds the member's identifier and context-scoped UCAN |
 | Welcome message | Context join token | HPKE-encrypted to new member's KeyPackage |
 | KeyPackage | Pre-key bundle | Published to relays, single-use, signed by identity key |
 | Proposal (Add/Remove/Update) | Governance action | Membership changes go through MLS proposals |
 | Commit | Governance commit | Finalizes proposals, advances epoch |
 | Application message | SCP envelope payload | Encrypted content |
 | Delivery Service | SCP relay(s) | Untrusted store-and-forward |
-| Authentication Service | DID resolution + UCAN validation | Fully decentralized — no AS server |
+| Authentication Service | Key-event-log replay + UCAN validation | Fully decentralized — no AS server |
 
-The MLS Authentication Service is where SCP diverges from typical deployments. Most MLS systems have a centralized AS that vouches for member identities. SCP has none. Each participant independently resolves DIDs from the DHT and validates UCAN chains.
+The MLS Authentication Service is where SCP diverges from typical deployments. Most MLS systems have a centralized AS that vouches for member identities. SCP has none. Each participant independently replays each member's key-event log and validates UCAN chains (`.docs/specs/03-identity.md` §3.10.4).
 
 **Ciphersuite — single, non-negotiable:**
 
@@ -200,7 +206,7 @@ MLS_128_DHKEMP256_AES128GCM_SHA256_P256
 - Hash: SHA-256
 - Signing: ECDSA on P-256 with SHA-256
 
-No ciphersuite negotiation in v1. No fallback. This eliminates downgrade attacks entirely. DID-to-DID encryption (Welcome messages) uses HPKE with a matching suite: `DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-128-GCM`.
+No ciphersuite negotiation in v1. No fallback. This eliminates downgrade attacks entirely. Identity-to-identity encryption (Welcome messages) uses HPKE with a matching suite: `DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-128-GCM`.
 
 #### Forward secrecy
 
@@ -229,21 +235,9 @@ The vulnerability window from a key compromise is bounded: forward secrecy prote
 #### Key lifecycle
 
 ```
-Identity Key (P-256, hardware-backed)
-├── Does not derive the identifier — the identifier is the inception event's digest (§9.7.4.2 R2)
-├── Signs DID document updates
-├── Fixes a pre-rotation commitment only inside the inception event; never re-commits alone (§9.7.4.2 R1)
-├── NEVER directly encrypts group content
-│
-Active Signing Key (P-256, rotatable)
-├── MLS LeafNode credentials
-├── Inner envelope signatures
-├── UCAN issuance
-├── Rotated via DID document update signed by Identity Key
-│
-Pre-Rotation Key (P-256, independent custody)
-├── Commitment (domain-separated SHA-256 of the public key) fixed in the inception event and in every reveal-authorized event
-├── Signs exactly one `CommitmentRollover` or `RootRecovery`, then is spent and destroyed (§9.7.4.2 R3, R5)
+Root set, Active Signing Key, Pre-Rotation Key (all P-256)
+├── The identity pillar above states each one's authority (§9.7.4.2 R1, R3, R5)
+├── None of the three ever directly encrypts group content
 │
 MLS Leaf Key (DHKEM(P-256), per-ciphersuite)
 ├── Generated by MLS library
@@ -420,7 +414,6 @@ Additional protections:
 - **Cover traffic** — one padded message per relay per 30 seconds (default on), real messages replace dummies
 - **Relay partitioning** — SDK distributes contexts across different relays to minimize overlap
 - **Persistent connections** — desktop maintains constant connections regardless of activity
-- **Local DHT node** — desktop runs a full Mainline DHT node so resolution queries are indistinguishable from routing traffic
 
 #### Relay threat model
 
@@ -438,9 +431,9 @@ Equivocation is detected by the Relay Consistency Protocol: periodic signed `Con
 
 | Scenario | Action |
 |---|---|
-| Active Signing Key compromised | `rotate_active_key` — new keypair, DID doc update signed by Identity Key. DID doesn't change. MLS Update in all contexts. |
-| Identity Key (`#0`) compromised | `RootRecovery` (`09-security-model.md` §9.7.4.2) — the pre-rotation key authorizes, a fresh root is installed, the identifier does not change. MLS Update in all contexts; key-continuity re-verification (§9.11). |
-| `#0` and `#active` compromised, pre-rotation key intact | Same as `#0` compromised — the `RootRecovery` installs fresh operational keys too |
+| Active Signing Key compromised | The root signs a `KeyState` listing a new key `current` and the old one `Superseded` (`.docs/specs/03-identity.md` §3.2.1). The identifier doesn't change. MLS Update in all contexts. |
+| Root compromised | `RootRecovery` (`09-security-model.md` §9.7.4.2) — the pre-rotation key authorizes, a fresh root is installed, the identifier does not change. MLS Update in all contexts; key-continuity re-verification (§9.11). |
+| Root and `#active` compromised, pre-rotation key intact | Same as a compromised root — the `RootRecovery` installs fresh operational keys too |
 | All keys compromised | Root cannot be recovered — the person establishes a new identity; context admins remove the old identity and admit the new one |
 
 After any recovery: UCAN revocation, KeyPackage rotation, contact notification, identity private state re-encryption. The exposure window is bounded by the PCS interval (default 24hrs, configurable to 1hr).
@@ -536,15 +529,15 @@ The agent handles everything SCP-specific: capability filtering (only exposes to
 
 Two complementary discovery channels:
 
-**DID document capabilities** — direct lookup, zero infrastructure. Every agent may publish structured capabilities in their DID document's `service` array. Anyone who knows a DID can resolve the document via Mainline DHT and inspect capabilities. Provides lookup, not search.
+**Service-record capabilities** — direct lookup, zero infrastructure. Every agent may publish self-asserted capability URIs in its service record. Anyone who knows an identifier can resolve that record from the identity's relays and inspect the capabilities (`.docs/specs/03-identity.md` §3.10.13). Provides lookup, not search.
 
 **Contexts with discovery tools** — searchable registries, SCP-native. Standard contexts with open join policies and standardized tools (`agent_search`, `agent_register`, `agent_deregister`). Anyone can create one. Two-tier membership: bounded writers (MLS members who process registrations) and unbounded readers (DID-authenticated, query via tool endpoints without joining the MLS group).
 
-Bootstrap: SDK ships with default bootstrap context IDs (analogous to browser CA lists or DNS root servers). Not privileged — starting points. If all defaults are unavailable, agents fall back to direct DID resolution and manual context ID sharing.
+Bootstrap: SDK ships with default bootstrap context IDs (analogous to browser CA lists or DNS root servers). Not privileged — starting points. If all defaults are unavailable, agents fall back to direct identity resolution and manual context ID sharing.
 
 #### Human-readable addressing
 
-Cryptographic identifiers (`did:dht:z6Mk...`) are the protocol's canonical identifiers, but humans need something speakable. The addressing layer maps human-readable strings to DIDs and context IDs through four resolution paths:
+The protocol's canonical identifier is the 32-byte digest of an inception event, and humans need something speakable. The addressing layer maps human-readable strings to identifiers and context IDs through four resolution paths:
 
 | Path | Format | Authority | Trust level |
 |---|---|---|---|
@@ -553,9 +546,9 @@ Cryptographic identifiers (`did:dht:z6Mk...`) are the protocol's canonical ident
 | **Attestation-backed handles** | `@alice_cooks` or `@alice:github` | External platform + cryptographic attestation | `AttestationVerified` |
 | **Domain handles** | `alice@example.com` | Domain operator via `.well-known/scp` | `DomainVerified` |
 
-Resolution order for unscoped queries: petnames first (local, instant), then all other paths in parallel. If multiple paths find the same DID, the result is `MultiLayerCorroborated`. If different DIDs are found, the user disambiguates once and the selection becomes a petname — resolving the collision permanently.
+Resolution order for unscoped queries: petnames first (local, instant), then all other paths in parallel. If multiple paths find the same identifier, the result is `MultiLayerCorroborated`. If different identifiers are found, the user disambiguates once and the selection becomes a petname — resolving the collision permanently.
 
-Each layer degrades independently. Remove any one and the rest continue working. Petnames always work (zero infrastructure). Discovery handles work with SCP infrastructure only. Domain handles work if DNS exists. The DID remains canonical regardless of which path resolved it.
+Each layer degrades independently. Remove any one and the rest continue working. Petnames always work (zero infrastructure). Discovery handles work with SCP infrastructure only. Domain handles work if DNS exists. The identifier remains canonical regardless of which path resolved it.
 
 ### Economic layer
 
