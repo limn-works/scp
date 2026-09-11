@@ -5861,6 +5861,35 @@ pub async fn execute_governance_action(
     // out the `ClassSMut` view held across the finalize awaits) rather than a
     // synchronous `discharge_with` closure. Keep-direction: the SINGLE persist runs
     // REGARDLESS of the finalize result; the finalize error is surfaced after.
+    discharge_and_order_governance_action(
+        token,
+        cell,
+        deps,
+        context_id,
+        proposal,
+        executor_did,
+        dispatch_outcome,
+    )
+    .await
+}
+
+/// Runs the discharge tail of `execute_governance_action`: finalize inside the
+/// RAII `begin_discharge` guard, the single fail-closed persist that runs
+/// REGARDLESS of the finalize result (keep-direction), and then the ordering of
+/// the three results. A post-effect dispatch error is returned first, then a
+/// finalize error, then a persist error. A finalize error that the dispatch
+/// error shadows is logged here because nothing else reports it;
+/// `commit_fail_closed` logs its own failure inside
+/// `persist_snapshot_fail_closed`.
+async fn discharge_and_order_governance_action(
+    token: crate::context::actor::class_s::ClassSCommitToken,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    proposal: &GovernanceProposal,
+    executor_did: Option<&DID>,
+    dispatch_outcome: Result<GovernanceActionResult, ContextError>,
+) -> Result<GovernanceActionResult, ContextError> {
     let mut discharge = token.begin_discharge(cell);
     let finalize_result = finalize_governance_action(
         discharge.view().rest_mut(),
@@ -5870,17 +5899,24 @@ pub async fn execute_governance_action(
         executor_did,
     )
     .await;
-    // Keep-direction: the fail-closed persist runs REGARDLESS of the finalize
-    // result. Error priority matches the former `discharge_with` `match`: a
-    // finalize error is surfaced BEFORE a persist error when both fail.
     let persist_result = discharge.commit_fail_closed(deps, context_id).await;
-    // Error priority: a post-effect dispatch error is the primary fact, then a
-    // finalize error, then a persist error. The persist has already run
-    // regardless of all three (keep-direction).
-    let result = dispatch_outcome?;
+    let result = match dispatch_outcome {
+        Ok(result) => result,
+        Err(dispatch_err) => {
+            if let Err(finalize_err) = &finalize_result {
+                tracing::error!(
+                    context_id,
+                    proposal_id = %hex::encode(proposal.proposal_id),
+                    error = %finalize_err,
+                    "finalize_governance_action failed after a post-effect dispatch \
+                     error; the dispatch error is returned and this one is logged only"
+                );
+            }
+            return Err(dispatch_err);
+        }
+    };
     finalize_result?;
     persist_result?;
-
     Ok(result)
 }
 
