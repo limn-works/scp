@@ -1475,7 +1475,7 @@ Tests that verify the protocol layer's typed domain methods (§17.4) correctly p
 | `nonce_pruning` | Record nonce with short expiry, advance clock, prune, verify nonce is gone |
 | `membership_roundtrip` | Store membership, load, verify role matches |
 | `sender_key_roundtrip` | Store sender key, load, verify key matches |
-| `did_cache_roundtrip` | Cache DID document, load, verify matches |
+| `key_state_cache_roundtrip` | Cache key state, load, verify matches |
 | `relay_score_list` | Store scores for 3 relays, list all, verify all returned |
 
 ### 16.13.8 MlsStorageBridge Correctness
