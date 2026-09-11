@@ -135,14 +135,14 @@ Invalid transitions (must return error):
    - Issues UCAN tokens for the joiner's role capabilities (ADR-009).
    - Appends `MemberJoined` event to event log.
 
-4. **`leave_context(handle: &ContextHandle, caller_did: &DID, member_did: &DID) -> Result<(), ContextError>`**
+4. **`leave_context(handle: &ContextHandle, caller_did: &[u8; 32], member_did: &[u8; 32]) -> Result<(), ContextError>`**
    - Authorization: self-removal (`caller_did == member_did`) is always allowed; otherwise caller must hold `MemberRemove` capability.
    - Calls ADR-001 `remove_member()` to remove from MLS group.
    - Removes member's sender key from all members' stores.
    - Appends `MemberLeft` event to event log.
    - If member count reaches zero, transitions to `Closing`.
 
-5. **`close_context(handle: &ContextHandle, initiator_did: &DID) -> Result<(), ContextError>`**
+5. **`close_context(handle: &ContextHandle, initiator_did: &[u8; 32]) -> Result<(), ContextError>`**
    - Verifies initiator has close capability (admin role or governance-permitted).
    - Transitions state to `Closing`.
    - Sends close notification to all members.
@@ -165,7 +165,7 @@ Invalid transitions (must return error):
    - Destroys MLS group state and sender keys per memory scope.
    - Appends `ContextExpired` event to event log.
 
-8. **`send_message(handle: &ContextHandle, sender_did: &DID, payload: &[u8]) -> Result<(), ContextError>`**
+8. **`send_message(handle: &ContextHandle, sender_did: &[u8; 32], payload: &[u8]) -> Result<(), ContextError>`**
    - Rejects if state is not `Active`.
    - Validates sender's UCAN for `messages:write` capability (ADR-009).
    - Assigns SCP sequence number (per-sender monotonic, spec section 9.8.5).
@@ -245,7 +245,7 @@ pub enum ContextMode {
 //   HPKE-wrapped key distribution (no MLS Welcome messages).
 // - `create_context` skips MLS group creation (step 2) and instead initializes
 //   the creator's broadcast key at epoch 0.
-// - `join_context` for subscribers registers DID-authenticated subscription
+// - `join_context` for subscribers registers identity-authenticated subscription
 //   without MLS add_member.
 // - `send_message` encrypts with the author's current broadcast key, wraps in
 //   `BroadcastEnvelope` (§5.14.5), and publishes to the public routing_id.
@@ -296,9 +296,9 @@ pub enum MemoryScope {
 
 **Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
 
-**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, overturned ADR-039's shared-identity `#agent` method, so a verifier resolves an issuer's key from that issuer's key state and not from a DID document (`09-security-model.md` §9.1 invariant 1, `03-identity.md` §3.10.4).
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, left a human identity one operational role, so a verifier resolves an issuer's key from that issuer's key state (`09-security-model.md` §9.1 invariant 1, `03-identity.md` §3.10.4).
 
-**Amendment (2026-09-10 — UCAN validation verifies an ES256 signature).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. The UCAN signature this ADR's validation step verifies is an ECDSA signature on P-256 over `base64url(header).base64url(payload)`, so the UCAN algorithm this ADR assumes is ES256 in place of EdDSA. The `kid` resolution step, the role-assignment rules, and the capability-ceiling enforcement are untouched.
+**Amendment (2026-09-10 — UCAN validation verifies an ES256 signature).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The UCAN signature this ADR's validation step verifies is an ECDSA signature on P-256 over `base64url(header).base64url(payload)`, so the UCAN algorithm this ADR assumes is ES256 in place of EdDSA. The `kid` resolution step, the role-assignment rules, and the capability-ceiling enforcement are untouched.
 
 ### Context
 
@@ -389,15 +389,15 @@ pub struct RoleDefinition {
 
    **Broadcast-specific roles.** Broadcast contexts (§5.14) add two roles that reuse existing primitives:
    - `author` — `MessagesWrite`, `MessagesRead`, `OutletQueryAll`, `OutletCallAll`. Authors are bounded. Added via `RoleAssigned` event.
-   - `subscriber` — `MessagesRead` only. In open broadcast contexts (`public-broadcast` template), `MessagesRead` is auto-granted on DID-authenticated registration, following the context reader-tier pattern (§6.2.2B [no such section]). In gated broadcast contexts (`gated-broadcast` template), `MessagesRead` requires an explicit admin-issued UCAN.
+   - `subscriber` — `MessagesRead` only. In open broadcast contexts (`public-broadcast` template), `MessagesRead` is auto-granted on identity-authenticated registration, following the context reader-tier pattern (§6.2.2B [no such section]). In gated broadcast contexts (`gated-broadcast` template), `MessagesRead` requires an explicit admin-issued UCAN.
 
    The auto-grant subscriber pattern extends the context two-tier model — it is not a new primitive.
 
-3. **`assign_role(context: &ContextHandle, member_did: &DID, role: &str, assigner_did: &DID) -> Result<Vec<UcanToken>, ContextError>`**
+3. **`assign_role(context: &ContextHandle, member_did: &[u8; 32], role: &str, assigner_did: &[u8; 32]) -> Result<Vec<UcanToken>, ContextError>`**
    - Verifies assigner has `RoleAssign` capability (via UCAN validation).
    - Validates role exists in context's role definitions.
    - Mints UCAN tokens for each capability in the role's permission set.
-   - Each token: `iss` = context creator DID, `aud` = member DID, `att` = `[{ "with": "scp:ctx:{context_id}/{capability}", "can": "invoke" }]`, `nnc` = unique nonce. The UCAN header includes `kid`, naming the operational role that signed, `"#active"`.
+   - Each token: `iss` = context creator identifier, `aud` = member identifier, `att` = `[{ "with": "scp:ctx:{context_id}/{capability}", "can": "invoke" }]`, `nnc` = unique nonce. The UCAN header includes `kid`, naming the operational role that signed, `"#active"`.
    - Distributes tokens to the member via MLS application message.
    - Revokes any previous tokens for this member (role change).
    - Appends `RoleAssigned` event to event log.
@@ -411,7 +411,7 @@ pub struct RoleDefinition {
    1. **Parse** — Decode JWT-format UCAN token; reject malformed tokens.
    2. **Signature verification** — Verify P-256 signature over `base64url(header).base64url(payload)`. If the header contains `kid`, resolve the public key from the issuer's key state under the operational role it names, `"#active"`. If `kid` is absent, default to that same role.
    3. **Chain verification** — For each proof CID in `prf`, resolve parent UCAN, verify its signature, verify parent's `aud` matches this token's `iss`. Recurse to root.
-   4. **Root issuer** — Verify root token's `iss` is the context creator's DID.
+   4. **Root issuer** — Verify root token's `iss` is the context creator's identifier.
    5. **Audience** — Verify token's `aud` matches the presenting agent's identifier. **Amended 2026-09-10:** ADR-063, inception-derived self-certifying identity over a key-event log, overturned the shared-identity key-scope self-delegation this step admitted, so `iss == aud` carries no key scope and a human delegates to its agent's own identifier (`09-security-model.md` §9.1 invariant 1).
    6. **Capability match** — Verify token's `att` includes the `required_capability`.
    7. **Attenuation** — Verify each delegation narrows or preserves capabilities (never widens).
@@ -424,7 +424,7 @@ pub struct RoleDefinition {
 
    **Phase 2 integration tests** exercise steps 1–2, 4–6, 8, 10–11 (the 8 steps that don't require delegation chain depth > 1). Phase 3 adds integration tests for steps 3, 7, 9.
 
-5. **`revoke_ucan(context: &ContextHandle, token_id: &str, revoker_did: &DID) -> Result<(), UcanError>`**
+5. **`revoke_ucan(context: &ContextHandle, token_id: &str, revoker_did: &[u8; 32]) -> Result<(), UcanError>`**
    - Verifies revoker has authority (must be the token issuer or the context creator).
    - Adds token to the context's revocation list.
    - Distributes revocation as MLS application message to all members.
@@ -477,13 +477,13 @@ pub struct RoleDefinition {
 
 ### Context
 
-Outlets are stateless functions scoped to a context (spec section 5.4). They are the protocol's answer to "bots" — outlets cannot initiate, only respond. All agency flows through accountable agents. Outlets have MCP-compatible JSON Schema interfaces (spec section 8.5), making them interoperable with existing MCP tooling. Every outlet registration includes schema, implementation hash, test vectors, and operator DID — providing verifiable integrity (spec section 7.3.3).
+Outlets are stateless functions scoped to a context (spec section 5.4). They are the protocol's answer to "bots" — outlets cannot initiate, only respond. All agency flows through accountable agents. Outlets have MCP-compatible JSON Schema interfaces (spec section 8.5), making them interoperable with existing MCP tooling. Every outlet registration includes schema, implementation hash, test vectors, and operator identifier — providing verifiable integrity (spec section 7.3.3).
 
 Cross-context outlet interfaces (spec section 6.2) allow structured interaction across context boundaries with bidirectional consent. The context governs the outlet call, not the agent. Stateful outlet sessions (spec section 6.2.1) enable multi-turn workflows via session IDs, TTLs, and per-call governance.
 
 ### Decision
 
-Implement outlet registration, invocation, and cross-context interfaces in `scp-core/context/outlets/`. Outlets are registered with full metadata (schema, hash, test vectors, operator DID), invoked through UCAN-enforced capability checks, and logged in the event log. Cross-context outlet interfaces require explicit bidirectional opt-in at the context level. Stateful sessions are tracked by the outlet's context with per-session TTLs.
+Implement outlet registration, invocation, and cross-context interfaces in `scp-core/context/outlets/`. Outlets are registered with full metadata (schema, hash, test vectors, operator identifier), invoked through UCAN-enforced capability checks, and logged in the event log. Cross-context outlet interfaces require explicit bidirectional opt-in at the context level. Stateful sessions are tracked by the outlet's context with per-session TTLs.
 
 ### Rationale
 
@@ -520,7 +520,7 @@ pub struct OutletRegistration {
     pub schema: OutletSchema,              // MCP-compatible JSON Schema
     pub implementation_hash: [u8; 32],   // SHA-256 of implementation
     pub test_vectors: Vec<TestVector>,   // Known input-output pairs
-    pub operator_did: DID,               // Accountable identity
+    pub operator_did: [u8; 32],               // Accountable identity
 }
 
 pub struct OutletSchema {
@@ -535,16 +535,16 @@ pub struct TestVector {
 }
 ```
 
-2. **`register_outlet(context: &ContextHandle, registration: OutletRegistration, registrant_did: &DID) -> Result<OutletId, OutletError>`**
+2. **`register_outlet(context: &ContextHandle, registration: OutletRegistration, registrant_did: &[u8; 32]) -> Result<OutletId, OutletError>`**
    - Validates registrant has `OutletRegister` capability via UCAN (ADR-009).
    - Validates input and output schemas are valid JSON Schema.
    - Validates implementation hash is 32 bytes.
-   - Validates operator DID is resolvable.
+   - Validates operator identifier is resolvable.
    - Stores the outlet registration in the context's outlet registry.
    - Appends `OutletRegistered` event to event log with full registration metadata.
    - Returns the outlet ID.
 
-3. **`invoke_outlet(context: &ContextHandle, outlet_id: &OutletId, input: serde_json::Value, invoker_did: &DID) -> Result<serde_json::Value, OutletError>`**
+3. **`invoke_outlet(context: &ContextHandle, outlet_id: &OutletId, input: serde_json::Value, invoker_did: &[u8; 32]) -> Result<serde_json::Value, OutletError>`**
    - Validates context state is `Active`.
    - Validates invoker has `OutletQuery(outlet_id)`/`OutletQueryAll` (Query) or `OutletCall(outlet_id)`/`OutletCallAll` (Action) capability via UCAN.
    - Validates input against the outlet's input schema.
@@ -562,7 +562,7 @@ Every outlet invocation follows a defined lifecycle with explicit states, timeou
 pub struct OutletRequest {
     pub request_id: String,          // UUID v4, unique per invocation
     pub outlet_id: OutletId,
-    pub invoker_did: DID,
+    pub invoker_did: [u8; 32],
     pub input: serde_json::Value,
     pub timeout_ms: u32,             // Caller-specified timeout (max: context ceiling, default: 30_000)
     pub session_id: Option<String>,  // For stateful sessions (§6.2.1)
@@ -613,8 +613,8 @@ pub enum OutletErrorCode {
 - `OutletRequest` and `OutletResponse` are both recorded as events in the context's event log (ADR-011).
 - The event includes: `request_id`, `outlet_id`, `invoker_did`, `status`, `execution_time_ms`, `SHA256(input)`, `SHA256(output)`. Full input/output is NOT recorded (may be large); only content hashes are stored.
 
-4. **`update_outlet(context: &ContextHandle, outlet_id: &OutletId, new_registration: OutletRegistration, updater_did: &DID) -> Result<(), OutletError>`**
-   - Validates updater is the outlet's operator DID or has admin role.
+4. **`update_outlet(context: &ContextHandle, outlet_id: &OutletId, new_registration: OutletRegistration, updater_did: &[u8; 32]) -> Result<(), OutletError>`**
+   - Validates updater is the outlet's operator identifier or has admin role.
    - Records old and new implementation hashes.
    - Updates the outlet registration.
    - Appends `OutletUpdated` event to event log (includes old hash, new hash, all changed fields).
@@ -641,7 +641,7 @@ pub struct OutletInterface {
 
    - **`expose_outlet(context: &ContextHandle, outlet_id: &OutletId, to_context: &ContextId) -> Result<OutletInterface, OutletError>`**: Initiates an outlet interface proposal from the source context. Requires admin capability.
    - **`accept_outlet_interface(context: &ContextHandle, interface: &OutletInterface) -> Result<(), OutletError>`**: Target context accepts the interface. Requires admin capability. Both `approved_by_source` and `approved_by_target` must be true before calls are permitted.
-   - **`invoke_cross_context(source_context: &ContextHandle, interface: &OutletInterface, input: serde_json::Value, invoker_did: &DID) -> Result<serde_json::Value, OutletError>`**: Invokes an outlet across context boundaries. Source context governance checks outbound. Target context governance checks inbound. Both event logs record the call with provenance.
+   - **`invoke_cross_context(source_context: &ContextHandle, interface: &OutletInterface, input: serde_json::Value, invoker_did: &[u8; 32]) -> Result<serde_json::Value, OutletError>`**: Invokes an outlet across context boundaries. Source context governance checks outbound. Target context governance checks inbound. Both event logs record the call with provenance.
    - Rate limiting enforced per interface.
 
 7. **Stateful outlet sessions (spec section 6.2.1):**
@@ -684,9 +684,9 @@ pub struct OutletSession {
 
 **Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
 
-**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, retired the DID document and left one operational role. A verifier resolves an actor's key by replaying that actor's key-event log (`03-identity.md` §3.10.4, `09-security-model.md` §9.1 invariant 1).
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, left one operational role, and a verifier resolves an actor's key by replaying that actor's key-event log (`03-identity.md` §3.10.4, `09-security-model.md` §9.1 invariant 1).
 
-**Amendment (2026-09-10 — every event and checkpoint signature is ECDSA on P-256).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. Each `signature` field on this ADR's event and checkpoint structures carries the type `P256Signature`, and the sentence separating an event signature from every other signature in the protocol names P-256. The Merkle construction, the leaf hashing, the inclusion-proof shape, and the `signing_key_id` apparatus are untouched: the ruling changed the signature algorithm and no part of the tree.
+**Amendment (2026-09-10 — every event and checkpoint signature is ECDSA on P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. Each `signature` field on this ADR's event and checkpoint structures carries the type `P256Signature`, and the sentence separating an event signature from every other signature in the protocol names P-256. The Merkle construction, the leaf hashing, the inclusion-proof shape, and the `signing_key_id` apparatus are untouched: the ruling changed the signature algorithm and no part of the tree.
 
 ### Context
 
@@ -735,7 +735,7 @@ pub struct EventLog {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub event_type: EventType,
-    pub actor_did: DID,
+    pub actor_did: [u8; 32],
     pub timestamp: u64,
     pub sequence: u64,              // Monotonic event sequence within this log
     pub payload: EventPayload,      // Type-specific data
@@ -906,9 +906,9 @@ pub enum EventType {
    carried in the leaf `EventPayload`, not inferred from `actor_did` (which, for
    admin-driven joins/removals/assignments, is the admin):
 
-   - `RoleAssigned` carries `RoleAssignedPayload { subject_did: DID, role: RoleName }`.
+   - `RoleAssigned` carries `RoleAssignedPayload { subject_did: [u8; 32], role: RoleName }`.
    - `MemberJoined` / `MemberLeft` carry a membership-change payload
-     `{ subject_did: DID, role_name: RoleName }`.
+     `{ subject_did: [u8; 32], role_name: RoleName }`.
 
    These three leaves were previously empty-payload leaves. Adding the payload
    changes their leaf preimage (`SHA-256(0x00 ‖ rmp_serde(Event))`) and therefore
@@ -919,7 +919,7 @@ pub enum EventType {
    `subject_did` from these payloads; any historical empty-payload leaf projects
    `subject_did = None`. No `EventType` variant is added or removed by this change —
    the variant count is unchanged; only the payload contents of three existing
-   variants gain a subject DID.
+   variants gain a subject identifier.
 
    > **Amendment (native↔WASM event-log unification).** `EventType` is the single
    > canonical event taxonomy across all implementations. The `scp-runtime`
@@ -1151,7 +1151,7 @@ pub struct ProofStep {
 ```rust
 pub struct ConsistencyCheckpoint {
     pub context_id: ContextId,
-    pub sender_did: DID,
+    pub sender_did: [u8; 32],
     pub event_count: u64,
     pub merkle_root: [u8; 32],
     pub epoch: Option<u64>,         // Current MLS epoch (None for Broadcast contexts)
@@ -1160,7 +1160,7 @@ pub struct ConsistencyCheckpoint {
 }
 ```
 
-   - **`generate_checkpoint(log: &EventLog, sender_did: &DID, epoch: u64, signing_key: &KeyHandle, signing_key_id: &str) -> Result<ConsistencyCheckpoint, EventLogError>`**: Creates and signs a checkpoint from the current log state. The `signing_key_id` names the operational role that signed, `"#active"`.
+   - **`generate_checkpoint(log: &EventLog, sender_did: &[u8; 32], epoch: u64, signing_key: &KeyHandle, signing_key_id: &str) -> Result<ConsistencyCheckpoint, EventLogError>`**: Creates and signs a checkpoint from the current log state. The `signing_key_id` names the operational role that signed, `"#active"`.
    - **`compare_checkpoint(local_log: &EventLog, remote_checkpoint: &ConsistencyCheckpoint) -> CheckpointComparison`**: Compares a received checkpoint against local state. Returns `Consistent`, `Divergent { first_divergent_event: Option<u64> }`, `Behind { missing_events: u64 }`, or `Ahead { extra_events: u64 }`.
    - Checkpoints are generated every 50 events or every 10 minutes, whichever comes first (spec section 9.9.3).
    - Checkpoints are sent as regular MLS application messages.
@@ -1185,7 +1185,7 @@ pub struct ConsistencyCheckpoint {
 
 **Status:** Decided
 
-**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, moved transport metadata out of the retired DID document into a separately signed service record (`03-identity.md` §3.10.13).
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, moved transport metadata into a separately signed service record (`03-identity.md` §3.10.13).
 
 ### Context
 
@@ -1334,7 +1334,7 @@ This test proves: context lifecycle works, roles enforce, outlets invoke, event 
 
 **Status:** Decided
 
-**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, retired the DID document, the Mainline distributed hash table, and the BEP44 signature that authenticated a record. Every `SCPRelay` entry below is an entry of the identity's service record, which its designated operational key signs and which carries its own monotonic sequence (`03-identity.md` §3.10.13). `18-addressability-and-deployment.md` §18.2.1 defines the entry type, §18.2.2A records that an identity publishes no DID document, and §18.5.1 states the bootstrap order.
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, moved every `SCPRelay` entry below into the identity's service record, which its designated operational key signs and which carries its own monotonic sequence (`03-identity.md` §3.10.13). `18-addressability-and-deployment.md` §18.2.1 defines the entry type and §18.5.1 states the bootstrap order.
 
 ### Context
 
@@ -1424,7 +1424,7 @@ Implement a complete addressability and deployment layer as specified in §18:
 
 **Status:** Decided
 
-**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, retired the DID document, and `03-identity.md` §3.10.13 defines the service record this endpoint returns instead.
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, replaced the record this endpoint returns, and `03-identity.md` §3.10.13 defines the service record it returns instead.
 
 ### Context
 
@@ -1462,7 +1462,7 @@ Implement two `ApplicationNode` features in the `scp-node` crate:
 ### Rationale
 
 - **Separate port for dev API:** A reverse proxy forwarding `*` to the public HTTPS port is a common deployment pattern. If the dev API shared the public port, every such proxy would expose it. Separate port requires explicit, intentional proxy configuration. The trade-off (two listeners) is negligible.
-- **Projection auth follows context admission mode:** §5.14 defines broadcast contexts with two admission models — open (keys distributed on DID registration) and gated (keys require `messagesRead` UCAN). Projection endpoints enforce the same access model: open contexts serve publicly; gated contexts require a valid `messagesRead` UCAN in the `Authorization: Bearer` header. Per-author `ProjectionPolicy` overrides (§18.11.2.1) provide granularity within the bounds set by the admission mode — a gated context cannot have public per-author overrides (the admission mode is the floor). Gated projection responses use `Cache-Control: private` to prevent CDN caching of authenticated content.
+- **Projection auth follows context admission mode:** §5.14 defines broadcast contexts with two admission models — open (keys distributed on identity registration) and gated (keys require `messagesRead` UCAN). Projection endpoints enforce the same access model: open contexts serve publicly; gated contexts require a valid `messagesRead` UCAN in the `Authorization: Bearer` header. Per-author `ProjectionPolicy` overrides (§18.11.2.1) provide granularity within the bounds set by the admission mode — a gated context cannot have public per-author overrides (the admission mode is the floor). Gated projection responses use `Cache-Control: private` to prevent CDN caching of authenticated content.
 - **Author-side only:** Subscriber-side projection would let any subscriber redistribute content via HTTP without the author's control or knowledge. Author-side projection means the author explicitly opts in.
 - **`routing_id` in URLs is not new disclosure:** `routing_id = SHA-256(context_id)` is already visible to every relay handling the broadcast context (§5.14.6). Using it in HTTP URLs reveals nothing beyond what relays already observe.
 - **`Arc<dyn BlobStorage>` sharing over IPC:** A separate `scp-broadcast-proxy` process would require IPC (Unix socket, shared memory) to access blobs. The keys and blobs are already in-process in the `ApplicationNode`. `Arc` sharing is zero-copy, zero-overhead.
@@ -1851,7 +1851,7 @@ Key design choices:
 
 **Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
 
-**Amendment (2026-09-10 — `BRIDGE_REGISTER` authentication is an ECDSA signature on P-256).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. The `BRIDGE_REGISTER` authentication this ADR's `BridgeRole` enum gates is an ECDSA signature on P-256. The unified construction pattern itself names no algorithm, so the ruling reaches one sentence of this ADR and no decision in it.
+**Amendment (2026-09-10 — `BRIDGE_REGISTER` authentication is an ECDSA signature on P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The `BRIDGE_REGISTER` authentication this ADR's `BridgeRole` enum gates is an ECDSA signature on P-256. The unified construction pattern itself names no algorithm, so the ruling reaches one sentence of this ADR and no decision in it.
 
 ### Context
 
@@ -1895,7 +1895,7 @@ The two guarantees the typestate markers previously enforced collapse into **req
 ### Rejected Alternatives
 
 1. **Keep the typestate builder kernel (status quo).** Rejected. The typestate markers are the precise mechanism that produces compile-retry loops for an LLM author and the shape that does not translate to four of five languages. "Compile-time safety" is real but is fully recovered by required enum fields, which are also legible. Retaining the builder would entrench the worst case against the Agent-first tenet.
-2. **Box the injected providers as `dyn` (e.g. `Arc<dyn Storage>`) to flatten the generics away.** Impossible, not merely undesirable: `KeyCustody`, `Storage`, and `DidMethod` use return-position `impl Trait` in trait (RPITIT) and are **not object-safe** — `Arc<dyn Storage>` does not compile, and the codebase already works around this in several places. Boxing would also put `async-trait` allocation on storage-read and sign hot paths, regressing the ADR-049 lock-free-read invariant. Providers therefore stay **typed enum-selectors / concrete types**, never `dyn`. The config object carries the generics on its selectors; they are not erased.
+2. **Box the injected providers as `dyn` (e.g. `Arc<dyn Storage>`) to flatten the generics away.** Impossible, not merely undesirable: `KeyCustody`, `Storage`, and `IdentityBackend` use return-position `impl Trait` in trait (RPITIT) and are **not object-safe** — `Arc<dyn Storage>` does not compile, and the codebase already works around this in several places. Boxing would also put `async-trait` allocation on storage-read and sign hot paths, regressing the ADR-049 lock-free-read invariant. Providers therefore stay **typed enum-selectors / concrete types**, never `dyn`. The config object carries the generics on its selectors; they are not erased.
 3. **Demote the `EncryptedStorage` seal to a runtime check** so production and testing share one unconditional `start(config)`. Rejected — this weakens the compile-time encryption-at-rest guarantee (`EncryptedStorage` is a sealed trait; production `Node::start` requires `S: EncryptedStorage`, the `start_for_testing` path is feature-gated). Production must not be able to persist plaintext, and that must hold at compile time, not by convention. The guarantee is preserved as the `start`/`start_for_testing` trait-bound split — the one allowed exception to M5 — and additionally backed by a structural test that the unencrypted path is unreachable from the production constructor.
 
 ### Acceptance Criteria
@@ -1903,7 +1903,7 @@ The two guarantees the typestate markers previously enforced collapse into **req
 1. **`.docs/standards/construction.md`** exists, frames itself as the enactment of the Agent-first API design tenet, and specifies rules M1–M5, the per-entry-point target shapes, and the five-language equivalence table.
 2. **CLAUDE.md** carries the **Agent-first API design** builder tenet, and the "APIs: self-evident, one happy path" architecture rule references it.
 3. **`NodeConfig`** replaces `ApplicationNodeBuilder`: required fields `reach: Reach`, `identity: IdentitySource`, and a required storage slot (no whole-struct `Default`); enum fields `tls`, `dht`; defaulted optionals for the remainder. The Rust-core `NodeConfig` stays generic over the storage type `S` (the `<K, D, S>` generics survive, carried by the config and its selectors) and carries the injected provider as a typed core slot — it does **not** carry the FFI `StorageConfig` enum (scp-core does not depend on scp-ffi). Each FFI bridge mirrors `NodeConfig` as its own per-bridge config, lowering the storage slot to that bridge's `StorageConfig` enum. Entry: `Node::start(NodeConfig)` (production, `where S: EncryptedStorage`) and `Node::start_for_testing(NodeConfig)` (feature-gated, any `Storage`). The `Dom`/`Id` typestate markers are deleted.
-4. **`RelayConfig`** replaces `supports_bridge: bool` with a `BridgeRole` enum (`Default = Disabled`, the fail-safe). `BridgeRole::Enabled` is **payload-free**: brokering authenticates each `BRIDGE_REGISTER` by an P-256 signature over the DID-to-routing-ID mapping (SCP-247, §10.12.4), so enabling the broker role needs no shared secret. The relay's `bridge_secret: Option<[u8;32]>` is a **separate, orthogonal** field — the internal-relay WebSocket connection-admission secret (`Authorization: Bearer`), set independently of the broker role (a Node sets `bridge_secret` on a relay that brokers nothing) — and is therefore **not** folded into `BridgeRole` and not part of the construction-pattern surface. `RelayConfig` may keep its whole-struct `Default` under M4 precisely because `BridgeRole::default() == Disabled` makes its sole security-consequential field fail-safe. Entry: `Relay::start(RelayConfig, storage)` (the SDK-facing entry, which wraps the internal low-level `RelayServer::new(config, storage)` — `RelayServer::new` is not the public pattern surface; see the entry-verb rule in construction.md).
+4. **`RelayConfig`** replaces `supports_bridge: bool` with a `BridgeRole` enum (`Default = Disabled`, the fail-safe). `BridgeRole::Enabled` is **payload-free**: brokering authenticates each `BRIDGE_REGISTER` by a P-256 signature over the identifier-to-routing-id mapping (SCP-247, §10.12.4), so enabling the broker role needs no shared secret. The relay's `bridge_secret: Option<[u8;32]>` is a **separate, orthogonal** field — the internal-relay WebSocket connection-admission secret (`Authorization: Bearer`), set independently of the broker role (a Node sets `bridge_secret` on a relay that brokers nothing) — and is therefore **not** folded into `BridgeRole` and not part of the construction-pattern surface. `RelayConfig` may keep its whole-struct `Default` under M4 precisely because `BridgeRole::default() == Disabled` makes its sole security-consequential field fail-safe. Entry: `Relay::start(RelayConfig, storage)` (the SDK-facing entry, which wraps the internal low-level `RelayServer::new(config, storage)` — `RelayServer::new` is not the public pattern surface; see the entry-verb rule in construction.md).
 5. **`HostSiteConfig`** folds `HostSiteOptions`: `reach: Reach` (required), `tls: TlsMode` (the same enum as `NodeConfig.tls`; folds the `plaintext` bool), `dht: DhtMode`, plus deployment fields. The host config takes the name `HostSiteConfig`, **not** the bare `SiteConfig`, because `crates/scp-node/src/projection.rs` already exports an FFI-surfaced `SiteConfig` (virtual-host deploy limits) that the three bridges and the SDK capability matrix track — renaming it is an out-of-scope bridge-parity hazard, so the construction host config takes the distinct name (a compiler-level constraint, the one legitimate naming deviation). `host_site` (today `host_site(opts: HostSiteOptions)`) remains the fail-safe sugar tier, constructing a full `HostSiteConfig` and delegating. `Reach` is a new enum (built in P1) that folds the existing `PublicSurface`, `ReachabilityTier`, and `skip_nat`/`no_domain` machinery in `crates/scp-node/src`; `DhtMode` (currently in `crates/scp-node/src/self_host.rs`) is promoted to a shared location so Node and Site share one definition.
 6. **`ContextConfig { creation: ContextCreation }`** with `<manager>.create(ContextConfig)` replaces the Rust `create_context().template().build()` builder, where `ContextCreation = Template { template, peer } | Explicit { ceiling, roles, governance, memory_scope }`. This eliminates the `sdk-common.md` Rust/options-object divergence — all five languages now use the same options-object shape. **Receiver:** the verb is `create`, but unlike `Identity::create` (a manager-free top-level constructor) a context is created **within an existing manager runtime** — the Rust-core `Supervisor` (which absorbed the former `ContextManager`, ADR-049) that owns the MLS group creation, actor spawn, and event-log init a context create performs, and that the FFI bridges already drive via `create_context`. The entry is therefore the verb-`create` method on the live manager (`<manager>.create(ContextConfig)`), surfaced by the language SDKs as a method on their SDK handle (`sdk.create_context` / `sdk.createContext`); see the Context receiver carve-out in construction.md. **Bilateral peer:** `Template`'s optional `peer` is for the invitation step; invitation/Welcome-delivery is a higher SDK layer, so until it is wired the core `create` entry rejects a supplied `peer` with a loud typed `ContextCreationError::BilateralPeerNotSupported` rather than silently dropping it (CLAUDE.md "no silent" tenet). `peer: None` is the supported form at this layer.
 7. **`IdentityConfig { method, custody, persistence }`** with `Identity::create(IdentityConfig)`; `method` and `custody` required. `persistence: None` is the fail-safe default (ephemeral identity, no key material at rest); when `Some(StorageSlot)`, the production `Identity::create` path binds the slot to `EncryptedStorage` exactly as `Node::start` does — identity key material persists only to an encrypted slot, including via `StorageSlot::Custom` (the `Custom(concrete)` it carries must be an `EncryptedStorage` type). A Node's persisted identity is the same model sourced differently: it reuses the Node's own `NodeConfig.storage` slot rather than a separate identity slot.
@@ -1929,12 +1929,12 @@ The two guarantees the typestate markers previously enforced collapse into **req
 
 A `scp-node` (`crates/scp-node`) is pure infrastructure: a relay (store-and-forward of opaque encrypted blobs, §10.4), an identity service (identity resolution and key-event-log publication), and an HTTP projection surface (§10.12.11). The specs already imply that a node never *participates* in a context as itself:
 
-- **§10.2 (Device-as-Node):** the device *is* a node, but the protocol's guarantee is "no server *owns* you" — identity and context state live with the DID, not the node.
+- **§10.2 (Device-as-Node):** the device *is* a node, but the protocol's guarantee is "no server *owns* you" — identity and context state live with the identity, not the node.
 - **§10.4 (Relay Architecture):** relays are protocol-unaware — they "store and forward encrypted blobs," and "cannot read content, inspect membership, or understand context semantics."
 - **§10.5 (SDK Transport Architecture):** "The SCP SDK owns all protocol logic — contexts, agents, trust, capabilities, governance." Transport (the node's job) "is not the product."
 - **§10.12.6 (Transport Security):** the relay authenticates nothing at the transport level; MLS is the confidentiality boundary; the relay is a dumb pipe by construction.
 
-All *participation* — joining a context, creating an MLS group, publishing `BroadcastContent`, signing governance votes — is performed by an **SDK participant client** (a `Supervisor`/`ContextManager`, ADR-049) **bound to a DID**, which brings its own custody and runs the full protocol pipeline. There is exactly **one participant engine** in the codebase (the `Supervisor`); a node is never a second, special kind of participant.
+All *participation* — joining a context, creating an MLS group, publishing `BroadcastContent`, signing governance votes — is performed by an **SDK participant client** (a `Supervisor`/`ContextManager`, ADR-049) **bound to an identity**, which brings its own custody and runs the full protocol pipeline. There is exactly **one participant engine** in the codebase (the `Supervisor`); a node is never a second, special kind of participant.
 
 "Self-host website publishing" (the SHB PRD) reads at first glance like "the node participates." It is not. It is a **co-located SDK participant client running inside the node process**, sharing the node's custody, publishing the site as `BroadcastContent` over the node's own loopback relay (§10.12.11, ADR-042). The participant and the node are distinct roles that happen to share a process.
 
@@ -1942,9 +1942,9 @@ The current implementation **violates** this boundary. `crates/scp-node/src/self
 
 ### Decision
 
-**A node is pure infrastructure and NEVER participates in a context as itself.** A node is: a relay (§10.4), an identity service, and an HTTP projection surface (§10.12.11). It holds custody and resolves DIDs, but it does not join contexts, create MLS groups, or sign protocol messages in its own right.
+**A node is pure infrastructure and NEVER participates in a context as itself.** A node is: a relay (§10.4), an identity service, and an HTTP projection surface (§10.12.11). It holds custody and resolves identifiers, but it does not join contexts, create MLS groups, or sign protocol messages in its own right.
 
-**All participation is performed by an SDK participant client (a `Supervisor`/`ContextManager`) bound to a DID.** There is one participant engine. A participant brings custody, a DID, and the full protocol pipeline — including the **real, log-derived `KeyResolver`** that extracts a voter's signing key from their resolved key state, keyed by the requested `SigningKeyId` (`03-identity.md` §3.10.4). A participant constructed with a `|_, _| None` resolver is incomplete by the completeness baseline (CLAUDE.md) and is forbidden.
+**All participation is performed by an SDK participant client (a `Supervisor`/`ContextManager`) bound to an identity.** There is one participant engine. A participant brings custody, an identity, and the full protocol pipeline — including the **real, log-derived `KeyResolver`** that extracts a voter's signing key from their resolved key state, keyed by the requested `SigningKeyId` (`03-identity.md` §3.10.4). A participant constructed with a `|_, _| None` resolver is incomplete by the completeness baseline (CLAUDE.md) and is forbidden.
 
 There are **two deployment shapes** for a participant relative to a node:
 
@@ -1963,7 +1963,7 @@ The relay's `/scp/v1` route is served on the node's existing TLS-terminated **Fu
 
 ### Rejected Alternatives
 
-1. **Node-as-participant special mode (rejected).** Let the node itself join contexts and publish, with a node-specific participant path that may run with a reduced resolver (the de-facto status quo at `self_host.rs`). **Rejected:** it creates a *second* participant engine alongside the `Supervisor`, violating "one canonical pattern" (Agent-first API design) and "Simple over complex." Worse, the node-specific path is where the `|_, _| None` resolver hid — a node "participating" with vote-verification disabled is exactly the resolver gap this ADR closes. A node has no DID-bound participant identity of its own; making it pretend to be one blurs §10.4's "protocol-unaware relay" guarantee. Participation must always be a real `Supervisor` bound to a DID with the real resolver, whether co-located or external.
+1. **Node-as-participant special mode (rejected).** Let the node itself join contexts and publish, with a node-specific participant path that may run with a reduced resolver (the de-facto status quo at `self_host.rs`). **Rejected:** it creates a *second* participant engine alongside the `Supervisor`, violating "one canonical pattern" (Agent-first API design) and "Simple over complex." Worse, the node-specific path is where the `|_, _| None` resolver hid — a node "participating" with vote-verification disabled is exactly the resolver gap this ADR closes. A node holds no participant identity of its own; making it pretend to be one blurs §10.4's "protocol-unaware relay" guarantee. Participation must always be a real `Supervisor` bound to an identity with the real resolver, whether co-located or external.
 2. **Share an `Arc<dyn BlobStore>` directly between the co-located participant and the node (rejected).** Skip the loopback relay; hand the participant the node's blob backend in-process. **Rejected:** it makes the BUNDLED shape structurally different from the EXTERNAL shape (which must go over a socket), so the bundled binary would not exercise the real publish→relay→`commit_deploy` path. SHB-002 deliberately communicates via the loopback relay, "NOT a directly-shared `Arc` blob backend," so the same code path is proven end to end.
 3. **Keep the stubbed `KeyResolver` as a documented node limitation (rejected).** Accept `|_, _| None` because the cycle is inconvenient. **Rejected:** violates the completeness baseline ("never `None` when data exists elsewhere in the system"; CLAUDE.md). The real value exists; the only obstacle is crate layering. That is fixed by **hoisting the pure document-VM key extraction** (`verifying_key_from_document(document, kid)`) into a lower-layer crate (`scp-identity`, which already owns `DualLayerResolver` and every extraction primitive) and having both the FFI bridges and `scp-node` consume that one shared, tested helper — not by accepting a degraded participant, and not by duplicating the extraction inline in `scp-node` (a second copy is exactly the "resolver silently ignores the `SigningKeyId`" failure mode).
 4. **A relay admission token (rejected).** Add an optional relay-issued "admission token" on the external client connection to gate who may connect — whether as the access-control boundary or merely as abuse prevention. **Rejected on both counts.** As an access-control boundary it would re-introduce transport-level access control over a relay the protocol mandates be a dumb pipe (§10.4), duplicating — in weaker, relay-trusting form — the access control MLS/UCAN already enforce cryptographically (encryption-as-access-control). As mere abuse prevention it is redundant with the relay's existing rate limiting (§10.4) and economics (§19.8), and an allowlist of pre-shared secrets is fundamentally at odds with the anonymous, DHT-auto-discovered relay model (§10.4) — participants do not hand-pick relays or arrange secrets with them. External reachability is therefore governed solely by the existing public-surface, bind-address, and TLS controls; no relay-issued credential is introduced.
