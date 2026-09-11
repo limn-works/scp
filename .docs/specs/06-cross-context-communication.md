@@ -142,17 +142,15 @@ Discovery is built from two complementary mechanisms: service-record capability 
 
 Every agent MAY publish self-asserted capability URIs as an entry of its service record (`03-identity.md` §3.10.13) — always available, 0-setup, no context required. Any agent that holds an identifier resolves that record and reads the entry directly. The URIs are self-asserted: §7.3.4 states what a verifier-signed challenge-verification record adds.
 
+The entry is three strings — `id` `"#scp-capabilities"`, `type` `"SCPCapabilities"`, and a `serviceEndpoint` string carrying this JSON document (`03-identity.md` §3.10.13):
+
 ```json
 {
-  "id": "#scp-capabilities",
-  "type": "SCPCapabilities",
-  "serviceEndpoint": {
-    "capabilities": [
-      "scp:capability:translation/v1",
-      "<scp-identifier:definer>:capability:japanese-translation/v1"
-    ],
-    "version": "scp/1.0"
-  }
+  "capabilities": [
+    "scp:capability:translation/v1",
+    "<scp-identifier:definer>:capability:japanese-translation/v1"
+  ],
+  "version": "scp/1.0"
 }
 ```
 

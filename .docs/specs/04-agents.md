@@ -38,36 +38,32 @@ Contexts can require specific capability levels for admission. "This context req
 
 ### 4.4.1 Agent Capability Metadata Schema
 
-The capability metadata profile an identity publishes among the self-asserted capability URIs of its service record (`03-identity.md` §3.10.13, §18.2.2) uses the following structured format:
+An identity publishes its capability metadata profile among the self-asserted capability URIs of its service record (`03-identity.md` §3.10.13, §18.2.2). A service-record entry is three strings — `id`, `type`, and `serviceEndpoint` — so the entry is `id` `"#scp-capabilities"`, `type` `"SCPCapabilities"`, and a `serviceEndpoint` string carrying the JSON document below, the way a custody attestation travels in its own entry (`27-attestations.md` §27.4.4).
 
 ```json
 {
-  "id": "#scp-capabilities",
-  "type": "SCPCapabilities",
-  "serviceEndpoint": {
-    "scp_version": "1.0",
-    "self_attested": [
-      "scp:capability:schema-validation/v1",
-      "scp:capability:multilingual/v1"
-    ],
-    "challenge_verified": [
-      {
-        "capability": "scp:capability:prompt-injection-resistance/v1",
-        "verifier_did": "<scp-identifier:verifier>",
-        "verified_at": 1700000000,
-        "expires_at": 1702592000,
-        "verification_id": "cv-abc123"
-      }
-    ],
-    "custom": [
-      {
-        "capability": "<scp-identifier:definer>:capability:cooking-expertise/v1",
-        "level": "challenge_verified",
-        "verifier_did": "<scp-identifier:chef>",
-        "verified_at": 1700000000
-      }
-    ]
-  }
+  "scp_version": "1.0",
+  "self_attested": [
+    "scp:capability:schema-validation/v1",
+    "scp:capability:multilingual/v1"
+  ],
+  "challenge_verified": [
+    {
+      "capability": "scp:capability:prompt-injection-resistance/v1",
+      "verifier_did": "<scp-identifier:verifier>",
+      "verified_at": 1700000000,
+      "expires_at": 1702592000,
+      "verification_id": "cv-abc123"
+    }
+  ],
+  "custom": [
+    {
+      "capability": "<scp-identifier:definer>:capability:cooking-expertise/v1",
+      "level": "challenge_verified",
+      "verifier_did": "<scp-identifier:chef>",
+      "verified_at": 1700000000
+    }
+  ]
 }
 ```
 
