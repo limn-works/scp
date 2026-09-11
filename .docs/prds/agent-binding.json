@@ -84,11 +84,11 @@
       "files": [
         ".docs/adrs/phase-1.md"
       ],
-      "description": "Write ADR-039 in .docs/adrs/phase-1.md defining the shared-DID human-agent identity model. Decision: human and agent share one DID with #0 (identity key), #active (human signing key), #agent (agent signing key) verification methods. Rationale: mechanical enforcement of one-agent-per-context (verifiers reject DID documents with multiple #agent VMs), structural accountability (agent actions trace to human DID without UCAN chain resolution), protocol-native action provenance. Rejected alternative: separate DIDs linked by UCAN delegation — zero mechanical enforcement, agent identity structurally independent, human-agent unlinkability contradicts §9.1 invariant 1 and §4.5. Includes permission model (Categories A/B/C), enforcement stack (5 layers), and impacts on MLS, UCAN, inner envelope, key continuity, governance, and compromise recovery.",
+      "description": "Write ADR-039 in .docs/adrs/phase-1.md defining the shared-DID human-agent identity model. Decision: human and agent share one DID with #0 (identity key), #active (human signing key), #agent (agent signing key) verification methods. Rationale: mechanical enforcement of one-agent-per-context (verifiers reject a second #agent VM), structural accountability (agent actions trace to human DID without UCAN chain resolution), protocol-native action provenance. Rejected alternative: separate DIDs linked by UCAN delegation — zero mechanical enforcement, agent identity structurally independent, human-agent unlinkability contradicts §9.1 invariant 1 and §4.5. Includes permission model (Categories A/B/C), enforcement stack (5 layers), and impacts on MLS, UCAN, inner envelope, key continuity, governance, and compromise recovery.",
       "acceptanceCriteria": [
         "ADR-039 exists in .docs/adrs/phase-1.md with Status: Accepted",
         "ADR-039 Extends: ADR-003 (DID Creation)",
-        "Decision section defines three verification methods: #0 (Identity Key, Ed25519, hardware-backed), #active (Human Signing Key, Ed25519), #agent (Agent Signing Key, Ed25519, optional, rotatable)",
+        "Decision section defines three verification methods: #0 (Identity Key, hardware-backed), #active (Human Signing Key), #agent (Agent Signing Key, optional, rotatable)",
         "Permission Model section defines Category A (#0 only: DID doc mods), Category B (user-configurable operational actions), Category C (context-configurable restrictions)",
         "Enforcement Stack section defines 5 layers: custody separation, SDK defaults, verifier validation, custody attestation, behavioral signals",
         "MLS Impact section adds signing_key_id to ScpCredential",
@@ -143,22 +143,22 @@
       "files": [
         ".docs/specs/03-identity.md"
       ],
-      "description": "Update §3 (Identity) to integrate the shared-DID model from ADR-039. §3.1 (Root of Identity) must document that a DID has three verification methods: #0 (identity), #active (human signing), #agent (agent signing, optional). §3.2 (Key Custody) must document custody separation between hardware-backed #active and software-based #agent. §3.9 (Key Lifecycle) must document agent key generation, rotation via #0, and removal. Add new subsection for agent key management operations: add_agent_key(), remove_agent_key(), rotate_agent_key(). Document the structural constraint: exactly one #agent VM per DID document; verifiers reject documents with multiple #agent VMs.",
+      "description": "Update §3 (Identity) to integrate the shared-DID model from ADR-039. §3.1 (Root of Identity) must document that a DID has three verification methods: #0 (identity), #active (human signing), #agent (agent signing, optional). §3.2 (Key Custody) must document custody separation between hardware-backed #active and software-based #agent. §3.9 (Key Lifecycle) must document agent key generation, rotation via #0, and removal. Add new subsection for agent key management operations: add_agent_key(), remove_agent_key(), rotate_agent_key(). Document the structural constraint: exactly one #agent VM per key state; verifiers reject a second #agent VM.",
       "acceptanceCriteria": [
         "§3.1 documents three verification methods: #0 (Identity Key), #active (Human Signing Key), #agent (Agent Signing Key, optional)",
         "§3.2 documents custody separation: #active in hardware (SE/AKS), #agent in software keychain",
         "§3.9 documents agent key lifecycle: generation at identity creation or later, rotation signed by #0, removal signed by #0",
         "New subsection documents add_agent_key(), remove_agent_key(), rotate_agent_key() operations",
-        "Structural constraint documented: exactly one #agent VM per DID document, verifiers reject multiple",
+        "Structural constraint documented: exactly one #agent VM per key state, verifiers reject multiple",
         "#agent is explicitly optional — not every DID needs an agent",
-        "Trust chain documented: #0 authorizes #active and #agent via DID document publication"
+        "Trust chain documented: #0 authorizes #active and #agent via key state publication"
       ],
       "actionItems": [
         "Update §3.1 to add #agent as third verification method",
         "Update §3.2 to document custody separation for agent keys",
         "Update §3.9 to document agent key lifecycle (generation, rotation, removal)",
         "Add subsection for agent key management operations",
-        "Document structural constraint (one #agent per DID document)"
+        "Document structural constraint (one #agent per key state)"
       ],
       "blockedBy": [
         "SCP-AB-001"
@@ -193,10 +193,10 @@
       "files": [
         ".docs/specs/04-agents.md"
       ],
-      "description": "Update §4 (Agents) to reflect the shared-DID model from ADR-039. §4.2 (Binding) must state that agents are bound to their human's DID via #agent verification method — not via separate DID with UCAN delegation. §4.3 (One Agent Per Person Per Context) must state that this is now mechanically enforced: exactly one #agent VM per DID document, verifiers reject documents with multiple. §4.5 (The Human-Agent Pair) must state that the pair shares one DID — agent actions are structurally traceable to the human without UCAN chain resolution. §4.7 (Context-Bound at Protocol Level) must document Category C context-configurable restrictions: agent_keys_allowed, agent-specific roles, agent_rate_limit, agent_cosign_required. §4.8 (Agent Fleet) must document how fleet operation works under shared-DID: one agent per DID, but a human can have multiple DIDs for fleet scenarios (with full Sybil cost per identity).",
+      "description": "Update §4 (Agents) to reflect the shared-DID model from ADR-039. §4.2 (Binding) must state that agents are bound to their human's DID via #agent verification method — not via separate DID with UCAN delegation. §4.3 (One Agent Per Person Per Context) must state that this is now mechanically enforced: exactly one #agent VM per key state, verifiers reject documents with multiple. §4.5 (The Human-Agent Pair) must state that the pair shares one DID — agent actions are structurally traceable to the human without UCAN chain resolution. §4.7 (Context-Bound at Protocol Level) must document Category C context-configurable restrictions: agent_keys_allowed, agent-specific roles, agent_rate_limit, agent_cosign_required. §4.8 (Agent Fleet) must document how fleet operation works under shared-DID: one agent per DID, but a human can have multiple DIDs for fleet scenarios (with full Sybil cost per identity).",
       "acceptanceCriteria": [
         "§4.2 states binding is via #agent verification method on the human's DID",
-        "§4.3 states one-agent-per-context is mechanically enforced by DID document structure (one #agent VM max)",
+        "§4.3 states one-agent-per-context is mechanically enforced by key state structure (one #agent VM max)",
         "§4.5 states human-agent pair shares one DID, agent accountability is structural not inferential",
         "§4.7 documents Category C context restrictions: agent_keys_allowed, agent-specific roles, agent_rate_limit, agent_cosign_required",
         "§4.8 documents fleet operation under shared-DID model: one agent per DID, multiple DIDs for fleet (full Sybil cost each)",
@@ -251,12 +251,12 @@
       "files": [
         ".docs/specs/09-security-model.md"
       ],
-      "description": "Update §9.7.4 (Key Lifecycle) and §9.12 (Compromise Recovery) to integrate agent key management per ADR-039. §9.7.4 must document the three-key model: #0 identity key (hardware, never rotates), #active human signing key (rotatable via Layer 1), #agent agent signing key (rotatable via Layer 1, optional). Document agent key generation at identity creation or later via add_agent_key(). Document rotation: human uses #0 to publish new DID document with updated #agent. Document compromise recovery: remove/replace #agent, revoke scoped UCANs, MLS credential updates, new KeyPackages. §9.12 must add an agent key compromise section with the 4-step recovery procedure.",
+      "description": "Update §9.7.4 (Key Lifecycle) and §9.12 (Compromise Recovery) to integrate agent key management per ADR-039. §9.7.4 must document the three-key model: #0 identity key (hardware, never rotates), #active human signing key (rotatable via Layer 1), #agent agent signing key (rotatable via Layer 1, optional). Document agent key generation at identity creation or later via add_agent_key(). Document rotation: human uses #0 to publish new key state with updated #agent. Document compromise recovery: remove/replace #agent, revoke scoped UCANs, MLS credential updates, new KeyPackages. §9.12 must add an agent key compromise section with the 4-step recovery procedure.",
       "acceptanceCriteria": [
         "§9.7.4 documents three verification methods: #0, #active, #agent with properties (holder, backing, rotatable, signs what)",
         "§9.7.4 documents agent key generation: optional at identity creation or later via add_agent_key()",
-        "§9.7.4 documents agent key rotation: signed by #0 via DID document update",
-        "§9.7.4 documents agent key removal: signed by #0 via DID document update",
+        "§9.7.4 documents agent key rotation: signed by #0 via key state update",
+        "§9.7.4 documents agent key removal: signed by #0 via key state update",
         "§9.12 includes agent key compromise recovery: (1) #0 publishes new DID doc removing/replacing #agent, (2) revoke UCANs with scp_key_scope #agent, (3) MLS credential updates, (4) new KeyPackages",
         "Agent key rotation does NOT require MLS re-key — only credential update via Update proposal"
       ],
@@ -362,7 +362,7 @@
         ".docs/specs/23-sync-and-offline-strategy.md",
         ".docs/specs/00-open-questions.md"
       ],
-      "description": "Update all secondary spec files that reference agent identity, agent DIDs, or agent-human binding to reflect the shared-DID model from ADR-039. §1 (Thesis): update 'human accountability' principle to note structural enforcement. §5 (Contexts): update §5.6 (Membership) and §5.9 (Governance) for one-DID-one-vote and Category C context restrictions (agent_keys_allowed, agent_rate_limit, agent_cosign_required). §7 (Trust): update §7.3.2 (Participation Records) for per-key participation tracking. §8 (Products): update §8.2 (App Interface) for agent key access. §17 (Persistence): update storage key conventions if agent key material requires new store keys. §18 (Addressability): update §18.2 (DID Document Service Endpoints) for ScpKeyCustodyAttestation service entry. §19 (Economic Governance): update §19.5 (Spending Capability) for refactored MintSpendingParams. §23 (Sync): update §23.8 (Multi-Device Coordination) for agent key rotation sync. §00 (Open Questions): close the agent binding question if listed, or add a closed entry.",
+      "description": "Update all secondary spec files that reference agent identity, agent DIDs, or agent-human binding to reflect the shared-DID model from ADR-039. §1 (Thesis): update 'human accountability' principle to note structural enforcement. §5 (Contexts): update §5.6 (Membership) and §5.9 (Governance) for one-DID-one-vote and Category C context restrictions (agent_keys_allowed, agent_rate_limit, agent_cosign_required). §7 (Trust): update §7.3.2 (Participation Records) for per-key participation tracking. §8 (Products): update §8.2 (App Interface) for agent key access. §17 (Persistence): update storage key conventions if agent key material requires new store keys. §18 (Addressability): update §18.2 (Service Record Entry Types) for the ScpKeyCustodyAttestation entry. §19 (Economic Governance): update §19.5 (Spending Capability) for refactored MintSpendingParams. §23 (Sync): update §23.8 (Multi-Device Coordination) for agent key rotation sync. §00 (Open Questions): close the agent binding question if listed, or add a closed entry.",
       "acceptanceCriteria": [
         "§1 human accountability principle references structural enforcement via shared-DID",
         "§5.6 membership reflects that human and agent share one DID (one membership entry)",
@@ -370,7 +370,7 @@
         "§7.3.2 participation records note per-key tracking (actions by #active vs #agent distinguishable)",
         "§8.2 app interface notes agent key access for SDK consumers",
         "§17 persistence documents any new storage keys for agent key material",
-        "§18.2 documents ScpKeyCustodyAttestation service entry in DID documents",
+        "§18.2 documents ScpKeyCustodyAttestation entry in service records",
         "§19.5 spending capability references refactored MintSpendingParams { did, key_scope }",
         "§23.8 multi-device coordination addresses agent key rotation across devices",
         "§00 open questions: agent binding marked as resolved with ADR-039 reference",
@@ -500,7 +500,7 @@
         "crates/scp-identity/src/document.rs",
         "crates/scp-identity/src/lib.rs"
       ],
-      "description": "Add #agent verification method support to DidDocument and ScpIdentity per ADR-039 acceptance criteria 1-2. DidDocument.verification_method must support three entries: #0 (Identity Key), #active (Human Signing Key), #agent (Agent Signing Key, optional). ScpIdentity gains agent_signing_key: Option<KeyHandle>. Add methods: add_agent_key(public_key) -> Result, remove_agent_key() -> Result, rotate_agent_key(new_public_key) -> Result. All three methods require #0 signature for authorization. Add validation: reject DID documents with more than one #agent VM. Serialize/deserialize must round-trip correctly with and without #agent.",
+      "description": "Add #agent verification method support to DidDocument and ScpIdentity per ADR-039 acceptance criteria 1-2. DidDocument.verification_method must support three entries: #0 (Identity Key), #active (Human Signing Key), #agent (Agent Signing Key, optional). ScpIdentity gains agent_signing_key: Option<KeyHandle>. Add methods: add_agent_key(public_key) -> Result, remove_agent_key() -> Result, rotate_agent_key(new_public_key) -> Result. All three methods require #0 signature for authorization. Add validation: reject key states with more than one #agent VM. Serialize/deserialize must round-trip correctly with and without #agent.",
       "acceptanceCriteria": [
         "DidDocument supports three verification methods: #0 (Identity Key), #active (Human Signing Key), #agent (Agent Signing Key)",
         "#agent verification method is optional — DidDocument valid without it",
@@ -508,7 +508,7 @@
         "add_agent_key(public_key) adds #agent VM to DidDocument, returns error if one already exists",
         "remove_agent_key() removes #agent VM from DidDocument, returns error if none exists",
         "rotate_agent_key(new_public_key) replaces existing #agent VM, returns error if none exists",
-        "Validation rejects DID documents with multiple #agent verification methods",
+        "Validation rejects key states with multiple #agent verification methods",
         "Serialization round-trips correctly with #agent present",
         "Serialization round-trips correctly without #agent (backward-compatible)",
         "All new methods require #0 (Identity Key) authorization",
@@ -553,27 +553,27 @@
       "files": [
         "crates/scp-identity/src/dht.rs"
       ],
-      "description": "Update DidDht::create() to optionally generate a fourth keypair for the agent signing key per ADR-039 acceptance criterion 3. The create() method gains an optional parameter (or builder method) to include an agent key. When provided, the generated DID document includes #agent as a third verification method. DidDht::update() must support adding, removing, and rotating #agent. DidDht::migrate() (Layer 2 migration) must preserve or drop #agent based on migration parameters. All DID document publications (create, update, migrate) must sign with #0.",
+      "description": "Update DidDht::create() to optionally generate a fourth keypair for the agent signing key per ADR-039 acceptance criterion 3. The create() method gains an optional parameter (or builder method) to include an agent key. When provided, the generated key state includes #agent as a third verification method. DidDht::update() must support adding, removing, and rotating #agent. DidDht::migrate() (Layer 2 migration) must preserve or drop #agent based on migration parameters. All key state publications (create, update, migrate) must sign with #0.",
       "acceptanceCriteria": [
         "DidDht::create() accepts optional agent key generation parameter",
-        "When agent key requested, create() generates Ed25519 keypair and includes #agent VM in DID document",
-        "When agent key not requested, create() produces DID document without #agent (backward-compatible)",
-        "DidDht::update() supports adding #agent to existing DID document",
-        "DidDht::update() supports removing #agent from existing DID document",
+        "When agent key requested, create() generates a keypair and includes #agent VM in key state",
+        "When agent key not requested, create() produces key state without #agent (backward-compatible)",
+        "DidDht::update() supports adding #agent to existing key state",
+        "DidDht::update() supports removing #agent from existing key state",
         "DidDht::update() supports rotating #agent (replace public key)",
-        "All DID document updates signed by #0 (Identity Key)",
-        "Published DID document resolves correctly with #agent present",
-        "Published DID document resolves correctly without #agent",
+        "All key state updates signed by #0 (Identity Key)",
+        "Published key state resolves correctly with #agent present",
+        "Published key state resolves correctly without #agent",
         "Tests verify create with and without agent key",
         "Tests verify update operations (add, remove, rotate agent key)",
         "Tests verify DID resolution round-trip with agent key"
       ],
       "actionItems": [
         "Add optional agent key parameter to DidDht::create()",
-        "Generate Ed25519 keypair for #agent when requested",
-        "Include #agent VM in DID document during creation",
+        "Generate a keypair for #agent when requested",
+        "Include #agent VM in key state during creation",
         "Update DidDht::update() for agent key add/remove/rotate",
-        "Ensure DID document publication signs with #0",
+        "Ensure key state publication signs with #0",
         "Add tests for all create and update paths"
       ],
       "blockedBy": [
@@ -640,12 +640,12 @@
         "crates/scp-core/src/crypto/mls/credential.rs",
         "crates/scp-core/src/crypto/mls/group.rs"
       ],
-      "description": "Add signing_key_id: String field to ScpCredential per ADR-039 acceptance criterion 5 and MLS Impact section. The field identifies which verification method (#active or #agent) signed the credential. Verifiers resolve the correct public key from the DID document based on this field. Same DID = same MLS membership entry regardless of signing key. Agent key rotation uses MLS Update proposal with new credential (not MLS re-key). Update credential serialization (MLS Credential payload). Update group operations that create or verify credentials: join, add member, update credential. Verifier must check signing_key_id matches the key that actually signed.",
+      "description": "Add signing_key_id: String field to ScpCredential per ADR-039 acceptance criterion 5 and MLS Impact section. The field identifies which verification method (#active or #agent) signed the credential. Verifiers resolve the correct public key from the key state based on this field. Same DID = same MLS membership entry regardless of signing key. Agent key rotation uses MLS Update proposal with new credential (not MLS re-key). Update credential serialization (MLS Credential payload). Update group operations that create or verify credentials: join, add member, update credential. Verifier must check signing_key_id matches the key that actually signed.",
       "acceptanceCriteria": [
         "ScpCredential includes signing_key_id: String field (value '#active' or '#agent')",
         "ScpCredential serialization round-trips correctly with signing_key_id",
         "Credential creation sets signing_key_id based on which key is used",
-        "Credential verification resolves public key from DID document using signing_key_id",
+        "Credential verification resolves public key from key state using signing_key_id",
         "Same DID with different signing_key_id values maps to same MLS membership entry",
         "Agent key rotation triggers MLS Update proposal with new credential (not re-key)",
         "Verifier rejects credential where signing_key_id does not match the actual signing key",
@@ -825,11 +825,11 @@
         "crates/scp-core/src/envelope/inner.rs",
         "crates/scp-core/src/crypto/sender_keys/key_protocol.rs"
       ],
-      "description": "Add signing_key_id: String field to InnerEnvelope per ADR-039 acceptance criterion 10. Verifiers use it to resolve the correct public key from the sender's DID document. Add signer_key_ref: String field to SenderKeyEpochAdvance per ADR-039 acceptance criterion 11. This allows recipients to verify that the sender key epoch advance was signed by the expected key. Update inner envelope creation and verification to use signing_key_id for key resolution. Update sender key protocol to include signer_key_ref in epoch advances.",
+      "description": "Add signing_key_id: String field to InnerEnvelope per ADR-039 acceptance criterion 10. Verifiers use it to resolve the correct public key from the sender's key state. Add signer_key_ref: String field to SenderKeyEpochAdvance per ADR-039 acceptance criterion 11. This allows recipients to verify that the sender key epoch advance was signed by the expected key. Update inner envelope creation and verification to use signing_key_id for key resolution. Update sender key protocol to include signer_key_ref in epoch advances.",
       "acceptanceCriteria": [
         "InnerEnvelope includes signing_key_id: String field (#active or #agent)",
         "Inner envelope creation sets signing_key_id based on signing key used",
-        "Inner envelope verification resolves public key from DID document using signing_key_id",
+        "Inner envelope verification resolves public key from key state using signing_key_id",
         "Verifier rejects inner envelope where signing_key_id does not match actual signing key",
         "SenderKeyEpochAdvance includes signer_key_ref: String field",
         "Epoch advance creation sets signer_key_ref based on signing key used",
@@ -962,7 +962,7 @@
     },
     {
       "id": "SCP-AB-018",
-      "title": "Implement ScpKeyCustodyAttestation type and DID document integration",
+      "title": "Implement ScpKeyCustodyAttestation type and service record integration",
       "gate": "gate-attestation",
       "priority": "P1",
       "severity": "critical",
@@ -971,25 +971,25 @@
         "crates/scp-identity/src/document.rs",
         "crates/scp-identity/src/attestation.rs"
       ],
-      "description": "Implement ScpKeyCustodyAttestation per ADR-039 acceptance criterion 16 and Enforcement Stack layer 4. At identity creation, the DID document includes a service entry declaring key custody model. The attestation declares: custody_model (hardware-biometric, hardware-pin, software), platform (ios, android, desktop, browser), platform_attestation (optional platform-specific proof — Apple App Attest token or Android Key Attestation certificate chain). Per the 2026-08-25 ruling in §27.4.4 of the attestations spec, a declaration naming a hardware model reads as software unless a verification of that proof returns a pass, so a consumer reads the model §27.4.4's clauses produce and never the declared string. Absence of attestation is itself a signal. Create attestation.rs module in scp-identity. Add ScpKeyCustodyAttestation as a DID document service entry type. The attestation is signed by #0.",
+      "description": "Implement ScpKeyCustodyAttestation per ADR-039 acceptance criterion 16 and Enforcement Stack layer 4. At identity creation, the service record includes a service entry declaring key custody model. The attestation declares: custody_model (hardware-biometric, hardware-pin, software), platform (ios, android, desktop, browser), platform_attestation (optional platform-specific proof — Apple App Attest token or Android Key Attestation certificate chain). Per the 2026-08-25 ruling in §27.4.4 of the attestations spec, a declaration naming a hardware model reads as software unless a verification of that proof returns a pass, so a consumer reads the model §27.4.4's clauses produce and never the declared string. Absence of attestation is itself a signal. Create attestation.rs module in scp-identity. Add ScpKeyCustodyAttestation as a service record entry type. The attestation is signed by #0.",
       "acceptanceCriteria": [
         "ScpKeyCustodyAttestation struct with fields: custody_model, platform, platform_attestation (optional), timestamp",
         "CustodyModel enum: HardwareBiometric, HardwarePin, Software",
         "Platform enum: Ios, Android, Desktop, Browser",
-        "Attestation published as DID document service entry with type 'ScpKeyCustodyAttestation'",
+        "Attestation published as a service record entry with type 'ScpKeyCustodyAttestation'",
         "Attestation signed by #0 (Identity Key)",
         "create_custody_attestation() generates attestation for current platform",
-        "Attestation serializes/deserializes correctly as DID document service entry",
-        "DID document can be created without custody attestation (backward-compatible)",
+        "Attestation serializes and deserializes correctly as a service record entry",
+        "A service record can be created without custody attestation (backward-compatible)",
         "Tests verify attestation creation for each custody model, and verify that a hardware custody model declared without a verified platform attestation proof reads as software (§27.4.4 clause 2)",
-        "Tests verify attestation round-trip through DID document service entries",
+        "Tests verify attestation round-trip through service record entries",
         "Tests verify attestation signature verification"
       ],
       "actionItems": [
         "Create crates/scp-identity/src/attestation.rs module",
         "Define ScpKeyCustodyAttestation, CustodyModel, Platform types",
         "Implement create_custody_attestation()",
-        "Add service entry type to DID document",
+        "Add the entry type to the service record",
         "Sign attestation with #0",
         "Update mod.rs exports",
         "Add unit tests"
@@ -1024,7 +1024,7 @@
         "crates/scp-core/src/trust/custody_violation.rs",
         "crates/scp-core/src/trust/mod.rs"
       ],
-      "description": "Implement ScpCustodyViolationAttestation per ADR-039 acceptance criteria 17-18 and Enforcement Stack layer 4. Unambiguous violations — Category A actions (DID document modifications) signed by #agent, or attestation mismatches with hardware proof — are permanently logged as ScpCustodyViolationAttestation records. These are append-only, never deleted. Create custody_violation.rs module in scp-core/src/trust/. Define violation types: CategoryAViolation (DID doc mod with #agent), AttestationMismatch (hardware proof contradicts behavior). DID owners can publish CounterAttestation records for reputation restoration. Violation records feed into trust evaluation (§7.1) as strong negative signals.",
+      "description": "Implement ScpCustodyViolationAttestation per ADR-039 acceptance criteria 17-18 and Enforcement Stack layer 4. Unambiguous violations — Category A actions (key state modifications) signed by #agent, or attestation mismatches with hardware proof — are permanently logged as ScpCustodyViolationAttestation records. These are append-only, never deleted. Create custody_violation.rs module in scp-core/src/trust/. Define violation types: CategoryAViolation (DID doc mod with #agent), AttestationMismatch (hardware proof contradicts behavior). DID owners can publish CounterAttestation records for reputation restoration. Violation records feed into trust evaluation (§7.1) as strong negative signals.",
       "acceptanceCriteria": [
         "ScpCustodyViolationAttestation struct with fields: violation_type, violator_did, evidence, timestamp, reporter_did, reporter_signature",
         "ViolationType enum: CategoryAViolation { action_type }, AttestationMismatch { expected, observed }",
@@ -1079,7 +1079,7 @@
         "crates/scp-core/src/crypto/ucan/validate.rs",
         "crates/scp-core/src/envelope/inner.rs"
       ],
-      "description": "Wire Enforcement Stack layer 3 (verifier validation) per ADR-039 acceptance criterion 15. All conformant verifiers must reject Category A actions (DID document modifications) signed by #agent. This is a network-level enforcement point: non-conformant SDKs can produce these signatures but they cannot propagate through the network. When a Category A action signed by #agent is detected, the verifier both rejects the action AND logs a ScpCustodyViolationAttestation (SCP-AB-019). Enforcement points: (1) UCAN validation — if the UCAN grants DID doc modification capability and kid is #agent, reject. (2) Inner envelope verification — if the action type is DID doc modification and signing_key_id is #agent, reject. Both rejection points call log_custody_violation() from SCP-AB-019.",
+      "description": "Wire Enforcement Stack layer 3 (verifier validation) per ADR-039 acceptance criterion 15. All conformant verifiers must reject Category A actions (key state modifications) signed by #agent. This is a network-level enforcement point: non-conformant SDKs can produce these signatures but they cannot propagate through the network. When a Category A action signed by #agent is detected, the verifier both rejects the action AND logs a ScpCustodyViolationAttestation (SCP-AB-019). Enforcement points: (1) UCAN validation — if the UCAN grants DID doc modification capability and kid is #agent, reject. (2) Inner envelope verification — if the action type is DID doc modification and signing_key_id is #agent, reject. Both rejection points call log_custody_violation() from SCP-AB-019.",
       "acceptanceCriteria": [
         "UCAN validator rejects tokens granting DID doc modification capability when kid is #agent",
         "UCAN validator returns UcanError::CategoryAViolation on rejection",
@@ -1140,8 +1140,8 @@
         "Test mints UCAN with scp_key_scope: '#agent' via self-delegation",
         "Test joins MLS group using agent credential (ScpCredential with signing_key_id: '#agent')",
         "Test sends message signed by #agent via inner envelope",
-        "Test verifies message at recipient: signing_key_id resolves to correct public key from DID document",
-        "Test rotates agent key via DID document update signed by #0",
+        "Test verifies message at recipient: signing_key_id resolves to correct public key from key state",
+        "Test rotates agent key via key state update signed by #0",
         "Test verifies MLS credential update propagates (Update proposal with new credential)",
         "Test verifies post-rotation messages use new agent key",
         "Test attempts Category A action (DID doc mod) with #agent — rejected",
@@ -1190,10 +1190,10 @@
       "files": [
         "crates/scp-core/src/crypto/mls/group.rs"
       ],
-      "description": "Update key continuity fingerprint computation per ADR-039 acceptance criterion 12 and Key Continuity section. The fingerprint must include all three verification methods: identity_key, active_key, agent_key. Agent key absence uses domain-derived sentinel SHA-256(\"SCP-ABSENT-AGENT-KEY\") to avoid Ed25519 identity point collision. Formula: fingerprint = SHA256(\"SCP-KEY-CONTINUITY-V1:\" || len(did_a) || did_a || len(did_b) || did_b || a_identity || a_active || a_agent || b_identity || b_active || b_agent) with 4-byte big-endian length prefixes on DIDs. Add negative tests: (1) fingerprint changes when agent key is added, (2) fingerprint changes when agent key is rotated, (3) fingerprint changes when agent key is removed, (4) fingerprint with no agent key uses domain-derived sentinel, (5) DID document with multiple #agent VMs is rejected.",
+      "description": "Update key continuity fingerprint computation per ADR-039 acceptance criterion 12 and Key Continuity section. The fingerprint must include all three verification methods: identity_key, active_key, agent_key. Agent key absence uses domain-derived sentinel SHA-256(\"SCP-ABSENT-AGENT-KEY\") to avoid an identity-element collision. Formula: fingerprint = SHA256(\"SCP-KEY-CONTINUITY-V1:\" || len(did_a) || did_a || len(did_b) || did_b || a_identity || a_active || a_agent || b_identity || b_active || b_agent) with 4-byte big-endian length prefixes on DIDs. Add negative tests: (1) fingerprint changes when agent key is added, (2) fingerprint changes when agent key is rotated, (3) fingerprint changes when agent key is removed, (4) fingerprint with no agent key uses domain-derived sentinel, (5) key state with multiple #agent VMs is rejected.",
       "acceptanceCriteria": [
         "Key continuity fingerprint includes all three VMs: identity_key, active_key, agent_key",
-        "Agent key absence uses domain-derived sentinel SHA-256(\"SCP-ABSENT-AGENT-KEY\") in fingerprint computation (not zero bytes, to avoid Ed25519 identity point collision)",
+        "Agent key absence uses domain-derived sentinel SHA-256(\"SCP-ABSENT-AGENT-KEY\") in fingerprint computation (not zero bytes, to avoid an identity-element collision)",
         "Fingerprint formula: SHA256(\"SCP-KEY-CONTINUITY-V1:\" || len(did_a) || did_a || len(did_b) || did_b || a_identity || a_active || a_agent || b_identity || b_active || b_agent) with 4-byte big-endian length prefixes on DID strings",
         "Fingerprint changes when agent key is added to a DID",
         "Fingerprint changes when agent key is rotated",
@@ -1201,7 +1201,7 @@
         "Fingerprint with no agent key on either side produces deterministic result (domain-derived sentinel)",
         "Fingerprint with agent key on one side but not other produces correct asymmetric result",
         "Tests verify fingerprint computation with various agent key states",
-        "Tests verify DID document with multiple #agent VMs is rejected (validation from SCP-AB-008)"
+        "Tests verify key state with multiple #agent VMs is rejected (validation from SCP-AB-008)"
       ],
       "actionItems": [
         "Update fingerprint computation to include agent key (or domain-derived sentinel if absent)",
