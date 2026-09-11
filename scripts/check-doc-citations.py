@@ -28,6 +28,8 @@ WHAT THE CHECK READS
     The files that tell an agent how to write and how to work: `.docs/standards/`,
     `.docs/lessons/`, `.claude/agents/`, `CLAUDE.md`, and the two build blueprints an
     agent reads before it writes a crate — `.docs/scaffold/` and `.docs/architecture.md`.
+    It also reads the product specs in `.docs/specs/` and the decision records in
+    `.docs/adrs/`, which is the widening the section below reserved.
     A citation counts when its leading number names a spec file — `§18.11.3` names
     `.docs/specs/18-addressability-and-deployment.md`. A number that names no spec file
     is not an SCP spec citation, so the check skips it, and so are citations the line
@@ -43,16 +45,20 @@ WHAT THE CHECK CANNOT DECIDE
     right section.
 
 WHAT THE CHECK DOES NOT READ, AND WHY
-    `.docs/specs/`, `.docs/adrs/`, `.docs/prds/`, and the dated plans and planning
-    sessions carried 56 dead citations on the day this check landed: §6.2.2B at 23 sites
-    and §6.2.2A at 3, which name subsections that spec 6 never split out of §6.2.2,
-    protocol-level discovery; §6.4 at 11 sites, which names a section spec 6 does not
-    have; §5.14.13 at 8 sites, the broadcast hosting handshake that ADR-049,
-    actor-per-context, withdrew on 2026-06-25; and §1.1 at 3 sites. Repointing §6.2.2B
-    takes an author's decision about what spec 6 should say, and inventing a target is
-    the defect this check exists to catch, so widening SCOPE_DIRS waits on that spec
-    work rather than on an exemption list. Widen it by adding the directory here once
-    its citations resolve — this check carries no per-site allowlist and gets none.
+    `.docs/prds/` and the dated plans and planning sessions. A PRD story names its
+    sources through a `section` field that `scripts/validate-prd.py` already resolves
+    against the spec file, so a second reader of the same field would re-check in weaker
+    text-search form a property that check enforces on the parsed story. A dated plan
+    records what an author believed on its date, so a citation that resolved then and
+    does not resolve now is the record working rather than a defect.
+
+    `.docs/specs/` and `.docs/adrs/` carried 56 dead citations on the day this check
+    landed — §6.2.2B at 23 sites, §6.2.2A at 3, §6.4 at 11, §5.14.13 at 8, and §1.1 at
+    3 — and this block reserved the widening until they resolved. Each surviving site
+    now carries the `[no such section]` marker beside the reference, which is the
+    declaration this check asks for and not an exemption: the marker tells a reader the
+    number resolves to nothing, and it exempts only the occurrence it follows. This
+    check carries no per-site allowlist and gets none.
 
 USAGE
     python3.12 scripts/check-doc-citations.py [--self-test]
@@ -88,7 +94,14 @@ FOREIGN = re.compile(
 MARKER = "[no such section]"
 
 # Positive scope: the artifacts that govern work in this repository.
-SCOPE_DIRS = (".docs/standards", ".docs/lessons", ".claude/agents", ".docs/scaffold")
+SCOPE_DIRS = (
+    ".docs/standards",
+    ".docs/lessons",
+    ".claude/agents",
+    ".docs/scaffold",
+    ".docs/specs",
+    ".docs/adrs",
+)
 SCOPE_FILES = ("CLAUDE.md", ".docs/architecture.md")
 
 

@@ -171,7 +171,7 @@
         },
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
-          "section": "### 10.12.7 DID Document Relay URL Encoding"
+          "section": "### 10.12.7 Service-Record Relay URL Encoding"
         }
       ],
       "details": {
