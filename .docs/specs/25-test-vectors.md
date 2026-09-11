@@ -12,7 +12,7 @@ python3.12 scripts/gen-test-vectors-p256.py
 
 The script uses nothing outside the Python standard library, and it self-gates before it prints a byte: it checks itself against `SHA-256("")`, the RFC 6979 Appendix A.2.5 P-256 nonce and signature, RFC 5869 Appendix A.1 for HKDF-SHA256, and this section's own curve-independent `DataProvenance` hash (Vector 35), and it computes every public key twice by two scalar multiplications sharing no arithmetic, and a third time through the `cryptography` package where that package imports. A mismatch raises before anything prints.
 
-**Identifier strings in the fixtures, recorded 2026-09-10.** A vector that pins bytes over an identifier's textual form prints a fixture string of the shape `"did:dht:z6Mk…"`. That string is a fixture and states nothing about SCP's identifier: the identifier is the 32-byte digest of an inception event (`09-security-model.md` §9.7.4.2 R13), every derivation the protocol performs consumes those 32 digest bytes, and the routing derivations, both continuity-fingerprint forms and §25.26's key-event vectors are fixed over them. What waits is the textual form, which the identity-substrate plan tracks and a later revision of R13 fixes; the fixture strings change when it lands, and no sentence here decides it.
+**Identifier strings in the fixtures, recorded 2026-09-10.** A vector that pins bytes over an identifier's textual form prints a fixture string of the shape `"did:dht:z6Mk…"`. That string is a fixture and states nothing about SCP's identifier: the identifier is the 32-byte digest of an inception event (`09-security-model.md` §9.7.4.2 R13), and the routing derivations, both continuity-fingerprint forms and §25.26's key-event vectors consume those 32 bytes. **The fixture strings carry that shape because the generator emitted it when the vectors were pinned, and the shape carries no meaning**: R13 defers the textual form and no section of this corpus decides it, so such a vector pins the construction, the separator and the signature over the bytes it prints, and pins no textual form. `09-security-model.md` §9.5.2 enumerates the sixteen preimages that wait on R13. The generator regenerates each fixture string and every digest below it when a later revision of R13 fixes the encoding.
 
 **What a signature covers.** Every SCP signature here is an ECDSA signature over a 32-byte canonical hash, so the ECDSA message digest **is** that canonical hash and no second SHA-256 reaches it. The vectors run RFC 6979 with `h1` set to that same digest, because §9.5 fixes RFC 6979 with SHA-256 for a software signer and states no value for `h1` under a prehashed digest. An implementation that hashes the digest a second time reproduces none of the signature bytes below.
 
@@ -62,7 +62,7 @@ Tertiary public key, uncompressed:
   f0
 ```
 
-The three seeds are RFC 8032 Section 7.1's first three test-vector seeds. SCP superseded Ed25519 on 2026-09-10 (§9.5), so they name no Ed25519 keypair and the corpus retains them only so its provenance stays legible across the curve change. The tertiary key is the pre-rotation key of §25.26's vector identity and the second point of §25.28's commitment vector. An implementation that cannot reproduce one of the three public keys from its seed has a broken P-256 implementation, a broken HKDF, or a broken reading of the rule above, and MUST NOT proceed with interoperability testing.
+The three seeds are RFC 8032 Section 7.1's first three test-vector seeds, and the seed-to-scalar rule above turns each into a P-256 scalar. The corpus retains them so its provenance stays legible across the curve change of §9.5. The tertiary key is the pre-rotation key of §25.26's vector identity and the second point of §25.28's commitment vector. An implementation that cannot reproduce one of the three public keys from its seed MUST NOT proceed with interoperability testing, and §25.17 step 2 names what is broken.
 
 **The same keys serve ECDH for HPKE**, because SCP's HPKE suite is DHKEM(P-256, HKDF-SHA256) (§9.5) and a key-agreement key on this curve is a P-256 key like any other. No separate key material stands between the two roles, and no birational map does either.
 
@@ -89,13 +89,13 @@ Expected bytes:
 
 ```
 Input:
-  field_value: "did:dht:z6MkTest"
+  field_value: "#active"      (the signing_key_id an InnerEnvelope carries, §9.5.2)
 
 Expected bytes:
-  0x00000010                              (length = 16, 4-byte BE)
-  0x6469643a6468743a7a364d6b54657374      (UTF-8 bytes)
+  0x00000007              (length = 7, 4-byte BE)
+  0x23616374697665        (UTF-8 bytes)
 
-Combined: 0x000000106469643a6468743a7a364d6b54657374
+Combined: 0x0000000723616374697665
 ```
 
 ### 25.3.3 Fixed-Length Field Encoding
@@ -516,7 +516,7 @@ checkpoint.merkle_root == tree::root (Vector 32)
 checkpoint.event_count == 9
 ```
 
-Regenerate both vectors with `python3.12 scripts/gen-test-vectors-p256.py` (§25.1). `crates/scp-event-log/tests/test_vectors.rs` asserts the pre-2026-09-10 Ed25519 values in `vector_32_typed_leaf_and_checkpoint_kat` and `vector_33_checkpoint_root_equals_tree_root_kat`; §25.18 states which artifact governs while that port is outstanding.
+Regenerate both vectors with `python3.12 scripts/gen-test-vectors-p256.py` (§25.1). `crates/scp-event-log/tests/test_vectors.rs` is one of the unported test files §25.18 names, which states which artifact governs until the port lands.
 
 ### Vector 35: `DataProvenance` -> `provenance_hash` KAT (§24.3.3)
 
@@ -612,8 +612,6 @@ Fingerprint:
 ```
 
 An implementation that concatenates the caller's own block first computes two different values for one honest pair and raises §9.11's maximum-severity MITM alert against an honest counterparty.
-
-**Vector 21 was deleted on 2026-09-10.** It pinned a fingerprint over `#0`, `#active`, and an absent `#agent` key standing in as `SHA-256("SCP-ABSENT-AGENT-KEY")`. §9.11's construction carries no `#agent` term and no sentinel of any kind, so the vector covered a construction the spec no longer states.
 
 ## 25.10 Claim Validation Vectors (§12.3)
 
@@ -900,9 +898,9 @@ To verify an implementation against these test vectors:
 
 4. **Hash verification.** Compute SHA-256 of each canonical byte sequence. Compare against the expected hash the vector prints.
 
-5. **Signature verification.** For signed structures, verify the printed 64-byte signature against the reference public key and the canonical hash, and confirm the verifier rejects the same signature with `s` replaced by `n − s` (§9.5's low-`s` rule). Then sign the canonical hash with your own signer and **verify the signature your signer produced against the same public key and the same hash**; a hardware signer's conformance check is that verification and never a comparison against the printed bytes. **Confirm as part of it that your signer emitted the low form**, because §9.5 obliges every signer to convert `(r, s)` to `(r, n − s)` when `s` exceeds half the group order and a substrate that returns the high form leaves that conversion to the code around it. A **software** signer MUST additionally reproduce the printed bytes exactly, because §9.5 requires it to derive the nonce under RFC 6979 with SHA-256 over that same digest.
+5. **Signature verification.** For signed structures, verify the printed 64-byte signature against the reference public key and the canonical hash, and confirm the verifier rejects the same signature with `s` replaced by `n − s` (§9.5's low-`s` rule). Then sign the canonical hash with your own signer and **verify the signature your signer produced against the same public key and the same hash**; a hardware signer's conformance check is that verification and never a comparison against the printed bytes. **Confirm as part of it that your signer emitted the low form** (§9.5), because a substrate that returns the high form leaves that conversion to the code around it. A **software** signer MUST additionally reproduce the printed bytes exactly, because §9.5 requires it to derive the nonce under RFC 6979 with SHA-256 over that same digest.
 
-5a. **Point validation.** Confirm your parser rejects a 33-byte encoding whose leading byte is neither `0x02` nor `0x03`, rejects a 65-byte encoding whose leading byte is not `0x04`, rejects an encoding whose decoded point does not satisfy the P-256 curve equation, and rejects the point at infinity — before that point reaches any verification and before it reaches any key agreement (§9.5). §25.2's three reference public keys are the positive cases; negate the y-coordinate of the tertiary key's uncompressed form and flip its final byte to obtain an off-curve negative case.
+5a. **Point validation.** Confirm your parser applies §9.5's point-validation criterion to every wire-read point before that point reaches any signature verification and any key agreement. §25.2's three reference public keys are the positive cases; negate the y-coordinate of the tertiary key's uncompressed form and flip its final byte to obtain an off-curve negative case.
 
 6. **Padding verification.** For each padding vector, construct the padded output and verify the total length matches the expected bucket size. Strip the padding and verify the original payload is recovered.
 
@@ -910,15 +908,9 @@ To verify an implementation against these test vectors:
 
 ## 25.18 Generating Reference Outputs
 
-`scripts/gen-test-vectors-p256.py` regenerates every value this section prints outside §25.21, §25.22 and §25.24, whose values live in the checked-in JSON fixtures those sections name:
+§25.1 names the generator, states how to run it, states which values it produces, and states which published known-answer tests it checks itself against. A value printed above that the generator does not reproduce is a defect in this section.
 
-```bash
-python3.12 scripts/gen-test-vectors-p256.py
-```
-
-§25.1 states what the script implements and which published known-answer tests it checks itself against. A value printed above that the script does not reproduce is a defect in this section.
-
-**The Rust reference implementation still signs under the superseded curve.** `crates/scp-runtime/tests/test_vectors.rs`, `crates/scp-event-log/tests/test_vectors.rs`, `crates/scp-crypto/src/pseudonym.rs`, and the custody-violation tests of `crates/scp-protocol` assert the Ed25519 values these vectors carried before 2026-09-10. SCP superseded Ed25519 on that date (§9.5 of the security-model spec) and the artifact flow puts the spec first, so this section is the authority for every byte above until those tests are ported to P-256. An implementer comparing against those Rust tests today reproduces the pre-2026-09-10 values, not the values above.
+**Six shipped artifacts still carry the superseded signature algorithm, and this paragraph is the one place this section says so.** `crates/scp-runtime/tests/test_vectors.rs`, `crates/scp-event-log/tests/test_vectors.rs`, `crates/scp-crypto/src/pseudonym.rs`, `crates/scp-client-wasm/tests/pseudonym_derivation_cross_target_kat.rs`, `tests/conformance/vectors/outlet_streaming_saga_vectors.json` and `tests/conformance/vectors/outlet_registration_v2.json` assert or carry the values these vectors printed before 2026-09-10, under the algorithm §9.5 of the security-model spec superseded on that date. The artifact flow puts the spec first, so this section is the authority for every byte above until each artifact is regenerated on P-256, and an implementer comparing against one of them today reproduces the superseded values.
 
 Independent implementations SHOULD run the generator, compare its output against the values printed above, and then embed those outputs in their own test suites.
 
@@ -1009,7 +1001,7 @@ Expected v2 pseudonym public key (epoch = 1, 33-byte compressed):
   0x037967cfe8d3111cdd72288ea3f444c15b710300323162fec63ca9036af73754e3
 ```
 
-`derive_pseudonym_keypair_known_answer_vectors` in `crates/scp-crypto/src/pseudonym.rs` (the wasm-safe home of the derivation, ADR-057 Option A) and `pseudonym_derivation_matches_golden_vectors` in `crates/scp-client-wasm/tests/pseudonym_derivation_cross_target_kat.rs` assert the pre-2026-09-10 Ed25519 values; §25.18 states which artifact governs while that port is outstanding. The native/`wasm32` byte-parity obligation those two tests carry is unchanged — only the curve and the key width changed.
+`derive_pseudonym_keypair_known_answer_vectors` in `crates/scp-crypto/src/pseudonym.rs` (the wasm-safe home of the derivation, ADR-057 Option A) and `pseudonym_derivation_matches_golden_vectors` in `crates/scp-client-wasm/tests/pseudonym_derivation_cross_target_kat.rs` are two of the unported artifacts §25.18 names. The native/`wasm32` byte-parity obligation those two tests carry is unchanged, because only the curve and the key width changed.
 
 ### Vector 36: `PseudonymAnnouncement` wire format + classifier decisions (§9.10.4)
 
@@ -1105,9 +1097,9 @@ Verification vector:
   verdict:    accept
 ```
 
-The P-256 signature is computed over the 32-byte canonical hash. Sign with the reference key (§25.2) and verify per §25.17 step 5. The preimage carries no key material, so the canonical hash above is unchanged from the value this vector pinned before SCP superseded Ed25519 on 2026-09-10; only the signature is new.
+The P-256 signature is computed over the 32-byte canonical hash. Sign with the reference key (§25.2) and verify per §25.17 step 5. The preimage carries no key material, so the canonical hash above is unchanged from the value this vector pinned before 2026-09-10 and only the signature is new.
 
-`vector_34_trust_attestation_signature` in `crates/scp-runtime/tests/test_vectors.rs` pins the expected hash, reconstructs the preimage byte-for-byte, and verifies a signed attestation through the production `verify_attestation` path. Its hash assertion still holds; its signature path is Ed25519 and §25.18 states which artifact governs while that port is outstanding.
+`vector_34_trust_attestation_signature` in `crates/scp-runtime/tests/test_vectors.rs` pins the expected hash, reconstructs the preimage byte-for-byte, and verifies a signed attestation through the production `verify_attestation` path. Its hash assertion still holds, and its signature path is one of the unported artifacts §25.18 names.
 
 ## 25.21 Outlet Streaming Conformance Vectors (§5.4.5)
 
@@ -1154,7 +1146,7 @@ Because the PyO3/NAPI/UniFFI handler-registration seam produces a single aggrega
 
 The **transactional-streaming** corner of the outlet taxonomy (ADR-061 *streaming saga*; §6.2.4 cross-context outlet invocation saga; §6.2.5 outlet invocation modes) is exercised by a set of **6 scenario vectors** that pin the observable artifacts of a cross-context stream: the sealed RFC-6962 `stream_manifest_hash` (§5.4.5 chunk manifest; a fixed 32 bytes regardless of stream length, ADR-061), the self-verifying `SCP-XCTX-STREAM-RECEIPT-V1` receipt over that root (`crates/scp-protocol/src/context/outlets/cross_context_saga.rs`), the atomic dual event-log join, the receive-side gap terminal, and the aggregate-schema terminal. This complements the same-context §25.21 set (`§5.4.5` progressive output), which does not exercise the saga's seal/receipt/dual-log artifacts.
 
-The canonical vector file is `tests/conformance/vectors/outlet_streaming_saga_vectors.json` (top-level `{version, vectors:[6]}`, each entry a `{name, spec}` envelope). Every chunk signature and every `caveats_binding` is **recomputed** at replay time under the §25.2 reference operator key (the P-256 key derived from seed `0x9d61…7f60`); the receipt round-trip KAT signs under that same §25.2 seed so its preimage and signature are byte-exact and checked in. That fixture was generated before SCP superseded Ed25519 on 2026-09-10 and still carries Ed25519 signature bytes; §25.18 states which artifact governs while that port is outstanding.
+The canonical vector file is `tests/conformance/vectors/outlet_streaming_saga_vectors.json` (top-level `{version, vectors:[6]}`, each entry a `{name, spec}` envelope). Every chunk signature and every `caveats_binding` is **recomputed** at replay time under the §25.2 reference operator key (the P-256 key derived from seed `0x9d61…7f60`); the receipt round-trip KAT signs under that same §25.2 seed so its preimage and signature are byte-exact and checked in. That fixture is one of the unported artifacts §25.18 names.
 
 ### Scenario matrix
 
@@ -1251,7 +1243,7 @@ The canonical conformance fixture lives at:
 tests/conformance/vectors/outlet_registration_v2.json
 ```
 
-The fixture documents **12 known-input / known-output vectors**, each signed under the §25.2 reference keypair. The checked-in fixture was generated before SCP superseded Ed25519 on 2026-09-10 and still carries Ed25519 keys and signatures; §25.18 states which artifact governs while that port is outstanding. Every entry carries:
+The fixture documents **12 known-input / known-output vectors**, each signed under the §25.2 reference keypair. The checked-in fixture is one of the unported artifacts §25.18 names. Every entry carries:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -1262,7 +1254,7 @@ The fixture documents **12 known-input / known-output vectors**, each signed und
 | `expected_canonical_hash` | hex string | SHA-256 of `expected_preimage` (32 bytes / 64 hex). Equals the output of `compute_outlet_registration_canonical_bytes`. |
 | `expected_signature` | hex string | Signature over `expected_canonical_hash` (64 bytes / 128 hex). |
 | `operator_did` | string | The signing operator's DID (the same across all vectors for determinism). |
-| `operator_public_key` | hex string | The operator's verifying key. §9.5 fixes 33 bytes / 66 hex for a P-256 verification key, and **the checked-in fixture carries 32 bytes**, because it was generated under the superseded Ed25519 curve as the sentence above this table states. A harness reads the width from the fixture it loads until that fixture is regenerated on P-256. |
+| `operator_public_key` | hex string | The operator's verifying key. §9.5 fixes 33 bytes / 66 hex for a P-256 verification key, and **the checked-in fixture carries 32 bytes**, because the sentence above this table puts it among the unported artifacts. A harness reads the width from the fixture it loads until that fixture is regenerated on P-256. |
 
 ### 25.24.1 Vector index
 
@@ -1322,9 +1314,11 @@ The regenerator is `#[ignore]` by default so the default `cargo test` run does n
 
 ## 25.26 Key-Event Preimage and Signature Slot Vectors (§9.7.4.2 definitions, §9.5)
 
-**What these vectors pin.** §9.7.4.2's definitions fix the key-event preimage's field order, so these vectors pin an inception event's own bytes, the digest of those bytes, the identifier that digest derives, and the routing id that identifier derives, then the signature slot each of the two forms produces over the same event. Only the identifier's textual form is still deferred (R13), and no derivation below consumes one.
+**What these vectors pin.** §9.7.4.2's definitions fix the key-event preimage's field order, so these vectors pin an inception event's own bytes, the digest of those bytes, the identifier that digest derives, and the routing id that identifier derives, then the signature slot each of the two forms produces over the same event.
 
-**The vector identity.** A one-member root set holding §25.2's reference key, one `#active` key which is §25.2's secondary key, a one-member next set whose pre-rotation key is §25.2's tertiary key, one designated witness, and a witnessing interval of 3600 seconds. Every key carries `KeyAlgorithm` `0x01` and `CustodyType` `Passkey` (`0x01`). The key-state snapshot is 177 bytes and the preimage is 359 bytes.
+**The vector identity.** A one-member root set holding §25.2's reference key, one `#active` key which is §25.2's secondary key, a one-member next set whose pre-rotation key is §25.2's tertiary key, one designated witness, and a witnessing interval of 3600 seconds. Every key carries `KeyAlgorithm` `0x01` and `CustodyType` `Passkey` (`0x01`). The key-state snapshot is 171 bytes and the preimage is 364 bytes.
+
+**The inception carries all twelve fields**, three as the sentinel §9.7.4.2's definitions fix: `standing_root` as one `0x00` byte, the revealed keys and the key-event seals as `BE32(0)` each. The committed member's custody type and key algorithm sit in the continuation, so the snapshot carries no next-set entry.
 
 ```
 Pre-rotation public key (33-byte SEC1 compressed):
@@ -1339,26 +1333,26 @@ Designated witness operator identifier:
 ### Vector 41: an inception whose one root slot carries the raw form (`form = 0x01`)
 
 ```
-Preimage (359 bytes), in §9.7.4.2's field order:
+Preimage (364 bytes), in §9.7.4.2's field order:
   5343502d4b454c2d4556454e542d56313a010000000000000000000000000000
   0000000000000000000000000000000000000000000000000000000000000000
-  0000000000000000000000000000000000000000000000000000000000010000
-  0000010100000001033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c22
-  95b1517883d47f3027000000010000000100000002033b1cac23f45cf1cdfdf0
-  b32f8f777b99166c1b69649c2295b1517883d47f302701010000000000000000
-  01010223702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412
-  b20aea020100000000000000000101000000010101000000019d94df95bc0a13
-  f1963f484414c320354c73c75bb86e96559e97765f5bc2d31300000e10020000
   0000000000000000000000000000000000000000000000000000000000000100
-  000001421be508c6ed135a9737895007e5ba16f9542e1b3440f6d00a515de80a
-  3e43eb00000001
+  00000001010000000000000001033b1cac23f45cf1cdfdf0b32f8f777b99166c
+  1b69649c2295b1517883d47f3027000000010000000100000002033b1cac23f4
+  5cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f30270101000000
+  000000000001010223702a648232f2d00713de9289753c2fbd4c4efa7e1e3390
+  5e3723a412b20aea020100000000000000000101000000019d94df95bc0a13f1
+  963f484414c320354c73c75bb86e96559e97765f5bc2d31300000e1002000000
+  0000000000000000000000000000000000000000000000000000000000000000
+  000100000001421be508c6ed135a9737895007e5ba16f9542e1b3440f6d00a51
+  5de80a3e43eb010100000001
 
 Preimage digest D:
-  fcd64b28cde081884543143d77e41161789386b51dc4263e9fc5755f8b17c930
+  d8ba4ebad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7
 Identifier, SHA-256("SCP-KEL-ID-V1:" || preimage):
-  0d230375c05876775265f7a49954a3bba9459ce25d2d5a380c1a9bc14a020b68
+  2c0f7f4478be94db0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf32
 Routing id, SHA-256("scp:did:" || identifier):
-  73fbe2ada899507f188a7e0f9c47a639e085caae13198f25aae149b08d1afbd0
+  f8affd47ab024cae9489a63fa1c632914c16f7329441b8fca65b32c78d86a4eb
 
 Root-set member 0, 33-byte SEC1 compressed point:
   033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f30
@@ -1367,39 +1361,39 @@ Root-set member 0, 33-byte SEC1 compressed point:
 Signature form: 0x01
 Slot length: 64 bytes
 Slot:
-  096207d81369d7f7909329ee2da8b05b0ef30697a49d8a1de668111f972b776a
-  48a66d03aa9f7910b51ad732c43a652bcf0b4a48904860e0b8b720f133eb5bdf
+  274e7cf73b6807ec53619491a1cc094a5fa2a649b4a04a043965597c7faa5e96
+  7e7b499be2e9750521b4bfec6fa65bfdd14c8e5c940bb60884d040da9d1e70a0
 ```
 
 ### Vector 42: an inception whose one root slot carries the WebAuthn assertion form (`form = 0x02`)
 
-**The preimage differs from Vector 41's in one byte**, the signature-form list's entry, so the two events carry different digests and different identifiers. That is the property the form list's presence in the preimage delivers: a relay cannot rewrite a slot's declared form without changing the event.
+**The preimage differs from Vector 41's in one byte**, the signature-form list's entry, so the two events carry different digests and different identifiers.
 
 ```
-Preimage (359 bytes):
+Preimage (364 bytes):
   5343502d4b454c2d4556454e542d56313a010000000000000000000000000000
   0000000000000000000000000000000000000000000000000000000000000000
-  0000000000000000000000000000000000000000000000000000000000010000
-  0000010200000001033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c22
-  95b1517883d47f3027000000010000000100000002033b1cac23f45cf1cdfdf0
-  b32f8f777b99166c1b69649c2295b1517883d47f302701010000000000000000
-  01010223702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412
-  b20aea020100000000000000000101000000010101000000019d94df95bc0a13
-  f1963f484414c320354c73c75bb86e96559e97765f5bc2d31300000e10020000
   0000000000000000000000000000000000000000000000000000000000000100
-  000001421be508c6ed135a9737895007e5ba16f9542e1b3440f6d00a515de80a
-  3e43eb00000001
+  00000001020000000000000001033b1cac23f45cf1cdfdf0b32f8f777b99166c
+  1b69649c2295b1517883d47f3027000000010000000100000002033b1cac23f4
+  5cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f30270101000000
+  000000000001010223702a648232f2d00713de9289753c2fbd4c4efa7e1e3390
+  5e3723a412b20aea020100000000000000000101000000019d94df95bc0a13f1
+  963f484414c320354c73c75bb86e96559e97765f5bc2d31300000e1002000000
+  0000000000000000000000000000000000000000000000000000000000000000
+  000100000001421be508c6ed135a9737895007e5ba16f9542e1b3440f6d00a51
+  5de80a3e43eb010100000001
 
 Preimage digest D:
-  cab5a09a8f8841644c2f7d1c64d6a685eddb3272965be01460ecda320616df2e
+  9a41b0fdb978014730ab7d8d56b9a77745b4ff4824affc096bbd923d14a569a6
 Identifier:
-  8c17ea16acf2dc019003c1e3148d860eadcc2018ef24834fb61c9943d55dcfe9
+  bb8f96731d62d4cc81b811c1ce47246bdaa7f8765ca43e62ded190bd38e65c3d
 
 Challenge (49 bytes), "SCP-KEY-EVENT-V1:" || D:
-  5343502d4b45592d4556454e542d56313acab5a09a8f8841644c2f7d1c64d6a6
-  85eddb3272965be01460ecda320616df2e
+  5343502d4b45592d4556454e542d56313a9a41b0fdb978014730ab7d8d56b9a7
+  7745b4ff4824affc096bbd923d14a569a6
 Challenge, unpadded base64url as clientDataJSON carries it:
-  U0NQLUtFWS1FVkVOVC1WMTrKtaCaj4hBZEwvfRxk1qaF7dsycpZb4BRg7NoyBhbfLg
+  U0NQLUtFWS1FVkVOVC1WMTqaQbD9uXgBRzCrfY1Wuad3RbT_SCSv_AlrvZI9FKVppg
 
 rpIdHash, SHA-256("ctx.network"):
   aee39d05bf6e1cbe288aedd7ead156f1d67399382d7a110e8f6c495d11689d76
@@ -1407,24 +1401,24 @@ authenticatorData (37 bytes) = rpIdHash || flags 0x05 || signCount 0:
   aee39d05bf6e1cbe288aedd7ead156f1d67399382d7a110e8f6c495d11689d76
   0500000000
 clientDataJSON (155 bytes):
-  {"type":"webauthn.get","challenge":"U0NQLUtFWS1FVkVOVC1WMTrKtaCaj4hBZEwvfRxk1qaF7dsycpZb4BRg7NoyBhbfLg","origin":"https://ctx.network","crossOrigin":false}
+  {"type":"webauthn.get","challenge":"U0NQLUtFWS1FVkVOVC1WMTqaQbD9uXgBRzCrfY1Wuad3RbT_SCSv_AlrvZI9FKVppg","origin":"https://ctx.network","crossOrigin":false}
 clientDataJSON bytes:
   7b2274797065223a22776562617574686e2e676574222c226368616c6c656e67
-  65223a2255304e514c55744657533146566b564f564331574d54724b74614361
-  6a3468425a4577766652786b317161463764737963705a6234425267374e6f79
-  426862664c67222c226f726967696e223a2268747470733a2f2f6374782e6e65
+  65223a2255304e514c55744657533146566b564f564331574d54716151624439
+  75586742527a437266593157756164335262545f534353765f416c72765a4939
+  464b56707067222c226f726967696e223a2268747470733a2f2f6374782e6e65
   74776f726b222c2263726f73734f726967696e223a66616c73657d
 SHA-256(clientDataJSON):
-  6317937fd9151bc5c0b23100340321387e74e638e5c62b311fa6a2f8489c3929
+  0b33b76a4ecb79e15753a17147ac39f6964ae20523e7e001c258e67d2562c236
 Signed message, authenticatorData || SHA-256(clientDataJSON):
   aee39d05bf6e1cbe288aedd7ead156f1d67399382d7a110e8f6c495d11689d76
-  05000000006317937fd9151bc5c0b23100340321387e74e638e5c62b311fa6a2
-  f8489c3929
+  05000000000b33b76a4ecb79e15753a17147ac39f6964ae20523e7e001c258e6
+  7d2562c236
 ECDSA message digest, SHA-256(signed message):
-  0d43ff083c4d3cc3be110e51011610e847bfcdab231e805bc100c7d8751d02eb
+  1f63ea5226c20ce261b3243ad941ef8834b0678cf4681b2f914963b0bffe4d6b
 Signature (64 raw bytes, low-s normalized):
-  71489c49d71dd7e7e819190029e49281b495751330c7b9b556d07f79d6a36de3
-  1506428e63d842987d258f2e179b1453b05ecdc43c37d522438b84f769cc06cd
+  6aee5c6f9b367f8a886fb996c2f08d77fefcddee6399f1b928cf1110cef786d0
+  315de3e854e0669d355b4968b5c2bc8075a5630e3c980844049ebcbf9716c424
 
 Signature form: 0x02
 Slot length: 264 bytes
@@ -1432,44 +1426,72 @@ Slot, BE32(len(authenticatorData)) || authenticatorData || BE32(len(clientDataJS
   00000025aee39d05bf6e1cbe288aedd7ead156f1d67399382d7a110e8f6c495d
   11689d7605000000000000009b7b2274797065223a22776562617574686e2e67
   6574222c226368616c6c656e6765223a2255304e514c55744657533146566b56
-  4f564331574d54724b746143616a3468425a4577766652786b31716146376473
-  7963705a6234425267374e6f79426862664c67222c226f726967696e223a2268
+  4f564331574d5471615162443975586742527a43726659315775616433526254
+  5f534353765f416c72765a4939464b56707067222c226f726967696e223a2268
   747470733a2f2f6374782e6e6574776f726b222c2263726f73734f726967696e
-  223a66616c73657d71489c49d71dd7e7e819190029e49281b495751330c7b9b5
-  56d07f79d6a36de31506428e63d842987d258f2e179b1453b05ecdc43c37d522
-  438b84f769cc06cd
+  223a66616c73657d6aee5c6f9b367f8a886fb996c2f08d77fefcddee6399f1b9
+  28cf1110cef786d0315de3e854e0669d355b4968b5c2bc8075a5630e3c980844
+  049ebcbf9716c424
 ```
 
-**Conformance procedure.** Rebuild the preimage from the field order §9.7.4.2's definitions state and compare it byte for byte; recompute the digest, the identifier and the routing id; then, for the assertion form, parse `clientDataJSON` as RFC 8259 JSON rejecting any duplicate member name, compare the decoded `type` against `"webauthn.get"` and the decoded `challenge` against the base64url above, check that the `authenticatorData` length is at least 37 and that bit 0 of byte 32 is set, reject a high-`s` signature, then verify the trailing 64 bytes over `authenticatorData || SHA-256(clientDataJSON)`.
+**Conformance procedure.** Rebuild the preimage from the field order §9.7.4.2's definitions state and compare it byte for byte, recompute the digest, the identifier and the routing id, then run against Vector 42's slot every assertion-slot check those same definitions state.
 
 ## 25.27 Witness-Layer and Relay-Proof Vectors (§9.7.4.2 definitions, §9.7.4.3, §9.18.2)
 
-Every object below names Vector 41's identity as its subject and Vector 41's event as the event a witness seeded at. **Neither object names a position in the witness's own key state**, because a community-relay-list operator's key is non-transferable and has no position to name: a verifier reads that key from the operator's list entry (`18-addressability-and-deployment.md` §18.5.1).
+The witness objects below name Vector 41's identity as their subject and Vector 41's event as the event a witness seeded at. **No object below names a position in a signer's own key state**, because a community-relay-list operator's key is non-transferable and has no position to name: a verifier reads that key from the operator's list entry, which Vector 49 pins.
 
 ### Vector 43: a witness's first cosigned head after a seed
 
-`previous_cosigned_digest` names the event the witness seeded at, which is Vector 41's inception event, the latest event whose key state names this witness. **It is never the all-zero placeholder**, which is what stops two first cosignatures of one witness satisfying the fault-proof predicate.
+`previous_cosigned_digest` names the event the witness seeded at, which is Vector 41's inception event, the latest event whose key state names this witness. **It is never the all-zero placeholder** (§9.7.4.3).
 
 ```
 witness:                    9d94df95bc0a13f1963f484414c320354c73c75bb86e96559e97765f5bc2d313
-subject:                    0d230375c05876775265f7a49954a3bba9459ce25d2d5a380c1a9bc14a020b68
+subject:                    2c0f7f4478be94db0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf32
 sequence:                   0
-event_digest:               fcd64b28cde081884543143d77e41161789386b51dc4263e9fc5755f8b17c930
-previous_cosigned_digest:   fcd64b28cde081884543143d77e41161789386b51dc4263e9fc5755f8b17c930
+event_digest:               d8ba4ebad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7
+previous_cosigned_digest:   d8ba4ebad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7
 observed_at:                1700000000
 
 Preimage (165 bytes = 21-byte separator + 144 field bytes):
   5343502d434f5349474e45442d484541442d56313a9d94df95bc0a13f1963f48
-  4414c320354c73c75bb86e96559e97765f5bc2d3130d230375c05876775265f7
-  a49954a3bba9459ce25d2d5a380c1a9bc14a020b680000000000000000fcd64b
-  28cde081884543143d77e41161789386b51dc4263e9fc5755f8b17c930fcd64b
-  28cde081884543143d77e41161789386b51dc4263e9fc5755f8b17c930000000
+  4414c320354c73c75bb86e96559e97765f5bc2d3132c0f7f4478be94db007831
+  1ef51ba3cc9934362b0f154dcbf9c597572e46cf320000000000000000d8ba4e
+  bad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7d8ba4e
+  bad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7000000
   006553f100
 Canonical hash:
-  baf56bda160573cbb58a9d90aa9eded1656f989074ac1d6ec040a7d46f6c1674
+  65e8132e2c131ed3e1709f19f623e29ef7cc6fdd3fddf7e04bb59acb41423e26
 Signature, secondary key (208 bytes on the wire):
-  de2be0eab3a4196ac0d90304fda7fd81258334d24382eba4621f536393db0e29
-  08f2bf9fb88700a6d1052b344c8780922fdbea8fecd25236745aba8b20af4439
+  7f96801cf4f21a6d78b0d669c8833b7aeb50e5db1d6f1cf2c4e9779fc86be1d8
+  72e9606fa7d9237dfd809dda3b89a531b9c8497c41d868cd036784cdacc6837c
+```
+
+### Vector 44: a relay proof of control over a served QUERY response
+
+**The object carries no key-state position**, for the reason the cosigned head carries none. **`value_digest` is length-prefixed**: a 4-byte blob count, then each blob under §9.5.1's variable-length rule, so one digest names one split of the served bytes into blobs.
+
+```
+operator:      c45b32c65d25b3d070929aa68fa4532f69fd5ab56fa15173be77d6c5c6d03c18
+nonce:         8c10b9bc0b5acdcfb85432747587fbbd8894bbad69f35de6dff46093513daac8
+routing_id:    f8affd47ab024cae9489a63fa1c632914c16f7329441b8fca65b32c78d86a4eb   (Vector 41's routing id)
+Served blobs, concatenated for display ("scp-25-served-blob-a", "scp-25-served-blob-bb"):
+  7363702d32352d7365727665642d626c6f622d617363702d32352d7365727665
+  642d626c6f622d6262
+value_digest = SHA-256(BE32(2) || BE32(len(A)) || A || BE32(len(B)) || B):
+  ebbf1905dedb60f162f2cc5190ae0a8cd0adc66bb34e0ea45469bc4957405115
+observed_at:   1700000000
+
+Preimage (155 bytes = 19-byte separator + 136 field bytes):
+  5343502d52454c41592d50524f4f462d56313ac45b32c65d25b3d070929aa68f
+  a4532f69fd5ab56fa15173be77d6c5c6d03c188c10b9bc0b5acdcfb854327475
+  87fbbd8894bbad69f35de6dff46093513daac8f8affd47ab024cae9489a63fa1
+  c632914c16f7329441b8fca65b32c78d86a4ebebbf1905dedb60f162f2cc5190
+  ae0a8cd0adc66bb34e0ea45469bc4957405115000000006553f100
+Canonical hash:
+  da84527c98e7b933bf9dd90795924dcfdc6dc58a7a80f475cfdf766d46ca766d
+Signature, reference key (200 bytes on the wire):
+  4dac593fea10e440cb649d0dccc0202aad333c627a485cb56161675ba826e798
+  685d6c9e920fa5d0932a94b3e6feb29fa5ccb788fcbd32c6daa14da5821ace1b
 ```
 
 ### Vector 45: the conflict statement a witness emits when its one check fails
@@ -1482,21 +1504,21 @@ offered_digest:     d57ac1967c8c6f17313209b43fd8513ac04d66a606f7d591ef65c7308abf
 
 Preimage (176 bytes = 24-byte separator + 152 field bytes):
   5343502d5749544e4553532d434f4e464c4943542d56313a9d94df95bc0a13f1
-  963f484414c320354c73c75bb86e96559e97765f5bc2d3130d230375c0587677
-  5265f7a49954a3bba9459ce25d2d5a380c1a9bc14a020b680000000000000007
+  963f484414c320354c73c75bb86e96559e97765f5bc2d3132c0f7f4478be94db
+  0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf320000000000000007
   9494a351a50e07b1d806cd1ac9c876fa9090cf31943bc894398d3a285c94e06f
   0000000000000007d57ac1967c8c6f17313209b43fd8513ac04d66a606f7d591
   ef65c7308abf0bcf000000006553f100
 Canonical hash:
-  a849d158de0dbcdef69bc96f78523b1bc8fb632685cf6cf6f2141ca759ed05b1
+  996de844303b52f97d2f5b899c32d0bce8c12f20a018af61d6b50b273ecbcec4
 Signature, secondary key (216 bytes on the wire):
-  d7e24b401f9783648ba429a186884731066e3ab7ab11452bac6adacbc0187d0b
-  0f370249c58f28f9bfcc68ba7e32f2fe0815e2d456475bc43f01ae77284bdf34
+  790962890917ca341f7fdc1b8ae497d48c7dd14a3039c7272cb6aab3a58512c3
+  22b760dd3acb789c3d43ef3efc5be06990ba1c6da8654885542a31ec52317cd2
 ```
 
 ### Vector 46: the two-heads fault proof
 
-Two cosigned heads of one witness, over one subject, naming one non-zero `previous_cosigned_digest` and two different `event_digest` values. **Those two objects together are the fault proof §9.7.4.3 defines**, and a relay keys its cosigned-head slot on (subject, witness, `previous_cosigned_digest`) so that both survive at one address (`03-identity.md` §3.10.2). A conforming implementation assembles the pair, verifies both signatures against the P-256 key the witness operator's community-relay-list entry declares, and reports a valid fault proof.
+Two cosigned heads of one witness, over one subject, naming one non-zero `previous_cosigned_digest` and two different `event_digest` values. **Those two objects together are the fault proof §9.7.4.3 defines**, and a relay keys its cosigned-head slot on (subject, witness, `event_digest`) so that both survive at one address (`03-identity.md` §3.10.2). A conforming implementation assembles the pair, verifies both signatures against the P-256 key the witness operator's community-relay-list entry declares, and reports a valid fault proof.
 
 ```
 Shared previous_cosigned_digest (non-zero):
@@ -1506,66 +1528,80 @@ Shared previous_cosigned_digest (non-zero):
       sequence: 21, observed_at: 1700000000
       preimage (165 bytes):
       5343502d434f5349474e45442d484541442d56313a9d94df95bc0a13f1963f48
-      4414c320354c73c75bb86e96559e97765f5bc2d3130d230375c05876775265f7
-      a49954a3bba9459ce25d2d5a380c1a9bc14a020b6800000000000000153dacf9
+      4414c320354c73c75bb86e96559e97765f5bc2d3132c0f7f4478be94db007831
+      1ef51ba3cc9934362b0f154dcbf9c597572e46cf3200000000000000153dacf9
       8cadc7a299e6f0b25f83aec640c34d5c16a2ba2252d1efcf246aebf0a05ec440
       e45bc301ca80bda9c235036ef19f3fbf833eb5f09960cfac1f1098af54000000
       006553f100
       canonical hash:
-  1f1083638602eb2dcb0d21db4701d275108ea8d18ae0b817b24cc7840ea11bee
+  a01ab83078ac16e02b2b33fd4c32a9f8990bb688642f6d8dcc9bdb0639fb8e87
       signature:
-  56115ac8f990a559b78ec0022e5bc42a0ec40b16a0c7cf8c885b789405f6c0e0
-  3bf4a4bfcdbaf5fddbd48cddef0553293e56f7ef8ed6d086d8bcd6394762defa
+  946ffa7b48b54d15fee4b42dc474b02966ca931ec37f890d3b01199b5290771c
+  6d5cb2d6f8abd0c4a364447aa4aef92a61dbdf49f6a992647c5485597b2615eb
 
 46b — event_digest: 53adb5551ff17eb6349a13afc7155a42b0496a7b9889e268eabe6d0c5f60f8a6
       sequence: 21, observed_at: 1700000001
       preimage (165 bytes):
       5343502d434f5349474e45442d484541442d56313a9d94df95bc0a13f1963f48
-      4414c320354c73c75bb86e96559e97765f5bc2d3130d230375c05876775265f7
-      a49954a3bba9459ce25d2d5a380c1a9bc14a020b68000000000000001553adb5
+      4414c320354c73c75bb86e96559e97765f5bc2d3132c0f7f4478be94db007831
+      1ef51ba3cc9934362b0f154dcbf9c597572e46cf32000000000000001553adb5
       551ff17eb6349a13afc7155a42b0496a7b9889e268eabe6d0c5f60f8a65ec440
       e45bc301ca80bda9c235036ef19f3fbf833eb5f09960cfac1f1098af54000000
       006553f101
       canonical hash:
-  6a325b08ff653308016d920d480b16ebcf20d4f4c05444f6b073cbf332c6e6dc
+  bf022c662d5842a169bda54c5578f06c08774e3bf8153605cf5da4f7fdbbc14c
       signature:
-  e0518d5556973b46e6312166480f1e8c461fb6e75802a8aed104e5d0202ff6b0
-  2d23d4213850245a543f07f6cd767d914120abdd8bd87c020da214b6c02b9ed6
+  a1d4602aeeef9be0ef10f13794a439d16e82e7f4a6ae1db68b5f7c2fbd707a6f
+  7c01169980aa038d1b47d9964da04a50a7b7bebf9fd1345245fe173a44c26eb4
 ```
 
-### Vector 44: a relay proof of control over a served QUERY response
+### Vector 49: the shipped community relay list
 
-**The object carries no key-state position.** §9.7.1 classifies it in the attestation class, so its signature verifies against the P-256 key the operator's community-relay-list entry declares. **`value_digest` is length-prefixed**: a 4-byte blob count, then each blob under §9.5.1's variable-length rule, so one digest names one split of the served bytes into blobs.
+`18-addressability-and-deployment.md` §18.5.1 fixes the artifact: one JSON document named `community-relays.json`, holding a JSON array of entries, each an object carrying `operator`, `key`, `url` and `free` in that order. The four bindings ship byte-identical copies, and a release process compares them against the digest below.
+
+The two entries are a fixture: each operator identifier is `SHA-256` over a stated ASCII label, and the two keys are §25.2's reference and secondary keys.
 
 ```
-operator:      c45b32c65d25b3d070929aa68fa4532f69fd5ab56fa15173be77d6c5c6d03c18
-nonce:         8c10b9bc0b5acdcfb85432747587fbbd8894bbad69f35de6dff46093513daac8
-routing_id:    73fbe2ada899507f188a7e0f9c47a639e085caae13198f25aae149b08d1afbd0   (Vector 41's routing id)
-Served blobs, concatenated for display ("scp-25-served-blob-a", "scp-25-served-blob-bb"):
-  7363702d32352d7365727665642d626c6f622d617363702d32352d7365727665
-  642d626c6f622d6262
-value_digest = SHA-256(BE32(2) || BE32(len(A)) || A || BE32(len(B)) || B):
-  ebbf1905dedb60f162f2cc5190ae0a8cd0adc66bb34e0ea45469bc4957405115
-observed_at:   1700000000
+File name:  community-relays.json
+entry 0:  operator = SHA-256("scp-25-relay-operator")
+          c45b32c65d25b3d070929aa68fa4532f69fd5ab56fa15173be77d6c5c6d03c18
+          key      = §25.2's reference key, 33-byte SEC1 compressed
+          033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027
+          url      = wss://relay.example.com/scp/v1
+          free     = true
+entry 1:  operator = SHA-256("scp-25-witness-operator")
+          9d94df95bc0a13f1963f484414c320354c73c75bb86e96559e97765f5bc2d313
+          key      = §25.2's secondary key, 33-byte SEC1 compressed
+          0223702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aea
+          url      = wss://relay2.example.com/scp/v1
+          free     = false
 
-Preimage (155 bytes = 19-byte separator + 136 field bytes):
-  5343502d52454c41592d50524f4f462d56313ac45b32c65d25b3d070929aa68f
-  a4532f69fd5ab56fa15173be77d6c5c6d03c188c10b9bc0b5acdcfb854327475
-  87fbbd8894bbad69f35de6dff46093513daac873fbe2ada899507f188a7e0f9c
-  47a639e085caae13198f25aae149b08d1afbd0ebbf1905dedb60f162f2cc5190
-  ae0a8cd0adc66bb34e0ea45469bc4957405115000000006553f100
-Canonical hash:
-  39810614f84be6d793191fad3b05efc990dba59f133fbb88bbcd9b17ac2b1957
-Signature, reference key (200 bytes on the wire):
-  6ed286373d151c207c584f7cb657de8d9cdd734a0a54272bedc8471243037f0f
-  3acf0a59d6c4083085715af8f4e509bd484830ea9c3a779f74bac596343c486d
+Document (415 bytes):
+[{"operator":"c45b32c65d25b3d070929aa68fa4532f69fd5ab56fa15173be77d6c5c6d03c18","key":"033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027","url":"wss://relay.example.com/scp/v1","free":true},{"operator":"9d94df95bc0a13f1963f484414c320354c73c75bb86e96559e97765f5bc2d313","key":"0223702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aea","url":"wss://relay2.example.com/scp/v1","free":false}]
+
+Document bytes:
+  5b7b226f70657261746f72223a22633435623332633635643235623364303730
+  3932396161363866613435333266363966643561623536666131353137336265
+  3737643663356336643033633138222c226b6579223a22303333623163616332
+  3366343563663163646664663062333266386637373762393931363663316236
+  39363439633232393562313531373838336434376633303237222c2275726c22
+  3a227773733a2f2f72656c61792e6578616d706c652e636f6d2f7363702f7631
+  222c2266726565223a747275657d2c7b226f70657261746f72223a2239643934
+  6466393562633061313366313936336634383434313463333230333534633733
+  63373562623836653936353539653937373635663562633264333133222c226b
+  6579223a22303232333730326136343832333266326430303731336465393238
+  3937353363326662643463346566613765316533333930356533373233613431
+  32623230616561222c2275726c223a227773733a2f2f72656c6179322e657861
+  6d706c652e636f6d2f7363702f7631222c2266726565223a66616c73657d5d
+SHA-256 over those bytes:
+  526839862b1ba39c6a9e163f8a56ef34162078ddffc8d0745dbf3b1a6de9c0b4
 ```
 
 ## 25.28 Pre-Rotation Commitment and Service Record Vectors (§9.7.4.2 definitions, `03-identity.md` §3.10.13)
 
 ### Vector 47: the pre-rotation commitment
 
-The commitment is `SHA-256("SCP-PREROTATION-COMMITMENT-V1:" || pre_rotation_public_key)` over one member of the next set. The public key is a fixed-length 33-byte SEC1 compressed point, so it carries no length prefix, and two distinct points give two distinct commitments.
+The commitment is `SHA-256("SCP-PREROTATION-COMMITMENT-V1:" || pre_rotation_public_key)` over one member of the next set, the public key being a 33-byte SEC1 compressed point carrying no length prefix (§9.7.4.2 definitions). Two distinct points give two distinct commitments.
 
 ```
 47a — §25.2's tertiary key, the pre-rotation key of Vector 41's identity
@@ -1594,7 +1630,7 @@ The commitment is `SHA-256("SCP-PREROTATION-COMMITMENT-V1:" || pre_rotation_publ
 A service record is `(identifier, sequence, entries)`, and `03-identity.md` §3.10.13 states its preimage. The signer is the operational key Vector 41's key state designates for the service-record role, which is §25.2's secondary key. The record's sequence is its own and is unrelated to the key-event log's.
 
 ```
-identifier:    0d230375c05876775265f7a49954a3bba9459ce25d2d5a380c1a9bc14a020b68
+identifier:    2c0f7f4478be94db0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf32
 sequence:      4
 entry_count:   3
   entry 0:  id "#scp-relay-1", type "SCPRelay", serviceEndpoint "wss://relay.example.com/scp/v1"
@@ -1612,11 +1648,11 @@ under §9.5.1's variable-length rule, in that order and with no discriminator:
   6d706c652e636f6d2f7363702f7631
 
 Address, SHA-256("scp:svc:" || identifier):
-  b6d076c449e32f50b87f468e2b3c17a5fd65adfddb37e1f10a2d135f06ebd8f9
+  415152a878481430157966302b508188f6715a49e2bc7072bad1c4a54af24f17
 
 Preimage (269 bytes = 22-byte separator + 247 field bytes):
-  5343502d534552564943452d5245434f52442d56313a0d230375c05876775265
-  f7a49954a3bba9459ce25d2d5a380c1a9bc14a020b6800000000000000040000
+  5343502d534552564943452d5245434f52442d56313a2c0f7f4478be94db0078
+  311ef51ba3cc9934362b0f154dcbf9c597572e46cf3200000000000000040000
   00030000000c237363702d72656c61792d310000000853435052656c61790000
   001e7773733a2f2f72656c61792e6578616d706c652e636f6d2f7363702f7631
   0000000c237363702d72656c61792d320000000853435052656c61790000001f
@@ -1625,8 +1661,8 @@ Preimage (269 bytes = 22-byte separator + 247 field bytes):
   72697661746553746174650000001e7773733a2f2f72656c61792e6578616d70
   6c652e636f6d2f7363702f7631
 Canonical hash:
-  1dc2b6295bc097970fc8cf494a6fee9f70267c9718a67b588bd59527062cd301
+  fcff6eee58fb20d5fa2a262d87ab409bd6f58a8daf40bb64afe746a8084b6889
 Signature, secondary key (311 bytes on the wire):
-  1cf8e0af0ba3fcec10b8199b0895bf7a36ad964413ff5a19179f87a79f98b6b6
-  601be526f8e5857472957d4ef53a77edc4b2aa96aa863fed2d3490e4b396d0b3
+  5ba64b72652d546603a529bf03ab548699269a77ee215b31edf0597cf258b3c3
+  775b5d1cf03291277d994e85bd0bdc99497e002f426d2d00351d186d001a1cc4
 ```
