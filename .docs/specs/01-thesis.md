@@ -28,7 +28,7 @@ The original plan was app-first: build a specific application, extract the proto
 - **OpenClaw**: Agents coordinating outside governed channels because no governed path exists.
 - **The competitive window**: MCP (Anthropic), WebMCP (Google+Microsoft), and UCP (Google+Shopify) are all tool-level protocols. Nobody is building the social layer. The window is open but closing.
 
-Agents ARE the killer app. The demand exists. Someone will build the killer app on top of SCP if the SDK is available. Apps are built on the SDK simultaneously — they validate the SDK surface and prove the "app on SCP" story, but don't gate SDK release.
+Agents ARE the killer app. The demand exists. Someone will build the killer app on top of SCP if the SDK is available.
 
 ### What SDK-First Means
 
