@@ -26,7 +26,7 @@ Every establishment event commits to the digests of the next root keys before an
 
 **One ciphersuite, ECDSA on NIST P-256 with SHA-256**, no negotiation and no fallback (§9.5). Root custody defaults to a passkey, whose private key no code path exports, so the person manages no key material (§9.7.4.1 item 4).
 
-**Relays carry the log.** A resolver queries the identity's own relays and a fallback set from the community relay list the SDK ships, and every relay a first contact reads proves control of its declared operator identity (`.docs/specs/03-identity.md` §3.10.1, §3.10.4). Transport and service metadata live in a separately signed service record, so a relay-endpoint change appends no key event (§3.10.13). An identity publishes no DID document (`.docs/specs/18-addressability-and-deployment.md` §18.2.2A).
+**Relays carry the log.** A resolver queries the identity's own relays and a fallback set from the community relay list the SDK ships, and every relay a first contact reads proves control of its declared operator identity (`.docs/specs/03-identity.md` §3.10.1, §3.10.4). Transport and service metadata live in a separately signed service record, so a relay-endpoint change appends no key event (§3.10.13).
 
 Identity private state (block lists, graph visibility policies, petnames, preferences) is encrypted to the owner's keys and replicated across relays as an append-only event log — the same
 infrastructure as context state, but membership of one.
@@ -94,7 +94,7 @@ Validation is zero-trust on every action:
 6. Nonce uniqueness check (prevents replay)
 7. For paid actions: spending UCAN present and sufficient
 
-A trusted DID with an expired token is denied. An unknown DID with a valid token is permitted. No exceptions.
+A trusted identifier with an expired token is denied. An unknown identifier with a valid token is permitted. No exceptions.
 
 #### 5. Trust (4-layer model)
 
@@ -159,7 +159,7 @@ boundary all in one.
 - **Encryption IS access control.** No relay or server enforces membership — the math does. Relays are untrusted: clients verify everything cryptographically and never rely on a relay for access control or correctness. A relay may validate a *public, self-certifying* key-event frame, whose chain verifies against its own bytes (`.docs/specs/03-identity.md` §3.10.2), to resist suppression, but is never trusted to, and never reads encrypted content.
 - **No operator required.** If Limn disappears tomorrow, SCP works exactly as designed. Identity resolution replays a log any relay can serve, relays are commodity storage, and governance is per-context.
 - **Provenance everywhere.** Not a feature — a core protocol property. Every message, outlet output, attestation, and cross-context transfer is traceable.
-- **Human accountability.** Every agent chains back to a human DID. The protocol provides the mechanism; contexts decide the requirement.
+- **Human accountability.** Every agent chains back to a human identity. The protocol provides the mechanism; contexts decide the requirement.
 - **Trust decays into validation.** New identities require trust. Established identities are validated by behavioral records from Merkle-verified event logs. The system gets more secure over time.
 
 ### Encryption and MLS — deep dive
@@ -373,7 +373,7 @@ The `BroadcastEnvelope`:
 ```rust
 pub struct BroadcastEnvelope {
     pub context_id: ContextId,
-    pub sender_did: DID,           // visible to relays (authors are public)
+    pub sender_did: Identifier,    // visible to relays (authors are public)
     pub sequence: u64,
     pub key_epoch: u64,
     pub timestamp: u64,
@@ -384,7 +384,7 @@ pub struct BroadcastEnvelope {
 }
 ```
 
-Subscriber registration uses the two-tier model from contexts with discovery tools: a bounded writer tier (MLS members, authors) and an unbounded reader tier (DID-authenticated subscribers). Open broadcasts grant keys on DID authentication alone; gated broadcasts require a `messagesRead` UCAN from the context admin, enabling paid subscriptions, invite-only communities, and tiered access.
+Subscriber registration uses the two-tier model from contexts with discovery tools: a bounded writer tier (MLS members, authors) and an unbounded reader tier (`#active`-authenticated subscribers). Open broadcasts grant keys on that authentication alone; gated broadcasts require a `messagesRead` UCAN from the context admin, enabling paid subscriptions, invite-only communities, and tiered access.
 
 #### Metadata privacy — what relays see
 
@@ -419,7 +419,7 @@ Additional protections:
 
 Relays are explicitly untrusted:
 
-**CAN:** Read routing metadata (pseudonyms, TTLs, blob sizes). Drop messages (suppression). Delay messages. Replay messages. Equivocate (show different histories to different members). Correlate traffic timing. See broadcast author DIDs.
+**CAN:** Read routing metadata (pseudonyms, TTLs, blob sizes). Drop messages (suppression). Delay messages. Replay messages. Equivocate (show different histories to different members). Correlate traffic timing. See broadcast author identifiers.
 
 **CANNOT:** Forge messages (requires P-256 key + MLS secrets). Decrypt content (requires MLS group key + sender-side key). Modify messages (inner signature + membership_tag fail). Inject members (requires HPKE Welcome to joiner's KeyPackage). Read broadcast content (requires author broadcast key).
 
@@ -450,18 +450,18 @@ Creating a context from scratch means specifying a ceiling, roles, governance mo
 | `bilateral-persistent` | Encrypted | Standing DM channel, no expiry. |
 | `coordination` | Encrypted | Time-boxed task context with outlets. Summary memory scope. |
 | `group-discussion` | Encrypted | Group chat with invites. Full persistence. |
-| `public-broadcast` | Broadcast | Open feed — anyone can subscribe on DID authentication alone. |
+| `public-broadcast` | Broadcast | Open feed — anyone can subscribe on `#active` authentication alone. |
 | `gated-broadcast` | Broadcast | Feed with access control — admin issues subscriber UCANs. |
 | `outlet-interface` | Encrypted | Cross-context outlet exposure point. |
 | `paid-service` | Encrypted | Outlet context with per-invocation cost. Extends `outlet-interface`. |
 | `paid-broadcast` | Broadcast | Subscription feed. Extends `gated-broadcast`. |
 | `handle-registry` | Encrypted | Context that serves human-readable handles. |
 
-Templates are protocol constants, not extensible. A template ID in context metadata is a commitment: "this context has exactly these properties." The joining party evaluates a single check — "do I accept this template from this DID at this TTL?" — instead of inspecting six parameters individually.
+Templates are protocol constants, not extensible. A template ID in context metadata is a commitment: "this context has exactly these properties." The joining party evaluates a single check — "do I accept this template from this identity at this TTL?" — instead of inspecting six parameters individually.
 
 #### Auto-accept policies
 
-Agents can configure rules for automatic context acceptance — the SDK joins without human confirmation when conditions are met. The only auto-accept trigger is a DID on the operator's explicit allowlist; co-membership and discoverability are not trust signals. Absent an explicit policy, every invitation prompts the human (default-deny). Example: "auto-accept `bilateral-ephemeral` from DIDs on my allowlist, if TTL is under 10 minutes, at most 5 per hour."
+Agents can configure rules for automatic context acceptance — the SDK joins without human confirmation when conditions are met. The only auto-accept trigger is an identifier on the operator's explicit allowlist; co-membership and discoverability are not trust signals. Absent an explicit policy, every invitation prompts the human (default-deny). Example: "auto-accept `bilateral-ephemeral` from identifiers on my allowlist, if TTL is under 10 minutes, at most 5 per hour."
 
 Two hard rules that cannot be overridden by any policy:
 - **No auto-accept for outlet-bearing contexts.** Outlet access enables cross-context data flow. Auto-accepting it would silently expand the agent's attack surface.
@@ -501,7 +501,7 @@ Protocol-enforced limits:
 
 #### Apps in SCP
 
-An app is not a protocol entity. There is no `App` type, no app DID, no app registration. What people experience as "an app" is a composite of contexts + members + outlets + data. The protocol doesn't model it because the constituent parts are already first-class.
+An app is not a protocol entity. There is no `App` type, no app identity, no app registration. What people experience as "an app" is a composite of contexts + members + outlets + data. The protocol doesn't model it because the constituent parts are already first-class.
 
 State exists at two layers:
 - **Protocol state** — membership, roles, capability tokens, outlet registrations, governance, content history, trust. This belongs to the protocol. It's portable and survives app death.
@@ -511,7 +511,7 @@ This separation is the anti-lock-in mechanism. If you leave an app, you keep you
 
 #### MCP compatibility
 
-SCP integrates with MCP (Model Context Protocol) through a translation layer. The SCP agent runs as an MCP server locally. The AI model sees tools and calls them via JSON-RPC. It has no awareness of SCP — no knowledge of DIDs, encryption, or governance.
+SCP integrates with MCP (Model Context Protocol) through a translation layer. The SCP agent runs as an MCP server locally. The AI model sees tools and calls them via JSON-RPC. It has no awareness of SCP — no knowledge of identifiers, encryption, or governance.
 
 ```
 AI Model (any MCP-speaking model)
@@ -521,7 +521,7 @@ SCP Agent (translation layer)
 Context [outlets, roles, members, governance]
 ```
 
-The agent handles everything SCP-specific: capability filtering (only exposes tools the human's role permits), DID signing, encryption, context routing. Tools from multiple contexts appear as namespaced MCP tools — `context_a/send_message`, `context_b/schedule_meeting`. Any MCP-compatible model (Claude, GPT, Gemini, local models) participates in SCP without modification.
+The agent handles everything SCP-specific: capability filtering (only exposes tools the human's role permits), `#active` signing, encryption, context routing. Tools from multiple contexts appear as namespaced MCP tools — `context_a/send_message`, `context_b/schedule_meeting`. Any MCP-compatible model (Claude, GPT, Gemini, local models) participates in SCP without modification.
 
 ### Discovery and addressing
 
@@ -531,7 +531,7 @@ Two complementary discovery channels:
 
 **Service-record capabilities** — direct lookup, zero infrastructure. Every agent may publish self-asserted capability URIs in its service record. Anyone who knows an identifier can resolve that record from the identity's relays and inspect the capabilities (`.docs/specs/03-identity.md` §3.10.13). Provides lookup, not search.
 
-**Contexts with discovery tools** — searchable registries, SCP-native. Standard contexts with open join policies and standardized tools (`agent_search`, `agent_register`, `agent_deregister`). Anyone can create one. Two-tier membership: bounded writers (MLS members who process registrations) and unbounded readers (DID-authenticated, query via tool endpoints without joining the MLS group).
+**Contexts with discovery tools** — searchable registries, SCP-native. Standard contexts with open join policies and standardized tools (`agent_search`, `agent_register`, `agent_deregister`). Anyone can create one. Two-tier membership: bounded writers (MLS members who process registrations) and unbounded readers (`#active`-authenticated, query via tool endpoints without joining the MLS group).
 
 Bootstrap: SDK ships with default bootstrap context IDs (analogous to browser CA lists or DNS root servers). Not privileged — starting points. If all defaults are unavailable, agents fall back to direct identity resolution and manual context ID sharing.
 
@@ -583,10 +583,10 @@ Combined with the fact that each sybil identity needs its own spending UCAN, ada
 
 The protocol doesn't claim to solve sybil (one person, many identities) — it makes sybil attacks expensive to mount, expensive to sustain, and costly when detected. Three layered mechanisms:
 
-1. **Device attestation.** Hardware-backed attestation (Apple App Attest, Google Play Integrity) ties DID creation to physical devices. One device = one DID. Doesn't prove one human (someone with two phones gets two identities), but makes identity creation cost the price of a device.
+1. **Device attestation.** Hardware-backed attestation (Apple App Attest, Google Play Integrity) ties identity creation to physical devices. One device = one identity. Doesn't prove one human (someone with two phones gets two identities), but makes identity creation cost the price of a device.
 
 2. **Earned capacity.** New identities start limited — restricted context creation, limited participation slots, constrained outlet invocation rates. Capacity grows through participation history and time. Sybil accounts are cheap to create but expensive to make useful.
 
-3. **Context-level thresholds.** Each context sets its own admission requirements — behavioral history, endorsements, attestations. A casual group chat requires just a valid DID. A high-trust financial context might require 6 months of history, 3 independent endorsements, and challenge-verified capabilities.
+3. **Context-level thresholds.** Each context sets its own admission requirements — behavioral history, endorsements, attestations. A casual group chat requires just a valid identity. A high-trust financial context might require 6 months of history, 3 independent endorsements, and challenge-verified capabilities.
 
 These compose: device attestation makes creation expensive, earned capacity makes new identities limited, context thresholds make meaningful participation require real history. And consequences for detected sybil attacks render the accounts single-use — the investment in aging and building history is lost.
