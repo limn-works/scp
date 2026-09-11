@@ -8,11 +8,11 @@ This is the artifact-flow invariant in `CLAUDE.md` applied to review triage. The
 
 ## The instance
 
-On 2026-09-02 the inquisitor filed a finding against the fork-precedence rule in `09-security-model.md` §9.7.4.2: a suffix whose commitment-revealing event also carries the standing root's signature should outrank one that does not. The orchestrator refused it, wrote a reason, and recorded the refusal as a decision. It never opened ADR-063, the inception-derived identity key-event log, which had carried that two-tier order since its acceptance.
+On 2026-09-02 the inquisitor filed a finding against the fork-precedence rule in `09-security-model.md` §9.7.4.2: a suffix whose commitment-revealing event also carries the standing root's signature should outrank one that does not. The orchestrator refused it, wrote a reason, and recorded the refusal as a decision. It never opened ADR-063, inception-derived self-certifying identity over a key-event log, which had carried that two-tier order since its acceptance.
 
-Eight review rounds then ran against the version the orchestrator had written. Every reviewer in those rounds checked the spec text against the plan of record, and the plan carried the orchestrator's version, so every round confirmed a rule the Accepted ADR contradicted. The refusal propagated because the checking procedure could not see past the artifact that carried the error.
+Eight review rounds then ran against the version the orchestrator had written. Each reviewer checked the spec text against the plan of record, and the plan carried the orchestrator's version, so every round confirmed a rule the Accepted ADR contradicted. The refusal propagated because the checking procedure could not see past the artifact that carried the error.
 
-Alec settled the question on 2026-09-07 in the finding's favour — "Root wins sounds like a good solution" — with the reason "If an attacker has the root, it's GG. What would you gain by trying to optimize against that case?" Pass 17 of the spec rebuild then re-amended ADR-063 back to the order it had held from acceptance, and rewrote six sites in the spec and the ADR that had been built on the refused version.
+Alec settled the question on 2026-09-07 in the finding's favour — "Root wins sounds like a good solution" — with the reason "If an attacker has the root, it's GG. What would you gain by trying to optimize against that case?" Pass 17 of the spec rebuild re-amended the ADR back to the order it had held from acceptance, and rewrote six sites built on the refused version.
 
 ## The fix
 
