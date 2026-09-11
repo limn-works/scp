@@ -14,7 +14,7 @@ bindings/kotlin/
     build.gradle.kts             # SDK module build
     src/
       main/kotlin/works/limn/scp/
-        Identity.kt              # Identity class, DIDDocument
+        Identity.kt              # Identity class
         Context.kt               # Context class, Membership
         Tools.kt                 # ToolDefinition, TestVector data classes
         Trust.kt                 # evaluateTrust(), TrustEvaluation
@@ -56,14 +56,14 @@ namespace scp {
   Identity identity_create(string custody);
 
   [Throws=ScpError]
-  Identity identity_load(string did);
+  Identity identity_load(bytes identifier);
 
   [Throws=ScpError]
-  DIDDocument identity_resolve(string did);
+  ResolutionOutcome identity_resolve(bytes identifier);
 };
 
 interface Identity {
-  string did();
+  bytes identifier();
   string custody_type();
 
   [Throws=ScpError]
@@ -158,7 +158,7 @@ detekt {
 
 ```kotlin
 data class Message(
-    val senderDid: String,
+    val senderIdentifier: ByteArray,
     val content: ByteArray,
     val timestamp: Long,
     val sequence: Long,
@@ -171,7 +171,7 @@ data class ToolDefinition(
     val description: String,
     val inputSchema: Map<String, Any>,
     val outputSchema: Map<String, Any>,
-    val operator: String,  // DID
+    val operator: ByteArray,  // identifier
     val testVectors: List<TestVector>? = null,
     val implementationHash: ByteArray? = null,
 )
@@ -198,7 +198,7 @@ class ValidationException(message: String, code: String) : ScpException(message,
 
 ```kotlin
 class Identity private constructor(private val handle: IdentityHandle) {
-    val did: String get() = handle.did()
+    val identifier: ByteArray get() = handle.identifier()
     val custodyType: String get() = handle.custodyType()
 
     companion object {
@@ -207,9 +207,9 @@ class Identity private constructor(private val handle: IdentityHandle) {
                 Identity(NativeLib.identityCreate(custody))
             }
 
-        suspend fun load(did: String): Identity =
+        suspend fun load(identifier: ByteArray): Identity =
             withContext(Dispatchers.IO) {
-                Identity(NativeLib.identityLoad(did))
+                Identity(NativeLib.identityLoad(identifier))
             }
     }
 
