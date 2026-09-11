@@ -73,7 +73,7 @@ Spec 12 (Platform Bridge Connectors) is by far the most substantial of these fou
 ### [12.3-005] Claimed Shadow Role Upgrade Path Unspecified
 - **Category**: Ambiguous state transitions
 - **Location**: 12.3
-- **What's missing**: 12.3 says shadows are "restricted by default" and context governance "may subsequently upgrade the role." But once a shadow is claimed (bound to a DID), the spec doesn't address what happens to the shadow's role. Does the claimant inherit the shadow's observer role? Does claiming automatically upgrade to full member? Does the claimant need to separately join the context?
+- **What's missing**: 12.3 says shadows are "restricted by default" and context governance "may subsequently upgrade the role." But once a shadow is claimed (bound to an identity), the spec doesn't address what happens to the shadow's role. Does the claimant inherit the shadow's observer role? Does claiming automatically upgrade to full member? Does the claimant need to separately join the context?
 - **Why it matters**: The transition from claimed shadow to full participant is ambiguous. An implementor must decide whether claiming creates a new membership entry or mutates the shadow in place.
 - **Severity**: HIGH
 
@@ -108,7 +108,7 @@ Spec 12 (Platform Bridge Connectors) is by far the most substantial of these fou
 ### [12.10.2-001] JWT Signing Algorithm Not Specified
 - **Category**: Missing wire format details
 - **Location**: 12.10.2
-- **What's missing**: The authentication section says "DID-signed bearer tokens" using JWT but does not specify the signing algorithm. Given the protocol uses Ed25519 everywhere, this should be `EdDSA` (RFC 8037), but the spec doesn't say. JWT `alg` header value is not specified.
+- **What's missing**: The authentication section says "identity-signed bearer tokens" using JWT but does not specify the signing algorithm. The JWT `alg` header value is not specified.
 - **Why it matters**: Without an explicit algorithm, implementations may use different JWT signing algorithms, producing incompatible tokens.
 - **Severity**: MEDIUM
 
@@ -119,24 +119,24 @@ Spec 12 (Platform Bridge Connectors) is by far the most substantial of these fou
 - **Why it matters**: Without a hard maximum, a bridge could issue tokens valid for years, creating a long-lived credential that survives bridge revocation.
 - **Severity**: MEDIUM
 
-### [12.10.2-003] DID Document Cache TTL Not Specified for Platform Verification
+### [12.10.2-003] Identity Resolution Cache TTL Not Specified for Platform Verification
 - **Category**: Missing constants/defaults
 - **Location**: 12.10.2
-- **What's missing**: "The platform MAY cache resolved DID documents with TTL." No default TTL specified. A platform that caches indefinitely would not detect DID key rotation. A platform that never caches would DDoS the DHT.
-- **Why it matters**: DID document caching directly impacts key rotation security. If a bridge operator rotates their key (compromise recovery), the platform must resolve the new key within a bounded time.
+- **What's missing**: The platform MAY cache resolved key state with a TTL. No default TTL is specified. A platform that caches indefinitely would not detect a key rotation. A platform that never caches would flood the relays.
+- **Why it matters**: Resolution caching directly impacts key rotation security. If a bridge operator rotates their key (compromise recovery), the platform must resolve the new key within a bounded time.
 - **Severity**: MEDIUM
 
 ### [12.10.2-004] Webhook Signature Scheme Underspecified
 - **Category**: Missing wire format details
 - **Location**: 12.10.2
-- **What's missing**: Webhook callbacks use `X-SCP-Signature: <Ed25519 signature over raw request body>`. This is ambiguous: is the signature over the raw bytes of the request body (before or after encoding)? Is there a domain separator? Is Content-Encoding considered? Is there a timestamp to prevent replay?
+- **What's missing**: Webhook callbacks use `X-SCP-Signature: <signature over raw request body>`. This is ambiguous: is the signature over the raw bytes of the request body (before or after encoding)? Is there a domain separator? Is Content-Encoding considered? Is there a timestamp to prevent replay?
 - **Why it matters**: Without a canonical serialization of the signed content and replay protection (timestamp or nonce), webhook signatures are replayable. An attacker who intercepts one webhook delivery can replay it indefinitely.
 - **Severity**: HIGH
 
 ### [12.10.2-005] Platform Key Registration Mechanism Unspecified
 - **Category**: Underspecified algorithms
 - **Location**: 12.10.2
-- **What's missing**: "The bridge node verifies the signature against the platform's pre-registered public key (exchanged during bridge registration)." How is this key exchanged? During what registration step? Is it a DID? A raw public key? A certificate?
+- **What's missing**: "The bridge node verifies the signature against the platform's pre-registered public key (exchanged during bridge registration)." How is this key exchanged? During what registration step? Is it an identity? A raw public key? A certificate?
 - **Why it matters**: Key exchange is a fundamental trust establishment step. Without specifying the mechanism, implementations must invent their own, which may be insecure.
 - **Severity**: HIGH
 
@@ -199,7 +199,7 @@ Spec 12 (Platform Bridge Connectors) is by far the most substantial of these fou
 ### [12.10.4-007] DELETE /v1/scp/bridge/shadow/{shadow_id} No Authorization Check Specified
 - **Category**: Security-relevant omissions
 - **Location**: 12.10.4
-- **What's missing**: The delete endpoint description says "the bridge operator" can delete shadows. But the authorization model only checks the bearer token (which proves the request comes from the bridge operator's DID). There is no specification of whether the bridge operator can delete shadows created by a different bridge in the same context. The implementation in `registration.rs` scopes by context but not by bridge instance.
+- **What's missing**: The delete endpoint description says "the bridge operator" can delete shadows. But the authorization model only checks the bearer token (which proves the request comes from the bridge operator's identity). There is no specification of whether the bridge operator can delete shadows created by a different bridge in the same context. The implementation in `registration.rs` scopes by context but not by bridge instance.
 - **Why it matters**: If shadow deletion is not scoped to the bridge that created the shadow, a malicious bridge operator could delete other bridges' shadows.
 - **Severity**: MEDIUM
 
@@ -326,13 +326,13 @@ Spec 12 (Platform Bridge Connectors) is by far the most substantial of these fou
 - **Category**: Security-relevant omissions
 - **Location**: 12
 - **What's missing**: Section 9.2 (threat vectors) does not include bridge-specific threats. A malicious bridge operator can: (a) fabricate shadow identities that don't correspond to real external users, (b) attribute messages to shadows that the external user never sent, (c) modify content in transit (relay/puppet modes), (d) forge platform timestamps, (e) refuse to relay SCP-to-platform messages while appearing active. None of these are addressed.
-- **Why it matters**: Bridge operators are explicitly trusted intermediaries. The threat model should enumerate what a malicious bridge operator can do and what the protocol's mitigations are. Currently, the answer is: a malicious operator can fabricate arbitrary content attributed to arbitrary external identities, and the only defense is operator DID accountability after the fact.
+- **Why it matters**: Bridge operators are explicitly trusted intermediaries. The threat model should enumerate what a malicious bridge operator can do and what the protocol's mitigations are. Currently, the answer is: a malicious operator can fabricate arbitrary content attributed to arbitrary external identities, and the only defense is operator accountability after the fact.
 - **Severity**: CRITICAL
 
 ### [12-SECURITY-002] No Mechanism to Verify External Platform Identity Claims
 - **Category**: Security-relevant omissions
 - **Location**: 12.3, 12.10.4 (attest)
-- **What's missing**: The attest endpoint lets a platform "vouch for a user's identity" but there is no protocol-level mechanism for verifying that the platform's attestation is truthful. The platform is trusted entirely based on the bridge operator's DID. A cooperating platform could fabricate attestations for users who don't exist on the platform.
+- **What's missing**: The attest endpoint lets a platform "vouch for a user's identity" but there is no protocol-level mechanism for verifying that the platform's attestation is truthful. The platform is trusted entirely based on the bridge operator's identity. A cooperating platform could fabricate attestations for users who don't exist on the platform.
 - **Why it matters**: The trust hierarchy assumes platform attestations are meaningful. Without verification, a malicious cooperating platform is indistinguishable from a legitimate one.
 - **Severity**: MEDIUM
 
@@ -470,7 +470,7 @@ Spec 12 (Platform Bridge Connectors) is by far the most substantial of these fou
 ### [15-001] Right to Erasure Content Handling Contradicts Merkle Integrity
 - **Category**: Cross-reference inconsistencies
 - **Location**: 15
-- **What's missing**: "Content they authored in contexts remains (attributed to a now-revoked DID)." But context event logs are Merkle trees (7.3.1). Removing content from a Merkle tree invalidates all subsequent hashes. The spec acknowledges the protocol "does not retroactively delete content" but doesn't address the tension between GDPR erasure requests and Merkle tree integrity. No specification of: (a) how to handle a legally-mandated erasure request, (b) whether "tombstoning" (replacing content with a tombstone record while preserving the Merkle structure) is supported, (c) whether erasure applies to the content or just the identity link.
+- **What's missing**: "Content they authored in contexts remains (attributed to a now-revoked identity)." But context event logs are Merkle trees (7.3.1). Removing content from a Merkle tree invalidates all subsequent hashes. The spec acknowledges the protocol "does not retroactively delete content" but doesn't address the tension between GDPR erasure requests and Merkle tree integrity. No specification of: (a) how to handle a legally-mandated erasure request, (b) whether "tombstoning" (replacing content with a tombstone record while preserving the Merkle structure) is supported, (c) whether erasure applies to the content or just the identity link.
 - **Why it matters**: EU GDPR Article 17 grants the right to erasure. SCP's architecture makes erasure structurally impossible for content in shared contexts. The spec hand-waves this with "apps and context governance can implement content deletion policies" without addressing the Merkle integrity constraint. A legally-mandated erasure request against a Merkle-logged context has no specified resolution.
 - **Severity**: CRITICAL
 
