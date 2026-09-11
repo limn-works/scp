@@ -56,7 +56,7 @@ AddressResolution:
   | Context   { context_id, relay_urls, mode, trust_level, resolution_path }
 ```
 
-Agent capabilities are not part of the addressing layer. A handle resolves to a DID; the DID document is the authoritative source for capabilities (`SCPCapabilities` service endpoint, §6.2.2A [no such section]). A handle registry caching capabilities would be stale by design — capabilities change when agents are updated, and the DID document reflects the current state. Contexts already provide capability search via `agent_search` (§6.2.2B [no such section]).
+Agent capabilities are not part of the addressing layer. A handle resolves to an identifier, and the identity's own service record carries its self-asserted capability URIs (`03-identity.md` §3.10.13). A handle registry caching capabilities would be stale by design — capabilities change when agents are updated, and the service record reflects the current state. Contexts already provide capability search via `agent_search` (§6.2.2B [no such section]).
 
 ### 22.2.2 Normalization
 
@@ -153,7 +153,7 @@ The `did` parameter in `handle_deregister` is explicit rather than inferred from
 
 1. **Canonical payload.** The request payload is serialized to canonical JSON (keys sorted lexicographically, no whitespace, no trailing commas). This produces a deterministic byte sequence regardless of JSON serialization library.
 2. **Signed content.** The signed bytes are: `"SCP-HANDLE-OUTLET-V1:" || outlet_name || ":" || canonical_json_bytes`, where `outlet_name` is one of `"handle_register"`, `"handle_lookup"`, `"handle_deregister"`, `"scope_register"`, `"scope_lookup"`, `"scope_deregister"`, and `||` denotes byte concatenation. The domain prefix `"SCP-HANDLE-OUTLET-V1:"` prevents cross-protocol signature reuse. Scope outlets sign with their own outlet name (e.g., `"scope_register"`), not the corresponding handle outlet name (`"handle_register"`). This maintains domain separation — a signature over a scope registration cannot be replayed as a handle registration, and vice versa.
-3. **Signature algorithm.** ECDSA on P-256 with SHA-256 (§9.5 of the security-model spec), using the requester's `#active` signing key (or `#agent` key if the request is agent-initiated under a valid UCAN delegation). **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`00-open-questions.md`).]**
+3. **Signature algorithm.** ECDSA on P-256 with SHA-256 (§9.5 of the security-model spec), using the `#active` signing key of the identity that issues the request — the requester's own, or an agent identity's where an agent initiates it under a UCAN delegation (`09-security-model.md` §9.1 invariant 1).
 4. **Transport.** The signature is carried as an additional field in the outlet call request envelope:
    ```
    {
@@ -163,7 +163,7 @@ The `did` parameter in `handle_deregister` is explicit rather than inferred from
      "signing_key_id": "#active"          // which verification method signed
    }
    ```
-5. **Writer verification.** The writer resolves the `requester_did` via DID document, extracts the public key for `signing_key_id`, and verifies the P-256 signature over the reconstructed `signed_content`. If verification fails, the request is rejected with a `BRIDGE_NOT_AUTHORIZED` error. The writer MUST verify that the DID document is fresh (fetched within the last 300 seconds or cached with valid TTL).
+5. **Writer verification.** The writer derives the `requester_did`'s key state by replaying its key-event log (`03-identity.md` §3.10.4), takes the key that state names in the `signing_key_id` role, and verifies the P-256 signature over the reconstructed `signed_content`. If verification fails, the request is rejected with a `BRIDGE_NOT_AUTHORIZED` error. The writer MUST hold a key state resolved within the last 300 seconds or cached under a valid bound (§9.10.7).
 
 **Two-tier model.** Handle outlets follow the same two-tier architecture as existing discovery outlets (§6.2.2B [no such section]). Writers (MLS members) process handle registrations. Readers (DID-authenticated, unbounded) perform handle lookups. Registration is a write operation processed by writers; lookup is a read operation available to all.
 
@@ -447,7 +447,7 @@ The context's governance determines what verification is required before a mappi
 4. For each: attestation_lookup(platform: platform, handle: "alice_cooks")
 5. Merge results, deduplicate by DID
 6. For each result, verify attestation is still valid (not revoked, not stale)
-7. Resolve DID(s) via Mainline DHT
+7. Resolve each identifier by replaying its key-event log (03-identity.md 3.10.4)
 8. Return results with trust_level: AttestationVerified
 ```
 
@@ -520,8 +520,9 @@ The `.well-known/scp` document format (§18.3.1) is extended with an optional `h
 3. Try domain resolution:
    a. Fetch https://example.com/.well-known/scp
    b. Look up "alice" in the "handles" map
-   c. If found: resolve DID via Mainline DHT (self-certifying, §9.6.1)
-      Verify: DID document's SCPRelay entries are consistent
+   c. If found: resolve the identifier by replaying its key-event log
+      (self-certifying, 09-security-model.md 9.6.1)
+      Verify: the service record's SCPRelay entries are consistent
       Return AddressResolution with trust_level: DomainVerified
 4. If domain resolution fails (no .well-known/scp, or handle not in map):
    a. Extract domain name as potential platform identifier
@@ -532,7 +533,7 @@ The `.well-known/scp` document format (§18.3.1) is extended with an optional `h
 
 This two-phase resolution eliminates the need for a hardcoded platform list. `alice@example.com` tries the domain first; `alice@x.com` also tries the domain first — if X serves `.well-known/scp` with handles, the domain result wins. If not, attestation fallback catches it. The trust level on the result tells the consumer which path succeeded.
 
-**Security properties.** Same as `.well-known/scp` generally (§18.3.2): NOT self-certifying, depends on HTTPS. The DID itself is verified via DHT, but the binding of a handle to that DID depends on domain control. An attacker who controls DNS/CA can serve fraudulent handles, but cannot forge the DHT-resolved DID document. Clients MUST perform the verification chain before trusting domain handle resolutions.
+**Security properties.** Same as `.well-known/scp` generally (§18.3.2): NOT self-certifying, depends on HTTPS. The identifier itself is verified by replaying its key-event log, but the binding of a handle to that identifier depends on domain control. An attacker who controls DNS or a certificate authority can serve fraudulent handles, and cannot forge a key-event log that recomputes to the identifier it claims (`09-security-model.md` §9.7.4.2 R2). Clients MUST perform the verification chain before trusting domain handle resolutions.
 
 **Trust level:** `DomainVerified` — the binding is HTTPS-dependent and domain-operator-controlled.
 
@@ -1161,9 +1162,9 @@ These events are appended to the identity private state event log (§3.7). They 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
 | `did` | `String` (DID) | Yes | The capability holder's DID. |
-| `capabilities` | `Vec<String>` | Yes | Capability URIs from DID document `SCPCapabilities` service. |
-| `service_endpoints` | `Vec<String>` | Yes | Service endpoint URLs from DID document. |
-| `resolved_at` | `u64` | Yes | Unix timestamp (seconds) of DID document resolution. |
+| `capabilities` | `Vec<String>` | Yes | The self-asserted capability URIs of the identity's service record. |
+| `service_endpoints` | `Vec<String>` | Yes | The endpoint URLs the identity's service record carries. |
+| `resolved_at` | `u64` | Yes | Unix timestamp (seconds) at which the service record resolved. |
 
 **`ContextDiscoveryResult`** — A discovered broadcast context.
 
@@ -1180,7 +1181,7 @@ These events are appended to the identity private state event log (§3.7). They 
 
 | Variant | Tag | Fields | Semantics |
 |---------|-----|--------|-----------|
-| `DhtDidDocument` | `"dht_did_document"` | — | Found via `SCPBroadcastContext` service in publisher's DID doc. |
+| `ServiceRecord` | `"service_record"` | — | Found via the `SCPBroadcastContext` entry of the publisher's service record. |
 | `WellKnown` | `"well_known"` | — | Found via `.well-known/scp` on a domain. |
 | `HandleRegistry` | `"handle_registry"` | `context_id: String` | Found via search in a context with discovery outlets. |
 | `ContextUri` | `"context_uri"` | — | Found via `scp://` URI. |
@@ -1192,7 +1193,7 @@ These events are appended to the identity private state event log (§3.7). They 
 | `default_contexts` | `Vec<BootstrapContextEntry>` | Yes | SDK default bootstrap contexts with creator DID verification. Replaces the former `default_context_ids: Vec<String>`. |
 | `auto_query_on_identity_creation` | `bool` | Yes | Whether to auto-query contexts with discovery outlets on first identity creation. |
 | `custom_contexts` | `Vec<BootstrapContextEntry>` | Yes | User-added contexts with creator DID verification. May be empty. Replaces the former `custom_context_ids: Vec<String>`. |
-| `fallback_to_did_resolution` | `bool` | Yes | Whether to fall back to DID document capability resolution. |
+| `fallback_to_did_resolution` | `bool` | Yes | Whether to fall back to reading capability URIs from the identity's service record. |
 
 **`BootstrapContextEntry`** — A bootstrap context with expected creator DID for post-join verification. The `expected_creator_did` field enables the SDK to verify that the context it joined was actually created by the expected operator, defending against context ID substitution attacks (§22.13.2).
 
@@ -1245,11 +1246,13 @@ The following outlet names are normative — independent implementations MUST us
 | `scope_lookup` | Reader (DID-authenticated query) | §22.3.5 |
 | `scope_deregister` | Writer (MLS member write) | §22.3.5 |
 
-### 22.11.8 DID Document Service Types
+### 22.11.8 Service-Record Entry Types
 
-| Service Type | Semantics | Spec Reference |
+The entry types `18-addressability-and-deployment.md` §18.2.2 enumerates; the three the addressing layer reads are:
+
+| Entry Type | Semantics | Spec Reference |
 |--------------|-----------|----------------|
-| `SCPCapabilities` | Agent capability URIs | §6.2.2A [no such section] |
+| `SCPCapabilities` | Self-asserted agent capability URIs | §6.2.2A [no such section] |
 | `SCPBroadcastContext` | Broadcast context advertisement | §5.14 |
 | `SCPRelay` | Relay endpoint URL | §18.3 |
 
