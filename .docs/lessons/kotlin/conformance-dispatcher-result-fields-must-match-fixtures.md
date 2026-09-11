@@ -5,20 +5,9 @@
 
 ## What Happened
 
-`ConformanceDispatcher.dispatchIdentityCreate` returns `{"handle", "custody_type"}` but the shared conformance fixture format defined in `.docs/scaffold/shared.md` expects `"did_prefix": "did:dht:"` in the `expected` block:
+`ConformanceDispatcher.dispatchIdentityCreate` returns `{"handle", "custody_type"}`. The shared conformance fixture format in `.docs/scaffold/shared.md` gives an `identity_create` fixture an `expected` block carrying an `identifier_len` key alongside `custody_type`.
 
-```json
-{
-  "test_id": "identity-create-001",
-  "operation": "identity_create",
-  "expected": {
-    "did_prefix": "did:dht:",
-    "custody_type": "in_memory"
-  }
-}
-```
-
-`compareResults` iterates `expected` keys and checks each against the `actual` map. A key absent from `actual` produces a mismatch. The `did_prefix` field is never returned by the dispatcher, so every `identity_create` fixture in `tests/conformance/` will fail.
+`compareResults` iterates `expected` keys and checks each against the `actual` map. A key absent from `actual` produces a mismatch. The dispatcher never returns `identifier_len`, so every `identity_create` fixture in `tests/conformance/` fails.
 
 ## Why It Was Silent
 
@@ -45,7 +34,7 @@ private suspend fun dispatchIdentityCreate(
     mapOf(
         "handle" to handle.toString(),
         "custody_type" to custody,
-        "did_prefix" to "did:dht:",  // required by shared fixture format
+        // every remaining `expected` key of the shared fixture format goes here
     )
 }
 ```
