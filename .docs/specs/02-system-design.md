@@ -47,7 +47,7 @@ The **protocol boundary** encompasses everything that touches the network — co
 ┌─────────────────────────────────────────────────────────┐
 │                     CONTEXT                              │
 │                                                          │
-│  Creator: DID (accountable identity)                     │
+│  Creator: identifier (accountable identity)              │
 │  Capability Ceiling: [declared at creation]              │
 │  Governance: [single-admin | multi-sig | consensus | …]  │
 │                                                          │
@@ -72,7 +72,7 @@ The **protocol boundary** encompasses everything that touches the network — co
 │  └─────────────────────────────────────────────────┘     │
 │                                                          │
 │  ┌─────────────────────────────────────────────────┐     │
-│  │ MEMBERS (one agent per DID per context)          │     │
+│  │ MEMBERS (one agent per identity per context)     │     │
 │  │                                                 │     │
 │  │  Alice·Agent ── role: admin                     │     │
 │  │  Bob·Agent ──── role: member                    │     │
@@ -146,10 +146,9 @@ The **protocol boundary** encompasses everything that touches the network — co
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                     HUMAN (DID)                               │
+│                     HUMAN (identifier)                        │
 │                                                               │
 │  Reputation, consequences, and trust attach here.             │
-│  Blocking this identity blocks all agents.                    │
 │                                                               │
 │  ┌──────────────────────────────────────────────────────┐     │
 │  │ CAPABILITY TOKENS (UCAN-based)                       │     │
@@ -224,7 +223,7 @@ The **protocol boundary** encompasses everything that touches the network — co
 │                                                                  │
 │                     IDENTITY + CAPABILITIES                      │
 │                                                                  │
-│   DID-based identity. UCAN-based capability tokens.              │
+│   Key-event-log identity. UCAN-based capability tokens.          │
 │   Invisible key custody. Social/device recovery.                 │
 │   Build on existing standards.                                   │
 │                                                                  │
