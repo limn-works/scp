@@ -4,7 +4,7 @@
 
 **Date:** 2026-03-04
 
-Every section number below names the spec corpus as it stood on that date. Three citations below name a section the corpus no longer holds, and each one resolves to nothing for its own reason: §10.6 now heads "Content and Data Sovereignty" rather than the native relay protocol this plan classifies, and §10.6.1 [no such section] no longer resolves at all, both by renumbering; §3.10.3 [no such section], "Layer 2: Mainline DHT", resolves to nothing because ADR-063, the inception-derived key-event-log identity substrate, cut the Mainline DHT rather than renumbering it; and §9.6.2 [no such section], "did:web Mitigations", resolves to nothing because the same ADR cut did:web. Read the numbers below as a record of what the plan assessed, and read `.docs/specs/` for what a section holds today.
+Every section number below names the spec corpus as it stood on that date. Two citations name a section the corpus no longer holds: §10.6 now heads "Content and Data Sovereignty" rather than the native relay protocol this plan classifies, and §10.6.1 [no such section] no longer resolves at all, both by renumbering. Read the numbers below as a record of what the plan assessed, and read `.docs/specs/` for what a section holds today.
 
 ---
 
@@ -26,7 +26,7 @@ SCP's protocol knowledge is currently spread across:
 ### 1.2 The Core Problem
 
 The current specs serve dual duty:
-1. **Normative protocol requirements** ("Clients MUST verify the BEP44 signature chain") — belongs in protocol spec
+1. **Normative protocol requirements** ("Clients MUST verify the key-event chain") — belongs in protocol spec
 2. **Reference implementation guidance** ("Implementation: crates/scp-core/src/provenance/", Rust trait definitions, crate paths, module layout) — belongs in SDK documentation
 
 These are interleaved within the same sections, sometimes within the same paragraphs. An independent implementer must mentally filter out the Rust-specific parts, and in some cases the protocol requirement is only expressed through a Rust type definition with no language-agnostic description.
@@ -57,12 +57,11 @@ These are interleaved within the same sections, sometimes within the same paragr
 5. **ProtocolRepository scope:** Spec §17.4 describes ProtocolRepository as a thick abstraction layer with ~55+ typed methods covering all domain areas. Implementation has ProtocolRepository with only the economy module complete. The protocol spec should not describe ProtocolRepository at all — it's an implementation pattern, not a protocol requirement. The protocol should define key conventions and serialization format.
 6. **Spec 13 (Versioning):** 10 lines of aspirational prose. No concrete version negotiation protocol, no ProtocolVersion type definition, no minimum version enforcement mechanism. This is a gap that needs to be filled before the protocol spec can be complete.
 7. **Spec 14 (Protocol Governance):** 9 lines about foundation governance trajectory. Not a protocol specification — it's a project governance statement. Does not belong in the protocol spec.
-8. **Spec §3.10.10 DidResolver trait:** The section defines the resolution protocol (§3.10.4) in language-agnostic terms AND defines a Rust trait. The protocol part is normative; the Rust trait is implementation. Need to separate.
+8. **Spec §3.10.10 resolution trait:** The section defines the resolution protocol (§3.10.4) in language-agnostic terms AND defines a Rust trait. The protocol part is normative; the Rust trait is implementation. Need to separate.
 9. **Spec §17.2 Storage trait:** Defined as a Rust trait with async fn signatures. The protocol need is "implementations must provide key-value storage with these operations" — the Rust syntax is implementation.
 10. **Architecture.md §1.2 message lifecycle:** Contains protocol-level security checkpoint annotations that ARE normative. But they're embedded in a document that is otherwise entirely implementation architecture. These need to be extracted to the protocol spec.
-11. **DID document serialization divergence from did:dht.** Standard did:dht specifies DNS packet encoding (TXT/SRV records) for DID documents. SCP uses JSON-LD serialization on the relay layer, with DNS packet encoding only for the DHT layer (BEP44 compatibility). The protocol spec must explicitly define both serialization formats: JSON-LD for relay-stored documents and DNS packets for DHT-stored documents. This divergence is intentional (JSON-LD removes the 1000-byte payload limit), but it needs formal specification — currently §3.10 describes the dual-layer architecture without specifying the serialization difference between layers.
-12. **Multi-key architecture underspecified and scattered.** §3.9 mentions key generation, distribution, rotation, and destruction at a high level and references §9.7.4 for the full lifecycle. The multi-key separation (Identity `#0` / Human Signing `#active` / Pre-Rotation / Agent Signing `#agent`) is described across §3.9, §3.10, §4.2, §4.5 (ADR-039), §9.7.4, §9.8.1 (updated preimage), and §11.2.3 (prior art) but not formally specified in a single authoritative section. The protocol spec must consolidate this with wire formats, not scattered across 6+ locations.
-13. ~~**Signature preimage mismatch.**~~ ✅ **Resolved.** §9.8.1 now includes all 9 fields in the inner signature preimage: `context_id || sender_did || signing_key_id || epoch || generation_number || sequence_number || timestamp || payload_hash || provenance_hash`. Matches ADR-039.
+11. **Multi-key architecture underspecified and scattered.** §3.9 mentions key generation, distribution, rotation, and destruction at a high level and references §9.7.4 for the full lifecycle. The multi-key separation (Identity `#0` / Human Signing `#active` / Pre-Rotation) is described across §3.9, §3.10, §4.2, §4.5 (ADR-039), §9.7.4, §9.8.1 (updated preimage), and §11.2.3 (prior art) but not formally specified in a single authoritative section. The protocol spec must consolidate this with wire formats, not scattered across 6+ locations.
+12. **Signature preimage mismatch — resolved.** §9.8.1 now includes all 9 fields in the inner signature preimage: `context_id || sender_did || signing_key_id || epoch || generation_number || sequence_number || timestamp || payload_hash || provenance_hash`. Matches ADR-039.
 
 ---
 
@@ -102,7 +101,7 @@ Every section of every current spec file, classified as:
 ### Spec 03 — Identity (387 lines)
 | Section | Classification | Notes |
 |---------|---------------|-------|
-| §3.1 Root of Identity | **P** | DID foundation — normative |
+| §3.1 Root of Identity | **P** | Identity foundation — normative |
 | §3.2 Key Custody | **P** | Custody abstraction — normative (defines what implementations must support) |
 | §3.3 Recovery | **P** | Recovery mechanisms — normative |
 | §3.4 Linking Existing Identities | **P** | Identity linking — normative |
@@ -112,50 +111,47 @@ Every section of every current spec file, classified as:
 | §3.7 Identity Private State | **P** | Private state model, encryption, sync, integrity — normative |
 | §3.7.1 Block List Storage | **P** | Event types, propagation protocol — normative |
 | §3.7.1 "ProtocolRepository methods" block | **I** | Rust method signatures — implementation |
-| §3.8 DID Resolution Security | **P** | did:dht self-certification, did:web mitigations — normative |
+| §3.8 Resolution Security | **P** | Self-certification — normative |
 | §3.9 Key Lifecycle | **P** | Generation, distribution, rotation, destruction — normative |
-| §3.10 DID Resolution Layers | **P** | Dual-layer architecture — normative |
+| §3.10 Identity Resolution | **P** | Resolution architecture — normative |
 | §3.10.1 Resolution Priority (table) | **P** | Priority semantics — normative |
-| §3.10.2 Layer 1: SCP Relay-Based Resolution | **P** | Routing ID derivation, PUBLISH/QUERY format — normative |
-| §3.10.3 [no such section] Layer 2: Mainline DHT | **P** | Fallback role — normative |
+| §3.10.2 SCP Relay-Based Resolution | **P** | Routing ID derivation, PUBLISH/QUERY format — normative |
 | §3.10.4 Resolution Protocol | **P** | Full resolution sequence — **critical normative content** |
-| §3.10.5 Publishing Protocol | **P** | Dual-layer publishing — normative |
-| §3.10.6 Anti-Segmentation Invariant | **P** | MUST publish to both — normative |
+| §3.10.5 Publishing Protocol | **P** | Publishing sequence — normative |
+| §3.10.6 Anti-Segmentation Invariant | **P** | Publication invariant — normative |
 | §3.10.7 Version Resolution | **P** | Sequence number authority — normative |
 | §3.10.8 Security Analysis | **P** | Security properties — normative |
 | §3.10.9 Privacy Properties | **P** | Privacy analysis — normative |
-| §3.10.10 DidResolver Trait | **I** | Rust trait + struct definitions. **Protocol requirement is in §3.10.4; this section is SDK API.** |
+| §3.10.10 Resolution Trait | **I** | Rust trait + struct definitions. **Protocol requirement is in §3.10.4; this section is SDK API.** |
 | §3.10.11 Bootstrap and Network Growth | **N** | Growth trajectory — informational |
 | §3.10.12 Phase Integration (table) | **I** | Build phase assignments — implementation |
 
-**Action:** Nearly all protocol content. Remove: ProtocolRepository method blocks, DidResolver trait section, Phase Integration table. These are implementation artifacts.
+**Action:** Nearly all protocol content. Remove: ProtocolRepository method blocks, the resolution trait section, Phase Integration table. These are implementation artifacts.
 
-**GAP IDENTIFIED:** §3.10 (dual-layer resolution) is one of the most protocol-pure sections in the spec and should extract cleanly into the SCP Identity document. However, the **multi-key verification method architecture** (Identity Key `#0` / Human Signing Key `#active` / Pre-Rotation Key / Agent Signing Key `#agent`) is described across §3.9, §3.10, §4.2, §4.5, and ADR-039 but lacks a formal wire format specification. The extracted protocol spec needs:
-- Explicit key commitment scheme (how the pre-rotation key hash is encoded in the DID document)
+**GAP IDENTIFIED:** §3.10 (identity resolution) is one of the most protocol-pure sections in the spec and should extract cleanly into the SCP Identity document. However, the **multi-key architecture** (Identity Key `#0` / Human Signing Key `#active` / Pre-Rotation Key) is described across §3.9, §3.10, §4.2, §4.5, and ADR-039 but lacks a formal wire format specification. The extracted protocol spec needs:
+- Explicit key commitment scheme (how the pre-rotation key hash is encoded in the key-event log)
 - Key rotation authorization chain (how the Human Signing Key proves it was authorized by the Identity Key)
-- DID document structure showing all verification methods (`#0`, `#active`, `#agent`) and their roles
+- Key-state structure showing `#0` and `#active` and their roles
 - Wire format for key rotation messages
-- **Agent Signing Key (`#agent`) verification method format** — how it appears in the DID document, its relationship to the `#active` key
-- **Self-delegation UCAN format** — `iss == aud` (same DID) with `fct.scp_key_scope: "#agent"`, UCAN header `signing_key_id`
-- **`ScpKeyCustodyAttestation` service entry format** — DID document service entry declaring key custody model
-- **`ScpCustodyViolationAttestation` format** — permanent violation logging for Category A violations by `#agent`
+- **`ScpKeyCustodyAttestation` service entry format** — the service-record entry declaring the key custody model
+- **`ScpCustodyViolationAttestation` format** — permanent violation logging for Category A violations
 - **Permission category definitions** — Category A (`#0` only), Category B (user-configurable), Category C (context-configurable)
 
-This is a P0 gap for the Identity document — the multi-key architecture and shared-DID human-agent model are novel contributions and must be specified precisely enough for independent implementation.
+This is a P0 gap for the Identity document — the multi-key architecture is a novel contribution and must be specified precisely enough for independent implementation.
 
 ### Spec 04 — Agents (69 lines + ADR-039 additions)
 | Section | Classification | Notes |
 |---------|---------------|-------|
 | §4.1 Core Principle | **P** | Human traceability — normative |
-| §4.2 Binding (updated ADR-039) | **P** | Personal + institutional agents, shared-DID model, `#agent` verification method — normative |
+| §4.2 Binding (updated ADR-039) | **P** | Personal + institutional agents — normative |
 | §4.3 One Agent Per Person Per Context (updated ADR-039) | **P** | Social constraint, `signing_key_id` attribution — normative |
 | §4.4 Bring Your Own Agent | **P** | Capability metadata, self-attested vs challenge-verified — normative |
-| §4.5 The Human-Agent Pair (updated ADR-039) | **P** | Shared-DID model, self-delegation UCAN, Category A/B/C permissions, 5-layer enforcement stack — **critical normative content** |
+| §4.5 The Human-Agent Pair (updated ADR-039) | **P** | Category A/B/C permissions, 5-layer enforcement stack — **critical normative content** |
 | §4.6 Agents Are Consumers, Not Enforcers | **P** | Enforcement is cryptographic — normative |
 | §4.7 Context-Bound at Protocol Level | **P** | Agent isolation, A2A rejection rationale — normative |
 | §4.8 Agent Fleet | **P** | Fleet model, earned capacity reference — normative |
 
-**Action:** Entirely protocol content. Extract as-is. **Note:** ADR-039 significantly enriches §4.2, §4.3, and §4.5 with shared-DID semantics, permission categories, and the enforcement stack. These are protocol-level (not implementation-level) additions — they define how verifiers validate agent actions.
+**Action:** Entirely protocol content. Extract as-is. **Note:** ADR-039 enriches §4.2, §4.3, and §4.5 with permission categories and the enforcement stack. These are protocol-level (not implementation-level) additions — they define how verifiers validate agent actions.
 
 ### Spec 05 — Contexts (960 lines)
 | Section | Classification | Notes |
@@ -163,7 +159,7 @@ This is a P0 gap for the Identity document — the multi-key architecture and sh
 | §5.1 Definition | **P** | Context definition, properties — normative |
 | §5.2 Creation | **P** | Creation semantics — normative |
 | §5.3 Capability Ceiling | **P** | Ceiling categories, ceiling policy, economic policy orthogonality — normative |
-| §5.4 Tools | **P** | Tool registration (schema, hash, test vectors, operator DID, cost) — normative |
+| §5.4 Tools | **P** | Tool registration (schema, hash, test vectors, operator identity, cost) — normative |
 | §5.5 Roles | **P** | Role properties, broadcast roles — normative |
 | §5.6 Membership | **P** | One-per-human, broadcast two-tier — normative |
 | §5.7 Metadata | **P** | Pre-opt-in visibility — normative |
@@ -229,9 +225,8 @@ This is a P0 gap for the Identity document — the multi-key architecture and sh
 | §9.3 Sybil Resistance | **P** | Trust signals, composable approach — normative |
 | §9.4 Systemic Defense Philosophy | **P** | Behavioral analysis over content inspection — normative |
 | §9.5 Security Boundaries (5 boundaries) | **P** | Protocol boundary, context, role, capability, trust — normative |
-| §9.6 DID Security | **P** | did:dht self-certification, BEP44, sequence numbers — normative |
-| §9.6.1 BEP44 Verification | **P** | Verification algorithm — **critical normative content** |
-| §9.6.2 [no such section] did:web Mitigations | **P** | TOFU, TLS pinning — normative |
+| §9.6 Identity Verification | **P** | Self-certification, sequence numbers — normative |
+| §9.6.1 Record verification | **P** | Verification algorithm — **critical normative content** |
 | §9.6.3 Relay List Authentication | **P** | NIP-65 pattern — normative |
 | §9.7 MLS Integration | **P** | Epoch management, key rotation, PCS — normative |
 | §9.7.1-4 MLS subsections | **P** | All MLS details — normative |
@@ -289,8 +284,8 @@ This is a P0 gap for the Identity document — the multi-key architecture and sh
 | §11.1.2 Autobase and Multi-Writer | **N** | Single-writer-composed vs native multi-writer — informational |
 | §11.1.3 Keet and Group Encryption | **N** | Existence proof vs published spec — informational |
 | §11.1.4 Architectural Divergences | **N** | Transport coupling, trust, governance, offline — informational |
-| §11.2 DID DHT and SCP's Identity Layer (new) | **P/N** | did:dht spec, SCP departures (dual-layer, multi-key incl. `#agent`, healing, JSON-LD), implementation independence, governance risk. The departures description (§11.2.3) contains **normative protocol content** — updated for ADR-039 shared-DID model — that belongs in the SCP Identity protocol document. The did:dht spec summary (§11.2.1) and governance analysis (§11.2.4-5) are informational. |
-| §11.3 "What no existing standard covers" | **N** | Informational — updated to include DID innovations |
+| §11.2 DID DHT and SCP's Identity Layer (new) | **P/N** | did:dht spec, SCP departures, implementation independence, governance risk. The departures description (§11.2.3) contains **normative protocol content** that belongs in the SCP Identity protocol document. The did:dht spec summary (§11.2.1) and governance analysis (§11.2.4-5) are informational. |
+| §11.3 "What no existing standard covers" | **N** | Informational — updated to include identity innovations |
 
 **Action:** Does not belong in protocol spec as a whole. However, §11.2.3 (SCP's departures from did:dht) contains normative content that should be extracted into the SCP Identity document. The structural comparisons (Hypercore, did:dht) belong in the white paper. The "What no existing standard covers" summary belongs in the white paper introduction.
 
@@ -366,7 +361,7 @@ This is a P0 gap for the Identity document — the multi-key architecture and sh
 ### Spec 18 — Addressability and Deployment (663 lines)
 | Section | Classification | Notes |
 |---------|---------------|-------|
-| §18.1 DID Document Structure | **P** | Service endpoint types — normative |
+| §18.1 Service Record Structure | **P** | Entry types — normative |
 | §18.2 Service Endpoint Specification | **P** | All endpoint types (SCPRelay, etc.) — **critical normative content** |
 | §18.3 .well-known/scp | **P** | Discovery endpoint format — normative |
 | §18.4 scp:// URI | **P** | URI scheme — normative |
@@ -471,7 +466,7 @@ The 38 ADRs across 6 phase files contain both protocol-level and implementation-
 |-----|-------|---------------------|
 | ADR-001 | MLS Integration | Cipher suite selection, credential type, key package lifetime |
 | ADR-002 | Envelope Format | Outer/inner envelope wire format — **critical** |
-| ADR-003 | DID Method | did:dht primary, BEP44, resolution |
+| ADR-003 | Identity creation | Publication and resolution |
 | ADR-004 | Native Relay Protocol | Wire types, WebSocket protocol — **critical** |
 | ADR-005 | Transport Abstraction | Transport trait contract |
 | ADR-007 | Sender Key Distribution | Pull model, wire types — **critical** |
@@ -486,7 +481,7 @@ The 38 ADRs across 6 phase files contain both protocol-level and implementation-
 | ADR-029 | Offline/Sync Strategy | Offline/sync protocol |
 | ADR-031 | Governance Actions | 24 action types |
 | ADR-038 | Content Access Control | Access key layer, CEK wrapping |
-| ADR-039 | Shared-DID Human-Agent Identity | Shared-DID model, `#agent` verification method, signing_key_id, self-delegation UCAN, Category A/B/C permissions, 5-layer enforcement stack, custody attestation — **critical** |
+| ADR-039 | Human-Agent Identity | signing_key_id, Category A/B/C permissions, 5-layer enforcement stack, custody attestation — **critical** |
 
 ### Implementation-Level ADRs (stay in current docs)
 | ADR | Topic | Why Implementation |
@@ -521,14 +516,14 @@ Multiple focused documents, each covering a specific protocol subsystem. Easier 
 | Document | Covers | Current Source |
 |----------|--------|----------------|
 | **SCP Core** | Thesis, system model, contexts, agents, governance | Specs 01, 02, 04, 05, 08 |
-| **SCP Identity** | DID, resolution, attestations, private state, social graph | Spec 03 |
+| **SCP Identity** | Identity, resolution, attestations, private state, social graph | Spec 03 |
 | **SCP Security** | Threat model, invariants, MLS integration, sender keys, content access, metadata privacy | Spec 09 |
 | **SCP Trust** | Capability model, UCAN, behavioral validation, trust evaluation | Spec 07 |
 | **SCP Transport** | Relay protocol, transport abstraction, native relay wire format | Spec 10 |
 | **SCP Cross-Context** | Tool interfaces, child contexts, bridge connectors | Specs 06, 12 |
 | **SCP Addressing** | Human-readable addressing, discovery, URI scheme | Spec 22 |
 | **SCP Persistence** | Key conventions, serialization, storage requirements | Spec 17 (normative parts only) |
-| **SCP Addressability** | .well-known/scp, DID document structure, bootstrap | Spec 18 (normative parts only) |
+| **SCP Addressability** | .well-known/scp, service record structure, bootstrap | Spec 18 (normative parts only) |
 | **SCP Economic** | Economic governance, payment protocol, spending UCANs | Spec 19 |
 | **SCP Provenance** | Provenance types, attachment, chain depth, quality tiers | Spec 24 |
 | **SCP Sync** | Offline strategy, reconnection protocol, epoch catch-up | Spec 23 |
@@ -576,7 +571,7 @@ Example (InnerEnvelope):
 ```
 struct {
     opaque context_id<1..2^16-1>;      /* Context identifier */
-    opaque sender_did<1..2^16-1>;      /* Sender's DID string */
+    opaque sender_did<1..2^16-1>;      /* Sender identifier */
     uint64 epoch;                       /* MLS epoch number */
     uint64 generation;                  /* MLS generation within epoch */
     uint64 sequence;                    /* Per-sender monotonic sequence */
@@ -585,7 +580,7 @@ struct {
     opaque payload<0..2^32-1>;         /* Bucket-padded plaintext */
     optional<Provenance> provenance;   /* Cross-context provenance */
     opaque provenance_hash[32];        /* SHA-256 of provenance */
-    opaque signature<0..2^16-1>;       /* Ed25519 signature */
+    opaque signature<0..2^16-1>;       /* Signature */
 } InnerEnvelope;
 ```
 
@@ -597,10 +592,10 @@ WellKnownScp:
   Field              Type                Required  Description
   ─────              ────                ────────  ───────────
   version            uint32              MUST      Protocol version
-  did                string              MUST      Operator's DID
+  did                string              MUST      Operator identifier
   relay_urls         array<string>       MUST      WebSocket relay URLs
   contexts           array<ContextRef>   MAY       Published context metadata
-  handles            map<string, DID>    MAY       Handle → DID mapping (§22.6)
+  handles            map<string, string> MAY       Handle → identity mapping (§22.6)
   relay_config       RelayConfig         MAY       Relay operational parameters
 ```
 
@@ -627,16 +622,13 @@ The protocol spec must define:
 | Category | Priority | Description |
 |----------|----------|-------------|
 | Envelope serialization | **P0** | InnerEnvelope, OuterEnvelope: given these field values, the serialized bytes are exactly X |
-| BEP44 signature verification | **P0** | Given this DID and this document, the signature verification succeeds/fails |
-| Routing ID derivation | **P0** | Given this context_id/DID, the routing_id is exactly X |
-| DID routing ID derivation | **P0** | Given this DID string, SHA-256("scp:did:" \|\| did_string) is exactly X |
-| Multi-key DID document | **P0** | Given these keys (`#0`, `#active`, `#agent`), the DID document structure is exactly X |
+| Routing ID derivation | **P0** | Given this context_id or identifier, the routing_id is exactly X |
+| Identity routing ID derivation | **P0** | Given this identifier, SHA-256("scp:did:" \|\| identifier_bytes) is exactly X |
+| Multi-key key state | **P0** | Given these keys (`#0`, `#active`), the key state is exactly X |
 | Key rotation authorization | **P0** | Given this Identity Key and new Human Signing Key, the rotation message is exactly X |
-| z-base-32 encoding | **P0** | Given this Ed25519 public key, the z-base-32 encoding is exactly X (did:dht compatibility) |
 | signing_key_id in InnerEnvelope | **P0** | Given this InnerEnvelope with signing_key_id="#active", the serialized bytes and signature preimage are exactly X |
-| ScpCredential with signing_key_id | **P0** | Given this ScpCredential with signing_key_id="#agent", the serialized format is exactly X |
-| Self-delegation UCAN | **P0** | Given this self-delegation UCAN (iss==aud, fct.scp_key_scope="#agent"), the encoded token is exactly X |
-| Custody attestation | **P1** | Given this ScpKeyCustodyAttestation, the DID document service entry format is exactly X |
+| ScpCredential with signing_key_id | **P0** | Given this ScpCredential, the serialized format is exactly X |
+| Custody attestation | **P1** | Given this ScpKeyCustodyAttestation, the service-record entry format is exactly X |
 | HKDF key derivation | **P0** | Given this key material and context, the derived key is exactly X |
 | Sender key HPKE wrapping | **P0** | Given this sender key and recipient, the wrapped key is exactly X |
 | AES-256-KW wrapping | **P0** | Given this CEK and access key, the wrapped CEK is exactly X |
@@ -657,7 +649,7 @@ JSON files, one per category, structured as:
       "description": "minimal envelope with no provenance",
       "input": {
         "context_id": "ctx_abc123",
-        "sender_did": "did:dht:z6Mk...",
+        "sender_did": "<identifier>",
         "epoch": 0,
         "generation": 0,
         "sequence": 1,
@@ -666,7 +658,7 @@ JSON files, one per category, structured as:
         "payload": "48656c6c6f",
         "provenance": null,
         "provenance_hash": "0000...0000",
-        "signature": "ed25519sig..."
+        "signature": "<signature>"
       },
       "expected_output": "msgpack_hex_bytes...",
       "notes": "Provenance is null; provenance_hash is all-zeros"
@@ -689,22 +681,20 @@ JSON files, one per category, structured as:
 
 4. **Formal wire format definitions.** All message types need language-agnostic notation. See §5 of this plan.
 
-5. **Multi-key architecture wire format (expanded by ADR-039).** The multi-key identity architecture (Identity Key `#0` / Human Signing Key `#active` / Pre-Rotation Key / Agent Signing Key `#agent`) is a novel contribution described in prose (§3.9, §3.10, §4.2, §4.5, ADR-039) but lacks formal specification. The protocol spec must define:
-   - Pre-rotation key commitment format (how the hash is encoded in the DID document)
+5. **Multi-key architecture wire format (expanded by ADR-039).** The multi-key identity architecture (Identity Key `#0` / Human Signing Key `#active` / Pre-Rotation Key) is a novel contribution described in prose (§3.9, §3.10, §4.2, §4.5, ADR-039) but lacks formal specification. The protocol spec must define:
+   - Pre-rotation key commitment format (how the hash is encoded in the key-event log)
    - Key rotation authorization chain (how Human Signing Key proves authorization by Identity Key)
-   - DID document structure showing all verification methods (`#0`, `#active`, `#agent`) and their service endpoint types
+   - Key-state structure showing `#0` and `#active` and their roles
    - Key rotation wire message format
    - Rotation under compromise: the pre-rotation recovery protocol
-   - **Agent Signing Key (`#agent`) verification method format** in DID document
-   - **Self-delegation UCAN wire format:** `iss == aud` with `fct.scp_key_scope: "#agent"`, `signing_key_id` in UCAN header
    - **`signing_key_id` field** in InnerEnvelope, ScpCredential, SenderKeyEpochAdvance — how it's serialized and validated
    - **Inner signature preimage** updated to include `signing_key_id` — must match between spec §9.8.1 and ADR-039
-   - **`ScpKeyCustodyAttestation`** DID document service entry format
+   - **`ScpKeyCustodyAttestation`** service-record entry format
    - **`ScpCustodyViolationAttestation`** format for permanent violation logging
    - **Permission category definitions:** Category A (`#0` only), Category B (user-configurable), Category C (context-configurable)
    - **`MintSpendingParams` refactoring:** `{ did, key_scope }` replaces `{ issuer_did, agent_did }` — wire format change in §19
 
-   This is critical because the multi-key architecture and shared-DID model are among SCP's most significant novel contributions — they must be specified precisely enough for independent implementation.
+   This is critical because the multi-key architecture is among SCP's most significant novel contributions — it must be specified precisely enough for independent implementation.
 
 ### 7.2 Important Gaps (P1 — should be filled for completeness)
 
@@ -720,7 +710,7 @@ JSON files, one per category, structured as:
 
 9. **Formal security proofs.** Formal analysis of the composed construction (MLS + sender keys + UCAN + Merkle) would be the strongest validation signal.
 
-10. **IANA-style registry.** If the protocol is submitted to IETF, certain values need registry allocation: capability categories, governance action types, event types, DID service endpoint types.
+10. **IANA-style registry.** If the protocol is submitted to IETF, certain values need registry allocation: capability categories, governance action types, event types, service-record entry types.
 
 11. **Interoperability test suite.** Beyond test vectors, a runnable interop test suite (like MLS interop events) that tests cross-implementation communication.
 
@@ -785,7 +775,7 @@ Processing order (dependencies first):
 
 16. **Define all key derivation operations**:
     - Routing ID from context key (HKDF)
-    - DID routing ID (SHA-256("scp:did:" || did_string))
+    - Identity routing ID (SHA-256("scp:did:" || identifier_bytes))
     - Metadata routing ID (HMAC-SHA256(context_metadata_key, context_id || "scp-metadata-v2"), §9.10.4.B)
     - Broadcast routing ID (SHA-256(context_id))
     - Sender key wrapping (HPKE, domain "scp-sender-key-v1")
@@ -794,19 +784,15 @@ Processing order (dependencies first):
     - AAD construction (context_id || sender_did || sequence_number)
     - Domain separation strings (enumerate all)
 
-17. **Define DID-specific wire formats**:
-    - DID document structure (JSON-LD for relay layer, DNS packet for DHT layer)
-    - Multi-key architecture: Identity Key (`#0`), Human Signing Key (`#active`), Pre-Rotation Key commitment, Agent Signing Key (`#agent`)
+17. **Define identity wire formats**:
+    - Multi-key architecture: Identity Key (`#0`), Human Signing Key (`#active`), Pre-Rotation Key commitment
     - `signing_key_id` field in InnerEnvelope, ScpCredential, SenderKeyEpochAdvance
     - Inner signature preimage with `signing_key_id` (per ADR-039)
-    - Self-delegation UCAN format (`iss == aud`, `fct.scp_key_scope`)
-    - `ScpKeyCustodyAttestation` DID document service entry
+    - `ScpKeyCustodyAttestation` service-record entry
     - `ScpCustodyViolationAttestation` format
     - `MintSpendingParams` updated format (`{ did, key_scope }` replacing `{ issuer_did, agent_did }`)
     - Key rotation authorization message
-    - BEP44 signed mutable item format (for DHT publishing)
-    - DID document service endpoint types (SCPRelay, IdentityPrivateState, etc.)
-    - z-base-32 encoding specification (for DID string ↔ Ed25519 public key conversion)
+    - Service-record entry types (SCPRelay, IdentityPrivateState, etc.)
 
 ### Phase 5: Test Vectors (2 weeks, parallel with Phase 4)
 
