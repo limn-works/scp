@@ -12,7 +12,7 @@ bindings/python/
   scp_sdk/
     __init__.py                 # Re-exports: Identity, Context, ToolDefinition, ScpError, __version__
     py.typed                    # PEP 561 marker for type checkers
-    identity.py                 # Identity class, DIDDocument
+    identity.py                 # Identity class
     context.py                  # Context class, Membership, async context manager
     tools.py                    # ToolDefinition, TestVector dataclasses
     trust.py                    # evaluate_trust(), TrustEvaluation
@@ -140,7 +140,7 @@ pub struct PyIdentity {
 #[pymethods]
 impl PyIdentity {
     #[getter]
-    fn did(&self) -> &str { &self.inner.did }
+    fn identifier(&self) -> &[u8] { &self.inner.identifier }
 
     #[getter]
     fn custody_type(&self) -> &str { self.inner.custody_type.as_str() }
