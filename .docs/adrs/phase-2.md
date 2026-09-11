@@ -296,6 +296,8 @@ pub enum MemoryScope {
 
 **Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
 
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, overturned ADR-039's shared-identity `#agent` method, so a verifier resolves an issuer's key from that issuer's key state and not from a DID document (`09-security-model.md` §9.1 invariant 1, `03-identity.md` §3.10.4).
+
 **Amendment (2026-09-10 — UCAN validation verifies an ES256 signature).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. The UCAN signature this ADR's validation step verifies is an ECDSA signature on P-256 over `base64url(header).base64url(payload)`, so the UCAN algorithm this ADR assumes is ES256 in place of EdDSA. The `kid` resolution step, the role-assignment rules, and the capability-ceiling enforcement are untouched.
 
 ### Context
@@ -328,7 +330,7 @@ Implement UCAN-based capability enforcement in `scp-core/context/` and `scp-core
 ### Dependencies
 
 - **ADR-008 (Context):** Roles exist within contexts. Role assignment happens on member join. The capability ceiling is a context parameter.
-- **ADR-003 (DID):** UCAN tokens are signed by DIDs. Delegation chains reference DIDs. Validation requires DID resolution for public key lookup.
+- **ADR-063 (identity substrate):** UCAN tokens are signed by identities and delegation chains reference identifiers, so validation resolves the issuer's key state for the public key (`03-identity.md` §3.10.4).
 - **rs-ucan library:** Third-party UCAN implementation. Must support UCAN 0.10+ spec with mandatory nonce field. [Note: replaced by native impl in scp-core/src/crypto/ucan/]
 
 ### Acceptance Criteria
@@ -395,7 +397,7 @@ pub struct RoleDefinition {
    - Verifies assigner has `RoleAssign` capability (via UCAN validation).
    - Validates role exists in context's role definitions.
    - Mints UCAN tokens for each capability in the role's permission set.
-   - Each token: `iss` = context creator DID, `aud` = member DID, `att` = `[{ "with": "scp:ctx:{context_id}/{capability}", "can": "invoke" }]`, `nnc` = unique nonce. The UCAN header includes `kid` (ADR-039) identifying the signing verification method (e.g., `"#active"` or `"#agent"`), enabling verifiers to resolve the correct public key from the issuer's DID document.
+   - Each token: `iss` = context creator DID, `aud` = member DID, `att` = `[{ "with": "scp:ctx:{context_id}/{capability}", "can": "invoke" }]`, `nnc` = unique nonce. The UCAN header includes `kid`, naming the operational role that signed, `"#active"`.
    - Distributes tokens to the member via MLS application message.
    - Revokes any previous tokens for this member (role change).
    - Appends `RoleAssigned` event to event log.
@@ -407,10 +409,10 @@ pub struct RoleDefinition {
 
    The 11 steps:
    1. **Parse** — Decode JWT-format UCAN token; reject malformed tokens.
-   2. **Signature verification** — Verify P-256 signature over `base64url(header).base64url(payload)`. If the header contains `kid` (ADR-039), resolve the correct public key from the issuer's DID document using that verification method ID (e.g., `"#active"`, `"#agent"`). If `kid` is absent, default to the issuer's `#active` verification method.
+   2. **Signature verification** — Verify P-256 signature over `base64url(header).base64url(payload)`. If the header contains `kid`, resolve the public key from the issuer's key state under the operational role it names, `"#active"`. If `kid` is absent, default to that same role.
    3. **Chain verification** — For each proof CID in `prf`, resolve parent UCAN, verify its signature, verify parent's `aud` matches this token's `iss`. Recurse to root.
    4. **Root issuer** — Verify root token's `iss` is the context creator's DID.
-   5. **Audience** — Verify token's `aud` matches the presenting agent's DID. Self-delegation (`iss == aud`) is valid when the token's `fct` contains `scp_key_scope` (ADR-039), indicating key-scope delegation (e.g., human delegates to their own agent key).
+   5. **Audience** — Verify token's `aud` matches the presenting agent's identifier. **Amended 2026-09-10:** ADR-063, inception-derived self-certifying identity over a key-event log, overturned the shared-identity key-scope self-delegation this step admitted, so `iss == aud` carries no key scope and a human delegates to its agent's own identifier (`09-security-model.md` §9.1 invariant 1).
    6. **Capability match** — Verify token's `att` includes the `required_capability`.
    7. **Attenuation** — Verify each delegation narrows or preserves capabilities (never widens).
    8. **Ceiling** — Verify every capability the token grants is within the context's immutable capability ceiling — not only the invoked `required_capability`. The token's entire attestation set (`att`) is checked; a token carrying any out-of-ceiling attestation is rejected even if the invoked capability is itself within the ceiling.
@@ -682,6 +684,8 @@ pub struct OutletSession {
 
 **Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
 
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, retired the DID document and left one operational role. A verifier resolves an actor's key by replaying that actor's key-event log (`03-identity.md` §3.10.4, `09-security-model.md` §9.1 invariant 1).
+
 **Amendment (2026-09-10 — every event and checkpoint signature is ECDSA on P-256).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. Each `signature` field on this ADR's event and checkpoint structures carries the type `P256Signature`, and the sentence separating an event signature from every other signature in the protocol names P-256. The Merkle construction, the leaf hashing, the inclusion-proof shape, and the `signing_key_id` apparatus are untouched: the ruling changed the signature algorithm and no part of the tree.
 
 ### Context
@@ -715,7 +719,7 @@ Implement an append-only Merkle tree per context in `scp-core/event_log/`. The t
 
 - **ADR-008 (Context):** The event log is owned by a context. Every context state transition is an event. The Context Manager appends events to the log.
 - **ADR-002 (Envelope):** Events reference envelope hashes for message events.
-- **ADR-003 (DID):** Events are signed by the acting agent's DID. The verification method that signed an event (`"#active"` or `"#agent"`, ADR-039) is carried by the signature apparatus, **not** as a field on the `Event` struct — the canonical `scp_event_log::Event` has seven fields (`event_type`, `actor_did`, `timestamp`, `sequence`, `payload`, `prev_hash`, `signature`) and no `signing_key_id`. A verifier resolves the correct public key from the actor's DID document exactly as it does for any other P-256 signature in the protocol (see the signing-key-identification note in criterion 1). Checkpoint signatures are verified against DID public keys.
+- **ADR-063 (identity substrate):** Events and checkpoints are signed by the acting agent's identity, and a verifier resolves the public key from that identity's key state. Criterion 1's signing-key-identification note states why `Event` carries no `signing_key_id` field.
 
 ### Acceptance Criteria
 
@@ -740,12 +744,12 @@ pub struct Event {
 }
 ```
 
-   **Signing-key identification (ADR-039).** The verification method that signed
-   an event (`"#active"` or `"#agent"`) is carried by the credential / signature
-   apparatus, **not** as a struct field on `Event`. The canonical
-   `scp_event_log::Event` type has no `signing_key_id` field; a verifier resolves
-   the correct public key from the actor's DID document the same way it does for
-   any other P-256 signature in the protocol. (The `signing_key_id` parameter
+   **Signing-key identification.** The operational role that signed an event,
+   `"#active"`, is carried by the credential / signature apparatus, **not** as a
+   struct field on `Event`. The canonical `scp_event_log::Event` type has no
+   `signing_key_id` field, and a verifier resolves the public key from the
+   actor's key state the same way it does for any other P-256 signature in the
+   protocol. (The `signing_key_id` parameter
    on `generate_checkpoint` in criterion 8 is a *checkpoint*-signing argument and
    is unaffected.)
 
@@ -1156,7 +1160,7 @@ pub struct ConsistencyCheckpoint {
 }
 ```
 
-   - **`generate_checkpoint(log: &EventLog, sender_did: &DID, epoch: u64, signing_key: &KeyHandle, signing_key_id: &str) -> Result<ConsistencyCheckpoint, EventLogError>`**: Creates and signs a checkpoint from the current log state. The `signing_key_id` (ADR-039) identifies which verification method signed (accepts `"#active"` or `"#agent"`).
+   - **`generate_checkpoint(log: &EventLog, sender_did: &DID, epoch: u64, signing_key: &KeyHandle, signing_key_id: &str) -> Result<ConsistencyCheckpoint, EventLogError>`**: Creates and signs a checkpoint from the current log state. The `signing_key_id` names the operational role that signed, `"#active"`.
    - **`compare_checkpoint(local_log: &EventLog, remote_checkpoint: &ConsistencyCheckpoint) -> CheckpointComparison`**: Compares a received checkpoint against local state. Returns `Consistent`, `Divergent { first_divergent_event: Option<u64> }`, `Behind { missing_events: u64 }`, or `Ahead { extra_events: u64 }`.
    - Checkpoints are generated every 50 events or every 10 minutes, whichever comes first (spec section 9.9.3).
    - Checkpoints are sent as regular MLS application messages.
@@ -1180,6 +1184,8 @@ pub struct ConsistencyCheckpoint {
 ## ADR-012: Multi-Transport Routing
 
 **Status:** Decided
+
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, moved transport metadata out of the retired DID document into a separately signed service record (`03-identity.md` §3.10.13).
 
 ### Context
 
@@ -1205,7 +1211,7 @@ Implement the full `TransportManager` in `scp-transport/manager.rs` with multi-a
 - **Stream merging:** `tokio-stream` or `futures` for merging subscription streams from multiple adapters with deduplication.
 - **Crate:** `scp-transport`
 - **Module:** `scp-transport/manager.rs` (completing the stub from ADR-005)
-- **Relay discovery:** Relay lists are published in DID documents (spec section 9.10.2). The TransportManager reads relay lists from resolved DID documents for recipients.
+- **Relay discovery:** Relay lists are entries of the identity's service record (`03-identity.md` §3.10.13). The TransportManager reads a recipient's relay list from that recipient's resolved service record.
 
 ### Dependencies
 
@@ -1328,47 +1334,49 @@ This test proves: context lifecycle works, roles enforce, outlets invoke, event 
 
 **Status:** Decided
 
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, retired the DID document, the Mainline distributed hash table, and the BEP44 signature that authenticated a record. Every `SCPRelay` entry below is an entry of the identity's service record, which its designated operational key signs and which carries its own monotonic sequence (`03-identity.md` §3.10.13). `18-addressability-and-deployment.md` §18.2.1 defines the entry type, §18.2.2A records that an identity publishes no DID document, and §18.5.1 states the bootstrap order.
+
 ### Context
 
 SCP's protocol layer (identity, contexts, relays, encryption) is fully specified. What's missing is how things get found and how complete applications get deployed. Today:
-- No standard DID service endpoint type for "this is my SCP relay"
+- No standard service-record entry type for "this is my SCP relay"
 - No HTTP-level discovery from a domain name (no `.well-known/scp`)
 - No universal context URI scheme (only `scp://broadcast/...` exists)
 - No SDK bootstrap story (how a client learns its first relay — open question in §00)
 - No deployment pattern for "relay + participant + HTTP server on one box"
 
-SCP-033 (TransportManager multi-relay) consumes relay lists from DID documents but nothing writes them there. The relay discovery open question in §00 explicitly states this gap.
+SCP-033 (TransportManager multi-relay) consumes an identity's published relay list but nothing writes one. The relay discovery open question in §00 explicitly states this gap.
 
 ### Decision
 
 Implement a complete addressability and deployment layer as specified in §18:
 
-1. **`SCPRelay` DID service endpoint type** (§18.2.1) — transport-layer relay URLs in DID documents, distinct from `SCPCapabilities` (ADR-020, application-layer). Self-certified via BEP44.
-2. **`.well-known/scp`** (§18.3) — advisory HTTP on-ramp for web discovery. NOT self-certifying. Clients MUST verify against DHT-resolved DID documents. Exposes relay URLs, operator DID, relay config, and broadcast context IDs only.
+1. **`SCPRelay` service-record entry type** (§18.2.1) — transport-layer relay URLs in the identity's service record, distinct from `SCPCapabilities` (ADR-020, application-layer). Signed by the operational key the key state designates for the service-record role.
+2. **`.well-known/scp`** (§18.3) — advisory HTTP on-ramp for web discovery. NOT self-certifying. Clients MUST verify against the operator's resolved service record. Exposes relay URLs, the operator's identifier, relay config, and broadcast context IDs only.
 3. **Universal context URI** (§18.4) — `scp://context/<hex>?relay=<url>[&mode=...][&name=...]`. Discovery-only, no embedded key material. Legacy `scp://broadcast/...` accepted as alias.
-4. **Relay bootstrap priority chain** (§18.5) — explicit config → DID document → `.well-known/scp` → peer discovery → fallback list. Closes §00 open question.
+4. **Relay bootstrap priority chain** (§18.5) — explicit config → `.well-known/scp` → peer relay discovery → the community relay list. Closes §00 open question.
 5. **`ApplicationNode`** (§18.6) — concrete SDK type in new `scp-node` crate. Composes relay server + identity + HTTP server + TLS (ACME). Not an HTTP framework — exposes axum Router instances for composition.
 
 ### Rationale
 
 - **SCPRelay vs SCPCapabilities:** Different consumers, different purposes. TransportManager needs relay URLs (transport). Discovery Engine needs capability schemas (application). Conflating them forces both consumers to parse the same entry and filter. Separate types are cleaner.
-- **`.well-known/scp` is advisory, not trusted:** HTTPS-dependent discovery cannot provide the self-certifying guarantees of DID+DHT. Making the trust boundary explicit prevents false confidence. The verification chain (§18.3.2) gives BEP44-grade assurance when performed.
+- **`.well-known/scp` is advisory, not trusted:** HTTPS-dependent discovery cannot provide the self-certifying guarantee a replayed key-event log gives. Making the trust boundary explicit prevents false confidence. The verification chain (§18.3.2) gives that assurance when performed.
 - **Context URIs are discovery-only:** Embedding key material in URIs creates a shareable key — anyone with the URI could derive access. MLS membership is a separate, governed flow. URIs point to metadata for inspection, not access.
 - **`ApplicationNode` is composition, not framework:** Prescribing an HTTP framework locks out existing ecosystems. Exposing axum Routers lets applications compose SCP infrastructure into their existing server architecture.
 - **ACME HTTP-01 needs port 80:** This is the simplest path for most deployments. DNS-01 alternative covers environments without port 80 access (NAT, shared hosting).
 
 ### Dependencies
 
-- **ADR-003 (DID):** SCPRelay extends the DID document with a new service entry type. Relay URL publication extends the DID publish flow.
+- **ADR-063 (identity substrate):** `SCPRelay` is an entry type of the service record. Relay URL publication extends the service-record publish flow and appends no key event.
 - **ADR-004 (Native Relay):** The relay server in ApplicationNode implements ADR-004. The `wss://<host>/scp/v1` URL format comes from ADR-004. Relay operator config fields in `.well-known/scp` mirror ADR-004's configuration table.
 - **ADR-012 (TransportManager):** TransportConfig and relay bootstrap resolution wire into TransportManager initialization. Multi-relay fanout (ADR-012) is the federation mechanism (§18.7).
-- **ADR-020 (SCPCapabilities):** SCPRelay is distinguished from SCPCapabilities as separate DID service types (§18.2.2).
+- **ADR-020 (SCPCapabilities):** `SCPRelay` is distinguished from `SCPCapabilities` as a separate service-record entry type (§18.2.2).
 
 ### Acceptance Criteria
 
-1. **`SCPRelay` service entry type** exists in `DidDocument`. `add_relay_service(url)` adds an entry. `relay_service_urls()` returns all relay URLs. Serde roundtrip preserves SCPRelay entries alongside existing service types (PreRotationCommitment, IdentityPrivateState).
+1. **`SCPRelay` entry type** exists in the service record. `add_relay_service(url)` adds an entry. `relay_service_urls()` returns all relay URLs. Serde roundtrip preserves `SCPRelay` entries alongside the other entry types `18-addressability-and-deployment.md` §18.2.2 lists. `PreRotationCommitment` is retired as an entry type, because the commitment is a field of the inception event and of every reveal-authorized event.
 
-2. **DID publish flow** accepts optional `relay_urls: Vec<Url>`. When provided, relay URLs appear as SCPRelay service entries in the published DID document. BEP44 signature covers relay entries. Sequence number monotonicity (§9.6.3) applies to relay list updates.
+2. **Service-record publish flow** accepts optional `relay_urls: Vec<Url>`. When provided, relay URLs appear as `SCPRelay` entries in the published service record. The record's signature covers the entries, and the record's own monotonic sequence orders relay-list updates.
 
 3. **`ScpUri` type** parses and serializes the universal context URI format: `scp://context/<hex>?relay=<url>[&relay=<url2>][&mode=...][&name=...]`. Legacy `scp://broadcast/<hex>?relay=<url>` accepted as alias. Invalid URIs return typed errors. Percent-encoding per RFC 3986. Parse/serialize roundtrip.
 
@@ -1376,7 +1384,7 @@ Implement a complete addressability and deployment layer as specified in §18:
 
 5. **`TransportConfig` struct** with relay_urls (explicit), bootstrap_domain (optional), dedup_cache_size, dedup_cache_ttl. `ResolveRelays` trait implements the bootstrap priority chain (§18.5.1). TransportManager accepts TransportConfig at initialization.
 
-6. **`scp-node` crate** with `ApplicationNode` builder: `.domain()`, `.identity()` / `.generate_identity()`, `.storage()`, `.build()`. Build wires relay server start, DID publication with SCPRelay entries, storage initialization. `node.relay()`, `node.identity()`, `node.storage()` accessors work.
+6. **`scp-node` crate** with `ApplicationNode` builder: `.domain()`, `.identity()` / `.generate_identity()`, `.storage()`, `.build()`. Build wires relay server start, service-record publication with `SCPRelay` entries, storage initialization. `node.relay()`, `node.identity()`, `node.storage()` accessors work.
 
    > **Superseded by ADR-052 (Unified Construction Pattern).** The fluent typestate builder (`.domain()/.identity()/.storage()/.build()`) mandated here is replaced by a flat `NodeConfig` config object constructed via `Node::start(config)` / `Node::start_for_testing(config)`. Only this AC is superseded; the rest of ADR-032 stands. See ADR-052 for the rationale and the full pattern.
 
@@ -1384,7 +1392,7 @@ Implement a complete addressability and deployment layer as specified in §18:
 
 8. **HTTP server:** `node.well_known_router()` returns axum Router serving `GET /.well-known/scp` with dynamically generated content. `node.relay_router()` returns axum Router handling WebSocket upgrade at `/scp/v1`. `node.serve(app_router)` merges routes and binds HTTPS.
 
-9. **Integration test:** ApplicationNode starts → DID published → `.well-known/scp` reachable → relay accepts connections. Client discovers relay via `.well-known/scp` → verifies against DID → connects → subscribes. `scp://` URI roundtrip through creation and parsing.
+9. **Integration test:** ApplicationNode starts → service record published → `.well-known/scp` reachable → relay accepts connections. Client discovers relay via `.well-known/scp` → verifies against the resolved service record → connects → subscribes. `scp://` URI roundtrip through creation and parsing.
 
 ### Scope
 
@@ -1399,7 +1407,7 @@ Implement a complete addressability and deployment layer as specified in §18:
 | File | Change |
 |------|--------|
 | `scp-core/src/identity/document.rs` | Add SCPRelay service entry type |
-| `scp-core/src/identity/dht.rs` | Wire relay URL publication into DID publish |
+| `scp-core/src/identity/dht.rs` | Wire relay URL publication into the service-record publish |
 | `scp-core/src/uri.rs` (new) | ScpUri type, parsing, serialization |
 | `scp-core/src/well_known.rs` (new) | WellKnownScp type, serialization |
 | `scp-transport/src/config.rs` (new) | TransportConfig, ResolveRelays trait |
@@ -1415,6 +1423,8 @@ Implement a complete addressability and deployment layer as specified in §18:
 > **Note:** ADR-035 is numbered non-sequentially (same pattern as ADR-032). Both features are `ApplicationNode`-scope extensions that depend on Phase 2 ADRs and live in the `scp-node` crate. They are application-layer conveniences, not protocol changes.
 
 **Status:** Decided
+
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, retired the DID document, and `03-identity.md` §3.10.13 defines the service record this endpoint returns instead.
 
 ### Context
 
@@ -1475,7 +1485,7 @@ Implement two `ApplicationNode` features in the `scp-node` crate:
 1. **Dev API bearer token** generated at startup, logged at INFO, available via `node.dev_token()`.
 2. **Dev API bound to localhost** on a separate port from the public HTTPS listener.
 3. **`GET /scp/dev/v1/health`** returns uptime, relay connection count, and storage status.
-4. **`GET /scp/dev/v1/identity`** returns DID string and DID document.
+4. **`GET /scp/dev/v1/identity`** returns the identity's identifier and its service record.
 5. **`GET /scp/dev/v1/relay/status`** returns bound address, active connections, and blob count.
 6. **`GET /scp/dev/v1/contexts`** returns list of registered broadcast contexts.
 7. **`GET /scp/dev/v1/contexts/:id`** returns single context details. 404 for unknown ID.
@@ -1879,7 +1889,7 @@ The two guarantees the typestate markers previously enforced collapse into **req
 - **Cites the Agent-first API design tenet (CLAUDE.md).** Typestate is unsafe *for the actual author* — a model that cannot track phantom ordering enters a compile-retry loop. Encoding required choices as required fields makes the same compile-time guarantee legible.
 - **"No DOA decisions" (CLAUDE.md).** Three divergent construction patterns is a design that needs replacing; replacing it now, with one pattern that holds across all five languages, is the permanent commitment.
 - **"APIs: self-evident, one happy path" (CLAUDE.md).** One config object, one entry function, one shape per operation across all bindings — the maximally self-evident surface.
-- **Injection-through-initializers is preserved (architecture.md §2.5).** Custody, storage, DID method, and transport remain trait-injected; they are carried as typed fields/selectors *inside* the config object. Nothing is constructed by a module that should receive it. The flat config object is the initializer the §2.5 invariant already requires — it is the vehicle for injection, not a bypass of it.
+- **Injection-through-initializers is preserved (architecture.md §2.5).** Custody, storage, the identity backend, and transport remain trait-injected; they are carried as typed fields/selectors *inside* the config object. Nothing is constructed by a module that should receive it. The flat config object is the initializer the §2.5 invariant already requires — it is the vehicle for injection, not a bypass of it.
 - **Proven cross-language mapping.** The existing `StorageConfig` FFI mapping already demonstrates the equivalence (see the canonical table in construction.md §Five-language equivalence). The pattern is not speculative.
 
 ### Rejected Alternatives
@@ -1917,7 +1927,7 @@ The two guarantees the typestate markers previously enforced collapse into **req
 
 ### Context
 
-A `scp-node` (`crates/scp-node`) is pure infrastructure: a relay (store-and-forward of opaque encrypted blobs, §10.4), an identity service (DID resolution / DHT publication), and an HTTP projection surface (§10.12.11). The specs already imply that a node never *participates* in a context as itself:
+A `scp-node` (`crates/scp-node`) is pure infrastructure: a relay (store-and-forward of opaque encrypted blobs, §10.4), an identity service (identity resolution and key-event-log publication), and an HTTP projection surface (§10.12.11). The specs already imply that a node never *participates* in a context as itself:
 
 - **§10.2 (Device-as-Node):** the device *is* a node, but the protocol's guarantee is "no server *owns* you" — identity and context state live with the DID, not the node.
 - **§10.4 (Relay Architecture):** relays are protocol-unaware — they "store and forward encrypted blobs," and "cannot read content, inspect membership, or understand context semantics."
@@ -2029,7 +2039,7 @@ The structured op was built precisely to retire this antipattern. This ADR recor
 - **Spec §7.2 (Layer 1: Protocol Enforcement), §7.2.1 (Tier 1 full UCAN validation), and §7.2.4 (Structured capability evaluation):** the normative prose this ADR enacts. §7.2.4 defines the structured-evaluation result and the gate-vs-diagnostic distinction at protocol level.
 - **ADR-016 (11-step UCAN validation pipeline, `.docs/adrs/phase-3.md`):** the gate `ucan_validate` enacts; `evaluate_ucan` mirrors its stage boundaries exactly.
 - **ADR-009 (Role Assignment and Capability Ceiling Enforcement):** the `NonceTracker` foundation — its acceptance criteria define the `NonceTracker` struct and the `check_and_record` (gate) / `check_replay` (diagnostic) operations whose differing nonce side effect distinguishes the gate (records) from the diagnostic (read-only probe). ADR-016 (cited above) is the normative nonce-validation pipeline (format, freshness, replay window).
-- **ADR-039 (shared-DID key scope, Category-A enforcement):** sub-checks inside the `signatures_valid` stage of `CapabilityValidation`.
+- **ADR-063 (identity substrate):** the signer-identity sub-checks inside the `signatures_valid` stage of `CapabilityValidation`.
 - **Agent-first API design tenet (CLAUDE.md) + per-SDK idiom lesson (`.docs/lessons/per-sdk-idiom-not-cross-language-dogma.md`):** identical record *shape* across bindings, but per-SDK idiomatic wrappers — not a single shape forced onto every language.
 - **Lesson `.docs/lessons/sdk-consume-structured-ffi-results-not-error-prose.md`:** why prose-parsing of FFI error strings is a recurring failure mode (it masked the multi-attestation nonce defect), and the structural prevention this ADR rests on — SDKs consume the typed `CapabilityValidation`/structured result, never reconstruct per-check outcomes from message text.
 - **Bridge error-code taxonomy (`[SCP-CAT-NNNN]` codes, `scripts/check-error-codes.sh`):** the source of SDK error typing, surfaced via one mapping chokepoint.
