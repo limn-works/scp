@@ -30,19 +30,18 @@ observable and not exhaustive.
 
 ## Migration is the designed exception
 
-The `consume(handle)` → `import_ed25519_signing_key(seed)` step transits the 32-byte
-pre-rotation seed through shared bridge process memory: `consume` destroy-and-exports raw
-bytes from the pre-rotation substrate, the bytes cross the FFI boundary as a
-`Zeroizing<[u8; 32]>`, `import_ed25519_signing_key` consumes them into the operational
-substrate, and `Zeroizing` wipes the buffer on drop. `Zeroizing` narrows the exposure
-window rather than closing it: a core dump, a debugger attach, or a cold-boot attack while
-the bytes are live captures the seed in plaintext.
+The handoff transits the 32-byte pre-rotation seed through shared bridge process memory:
+the pre-rotation custody adapter destroy-and-exports raw bytes, the bytes cross the FFI
+boundary in a `Zeroizing` buffer, the operational substrate imports them, and `Zeroizing`
+wipes the buffer on drop. `Zeroizing` narrows the exposure window rather than closing it: a
+core dump, a debugger attach, or a cold-boot attack while the bytes are live captures the
+seed in plaintext.
 
-Revealing the pre-rotation seed during migration is the protocol's intended handoff
-mechanism, so the obligation is to keep the `consume` → `import` sequence tight, with no
-intervening IO, logging, persistence, or copies. A backend where the key never exists as
-raw bytes — a hardware security module, or a Secure Enclave generating the key
-internally — could rewrap within one substrate and avoid the transit.
+Revealing the pre-rotation key is the protocol's intended handoff mechanism, so the
+obligation is to keep the export and the import tight, with no intervening IO, logging,
+persistence, or copies. A backend where the key never exists as raw bytes — a hardware
+security module, or a secure element generating the key internally — rewraps within one
+substrate and avoids the transit.
 
 ## Rules
 
@@ -59,5 +58,5 @@ internally — could rewrap within one substrate and avoid the transit.
   which carries the corrected type-isolation claim.
 - `.docs/adrs/ADR-054-pre-rotation-custody-substrate-isolation.md` — the decision this
   lesson corrects.
-- `crates/scp-ffi/uniffi/src/bridge.rs`, in `generate_ephemeral_ed25519_seed` — the code
-  comment recording that type-level isolation is satisfied while substrate isolation is not.
+- `crates/scp-ffi/uniffi/src/bridge.rs` — the code comment recording that type-level
+  isolation is satisfied while substrate isolation is not.
