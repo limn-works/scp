@@ -109,7 +109,7 @@ Language-specific patterns (e.g., Swift `MARK` comments, Rust `mod` blocks, Pyth
 
 Per-identity methods in `scp-runtime`'s `context/supervisor` layer encode their **capability axis** in the name, so a mis-placed operation reads as wrong on sight (ADR-049 §5 placement invariant):
 
-- **`my_*` prefix** = actor-internal own-identity accessor. Takes `&OwnedIdentityDid` and reaches only the identity that owns the calling actor — e.g. `my_wrapping_public_key`, `my_key_package_store`. This holds even when the return is public data; the prefix marks caller-isolation, not data-sensitivity.
-- **Plain verbs** = bridge-external node bootstraps. Take a bare `DID`, with local-identity custody enforced at the FFI bridge — e.g. `create_context`, `spawn_actor_from_welcome`, `reserve_key_package`.
+- **`my_*` prefix** = actor-internal own-identity accessor. It reaches only the identity that owns the calling actor — e.g. `my_wrapping_public_key`, `my_key_package_store`. This holds even when the return is public data; the prefix marks caller-isolation, not data-sensitivity.
+- **Plain verbs** = bridge-external node bootstraps. Take a bare identifier, with local-identity custody enforced at the FFI bridge — e.g. `create_context`, `spawn_actor_from_welcome`, `reserve_key_package`.
 
-So a `my_`-prefixed method taking a bare `DID`, or a plain-verb method taking `&OwnedIdentityDid`, is a naming/axis violation. See `.docs/lessons/per-identity-op-placement-two-axes.md`.
+So a `my_`-prefixed method taking an identifier, or a plain-verb method reaching the owning identity, is a naming/axis violation. See `.docs/lessons/per-identity-op-placement-two-axes.md`.
