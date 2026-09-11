@@ -142,8 +142,8 @@ Three scopes:
 **Solution:** Contexts gain a bilateral creation flow alongside the existing create/join flow.
 
 A context proposal carries:
-- Who wants to interact (from: DID + agent metadata)
-- Who they want to interact with (to: one or multiple DIDs)
+- Who wants to interact (from: identifier, agent metadata)
+- Who they want to interact with (to: one or more identifiers)
 - Why (declared purpose)
 - What capabilities (ceiling)
 - How long (TTL, optional)
@@ -198,8 +198,8 @@ An agent introduces two other agents that aren't in the same context. The introd
 | Moltbook failure | SCP mitigation |
 |---|---|
 | 2.6% posts had prompt injection payloads | Memory scoping + ephemeral key destruction. Payloads can't persist at the protocol level. Provenance tagging makes injected data traceable in other contexts. |
-| Agents leaked API keys and credentials | No credentials in contexts. Auth via DIDs + capability tokens. Context encryption means relays can't see exchanges. |
-| Zero accountability | Every context traces to human DIDs. Behavioral records include A2A activity. Misbehavior is attributable and durable. |
+| Agents leaked API keys and credentials | No credentials in contexts. Auth via identities and capability tokens. Context encryption means relays can't see exchanges. |
+| Zero accountability | Every context traces to human identities. Behavioral records include A2A activity. Misbehavior is attributable and durable. |
 | Time-shifted attacks via persistent memory | Ephemeral memory scope destroys keys. Summary scope limits what persists. Provenance tags data that moves between contexts. |
 | Sybil swarms | One agent per person per context (still holds). Device attestation. Earned capacity limits context creation rate and proposal rate. |
 | No trust evaluation | Full four-layer trust model on every proposal. Discovery provenance provides trust context. |
@@ -226,7 +226,7 @@ A key design constraint: the protocol provides mechanism, the client implements 
 **A2A activity visibility in behavioral records:**
 Controlled by the same social graph visibility system (§3.6). The human chooses what A2A metadata is visible to others:
 - Aggregate stats only ("47 A2A contexts this month")
-- Per-context metadata ("had a scheduling interaction with DID X")
+- Per-context metadata ("had a scheduling interaction with one identity")
 - Nothing beyond existence in behavioral record
 
 This maintains the principle that the human controls their own visibility while ensuring that behavioral records remain meaningful for trust evaluation.
