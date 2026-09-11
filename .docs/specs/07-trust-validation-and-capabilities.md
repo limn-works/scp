@@ -72,7 +72,7 @@ Full 11-step UCAN validation (ADR-016 criterion 2) runs at **token presentation 
 The 11 validation steps are:
 
 1. Parse the JWT-format UCAN token
-2. Verify the P-256 signature (resolving `kid` from the DID document per ADR-039, the shared-DID human-agent identity model)
+2. Verify the P-256 signature, resolving `kid` against the key state derived from the issuer's key-event log (`03-identity.md` §3.10.4)
 3. Verify delegation chain integrity (`prf` chain, each parent's `aud` matches child's `iss`)
 4. Verify root issuer is the context creator's DID
 5. Verify audience matches the presenting agent's DID (self-delegation valid with `fct.scp_key_scope`)
@@ -112,7 +112,7 @@ No action proceeds on reputation or identity alone. A trusted DID whose cached c
 
 This two-tier design is not a relaxation of security. Tier 2 checks are derived from Tier 1 validation — they are a performance optimization that preserves the security invariant. Every capability in the cache traces back to a cryptographically authorized source: externally-presented tokens (cross-context outlet invocation, broadcast admission) are validated through the full Tier-1 UCAN chain, and role-derived capabilities trace to the signed governance authorization that granted the role (context creation for the creator; the signed `AddMember`/`AssignRole` governance action thereafter). The role-derived `member_capabilities` entries are local materializations of that signed authorization, not independently-presented bearer tokens.
 
-**Capability tokens** are fine-grained, per-context, per-capability. Build on UCAN (User Controlled Authorization Networks). Under the shared-DID model (ADR-039), intra-DID delegation uses self-delegation UCANs where `iss == aud` (same DID), the issuing key is `#active`, and `fct.scp_key_scope: "#agent"` scopes the delegation to the agent verification method. Tokens are independently revocable — you can revoke one capability from one agent in one context without affecting anything else. The UCAN chain provides verifiable delegation: the protocol can trace any token back to the root authority that granted it.
+**Capability tokens** are fine-grained, per-context, per-capability. Build on UCAN (User Controlled Authorization Networks). A human delegates to its agent by issuing a UCAN under the human identity's `#active` key whose audience is the agent identity, which exercises it under its own `#active` key (`09-security-model.md` §9.1 invariant 1). Tokens are independently revocable — you can revoke one capability from one agent in one context without affecting anything else. The UCAN chain provides verifiable delegation: the protocol can trace any token back to the root authority that granted it.
 
 **`Custom(String)` capabilities** extend the built-in capability set. Custom capabilities use the `{resource}:{action}` format and are subject to the same ceiling enforcement — a custom capability must be in the context's capability ceiling to be exercised. To be a valid ceiling entry, a custom capability MUST be well-formed per the ceiling-entry grammar (§5.3.1.1), which is the authoritative definition of the permitted charset: `{resource}` and `{action}` are non-empty kebab-case tokens (`[a-z0-9-]+`, no `:`, no `*`, no whitespace) separated by **exactly one** colon, with the asterisk permitted **only** as the whole action segment of an explicit `{resource}:*` wildcard (never in the resource position, never as a substring). A bare single-token custom with no action (e.g. `payments`) is **not** a valid ceiling entry — there is no implicit wildcard — and is rejected at context creation with `InvalidCeilingCategory` (§5.3.1). A custom entry is additionally valid only if it does not name a built-in capability under any spelling — enforced by canonical resolution: resolving the entry's string through the protocol's canonical capability parser must not yield a built-in (§5.3.1.1). A custom `{resource}:*` wildcard is **further** rejected when `{resource}` is the resource token of any built-in capability (e.g. `member:*`, `messages:*`, `governance:*`): canonical resolution does not catch this (no `member:*` built-in exists) but ceiling wildcard coverage would let such an entry silently grant the privileged built-in actions in that family (e.g. `member:ban`) — closed by construction over the built-in resource-token set (§5.3.1.1 "No built-in-resource wildcard shadow"); a non-wildcard custom action under a built-in resource (e.g. `member:promote`) and a wildcard over a non-built-in resource (e.g. `payments:*`) both remain valid. Ceiling-entry strings are subject to the same string sanitization (§9.1A) and 256-byte length cap as other context string fields (§9.1A "String field validation" table in §5.9). Delegation and attenuation of custom capabilities follow the standard UCAN URI structure (`scp:ctx:{context_id}/{resource}:{action}`), so custom capabilities compose with the delegation chain exactly like built-in capabilities.
 
@@ -286,11 +286,11 @@ The `signer_public_key` in the `ParticipationProfile` is the public half of this
 
 Statements are stored on source context relays. The context controls the storage. The agent cannot write, modify, or delete statements — this is the critical integrity guarantee. When a member's participation facts change, the context re-computes and re-signs the statement, replacing the prior version in place.
 
-**DID document service endpoint:**
+**Service-record entry:**
 
-Each agent's DID document lists a `ParticipationStatements` service endpoint that points to a relay or aggregation endpoint where their statements can be fetched by verifiers. This is the discovery mechanism — admitting contexts resolve the agent's DID, find the service endpoint, and fetch statements from it. The endpoint type MUST be listed in the DID document service endpoint cross-reference table (§18.2.2). **[Superseded 2026-09-10 — the protocol produces no DID document and uses no did:dht: ADR-063, the inception-derived key-event-log identity substrate, replaced both with the key-event log and the service record (`03-identity.md` §3.10.13). A verifier resolves `#active` from the key state the latest state-carrying event carries (`09-security-model.md` §9.7.4.2 R8).]**
+Each agent's service record carries a `ParticipationStatements` entry pointing to a relay or aggregation endpoint where a verifier fetches their statements (`03-identity.md` §3.10.13). This is the discovery mechanism: an admitting context resolves the agent's service record, reads the entry, and fetches statements from it. The entry type MUST be listed in the cross-reference table of `18-addressability-and-deployment.md` §18.2.2.
 
-**ParticipationStatements service endpoint format.** The DID document entry:
+**`ParticipationStatements` entry format.**
 
 ```json
 {
@@ -351,7 +351,7 @@ Agents opt into per-context attestations by allowing the context to publish part
 
 1. Context declares one or more `RequireParticipation` entries in `ContextParams` admission requirements.
 2. Joining agent sees the requirements in context metadata before opting in (legibility tenet — visible before join decision).
-3. Admitting context resolves the agent's DID document and finds the `ParticipationStatements` service endpoint. **[Superseded 2026-09-10 — the protocol produces no DID document and uses no did:dht: ADR-063, the inception-derived key-event-log identity substrate, replaced both with the key-event log and the service record (`03-identity.md` §3.10.13). A verifier resolves `#active` from the key state the latest state-carrying event carries (`09-security-model.md` §9.7.4.2 R8).]**
+3. The admitting context resolves the agent's service record and reads its `ParticipationStatements` entry (`03-identity.md` §3.10.13).
 4. Admitting context fetches statements from the service endpoint.
 5. Admitting context verifies: (a) each statement's signed `subject_did` equals the DID of the agent being admitted — statements for any other subject are discarded before they can contribute to any threshold, freshness, or distinct-signer count (closing cross-subject participation-profile replay, where a victim's genuine high-standing profiles are presented to admit a different agent), (b) each statement's P-256 signature is valid over its fields, (c) signers are distinct (N different `signer_public_key` values — proving N independent contexts), (d) each required fact meets the required threshold, (e) each statement's `updated_at` is within `max_age_secs` of the current time, (f) statements span at least `min_contexts` distinct signers for each requirement.
 6. If any requirement is not met, admission is denied.
@@ -375,7 +375,7 @@ All checks are mechanical — no judgment, no discretion, no governance vote. Th
 
 - The admitting context fetches from the agent's service endpoint — bounded by one fetch per admission attempt. No amplification vector.
 - Source contexts only produce statements for opted-in members. No unauthenticated statement generation.
-- Statement size is bounded: ~150 bytes per statement per context. 100 contexts = ~15KB (acceptable). 1000 contexts = ~150KB (served via the service endpoint, not inline in the DID document).
+- Statement size is bounded: ~150 bytes per statement per context. 100 contexts = ~15KB (acceptable). 1000 contexts = ~150KB (served from the endpoint the entry names, not carried inline in the service record).
 
 **Example admission policy:**
 
@@ -457,7 +457,7 @@ ChallengeVerification {
 }
 ```
 
-**Storage and discovery.** `ChallengeVerification` records are stored in the subject's DID document as entries in the `SCPCapabilities` service endpoint, alongside self-attested capabilities. The record is also stored in the context's event log if the challenge was administered within a context. Verifiers fetch records from the subject's `SCPCapabilities` endpoint during admission checks (§7.3.4.4). Records are identified by `verification_id` for deduplication and revocation.
+**Storage and discovery.** A `ChallengeVerification` record is its own signed object the subject references, and not a field of any document the subject publishes; the service record carries only the self-asserted capability URIs (`03-identity.md` §3.10.13). The record is also stored in the context's event log if the challenge was administered within a context. Verifiers fetch records from the endpoint the subject's service record names during admission checks (§7.3.4.4). Records are identified by `verification_id` for deduplication and revocation.
 
 **Expiry.** Challenge verifications expire after the `expires_at` timestamp. The maximum validity period is 90 days — capabilities can degrade over time (model updates, configuration changes), so re-verification is necessary. Contexts MAY require shorter validity periods in their admission requirements.
 
@@ -551,7 +551,7 @@ System capabilities declare what a node does (e.g., relay operation, bridge oper
 
 Capability URIs have two verification levels:
 
-- **Self-attested.** Declaring a URI in a DID document's `SCPCapabilities` service entry. Anyone can do this. The claim carries the weight of the claimant's identity and participation history.
+- **Self-attested.** Declaring a URI among the self-asserted capability URIs of the identity's service record (`03-identity.md` §3.10.13). Anyone can do this. The claim carries the weight of the claimant's identity and participation history.
 - **Challenge-verified.** A signed `ChallengeVerification` record (§7.3.4) demonstrates that a specific verifier tested the capability and the agent passed. The verifier's signature prevents forgery.
 
 The `scp:capability:*` prefix reservation provides an additional layer: SDKs reject unknown protocol-scoped URIs at parse time, preventing agents from fabricating protocol capability claims that don't correspond to real challenge suites.
@@ -684,13 +684,13 @@ The signed protocol registry is a JSON document listing all valid `scp:capabilit
 }
 ```
 
-**Signing authority.** The registry is signed by the SCP protocol authority key — a dedicated P-256 key whose public key is hardcoded in every SDK build. The signing key is distinct from any identity key. The key is published in the protocol governance DID document (§14) and in the SDK source code. The signing key MUST be rotatable via the protocol governance process (§14). On rotation, the new key is published with a 90-day grace period during which both old and new signatures are accepted. The old key MUST be accepted for verification of registry versions published before the rotation event. After the 90-day grace period, the old key is no longer accepted for newly-fetched registry documents (but historical verification of previously-cached versions remains valid).
+**Signing authority.** The registry is signed by the SCP protocol authority key — a dedicated P-256 key whose public key is hardcoded in every SDK build. The signing key is distinct from any identity key. The key is published in the protocol governance identity's service record (§14) and in the SDK source code. The signing key MUST be rotatable via the protocol governance process (§14). On rotation, the new key is published with a 90-day grace period during which both old and new signatures are accepted. The old key MUST be accepted for verification of registry versions published before the rotation event. After the 90-day grace period, the old key is no longer accepted for newly-fetched registry documents (but historical verification of previously-cached versions remains valid).
 
 **Distribution.** The registry is distributed through four channels:
 1. **Bundled in SDK (REQUIRED).** Each SDK release MUST include the registry version current at release time. This is the cold-start source and the fallback when all network sources are unavailable. SDKs MUST operate correctly using only the bundled snapshot — network fetch is an update mechanism, not a boot dependency.
 2. **Fetched from protocol relay (primary network source).** SDKs periodically fetch the latest registry from a well-known protocol relay URL: `https://registry.scp.dev/v1/capability-registry.json`. Fetch interval: once per 24 hours. The response includes `ETag` and `Last-Modified` headers for conditional requests.
 3. **Fetched from alternative URL (fallback network source).** SDKs MUST support at least one alternative fetch URL as a fallback when the primary URL is unreachable. The default alternative is `https://raw.githubusercontent.works/limn-scp/protocol-registry/main/v1/capability-registry.json`. Implementations MAY add additional fallback URLs (e.g., IPFS CID-addressed copies). Fallback URLs serve the same signed document — the signature verification is the trust anchor, not the transport URL.
-4. **Embedded in DID document.** The protocol governance DID document includes a `ProtocolRegistry` service endpoint pointing to the current registry URL.
+4. **Named by the governance service record.** The protocol governance identity's service record carries a `ProtocolRegistry` entry pointing to the current registry URL (`03-identity.md` §3.10.13).
 
 **Managed centralization tradeoff.** The registry model is a managed centralization tradeoff analogous to browser CA root stores or system time zone databases: a curated, signed list distributed with the software and periodically updated from a canonical source. The signing key — not the distribution URL — is the trust anchor. Implementations MAY override the default registry with a custom registry by providing an alternative signing key and fetch URL via SDK configuration. This enables private deployments, forks, and testing without protocol changes. Custom registries MUST use the same format and verification rules; only the signing key and fetch URLs differ.
 
@@ -709,7 +709,7 @@ Contexts can require specific capabilities for admission. Admission requirements
 - `(scp:capability:schema-validation/v1, SelfAttested)` — agent must declare the capability (self-attested is sufficient).
 - `(<scp-identifier:definer>:capability:domain-expertise/v1, ChallengeVerified)` — custom capability defined by a specific identity, challenge-verified.
 
-Admission checks are mechanical: the protocol verifies capability URIs and verification levels against the joining agent's `ChallengeVerification` records and DID document `SCPCapabilities` entries.
+Admission checks are mechanical: the protocol verifies capability URIs and verification levels against the joining agent's `ChallengeVerification` records and the self-asserted capability URIs of its service record.
 
 **Verification flow:**
 
@@ -971,7 +971,7 @@ RevocationStatus = Active
 ```
 
 - All attestations are created with `revocation_status: Active`.
-- Revocation is performed by the issuer by publishing an updated attestation with `revocation_status: Revoked { ... }` to the same location as the original attestation (DID document entry, relay-published attestation blob, or revocation endpoint). Note: an attestation location is never the context event log — attestations are credential-layer artifacts (§7.4), not context-log leaves.
+- Revocation is performed by the issuer by publishing an updated attestation with `revocation_status: Revoked { ... }` to the same location as the original attestation (the endpoint the subject's service record names, a relay-published attestation blob, or a revocation endpoint). Note: an attestation location is never the context event log — attestations are credential-layer artifacts (§7.4), not context-log leaves.
 - Validators MUST reject any attestation with `revocation_status: Revoked`. A revoked attestation provides no trust signal — it is treated as if it does not exist for validation purposes.
 - Serialization: MessagePack, matching the SCP standard serialization format. The `RevocationStatus` enum is serialized as a tagged variant: `Active` as `{"Active": {}}`, `Revoked` as `{"Revoked": {"reason": "...", "revoked_at": ..., "revoked_by": "did:..."}}`.
 - The `revoked_by` field MUST equal the attestation's `issuer`. Only the issuer can revoke their own attestation. Context governance can request revocation but cannot unilaterally revoke another issuer's attestation — the governance mechanism is to remove the attestation from the context's accepted set, not to modify the attestation itself.
@@ -1010,7 +1010,7 @@ Attestations are solicited and presented through several patterns:
 
 ### 7.4.4 Revocation
 
-All attestations are independently revocable by their issuer. The issuer revokes an attestation by updating its `revocation_status` field from `Active` to `Revoked { reason, revoked_at, revoked_by }` (§7.4.1) and publishing the updated attestation to the same location as the original (DID document entry, relay-published attestation blob, or revocation endpoint — never the context event log, since attestations are credential-layer artifacts per §7.4, not context-log leaves). Only the issuer (`revoked_by == issuer`) can revoke an attestation. Revocation is immediate for new verifications — validators MUST check `revocation_status` on every attestation evaluation. Agents that cached a previous verification SHOULD re-check on a defined interval (RECOMMENDED: at least once per hour for security-critical attestations, once per day for others). A revoked attestation MUST NOT be accepted by validators for any purpose.
+All attestations are independently revocable by their issuer. The issuer revokes an attestation by updating its `revocation_status` field from `Active` to `Revoked { reason, revoked_at, revoked_by }` (§7.4.1) and publishing the updated attestation to the same location as the original (the endpoint the subject's service record names, a relay-published attestation blob, or a revocation endpoint — never the context event log, since attestations are credential-layer artifacts per §7.4, not context-log leaves). Only the issuer (`revoked_by == issuer`) can revoke an attestation. Revocation is immediate for new verifications — validators MUST check `revocation_status` on every attestation evaluation. Agents that cached a previous verification SHOULD re-check on a defined interval (RECOMMENDED: at least once per hour for security-critical attestations, once per day for others). A revoked attestation MUST NOT be accepted by validators for any purpose.
 
 ## 7.5 Layer 4: Trust Evaluation
 
