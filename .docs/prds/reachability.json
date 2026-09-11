@@ -455,7 +455,7 @@
     },
     {
       "id": "SCP-241",
-      "title": "Implement DidResolver trait with parallel dual-layer resolution",
+      "title": "Implement IdentityBackend::resolve with parallel multi-relay resolution",
       "gate": "gate-reachability-2",
       "priority": "P0",
       "severity": "critical",
@@ -463,29 +463,29 @@
       "files": [
         "crates/scp-identity/src/resolver.rs"
       ],
-      "description": "Implement the DidResolver trait (§3.10.10) that composes relay QUERY with DhtClient::resolve() for parallel dual-layer resolution. Both layers are queried in parallel via tokio::join! with per-layer 10-second timeouts. Valid means the record's chain verifies and its sequence is at least the last cached sequence. When both return valid documents, highest sequence number wins. On a tie, relay is preferred (lower latency). ResolutionSource enum tracks whether the result came from an SCP relay, Mainline DHT, or cache.",
+      "description": "Implement the IdentityBackend trait (§3.10.10), the protocol's one resolution entry point. resolve takes the identifier's 32 raw digest bytes and returns a ResolutionOutcome carrying a verdict, key state, and sources. The resolver queries the identity's own relays and the fallback set in parallel, with per-relay 10-second timeouts, and counts a response only where it verified that chain. Fork precedence ranks two diverging chains (§9.7.4.2 R6).",
       "acceptanceCriteria": [
-        "DidResolver trait defined with resolve(&self, did: &str) -> Result<Option<ResolvedDidDocument>>",
-        "ResolvedDidDocument contains document, seq, and source fields",
-        "ResolutionSource enum has ScpRelay { relay_url: String }, MainlineDht, and Cache variants",
-        "Parallel query: both SCP relay and DHT resolution initiated concurrently via tokio::join!",
-        "Both layers are awaited; highest sequence number wins (§3.10.7)",
-        "When both return valid documents, highest sequence number wins; on tie, relay preferred",
-        "Results with seq < cached_sequence are rejected (rollback protection)",
-        "DidMethod::resolve() continues to work for single-layer DHT resolution (no regression)",
-        "Unit test: relay responds with valid doc, DHT returns nothing — relay result used",
-        "Unit test: DHT responds with valid doc, relay returns nothing — DHT result used",
-        "Unit test: both respond, higher seq wins regardless of arrival order",
-        "Unit test: one layer fails, other layer's result is accepted"
+        "IdentityBackend::resolve(&self, identifier: &[u8; 32]) -> Result<ResolutionOutcome, IdentityError> (§3.10.10)",
+        "ResolutionOutcome carries verdict, key_state, and sources; key_state is present on Confirmed and Adopted alone",
+        "ResolutionSources carries relays_reached, declared_operators, proven, and head_provenance",
+        "The resolver queries both relay sets concurrently via tokio::join! (§3.10.4 step 2)",
+        "The resolver decodes each response, recomputes its identifier from the inception event, and verifies every later event (§3.10.4)",
+        "A response failing any of those three checks is discarded",
+        "A prefix chain loses to the longer chain (§3.10.4 step 4)",
+        "Fork precedence ranks two diverging chains; a tie returns Contested (§9.7.4.2 R6, R7)",
+        "A head below the accepted sequence returns Discarded{accepted_head} (§9.7.4.2 R12)",
+        "Unit test: one relay serves a verifying chain and a second nothing — that chain is adopted",
+        "Unit test: two prefix-related chains — the longer wins whatever the arrival order",
+        "Unit test: one relay fails, the other's chain is accepted"
       ],
       "actionItems": [
-        "Define DidResolver trait, ResolvedDidDocument struct, and ResolutionSource enum",
-        "Implement DualLayerResolver composing relay resolution (SCP-240) and DhtClient::resolve()",
-        "Implement parallel query with tokio::join! and per-layer timeouts",
-        "Implement highest-seq-wins logic when both layers return valid documents",
-        "Implement rollback protection: reject results with seq < cached_sequence",
-        "Preserve DidMethod::resolve() for backward compatibility",
-        "Add tests for all resolution scenarios"
+        "Define IdentityBackend, ResolutionOutcome, and ResolutionSources",
+        "Implement the resolver over relay QUERY (SCP-240)",
+        "Implement parallel query with tokio::join! and per-relay timeouts",
+        "Implement prefix settlement and fork precedence over surviving chains",
+        "Implement rollback protection: Discarded below the accepted head's sequence",
+        "Add tests for all resolution scenarios",
+        "Preserve DidMethod::resolve"
       ],
       "blockedBy": [
         "SCP-240"
