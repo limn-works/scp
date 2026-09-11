@@ -94,11 +94,11 @@ Major version changes use a new URL path (`/scp/v2`). A relay MAY serve multiple
 
 Implementations advertise their supported protocol version through three mechanisms, each serving a different discovery scenario:
 
-### 13.3.1 DID Document Service Endpoint
+### 13.3.1 Service Record Entry
 
-The `SCPRelay` service endpoint (§18.2.1) URL already encodes the major version in its path (`/scp/v1`). No change required for major version advertisement.
+The `SCPRelay` service-record entry (§18.2.1) carries a URL that encodes the major version in its path (`/scp/v1`), so major version advertisement needs no new field.
 
-For minor version advertisement, the `SCPRelay` service entry gains an optional `scpVersion` property:
+For minor version advertisement, the `SCPRelay` entry gains an optional `scpVersion` property:
 
 ```json
 {
@@ -261,7 +261,7 @@ The `scp:ext:` prefix is reserved for protocol-defined extensions. Third-party e
 Extensions are advertised through the same three mechanisms as protocol version (§13.3):
 
 - **Relay `hello` event:** `extensions` array lists supported relay-side extensions.
-- **DID document:** `SCPRelay` service entry gains optional `extensions` array.
+- **Service record:** `SCPRelay` entry gains an optional `extensions` array.
 - **`.well-known/scp`:** `relay_config` gains optional `extensions` array.
 
 Context-level extensions are declared in `ContextParams` as an optional `extensions: Vec<String>` field. Contexts can require specific extensions for participation — a context that uses a new encryption scheme defined as an extension can declare it, and SDKs that don't support the extension refuse to join (same as `min_protocol_version`).
@@ -302,7 +302,7 @@ When a new major version is released:
 
 1. **Dual-serve period.** Relays SHOULD serve both the old and new major version paths simultaneously for a transition period. The transition period length is defined in the version's release notes (recommended minimum: 6 months).
 2. **Context migration.** Contexts do not automatically upgrade. A context created under SCP/1.x remains an SCP/1.x context. To use SCP/2.x features, create a new context and migrate members. Context migration tooling (member re-invitation, history reference) is an SDK concern, not a protocol concern.
-3. **Identity continuity.** DID documents span protocol versions. An identity's DID document MAY advertise relay endpoints for multiple major versions simultaneously. The DID itself does not change across protocol versions.
+3. **Identity continuity.** An identity's service record MAY advertise relay endpoints for several major versions (`03-identity.md` §3.10.13), and the identifier does not change across protocol versions.
 4. **No implicit upgrade.** The protocol never silently upgrades a context or connection to a new major version. All major version transitions are explicit — new URL path, new context, new wire format.
 
 ## 13.9 Implementation Conformance
