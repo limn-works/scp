@@ -418,7 +418,7 @@ SCP uses UCAN (User Controlled Authorization Networks) [11] for capability-based
 
 UCANs provide verifiable delegation chains — any token can be traced back to the root authority that granted it. Tokens are independently revocable: a human can revoke one capability from one agent in one context without affecting anything else.
 
-A human authorizes its agent by issuing a UCAN to the agent's own identity, attenuated to the actions it may take. The identity binding is separate and structural: the human's key-event log anchors the agent identity's establishment events (Section 4.4).
+A human authorizes its agent by issuing a UCAN to the agent's own identity, attenuated to the actions it may take. The identity binding is separate and structural: the human's key-event log anchors the agent identity's establishment events (Section 4.4). How a controller produces that anchor and how a verifier checks it is unspecified, and until it is specified a verifier rejects every chain claiming a delegator, so no delegated agent identity resolves today.
 
 ### 7.2 Capability Categories
 

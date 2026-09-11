@@ -1508,8 +1508,8 @@ WEBAUTHN_RP_ID = b"ctx.network"
 # Synthesized authenticatorData, in WebAuthn's own layout for an assertion:
 #   rpIdHash (32) || flags (1) || signCount (4 big-endian).
 # flags 0x05 sets user present (0x01) and user verified (0x04). §9.7.4.2's
-# definitions require the user-presence bit and read the user-verification bit
-# as information, so a conforming slot may carry 0x01 here instead.
+# definitions require the user-presence bit and state no rule about the
+# user-verification bit, so a conforming slot may carry 0x01 here instead.
 WEBAUTHN_FLAGS = 0x05
 WEBAUTHN_SIGN_COUNT = 0
 # Synthesized clientDataJSON: the exact byte string a browser serializes, with no
