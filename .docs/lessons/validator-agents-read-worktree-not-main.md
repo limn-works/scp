@@ -67,8 +67,8 @@ A related pattern from `CLAUDE.md`:
 > If a cherry-pick resolves to "nothing to commit," the changes DID NOT LAND. Investigate.
 
 This is the inverse: the orchestrator believed changes landed (because they were on a local
-branch) when they had not yet been pushed or merged. Both patterns stem from conflating local
-state with remote/canonical state.
+branch) when they had not yet been pushed or merged. Both patterns conflate local state with canonical
+remote state.
 
 ## Related
 
