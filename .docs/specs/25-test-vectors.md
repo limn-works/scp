@@ -613,7 +613,7 @@ Fingerprint:
 
 An implementation that concatenates the caller's own block first computes two different values for one honest pair and raises §9.11's maximum-severity MITM alert against an honest counterparty.
 
-**Vector 21 was deleted on 2026-09-10.** It pinned a fingerprint over `#0`, `#active`, and an absent `#agent` key standing in as `SHA-256("SCP-ABSENT-AGENT-KEY")`. §9.11's construction carries no `#agent` term and no sentinel of any kind, so the vector covered a construction the spec no longer states. **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`00-open-questions.md`).]**
+**Vector 21 was deleted on 2026-09-10.** It pinned a fingerprint over `#0`, `#active`, and an absent `#agent` key standing in as `SHA-256("SCP-ABSENT-AGENT-KEY")`. §9.11's construction carries no `#agent` term and no sentinel of any kind, so the vector covered a construction the spec no longer states.
 
 ## 25.10 Claim Validation Vectors (§12.3)
 

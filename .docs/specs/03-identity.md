@@ -203,7 +203,7 @@ id = hex(SHA-256(
 
 The `issued_at` timestamp is encoded as 8-byte big-endian for deterministic cross-platform computation. See §25.16 (Vector 29) for a test vector.
 
-**Revocation check:** Verifiers check revocation by resolving the issuer's service record (§3.10.13) and reading its `AttestationRevocations` pointer (§18.2.2, whose service-endpoint framing Track U4 reconciles with the service record). The pointer's target returns a list of revoked attestation IDs. If the attestation's `id` appears in the list, it is revoked. Additionally, the `revocation_status` field in the attestation itself is checked — if `Revoked`, the attestation is invalid regardless of the revocation endpoint.
+**Revocation check:** Verifiers check revocation by resolving the issuer's service record (§3.10.13) and reading its `AttestationRevocations` pointer (`18-addressability-and-deployment.md` §18.2.2). The pointer's target returns a list of revoked attestation IDs. If the attestation's `id` appears in the list, it is revoked. Additionally, the `revocation_status` field in the attestation itself is checked — if `Revoked`, the attestation is invalid regardless of the revocation endpoint.
 
 ### 3.5.3 Service-Record Attestation Entry
 
