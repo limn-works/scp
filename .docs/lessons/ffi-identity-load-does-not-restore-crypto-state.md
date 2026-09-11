@@ -4,8 +4,8 @@
 
 ## The Bug
 
-`py_identity_load` reads (DID, custody_label) from `InMemoryStorage` and returns a `PyIdentity`.
-It does NOT call `register_identity`, so the DID is absent from `IDENTITY_REGISTRY`. Any
+`py_identity_load` reads the identifier and the custody label from `InMemoryStorage` and returns a
+`PyIdentity`. It does NOT call `register_identity`, so the entry is absent from `IDENTITY_REGISTRY`. Any
 subsequent crypto operation — `py_ucan_mint`, `py_context_send`, `py_context_create` pseudonym
 derivation, `py_identity_rotate_key` — calls `with_identity()` and fails with:
 
@@ -18,19 +18,18 @@ The returned `PyIdentity` looks valid but is cryptographically inert.
 ## Why This Cannot Be Fixed Transparently
 
 `InMemoryKeyCustody` is an in-memory `HashMap<u64, SigningKey>`. It does not persist across
-process restarts. Loading a DID from storage recreates the *metadata* (DID string, custody label)
-but not the *key handles* — the `u64` IDs that map to actual Ed25519 key material. There is no
-way to restore a `KeyHandle` that points to a live key without also restoring the custody's
-internal map.
+process restarts. Loading an identity from storage recreates the *metadata* (the identifier, the custody label)
+but not the *key handles* — the `u64` IDs that map to live key material. No path restores a `KeyHandle` pointing at a live key without also
+restoring the custody's internal map.
 
-This is a fundamental constraint of the in-memory testing adapter, not a code omission. Fixing it
+This is a constraint of the in-memory testing adapter, not a code omission. Fixing it
 requires one of:
 
 1. **Encrypted key material persistence** — serialize InMemoryKeyCustody's key map to storage,
-   restore on load. This is the right long-term path (spec §17 ProtocolRepository) but requires
+   restore on load. This is the long-term path (spec §17 ProtocolRepository) but requires
    encrypted blob storage, not plain `InMemoryStorage`.
-2. **Session-scoped identity** — document that `py_identity_load` only restores metadata for
-   display purposes (DID display, custody label inspection). Crypto operations require a fresh
+2. **Session-scoped identity** — document that `py_identity_load` restores metadata for display
+   alone (the identifier, the custody label). Crypto operations require a fresh
    `py_identity_create` each session, which is consistent with how hardware-backed custody
    (Secure Enclave, Android Keystore) works: keys are always in the hardware, handles are
    ephemeral session references.
@@ -40,15 +39,15 @@ requires one of:
 
 ## The Invariant
 
-Any function that populates `IDENTITY_REGISTRY` (i.e., any path through which an identity
-enters the system) must supply a live `KeyCustody` instance that owns the actual key material.
+Any function that populates `IDENTITY_REGISTRY` — any path by which an identity enters the
+system — must supply a live `KeyCustody` instance that owns the key material.
 There are exactly two such paths:
 
 1. `py_identity_create` — creates keys, registers entry. (Works.)
 2. `py_identity_load` — restores from storage. (Broken: no crypto state.)
 
-A future `py_identity_load` that fully restores crypto state must restore both the DID document
-and the custody's key material. The custody type field in storage (`"in_memory"`) is insufficient
+A future `py_identity_load` that fully restores crypto state must restore both the identity's key
+state and the custody's key material. The custody type field in storage (`"in_memory"`) is insufficient
 to reconstruct a live custody instance.
 
 ## How to Catch This
