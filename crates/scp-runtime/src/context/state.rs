@@ -1894,20 +1894,182 @@ pub(crate) fn create_governance_engine(
     }
 }
 
+/// Says whether the caller of [`fresh_governance_state`] may seed the live
+/// outlet registry from the immutable genesis declaration `ContextParams.outlets`.
+///
+/// `ContextParams` is frozen at genesis: `governance_helpers::execute_remove_outlet`
+/// deletes an outlet from the live `GovernanceState::registered_outlets` and
+/// writes nothing back to `params`, so `params.outlets` records what the creator
+/// declared and never records what governance later revoked. Registry membership
+/// is an authorization grant — `actor::handlers::saga` rejects a cross-context
+/// `PrepareB` whose outlet id is absent from `registered_outlets` — so installing
+/// the genesis declaration at a moment when governance may already have revoked
+/// an entry grants authority the context withdrew.
+///
+/// The two genesis callers stand at different points in the context's life, so
+/// they get different variants (GitHub #2250).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum OutletRegistrySeed {
+    /// The creator, inside `builder::create_context`, at genesis. No governance
+    /// action has run yet, so the live registry equals `params.outlets` by
+    /// construction. `validate_params` has already run
+    /// [`validate_genesis_outlets`] over the declaration.
+    ///
+    /// **The creator holds grants that a Welcome-joiner does not.** A registry
+    /// entry authorizes invocation: `actor::handlers::saga::validate_input_specificity`
+    /// rejects a cross-context `PrepareB` whose outlet id is absent from
+    /// `registered_outlets` with SCP-SAGA-13016 `PermissionDenied`. The creator
+    /// seeds the genesis outlets and every joiner seeds none
+    /// ([`OutletRegistrySeed::AwaitingLeafReplication`]), so the same `PrepareB`
+    /// naming a genesis outlet proceeds on the creator's actor and is refused on
+    /// each joiner's actor, and the caller's result depends on which member of
+    /// the target context handled the request. §5.4 of the contexts spec states
+    /// that any outlet change is visible to all context members, which the
+    /// missing replication reader named on the other variant does not yet
+    /// deliver. Seeding the joiner from `params.outlets` would replace this
+    /// divergence with a joiner that grants an outlet governance already
+    /// revoked, so neither seed converges the two members: only a reader of the
+    /// creator's `OutletRegistered`/`OutletRemoved` leaves does (GitHub #2250).
+    GenesisDeclaration,
+    /// A Welcome-joiner, inside `Supervisor::build_welcome_joiner_state`, at an
+    /// arbitrary later epoch. This joiner has read no live registry, so it starts
+    /// empty.
+    ///
+    /// **The joiner's registry stays empty, and no code closes the gap today.**
+    /// The record that could close it exists: the creator's
+    /// `OutletRegistered` leaves each carry an
+    /// `scp_protocol::context::outlets::OutletRegisteredEvent`, and each
+    /// `OutletRemoved` leaf carries an `OutletRemovedEvent`, so the two together
+    /// name every grant and every withdrawal (§5.4: "silent outlet modification
+    /// is not possible — any change is visible to all context members"). What
+    /// does not exist is a reader: no runtime path replays another member's
+    /// event log into `registered_outlets`, so a joiner's registry reads find
+    /// nothing for the life of the context, and the outlet-invocation paths fail
+    /// closed with `PermissionDenied` — a state the caller can detect, unlike a
+    /// registry that answers from a stale snapshot.
+    ///
+    /// Seeding from `params.outlets` instead would answer those reads from the
+    /// frozen genesis declaration, which records no removal governance made
+    /// after genesis, so a joiner would grant invocation authority the context
+    /// had already withdrawn. Failing closed on a grant the joiner cannot verify
+    /// beats granting one the context revoked, which is why this variant seeds
+    /// nothing rather than seeding the declaration (GitHub #2250).
+    AwaitingLeafReplication,
+}
+
+/// Rejects an `OutletRegistration` set that
+/// `scp_protocol::context::outlets::registry::register_outlet` would refuse.
+///
+/// Every runtime path that installs a whole set of registrations into a
+/// context's live `GovernanceState::registered_outlets` calls this function.
+/// The rejection message opens with `origin`, so a reader of the error learns
+/// which set the caller refused:
+/// - `builder::validate_params` passes `"genesis"`, for the creator's own
+///   parameters.
+/// - `Supervisor::spawn_actor_from_welcome`'s Precheck C passes `"genesis"`, for
+///   the creator-signed parameters a joiner receives from a peer.
+/// - `lifecycle_helpers::import_context` passes `"imported"`, for the
+///   registrations a creator-signed `ContextExport` carries. The export
+///   signature authenticates the origin of those bytes and does not establish
+///   that they are well formed, so a non-conformant or hostile creator reaches
+///   the live registry through this path.
+/// - `lifecycle_helpers::restore_context` passes `"restored"`, for the
+///   registrations a persisted `ContextSnapshot` carries. A snapshot an earlier
+///   build wrote, or a snapshot an attacker edited on disk, reaches the live
+///   registry through this path on every process restart.
+///
+/// `governance_helpers::execute_register_outlet` installs ONE registration
+/// rather than a set, and runs the same three checks against the live registry:
+/// the [`MAX_REGISTERED_OUTLETS`] bound, `OutletRegistration::validate_registrable`,
+/// and a duplicate-`outlet_id` rejection. Those five paths are every writer of
+/// `GovernanceState::registered_outlets` the runtime has, so no path puts an
+/// `OutletRegistration` into a context's live registry without running the
+/// checks (GitHub #2250).
+///
+/// Three checks run here, in this order:
+/// 1. The per-context registry cap, [`MAX_REGISTERED_OUTLETS`].
+/// 2. `OutletRegistration::validate_registrable` on each registration — the
+///    §5.4.2 Query cost floor, both JSON Schemas, the §6.2/§9.2.1 schema
+///    specificity floor, and the operator DID. Without this check the caller
+///    installs into the live authorization registry whatever the parameters,
+///    the export, or the snapshot carried, and the FFI bridges' name-only outlet
+///    surface carried a fabricated operator DID and two empty schemas.
+/// 3. Uniqueness of `outlet_id` across the set. `OutletRegistry` is a map keyed
+///    by `outlet_id`, and `GovernanceState::registered_outlets` is a `Vec`, so a
+///    duplicate id would install two entries that the registry type itself
+///    cannot hold, and a later `execute_remove_outlet` would delete one of the
+///    two and leave the other answering invocations the context revoked.
+///
+/// # Errors
+///
+/// Returns the message naming the failed check and the outlet id it failed on.
+/// Each caller wraps that message in the error type its own path returns.
+pub(crate) fn validate_outlet_registry_set(
+    outlets: &[OutletRegistration],
+    origin: &str,
+) -> Result<(), String> {
+    if outlets.len() > MAX_REGISTERED_OUTLETS {
+        return Err(format!(
+            "{origin} outlet count {} exceeds the per-context limit of {MAX_REGISTERED_OUTLETS}",
+            outlets.len(),
+        ));
+    }
+
+    let mut seen: HashSet<&str> = HashSet::with_capacity(outlets.len());
+    for outlet in outlets {
+        outlet.validate_registrable().map_err(|e| {
+            format!(
+                "{origin} outlet {:?} is not a registrable OutletRegistration: {e}",
+                outlet.outlet_id,
+            )
+        })?;
+        if !seen.insert(outlet.outlet_id.as_str()) {
+            return Err(format!(
+                "{origin} outlet id {:?} is declared more than once",
+                outlet.outlet_id,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Rejects a genesis outlet declaration that
+/// `scp_protocol::context::outlets::registry::register_outlet` would refuse.
+///
+/// Calls [`validate_outlet_registry_set`] with the `"genesis"` origin, which is
+/// where the three checks and the reason each one exists are written down. Both
+/// entrypoints that accept a `ContextParams` and reach [`fresh_governance_state`]
+/// call this: `builder::validate_params` for the creator's own parameters, and
+/// `Supervisor::spawn_actor_from_welcome`'s Precheck C for the creator-signed
+/// parameters a joiner receives from a peer (GitHub #2250).
+///
+/// # Errors
+///
+/// Returns [`ContextCreationError::CreationFailed`] naming the failed check and
+/// the outlet id it failed on.
+pub(crate) fn validate_genesis_outlets(
+    outlets: &[OutletRegistration],
+) -> Result<(), ContextCreationError> {
+    validate_outlet_registry_set(outlets, "genesis").map_err(ContextCreationError::CreationFailed)
+}
+
 /// Builds the fresh-context [`GovernanceState`] shared by BOTH the creator-side
 /// create path ([`crate::context::lifecycle_helpers::create_context`]) and the
 /// join-side spawn-from-Welcome path
 /// ([`crate::context::supervisor::Supervisor::build_welcome_joiner_state`]).
 ///
 /// Both entrypoints stand up an identical fresh governance bucket — empty
-/// proposal/outlet/ceiling/economy maps, the matrix-default hard rate limiter, a
+/// proposal/ceiling/economy maps, the matrix-default hard rate limiter, a
 /// 60-second velocity window, and a fresh spending-nonce tracker — differing
 /// only in the already-built `engine`, the initial `last_known_members` roster,
-/// and the `context_id`/`clock` the nonce tracker binds. Extracting the field
-/// set here means the two paths cannot silently DRIFT: a new `GovernanceState`
-/// field forces one edit, not two. The import/restore paths are deliberately
-/// NOT routed through this helper — they populate the bucket from a persisted
-/// snapshot, not from fresh defaults.
+/// the `context_id`/`clock` the nonce tracker binds, and the `outlet_seed` the
+/// caller states. Extracting the field set here means the two paths cannot
+/// silently DRIFT: a new `GovernanceState` field forces one edit, not two. The
+/// outlet registry is the one field the two paths deliberately differ on, and
+/// [`OutletRegistrySeed`] makes each caller declare which it is rather than
+/// leaving the difference to a literal at the call site. The import/restore
+/// paths are deliberately NOT routed through this helper — they populate the
+/// bucket from a persisted snapshot, not from fresh defaults.
 ///
 /// The threshold signer set + quorum value are derived from
 /// `params.governance` here (empty / zero for non-`Threshold` models), matching
@@ -1918,6 +2080,7 @@ pub(crate) fn fresh_governance_state(
     last_known_members: HashSet<DID>,
     context_id: &str,
     clock: Arc<dyn Clock>,
+    outlet_seed: OutletRegistrySeed,
 ) -> GovernanceState {
     let (threshold_signers, threshold_value) = match &params.governance {
         GovernanceModel::Threshold { threshold, signers } => (signers.clone(), *threshold),
@@ -1932,7 +2095,15 @@ pub(crate) fn fresh_governance_state(
         deadlock: DeadlockDetectionState::default(),
         pending_ceiling_modification: None,
         pending_economic_policy_change: None,
-        registered_outlets: Vec::new(),
+        // §5.1/§5.12: outlets are declared at creation, so the creator seeds the
+        // live registry from `params.outlets` (GitHub #2020). The caller states
+        // which genesis path it is on, because only the creator may read the
+        // immutable genesis declaration as the live registry — see
+        // [`OutletRegistrySeed`] for why a Welcome-joiner may not.
+        registered_outlets: match outlet_seed {
+            OutletRegistrySeed::GenesisDeclaration => params.outlets.clone(),
+            OutletRegistrySeed::AwaitingLeafReplication => Vec::new(),
+        },
         outlet_interfaces: Vec::new(),
         pruning_policy: None,
         message_pricing: crate::context::lifecycle_logic::derive_message_pricing(

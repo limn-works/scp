@@ -251,6 +251,67 @@ impl OutletRegistry {
 }
 
 // ---------------------------------------------------------------------------
+// OutletRegistration::validate_registrable
+// ---------------------------------------------------------------------------
+
+impl OutletRegistration {
+    /// Validates every property of this registration that a reader can decide
+    /// from the registration alone, with no registry and no role state.
+    ///
+    /// [`register_outlet`] calls this, and so does every runtime path that
+    /// installs an `OutletRegistration` into a context's live registry without
+    /// going through [`register_outlet`]: the genesis declaration a creator
+    /// writes into `ContextParams.outlets`, and the governance action
+    /// `GovernanceAction::RegisterOutlet`. One method holding the checks means
+    /// those paths run the SAME checks rather than a re-spelled subset, so no
+    /// path can install a registration [`register_outlet`] would have refused.
+    ///
+    /// The checks, in the order [`register_outlet`] ran them before the
+    /// extraction:
+    /// 1. [`OutletRegistration::validate`] — the §5.4.2 Query structural cost
+    ///    floor. That method checks the cost declaration and nothing else; this
+    ///    one is the full registration check, and calls it first.
+    /// 2. [`schema::validate_schema`] on the input schema, then on the output
+    ///    schema.
+    /// 3. [`schema::validate_specificity_floor`] across both schemas (§6.2,
+    ///    §9.2.1).
+    /// 4. `operator_did` parses as a DID (§5.4.1).
+    ///
+    /// Two checks stay in [`register_outlet`], because neither is a property of
+    /// the registration: the registrant's `OutletRegister` capability reads the
+    /// role state, and the duplicate-`outlet_id` check reads the registry. The
+    /// `implementation_hash` needs no check — `[u8; 32]` bounds it at compile
+    /// time.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`OutletError`] of whichever check failed first.
+    pub fn validate_registrable(&self) -> Result<(), OutletError> {
+        self.validate()?;
+
+        schema::validate_schema(&self.schema.input_schema)
+            .map_err(OutletError::InvalidInputSchema)?;
+        schema::validate_schema(&self.schema.output_schema)
+            .map_err(OutletError::InvalidOutputSchema)?;
+
+        if let Err((side, field_count)) = schema::validate_specificity_floor(
+            &self.schema.input_schema,
+            &self.schema.output_schema,
+        ) {
+            return Err(OutletError::SchemaSpecificityFloor {
+                side: side.to_owned(),
+                field_count,
+                min_fields: schema::MIN_SCHEMA_FIELDS,
+            });
+        }
+
+        validate_did(&self.operator_did)?;
+
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // register_outlet
 // ---------------------------------------------------------------------------
 
@@ -258,12 +319,11 @@ impl OutletRegistry {
 ///
 /// Validates:
 /// 1. Registrant has `OutletRegister` capability via UCAN (ADR-009).
-/// 2. Input and output schemas are valid JSON Schema.
-/// 3. Implementation hash is 32 bytes (enforced by type system).
-/// 4. Operator DID is resolvable (basic format check).
-/// 5. Outlet ID is not already registered.
-/// 6. `OutletRegistration::validate()` — Query structural cost floor
-///    (§5.4.2, SCP-OUT-012).
+/// 2. Everything [`OutletRegistration::validate_registrable`] checks — the §5.4.2 Query
+///    structural cost floor, both JSON Schemas, the specificity floor, and the
+///    operator DID. The implementation hash is 32 bytes by type, so it needs no
+///    runtime check.
+/// 3. Outlet ID is not already registered.
 ///
 /// On success, stores the registration and returns the outlet ID along with a
 /// [`OutletRegisteredEvent`] for the caller to append to the event log.
@@ -286,37 +346,15 @@ pub fn register_outlet(
         });
     }
 
-    // 2. Pure structural validation (§5.4.2 Query cost floor — SCP-OUT-012).
-    //    Runs before schema validation so a misclassified Query+cost is
-    //    rejected with the precise QueryCostViolation rather than masked
-    //    by an unrelated downstream failure.
-    registration.validate()?;
+    // 2. Every check that reads the registration alone: the §5.4.2 Query cost
+    //    floor, both schemas, the specificity floor, and the operator DID. The
+    //    genesis and governance install paths call the same function, so a
+    //    registration this call would refuse is refused there too. The
+    //    implementation hash needs no runtime check — `[u8; 32]` bounds it at
+    //    compile time.
+    registration.validate_registrable()?;
 
-    // 3. Validate schemas.
-    schema::validate_schema(&registration.schema.input_schema)
-        .map_err(OutletError::InvalidInputSchema)?;
-    schema::validate_schema(&registration.schema.output_schema)
-        .map_err(OutletError::InvalidOutputSchema)?;
-
-    // 2b. Enforce schema specificity floor (spec section 6.2, 9.2.1).
-    if let Err((side, field_count)) = schema::validate_specificity_floor(
-        &registration.schema.input_schema,
-        &registration.schema.output_schema,
-    ) {
-        return Err(OutletError::SchemaSpecificityFloor {
-            side: side.to_owned(),
-            field_count,
-            min_fields: schema::MIN_SCHEMA_FIELDS,
-        });
-    }
-
-    // 3. Implementation hash is 32 bytes by type ([u8; 32]) -- enforced at compile time.
-    //    No runtime check needed.
-
-    // 4. Validate operator DID is resolvable (basic format check).
-    validate_did(&registration.operator_did)?;
-
-    // 5. Check for duplicate outlet ID.
+    // 3. Check for duplicate outlet ID.
     if registry.contains(&registration.outlet_id) {
         return Err(OutletError::OutletAlreadyRegistered {
             outlet_id: registration.outlet_id,
@@ -1458,6 +1496,93 @@ mod tests {
         let json = serde_json::to_string(&vector).unwrap();
         let deserialized: OutletTestVector = serde_json::from_str(&json).unwrap();
         assert_eq!(vector, deserialized);
+    }
+
+    // ----- OutletRegistration::validate_registrable -----
+
+    /// The extracted checks accept the registration `register_outlet` accepts,
+    /// with no registry and no role state (GitHub #2250).
+    #[test]
+    fn validate_registrable_accepts_a_registrable_registration() {
+        assert!(valid_registration("calc").validate_registrable().is_ok());
+    }
+
+    /// The shape the FFI bridges fabricated from an outlet name — operator DID
+    /// `did:key:placeholder`, two property-free schemas, an all-zero
+    /// implementation hash, an empty signature — is refused, so a genesis
+    /// declaration carrying it cannot install a registration naming an
+    /// unresolvable operator into a context's authorization registry.
+    #[test]
+    fn validate_registrable_rejects_the_fabricated_name_only_registration() {
+        let mut reg = valid_registration("weather");
+        reg.schema.input_schema = serde_json::Value::Object(serde_json::Map::default());
+        reg.schema.output_schema = serde_json::Value::Object(serde_json::Map::default());
+        reg.implementation_hash = [0u8; 32];
+        reg.operator_did = DID("did:key:placeholder".to_owned());
+        reg.signature = Vec::new();
+        assert!(
+            matches!(
+                reg.validate_registrable(),
+                Err(OutletError::InvalidInputSchema(_))
+            ),
+            "a `{{}}` schema declares no `type`, so it fails structural schema \
+             validation before any later check"
+        );
+    }
+
+    /// A schema that IS structurally valid but declares fewer than
+    /// [`schema::MIN_SCHEMA_FIELDS`] properties on both sides fails the
+    /// §6.2/§9.2.1 specificity floor — the check that stops a registration from
+    /// functioning as an arbitrary message channel.
+    #[test]
+    fn validate_registrable_rejects_schemas_under_the_specificity_floor() {
+        let mut reg = valid_registration("weather");
+        reg.schema.input_schema = serde_json::json!({"type": "object"});
+        reg.schema.output_schema = serde_json::json!({"type": "object"});
+        assert!(matches!(
+            reg.validate_registrable(),
+            Err(OutletError::SchemaSpecificityFloor { .. })
+        ));
+    }
+
+    /// An operator DID that is not a DID is refused.
+    #[test]
+    fn validate_registrable_rejects_a_non_did_operator() {
+        let mut reg = valid_registration("calc");
+        reg.operator_did = DID("not-a-did".to_owned());
+        assert!(matches!(
+            reg.validate_registrable(),
+            Err(OutletError::UnresolvableDid { .. })
+        ));
+    }
+
+    /// A malformed JSON Schema is refused.
+    #[test]
+    fn validate_registrable_rejects_a_malformed_schema() {
+        let mut reg = valid_registration("calc");
+        reg.schema.input_schema = serde_json::json!("a string, not a schema object");
+        assert!(matches!(
+            reg.validate_registrable(),
+            Err(OutletError::InvalidInputSchema(_))
+        ));
+    }
+
+    /// A Query outlet declaring a positive cost violates the §5.4.2 structural
+    /// floor, and the extracted checks still catch it.
+    #[test]
+    fn validate_registrable_rejects_a_query_outlet_with_a_cost() {
+        let mut reg = valid_registration("search");
+        reg.kind = OutletKind::Query;
+        reg.cost = Some(OutletCost {
+            amount: Amount(10),
+            currency: "USD".to_owned(),
+            payee: "did:dht:z6MkPayee".into(),
+            cost_formula: None,
+        });
+        assert!(matches!(
+            reg.validate_registrable(),
+            Err(OutletError::QueryCostViolation { .. })
+        ));
     }
 
     // ----- DID validation -----
