@@ -89,7 +89,7 @@ The most concerning patterns are: (1) a cryptographic construction error in ADR-
 ### [ADR-020] H5: Discovery Reader Authentication Not Specified
 - **Category**: Underspecified interfaces
 - **Location**: ADR-020, acceptance criterion 4-5
-- **What's missing**: "Reader tier: DID-authenticated, unbounded, query via outlet endpoints without MLS join." How is DID authentication performed for readers who are not MLS group members? The ADR says "DID-signed request" but does not specify the authentication protocol -- is it a signed HTTP request? A signed SCP message? What prevents replay of a valid DID-signed query?
+- **What's missing**: "Reader tier: identity-authenticated, unbounded, query via outlet endpoints without MLS join." How does a reader who is not an MLS group member authenticate? The ADR says "signed request" but does not specify the authentication protocol -- is it a signed HTTP request? A signed SCP message? What prevents replay of a valid signed query?
 - **Why it matters**: Unauthenticated or replay-vulnerable reader queries could be used to enumerate all entries in a context with discovery outlets.
 - **Severity**: HIGH
 
@@ -138,7 +138,7 @@ The most concerning patterns are: (1) a cryptographic construction error in ADR-
 ### [ADR-038] H12: WrappedCek member_id 8-byte Truncation -- Birthday Collision at Scale
 - **Category**: Missing security analysis
 - **Location**: ADR-038, section 4, `WrappedCek.member_id`
-- **What's missing**: The ADR claims "collision probability for 8-byte hashes is ~1 in 10^18." This is the collision probability for a specific pair. For birthday-bound collisions across a group, at ~2^32 (~4 billion) distinct DIDs, the probability of any collision reaches ~50%. While this is far beyond typical context sizes, it creates a systemic risk: if ANY two DIDs in the protocol's entire lifetime collide on their 8-byte truncated hash, one member could silently decrypt another's content using the wrong access key. The failure mode is silent and undetectable.
+- **What's missing**: The ADR claims "collision probability for 8-byte hashes is ~1 in 10^18." This is the collision probability for a specific pair. For birthday-bound collisions across a group, at ~2^32 (~4 billion) distinct identifiers, the probability of any collision reaches ~50%. While this is far beyond typical context sizes, it creates a systemic risk: if ANY two identifiers in the protocol's entire lifetime collide on their 8-byte truncated hash, one member could silently decrypt another's content using the wrong access key. The failure mode is silent and undetectable.
 - **Why it matters**: For a protocol designed to scale, 8 bytes provides only 64 bits of collision resistance. Industry standard for this type of identifier is 16 bytes minimum.
 - **Severity**: HIGH
 
@@ -163,7 +163,7 @@ The most concerning patterns are: (1) a cryptographic construction error in ADR-
 ### [ADR-017] M2: Attestation Revocation Check Has No Specified Protocol
 - **Category**: Underspecified interfaces
 - **Location**: ADR-017, acceptance criterion 3, `verify_attestation`
-- **What's missing**: "Checks revocation: queries revocation status." How? Where is the revocation list? Is it per-context, per-DID, global? Is it a CRL, an OCSP-like protocol, or something else? The ProtocolRepository integration mentions "Store revocation list state per context" but no query protocol is defined.
+- **What's missing**: "Checks revocation: queries revocation status." How? Where is the revocation list? Is it per-context, per identity, or global? Is it a CRL, an OCSP-like protocol, or something else? The ProtocolRepository integration mentions "Store revocation list state per context" but no query protocol is defined.
 - **Why it matters**: Without a revocation check protocol, attestation revocation is unenforceable.
 - **Severity**: MEDIUM
 
@@ -226,8 +226,8 @@ The most concerning patterns are: (1) a cryptographic construction error in ADR-
 ### [ADR-023] M11: Shadow Identity Platform Handle Verification Unspecified
 - **Category**: Underspecified interfaces
 - **Location**: ADR-023, `ClaimRequest` struct
-- **What's missing**: "Protocol verifies attestation matches shadow's platform handle." How is the platform handle verified? For a Slack handle, who verifies the claimant actually owns that Slack account? The identity attestation (section 3.5) proves the claimant holds a DID, but does not prove they own the platform handle. The bridge operator could verify, but the trust model for bridge-mediated verification is not specified.
-- **Why it matters**: Without platform handle verification, any DID can claim any shadow identity, stealing attribution for another user's actions.
+- **What's missing**: "Protocol verifies attestation matches shadow's platform handle." How is the platform handle verified? For a Slack handle, who verifies the claimant actually owns that Slack account? The identity attestation (section 3.5) proves the claimant holds an identity, but does not prove they own the platform handle. The bridge operator could verify, but the trust model for bridge-mediated verification is not specified.
+- **Why it matters**: Without platform handle verification, any identity can claim any shadow identity, stealing attribution for another user's actions.
 - **Severity**: MEDIUM
 
 ### [ADR-023] M12: Bridge Provenance Does Not Track Multiple Bridge Hops
@@ -268,7 +268,7 @@ The most concerning patterns are: (1) a cryptographic construction error in ADR-
 ### [ADR-029] M17: Outbound Queue Inner Envelopes Contain Stale Signatures
 - **Category**: Missing security analysis
 - **Location**: ADR-029, section 1
-- **What's missing**: "Messages are serialized to their inner envelope form (signed, padded) but NOT MLS-encrypted." The inner envelope signature binds to the sender's current signing key at queue time. If the sender rotates their signing key while offline (or between queue and drain), the queued inner envelopes have signatures from the old key. Recipients may reject these as invalid if the old key has been rotated out of the DID document.
+- **What's missing**: "Messages are serialized to their inner envelope form (signed, padded) but NOT MLS-encrypted." The inner envelope signature binds to the sender's current signing key at queue time. If the sender rotates their signing key while offline (or between queue and drain), the queued inner envelopes have signatures from the old key. Recipients may reject these as invalid if the key-event log has rotated the old key out.
 - **Why it matters**: Key rotation between queue and drain silently invalidates all queued messages.
 - **Severity**: MEDIUM
 
@@ -282,7 +282,7 @@ The most concerning patterns are: (1) a cryptographic construction error in ADR-
 ### [ADR-030] M19: Checkpoint State Snapshot Is Extremely Large at Scale
 - **Category**: Scope gaps
 - **Location**: ADR-030, `ContextStateSnapshot` struct
-- **What's missing**: `ContextStateSnapshot` includes `membership: Vec<(DID, RoleName)>`, `outlets: Vec<OutletRegistration>`, `sender_key_epochs: Vec<(DID, u64)>`, `blocks: Vec<(DID, DID)>`, and `ucan_revocations: Vec<String>`. For a context with 500 members and 100 outlets, the snapshot could be hundreds of kilobytes. The ADR does not specify a maximum snapshot size or compression strategy, and this is published as an event log entry.
+- **What's missing**: `ContextStateSnapshot` includes the membership roster, the outlet registrations, the per-sender key epochs, the block pairs, and the UCAN revocations. For a context with 500 members and 100 outlets, the snapshot could be hundreds of kilobytes. The ADR does not specify a maximum snapshot size or compression strategy, and this is published as an event log entry.
 - **Why it matters**: Large checkpoint events dominate storage on mobile devices and increase relay bandwidth costs.
 - **Severity**: MEDIUM
 
@@ -342,7 +342,7 @@ The most concerning patterns are: (1) a cryptographic construction error in ADR-
 ### [ADR-024] L5: MediaSession Has No Maximum Participant Limit
 - **Category**: Missing defaults
 - **Location**: ADR-024, `MediaSession` struct
-- **What's missing**: `participants: Vec<DID>` has no specified maximum. WebRTC scales poorly beyond ~50 participants for audio and ~10 for video. No guidance is provided.
+- **What's missing**: The participant list has no specified maximum. WebRTC scales poorly beyond ~50 participants for audio and ~10 for video. No guidance is provided.
 - **Why it matters**: Quality of experience degradation, not a security issue.
 - **Severity**: LOW
 
@@ -384,7 +384,7 @@ The most concerning patterns are: (1) a cryptographic construction error in ADR-
 ### [ADR-041] L11: 27 Capability URIs Listed But No Test Vector Suite
 - **Category**: Underspecified interfaces
 - **Location**: ADR-041, acceptance criteria
-- **What's missing**: The URI parser is specified but no test vectors are provided for parsing edge cases (unicode, percent-encoding, version number boundaries, DID-scoped capabilities with unusual DID methods).
+- **What's missing**: The URI parser is specified but no test vectors are provided for parsing edge cases (unicode, percent-encoding, version number boundaries, identity-scoped capabilities).
 - **Why it matters**: Parser divergence across SDK implementations.
 - **Severity**: LOW
 
