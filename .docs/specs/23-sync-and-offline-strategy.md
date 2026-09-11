@@ -313,7 +313,7 @@ Per-context sync outcomes are reported to the application layer:
 
 ## 23.16 Sync Protocol Wire Formats
 
-All sync protocol messages are serialized as MessagePack with named fields (`rmp-serde` with `named` configuration). Types exchanged between implementations as MLS application messages or via relay must use these exact field names and types.
+Every sync protocol message serializes as MessagePack with named fields (`rmp-serde` in its `named` configuration). Two implementations exchanging these types as MLS application messages, or through a relay, use the exact field names and types below. Every signature is a 64-byte raw P-256 signature over a canonical hash the `09-security-model.md` §9.5.1 construction builds.
 
 ### 23.16.1 ConsistencyCheckpoint
 
@@ -322,66 +322,68 @@ Exchanged between members as MLS application messages during event log reconcili
 | Field | Type | Description |
 |-------|------|-------------|
 | `context_id` | string | Context identifier |
-| `sender_did` | string | DID of the checkpoint sender |
-| `event_count` | u64 | Number of events in sender's local event log |
-| `merkle_root` | bytes (32) | SHA-256 Merkle root of sender's event log |
-| `epoch` | u64 or null | MLS epoch on sender's device; null for Broadcast contexts |
+| `sender_did` | string | The sending member's identifier |
+| `event_count` | u64 | Number of events in the sender's local event log |
+| `merkle_root` | bytes (32) | SHA-256 Merkle root of the sender's event log |
+| `epoch` | u64 or null | MLS epoch on the sender's device; null for a Broadcast context |
 | `timestamp` | u64 | Unix seconds when generated |
-| `signature` | bytes (64) | P-256 signature (`r \|\| s`) over the canonical hash of all fields above |
+| `signature` | bytes (64) | P-256 signature over the canonical hash of every field above |
 
-**Signature construction:** Domain separator `"SCP-CHECKPOINT-V1:"` (§9.18.2). The canonical hash follows §9.5.1: `SHA-256("SCP-CHECKPOINT-V1:" || BE32(len(context_id)) || context_id || BE32(len(sender_did)) || sender_did || event_count (8-byte BE u64) || merkle_root (32 bytes) || epoch_flag (1 byte: 0x01 if present, 0x00 if null) || epoch (8-byte BE u64, omitted if null) || timestamp (8-byte BE u64))`. All variable-length fields use `BE32(len())` prefixes per §9.5.1. The `sender_did` is included to prevent checkpoint misattribution. The `epoch` field uses a presence flag: `0x01 || epoch_BE` when present, `0x00` when null (Broadcast contexts). The signature is a P-256 signature over this hash, signed by the sender's `#active` or `#agent` verification method key (ADR-039). **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`00-open-questions.md`).]**
+**Signature construction.** Domain separator `"SCP-CHECKPOINT-V1:"` (§9.18.2). The canonical hash is `SHA-256("SCP-CHECKPOINT-V1:" ‖ BE32(len(context_id)) ‖ context_id ‖ BE32(len(sender_did)) ‖ sender_did ‖ event_count ‖ merkle_root ‖ epoch_flag ‖ epoch ‖ timestamp)`, with every integer 8-byte big-endian, `merkle_root` carried raw as a fixed-length field, and `epoch_flag` one byte, `0x01` followed by the epoch when present and `0x00` alone when null. `sender_did` sits in the preimage so a checkpoint cannot be misattributed.
+
+**Who signs it.** The checkpoint verifies against the key the member's key state lists `current` in the role the message names (`09-security-model.md` §9.7.1). An identity's key state names one operational role, `#active`, so there is one such key and no fallback.
 
 ### 23.16.2 CommitRangeRequest
 
-Sent as MLS application message when relay backfill does not contain all Commits needed for epoch catch-up (§23.4.1, source 2).
+Sent as an MLS application message when relay backfill does not carry every Commit an epoch catch-up needs (§23.4.1).
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `context_id` | string | Context identifier |
-| `from_epoch` | u64 | First epoch to retrieve (inclusive) |
-| `to_epoch` | u64 | Last epoch to retrieve (inclusive) |
-| `requester_did` | string | DID of the requesting member |
-| `signature` | bytes (64) | P-256 signature (`r \|\| s`) for authentication |
+| `from_epoch` | u64 | First epoch to retrieve, inclusive |
+| `to_epoch` | u64 | Last epoch to retrieve, inclusive |
+| `requester_did` | string | The requesting member's identifier |
+| `signature` | bytes (64) | P-256 signature authenticating the requester |
 
-**Signature construction:** Domain separator `"SCP-COMMIT-RANGE-REQ-V1:"` (§9.18.2). Canonical hash per §9.5.1: `SHA-256("SCP-COMMIT-RANGE-REQ-V1:" || BE32(len(context_id)) || context_id || from_epoch (8-byte BE u64) || to_epoch (8-byte BE u64) || BE32(len(requester_did)) || requester_did)`. The signature authenticates the requester and prevents request forgery.
+**Signature construction.** Domain separator `"SCP-COMMIT-RANGE-REQ-V1:"` (§9.18.2), over `BE32(len(context_id)) ‖ context_id ‖ from_epoch ‖ to_epoch ‖ BE32(len(requester_did)) ‖ requester_did`. The signature is what stops a party forging a request under another member's identifier.
 
 ### 23.16.3 CommitRangeResponse
 
-Response to CommitRangeRequest, sent as MLS application message (§23.4.1, source 2).
+The response to a `CommitRangeRequest`, sent as an MLS application message.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `context_id` | string | Context identifier |
-| `commits` | array of bytes | Serialized MLS Commit messages, strictly ascending epoch order |
-| `responder_did` | string | DID of the responding member |
-| `signature` | bytes (64) | P-256 signature (`r \|\| s`) for authentication |
+| `commits` | array of bytes | Serialized MLS Commit messages, strictly ascending by epoch |
+| `responder_did` | string | The responding member's identifier |
+| `signature` | bytes (64) | P-256 signature authenticating the responder |
 
-**Signature construction:** Domain separator `"SCP-COMMIT-RANGE-RESP-V1:"` (§9.18.2). Canonical hash per §9.5.1: `SHA-256("SCP-COMMIT-RANGE-RESP-V1:" || BE32(len(context_id)) || context_id || BE32(len(commits_concat)) || commits_concat || BE32(len(responder_did)) || responder_did)`, where `commits_concat` is each commit entry prefixed by its own `BE32(len())` and then concatenated. The signature authenticates the responder and prevents response tampering.
-
-Each entry in `commits` is an opaque serialized MLS Commit message as produced by the MLS library. Ordering MUST be strictly ascending by epoch.
+**Signature construction.** Domain separator `"SCP-COMMIT-RANGE-RESP-V1:"` (§9.18.2), over `BE32(len(context_id)) ‖ context_id ‖ BE32(len(commits_concat)) ‖ commits_concat ‖ BE32(len(responder_did)) ‖ responder_did`, where `commits_concat` prefixes each commit with its own `BE32` length before concatenating. Each entry is an opaque serialized MLS Commit as the MLS library produced it.
 
 ### 23.16.4 ContextSnapshot
 
-Self-contained context state at a point in time. Used for Tier 2 delta sync recovery (§23.5, ADR-029).
+Self-contained context state at a point in time, used for the Tier 2 delta sync recovery of §23.5 (ADR-029).
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `context_id` | string | Context identifier |
-| `timestamp` | u64 | Unix seconds when snapshot was taken |
-| `mls_epoch` | u64 or null | MLS epoch at snapshot time; null for Broadcast contexts |
+| `timestamp` | u64 | Unix seconds when the snapshot was taken |
+| `mls_epoch` | u64 or null | MLS epoch at snapshot time; null for a Broadcast context |
 | `event_log_merkle_root` | bytes (32) | SHA-256 Merkle root at snapshot time |
-| `event_count` | u64 | Number of events in log at snapshot time |
-| `members` | map<string, MembershipEntry> | DID string → membership entry (BTreeMap for deterministic ordering) |
-| `role_definitions` | map<string, array of string> | Role name → capability names |
-| `params_hash` | bytes (32) | SHA-256 of serialized ContextParams |
+| `event_count` | u64 | Number of events in the log at snapshot time |
+| `members` | map | Identifier to `MembershipEntry`, ordered by key |
+| `role_definitions` | map | Role name to capability names |
+| `params_hash` | bytes (32) | SHA-256 of the serialized `ContextParams` |
 | `outlet_names` | array of string | Registered outlet names at snapshot time |
-| `creator_did` | string | DID of snapshot creator |
-| `key_boundaries` | array of KeyBoundaryEntry | One entry per (identity, key) pair whose key this context retired, in ascending order of `did` then `key_bytes`. `09-security-model.md` §9.7.1 states what a member does with the values, and it adopts one only where this entry's evidence supports it |
-| `key_state_head` | bytes (32) | The creator's key-state anchor at the moment it signed. `09-security-model.md` §9.7.1's log-anchored row constructs the value |
-| `signature` | bytes (64) | P-256 signature (`r \|\| s`) over all fields except `signature` |
+| `creator_did` | string | The snapshot creator's identifier |
+| `key_boundaries` | array of `KeyBoundaryEntry` | One entry per (identity, key) pair whose key this context retired, ascending by identifier then key bytes |
+| `key_state_head` | bytes (32) | The creator's key-state anchor at the moment it signed (`09-security-model.md` §9.7.1) |
+| `signature` | bytes (64) | P-256 signature over every field except this one |
 | `sequence` | u64 | Monotonically increasing snapshot sequence per context |
 
-**Signature construction:** Domain separator `"SCP-CONTEXT-SNAPSHOT-V3:"` (§9.18.2). Canonical hash per §9.5.1: `SHA-256("SCP-CONTEXT-SNAPSHOT-V3:" || BE32(len(context_id)) || context_id || timestamp (8-byte BE u64) || mls_epoch_flag (1 byte: 0x01 if present, 0x00 if null) || mls_epoch (8-byte BE u64, omitted if null) || event_log_merkle_root (32 bytes) || event_count (8-byte BE u64) || members_hash (32 bytes) || role_definitions_hash (32 bytes) || params_hash (32 bytes) || outlet_names_hash (32 bytes) || key_boundaries_hash (32 bytes) || BE32(len(creator_did)) || creator_did || key_state_head (32 bytes, fixed-length, no length prefix) || sequence (8-byte BE u64))`. **The separator is `-V3:` because the preimage gained `key_state_head` and then `key_boundaries_hash`**, and §9.5.1 requires a version bump on any added field. The `members_hash` is `SHA-256` of BTreeMap entries serialized in key order: for each `(did, entry)`, emit `BE32(len(did)) || did || BE32(len(role_name)) || role_name || sequence_number (8-byte BE u64)`. The `role_definitions_hash` is `SHA-256` of entries in key order: for each `(role, caps)`, emit `BE32(len(role)) || role || BE32(count) || [BE32(len(cap)) || cap ...]`. The `outlet_names_hash` is `SHA-256` of `BE32(count) || [BE32(len(name)) || name ...]` in array order. The `key_boundaries_hash` is `SHA-256` of `BE32(count) || [entry ...]` over the entries in the array's own order, each entry emitting `BE32(len(did)) || did || key_bytes (33) || boundary_epoch (8-byte BE u64) || first_commit_epoch (8-byte BE u64) || retirement_commit_epoch (8-byte BE u64) || commit_transcript_hash (32 bytes)`. The `mls_epoch` field uses a presence flag matching ConsistencyCheckpoint (§23.16.1). The signature is a P-256 signature over this hash, signed by the `#active` key `creator_did`'s key state listed `current` at the position `key_state_head` names. **A verifier checks it under the log-anchored evidence class of `09-security-model.md` §9.7.1 and never against the creator's present `current` key**: a snapshot is durable evidence a later joiner reads to learn a boundary, so a routine rotation by the creator would otherwise void every snapshot it ever signed. There is no `#agent` fallback: under ADR-063, the inception-derived key-event-log identity substrate, an agent is a delegated identity with its own key-event log and its own `#active`, so the signer is whichever identity's log the snapshot's `creator_did` names. **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`00-open-questions.md`).]**
+**Signature construction.** Domain separator `"SCP-CONTEXT-SNAPSHOT-V3:"` (§9.18.2), over `BE32(len(context_id)) ‖ context_id ‖ timestamp ‖ mls_epoch_flag ‖ mls_epoch ‖ event_log_merkle_root ‖ event_count ‖ members_hash ‖ role_definitions_hash ‖ params_hash ‖ outlet_names_hash ‖ key_boundaries_hash ‖ BE32(len(creator_did)) ‖ creator_did ‖ key_state_head ‖ sequence`, with `key_state_head` raw as a fixed-length field. **The separator carries `-V3` because the preimage gained `key_state_head` and then `key_boundaries_hash`**, and §9.5.1 requires a version bump on any added field. Each of the four component hashes is `SHA-256` over its collection under §9.5.1's rules, in key order for a map and array order for a list: a member emits `BE32(len(did)) ‖ did ‖ BE32(len(role_name)) ‖ role_name ‖ sequence_number`, a role `BE32(len(role)) ‖ role ‖ BE32(count) ‖ [BE32(len(cap)) ‖ cap …]`, an outlet name `BE32(len(name)) ‖ name` behind a `BE32` count, and a key boundary `BE32(len(did)) ‖ did ‖ key_bytes ‖ boundary_epoch ‖ first_commit_epoch ‖ retirement_commit_epoch ‖ commit_transcript_hash`.
+
+**Who signs it, and against which key a verifier checks it.** The signer is the `#active` key the `creator_did`'s key state listed `current` at the position `key_state_head` names. A verifier checks the signature under the log-anchored evidence class of `09-security-model.md` §9.7.1 and never against the creator's present `current` key: a snapshot is durable evidence a later joiner reads to learn a boundary, so a routine rotation by the creator would otherwise void every snapshot it ever signed.
 
 **KeyBoundaryEntry:**
 
@@ -389,128 +391,105 @@ Self-contained context state at a point in time. Used for Tier 2 delta sync reco
 |-------|------|-------------|
 | `did` | string | The identity whose key this context retired |
 | `key_bytes` | bytes (33) | The retired key's SEC1 compressed P-256 public key (`09-security-model.md` §9.5) |
-| `boundary_epoch` | u64 | The epoch of the Commit that follows that key's retirement in this context — the key's boundary here (`09-security-model.md` §9.7.1) |
-| `first_commit_epoch` | u64 | The epoch of the earliest Commit from that identity whose leaf attestation verified under `key_bytes`. The condition that makes an absent retirement informative reads this value |
+| `boundary_epoch` | u64 | The epoch of the Commit that follows that key's retirement in this context (`09-security-model.md` §9.7.1) |
+| `first_commit_epoch` | u64 | The epoch of the earliest Commit from that identity whose leaf attestation verified under `key_bytes` |
 | `retirement_commit_epoch` | u64 | The epoch of the retirement Commit itself |
-| `commit_transcript_hash` | bytes (32) | `SHA-256` over the `confirmed_transcript_hash` of the two Commits the two epochs above name, in that order. This is the Commit-history evidence a member checks the asserted boundary against |
+| `commit_transcript_hash` | bytes (32) | SHA-256 over the `confirmed_transcript_hash` of the two Commits those epochs name, in that order |
 
-**A producer emits an entry only for a key whose retirement Commit it holds**, and it emits none for a key it never watched sign in this context. A member adopts a `boundary_epoch` only where the entry's evidence supports it and reports `Invalid{no_boundary}` for the span otherwise, whether it holds one snapshot or two (`09-security-model.md` §9.7.1). Without the evidence field a member syncing a single snapshot — the common case — would adopt whatever boundary the producer asserted.
+A producer emits an entry only for a key whose retirement Commit it holds, and none for a key it never watched sign in this context. A member adopts a `boundary_epoch` only where the entry's evidence supports it and returns `ContentVerdict::Invalid{no_boundary}` for the span otherwise (`09-security-model.md` §9.7.1). Without the evidence field a member syncing one snapshot would adopt whatever boundary the producer asserted.
 
 **MembershipEntry:**
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `did` | string | Member's DID |
-| `role_name` | string | Assigned role name (e.g., `"admin"`, `"member"`) |
-| `sequence_number` | u64 | Per-sender monotonic sequence number at snapshot time. MUST be preserved under the invariants specified in §23.17. |
+| `did` | string | The member's identifier |
+| `role_name` | string | Assigned role name |
+| `sequence_number` | u64 | Per-sender monotonic sequence at snapshot time, preserved under §23.17 |
 
 ### 23.16.5 SnapshotDelta
 
-Computed difference between two ContextSnapshots for efficient state update (§23.5, Tier 2).
+The computed difference between two `ContextSnapshot` values, for the efficient state update of §23.5.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `context_id` | string | Context identifier |
-| `from_sequence` | u64 | Old (stale) snapshot sequence number |
-| `to_sequence` | u64 | New (current) snapshot sequence number |
-| `from_epoch` | u64 or null | MLS epoch at old snapshot |
-| `to_epoch` | u64 or null | MLS epoch at new snapshot |
-| `membership_changes` | array of MembershipChange | Changes between snapshots |
-| `role_definition_changes` | map<string, array of string> | Roles added or modified |
+| `from_sequence` / `to_sequence` | u64 | The stale and current snapshot sequences |
+| `from_epoch` / `to_epoch` | u64 or null | MLS epoch at each snapshot |
+| `membership_changes` | array of `MembershipChange` | Changes between the two snapshots |
+| `role_definition_changes` | map | Roles added or modified |
 | `removed_role_definitions` | array of string | Roles removed |
-| `added_outlets` | array of string | Outlets added |
-| `removed_outlets` | array of string | Outlets removed |
-| `params_changed` | bool | Whether context parameters hash changed |
-| `events_added` | u64 | Number of events added between snapshots |
-| `old_merkle_root` | bytes (32) | Merkle root from old snapshot |
-| `new_merkle_root` | bytes (32) | Merkle root from new snapshot |
+| `added_outlets` / `removed_outlets` | array of string | Outlets added and removed |
+| `params_changed` | bool | Whether the context parameters hash changed |
+| `events_added` | u64 | Events added between the snapshots |
+| `old_merkle_root` / `new_merkle_root` | bytes (32) | Merkle root at each snapshot |
 
-**MembershipChange** (tagged enum):
-
-| Variant | Fields | Description |
-|---------|--------|-------------|
-| `Joined` | `MembershipEntry` | New member joined |
-| `Left` | `did: string` | Member left or was removed |
-| `RoleChanged` | `did: string, old_role: string, new_role: string` | Member's role changed |
+`MembershipChange` is a tagged enum: `Joined` carrying a `MembershipEntry`, `Left` carrying the member's identifier, and `RoleChanged` carrying the identifier with the old and new role names.
 
 ### 23.16.6 EquivocationAlert
 
-Raised when relay equivocation is detected (§9.9.3, §23.7). May be recorded in the event log.
+Raised when a member detects relay equivocation (§9.9.3, §23.7), and recordable in the event log.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `context_id` | string | Context where equivocation was detected |
-| `detector_did` | string | DID of the detecting member |
-| `divergent_did` | string | DID of the member whose checkpoint diverges |
-| `divergent_event_count` | u64 | Event count at which Merkle roots diverge |
-| `local_merkle_root` | bytes (32) | Detector's Merkle root at divergent count |
-| `remote_merkle_root` | bytes (32) | Divergent member's Merkle root |
-| `evidence` | EquivocationEvidence or null | Conflicting checkpoints if available |
-| `detected_at` | u64 | Unix seconds when alert was raised |
-| `local_epoch` | u64 or null | MLS epoch on detector's device |
+| `context_id` | string | Where the detector observed the equivocation |
+| `detector_did` | string | The detecting member's identifier |
+| `divergent_did` | string | The identifier whose checkpoint diverges |
+| `divergent_event_count` | u64 | Event count at which the Merkle roots diverge |
+| `local_merkle_root` / `remote_merkle_root` | bytes (32) | The two roots at that count |
+| `evidence` | `EquivocationEvidence` or null | The two conflicting checkpoints, where the detector holds them |
+| `detected_at` | u64 | Unix seconds when the alert was raised |
+| `local_epoch` | u64 or null | MLS epoch on the detector's device |
 
-**EquivocationEvidence:**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `local_checkpoint` | ConsistencyCheckpoint | Detector's checkpoint |
-| `remote_checkpoint` | ConsistencyCheckpoint | Divergent member's checkpoint |
-| `divergent_event_count` | u64 | Event count at divergence |
+`EquivocationEvidence` carries the detector's `ConsistencyCheckpoint`, the divergent member's, and the event count at divergence.
 
 ### 23.16.7 ResetRequest
 
-Sent via relay as **plaintext** (not MLS-encrypted) when the member cannot encrypt at the current epoch. Already specified in §23.5.2; field table provided here for completeness.
+Sent through a relay as plaintext, because the member cannot encrypt at the current epoch. §23.5.2 specifies the protocol and the canonical hash; this table states the fields.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `context_id` | string | Context identifier |
-| `member_did` | string | DID of the requesting member |
-| `last_known_epoch` | u64 | Last MLS epoch the member has state for |
-| `reason` | ResetReason | Why the reset is needed |
-| `nonce` | bytes (16) | CSPRNG random, anti-replay |
+| `member_did` | string | The requesting member's identifier |
+| `last_known_epoch` | u64 | The last MLS epoch the member holds state for |
+| `reason` | `ResetReason` | Why the reset is needed |
+| `nonce` | bytes (16) | Drawn from a CSPRNG, anti-replay |
 | `timestamp` | u64 | Unix seconds |
-| `signature` | bytes (64) | P-256 signature using domain separator `"SCP-RESET-REQUEST-V1:"` per §9.18.2 |
+| `signature` | bytes (64) | P-256 signature under `"SCP-RESET-REQUEST-V1:"` (§9.18.2) |
 
-**ResetReason** (tagged enum):
-
-| Variant | Fields | Description |
-|---------|--------|-------------|
-| `ExtendedOffline` | `offline_duration_secs: u64` | Member was offline for extended period |
-| `CatchUpFailed` | `attempted_sources: array of string` | Epoch catch-up failed despite trying listed sources |
-| `GovernanceAction` | `proposal_id: string` | Governance action triggered the reset |
-
-Canonical hash construction for ResetRequest signature is specified in §23.5.2.
+`ResetReason` is a tagged enum: `ExtendedOffline` carrying the offline duration in seconds, `CatchUpFailed` carrying the sources attempted, and `GovernanceAction` carrying the proposal identifier.
 
 ### 23.16.8 Signed Context Export
 
-**Scope.** This section governs the signed integrity proof on the `ContextExport` snapshot — the *full* embedded context state produced for backup, migration, and device transfer (§17.5). This is a different artifact from the §23.16.4 `ContextSnapshot`, which is the Tier-2 sync delta type exchanged as an MLS application message (§23.5) and is used only there. The §23.16.4 enumerated-subset hash recipe MUST NOT be used to sign a `ContextExport`; the construction below is normative for export.
+**Scope.** This section governs the signed integrity proof on a `ContextExport`, the full embedded context state produced for backup, migration, and device transfer (§17.5). It is a different artifact from the §23.16.4 `ContextSnapshot`, which is the Tier-2 sync delta exchanged as an MLS application message, and the enumerated-subset hash of §23.16.4 MUST NOT be used to sign an export.
 
-A `ContextExport` restores trusted context state verbatim on import — role ceilings, per-member capabilities, suspended capabilities, role assignments, threshold signer set and threshold value, governance model configuration, economic policy, consequence rules, the read-exclusion list, the access-key store, any pending ceiling modification, and outlet registrations are all read directly from the snapshot into the importing instance's authoritative state (see `import_context`, `lifecycle_helpers.rs:1309-1691`). Every field the importer trusts MUST therefore be covered by the signature. An enumerated-subset hash that signs only membership/role-definitions/params/outlet-names leaves the remaining trusted fields forgeable: a tampered export could raise a role's ceiling, inject member capabilities, rewrite the threshold quorum, swap the governance model, or alter the economic policy, and the importer would restore the forged state with a valid signature. The signature MUST cover the whole snapshot.
+**The signature covers the whole snapshot**, because an import restores trusted state verbatim: role ceilings, per-member capabilities, suspended capabilities, role assignments, the threshold signer set and its threshold, the governance model, the economic policy, consequence rules, the read-exclusion list, the access-key store, a pending ceiling modification, and outlet registrations. An enumerated-subset hash would leave a tampered export able to raise a role's ceiling, inject capabilities, rewrite the quorum, or swap the governance model under a valid signature.
 
-**Event-log binding (normative).** The exported event log is restored verbatim on import and is therefore trusted state. To bring it under the signature, the event log's Merkle root MUST be carried as a field of the signed `ContextSnapshot` (`event_log_merkle_root`, the root of the exported `event_log_data` at export time; all-zero when no event log is included, e.g. an `ExportScope::Public` export). Because the signature covers `JCS(ContextSnapshot)`, this binds the root into the signed preimage. On import, after the signature verifies, the importer MUST recompute the Merkle root over the received `event_log_data` and compare it (constant-time) to the **signed** `snapshot.event_log_merkle_root`; a mismatch MUST reject the import. The `ContextExport` envelope MAY also carry an unsigned `merkle_root` for observability, but that envelope field is attacker-controlled in transit and MUST NOT be the sole comparison target: if present it MUST equal the signed snapshot root or the import is rejected. Without this binding, a holder of one validly-signed snapshot could substitute a different internally-consistent event log (and matching envelope root) and have it accepted, since neither the envelope root nor the event log itself would be under the signature. The `event_log_merkle_root` is the RFC 6962 `tree::root` (ADR-011) computed over typed-event leaves (`SHA-256(0x00 ‖ rmp_serde(Event))`), NOT the head of the prior free-form-string hash-chain. The importer recomputes `tree::root` over the received `event_log_data` and gates it against the signed root. Because the `tree::root` binds the entire ordered leaf set, any alteration yields a different root than the creator signed — dropping the oldest entries (a *prefix* truncation), dropping the newest entries (a suffix truncation), or removing, reordering, adding, or forging any entry — and is rejected. Truncation forgery is closed by construction, not merely detected.
+**The event log is bound through the snapshot.** The exported log's Merkle root rides as the snapshot's `event_log_merkle_root`, all-zero where the export carries no log, so the signature covers it. Once the signature verifies, the importer recomputes the root over the received log and compares it in constant time against the signed value, rejecting a mismatch; an unsigned envelope root MUST equal the signed one or the import is rejected. The root is the RFC 6962 `tree::root` (ADR-011) over typed-event leaves, and it binds the whole ordered leaf set, so a prefix truncation, a suffix truncation, a reorder, and a forged entry each yield a different root. Truncation forgery is closed by construction rather than detected.
 
-**Construction.** The export signature is a **P-256 ECDSA signature over `SHA-256(domain || scope-tag-byte || key_state_head || JCS(ContextSnapshot))`**, where `key_state_head` is the exporting identity's 32-byte key-state anchor, written raw with no length prefix (a fixed-length field, `09-security-model.md` §9.5.1) and placed immediately after the scope-tag byte, and where:
+**Construction.** The export signature is a P-256 signature over
 
-- `domain` is the byte string `"SCP-CONTEXT-EXPORT-V3:"` (the domain separator registered in §9.18.2), concatenated as a prefix with no separator byte. **The separator is `-V3:` because the preimage gained `key_state_head`** (below) and the snapshot it covers gained `key_boundaries`, and §9.5.1 requires a version bump on any added field. This is DISTINCT from the §23.16.4 sync-delta separator `"SCP-CONTEXT-SNAPSHOT-V3:"`: the signed-export digest and the sync-delta digest are both signed under the same `creator_did` key, so they MUST be domain-separated at the hash preimage to prevent cross-protocol signature confusion. An implementation MUST NOT use the sync-delta separator for export, and MUST NOT use the export separator for the sync-delta hash.
-- `scope-tag-byte` is a single byte encoding the export scope discriminant, placed IMMEDIATELY after the domain separator and BEFORE the JCS bytes: `0x00` for a `Full` export, `0x01` for a `Public` export. Binding the scope into the signed preimage means a holder of a legitimately-signed `Public` export cannot flip the (otherwise unsigned) envelope `scope` field to `Full` (or vice versa) and have it still verify — the verifier sources the scope from the received envelope, recomputes the digest with that scope byte, and a flipped scope yields a different digest than the creator signed, so verification fails by construction. This replaces the prior reliance on the "hollow context" argument (that a flipped-to-`Full` public export was benign because it carried no sensitive state). The byte values are stable wire values that MUST NEVER change once shipped; new scopes take new, never-reused byte values.
-- `JCS(ContextSnapshot)` is the RFC 8785 (JSON Canonicalization Scheme) canonical-JSON serialization of the *entire* `ContextSnapshot` value embedded in the export — every field, not a subset. This is the repo's canonical-JSON convention (serde_json_canonicalizer; cf. `scp-protocol::jcs`). The reference implementation is `ContextExport::canonical_snapshot_hash` in the native runtime (`scp-runtime/src/context/export_import.rs`, produced by `create_export`): serialize the snapshot to canonical JSON, then `SHA-256(domain-bytes || scope-tag-byte || snapshot-json-bytes)`, then sign the 32-byte digest.
-- `key_state_head` is the value `09-security-model.md` §9.7.1's log-anchored row constructs, and this section restates none of that construction. It is inside the preimage rather than beside the signature, so the signer cannot revise the anchoring position after the fact. The same 32 bytes are carried in the snapshot's own `key_state_head` field (§23.16.4), and a verifier that reads the two and finds them different rejects the export.
-- The snapshot's `key_boundaries` array (§23.16.4) rides inside `JCS(ContextSnapshot)` like every other field, so an export carries each retired key's boundary epoch and the Commit-history evidence supporting it under the same signature, and an importing member applies `09-security-model.md` §9.7.1's adoption test to each entry.
-- The signature is produced over that 32-byte digest (not over the raw JSON), as a 64-byte raw `r || s` P-256 signature (`09-security-model.md` §9.5).
+```
+SHA-256("SCP-CONTEXT-EXPORT-V3:" ‖ scope_tag ‖ key_state_head ‖ JCS(ContextSnapshot))
+```
 
-**Set/Map canonicalization (normative).** Any field of the snapshot whose Rust type is a set or map with non-deterministic iteration order (e.g. `HashSet`, `HashMap`) MUST be canonicalized to a deterministic ordering — sorted by key for maps, sorted by element for sets (the `BTreeMap`/`BTreeSet` convention) — in the value that is fed to JCS, so that the canonical JSON and therefore the digest are byte-identical across runs. RFC 8785 already fixes object-member ordering by key, but the producing implementation MUST NOT rely on a set/map's incidental iteration order for array-valued fields: array elements derived from a set MUST be emitted in sorted order before serialization. The determinism requirement is that the implementation MUST produce the same digest for the same logical snapshot across runs and regardless of incidental set/map insertion or iteration order. The export construction — domain separator, scope-tag byte, full-JCS digest over the snapshot value, P-256 ECDSA, `creator_did` signer, verify-before-restore, and `exporter_did == creator_did` — is the native runtime's single implementation; the protocol engine runs in one place (ADR-055), so there is no second serializer to converge against.
+- `scope_tag` is one byte, `0x00` for a `Full` export and `0x01` for a `Public` one, placed immediately after the separator. Binding the scope into the preimage means a holder of a signed `Public` export cannot flip the envelope's unsigned `scope` field to `Full` and still verify: the verifier sources the scope from the received envelope and recomputes, so a flipped scope yields a different digest. These byte values are stable wire values that never change once shipped, and a new scope takes a new value.
+- `key_state_head` is the exporting identity's 32-byte key-state anchor, written raw as a fixed-length field (§9.5.1). It sits inside the preimage rather than beside the signature, so the signer cannot revise the anchoring position afterwards. The snapshot's own `key_state_head` field carries the same 32 bytes, and a verifier that reads the two and finds them different rejects the export. `09-security-model.md` §9.7.1's log-anchored row constructs the value, and this section restates none of that construction.
+- `JCS(ContextSnapshot)` is the RFC 8785 canonical JSON of the entire snapshot value, every field and not a subset. The snapshot's `key_boundaries` array rides inside it like every other field, so an export carries each retired key's boundary epoch and its Commit-history evidence under the same signature.
+- **The separator carries `-V3` because the preimage gained `key_state_head`** and the snapshot it covers gained `key_boundaries`, and §9.5.1 requires a version bump on any added field. It is distinct from `"SCP-CONTEXT-SNAPSHOT-V3:"`, because both digests are signed under the same key and must be domain-separated against cross-protocol signature confusion.
 
-**Signer.** The signer is the snapshot's `creator_did` (located at `role_state.creator_did`). The signature is produced by the `#active` key that identity's key state listed `current` at the position `key_state_head` names. **There is no `#agent` fallback**: under ADR-063, the inception-derived key-event-log identity substrate, an agent is a delegated identity with its own key-event log and its own `#active`, and `#active` is an identity's one operational role (`09-security-model.md` §9.7.4.2 definitions), so every key state a verifier accepts names exactly one. The exporter signs with the custody key backing that key. **[Superseded 2026-09-10 — a human identity's key state names one operational role, `#active`, and names no agent key (`09-security-model.md` §9.1 invariant 1); an agent is a separate identity whose establishment events the human's log anchors, and that delegation model is unspecified as of 2026-09-10 (`00-open-questions.md`).]**
+**Set and map canonicalization.** Any snapshot field whose type is a set or map with non-deterministic iteration order is canonicalized to a deterministic ordering — sorted by key for a map, sorted by element for a set — in the value fed to JCS, so the digest is byte-identical across runs. RFC 8785 fixes object-member ordering by key, and a producing implementation MUST NOT rely on a set's incidental iteration order for an array-valued field.
 
-**Importer verification and authorization (normative).** Before restoring *any* state from a `ContextExport`, an importing implementation MUST:
+**Who signs it.** The signer is the snapshot's `creator_did`, through the `#active` key that identity's key state listed `current` at the position `key_state_head` names. An identity's key state names one operational role, so there is one such key and no fallback.
 
-1. **Resolve the verifying key from `creator_did` under the log-anchored evidence class.** Resolve the snapshot's `creator_did` to its key state by replaying its key-event log (`03-identity.md` §3.10.4; the protocol produces no DID document), then take the key the state at the position `key_state_head` names listed `current` in the `#active` role, and accept the signature **iff** that key was `current` at that position (`09-security-model.md` §9.7.1, the log-anchored evidence class, which also states the further test for a key the state lists `Compromised{from: N}`). The verifying key is derived from `creator_did` and the signed `key_state_head` — never from an unauthenticated envelope field, and never from the creator's present `current` key, which a routine rotation would change and which would reject every export signed before it. **No witness cosignature enters this verification, and an export carries none.** The importer needs the creator's chain up to the position `key_state_head` names, and it verifies that chain under `09-security-model.md` §9.7.4.2 R1 through R4, which reads signed bytes alone. **An offline importer therefore reaches the same verdict as an online one**, which is the property that made an earlier draft of this step carry cosigned heads in the envelope: under the watch-and-report ruling of 2026-09-10 no verdict reads a cosignature, so that field is unnecessary and this spec defines none. What an importer MUST hold instead is the creator's key-event chain up to that position, which an offline importer obtains from its own prior resolution of that identity; an importer holding no such chain, and no network path to fetch one, MUST reject the import rather than restore state under an unverified key.
-2. **Assert `exporter_did == creator_did`.** The export envelope's `exporter_did` MUST equal the snapshot's `creator_did`. An export whose declared exporter is not the snapshot creator MUST be rejected. This binds the signing authority to the creator identity and prevents a non-creator from re-wrapping a snapshot under their own key.
-3. **Verify the signature before restore.** Recompute `SHA-256(domain || scope-tag-byte || key_state_head || JCS(snapshot))` over the *received* envelope — sourcing the `scope-tag-byte` from the received envelope's `scope` field and `key_state_head` from the snapshot, in the position the **Construction** paragraph fixes — and verify the P-256 signature against the resolved verifying key (strict verification). Because the scope byte is in the preimage, a tampered envelope scope makes the recomputed digest diverge from the signed one and the signature fails. Verification MUST happen before any field of the snapshot is read into authoritative state. A failed signature MUST abort the import with a signature error (`SCP-CTX-2093`) distinct from the version error (`SCP-CTX-2094`).
+**Importer verification, before any state is restored.**
 
-**Signed vs. wiped fields.** The signature covers the *entire* `ContextSnapshot`. However, certain per-instance fields carried in the snapshot are deliberately NOT trusted from the import even though they are signed: the importer intentionally wipes or sanitizes them because they are local-instance anti-abuse or accounting state with no cross-instance meaning, and inheriting them from a (possibly hostile, possibly merely foreign) exporter would let the exporter pre-load enforcement state against the importing node. Per `import_context` (`lifecycle_helpers.rs:1518-1632`), the importer WIPES `approved_proposals` (rebuilt from the imported event log), resets `next_proposal_seq` to `0`, WIPES `budget_tracker`, WIPES `participation_cache`, starts a FRESH spending-nonce tracker (the import path diverges from the local `restore_context` reload, which rehydrates the nonce tracker), WIPES `proposal_timestamps`, and validates/sanitizes the anti-spam snapshot state (hard-rate-limit and velocity trackers rejected if they carry future timestamps; `cooldown_until` clamped to a bounded horizon). The signature guarantees these fields were not tampered in transit; the wipe guarantees they cannot be weaponized regardless. The fields enumerated under *Construction* above (ceiling, member/suspended capabilities, assignments, threshold set/value, governance model config, economic policy, consequence rules, read-exclusion list, access-key store, pending ceiling modification, outlet registrations) are by contrast trusted verbatim and depend entirely on the full-snapshot signature for their integrity.
+1. **Resolve the verifying key under the log-anchored evidence class.** Replay the `creator_did`'s key-event log (`03-identity.md` §3.10.4), because the protocol produces no DID document and establishing control authority takes the sequence of key events; KERI states the same requirement for a validator in `spec-body` §Verifier. Take the key the state at the position `key_state_head` names listed `current` in the `#active` role, and accept the signature only where that key was `current` at that position (`09-security-model.md` §9.7.1). The verifying key comes from `creator_did` and the signed anchor, never from an unauthenticated envelope field and never from the creator's present `current` key. **No witness cosignature enters this verification and an export carries none**, so an offline importer reaches the same verdict as an online one; an importer holding neither the creator's chain up to that position nor a network path to fetch one MUST reject the import rather than restore state under an unverified key.
+2. **Assert that the envelope's `exporter_did` equals the snapshot's `creator_did`**, and reject the export where they differ. This binds the signing authority to the creator and stops a non-creator re-wrapping a snapshot under its own key.
+3. **Verify the signature before restore.** Recompute the digest over the received envelope, sourcing `scope_tag` from its `scope` field and `key_state_head` from the snapshot, and verify the P-256 signature against the resolved key. Verification happens before any snapshot field reaches authoritative state, and a failed signature aborts the import with a signature error (`SCP-CTX-2093`) distinct from the version error (`SCP-CTX-2094`).
 
-**Format version.** The export format `version` (§17.5, `StoredValue`-wrapped MessagePack envelope) is **6** for the boundary-carrying, anchor-bound, scope-bound, full-snapshot signed construction (it incremented from 5, whose snapshot carried no `key_boundaries`, so an importing member learned no boundary from the export and judged a retired key's content with no evidence either way). Imports MUST reject any version that is not the current signed format with a dedicated *version* error (`SCP-CTX-2094`), which is distinct from a signature-verification failure (`SCP-CTX-2093`); the version gate fires before any signature is checked, so a caller can tell an old/unsupported format apart from a forged signature. SCP is pre-release with no deployed exports, so prior versions are not accepted on import — the correct end state ships directly.
+**Signed but not trusted.** The importer wipes the per-instance fields carrying local anti-abuse and accounting state, because inheriting them would let an exporter pre-load enforcement state against the importing node: it rebuilds the approved-proposal set from the imported event log, resets the proposal sequence, wipes the budget tracker, the participation cache and the proposal timestamps, starts a fresh spending-nonce tracker, and sanitizes the anti-spam trackers, rejecting future timestamps and clamping a cooldown to a bounded horizon. The fields the paragraph above enumerates are trusted verbatim and rest on the full-snapshot signature.
+
+**Format version.** The export format version is **6**, for the boundary-carrying, anchor-bound, scope-bound, full-snapshot signed construction; version 5's snapshot carried no `key_boundaries`, so an importing member learned no boundary from the export. An import rejects any other version with the version error above, which fires before any signature check so a caller tells an unsupported format from a forged signature. SCP is pre-release with no deployed exports, so no prior version is accepted.
 
 ## 23.17 Snapshot Sequence-Floor Invariants
 
