@@ -36,18 +36,18 @@ Each test specifies:
 | **Spec Sections** | §3.1, §3.2, `09-security-model.md` §9.7.4.2 R2, R13, definitions |
 | **Preconditions** | None. |
 | **Steps** | 1. Generate the root set's P-256 keypairs and the pre-rotation keypairs. 2. Compose the inception event under the preimage field order `09-security-model.md` §9.7.4.2's definitions fix, carrying the root set and its threshold, the first commitment list and next threshold, and the initial key state. 3. Sign it with a root signature verifying against the set it installs. 4. Compute the identifier as `SHA-256("SCP-KEL-ID-V1:" \|\| inception_signed_preimage)`. 5. Publish the key-event record frame at `SHA-256("scp:did:" \|\| identifier_bytes)`. |
-| **Expected Outcome** | The identifier recomputes from the served inception event under R2. The derived key state names one operational role `#active` and names no agent key. The identity resolves the moment its inception event is published, with no witness cosignature. **This test replaced the did:dht DID-document test on 2026-09-10**: ADR-063, the inception-derived key-event-log identity substrate, cut did:dht and cut the DID document, so no conforming implementation produces either. |
+| **Expected Outcome** | The identifier recomputes from the served inception event under R2. The derived key state names one operational role `#active` and names no agent key. The identity resolves the moment its inception event is published, with no witness cosignature. |
 
-### CONF-002: DID Resolution and Self-Certification
+### CONF-002: Key-State Resolution and Self-Certification
 
 | Field | Value |
 |-------|-------|
 | **Layer** | Identity |
 | **Tier** | Core |
-| **Spec Sections** | §3.1, §9.6.1 |
-| **Preconditions** | DID published to Mainline DHT (or test DHT). |
-| **Steps** | 1. Resolve DID via DHT lookup. 2. Verify BEP44 signature against the public key encoded in the DID string. 3. Parse DID document. |
-| **Expected Outcome** | BEP44 signature verification succeeds. DID document matches what was published. The public key embedded in the DID string matches `#0`. |
+| **Spec Sections** | §3.1, §9.6.1, `03-identity.md` §3.10.4, `09-security-model.md` §9.7.4.2 R2, R8, R11 |
+| **Preconditions** | A key-event log published to two community relays under distinct declared operators. The resolver holds no baseline. |
+| **Steps** | 1. Query both relays at the identifier's routing id with `proof_nonce` set. 2. Decode each frame and verify every event. 3. Recompute the identifier under R2. 4. Apply the relay proof's five checks. 5. Derive the key state under R8. |
+| **Expected Outcome** | The recomputed identifier equals the one queried, so the binding verifies from the served bytes alone. Both relay proofs verify, R11's floor is met, and the resolver returns the derived key state rather than `Inconclusive{SingleSource}`. |
 
 ### CONF-003: Key Rotation (Active Key Update)
 
@@ -55,32 +55,32 @@ Each test specifies:
 |-------|-------|
 | **Layer** | Identity |
 | **Tier** | Core |
-| **Spec Sections** | §3.3, §9.11 |
-| **Preconditions** | DID with established `#active` key. Existing messages signed with old key. |
-| **Steps** | 1. Generate new P-256 keypair for `#active`. 2. Update DID document with new `#active` key. 3. Publish updated document with incremented sequence number. 4. Resolve DID again. 5. Verify old `#active` key is no longer in document. 6. Verify key continuity fingerprint changed. |
-| **Expected Outcome** | New DID document has new `#active` key. Old `#active` key is absent. Key continuity fingerprint (§9.11) reflects the change. Messages signed with old key still verify against the old key (retained by recipients). |
+| **Spec Sections** | `03-identity.md` §3.2.1 case 1, §9.11, `09-security-model.md` §9.7.4.2 R3, R8 |
+| **Preconditions** | An identity with an established `#active` key. Existing messages signed with the old key. |
+| **Steps** | 1. Generate a new P-256 keypair for `#active`. 2. Compose a `KeyState` event whose snapshot lists the new key `current` in the `#active` role and the old key `Superseded`. 3. Sign it with the standing root and publish the extended chain. 4. Resolve the identity again. 5. Verify the old key's condition is `Superseded`. 6. Verify the key continuity fingerprint changed. |
+| **Expected Outcome** | The derived key state lists the new key `current` and the old key `Superseded`: a condition and never an absence retires a key. The key continuity fingerprint (§9.11) reflects the change. Messages signed with the old key still verify, because a content signature verifies against a retired key (§9.7.1). |
 
-### CONF-004: Agent Binding (Human DID Attests Agent DID)
-
-| Field | Value |
-|-------|-------|
-| **Layer** | Identity |
-| **Tier** | Core |
-| **Spec Sections** | §4.2, ADR-039 |
-| **Preconditions** | Human DID and agent DID both created. |
-| **Steps** | 1. Create identity attestation binding agent DID to human DID. 2. Sign attestation with human's `#active` key. 3. Verify attestation signature. 4. Verify agent DID's `#agent` key matches the key in the attestation. **[Superseded 2026-09-10 — one operational role `#active`, no agent key; `09-security-model.md` §9.1 invariant 1]** |
-| **Expected Outcome** | Attestation is valid. Agent DID traces to human DID through the attestation chain. |
-
-### CONF-005: Multi-Device (Same DID, Different Device Keys)
+### CONF-004: A Chain Claiming Delegation Is Rejected
 
 | Field | Value |
 |-------|-------|
 | **Layer** | Identity |
 | **Tier** | Core |
-| **Spec Sections** | §3.4 |
-| **Preconditions** | DID exists on device A. |
-| **Steps** | 1. On device B, derive device-specific signing material from the same DID. 2. Both devices sign messages. 3. Both signatures verify against the DID document. |
-| **Expected Outcome** | Both devices can sign messages that verify against the same DID. The DID document is the single source of truth. |
+| **Spec Sections** | `09-security-model.md` §9.1 invariants 1 and 4, §9.7.4.2 R3, `00-open-questions.md` |
+| **Preconditions** | A human identity and a second identity whose inception event names the human as its delegator. |
+| **Steps** | 1. Publish both chains. 2. Resolve the second identity. |
+| **Expected Outcome** | R3 rejects every chain whose delegator field is nonzero, so the second identity does not resolve and signs no autonomous action. The delegation model is unspecified as of 2026-09-10 (`00-open-questions.md`), and this test asserts the fail-closed rejection that stands until it lands. |
+
+### CONF-005: Multi-Device (One Identity, Different Device Leaf Keys)
+
+| Field | Value |
+|-------|-------|
+| **Layer** | Identity |
+| **Tier** | Core |
+| **Spec Sections** | `10-infrastructure-and-self-hosting.md` §10.8.1, `09-security-model.md` §9.7.1 |
+| **Preconditions** | An identity established on device A. |
+| **Steps** | 1. On device B, generate an ephemeral context-scoped MLS leaf key for the same identity. 2. Sign a KeyPackage attestation over each device's leaf key with the identity's `#active` key. 3. Verify both attestations. |
+| **Expected Outcome** | Both attestations verify against the key the identity's key state lists `current` in the `#active` role, so both devices act for one identity. An attestation and never a document binds a leaf key to an identity. |
 
 ## 26.4 Context Tests (§5, §6)
 
@@ -193,7 +193,7 @@ Each test specifies:
 | **Tier** | Core |
 | **Spec Sections** | §9.5.2, §9.8, §9.10 |
 | **Preconditions** | Recipient is member of context. Has sender's sender key. |
-| **Steps** | 1. Receive OuterEnvelope from relay. 2. Strip padding, recover original ciphertext. 3. Decrypt with sender key. 4. Verify InnerEnvelope signature against sender's DID document. 5. Verify epoch, sequence, timestamp. |
+| **Steps** | 1. Receive OuterEnvelope from relay. 2. Strip padding, recover original ciphertext. 3. Decrypt with sender key. 4. Verify the InnerEnvelope signature against the key the sender's key state names in the signing role (`03-identity.md` §3.10.4). 5. Verify epoch, sequence, timestamp. |
 | **Expected Outcome** | Decryption succeeds. Signature verification succeeds. Plaintext matches original. |
 
 ### CONF-016: Padding Roundtrip
