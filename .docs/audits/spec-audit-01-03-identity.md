@@ -16,7 +16,7 @@ The most severe gaps are: (1) the social/device recovery protocol in section 3.3
 
 - **Category**: Missing conformance criteria
 - **Location**: Section 1, line 8 -- "Agents are the primary actors, not humans operating through clients."
-- **What's missing**: No conformance test or protocol-level mechanism enforces or distinguishes this property. How does a conformant implementation verify that agents (not humans typing into a UI) are the primary actors? The protocol allows both `#active` and `#agent` signatures (ADR-039), so a human operating through a client is indistinguishable from an agent at the protocol level unless the signing key differs.
+- **What's missing**: No conformance test or protocol-level mechanism enforces or distinguishes this property. How does a conformant implementation verify that agents (not humans typing into a UI) are the primary actors? The protocol carries one operational role per identity, `#active` (ADR-039), so a human operating through a client is indistinguishable from an agent at the protocol level unless the signing identity differs.
 - **Why it matters**: This is a thesis statement, not a protocol requirement. If it cannot be tested, it should be explicitly marked as a design philosophy rather than an enforceable property. Currently it reads as a protocol invariant.
 - **Severity**: LOW
 
@@ -40,7 +40,7 @@ The most severe gaps are: (1) the social/device recovery protocol in section 3.3
 
 - **Category**: Missing edge cases
 - **Location**: Section 2.2, line 75 -- "MEMBERS (one agent per human)"
-- **What's missing**: What happens when a user attempts to join a context with a second DID (violating the one-human-per-context rule)? The protocol relies on DID uniqueness, but if a user controls multiple DIDs (which is possible and addressed in section 9.3), the one-agent-per-context invariant is enforceable only per-DID, not per-human. The spec acknowledges this in section 9.3 (Sybil resistance is a deterrent, not enforcement), but section 2.2 presents it as a hard structural property ("one agent per person per context") without the caveat.
+- **What's missing**: What happens when a user attempts to join a context with a second identity (violating the one-human-per-context rule)? The protocol relies on identifier uniqueness, but if a user controls multiple identities (which is possible and addressed in section 9.3), the one-agent-per-context invariant is enforceable only per identity, not per human. The spec acknowledges this in section 9.3 (Sybil resistance is a deterrent, not enforcement), but section 2.2 presents it as a hard structural property ("one agent per person per context") without the caveat.
 - **Why it matters**: An implementor reading only section 2 would believe this is cryptographically enforced. It is not. The inconsistency between sections 2.2 and 9.3 on this point could lead to false security assumptions in implementations.
 - **Severity**: MEDIUM
 
@@ -82,8 +82,8 @@ The most severe gaps are: (1) the social/device recovery protocol in section 3.3
 - **Location**: Section 3.3, lines 22-28
 - **What's missing**: The entire recovery subsystem is described in three bullet points with zero protocol specification:
   - **Trusted device recovery**: No protocol for how one device "vouches" for another. No wire format for the vouching message. No specification of what "vouching" proves (that the new device holds a key? that the user authenticated on the trusted device?). No maximum number of trusted devices. No timeout for vouching requests.
-  - **Social recovery**: No quorum/threshold specification (how many trusted contacts must confirm?). No wire format for recovery requests or confirmations. No protocol for how recovery contacts are designated (stored where? encrypted how?). No specification of what recovery contacts can actually do -- can they issue a new DID? Re-add a member to contexts? Both? Neither? No timeout for social recovery requests. No protection against a colluding subset of recovery contacts.
-  - **Platform-backed recovery**: No specification of how platform recovery (Apple/Google) maps to DID key recovery. If the user's iCloud account is recovered, how does that restore their SCP identity key? What if the Secure Enclave key was hardware-bound and cannot be exported?
+  - **Social recovery**: No quorum/threshold specification (how many trusted contacts must confirm?). No wire format for recovery requests or confirmations. No protocol for how recovery contacts are designated (stored where? encrypted how?). No specification of what recovery contacts can actually do -- can they issue a new identity? Re-add a member to contexts? Both? Neither? No timeout for social recovery requests. No protection against a colluding subset of recovery contacts.
+  - **Platform-backed recovery**: No specification of how platform recovery (Apple/Google) maps to identity key recovery. If the user's iCloud account is recovered, how does that restore their SCP identity key? What if the Secure Enclave key was hardware-bound and cannot be exported?
 - **Why it matters**: Recovery is the most important safety mechanism for users. A user who loses their single device and has no recovery path loses their entire identity, all context memberships, and all private state permanently. The spec acknowledges this ("platform-backed recovery is the practical safety net") but provides zero implementation guidance. An implementor cannot build a conformant recovery system from this spec. Section 9.12 covers compromise recovery (key rotation after suspected compromise), but that assumes access to at least one working key. Section 3.3 covers total key loss, and it has nothing.
 - **Severity**: CRITICAL
 
@@ -92,7 +92,7 @@ The most severe gaps are: (1) the social/device recovery protocol in section 3.3
 - **Category**: Underspecified algorithms
 - **Location**: Section 3.2, line 18 -- "Migration between custody methods is possible without changing identity."
 - **What's missing**: No protocol for custody migration. If a user moves from Apple Secure Enclave to a hardware security key, what happens? Is the Identity Key re-generated? If the Identity Key is in a Secure Enclave and cannot be exported, how is migration performed? Does migration require the pre-rotation key? What is the wire format for custody migration authorization?
-- **Why it matters**: This is a core claim of the identity layer. If custody migration changes the DID (because the Identity Key changes), then identity continuity is broken. If it does not change the DID, then somehow the same key must move between custody providers -- which is impossible for HSM-bound keys. The spec makes a promise it does not specify how to keep.
+- **Why it matters**: This is a core claim of the identity layer. If custody migration changes the identifier (because the Identity Key changes), then identity continuity is broken. If it does not change the identifier, then somehow the same key must move between custody providers -- which is impossible for HSM-bound keys. The spec makes a promise it does not specify how to keep.
 - **Severity**: HIGH
 
 ### [03-IDENTITY] Identity attestation wire format is unspecified
@@ -104,7 +104,7 @@ The most severe gaps are: (1) the social/device recovery protocol in section 3.3
   - Serialization format is not specified (JSON? CBOR? MessagePack?)
   - The `evidence` field is "type-specific" but no type-specific evidence schema is defined for identity link attestations
   - The `claim` field is "structured content (type-specific)" but the structure for identity link claims is not defined
-  - The `revocation` field specifies "how to check if revoked" but the format of the revocation reference is not defined (URL? DID document entry? Merkle log reference? All three are mentioned but no canonical format is chosen)
+  - The `revocation` field specifies "how to check if revoked" but the format of the revocation reference is not defined (URL? Service-record entry? Merkle log reference? All three are mentioned but no canonical format is chosen)
   - Signature scope is not defined -- what bytes are signed? The entire serialized attestation minus the signature field? A canonical hash of specific fields?
 - **Why it matters**: Two implementations cannot produce interoperable attestations from this spec. An attestation created by one SDK cannot be verified by another unless they agree on serialization, field ordering, and signature scope.
 - **Severity**: HIGH
@@ -113,7 +113,7 @@ The most severe gaps are: (1) the social/device recovery protocol in section 3.3
 
 - **Category**: Underspecified algorithms
 - **Location**: Section 3.5, line 44 -- "Verification methods vary by platform (OAuth proof, signed message, DNS record, etc.)"
-- **What's missing**: No platform-specific verification protocols are defined. For OAuth: which OAuth flow? What claims must the OAuth token contain? How is the OAuth token bound to the DID? For DNS records: what record type (TXT? CNAME?)? What format? What domain? For signed messages: signed with what key? What format? Where published? The open questions document (line 15) marks this as "Resolved" and says "section 3.5 and section 7.4.2 specify platform-specific verification flows," but they do not -- they list the categories (OAuth, DNS, signed post) without specifying any flow.
+- **What's missing**: No platform-specific verification protocols are defined. For OAuth: which OAuth flow? What claims must the OAuth token contain? How is the OAuth token bound to the identity? For DNS records: what record type (TXT? CNAME?)? What format? What domain? For signed messages: signed with what key? What format? Where published? The open questions document (line 15) marks this as "Resolved" and says "section 3.5 and section 7.4.2 specify platform-specific verification flows," but they do not -- they list the categories (OAuth, DNS, signed post) without specifying any flow.
 - **Why it matters**: Without standardized verification protocols, attestation verification is implementation-specific. Alice's SDK might accept an OAuth token that Bob's SDK rejects because they use different verification criteria. This undermines the "independently verifiable" property (section 3.5, line 44).
 - **Severity**: HIGH
 
@@ -136,8 +136,8 @@ The most severe gaps are: (1) the social/device recovery protocol in section 3.3
 ### [03-IDENTITY] Shadow identity claiming (section 3.5 item 2) protocol unspecified
 
 - **Category**: Underspecified algorithms
-- **Location**: Section 3.5, line 51 -- "a user can claim it by presenting a matching attestation. The shadow identity merges with their real DID."
-- **What's missing**: No merge protocol is specified. What does "merge" mean at the protocol level? Is the shadow DID replaced by the real DID in context membership? Are the shadow's messages re-attributed? What happens to the shadow's participation record? What happens if two users both claim the same shadow identity? What is the authorization flow -- who approves the merge? Section 12 (bridge connectors) is referenced but the merge protocol itself is not specified.
+- **Location**: Section 3.5, line 51 -- "a user can claim it by presenting a matching attestation. The shadow identity merges with their real identity."
+- **What's missing**: No merge protocol is specified. What does "merge" mean at the protocol level? Is the shadow identity replaced by the real identity in context membership? Are the shadow's messages re-attributed? What happens to the shadow's participation record? What happens if two users both claim the same shadow identity? What is the authorization flow -- who approves the merge? Section 12 (bridge connectors) is referenced but the merge protocol itself is not specified.
 - **Why it matters**: Shadow identity merging has profound implications for identity continuity, participation records, and context membership. Without a specified protocol, implementations will handle merges inconsistently, potentially causing identity confusion or attribute theft.
 - **Severity**: HIGH
 
@@ -173,8 +173,8 @@ The most severe gaps are: (1) the social/device recovery protocol in section 3.3
 
 - **Category**: Underspecified algorithms
 - **Location**: Section 3.7, line 122 -- "Private state is encrypted to the identity's own keys."
-- **What's missing**: Which key? The Identity Key (`#0`) is Ed25519, which is a signing key, not an encryption key. The Active Signing Key (`#active`) is also Ed25519. Neither is directly usable for encryption. The MLS ciphersuite uses X25519 for key agreement. So:
-  - Is a derived X25519 key used (Ed25519-to-X25519 conversion)?
+- **What's missing**: Which key? The Identity Key (`#0`) signs and never encrypts, and the Active Signing Key (`#active`) signs and never encrypts. The MLS ciphersuite uses P-256 for key agreement. So:
+  - Is a derived key-agreement key used?
   - Is a separate encryption key maintained for private state?
   - Which AEAD algorithm is used (AES-128-GCM per the MLS suite? AES-256-GCM? Something else)?
   - How is the symmetric key derived (HKDF? From what input keying material?)
@@ -196,7 +196,7 @@ The most severe gaps are: (1) the social/device recovery protocol in section 3.3
 
 - **Category**: Missing constants/defaults
 - **Location**: Section 3.7, line 136 -- "Less constrained than context state"
-- **What's missing**: No size limits are specified for identity private state. The spec says "relays MAY enforce per-DID storage quotas as an operational concern" but provides no default, no recommended range, and no protocol-level maximum. What happens when a relay's storage quota is exceeded? Is the user notified? Are oldest events evicted?
+- **What's missing**: No size limits are specified for identity private state. The spec permits relays to enforce per-identity storage quotas as an operational concern but states no default, no recommended range, and no protocol-level maximum. What happens when a relay's storage quota is exceeded? Is the user notified? Are oldest events evicted?
 - **Why it matters**: Without a protocol-level size limit or at least a recommended default, relay implementations will diverge. A user who accumulates years of block list events, annotations, and agent memory may find their private state exceeds some relay's arbitrary quota, losing data silently.
 - **Severity**: MEDIUM
 
@@ -212,56 +212,56 @@ The most severe gaps are: (1) the social/device recovery protocol in section 3.3
 
 - **Category**: Missing wire format details
 - **Location**: Section 3.7, line 124 -- "Same as context state: encrypted blobs stored on your published relays"
-- **What's missing**: Section 3.10.2 specifies DID document routing_id derivation as `SHA-256("scp:did:" || did_string)`. But identity PRIVATE STATE is a different blob type. What routing_id is used for private state blobs? The `IdentityPrivateState` service endpoint (section 3.7 line 139) lists relays, but the actual routing_id for private state blobs is not specified. Is it `SHA-256("scp:identity-private:" || did_string)`? Something else?
+- **What's missing**: Section 3.10.2 specifies the key-event record routing_id derivation as `SHA-256("scp:did:" || identifier_bytes)`. But identity PRIVATE STATE is a different blob type. What routing_id is used for private state blobs? The `IdentityPrivateState` service-record entry (section 3.7) lists relays, but the actual routing_id for private state blobs is not specified. Is it `SHA-256("scp:identity-private:" || identifier_bytes)`? Something else?
 - **Why it matters**: Without a specified routing_id, implementations cannot store or retrieve private state from relays interoperably.
 - **Severity**: HIGH
 
 ### [03-IDENTITY] IdentityPrivateState service endpoint format unspecified
 
 - **Category**: Missing wire format details
-- **Location**: Section 3.7, line 139 -- "The DID document includes a service endpoint of type `IdentityPrivateState`"
+- **Location**: Section 3.7 -- the service record carries an entry of type `IdentityPrivateState`
 - **What's missing**: Section 18.2.2 lists `IdentityPrivateState` as a service endpoint type but provides no format specification. Section 18.2.1 specifies the `SCPRelay` format in detail (URL format, multiple entries, ordering). No equivalent specification exists for `IdentityPrivateState`. What is the service endpoint URL format? Is it the same relay URL format as `SCPRelay`? Can it point to different relays than `SCPRelay`? How many entries are recommended?
 - **Why it matters**: Implementors cannot construct or parse `IdentityPrivateState` service endpoints without a format specification.
 - **Severity**: MEDIUM
 
-### [03-IDENTITY] DID resolution -- stale document "last known sequence number" bootstrap
+### [03-IDENTITY] Identity resolution -- stale record, "last known sequence number" bootstrap
 
 - **Category**: Missing edge cases
-- **Location**: Section 3.10.4, line 274 -- "Verify seq >= last_known_seq for this DID"
-- **What's missing**: On first resolution of a DID (no cached document), `last_known_seq` is 0 (or absent). An attacker who can serve a stale document with seq=1 while the current document is at seq=100 wins the first resolution race if their response arrives first. The spec says "accept the valid response with highest sequence number" (line 275), which mitigates this in the parallel query case (both responses compared). But: what if only one layer responds (the other times out)? The single response is accepted regardless of freshness because there is no baseline.
-- **Why it matters**: First-contact resolution from a single layer is vulnerable to stale document attacks. The parallel query mitigates but does not eliminate this if one layer is unreachable or compromised.
+- **Location**: Section 3.10.4, line 274 -- "Verify seq >= last_known_seq" for this identity
+- **What's missing**: On first resolution of an identity (no cached record), `last_known_seq` is 0 (or absent). An attacker who can serve a stale record with seq=1 while the current record is at seq=100 wins the first resolution race if their response arrives first. The spec says "accept the valid response with highest sequence number" (line 275), which mitigates this in the parallel query case (both responses compared). But: what if only one layer responds (the other times out)? The single response is accepted regardless of freshness because there is no baseline.
+- **Why it matters**: First-contact resolution from a single source is vulnerable to stale-record attacks. The parallel query mitigates but does not eliminate this if one layer is unreachable or compromised.
 - **Severity**: MEDIUM
 
-### [03-IDENTITY] DID resolution cancellation of slower query -- no specification
+### [03-IDENTITY] Identity resolution cancellation of slower query -- no specification
 
 - **Category**: Undefined error/failure behavior
 - **Location**: Section 3.10.1, line 209 -- "The slower query is cancelled once the first valid response arrives."
-- **What's missing**: No specification of cancellation behavior. What if the slower query has already established a connection? Does it send a cancellation message or just drop the connection? What if the slower query returns a response with a HIGHER sequence number than the first? Should the client actually wait for both before deciding? The text says "first valid response wins" but then section 3.10.7 says "the document with the highest sequence number is accepted" -- these are contradictory if the first response has a lower sequence number.
+- **What's missing**: No specification of cancellation behavior. What if the slower query has already established a connection? Does it send a cancellation message or just drop the connection? What if the slower query returns a response with a HIGHER sequence number than the first? Should the client actually wait for both before deciding? The text says "first valid response wins" but then section 3.10.7 accepts the record with the highest sequence number -- these are contradictory if the first response has a lower sequence number.
 - **Why it matters**: The contradiction between "first valid response wins" (line 209) and "highest sequence number wins" (line 275) means implementations will diverge. A security-conscious implementation should wait for both; a latency-optimized one should take the first. The spec needs to pick one or specify the reconciliation protocol.
 - **Severity**: HIGH
 
-### [03-IDENTITY] DID routing_id collision with context routing_ids
+### [03-IDENTITY] Identity routing_id collision with context routing_ids
 
 - **Category**: Security-relevant omissions
 - **Location**: Section 3.10.2, lines 217-221
-- **What's missing**: The domain separator `"scp:did:"` prevents collision with other SCP routing_id schemes. But the spec does not prove or verify non-collision. The context metadata routing_id uses `SHA-256(context_id || "scp-metadata")`. If a context_id happens to start with `"did:"` followed by a DID string, the resulting routing_ids would differ (different prefix structure), but this is not formally proven. More importantly: what prevents a user from creating a context with an ID that, when fed through one routing scheme, produces the same SHA-256 output as a DID through the DID routing scheme? (Answer: SHA-256 collision resistance. But this should be stated explicitly as a security dependency.)
-- **Why it matters**: Routing_id collision would cause private state or DID documents to be overwritten by context data or vice versa. The security argument depends on SHA-256 collision resistance, which should be stated explicitly rather than left implicit.
+- **What's missing**: The domain separator `"scp:did:"` prevents collision with other SCP routing_id schemes. But the spec does not prove or verify non-collision. The context metadata routing_id uses `SHA-256(context_id || "scp-metadata")`. What prevents a user from creating a context whose ID, fed through one routing scheme, produces the same SHA-256 output as an identifier fed through the identity routing scheme? (Answer: SHA-256 collision resistance. But this should be stated explicitly as a security dependency.)
+- **Why it matters**: Routing_id collision would cause private state or key-event records to be overwritten by context data or vice versa. The security argument depends on SHA-256 collision resistance, which should be stated explicitly rather than left implicit.
 - **Severity**: LOW
 
-### [03-IDENTITY] DID resolution cache invalidation and freshness
+### [03-IDENTITY] Identity resolution cache invalidation and freshness
 
 - **Category**: Missing constants/defaults
 - **Location**: Section 3.10.4, line 276-277 -- "24h refresh for active contacts, 7d for inactive"
-- **What's missing**: Definition of "active" vs "inactive" contacts. Is a contact "active" if they share any context? If they exchanged a message in the last N hours? If their DID was resolved in the last M hours? The caching policy values (24h, 7d) are specified but the classification criteria are not.
-- **Why it matters**: Without a definition of "active," two implementations may cache the same contact's DID document for dramatically different durations, affecting key rotation propagation time.
+- **What's missing**: Definition of "active" vs "inactive" contacts. Is a contact "active" if they share any context? If they exchanged a message in the last N hours? If the identity was resolved in the last M hours? The caching policy values (24h, 7d) are specified but the classification criteria are not.
+- **Why it matters**: Without a definition of "active," two implementations may cache the same contact's key state for dramatically different durations, affecting key rotation propagation time.
 - **Severity**: MEDIUM
 
 ### [03-IDENTITY] RepublishManager -- relay republish failure handling unspecified
 
 - **Category**: Undefined error/failure behavior
 - **Location**: Section 3.10.5, lines 294-296
-- **What's missing**: RepublishManager schedules relay republishing every 6 days. What happens if republishing fails? How many retries? What backoff strategy? If a relay is persistently unreachable, is it removed from the publication set? Is the user notified? What if ALL relays are unreachable for more than 7 days (the blob_ttl)? The DID document expires on all relays and the identity becomes unresolvable via the relay layer.
-- **Why it matters**: The 7-day TTL with 6-day republish cycle gives a 1-day safety margin. If the device is offline for more than 7 days, the relay-layer DID document expires. The spec should specify recovery behavior for this scenario.
+- **What's missing**: RepublishManager schedules relay republishing every 6 days. What happens if republishing fails? How many retries? What backoff strategy? If a relay is persistently unreachable, is it removed from the publication set? Is the user notified? What if ALL relays are unreachable for more than 7 days (the blob_ttl)? The key-event record expires on all relays and the identity becomes unresolvable.
+- **Why it matters**: The 7-day TTL with 6-day republish cycle gives a 1-day safety margin. If the device is offline for more than 7 days, the relay-stored key-event record expires. The spec should specify recovery behavior for this scenario.
 - **Severity**: MEDIUM
 
 ### [03-IDENTITY] Bootstrap relay list -- location and update mechanism
@@ -272,16 +272,16 @@ The most severe gaps are: (1) the social/device recovery protocol in section 3.3
 - **Why it matters**: If the bootstrap relay list is hardcoded in the SDK and the relays go down, relay-layer resolution fails entirely. The update mechanism is critical for protocol resilience.
 - **Severity**: MEDIUM
 
-### [03-IDENTITY] DidResolver trait -- error handling and timeout
+### [03-IDENTITY] IdentityBackend::resolve -- error handling and timeout
 
 - **Category**: Undefined error/failure behavior
 - **Location**: Section 3.10.10, lines 342-371
-- **What's missing**: The `DidResolver` trait returns `Result<Option<ResolvedDidDocument>, IdentityError>` but:
+- **What's missing**: `IdentityBackend::resolve` returns a `ResolutionOutcome` or an `IdentityError`, but:
   - No timeout is specified for the resolve operation. How long should the resolver wait before returning `None`?
   - No specification of what `IdentityError` variants must exist
-  - No specification of behavior when the cache returns a document but both layers fail to provide a fresh one -- does it return the cached document with a staleness warning? Return an error? Return the cache silently?
-  - The `ResolutionSource::Cache` variant does not record which layer originally served the document or when it was cached
-- **Why it matters**: Timeout behavior is critical for user experience (hanging resolution blocks context joining) and for security (a resolver that waits indefinitely for DHT is vulnerable to DoS via DHT unresponsiveness).
+  - No specification of behavior when the cache returns a record but every relay fails to provide a fresh one -- does it return the cached record with a staleness warning? Return an error? Return the cache silently?
+  - The `ResolutionSource::Cache` variant does not record which relay originally served the record or when it was cached
+- **Why it matters**: Timeout behavior is critical for user experience (hanging resolution blocks context joining) and for security (a resolver that waits indefinitely is vulnerable to denial of service through relay unresponsiveness).
 - **Severity**: MEDIUM
 
 ### [03-IDENTITY] Block/mute -- mute enforcement mechanism underspecified
@@ -316,19 +316,11 @@ The most severe gaps are: (1) the social/device recovery protocol in section 3.3
 - **Why it matters**: An implementor needs both read and write interfaces. The write path is the more complex one (it triggers propagation, sender key rotation, access key deletion) and is entirely missing from the ProtocolRepository specification.
 - **Severity**: MEDIUM
 
-### [03-IDENTITY] DID document structure for SCP -- field-level specification missing
-
-- **Category**: Missing wire format details
-- **Location**: Section 3.7, lines 101-119 (public state tree) and section 18.2 (service endpoints)
-- **What's missing**: The spec describes the DID document structure as a tree (verification methods, service endpoints, published attestations) but never provides the complete field-level DID document format. Section 9.7.1 shows the MLS LeafNode credential contains `DID + UCAN + signing_key_id`, but the DID document itself -- which must be serializable for BEP44 signing and publication -- has no canonical field specification. The did:dht spec defines a DNS-based wire format, but SCP's DID document includes SCP-specific extensions (`ScpKeyCustodyAttestation`, multiple SCP service endpoint types, pre-rotation commitments) that must be specified for interoperability.
-- **Why it matters**: Two SDKs must produce byte-identical DID documents for the same identity state in order for BEP44 signatures to verify. Without a canonical serialization format, this is impossible.
-- **Severity**: HIGH
-
 ### [03-IDENTITY] KeyPackage buffer replenishment -- no specification of generation parameters
 
 - **Category**: Missing constants/defaults
 - **Location**: Section 9.7.4, line 337 -- "The SDK MUST maintain a buffer of at least 10 unused KeyPackages per identity on relays. Replenished when the buffer drops below 5."
-- **What's missing**: KeyPackage generation parameters: what MLS ciphersuite version? What lifetime/expiry for KeyPackages? What credential content (DID, UCAN, signing_key_id -- which UCAN? A dedicated KeyPackage UCAN or the context-scoped one?)? How does the SDK know the buffer has dropped below 5 -- does it poll relays or does the relay push a notification? What if the relay is unreachable during replenishment?
+- **What's missing**: KeyPackage generation parameters: what MLS ciphersuite version? What lifetime/expiry for KeyPackages? What credential content (identifier, UCAN, signing_key_id -- which UCAN? A dedicated KeyPackage UCAN or the context-scoped one?)? How does the SDK know the buffer has dropped below 5 -- does it poll relays or does the relay push a notification? What if the relay is unreachable during replenishment?
 - **Why it matters**: KeyPackage exhaustion means new members cannot be added to contexts involving this identity until KeyPackages are replenished. The replenishment trigger and relay interaction protocol must be specified.
 - **Severity**: MEDIUM
 
@@ -338,7 +330,7 @@ The most severe gaps are: (1) the social/device recovery protocol in section 3.3
 - **Location**: Section 3.4, lines 31-32
 - **What's missing**: The entire section is: "Existing platform identities (Google, Apple, social accounts) can be linked to a protocol identity but are never the root. They serve as convenience and interop, not as source of truth." This states the design intent but provides zero specification:
   - How is linking performed at the protocol level?
-  - What does "linked" mean? A service endpoint? An attestation? A DID document extension?
+  - What does "linked" mean? A service-record entry? An attestation?
   - How is the link verified?
   - Can links be unlinked?
   - How does linking relate to the attestations in section 3.5?
@@ -349,7 +341,7 @@ The most severe gaps are: (1) the social/device recovery protocol in section 3.3
 
 - **Category**: Missing conformance criteria
 - **Location**: Section 3.10.6, line 307
-- **What's missing**: The spec mandates specific API methods (`RepublishConfig::disable_dht()`, `RepublishConfig::disable_relay()`) and a warning message. This is spec-as-API-design, which is unusual and potentially fragile. The conformance requirement should be behavioral ("the SDK MUST warn when a resolution layer is disabled") not API-specific. The mandated warning message text is also specified ("DID resolution layer disabled...") which is overly prescriptive for a protocol spec.
+- **What's missing**: The spec mandates specific API methods (`RepublishConfig::disable_dht()`, `RepublishConfig::disable_relay()`) and a warning message. This is spec-as-API-design, which is unusual and potentially fragile. The conformance requirement should be behavioral ("the SDK MUST warn when a resolution layer is disabled") not API-specific. The mandated warning message text is also specified ("resolution layer disabled...") which is overly prescriptive for a protocol spec.
 - **Why it matters**: Language bindings may not support the exact Rust API shape. The spec should specify the required behavior, not the Rust API.
 - **Severity**: LOW
 
@@ -369,17 +361,9 @@ The most severe gaps are: (1) the social/device recovery protocol in section 3.3
 
 - **Category**: Underspecified algorithms
 - **Location**: Section 9.3, line 180 (cross-referenced from section 3.5/3.6) -- "New identities start with limited capabilities -- restricted context creation, limited participation slots, constrained outlet invocation rates."
-- **What's missing**: No specification of initial capacity values, growth rates, or capacity thresholds. What are the default limits for a new identity? How many contexts can a new DID create? How many participation slots? What outlet invocation rate? How does capacity grow (linearly? exponentially? step functions?)? What inputs drive growth?
+- **What's missing**: No specification of initial capacity values, growth rates, or capacity thresholds. What are the default limits for a new identity? How many contexts can a new identity create? How many participation slots? What outlet invocation rate? How does capacity grow (linearly? exponentially? step functions?)? What inputs drive growth?
 - **Why it matters**: The open questions document marks this as resolved with the note that "earned capacity scoring is a product-layer concern, not a protocol-level specification." But section 9.3 states capacity limits as protocol properties ("restricted context creation, limited participation slots"), not product features. If the protocol does not enforce capacity limits, the Sybil resistance mechanism described in section 9.3 does not work as described. This is a coherence issue between the spec's claims and its explicit deferral.
 - **Severity**: HIGH
-
-### [03-IDENTITY] Cross-reference inconsistency: section 3.5 uses did:key in example
-
-- **Category**: Cross-reference inconsistencies
-- **Location**: Section 3.5, line 38 -- "The human behind DID `did:key:abc...`"
-- **What's missing**: The example uses `did:key` but the protocol's target DID method is `did:dht` (sections 3.8, 9.6.1). `did:key` is not mentioned anywhere else in the spec as a supported method. This is likely an editorial error in the example, but it creates confusion about supported DID methods.
-- **Why it matters**: An implementor reading section 3.5 might assume did:key is supported.
-- **Severity**: LOW
 
 ### [03-IDENTITY] Multi-device access to identity private state -- key sharing protocol absent
 
@@ -388,14 +372,6 @@ The most severe gaps are: (1) the social/device recovery protocol in section 3.3
 - **What's missing**: For multi-device access to work, all devices must be able to decrypt private state. The Identity Key is specified as hardware-bound (Secure Enclave, line 332 of section 9.7.4 -- "Private key never exported from the secure element"). If the Identity Key is used for private state encryption and cannot be exported, a second device cannot decrypt the private state. There must be a key derivation or key sharing protocol for multi-device scenarios. No such protocol is specified.
 - **Why it matters**: This is a fundamental architectural gap. Either the private state encryption key must be exportable (contradicting the HSM requirement) or there must be a key distribution protocol between devices. Without either, multi-device private state access is impossible.
 - **Severity**: CRITICAL
-
-### [03-IDENTITY] DID document size budget discrepancy
-
-- **Category**: Cross-reference inconsistencies
-- **Location**: Section 3.10.2, line 247 -- "DID documents range from 2-30KB... The relay blob size limit is 256KB (ADR-004)."
-- **What's missing**: The 2-30KB estimate appears to be based on current assumptions. As the spec adds more service endpoint types (SCPRelay, SCPCapabilities, IdentityPrivateState, PreRotationCommitment, SCPBroadcastContext, ParticipationStatements -- at least 6 types, potentially multiple entries each) plus attestations plus agent capability metadata, this could grow significantly. No maximum size is specified for DID documents specifically, only the general 256KB relay blob limit.
-- **Why it matters**: A DID document that approaches the 256KB blob limit would be expensive to resolve and process. The spec should either specify a DID document size limit or acknowledge the growth trajectory.
-- **Severity**: LOW
 
 ### [02-SYSTEM-DESIGN] Cross-context outlet interface "mutual consent" -- governance approval protocol for interfaces not specified in section 2
 
@@ -429,14 +405,6 @@ The most severe gaps are: (1) the social/device recovery protocol in section 3.3
 - **Why it matters**: The pre-rotation key is the security backstop for the entire identity system. Its custody must be specified with the same rigor as the Identity Key custody.
 - **Severity**: HIGH
 
-### [03-IDENTITY] BEP44 sequence number overflow
-
-- **Category**: Missing edge cases
-- **Location**: Section 3.10.7, line 311 -- "The BEP44 sequence number is monotonically increasing"
-- **What's missing**: BEP44 sequence numbers are signed 64-bit integers (per BEP44 spec). What happens when the sequence number approaches `i64::MAX`? This is unlikely in practice (trillions of updates) but should be acknowledged. What happens if an implementation uses unsigned 64-bit and a BEP44 node returns a negative sequence number?
-- **Why it matters**: Integer overflow in sequence numbers could cause freshness checks to accept stale documents. An explicit note about the sequence number range would prevent implementation bugs.
-- **Severity**: LOW
-
 ### [03-IDENTITY] Concurrent block and unblock from multiple devices
 
 - **Category**: Missing edge cases
@@ -452,10 +420,10 @@ The most severe gaps are: (1) the social/device recovery protocol in section 3.3
 | Severity | Count |
 |----------|-------|
 | CRITICAL | 3 |
-| HIGH | 11 |
+| HIGH | 10 |
 | MEDIUM | 15 |
-| LOW | 9 |
-| **Total** | **38** |
+| LOW | 6 |
+| **Total** | **34** |
 
 ## Critical Findings Summary
 
