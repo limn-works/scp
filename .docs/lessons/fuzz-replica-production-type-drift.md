@@ -49,8 +49,8 @@ with a stale replica hides the gap.
 
 **Option 1 (preferred): `pub` or `pub(crate)` with `#[doc(hidden)]`.**
 
-Make the production function public with a `#[doc(hidden)]` attribute to signal it is
-implementation-internal but accessible for testing and fuzzing:
+Make the production function public with `#[doc(hidden)]`, which signals that it is
+implementation-internal and reachable for testing and fuzzing:
 
 ```rust
 // crates/scp-runtime/src/encrypt.rs
@@ -71,13 +71,13 @@ fuzz_target!(|input: ArbAadInput| {
 **Option 2: byte-equality conformance test.**
 
 Add a `#[test]` in the production crate that verifies the fuzz-target replica matches the
-production function for a representative set of inputs. This does not eliminate drift but
-detects it at CI time:
+production function on a set of inputs. This does not eliminate drift; it detects drift at
+CI time:
 
 ```rust
 #[test]
 fn build_sender_aad_matches_fuzz_replica() {
-    let cases = [("ctx:abc", "did:dht:xyz"), ("", "did:dht:zzz")];
+    let cases = [("ctx:abc", "sender-a"), ("", "sender-b")];
     for (ctx, did) in cases {
         assert_eq!(
             build_sender_aad(ctx, did),
