@@ -25,7 +25,7 @@ Concrete mechanisms that don't require platform cooperation:
 - **User-authenticated scraping.** The user is already authenticated on these platforms. A browser extension or local agent component extracts data from their authenticated sessions. This is accessing your own data through your own session — legally distinct from unauthorized scraping.
 - **Data portability exports.** GDPR, CCPA, and the EU Digital Markets Act give users the right to export their data. X, Facebook, and Instagram all offer structured exports (JSON/HTML). Good for initial bootstrap, but snapshots — not live feeds.
 - **Public API surface.** Even restricted APIs have some surface. Bluesky/AT Protocol and Mastodon/ActivityPub are fully open and trivial to bridge.
-- **Identity linking (§3.4 in the original spec).** The spec already said platform identities can be linked to a protocol identity. When your local agent imports your X social graph, it discovers that some contacts are also SCP participants because they've linked their X handle to their DID.
+- **Identity linking (§3.4 in the original spec).** The spec already said platform identities can be linked to a protocol identity. When your local agent imports your X social graph, it discovers that some contacts are also SCP participants because they've linked their X handle to their identity.
 
 ### Escalating to Protocol-Level Connectors
 
@@ -39,12 +39,12 @@ The user also flagged **identity attestation as a keystone feature** — "non-fu
 
 ### What Got Added to the Spec
 
-**§3.5 Identity Attestations.** Cryptographic proofs binding external platform handles to DIDs. Properties: non-fungible, user-initiated, independently verifiable, revocable, discoverable. Enables three flows: social graph import, shadow identity claiming, cross-platform reputation continuity.
+**§3.5 Identity Attestations.** Cryptographic proofs binding external platform handles to identities. Properties: non-fungible, user-initiated, independently verifiable, revocable, discoverable. Enables three flows: social graph import, shadow identity claiming, cross-platform reputation continuity.
 
 **§12 Platform Bridge Connectors** (full new section, 9 subsections):
 
 - Bridge connectors as protocol entities — operated by accountable identities, registered with contexts, transparent, revocable.
-- **Shadow identities** — protocol-level representations of external platform users. Attributed but not verified (attribution comes from bridge operator, not from the user themselves). Restricted by default. Marked as bridged. Claimable — if the user later joins SCP and publishes a matching attestation, the shadow merges with their real DID. Past actions get retroactively attributed. The shadow is retired. This transition is one-way and irreversible.
+- **Shadow identities** — protocol-level representations of external platform users. Attributed but not verified (attribution comes from bridge operator, not from the user themselves). Restricted by default. Marked as bridged. Claimable — if the user later joins SCP and publishes a matching attestation, the shadow merges with their real identity. Past actions get retroactively attributed. The shadow is retired. This transition is one-way and irreversible.
 - **Four operating modes:** relay (single bot on external platform, most robust), puppet (bridge authenticates as user on external platform, best fidelity, requires credential delegation), API (official platform API, most stable, most limited), cooperative (platform voluntarily implements the bridge connector interface — the aspirational mode).
 - **Trust hierarchy for bridged content:** native SCP action (strongest) → native identity + bridged action → claimed shadow + historical bridged action → unclaimed shadow + bridged action (weakest). Agents calibrate behavior based on provenance.
 - Bridge connectors don't violate context isolation. They're translation infrastructure, not agents.
@@ -134,7 +134,7 @@ Matrix has been around for 12 years without mainstream adoption. Lessons:
 
 - **Homeserver complexity.** Running Synapse is a sysadmin job. SCP's self-hosting promise needs to be dramatically simpler or it'll repeat this.
 - **Federation performance.** Matrix state resolution is computationally expensive and slow.
-- **Identity fragility.** Homeserver-bound identity = server operator is single point of failure. SCP's DID-based identity is the right correction.
+- **Identity fragility.** Homeserver-bound identity = server operator is single point of failure. SCP's cryptographic identity is the right correction.
 - **Bridge fragility.** Matrix bridges break monthly. SCP's cooperative mode is the right aspiration but relay/puppet will face the same whack-a-mole.
 - **"Protocol for nerds" problem.** Matrix is a good protocol most people will never use directly. SCP needs to be invisible infrastructure used *through* apps (Cronica first), not a protocol people interact with.
 
@@ -190,13 +190,13 @@ Properties: declarative not imperative, validated against ceiling + role, machin
 
 **Win condition:** Self-hosting means "install an app."
 
-This was subjected to a realism check (see section 4 below). Revised to be honest: device is a full participant when online, but offline devices are unavailable nodes. The real guarantee is "no server owns you," not "no server needed." DID-based identity surviving infrastructure death is the structural advantage over Matrix, not the elimination of servers.
+This was subjected to a realism check (see section 4 below). Revised to be honest: device is a full participant when online, but offline devices are unavailable nodes. The real guarantee is "no server owns you," not "no server needed." Cryptographic identity surviving infrastructure death is the structural advantage over Matrix, not the elimination of servers.
 
 ### Relay Architecture (§10.4, revised)
 
 **Win condition:** Offline devices don't break the protocol.
 
-Also subjected to realism check. Revised to acknowledge: metadata exposure unsolved at scale, relay discovery is a real problem, "simple message queue" undersells operational complexity, gravitational pull toward popular relays is inevitable (but not lock-in because DID identity). Self-hosting a relay is a server task, not "install an app."
+Also subjected to realism check. Revised to acknowledge: metadata exposure unsolved at scale, relay discovery is a real problem, "simple message queue" undersells operational complexity, gravitational pull toward popular relays is inevitable (but not lock-in because identity is cryptographic). Self-hosting a relay is a server task, not "install an app."
 
 ### Cooperative Mode Incentive Structure (§12.9)
 
@@ -212,7 +212,7 @@ Every addition is a **structural enforcement** that removes a failure mode by ma
 - You can't lock users to your app via context state (state layering)
 - You can't ship an overprivileged app past the declaration contract
 - You can't require a server to participate (device-as-node)
-- You can't gain platform leverage through relay operation (substitutable relays + DID identity)
+- You can't gain platform leverage through relay operation (substitutable relays + cryptographic identity)
 - You can't ignore bridging without your users paying the trust cost (cooperative mode incentives)
 
 ---
@@ -258,7 +258,7 @@ Nostr was introduced here as the closest real-world analog — attempting almost
 | No server needed | Technically true. Practically, relay goes down, you're invisible. |
 | Identity survives relay death | **Yes — this is the real win.** Keypair identity means no server owns you. |
 
-The last point is what actually works and actually matters. DID-based identity is the real structural advantage over Matrix, not the relay architecture.
+The last point is what actually works and actually matters. Cryptographic identity is the real structural advantage over Matrix, not the relay architecture.
 
 ### What Changed in the Spec
 
@@ -278,7 +278,7 @@ This was the pivotal realization. At the transport and identity layer, SCP is re
 
 | SCP Concept | Nostr Equivalent |
 |---|---|
-| DID (keypair-based identity) | npub/nsec (public key IS identity) |
+| Cryptographic identity (keypair-based) | npub/nsec (public key IS identity) |
 | Substitutable relays | Nostr relays |
 | Encrypted payloads, relay doesn't interpret | Nostr events, relays store signed blobs |
 | Client-side intelligence | Nostr clients are the smart layer |
@@ -322,9 +322,9 @@ Three options were discussed:
 - Nostr's simplicity may be a constraint. SCP may need richer primitives (structured capability tokens, context state machines, governance transactions) awkward as Nostr events.
 - Relay semantics. SCP contexts need access control. Nostr relays are mostly open. NIP-42 (relay auth) exists but isn't universal. SCP would need SCP-aware relays OR an encryption-based access model (see below).
 - Dependency risk on Nostr's ecosystem/governance.
-- DID vs npub. Nostr uses raw public keys — can't change key without changing identity. SCP's DID model allows key rotation, important for recovery.
+- Identifier vs npub. Nostr uses raw public keys — can't change key without changing identity. SCP's identity model allows key rotation, important for recovery.
 
-**Middle path (what the spec now says):** Define SCP protocol semantics independently. Provide a Nostr binding as the reference transport. Allow alternative transports (Matrix, libp2p, raw WebSocket). Use DIDs as identity layer with trivial mapping to Nostr npubs for Nostr-transport contexts.
+**Middle path (what the spec now says):** Define SCP protocol semantics independently. Provide a Nostr binding as the reference transport. Allow alternative transports (Matrix, libp2p, raw WebSocket). Use SCP identities with trivial mapping to Nostr npubs for Nostr-transport contexts.
 
 ### The Access Control Tension — And Its Resolution
 
@@ -359,7 +359,7 @@ SCP SDK
 ├── Core Protocol Logic (100% SCP's responsibility)
 │   ├── Context management, agent lifecycle
 │   ├── Trust evaluation, capability tokens (UCAN)
-│   ├── Identity (DID), role enforcement
+│   ├── Identity, role enforcement
 │   ├── Governance, provenance tracking
 │   └── Bridge connector management, app capability declarations
 │
@@ -389,7 +389,7 @@ SCP SDK
 | Relay behavior | Specify what SCP needs from a relay. | Implementing relay software. Existing relays cover this. |
 | Relay operation | Ship reference config/deployment guide. | Running relays for users (managed infra — business layer). |
 | Encryption | Full ownership. Envelope format, key management, access control. | — |
-| Identity | Full ownership. DID management, custody, attestations. Binding maps DIDs to transport identities. | — |
+| Identity | Full ownership. Key management, custody, attestations. Binding maps identities to transport identities. | — |
 
 ### Key Clarification
 
@@ -405,7 +405,7 @@ The abstraction is designed before the first binding, not extracted from it afte
 |---|---|
 | §1 Thesis | Core thesis, design principles, positioning |
 | §2 System Design | Conceptual architecture, diagrams, context interior, cross-context communication, trust model, full stack |
-| §3 Identity | DID-based, key custody abstracted, social/device recovery, linking existing identities, identity attestations |
+| §3 Identity | key custody abstracted, social/device recovery, linking existing identities, identity attestations |
 | §4 Agents | Core principle, binding, one-per-context, BYOA, human-agent pair, context-bound, fleet model |
 | §5 Contexts | Definition, creation, capability ceiling, tools, roles, membership, metadata, context identity, governance (conceptual) |
 | §6 Cross-Context | Agent isolation (absolute), context-to-context tool interfaces (stateless, opt-in), human-as-bridge |
@@ -430,8 +430,8 @@ This is the first domino. Encryption-as-access-control is the linchpin of the wh
 **2. Transport abstraction interface.**
 The spec says it should exist and roughly what it provides. It doesn't define the actual methods, the envelope format, or the binding contract. This is the SDK's most fundamental interface — everything above it is protocol logic, everything below it is pluggable transport. Needs to be designed and written down.
 
-**3. DID method selection.**
-The spec says "build on DID" but DIDs are a family of methods (`did:key`, `did:web`, `did:pkh`, `did:ion`, dozens more). Which one? `did:key` is simplest (just a public key, no resolution infrastructure) and closest to Nostr's model. `did:web` needs a web server. `did:ion` needs Bitcoin. This choice affects identity resolution, recovery, and key rotation. Important nuance: Nostr uses raw public keys — can't change your key without changing your identity. SCP's DID model should allow key rotation, which is important for recovery. This pushes away from `did:key` (which is also just a raw key) and toward something with a document that can be updated.
+**3. Identity method selection.**
+The spec left the method open, and the session weighed the published methods against each other. The inception-derived key-event-log identity substrate settled the question: an identity's identifier is the digest of its inception event, and its key-event log carries every rotation.
 
 **4. UCAN capability schema.**
 The spec says "UCAN-based capability tokens" throughout but doesn't design the actual capability schema. What capabilities exist? What's the token format? How are they granted, presented, verified, revoked? This is the enforcement mechanism for roles, context ceilings, and trust evaluation. Without it, roles and ceilings are conceptual, not enforceable.
@@ -460,7 +460,7 @@ These don't block building but block the protocol from being useful at scale.
 Social graph is not a protocol primitive. It is local agent state, computed from context membership, shared via the same capability-gated permission model as any other personal data. No follow/friend primitives. No global graph. No public follower counts. Block/mute is local agent policy. Added to spec as §3.6.
 
 **10. Identity attestation discovery.**
-How does Alice find out that `@bob_x` on X maps to `did:key:abc`? This is what makes social graph import and shadow identity claiming work in practice. Without it, bridging is theoretically possible but practically useless. Options: distributed registry, DHT, attestations in DID documents, gossip protocol. Must be decentralized.
+How does Alice find out which SCP identity `@bob_x` on X belongs to? This is what makes social graph import and shadow identity claiming work in practice. Without it, bridging is theoretically possible but practically useless. Options: distributed registry, DHT, attestations, gossip protocol. Must be decentralized.
 
 **11. Context discovery.**
 How do users find contexts to join? Search? Invitations only? Directory? Recommendation? This is the "how does anyone find anything" problem. If contexts are cryptographic entities you opt into by key, there must be a discovery layer that maps human-meaningful information to context keys.
@@ -541,7 +541,7 @@ These sections have clear positions and don't need more design work at the spec 
 
 - §1 Thesis — solid
 - §2 System Design — the diagrams and conceptual architecture are clear
-- §3 Identity — DID-based, key custody abstracted, social recovery, identity attestations
+- §3 Identity — key custody abstracted, social recovery, identity attestations
 - §4 Agents — binding, one-per-context, BYOA, human-agent pair, context-bound, fleet
 - §5 Contexts — definition, creation, capability ceiling, tools, roles, membership, metadata, governance (at the conceptual level)
 - §6 Cross-Context Communication — agent isolation, tool interfaces, human-as-bridge
@@ -567,9 +567,7 @@ members are added/removed, forward secrecy guarantees, key rotation cost, perfor
 2. Transport abstraction interface. The spec says it should exist and roughly what it provides. It doesn't define the actual methods, the envelope format, or the binding contract. This is
 the SDK's most fundamental interface — everything above it is protocol logic, everything below it is pluggable transport. Needs to be designed and written.
 
-3. DID method selection. The spec says "build on DID" but DIDs are a family of methods (did:key, did:web, did:pkh, did:ion, dozens more). Which one? did:key is simplest (just a public key,
-no resolution infrastructure) and closest to Nostr's model. did:web needs a web server. did:ion needs Bitcoin. This choice affects everything about identity resolution, recovery, and key
-rotation.
+3. Identity method selection. The spec left the method open, as the Tier 1 gap list above records.
 
 4. UCAN specifics. The spec says "UCAN-based capability tokens" throughout but doesn't design the actual capability schema. What capabilities exist? What's the token format? How are they
 granted, presented, verified, revoked? This is the enforcement mechanism for roles, context ceilings, and trust evaluation.
@@ -593,7 +591,7 @@ Tier 3: Blocks Growth / Network Effects
 9. Social graph structure. How do relationships exist at the protocol level? Follow/friend semantics? Discovery? The spec mentions "social graph" but doesn't define it as a protocol
 concept.
 
-10. Identity attestation discovery. How does Alice find out that @bob_x on X maps to did:key:abc? This is what makes social graph import and shadow identity claiming work. Without it,
+10. Identity attestation discovery. How does Alice find out which SCP identity @bob_x on X belongs to? This is what makes social graph import and shadow identity claiming work. Without it,
 bridging is theoretically possible but practically useless.
 
 11. Context discovery. How do users find contexts to join? Search? Invitations only? Directory? This is the "how does anyone find anything" problem.
@@ -613,12 +611,12 @@ Tier 4: Important But Not Urgent
 
 ---
 My recommendation for what to work through next: Tier 1 items, in order. Context key management is the first domino — it determines the encryption model, which determines the envelope
-format, which determines the transport abstraction, which determines what the SDK looks like. Then UCAN capability schema and DID method, because those are the other two protocol primitives
+format, which determines the transport abstraction, which determines what the SDK looks like. Then UCAN capability schema and the identity method, because those are the other two protocol primitives
   everything is built on.
    
 Two paths, depending on whether the priority is implementation-readiness or spec validation:
 
-**Path A: Tier 1 deep dive.** Start with context key management (MLS vs. Sender Keys). This is the first domino — it determines the encryption model, which determines the envelope format, which determines the transport abstraction, which determines what the SDK looks like. Then DID method and UCAN capability schema. After this session, you'd have enough to start writing SDK code.
+**Path A: Tier 1 deep dive.** Start with context key management (MLS vs. Sender Keys). This is the first domino — it determines the encryption model, which determines the envelope format, which determines the transport abstraction, which determines what the SDK looks like. Then the identity method and UCAN capability schema. After this session, you'd have enough to start writing SDK code.
 
 **Path B: Cronica mapping.** Force every SCP abstraction through a concrete use case. What is a Cronica quest as an SCP context? What tools does it expose? What roles exist? How does the AI Guide participate — is it an agent, a tool, both? What capability ceiling does a quest context declare? This will reveal which abstractions are load-bearing and which are theoretical overhead. It may also surface missing concepts the spec hasn't considered.
 
@@ -647,7 +645,7 @@ Seven attestation types were identified:
 3. **Tool integrity.** Operator attests tool behavior and implementation. Evidence: implementation hash + test vectors. Verified via deterministic testing (Layer 2).
 4. **Agent capability.** Human attests their agent's capabilities/defenses. Some self-attested, some challenge-verifiable (see below).
 5. **Endorsement.** One identity vouches for another's competence in a specific domain. No objective evidence — value derives from the endorser's own behavioral record and endorsement accuracy history.
-6. **Role assignment.** Governance assigns a role. Evidence: governance action signed by authorized DIDs.
+6. **Role assignment.** Governance assigns a role. Evidence: governance action signed by authorized identities.
 7. **Context endorsement.** Any identity vouches for a context's legitimacy. Subjective, but endorser's behavioral record provides calibration.
 
 ### Solicitation and Presentation Patterns
@@ -740,7 +738,7 @@ Layer 4: Trust Evaluation (judge what it means)
 
 All seven mechanisms were written into §7 (Trust, Validation, and Capabilities), which was rewritten from ~25 lines to 200+ lines with full subsections. Supporting changes:
 
-- §5.4 (Tools) expanded with test vectors, implementation hashes, operator DIDs
+- §5.4 (Tools) expanded with test vectors, implementation hashes, operator identities
 - §4.4 (Agent capability metadata) expanded with self-attested vs. challenge-verified distinction
 - §9.2 (Context poisoning) expanded with references to consequence mechanisms, verifiable event logs, tool integrity
 - §9.3 (Systemic Defense Philosophy) rewritten with four principles: validate minimize trust, inspect behavior topology, consequences over character, observability as immune system
@@ -810,11 +808,11 @@ This resolved gap item #9 from the Tier 3 analysis and was added to the spec as 
 
 ### Identity Private State — New Primitive (§3.7)
 
-Block/mute exposed a gap: the protocol had context-scoped state (multi-party, shared) and identity public state (DID document, keys, attestations), but no concept of **identity-scoped private state** — data that's personal, cross-context, needs to survive device loss, and must remain invisible to others.
+Block/mute exposed a gap: the protocol had context-scoped state (multi-party, shared) and identity public state (keys, attestations), but no concept of **identity-scoped private state** — data that's personal, cross-context, needs to survive device loss, and must remain invisible to others.
 
 A "personal context" (single-member context as a private state container) was considered and rejected — a context needs to live somewhere, be replicated by someone, and a single-member context with no other members to keep it alive just collapses into "encrypted blob on a relay" with context overhead for no benefit.
 
-**The solution: identity private state as a first-class primitive.** Your DID has public state (keys, endpoints, attestations) and private state (encrypted to your own keys, replicated to your relays, portable with your identity).
+**The solution: identity private state as a first-class primitive.** Your identity has public state (keys, endpoints, attestations) and private state (encrypted to your own keys, replicated to your relays, portable with your identity).
 
 Key design properties:
 - **Single-owner encryption.** No group key management. Only you hold the decryption key.
@@ -823,7 +821,7 @@ Key design properties:
 - **Integrity-verified.** Merkle root over the log. Relay tampering is detectable.
 - **The single-owner degenerate case of context state.** Same infrastructure, same integrity model, no governance, no roles, no capability ceiling.
 
-Contents: block/mute lists, graph visibility policies, agent configuration defaults, personal annotations on DIDs, notification preferences, draft attestations, and anything else identity-scoped and private.
+Contents: block/mute lists, graph visibility policies, agent configuration defaults, personal annotations on identities, notification preferences, draft attestations, and anything else identity-scoped and private.
 
 This is the personal data layer the protocol was missing. Context state handles multi-party social data. Identity private state handles single-party personal data. Together they cover everything without local-only state.
 
@@ -855,9 +853,9 @@ A consumer-perspective assessment of the spec identified 11 topics the protocol 
 
 **Relay economics (§10.10).** App builder and operator responsibility. The protocol defines what relays do, not who runs them or why. Community relays, paid services, app-bundled infrastructure, self-hosted — all valid. Protocol ensures none create lock-in.
 
-**Sybil resistance (§9.3).** Three-layer approach: device attestation (one DID per physical device via Apple App Attest / Google Play Integrity) + earned capacity (new identities start limited, grow through participation) + context-level social verification (contexts set their own admission thresholds, like Reddit's karma/age requirements). No biometrics, no KYC. Makes sybil attacks expensive rather than impossible.
+**Sybil resistance (§9.3).** Three-layer approach: device attestation (one identity per physical device via Apple App Attest / Google Play Integrity) + earned capacity (new identities start limited, grow through participation) + context-level social verification (contexts set their own admission thresholds, like Reddit's karma/age requirements). No biometrics, no KYC. Makes sybil attacks expensive rather than impossible.
 
-**Regulatory compliance (§15).** Obligations fall on protocol users (app developers, relay operators, infrastructure providers). Protocol is built compliance-first and privacy-first: end-to-end encryption, self-sovereign identity, minimal protocol state, context-level content moderation tools. Right to erasure = DID revocation + attestation revocation (content in contexts remains, attributed to revoked DID). Content moderation is context governance responsibility. Same boundary as TCP/IP and HTTP.
+**Regulatory compliance (§15).** Obligations fall on protocol users (app developers, relay operators, infrastructure providers). Protocol is built compliance-first and privacy-first: end-to-end encryption, self-sovereign identity, minimal protocol state, context-level content moderation tools. Right to erasure = identity revocation + attestation revocation (content in contexts remains, attributed to the revoked identity). Content moderation is context governance responsibility. Same boundary as TCP/IP and HTTP.
 
 ### Key Reframing: "Agent as Consumer"
 
@@ -870,7 +868,7 @@ During the assessment, the user corrected the frame: SCP's consumer is not a hum
 ### What Remains
 
 After this pass, the spec's surface area coverage is substantially complete at the architectural level. What remains is:
-- **Tier 1 implementation specifics** (context key management, transport interface, DID method, UCAN schema)
+- **Tier 1 implementation specifics** (context key management, transport interface, identity method, UCAN schema)
 - **Tier 2 application specifics** (context lifecycle, minimum agent, capability declaration format, Cronica mapping)
 - **Offline/local-first mechanics** (informed by device-as-node but not specified)
 - **Transport layer specifics** (the 5-6 methods, envelope format, binding contract)
