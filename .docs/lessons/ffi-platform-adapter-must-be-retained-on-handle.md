@@ -1,18 +1,18 @@
 # FFI Platform Adapter Must Be Retained on the Handle Struct
 
 **Rule**: When an FFI bridge function creates a platform adapter (e.g., `KeyCustodyProviderAdapter`) to
-perform a one-shot operation (DID creation, key generation), that adapter must be stored on the opaque
+perform a one-shot operation (identity creation, key generation), that adapter must be stored on the opaque
 handle struct — not dropped at scope exit — if any subsequent operation on that handle needs the same
 provider.
 
 **Context (the SCP-214 review)**: `identity_create_platform` in
 `crates/scp-ffi/uniffi/src/bridge.rs` creates a `KeyCustodyProviderAdapter` wrapping the injected
-`KeyCustodyProvider` callback, calls `dht.create(&adapter)` to create the DID, then returns an
+`KeyCustodyProvider` callback, calls `dht.create(&adapter)` to create the identity, then returns an
 `Identity` struct with `in_memory_custody: None`. The adapter is dropped at the end of the function.
 
-Consequence: every subsequent operation that requires the platform custody provider — `context_create`
-(routing ID derivation), message signing (`create_inner_envelope`), key rotation (`DidMethod::rotate`),
-UCAN minting — has no reference to the provider. The UniFFI and NAPI `context_create` functions both
+Consequence: every subsequent operation that requires the platform custody provider — routing-ID
+derivation in `context_create`, message signing, key rotation, UCAN minting — has no reference to the
+provider. The UniFFI and NAPI `context_create` functions both
 gate routing ID derivation on `in_memory_custody.is_some()`, which is always `false` for platform
 identities. Platform custody identities silently get `routing_id: None` for every context they create.
 
