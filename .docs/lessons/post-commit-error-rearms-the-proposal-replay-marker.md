@@ -100,3 +100,14 @@ cannot be executed again, and the members submit a new `ExtendTtl` proposal once
 consent is unanimous. A helper whose pre-checks must leave a proposal retryable
 reads through the cell's `Deref` and takes no `class_c_view` before its first
 commit; `execute_reset_member` reads `cell.handle` and `cell.membership` that way.
+The same rule binds a staging the helper undoes on failure, because the cell
+counts a hand-out and cannot see that a later hand-out reversed it.
+`execute_propose_context_migration` staged `migration_state` and two buffered
+events through `class_c_view()` before its fallible `create_context` call and
+cleared them through a second `class_c_view()` when that call failed, so the
+epoch advanced by two with nothing landed, `execute_governance_action` kept the
+marker, and the proposal id could not be retried after a transient
+destination-creation failure. The staging now runs after the destination exists,
+so the failure path takes no view; `rolled_back_migration_leaves_the_mutation_epoch_unchanged`
+and `rolled_back_migration_drops_marker_so_the_proposal_is_retryable` in
+`crates/scp-runtime/src/context/actor/handlers/broadcast.rs` pin both halves.

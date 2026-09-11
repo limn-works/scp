@@ -3821,7 +3821,8 @@ pub fn execute_propose_context_migration<'a>(
                 ContextError::PermissionDenied("cannot transition to MigratingOut".to_owned())
             })?;
 
-        // Buffer migration events WITHOUT broadcasting (rollback-able block).
+        // The two migration events; buffered and broadcast only after the
+        // destination exists.
         let proposed_event = ContextEvent::ContextMigrationProposed {
             destination_context_id: destination_context_id.clone(),
             reason: reason.to_owned(),
@@ -3834,22 +3835,14 @@ pub fn execute_propose_context_migration<'a>(
             grace_period_end,
         };
 
-        // Coalesced Class-C staging (migration_state + buffered events) in a
-        // view borrow that drops before the `create_context` await.
-        let buffer_len_before_migration = {
-            let mut view = cell.class_c_view();
-            *view.migration_state_mut() = Some(MigrationState {
-                destination_context_id: destination_context_id.clone(),
-                reason: reason.to_owned(),
-                grace_period_end,
-                auto_invite,
-                proposal_id,
-            });
-            let buffer_len_before_migration = view.receive_buffer_mut().len();
-            view.receive_buffer_mut().push(proposed_event.clone());
-            view.receive_buffer_mut().push(started_event.clone());
-            buffer_len_before_migration
-        };
+        // The Class-C staging (migration_state + the two buffered events) runs
+        // AFTER `create_context` returns `Ok`, below. A `class_c_view()` here
+        // would advance the cell's `mutation_epoch` before the fallible
+        // destination creation; `execute_governance_action` reads an advanced
+        // epoch as "an effect landed" and keeps the replay marker, and a
+        // destination-creation failure applies nothing to this context (the
+        // handle returns to `Active`), so the proposal must stay retryable.
+        // Nothing reads this cell during the await: the actor holds it `&mut`.
 
         // Phase 2A.9: lifecycle_helpers::create_context is now actor-shape
         // (bootstrap form — constructs fresh PerContextState, registers
@@ -3880,20 +3873,28 @@ pub fn execute_propose_context_migration<'a>(
             None,
         ));
         if let Err(e) = create_fut.await {
-            // Roll back: revert source to Active and clear migration state. The
-            // `transition_to` await runs with no view borrow live; the Class-C
-            // rollback (clear migration state + truncate the buffered events)
-            // then runs in a short view borrow.
+            // Roll back: revert the source handle to Active. No Class-C field
+            // was written before the await, so no view is taken here and the
+            // cell's `mutation_epoch` is unchanged across the failure.
             let _ = cell.handle.transition_to(&ContextState::Active);
-            {
-                let mut view = cell.class_c_view();
-                *view.migration_state_mut() = None;
-                view.receive_buffer_mut()
-                    .truncate(buffer_len_before_migration);
-            }
             return Err(ContextError::PermissionDenied(format!(
                 "failed to create destination context: {e}"
             )));
+        }
+
+        // Coalesced Class-C staging (migration_state + buffered events) in a
+        // short view borrow, now that the destination exists.
+        {
+            let mut view = cell.class_c_view();
+            *view.migration_state_mut() = Some(MigrationState {
+                destination_context_id: destination_context_id.clone(),
+                reason: reason.to_owned(),
+                grace_period_end,
+                auto_invite,
+                proposal_id,
+            });
+            view.receive_buffer_mut().push(proposed_event.clone());
+            view.receive_buffer_mut().push(started_event.clone());
         }
 
         // Broadcast the migration events that were buffered above.

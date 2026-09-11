@@ -2262,6 +2262,138 @@ mod tests {
         );
     }
 
+    /// Destination params whose `min_protocol_version` names a major this SDK
+    /// does not speak, so `lifecycle_helpers::create_context` fails at its
+    /// version check, before it touches any provider or spawns an actor.
+    fn undeliverable_destination_params() -> scp_protocol::context::params::ContextParams {
+        scp_protocol::context::params::ContextParams {
+            min_protocol_version: Some((9, 0)),
+            ..scp_protocol::context::params::ContextParams::default()
+        }
+    }
+
+    /// `execute_propose_context_migration` applies nothing to the source
+    /// context when the destination creation fails: the handle returns to
+    /// `Active`, `migration_state` stays `None`, the receive buffer keeps its
+    /// length, and no leaf is appended. The cell's `mutation_epoch` must not
+    /// move across that failure, because `execute_governance_action` reads an
+    /// advanced epoch as "an effect landed" and keeps the replay marker. Before
+    /// the fix, the helper staged `migration_state` and two buffered events
+    /// through `class_c_view()` before the fallible `create_context` await and
+    /// undid them through a second `class_c_view()` on failure, so the epoch
+    /// advanced by two with nothing landed.
+    #[tokio::test]
+    async fn rolled_back_migration_leaves_the_mutation_epoch_unchanged() {
+        let (deps, appends) = build_deps().await;
+        let (state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        let mut cell = ClassSCell::new(state);
+        appends.store(0, Ordering::SeqCst);
+        let epoch_before = cell.mutation_epoch();
+        let buffered_before = cell.receive_buffer.len();
+
+        let result = crate::context::governance_helpers::execute_propose_context_migration(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &undeliverable_destination_params(),
+            "fixture",
+            60,
+            false,
+            crate::context::governance_helpers::CommitMeta {
+                pid: [0x77; 32],
+                actor_did: CREATOR_DID,
+                timestamp_secs: 1_700_000_000,
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(
+                &result,
+                Err(ContextError::PermissionDenied(msg))
+                    if msg.starts_with("failed to create destination context")
+            ),
+            "the helper must reach and report the destination-creation failure, \
+             not an earlier pre-check; got {result:?}"
+        );
+        assert_eq!(
+            cell.mutation_epoch(),
+            epoch_before,
+            "a rolled-back migration must hand out no view, so the epoch holds"
+        );
+        assert_eq!(cell.handle.state(), ContextState::Active);
+        assert!(cell.migration_state.is_none());
+        assert_eq!(cell.receive_buffer.len(), buffered_before);
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            0,
+            "a rolled-back migration appends nothing"
+        );
+    }
+
+    /// The same failure through `execute_governance_action`: the epoch is
+    /// unchanged across the dispatch, so the caller classifies the error as
+    /// pre-effect, drops the replay marker, and a second execution of the same
+    /// proposal id reaches the helper again and reports the same
+    /// destination-creation failure, not an already-executed refusal.
+    #[tokio::test]
+    async fn rolled_back_migration_drops_marker_so_the_proposal_is_retryable() {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let (deps, appends) = build_deps().await;
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        let proposal_id = seed_approved_proposal(
+            &mut state,
+            &ctx_hex,
+            GovernanceAction::ProposeContextMigration {
+                new_context_params: Box::new(undeliverable_destination_params()),
+                reason: "fixture".to_owned(),
+                grace_period_secs: 60,
+                auto_invite: false,
+            },
+        );
+        let mut cell = ClassSCell::new(state);
+        appends.store(0, Ordering::SeqCst);
+
+        for attempt in 0..2 {
+            let result = crate::context::governance_helpers::execute_governance_action(
+                &mut cell,
+                &deps,
+                &ctx_hex,
+                &proposal_id,
+                Some(&DID(CREATOR_DID.to_owned())),
+                None,
+            )
+            .await;
+            assert!(
+                matches!(
+                    &result,
+                    Err(ContextError::PermissionDenied(msg))
+                        if msg.starts_with("failed to create destination context")
+                ),
+                "attempt {attempt}: the destination-creation failure must surface, \
+                 not an already-executed refusal; got {result:?}"
+            );
+            assert!(
+                !cell
+                    .governance
+                    .class_s
+                    .executed_proposals
+                    .contains_key(&proposal_id),
+                "attempt {attempt}: a rolled-back migration must drop the replay marker"
+            );
+            assert_eq!(cell.handle.state(), ContextState::Active);
+            assert!(cell.migration_state.is_none());
+        }
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            0,
+            "a rolled-back migration appends nothing on either attempt"
+        );
+    }
+
     /// A rejected TTL extension is the one dispatch that advances the cell's
     /// `mutation_epoch` without applying a governance effect: `execute_extend_ttl`
     /// appends and credits a `TtlExtensionRejected` leaf, then returns
