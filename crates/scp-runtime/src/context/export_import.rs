@@ -1630,12 +1630,24 @@ mod tests {
             .insert(prop_x, (make_proposal(prop_x), 1u64, 100u64));
         base.approved_proposals
             .insert(prop_y, (make_proposal(prop_y), 2u64, 200u64));
+        // xctx_committed_invocations: HashSet<SagaId> (serde_sorted_set) — the
+        // last unsorted set in this struct; two elements are enough for a
+        // `RandomState` order to differ between two `HashSet`s.
+        base.xctx_committed_invocations
+            .insert(crate::context::supervisor::saga_journal::SagaId(
+                "saga-zulu-0001".to_owned(),
+            ));
+        base.xctx_committed_invocations
+            .insert(crate::context::supervisor::saga_journal::SagaId(
+                "saga-alpha-0002".to_owned(),
+            ));
 
         // Structurally-identical copy with every set/map rebuilt in reverse
         // iteration order.
         let mut shuffled = base.clone();
         reinsert_reversed_set(&mut shuffled.executed_proposals);
         reinsert_reversed_set(&mut shuffled.read_exclusion_list);
+        reinsert_reversed_set(&mut shuffled.xctx_committed_invocations);
         reinsert_reversed_map(&mut shuffled.approved_proposals);
 
         let hash_of = |snap: ContextSnapshot| -> [u8; 32] {
