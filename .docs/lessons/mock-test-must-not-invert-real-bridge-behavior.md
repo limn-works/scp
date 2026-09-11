@@ -1,10 +1,9 @@
 # A Mock Test That Inverts Real Behavior Is a Silent Future Blocker
 
 **Problem**: `bindings/typescript/tests/identity-lifecycle.test.ts` asserted
-`migrated.did === identity.did` for `identityMigrate`. The bridge does the opposite:
-migration produces a new DID, which the Rust `migrate_returns_new_did` test asserts and
-§9.12 of the security-model spec requires. The mock stubbed the migrate return value to echo
-its input DID, and the assertion then compared the echo against the input, so the test
+`migrated.did === identity.did` for `identityMigrate`, and the bridge did the opposite, which
+the Rust `migrate_returns_new_did` test asserts. The mock stubbed the migrate return value to
+echo its input, and the assertion then compared the echo against the input, so the test
 exercised the mock rather than the bridge. The test passed only because CI skips it when the
 native addon is not built. The day the addon ships, that test fails on correct code and
 blocks the correct implementation.
