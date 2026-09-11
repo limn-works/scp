@@ -116,9 +116,10 @@ import Testing
 @testable import SCP
 
 @Test
-func createIdentityReturnsValidDid() async throws {
+func createIdentityReturnsA32ByteIdentifier() async throws {
     let identity = try await Identity.create(custody: "in_memory")
-    #expect(identity.did.hasPrefix("did:dht:"))
+    // 09-security-model.md §9.7.4.2 R13
+    #expect(identity.identifier.count == 32)
 }
 
 @Test
