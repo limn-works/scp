@@ -22,24 +22,24 @@ Build order: ADR-023 + ADR-024 (parallel, both depend on Phase 1-4) --> ADR-025 
 
 **Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
 
-**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, overturned ADR-039's shared-identity `#agent` method, so a bridge operator holds no second key on its own identity. `09-security-model.md` §9.1 invariant 1 states the replacing model and records that its delegation anchor is unspecified, so the bridge signs under the operator's `#active` key until that anchor lands.
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, left an identity one operational role, so a bridge operator holds no second key on its own identity. `09-security-model.md` §9.1 invariant 1 states the replacing model and records that its delegation anchor is unspecified, so the bridge signs under the operator's `#active` key until that anchor lands.
 
-**Amendment (2026-09-10 — the connector signature is ECDSA on P-256).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. The `signature` field on this ADR's signed connector structure carries the type `P256Signature`. No other sentence of this ADR names a curve, so the ruling reaches its wire type and no decision in it.
+**Amendment (2026-09-10 — the connector signature is ECDSA on P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The `signature` field on this ADR's signed connector structure carries the type `P256Signature`. No other sentence of this ADR names a curve, so the ruling reaches its wire type and no decision in it.
 
 ### Context
 
-Spec §12 comprehensively specifies bridge architecture. Bridges are protocol entities (not agents) that translate between external platforms and SCP. They have an accountable operator DID, operate in one of four modes, and create shadow identities for external platform participants. All bridged content carries full provenance chain. Shadow claiming via identity attestation enables users to transition from shadow to native SCP identity.
+Spec §12 comprehensively specifies bridge architecture. Bridges are protocol entities (not agents) that translate between external platforms and SCP. They have an accountable operator identity, operate in one of four modes, and create shadow identities for external platform participants. All bridged content carries full provenance chain. Shadow claiming via identity attestation enables users to transition from shadow to native SCP identity.
 
 ### Decision
 
-Implement bridge support in `scp-core/bridge/`. Bridge connector as registered protocol entity with accountable operator DID. The bridge operator signs bridge protocol messages with its `#active` key, because a human identity's key state names one operational role and names no agent key. Shadow identities as restricted participants (observer default). Four operating modes (Relay, Puppet, Api, Cooperative). All bridged content carries full provenance chain. Shadow claiming via identity attestation (§3.5) is one-way and irreversible.
+Implement bridge support in `scp-core/bridge/`. Bridge connector as registered protocol entity with an accountable operator identity. The bridge operator signs bridge protocol messages with its `#active` key, because a human identity's key state names one operational role and names no agent key. Shadow identities as restricted participants (observer default). Four operating modes (Relay, Puppet, Api, Cooperative). All bridged content carries full provenance chain. Shadow claiming via identity attestation (§3.5) is one-way and irreversible.
 
 ### Rationale
 
 - **Protocol entity over agent:** Bridges are not agents — they don't exercise judgment or make decisions. They translate between external platforms and SCP mechanically. Making them a distinct entity type prevents confusion with agents and enforces different trust evaluation (bridges are trusted to translate faithfully, not to act autonomously).
-- **Accountable operator DID:** Every bridge has a human operator whose DID is visible in context metadata. This satisfies the "human accountability" protocol tenet — bridged actions trace to the bridge operator, and through the bridge to the external platform participant.
+- **Accountable operator identity:** Every bridge has a human operator whose identifier is visible in context metadata. This satisfies the "human accountability" protocol tenet — bridged actions trace to the bridge operator, and through the bridge to the external platform participant.
 - **Shadow identities over anonymous bridging:** External platform participants don't have SCP identities. Shadow identities give them protocol-level representation (with provenance) rather than attributing everything to the bridge operator. Shadows are restricted by default (observer role) to prevent capability escalation through bridges.
-- **One-way claiming:** Once a shadow is claimed (bound to a DID via identity attestation), the binding is permanent. This prevents identity confusion and simplifies attribution — historical actions are retroattributed once and for all.
+- **One-way claiming:** Once a shadow is claimed (bound to an identifier via identity attestation), the binding is permanent. This prevents identity confusion and simplifies attribution — historical actions are retroattributed once and for all.
 - **Four modes for different integration depths:** Relay (read-only mirroring), Puppet (bridge acts on behalf of external user), Api (platform API integration), Cooperative (native SCP support on external platform). Each mode has different trust implications visible before opt-in.
 
 ### Implementation
@@ -51,7 +51,7 @@ Implement bridge support in `scp-core/bridge/`. Bridge connector as registered p
 ### Dependencies
 
 - **ADR-008 (Context Governance):** Bridge registration requires context governance approval. Bridge revocation is a governance action.
-- **ADR-003 (DID/Identity Attestation):** Shadow claiming uses identity attestation (§3.5) to bind external handle to DID.
+- **ADR-003 (identity attestation):** Shadow claiming uses identity attestation (§3.5) to bind an external handle to an identifier.
 - **ADR-019 (Data Provenance):** All bridged content carries `BridgeProvenance` extending `DataProvenance`.
 - **ADR-011 (Event Log):** Bridge registration, shadow creation, and claiming are context events.
 
@@ -62,7 +62,7 @@ Implement bridge support in `scp-core/bridge/`. Bridge connector as registered p
 ```rust
 pub struct BridgeConnector {
     pub bridge_id: String,
-    pub operator_did: DID,
+    pub operator_did: [u8; 32],
     pub platform: String,
     pub mode: BridgeMode,
     pub status: BridgeStatus,
@@ -94,7 +94,7 @@ pub struct ShadowIdentity {
 
 pub enum ShadowProvenanceStatus {
     Shadow,   // Unclaimed — attributed via bridge
-    Claimed,  // Bound to a DID via identity attestation
+    Claimed,  // Bound to an identifier via identity attestation
 }
 
 /// Extension of DataProvenance for bridged content.
@@ -102,16 +102,16 @@ pub struct BridgeProvenance {
     pub base: DataProvenance,
     pub originating_platform: String,
     pub bridge_connector_id: String,
-    pub operator_did: DID,
+    pub operator_did: [u8; 32],
     pub bridge_mode: BridgeMode,
     pub shadow_status: ShadowProvenanceStatus,
 }
 
 pub struct ClaimRequest {
     pub shadow_id: String,
-    pub claimant_did: DID,
+    pub claimant_did: [u8; 32],
     pub platform_handle: String,
-    pub identity_attestation: Attestation,  // §3.5 attestation binding handle to DID
+    pub identity_attestation: Attestation,  // §3.5 attestation binding handle to identifier
     pub timestamp: u64,
     pub signature: P256Signature,
 }
@@ -127,8 +127,8 @@ pub enum ClaimError {
 ```
 
 2. **Bridge registration:**
-   - Operator DID presents registration request to context governance.
-   - Context governance approves or rejects. The approver must be a different DID from the operator (self-approval is forbidden).
+   - The operator presents a registration request to context governance.
+   - Context governance approves or rejects. The approver must be a different identity from the operator (self-approval is forbidden).
    - Registered bridge visible in context metadata (visible before opt-in, per legibility tenet).
    - Registration is a context event in the Merkle log.
 
@@ -143,7 +143,7 @@ pub enum ClaimError {
 
 5. **Provenance marking:**
    - All actions/content attributed to shadow identities carry `BridgeProvenance`.
-   - `BridgeProvenance` includes: originating platform, bridge connector ID, operator DID, operating mode, shadow/claimed status.
+   - `BridgeProvenance` includes: originating platform, bridge connector ID, operator identifier, operating mode, shadow/claimed status.
    - No shadow action mistakable for native SCP action.
 
 6. **Trust hierarchy (two axes per §12.5):**
@@ -154,13 +154,13 @@ pub enum ClaimError {
    - Both identity confidence and transport confidence factor into evaluation.
 
 7. **Shadow claiming:**
-   - Claimant publishes identity attestation (§3.5) binding external handle to DID.
+   - Claimant publishes identity attestation (§3.5) binding an external handle to its identifier.
    - Protocol verifies attestation matches shadow's platform handle.
-   - Shadow retired, historical actions retroattributed to claimant DID.
+   - Shadow retired, historical actions retroattributed to the claimant's identifier.
 
 8. **Claiming is one-way and irreversible:**
    - Claimed shadow cannot be unclaimed.
-   - Claimed shadow cannot be re-assigned to a different DID.
+   - Claimed shadow cannot be re-assigned to a different identity.
 
 9. **Bridge revocation:**
    - Context governance removes bridge at any time.
@@ -232,7 +232,7 @@ Implement `scp-media/` crate. Delegated model: context provides identity + trust
 pub struct MediaSession {
     pub session_id: String,
     pub context_id: ContextId,
-    pub participants: Vec<DID>,
+    pub participants: Vec<[u8; 32]>,
     pub capabilities: Vec<MediaCapability>,
     pub state: MediaSessionState,
     pub started_at: u64,
@@ -259,14 +259,14 @@ pub enum SignalingMessage {
 
 pub struct SessionDescription {
     pub sdp: String,
-    pub sender_did: DID,
+    pub sender_did: [u8; 32],
 }
 
 pub struct Candidate {
     pub candidate: String,
     pub sdp_mid: Option<String>,
     pub sdp_mline_index: Option<u16>,
-    pub sender_did: DID,
+    pub sender_did: [u8; 32],
 }
 
 pub struct MediaKeyMaterial {
@@ -330,13 +330,13 @@ WebRTC library integration is platform-specific (webrtc-rs for native, browser W
 
 **Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling and the passkey root custody ruling) — see the amendment below.
 
-**Amendment (2026-09-10 — every SCP key is ECDSA on P-256, and root custody defaults to a passkey).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519, and that root custody defaults to a passkey (`09-security-model.md` §9.7.4.1 item 4). This ADR's Context named the Secure Enclave's P-256-only support as "the key constraint shaping this ADR" and called it "not a limitation the protocol can design around". That sentence inverted cause and effect: Apple fixed the hardware and SCP chose the curve. Nobody chose Ed25519 — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5, and no ADR, planning session, or issue argued it against an alternative. Issue #392, the Secure Enclave key-custody request, was closed by an agent on that curve mismatch and reopened by Alec, who wrote that the "design space was not explored… Needs full research and a proper design decision". The research never happened; the issue was rescoped to biometric gating and closed. The reason for P-256, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Three consequences for this ADR, each written into the text below. The Secure Enclave now holds SCP operational signing keys on Apple platforms, so the Rationale's "Why Keychain … not Secure Enclave" argument is withdrawn. Acceptance criterion 8, which forbade `AppleKeyCustody` from generating or using a Secure Enclave key for SCP signing, is inverted and restated. The root member is held by a passkey through Apple's passkey provider, so no Keychain generic-password item holds it.
+**Amendment (2026-09-10 — every SCP key is ECDSA on P-256, and root custody defaults to a passkey).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. `09-security-model.md` §9.7.4.1 item 4 states the passkey default. This ADR's Context named the Secure Enclave's P-256-only support as "the key constraint shaping this ADR" and called it "not a limitation the protocol can design around". That sentence inverted cause and effect: Apple fixed the hardware and SCP chose the curve. Three consequences for this ADR, each written into the text below. The Secure Enclave now holds SCP operational signing keys on Apple platforms, so the Rationale's "Why Keychain … not Secure Enclave" argument is withdrawn. Acceptance criterion 8, which forbade `AppleKeyCustody` from generating or using a Secure Enclave key for SCP signing, is inverted and restated. The root member is held by a passkey through Apple's passkey provider, so no Keychain generic-password item holds it.
 
 ### Context
 
 SCP's platform adapter layer (ADR-006) defines four traits: `KeyCustody`, `DeviceAttestation`, `Push`, and `Storage`. Phase 1-2 provided in-memory implementations for testing. The Apple platform adapter provides production implementations for iOS and macOS using Apple's hardware security APIs.
 
-**Apple's Secure Enclave performs P-256 key operations and no others**, and since the curve ruling of 2026-09-10 every SCP key is a P-256 key, so the enclave holds every SCP operational signing key on iOS and macOS. `AppleKeyCustody` generates each such key inside the enclave, and the private bytes never leave it. Until 2026-09-10 this ADR read the same hardware fact in the opposite direction: SCP signed with Ed25519 and agreed keys with X25519, the enclave supported neither, and this paragraph called that "not a limitation the protocol can design around". The curve was SCP's to choose and the amendment above records who chose it and when.
+**Apple's Secure Enclave performs P-256 key operations and no others**, and since the curve ruling of 2026-09-10 every SCP key is a P-256 key, so the enclave holds every SCP operational signing key on iOS and macOS. `AppleKeyCustody` generates each such key inside the enclave, and the private bytes never leave it. Until 2026-09-10 this ADR read the same hardware fact in the opposite direction, and the amendment above records who changed it and when.
 
 The root member follows a different substrate again: `09-security-model.md` §9.7.4.1 item 4 makes a passkey the default root custody, which on Apple platforms is the system passkey provider rather than a Keychain generic-password item or an enclave key this adapter creates. §17.8 of the persistence spec names the Secure Enclave and the passkey in its Apple row. Android reaches the same hardware floor from API 23 (ADR-027, the Android platform adapter).
 
@@ -360,7 +360,7 @@ Implement the Apple platform adapter in Swift (`bindings/swift/Sources/SCP/Platf
 
 **Device attestation:** `AppleDeviceAttestation` uses `DCAppAttestService` (App Attest). A Secure Enclave-backed P-256 key is generated via `generateKey(completionHandler:)`. Attestations are requested via `attestKey(_:clientDataHash:completionHandler:)` where `clientDataHash` is `SHA-256(challenge || deviceID)`. Assertions are generated via `generateAssertion(_:clientData:completionHandler:)` for subsequent operations. The attestation token is forwarded to the SCP relay for server-side verification via Apple's attestation service endpoints. On simulator and in environments where App Attest is unavailable, the adapter falls back to a software-only attestation with `method: .softwareOnly`.
 
-**Push notifications:** `ApplePushProvider` wraps UNUserNotificationCenter and registers with APNs via `UIApplication.registerForRemoteNotifications()` / `NSApplication.registerForRemoteNotifications()`. The APNs payload is strictly opaque per §10.7: `{"aps": {"content-available": 1}}` with no additional fields. A content-available notification (silent push) wakes the app. The app then connects to its relay set and pulls all pending encrypted envelopes. No context ID, sender DID, message preview, or other metadata is included in the payload. Apple/Google learn only that the device received a notification at a specific time.
+**Push notifications:** `ApplePushProvider` wraps UNUserNotificationCenter and registers with APNs via `UIApplication.registerForRemoteNotifications()` / `NSApplication.registerForRemoteNotifications()`. The APNs payload is strictly opaque per §10.7: `{"aps": {"content-available": 1}}` with no additional fields. A content-available notification (silent push) wakes the app. The app then connects to its relay set and pulls all pending encrypted envelopes. No context ID, sender identifier, message preview, or other metadata is included in the payload. Apple/Google learn only that the device received a notification at a specific time.
 
 **Storage:** `AppleStorage` wraps a SQLCipher-encrypted SQLite database (`rusqlite` with `bundled-sqlcipher` feature, bridged via UniFFI). The encryption key is a 32-byte secret stored in Keychain with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`. The SQLite database file itself carries `NSFileProtectionCompleteUntilFirstUserAuthentication` (iOS only), which allows background processing while the device is locked after first unlock. On macOS, file-level protection is not applicable.
 
@@ -511,7 +511,7 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
 ### Acceptance Criteria
 
 1. **`AppleKeyCustody` — Keychain storage:**
-   - `generateKeypair(keyType: KeyType) -> KeyHandle`: Generates a P-256 keypair in the Secure Enclave, stores the key reference in Keychain with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, and returns an opaque handle (UUID string). Fails with `PlatformError.keychainError(OSStatus)` on Keychain failure. Called during identity creation for the Active Signing Key, the pre-rotation key, and, when agent delegation is enabled (ADR-039, the shared-DID human-agent identity model), the Agent Signing Key. It is not called for the root member, which the system passkey provider holds (`09-security-model.md` §9.7.4.1 item 4).
+   - `generateKeypair(keyType: KeyType) -> KeyHandle`: Generates a P-256 keypair in the Secure Enclave, stores the key reference in Keychain with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, and returns an opaque handle (UUID string). Fails with `PlatformError.keychainError(OSStatus)` on Keychain failure. Called during identity creation for the Active Signing Key and the pre-rotation key. It is not called for the root member, which the system passkey provider holds (`09-security-model.md` §9.7.4.1 item 4).
    - `sign(keyHandle: String, data: Data) -> Data`: Asks the Secure Enclave to sign `data` under the referenced P-256 key and returns the 64-byte raw `r || s` signature of `09-security-model.md` §9.5, with `s` in the low half of the group order. Returns `PlatformError.wrongKeyType` for a handle whose key type does not sign.
    - `publicKey(keyHandle: String) -> Data`: Returns the 33-byte SEC1 compressed P-256 public key for a handle.
    - `destroyKey(keyHandle: String)`: Deletes the Keychain item. Verifies deletion by confirming `errSecItemNotFound` on re-fetch. Returns `PlatformError.destructionFailed` if the item persists.
@@ -534,7 +534,7 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
 4. **`ApplePushProvider` — APNs:**
    - `register() -> PushToken`: Registers with APNs via `registerForRemoteNotifications()`. Returns the device token as hex string. Fails with `PlatformError.pushRegistrationFailed(String)` if APNs registration fails.
    - `handleNotification(payload: Data) -> WakeSignal`: Processes an incoming silent push notification. Verifies the payload is `{"aps": {"content-available": 1}}`. Returns `WakeSignal.wake`. Rejects payloads containing any field other than `aps.content-available`.
-   - The relay MUST send only `{"aps": {"content-available": 1}}` payloads. The adapter enforces opacity on receipt. No context ID, sender DID, or message count is acceptable in the payload.
+   - The relay MUST send only `{"aps": {"content-available": 1}}` payloads. The adapter enforces opacity on receipt. No context ID, sender identifier, or message count is acceptable in the payload.
    - APNs registration uses the `.alert` notification category with `UNAuthorizationOptions.alert` only for system notification permission; the actual push payload remains silent.
 
 5. **`AppleStorage` — SQLCipher:**
@@ -614,7 +614,7 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
 
 **Status:** Decided
 
-**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, retired the DID document and the `did:dht` identifier form. Resolution returns a key state, and an identifier's textual form is a later revision's concern, which `09-security-model.md` §9.7.4.2 R13 defers, so no example here prints one.
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, made resolution return a key state, and `09-security-model.md` §9.7.4.2 R13 defers the identifier's textual form, so no example here prints one.
 
 ### Context
 
@@ -628,7 +628,7 @@ Swift 6.2 with `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` is the baseline, maki
 
 Implement the Swift SDK as the `SCP` Swift package at `bindings/swift/`. The package imports `ScpFFI.xcframework` (UniFFI-generated binary), re-exports it through `Sources/SCP/Internal/ScpBindings.swift`, and builds a pure Swift ergonomics layer in `Sources/SCP/`. The top-level entry point is `SCP` — an actor that initializes the identity and injects the Apple platform adapter. `SCPContext` is the primary interactive type — an actor exposing `AsyncStream<Message>` for streaming and a `close()` / `deinit` lifecycle.
 
-Actor isolation follows the Swift 6.2 approachable concurrency rules: data carrier types (`Message`, `DIDDocument`, `OutletDefinition`) are `nonisolated struct` and `Sendable` by definition. Interactive types (`SCP`, `SCPContext`, `SCPIdentity`) are custom actors. `SCPEventLog` and `SCPTransport` are `nonisolated` since they have no mutable state after construction. `SwiftUI` observation uses `@Observable` for SCP state containers (Swift 5.9+). Streaming uses `AsyncStream<Message>` (not Combine) — the right choice for Swift 6 structured concurrency. The SPM package is configured as a binary framework target with XCFramework checksum verification.
+Actor isolation follows the Swift 6.2 approachable concurrency rules: data carrier types (`Message`, `ResolutionOutcome`, `OutletDefinition`) are `nonisolated struct` and `Sendable` by definition. Interactive types (`SCP`, `SCPContext`, `SCPIdentity`) are custom actors. `SCPEventLog` and `SCPTransport` are `nonisolated` since they have no mutable state after construction. `SwiftUI` observation uses `@Observable` for SCP state containers (Swift 5.9+). Streaming uses `AsyncStream<Message>` (not Combine) — the right choice for Swift 6 structured concurrency. The SPM package is configured as a binary framework target with XCFramework checksum verification.
 
 ### Rationale
 
@@ -636,8 +636,8 @@ Actor isolation follows the Swift 6.2 approachable concurrency rules: data carri
 - **`AsyncStream<Message>` over Combine:** Swift 6 strict concurrency treats Combine as a compatibility layer, not the forward path. `AsyncStream` integrates naturally with `for await` loops, structured concurrency cancellation, and `TaskGroup`. It requires zero imported frameworks and works identically on iOS, macOS, and in Swift package tests. Combine's `Publisher` → `AsyncSequence` bridging adds indirection without benefit.
 - **`@Observable` for SwiftUI state:** The `@Observable` macro (Swift 5.9+, iOS 17+) tracks property access at the granularity of individual properties rather than the whole object. This means `SCPContextState` annotated with `@Observable` triggers minimal view updates when only `memberCount` changes, not when `lastMessage` changes. Property wrappers like `@Published` (Combine) are legacy in this context.
 - **`deinit` + explicit `close()` for resource cleanup:** SCP contexts hold live crypto state (MLS group keys, sender AES-256 keys) that must be zeroed on deallocation. `close()` is the user-visible method for graceful teardown (leave the MLS group, flush the event log, close the transport connection). `deinit` is the safety net — it schedules a `Task { try? await close() }` to prevent resource leaks when a context object is dropped without explicit close. This matches the `Symbol.asyncDispose` pattern in the TypeScript SDK.
-- **`nonisolated struct` for DTOs:** Data carrier types (`Message`, `DIDDocument`, `OutletDefinition`, `Provenance`) are value types with no mutable state after construction. Marking them `nonisolated struct` makes all members inherit nonisolated context, satisfying Swift 6 `Sendable` without `@unchecked Sendable`. They cross actor boundaries freely as `Sendable` values.
-- **`SCP.create()` as async factory, not `init`:** The identity initialization path (`identity_create()`) is async (involves key generation and DID registration). Swift actors cannot have `async init`. The factory pattern `await SCP.create()` is the idiomatic solution. `ApplePlatformAdapter.make()` is injected at creation time — the caller controls custody.
+- **`nonisolated struct` for DTOs:** Data carrier types (`Message`, `ResolutionOutcome`, `OutletDefinition`, `Provenance`) are value types with no mutable state after construction. Marking them `nonisolated struct` makes all members inherit nonisolated context, satisfying Swift 6 `Sendable` without `@unchecked Sendable`. They cross actor boundaries freely as `Sendable` values.
+- **`SCP.create()` as async factory, not `init`:** The identity initialization path (`identity_create()`) is async, because it generates keys and publishes the inception event. Swift actors cannot have `async init`. The factory pattern `await SCP.create()` is the idiomatic solution. `ApplePlatformAdapter.make()` is injected at creation time — the caller controls custody.
 - **SPM binary framework target:** XCFramework binary distribution via SPM `binaryTarget` with checksum verification gives consumers a single `Package.swift` dependency with no Rust toolchain requirement. Swift compiler verifies the binary against the declared checksum on resolution.
 - **Flat delegation pattern — no logic in Swift:** Every Swift SDK method calls exactly one UniFFI bridge function. Zero protocol logic lives in the Swift layer. This prevents divergence between the Rust engine and the Swift surface and ensures one implementation of every operation.
 
@@ -657,7 +657,7 @@ bindings/swift/
   Sources/
     SCP/
       SCP.swift                       # SCP actor — top-level entry point, identity + transport init
-      Identity.swift                  # SCPIdentity actor, DIDDocument struct
+      Identity.swift                  # SCPIdentity actor, ResolutionOutcome struct
       Context.swift                   # SCPContext actor, AsyncStream<Message>, lifecycle
       Outlets.swift                     # OutletDefinition, TestVector, OutletVerificationResult structs
       Trust.swift                     # evaluateTrust(), TrustEvaluation struct
@@ -775,29 +775,29 @@ public actor SCP {
 **`SCPIdentity` actor:**
 
 ```swift
-/// An SCP identity (DID). Holds the signing key handle — never exposes private key bytes.
+/// An SCP identity. Holds the signing key handle — never exposes private key bytes.
 public actor SCPIdentity {
-    public let did: String
+    public let identifier: Data
     public let custodyType: String
 
     internal let handle: IdentityHandle
 
     internal init(handle: IdentityHandle) {
-        self.did = handle.did()
+        self.identifier = handle.identifier()
         self.custodyType = handle.custodyType()
         self.handle = handle
     }
 
     /// Load an existing identity from storage.
-    public static func load(did: String) async throws -> SCPIdentity {
-        let handle = try await identity_load(did: did)
+    public static func load(identifier: Data) async throws -> SCPIdentity {
+        let handle = try await identity_load(identifier: identifier)
         return SCPIdentity(handle: handle)
     }
 
     /// Resolve another identity's key state.
-    public func resolve(did: String) async throws -> DIDDocument {
-        let record = try await identity_resolve(did: did)
-        return DIDDocument(from: record)
+    public func resolve(identifier: Data) async throws -> ResolutionOutcome {
+        let record = try await identity_resolve(identifier: identifier)
+        return ResolutionOutcome(from: record)
     }
 
     /// Rotate this identity's signing key. Returns an updated identity.
@@ -1008,11 +1008,12 @@ public nonisolated struct OutletDefinition: Sendable {
     public let implementationHash: Data?
 }
 
-/// A key state resolved from an identity's key-event log.
-public nonisolated struct DIDDocument: Sendable {
-    public let did: String
-    public let verificationMethods: [VerificationMethod]
-    public let services: [ServiceEndpoint]
+/// What one resolution learned, mirroring `03-identity.md` §3.10.10.
+public nonisolated struct ResolutionOutcome: Sendable {
+    public let verdict: ResolutionVerdict
+    /// Present on `.confirmed` and `.adopted`, absent on every other verdict.
+    public let keyState: KeyState?
+    public let sources: ResolutionSources
     public let resolvedAt: TimeInterval
 }
 ```
@@ -1057,7 +1058,7 @@ public func validateUcan(token: String, capability: String, contextId: String) a
     try await ucan_validate(token: token, capability: capability, contextId: contextId)
 }
 
-/// Mint a UCAN token delegating capabilities to a member DID.
+/// Mint a UCAN token delegating capabilities to a member identity.
 public func mintUcan(
     identity: SCPIdentity,
     memberDid: String,
@@ -1112,7 +1113,7 @@ private func makeMessageStream(handle: ContextHandle) -> AsyncStream<Message> {
    All three commands exit 0 with zero warnings at `SWIFT_STRICT_CONCURRENCY=complete`.
 
 2. **`SCP.create()` factory:**
-   - `await SCP.create(custody: .platform)` returns an `SCP` actor with a valid `identity.did`.
+   - `await SCP.create(custody: .platform)` returns an `SCP` actor with a valid `identity.identifier`.
    - `await SCP.create(custody: .inMemory)` returns an `SCP` actor with a software-backed identity (for testing).
    - `SCP.create()` calls `ApplePlatformAdapter.make()` when `custody == .platform` and injects all four providers.
 
@@ -1121,14 +1122,14 @@ private func makeMessageStream(handle: ContextHandle) -> AsyncStream<Message> {
    ```swift
    let scp = try await SCP.create(custody: .inMemory)
    let identity = scp.identity
-   #expect(await !identity.did.isEmpty)
+   #expect(await identity.identifier.count == 32)
    #expect(await identity.custodyType == "in_memory")
 
-   let doc = try await identity.resolve(did: await identity.did)
+   let outcome = try await identity.resolve(identifier: await identity.identifier)
    #expect(!doc.verificationMethods.isEmpty)
 
    let rotated = try await identity.rotateKey()
-   #expect(await rotated.did == identity.did)  // DID is stable; key material rotates
+   #expect(await rotated.identifier == identity.identifier)  // the identifier is stable; key material rotates
    ```
 
 4. **`SCPContext` lifecycle:**
@@ -1180,7 +1181,7 @@ private func makeMessageStream(handle: ContextHandle) -> AsyncStream<Message> {
        description: "Summarize text",
        inputSchema: #"{"type":"object","properties":{"text":{"type":"string"}}}"#,
        outputSchema: #"{"type":"object","properties":{"summary":{"type":"string"}}}"#,
-       operatorDid: await scp.identity.did,
+       operatorDid: await scp.identity.identifier,
        testVectors: nil,
        implementationHash: nil
    ))
@@ -1247,13 +1248,13 @@ private func makeMessageStream(handle: ContextHandle) -> AsyncStream<Message> {
 |------|---------|
 | `Package.swift` | SPM package definition — binary XCFramework target + SCP source target + test target |
 | `Sources/SCP/SCP.swift` | `SCP` actor — top-level entry point, `create()` factory, `createContext()`, `joinContext()` |
-| `Sources/SCP/Identity.swift` | `SCPIdentity` actor — DID, `load()`, `resolve()`, `rotateKey()` |
+| `Sources/SCP/Identity.swift` | `SCPIdentity` actor — identifier, `load()`, `resolve()`, `rotateKey()` |
 | `Sources/SCP/Context.swift` | `SCPContext` actor — `send()`, `messages` stream, `invoke()`, `registerOutlet()`, `leave()`, `close()`, `deinit` |
 | `Sources/SCP/Outlets.swift` | `OutletDefinition`, `TestVector`, `OutletVerificationResult` nonisolated structs |
 | `Sources/SCP/Trust.swift` | `evaluateTrust()`, `TrustEvaluation` struct |
 | `Sources/SCP/EventLog.swift` | `SCPEventLog` (nonisolated class), `Event`, `Proof`, `Checkpoint` structs |
 | `Sources/SCP/Transport.swift` | `TransportConfig` struct, transport connection helpers |
-| `Sources/SCP/Types.swift` | `Message`, `Provenance`, `Capability`, `ContextParams`, `DIDDocument`, enums — all nonisolated Sendable structs |
+| `Sources/SCP/Types.swift` | `Message`, `Provenance`, `Capability`, `ContextParams`, `ResolutionOutcome`, enums — all nonisolated Sendable structs |
 | `Sources/SCP/Errors.swift` | `ScpError` enum, `LocalizedError` conformance, `init(from: ScpBindings.ScpError)` mapping |
 | `Sources/SCP/Ucan.swift` | `validateUcan()`, `mintUcan()`, `revokeUcan()` free functions |
 | `Sources/SCP/Mcp.swift` | `serveMcp()`, `McpClient` |
