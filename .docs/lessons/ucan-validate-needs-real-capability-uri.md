@@ -10,7 +10,7 @@
   `scp:ctx:{contextId}/{resource}:{action}` URI. The bridge rejects a bare `"*"` at
   URI-parse time, before any cryptographic check runs, so the caller receives an all-false
   verdict that reads as a legitimate result rather than an error.
-- **Pass the DID of the participant under assessment, and never let it default.** The
+- **Pass the identifier of the participant under assessment, and never let it default.** The
   bridge rejects an empty or absent `presenting_agent_did` / `subject_did`, which is what
   keeps the audience check from collapsing into `aud == aud`.
 - **A read-only capability evaluation measures self-consistency, not authorization.**
@@ -40,7 +40,7 @@
 - **Return typed results across the FFI; never classify a failure by prefix-matching a
   Display message.** A prose classifier couples every SDK to Rust's message text, and the
   safe failure mode — all-false on an unrecognized message — makes a reworded message a
-  silent regression rather than a loud one.
+  silent regression.
 - **Never infer "every earlier stage passed" from a hardcoded pipeline order.** A classifier
   that maps a failing stage to a list of stages it assumes ran first reports wrong `true`
   fields the moment someone reorders the pipeline, and the reorder produces no failing test.
