@@ -27,7 +27,7 @@ Build order: ADR-017 + ADR-019 (parallel, both depend on Phase 1-3) --> ADR-018 
 
 **Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
 
-**Amendment (2026-09-10 — trust-layer signature verification is ECDSA on P-256).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. The three signed structures this ADR defines carry `P256Signature` fields, its signature-verification step verifies an ECDSA signature on P-256 against the issuer's resolved public key, and its dependency list names the `p256` crate in place of an Ed25519 one. The four evaluation layers, their ordering, and the fail-closed direction are untouched.
+**Amendment (2026-09-10 — trust-layer signature verification is ECDSA on P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The three signed structures this ADR defines carry `P256Signature` fields, its signature-verification step verifies an ECDSA signature on P-256 against the issuer's resolved public key, and its dependency list names the `p256` crate. The four evaluation layers, their ordering, and the fail-closed direction are untouched.
 
 ### Context
 
@@ -64,7 +64,7 @@ Implement `scp-core/trust/` module. Participation records are computed locally f
 ```rust
 /// Verifiable facts computed from context event logs.
 pub struct ParticipationRecord {
-    pub subject_did: DID,
+    pub subject_did: [u8; 32],
     pub context_id: ContextId,
     pub participation_count: u64,
     pub participation_duration_seconds: u64,
@@ -82,8 +82,8 @@ pub struct ParticipationRecord {
 pub struct Attestation {
     pub id: String,
     pub attestation_type: AttestationType,
-    pub issuer: DID,
-    pub subject: DID,
+    pub issuer: [u8; 32],
+    pub subject: [u8; 32],
     pub claim: serde_json::Value,
     pub evidence: Option<AttestationEvidence>,
     pub issued_at: u64,
@@ -107,8 +107,8 @@ pub enum AttestationType {
 pub struct ChallengeRequest {
     pub challenge_id: String,
     pub challenge_type: ChallengeType,
-    pub challenger_did: DID,
-    pub subject_did: DID,
+    pub challenger_did: [u8; 32],
+    pub subject_did: [u8; 32],
     pub parameters: serde_json::Value,
     pub timeout: Duration,
     pub signature: P256Signature,
@@ -116,7 +116,7 @@ pub struct ChallengeRequest {
 
 pub struct ChallengeResponse {
     pub challenge_id: String,
-    pub responder_did: DID,
+    pub responder_did: [u8; 32],
     pub result: serde_json::Value,
     pub completed_at: u64,
     pub signature: P256Signature,
@@ -159,13 +159,13 @@ pub struct TrustInput {
 ```
 
 2. **`compute_participation_record(event_log, subject_did) -> Result<ParticipationRecord, TrustError>`**
-   - Scans event log entries for the subject DID.
+   - Scans event log entries for the subject identifier.
    - Computes: participation count/duration, outlet invocations by type/frequency, governance actions against/by identity, role progression, attestation history, context creation history.
    - Captures the Merkle root at computation time for verifiability.
    - Pure computation — no side effects, no storage.
 
 3. **`verify_attestation(attestation) -> Result<(), TrustError>`**
-   - Verifies P-256 signature against issuer's public key (resolved via DID).
+   - Verifies the P-256 signature against the issuer's public key, which the issuer's key state supplies (`03-identity.md` §3.10.4).
    - Validates evidence per attestation type.
    - Checks expiry: rejects if `expires_at < now`.
    - Checks revocation: queries revocation status.
@@ -176,7 +176,7 @@ pub struct TrustInput {
    - Standard challenge suites: prompt injection resistance, schema validation, rate limit compliance.
 
 5. **`verify_challenge_response(request, response) -> Result<ChallengeVerification, TrustError>`**
-   - Verifies response signature against responder's DID.
+   - Verifies the response signature against the responder's operational key.
    - Validates response matches the challenge parameters.
    - Distinguishes self-attested vs challenge-verified in metadata.
 
@@ -188,13 +188,13 @@ pub struct TrustInput {
    - Returns list of triggered consequences with the triggering evidence.
 
 7. **`check_threshold_attestation(&ThresholdCheckInput) -> ThresholdResult`**
-   - `ThresholdCheckInput` carries an attestation type, an attestor set, a threshold requirement, a subject DID, a `DidPublicKeyResolver`, a `Clock`, and an optional external revocation checker.
+   - `ThresholdCheckInput` carries an attestation type, an attestor set, a threshold requirement, a subject identifier, a `KeyResolver`, a `Clock`, and an optional external revocation checker.
    - Admits an attestor only when that attestor's carried attestation answers a required type, names a given subject, names that attestor as its own issuer, and passes `verify_attestation_with_revocation`.
-   - Deduplicates admitted attestors by DID, per spec §7.3.5 rule 1: "Attestors MUST have distinct DIDs. Multiple attestations from the same DID count as one attestation regardless of quantity." Deduplication runs after verification, so a rejected duplicate never consumes a slot.
+   - Deduplicates admitted attestors by identifier, per spec §7.3.5 rule 1, which requires attestors to carry distinct identifiers and counts several attestations from one attestor as one. Deduplication runs after verification, so a rejected duplicate never consumes a slot.
    - Verifies independence: shared context memberships and mutual endorsements reduce independence score.
    - Returns whether the N-of-M threshold is met with sufficient independence.
 
-   A prior revision of this ADR recorded three positional parameters — `(attestation_type, attestors, requirement)` — which admitted no subject, no issuer binding, and no signature check. Spec §7.3.5 rule 1 states distinct DIDs as REQUIRED, and that signature could not satisfy that rule, so N copies of one attestor yielded a full count and a maximum independence score. GitHub issue #2335 finding 9 recorded that gap; a named-field record above replaces those three parameters so no call path can skip a rule.
+   A prior revision of this ADR recorded three positional parameters — `(attestation_type, attestors, requirement)` — which admitted no subject, no issuer binding, and no signature check. Spec §7.3.5 rule 1 states distinct identifiers as REQUIRED, and that signature could not satisfy that rule, so N copies of one attestor yielded a full count and a maximum independence score. GitHub issue #2335 finding 9 recorded that gap; a named-field record above replaces those three parameters so no call path can skip a rule.
 
 8. **`check_attestation_freshness(attestation) -> FreshnessStatus`**
    - Evaluates renewal interval. Stale attestations (past renewal interval but not expired) are degraded, not revoked.
@@ -409,7 +409,7 @@ Implement `scp-core/provenance/` module. `DataProvenance` struct is attached aut
 pub struct DataProvenance {
     pub source_context: ContextId,
     pub source_type: SourceType,
-    pub counterparties: Vec<DID>,
+    pub counterparties: Vec<[u8; 32]>,
     pub purpose: Option<String>,
     pub discovery_method: DiscoveryMethod,
     pub age: Duration,
@@ -496,15 +496,15 @@ pub enum ProvenanceQuality {
 
 **Status:** Decided
 
-**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, retired the DID document. An agent's self-asserted capability URIs are `SCPCapabilities` entries of its service record, which its designated operational key signs (`03-identity.md` §3.10.13), and a resolver reaches that record by the identity resolution of §3.10.4 rather than by a DID-method lookup.
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, moved an agent's self-asserted capability URIs into `SCPCapabilities` entries of its service record, which its designated operational key signs (`03-identity.md` §3.10.13), and a resolver reaches that record by the identity resolution of §3.10.4 rather than by an identifier-method lookup.
 
 ### Context
 
-Spec §6.2.2 defines two-tier discovery: service-record capabilities (direct lookup, zero setup) and contexts with discovery outlets (searchable registries, community-operated). A service record contains a `SCPCapabilities` entry that lists an agent's capabilities — resolvable by anyone who knows the identifier. These are standard SCP contexts with open join policies and standardized outlet schemas for search, registration, and deregistration. Two-tier membership (§6.2.2B [no such section]) separates writers (MLS members, bounded) from readers (DID-authenticated, unbounded).
+Spec §6.2.2 defines two-tier discovery: service-record capabilities (direct lookup, zero setup) and contexts with discovery outlets (searchable registries, community-operated). A service record contains a `SCPCapabilities` entry that lists an agent's capabilities — resolvable by anyone who knows the identifier. These are standard SCP contexts with open join policies and standardized outlet schemas for search, registration, and deregistration. Two-tier membership (§6.2.2B [no such section]) separates writers (MLS members, bounded) from readers (identifier-authenticated, unbounded).
 
 ### Decision
 
-Implement `scp-core/discovery/` module. Service-record capability resolution over the identity resolution of `03-identity.md` §3.10.4. Contexts with discovery outlets as standard SCP contexts with standardized outlet schemas. Two-tier membership: writer (MLS, bounded at 500) + reader (DID-authenticated, unbounded). SDK provides unified search that merges local cache, DID resolution, and context queries.
+Implement `scp-core/discovery/` module. Service-record capability resolution over the identity resolution of `03-identity.md` §3.10.4. Contexts with discovery outlets as standard SCP contexts with standardized outlet schemas. Two-tier membership: writer (MLS, bounded at 500) + reader (identity-authenticated, unbounded). SDK provides unified search that merges local cache, identifier resolution, and context queries.
 
 ### Rationale
 
@@ -532,7 +532,7 @@ Implement `scp-core/discovery/` module. Service-record capability resolution ove
 ```rust
 /// Capability entry from a service record.
 pub struct CapabilityEntry {
-    pub did: DID,
+    pub did: [u8; 32],
     pub capabilities: Vec<String>,
     pub service_endpoints: Vec<String>,
     pub resolved_at: u64,
@@ -550,7 +550,7 @@ pub struct DiscoveryResult {
 }
 
 pub struct DiscoveryResultEntry {
-    pub did: DID,
+    pub did: [u8; 32],
     pub capabilities: Vec<String>,
     pub participation_summary: Option<serde_json::Value>,
     pub provenance: DataProvenance,
@@ -558,7 +558,7 @@ pub struct DiscoveryResultEntry {
 }
 
 pub struct RegistrationEntry {
-    pub did: DID,
+    pub did: [u8; 32],
     pub capabilities: Vec<String>,
     pub metadata: serde_json::Value,
     pub entry_id: String,
@@ -587,16 +587,16 @@ agent_deregister(did) -> { removed }
 
 4. **Two-tier membership:**
    - Writer tier: MLS members, bounded at 500, process registrations as MLS application messages.
-   - Reader tier: DID-authenticated, unbounded, query via outlet endpoints without MLS join.
+   - Reader tier: identity-authenticated, unbounded, query via outlet endpoints without MLS join.
 
 5. **Registration flow:**
-   - Reader sends DID-signed request.
+   - Reader sends a request signed by its operational key.
    - Writer verifies signature, records in event log as application message.
    - Registrant does NOT become MLS member.
 
 6. **Self-service updates:**
-   - Registered agents update entries via DID-authenticated requests to outlet endpoints.
-   - Writers verify DID matches entry owner before applying update.
+   - Registered agents update entries via identity-authenticated requests to outlet endpoints.
+   - Writers verify that the requester's identifier matches the entry owner before applying an update.
 
 7. **`unified_search(query, known_contexts) -> Result<DiscoveryResult, DiscoveryError>`**
    - Local contact cache (instant).
@@ -607,7 +607,7 @@ agent_deregister(did) -> { removed }
 8. **Bootstrap:**
    - SDK ships configurable default bootstrap context IDs.
    - Auto-query on first identity creation (opt-out).
-   - Fallback to direct DID resolution + manual context ID sharing.
+   - Fallback to direct identity resolution + manual context ID sharing.
 
 9. **Privacy:**
    - Registration opt-in per context.
@@ -639,9 +639,9 @@ agent_deregister(did) -> { removed }
 
 **Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
 
-**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, retired the DID document and overturned ADR-039's shared-identity `#agent` method. An identity carries a root set, one operational key, and a pre-rotation commitment; resolution returns a key state rather than a document (`09-security-model.md` §9.1 invariant 1, `03-identity.md` §3.10.4).
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, gave an identity a root set, one operational key, and a pre-rotation commitment, and resolution returns a key state (`09-security-model.md` §9.1 invariant 1, `03-identity.md` §3.10.4).
 
-**Amendment (2026-09-10 — the bridge's pseudonym derivation and Secure Enclave custody move to P-256).** Alec ruled on 2026-09-10 that every SCP key is an ECDSA key on NIST P-256 (`09-security-model.md` §9.5), superseding Ed25519 and X25519. The reason, which the orchestrator recommended and Alec accepted: P-256 is the curve every secure enclave, every passkey provider, every FIDO2 token, every TPM, and every browser's WebCrypto speaks, so hardware custody becomes real on Apple platforms and in the browser. Ed25519 was never argued against an alternative — it arrived in February 2026 as the joint default of did:dht, of the MLS baseline ciphersuite, and of the one-algorithm rule of `09-security-model.md` §9.5. SCP is pre-release, so no migration code follows. The pseudonym derivation this ADR's bridge exposes gains the seed-to-scalar step of §9.10.4 of the security-model spec, so its comment reads `P256_keygen(seed_to_scalar(seed[0..32]))`. The `KeyCustodyProvider` note states that the Swift implementation generates each P-256 key in the Secure Enclave, which the ruling made reachable and which ADR-025, the Apple platform adapter, carries in its own 2026-09-10 amendment. The UniFFI type mapping and the callback-interface shape are untouched.
+**Amendment (2026-09-10 — the bridge's pseudonym derivation and Secure Enclave custody move to P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The pseudonym derivation this ADR's bridge exposes gains the seed-to-scalar step of §9.10.4 of the security-model spec, so its comment reads `P256_keygen(seed_to_scalar(seed[0..32]))`. The `KeyCustodyProvider` note states that the Swift implementation generates each P-256 key in the Secure Enclave, which the ruling made reachable and which ADR-025, the Apple platform adapter, carries in its own 2026-09-10 amendment. The UniFFI type mapping and the callback-interface shape are untouched.
 
 ### Context
 
@@ -682,7 +682,7 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
 
 ### Dependencies
 
-- **All Phase 1 ADRs (ADR-001 through ADR-007):** The bridge exposes MLS operations, envelope creation, DID identity, transport, sender keys, and platform adapters to Swift and Kotlin.
+- **All Phase 1 ADRs (ADR-001 through ADR-007):** The bridge exposes MLS operations, envelope creation, identity, transport, sender keys, and platform adapters to Swift and Kotlin.
 - **All Phase 2 ADRs (ADR-008 through ADR-012):** The bridge exposes context lifecycle, role/UCAN enforcement, outlet registration/invocation, event log queries, and multi-transport routing to Swift and Kotlin.
 - **ADR-013 (PyO3 Bridge):** Establishes the FFI pattern. The UniFFI bridge mirrors the same logical API surface: same function set, same type categories (opaque vs value), same error hierarchy. ADR-013 is the reference implementation; ADR-021 must expose an equivalent surface.
 - **ADR-006 (Platform Abstraction):** Platform traits (`KeyCustody`, `PushProvider`, `Storage`, `DeviceAttestationProvider`) are exposed as callback interfaces. Swift implementations use Keychain/APNs/DCAppAttestService; Kotlin implementations use Android Keystore/SharedPreferences/FCM/Play Integrity.
@@ -702,16 +702,16 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
    async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError> { ... }
 
    #[uniffi::export]
-   async fn identity_load(did: String) -> Result<Arc<Identity>, ScpError> { ... }
+   async fn identity_load(identifier: Vec<u8>) -> Result<Arc<Identity>, ScpError> { ... }
 
    #[uniffi::export]
-   async fn identity_resolve(did: String) -> Result<DIDDocument, ScpError> { ... }
+   async fn identity_resolve(identifier: Vec<u8>) -> Result<ResolutionOutcome, ScpError> { ... }
    ```
 
    - `identity_create(custody) -> Identity` — creates a new identity with a root set, an Active Signing Key, and a Pre-Rotation Key. `custody` is a string: `"platform"`, `"in_memory"`.
-   - `identity_load(did) -> Identity` — loads an existing identity from storage.
-   - `identity_resolve(did) -> DIDDocument` — resolves an identifier to its key state. The key state names the standing root, the one operational role `#active`, and each member of the next set.
-   - `Identity` is an opaque object interface exposing: `did() -> String`, `custody_type() -> String`, `rotateActiveKey() -> Identity`, `rotateAgentKey() -> Identity`. No rule stands behind the agent-key rotation, because a human identity's key state names no agent key.
+   - `identity_load(identifier) -> Identity` — loads an existing identity from storage.
+   - `identity_resolve(identifier) -> ResolutionOutcome` — resolves an identifier to its key state. The key state names the standing root, the one operational role `#active`, and each member of the next set.
+   - `Identity` is an opaque object interface exposing: `identifier() -> Vec<u8>`, `custody_type() -> String`, and `rotateActiveKey() -> Identity`.
 
 3. **Context bridge functions:**
 
@@ -794,7 +794,7 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
     |-----------|-------------|-----------------|------------------|
     | `ContextParams` | `#[derive(uniffi::Record)]` | `struct ContextParams` | `data class ContextParams` |
     | `Message` | `#[derive(uniffi::Record)]` | `struct Message` | `data class Message` |
-    | `DIDDocument` | `#[derive(uniffi::Record)]` | `struct DIDDocument` | `data class DIDDocument` |
+    | `ResolutionOutcome` | `#[derive(uniffi::Record)]` | `struct ResolutionOutcome` | `data class ResolutionOutcome` |
     | `OutletDefinition` | `#[derive(uniffi::Record)]` | `struct OutletDefinition` | `data class OutletDefinition` |
     | `OutletVerificationResult` | `#[derive(uniffi::Record)]` | `struct OutletVerificationResult` | `data class OutletVerificationResult` |
     | `TransportStatus` | `#[derive(uniffi::Record)]` | `struct TransportStatus` | `data class TransportStatus` |
@@ -899,7 +899,7 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
     - All functions that perform I/O (network, storage, crypto operations) are declared `async` in the UniFFI export.
     - UniFFI generates Swift `async` functions (bridged via `CheckedContinuation`) and Kotlin `suspend` functions (bridged via coroutine integration).
     - The Rust tokio runtime executes the future; UniFFI's async scaffolding resumes the caller's async context on completion.
-    - Sync accessors on opaque objects (e.g., `Identity.did()`, `ContextHandle.context_id()`) are non-async and return immediately.
+    - Sync accessors on opaque objects (e.g., `Identity.identifier()`, `ContextHandle.context_id()`) are non-async and return immediately.
     - Streaming (message receive) uses the `MessageListener` callback interface rather than async return, because UniFFI does not support returning `Stream` types. The Swift/Kotlin SDK wrapper layers convert the callback pattern to `AsyncSequence` / `Flow` respectively.
 
 14. **Thread safety:**
@@ -1553,7 +1553,7 @@ This is the only structural shape that respects the "one implementation" invaria
 
 **Status:** Decided
 
-**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, retired the DID document. A self-asserted capability URI is an `SCPCapabilities` entry of the declaring identity's service record (`03-identity.md` §3.10.13), and the identity-scoped custom namespace resolves through the identity resolution of §3.10.4.
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, made a self-asserted capability URI an `SCPCapabilities` entry of the declaring identity's service record (`03-identity.md` §3.10.13), and the identity-scoped custom namespace resolves through the identity resolution of §3.10.4.
 
 ### Context
 
@@ -1592,13 +1592,13 @@ Initial protocol registry defines 28 challenge capabilities across 10 categories
 | Bias / Fairness | `bias-resistance/v1`, `viewpoint-diversity/v1` |
 | Factual / Hallucination | `factual-accuracy/v1`, `hallucination-resistance/v1`, `source-attribution/v1` |
 
-**2. DID-scoped custom capabilities:**
+**2. Identity-scoped custom capabilities:**
 
 ```
-did:{method}:{id}:capability:{kebab-case-name}/v{integer}
+{identifier}:capability:{kebab-case-name}/v{integer}
 ```
 
-Anyone can define capabilities under their own DID. Authority is the definer's identity. Verifiers evaluate the capability based on who defined it — trust in the capability is trust in the definer.
+The identifier's textual encoding waits on a later revision of `09-security-model.md` §9.7.4.2 R13, so this ADR fixes the suffix and not the prefix. Anyone can define capabilities under their own identifier. Authority is the definer's identity. Verifiers evaluate the capability based on who defined it — trust in the capability is trust in the definer.
 
 **3. System capabilities (`scp:system:*`):**
 
@@ -1618,7 +1618,7 @@ Protocol-level feature flags for node roles. Not challenge-testable — these de
 ### Rationale
 
 - **Structured URIs over free-form strings:** Free-form strings (the `Custom(String)` approach) provide no authority boundary, no versioning, and no way to distinguish protocol-defined from user-defined capabilities. URI structure solves all three: the prefix identifies authority, `/v{N}` provides versioning, and kebab-case enforces naming consistency.
-- **DID-scoped custom namespace over centralized registry:** A centralized registry (maintained by Limn or a standards body) would violate the "protocol requires no operator" tenet. DID-scoped custom capabilities are self-sovereign — anyone can define them under their own DID without permission from any authority.
+- **Identity-scoped custom namespace over centralized registry:** A centralized registry (maintained by Limn or a standards body) would violate the "protocol requires no operator" tenet. Identity-scoped custom capabilities are self-sovereign — anyone can define them under their own identifier without permission from any authority.
 - **SDK-enforced prefix reservation over social convention:** Social convention ("please don't use `scp:capability:*` for your own capabilities") is unenforceable. SDK-level rejection of unknown `scp:capability:*` URIs makes spoofing mechanically impossible for conformant implementations.
 - **Versioned capabilities over unversioned:** Challenge suites will evolve as attack vectors and verification techniques improve. Version numbers enable breaking changes without invalidating existing verifications.
 - **System capabilities as separate namespace:** System capabilities (`scp:system:*`) describe node roles, not agent behaviors. They are not challenge-testable. Mixing them with challenge capabilities would create confusion about what can and cannot be verified.
@@ -1627,7 +1627,7 @@ Protocol-level feature flags for node roles. Not challenge-testable — these de
 
 1. **Free-form strings with no namespace structure.** The current `Custom(String)` approach. No authority boundary, no versioning, no anti-spoofing. Anyone can claim any string. This is what the protocol had before this ADR. Rejected because it provides no mechanism to distinguish protocol-defined from user-defined capabilities, and no way to prevent capability impersonation.
 
-2. **Centralized registry maintained by a standards body or Limn.** A single authority defines and maintains the canonical capability list. New capabilities require registry approval. Rejected because it violates the "protocol requires no operator" tenet and creates a bottleneck for ecosystem evolution. The DID-scoped namespace provides the same extensibility without central authority.
+2. **Centralized registry maintained by a standards body or Limn.** A single authority defines and maintains the canonical capability list. New capabilities require registry approval. Rejected because it violates the "protocol requires no operator" tenet and creates a bottleneck for ecosystem evolution. The identifier-scoped namespace provides the same extensibility without central authority.
 
 3. **Capability ontology (OWL/RDF).** Formal semantic web vocabulary for capability relationships (subsumption, composition, equivalence). Provides rich reasoning but adds enormous complexity. Rejected because SCP capabilities are atomic (exact string match) and do not require subsumption reasoning. The URI structure provides sufficient expressiveness for the protocol's needs.
 
@@ -1638,7 +1638,7 @@ Protocol-level feature flags for node roles. Not challenge-testable — these de
 - Context admission requirements can reference specific capability URIs (e.g., "requires `scp:capability:prompt-injection-resistance/v1` challenge-verified").
 - SDK implementations across all languages must include the protocol registry and reject unknown `scp:capability:*` URIs.
 - The protocol registry is versioned and signed. Adding new `scp:capability:*` URIs requires a protocol version bump.
-- DID-scoped custom capabilities enable ecosystem-driven extension without protocol changes.
+- Identity-scoped custom capabilities enable ecosystem-driven extension without protocol changes.
 
 ### Dependencies
 
@@ -1649,11 +1649,11 @@ Protocol-level feature flags for node roles. Not challenge-testable — these de
 
 ### Acceptance Criteria
 
-1. **URI parser** validates `scp:capability:{kebab-case}/v{N}`, `did:{method}:{id}:capability:{kebab-case}/v{N}`, and `scp:system:{kebab-case}`. Rejects malformed URIs with specific error variants.
+1. **URI parser** validates `scp:capability:{kebab-case}/v{N}`, `{identifier}:capability:{kebab-case}/v{N}`, and `scp:system:{kebab-case}`. Rejects malformed URIs with specific error variants.
 
 2. **Protocol registry** contains all 28 challenge capability URIs and 5 system capability URIs. Lookup by URI returns registry metadata (category, description, parameter schema). Unknown `scp:capability:*` URIs return `Err(UnknownProtocolCapability)`.
 
-3. **`ChallengeType` unification:** existing `PromptInjectionResistance` maps to `scp:capability:prompt-injection-resistance/v1`, `SchemaValidation` maps to `scp:capability:schema-validation/v1`, `RateLimitCompliance` maps to `scp:capability:rate-limit-compliance/v1`. `Custom(String)` is replaced by `Uri(CapabilityUri)` which must be a valid DID-scoped or protocol-scoped URI.
+3. **`ChallengeType` unification:** existing `PromptInjectionResistance` maps to `scp:capability:prompt-injection-resistance/v1`, `SchemaValidation` maps to `scp:capability:schema-validation/v1`, `RateLimitCompliance` maps to `scp:capability:rate-limit-compliance/v1`. `Custom(String)` is replaced by `Uri(CapabilityUri)` which must be a valid identity-scoped or protocol-scoped URI.
 
 4. **`CapabilityEntry` update:** `capabilities: Vec<String>` becomes `capabilities: Vec<CapabilityUri>` where `CapabilityUri` is the validated URI type. Service-record entry parsing validates URIs.
 
@@ -1671,9 +1671,9 @@ Protocol-level feature flags for node roles. Not challenge-testable — these de
 
 ### Context
 
-SCP's human-readable addressing system (§22) defines handle outlets (`handle_register`, `handle_lookup`, `handle_deregister`) that map human-readable names to DIDs or context IDs within a context's handle registry. The addressing system also defines "scopes" — the part after `@` in addresses like `alice@cooking-community` — which currently resolve via a client-side mapping of scope names to context IDs (§22.3.2). There is no protocol-level mechanism to register, look up, or deregister scope-to-context mappings.
+SCP's human-readable addressing system (§22) defines handle outlets (`handle_register`, `handle_lookup`, `handle_deregister`) that map human-readable names to identifiers or context IDs within a context's handle registry. The addressing system also defines "scopes" — the part after `@` in addresses like `alice@cooking-community` — which currently resolve via a client-side mapping of scope names to context IDs (§22.3.2). There is no protocol-level mechanism to register, look up, or deregister scope-to-context mappings.
 
-Scope registration is needed so that contexts can be discovered by human-readable names. For example, a user typing `alice@cooking-community` needs to resolve `cooking-community` to a context ID before they can resolve `alice` within that context's handle registry. This is a two-hop resolution: scope name to context ID, then handle name to DID.
+Scope registration is needed so that contexts can be discovered by human-readable names. For example, a user typing `alice@cooking-community` needs to resolve `cooking-community` to a context ID before they can resolve `alice` within that context's handle registry. This is a two-hop resolution: scope name to context ID, then handle name to identifier.
 
 The existing handle outlets already support `HandleTarget::Context`, which maps a handle name to a context ID plus relay URLs. Scope registration is functionally identical to handle registration with two constraints: (1) the target must be a context, not an identity; (2) scope names must not contain dots, since dots are the syntactic discriminator between scope-based and domain-based resolution (§22.8.1).
 
@@ -1681,7 +1681,7 @@ The existing handle outlets already support `HandleTarget::Context`, which maps 
 
 Scope registration uses **independent structs for all types**, with separate storage. Three scope outlets — `scope_register`, `scope_lookup`, `scope_deregister` — mirror the corresponding handle outlet logic with two constraints enforced at the registry level:
 
-1. **Context-only targets.** `ScopeTarget` is context-only by construction — it has no identity variant. Scope names map to contexts, not to individual DIDs. Identity resolution within a context uses handle outlets directly.
+1. **Context-only targets.** `ScopeTarget` is context-only by construction — it has no identity variant. Scope names map to contexts, not to individual identifiers. Identity resolution within a context uses handle outlets directly.
 
 2. **No dots in scope names.** `validate_scope_name()` enforces the charset `[a-z0-9-]` (matching §22.3.2 normalization output), max 64 characters, no leading or trailing hyphens. Dots are forbidden because the presence of a dot in the scope portion of an address is the syntactic discriminator that routes resolution to the domain path (§22.8.1). Underscores are excluded to match the normalization output of §22.3.2, which strips non-alphanumeric characters except hyphens.
 
@@ -1691,11 +1691,11 @@ Scope registration uses **independent structs for all types**, with separate sto
 // All scope types are independent structs
 ScopeRegisterParams   { name: String, target: ScopeTarget, metadata: Option<ScopeMetadata> }
 ScopeLookupParams     { name: String }
-ScopeDeregisterParams { name: String, did: DID }
+ScopeDeregisterParams { name: String, did: [u8; 32] }
 ScopeRegisterResult   { status: ScopeRegisterStatus, entry_id: Option<String> }
 ScopeLookupResult     { results: Vec<ScopeEntry> }
 ScopeDeregisterResult { removed: bool }
-ScopeEntry            { name: String, target: ScopeTarget, owner_did: DID, registered_at: u64, metadata: ScopeMetadata, entry_id: String }
+ScopeEntry            { name: String, target: ScopeTarget, owner_did: [u8; 32], registered_at: u64, metadata: ScopeMetadata, entry_id: String }
 ScopeMetadata         { description: Option<String>, tags: Option<Vec<String>> }
 ScopeTarget           { context_id: String, relay_urls: Vec<String> }
 ScopeRegisterStatus   :: Registered | Conflict | Updated
@@ -1711,7 +1711,7 @@ Callers always use the `Scope*` names because scope operations are conceptually 
 
 These constraints are built into the registry, not just the outlet wrapper.
 
-Separate outlet names (`scope_*` vs `handle_*`) provide semantic separation at the API surface: scope outlets are "the phone book for namespaces" (mapping scope names to context IDs), while handle outlets are "the phone book for participants" (mapping names to DIDs or contexts within a single namespace).
+Separate outlet names (`scope_*` vs `handle_*`) provide semantic separation at the API surface: scope outlets are "the phone book for namespaces" (mapping scope names to context IDs), while handle outlets are "the phone book for participants" (mapping names to identifiers or contexts within a single namespace).
 
 See §22.3.5 for the detailed outlet schemas, `validate_scope_name()` rules, resolution flow, hosting model, and authorization model.
 
@@ -1757,19 +1757,19 @@ See §22.3.5 for the detailed outlet schemas, `validate_scope_name()` rules, res
 
 #### Inherited Handle-Outlet Threats
 
-Scope outlets inherit all handle-outlet security properties (see §22.3.1 for the DID-signed request scheme and full threat analysis) because they mirror handle outlet logic. The scope-specific difference: a malicious relay URL in a scope entry has **namespace-wide blast radius** — it affects every address resolved through that scope, not just a single identity lookup.
+Scope outlets inherit all handle-outlet security properties (see §22.3.1 for the signed-request scheme and full threat analysis) because they mirror handle outlet logic. The scope-specific difference: a malicious relay URL in a scope entry has **namespace-wide blast radius** — it affects every address resolved through that scope, not just a single identity lookup.
 
 **Cross-type namespace collision: eliminated.** Because `ScopeRegistry` uses separate storage from `HandleRegistry`, a handle registration cannot block, shadow, or interfere with a scope registration (and vice versa). Each registry enforces its own constraints independently.
 
-**TOCTOU risk on re-registration: eliminated.** Same-owner re-registration (`scope_register` by the same DID with a different target or metadata) atomically updates the existing entry in place and returns `Updated` status. This eliminates the race window that would exist if the owner had to deregister and re-register separately — another registrant could claim the name between the two operations.
+**TOCTOU risk on re-registration: eliminated.** Same-owner re-registration (`scope_register` by the same identifier with a different target or metadata) atomically updates the existing entry in place and returns `Updated` status. This eliminates the race window that would exist if the owner had to deregister and re-register separately — another registrant could claim the name between the two operations.
 
 #### Typosquatting Across Resolution Boundaries
 
-**Threat:** `alice@limn` (scope-based, no dot) and `alice@limn.co` (domain-based, has dot) are different resolution paths that may resolve to different DIDs. A user may not distinguish between them.
+**Threat:** `alice@limn` (scope-based, no dot) and `alice@limn.co` (domain-based, has dot) are different resolution paths that may resolve to different identifiers. A user may not distinguish between them.
 
 **Mitigations:**
 - **(a) Resolution path metadata.** The multi-path resolver returns results with explicit `ResolutionPath` metadata (§22.8). Consumers can distinguish scope-resolved results from domain-resolved results.
-- **(b) SDK similarity warnings.** SDKs SHOULD warn when similar addresses resolve via different paths to different DIDs. For example, if both `alice@limn` and `alice@limn.co` are in the user's history and resolve to different DIDs, the SDK should surface this as a potential confusion risk.
+- **(b) SDK similarity warnings.** SDKs SHOULD warn when similar addresses resolve via different paths to different identifiers. For example, if both `alice@limn` and `alice@limn.co` are in the user's history and resolve to different identifiers, the SDK should surface this as a potential confusion risk.
 - **(c) Petname disambiguation.** Petnames (§22.4) provide user-controlled disambiguation that overrides any ambiguity. Once the user assigns a petname, the ambiguous address is bypassed entirely.
 
 **Classification:** UX hazard with SDK-level mitigations. Not a protocol-level vulnerability.
@@ -1788,7 +1788,7 @@ Scope outlets inherit all handle-outlet security properties (see §22.3.1 for th
 
 #### Scope Registry Surveillance
 
-Scope registries, as first-hop resolution points, see resolution metadata for every scoped address lookup. A scope registry operator observes which scope names are queried, by which DIDs, and at what frequency. Privacy-sensitive deployments should consider the implications of centralized scope registries. The mitigations from §22.10.5 (Query Surveillance) apply: distribute lookups across multiple registries, leverage SDK caching, and note that the protocol does not mandate query logging beyond registration events.
+Scope registries, as first-hop resolution points, see resolution metadata for every scoped address lookup. A scope registry operator observes which scope names are queried, by which identifiers, and at what frequency. Privacy-sensitive deployments should consider the implications of centralized scope registries. The mitigations from §22.10.5 (Query Surveillance) apply: distribute lookups across multiple registries, leverage SDK caching, and note that the protocol does not mandate query logging beyond registration events.
 
 ### Dependencies
 
@@ -1812,7 +1812,7 @@ Scope registries, as first-hop resolution points, see resolution metadata for ev
 
 6. **Independent structs for all types.** Every scope type is an independent struct: `ScopeRegisterParams { name, target: ScopeTarget, metadata }`, `ScopeLookupParams { name }`, `ScopeDeregisterParams { name, did }`, `ScopeRegisterResult { status: ScopeRegisterStatus, entry_id }`, `ScopeLookupResult { results: Vec<ScopeEntry> }`, `ScopeDeregisterResult { removed }`, `ScopeEntry { name, target: ScopeTarget, owner_did, registered_at, metadata, entry_id }`, `ScopeMetadata { description, tags }`, `ScopeTarget { context_id, relay_urls }`, `ScopeRegisterStatus { Registered, Conflict, Updated }`. No scope type is a type alias for a handle type. All callsites use the `Scope*` names.
 
-7. **Separate `ScopeRegistry` storage.** `ScopeRegistry` is its own struct with its own `HashMap<String, ScopeEntry>`. It is NOT a `HandleRegistry` instance. Scope entries and handle entries never share storage. Constraint enforcement (`validate_scope_name()`, context-only targets via `ScopeTarget`) is built into `ScopeRegistry::register()`. Since `ScopeTarget` is context-only by construction, the identity ownership check from `HandleRegistry` does not apply — there is no DID-to-handle binding to verify at registration time. Deregistration still verifies that the requester's DID matches the entry's `owner_did`.
+7. **Separate `ScopeRegistry` storage.** `ScopeRegistry` is its own struct with its own `HashMap<String, ScopeEntry>`. It is NOT a `HandleRegistry` instance. Scope entries and handle entries never share storage. Constraint enforcement (`validate_scope_name()`, context-only targets via `ScopeTarget`) is built into `ScopeRegistry::register()`. Since `ScopeTarget` is context-only by construction, the identity ownership check from `HandleRegistry` does not apply — there is no identifier-to-handle binding to verify at registration time. Deregistration still verifies that the requester's identifier matches the entry's `owner_did`.
 
 8. **FFI bridges.** All three bridges (PyO3, NAPI, UniFFI) expose `scope_register`, `scope_lookup`, `scope_deregister` functions. Each bridge has a `scope_registries()` global singleton separate from `handle_registries()`.
 
