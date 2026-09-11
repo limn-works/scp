@@ -3,8 +3,8 @@
 **Problem**: a shared `_fromHandle` constructor is written against the common shape of an
 object, so it drops by omission whatever a specific bridge method returns beyond that shape.
 The napi `identityMigrate` returns a handle carrying `rotationEventJson` — the rotation event
-the caller must distribute to active context members, per §9.12 of the security-model spec
-and §4b of ADR-003, DID creation. The TypeScript SDK re-wrapped that handle through
+the caller must distribute to active context members, per the compromise recovery protocol,
+§9.12 of the security-model spec. The TypeScript SDK re-wrapped that handle through
 `Identity._fromHandle`, which captures `did` and `custodyType` alone, so the field existed on
 the bridge handle and reached no accessor. The migrate-then-distribute flow was impossible
 from TypeScript, and the operation looked wired because it returned an `Identity`.
