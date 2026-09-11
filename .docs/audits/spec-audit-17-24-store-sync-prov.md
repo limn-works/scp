@@ -24,7 +24,7 @@ The findings are organized per-file, then by severity.
 ### [17.2] Missing Maximum Key Length
 - **Category**: Missing constants/defaults
 - **Location**: Section 17.2-17.3
-- **What's missing**: Keys are "UTF-8 strings" with no maximum length specified. The key convention in 17.3 uses DIDs (variable length), context IDs (hex-encoded, variable length), and zero-padded sequence numbers. No maximum key length is specified. SQLite has a default max key of ~1 billion bytes; other backends may not.
+- **What's missing**: Keys are "UTF-8 strings" with no maximum length specified. The key convention in 17.3 uses identifiers, context IDs (hex-encoded, variable length), and zero-padded sequence numbers. No maximum key length is specified. SQLite has a default max key of ~1 billion bytes; other backends may not.
 - **Why it matters**: An adapter implementing `Storage` for a backend with a shorter key limit (e.g., redb's 4 KiB key limit) would silently truncate or fail. Without a specified max, conformance testing cannot validate key length handling.
 - **Severity**: LOW
 
@@ -35,11 +35,11 @@ The findings are organized per-file, then by severity.
 - **Why it matters**: Without a value size limit, a malicious or buggy protocol layer could cause OOM in storage backends that buffer the full value in memory. The streaming API exists for `BlobStorage` but not for `Storage`.
 - **Severity**: MEDIUM
 
-### [17.3] DID Cache TTL Not Specified
+### [17.3] Resolution Cache TTL Not Specified
 - **Category**: Missing constants/defaults
 - **Location**: Section 17.4, lines 183-185
-- **What's missing**: `cache_did_document` accepts an `expires_at: u64` parameter, but no default or recommended TTL is specified anywhere in the spec. How long should a cached DID document be considered valid? The spec for DID resolution (section 3) and the BEP44 sequence number monotonicity rule (section 18.2.1) are relevant but don't specify a cache duration.
-- **Why it matters**: Too short a TTL causes excessive DHT queries (bandwidth, latency). Too long a TTL means stale DID documents (missed key rotations, relay URL changes). An implementor must guess.
+- **What's missing**: `cache_did_document` accepts an `expires_at: u64` parameter, but no default or recommended TTL is specified anywhere in the spec. How long should a cached key state be considered valid? The identity resolution spec (section 3) and the sequence monotonicity rule (section 18.2.1) are relevant but don't specify a cache duration.
+- **Why it matters**: Too short a TTL causes excessive relay queries (bandwidth, latency). Too long a TTL means stale key state (missed key rotations, relay URL changes). An implementor must guess.
 - **Severity**: MEDIUM
 
 ### [17.3] TOFU Record Format Undefined
@@ -140,7 +140,7 @@ The findings are organized per-file, then by severity.
 ### [18.3.2] Verification Chain Timeout Not Specified
 - **Category**: Missing constants/defaults
 - **Location**: Section 18.3.2, lines 128-133
-- **What's missing**: The verification chain (fetch `.well-known/scp`, resolve DID via DHT, compare) involves two network operations. No timeout is specified for either step or for the overall verification. No behavior is specified if DHT resolution fails (is `.well-known/scp` data usable without verification?).
+- **What's missing**: The verification chain (fetch `.well-known/scp`, resolve the identity, compare) involves two network operations. No timeout is specified for either step or for the overall verification. No behavior is specified if resolution fails (is `.well-known/scp` data usable without verification?).
 - **Why it matters**: In practice, DHT resolution can take seconds to minutes depending on network conditions. Without a timeout, clients may hang. Without fallback behavior, clients with no DHT access (e.g., behind restrictive firewalls) cannot use `.well-known/scp` at all.
 - **Severity**: MEDIUM
 
@@ -172,11 +172,11 @@ The findings are organized per-file, then by severity.
 - **Why it matters**: ACME failures are common in production (port 80 blocked, DNS propagation delay, rate limits). The failure mode determines whether the node is available during certificate issues.
 - **Severity**: MEDIUM
 
-### [18.6.4] DID Re-Publication Trigger Not Fully Specified
+### [18.6.4] Re-Publication Trigger Not Fully Specified
 - **Category**: Missing edge cases
 - **Location**: Section 18.6.4, line 383
-- **What's missing**: "DID publication happens once on `.build()` and on relay URL changes." But relay URL changes are never specified as a runtime operation on `ApplicationNode`. There's no `update_relay_url()` method. And the BEP44 republication interval for liveness (keeping the DHT entry alive) is not specified in this section, though section 3 mentions "every 6 days."
-- **Why it matters**: BEP44 entries have a TTL. Without periodic republication, the identity becomes unresolvable after the DHT entry expires. The 6-day interval is mentioned in section 3 but not cross-referenced here, and `ApplicationNode` doesn't appear to have a background republication task.
+- **What's missing**: "Publication happens once on `.build()` and on relay URL changes." But relay URL changes are never specified as a runtime operation on `ApplicationNode`. There's no `update_relay_url()` method. And the republication interval for liveness (keeping the stored record alive) is not specified in this section, though section 3 mentions "every 6 days."
+- **Why it matters**: Relay-stored records have a TTL. Without periodic republication, the identity becomes unresolvable after the record expires. The 6-day interval is mentioned in section 3 but not cross-referenced here, and `ApplicationNode` doesn't appear to have a background republication task.
 - **Severity**: MEDIUM
 
 ### [18.10.2] Dev API Token Entropy Not Specified
@@ -260,17 +260,17 @@ The findings are organized per-file, then by severity.
 - **Why it matters**: Without a minimum notification period, a context operator could change pricing from $0 to $1000/message with zero notice, trapping agents with queued messages.
 - **Severity**: HIGH
 
-### [19.3] EconomicPolicy payee DID Verification Not Specified
+### [19.3] EconomicPolicy payee Verification Not Specified
 - **Category**: Security-relevant omissions
 - **Location**: Section 19.3, line 302
-- **What's missing**: `payee: DID` -- who verifies that the payee DID is legitimate? Can any context admin set any DID as the payee? Is there a requirement that the payee DID be a member of the context? Or the context creator?
-- **Why it matters**: A compromised admin could change the payee DID to their own, redirecting all payments. Without verification requirements, this is an expected attack vector.
+- **What's missing**: The `payee` field -- who verifies that the payee is legitimate? Can any context admin set any identity as the payee? Must the payee be a member of the context, or the context creator?
+- **Why it matters**: A compromised admin could change the payee to their own, redirecting all payments. Without verification requirements, this is an expected attack vector.
 - **Severity**: MEDIUM
 
 ### [19.3] Outlet-Level Cost Payee and Currency Independence
 - **Category**: Missing edge cases
 - **Location**: Section 19.3, line 314
-- **What's missing**: "Outlet costs carry their own payee DID (may differ from context payee)." But what if the outlet's currency differs from the context's currency? Must the payer hold adapter credentials for both? What if the payer has a spending UCAN for USD but the outlet costs BTC?
+- **What's missing**: "Outlet costs carry their own payee (may differ from context payee)." But what if the outlet's currency differs from the context's currency? Must the payer hold adapter credentials for both? What if the payer has a spending UCAN for USD but the outlet costs BTC?
 - **Why it matters**: Multi-currency contexts create combinatorial adapter requirements that the spec doesn't address.
 - **Severity**: LOW
 
@@ -326,7 +326,7 @@ The findings are organized per-file, then by severity.
 ### [19.6] PaymentReceipt signature Scope Not Specified
 - **Category**: Security-relevant omissions
 - **Location**: Section 19.6, line 423
-- **What's missing**: `signature: Vec<u8>` is "Ed25519 signature by payer." But what is signed? The entire receipt? A canonical serialization of specific fields? If the signature covers `adapter_proof` (which varies by adapter), the verification must know the canonical form. Also, which key signs -- the payer's `#active` key? `#agent` key? Either?
+- **What's missing**: `signature: Vec<u8>` is a signature by the payer. But what is signed? The entire receipt? A canonical serialization of specific fields? If the signature covers `adapter_proof` (which varies by adapter), the verification must know the canonical form. Also, which key signs the receipt?
 - **Why it matters**: Without specifying the signed payload, receipt signature verification is non-interoperable. Different implementations would compute different signatures for the same receipt.
 - **Severity**: HIGH
 
@@ -383,10 +383,10 @@ The findings are organized per-file, then by severity.
 - **Why it matters**: The disambiguation rule is fragile. In practice, new TLDs and single-label domains mean the "contains a dot" heuristic has edge cases.
 - **Severity**: LOW
 
-### [22.3.1] Handle Outlet DID-Signature Verification Scheme Not Specified
+### [22.3.1] Handle Outlet Signature Verification Scheme Not Specified
 - **Category**: Security-relevant omissions
 - **Location**: Section 22.3.1, line 148
-- **What's missing**: "All handle outlet requests MUST carry a DID signature over the request payload." But: (a) What is "the request payload" -- the JSON body? A canonical serialization? (b) What signature scheme -- Ed25519 over the raw bytes? JWS? (c) Where is the signature carried -- an HTTP header? A field in the request body? A UCAN?
+- **What's missing**: "All handle outlet requests MUST carry an identity signature over the request payload." But: (a) What is "the request payload" -- the JSON body? A canonical serialization? (b) What signature scheme -- a raw signature over the bytes? JWS? (c) Where is the signature carried -- an HTTP header? A field in the request body? A UCAN?
 - **Why it matters**: Without specifying the signature format, implementations cannot verify each other's registrations. Cross-implementation context participation would fail.
 - **Severity**: HIGH
 
@@ -414,7 +414,7 @@ The findings are organized per-file, then by severity.
 ### [22.5.1] Attestation Lookup Pagination Not Specified
 - **Category**: Missing constants/defaults
 - **Location**: Section 22.5.1, lines 263-279
-- **What's missing**: The `attestation_lookup` outlet returns `results: [{...}]` with no pagination mechanism. If a popular handle has hundreds of claiming DIDs, the response could be very large.
+- **What's missing**: The `attestation_lookup` outlet returns `results: [{...}]` with no pagination mechanism. If a popular handle has hundreds of claiming identities, the response could be very large.
 - **Why it matters**: Unbounded response size in a discovery outlet call.
 - **Severity**: LOW
 
@@ -450,7 +450,7 @@ The findings are organized per-file, then by severity.
 - **Category**: Missing edge cases
 - **Location**: Section 22.8.4, line 479
 - **What's missing**: Cache entries have per-layer TTLs but no invalidation mechanism beyond TTL expiry. If a handle is deregistered from a context with discovery outlets, the cache could serve stale results for up to 15 minutes (the context TTL). No push-based invalidation or event-based cache clearing is specified.
-- **Why it matters**: 15 minutes of stale handle resolution could lead a user to contact the wrong DID.
+- **Why it matters**: 15 minutes of stale handle resolution could lead a user to contact the wrong identity.
 - **Severity**: LOW
 
 ---
@@ -551,7 +551,7 @@ The findings are organized per-file, then by severity.
 ### [23.6.1] Deadlock Detection Mechanism Not Specified
 - **Category**: Underspecified algorithms
 - **Location**: Section 23.6.1, line 148
-- **What's missing**: "Detected when the governance model requires votes from permanently unavailable DIDs." But: (a) When is a DID "permanently unavailable"? After what duration? (b) How is this distinguished from "temporarily unavailable" (just a long offline period)? (c) What mechanism detects this -- periodic polling? Admin manual action?
+- **What's missing**: "Detected when the governance model requires votes from permanently unavailable identities." But: (a) When is an identity "permanently unavailable"? After what duration? (b) How is this distinguished from "temporarily unavailable" (just a long offline period)? (c) What mechanism detects this -- periodic polling? Admin manual action?
 - **Why it matters**: Without a detection threshold, governance models that require specific members' votes can be permanently stuck if a member loses their keys.
 - **Severity**: MEDIUM
 
@@ -618,7 +618,7 @@ The findings are organized per-file, then by severity.
 ### [24.3.1] "Current Membership Roster" Privacy Concern
 - **Category**: Security-relevant omissions
 - **Location**: Section 24.3.1, line 87
-- **What's missing**: `counterparties` is "the source context's current membership roster DIDs at the time of data flow." This means crossing a context boundary leaks the entire membership roster of the source context to the target context. For encrypted contexts, membership is supposed to be private (visible only to members, section 9.10).
+- **What's missing**: `counterparties` is "the source context's current membership roster at the time of data flow." This means crossing a context boundary leaks the entire membership roster of the source context to the target context. For encrypted contexts, membership is supposed to be private (visible only to members, section 9.10).
 - **Why it matters**: Provenance attachment creates a side-channel for membership enumeration. An adversary could create a context, invite a target, and trigger cross-context data flow to learn who else is in the target's other contexts.
 - **Severity**: HIGH
 
@@ -678,7 +678,7 @@ The findings are organized per-file, then by severity.
 ### [18/19] Relay Economic Config in .well-known/scp vs Runtime Discovery
 - **Category**: Missing edge cases
 - **Location**: Sections 18.3.3 and 19.8
-- **What's missing**: Relay economic config is available in `.well-known/scp` (HTTP-accessible before WebSocket connection). But `.well-known/scp` is optional and SHOULD-level. For relays without a domain (`.no_domain()` mode), there is no HTTP endpoint. How does a client discover a no-domain relay's economic policy? Over the WebSocket connection? Via the DID document?
+- **What's missing**: Relay economic config is available in `.well-known/scp` (HTTP-accessible before WebSocket connection). But `.well-known/scp` is optional and SHOULD-level. For relays without a domain (`.no_domain()` mode), there is no HTTP endpoint. How does a client discover a no-domain relay's economic policy? Over the WebSocket connection? Via the service record?
 - **Why it matters**: No-domain relays that charge for transport have no discovery mechanism for their economic policy.
 - **Severity**: MEDIUM
 
