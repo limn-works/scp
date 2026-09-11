@@ -1400,7 +1400,6 @@ COUNTER_EXPLANATION = "agent key compromised; rotated and republished"
 # shipped code. Re-signing their preimages onto P-256 would have widened that teardown.
 
 
-
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -1436,7 +1435,7 @@ VECTOR_PREROTATION_POINT = REF_KEY_3.compressed
 
 
 def key_state_entry(point: bytes, role: int, condition: int) -> bytes:
-    """One 45-byte key-state entry, per §9.18.17's MAX_KEYS_PER_CHAIN arithmetic."""
+    """One 45-byte key-state entry, in §9.7.4.2's key-state snapshot order."""
     entry = (
         fixed_field(point)
         + u8(role)
@@ -1456,8 +1455,8 @@ def vector_key_state() -> bytes:
         + key_state_entry(REF_KEY_1.compressed, ROLE_ROOT, CONDITION_CURRENT)
         + key_state_entry(REF_KEY_2.compressed, ROLE_ACTIVE, CONDITION_CURRENT)
         + u32(1)  # next-set count
+        + u8(CUSTODY_PASSKEY)  # the entry is custody_type then key_algorithm
         + u8(KEY_ALGORITHM_ECDSA_P256_SHA256)
-        + u8(CUSTODY_PASSKEY)
         + u32(1)  # witness-set count
         + fixed_field(VECTOR_WITNESS_OPERATOR)
         + u32(VECTOR_WITNESSING_INTERVAL)
@@ -1476,14 +1475,20 @@ def inception_preimage(form: int) -> bytes:
         + u64(0)  # 3. sequence
         + fixed_field(ZERO32)  # 4. predecessor placeholder
         # 5. standing_root: the RootRecovery kind alone carries it
-        + u32(1) + u8(0)  # 6. signer index list of the one root group
-        + u32(1) + u8(form)  # 7. signature-form list of that group
+        + u32(1)
+        + u8(0)  # 6. signer index list of the one root group
+        + u32(1)
+        + u8(form)  # 7. signature-form list of that group
         # 8. revealed keys: the reveal-authorized kinds alone carry them
-        + u32(1) + fixed_field(REF_KEY_1.compressed) + u32(1)  # 9. installed root set + threshold
+        + u32(1)
+        + fixed_field(REF_KEY_1.compressed)
+        + u32(1)  # 9. installed root set + threshold
         + vector_key_state()  # 10. key-state snapshot
         # 11. key-event seals: the KeyState kind alone carries them
         + u8(CONTINUATION_COMMITMENT)  # 12. continuation
-        + u32(1) + fixed_field(commitment) + u32(1)
+        + u32(1)
+        + fixed_field(commitment)
+        + u32(1)
     )
 
 
@@ -1618,8 +1623,6 @@ def emit_key_event_slots() -> None:
 # --- §25.27 the cosigned head and the relay proof of control ---
 
 WITNESS_ID = sha256(b"scp-25-witness-operator")
-WITNESS_KEY_STATE_HEAD = sha256(b"scp-25-witness-key-state-head")
-SUBJECT_ID = sha256(b"scp-25-subject-identifier")
 COSIGN_OBSERVED_AT = 1_700_000_000
 RELAY_OPERATOR_ID = sha256(b"scp-25-relay-operator")
 RESOLVER_NONCE = sha256(b"scp-25-resolver-nonce")
@@ -1627,7 +1630,9 @@ SERVED_BLOB_A = b"scp-25-served-blob-a"
 SERVED_BLOB_B = b"scp-25-served-blob-bb"
 # §9.7.4.2 definitions: a 4-byte blob count, then each blob under §9.5.1's
 # variable-length rule, so one digest names one split of the bytes into blobs.
-SERVED_VALUE_DIGEST = sha256(u32(2) + var_field(SERVED_BLOB_A) + var_field(SERVED_BLOB_B))
+SERVED_VALUE_DIGEST = sha256(
+    u32(2) + var_field(SERVED_BLOB_A) + var_field(SERVED_BLOB_B)
+)
 
 
 def emit_witness_and_relay_objects() -> None:
@@ -1636,20 +1641,20 @@ def emit_witness_and_relay_objects() -> None:
     subject = INCEPTION_IDENTIFIER
     designating_digest = INCEPTION_DIGEST
 
-    def cosigned_head(label, sequence, event_digest, previous, observed_at, key=REF_KEY_2):
+    def cosigned_head(
+        label, sequence, event_digest, previous, observed_at, key=REF_KEY_2
+    ):
         fields = (
             fixed_field(WITNESS_ID)
-            + fixed_field(WITNESS_KEY_STATE_HEAD)
             + fixed_field(subject)
             + u64(sequence)
             + fixed_field(event_digest)
             + fixed_field(previous)
             + u64(observed_at)
         )
-        assert len(fields) == 176, len(fields)
+        assert len(fields) == 144, len(fields)
         assert previous != bytes(32), "previous_cosigned_digest is never zero"
         emit_hex(f"{label}.witness", WITNESS_ID)
-        emit_hex(f"{label}.witness_key_state_head", WITNESS_KEY_STATE_HEAD)
         emit_hex(f"{label}.subject", subject)
         emit(f"{label}.sequence", sequence)
         emit_hex(f"{label}.event_digest", event_digest)
@@ -1664,14 +1669,15 @@ def emit_witness_and_relay_objects() -> None:
 
     # Vector 43: a witness's first cosigned head after seeding at the event that
     # designated it. previous_cosigned_digest names that event, never zero.
-    cosigned_head("vector_43", 0, designating_digest, designating_digest, COSIGN_OBSERVED_AT)
+    cosigned_head(
+        "vector_43", 0, designating_digest, designating_digest, COSIGN_OBSERVED_AT
+    )
 
     # Vector 45: the conflict statement a witness emits when the one check fails.
     held_digest = sha256(b"scp-25-conflict-held-event")
     offered_digest = sha256(b"scp-25-conflict-offered-event")
     conflict_fields = (
         fixed_field(WITNESS_ID)
-        + fixed_field(WITNESS_KEY_STATE_HEAD)
         + fixed_field(subject)
         + u64(7)
         + fixed_field(held_digest)
@@ -1679,7 +1685,7 @@ def emit_witness_and_relay_objects() -> None:
         + fixed_field(offered_digest)
         + u64(COSIGN_OBSERVED_AT)
     )
-    assert len(conflict_fields) == 184, len(conflict_fields)
+    assert len(conflict_fields) == 152, len(conflict_fields)
     emit_hex("vector_45.witness", WITNESS_ID)
     emit_hex("vector_45.subject", subject)
     emit("vector_45.held_sequence", 7)
@@ -1720,6 +1726,7 @@ def emit_witness_and_relay_objects() -> None:
     emit_hex("vector_44.routing_id", routing_id)
     emit_hex("vector_44.value_digest_input_blobs", SERVED_BLOB_A + SERVED_BLOB_B)
     emit_hex("vector_44.value_digest", SERVED_VALUE_DIGEST)
+    emit("vector_44.observed_at", COSIGN_OBSERVED_AT)
     emit("vector_44.field_bytes", len(proof_fields))
     sign_and_emit(
         "vector_44",
@@ -1727,6 +1734,75 @@ def emit_witness_and_relay_objects() -> None:
         REF_KEY_1,
     )
     emit("vector_44.object_bytes", len(proof_fields) + 64)
+
+
+# ---------------------------------------------------------------------------
+# §25.28 The pre-rotation commitment and the service record
+# (§9.7.4.2 definitions, `03-identity.md` §3.10.13, §9.18.2)
+# ---------------------------------------------------------------------------
+
+SERVICE_RECORD_SEPARATOR = "SCP-SERVICE-RECORD-V1:"
+SERVICE_RECORD_SEQUENCE = 4
+# Three entries in the order a record carries them. Each encodes as its three
+# strings under §9.5.1's variable-length rule, in the order id, type,
+# serviceEndpoint, and carries no type discriminator beside them.
+SERVICE_RECORD_ENTRIES = [
+    ("#scp-relay-1", "SCPRelay", "wss://relay.example.com/scp/v1"),
+    ("#scp-relay-2", "SCPRelay", "wss://relay2.example.com/scp/v1"),
+    ("#private-state-1", "IdentityPrivateState", "wss://relay.example.com/scp/v1"),
+]
+
+
+def service_record_entries_field() -> bytes:
+    """The `entries` field: a 4-byte count, then each entry's three strings."""
+    body = b"".join(
+        var_field(entry_id) + var_field(entry_type) + var_field(endpoint)
+        for entry_id, entry_type, endpoint in SERVICE_RECORD_ENTRIES
+    )
+    return u32(len(SERVICE_RECORD_ENTRIES)) + body
+
+
+def emit_commitment_and_service_record() -> None:
+    section("§25.28 Pre-rotation commitment and service record")
+
+    # --- Vector 47: the pre-rotation commitment over two distinct points. ---
+    # The commitment is SHA-256 over the separator and one 33-byte SEC1
+    # compressed point carrying no length prefix (§9.7.4.2 definitions).
+    for label, key in (("vector_47a", REF_KEY_3), ("vector_47b", REF_KEY_2)):
+        point = key.compressed
+        commitment = sha256(PREROTATION_SEPARATOR + point)
+        emit(f"{label}.key_name", key.name)
+        emit_hex(f"{label}.pre_rotation_public_key", point)
+        emit(f"{label}.preimage_len", len(PREROTATION_SEPARATOR) + len(point))
+        emit_hex(f"{label}.preimage", PREROTATION_SEPARATOR + point)
+        emit_hex(f"{label}.commitment", commitment)
+    assert sha256(PREROTATION_SEPARATOR + REF_KEY_3.compressed) != sha256(
+        PREROTATION_SEPARATOR + REF_KEY_2.compressed
+    ), "vector_47: two points must give two commitments"
+
+    # --- Vector 48: a service record signed by the designated operational key. ---
+    # The vector identity of §25.26 designates #active for the service-record
+    # role, and §25.2's secondary key is that key.
+    identifier = INCEPTION_IDENTIFIER
+    entries = service_record_entries_field()
+    fields = fixed_field(identifier) + u64(SERVICE_RECORD_SEQUENCE) + entries
+    emit_hex("vector_48.identifier", identifier)
+    emit("vector_48.sequence", SERVICE_RECORD_SEQUENCE)
+    emit("vector_48.entry_count", len(SERVICE_RECORD_ENTRIES))
+    for index, (entry_id, entry_type, endpoint) in enumerate(SERVICE_RECORD_ENTRIES):
+        emit(f"vector_48.entry_{index}.id", entry_id)
+        emit(f"vector_48.entry_{index}.type", entry_type)
+        emit(f"vector_48.entry_{index}.serviceEndpoint", endpoint)
+    emit("vector_48.entries_len", len(entries))
+    emit_hex("vector_48.entries", entries)
+    emit("vector_48.field_bytes", len(fields))
+    emit_hex("vector_48.routing_id", sha256(b"scp:svc:" + identifier))
+    sign_and_emit(
+        "vector_48",
+        canonical_preimage(SERVICE_RECORD_SEPARATOR, fields),
+        REF_KEY_2,
+    )
+    emit("vector_48.object_bytes", len(fields) + 64)
 
 
 def main() -> int:
@@ -1754,6 +1830,7 @@ def main() -> int:
     emit_keypackage_attestation()
     emit_key_event_slots()
     emit_witness_and_relay_objects()
+    emit_commitment_and_service_record()
     print("\n".join(_LINES))
     return 0
 
