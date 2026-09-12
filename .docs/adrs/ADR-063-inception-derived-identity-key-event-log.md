@@ -1,10 +1,10 @@
 # ADR-063: Inception-Derived Self-Certifying Identity over a Key-Event Log
 
-**Status:** Accepted 2026-08-30, the day Alec settled the identity form and delegated the choice of a freshness anchor. He confirmed the witness and watcher layer in scope on 2026-08-31. Five later rulings by Alec changed decisions this record already carried, and one executor call rewrote a sixth. Each amendment sits beside the decision it changed, with its date. Accepted records that the identity model is settled and not that the code exists.
+**Status:** Accepted 2026-08-30, the day Alec settled the identity form and delegated the choice of a freshness anchor. He confirmed the witness and watcher layer in scope on 2026-08-31. Four later rulings by Alec changed decisions this record already carried, and one executor call rewrote a fifth. Each amendment sits beside the decision it changed, with its date. Accepted records that the identity model is settled and not that the code exists.
 
 **Supersedes:** ADR-003, DID creation over did:dht, and ADR-039, the shared-DID human-agent identity model. Each flips to `Superseded by ADR-063` and keeps its body as the historical record.
 
-This record states the decisions and the reasons for them. The rules live in the specifications, and each decision below names the section that carries its rule.
+Each decision below states what was decided, who decided it and when, and names the specification section that carries both its rule and its reason.
 
 ## Context
 
@@ -50,13 +50,13 @@ SCP's identity is an inception-derived self-certifying identifier over an append
 
 ### The curve and the root's custody
 
-**Every SCP key is an ECDSA key on NIST P-256 with SHA-256.** Alec ruled on 2026-09-10: "ok p256 then". **Amended 2026-09-10**, superseding Ed25519. The protocol mandates one ciphersuite for version 1, with no negotiation and no fallback. `09-security-model.md` §9.5 states the suite, the signature encoding, the point-validation obligation a verifier carries, and the reason the orchestrator recommended this curve and Alec accepted it.
+**Every SCP key is an ECDSA key on NIST P-256 with SHA-256.** Alec ruled on 2026-09-10: "ok p256 then". **Amended 2026-09-10**, superseding Ed25519. The protocol mandates one ciphersuite for version 1, with no negotiation and no fallback. `09-security-model.md` §9.5 carries the rule and the reason.
 
-**Root custody defaults to a passkey.** Alec named the substrate on 2026-09-10, "a passkey in your apple passwords or similar", and typed the domain rule the same day: "roots would get created under a universal identifier by default like ctx.network". **Amended 2026-09-10.** The consequence for the log is that a root signature may be a WebAuthn assertion rather than a raw signature. `09-security-model.md` §9.7.4.1 item 4 states why a non-exportable substrate is what the default turns on, and §9.7.4.2's definitions state both slot layouts and the checks a verifier runs on an assertion.
+**Root custody defaults to a passkey.** Alec named the substrate on 2026-09-10, "a passkey in your apple passwords or similar", and typed the domain rule the same day: "roots would get created under a universal identifier by default like ctx.network". **Amended 2026-09-10.** The consequence for the log is that a root signature may be a WebAuthn assertion. `09-security-model.md` §9.7.4.1 item 4 states why a non-exportable substrate is what the default turns on, and §9.7.4.2's definitions state both slot layouts and the checks a verifier runs on an assertion.
 
 **Self custody of a key the controller can copy leaves the consumer profile.** Alec ruled on 2026-09-10 that self custody "is writing down a key, yes" and is "not a concern". `09-security-model.md` §9.7.4.1 item 4 states which method conforms on which profile and why the three copyable methods sit on the headless profile alone.
 
-**The root credential and the pre-rotation credential share one platform account by default.** Alec chose that default on 2026-09-10 from two options the orchestrator put to him: keep the two together and tell the user. **Amended 2026-09-10.** The identity-substrate decision log records the ruling as prose and records no reason from Alec. The default places the identity's root authority and its recovery authority behind one authentication factor, so the same section requires the SDK to state the co-residence at custody selection and to offer a separated pre-rotation credential.
+**The root credential and the pre-rotation credential share one platform account by default.** Alec chose that default on 2026-09-10 from two options the orchestrator put to him: keep the two together and tell the user. **Amended 2026-09-10.** The identity-substrate decision log records the ruling as prose and records no reason from Alec. `09-security-model.md` §9.7.4.1 item 4 carries what the default costs and the two obligations it puts on the SDK.
 
 **Device custody and recovery stay in the platform layer, outside the identity method.** The executor decided it on 2026-08-30 from the KERI grounding: KERI puts device-loss custody recovery in the wallet layer and not in the method, which is what confirmed that the earlier churn over a device-custody DID method was self-inflicted by pulling custody into the method. Alec's contribution is the question that opened it, "wallet???". The custody obligations the protocol does state live in `09-security-model.md` §9.7.4.1, and ADR-054, pre-rotation key custody substrate isolation, is their Proposed realization.
 
@@ -108,7 +108,7 @@ The split is what keeps the root cold across a transport change. A relay-endpoin
 
 ### Executor calls on record
 
-Ten calls the orchestrator made and surfaced to Alec rather than asked about. He may reverse any of them.
+Nineteen calls the orchestrator made and surfaced to Alec rather than asked about. He may reverse any of them. Calls 1 through 10 were made on or before 2026-09-10; calls 11 through 19 on 2026-09-11, after round 13's and round 14's reviewers read the fresh corpus.
 
 1. Superseding a decided ADR takes a new ADR, a status flip on the old one, and the old body retained as the historical record.
 2. One ADR covers the whole substrate, with rotation and recovery as log events, and the custody realization stays in the pre-rotation custody discussion and in ADR-054, pre-rotation key custody substrate isolation.
@@ -120,6 +120,18 @@ Ten calls the orchestrator made and surfaced to Alec rather than asked about. He
 8. **A relay operator's identifier is non-transferable.** An operator's community-relay-list entry carries its P-256 public key, that key does not rotate, and a new key takes a new entry at the next release. This deletes the operator-chain resolution floor, its disclosed truncation residual, the witness-key-state field of both witness objects, and the rule that split which position each object reads. The cost SCP takes on is that an operator whose key leaks is replaced at a release boundary rather than by its own rotation.
 9. **Reserve rotation is allowed.** An unexposed member of the next set may be re-committed, and the destruction duty binds revealed keys only. The recommendation of a next threshold of two or more now has a mechanism behind it.
 10. **The conflict register is resolved.** Twenty-six of its twenty-seven entries carry a resolution and its author. The twenty-seventh, a proposal that Limn ship an out-of-cycle release to remove an operator, is the agent's proposal and stays open for Alec. Three curator obligations leave the specification corpus for the relay plan as open proposals, because Alec's 2026-09-07 question about who curates the shipped list is unanswered.
+11. **A `retain` flag on the wire.** A PUBLISH at one of the four retained kinds sets one bit telling a validating relay the blob sits under R9's retention and not under the shared blob TTL; without it an honest identity's whole key history expired from every relay after eight quiet days. A relay that does not validate refuses those four kinds, because it holds the address digest and never the preimage.
+12. **The byte bound returns, carrying the eviction rank the count bound already had**, because a count bound alone leaves one divergent suffix's bytes unbounded. Alec was told the bound returns, asked what it costs, and answered "ok"; the 512 MiB figure, a relay's latitude to configure a lower one, and the silence of an eviction are the orchestrator's derivation.
+13. **A fourth signature-verification class, the community-relay-list operator key.** A relay proof, a cosigned head and a conflict statement each verify against the non-transferable key that operator's entry declares, which names no position and belongs to no key state, so neither existing class's rule can execute on them.
+14. **An absent-field sentinel for the key-event preimage.** Every kind carries all twelve fields, a field the kind does not carry present with its sentinel, and each composite field's sentinel is the four bytes `BE32(0)`. Without it one `KeyState` had four conforming encodings and each implementation rejected the other's chain.
+15. **Eight enumerations gain a bound type name**, and three of the eight gain variant names, because each serializes on the wire or surfaces to a caller and four bindings would otherwise invent four names.
+16. **The accepted chain sits outside the retained set**, carries no eviction rank and is never evicted; at a first-contact verifier the chain it adopts under R11 becomes its accepted chain, and the fetch bound governs until then.
+17. **The fault proof gains a fifth condition**, excluding the designating event's digest, and all five are checkable by a party holding the witness's prior head. Without the fifth, one witness seeding twice at one designating event indicted an honest operator; without the checkability the proof was undecidable.
+18. **One operator key is one witness**, and R11's first-contact floor counts operator keys rather than declared operator names, which is a local byte comparison over the shipped list.
+19. **A cosigned head is keyed on `event_digest`** at the verifier and at the relay alike. The two heads of a fault proof share their subject, their witness and their previous digest by definition, so any other key collided them at one slot and a one-per-key cap discarded one.
+
+**The accepted-chain bound is not an executor call.** Nothing bounds what one identifier costs a verifier to fetch and verify or a validating relay to store, and the choice between a byte cap and a verified checkpoint is a rule rather than a sentence. The orchestrator put both shapes to Alec on 2026-09-11 and his answer is pending, so `09-security-model.md` §9.7.4.2 R9 and §9.18.17 carry the byte-cap shape marked as a proposal and no party implements either today.
+
 
 ## Relationship to KERI
 
@@ -127,7 +139,7 @@ In every citation below, `spec-body` names a section of the KERI specification b
 
 ### What SCP adopts as KERI states it
 
-Each rule below is KERI's, and the SCP section that carries it cites KERI and restates none of it.
+Each rule below is KERI's, and the SCP section that carries it cites KERI.
 
 - **Pre-rotation with two thresholds.** The current key list and its threshold, the next digest list and its threshold, and the rule that a rotation satisfies the prior event's next threshold as well as its own (`spec-body` §Key list field, §Key and key digest threshold fields, §Next key digest list field, §Pre-rotation, §General Pre-rotation).
 - **Indexed signatures**, which let a threshold set sign without a fixed layout (§Indexed Signatures).
@@ -207,7 +219,7 @@ Each rule below is KERI's, and the SCP section that carries it cites KERI and re
 
 **Ranking a fork by witness cosignature.** Rejected on 2026-09-05, before the watch-and-report ruling and independently of it. Ranking by cosignature hands a thief who holds the root and a copied pre-rotation key the win over a controller who holds the genuine pre-rotation key and has lost the root, which inverts the outcome the root rule exists to deliver. A cosignature is evidence a party reads and never a term any rank reads.
 
-**Ordering two valid reveals of one commitment by first observation.** Proposed on 2026-09-06 and withdrawn the same day after four reviewers rejected it, before anything reached a specification. Ordering by first observation divides relying parties by what each saw first. Ordering by any field in the events lets the second author read the first and match it. Every such rule removes recovery from an unforeseen compromise, because the owner's own recovery is the second reveal in exactly the case the owner needs it.
+**Ordering two valid reveals of one commitment by first observation.** Proposed on 2026-09-06 and withdrawn the same day after four reviewers rejected it, before anything reached a specification. Ordering by first observation divides relying parties by what each saw first. Ordering by any field in the events lets the second author read the first and match it. `09-security-model.md` §9.7.4.2 R6 carries the rule and the reason.
 
 **Ed25519, the curve SCP carried until 2026-09-10.** Nobody chose it: it arrived as the joint default of did:dht, whose identifier is an Ed25519 key, of the MLS baseline ciphersuite, and of the one-algorithm rule this project set. No ADR, planning session, or issue argued it against an alternative, and the one issue that raised the Secure Enclave mismatch was closed by an agent, reopened by Alec for research, and closed again without the research. Superseded by Alec's P-256 ruling on 2026-09-10. Of the three reasons that had been offered for it, did:dht is dead, the MLS baseline governs an ephemeral leaf key rather than an identity key, and the one-algorithm rule is a rule this project set and can set differently.
 
@@ -223,4 +235,4 @@ ADR-057, in-browser SCP clients over a shared MLS crate, rested on did:dht resol
 
 ADR-054, pre-rotation key custody substrate isolation, and RFC #2130, pre-rotation recovery custody, are the Proposed realization of the independent pre-rotation custody this record depends on. The dependency is the specification rule in `09-security-model.md` §9.7.4.1, not that Proposed realization.
 
-Each decision above names the specification section that carries its rule, and no second index of those pointers stands here.
+Each decision above names the specification section that carries its rule.

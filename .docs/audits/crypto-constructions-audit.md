@@ -138,7 +138,7 @@ The most serious category of findings involves underspecified constructions wher
 - **Construction**: Identity private state encryption
 - **Location**: 03-identity.md, section 3.7
 - **What's missing**: The spec says "Private state is encrypted to the identity's own keys" and "Only you hold the decryption key." It names no algorithm, no encrypting key, no key derivation, no nonce rule, no AAD binding, and no re-encryption procedure. This is a complete specification gap for a construction that protects block lists, graph policies, agent configs, and annotations.
-- **Resolution (later)**: Accepted and fixed. `03-identity.md` §3.7, Identity Private State, states the encryption model, and `03-identity.md` §3.10.13, the service record, states where the private state is stored. This finding cites both and restates neither.
+- **Resolution (later)**: Accepted and fixed. `03-identity.md` §3.7, Identity Private State, states the encryption model, and `03-identity.md` §3.10.13, the service record, states where the private state is stored.
 - **Security impact**: Without a specified encryption scheme, each platform will implement its own, and identity private state will not be portable across platforms or devices. The security properties (authenticated encryption, forward secrecy on rotation) are aspirational but unverifiable.
 - **Severity**: HIGH
 
@@ -223,7 +223,7 @@ The most serious category of findings involves underspecified constructions wher
 - **Construction**: Identity private state re-encryption
 - **Location**: 03-identity.md, section 3.7
 - **What's missing**: "On identity key rotation (§9.12), private state is re-encrypted to the new key. Single-owner case requires no group redistribution -- the owner re-encrypts and republishes." The spec states no operational procedure for re-encryption, no rule on zeroizing the old key, no handling for a device offline during rotation, and no atomicity requirement.
-- **Resolution (later)**: Accepted and fixed. `03-identity.md` §3.7, Identity Private State, states the rotation procedure, and `03-identity.md` §3.10.13, the service record, states where the private state is stored. This finding cites both and restates neither.
+- **Resolution (later)**: Accepted and fixed. `03-identity.md` §3.7, Identity Private State, states the rotation procedure, and `03-identity.md` §3.10.13, the service record, states where the private state is stored.
 - **Security impact**: A crash during re-encryption could leave identity private state in an inconsistent state where some events require the old key (which may have been zeroized) and others require the new key. Data loss of block lists, graph policies, and other identity-critical state.
 - **Severity**: MEDIUM
 

@@ -698,7 +698,7 @@ Total findings: **1 CRITICAL, 16 HIGH, 18 MEDIUM, 5 LOW**.
 - **What's missing**: Bridge registration and the context pseudonym system each derive a value the spec calls "routing_id", by two different functions, and no section says which one applies where.
 - **Why it matters**: If the bridge validates using one scheme but the relay publishes using the other, bridge registration fails. An implementor reading both sections needs disambiguation.
 - **Severity**: HIGH
-- **Resolution (later)**: Rule R13 of `09-security-model.md` §9.7.4.2 is the one home of the identity routing derivations, which this finding cites and does not restate.
+- **Resolution (later)**: Rule R13 of `09-security-model.md` §9.7.4.2 states the identity routing derivations, which this finding cites.
 
 ### [10.14.2] QUIC 0-RTT Replay for PUBLISH
 - **Category**: Security-relevant omission

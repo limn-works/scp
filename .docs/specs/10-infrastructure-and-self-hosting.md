@@ -725,7 +725,7 @@ Domain-based deployment is not a paid tier or a higher service level. Operators 
 
 TLS is required for all domain-based relay connections (§9.13). Self-hosted relays without a domain present a challenge: a laptop behind NAT with no domain cannot obtain a CA-signed TLS certificate, and self-signed certificates provide no trust benefit over plaintext (no trust anchor for the connecting peer to verify against).
 
-**Key decision: `ws://` (plaintext WebSocket) is permitted exactly where `09-security-model.md` §9.13 permits it.** §9.13 is the one home of that criterion and this section restates none of it; the table below records which tier each source falls on.
+**Key decision: `ws://` (plaintext WebSocket) is permitted exactly where `09-security-model.md` §9.13 permits it.** §9.13 states that criterion, and the table below records which tier each source falls on.
 
 | Relay type | Where the resolver took the URL | Transport | TLS required |
 |-----------|---------------|-----------|-------------|

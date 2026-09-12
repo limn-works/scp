@@ -798,7 +798,7 @@ Verification vector:
   verdict:    accept
 ```
 
-A software signer under RFC 6979 reproduces those signature bytes; a hardware signer produces different bytes over the same canonical hash and is checked against the verification vector instead (§25.4 states the rule once and this vector follows it). Before 2026-09-10 this vector printed no hash at all and told the reader to compute one from the Rust reference implementation, so it pinned nothing an independent implementer could check.
+A software signer under RFC 6979 reproduces those signature bytes; a hardware signer produces different bytes over the same canonical hash and is checked against the verification vector instead (§25.4 states that rule). Before 2026-09-10 this vector printed no hash at all and told the reader to compute one from the Rust reference implementation, so it pinned nothing an independent implementer could check.
 
 ## 25.14 Pseudonymization Vectors (§24.3.5)
 
@@ -910,7 +910,7 @@ To verify an implementation against these test vectors:
 
 §25.1 names the generator, states how to run it, states which values it produces, and states which published known-answer tests it checks itself against. A value printed above that the generator does not reproduce is a defect in this section.
 
-**Six shipped artifacts still carry the superseded signature algorithm, and this paragraph is the one place this section says so.** `crates/scp-runtime/tests/test_vectors.rs`, `crates/scp-event-log/tests/test_vectors.rs`, `crates/scp-crypto/src/pseudonym.rs`, `crates/scp-client-wasm/tests/pseudonym_derivation_cross_target_kat.rs`, `tests/conformance/vectors/outlet_streaming_saga_vectors.json` and `tests/conformance/vectors/outlet_registration_v2.json` assert or carry the values these vectors printed before 2026-09-10, under the algorithm §9.5 of the security-model spec superseded on that date. The artifact flow puts the spec first, so this section is the authority for every byte above until each artifact is regenerated on P-256, and an implementer comparing against one of them today reproduces the superseded values.
+**Six shipped artifacts still carry the superseded signature algorithm.** `crates/scp-runtime/tests/test_vectors.rs`, `crates/scp-event-log/tests/test_vectors.rs`, `crates/scp-crypto/src/pseudonym.rs`, `crates/scp-client-wasm/tests/pseudonym_derivation_cross_target_kat.rs`, `tests/conformance/vectors/outlet_streaming_saga_vectors.json` and `tests/conformance/vectors/outlet_registration_v2.json` assert or carry the values these vectors printed before 2026-09-10, under the algorithm §9.5 of the security-model spec superseded on that date. The artifact flow puts the spec first, so this section is the authority for every byte above until each artifact is regenerated on P-256, and an implementer comparing against one of them today reproduces the superseded values.
 
 Independent implementations SHOULD run the generator, compare its output against the values printed above, and then embed those outputs in their own test suites.
 
