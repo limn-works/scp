@@ -2113,7 +2113,18 @@ pub async fn execute_extend_ttl(
         cell.membership.member_dids().map(|d| &**d).collect();
     let approval_dids: std::collections::HashSet<&str> =
         approvals.iter().map(|v| &*v.voter_did).collect();
-    let missing: Vec<&str> = member_dids.difference(&approval_dids).copied().collect();
+    // Both sets iterate in a per-process `RandomState` order, and both lists
+    // this helper derives from them (`rejecting_members` below, `consenting`
+    // further down) are fields of a canonical leaf preimage. §9.9.3 of the
+    // security-model spec, the equivocation-detection protocol, requires
+    // every field of a canonical leaf to be convergent, so both lists sort
+    // before they reach a payload: two honest members that append the same
+    // leaf from the same tally must append the same bytes, or their Merkle
+    // roots diverge at equal count and the equal-count/equal-root test
+    // reports equivocation between them. The bilateral twin sorts the same
+    // way (`TtlExtension::consented_dids`).
+    let mut missing: Vec<&str> = member_dids.difference(&approval_dids).copied().collect();
+    missing.sort_unstable();
     if !missing.is_empty() {
         let rejecting_members: Vec<&str> = missing.clone();
         let rejected_payload = scp_event_log::payload::encode_payload(
@@ -2154,7 +2165,8 @@ pub async fn execute_extend_ttl(
         )));
     }
 
-    let consenting: Vec<String> = approval_dids.iter().map(|d| (*d).to_owned()).collect();
+    let mut consenting: Vec<String> = approval_dids.iter().map(|d| (*d).to_owned()).collect();
+    consenting.sort_unstable();
     drop(approval_dids);
     drop(member_dids);
 

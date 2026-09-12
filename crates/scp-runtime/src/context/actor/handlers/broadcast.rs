@@ -686,8 +686,17 @@ mod tests {
     // `append_membership_change_leaf` → `append_context_event_with_payload` →
     // `append_event`, so counting `append_event` counts the leaf. The other
     // methods just need to succeed; the rest of the trait uses its default impls.
+    /// Every appended leaf as `(event type, payload bytes)`, shared between
+    /// the [`TestEventLog`] that fills it and the test that reads it back.
+    /// `std::sync::RwLock` is the one shared lock the runtime's clippy
+    /// `disallowed-types` list admits.
+    type RecordedLeaves = Arc<std::sync::RwLock<Vec<(scp_event_log::EventType, Vec<u8>)>>>;
+
     struct TestEventLog {
         appended: Arc<AtomicUsize>,
+        /// Every appended leaf as `(event type, payload bytes)`, so a test can
+        /// decode a payload and assert the bytes a member committed.
+        recorded: RecordedLeaves,
     }
     #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for TestEventLog {
@@ -700,12 +709,16 @@ mod tests {
         async fn append_event(
             &self,
             _id: &[u8; 32],
-            _event: scp_event_log::EventType,
+            event: scp_event_log::EventType,
             _actor: &str,
-            _payload: scp_event_log::EventPayload,
+            payload: scp_event_log::EventPayload,
             _timestamp_secs: u64,
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             self.appended.fetch_add(1, Ordering::SeqCst);
+            self.recorded
+                .write()
+                .expect("recorded leaves lock")
+                .push((event, payload.data));
             Ok(())
         }
         async fn destroy_event_log(
@@ -754,6 +767,14 @@ mod tests {
     /// deps plus the shared event-log append counter (number of leaves appended),
     /// so a test can assert that a rejected subscribe appends none.
     async fn build_deps() -> (ActorDeps, Arc<AtomicUsize>) {
+        let (deps, appended, _recorded) = build_deps_recording().await;
+        (deps, appended)
+    }
+
+    /// [`build_deps`] plus the recorded `(event type, payload bytes)` of every
+    /// appended leaf, for a test that asserts the bytes a leaf carries and not
+    /// only how many leaves landed.
+    async fn build_deps_recording() -> (ActorDeps, Arc<AtomicUsize>, RecordedLeaves) {
         use crate::context::supervisor::supervisor::Supervisor;
         use scp_platform::in_memory::InMemoryStorage;
 
@@ -774,9 +795,11 @@ mod tests {
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
         let appended = Arc::new(AtomicUsize::new(0));
+        let recorded: RecordedLeaves = Arc::new(std::sync::RwLock::new(Vec::new()));
         let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
             Box::new(TestEventLog {
                 appended: Arc::clone(&appended),
+                recorded: Arc::clone(&recorded),
             });
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
             Arc::new(
@@ -800,7 +823,7 @@ mod tests {
             .build_actor_deps(&DID("did:example:broadcast-actor".to_owned()))
             .await
             .expect("build_actor_deps");
-        (deps, appended)
+        (deps, appended, recorded)
     }
 
     /// Build an ACTIVE broadcast `ClassSCell` with the given admission policy,
@@ -2734,6 +2757,180 @@ mod tests {
             cell.checkpoint_events_since, 0,
             "no leaf landed, so nothing is credited: an unconditional credit would \
              mint the §9.9.3 checkpoint one position early"
+        );
+    }
+
+    /// Four members in deliberately unsorted insertion order, so a list that
+    /// copies a `HashSet`'s iteration order is sorted by accident with
+    /// probability 1 in 24 per process.
+    const UNSORTED_MEMBERS_4: [&str; 4] = [
+        "did:example:member-zulu",
+        "did:example:member-alpha",
+        "did:example:member-mike",
+        "did:example:member-echo",
+    ];
+
+    /// Add [`UNSORTED_MEMBERS_4`] to the cell's roster in the listed order and
+    /// return the same four DIDs sorted, which is the order a convergent leaf
+    /// field must carry.
+    fn add_unsorted_members(cell: &mut ClassSCell) -> Vec<String> {
+        for did in UNSORTED_MEMBERS_4 {
+            cell.class_c_view().membership_class_c_mut().add_member(
+                DID(did.to_owned()),
+                "member".to_owned(),
+                vec![],
+            );
+        }
+        let mut sorted: Vec<String> = UNSORTED_MEMBERS_4.iter().map(|d| (*d).to_owned()).collect();
+        sorted.sort_unstable();
+        sorted
+    }
+
+    /// An approval whose signature `execute_extend_ttl` never reads: the
+    /// helper tallies `voter_did` only, because the engine verified every
+    /// vote when it approved the proposal.
+    fn unverified_approval(did: &str) -> scp_protocol::context::governance::SignedVote {
+        scp_protocol::context::governance::SignedVote {
+            voter_did: DID(did.to_owned()),
+            vote: scp_protocol::context::governance::VoteType::Approve,
+            timestamp: 1_700_000_000,
+            signature: vec![0; 64],
+        }
+    }
+
+    /// `rejecting_members` in the `TtlExtensionRejected` leaf is a canonical
+    /// leaf field, and §9.9.3 of the security-model spec, the equivocation-
+    /// detection protocol, requires every canonical leaf field to be
+    /// convergent. Before the fix the helper copied the list out of a
+    /// `HashSet<&str>` difference, whose iteration order differs per process,
+    /// so two honest members appending the same rejection computed different
+    /// Merkle roots at equal count. The leaf must carry the four missing
+    /// approvers in sorted order regardless of roster insertion order.
+    #[tokio::test]
+    async fn rejected_extend_ttl_leaf_lists_rejecting_members_sorted() {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let (deps, appends, recorded) = build_deps_recording().await;
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        let proposal_id = seed_approved_proposal(
+            &mut state,
+            &ctx_hex,
+            GovernanceAction::ExtendTtl {
+                additional_secs: 3_600,
+            },
+        );
+        // The creator's approval alone: the four added members never voted.
+        let approvals = state
+            .governance
+            .engine
+            .get_proposal(&proposal_id)
+            .expect("engine tracks the proposal")
+            .approvals
+            .clone();
+        let mut cell = ClassSCell::new(state);
+        let expected_sorted = add_unsorted_members(&mut cell);
+        appends.store(0, Ordering::SeqCst);
+        recorded.write().expect("recorded leaves lock").clear();
+
+        let result = crate::context::governance_helpers::execute_extend_ttl(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            3_600,
+            &approvals,
+            commit_meta(0xc4),
+        )
+        .await;
+
+        assert!(
+            matches!(&result, Err(ContextError::PermissionDenied(msg)) if msg.contains("4 of 5")),
+            "four of five members have not approved; got {result:?}"
+        );
+        let leaves = recorded.read().expect("recorded leaves lock").clone();
+        assert_eq!(leaves.len(), 1, "exactly the rejection leaf lands");
+        let (event_type, bytes) = &leaves[0];
+        assert_eq!(*event_type, scp_event_log::EventType::TtlExtensionRejected);
+        let payload: scp_event_log::payload::TtlExtensionRejectedPayload =
+            scp_event_log::payload::decode_payload(&scp_event_log::EventPayload {
+                data: bytes.clone(),
+            })
+            .expect("the leaf decodes as TtlExtensionRejectedPayload");
+        assert_eq!(payload.proposal_id, [0xc4; 32]);
+        assert_eq!(
+            payload.rejecting_members, expected_sorted,
+            "rejecting_members must be sorted so every honest member appends the same bytes"
+        );
+    }
+
+    /// The consent twin of
+    /// [`rejected_extend_ttl_leaf_lists_rejecting_members_sorted`]:
+    /// `consenting_members` in the `TtlExtended` leaf came from the approval
+    /// `HashSet`'s iteration order before the fix. With unanimous approval on
+    /// a context that has a TTL, the one `TtlExtended` leaf must list all
+    /// five consenting members sorted, matching the sort the bilateral
+    /// `reset_ttl_timer` path already applies through
+    /// `TtlExtension::consented_dids`.
+    #[tokio::test]
+    async fn unanimous_extend_ttl_leaf_lists_consenting_members_sorted() {
+        let (deps, appends, recorded) = build_deps_recording().await;
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        // A TTL, so `extend_ttl_deadline_and_record` derives a convergent
+        // deadline and appends the leaf.
+        state.handle = crate::context::ContextHandle::new(
+            ctx_hex.clone(),
+            scp_protocol::context::ContextParams {
+                ttl: Some(std::time::Duration::from_secs(3_600)),
+                ..Default::default()
+            },
+        );
+        state
+            .handle
+            .transition_to(&ContextState::Active)
+            .expect("activate");
+        let mut cell = ClassSCell::new(state);
+        let mut expected_sorted = add_unsorted_members(&mut cell);
+        expected_sorted.push(CREATOR_DID.to_owned());
+        expected_sorted.sort_unstable();
+        // Approvals in the unsorted roster order, creator last.
+        let approvals: Vec<scp_protocol::context::governance::SignedVote> = UNSORTED_MEMBERS_4
+            .iter()
+            .chain(std::iter::once(&CREATOR_DID))
+            .map(|did| unverified_approval(did))
+            .collect();
+        appends.store(0, Ordering::SeqCst);
+        recorded.write().expect("recorded leaves lock").clear();
+        reset_leaf_counter(&mut cell);
+
+        crate::context::governance_helpers::execute_extend_ttl(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            3_600,
+            &approvals,
+            commit_meta(0xc5),
+        )
+        .await
+        .expect("unanimous consent extends the TTL");
+
+        let leaves = recorded.read().expect("recorded leaves lock").clone();
+        assert_eq!(leaves.len(), 1, "exactly the TtlExtended leaf lands");
+        let (event_type, bytes) = &leaves[0];
+        assert_eq!(*event_type, scp_event_log::EventType::TtlExtended);
+        let payload: scp_event_log::payload::TtlExtendedPayload =
+            scp_event_log::payload::decode_payload(&scp_event_log::EventPayload {
+                data: bytes.clone(),
+            })
+            .expect("the leaf decodes as TtlExtendedPayload");
+        assert_eq!(payload.proposal_id, [0xc5; 32]);
+        assert_eq!(
+            payload.consenting_members, expected_sorted,
+            "consenting_members must be sorted so every honest member appends the same bytes"
+        );
+        assert_eq!(
+            cell.checkpoint_events_since, 1,
+            "the landed leaf is credited once"
         );
     }
 
