@@ -1,6 +1,8 @@
 ---
 
-> **Line number shift notice:** References to `05-contexts.md` §5.14 (broadcast) are shifted +47 to +64 after PR #296 merged. All findings remain valid.
+> **Line number shift notice:** References to `05-contexts.md` §5.14 (broadcast) are shifted +47 to +64 after PR #296 merged.
+>
+> **Annotation, 2026-09-11.** This file is the record its author wrote, and a `**Resolution (later)**` line marks each finding the corpus has since closed. Three that this annotation adds are CRYPTO-01, CRYPTO-02 and CRYPTO-15; every other finding stands as the author wrote it, and no finding text below is edited to match the current corpus.
 
 # SCP Cryptographic Specification Audit
 
@@ -18,6 +20,7 @@ The most serious category of findings involves underspecified constructions wher
 - **Construction**: InnerEnvelope canonical hash and signature
 - **Location**: 09-security-model.md, line 214 (section 9.5) and line 368 (section 9.8.1)
 - **What's missing**: The signature formula is `SHA256("SCP-INNER-ENVELOPE-V1:" || context_id || sender_did || epoch || generation_number || sequence_number || timestamp || payload_hash || provenance_hash)`. The `context_id` and `sender_did` are variable-length strings. No length prefixes are specified. A `context_id` of "abc" with `sender_did` of "def" produces the same hash input as `context_id` "ab" with `sender_did` "cdef". The migration proof formula (line 350) correctly uses `len()` as 4-byte BE prefixes for its variable-length fields -- this same pattern is missing from the envelope signatures.
+- **Resolution (later)**: Accepted and fixed. The `InnerEnvelope` field table of `09-security-model.md` §9.5.2 carries a 4-byte big-endian length prefix on every variable-length field, under the canonical hash construction §9.5.1 states.
 - **Security impact**: Concatenation ambiguity enables second-preimage attacks where an attacker can construct a different `(context_id, sender_did)` pair that produces the same signature input. This is a forgery vector: a valid signature over one context/sender pair could validate for a different pair. In practice, the exploitation requires finding two valid identifiers whose concatenation matches, which is constrained but not impossible.
 - **Severity**: CRITICAL
 
@@ -25,6 +28,7 @@ The most serious category of findings involves underspecified constructions wher
 - **Construction**: BroadcastEnvelope canonical hash and signature
 - **Location**: 09-security-model.md, line 216 (section 9.5)
 - **What's missing**: Same as CRYPTO-01. The formula `SHA256(context_id || sender_did || sequence || key_epoch || timestamp || content_hash || provenance_hash)` uses raw concatenation of variable-length `context_id` and `sender_did` without length prefixes. Additionally, this formula lacks the domain separator present in InnerEnvelope (`"SCP-INNER-ENVELOPE-V1:"`). There is no `"SCP-BROADCAST-ENVELOPE-V1:"` prefix.
+- **Resolution (later)**: Accepted and fixed. The `BroadcastEnvelope` field table of `09-security-model.md` §9.5.2 carries a 4-byte big-endian length prefix on every variable-length field, and §9.18.2 registers the separator `"SCP-BROADCAST-ENVELOPE-V1:"`.
 - **Security impact**: (1) Same concatenation ambiguity as CRYPTO-01. (2) The missing domain separator means the same `(context_id, sender_did, ...)` values produce hash inputs that could collide with other hash constructions in the protocol. A valid broadcast signature could potentially be replayed as an InnerEnvelope signature if the fixed-length fields happen to align. The domain separator on InnerEnvelope prevents InnerEnvelope-to-Broadcast replay, but not the reverse direction.
 - **Severity**: CRITICAL
 
@@ -110,6 +114,7 @@ The most serious category of findings involves underspecified constructions wher
 - **Construction**: Pre-rotation commitment scheme
 - **Location**: 09-security-model.md, line 334 (section 9.7.4)
 - **What's missing**: The pre-rotation commitment is `SHA-256(public_key)` -- a bare hash of the 32-byte public key with no domain separator, no length prefix, and no version tag. If any other construction in the protocol hashes a 32-byte value with SHA-256, the commitments could collide in meaning. The migration proof (line 350) correctly uses `"SCP-MIGRATION-V1:"` as a domain separator. The commitment itself should use something like `SHA-256("SCP-PRE-ROTATION-COMMITMENT-V1:" || public_key)`.
+- **Resolution (later)**: Accepted and fixed, under a spelling this finding does not use. The commitment is `SHA-256("SCP-PREROTATION-COMMITMENT-V1:" ‖ pre_rotation_public_key)` over a 33-byte SEC1 compressed point (`09-security-model.md` §9.7.4.2 definitions), which §25.28's Vector 47 pins; the separator carries no hyphen between PRE and ROTATION, so an implementer taking this finding's recommended spelling computes commitments no reveal ever matches.
 - **Security impact**: In isolation, this is low risk because the commitment is stored in a specific field of the key-event log. However, the protocol uses SHA-256 hashes of 32-byte values in multiple places (event hashes, routing IDs, etc.). A commitment value that happens to match another hash could be confused in contexts where the field type is not checked. More importantly, this violates the spec's own domain separation pattern used everywhere else.
 - **Severity**: LOW
 

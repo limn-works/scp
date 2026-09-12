@@ -672,7 +672,7 @@ Resolution is the trust root for the whole protocol: where an attacker can subst
 
 ### 3.8.1 The Identifier in a Deterministic Derivation
 
-**A derivation that two independent parties must reproduce byte for byte consumes the identifier's 32 raw digest bytes** (`09-security-model.md` §9.7.4.2 R13). The `derived_context_id` of §5.15.8 is one such derivation. A fixed-length digest admits exactly one encoding, so two honest parties cannot split onto divergent values, and the length-prefix discipline of `09-security-model.md` §9.5.1 keeps the field boundaries unambiguous whatever the neighbouring fields carry. **A string that is not the canonical form of an inception-derived identifier is rejected at a fail-loud admission gate and never silently coerced**, at every gate that takes an identifier from outside the SDK: without that gate three conforming implementations hash, hex-decode, or left-pad the same bad input, each derives a different value, and the cross-party check fires at the peer while the party holding the bad input believes its identifier valid.
+**A derivation that two independent parties must reproduce byte for byte consumes the identifier's 32 raw digest bytes** (`09-security-model.md` §9.7.4.2 R13). The `derived_context_id` of §5.15.8 is one such derivation. A fixed-length digest admits exactly one encoding, so two honest parties cannot split onto divergent values, and the length-prefix discipline of `09-security-model.md` §9.5.1 keeps the field boundaries unambiguous whatever the neighbouring fields carry. **A string that is not the canonical form of an inception-derived identifier is rejected at a fail-loud admission gate, with `IdentityError::NonCanonicalIdentifier` (§3.10.10), and never silently coerced**, at every gate that takes an identifier from outside the SDK: without that gate three conforming implementations hash, hex-decode, or left-pad the same bad input, each derives a different value, and the cross-party check fires at the peer while the party holding the bad input believes its identifier valid.
 
 **A preimage that takes the identifier as UTF-8 bytes is not yet computable**, because R13 defers the identifier's textual form. `09-security-model.md` §9.5.2 enumerates every signed structure that waits on it, and a reader MUST NOT treat one of those preimages as computable until a later revision of R13 fixes the encoding.
 
@@ -734,7 +734,7 @@ The resolution protocol runs seven steps.
 
 **Two relays serving heads of one chain at one sequence** are compared event by event over each event's preimage digest, never over the chain bytes and never over the framing. Where every position's digests agree the two records are one chain, whether or not their bytes match, because §9.5 admits a hardware signer that draws its own nonce and two encodings of one event are then ordinary. Where the digests differ at any position the two heads are divergent events at one sequence, and step 4 settles them. KERI identifies an event by its digest in the same way, under `spec-body` §SAID fields.
 
-**Where every relay fails**, a cached key state under seven days old is returned as a `Confirmed` verdict carrying the cached head, with `HeadProvenance` unchanged and no relays reached; otherwise resolution fails with a typed error. `Confirmed` is the verdict because the cached head is a head the party already adopted and re-adopts, which is what that verdict means everywhere else in `09-security-model.md` §9.7.4.2 R14. **The resolver MUST NOT fabricate a key state.** A relay that does not answer within the per-relay timeout is a failure for that attempt, and the resolver falls through to the others rather than retrying it synchronously.
+**Where every relay fails**, a cached key state under seven days old is returned as a `Confirmed` verdict carrying the cached head, with `HeadProvenance` unchanged and no relays reached; otherwise resolution fails with `IdentityError::NoRelayReachable` (§3.10.10). `Confirmed` is the verdict because the cached head is a head the party already adopted and re-adopts, which is what that verdict means everywhere else in `09-security-model.md` §9.7.4.2 R14. **The resolver MUST NOT fabricate a key state.** A relay that does not answer within the per-relay timeout is a failure for that attempt, and the resolver falls through to the others rather than retrying it synchronously.
 
 ### 3.10.5 Publishing Protocol
 
@@ -794,6 +794,37 @@ pub trait IdentityBackend: Send + Sync {
     /// Publishes the identity's service record under its designated key (§3.10.13).
     fn publish_service_record(&self, identifier: &[u8; 32], record: &[u8])
         -> impl Future<Output = Result<PublishOutcome, IdentityError>> + Send;
+}
+
+/// The error half of every method above. A refusal the protocol mandates
+/// carries one of these variants, each registered in the `SCP-IDENT-` code
+/// range `.docs/standards/sdk-common.md` reserves, so four bindings mint one
+/// code rather than four and a caller tells a custody choice from a network
+/// condition.
+pub enum IdentityError {
+    /// SCP-IDENT-1001. No substrate satisfies the independent-residence
+    /// requirement of `09-security-model.md` §9.7.4.1 item 3a, so identity
+    /// creation and every later reveal fail closed.
+    NoIndependentSubstrate,
+    /// SCP-IDENT-1002. The SDK holds a threshold of the standing root, so it
+    /// refuses to sign `standing_root: Lost` (§9.7.4.2 R3).
+    RootThresholdHeld,
+    /// SCP-IDENT-1003. The SDK can reach no source in the fallback set, so it
+    /// refuses to compose a reveal-authorized event (§9.7.4.2 R10).
+    NoFallbackSourceReachable,
+    /// SCP-IDENT-1004. The SDK can observe another unpublished
+    /// reveal-authorized event or a pending handle for this identity
+    /// (§9.7.4.2 R10).
+    RevealAlreadyPending,
+    /// SCP-IDENT-1005. The verifier could not persist a contested verdict, its
+    /// retained suffixes, or the accepted-head baseline (§9.7.4.2 R14).
+    PersistFailed,
+    /// SCP-IDENT-1006. Every relay failed and no cached key state is fresh
+    /// enough to return (§3.10.4).
+    NoRelayReachable,
+    /// SCP-IDENT-1007. A string reached an admission gate that is not the
+    /// canonical form of an inception-derived identifier (§3.8.1).
+    NonCanonicalIdentifier,
 }
 
 /// Every resolution returns one of the six verdicts of
