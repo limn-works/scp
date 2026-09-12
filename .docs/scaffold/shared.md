@@ -72,6 +72,10 @@ All SDKs use language-idiomatic casing for the same logical identifiers.
 | UCAN revoke | `ucan::revoke` | `revoke()` | `revoke()` | `revokeUcanToken()` | `ucanRevoke()` | `UcanRevoke()` | `UcanRevokeAsync()` | `ucanRevoke()` |
 | Error base | `ScpError` | `ScpError` | `ScpError` | `ScpError` | `ScpException` | `ScpError` | `ScpException` | `ScpException` |
 | Package name | `scp-core` | `scp-python` | `@limn-works/scp-ts` | `SCP` | `works.limn:scp-kt` | `scp-go` | `Limn.Scp` | `works.limn:scp-java` |
+| Resolve identity | `IdentityBackend::resolve` | `backend.resolve()` | `backend.resolve()` | `backend.resolve()` | `backend.resolve()` | `backend.Resolve()` | `backend.ResolveAsync()` | `backend.resolve()` |
+| Read service record | `IdentityBackend::read_service_record` | `backend.read_service_record()` | `backend.readServiceRecord()` | `backend.readServiceRecord()` | `backend.readServiceRecord()` | `backend.ReadServiceRecord()` | `backend.ReadServiceRecordAsync()` | `backend.readServiceRecord()` |
+
+**Name-bound enumerations are the exception to language-idiomatic casing of the identifier itself.** `09-security-model.md` §9.7.4.2's definitions fix the type name and every variant name of each name-bound enumeration — `SignatureForm`, `KeyAlgorithm`, `CustodyType`, `CustodyProfile`, `KeyRole`, `KeyCondition`, `EventKind`, `Continuation`, `StandingRootDeclaration`, `RecoveryHandle`, `RecoveryPhase`, `HeadProvenance`, `ContinuityStanding`, `ResolutionVerdict`, `InconclusiveCause`, `TieClass`, `ContentVerdict`, `UnverifiedReason`, `ContentInvalidCause`, `ServiceRecordVerdict` — and `.docs/standards/conventions.md` states the one recasing rule each language applies to that spelling.
 
 ### Casing rules per language
 
@@ -147,12 +151,12 @@ Tests are defined as JSON fixtures:
 {
   "test_id": "identity-create-001",
   "category": "identity",
-  "description": "Create identity with in-memory custody",
+  "description": "Create identity with passkey root custody on a desktop profile",
   "operation": "identity_create",
-  "input": { "custody": "in_memory" },
+  "input": { "custody_type": "Passkey", "custody_profile": "Desktop" },
   "expected": {
     "identifier_len": 32,
-    "custody_type": "in_memory"
+    "custody_type": "Passkey"
   }
 }
 ```

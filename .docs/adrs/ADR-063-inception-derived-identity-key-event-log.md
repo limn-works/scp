@@ -74,7 +74,7 @@ SCP's identity is an inception-derived self-certifying identifier over an append
 
 **Witnesses are relays.** Alec asked on 2026-08-31, "witness policy essentialy has the same machinery as identity relays then?" The layer reuses the relay infrastructure, the identity-to-relay association, the application management, and the shipped-default machinery SCP already runs for transport, and adds a cosigned head, two key-state fields, and the comparison a watcher runs.
 
-**A witness watches and reports, and decides nothing.** Alec ruled it on 2026-09-10: "watch and report as well". **Amended 2026-09-10.** No rule of `09-security-model.md` §9.7.4.2 reads a cosignature. §9.7.4.3 states the one check a witness runs, the two objects it produces, and the residual this ruling leaves standing.
+**A witness watches and reports, and decides nothing.** Alec ruled it on 2026-09-10: "watch and report as well". **Amended 2026-09-10.** `09-security-model.md` §9.7.4.3 states the one check a witness runs, the two objects it produces, and the residual this ruling leaves standing.
 
 **The superseded required model was the orchestrator's design call and not Alec's.** `09-security-model.md` §9.7.4.3 carries the exchange that establishes the attribution. He had stated the general correction on 2026-09-06: "I said B because you presented as an option that solves the problem not because it was something specific that I wanted. You gave me some options. I chose one."
 
@@ -166,7 +166,7 @@ Each rule below is KERI's, and the SCP section that carries it cites KERI.
 
 **Fork precedence.** KERI resolves two versions of one event by first observation and pays for it with a watcher network that makes the first observation ambient (`spec-body` §First Seen Policy, §Superseding Recovery). SCP replaced that with the root rule, on Alec's 2026-09-07 ruling. The reason a first-observation rule cannot stand here: it divides relying parties by what each saw first, and it forecloses recovery from an unforeseen compromise in exactly the case the owner needs it, because the owner's own recovery is the second reveal of the commitment. The substitution is not free, and the Alternatives section below states what it costs.
 
-**The witness layer.** KERI's witnesses gate an event's acceptance through a threshold of receipts and an agreement algorithm (`spec-body` §KERI's Algorithm for Witness Agreement). Under Alec's watch-and-report ruling an SCP witness gates nothing: it runs one check, signs or refuses, and no validity rule reads its signature. KERI's kind-based carve-out, which lets a recovery past a witness's held head, is dropped with the gate, because under watch-and-report a recovery reaches witnesses by naming a fresh set and needs no carve-out.
+**The witness layer.** KERI's witnesses gate an event's acceptance through a threshold of receipts and an agreement algorithm (`spec-body` §KERI's Algorithm for Witness Agreement). Under Alec's watch-and-report ruling an SCP witness runs one check and signs or refuses (`09-security-model.md` §9.7.4.3). KERI's kind-based carve-out, which lets a recovery past a witness's held head, is dropped with the gate, because under watch-and-report a recovery reaches witnesses by naming a fresh set and needs no carve-out.
 
 **The key-event seal.** SCP keeps KERI's seal for anchoring another identity's key event and drops KERI's anchoring of arbitrary data, because SCP content commits through MLS and never touches the log.
 

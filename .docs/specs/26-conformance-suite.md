@@ -57,8 +57,8 @@ Each test specifies:
 | **Tier** | Core |
 | **Spec Sections** | `03-identity.md` §3.2.1 case 1, §9.11, `09-security-model.md` §9.7.4.2 R3, R8 |
 | **Preconditions** | An identity with an established `#active` key. Existing messages signed with the old key. |
-| **Steps** | 1. Generate a new P-256 keypair for `#active`. 2. Compose a `KeyState` event whose snapshot lists the new key `current` in the `#active` role and the old key `Superseded`. 3. Sign it with the standing root and publish the extended chain. 4. Resolve the identity again. 5. Verify the old key's condition is `Superseded`. 6. Verify the key continuity fingerprint changed. |
-| **Expected Outcome** | The derived key state lists the new key `current` and the old key `Superseded`: a condition and never an absence retires a key. The key continuity fingerprint (§9.11) reflects the change. Messages signed with the old key still verify, because a content signature verifies against a retired key (§9.7.1). |
+| **Steps** | 1. Generate a new P-256 keypair for `#active`. 2. Compose a `KeyState` whose key list carries the new key `current` in the `#active` role and the old key's `Superseded` drop entry. 3. Sign it with the standing root, publish the extended chain, and resolve the identity again. 5. Verify the old key reads `Superseded`. 6. Verify the fingerprint changed. |
+| **Expected Outcome** | The derived key state lists the new key `current`, and a replay reads the old key `Superseded` from that event's drop entry: a condition and never an absence retires a key. The key continuity fingerprint (§9.11) reflects the change. Messages signed with the old key still verify, because a content signature verifies against a retired key (§9.7.1). |
 
 ### CONF-004: A Chain Claiming Delegation Is Rejected
 

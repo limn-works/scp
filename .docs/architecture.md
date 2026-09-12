@@ -766,12 +766,7 @@ Each replaceable trait imposes invariants that every implementation must uphold.
 - `delete` is best-effort — untrusted transports may ignore it.
 - Adapters map transport-specific semantics (WebSocket, Nostr relay, libp2p, etc.) onto this uniform interface.
 
-**`IdentityBackend`** (scp-identity) — `Send + Sync`, async methods. ADR-063 names the seam.
-- `create` composes the inception event, which fixes the root set, the first pre-rotation commitment and the initial key state, and returns the identity whose identifier is that event's digest (`09-security-model.md` §9.7.4.2 R2, R13).
-- `verify` is a local, synchronous check: recompute the identifier from the inception event's signed preimage and compare (R2).
-- `resolve` is the protocol's one resolution entry point: it takes the identifier's 32 raw digest bytes and returns a `ResolutionOutcome` (`03-identity.md` §3.10.10).
-- `publish` writes the key-event record at the identifier's routing id and the service record at its own (`03-identity.md` §3.10.5, §3.10.13).
-- `rotate` composes a `KeyState` event listing the new operational key `current` and the old one `Superseded`, signed by the standing root. The identifier does not change (`03-identity.md` §3.2.1 case 1).
+**`IdentityBackend`** (scp-identity) — `Send + Sync`, async. `03-identity.md` §3.10.10 declares the trait's four methods with their return types and their error type, and this entry lists none of its own. ADR-063 names the seam.
 
 **`MlsBackend`** (scp-runtime/crypto/mls) — `Send + Sync`, async methods (via `#[async_trait]`). Replaces the deleted `ContextCryptoProvider` (ADR-049).
 - Stateless MLS primitives: `create_group`, `add_member_raw`, `remove_member_raw`, `encrypt`, `decrypt`, `process_commit`, `advance_epoch`, `validate_key_package`, `generate_key_package`, `join_from_welcome`.

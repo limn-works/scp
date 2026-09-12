@@ -36,6 +36,7 @@ See `sdk-common.md` for the full cross-language casing table. Summary of univers
 - **Type names** are `PascalCase` in every language
 - **Constants** are `SCREAMING_SNAKE_CASE` in most languages (except Swift: `camelCase`, C#: `PascalCase`)
 - **Acronyms** follow language convention: `URLString` vs `urlString` — see per-language standards
+- **A name-bound enumeration's variants** take the spelling `09-security-model.md` §9.7.4.2's definitions give them, recased by one deterministic rule per language: `PascalCase` in Rust, Swift and Kotlin, `SCREAMING_SNAKE_CASE` in Python, and the language's own convention in TypeScript, each derived by splitting the spec's spelling on word boundaries and recasing. No binding author chooses a spelling, and the shared conformance fixtures compare a variant across languages after that recasing
 
 ## Git Commits
 
