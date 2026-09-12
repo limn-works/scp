@@ -7,7 +7,7 @@
 //! author rotates their broadcast key, and the blocked subscriber receives no
 //! response to future key requests.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::BuildHasher;
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -242,7 +242,7 @@ pub struct AuthorState {
     /// INSERT is a downward-authorization revocation and a REMOVE is a re-grant,
     /// so only the in-module block/ban/unblock mutators may write it. Read
     /// externally via [`Self::block_list`].
-    block_list: HashSet<String>,
+    block_list: BTreeSet<String>,
 }
 
 impl AuthorState {
@@ -255,7 +255,7 @@ impl AuthorState {
             broadcast_key: generate_sender_key(),
             epoch: 0,
             next_sequence: 1,
-            block_list: HashSet::new(),
+            block_list: BTreeSet::new(),
         }
     }
 
@@ -279,7 +279,7 @@ impl AuthorState {
     /// field is private; block-list writes are security mutations reachable only
     /// through the in-module block/ban/unblock mutators.
     #[must_use]
-    pub const fn block_list(&self) -> &HashSet<String> {
+    pub const fn block_list(&self) -> &BTreeSet<String> {
         &self.block_list
     }
 }
@@ -325,7 +325,7 @@ pub struct BlockResult {
     /// The author DID whose block list was modified.
     pub author_did: String,
     /// The full block list after the block operation, for persistence.
-    pub block_list: HashSet<String>,
+    pub block_list: BTreeSet<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -345,7 +345,7 @@ pub struct UnblockResult {
     /// The author DID whose block list was modified.
     pub author_did: String,
     /// The full block list after the unblock operation, for persistence.
-    pub block_list: HashSet<String>,
+    pub block_list: BTreeSet<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -588,10 +588,25 @@ pub struct BroadcastContext {
     /// Admission policy: open or gated.
     admission: BroadcastAdmission,
     /// Local view of known subscribers. Not a distributed index — bounded by
-    /// context policy, not `HashMap` capacity.
-    subscribers: HashMap<String, SubscriberRecord>,
-    /// Per-author broadcast key state, keyed by author DID.
-    authors: HashMap<String, AuthorState>,
+    /// context policy, not map capacity. `BTreeMap` for the same reason as
+    /// `authors`: this is the OTHER roster on this struct, and both are handed
+    /// out as public iterators ([`Self::subscribers`], [`Self::author_dids`]).
+    /// One rule for both rosters — DID-lexicographic iteration order, no
+    /// per-roster exception a caller has to remember — is what stops a future
+    /// caller from feeding a randomized order into a Merkle leaf, the exact
+    /// defect the `authors` conversion fixes.
+    subscribers: BTreeMap<String, SubscriberRecord>,
+    /// Per-author broadcast key state, keyed by author DID. `BTreeMap` (not
+    /// `HashMap`) BY CONSTRUCTION: every Vec derived from this map's iteration
+    /// order — the per-author key-epoch advance sets returned by
+    /// [`Self::rotate_all_author_keys`], [`Self::governance_ban_subscriber`]
+    /// and [`BroadcastContextClassCParts::unsubscribe`] — becomes a sequence
+    /// of `KeyEpochAdvance` event-log Merkle leaves. `HashMap` iteration order
+    /// is randomized per process, so the same logical rotation would otherwise
+    /// produce a different leaf sequence (and Merkle root) on different
+    /// members and across replays. Key order is DID-lexicographic and needs no
+    /// sort at any egress site.
+    authors: BTreeMap<String, AuthorState>,
     /// Durable governance-ban record (§5.14.8). DIDs banned by an authority via
     /// `RevokeAccess`/`governance_ban_subscriber`. This is INDEPENDENT of the
     /// `subscribers` registry and of the runtime membership-scoped
@@ -603,7 +618,7 @@ pub struct BroadcastContext {
     /// DID cannot re-subscribe by leaving and replaying a retained `messages:read`
     /// UCAN. Carried across restart in [`BroadcastContextSnapshot`] on the same
     /// Class-S fail-closed path as `block_list`.
-    banned_subscribers: HashSet<String>,
+    banned_subscribers: BTreeSet<String>,
 }
 
 /// Uniform deny reason for a broadcast key request (§5.14.8 non-leakage).
@@ -664,7 +679,7 @@ pub const SUBSCRIBE_DENY_REASON: &str = "subscriber is not permitted to subscrib
 pub struct BroadcastContextClassCParts<'a> {
     /// `&mut` to the subscriber roster (Class-C — roster ADD/REMOVE carries no
     /// key secrecy; content is public, per-author keys protect publication).
-    pub subscribers: &'a mut HashMap<String, SubscriberRecord>,
+    pub subscribers: &'a mut BTreeMap<String, SubscriberRecord>,
     /// `&mut` to the per-author key state. The [`AuthorState`] security fields
     /// (`broadcast_key` / `epoch` / `block_list`) are PRIVATE, so DIRECT raw
     /// field reach through this `&mut` is limited to `next_sequence` for code
@@ -680,7 +695,7 @@ pub struct BroadcastContextClassCParts<'a> {
     /// [`BroadcastContext`] — only those carry the fail-closed, must-survive-
     /// crash guarantee; the safe-direction unsubscribe/unblock writes are
     /// persisted best-effort.
-    pub authors: &'a mut HashMap<String, AuthorState>,
+    pub authors: &'a mut BTreeMap<String, AuthorState>,
     /// Copy of the admission policy (read-only input to `subscribe`).
     pub admission: BroadcastAdmission,
     /// Shared `&` to the context identifier (structural identity, stable).
@@ -691,7 +706,7 @@ pub struct BroadcastContextClassCParts<'a> {
     /// gets NO `&mut` — ban WRITES (`governance_ban_subscriber`) and un-ban
     /// (`governance_unban_subscriber`) stay inherent on the whole
     /// `&mut BroadcastContext`, keeping the durable ban authority-only-clearable.
-    pub banned_subscribers: &'a HashSet<String>,
+    pub banned_subscribers: &'a BTreeSet<String>,
 }
 
 impl BroadcastContextClassCParts<'_> {
@@ -1062,9 +1077,9 @@ impl BroadcastContext {
         Ok(Self {
             context_id,
             admission,
-            subscribers: HashMap::new(),
-            authors: HashMap::new(),
-            banned_subscribers: HashSet::new(),
+            subscribers: BTreeMap::new(),
+            authors: BTreeMap::new(),
+            banned_subscribers: BTreeSet::new(),
         })
     }
 
@@ -1172,10 +1187,10 @@ impl BroadcastContext {
     /// registered.
     pub fn add_author(&mut self, author_did: &str) -> Result<&AuthorState, ContextError> {
         match self.authors.entry(author_did.to_owned()) {
-            std::collections::hash_map::Entry::Occupied(_) => Err(ContextError::PermissionDenied(
+            std::collections::btree_map::Entry::Occupied(_) => Err(ContextError::PermissionDenied(
                 format!("author already registered: {author_did}"),
             )),
-            std::collections::hash_map::Entry::Vacant(entry) => {
+            std::collections::btree_map::Entry::Vacant(entry) => {
                 Ok(entry.insert(AuthorState::new(author_did.to_owned())))
             }
         }
@@ -1488,7 +1503,7 @@ impl BroadcastContext {
     pub fn restore_block_list(
         &mut self,
         author_did: &str,
-        block_list: HashSet<String>,
+        block_list: BTreeSet<String>,
     ) -> Result<(), ContextError> {
         let author = self.authors.get_mut(author_did).ok_or_else(|| {
             ContextError::MemberNotFound(format!("author not found: {author_did}"))
@@ -1716,11 +1731,6 @@ impl BroadcastContext {
                 timestamp: timestamp_ms,
             });
         }
-        // Sort by author_did for deterministic event-log leaf ordering across
-        // replicas and reconstructions. HashMap iteration order is randomized
-        // per process, so the same logical rotation would otherwise produce
-        // a different Merkle root on different nodes or replays.
-        advances.sort_unstable_by(|a, b| a.author_did.cmp(&b.author_did));
         Ok(advances)
     }
 
@@ -2109,12 +2119,22 @@ impl BroadcastContext {
         }
     }
 
-    /// Returns an iterator over all subscriber records.
+    /// Returns an iterator over all subscriber records, in DID-lexicographic
+    /// order.
+    ///
+    /// The order is guaranteed BY CONSTRUCTION (the backing `BTreeMap`), not by
+    /// a sort at this call site, so it holds for every caller on every process
+    /// without a "callers must sort" contract to remember.
     pub fn subscribers(&self) -> impl Iterator<Item = &SubscriberRecord> {
         self.subscribers.values()
     }
 
-    /// Returns an iterator over all author DIDs.
+    /// Returns an iterator over all author DIDs, in DID-lexicographic order.
+    ///
+    /// The order is guaranteed BY CONSTRUCTION (the backing `BTreeMap`), not by
+    /// a sort at this call site. Callers deriving an event-log leaf sequence
+    /// from this iterator therefore produce the same sequence — and the same
+    /// Merkle root — on every member and across replays.
     pub fn author_dids(&self) -> impl Iterator<Item = &String> {
         self.authors.keys()
     }
@@ -2213,17 +2233,20 @@ pub struct BroadcastContextSnapshot {
     pub context_id: String,
     /// Admission policy: open or gated.
     pub admission: BroadcastAdmission,
-    /// Subscriber roster, keyed by subscriber DID.
-    pub subscribers: HashMap<String, SubscriberRecord>,
-    /// Per-author broadcast key state, keyed by author DID.
-    pub authors: HashMap<String, AuthorStateSnapshot>,
+    /// Subscriber roster, keyed by subscriber DID. `BTreeMap` mirrors the live
+    /// [`BroadcastContext`] field.
+    pub subscribers: BTreeMap<String, SubscriberRecord>,
+    /// Per-author broadcast key state, keyed by author DID. `BTreeMap` mirrors
+    /// the live [`BroadcastContext`] field, so the persisted and exported
+    /// encodings are byte-deterministic for identical logical state.
+    pub authors: BTreeMap<String, AuthorStateSnapshot>,
     /// Durable governance-ban record (§5.14.8, #2088). Carries the authoritative
     /// ban set across restart on the same Class-S fail-closed path as
     /// `block_list`. `#[serde(default)]` for backward-compat: a snapshot written
     /// before this field existed deserializes to an empty set (no bans lost,
     /// because pre-existing persisted state had no separate ban record).
     #[serde(default)]
-    pub banned_subscribers: HashSet<String>,
+    pub banned_subscribers: BTreeSet<String>,
 }
 
 /// Serializable snapshot of per-author broadcast key state.
@@ -2242,7 +2265,7 @@ pub struct AuthorStateSnapshot {
     /// Next sequence number for this author's messages (§5.14.5).
     pub next_sequence: u64,
     /// DIDs blocked by this author.
-    pub block_list: HashSet<String>,
+    pub block_list: BTreeSet<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2364,6 +2387,7 @@ mod tests {
     use crate::crypto::ucan::{Attenuation, UcanHeader, UcanPayload};
     use scp_clock::Clock;
     use std::collections::HashMap as StdHashMap;
+    use std::collections::HashSet;
 
     // AAD constants for sender-layer encrypt/decrypt in broadcast tests.
     // These bind the test ciphertexts to a fixed context so AAD is consistent
@@ -3687,7 +3711,7 @@ mod tests {
         ctx.add_author("did:example:alice").unwrap();
         subscribe_open(&mut ctx, "did:example:dave", None, 1000).unwrap();
 
-        let mut stored_block_list = HashSet::new();
+        let mut stored_block_list = BTreeSet::new();
         stored_block_list.insert("did:example:dave".to_owned());
         stored_block_list.insert("did:example:eve".to_owned());
 
@@ -3702,7 +3726,7 @@ mod tests {
     #[test]
     fn restore_block_list_unknown_author_returns_error() {
         let mut ctx = make_open_ctx();
-        let result = ctx.restore_block_list("did:example:unknown", HashSet::new());
+        let result = ctx.restore_block_list("did:example:unknown", BTreeSet::new());
         assert!(result.is_err());
     }
 
@@ -4462,6 +4486,136 @@ mod tests {
         let mut dids: Vec<&str> = ctx.author_dids().map(String::as_str).collect();
         dids.sort_unstable();
         assert_eq!(dids, vec!["did:example:alice", "did:example:bob"]);
+    }
+
+    // =======================================================================
+    // Author-egress ordering determinism (§5.14.10 KeyEpochAdvance leaves)
+    //
+    // Every Vec derived from the `authors` map becomes a SEQUENCE of event-log
+    // Merkle leaves. The map is a `BTreeMap`, so DID-lexicographic order holds
+    // BY CONSTRUCTION at every egress site — no sort, no "callers must preserve
+    // this order" contract. These tests pin that: they fail if `authors` is
+    // reverted to a `HashMap` (whose iteration order is randomized per map
+    // instance and per process).
+    // =======================================================================
+
+    /// Ten author DIDs whose insertion order is deliberately NOT their sorted
+    /// order. With ten distinct keys, a randomized map iterating in exactly
+    /// sorted order has probability 1/10! (~2.8e-7), so a `HashMap` regression
+    /// is caught deterministically in practice.
+    const ORDERING_AUTHORS: [&str; 10] = [
+        "did:example:zeta",
+        "did:example:mu",
+        "did:example:alpha",
+        "did:example:tau",
+        "did:example:beta",
+        "did:example:omega",
+        "did:example:kappa",
+        "did:example:delta",
+        "did:example:sigma",
+        "did:example:iota",
+    ];
+
+    fn ctx_with_ordering_authors(reverse_insertion: bool) -> BroadcastContext {
+        let mut ctx = make_open_ctx();
+        let mut order: Vec<&str> = ORDERING_AUTHORS.to_vec();
+        if reverse_insertion {
+            order.reverse();
+        }
+        for did in order {
+            ctx.add_author(did).unwrap();
+        }
+        ctx
+    }
+
+    fn sorted_ordering_authors() -> Vec<String> {
+        let mut expected: Vec<String> = ORDERING_AUTHORS.iter().map(|d| (*d).to_owned()).collect();
+        expected.sort();
+        expected
+    }
+
+    #[test]
+    fn rotate_all_author_keys_yields_advances_in_did_order() {
+        let mut ctx = ctx_with_ordering_authors(false);
+        let advances = ctx.rotate_all_author_keys(1_700_000_000_000).unwrap();
+
+        let dids: Vec<String> = advances.iter().map(|a| a.author_did.clone()).collect();
+        assert_eq!(
+            dids,
+            sorted_ordering_authors(),
+            "rotate_all_author_keys must yield one advance per author in \
+             DID-lexicographic order — the KeyEpochAdvance leaf sequence \
+             (§5.14.10) and therefore the Merkle root depend on it"
+        );
+    }
+
+    #[test]
+    fn rotate_all_author_keys_order_is_insertion_independent() {
+        let mut forward = ctx_with_ordering_authors(false);
+        let mut reverse = ctx_with_ordering_authors(true);
+
+        let forward_dids: Vec<String> = forward
+            .rotate_all_author_keys(1_700_000_000_000)
+            .unwrap()
+            .iter()
+            .map(|a| a.author_did.clone())
+            .collect();
+        let reverse_dids: Vec<String> = reverse
+            .rotate_all_author_keys(1_700_000_000_000)
+            .unwrap()
+            .iter()
+            .map(|a| a.author_did.clone())
+            .collect();
+
+        assert_eq!(
+            forward_dids, reverse_dids,
+            "two members that learned the same authors in different orders must \
+             emit the same KeyEpochAdvance leaf sequence, else their Merkle \
+             roots diverge"
+        );
+    }
+
+    #[test]
+    fn governance_ban_subscriber_yields_rotations_in_did_order() {
+        let mut ctx = ctx_with_ordering_authors(false);
+        subscribe_open(&mut ctx, "did:example:banned", None, 1000).unwrap();
+
+        let result = ctx
+            .governance_ban_subscriber("did:example:banned", AccessScope::Read)
+            .unwrap();
+
+        let dids: Vec<String> = result
+            .rotated_authors
+            .iter()
+            .map(|r| r.author_did.clone())
+            .collect();
+        assert_eq!(
+            dids,
+            sorted_ordering_authors(),
+            "governance_ban_subscriber must yield its forward-secrecy rotations \
+             in DID-lexicographic order — execute_revoke turns each into a \
+             KeyEpochAdvance leaf"
+        );
+    }
+
+    #[test]
+    fn unsubscribe_with_rotation_yields_rotations_in_did_order() {
+        let mut ctx = ctx_with_ordering_authors(false);
+        subscribe_open(&mut ctx, "did:example:leaver", None, 1000).unwrap();
+
+        let result = ctx.unsubscribe("did:example:leaver", true).unwrap();
+
+        let dids: Vec<String> = result
+            .key_rotations
+            .iter()
+            .map(|r| r.author_did.clone())
+            .collect();
+        assert_eq!(
+            dids,
+            sorted_ordering_authors(),
+            "unsubscribe key rotations must be in DID-lexicographic order — \
+             unsubscribe_broadcast turns each into a KeyEpochAdvance leaf"
+        );
     }
 
     // =======================================================================

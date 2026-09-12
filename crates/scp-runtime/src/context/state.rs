@@ -1117,8 +1117,15 @@ pub struct ContextSnapshot {
     /// rollback would let a replay double-settle the escrow, the exact hazard
     /// the synchronous persist forecloses. Same-node restore REHYDRATES it;
     /// cross-node export/import DROP it to empty. `#[serde(default)]` so legacy /
-    /// stripped snapshots deserialize as empty.
-    #[serde(default)]
+    /// stripped snapshots deserialize as empty. `serde_sorted_set` because
+    /// `canonical_snapshot_hash` (`export_import.rs`) hashes the JCS bytes of
+    /// this whole struct into the signed export preimage, JCS keeps array
+    /// element order as serialized, and a `HashSet` iterates in its
+    /// `RandomState` order: without the sorted serializer an exporter and an
+    /// importer that hold the same two `SagaId`s produce different bytes and the
+    /// importer rejects a legitimately signed export as
+    /// `SnapshotSignatureInvalid`.
+    #[serde(default, with = "scp_protocol::serde_util::serde_sorted_set")]
     pub xctx_committed_invocations:
         std::collections::HashSet<crate::context::supervisor::saga_journal::SagaId>,
 

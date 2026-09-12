@@ -979,11 +979,40 @@ pub async fn execute_revoke(
             timestamp_secs,
         )
         .await?;
-    // Spec §2008 / §2015: emit one best-effort KeyEpochAdvance leaf per author
-    // whose broadcast key was rotated by the governance ban.  Each rotation
-    // advances by exactly 1, so old_epoch = new_epoch.saturating_sub(1).
-    // Errors are non-fatal: warn and continue (same pattern as MemberBlocked).
-    let mut kea_success_count: u64 = 0;
+    // Class-C counter bump for the AccessRevoked leaf, inline immediately after
+    // its `?`-append. The counter must track the true durable-leaf count
+    // (governance_logic.rs:156-158) to prevent §9.9.3 checkpoint-position drift.
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
+
+    // §5.14.10: one KeyEpochAdvance leaf per author whose broadcast key was
+    // rotated by the governance ban. Each rotation advances by exactly 1, so
+    // old_epoch = new_epoch.saturating_sub(1).
+    //
+    // THIS LOOP MUST NOT RETURN `Err`. By the time it runs, the ban and every
+    // author-key rotation are durably persisted (the fail-closed
+    // `commit_class_s_keep` above) and the `AccessRevoked` anchor leaf is
+    // appended, so an `Err` here would tell the caller that a revoke which
+    // landed did not land. `execute_governance_action` keeps the proposal's
+    // replay marker whenever the cell's `mutation_epoch` advanced during
+    // dispatch, so the `Err` would not re-arm replay; it would only misreport
+    // the outcome and skip the remaining authors' leaves.
+    // `governance_ban_subscriber` rotates every author unconditionally (it has
+    // no already-banned early return), which is why a replayed RevokeAccess
+    // would advance every author's epoch a SECOND time, write a second
+    // `AccessRevoked` leaf, and leave this member's log divergent from every
+    // member that applied the commit once — a divergence §9.9.3 reads as
+    // equivocation. The epoch rule in `execute_governance_action` closes that
+    // replay for every helper in this file.
+    //
+    // The failure still reaches an operator: each miss logs at ERROR with the
+    // context, the author DID, and the underlying error. A log line is an
+    // honest signal that the log is short a leaf; an `Err` return is a false
+    // one, because it reports "the revoke did not happen" about a revoke that
+    // did happen.
+    //
+    // The counter is bumped INLINE in the success arm, never coalesced at the
+    // end, so the leaves that did land are still credited when a later one
+    // fails.
     for rotation in &rotated_authors {
         let old_epoch = rotation.new_epoch.saturating_sub(1);
         match scp_event_log::payload::encode_payload(
@@ -1004,31 +1033,28 @@ pub async fn execute_revoke(
                     )
                     .await
                 {
-                    tracing::warn!(
+                    tracing::error!(
                         context_id = %context_id,
                         author_did = %rotation.author_did,
                         error = %e,
-                        "KeyEpochAdvance event-log append failed after governance ban (best-effort)"
+                        "KeyEpochAdvance event-log append failed after governance ban — \
+                         the event log is short one leaf for this author"
                     );
                 } else {
-                    kea_success_count += 1;
+                    *cell.class_c_view().checkpoint_events_since_mut() += 1;
                 }
             }
             Err(e) => {
-                tracing::warn!(
+                tracing::error!(
                     context_id = %context_id,
                     author_did = %rotation.author_did,
                     error = %e,
-                    "KeyEpochAdvance payload encode failed after governance ban (best-effort)"
+                    "KeyEpochAdvance payload encode failed after governance ban — \
+                     the event log is short one leaf for this author"
                 );
             }
         }
     }
-    // Coalesced Class-C counter bump: 1 for AccessRevoked + each KeyEpochAdvance
-    // leaf that actually appended. The counter must track the true durable-leaf
-    // count (governance_logic.rs:156-158) to prevent §9.9.3 checkpoint-position
-    // drift. Best-effort leaves that failed are excluded — they were never durable.
-    *cell.class_c_view().checkpoint_events_since_mut() += 1 + kea_success_count;
 
     // H7: Rotate sender key after write-side revocation.
     if needs_sender_key_rotation {
@@ -2158,7 +2184,18 @@ pub async fn execute_extend_ttl(
         cell.membership.member_dids().map(|d| &**d).collect();
     let approval_dids: std::collections::HashSet<&str> =
         approvals.iter().map(|v| &*v.voter_did).collect();
-    let missing: Vec<&str> = member_dids.difference(&approval_dids).copied().collect();
+    // Both sets iterate in a per-process `RandomState` order, and both lists
+    // this helper derives from them (`rejecting_members` below, `consenting`
+    // further down) are fields of a canonical leaf preimage. §9.9.3 of the
+    // security-model spec, the equivocation-detection protocol, requires
+    // every field of a canonical leaf to be convergent, so both lists sort
+    // before they reach a payload: two honest members that append the same
+    // leaf from the same tally must append the same bytes, or their Merkle
+    // roots diverge at equal count and the equal-count/equal-root test
+    // reports equivocation between them. The bilateral twin sorts the same
+    // way (`TtlExtension::consented_dids`).
+    let mut missing: Vec<&str> = member_dids.difference(&approval_dids).copied().collect();
+    missing.sort_unstable();
     if !missing.is_empty() {
         let rejecting_members: Vec<&str> = missing.clone();
         let rejected_payload = scp_event_log::payload::encode_payload(
@@ -2183,13 +2220,24 @@ pub async fn execute_extend_ttl(
         // `member_dids()`) before taking the Class-C view.
         drop(missing);
         drop(member_dids);
+        // The rejection leaf landed and is credited here, which advances the
+        // cell's `mutation_epoch`, so `execute_governance_action` keeps this
+        // proposal's replay marker: a rejected attempt consumes the proposal
+        // (§5.10.1 step 6 of the contexts spec: the extension fails and the
+        // original TTL remains), and the members submit a new ExtendTtl
+        // proposal once consent is unanimous. Re-executing the same id would
+        // append a second `TtlExtensionRejected` leaf per attempt. The `Err`
+        // also keeps `execute_governance_action` from running finalize, so no
+        // `GovernanceActionExecuted` leaf records an extension that did not
+        // happen.
         *cell.class_c_view().checkpoint_events_since_mut() += 1;
         return Err(ContextError::PermissionDenied(format!(
             "TTL extension requires unanimous consent — {missing_len} of {member_count} members have not approved",
         )));
     }
 
-    let consenting: Vec<String> = approval_dids.iter().map(|d| (*d).to_owned()).collect();
+    let mut consenting: Vec<String> = approval_dids.iter().map(|d| (*d).to_owned()).collect();
+    consenting.sort_unstable();
     drop(approval_dids);
     drop(member_dids);
 
@@ -2204,7 +2252,12 @@ pub async fn execute_extend_ttl(
     // stamps the leaf with the committer-assigned `timestamp_secs`
     // (`proposal.created_at`). A context whose log yields no convergent deadline
     // has no TTL to extend ⇒ no-op, no leaf. The append is best-effort/fail-safe
-    // (a lost leaf re-derives the shorter un-extended base on restore).
+    // (a lost leaf re-derives the shorter un-extended base on restore). The
+    // combinator credits `checkpoint_events_since` itself, in the one arm where
+    // the `TtlExtended` leaf landed, so this helper credits nothing: three of
+    // the combinator's paths (no convergent deadline, payload encode failure,
+    // append failure) append no leaf, and an unconditional credit here would
+    // run the §9.9.3 checkpoint position one leaf ahead of the log on each.
     crate::context::ttl_close_helpers::extend_ttl_deadline_and_record(
         cell,
         deps.event_log.as_ref(),
@@ -2220,7 +2273,6 @@ pub async fn execute_extend_ttl(
     .await;
 
     crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id).await;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -2721,12 +2773,14 @@ pub async fn execute_reset_member(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    {
-        let mut view = cell.class_c_view();
-        require_active(view.handle_mut())?;
-        if !view.membership_class_c_mut().contains(did.as_ref()) {
-            return Err(ContextError::MemberNotFound(did.to_string()));
-        }
+    // Read-only pre-checks through `Deref`. A rejected proposal must reach
+    // `execute_governance_action` with the cell's `mutation_epoch` unchanged,
+    // so that it drops the replay marker and the proposal can be retried; a
+    // `class_c_view()` here would advance the epoch and pin the marker for a
+    // proposal that applied nothing.
+    require_active(&cell.handle)?;
+    if !cell.membership.member_dids().any(|member| member == did) {
+        return Err(ContextError::MemberNotFound(did.to_string()));
     }
 
     // Member reset = leave + immediately re-join (ADR-029 §Tier 3).
@@ -3260,18 +3314,41 @@ pub async fn execute_rotate_content_keys(
         )
         .await?;
 
-    // Emit one `KeyEpochAdvance` leaf per broadcast author whose key was
-    // rotated (§5.14.10, #1847). Best-effort: warn on failure, no error
-    // propagation — same pattern as governance_ban_subscriber in
-    // `execute_revoke`. `key_advances` is empty on the non-broadcast path.
+    // Class-C counter bump for the ContentKeysRotated leaf, inline immediately
+    // after its `?`-append. The counter must track the true durable-leaf count
+    // (governance_logic.rs:156-158) to prevent §9.9.3 checkpoint-position drift.
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
+
+    // One `KeyEpochAdvance` leaf per broadcast author whose key was rotated
+    // (§5.14.10, #1847). `key_advances` is empty on the non-broadcast path, and
+    // arrives in DID-lexicographic order by construction (the `authors`
+    // `BTreeMap` in `scp_protocol::context::broadcast`), so the leaf sequence —
+    // and therefore the Merkle root — is identical on every member and across
+    // replays.
     //
-    // NOTE: `advance.timestamp` (milliseconds) is not used here — the
-    // event-log append takes `timestamp_secs` directly. The ms field is
-    // carried by `BroadcastKeyEpochAdvance` for the relay-message consumer
-    // on the per-author block path; it is dead data in this governance path.
-    // `old_epoch` is derived as `new_epoch - 1` because `rotate_all_author_keys`
-    // always increments by exactly 1 (pre-validated, sound by construction).
-    let mut kea_success_count: u64 = 0;
+    // THIS LOOP MUST NOT RETURN `Err`, for the reason spelled out at the
+    // matching loop in `execute_revoke`: the rotation and the
+    // `ContentKeysRotated` anchor leaf are already durable, so an `Err` here
+    // would misreport a rotation that landed and skip the remaining authors'
+    // leaves. `execute_governance_action` keeps the replay marker on a
+    // post-effect error (the cell's `mutation_epoch` advanced), so the `Err`
+    // would not re-arm replay of `rotate_all_author_keys`, which advances every
+    // author unconditionally and would otherwise advance every epoch a second
+    // time and write a second `ContentKeysRotated` leaf (§9.9.3 divergence).
+    //
+    // The failure still reaches an operator: each miss logs at ERROR with the
+    // context, the author DID, and the underlying error.
+    //
+    // The counter is bumped INLINE in the success arm, never coalesced at the
+    // end, so the leaves that did land are still credited when a later one
+    // fails.
+    //
+    // NOTE: `advance.timestamp` (milliseconds) is not used here — the event-log
+    // append takes `timestamp_secs` directly. The ms field is carried by
+    // `BroadcastKeyEpochAdvance` for the relay-message consumer on the per-author
+    // block path; it is dead data in this governance path. `old_epoch` is
+    // derived as `new_epoch - 1` because `rotate_all_author_keys` always
+    // increments by exactly 1 (pre-validated, sound by construction).
     for advance in &key_advances {
         let old_epoch = advance.new_epoch.saturating_sub(1);
         match scp_event_log::payload::encode_payload(
@@ -3292,32 +3369,28 @@ pub async fn execute_rotate_content_keys(
                     )
                     .await
                 {
-                    tracing::warn!(
+                    tracing::error!(
                         context_id = %context_id,
                         author_did = %advance.author_did,
                         error = %e,
-                        "KeyEpochAdvance event-log append failed after RotateContentKeys (best-effort)"
+                        "KeyEpochAdvance event-log append failed after RotateContentKeys — \
+                         the event log is short one leaf for this author"
                     );
                 } else {
-                    kea_success_count += 1;
+                    *cell.class_c_view().checkpoint_events_since_mut() += 1;
                 }
             }
             Err(e) => {
-                tracing::warn!(
+                tracing::error!(
                     context_id = %context_id,
                     author_did = %advance.author_did,
                     error = %e,
-                    "KeyEpochAdvance payload encode failed after RotateContentKeys (best-effort)"
+                    "KeyEpochAdvance payload encode failed after RotateContentKeys — \
+                     the event log is short one leaf for this author"
                 );
             }
         }
     }
-    // Coalesced Class-C counter bump: 1 for ContentKeysRotated + each
-    // KeyEpochAdvance leaf that actually appended. The counter must track the
-    // true durable-leaf count (governance_logic.rs:156-158) to prevent §9.9.3
-    // checkpoint-position drift. Best-effort leaves that failed are excluded —
-    // they were never durable.
-    *cell.class_c_view().checkpoint_events_since_mut() += 1 + kea_success_count;
     Ok(())
 }
 
@@ -3416,6 +3489,11 @@ pub async fn execute_reconfigure_governance(
             timestamp_secs,
         )
         .await?;
+    // Inline Class-C counter bump for THIS leaf. This helper appends TWO durable
+    // leaves; each needs its own bump immediately after its `?`-append so a
+    // failure on the second still credits the first (governance_logic.rs:156-158,
+    // §9.9.3 checkpoint-position drift).
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     // Append the companion GovernanceDeadlockRecovery leaf carrying the
     // structured recovery justification (issue #1847).  The two leaves share
@@ -3451,7 +3529,6 @@ pub async fn execute_reconfigure_governance(
             timestamp_secs,
         )
         .await?;
-
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -3610,6 +3687,14 @@ pub async fn execute_approve_spend(
             timestamp_secs,
         )
         .await?;
+    // Class-C counter bump for the SpendApproved leaf, inline immediately after
+    // its `?`-append. The counter must track the true durable-leaf count
+    // (governance_logic.rs:156-158): `create_checkpoint_if_due_view`
+    // (queries_helpers.rs) gates BOTH §9.9.3 triggers on it — `events_since >=
+    // 50` and `events_since > 0 && elapsed >= 600` — so a context whose only
+    // governance traffic is ApproveSpend would never mint a checkpoint at all,
+    // and a mixed context drifts its checkpoint position by one leaf per grant.
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -3819,7 +3904,8 @@ pub fn execute_propose_context_migration<'a>(
                 ContextError::PermissionDenied("cannot transition to MigratingOut".to_owned())
             })?;
 
-        // Buffer migration events WITHOUT broadcasting (rollback-able block).
+        // The two migration events; buffered and broadcast only after the
+        // destination exists.
         let proposed_event = ContextEvent::ContextMigrationProposed {
             destination_context_id: destination_context_id.clone(),
             reason: reason.to_owned(),
@@ -3832,22 +3918,14 @@ pub fn execute_propose_context_migration<'a>(
             grace_period_end,
         };
 
-        // Coalesced Class-C staging (migration_state + buffered events) in a
-        // view borrow that drops before the `create_context` await.
-        let buffer_len_before_migration = {
-            let mut view = cell.class_c_view();
-            *view.migration_state_mut() = Some(MigrationState {
-                destination_context_id: destination_context_id.clone(),
-                reason: reason.to_owned(),
-                grace_period_end,
-                auto_invite,
-                proposal_id,
-            });
-            let buffer_len_before_migration = view.receive_buffer_mut().len();
-            view.receive_buffer_mut().push(proposed_event.clone());
-            view.receive_buffer_mut().push(started_event.clone());
-            buffer_len_before_migration
-        };
+        // The Class-C staging (migration_state + the two buffered events) runs
+        // AFTER `create_context` returns `Ok`, below. A `class_c_view()` here
+        // would advance the cell's `mutation_epoch` before the fallible
+        // destination creation; `execute_governance_action` reads an advanced
+        // epoch as "an effect landed" and keeps the replay marker, and a
+        // destination-creation failure applies nothing to this context (the
+        // handle returns to `Active`), so the proposal must stay retryable.
+        // Nothing reads this cell during the await: the actor holds it `&mut`.
 
         // Phase 2A.9: lifecycle_helpers::create_context is now actor-shape
         // (bootstrap form — constructs fresh PerContextState, registers
@@ -3878,20 +3956,28 @@ pub fn execute_propose_context_migration<'a>(
             None,
         ));
         if let Err(e) = create_fut.await {
-            // Roll back: revert source to Active and clear migration state. The
-            // `transition_to` await runs with no view borrow live; the Class-C
-            // rollback (clear migration state + truncate the buffered events)
-            // then runs in a short view borrow.
+            // Roll back: revert the source handle to Active. No Class-C field
+            // was written before the await, so no view is taken here and the
+            // cell's `mutation_epoch` is unchanged across the failure.
             let _ = cell.handle.transition_to(&ContextState::Active);
-            {
-                let mut view = cell.class_c_view();
-                *view.migration_state_mut() = None;
-                view.receive_buffer_mut()
-                    .truncate(buffer_len_before_migration);
-            }
             return Err(ContextError::PermissionDenied(format!(
                 "failed to create destination context: {e}"
             )));
+        }
+
+        // Coalesced Class-C staging (migration_state + buffered events) in a
+        // short view borrow, now that the destination exists.
+        {
+            let mut view = cell.class_c_view();
+            *view.migration_state_mut() = Some(MigrationState {
+                destination_context_id: destination_context_id.clone(),
+                reason: reason.to_owned(),
+                grace_period_end,
+                auto_invite,
+                proposal_id,
+            });
+            view.receive_buffer_mut().push(proposed_event.clone());
+            view.receive_buffer_mut().push(started_event.clone());
         }
 
         // Broadcast the migration events that were buffered above.
@@ -5496,11 +5582,11 @@ pub async fn finalize_governance_action(
         );
     }
 
-    // 3. Remove the executed proposal from approved_proposals.
-    state
-        .governance
-        .approved_proposals
-        .remove(&proposal.proposal_id);
+    // 3. The removal of the consumed proposal from `approved_proposals` is
+    //    owned by `discharge_and_order_governance_action`, which runs it on
+    //    every path that keeps the replay marker — a finalize error above, or
+    //    a post-effect dispatch error that skips this body, must not leave the
+    //    entry behind.
 
     // Evaluate consequence rules after governance action (ADR-017,
     // #1531). Use split-borrow variant so both legacy and actor-shape
@@ -5777,7 +5863,41 @@ pub async fn execute_governance_action(
         Ok(())
     })?;
 
-    let result = match dispatch_governance_action(
+    // The replay-marker contract for a dispatch error. Every `execute_*` helper
+    // applies its effect through a `ClassSCell` combinator or view, and the
+    // cell advances `mutation_epoch` at each such hand-out, so the epoch read
+    // here and re-read on `Err` tells the two failure classes apart without a
+    // per-helper tag:
+    //   - epoch unchanged ⇒ the helper applied nothing (a permission check, an
+    //     MLS failure, a pre-commit encode error). Drop the marker, persist the
+    //     removal fail-closed, and surface the error: the proposal is retryable.
+    //   - epoch advanced ⇒ a mutation or a credited leaf landed before the error
+    //     (the canonical case: a fail-closed `commit_class_s_keep` persisted a
+    //     ban and the anchor-leaf append that follows it failed). Keep the
+    //     marker, persist it fail-closed, and surface the error. The proposal
+    //     is consumed, so `discharge_and_order_governance_action` also removes
+    //     it from `approved_proposals` (the conflict-tracking set), fail-closed
+    //     in the same persist: an entry that stays there makes every later
+    //     conflicting proposal lose to a proposal that can never run. Finalize
+    //     does NOT run on this path: `finalize_governance_action` appends the
+    //     `GovernanceActionExecuted` leaf and emits the executed event, and
+    //     each of those asserts a completed action, while the helper reported
+    //     failure. An advanced
+    //     epoch does not prove the action's effect landed — `execute_extend_ttl`
+    //     credits its `TtlExtensionRejected` leaf and then returns
+    //     `PermissionDenied` with the TTL unchanged — so a finalize here would
+    //     write an executed record for a rejected extension. The marker stays
+    //     because dropping it would let the same proposal id run the helper
+    //     again and re-apply a non-idempotent effect (`governance_ban_subscriber`
+    //     and `rotate_all_author_keys` advance every author's epoch a second
+    //     time; a rejected TTL extension appends a second `TtlExtensionRejected`
+    //     leaf), which diverges this member's log from every member that ran
+    //     the helper once — a divergence §9.9.3 of the security-model spec reads
+    //     as equivocation.
+    // The marker's own `begin_class_s` above already advanced the epoch, so the
+    // baseline is read after it.
+    let epoch_before_dispatch = cell.mutation_epoch();
+    let dispatch_outcome = match dispatch_governance_action(
         cell,
         deps,
         context_id,
@@ -5787,18 +5907,19 @@ pub async fn execute_governance_action(
     )
     .await
     {
-        Ok(r) => r,
-        Err(e) => {
-            // Roll back the executed marker on dispatch failure so the proposal
-            // can be retried (e.g. after a transient crypto error). The removal
-            // is itself a Class-S transition that must be durable fail-closed
-            // (keep-direction: a crash must not resurrect the marker and block
-            // the retry). It is staged through the deferred-persist token's own
-            // ClassSMut flow — `discharge_with` runs the removal closure
-            // (`ClassSMut::governance_class_s_mut().executed_proposals.remove`)
-            // and then performs the SINGLE fail-closed persist the token already
-            // owed, so the removed-marker state is what lands durably (no
-            // `state_mut`, exactly one persist — the one the token deferred).
+        Ok(r) => Ok(r),
+        Err(e) if cell.mutation_epoch() == epoch_before_dispatch => {
+            // Roll back the executed marker: the dispatch applied no effect, so
+            // the proposal can be retried (e.g. after a transient crypto error).
+            // The removal is itself a Class-S transition that must be durable
+            // fail-closed (keep-direction: a crash must not resurrect the marker
+            // and block the retry). It is staged through the deferred-persist
+            // token's own ClassSMut flow — `discharge_with` runs the removal
+            // closure (`ClassSMut::governance_class_s_mut().executed_proposals
+            // .remove`) and then performs the SINGLE fail-closed persist the
+            // token already owed, so the removed-marker state is what lands
+            // durably (no `state_mut`, exactly one persist — the one the token
+            // deferred).
             token
                 .discharge_with(cell, deps, context_id, |mut view| {
                     view.governance_class_s_mut()
@@ -5809,39 +5930,130 @@ pub async fn execute_governance_action(
                 .await?;
             return Err(e);
         }
+        Err(e) => {
+            tracing::error!(
+                context_id,
+                proposal_id = %hex::encode(proposal.proposal_id),
+                error = %e,
+                "governance dispatch failed AFTER a mutation or a leaf landed \
+                 (the cell's mutation epoch advanced); the executed-proposal \
+                 replay marker is kept and persisted so the same id cannot re-run \
+                 a non-idempotent action, and finalize is skipped so no \
+                 GovernanceActionExecuted leaf asserts an action the helper \
+                 reported as failed. The caller sees this error; the effect that \
+                 landed is not undone."
+            );
+            Err(e)
+        }
     };
 
     // STRENGTHENING (ADR-049 §9, authorized): `finalize_governance_action`'s
     // own persist was best-effort; the executed-marker durability now rides the
-    // token's FAIL-CLOSED `commit` instead. `finalize_governance_action` is a
-    // Class-C body reached through the token's `discharge_with` ClassSMut view
-    // (`rest_mut()`), so it runs and is then persisted FAIL-CLOSED by the SINGLE
-    // deferred persist the token owed — no whole-state `state_mut`. On a finalize
-    // error the persist STILL runs (keep-direction — the executed marker stays
-    // set and must persist) and `discharge_with` surfaces the finalize error.
-    // Deferred fail-closed discharge with an ASYNC finalize body (ADR-049
-    // Decision 7): `finalize_governance_action` appends to the async
-    // `EventLogPersistence`-backed Merkle log while mutating the state,
-    // interleaved, so it runs inside the RAII `begin_discharge` guard (which hands
-    // out the `ClassSMut` view held across the finalize awaits) rather than a
-    // synchronous `discharge_with` closure. Keep-direction: the SINGLE persist runs
-    // REGARDLESS of the finalize result; the finalize error is surfaced after.
-    let mut discharge = token.begin_discharge(cell);
-    let finalize_result = finalize_governance_action(
-        discharge.view().rest_mut(),
+    // token's FAIL-CLOSED persist instead. On `Ok`, `finalize_governance_action`
+    // is a Class-C body reached through the RAII `begin_discharge` guard's
+    // ClassSMut view (`rest_mut()`), so it runs and is then persisted FAIL-CLOSED
+    // by the SINGLE deferred persist the token owed — no whole-state `state_mut`.
+    // On a finalize error the persist STILL runs (keep-direction — the executed
+    // marker stays set and must persist) and the finalize error is surfaced
+    // after. The guard replaces a synchronous `discharge_with` closure because
+    // finalize appends to the async `EventLogPersistence`-backed Merkle log while
+    // mutating the state, interleaved (ADR-049 Decision 7). On a post-effect
+    // `Err`, the same guard persists the kept marker and the proposal's removal
+    // from `approved_proposals`, and finalize does not run (see the
+    // replay-marker contract above).
+    discharge_and_order_governance_action(
+        token,
+        cell,
         deps,
         context_id,
         proposal,
         executor_did,
+        dispatch_outcome,
     )
-    .await;
-    // Keep-direction: the fail-closed persist runs REGARDLESS of the finalize
-    // result. Error priority matches the former `discharge_with` `match`: a
-    // finalize error is surfaced BEFORE a persist error when both fail.
+    .await
+}
+
+/// Runs the discharge tail of `execute_governance_action`.
+///
+/// Every path that reaches this helper keeps the replay marker, so the proposal
+/// is consumed: the same id can never run the dispatch again. This helper
+/// therefore removes the proposal from `approved_proposals` on EVERY path,
+/// inside the RAII `begin_discharge` guard, so the single fail-closed persist
+/// covers the kept marker and the removal together. `approved_proposals` is the
+/// conflict-tracking set `detect_and_handle_conflicts` reads on each later
+/// approval: an entry that outlives its marker makes every later conflicting
+/// proposal lose to a proposal that cannot run, and the marker's own TTL
+/// (`EXECUTED_PROPOSALS_TTL_SECS`) never reaches the entry. Removing the entry
+/// records consumption, not completion — `finalize_governance_action` used to
+/// own this removal, which meant a finalize error before its removal step, or
+/// a post-effect dispatch error that skips finalize, left the entry behind.
+///
+/// On a dispatch `Ok`: finalize inside the guard, then the removal, then the
+/// single fail-closed persist that runs REGARDLESS of the finalize result
+/// (keep-direction), then the ordering of the two results — a finalize error
+/// first, then a persist error.
+///
+/// On a post-effect dispatch `Err` (the cell's `mutation_epoch` advanced, so
+/// the caller kept the replay marker): the removal, then the persist, then the
+/// dispatch error is returned. Finalize does NOT run: it appends the
+/// `GovernanceActionExecuted` leaf and emits the executed event, and each of
+/// those records a completed action, while the helper reported that the action
+/// did not complete. A persist error on this path is logged here because the
+/// dispatch error is the one returned; `persist_snapshot_fail_closed` logs the
+/// same failure at its own site.
+async fn discharge_and_order_governance_action(
+    token: crate::context::actor::class_s::ClassSCommitToken,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    proposal: &GovernanceProposal,
+    executor_did: &DID,
+    dispatch_outcome: Result<GovernanceActionResult, ContextError>,
+) -> Result<GovernanceActionResult, ContextError> {
+    let mut discharge = token.begin_discharge(cell);
+    let finalize_result = match &dispatch_outcome {
+        Ok(_) => {
+            finalize_governance_action(
+                discharge.view().rest_mut(),
+                deps,
+                context_id,
+                proposal,
+                executor_did,
+            )
+            .await
+        }
+        Err(_) => Ok(()),
+    };
+    // The proposal is consumed on every path that reaches here (the replay
+    // marker is kept), so it leaves the conflict-tracking set whichever way
+    // the dispatch and finalize resolved.
+    discharge
+        .view()
+        .rest_mut()
+        .governance
+        .approved_proposals
+        .remove(&proposal.proposal_id);
     let persist_result = discharge.commit_fail_closed(deps, context_id).await;
+    let result = match dispatch_outcome {
+        Ok(result) => result,
+        Err(dispatch_err) => {
+            if let Err(persist_err) = persist_result {
+                tracing::error!(
+                    context_id,
+                    proposal_id = %hex::encode(proposal.proposal_id),
+                    error = %persist_err,
+                    "the fail-closed persist of the kept executed-proposal replay \
+                     marker and the consumed proposal's removal from \
+                     approved_proposals failed after a post-effect dispatch \
+                     error; the dispatch error is returned and this one is \
+                     logged only"
+                );
+            }
+            return Err(dispatch_err);
+        }
+    };
     finalize_result?;
     persist_result?;
-
     Ok(result)
 }
 
@@ -6520,6 +6732,123 @@ mod commit_broadcast_retry_tests {
             .build_actor_deps(&DID(ADMIN.to_owned()))
             .await
             .expect("build_actor_deps")
+    }
+
+    /// `execute_approve_spend` appends one durable `SpendApproved` leaf, so
+    /// `checkpoint_events_since` must advance by one.
+    ///
+    /// `create_checkpoint_if_due_view` (`queries_helpers.rs`) gates BOTH §9.9.3
+    /// triggers on this counter — `events_since >= 50` and `events_since > 0 &&
+    /// elapsed >= 600` — so a context whose only governance traffic is
+    /// `ApproveSpend` would never mint a consistency checkpoint at all while its
+    /// log kept growing.
+    #[tokio::test]
+    async fn approve_spend_credits_its_durable_leaf() {
+        let deps = build_deps(
+            Box::new(RecordingTransport {
+                sends: Arc::new(AtomicUsize::new(0)),
+                fail: false,
+            }),
+            Box::new(CountingOkPersistence {
+                persists: Arc::new(AtomicUsize::new(0)),
+                last_snapshot: Arc::new(Mutex::new(None)),
+            }),
+        )
+        .await;
+        let mut state = fresh_state();
+        state
+            .handle
+            .transition_to(&scp_protocol::context::ContextState::Active)
+            .expect("activate");
+        state
+            .membership
+            .add_member(DID(TARGET.to_owned()), "member".to_owned(), vec![]);
+        let mut cell = ClassSCell::new(state);
+        *cell.class_c_view().checkpoint_events_since_mut() = 0;
+
+        super::execute_approve_spend(
+            &mut cell,
+            &deps,
+            &ctx_hex(),
+            &DID(TARGET.to_owned()),
+            scp_protocol::economy::types::Amount::new(500),
+            "test-purpose",
+            super::CommitMeta {
+                pid: [0x4e; 32],
+                actor_did: ADMIN,
+                timestamp_secs: 1_700_000_000,
+            },
+        )
+        .await
+        .expect("approve spend succeeds");
+
+        assert_eq!(
+            cell.checkpoint_events_since, 1,
+            "checkpoint_events_since must equal the durable-leaf count: the \
+             SpendApproved leaf. Crediting zero freezes both §9.9.3 checkpoint \
+             triggers, which read this counter"
+        );
+    }
+
+    /// `execute_reconfigure_governance` appends TWO durable leaves —
+    /// `GovernanceReconfigured` and its `GovernanceDeadlockRecovery` companion
+    /// — so `checkpoint_events_since` must advance by TWO. Crediting one drifts
+    /// the §9.9.3 checkpoint position by a leaf per deadlock recovery.
+    #[tokio::test]
+    async fn reconfigure_governance_credits_both_durable_leaves() {
+        use scp_protocol::context::governance::{DeadlockJustification, GovernanceReconfigAction};
+
+        let deps = build_deps(
+            Box::new(RecordingTransport {
+                sends: Arc::new(AtomicUsize::new(0)),
+                fail: false,
+            }),
+            Box::new(CountingOkPersistence {
+                persists: Arc::new(AtomicUsize::new(0)),
+                last_snapshot: Arc::new(Mutex::new(None)),
+            }),
+        )
+        .await;
+        let mut state = fresh_state();
+        state
+            .handle
+            .transition_to(&scp_protocol::context::ContextState::Active)
+            .expect("activate");
+        state.governance.class_s.threshold_signers = vec![
+            DID(ADMIN.to_owned()),
+            DID(TARGET.to_owned()),
+            DID("did:dht:z6MkThirdSigner".to_owned()),
+        ];
+        state.governance.class_s.threshold_value = 2;
+        let mut cell = ClassSCell::new(state);
+        *cell.class_c_view().checkpoint_events_since_mut() = 0;
+
+        super::execute_reconfigure_governance(
+            &mut cell,
+            &deps,
+            &ctx_hex(),
+            &[GovernanceReconfigAction::RemoveInactiveSigner {
+                did: DID(TARGET.to_owned()),
+            }],
+            &DeadlockJustification {
+                unavailable_dids: vec![DID(TARGET.to_owned())],
+                missed_windows: vec![(DID(TARGET.to_owned()), 3)],
+                detected_at: 1_700_000_000,
+            },
+            super::CommitMeta {
+                pid: [0x4d; 32],
+                actor_did: ADMIN,
+                timestamp_secs: 1_700_000_000,
+            },
+        )
+        .await
+        .expect("reconfigure succeeds");
+
+        assert_eq!(
+            cell.checkpoint_events_since, 2,
+            "checkpoint_events_since must equal the durable-leaf count: \
+             GovernanceReconfigured AND its GovernanceDeadlockRecovery companion"
+        );
     }
 
     /// A fresh encrypted test state with an empty pending-commit queue.
