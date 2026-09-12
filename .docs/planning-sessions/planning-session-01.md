@@ -6,6 +6,15 @@
 
 ---
 
+> **Annotation, 2026-09-11.** Everything below is the record as it was written on the date
+> above, restored unedited. The identity model it names — did:dht, the DID document and its
+> verification methods, the shared `#agent` key, the identifier as a `did:` string — was
+> replaced on 2026-08-30 by ADR-063, the inception-derived key-event-log identity substrate,
+> whose rules `.docs/specs/09-security-model.md` §9.7.4.2 and `.docs/specs/03-identity.md`
+> carry. A record of what a named party read on a named date states what that party read, so
+> this annotation records what replaced it and the text below is not edited to match.
+
+
 ## Origin and Motivation
 
 Alec observed that app generation is becoming trivial — clients and server logic will be generated on-demand from simple prompts. What remains hard is the connective tissue: identity, social relationships, transport, persistence, and trust. He proposed building an open, ecosystem-agnostic infrastructure layer that sits beneath any generated or traditional application.
@@ -30,7 +39,7 @@ The protocol is called the **Shared Context Protocol (SCP)**. The name reflects 
 
 ### Identity
 
-**Decision:** Cryptographic root identity using W3C Decentralized Identifiers, replaced by the inception-derived key-event-log identity substrate.
+**Decision:** Cryptographic root identity using DIDs (W3C Decentralized Identifiers).
 
 **Key custody:** Users never see or manage keys. Custody is delegated to whatever the user already trusts:
 - Device secure enclave (iOS Secure Enclave, Android Keystore)
@@ -38,7 +47,7 @@ The protocol is called the **Shared Context Protocol (SCP)**. The name reflects 
 - Hardware security keys
 - Self-managed keys (power users)
 
-The identity layer abstracts custody completely. The user authenticates however they choose; under the hood that resolves to a protocol-level identifier. Migration between custody methods is possible without changing identity.
+The identity layer abstracts custody completely. The user authenticates however they choose; under the hood that resolves to a protocol-level DID. Migration between custody methods is possible without changing identity.
 
 **Recovery:** No seed phrases. Three mechanisms:
 - Trusted device recovery (another device you control vouches for a new one)
@@ -113,7 +122,7 @@ This was the single biggest simplification in the session. It eliminated an enti
 This mirrors how humans already think: "I trust John with my calendar but not my wallet." The protocol formalizes this intuition.
 
 When an agent presents itself, it provides:
-1. Proof of binding to a human
+1. Proof of binding to a human (DID verification)
 2. Capability tokens granted by that human (UCAN-based)
 3. Agent capability metadata
 
@@ -209,6 +218,7 @@ Apps can be any shape: thick clients with minimal protocol reliance, thin shells
 
 | Component | Standard | Relationship |
 |---|---|---|
+| Identity | DID (W3C) | Build on directly |
 | Capability tokens | UCAN | Build on directly |
 | Key custody | Passkeys, WebAuthn, Secure Enclave | Delegate to |
 | Transport | Matrix, libp2p | Build on / interop |
@@ -304,13 +314,13 @@ Alec compared this to how search engines work — detecting coordination through
 
 ### The AI Guide
 
-The AI Guide is Cronica's institutional agent — bound to Cronica as an entity, with its own identity. When a user creates a quest, the Guide joins the quest context with a specific role (e.g., "guide") that has permissions to suggest steps, provide information, respond to questions, but can't modify quest structure without user approval.
+The AI Guide is Cronica's institutional agent — bound to Cronica as an entity, with its own DID. When a user creates a quest, the Guide joins the quest context with a specific role (e.g., "guide") that has permissions to suggest steps, provide information, respond to questions, but can't modify quest structure without user approval.
 
 This means: the Guide is accountable (traced to Cronica), transparent (its role and permissions are visible), and replaceable (user could theoretically use a different guide or kick it out).
 
 ### Generated Alternative Clients
 
-The key scenario we explored: a user asks their agent to generate a custom quest app that's different from Cronica — simpler, different features, different UI. This generated client authenticates with the same identity, sees the same contexts, interacts with the same social graph, because everything lives at the SCP layer. The client is just a view.
+The key scenario we explored: a user asks their agent to generate a custom quest app that's different from Cronica — simpler, different features, different UI. This generated client authenticates with the same DID, sees the same contexts, interacts with the same social graph, because everything lives at the SCP layer. The client is just a view.
 
 Bob on Cronica and Alice on a generated client can interact in the same quest context. Neither client knows or cares what the other is using.
 
@@ -341,7 +351,7 @@ MCP is how an agent talks to a database. SCP is how an agent is allowed to exist
 ## Feasibility Assessment
 
 ### Feasible Today
-- Identity layer (UCANs and passkeys have SDKs and production usage)
+- Identity layer (DIDs, UCANs, passkeys all have SDKs and production usage)
 - Context model (data model with access control — standard backend engineering)
 - Tool system (MCP exists and does most of this; wrap with SCP permissions)
 - Basic transport (Matrix is federated, has SDKs, handles real-time messaging)
@@ -364,7 +374,7 @@ MCP is how an agent talks to a database. SCP is how an agent is allowed to exist
 - **Scope.** Consumer app + protocol + infrastructure + SDKs = four products simultaneously.
 
 ### Recommended Phasing
-1. Months 1-3: Build Cronica with SCP abstractions as architecture (identity internally, contexts as data model, roles/tokens for permissions). Don't publish the protocol.
+1. Months 1-3: Build Cronica with SCP abstractions as architecture (DIDs internally, contexts as data model, roles/tokens for permissions). Don't publish the protocol.
 2. Months 3-6: Ship Cronica. Get users. Learn what matters.
 3. Months 6-12: Extract the protocol. Publish SDK. Open SCP layer.
 4. 12+: Federation, self-hosting, full vision.
