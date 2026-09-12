@@ -258,7 +258,7 @@ An SCP identity is an append-only key-event log, and its identifier is the SHA-2
 
 KERI [24] introduced this construction as the autonomic identifier. SCP takes that shape, encodes it in its own format, and adopts none of KERI's wire encodings, discovery protocol, or witness pools. `09-security-model.md` §9.7.4.2 states the derivation and every rule a verifier applies, and ADR-063 records why SCP chose a key-event log over a method that resolved a mutable record.
 
-Key custody stays invisible to the person. The root credential defaults to a passkey whose private key no code path exports, and and a root changes only through a `RootRecovery` revealing the standing pre-rotation commitment. Trusted-device, social and platform-backed mechanisms help a controller reach its own credentials and authorize no root change (`03-identity.md` §3.3).
+Key custody stays invisible. The root credential defaults to a passkey no code path exports, and and a root changes only through a `RootRecovery` revealing the standing commitment. Trusted-device, social and platform-backed mechanisms help a controller reach its credentials and authorize no root change (`03-identity.md` §3.3).
 
 ### 4.2 Root Authority, Operational Key, and Pre-Rotation
 
@@ -299,7 +299,7 @@ On a first contact, where the resolver holds no earlier chain for the identifier
 
 Publishing to the fallback set is a MUST, which stops the network fragmenting into separate resolution namespaces, and a publish cycle that reached no fallback relay is reported as a failed publication (`03-identity.md` §3.10.6). Freshness rests on the log's own highest-sequence event: a relay re-serves an event the controller already signed and signs none itself, and a resolver rejects a lower sequence on the chain it accepted, so a relay that withholds the newest event denies service and cannot roll a reader back onto a superseded key state (`09-security-model.md` §9.7.4.2 R12).
 
-An identity may designate relays as **witnesses** that cosign its log head. A witness runs one check — the offered chain carries the head it last cosigned for that identity — then signs or refuses, emitting a signed conflict statement where the chain carries a different event there. A witness adjudicates nothing: its cosigned heads and conflict statements are portable evidence of a fork, which a relying party decides under Section 4.2's precedence rules (`09-security-model.md` §9.7.4.3).
+An identity may designate relays as **witnesses** that cosign its log head. A witness runs one check — the offered chain carries the head it last cosigned for that identity — then signs or refuses, emitting a signed conflict statement where the chain carries a different event. A witness adjudicates nothing: its cosigned heads and conflict statements are portable evidence of a fork, which a relying party decides under Section 4.2 (`09-security-model.md` §9.7.4.3).
 
 ### 4.4 The Human-Agent Relationship
 
