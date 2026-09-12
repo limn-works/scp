@@ -576,9 +576,10 @@ Implement a WebSocket-based store-and-forward relay server and its corresponding
 
 **Relay server operations:**
 
-1. **`PUBLISH { routing_id, recipient_hint, blob_ttl, blob }`**
+1. **`PUBLISH { routing_id, recipient_hint, blob_ttl, retain, blob }`**
    - Accept an opaque blob associated with a `routing_id`.
    - `recipient_hint` (optional): a per-context pseudonym (§9.10.4) indicating the intended recipient for directed delivery. If absent, the blob is broadcast to all subscribers of this `routing_id`.
+   - `retain` (optional boolean, **amended 2026-09-11**): REQUIRED true at the four retained kinds `scp:did:`, `scp:svc:`, `scp:wit:` and `scp:wcf:`, and absent at every other kind (`09-security-model.md` §9.10.12). A validating relay stores a `retain` write under §9.7.4.2 R9's retention rules and expires it never, rejects a write at one of those four kinds that omits the flag, and rejects the flag at any other kind; a relay that does not validate rejects a write at those four kinds outright, because it holds the address digest and never the preimage. `blob_ttl` is absent on a `retain` write.
    - Store it for `blob_ttl` seconds.
    - Return a `blob_id` (SHA-256 hash of the blob) as confirmation.
    - Deliver immediately to any active subscribers of this `routing_id`. If `recipient_hint` is present, deliver only to the matching subscriber (optimization — the blob is still encrypted and opaque to non-recipients).
@@ -591,8 +592,9 @@ Implement a WebSocket-based store-and-forward relay server and its corresponding
 3. **`UNSUBSCRIBE { routing_id }`**
    - Stop receiving blobs for this `routing_id` on this connection.
 
-4. **`QUERY { routing_id, since?, limit? }`**
+4. **`QUERY { routing_id, since?, limit?, proof_nonce? }`**
    - One-shot query: return stored blobs for a `routing_id`, optionally filtered by `since` timestamp, with optional `limit`.
+   - `proof_nonce` (optional, 32 bytes, **amended 2026-09-11**): 32 bytes the resolver drew freshly for this query, REQUIRED on every query of a first contact (`09-security-model.md` §9.7.4.2 R11). A relay that received one and can sign under the operator identity its community-relay-list entry declares MUST return a `relay_proof` on the BLOB response.
    - Does not create a subscription.
 
 5. **`DELETE { blob_id }`**
@@ -607,7 +609,7 @@ Implement a WebSocket-based store-and-forward relay server and its corresponding
 
 **Relay server requirements:**
 
-- TTL enforcement: a background task deletes expired blobs.
+- TTL enforcement: a background task deletes expired blobs, and it skips a blob stored under `retain` (**amended 2026-09-11**), because such a blob carries no TTL and a validating relay expires it never (`09-security-model.md` §9.10.12).
 - No blob inspection of encrypted content: the relay never parses, validates, or inspects the contents of *encrypted, opaque* blobs (`OuterEnvelope`s and any other ciphertext). It routes by `routing_id`, stores for `blob_ttl`, and delivers — it learns nothing about who sent a message, what context it belongs to, or what it contains. The **sole, narrow exception** is the OPTIONAL key-event-record validation below: a validating SCP-native relay MAY validate *public, self-certifying* identifier-record frames (which carry no confidential content — they are signed, plaintext identity records) for availability / anti-suppression. This exception never applies to encrypted content and is never a trust dependency (the client always re-verifies, §3.10.2). "Untrusted dumb pipe," not "does zero validation," is the invariant.
 - No client authentication: any WebSocket client can connect, publish, subscribe, query.
 - Connection multiplexing: one WebSocket connection supports multiple subscriptions.
@@ -617,7 +619,7 @@ Implement a WebSocket-based store-and-forward relay server and its corresponding
 
 - Implements `TransportAdapter` trait (ADR-005).
 - Manages WebSocket connection lifecycle (connect, reconnect, keepalive).
-- Maps `send(envelope)` to `PUBLISH`.
+- Maps `send(envelope)` to `PUBLISH`, which is this operation's one name.
 - Maps `subscribe(routing_id)` to `SUBSCRIBE` + stream of decoded envelopes.
 - Maps `query(routing_id, since)` to `QUERY`.
 - Maps `delete(blob_id)` to `DELETE`.
@@ -664,15 +666,15 @@ Every message is a MessagePack map with a required `op` field (string) plus oper
 
 | Op | Fields | Response |
 |----|--------|----------|
-| `PUBLISH` | `routing_id: bin32`, `recipient_hint: bin32?`, `blob_ttl: u32`, `blob: bin` | OK with `blob_id` |
+| `PUBLISH` | `routing_id: bin32`, `recipient_hint: bin32?`, `blob_ttl: u32?`, `retain: bool?`, `blob: bin` | OK with `blob_id` |
 | `SUBSCRIBE` | `routing_id: bin32`, `since: u64?` | OK, then BLOB stream, then EVENT `backfill_complete` |
 | `UNSUBSCRIBE` | `routing_id: bin32` | OK |
-| `QUERY` | `routing_id: bin32`, `since: u64?`, `limit: u32?` (default 100, max 1000) | BLOB stream, then EVENT `query_complete` |
+| `QUERY` | `routing_id: bin32`, `since: u64?`, `limit: u32?` (default 100, max 1000), `proof_nonce: bin32?` | BLOB stream, then EVENT `query_complete` |
 | `DELETE` | `blob_id: bin32` | OK (best-effort, does not confirm existence) |
 | `ACK` | `blob_id: bin32` | None (fire-and-forget) |
 | `PING` | `ts: u64` | PONG |
 
-**Constraints:** `blob_ttl` 1–604800 (7 days). `blob` 1–262144 bytes (256KB). `routing_id`, `recipient_hint`, `blob_id` are exactly 32 bytes, encoded as MessagePack `bin 32` (not hex/base64 strings).
+**Constraints:** `blob_ttl` 1–604800 (7 days), and absent on a `retain` write. `blob` 1–262144 bytes (256KB). `routing_id`, `recipient_hint`, `blob_id` are exactly 32 bytes, encoded as MessagePack `bin 32` (not hex/base64 strings).
 
 #### Relay-to-Client Messages
 
@@ -680,7 +682,7 @@ Every message is a MessagePack map with a required `op` field (string) plus oper
 |----|--------|------|
 | `OK` | `ref: string?`, `blob_id: bin32?` | Success response. `blob_id` present only for PUBLISH. |
 | `ERR` | `ref: string?`, `code: u16`, `msg: string` | Error response. `msg` is for logging, not parsing. |
-| `BLOB` | `routing_id: bin32`, `blob_id: bin32`, `recipient_hint: bin32?`, `blob_ttl: u32`, `stored_at: u64`, `blob: bin` | Blob delivery (subscription, backfill, or query). `blob_id = SHA-256(blob)` — clients SHOULD verify. |
+| `BLOB` | `routing_id: bin32`, `blob_id: bin32`, `recipient_hint: bin32?`, `blob_ttl: u32?`, `stored_at: u64`, `relay_proof: bin200?`, `blob: bin` | Blob delivery (subscription, backfill, or query). `blob_id = SHA-256(blob)` — clients SHOULD verify. `relay_proof` carries the 200-byte relay proof of control `09-security-model.md` §9.7.4.2's definitions state, returned where the QUERY carried a `proof_nonce`. |
 | `EVENT` | `ref: string?`, `type: string`, type-specific fields | Protocol events: `backfill_complete` (with `routing_id`), `query_complete` (with `count`). |
 | `PONG` | `ts: u64` | Keepalive response. |
 
@@ -719,10 +721,10 @@ Published out-of-band (relay metadata page, a service-record entry). Relay MAY i
 ```rust
 /// Client-to-relay operations (scp-transport/src/native/protocol.rs)
 pub enum ClientMessage {
-    Publish { ref_id: Option<String>, routing_id: [u8; 32], recipient_hint: Option<[u8; 32]>, blob_ttl: u32, blob: Vec<u8> },
+    Publish { ref_id: Option<String>, routing_id: [u8; 32], recipient_hint: Option<[u8; 32]>, blob_ttl: Option<u32>, retain: Option<bool>, blob: Vec<u8> },
     Subscribe { ref_id: Option<String>, routing_id: [u8; 32], since: Option<u64> },
     Unsubscribe { ref_id: Option<String>, routing_id: [u8; 32] },
-    Query { ref_id: Option<String>, routing_id: [u8; 32], since: Option<u64>, limit: Option<u32> },
+    Query { ref_id: Option<String>, routing_id: [u8; 32], since: Option<u64>, limit: Option<u32>, proof_nonce: Option<[u8; 32]> },
     Delete { ref_id: Option<String>, blob_id: [u8; 32] },
     Ack { blob_id: [u8; 32] },
     Ping { ts: u64 },
@@ -732,7 +734,7 @@ pub enum ClientMessage {
 pub enum RelayMessage {
     Ok { ref_id: Option<String>, blob_id: Option<[u8; 32]> },
     Err { ref_id: Option<String>, code: u16, msg: String },
-    Blob { routing_id: [u8; 32], blob_id: [u8; 32], recipient_hint: Option<[u8; 32]>, blob_ttl: u32, stored_at: u64, blob: Vec<u8> },
+    Blob { routing_id: [u8; 32], blob_id: [u8; 32], recipient_hint: Option<[u8; 32]>, blob_ttl: Option<u32>, stored_at: u64, relay_proof: Option<[u8; 200]>, blob: Vec<u8> },
     Event { ref_id: Option<String>, event_type: String },
     Pong { ts: u64 },
 }
@@ -1214,7 +1216,7 @@ This test proves: identity works, encryption works, the envelope format works, s
 **Status:** Superseded by ADR-063 (2026-08-30)
 **Extends:** ADR-003 (DID Creation)
 
-ADR-063, inception-derived self-certifying identity over a key-event log, replaces the shared-identity structure this record decided. A human identity's key state names one operational role, `#active`, and names no agent key. An agent holds its own identity, whose establishment events the human's key-event log anchors (`09-security-model.md` §9.1 invariant 1). How a controller produces that anchor and how a verifier checks it is unspecified as of 2026-09-10 (`.docs/specs/00-open-questions.md`), and `09-security-model.md` §9.7.4.2 R3 rejects every chain claiming a delegator until it lands. The body below is retained as the historical record that motivated the supersession; the shared identity, the `#agent` verification method, and the category permissions it describes no longer describe SCP's identity model.
+ADR-063, inception-derived self-certifying identity over a key-event log, replaces the shared-identity structure this record decided. A human identity's key state names one operational role, `#active`, and names no agent key. An agent holds its own identity, whose establishment events the human's key-event log anchors (`09-security-model.md` §9.1 invariant 1). How a controller produces that anchor and how a verifier checks it is unspecified as of 2026-09-10 (`.docs/specs/00-open-questions.md`), and `09-security-model.md` §9.7.4.2 R3 rejects every chain claiming a delegator until it lands. The body below is retained as the historical record that motivated the supersession; the shared identity, the `#agent` verification method, and the category permissions it describes no longer describe SCP's identity model. **Two parts of that body are not the March 2026 text:** its three key slots and its key-continuity-fingerprint sentence were rewritten from Ed25519 to P-256 on 2026-09-10 under Alec's curve ruling, so a reader comparing them against ADR-063's account of where Ed25519 came from is reading a later edit. Every other sentence below is the March 2026 text.
 
 ### Context
 
