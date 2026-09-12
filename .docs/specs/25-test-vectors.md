@@ -22,7 +22,7 @@ Three P-256 keypairs carry every signature in this section. Each derives from a 
 
 **Seed-to-scalar rule.** A seed becomes a private scalar by the extra-random-bits method of FIPS 186-5 Appendix A.2.1, which §9.10.4 states in full: expand the seed to 48 bytes with HKDF-Expand-SHA256 under a label, read those bytes as a big-endian integer, reduce modulo `n − 1`, and add one. P-256 carries no RFC 8032 seed expansion, so the curve ruling of 2026-09-10 required a defined step here. The label for these three fixtures is the ASCII string `"SCP-TEST-VECTOR-KEY-V1"`, which labels a test fixture and names no protocol object, so §9.18.2 registers no separator for it.
 
-Each key prints its seed, its private scalar, the 33-byte SEC1 compressed point §9.5 fixes for signature verification, and the 65-byte uncompressed point RFC 9420 §5.1.2 and RFC 9180 §7.1 fix.
+Each key prints its seed, its private scalar, the 33-byte SEC1 compressed point §9.5 fixes for signature verification, and the 65-byte uncompressed point RFC 9420 §5.1.2 and RFC 9180 §7.1 fix. **These three are fixtures and their private scalars are published here**, so no key below is ever a shipped key: Vector 49's two community-relay-list entries carry the reference and secondary keys, which is what makes that vector a fixture rather than the artifact a binding ships (`18-addressability-and-deployment.md` §18.5.1).
 
 ```
 Reference seed:
@@ -1436,6 +1436,47 @@ Slot, BE32(len(authenticatorData)) || authenticatorData || BE32(len(clientDataJS
 
 **Conformance procedure.** Rebuild the preimage from the field order §9.7.4.2's definitions state and compare it byte for byte, recompute the digest, the identifier and the routing id, then run against Vector 42's slot every assertion-slot check those same definitions state.
 
+
+### Vector 50: a `KeyState` that pins both composite absent-field sentinels
+
+Vectors 41 and 42 carry an `Inception`, which carries fields 9 and 12 in substance, so neither pins the sentinel either composite field takes when a kind does not carry it. This `KeyState` sits at sequence 1 of Vector 41's identity, changes the witnessing interval to 7200 seconds and nothing else, and carries one key-event seal. **Field 9, the installed root set and its threshold, writes `BE32(0)` and no trailing threshold, so its sentinel is four bytes and not eight. Field 12, the continuation, writes `BE32(0)` and never the one-byte `0x00`**, because `0x00` is the registered live value declaring abandonment and a one-byte sentinel would be byte-identical to a declaration that the identity is terminal.
+
+```
+kind:                 0x02  (KeyState)
+sequence:             1
+identifier:           2c0f7f4478be94db0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf32
+predecessor_digest:   d8ba4ebad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7   (Vector 41's preimage digest)
+witnessing_interval:  7200
+sealed event digest:  1c7f9fb5d17d8773900e072f0fea733baf4fc5e2ce240107df69072646e775a2
+key-event seal:       caf80a0c2332b8a2e1454c355f84142f34d24e92b45db3c0948d90adbd762488
+field 9 sentinel:     00000000   (4 bytes)
+field 12 sentinel:    00000000   (4 bytes)
+key_state_bytes:      171
+preimage_len:         320
+```
+
+**Preimage (320 bytes), including the `"SCP-KEL-EVENT-V1:"` separator:**
+
+```
+  5343502d4b454c2d4556454e542d56313a022c0f7f4478be94db0078311ef51b
+  a3cc9934362b0f154dcbf9c597572e46cf320000000000000001d8ba4ebad526
+  57208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7000000000100
+  000000010100000000000000000000000100000002033b1cac23f45cf1cdfdf0
+  b32f8f777b99166c1b69649c2295b1517883d47f302701010000000000000000
+  01010223702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412
+  b20aea020100000000000000000101000000019d94df95bc0a13f1963f484414
+  c320354c73c75bb86e96559e97765f5bc2d31300001c20020000000000000000
+  00000000000000000000000000000000000000000000000000000001caf80a0c
+  2332b8a2e1454c355f84142f34d24e92b45db3c0948d90adbd76248800000000
+```
+
+```
+preimage_digest:      4b56f7b97027fdcd5e480ecb88528441e30186b5e2b54db0fefd7b53ad1a120d
+slot (raw form, 64):  6e8b92a9e7cc10d9233ab31f0465590526b1096fca8721095322c763f5d4e01c58b75ee1398787f3c6dd372b7fcf8929380e24c70d072d0588f43bbf2a7c567c
+```
+
+**Conformance procedure.** Rebuild the preimage from the field order and the sentinel rule §9.7.4.2's definitions state, compare it byte for byte, and recompute the digest. An implementation that writes field 9's sentinel as eight bytes, or field 12's as the one byte `0x00`, produces a different digest here and a different `predecessor_digest` at every later event.
+
 ## 25.27 Witness-Layer and Relay-Proof Vectors (§9.7.4.2 definitions, §9.7.4.3, §9.18.2)
 
 The witness objects below name Vector 41's identity as their subject and Vector 41's event as the event a witness seeded at. **No object below names a position in a signer's own key state**, because a community-relay-list operator's key is non-transferable and has no position to name: a verifier reads that key from the operator's list entry, which Vector 49 pins.
@@ -1555,11 +1596,9 @@ Shared previous_cosigned_digest (non-zero):
   7c01169980aa038d1b47d9964da04a50a7b7bebf9fd1345245fe173a44c26eb4
 ```
 
-### Vector 49: the shipped community relay list
+### Vector 49: the community relay list's encoding
 
-`18-addressability-and-deployment.md` §18.5.1 fixes the artifact: one JSON document named `community-relays.json`, holding a JSON array of entries, each an object carrying `operator`, `key`, `url` and `free` in that order. The four bindings ship byte-identical copies, and a release process compares them against the digest below.
-
-The two entries are a fixture: each operator identifier is `SHA-256` over a stated ASCII label, and the two keys are §25.2's reference and secondary keys.
+`18-addressability-and-deployment.md` §18.5.1 fixes the artifact: one JSON document named `community-relays.json`, holding a JSON array of entries, each an object carrying `operator`, `key`, `url` and `free` in that order. **The two entries below are a fixture and are never the shipped list.** Each operator identifier is `SHA-256` over a stated ASCII label, and the two keys are §25.2's reference and secondary keys, whose private scalars §25.2 prints. This vector pins the document's encoding — member order, lowercase hexadecimal, no insignificant whitespace, and the digest construction — and pins no byte a binding ships. The shipped `community-relays.json` is a release artifact the curator publishes; a release process computes this digest over the four bindings' copies and compares them to each other, never to the digest below, and an entry whose `key` appears anywhere in this corpus MUST NOT ship.
 
 ```
 File name:  community-relays.json

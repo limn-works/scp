@@ -1408,6 +1408,7 @@ def emit_keypackage_attestation() -> None:
 # that digest derives, then pin the slot each signature form produces over it.
 
 KIND_INCEPTION = 0x01
+KIND_KEY_STATE = 0x02
 ROLE_ROOT = 0x01
 ROLE_ACTIVE = 0x02
 CONDITION_CURRENT = 0x01
@@ -1416,6 +1417,7 @@ KEY_ALGORITHM_ECDSA_P256_SHA256 = 0x01
 CONTINUATION_COMMITMENT = 0x01
 PREROTATION_SEPARATOR = b"SCP-PREROTATION-COMMITMENT-V1:"
 KEL_EVENT_SEPARATOR = b"SCP-KEL-EVENT-V1:"
+KEL_SEAL_SEPARATOR = b"SCP-KEL-SEAL-V1:"
 KEL_ID_SEPARATOR = b"SCP-KEL-ID-V1:"
 ZERO32 = bytes(32)
 
@@ -1441,7 +1443,7 @@ def key_state_entry(point: bytes, role: int, condition: int) -> bytes:
     return entry
 
 
-def vector_key_state() -> bytes:
+def vector_key_state(witnessing_interval: int = VECTOR_WITNESSING_INTERVAL) -> bytes:
     """The key-state snapshot, in the order §9.7.4.2's definitions fix.
 
     The snapshot carries no next-set entry: each committed member's custody
@@ -1455,7 +1457,7 @@ def vector_key_state() -> bytes:
         + key_state_entry(REF_KEY_2.compressed, ROLE_ACTIVE, CONDITION_CURRENT)
         + u32(1)  # witness-set count
         + fixed_field(VECTOR_WITNESS_OPERATOR)
-        + u32(VECTOR_WITNESSING_INTERVAL)
+        + u32(witnessing_interval)
         + u8(ROLE_ACTIVE)  # service-key role discriminator
         + fixed_field(ZERO32)  # delegator: non-delegated
     )
@@ -1492,6 +1494,39 @@ def inception_preimage(form: int) -> bytes:
         + u8(CUSTODY_PASSKEY)  # the committed member's custody type
         + u8(KEY_ALGORITHM_ECDSA_P256_SHA256)  # and its key algorithm
         + u32(1)
+    )
+
+
+# The `KeyState` at sequence 1 of the same identity. It changes the witnessing
+# interval and nothing else, so R3's "a snapshot identical to its predecessor's"
+# defect does not fire. It is the vector that pins the two composite sentinels:
+# field 9, the installed root set and its threshold, writes `BE32(0)` and no
+# trailing threshold, so its sentinel is four bytes and not eight; and field 12,
+# the continuation, writes `BE32(0)` and never the one-byte `0x00`, because
+# `0x00` is the registered live value declaring abandonment.
+KEY_STATE_WITNESSING_INTERVAL = 7200
+SEALED_EVENT_DIGEST = sha256(b"scp-25-sealed-delegate-event")
+
+
+def key_state_preimage(identifier: bytes, predecessor_digest: bytes) -> bytes:
+    """The `KeyState` event's signed preimage, in §9.7.4.2's field order."""
+    return (
+        KEL_EVENT_SEPARATOR
+        + u8(KIND_KEY_STATE)  # 1. event_type
+        + fixed_field(identifier)  # 2. identifier
+        + u64(1)  # 3. sequence
+        + fixed_field(predecessor_digest)  # 4. predecessor_digest
+        + u8(0)  # 5. standing_root: sentinel, one 0x00 byte
+        + u32(1)
+        + u8(0)  # 6. signer index list of the one root group
+        + u32(1)
+        + u8(0x01)  # 7. signature-form list of that group: the raw form
+        + u32(0)  # 8. revealed keys: sentinel, a reveal carries them
+        + u32(0)  # 9. installed root set + threshold: composite sentinel, 4 bytes
+        + vector_key_state(KEY_STATE_WITNESSING_INTERVAL)  # 10. key-state snapshot
+        + u32(1)  # 11. key-event seals, carried in substance
+        + fixed_field(sha256(KEL_SEAL_SEPARATOR + SEALED_EVENT_DIGEST))
+        + u32(0)  # 12. continuation: composite sentinel, 4 bytes, never 0x00
     )
 
 
@@ -1617,6 +1652,36 @@ def emit_key_event_slots() -> None:
     emit_hex("vector_42.signature", assertion_sig)
     emit("vector_42.slot_len", len(slot))
     emit_hex("vector_42.slot", slot)
+
+    # --- Vector 50: a `KeyState` that pins both composite sentinels. ---
+    preimage_50 = key_state_preimage(identifier_41, digest_41)
+    digest_50 = sha256(preimage_50)
+    emit("vector_50.kind", "0x02")
+    emit("vector_50.sequence", 1)
+    emit_hex("vector_50.identifier", identifier_41)
+    emit_hex("vector_50.predecessor_digest", digest_41)
+    emit("vector_50.witnessing_interval", KEY_STATE_WITNESSING_INTERVAL)
+    emit_hex("vector_50.sealed_event_digest", SEALED_EVENT_DIGEST)
+    emit_hex(
+        "vector_50.key_event_seal",
+        sha256(KEL_SEAL_SEPARATOR + SEALED_EVENT_DIGEST),
+    )
+    emit("vector_50.field_9_sentinel", "00000000")
+    emit("vector_50.field_12_sentinel", "00000000")
+    emit("vector_50.key_state_bytes", len(vector_key_state(KEY_STATE_WITNESSING_INTERVAL)))
+    emit("vector_50.preimage_len", len(preimage_50))
+    emit_hex("vector_50.preimage", preimage_50)
+    emit_hex("vector_50.preimage_digest", digest_50)
+    # Field 9's sentinel is four bytes and never eight, and field 12's is four
+    # bytes and never the one-byte `0x00`, which is the live abandonment value.
+    assert preimage_50.count(b"\x00\x00\x00\x00") >= 2
+    sig_50 = ecdsa_sign(REF_KEY_1.d, digest_50)
+    assert ecdsa_verify(REF_KEY_1.point, digest_50, sig_50)
+    if _HAVE_CRYPTOGRAPHY:
+        _verify_with_cryptography(REF_KEY_1, digest_50, sig_50, "vector_50")
+    assert int.from_bytes(sig_50[32:], "big") * 2 <= N, "vector_50: high-s"
+    emit("vector_50.slot_len", len(sig_50))
+    emit_hex("vector_50.slot", sig_50)
 
     global INCEPTION_DIGEST, INCEPTION_IDENTIFIER
     INCEPTION_DIGEST = digest_41
@@ -1791,9 +1856,9 @@ def emit_community_relay_list() -> None:
         emit(f"vector_49.entry_{index}.url", url)
         emit(f"vector_49.entry_{index}.free", "true" if free else "false")
     assert any(free for *_, free in RELAY_LIST_ENTRIES), "§18.5.1: one free entry"
-    assert len({operator for operator, *_ in RELAY_LIST_ENTRIES}) == len(
+    assert len({key for _, key, *_ in RELAY_LIST_ENTRIES}) == len(
         RELAY_LIST_ENTRIES
-    ), "§18.5.1: no two entries declare one operator"
+    ), "§18.5.1: two entries whose `key` bytes are equal are one operator"
     emit("vector_49.document_len", len(document))
     emit("vector_49.document", document.decode())
     emit_hex("vector_49.document_bytes", document)
