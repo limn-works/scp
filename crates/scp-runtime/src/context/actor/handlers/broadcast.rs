@@ -1828,6 +1828,25 @@ mod tests {
         proposal_id
     }
 
+    /// Seed the conflict-tracking entry `detect_and_handle_conflicts` inserts
+    /// for an approved proposal, so a test can assert that execution consumes
+    /// it. `seed_approved_proposal` seeds only the engine.
+    fn seed_conflict_tracking_entry(
+        state: &mut PerContextState,
+        proposal_id: &scp_protocol::context::governance::ProposalId,
+    ) {
+        let tracked = state
+            .governance
+            .engine
+            .get_proposal(proposal_id)
+            .cloned()
+            .expect("the seeded proposal is engine-tracked");
+        state
+            .governance
+            .approved_proposals
+            .insert(*proposal_id, (tracked, 0, 1_700_000_000));
+    }
+
     /// Three authors, deliberately not in sorted insertion order.
     const AUTHORS_3: [&str; 3] = [
         "did:example:author-zulu",
@@ -2139,6 +2158,7 @@ mod tests {
                 access: AccessScope::Read,
             },
         );
+        seed_conflict_tracking_entry(&mut state, &proposal_id);
         let mut cell = ClassSCell::new(state);
         dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
             .await
@@ -2173,6 +2193,15 @@ mod tests {
                 .contains_key(&proposal_id),
             "a dispatch error raised AFTER the keep-commit must keep the replay marker"
         );
+        assert!(
+            !cell
+                .governance
+                .approved_proposals
+                .contains_key(&proposal_id),
+            "a consumed proposal must leave `approved_proposals`: the kept marker \
+             blocks its re-execution, so an entry that stayed would make every \
+             later conflicting proposal lose to a proposal that can never run"
+        );
         let landed_after_first = appends.load(Ordering::SeqCst);
         assert_eq!(
             landed_after_first, 0,
@@ -2205,6 +2234,164 @@ mod tests {
             landed_after_first,
             "the refused replay must append no leaf: a second run would rotate \
              every author again and write a second AccessRevoked leaf"
+        );
+    }
+
+    /// A later proposal that conflicts with a consumed one (a same-DID
+    /// `RevokeAccess`, per `actions_conflict`) must be admitted once the
+    /// consumed proposal's post-effect failure has removed it from
+    /// `approved_proposals`. Before the fix, `detect_and_handle_conflicts`
+    /// found the consumed entry, saw the later proposal's higher sequence,
+    /// returned `ConflictResolved` with the later proposal as loser, and never
+    /// inserted it, so no conflicting action could be approved again in that
+    /// context while the consumed entry itself could never run.
+    #[tokio::test]
+    async fn consumed_proposal_no_longer_wins_conflicts_against_later_proposals() {
+        use scp_protocol::context::governance::{AccessScope, GovernanceAction};
+
+        let (mut deps, _appends) = build_deps().await;
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
+        let proposal_id = seed_approved_proposal(
+            &mut state,
+            &ctx_hex,
+            GovernanceAction::RevokeAccess {
+                did: DID(SUBSCRIBER_DID.to_owned()),
+                access: AccessScope::Read,
+            },
+        );
+        seed_conflict_tracking_entry(&mut state, &proposal_id);
+        let mut cell = ClassSCell::new(state);
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
+            .await
+            .expect("open subscribe");
+        cell.class_c_view().membership_class_c_mut().add_member(
+            DID(SUBSCRIBER_DID.to_owned()),
+            "member".to_owned(),
+            vec![],
+        );
+        let _appends = inject_failing_log(&mut deps, scp_event_log::EventType::AccessRevoked, 0);
+        let first = crate::context::governance_helpers::execute_governance_action(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &proposal_id,
+            Some(&DID(CREATOR_DID.to_owned())),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(first, Err(ContextError::EventLogFailed(_))),
+            "the fixture's anchor-leaf failure must be post-effect; got {first:?}"
+        );
+        assert!(
+            cell.governance
+                .class_s
+                .executed_proposals
+                .contains_key(&proposal_id),
+            "the fixture consumes the proposal: the replay marker is kept"
+        );
+
+        // The later same-DID `RevokeAccess` carries a different scope, so its
+        // deterministic id differs from the consumed proposal's.
+        let (mut scratch, _) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
+        let later_id = seed_approved_proposal(
+            &mut scratch,
+            &ctx_hex,
+            GovernanceAction::RevokeAccess {
+                did: DID(SUBSCRIBER_DID.to_owned()),
+                access: AccessScope::Write,
+            },
+        );
+        let later = scratch
+            .governance
+            .engine
+            .get_proposal(&later_id)
+            .cloned()
+            .expect("the later proposal is engine-tracked");
+        let events = crate::context::governance_helpers::detect_and_handle_conflicts(
+            &mut cell, &deps, &later,
+        );
+        assert!(
+            events.is_empty(),
+            "no conflict may be reported against a consumed proposal; got {events:?}"
+        );
+        assert!(
+            cell.governance.approved_proposals.contains_key(&later_id),
+            "the later conflicting proposal must be tracked for execution"
+        );
+    }
+
+    /// A finalize error — the `GovernanceActionExecuted` append fails after the
+    /// dispatch applied its effect — keeps the replay marker, so the proposal is
+    /// consumed and must leave `approved_proposals` in the same fail-closed
+    /// persist. Before the fix `finalize_governance_action` owned the removal
+    /// and ran it after that append, so the append failure skipped it and the
+    /// entry outlived its marker.
+    #[tokio::test]
+    async fn finalize_leaf_failure_removes_the_consumed_proposal_from_approved_proposals() {
+        use scp_protocol::context::governance::{AccessScope, GovernanceAction};
+
+        let (mut deps, _appends) = build_deps().await;
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
+        let proposal_id = seed_approved_proposal(
+            &mut state,
+            &ctx_hex,
+            GovernanceAction::RevokeAccess {
+                did: DID(SUBSCRIBER_DID.to_owned()),
+                access: AccessScope::Read,
+            },
+        );
+        seed_conflict_tracking_entry(&mut state, &proposal_id);
+        let mut cell = ClassSCell::new(state);
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
+            .await
+            .expect("open subscribe");
+        cell.class_c_view().membership_class_c_mut().add_member(
+            DID(SUBSCRIBER_DID.to_owned()),
+            "member".to_owned(),
+            vec![],
+        );
+        let appends = inject_failing_log(
+            &mut deps,
+            scp_event_log::EventType::GovernanceActionExecuted,
+            0,
+        );
+
+        let result = crate::context::governance_helpers::execute_governance_action(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &proposal_id,
+            Some(&DID(CREATOR_DID.to_owned())),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ContextError::EventLogFailed(_))),
+            "the executed-leaf append failure must reach the caller; got {result:?}"
+        );
+        assert!(
+            appends.load(Ordering::SeqCst) >= 1,
+            "the dispatch's own leaves landed before finalize failed"
+        );
+        assert!(
+            cell.governance
+                .class_s
+                .executed_proposals
+                .contains_key(&proposal_id),
+            "a finalize error after a landed effect keeps the replay marker"
+        );
+        assert!(
+            !cell
+                .governance
+                .approved_proposals
+                .contains_key(&proposal_id),
+            "the consumed proposal must leave `approved_proposals` even though \
+             finalize failed before its own tail ran"
         );
     }
 
@@ -2401,8 +2588,9 @@ mod tests {
     /// keeps the replay marker (a retry would append a second rejection leaf on
     /// this member only, which §9.9.3 of the security-model spec reads as
     /// equivocation) and must NOT run finalize: a `GovernanceActionExecuted`
-    /// leaf, the executed event, and the removal from `approved_proposals` each
-    /// record an extension that §5.10.1 step 6 of the contexts spec says failed.
+    /// leaf and the executed event each record an extension that §5.10.1 step 6
+    /// of the contexts spec says failed. The consumed proposal still leaves
+    /// `approved_proposals`: that entry tracks conflicts, not completion.
     /// Before the fix, finalize ran on every post-effect error, so the log
     /// carried `TtlExtensionRejected` followed by `GovernanceActionExecuted` for
     /// the same proposal id.
@@ -2420,6 +2608,7 @@ mod tests {
                 additional_secs: 3_600,
             },
         );
+        seed_conflict_tracking_entry(&mut state, &proposal_id);
         let mut cell = ClassSCell::new(state);
         // A member the single-admin proposal carries no approval for, so the
         // unanimity check finds one consent missing.
@@ -2465,6 +2654,13 @@ mod tests {
                 .executed_proposals
                 .contains_key(&proposal_id),
             "a rejected attempt consumes the proposal: the replay marker stays"
+        );
+        assert!(
+            !cell
+                .governance
+                .approved_proposals
+                .contains_key(&proposal_id),
+            "a rejected attempt consumes the proposal: it leaves `approved_proposals`"
         );
 
         let second = crate::context::governance_helpers::execute_governance_action(

@@ -79,9 +79,24 @@ removed and the proposal stays retryable. A changed epoch means a mutation or
 a leaf landed, so the marker stays and its persist runs fail-closed, and the
 dispatch error reaches the caller with an ERROR log naming the context and the
 proposal. `finalize_governance_action` does not run on that path. It appends
-the `GovernanceActionExecuted` leaf, emits the executed event, and removes the
-proposal from `approved_proposals`, and each of those records a completed
-action; the helper reported that the action did not complete. A changed epoch
+the `GovernanceActionExecuted` leaf and emits the executed event, and each of
+those records a completed action; the helper reported that the action did not
+complete. The proposal still leaves `approved_proposals` on that path:
+`discharge_and_order_governance_action` removes it inside the same fail-closed
+persist that keeps the marker: on the success path, on a finalize error, and on
+a post-effect dispatch error. `approved_proposals` is the conflict-tracking set that
+`detect_and_handle_conflicts` reads on every later approval, and it records
+which proposals can still run, not which completed. The first version of this
+fix left the removal inside `finalize_governance_action`, so a consumed
+proposal whose finalize did not run, or whose finalize failed before its
+removal step, stayed in the set with its marker kept. Every later proposal that
+conflicted with it — every `RotateContentKeys` after a rotation whose anchor
+leaf failed once, every same-DID `RevokeAccess` — then carried a higher sequence,
+lost to the stale entry, and was never inserted, while the stale entry itself
+could never run. `finalize_leaf_failure_removes_the_consumed_proposal_from_approved_proposals`
+and the conflict-admission tail of
+`anchor_leaf_failure_after_commit_keeps_marker_and_blocks_re_execution` pin the
+removal. A changed epoch
 also does not prove that the action's effect landed: `execute_extend_ttl`
 credits its `TtlExtensionRejected` leaf and then returns `PermissionDenied`
 with the TTL unchanged, so a finalize on the error path wrote an executed

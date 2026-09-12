@@ -5499,11 +5499,11 @@ pub async fn finalize_governance_action(
         );
     }
 
-    // 3. Remove the executed proposal from approved_proposals.
-    state
-        .governance
-        .approved_proposals
-        .remove(&proposal.proposal_id);
+    // 3. The removal of the consumed proposal from `approved_proposals` is
+    //    owned by `discharge_and_order_governance_action`, which runs it on
+    //    every path that keeps the replay marker — a finalize error above, or
+    //    a post-effect dispatch error that skips this body, must not leave the
+    //    entry behind.
 
     // Evaluate consequence rules after governance action (ADR-017,
     // #1531). Use split-borrow variant so both legacy and actor-shape
@@ -5791,11 +5791,15 @@ pub async fn execute_governance_action(
     //   - epoch advanced ⇒ a mutation or a credited leaf landed before the error
     //     (the canonical case: a fail-closed `commit_class_s_keep` persisted a
     //     ban and the anchor-leaf append that follows it failed). Keep the
-    //     marker, persist it fail-closed, and surface the error. Finalize does
-    //     NOT run on this path: `finalize_governance_action` appends the
-    //     `GovernanceActionExecuted` leaf, emits the executed event, and drops
-    //     the proposal from `approved_proposals`, and each of those asserts a
-    //     completed action, while the helper reported failure. An advanced
+    //     marker, persist it fail-closed, and surface the error. The proposal
+    //     is consumed, so `discharge_and_order_governance_action` also removes
+    //     it from `approved_proposals` (the conflict-tracking set), fail-closed
+    //     in the same persist: an entry that stays there makes every later
+    //     conflicting proposal lose to a proposal that can never run. Finalize
+    //     does NOT run on this path: `finalize_governance_action` appends the
+    //     `GovernanceActionExecuted` leaf and emits the executed event, and
+    //     each of those asserts a completed action, while the helper reported
+    //     failure. An advanced
     //     epoch does not prove the action's effect landed — `execute_extend_ttl`
     //     credits its `TtlExtensionRejected` leaf and then returns
     //     `PermissionDenied` with the TTL unchanged — so a finalize here would
@@ -5871,8 +5875,9 @@ pub async fn execute_governance_action(
     // after. The guard replaces a synchronous `discharge_with` closure because
     // finalize appends to the async `EventLogPersistence`-backed Merkle log while
     // mutating the state, interleaved (ADR-049 Decision 7). On a post-effect
-    // `Err`, the token's read-only `commit` persists the kept marker and finalize
-    // does not run (see the replay-marker contract above).
+    // `Err`, the same guard persists the kept marker and the proposal's removal
+    // from `approved_proposals`, and finalize does not run (see the
+    // replay-marker contract above).
     discharge_and_order_governance_action(
         token,
         cell,
@@ -5887,20 +5892,32 @@ pub async fn execute_governance_action(
 
 /// Runs the discharge tail of `execute_governance_action`.
 ///
-/// On a dispatch `Ok`: finalize inside the RAII `begin_discharge` guard, then
-/// the single fail-closed persist that runs REGARDLESS of the finalize result
+/// Every path that reaches this helper keeps the replay marker, so the proposal
+/// is consumed: the same id can never run the dispatch again. This helper
+/// therefore removes the proposal from `approved_proposals` on EVERY path,
+/// inside the RAII `begin_discharge` guard, so the single fail-closed persist
+/// covers the kept marker and the removal together. `approved_proposals` is the
+/// conflict-tracking set `detect_and_handle_conflicts` reads on each later
+/// approval: an entry that outlives its marker makes every later conflicting
+/// proposal lose to a proposal that cannot run, and the marker's own TTL
+/// (`EXECUTED_PROPOSALS_TTL_SECS`) never reaches the entry. Removing the entry
+/// records consumption, not completion — `finalize_governance_action` used to
+/// own this removal, which meant a finalize error before its removal step, or
+/// a post-effect dispatch error that skips finalize, left the entry behind.
+///
+/// On a dispatch `Ok`: finalize inside the guard, then the removal, then the
+/// single fail-closed persist that runs REGARDLESS of the finalize result
 /// (keep-direction), then the ordering of the two results — a finalize error
 /// first, then a persist error.
 ///
 /// On a post-effect dispatch `Err` (the cell's `mutation_epoch` advanced, so
-/// the caller kept the replay marker): the token's read-only `commit` persists
-/// the kept marker fail-closed, finalize does NOT run, and the dispatch error is
-/// returned. `finalize_governance_action` appends the `GovernanceActionExecuted`
-/// leaf, emits the executed event, and removes the proposal from
-/// `approved_proposals`; each of those records a completed action, and the
-/// helper reported that the action did not complete. A persist error on this
-/// path is logged here because the dispatch error is the one returned;
-/// `persist_snapshot_fail_closed` logs the same failure at its own site.
+/// the caller kept the replay marker): the removal, then the persist, then the
+/// dispatch error is returned. Finalize does NOT run: it appends the
+/// `GovernanceActionExecuted` leaf and emits the executed event, and each of
+/// those records a completed action, while the helper reported that the action
+/// did not complete. A persist error on this path is logged here because the
+/// dispatch error is the one returned; `persist_snapshot_fail_closed` logs the
+/// same failure at its own site.
 async fn discharge_and_order_governance_action(
     token: crate::context::actor::class_s::ClassSCommitToken,
     cell: &mut crate::context::actor::class_s::ClassSCell,
@@ -5910,32 +5927,48 @@ async fn discharge_and_order_governance_action(
     executor_did: &DID,
     dispatch_outcome: Result<GovernanceActionResult, ContextError>,
 ) -> Result<GovernanceActionResult, ContextError> {
+    let mut discharge = token.begin_discharge(cell);
+    let finalize_result = match &dispatch_outcome {
+        Ok(_) => {
+            finalize_governance_action(
+                discharge.view().rest_mut(),
+                deps,
+                context_id,
+                proposal,
+                executor_did,
+            )
+            .await
+        }
+        Err(_) => Ok(()),
+    };
+    // The proposal is consumed on every path that reaches here (the replay
+    // marker is kept), so it leaves the conflict-tracking set whichever way
+    // the dispatch and finalize resolved.
+    discharge
+        .view()
+        .rest_mut()
+        .governance
+        .approved_proposals
+        .remove(&proposal.proposal_id);
+    let persist_result = discharge.commit_fail_closed(deps, context_id).await;
     let result = match dispatch_outcome {
         Ok(result) => result,
         Err(dispatch_err) => {
-            if let Err(persist_err) = token.commit(cell, deps, context_id).await {
+            if let Err(persist_err) = persist_result {
                 tracing::error!(
                     context_id,
                     proposal_id = %hex::encode(proposal.proposal_id),
                     error = %persist_err,
                     "the fail-closed persist of the kept executed-proposal replay \
-                     marker failed after a post-effect dispatch error; the \
-                     dispatch error is returned and this one is logged only"
+                     marker and the consumed proposal's removal from \
+                     approved_proposals failed after a post-effect dispatch \
+                     error; the dispatch error is returned and this one is \
+                     logged only"
                 );
             }
             return Err(dispatch_err);
         }
     };
-    let mut discharge = token.begin_discharge(cell);
-    let finalize_result = finalize_governance_action(
-        discharge.view().rest_mut(),
-        deps,
-        context_id,
-        proposal,
-        executor_did,
-    )
-    .await;
-    let persist_result = discharge.commit_fail_closed(deps, context_id).await;
     finalize_result?;
     persist_result?;
     Ok(result)
