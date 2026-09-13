@@ -5,6 +5,15 @@
 **Status:** Decided — awaiting execution (queued behind the ADR-057 in-flight slices; see the corrective-slice list in `.docs/adrs/ADR-057-in-browser-client-over-shared-mls.md`).
 **Provenance:** spec §9.6.2 KeyPackage lifecycle + §9.9.2 suppression detection (`.docs/specs/09-security-model.md`), §23 sync/offline strategy incl. §23.4.1 Welcome fast-forward and §23.5.2 Tier-3 reset (`.docs/specs/23-sync-and-offline-strategy.md`), §5.6 membership lifecycle + §5.4 presence-only state (`.docs/specs/05-contexts.md`), §10.8.1 multi-device + §10.9 presence-as-tool (`.docs/specs/10-infrastructure-and-self-hosting.md`), ADR-029 (`.docs/adrs/phase-6.md`), ADR-057 Consequences (deferred presence bullet). RFC 9420 §10 (last-resort KeyPackages).
 
+> **Annotation, 2026-09-13.** Everything below is the record as its author wrote it on the
+> date this file carries, restored unedited. The identity model it reads — the identifier written as a `did:` string — was
+> replaced on 2026-08-30 by ADR-063, the inception-derived key-event-log identity substrate,
+> whose rules `.docs/specs/09-security-model.md` §9.7.4.2 and `.docs/specs/03-identity.md`
+> §3.10 carry, and whose curve Alec settled on 2026-09-10 as ECDSA on NIST P-256
+> (`.docs/specs/09-security-model.md` §9.5). A record of what a named party read on a named
+> date states what that party read, so this annotation records what replaced the model and
+> no sentence below is edited to match.
+
 ## How this question was re-scoped
 
 ADR-057 deferred a "Presence ADR" for the browser client. Two corrections were made in this session before any decision:
@@ -14,9 +23,9 @@ ADR-057 deferred a "Presence ADR" for the browser client. Two corrections were m
 2. **The problem space is mostly already decided.** A corpus sweep confirmed five of six sub-problems are settled, shipped stances — not open questions:
    - §9.9.2 heartbeats are **relay-suppression detection only**, never a membership-liveness obligation. Members have zero idle obligations: "Standing contexts have zero idle cost. No keepalives, no heartbeats, no periodic key rotation (MLS key updates happen on message send, not on a timer)" (`05-contexts.md:1019`).
    - **Absence never evicts.** Membership removal is exclusively governance `RemoveMember`, self-`leave`, failed-join rollback, or child-context eligibility loss. There is no eviction-after-N-missed-anything anywhere, deliberately.
-   - **Reconnection/catch-up is fully specified and shipped** (§23 three-tier model, six-phase protocol, Tier-3 per-member reset preserving identity/role/history, RFC-6962 consistency-proof catch-up; ADR-029).
+   - **Reconnection/catch-up is fully specified and shipped** (§23 three-tier model, six-phase protocol, Tier-3 per-member reset preserving DID/role/history, RFC-6962 consistency-proof catch-up; ADR-029).
    - **Delegated keep-alive was decided away**, not overlooked: "Presence, typing indicators, live collaboration: these are tool-level or context-level capabilities, not protocol primitives" (§10.9). Nothing needs keeping alive because idle costs nothing and silence never evicts.
-   - **Multi-device (§10.8.1)** already lets any online device of an identity service that identity's liveness (shared per-identity sender/access keys, per-device leaves, KeyPackage pools).
+   - **Multi-device (§10.8.1)** already lets any online device of a DID service that DID's liveness (shared per-DID sender/access keys; per-device leaves and KeyPackage pools).
    - Terminology: "presence" already names an unrelated membership state — the presence-only member of §5.4 (read+write revoked, governance-visible). The deferred work must not be called "Presence."
 
 What survives as genuinely open is one structural defect and two small additions — decided below.
@@ -30,7 +39,7 @@ Both paths by which an absent member is added or recovered **require a live pre-
 
 Replenishment requires being online. KeyPackages are single-use and are consumed by *other people's actions* (adds) while the owner is away. SCP defines no reusable fallback. Therefore a sufficiently-added, sufficiently-offline member's pool drains to zero, at which point they are **un-re-addable and un-recoverable-past-Tier-2 until they come online and republish** — and if their absence already exceeds 7 days when this happens, the recovery path itself is the thing that's broken.
 
-The only mitigation the current design offers is an always-on device of the same identity that keeps the pool replenished. **Ruling: relying on that is absurd as a baseline** — it presumes most users run always-on personal infrastructure enrolled in every context they care about, which contradicts the phone-only reality of most users and cuts against the protocol-requires-no-operator tenet in spirit (per-user always-on hardware is a de facto per-user operator requirement). The defect is structural, and the fix must work for a phone-only user with zero infrastructure.
+The only mitigation the current design offers is an always-on device of the same DID that keeps the pool replenished. **Ruling: relying on that is absurd as a baseline** — it presumes most users run always-on personal infrastructure enrolled in every context they care about, which contradicts the phone-only reality of most users and cuts against the protocol-requires-no-operator tenet in spirit (per-user always-on hardware is a de facto per-user operator requirement). The defect is structural, and the fix must work for a phone-only user with zero infrastructure.
 
 ## Decisions
 

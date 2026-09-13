@@ -17,9 +17,18 @@ The three knobs that matter:
 |---|---|
 | `reach: Reach` | `Reach::NatTraversal` = probe the external address (STUN) and open a router port via NAT-PMP/UPnP (needs `--features upnp`). `Reach::Tunnel { public_url }` = the tunnel provides external reachability; skip NAT probing entirely. *(Note: `public_url` is not yet threaded — the node publishes a loopback URL and emits a runtime warning; reachability comes from the tunnel/proxy itself, not this field.)* `Reach::Local` = no probing; loopback only (dev/demo). *(Only these three variants are valid for `host_site`. `Reach::Domain` is valid in `NodeConfig` but returns `HostSiteError::InvalidConfig` here.)* |
 | `tls: TlsMode` | `TlsMode::SelfSigned` (default) = serve self-signed HTTPS (be-your-own-CA, no DNS). `TlsMode::Plaintext` = serve plain HTTP (for when a tunnel or proxy terminates TLS in front). *(Only these two variants are valid for `host_site`. `Acme`/`Terminated`/`Custom` are valid in `NodeConfig` but return `HostSiteError::InvalidConfig` here.)* |
-| `dht: DhtMode` | `DhtMode::Memory` (default) = never publish this node's address (fail-safe default). `DhtMode::Production` = publish the node's public address in the DHT — an IP-to-identity / approximate-location disclosure, and a deliberate opt-in. |
+| `dht: DhtMode` | `DhtMode::Memory` (default) = never publish this node's address (fail-safe default). `DhtMode::Production` = publish the node's public address bound to its DID to the global Mainline DHT — an IP-to-identity / approximate-location disclosure, and a deliberate opt-in. |
 
 ---
+
+> **Annotation, 2026-09-13.** Everything below is the record as its author wrote it on the
+> date this file carries, restored unedited. The identity model it reads — the Mainline distributed hash table and the identifier written as a `did:` string — was
+> replaced on 2026-08-30 by ADR-063, the inception-derived key-event-log identity substrate,
+> whose rules `.docs/specs/09-security-model.md` §9.7.4.2 and `.docs/specs/03-identity.md`
+> §3.10 carry, and whose curve Alec settled on 2026-09-10 as ECDSA on NIST P-256
+> (`.docs/specs/09-security-model.md` §9.5). A record of what a named party read on a named
+> date states what that party read, so this annotation records what replaced the model and
+> no sentence below is edited to match.
 
 ## Recipe 1 — Direct (raw public IP, no operator)
 
@@ -29,7 +38,7 @@ The pure-SCP path: your machine is the public endpoint, with no third party in t
 host_site(HostSiteConfig {
     site_dir: Some("./site".into()),
     storage_path: Some("./data".into()),
-    dht: DhtMode::Production,    // publish the node address so the site is discoverable
+    dht: DhtMode::Production,    // publish address->DID so the site is DID-discoverable
     // tls defaults to TlsMode::SelfSigned — self-signed HTTPS (be your own CA)
     ..HostSiteConfig::defaults(Reach::NatTraversal)  // probe + open a router port via NAT-PMP/UPnP
 })
@@ -58,8 +67,8 @@ External infrastructure:
 Trade-offs:
 
 - **IP exposure:** every visitor sees your machine's public IP. With `dht: DhtMode::Production` that
-  IP is additionally published in the DHT. Use `dht: DhtMode::Memory` to keep the address out of
-  the DHT and share the raw IP out-of-band instead.
+  IP is additionally bound to your node's DID in the global DHT. Use `dht: DhtMode::Memory` to keep
+  the address out of the DHT and share the raw IP out-of-band instead.
 - **Certificate:** self-signed, so browsers show a warning. A browser-trusted cert without a CA
   dependency requires a DNS name + ACME, which reintroduces DNS — out of scope for the pure path.
 - **Reachability:** fails behind CGNAT or a router with no port-control. Use Recipe 2 there.

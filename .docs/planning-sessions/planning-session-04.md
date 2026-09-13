@@ -6,6 +6,15 @@
 
 ---
 
+> **Annotation, 2026-09-13.** Everything below is the record as its author wrote it on the
+> date this file carries, restored unedited. The identity model it reads — did:dht, did:web, did:key, the DID document and its verification methods, the Mainline distributed hash table and the identifier written as a `did:` string — was
+> replaced on 2026-08-30 by ADR-063, the inception-derived key-event-log identity substrate,
+> whose rules `.docs/specs/09-security-model.md` §9.7.4.2 and `.docs/specs/03-identity.md`
+> §3.10 carry, and whose curve Alec settled on 2026-09-10 as ECDSA on NIST P-256
+> (`.docs/specs/09-security-model.md` §9.5). A record of what a named party read on a named
+> date states what that party read, so this annotation records what replaced the model and
+> no sentence below is edited to match.
+
 ## How This Session Started
 
 The question was: **how do you actually build this?** The spec describes a coherent system. The sketch shows API surfaces. But no software exists. This session moves from architecture to engineering — concrete technology choices, stack decisions, adapter patterns, and build sequencing.
@@ -25,11 +34,11 @@ What does not exist:
 - An SDK anyone can import
 - A working transport binding
 - A context key management implementation
-- An identity method selection
+- A DID method selection
 - A UCAN capability schema
 - Any running software
 
-The gap between "detailed blueprint" and "working protocol" is the four Tier 1 items identified in planning session 02: key management, transport abstraction, identity method, and UCAN schema. These are engineering decisions, not research problems — but they hadn't been made until this session.
+The gap between "detailed blueprint" and "working protocol" is the four Tier 1 items identified in planning session 02: key management, transport abstraction, DID method, and UCAN schema. These are engineering decisions, not research problems — but they hadn't been made until this session.
 
 ---
 
@@ -61,16 +70,33 @@ MLS wins because member removal = key rotation = blocking enforcement = ephemera
 Context created    → MLS group created → key tree initialized
 Member joins       → MLS Add proposal → key tree updated, new member gets key
 Member leaves      → MLS Remove proposal → key tree ratcheted, leaver excluded
-Block (identity-to-identity) → MLS Remove for blocker's sub-tree → blocked party loses blocker's keys
+Block (DID-to-DID) → MLS Remove for blocker's sub-tree → blocked party loses blocker's keys
 TTL expires        → MLS group dissolved → tree root destroyed
 Ephemeral close    → Same as TTL expiry → keys unrecoverable
 ```
 
 **Libraries:** OpenMLS (Rust, most mature), mls-rs (Rust, by Wire). Do not implement MLS from scratch.
 
-### Decision 2: The Identity Method
+### Decision 2: DID Method — `did:dht` (with `did:web` fallback for Cronica v1)
 
-**Choice:** the session picked `did:dht` as the target method and `did:web` as a v1 stepping stone for Cronica, ranking the published methods on key rotation, resolution infrastructure, decentralization, recovery, speed and library maturity. The inception-derived key-event-log identity substrate replaced both methods: an identity's identifier is the digest of its inception event, it never changes, and its key-event log carries the keys it installs.
+**Choice:** `did:dht` as the target method. `did:web` as a pragmatic v1 stepping stone for Cronica.
+
+**Why `did:dht`:**
+
+| Property | `did:key` | `did:web` | `did:dht` |
+|---|---|---|---|
+| Key rotation | Impossible (key IS identity) | Possible (update hosted document) | Possible (update DHT record) |
+| Resolution infrastructure | None needed (self-describing) | Web server required | Mainline DHT (BitTorrent's, millions of nodes) |
+| Decentralization | Fully decentralized | Centralized on hosting server | Decentralized via DHT |
+| Recovery | Cannot rotate key → identity lost if key lost | Server operator dependency | Rotate key, update DHT |
+| Speed | Instant (no resolution) | HTTP lookup (~100ms) | DHT lookup (~1-5s) |
+| Maturity | W3C standard, very mature | W3C standard, mature | Newer, fewer battle-tested libraries |
+
+`did:key` is ruled out because recovery (§3.3) requires key rotation — if you lose a key, you need to rotate to a new one without changing identity. `did:key` makes the key the identity, so key loss = identity loss.
+
+`did:dht` gives decentralized resolution with key rotation via the Mainline DHT. No blockchain, no server dependency, existing infrastructure with millions of nodes.
+
+**Pragmatic v1 path:** Cronica launches with `did:web` pointing at Limn's infrastructure. Simple, fast, reliable. The SDK abstracts the DID method — apps don't know or care which method underlies. Migration from `did:web` to `did:dht` is transparent to apps and users. The DID document content is identical; only the resolution mechanism changes.
 
 ### Decision 3: Transport — Nostr Binding First, Behind a Transport Abstraction
 
@@ -87,8 +113,8 @@ interface Transport {
   disconnect(relayAddress: URL) → void
 
   // Identity-relay mapping
-  publishRelayList(identifier, relays: [URL]) → void
-  discoverRelays(identifier) → [URL]
+  publishRelayList(did: DID, relays: [URL]) → void
+  discoverRelays(did: DID) → [URL]
 }
 ```
 
@@ -99,7 +125,7 @@ Six methods. Deliberately thin. Everything above this interface is SCP protocol 
 Why Nostr:
 - Relays already exist. Hundreds of them. No need to build relay infrastructure from scratch.
 - SCP encrypted envelopes are opaque blobs. Nostr relays store and forward signed events. These are the same operation.
-- Keypair identity maps nearly 1:1 (SCP public key → Nostr npub is a trivial conversion).
+- Keypair identity maps nearly 1:1 (DID public key → Nostr npub is a trivial conversion).
 - WebSocket-based — works in browsers, mobile, desktop.
 - NIP-42 (relay auth) exists for relays that want access control, though SCP doesn't need it (encryption-as-access-control handles this).
 - Mature client libraries in every language.
@@ -171,13 +197,13 @@ scp:identity:{did}/attestations       → create, revoke
 {
   "header": { "alg": "EdDSA", "typ": "JWT", "ucv": "0.10.0" },
   "payload": {
-    "iss": "<identifier>",
-    "aud": "agent:<identifier>:ctx:<context-id>",
+    "iss": "did:dht:z6MkpT...",
+    "aud": "agent:z6MkpT:ctx:z6Mkq8...",
     "att": [
-      { "with": "scp:ctx:<context-id>/messages", "can": "write" },
-      { "with": "scp:ctx:<context-id>/tool/guide_assistant", "can": "invoke" },
-      { "with": "scp:ctx:<context-id>/members", "can": "read" },
-      { "with": "scp:ctx:<context-id>/proposals", "can": "send" }
+      { "with": "scp:ctx:z6Mkq8.../messages", "can": "write" },
+      { "with": "scp:ctx:z6Mkq8.../tool/guide_assistant", "can": "invoke" },
+      { "with": "scp:ctx:z6Mkq8.../members", "can": "read" },
+      { "with": "scp:ctx:z6Mkq8.../proposals", "can": "send" }
     ],
     "exp": 1740000000,
     "nnc": "unique-nonce"
@@ -186,7 +212,7 @@ scp:identity:{did}/attestations       → create, revoke
 }
 ```
 
-**Delegation chain:** Human identity → Agent → Context-scoped token. Every token traces back to the human who authorized it. Revocation is per-token — revoke one capability in one context without affecting others.
+**Delegation chain:** Human DID → Agent → Context-scoped token. Every token traces back to the human who authorized it. Revocation is per-token — revoke one capability in one context without affecting others.
 
 **Libraries:** ucanto (TypeScript), rs-ucan (Rust), ucan-wasm. [Note: rs-ucan replaced by native impl in scp-core/src/crypto/ucan/]
 
@@ -201,7 +227,7 @@ The SDK is the entire product. Apps are thin shells over it. The API surface is 
 ```
 What a developer/LLM touches:        What the SDK handles invisibly:
 
-SCP.Context.create(...)               Identity key management
+SCP.Context.create(...)               DID key management
 SCP.Context.propose(...)              UCAN token creation/validation
 agent.send(...)                       MLS encryption/decryption
 agent.invoke(tool, input)             Transport (relay connections)
@@ -231,7 +257,7 @@ SCP.App.declare(manifest)             Merkle tree event logs
 │  │ Context       │  │ Trust         │  │ Identity      │            │
 │  │ Manager       │  │ Engine        │  │ Manager       │            │
 │  │               │  │               │  │               │            │
-│  │ - lifecycle   │  │ - 4-layer     │  │ - key ops     │            │
+│  │ - lifecycle   │  │ - 4-layer     │  │ - DID ops     │            │
 │  │ - membership  │  │   evaluation  │  │ - key custody │            │
 │  │ - roles       │  │ - behavioral  │  │ - attestations│            │
 │  │ - tools       │  │   records     │  │ - private     │            │
@@ -273,7 +299,7 @@ Android:    Kotlin (via UniFFI bindings from Rust) — later
 Web:        TypeScript/WASM (via wasm-bindgen from Rust) — later
 ```
 
-Why Rust core: the crypto libraries are strongest in Rust (OpenMLS, UCAN ecosystem, Nostr ecosystem). UniFFI (Mozilla's tool) generates Swift and Kotlin bindings from Rust automatically. Write the hard stuff once, expose it to every platform.
+Why Rust core: the crypto libraries are strongest in Rust (OpenMLS, DID/UCAN ecosystem, Nostr ecosystem). UniFFI (Mozilla's tool) generates Swift and Kotlin bindings from Rust automatically. Write the hard stuff once, expose it to every platform.
 
 ---
 
@@ -295,11 +321,11 @@ trait TransportAdapter {
     // Subscribe to incoming envelopes for a context
     async fn subscribe(&self, context_id: &str, since: Option<DateTime>) -> Result<Stream<EncryptedEnvelope>>;
 
-    // Publish this identity's relay/endpoint list for discoverability
-    async fn publish_endpoints(&self, identity: &[u8; 32], endpoints: &[Url]) -> Result<()>;
+    // Publish this DID's relay/endpoint list for discoverability
+    async fn publish_endpoints(&self, did: &DID, endpoints: &[Url]) -> Result<()>;
 
-    // Discover another identity's relay/endpoint list
-    async fn discover_endpoints(&self, identity: &[u8; 32]) -> Result<Vec<Url>>;
+    // Discover another DID's relay/endpoint list
+    async fn discover_endpoints(&self, did: &DID) -> Result<Vec<Url>>;
 
     // Connection lifecycle
     async fn connect(&self, endpoint: &Url) -> Result<Connection>;
@@ -324,7 +350,7 @@ struct TransportCapabilities {
 ```rust
 struct NostrTransportAdapter {
     relay_pool: RelayPool,          // manages WebSocket connections to multiple relays
-    keypair: NostrKeypair,          // derived from identity keys
+    keypair: NostrKeypair,          // derived from DID keys
     subscription_manager: SubscriptionManager,
 }
 
@@ -360,7 +386,7 @@ impl TransportAdapter for NostrTransportAdapter {
         Ok(stream.map(|event| base64_decode(&event.content)))
     }
 
-    async fn publish_endpoints(&self, identity: &[u8; 32], endpoints: &[Url]) -> Result<()> {
+    async fn publish_endpoints(&self, did: &DID, endpoints: &[Url]) -> Result<()> {
         // Publish as NIP-65 relay list metadata
         let event = NostrEvent {
             kind: 10002,            // NIP-65 relay list
@@ -370,9 +396,9 @@ impl TransportAdapter for NostrTransportAdapter {
         self.relay_pool.publish(event.sign(&self.keypair)?).await
     }
 
-    async fn discover_endpoints(&self, identity: &[u8; 32]) -> Result<Vec<Url>> {
-        // Look up the identity's Nostr npub, query for their NIP-65 relay list
-        let npub = identity_to_npub(identity)?;
+    async fn discover_endpoints(&self, did: &DID) -> Result<Vec<Url>> {
+        // Look up the DID's Nostr npub, query for their NIP-65 relay list
+        let npub = did_to_npub(did)?;
         let filter = Filter {
             authors: vec![npub],
             kinds: vec![10002],
@@ -735,7 +761,7 @@ struct BridgedContent {
     provenance: BridgeProvenance {
         platform: PlatformType,
         mode: BridgeMode,
-        operator: [u8; 32],
+        operator: DID,
         shadow: Option<ShadowIdentity>,
         external_timestamp: DateTime,
     },
@@ -747,7 +773,7 @@ struct BridgedContent {
 ```rust
 struct XBridgeAdapter {
     bot_account: XBotCredentials,       // single bot account on X
-    operator: [u8; 32],
+    operator_did: DID,
     context_id: String,
     shadow_registry: ShadowRegistry,
 }
@@ -784,7 +810,7 @@ impl BridgeAdapter for XBridgeAdapter {
 ```rust
 struct BlueskyBridgeAdapter {
     agent: AtprotoAgent,                // AT Protocol agent
-    operator: [u8; 32],
+    operator_did: DID,
     context_id: String,
 }
 
@@ -805,7 +831,7 @@ impl BridgeAdapter for BlueskyBridgeAdapter {
 ### Phase 1: Prove the Crypto Works (Weeks 1-4)
 
 Build a single Rust binary that:
-1. Creates an identity
+1. Creates a DID (`did:key` for now, swap method later)
 2. Creates an MLS group
 3. Encrypts a message to the group
 4. Wraps it in an SCP envelope
@@ -858,7 +884,7 @@ If this works, everything else is elaboration. If this doesn't work, the spec is
 - Bluesky bridge adapter (API mode)
 - Registry context implementation (agent discovery)
 
-**Deliverable:** Cronica runs on SCP. The AI Guide is a tool in quest contexts. Users have identities. Messages are E2E encrypted. X and Bluesky users can participate via bridges. Agents can discover each other through registry contexts.
+**Deliverable:** Cronica runs on SCP. The AI Guide is a tool in quest contexts. Users have DIDs. Messages are E2E encrypted. X and Bluesky users can participate via bridges. Agents can discover each other through registry contexts.
 
 ---
 
@@ -867,7 +893,7 @@ If this works, everything else is elaboration. If this doesn't work, the spec is
 | Component | Difficulty | Why |
 |---|---|---|
 | MLS integration | Medium | Libraries exist (OpenMLS), but group state management is fiddly — ratcheting, out-of-order messages, concurrent updates. |
-| Identity resolution | Medium | Fewer battle-tested libraries than MLS has. |
+| DID resolution (`did:dht`) | Medium | Newer method, fewer battle-tested libraries. `did:web` fallback is trivial. |
 | Nostr adapter | Low | Mature ecosystem. Relay protocol is simple. Many client libraries. |
 | Matrix adapter | Medium | Matrix client SDK is heavier. Room state management is more complex than Nostr events. |
 | WebSocket adapter | Low | Standard library work. |
@@ -890,7 +916,8 @@ If this works, everything else is elaboration. If this doesn't work, the spec is
 |---|---|---|
 | Group encryption | MLS (RFC 9420) | Sender Keys (O(n) removal), custom (unnecessary) |
 | MLS implementation | OpenMLS (Rust) | mls-rs (less mature), MLS++ (C++, harder FFI) |
-| Identity method | `did:dht` as target and `did:web` for Cronica v1, both replaced by the inception-derived key-event-log identity substrate | `did:key` (no rotation), `did:ion` (Bitcoin dependency) |
+| DID method (target) | `did:dht` | `did:key` (no rotation), `did:web` (centralized), `did:ion` (Bitcoin dependency) |
+| DID method (Cronica v1) | `did:web` (pragmatic, migrate later) | — |
 | Primary transport | Nostr binding | Matrix (heavier), libp2p (more complex), custom (unnecessary) |
 | Transport architecture | Abstraction + bindings (option 2 from session 02) | Pick one transport (option 3), define relay protocol (option 1) |
 | Core language | Rust | Go (weaker crypto ecosystem), TypeScript (performance), Swift (not cross-platform) |
@@ -901,6 +928,7 @@ If this works, everything else is elaboration. If this doesn't work, the spec is
 
 ## 8. What This Session Did Not Cover
 
+- **Specific DID:DHT library selection.** The `did:dht` ecosystem is newer; library maturity needs assessment.
 - **Offline/sync strategy.** Acknowledged as hard. MLS has pending proposals and welcome messages for offline members, but the sync model for extended offline periods (days/weeks) is undesigned.
 - **Event log pruning.** Merkle trees grow. The pruning/checkpoint strategy for long-lived contexts is unspecified.
 - **Relay infrastructure for Cronica.** Who runs the Nostr relays for Cronica's initial deployment? Self-operated? Third-party? Both?

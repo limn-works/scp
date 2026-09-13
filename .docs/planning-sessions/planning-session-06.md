@@ -1,10 +1,19 @@
 # SCP Planning Session 06 — Design Review and Architectural Corrections
 
 **Date:** February 22, 2026
-**Scope:** Review of PR #1 (architecture branch). Corrections to blocking mechanism, identity method ordering, transport independence, provenance elevation, cross-context tool call governance, ephemeral deletion, metadata privacy, A2A reconsideration, infrastructure independence.
+**Scope:** Review of PR #1 (architecture branch). Corrections to blocking mechanism, DID method ordering, transport independence, provenance elevation, cross-context tool call governance, ephemeral deletion, metadata privacy, A2A reconsideration, infrastructure independence.
 **Artifacts modified:** `.docs/specs/`, `sketch.md`, `architecture.md` (changes committed to architecture branch). `.docs/specs/00-open-questions.md` (new file, originally created as root `open-questions.md`, later moved).
 
 ---
+
+> **Annotation, 2026-09-13.** Everything below is the record as its author wrote it on the
+> date this file carries, restored unedited. The identity model it reads — did:dht, did:web and the identifier written as a `did:` string — was
+> replaced on 2026-08-30 by ADR-063, the inception-derived key-event-log identity substrate,
+> whose rules `.docs/specs/09-security-model.md` §9.7.4.2 and `.docs/specs/03-identity.md`
+> §3.10 carry, and whose curve Alec settled on 2026-09-10 as ECDSA on NIST P-256
+> (`.docs/specs/09-security-model.md` §9.5). A record of what a named party read on a named
+> date states what that party read, so this annotation records what replaced the model and
+> no sentence below is edited to match.
 
 ## How This Session Started
 
@@ -29,9 +38,13 @@ Full review of PR #1 ("Arch thought process") which added architecture.md, plann
 
 **Updated:** .docs/specs/ §3.6, §10.5
 
-### 1.2 The Identity Method Ordering
+### 1.2 did:dht First, did:web Fallback Only
 
-**Decision:** the session made `did:dht` the primary and first implementation, kept `did:web` only as a contingency if `did:dht` libraries proved unusable, and built no migration path between them. The inception-derived key-event-log identity substrate replaced both methods.
+**Problem:** The PR positioned did:web as the v1 method with migration to did:dht later. This creates throwaway work (TOFU infrastructure, TLS pinning, key-change alerting, migration path), adds a server dependency (contradicts infrastructure-minimal design), and ships into a planned migration.
+
+**Decision:** did:dht is the primary and first implementation. did:web exists as a contingency fallback if did:dht libraries prove unusable. No migration path is built. No stepping stone.
+
+**Rationale:** did:dht libraries exist in Rust. The risk of library issues is medium but the mitigation (fall back to did:web) is available without building it upfront. Starting with did:dht avoids building infrastructure (did:web resolution server) that the protocol doesn't need.
 
 **Updated:** .docs/specs/ §3.8, §9.6.2, §9.13. architecture.md §2.2, §5, §6, §7. sketch.md §15.
 
@@ -148,7 +161,7 @@ The PR deferred metadata privacy to "future versions." This was rejected. Everyt
 6. **Connection privacy** — Tor hidden services for relays + persistent connections on desktop
 7. **Per-context pseudonyms** — HKDF-derived, inside-encryption verification
 8. **Cover traffic** — Constant-rate on persistent connections, not applicable on mobile
-9. **Identity resolution privacy** — Tor-routed lookups on mobile
+9. **DID resolution privacy** — Local DHT node on persistent devices, Tor-routed on mobile
 10. **Relay query privacy** — Pseudonyms + relay set partitioning + subscription mixing
 
 These suggestions form a coherent metadata privacy architecture. See `.docs/specs/00-open-questions.md` for full analysis of each. *[All 10 decisions were subsequently resolved and written into §9.10.]*
@@ -162,25 +175,27 @@ These suggestions form a coherent metadata privacy architecture. See `.docs/spec
 **.docs/specs/:**
 - Added Core Principles section to §1 (identity, isolation, provenance, encryption, legibility, accountability)
 - §3.6: Blocking rewritten — sender-side key layer, not MLS removal
+- §3.8: did:web reframed as fallback only
 - §5.11: Ephemeral scope includes relay deletion requests
 - §6.2: Rewritten — context governs tool calls, not agents
 - §6.2.1: New — Stateful Tool Sessions
 - §6.2.2: New — Discovery via Tool Interfaces
 - §7.6: Provenance referenced as core principle
 - §7.7: Provenance reframed as implementing core principle, not introducing new concept
-- §3.8, §9.6.2, §9.13: `did:web` reframed as a fallback (§1.2 records its replacement)
+- §9.6.2: did:web as fallback, not stepping stone
+- §9.13: Certificate pinning language updated for did:web fallback
 - §10.5: Transport section rewritten — SCP native relay canonical, exhaustive adapter list, transport independence
 
 **architecture.md:**
 - §2.1: Transport adapters in system diagram updated (SCP native + expanded list)
 - §3.1: Crate structure updated (scp-transport/ expanded with native, hyperswarm, libp2p, webrtc)
-- §3.2: Identity Manager ordering updated
+- §3.2: Identity Manager — did:dht primary, did:web fallback
 - §8: Completely rewritten — "Protocol Requires No Operator" principle
-- §9: Risk table updated (transport adapter availability)
-- §10: Decision summary updated (identity method, transport, infrastructure)
+- §9: Risk table updated (transport adapter availability, did:dht risk reframed)
+- §10: Decision summary updated (DID method, transport, infrastructure)
 
 **sketch.md:**
-- §15: Identity method resolution note updated
+- §15: DID method resolution note updated
 
 ### Files Created:
 
@@ -207,7 +222,7 @@ These suggestions form a coherent metadata privacy architecture. See `.docs/spec
 The A2A architecture designed in session 03 is under reconsideration. The context extensions (TTL, memory scope) remain valuable regardless. Provenance tagging was elevated from A2A-specific to protocol-wide. If A2A is removed, the propose/accept flow, registries, and referral chains from session 03 are removed, but TTL, memory scope, and provenance remain.
 
 ### Planning Session 04 (Technical Implementation)
-Technology selections (MLS, UCAN, Rust core) are confirmed. Transport binding approach is corrected — session 04 positioned Nostr as primary; this session corrects to SCP native relay + transport independence. The adapter architecture remains valid but with expanded adapter list.
+Technology selections (MLS, did:dht, UCAN, Rust core) are confirmed. Transport binding approach is corrected — session 04 positioned Nostr as primary; this session corrects to SCP native relay + transport independence. The adapter architecture remains valid but with expanded adapter list.
 
 ### Planning Session 05 (Security Hardening)
 The cryptographic security model from session 05 is confirmed with one addition: the sender-side key layer for blocking. The envelope signature scope (§9.5) may need adjustment based on the minimal outer envelope decision (open question #2). The relay threat model (§9.9) is strengthened by metadata privacy decisions.
