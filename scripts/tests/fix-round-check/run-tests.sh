@@ -14,11 +14,14 @@
 #     not name exits 0 and proves nothing.
 #
 #   * THE PROPAGATION. A non-zero exit from any step is a non-zero exit from the script.
-#     Case 2 makes the stub cargo exit 1 on `check` and asserts that the script exits
-#     non-zero and names the compile step as failed. Case 3 makes the same stub cargo exit
-#     0 on every subcommand and asserts that the script exits 0 and names the compile and
-#     format steps as passing. Case 3 exists so case 2 is not vacuous: without it, a script
-#     that always failed would satisfy case 2.
+#     One case per step the stub can fail: case 2 makes the stub cargo exit 1 on `check`,
+#     case 5 makes it exit 1 on `fmt`, and each asserts that the script exits non-zero and
+#     names that step as failed while leaving the other reported as passing. Case 3 makes
+#     the stub exit 0 on both and asserts that the script exits 0 and names both steps as
+#     passing. Case 3 exists so cases 2 and 5 are not vacuous: without it, a script that
+#     always failed would satisfy them both. Cases 2 and 5 exist so case 3 is not vacuous:
+#     an earlier revision fixed the stub's `fmt` answer at 0, which left the format step's
+#     failure untested and let a mutation that discards it pass every assertion here.
 #
 # WHAT THE STUBS REPLACE, and what stays real. The cases replace `cargo`, `rustc`, and
 # `rustup` with scripts on a PATH this harness leads with, because the contract clauses
@@ -81,10 +84,11 @@ trap 'rm -rf "$WORK"' EXIT
 # one case sat in it for 87 minutes behind another worktree's `cargo clippy --workspace`
 # until a 2400-second bound killed the run after case 1.
 #
-# `cargo tree` stays delegated, so the eleven resolutions inside
-# `scripts/check-shipped-feature-graph.sh` read this repository and case 3 fails when that
-# gate rejects the tree. `cargo tree` takes no build lock: measured at 12.9 seconds for the
-# whole gate while another worktree held it.
+# `cargo tree` stays delegated, so the twelve resolutions inside
+# `scripts/check-shipped-feature-graph.sh` and `scripts/check-protocol-deps.sh` read this
+# repository and case 3 fails when either gate rejects the tree. `cargo tree` takes no build
+# lock: measured at 12.9 seconds and 391 ms for those two gates while another worktree held
+# it.
 #
 # WHAT THE STUBBED STEPS STILL PROVE. These cases test what the script does with a step's
 # exit code, not whether cargo formats correctly. `.github/workflows/ci.yml` runs the real
@@ -97,7 +101,7 @@ trap 'rm -rf "$WORK"' EXIT
 # `scripts/check-resolved-rustc.sh` skips its comparison only where the two names read one
 # file that rustup installed, and two distinct files put it on the path that compares.
 run_case() {
-    local case_name=$1 rustc_version=$2 cargo_check_rc=$3
+    local case_name=$1 rustc_version=$2 cargo_check_rc=$3 cargo_fmt_rc=${4:-0}
     local dir="$WORK/$case_name"
     mkdir -p "$dir/bin"
 
@@ -118,7 +122,7 @@ EOF
 printf '%s\n' "\$*" >> "$dir/cargo.log"
 case "\$1" in
     check) exit $cargo_check_rc ;;
-    fmt) exit 0 ;;
+    fmt) exit $cargo_fmt_rc ;;
     metadata) printf '{"version":1,"target_directory":"$dir/stub-target-dir"}\n'; exit 0 ;;
 esac
 # Delegating means removing this directory from PATH first. The cargo on PATH here is a
@@ -195,15 +199,45 @@ if [[ $rc -eq 0 ]]; then
 else
     report "case 3 exits 0 when every step passes" 1 "the script exited $rc; output tail: $(tail -n 6 "$WORK/passing/out.txt")"
 fi
-if grep -q 'compile ok' "$WORK/passing/out.txt" && grep -q 'format ok' "$WORK/passing/out.txt"; then
-    report "case 3 names the compile and format steps as passing" 0 ""
+if grep -q 'compile ok' "$WORK/passing/out.txt"; then
+    report "case 3 names the compile step as passing" 0 ""
 else
-    report "case 3 names the compile and format steps as passing" 1 "the summary holds neither 'compile ok' nor 'format ok': $(tail -n 3 "$WORK/passing/out.txt")"
+    report "case 3 names the compile step as passing" 1 "the summary holds no 'compile ok': $(tail -n 3 "$WORK/passing/out.txt")"
+fi
+if grep -q 'format ok' "$WORK/passing/out.txt"; then
+    report "case 3 names the format step as passing" 0 ""
+else
+    report "case 3 names the format step as passing" 1 "the summary holds no 'format ok': $(tail -n 3 "$WORK/passing/out.txt")"
 fi
 if grep -q 'gates 28/28 passed' "$WORK/passing/out.txt"; then
     report "case 3 ran all 28 gates against this repository" 0 ""
 else
     report "case 3 ran all 28 gates against this repository" 1 "the summary holds no 'gates 28/28 passed': $(tail -n 3 "$WORK/passing/out.txt")"
+fi
+
+# ── Case 5: the format step's failure reaches the exit code ──────────────────────────
+#
+# Case 2 fails only the compile step, so without this case the suite proves propagation
+# from one step and nothing about the rest. The mutation it kills: replacing the format
+# step's `run_step` call with a bare `cargo fmt --all -- --check` followed by
+# `RAN+=("format ok 0s")` drops that step's failure on the floor, and every other assertion
+# in this file still passes.
+run_case failing-format "$PIN_CHANNEL" 0 1
+rc=$(cat "$WORK/failing-format/rc.txt")
+if [[ $rc -eq 0 ]]; then
+    report "case 5 exits non-zero when cargo fmt fails" 1 "the script exited 0"
+else
+    report "case 5 exits non-zero when cargo fmt fails" 0 ""
+fi
+if grep -q 'format FAILED' "$WORK/failing-format/out.txt"; then
+    report "case 5 names the format step as failed" 0 ""
+else
+    report "case 5 names the format step as failed" 1 "the summary holds no 'format FAILED': $(tail -n 3 "$WORK/failing-format/out.txt")"
+fi
+if grep -q 'compile ok' "$WORK/failing-format/out.txt"; then
+    report "case 5 leaves the passing compile step reported as passing" 0 ""
+else
+    report "case 5 leaves the passing compile step reported as passing" 1 "the summary holds no 'compile ok': $(tail -n 3 "$WORK/failing-format/out.txt")"
 fi
 
 # ── Case 4: an unknown crate ─────────────────────────────────────────────────────────

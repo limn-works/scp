@@ -139,11 +139,20 @@ toolchain_t1=$(date +%s)
 # reason that measurement did not establish, so the call carries a 60-second bound. The
 # value it produces names a directory in one line of output and decides nothing, so a bound
 # that expires prints that it expired and the run continues.
-if metadata=$(timeout 60 cargo metadata --no-deps --format-version 1 --offline 2>/dev/null); then
+# `timeout` returns 124 for its own bound and the command's own status otherwise, and the
+# two mean different things to a reader: 124 says the queue held the call, while a manifest
+# cargo rejects makes it exit 1 in well under a second. An earlier revision printed the
+# timeout message for both, which pointed a reader at the build lock while its own manifest
+# was the fault.
+metadata_rc=0
+metadata=$(timeout 60 cargo metadata --no-deps --format-version 1 --offline 2>/dev/null) || metadata_rc=$?
+if [[ $metadata_rc -eq 0 ]]; then
     target_dir=$(printf '%s' "$metadata" | sed -nE 's/.*"target_directory":"([^"]*)".*/\1/p')
     [[ -n $target_dir ]] || target_dir="(cargo metadata named no target directory)"
-else
+elif [[ $metadata_rc -eq 124 ]]; then
     target_dir="(cargo metadata did not answer within 60s, so this line names no target directory)"
+else
+    target_dir="(cargo metadata exited $metadata_rc, so this line names no target directory)"
 fi
 
 # ── The crate set ────────────────────────────────────────────────────────────────────
@@ -191,15 +200,25 @@ crate_of_path() {
 # The files this branch changed: everything the working tree holds that differs from
 # HEAD, plus every file the commits since the merge base with origin/main touched. A fix
 # round runs this script with edits uncommitted, with edits committed, and with both.
+#
+# EVERY FAILURE HERE ENDS THE RUN. An earlier revision discarded both git errors, so a
+# checkout holding no `origin/main` ref — a single-branch clone, or an extracted tarball —
+# produced an empty file list, an empty crate set, a skipped compile step, and exit 0. That
+# is the shape this whole script exists to prevent: a green result that compiled nothing,
+# on a branch whose commits changed crate sources.
 changed_files() {
-    git -C "$REPO_ROOT" status --porcelain 2>/dev/null | sed -E 's/^.{3}//; s/^.* -> //'
-    local base
-    if base=$(git -C "$REPO_ROOT" merge-base HEAD origin/main 2>/dev/null); then
-        git -C "$REPO_ROOT" diff --name-only "$base" HEAD 2>/dev/null
+    local status base
+    if ! status=$(git -C "$REPO_ROOT" status --porcelain); then
+        printf 'fix-round-check: git status failed in %s, so this script could not read which files this branch changed.\n' "$REPO_ROOT" >&2
+        return 1
     fi
+    printf '%s\n' "$status" | sed -E 's/^.{3}//; s/^.* -> //'
+    if ! base=$(git -C "$REPO_ROOT" merge-base HEAD origin/main 2>/dev/null); then
+        printf 'fix-round-check: this checkout holds no merge base between HEAD and origin/main, so a committed edit would go unread and unchecked. Fetch origin/main, or name the crates on the command line.\n' >&2
+        return 1
+    fi
+    git -C "$REPO_ROOT" diff --name-only "$base" HEAD
 }
-
-CHANGED=$(changed_files | sort -u)
 
 declare -a CRATES=()
 crate_source=""
@@ -214,6 +233,11 @@ if [[ $# -gt 0 ]]; then
     done
 else
     crate_source="derived from the files this branch changed"
+    # `set -o pipefail` is on, so a failing `changed_files` propagates through `sort -u`.
+    if ! CHANGED=$(changed_files | sort -u); then
+        printf 'fix-round-check: the line above names why this script could not derive a crate set, so it compiled nothing and ran no gate.\n' >&2
+        exit 1
+    fi
     while IFS= read -r f; do
         [[ -n $f ]] || continue
         owner=$(crate_of_path "$f")
@@ -369,8 +393,17 @@ for g in "${GATES[@]}"; do
         *.py) runner=("$PYTHON" "$g") ;;
         *) runner=(bash "$g") ;;
     esac
-    if out=$("${runner[@]}" 2>&1); then
+    # Each gate carries the same 60-second-class bound the metadata call above carries, for
+    # the same reason: two of these gates start `cargo tree`, neither passes `--offline`,
+    # and a cargo command on this machine can sit in a queue for half an hour. A gate that
+    # does not finish proved nothing, so the run reports that rather than waiting.
+    out=$(timeout 300 "${runner[@]}" 2>&1)
+    gate_rc=$?
+    if [[ $gate_rc -eq 0 ]]; then
         gate_ran=$((gate_ran + 1))
+    elif [[ $gate_rc -eq 124 ]]; then
+        gate_failures=$((gate_failures + 1))
+        printf '  TIMED OUT after 300s %s — it did not finish, so this run proved nothing about it.\n' "$g" >&2
     else
         gate_failures=$((gate_failures + 1))
         printf '  FAILED %s\n' "$g" >&2
