@@ -14,21 +14,11 @@ sqlite = ["scp-platform/sqlite"]
 filesystem = ["scp-platform/filesystem"]
 sync = ["scp-platform/sync"]
 combined = ["scp-transport/combined"]
-# Compiles `helpers`, the only module here that names `scp_identity`. The two `DidDht`
-# constructors it calls are `#[cfg(any(test, feature = "testing"))]`, so the module needs
-# `scp-identity/testing` and nothing else in this crate does. `[dev-dependencies]` below
-# turns this on for this crate's own test build, which is where the module's two consumers
-# live.
-helpers = ["scp-identity/testing"]
 
 [dependencies]
 async-trait = { workspace = true }
 scp-core = { path = "../scp-core", features = ["allow_unencrypted_storage", "testing"] }
-# Default features. `scp-identity/testing` rides on this crate's own `helpers` feature
-# instead, because this was the only line in the workspace that enabled it, and as a normal
-# dependency edge it reached every build that pulls this crate — `scp-ffi`'s `testing`
-# feature among them.
-scp-identity = { path = "../scp-identity" }
+scp-identity = { path = "../scp-identity", features = ["testing"] }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
 # NORMAL testing edge (not dev-dep): `helpers.rs` uses `InMemoryDhtClient` /
 # `TestDidDht` at LIB level (this whole crate is a test harness), mirroring its
@@ -62,12 +52,6 @@ serde = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
-# This crate, naming itself, to turn `helpers` on for its own test build and for no other.
-# `tests/integration/sdk_usability.rs` and `tests/integration/node.rs` are the module's only
-# consumers in the workspace. A `cargo test` or `cargo nextest` build of this crate unifies
-# dev-dependency features into the library, so the module compiles there; a build that takes
-# this crate as a normal dependency never builds these dev-dependencies and never gets it.
-scp-testing = { path = ".", features = ["helpers"] }
 scp-core = { path = "../scp-core", features = ["testing"] }
 # The SDK-usability integration test builds relay wire messages directly; the
 # types live in the wasm-safe scp-relay-client leaf (ADR-057 Slice 3, D5).
