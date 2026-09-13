@@ -315,9 +315,10 @@ run_step format cargo fmt --all -- --check
 # directory" and compiled nothing for the 300 seconds before a timeout killed it. Its own
 # job in `.github/workflows/ci.yml` runs the underlying Rust test on the pushed head.
 #
-# `scripts/check-shipped-feature-graph.sh` stays in the list although it starts eleven
-# `cargo tree` resolutions, because `cargo tree` compiles nothing and takes no build lock:
-# the same 2026-09-13 run measured it at 12.9 seconds while the build lock was held.
+# TWO GATES STAY IN THE LIST ALTHOUGH THEY START CARGO. `scripts/check-shipped-feature-
+# graph.sh` runs eleven `cargo tree` resolutions and `scripts/check-protocol-deps.sh` runs
+# one, and `cargo tree` compiles nothing and takes no build lock: the same 2026-09-13 run
+# measured them at 12.9 seconds and 391 ms while another worktree held that lock.
 #
 # Measured on 2026-09-13, one run each, in the order below: 47 seconds for all 28.
 GATES=(
@@ -387,7 +388,13 @@ fi
 # ── The summary ──────────────────────────────────────────────────────────────────────
 crate_list="none"
 [[ ${#CRATES[@]} -gt 0 ]] && crate_list=$(IFS=' '; printf '%s' "${CRATES[*]}")
-ran_list=$(IFS='; '; printf '%s' "${RAN[*]}")
+# `IFS` joins an array on its FIRST character alone, so "; " would separate on ";" and drop
+# the space. The loop writes the two-character separator the summary line reads with.
+ran_list=""
+for r in "${RAN[@]}"; do
+    [[ -n $ran_list ]] && ran_list+="; "
+    ran_list+="$r"
+done
 skip_list="cargo nextest and workspace cargo clippy, which the rust-test and rust-clippy jobs of .github/workflows/ci.yml run on the pushed head"
 for s in ${SKIPPED[@]+"${SKIPPED[@]}"}; do skip_list+="; $s"; done
 

@@ -55,9 +55,8 @@ if [[ -z $PIN_CHANNEL ]]; then
     exit 1
 fi
 
-REAL_CARGO=$(command -v cargo 2>/dev/null || true)
-if [[ -z $REAL_CARGO ]]; then
-    printf 'run-tests: cargo is not on PATH, and the stub delegates every subcommand but `check` to it, so no case ran.\n' >&2
+if ! command -v cargo >/dev/null 2>&1; then
+    printf 'run-tests: cargo is not on PATH, and the stub delegates `cargo tree` to it, so no case ran.\n' >&2
     exit 1
 fi
 
@@ -70,13 +69,29 @@ trap 'rm -rf "$WORK"' EXIT
 #   $1 the version string the stub `rustc` reports
 #   $2 the exit code the stub `cargo` returns for `cargo check`
 #
-# The stub `cargo` intercepts `check` alone, returning $2, and hands every other subcommand
-# to the real cargo this harness found before it led PATH with the stub. Delegating rather
-# than answering keeps `cargo metadata`, `cargo fmt --check`, and the eleven `cargo tree`
-# resolutions inside `scripts/check-shipped-feature-graph.sh` reading this repository, so
-# case 3 fails when one of them rejects the tree. None of the three compiles anything. The
-# stub appends its argument list to `$WORK/<case>/cargo.log`, so a case can assert that no
-# cargo command ran.
+# The stub `cargo` answers `check`, `fmt`, and `metadata` itself and hands every other
+# subcommand to the real cargo this harness found before it led PATH with the stub.
+#
+# WHICH SUBCOMMANDS THE STUB ANSWERS, and the criterion that decides: a subcommand belongs
+# to the stub when the real one waits on the shared target directory's build lock, because
+# this harness must finish in a bounded time on a machine where some other worktree is
+# always compiling. `cargo check` waits by definition. `cargo fmt` waits because it resolves
+# the workspace through a full `cargo metadata` first, and `cargo metadata` waits for the
+# same reason. Measured on 2026-09-13: an earlier revision of this file delegated `fmt`, and
+# one case sat in it for 87 minutes behind another worktree's `cargo clippy --workspace`
+# until a 2400-second bound killed the run after case 1.
+#
+# `cargo tree` stays delegated, so the eleven resolutions inside
+# `scripts/check-shipped-feature-graph.sh` read this repository and case 3 fails when that
+# gate rejects the tree. `cargo tree` takes no build lock: measured at 12.9 seconds for the
+# whole gate while another worktree held it.
+#
+# WHAT THE STUBBED STEPS STILL PROVE. These cases test what the script does with a step's
+# exit code, not whether cargo formats correctly. `.github/workflows/ci.yml` runs the real
+# `cargo fmt --all -- --check` in its `rust-fmt` job on every pushed head.
+#
+# The stub appends its argument list to `$WORK/<case>/cargo.log`, so a case can assert that
+# no cargo command ran.
 #
 # `rustc` and `rustup` are written as two separate files on purpose:
 # `scripts/check-resolved-rustc.sh` skips its comparison only where the two names read one
@@ -101,8 +116,19 @@ EOF
     cat > "$dir/bin/cargo" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$dir/cargo.log"
-if [ "\$1" = "check" ]; then exit $cargo_check_rc; fi
-exec "$REAL_CARGO" "\$@"
+case "\$1" in
+    check) exit $cargo_check_rc ;;
+    fmt) exit 0 ;;
+    metadata) printf '{"version":1,"target_directory":"$dir/stub-target-dir"}\n'; exit 0 ;;
+esac
+# Delegating means removing this directory from PATH first. The cargo on PATH here is a
+# mise shim, and a shim re-resolves its tool through PATH, so a stub that kept itself on
+# PATH and exec'd that shim got the shim back into the stub. Each hop added mise's exported
+# environment, and after enough hops execve refused the call with "Argument list too long";
+# the calling gate read that as a cargo failure and retried, which spun. Measured on
+# 2026-09-13: one gate logged 17 identical \`cargo tree\` invocations in under ten minutes.
+export PATH="\${PATH#"$dir/bin:"}"
+exec cargo "\$@"
 EOF
 
     chmod +x "$dir/bin/rustc" "$dir/bin/rustup" "$dir/bin/cargo"
@@ -189,8 +215,13 @@ mkdir -p "$WORK/unknown-crate/bin"
 cat > "$WORK/unknown-crate/bin/cargo" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$WORK/unknown-crate/cargo.log"
-if [ "\$1" = "check" ]; then exit 0; fi
-exec "$REAL_CARGO" "\$@"
+case "\$1" in
+    check) exit 0 ;;
+    fmt) exit 0 ;;
+    metadata) printf '{"version":1,"target_directory":"$WORK/unknown-crate/stub-target-dir"}\n'; exit 0 ;;
+esac
+export PATH="\${PATH#"$WORK/unknown-crate/bin:"}"
+exec cargo "\$@"
 EOF
 cat > "$WORK/unknown-crate/bin/rustc" <<EOF
 #!/usr/bin/env bash
