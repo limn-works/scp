@@ -14,14 +14,19 @@
 #     not name exits 0 and proves nothing.
 #
 #   * THE PROPAGATION. A non-zero exit from any step is a non-zero exit from the script.
-#     One case per step the stub can fail: case 2 makes the stub cargo exit 1 on `check`,
-#     case 5 makes it exit 1 on `fmt`, and each asserts that the script exits non-zero and
-#     names that step as failed while leaving the other reported as passing. Case 3 makes
-#     the stub exit 0 on both and asserts that the script exits 0 and names both steps as
-#     passing. Case 3 exists so cases 2 and 5 are not vacuous: without it, a script that
-#     always failed would satisfy them both. Cases 2 and 5 exist so case 3 is not vacuous:
-#     an earlier revision fixed the stub's `fmt` answer at 0, which left the format step's
-#     failure untested and let a mutation that discards it pass every assertion here.
+#     The script runs four steps, and one case fails each: case 1 the toolchain step, case
+#     2 the compile step, case 5 the format step, and case 6 the gates step. Each asserts
+#     that the script exits non-zero, names that step as failed, and leaves the steps that
+#     passed reported as passing. Case 3 fails nothing and asserts that the script exits 0
+#     and names every step as passing.
+#
+#     EACH DIRECTION GUARDS THE OTHER. Case 3 exists so the failing cases are not vacuous:
+#     without it, a script that always failed would satisfy every one of them. The failing
+#     cases exist so case 3 is not vacuous, and two revisions of this file proved that they
+#     are needed rather than tidy. One fixed the stub's `fmt` answer at 0, which left a
+#     mutation that discards the format step's failure passing every assertion here. The
+#     next covered three steps and not the gates step, which left a mutation deleting
+#     `FAILED=1` from the gate-failure branch passing every assertion here.
 #
 # WHAT THE STUBS REPLACE, and what stays real. The cases replace `cargo`, `rustc`, and
 # `rustup` with scripts on a PATH this harness leads with, because the contract clauses
@@ -101,9 +106,24 @@ trap 'rm -rf "$WORK"' EXIT
 # `scripts/check-resolved-rustc.sh` skips its comparison only where the two names read one
 # file that rustup installed, and two distinct files put it on the path that compares.
 run_case() {
-    local case_name=$1 rustc_version=$2 cargo_check_rc=$3 cargo_fmt_rc=${4:-0}
+    local case_name=$1 rustc_version=$2 cargo_check_rc=$3 cargo_fmt_rc=${4:-0} python_rc=${5:-}
     local dir="$WORK/$case_name"
     mkdir -p "$dir/bin"
+
+    # A stub `python3.12` fails the gates step and no other.
+    # `scripts/fix-round-check.sh` resolves its interpreter through
+    # `command -v python3.12`, and nine of the 28 entries in its gate list run under it, so
+    # a case that plants a failing one makes the gates step fail while the compile and
+    # format steps pass. Cases that pass nothing here plant no such file and run the real
+    # interpreter.
+    if [[ -n $python_rc ]]; then
+        cat > "$dir/bin/python3.12" <<EOF
+#!/usr/bin/env bash
+printf 'stub python3.12 refusing to run %s\n' "\$*" >&2
+exit $python_rc
+EOF
+        chmod +x "$dir/bin/python3.12"
+    fi
 
     cat > "$dir/bin/rustc" <<EOF
 #!/usr/bin/env bash
@@ -238,6 +258,30 @@ if grep -q 'compile ok' "$WORK/failing-format/out.txt"; then
     report "case 5 leaves the passing compile step reported as passing" 0 ""
 else
     report "case 5 leaves the passing compile step reported as passing" 1 "the summary holds no 'compile ok': $(tail -n 3 "$WORK/failing-format/out.txt")"
+fi
+
+# ── Case 6: a failing gate reaches the exit code ─────────────────────────────────────
+#
+# Cases 2 and 5 fail the compile and format steps, and until this case no case failed a
+# gate. The mutation it kills: deleting `FAILED=1` from the gate-failure branch of
+# `scripts/fix-round-check.sh` lets a run print every failing gate, report the count in its
+# summary, and still exit 0, which every other assertion in this file permits.
+run_case failing-gate "$PIN_CHANNEL" 0 0 1
+rc=$(cat "$WORK/failing-gate/rc.txt")
+if [[ $rc -eq 0 ]]; then
+    report "case 6 exits non-zero when a gate fails" 1 "the script exited 0"
+else
+    report "case 6 exits non-zero when a gate fails" 0 ""
+fi
+if grep -qE 'gates [0-9]+/[0-9]+ passed, [0-9]+ FAILED' "$WORK/failing-gate/out.txt"; then
+    report "case 6 counts the failing gates in the summary" 0 ""
+else
+    report "case 6 counts the failing gates in the summary" 1 "the summary holds no gate-failure count: $(tail -n 3 "$WORK/failing-gate/out.txt")"
+fi
+if grep -q 'compile ok' "$WORK/failing-gate/out.txt"; then
+    report "case 6 leaves the compile step reported as passing" 0 ""
+else
+    report "case 6 leaves the compile step reported as passing" 1 "the summary holds no 'compile ok': $(tail -n 3 "$WORK/failing-gate/out.txt")"
 fi
 
 # ── Case 4: an unknown crate ─────────────────────────────────────────────────────────

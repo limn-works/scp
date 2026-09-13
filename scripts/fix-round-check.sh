@@ -113,6 +113,19 @@ if ! command -v cargo >/dev/null 2>&1; then
     exit 1
 fi
 
+# `timeout` bounds the `cargo metadata` call below and each of the 28 gates, so 29 call
+# sites depend on it. macOS ships neither `timeout` nor `gtimeout`, Homebrew's coreutils
+# supplies both names, and `.mise.toml` provisions neither, so a checkout that installed
+# only the prerequisites README.md lists has no such program. Without this guard every gate
+# would exit 127, and the run would print 28 blocks reading "timeout: command not found"
+# and report 28 enforcement violations that do not exist.
+TIMEOUT=timeout
+command -v "$TIMEOUT" >/dev/null 2>&1 || TIMEOUT=gtimeout
+if ! command -v "$TIMEOUT" >/dev/null 2>&1; then
+    printf 'fix-round-check: neither timeout nor gtimeout is on PATH, and this script bounds its cargo metadata call and every gate with one of them, so it checked nothing. Install GNU coreutils (brew install coreutils), then run this script again.\n' >&2
+    exit 1
+fi
+
 # ── Precondition: the compiler this shell resolves ───────────────────────────────────
 #
 # `scripts/check-resolved-rustc.sh` holds the comparison for every caller in this
@@ -145,7 +158,7 @@ toolchain_t1=$(date +%s)
 # timeout message for both, which pointed a reader at the build lock while its own manifest
 # was the fault.
 metadata_rc=0
-metadata=$(timeout 60 cargo metadata --no-deps --format-version 1 --offline 2>/dev/null) || metadata_rc=$?
+metadata=$("$TIMEOUT" 60 cargo metadata --no-deps --format-version 1 --offline 2>/dev/null) || metadata_rc=$?
 if [[ $metadata_rc -eq 0 ]]; then
     target_dir=$(printf '%s' "$metadata" | sed -nE 's/.*"target_directory":"([^"]*)".*/\1/p')
     [[ -n $target_dir ]] || target_dir="(cargo metadata named no target directory)"
@@ -393,11 +406,13 @@ for g in "${GATES[@]}"; do
         *.py) runner=("$PYTHON" "$g") ;;
         *) runner=(bash "$g") ;;
     esac
-    # Each gate carries the same 60-second-class bound the metadata call above carries, for
-    # the same reason: two of these gates start `cargo tree`, neither passes `--offline`,
-    # and a cargo command on this machine can sit in a queue for half an hour. A gate that
-    # does not finish proved nothing, so the run reports that rather than waiting.
-    out=$(timeout 300 "${runner[@]}" 2>&1)
+    # Each gate carries a 300-second bound for the same reason the metadata call above
+    # carries a 60-second one: two of these gates start `cargo tree`, neither passes
+    # `--offline`, and a cargo command on this machine can sit in a queue for half an hour.
+    # A gate that does not finish proved nothing, so the run reports that rather than
+    # waiting. The bound is 300 seconds rather than 60 because the slowest gate measured on
+    # 2026-09-13 took 12.9 seconds and the whole set took 47.
+    out=$("$TIMEOUT" 300 "${runner[@]}" 2>&1)
     gate_rc=$?
     if [[ $gate_rc -eq 0 ]]; then
         gate_ran=$((gate_ran + 1))
