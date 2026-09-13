@@ -106,9 +106,10 @@ ignore = [
     # openmls_rust_crypto -> hpke-rs -> libcrux-sha3 path as RUSTSEC-2026-0074 above.
     # OpenMLS does not drive this SHAKE code path. Awaiting upstream.
     "RUSTSEC-2026-0208",
-    # libcrux: potentially incorrect output of constant-time swap/select on aarch64.
-    # Same openmls_rust_crypto -> hpke-rs -> libcrux-sha3 path as RUSTSEC-2026-0074
-    # above; awaiting upstream migration. No runtime exposure.
+    # libcrux-secrets: potentially incorrect output of constant-time swap/select on
+    # aarch64. Transitive via
+    # openmls_rust_crypto -> hpke-rs -> libcrux-sha3 -> libcrux-traits -> libcrux-secrets.
+    # Awaiting upstream migration. No runtime exposure.
     "RUSTSEC-2026-0212",
 ]
 

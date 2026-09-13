@@ -129,26 +129,6 @@ required-features = ["testing"]
 
 [build-dependencies]
 uniffi = { version = "0.29", features = ["build", "tokio"] }
-# build.rs calls nothing in uniffi_bindgen. The line exists to make cargo compile that
-# crate once instead of twice.
-#
-# Feature resolver 2 resolves a package's features separately on the host side and the
-# target side, and cargo compiles the package twice when the two sides disagree. They
-# disagree here: `uniffi_build` declares `uniffi_bindgen` with `default-features = false`,
-# so the host copy resolves to no features, while this crate's normal `uniffi` dependency
-# reaches the same package through `cli -> bindgen` with defaults on and resolves
-# `["cargo-metadata", "default"]`. On run 34762016253 the two copies cost 25.5 s and 28.4 s,
-# which made `uniffi_bindgen` the second most expensive third-party package in the
-# workspace test build. Naming it here with default features on gives the host side the
-# same feature set as the target side, and cargo then shares one unit. This workspace sets
-# no `[profile.dev.build-override]`, so both sides also compile under the same profile,
-# which is the other condition for sharing.
-#
-# The feature this adds to the host copy — `cargo-metadata` — gates one module and one
-# branch inside `generate_swift_bindings`, which the `uniffi-bindgen` binary reaches and
-# `uniffi_build::generate_scaffolding` does not. Scaffolding generation behaves the same
-# either way.
-uniffi_bindgen = "0.29"
 
 [lints]
 workspace = true
