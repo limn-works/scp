@@ -4,7 +4,7 @@
 # cargo invocation and nothing about which unit cost what, so an engineer reducing compile
 # time cannot tell a 40-second dependency from a 2-second one. `cargo build --timings`
 # writes a per-unit table and a concurrency plot. This workflow runs the same four cargo
-# invocations `rust-test` runs, each under `--timings=html,json`, and uploads the reports.
+# invocations `rust-test` runs, each under `--timings`, and uploads the reports.
 #
 # WHY IT IS COLD. It installs no `Swatinem/rust-cache` step, so every run compiles the
 # whole dependency graph from scratch. The cache-miss path is the number this workflow
@@ -64,10 +64,9 @@ jobs:
           measure() {
             local label="$1"; shift
             rm -rf target/cargo-timings
-            /usr/bin/time -f "${label} wall %e s" cargo build "$@" --timings=html,json
+            /usr/bin/time -f "${label} wall %e s" cargo build "$@" --timings
             mkdir -p "timings/${label}"
             cp target/cargo-timings/cargo-timing.html "timings/${label}/timing.html"
-            cp target/cargo-timings/cargo-timing.json "timings/${label}/timing.json"
           }
 
           measure workspace-test --workspace --all-targets --features "$TEST_FEATURES"
