@@ -4323,6 +4323,14 @@ impl Supervisor {
                     .lookup_miss_error(context_id, format!("context not registered: {context_id}"));
                 reply_with_error(cmd, err);
             }
+            // Test-only counter read: a counter for an unknown context has no
+            // honest default, so the reply is the hard error.
+            #[cfg(feature = "testing")]
+            QueriesCommand::CheckpointEventsSince { ref context_id, .. } => {
+                let err = self
+                    .lookup_miss_error(context_id, format!("context not registered: {context_id}"));
+                reply_with_error(cmd, err);
+            }
             // Soft-default variants — legacy methods return the
             // variant-specific default on unknown context.
             QueriesCommand::MemberCount { .. }
@@ -5792,6 +5800,16 @@ impl Supervisor {
             BroadcastCommand::ReleaseBroadcastReservation { reply, .. } => {
                 let _ = reply.send(Ok(()));
                 Outcome::ok(())
+            }
+            // Test-only seed seam — context must exist.
+            #[cfg(feature = "testing")]
+            BroadcastCommand::SeedBroadcastAuthor {
+                context_id, reply, ..
+            } => {
+                let err = ContextError::ContextNotRegistered(context_id);
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
             }
         }
     }
@@ -14500,6 +14518,78 @@ impl Supervisor {
         })?
     }
 
+    /// Registers an additional DID as a broadcast author on an existing
+    /// broadcast context, bypassing the governance round-trip — test-only.
+    ///
+    /// Single-node integration tests that need a multi-author broadcast
+    /// context cannot drive genuine governance (the bridge key-resolver only
+    /// sees one actor's custody). This seam populates the author registry
+    /// mirroring the author-publish/add path, so multi-author KEA-leaf and
+    /// checkpoint-counter tests can exercise the real code path instead of
+    /// being limited to the creator-only case.
+    ///
+    /// Mirrors [`Self::seed_peer_pseudonym`] in purpose and gating. Gated
+    /// behind `testing` — never compiled into production builds, never
+    /// reachable from any FFI bridge.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::MembershipFailed`] if the context is not a
+    ///   broadcast context.
+    /// - [`ContextError::PermissionDenied`] if `author_did` is already
+    ///   registered.
+    /// - [`ContextError::ContextNotRegistered`] if the context has no actor.
+    /// - [`ContextError::TransportFailed`] if the actor reply channel closes.
+    #[cfg(feature = "testing")]
+    pub async fn seed_broadcast_author(
+        &self,
+        context_id: &str,
+        author_did: DID,
+    ) -> Result<(), ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = BroadcastCommand::SeedBroadcastAuthor {
+            context_id: context_id.to_owned(),
+            author_did,
+            reply: tx,
+        };
+        self.dispatch_broadcast_command(cmd).await?;
+        bounded_reply_await(rx).await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::seed_broadcast_author — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
+    /// Reads a context's `checkpoint_events_since` counter through the actor
+    /// mailbox — test-only.
+    ///
+    /// §9.9.3 of the security-model spec compares members' Merkle roots at an
+    /// equal event count, so every durable leaf a helper appends must credit
+    /// the counter exactly once. A test that counts leaves in the event log
+    /// cannot see a missed or doubled credit; a test that reads this counter
+    /// and compares its delta against the event-log delta can. Gated behind
+    /// `testing` — never compiled into production builds, never reachable from
+    /// any FFI bridge.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotRegistered`] if the context has no actor.
+    /// - [`ContextError::TransportFailed`] if the actor reply channel closes.
+    #[cfg(feature = "testing")]
+    pub async fn checkpoint_events_since(&self, context_id: &str) -> Result<u64, ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = QueriesCommand::CheckpointEventsSince {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        };
+        self.dispatch_query(cmd).await?;
+        bounded_reply_await(rx).await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::checkpoint_events_since — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
     /// Installs a member's §9.17 access key directly into a context's access
     /// key store via the actor mailbox — test-only.
     ///
@@ -15285,6 +15375,9 @@ impl Supervisor {
             BroadcastCommand::ReleaseBroadcastReservation { payload, .. } => {
                 Some(payload.context_id.as_str())
             }
+            // Test-only seed seam — routed to the per-context actor.
+            #[cfg(feature = "testing")]
+            BroadcastCommand::SeedBroadcastAuthor { context_id, .. } => Some(context_id.as_str()),
             // PublishBroadcast / PublishBroadcastContent need
             // KeyCustody on the shim, so they have no string target for
             // this custody-free router.
@@ -15442,7 +15535,8 @@ impl Supervisor {
             QueriesCommand::GetAccessKey { context_id, .. }
             | QueriesCommand::GetAllAccessKeys { context_id, .. }
             | QueriesCommand::RemainingBudgetForTest { context_id, .. }
-            | QueriesCommand::VelocityForTest { context_id, .. } => Some(context_id.as_str()),
+            | QueriesCommand::VelocityForTest { context_id, .. }
+            | QueriesCommand::CheckpointEventsSince { context_id, .. } => Some(context_id.as_str()),
         }
     }
 }
@@ -15846,6 +15940,11 @@ fn reply_with_soft_default(cmd: QueriesCommand) {
         QueriesCommand::VelocityForTest { reply, .. } => {
             let _ = reply.send(Ok(0));
         }
+        // Hard-error variant: routed through `reply_with_error`, never here.
+        #[cfg(feature = "testing")]
+        QueriesCommand::CheckpointEventsSince { .. } => {
+            debug_assert!(false, "hard-error variant routed through soft-default path");
+        }
     }
 }
 
@@ -15860,6 +15959,10 @@ fn reply_with_error(cmd: QueriesCommand, err: ContextError) {
             let _ = reply.send(Err(err));
         }
         QueriesCommand::GetBroadcastKeyForLocalAuthor { reply, .. } => {
+            let _ = reply.send(Err(err));
+        }
+        #[cfg(feature = "testing")]
+        QueriesCommand::CheckpointEventsSince { reply, .. } => {
             let _ = reply.send(Err(err));
         }
         // Every other variant is soft-fallback — they never route
