@@ -3965,3 +3965,153 @@ async fn rotate_content_keys_kea_append_failure_after_durable_advance_does_not_f
         "checkpoint_events_since delta must equal the durable-leaf delta"
     );
 }
+
+/// §5.14.8 *Event-log leaf append failure*: the member MUST NOT append a
+/// dropped `KeyEpochAdvance` leaf at a later position. Drives one fully
+/// successful `RotateContentKeys` after the operation whose second author's
+/// leaf was dropped, then asserts that the second operation appended exactly
+/// one `KeyEpochAdvance` leaf per author and nothing else: the dropped author
+/// holds one leaf in the whole log (the second operation's), the other author
+/// holds two, and both new leaves follow the second operation's
+/// `ContentKeysRotated` anchor. A later-position re-append of the dropped leaf
+/// (in the failing operation, on the next mutation, or on the next rotation)
+/// raises the total to four and turns the per-author split into `[2, 2]`.
+async fn assert_dropped_kea_leaf_is_never_reappended(
+    manager: &Arc<Supervisor>,
+    ctx_id: &str,
+    ctx_bytes: &[u8; 32],
+) {
+    let entries_before = manager
+        .event_log_entries(ctx_bytes)
+        .unwrap()
+        .expect("event log must exist before the follow-up rotation");
+    let kea_before = entries_before
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::KeyEpochAdvance)
+        .count();
+    assert_eq!(
+        kea_before, 1,
+        "precondition: exactly one leaf survived the failing operation"
+    );
+    let counter_before = manager.checkpoint_events_since(ctx_id).await.unwrap();
+
+    let sk_alice = signing_key_for_did(&alice());
+    let (proposal, _events, result) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::RotateContentKeys { reason: None },
+            &sk_alice,
+        )
+        .await
+        .expect("the follow-up rotation runs against a healthy event log");
+    assert_eq!(proposal.status, ProposalStatus::Approved);
+    assert!(
+        result.is_some(),
+        "SingleAdmin RotateContentKeys must auto-execute"
+    );
+
+    let entries = manager
+        .event_log_entries(ctx_bytes)
+        .unwrap()
+        .expect("event log must exist after the follow-up rotation");
+    let kea_positions: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.event_type == scp_event_log::EventType::KeyEpochAdvance)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        kea_positions.len(),
+        kea_before + 2,
+        "the follow-up rotation appends exactly one KeyEpochAdvance per author; \
+         a later-position re-append of the dropped leaf would make this four"
+    );
+    // GovernanceProposed + ContentKeysRotated + 2 KeyEpochAdvance, and nothing else.
+    assert_eq!(
+        entries.len() - entries_before.len(),
+        4,
+        "the follow-up rotation appends four leaves and no repair leaf"
+    );
+
+    let mut per_author: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for e in entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::KeyEpochAdvance)
+    {
+        *per_author.entry(e.actor_did.as_ref()).or_insert(0) += 1;
+    }
+    let mut counts: Vec<usize> = per_author.values().copied().collect();
+    counts.sort_unstable();
+    assert_eq!(
+        counts,
+        [1, 2],
+        "the author whose leaf was dropped holds one KeyEpochAdvance leaf (the follow-up \
+         rotation's); the other author holds two; a re-append would read [2, 2]"
+    );
+
+    let last_anchor = entries
+        .iter()
+        .rposition(|e| e.event_type == scp_event_log::EventType::ContentKeysRotated)
+        .expect("the follow-up rotation appended its ContentKeysRotated anchor");
+    let new_kea = &kea_positions[kea_before..];
+    assert!(
+        new_kea.iter().all(|&pos| pos > last_anchor),
+        "both follow-up KeyEpochAdvance leaves follow the follow-up ContentKeysRotated anchor \
+         (anchor at {last_anchor}, KEA at {new_kea:?})"
+    );
+
+    let counter_after = manager.checkpoint_events_since(ctx_id).await.unwrap();
+    assert_eq!(
+        counter_after - counter_before,
+        4,
+        "checkpoint_events_since credits the four landed leaves and no repair leaf"
+    );
+}
+
+#[tokio::test]
+async fn revoke_dropped_kea_leaf_is_never_reappended_by_a_later_rotation() {
+    let manager = new_manager_with_failing_kea_event_log(2);
+    let ctx_id = "ctx-ban-kea-no-reappend";
+    let ctx_bytes = two_author_broadcast_with_subscriber(&manager, ctx_id).await;
+
+    let sk_alice = signing_key_for_did(&alice());
+    manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::RevokeAccess {
+                did: carol(),
+                access: AccessScope::Both,
+            },
+            &sk_alice,
+        )
+        .await
+        .expect(
+            "a KeyEpochAdvance append failure after the durable ban must not fail the proposal",
+        );
+
+    assert_dropped_kea_leaf_is_never_reappended(&manager, ctx_id, &ctx_bytes).await;
+}
+
+#[tokio::test]
+async fn rotate_content_keys_dropped_kea_leaf_is_never_reappended_by_a_later_rotation() {
+    let manager = new_manager_with_failing_kea_event_log(2);
+    let ctx_id = "ctx-rotate-kea-no-reappend";
+    let ctx_bytes = two_author_broadcast_with_subscriber(&manager, ctx_id).await;
+
+    let sk_alice = signing_key_for_did(&alice());
+    manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::RotateContentKeys { reason: None },
+            &sk_alice,
+        )
+        .await
+        .expect(
+            "a KeyEpochAdvance append failure after the durable rotation must not fail the proposal",
+        );
+
+    assert_dropped_kea_leaf_is_never_reappended(&manager, ctx_id, &ctx_bytes).await;
+}
