@@ -39,18 +39,30 @@ that no filter lists therefore merges with every job that reads it skipped.
   gate reads the set of output names out of the workflow rather than out of a list it
   holds, so a lane added later without that clause fails the gate.
 - **The workflow file that defines a lane is itself a file that decides that lane.** Every
-  job the `rust` filter guards takes its cargo command, its feature list, its matrix and
-  its cache group from `.github/workflows/ci.yml`, so a commit that rewrites job
+  job a paths filter guards takes its cargo command, its feature list, its matrix and its
+  cache group from the workflow file that declares it, so a commit that rewrites job
   rust-test's command decides what that job compiles and runs exactly as `.clippy.toml`
   decides what rust-clippy reports. It meets the criterion this lesson opens with: a
   commit that edits one job's command and changes nothing else left every filter output
   false, skipped the job, and merged green over a command nothing had run — the rewritten
   lane first executing on whichever later pull request happened to touch `crates/`. The
-  `rust` filter therefore lists `.github/workflows/ci.yml`, and only that file: `docs.yml`,
-  `fuzz.yml`, `release.yml` and `build-matrix.yml` define no job that filter guards. This
-  is not the rejected alternative below — that one runs the Rust lane on every `.docs/`
-  and `.claude/agent-memory/` commit, which is most commits, while this entry names one
-  file whose commits are rare and are the ones that need the lane.
+  file decides every lane the workflow guards, not the one whose name matches the job
+  that revealed the hole: the first fix listed `.github/workflows/ci.yml` in the `rust`
+  filter alone, which ran the Rust lane on a change to the file and still skipped
+  `python-test`, `typescript-check`, `typescript-wasm-check`,
+  `scaffold-typescript-web-check`, `kotlin-test`, `swift-build-test` and `fuzz-build`,
+  each of which takes its command from the same file. `ci.yml` therefore lists itself in
+  the `toolchain` filter, which every output but `fuzz` ORs in, and a second time in the
+  `fuzz` filter, because the `fuzz` output reads that filter alone; `docs.yml` lists
+  itself in its own `toolchain` filter, which its `docs` output ORs in. `fuzz.yml`,
+  `release.yml` and `build-matrix.yml` guard no job with a paths filter, so they route
+  nothing. Check 2e of `scripts/check-toolchain-wiring.sh` reads every output of the
+  `changes` job of every paths-filtered workflow, resolves the filter names the output's
+  expression refers to, and fails when none of those filters lists the workflow's own
+  path, so a lane added later without a route from its own file fails the gate. This is
+  not the rejected alternative below — that one runs every lane on every `.docs/` and
+  `.claude/agent-memory/` commit, which is most commits, while this entry names one file
+  whose commits are rare and are the ones that need every lane.
 - **`on: pull_request: paths:` needs no such routing, because it fails closed.** A required
   check whose workflow never starts stays pending and blocks the merge. The skipped-job
   mechanism is the one that reports success for a job nothing ran.

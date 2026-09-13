@@ -168,9 +168,46 @@ jobs:
           filters: |
             # The files that decide how every lane compiles, rather than what any one lane
             # compiles. The `outputs:` block above ORs this filter into every other lane,
-            # so no other filter repeats an entry listed here.
+            # so no other filter repeats an entry listed here — except `fuzz`, whose
+            # output reads its own filter alone, so the `fuzz` filter lists this workflow
+            # file a second time.
             toolchain:
               - 'rust-toolchain.toml'
+              # This file itself. Every job a filter in this workflow guards takes its
+              # command, its feature list, its matrix and its cache group from this file:
+              # python-test runs `maturin develop`, typescript-check runs
+              # `cargo build -p scp-ffi-napi`, kotlin-test runs
+              # `cargo build -p scp-ffi-uniffi`, swift-build-test runs
+              # `bindings/swift/build-xcframework.sh`, and rust-test runs
+              # `cargo nextest`, each with the arguments written here. A change to this
+              # file decides what every one of those jobs compiles and runs, so it sits
+              # in the filter every output but `fuzz` ORs in.
+              #
+              # It meets the criterion
+              # `.docs/lessons/route-a-changed-file-to-every-lane-it-decides.md` states
+              # for a path that needs routing: omitting it is invisible on an ordinary
+              # pull request. A pull request that rewrites job rust-test's cargo command
+              # and changes nothing else left every filter output false, skipped
+              # rust-test, and merged with the `ci` aggregator green over a command
+              # nothing had run — the rewritten lane first executing on whichever later
+              # pull request happened to touch `crates/`. Listing the file in the `rust`
+              # filter alone closed that hole for the Rust lane and left it open for
+              # python-test, typescript-check, typescript-wasm-check,
+              # scaffold-typescript-web-check, kotlin-test, swift-build-test and
+              # fuzz-build, each of which takes its command from this file too.
+              #
+              # This is not the `'**'`-minus-exclusions filter that lesson rejects. That
+              # alternative runs every lane on every `.docs/` and
+              # `.claude/agent-memory/` commit, which is most of them; this entry names
+              # one file, and a commit that edits it is rare and is exactly the commit
+              # that needs every lane. The other workflows stay out of this filter:
+              # `docs.yml` guards its own `rust-docs` job and lists itself in its own
+              # `toolchain` filter, and `fuzz.yml`, `release.yml` and
+              # `build-matrix.yml` define no job a paths filter guards.
+              # `scripts/check-toolchain-wiring.sh` check 2e reads every output of the
+              # `changes` job of every paths-filtered workflow and fails when one of them
+              # reads no filter that lists the workflow's own path.
+              - '.github/workflows/ci.yml'
               # Cargo reads `.cargo/config.toml` out of every ancestor directory of the
               # one a cargo command runs in, so this file reaches every cargo invocation
               # in this workspace and every `wasm-pack build` under it. Its
@@ -194,28 +231,6 @@ jobs:
               # reads it, and the next branch to rebase would find the check red.
               - '.clippy.toml'
               - 'rustfmt.toml'
-              # This file itself. Every job this filter guards takes its cargo command,
-              # its feature list, its matrix and its cache group from this file, so a
-              # change here decides what each of those jobs compiles and runs — which is
-              # the same reason `.clippy.toml` is listed two lines above.
-              #
-              # It meets the criterion
-              # `.docs/lessons/route-a-changed-file-to-every-lane-it-decides.md` states
-              # for a path that needs routing: omitting it is invisible on an ordinary
-              # pull request. A pull request that rewrites job rust-test's cargo command
-              # and changes nothing else left every filter output false, skipped
-              # rust-test, and merged with the `ci` aggregator green over a command
-              # nothing had run — the rewritten lane first executing on whichever later
-              # pull request happened to touch `crates/`.
-              #
-              # This is not the `'**'`-minus-exclusions filter that lesson rejects. That
-              # alternative runs the Rust lane on every `.docs/` and
-              # `.claude/agent-memory/` commit, which is most of them; this entry names
-              # one file, and a commit that edits it is rare and is exactly the commit
-              # that needs the lane. The other workflows stay out: `docs.yml`,
-              # `fuzz.yml`, `release.yml` and `build-matrix.yml` define no job this
-              # filter guards.
-              - '.github/workflows/ci.yml'
               # `scripts/check-toolchain-wiring.sh` enumerates every root-level file in
               # the git tree, and every cargo configuration file the tree holds at any
               # depth, and fails when one is listed neither here nor in the `toolchain`
@@ -304,6 +319,13 @@ jobs:
               # own `[workspace]` table and cargo resolves this build against
               # fuzz/Cargo.lock, which `fuzz/**` above already covers.
               - 'Cargo.toml'
+              # This file itself, listed a second time because the `fuzz` output above
+              # reads this filter alone and never the `toolchain` filter, which holds
+              # the other copy. Job fuzz-build takes its `cargo check` command, its
+              # working directory and its cache group from this file, so a pull request
+              # that rewrites that command and changes nothing else would otherwise
+              # skip the one job that runs it.
+              - '.github/workflows/ci.yml'
 
   # ── Error codes ───────────────────────────────────────────────────
   error-codes:
