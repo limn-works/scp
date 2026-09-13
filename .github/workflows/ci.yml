@@ -794,9 +794,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Free disk space
+      - name: Free disk space when the runner is short of it
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -837,28 +848,66 @@ jobs:
   # filter-key check in scripts/tests/ci-gate/ci_gate_selftest.py read only
   # job-level conditions, so neither could see it. That self-test now rejects
   # any `needs.changes.outputs.*` reference outside a job-level `if:`.
+  #
+  # ── Why this job is a 2 × 4 matrix ──────────────────────────────────────────
+  #
+  # Measured on run 34721754678, whose log line
+  # `Restored from cache key "v0-rust-rust-test-Linux-x64-…" full match: true.`
+  # makes it the one warm sample in that week's runs: the ubuntu leg spent
+  # 4 min 16 s compiling (26 `Compiling` lines — rust-cache restores the 890
+  # dependency crates and every workspace crate rebuilds, because a checkout
+  # writes each source file with the checkout's own mtime) and 6 min 43 s running
+  # 11314 tests. Execution was the larger half and it divides; compilation does
+  # not, since nextest builds every test binary before it runs any subset.
+  #
+  # `--partition count:k/4` splits the run and not the build, so four shards cost
+  # four compiles and turn 6 min 43 s of execution into 1 min 41 s. Each shard is
+  # therefore about 0.9 + 4.3 + 1.7 minutes rather than 16.8, and the union of
+  # the four shards is the same 11314 tests: nextest assigns each test to exactly
+  # one partition.
+  #
+  # Only shard 1 writes the `workspace-debug` cache. All four legs compile the
+  # same target directory, so any of them could, and naming one keeps the
+  # entry's contents decided rather than raced.
   rust-test:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    name: Rust / test (${{ matrix.os }})
+    name: Rust / test (${{ matrix.os }}, shard ${{ matrix.shard }}/4)
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        shard: [1, 2, 3, 4]
     steps:
-      - name: Free disk space (Ubuntu)
+      - name: Free disk space when the runner is short of it
         if: runner.os == 'Linux'
         run: |
-          # The full Rust workspace (657 deps, 16 crates) needs ~12GB to compile.
-          # Ubuntu runners ship with ~14GB free but pre-installed SDKs consume
-          # most of it. Remove unused toolchains to reclaim ~20GB.
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          df -h /
+          # This step used to delete four preinstalled SDK trees unconditionally,
+          # under a comment reading "Ubuntu runners ship with ~14GB free but
+          # pre-installed SDKs consume most of it". That premise is stale. The
+          # runner image these jobs get reports `/dev/root 145G 40G 105G 28% /`
+          # after the deletions (run 34721754678 and run 34750056435 both print
+          # it), so about 85 GB was free before them, against the ~12 GB this
+          # workspace needs. The deletions bought nothing and cost between 21 s
+          # and 2 min 12 s per job across the six jobs that ran them.
+          #
+          # The guarantee stays and only the work goes: the threshold below is
+          # what the removed comment claimed the runner lacked, plus room for the
+          # restored cache and the test binaries, so a future image with a
+          # smaller disk still reclaims the space and this one skips in under a
+          # second.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet
+            sudo rm -rf /usr/local/lib/android
+            sudo rm -rf /opt/ghc
+            sudo rm -rf /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
@@ -867,7 +916,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-debug
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard == 1 }}
       - uses: taiki-e/install-action@nextest
       - name: Run tests
         run: |
@@ -881,7 +930,55 @@ jobs:
           # in-memory custody tests run. Mobile production builds (iOS
           # XCFramework, Android .aar) MUST NOT enable this feature.
           # See GitHub issue #88.
-          cargo nextest run --workspace --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/testing,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/testing,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/testing,scp-ffi-uniffi/outlet-capability-test-grant
+          #
+          # `--no-tests=fail` because `--partition` narrows the selection: a
+          # filter that selects nothing must fail this shard rather than report
+          # success over zero assertions, which is the zero-test defect
+          # scripts/tests/ci-gate/ci_gate_selftest.py records.
+          cargo nextest run --workspace --no-tests=fail --partition count:${{ matrix.shard }}/4 --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/testing,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/testing,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/testing,scp-ffi-uniffi/outlet-capability-test-grant
+
+  # ── Optional-feature test lanes ─────────────────────────────────────────────
+  #
+  # Three invocations that job rust-test above used to carry. Each one activates
+  # a feature `--workspace` does not, so each one recompiles its package's graph
+  # under a feature set no other command in that job builds — 2 min 53 s of
+  # compilation and 43 s of execution on the warm run cited above. Sharding
+  # rust-test four ways would have repeated all of it four times per OS.
+  #
+  # Both operating systems, for the same reason rust-test runs on both: the
+  # scp-testing lane below opens a real on-disk SQLite database across two
+  # processes and takes an `fs2` advisory file lock, whose semantics differ
+  # between Darwin and Linux, and the quic/udp lane sets socket options whose
+  # kernel behaviour differs between the two.
+  rust-test-optional-features:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    name: Rust / test (optional features, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: false
+      - uses: taiki-e/install-action@nextest
+      - name: Run tests
+        run: |
+          LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            export DYLD_LIBRARY_PATH="${LIBDIR}${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+          else
+            export LD_LIBRARY_PATH="${LIBDIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          fi
           # Test scp-transport with optional features that aren't enabled by
           # --workspace (combined includes rusqlite + scp-platform; local-cache
           # enables caching logic).
@@ -918,10 +1015,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Free disk space
+      - name: Free disk space when the runner is short of it
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
@@ -972,10 +1079,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Free disk space
+      - name: Free disk space when the runner is short of it
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
@@ -1044,10 +1161,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Free disk space
+      - name: Free disk space when the runner is short of it
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
@@ -1132,9 +1259,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Free disk space
+      - name: Free disk space when the runner is short of it
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
@@ -1205,8 +1343,20 @@ jobs:
       # The builder stage measures about 6 GB — 2 GB of it the pin's cross-compilation
       # targets — before the buildx cache blobs. `rust-clippy` here and all three jobs in
       # `fuzz.yml` already reclaim this space.
-      - name: Free disk space
-        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Free disk space when the runner is short of it
+        run: |
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
@@ -1273,9 +1423,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Free disk space
+      - name: Free disk space when the runner is short of it
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
         with:
@@ -1324,9 +1485,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Free disk space
+      - name: Free disk space when the runner is short of it
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
       - uses: dtolnay/rust-toolchain@stable
@@ -1384,9 +1556,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Free disk space
+      - name: Free disk space when the runner is short of it
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
       - uses: dtolnay/rust-toolchain@stable
@@ -1445,9 +1628,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Free disk space
+      - name: Free disk space when the runner is short of it
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
       - uses: dtolnay/rust-toolchain@stable
@@ -1489,10 +1683,21 @@ jobs:
       run:
         working-directory: bindings/kotlin
     steps:
-      - name: Free disk space
+      - name: Free disk space when the runner is short of it
         working-directory: /
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: actions/setup-java@v4
         with:
@@ -1539,9 +1744,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Free disk space
+      - name: Free disk space when the runner is short of it
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: actions/setup-java@v4
         with:
@@ -1680,9 +1896,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Free disk space
+      - name: Free disk space when the runner is short of it
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - name: Check for unresolved issue placeholders
         # Runs immediately after checkout — a 1-second grep should not wait
@@ -1781,9 +2008,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Free disk space
+      - name: Free disk space when the runner is short of it
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
         with:
@@ -2008,6 +2246,7 @@ jobs:
       - rust-fmt
       - rust-clippy
       - rust-test
+      - rust-test-optional-features
       - rust-test-napi-production
       - rust-build-pyo3-production
       - rust-build-uniffi-production
