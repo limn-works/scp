@@ -1142,7 +1142,7 @@ The relying party verifies a response:
    b. Recompute the identifier from the served chain's inception event and
       verify every event of the chain (§9.6.1); derive the key state from
       the chain's latest state-carrying event (`09-security-model.md`
-      §9.7.4.2 R8). Resolution yields key state and nothing else
+      §9.7.4.2 R8), which is what a resolution yields
       (`09-security-model.md` §9.6.1).
    c. Cache policy: the key state MUST be fresh — resolved within the last
       300 seconds. A stale key state MUST trigger a fresh resolution.
