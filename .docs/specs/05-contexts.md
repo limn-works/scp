@@ -2043,7 +2043,7 @@ Governance ban lifecycle:
 1. Governance proposal: `RevokeAccess { did, access: Read }` — proposed via the standard governance flow (§5.9).
 2. Context manager verifies `member:ban` capability in ceiling — rejects with `PermissionDenied` if absent.
 3. On approval: subscriber removed from registry, added to all authors' block lists.
-4. All authors rotate keys — mandatory epoch advance per author, durable before step 5; one `KeyEpochAdvance` leaf per rotated author follows the leaf in step 5.
+4. All authors rotate keys — mandatory epoch advance per author, durable before step 5; one `KeyEpochAdvance` leaf per rotated author, in ascending author-DID order, follows the leaf in step 5.
 5. `ReadAccessRevoked` event emitted to event log.
 6. Future `handle_key_request` from banned subscriber returns `Deny` for all authors.
 
