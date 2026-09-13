@@ -45,7 +45,7 @@ Each test specifies:
 | **Layer** | Identity |
 | **Tier** | Core |
 | **Spec Sections** | §3.1, §9.6.1, `03-identity.md` §3.10.4, `09-security-model.md` §9.7.4.2 R2, R8, R11 |
-| **Preconditions** | A key-event log published to two community relays under distinct declared operators. The resolver holds no baseline. |
+| **Preconditions** | A key-event log published to two community relays under distinct operator keys. The resolver holds no baseline. |
 | **Steps** | 1. Query both relays at the identifier's routing id with `proof_nonce` set. 2. Decode each frame and verify every event. 3. Recompute the identifier under R2. 4. Apply the relay proof's five checks. 5. Derive the key state under R8. |
 | **Expected Outcome** | The recomputed identifier equals the one queried, so the binding verifies from the served bytes alone. Both relay proofs verify, R11's floor is met, and the resolver returns the derived key state rather than `Inconclusive{SingleSource}`. |
 
@@ -57,7 +57,7 @@ Each test specifies:
 | **Tier** | Core |
 | **Spec Sections** | `03-identity.md` §3.2.1 case 1, §9.11, `09-security-model.md` §9.7.4.2 R3, R8 |
 | **Preconditions** | An identity with an established `#active` key. Existing messages signed with the old key. |
-| **Steps** | 1. Generate a new P-256 `#active` keypair. 2. Compose a `KeyState` carrying the new key `current` in the `#active` role and the old key's `Superseded` drop entry. 3. Sign it with the standing root, publish the chain, and resolve the identity again. 5. Verify the old key reads `Superseded` and the fingerprint changed. |
+| **Steps** | 1. Generate a new P-256 `#active` keypair. 2. Compose a `KeyState` carrying the new key `current` in the `#active` role and the old key's `Superseded` drop entry. 3. Sign it with the standing root, publish the chain, and resolve the identity again. 4. Verify the old key reads `Superseded` and the fingerprint changed. |
 | **Expected Outcome** | The derived key state lists the new key `current`, and a replay reads the old key `Superseded` from that event's drop entry: a condition retires a key, not an absence. The key continuity fingerprint (§9.11) reflects the change. Messages signed with the old key still verify, because a content signature verifies against a retired key (§9.7.1). |
 
 ### CONF-004: A Chain Claiming Delegation Is Rejected
