@@ -1439,7 +1439,7 @@ Slot, BE32(len(authenticatorData)) || authenticatorData || BE32(len(clientDataJS
 
 ### Vector 50: a `KeyState` that pins both composite absent-field sentinels
 
-Vectors 41 and 42 carry an `Inception`, which carries fields 9 and 12 in substance, so neither pins the sentinel either composite field takes when a kind does not carry it. This `KeyState` sits at sequence 1 of Vector 41's identity, changes the witnessing interval to 7200 seconds and nothing else, and carries one key-event seal. **Field 9, the installed root set and its threshold, writes `BE32(0)` and no trailing threshold, so its sentinel is four bytes and not eight. Field 12, the continuation, writes `BE32(0)` and never the one-byte `0x00`**, because `0x00` is the registered live value declaring abandonment and a one-byte sentinel would be byte-identical to a declaration that the identity is terminal.
+Vectors 41 and 42 carry an `Inception`, which carries fields 9 and 12 in substance, so neither pins the sentinel either composite field takes when a kind does not carry it. This `KeyState` sits at sequence 1 of Vector 41's identity, changes the witnessing interval to 7200 seconds and nothing else, and carries one key-event seal. Its field 9 and its field 12 each carry the four-byte composite sentinel `09-security-model.md` §9.7.4.2's definitions state, and the bytes below are what pin them.
 
 ```
 kind:                 0x02  (KeyState)
