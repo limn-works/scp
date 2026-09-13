@@ -36,15 +36,29 @@ env:
 # compile the same crate graph into the same target directory read and write one entry.
 # `save-if` restricts writing to a push to `main`, whose entries every pull request and
 # every merge-queue run can read. Together they take this workflow from eighteen entries
-# per generation to six, and they put those six on the ref that every run reads.
+# per generation to eight, and they put those eight on the ref that every run reads.
 #
-# THE GROUPS, one per (target directory a job writes, runner OS). rust-cache already
-# appends the OS and architecture to every key, so a group name never spells one out:
+# THE GROUPS, one per (target directory a job writes, compile mode of its dependency
+# units, runner OS). Cargo hashes the compile mode into every artifact's metadata
+# suffix beside the profile and the feature set, so `cargo clippy` and `cargo doc`,
+# which compile each dependency to an `.rmeta` in check mode, share no artifact with
+# `cargo build` and `cargo nextest`, which compile the same dependency to an `.rlib` in
+# build mode: the two land under different `.fingerprint/<crate>-<hash>` names in the
+# same `target/debug`, and a check-mode job that restores a build-mode entry gets the
+# registry and recompiles every dependency. That is why the directory alone does not
+# name a group. rust-cache already appends the OS and architecture to every key, so a
+# group name never spells one out:
 #
-#   workspace-debug   `target/debug` — rust-clippy, rust-test (both matrix legs),
+#   workspace-debug   `target/debug` under build mode — rust-test (both matrix legs),
 #                     rust-test-napi-production, rust-build-pyo3-production,
-#                     rust-build-uniffi-production, rust-doc, kotlin-test,
-#                     fail-closed-pre-rotation, shipped-feature-graph.
+#                     rust-build-uniffi-production, rust-doc (its `cargo test --doc`),
+#                     kotlin-test, fail-closed-pre-rotation, shipped-feature-graph.
+#   workspace-check   `target/debug` under check mode — rust-clippy, whose two
+#                     `cargo clippy` commands compile every dependency to an `.rmeta`,
+#                     and rust-doc (its `cargo doc --no-deps`, whose dependency units
+#                     cargo compiles in check mode as well). rust-doc restores both
+#                     groups, one rust-cache step each, because its two commands read
+#                     two disjoint artifact sets out of the one directory.
 #   workspace-release `target/release` — python-test and bridge-parity (both run
 #                     `maturin develop --release`), typescript-check and bridge-parity
 #                     (both run `cargo build -p scp-ffi-napi --release`), and
@@ -73,7 +87,7 @@ env:
 # The cap is per repository, so `.github/workflows/fuzz.yml` counts against the same
 # 10 GB: it writes two further groups, `fuzz-run` and `fuzz-run-opt`, both holding
 # `fuzz/target/<host triple>/release` under `cargo fuzz run`'s RUSTFLAGS (its group
-# comment on job fuzz-nightly says why two). Eight groups per generation across the two
+# comment on job fuzz-nightly says why two). Ten groups per generation across the two
 # workflows, where the two together wrote thirty-six entries before.
 # `scripts/check-workflow-compile-steps.py`, run by job toolchain-wiring, fails any
 # rust-cache step in any workflow that names no `shared-key` or no `save-if`, and any
@@ -85,9 +99,11 @@ env:
 # `save-if` at its default would let the shortest job in a group decide the entry's
 # contents — shipped-feature-graph resolves a feature graph and compiles almost nothing,
 # and it finishes eleven minutes before rust-test. The producers are rust-test
-# (workspace-debug), bridge-parity (workspace-release), typescript-wasm-check (wasm32),
-# swift-build-test (apple-uniffi), bridge-parity-swift (apple-parity) and fuzz-build
-# (fuzz): in each group, the job that compiles the most of that directory.
+# (workspace-debug), rust-clippy (workspace-check), rust-test-optional-features
+# (transport-optional), bridge-parity (workspace-release), typescript-wasm-check
+# (wasm32), swift-build-test (apple-uniffi), bridge-parity-swift (apple-parity) and
+# fuzz-build (fuzz): in each group, the job that compiles the most of that directory
+# under that mode.
 #
 # WHAT IS DELIBERATELY LEFT OFF. `cache-workspace-crates` stays false. A checkout writes
 # every source file with the checkout's own mtime, which is newer than any cached
@@ -867,10 +883,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # Writes the `workspace-check` group. Both `cargo clippy` commands below compile
+      # every dependency in check mode, to an `.rmeta` under a metadata hash that
+      # includes the mode, so the `workspace-debug` entry rust-test writes under build
+      # mode holds nothing this job can restore: reading that entry gave this job the
+      # registry and a `Checking` line for every one of the ~650 dependencies on every
+      # run. This job is the one that compiles the most of `target/debug` in check
+      # mode, so it is the group's producer; rust-doc reads the group for its
+      # `cargo doc`.
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace-debug
-          save-if: false
+          shared-key: workspace-check
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run clippy
         run: |
           export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -1359,9 +1383,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # Two restores, one per compile mode this job's commands run under, and both write
+      # nothing. `cargo test --doc` links every doctest against build-mode `.rlib`s, the
+      # artifacts rust-test writes to the `workspace-debug` group; `cargo doc --no-deps`
+      # compiles every dependency to a check-mode `.rmeta`, the artifacts rust-clippy
+      # writes to the `workspace-check` group. Cargo names the two sets under different
+      # metadata hashes in the one `target/debug`, so the second restore adds to the
+      # first and overwrites nothing; each step's key names its own group, so neither
+      # restore can match the other's entry.
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-debug
+          save-if: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-check
           save-if: false
       - name: Run doc tests and build docs
         # `--document-private-items` is what lets this job reject a broken intra-doc

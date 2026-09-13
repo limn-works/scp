@@ -9,7 +9,10 @@
 #     workflow files, because the cache cap is per repository — and a writer whose
 #     `save-if` does not name `refs/heads/main`. It passes a group with one writer on
 #     main and readers at `false`, including a writer whose `save-if` is a matrix
-#     expression.
+#     expression, and it passes a job that restores two groups through two rust-cache
+#     steps, both at `false` — the shape job rust-doc of ci.yml takes, because its
+#     `cargo test --doc` reads build-mode artifacts and its `cargo doc` reads check-mode
+#     ones, and the check counts each step in its own group.
 #   * Check 2 (uniffi-bindgen steps) fails a `cargo run` with no profile or target flags
 #     whose `--library` sits under `target/<triple>/release` (the second-compile shape
 #     from build-xcframework.sh and the Swift job of build-matrix.yml), one whose
@@ -63,7 +66,7 @@ EXPECTED_EXITS=(
     "1"
 )
 EXPECTED_SUBSTRINGS=(
-    "OK: 4 rust-cache step(s) in 2 group(s)"
+    "OK: 6 rust-cache step(s) in 3 group(s)"
     "names no \`shared-key\`"
     "names both \`key\` and \`shared-key\`"
     "names no \`save-if\`"

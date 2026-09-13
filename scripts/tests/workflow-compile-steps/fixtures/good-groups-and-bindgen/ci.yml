@@ -1,4 +1,6 @@
-# Two groups, one writer each, on main; three uniffi-bindgen steps whose `cargo run`
+# Three groups, one writer each, on main — the build-mode and check-mode jobs that
+# write one `target/debug` hold two of them, and a job whose commands span both modes
+# restores both groups, one step each; three uniffi-bindgen steps whose `cargo run`
 # flags name the directory the `--library` sits in.
 name: Good
 on: push
@@ -16,9 +18,23 @@ jobs:
     steps:
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: workspace-check
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy
+  doc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Swatinem/rust-cache@v2
+        with:
           shared-key: workspace-debug
           save-if: false
-      - run: cargo clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-check
+          save-if: false
+      - run: |
+          cargo test --doc
+          cargo doc --no-deps
   fuzz-nightly:
     runs-on: ubuntu-latest
     strategy:

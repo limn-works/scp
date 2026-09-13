@@ -49,12 +49,24 @@ repository, evicted each other.
   the repository's 21 sized Rust entries sat on a pull-request ref or a merge-queue ref and
   not one sat on `refs/heads/main`.
 - **Name the group by what a job writes, not by what a job is called.** Jobs that compile
-  the same crate graph into the same target directory share one entry through
-  `shared-key`, and the action already appends the runner OS and architecture, so a group
-  name never spells either out. Two jobs whose cargo commands differ only in `--release`
-  write two directories and need two groups: cargo shares no artifact between
-  `target/debug` and `target/release`, nor between `target/release` and
-  `target/<triple>/release`.
+  the same crate graph into the same target directory under the same compile mode share
+  one entry through `shared-key`, and the action already appends the runner OS and
+  architecture, so a group name never spells either out. Two jobs whose cargo commands
+  differ only in `--release` write two directories and need two groups: cargo shares no
+  artifact between `target/debug` and `target/release`, nor between `target/release` and
+  `target/<triple>/release`. Two jobs whose commands differ only in compile mode write
+  the one directory and still need two groups: cargo hashes the mode into each
+  artifact's metadata suffix beside the profile and the feature set, so `cargo clippy`
+  and `cargo doc` compile every dependency to a check-mode `.rmeta` under one
+  `.fingerprint/<crate>-<hash>` name while `cargo build` and `cargo nextest` compile it
+  to a build-mode `.rlib` under another. The first version of this change put
+  `rust-clippy` and `rust-doc` in the `workspace-debug` group whose only writer runs
+  `cargo nextest`; each restore reported a full-key hit, and clippy then printed
+  `Checking` for every dependency, because no entry on any ref held a check-mode
+  artifact and the only jobs that produce one were forbidden to save. The group listing
+  in `ci.yml` now names the mode as the axis, and `rust-clippy` writes its own
+  `workspace-check` group. A job whose commands span both modes — `rust-doc` runs
+  `cargo test --doc` and `cargo doc` — restores both groups, one step each.
 - **In a shared group, name the producer and silence every other member.** The first job
   to reach its post step uploads, and every later job with that key is told the entry
   already exists. Left alone, the group's contents are decided by whichever member

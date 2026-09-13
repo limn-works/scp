@@ -16,7 +16,14 @@ CHECK 1 — every `Swatinem/rust-cache` step names its group and says whether it
   wrote eighteen copies of the same compiled dependencies against GitHub's 10 GB
   per-repository cap and evicted each other (`.docs/lessons/a-cache-that-never-
   restores-is-not-a-cache.md`). `shared-key` makes the jobs that write one target
-  directory share one entry. `key` is dead beside `shared-key` — the action drops it
+  directory under one compile mode share one entry; the mode is an axis because cargo
+  hashes it into each artifact's metadata suffix, so a check-mode `cargo clippy` restores
+  nothing out of an entry a build-mode `cargo nextest` wrote into the same directory.
+  This check reads the group's shape — named, one writer, on `main` — and not which
+  mode each member compiles under, because a member's mode sits in a `run:` script that
+  can call a shell script that calls cargo, which no reader of the workflow file alone
+  can classify; the group listing at the top of `ci.yml` is where a reader holds that
+  axis. `key` is dead beside `shared-key` — the action drops it
   when `shared-key` is set — so a reader who sees both believes the entries differ when
   they do not, and this check rejects the pair. A group with two writers lets whichever
   finishes first decide the entry's contents; a group with no writer never populates;
