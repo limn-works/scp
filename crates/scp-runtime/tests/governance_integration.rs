@@ -3996,11 +3996,20 @@ async fn assert_dropped_kea_leaf_is_never_reappended(
     let counter_before = manager.checkpoint_events_since(ctx_id).await.unwrap();
 
     let sk_alice = signing_key_for_did(&alice());
+    // `compute_proposal_id` hashes (context id, proposer DID, JCS(action),
+    // `context.now` in whole seconds). A caller whose failing operation was
+    // `RotateContentKeys { reason: None }` from alice on this context would
+    // collide with a second identical proposal inside the same second and
+    // `propose` would reject it as `DuplicateProposal`, so the follow-up
+    // rotation carries a distinct `reason` and its proposal id differs from
+    // every caller's first proposal regardless of the wall clock.
     let (proposal, _events, result) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
-            GovernanceAction::RotateContentKeys { reason: None },
+            GovernanceAction::RotateContentKeys {
+                reason: Some("follow-up rotation after a dropped KeyEpochAdvance leaf".to_string()),
+            },
             &sk_alice,
         )
         .await
