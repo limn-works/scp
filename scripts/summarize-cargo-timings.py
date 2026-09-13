@@ -46,45 +46,13 @@ def extract_array(html: str, name: str) -> list[dict]:
     return json.loads(match.group(1))
 
 
-def units_from_json(report: Path) -> list[dict]:
-    """Read unit durations out of cargo's `--timings=json` stream.
-
-    The stream carries a duration per unit and no start second, so a caller gets the
-    slowest-unit ranking from it and gets no concurrency or wall-time figure.
-    """
-    path = report.parent / "timing.json"
-    if not path.exists():
-        return []
-    units = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        record = json.loads(line)
-        if record.get("reason") != "timing-info":
-            continue
-        name, version = record["package_id"].split()[:2]
-        units.append(
-            {
-                "name": name.rsplit("#", 1)[-1],
-                "version": version.lstrip("v"),
-                "mode": record.get("mode", ""),
-                "duration": record["duration"],
-                "start": 0.0,
-                "target": ",".join(record.get("target", {}).get("kind", [])),
-            }
-        )
-    return units
-
-
 def summarize(report: Path) -> None:
     html = report.read_text(encoding="utf-8")
     print(f"=== {report.parent.name} ===")
     units = extract_array(html, "UNIT_DATA")
     concurrency = extract_array(html, "CONCURRENCY_DATA")
     if not units:
-        units = units_from_json(report)
-    if not units:
-        print("  no unit data in either the HTML or the JSON report\n")
+        print("  the report carries no unit data\n")
         return
 
     wall = max(u["start"] + u["duration"] for u in units)
