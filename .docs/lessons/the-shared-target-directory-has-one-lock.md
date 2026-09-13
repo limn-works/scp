@@ -25,6 +25,23 @@ it started, so the two measurements agree to within two seconds.
 Cargo prints one line when this happens: `Blocking waiting for file lock on build
 directory`. A run that prints it and then sits is queued, not compiling.
 
+## The same command, run again against a cache that needed nothing: 28 minutes 27 seconds
+
+Immediately after the run above finished, the identical `cargo check -p scp-protocol
+--all-targets` ran again in the same worktree, against artifacts it had just written.
+Cargo printed no `Checking` line at all, only `Finished … in 28m 27s`. Every second of that
+was queued behind another worktree's `cargo check -p scp-node --tests`.
+
+Two further attempts to time a run measured the same thing: one died on a 900-second bound
+having never acquired the lock, and one was killed after 22 minutes still waiting.
+
+When the lock is free, the whole local check is fast. Measured the same day with nothing
+else compiling, `bash scripts/fix-round-check.sh scp-protocol` took 49 seconds end to end:
+under a second for the toolchain comparison, 0 seconds for a `cargo check` against warm
+artifacts, 3 seconds for `cargo fmt --all -- --check`, and 46 seconds for all 28 gates. The
+same script with no argument took 50 seconds. So the queue, not the work, is what a fix
+round waits on.
+
 ## Who held the lock
 
 The lock's holder was another agent's `cargo check -p scp-protocol -p scp-node --tests`,
@@ -136,6 +153,25 @@ two and a half minutes once while another worktree's `cargo check` ran. `cargo f
 the same concurrency, because `cargo fmt` resolves the workspace through a full
 `cargo metadata` first. Neither compiles anything. Treat a stalled `cargo fmt` or
 `cargo metadata` as the same queue rather than as a broken toolchain.
+
+## Within one worktree the cache stays warm across branches
+
+Cargo's `-C metadata` hash reads the package name, its version, the absolute path of its
+source, the selected features, the profile, and the compiler. A branch changes none of
+those, so two branches checked out in turn into one worktree address the same artifacts,
+and cargo recompiles a crate only where the branch changed that crate's source.
+
+Worked against `fix/bridge-handlers-honor-auth-scope`, the branch of pull request #2373,
+bridge handlers honouring the authorization scope: its diff changes six files in
+`crates/scp-protocol/` and no file in `crates/scp-clock/`, `crates/scp-crypto/`,
+`crates/scp-did/`, or `crates/scp-event-log/`, and its `Cargo.lock` differs by one line, an
+`async-trait` entry in `scp-node`'s dependency list. So `cargo check -p scp-protocol
+--all-targets` on that branch recompiles the three `scp_protocol` units and reuses its four
+workspace dependencies and every registry dependency. Switching back recompiles the same
+three units in the other direction.
+
+That claim is read off the diff and off cargo's hash inputs. Three attempts to time the run
+itself each died in the queue described above, so no wall time here measures it.
 
 ## What this means for a check run before a push
 
