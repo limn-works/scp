@@ -19,8 +19,11 @@
 //! - [`assertions`] — Protocol-level assertion primitives (delivery, ordering,
 //!   suppression detection, pseudonym unlinkability, blocking, epoch consistency).
 //! - [`presets`] — 8 pre-configured scenarios for common test patterns.
-//! - [`helpers`] — Test doubles for `ApplicationNode` (TLS providers, NAT
-//!   strategies, DID methods).
+//! - `helpers` — Test doubles for `ApplicationNode` (TLS providers, NAT
+//!   strategies, DID methods). Compiled only under this crate's `helpers`
+//!   feature, which this crate's own `[dev-dependencies]` turn on, so a
+//!   `cargo doc` run that builds no dev-dependencies documents no such module
+//!   and this line carries no link.
 //!
 //! # Conformance macros
 //!
