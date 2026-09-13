@@ -43,12 +43,6 @@ ignore = [
     # scp-client-wasm each declare `js` in a `cfg(target_arch = "wasm32")` section.
     # openmls offers no other wasm32 time source.
     "RUSTSEC-2024-0384",
-    # libcrux-sha3: incorrect incremental SHAKE XOF output. Transitive via
-    # openmls_rust_crypto -> hpke-rs -> libcrux-sha3, the SHA-3 backend hpke-rs
-    # compiles in. OpenMLS drives hpke-rs through its one-shot AEAD and KDF surface,
-    # not the incremental SHAKE squeeze API this advisory covers. Awaiting an hpke-rs
-    # release that raises its libcrux-sha3 floor.
-    "RUSTSEC-2026-0074",
     # proc-macro-error2: unmaintained (fork of proc-macro-error, also
     # unmaintained). Build-time proc-macro support crate, transitive via
     # hax-lib-macros <- hax-lib <- libcrux-sha3 <- hpke-rs <- openmls_rust_crypto:
@@ -82,19 +76,29 @@ ignore = [
     # Sync) and `Vec<u8>` — so the missing-bound exploit condition cannot be
     # met by our usage. Awaiting a feasible pyo3 0.29 migration.
     "RUSTSEC-2026-0177",
-    # libcrux-sha3: incorrect output of the incremental portable SHAKE API across
-    # multiple squeeze calls. Same openmls_rust_crypto -> hpke-rs -> libcrux-sha3 path
-    # as RUSTSEC-2026-0074 above. OpenMLS uses SHA-2/HKDF for its KDF, not the
-    # incremental SHAKE squeeze path. Awaiting upstream.
+    # libcrux-sha3 0.0.8: incorrect output of the incremental portable SHAKE API across
+    # multiple squeeze calls. Transitive via openmls_rust_crypto -> hpke-rs 0.6.1 ->
+    # libcrux-sha3, the SHA-3 backend hpke-rs compiles in. OpenMLS drives hpke-rs through
+    # its one-shot AEAD and KDF surface and uses SHA-2/HKDF for its KDF, so no SCP path
+    # reaches the incremental SHAKE squeeze API this advisory covers. The advisory names
+    # libcrux-sha3 >= 0.0.10 as patched. hpke-rs 0.6.1 requires libcrux-sha3 `^0.0.8`,
+    # hpke-rs 0.7.0 requires libcrux-sha3 `=0.0.10`, and openmls_rust_crypto 0.5.1
+    # requires hpke-rs `^0.6.0`, so one of two releases clears this entry: an hpke-rs 0.6
+    # release that requires libcrux-sha3 >= 0.0.10, or an openmls_rust_crypto release
+    # that requires hpke-rs 0.7. Re-check with `cargo update --dry-run -p hpke-rs` and
+    # `cargo update --dry-run -p openmls_rust_crypto` whenever you touch this file.
     "RUSTSEC-2026-0207",
-    # libcrux: potential panic in the AVX2 SHAKE-256 implementation. Same
-    # openmls_rust_crypto -> hpke-rs -> libcrux-sha3 path as RUSTSEC-2026-0074 above.
-    # OpenMLS does not drive this SHAKE code path. Awaiting upstream.
+    # libcrux-sha3 0.0.8: potential panic in the AVX2 SHAKE-256 implementation. Same path
+    # and same patched release (libcrux-sha3 >= 0.0.10) as RUSTSEC-2026-0207 above; OpenMLS
+    # does not drive this SHAKE code path. Either release named above clears both entries.
     "RUSTSEC-2026-0208",
-    # libcrux-secrets: potentially incorrect output of constant-time swap/select on
+    # libcrux-secrets 0.0.5: potentially incorrect output of constant-time swap/select on
     # aarch64. Transitive via
-    # openmls_rust_crypto -> hpke-rs -> libcrux-sha3 -> libcrux-traits -> libcrux-secrets.
-    # Awaiting upstream migration. No runtime exposure.
+    # openmls_rust_crypto -> hpke-rs -> libcrux-sha3 -> libcrux-traits 0.0.6 -> libcrux-secrets.
+    # The advisory names libcrux-secrets >= 0.0.6 as patched; libcrux-traits 0.0.6 requires
+    # libcrux-secrets 0.0.5, so a libcrux-traits release that requires libcrux-secrets
+    # >= 0.0.6 clears this entry. Re-check with
+    # `cargo update --dry-run -p libcrux-secrets` whenever you touch this file.
     "RUSTSEC-2026-0212",
 ]
 

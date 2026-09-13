@@ -54,12 +54,28 @@ so the reinstated entry masked all three lines, and its comment named only the f
 Every requirement on rand in the lock is a caret range that admits the patched release:
 the workspace's own `rand = "0.8"`, `hpke-rs-rust-crypto` and `openmls_rust_crypto` on
 0.8, `crc-fast`, `libcrux-traits`, `metrics-util`, `quinn-proto` and `tungstenite` on
-0.9, and
-`hpke-rs-libcrux` on 0.10. So
+0.9, and `hpke-rs-libcrux` on 0.10. So
 `cargo update -p rand@0.8.5 -p rand@0.9.2 -p rand@0.10.0` moved three lock entries to
 rand 0.8.8, 0.9.5 and 0.10.2 and changed nothing else, the same command inside `fuzz/`
 moved the three entries `fuzz/Cargo.lock` carried, and the entry came out of `deny.toml`
 for the reason the rule above names: a lock-only update fixed the advisory.
+
+The same review then applied test 1 to every other entry in the list. RUSTSEC-2026-0074,
+the libcrux-sha3 advisory for incorrect incremental SHAKE XOF output, names
+libcrux-sha3 >= 0.0.8 as patched, and its comment read "Awaiting an hpke-rs release that
+raises its libcrux-sha3 floor". `Cargo.lock` resolved hpke-rs 0.6.0 with libcrux-sha3
+0.0.6 and 0.0.7, and `cargo update --dry-run -p hpke-rs@0.6.0` moved hpke-rs to 0.6.1,
+which requires libcrux-sha3 `^0.0.8`, so that release had shipped and nobody had
+re-checked the comment against it. The update moved ten lock entries to newer releases, removed the eleven
+entries that only the older libcrux releases pulled in, and the entry came out. `fuzz/Cargo.lock`
+already resolved hpke-rs 0.6.1 and libcrux-sha3 0.0.8, because the Fuzz CI jobs run
+`cargo check` without `--locked` and had re-resolved it. The three libcrux entries that
+stay — RUSTSEC-2026-0207 and RUSTSEC-2026-0208 on libcrux-sha3, patched at >= 0.0.10, and
+RUSTSEC-2026-0212 on libcrux-secrets, patched at >= 0.0.6 — fail both tests today:
+hpke-rs 0.6.1 requires libcrux-sha3 `^0.0.8`, hpke-rs 0.7.0 requires libcrux-sha3
+`=0.0.10` but openmls_rust_crypto 0.5.1 does not admit hpke-rs 0.7, and libcrux-traits
+0.0.6 requires libcrux-secrets `=0.0.5`. Each of those three comments now names the
+release that clears it.
 
 ## What the two runs showed
 
