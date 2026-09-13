@@ -714,7 +714,7 @@ An identity's key-event log rides in the key-event record frame `09-security-mod
 
 **A validating relay also stores the witness layer's two records**, at `SHA-256("scp:wit:" ‖ identifier_bytes)` and `SHA-256("scp:wcf:" ‖ identifier_bytes)` (`09-security-model.md` §9.7.4.2 R13), in the frames §9.10.12 states. It accepts one where three things hold: the signature verifies against the P-256 key that operator's community-relay-list entry declares (`18-addressability-and-deployment.md` §18.5.1); the object's `witness` names a member of the witness set the key state at that subject's head carries, on a chain the relay itself holds, so a relay holding no chain for a subject accepts no witness record for it; and the address is not already full for that pair. **The caps**, under `09-security-model.md` §9.18.17: at most one cosigned head per (subject, witness, `event_digest`), replaced only by a strictly higher `sequence`; at most `MAX_RETAINED_SUFFIXES` conflict statements per (subject, witness), evicting the lowest `observed_at` beyond that; and at most `MAX_WITNESS_SET_SIZE` × `MAX_RETAINED_SUFFIXES` objects per subject at each address, because an honest witness emits one successor per baseline and a faulty one occupies at most `MAX_RETAINED_SUFFIXES`. **The `event_digest` term is the exception to strictly-higher replacement**: a fault proof's two cosigned heads carry one `subject`, one `witness` and one `previous_cosigned_digest`, and differ in `event_digest` alone (`09-security-model.md` §9.7.4.3), so the relay keeps both, and without that term one head would replace the other and no party could assemble the pair. Both the filter and the caps are load-bearing: without the filter any party that mints an identity writes cosigned-head records for any public identifier, and without the caps a member of the standing set writes without bound. A relay an identity designates as a witness runs the one check and holds the durable per-subject state `09-security-model.md` §9.7.4.3 states.
 
-**The retention bounds.** A validating relay applies R9's count bound, byte bound, accepted-chain bound and eviction rule per identifier (`09-security-model.md` §9.7.4.2 R9, §9.18.17).
+**The retention bounds and the storage budget.** A validating relay applies R9's count bound, byte bound and eviction rule per identifier, and refuses a PUBLISH that would exceed any of the three storage budgets R9 states with `IdentityError::StorageBudgetExceeded` (§3.10.10), serving every record it already holds (`09-security-model.md` §9.7.4.2 R9, §9.18.17). A relay that charges refuses an unpaid PUBLISH the same way (`19-economic-governance.md` §19.8).
 
 **Relay-side validation is an optional capability of SCP-native relays, and witnessing is a separate role a relay takes only where an identity designates it.** A foreign transport that cannot validate stores the frame as an opaque blob and carries content. **First contact and resolution require SCP-native listed relays**, because R11's floor counts only community-relay-list entries serving a relay proof of control, so a party whose only transport is a foreign adapter adopts no head on any first contact. A verifier still depends on no relay for correctness, because it verifies every event itself; KERI calls that property end-verifiability in `spec-body` §End-verifiable, "KERI has no security dependency on any other infrastructure".
 
@@ -745,6 +745,8 @@ On appending a key event the owner builds the chain from the inception event to 
 ### 3.10.6 Anti-Segmentation Invariant
 
 **Publishing to the fallback set is a MUST.** An identity that published only to relays of its own would be resolvable only by a party that already holds its service record, because a first-contact reader knows no relay of that identity to query, so identities would partition into islands reachable by their existing contacts and by nobody else. **A publish cycle that reached no relay in the fallback set MUST therefore be reported to the caller as a failed publication**, never as a success.
+
+**A relay's refusal is never a verdict about the identity**, and the publisher's recourse is the next entry of its fallback set: a relay refuses a PUBLISH that would exceed one of its storage budgets, and a charging relay refuses an unpaid one (`09-security-model.md` §9.7.4.2 R9). The recourse is mechanical because the fallback set comes from the shipped community relay list rather than from relays the identity itself chose (`18-addressability-and-deployment.md` §18.5.1).
 
 **A publish cycle that reached no witness MUST be reported as degraded and never as a failure.** An identity that publishes everywhere and submits to no witness is still resolvable by every stranger and keeps its `09-security-model.md` §9.11 standing at every peer (§9.7.4.3). What it gives up is portability: a cosigned head travels to a party that did not perform the read, and a peer's own relay read does not.
 
@@ -825,6 +827,23 @@ pub enum IdentityError {
     /// SCP-IDENT-1007. A string reached an admission gate that is not the
     /// canonical form of an inception-derived identifier (§3.8.1).
     NonCanonicalIdentifier,
+    /// SCP-IDENT-1008. A relay refused a PUBLISH that would exceed one of the
+    /// three storage budgets it configures (`09-security-model.md`
+    /// §9.7.4.2 R9). `scope` names which one, so the publisher tells a budget
+    /// its own identity filled from one the relay filled for everyone.
+    StorageBudgetExceeded { scope: BudgetScope },
+}
+
+/// Which of a validating relay's three storage budgets a refusal exceeded
+/// (`09-security-model.md` §9.7.4.2 R9). The type name and all three variant
+/// names are carried unchanged by every SDK binding.
+pub enum BudgetScope {
+    /// The budget the relay holds for the published identifier.
+    Identifier,
+    /// The budget the relay holds for the key that signed the PUBLISH.
+    Publisher,
+    /// The budget the relay holds across every identifier it stores.
+    Total,
 }
 
 /// Every resolution returns one of the six verdicts of
