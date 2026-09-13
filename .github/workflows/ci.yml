@@ -160,6 +160,28 @@ jobs:
               # reads it, and the next branch to rebase would find the check red.
               - '.clippy.toml'
               - 'rustfmt.toml'
+              # This file itself. Every job this filter guards takes its cargo command,
+              # its feature list, its matrix and its cache group from this file, so a
+              # change here decides what each of those jobs compiles and runs — which is
+              # the same reason `.clippy.toml` is listed two lines above.
+              #
+              # It meets the criterion
+              # `.docs/lessons/route-a-changed-file-to-every-lane-it-decides.md` states
+              # for a path that needs routing: omitting it is invisible on an ordinary
+              # pull request. A pull request that rewrites job rust-test's cargo command
+              # and changes nothing else left every filter output false, skipped
+              # rust-test, and merged with the `ci` aggregator green over a command
+              # nothing had run — the rewritten lane first executing on whichever later
+              # pull request happened to touch `crates/`.
+              #
+              # This is not the `'**'`-minus-exclusions filter that lesson rejects. That
+              # alternative runs the Rust lane on every `.docs/` and
+              # `.claude/agent-memory/` commit, which is most of them; this entry names
+              # one file, and a commit that edits it is rare and is exactly the commit
+              # that needs the lane. The other workflows stay out: `docs.yml`,
+              # `fuzz.yml`, `release.yml` and `build-matrix.yml` define no job this
+              # filter guards.
+              - '.github/workflows/ci.yml'
               # `scripts/check-toolchain-wiring.sh` enumerates every root-level file in
               # the git tree, and every cargo configuration file the tree holds at any
               # depth, and fails when one is listed neither here nor in the `toolchain`

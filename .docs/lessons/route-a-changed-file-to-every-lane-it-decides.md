@@ -38,6 +38,19 @@ that no filter lists therefore merges with every job that reads it skipped.
   `steps.filter.outputs.<lane> == 'true' || steps.filter.outputs.toolchain == 'true'`. The
   gate reads the set of output names out of the workflow rather than out of a list it
   holds, so a lane added later without that clause fails the gate.
+- **The workflow file that defines a lane is itself a file that decides that lane.** Every
+  job the `rust` filter guards takes its cargo command, its feature list, its matrix and
+  its cache group from `.github/workflows/ci.yml`, so a commit that rewrites job
+  rust-test's command decides what that job compiles and runs exactly as `.clippy.toml`
+  decides what rust-clippy reports. It meets the criterion this lesson opens with: a
+  commit that edits one job's command and changes nothing else left every filter output
+  false, skipped the job, and merged green over a command nothing had run — the rewritten
+  lane first executing on whichever later pull request happened to touch `crates/`. The
+  `rust` filter therefore lists `.github/workflows/ci.yml`, and only that file: `docs.yml`,
+  `fuzz.yml`, `release.yml` and `build-matrix.yml` define no job that filter guards. This
+  is not the rejected alternative below — that one runs the Rust lane on every `.docs/`
+  and `.claude/agent-memory/` commit, which is most commits, while this entry names one
+  file whose commits are rare and are the ones that need the lane.
 - **`on: pull_request: paths:` needs no such routing, because it fails closed.** A required
   check whose workflow never starts stays pending and blocks the merge. The skipped-job
   mechanism is the one that reports success for a job nothing ran.
