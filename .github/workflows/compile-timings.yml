@@ -10,15 +10,20 @@
 # whole dependency graph from scratch. The cache-miss path is the number this workflow
 # exists to measure.
 #
-# WHEN IT RUNS. On a push to a branch whose name starts with `perf/`, and on manual
-# dispatch. It never runs on `main`, on a pull request, or in the merge queue, and no job
-# in `ci.yml` lists it under `needs:`, so it gates nothing and blocks no merge.
+# WHEN IT RUNS. On a push to one of the branches named below, and on manual dispatch
+# against any ref. It never runs on `main`, on a pull request, or in the merge queue, and
+# no job in `ci.yml` lists it under `needs:`, so it gates nothing and blocks no merge.
 name: Compile timings
 
 on:
   push:
     branches:
-      - "perf/**"
+      # Named one by one rather than matched with `perf/**`. Several agents branch under
+      # that prefix at once, and a glob would give each of their pushes a 25-minute
+      # four-build job none of them asked for. Add a branch here to measure it, or reach
+      # the same job on any ref through `workflow_dispatch`.
+      - perf/cold-compile-root-cause
+      - perf/cold-compile-baseline
   workflow_dispatch:
 
 permissions:
