@@ -467,7 +467,7 @@
       "acceptanceCriteria": [
         "IdentityBackend::resolve(&self, identifier: &[u8; 32]) -> Result<ResolutionOutcome, IdentityError> (§3.10.10)",
         "ResolutionOutcome carries verdict, key_state, and sources; key_state is present on Confirmed and Adopted alone",
-        "ResolutionSources carries relays_reached, declared_operators, proven, and head_provenance",
+        "ResolutionSources carries relays_reached, declared, proven, and head_provenance, with `declared` and `proven` holding 33-byte SEC1 compressed operator keys because R11's first-contact floor counts keys and never declared operator identifiers (`03-identity.md` §3.10.10, `09-security-model.md` §9.7.4.2 R11)",
         "The resolver queries both relay sets concurrently via tokio::join! (§3.10.4 step 2)",
         "The resolver decodes each response, recomputes its identifier from the inception event, and verifies every later event (§3.10.4)",
         "A response failing any of those three checks is discarded",
@@ -485,7 +485,7 @@
         "Implement prefix settlement and fork precedence over surviving chains",
         "Implement rollback protection: Discarded below the accepted head's sequence",
         "Add tests for all resolution scenarios",
-        "Preserve DidMethod::resolve"
+        "Preserve the one resolution entry point, `IdentityBackend::resolve` (`03-identity.md` §3.10.10)"
       ],
       "blockedBy": [
         "SCP-240"
