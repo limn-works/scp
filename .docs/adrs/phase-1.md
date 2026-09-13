@@ -576,11 +576,12 @@ Implement a WebSocket-based store-and-forward relay server and its corresponding
 
 **Relay server operations:**
 
-1. **`PUBLISH { routing_id, recipient_hint, blob_ttl, retain, blob }`**
+1. **`PUBLISH { routing_id, recipient_hint, blob_ttl, retain, nonce, blob }`**
    - Accept an opaque blob associated with a `routing_id`.
    - `recipient_hint` (optional): a per-context pseudonym (§9.10.4) indicating the intended recipient for directed delivery. If absent, the blob is broadcast to all subscribers of this `routing_id`.
-   - `retain` (optional boolean, **amended 2026-09-11**): REQUIRED true at the four retained kinds `scp:did:`, `scp:svc:`, `scp:wit:` and `scp:wcf:`, and absent at every other kind (`09-security-model.md` §9.10.12). A validating relay stores a `retain` write under §9.7.4.2 R9's retention rules and expires it never, rejects a write at one of those four kinds that omits the flag, and rejects the flag at any other kind; a relay that does not validate rejects a write at those four kinds outright, because it holds the address digest and never the preimage. `blob_ttl` is absent on a `retain` write.
-   - Store it for `blob_ttl` seconds.
+   - `retain` (optional boolean, **amended 2026-09-11**): REQUIRED true at the four retained kinds `scp:did:`, `scp:svc:`, `scp:wit:` and `scp:wcf:`, and absent at every other kind (`09-security-model.md` §9.10.12). A validating relay stores a `retain` write under §9.7.4.2 R9's retention rules and expires it never, rejects a write at one of those four kinds that omits the flag, and rejects the flag at any other kind; a relay that does not validate rejects a write carrying `retain: true`, which is the one test it can run, because it holds the address digest and never the preimage. `blob_ttl` is absent on a `retain` write.
+   - `nonce` (optional `u64`, **amended 2026-09-13**): the proof-of-work nonce a key-event PUBLISH carries (`09-security-model.md` §9.10.12). A relay declaring `pow_difficulty = N` greater than zero in its `relay_config` (`18-addressability-and-deployment.md` §18.3.3) accepts the write only where `SHA-256(routing_id ‖ blob_digest ‖ nonce)` carries N leading zero bits, and a relay declaring zero requires nothing of the field. Alec settled the proof-of-work rule on 2026-09-13 (`09-security-model.md` §9.7.4.2 R9).
+   - Store it for `blob_ttl` seconds **where the write carries one**; a `retain` write carries none and a validating relay expires it never.
    - Return a `blob_id` (SHA-256 hash of the blob) as confirmation.
    - Deliver immediately to any active subscribers of this `routing_id`. If `recipient_hint` is present, deliver only to the matching subscriber (optimization — the blob is still encrypted and opaque to non-recipients).
 
@@ -666,7 +667,7 @@ Every message is a MessagePack map with a required `op` field (string) plus oper
 
 | Op | Fields | Response |
 |----|--------|----------|
-| `PUBLISH` | `routing_id: bin32`, `recipient_hint: bin32?`, `blob_ttl: u32?`, `retain: bool?`, `blob: bin` | OK with `blob_id` |
+| `PUBLISH` | `routing_id: bin32`, `recipient_hint: bin32?`, `blob_ttl: u32?`, `retain: bool?`, `nonce: u64?`, `blob: bin` | OK with `blob_id` |
 | `SUBSCRIBE` | `routing_id: bin32`, `since: u64?` | OK, then BLOB stream, then EVENT `backfill_complete` |
 | `UNSUBSCRIBE` | `routing_id: bin32` | OK |
 | `QUERY` | `routing_id: bin32`, `since: u64?`, `limit: u32?` (default 100, max 1000), `proof_nonce: bin32?` | BLOB stream, then EVENT `query_complete` |
@@ -688,7 +689,7 @@ Every message is a MessagePack map with a required `op` field (string) plus oper
 
 #### Error Codes
 
-**Client errors (4xxx):** `4000` INVALID_MESSAGE, `4001` UNKNOWN_OP, `4002` MISSING_FIELD, `4003` INVALID_FIELD, `4010` BLOB_TOO_LARGE, `4011` TTL_TOO_LONG, `4012` LIMIT_EXCEEDED, `4020` RATE_LIMITED, `4021` TOO_MANY_SUBSCRIPTIONS, `4040` DID_RECORD_REJECTED (a validating SCP-native relay rejected an operation at an identity-domain `routing_id`: a PUBLISH of a frame that failed the identifier-to-routing-id binding or chain verification, a non-superseding slot placement, any blob published to a slot-claimed `routing_id` that is not a frame passing the four validation steps, or a DELETE of a stored frame whose chain verifies — see the Key-Event-Record Slot-Exclusivity subsection. **Amended 2026-09-10:** the code's name carries the retired identifier-record vocabulary, and this ADR names the wire constant as it ships rather than inventing one).
+**Client errors (4xxx):** `4000` INVALID_MESSAGE, `4001` UNKNOWN_OP, `4002` MISSING_FIELD, `4003` INVALID_FIELD, `4010` BLOB_TOO_LARGE, `4011` TTL_TOO_LONG, `4012` LIMIT_EXCEEDED, `4020` RATE_LIMITED, `4021` TOO_MANY_SUBSCRIPTIONS, `4041` STORAGE_POLICY_REFUSED (a validating SCP-native relay refused a PUBLISH that failed one term of the write policy it declares, carrying a `scope` field whose value is one of `identifier`, `total`, `rate_limit`, `payment` or `proof_of_work`; the SDK surfaces it as `IdentityError::StorageBudgetExceeded{scope}`, `03-identity.md` §3.10.10. **Added 2026-09-13** under Alec's storage ruling: the refusal is never a verdict about the identity, and a publisher that read it as `4040` would tell a controller its own recovery event is malformed), `4040` DID_RECORD_REJECTED (a validating SCP-native relay rejected an operation at an identity-domain `routing_id`: a PUBLISH of a frame that failed the identifier-to-routing-id binding or chain verification, a non-superseding slot placement, any blob published to a slot-claimed `routing_id` that is not a frame passing the four validation steps, or a DELETE of a stored frame whose chain verifies — see the Key-Event-Record Slot-Exclusivity subsection. **Amended 2026-09-10:** the code's name carries the retired identifier-record vocabulary, and this ADR names the wire constant as it ships rather than inventing one).
 
 **Server errors (5xxx):** `5000` INTERNAL_ERROR, `5001` STORAGE_FULL, `5002` SHUTTING_DOWN.
 
@@ -721,7 +722,7 @@ Published out-of-band (relay metadata page, a service-record entry). Relay MAY i
 ```rust
 /// Client-to-relay operations (scp-transport/src/native/protocol.rs)
 pub enum ClientMessage {
-    Publish { ref_id: Option<String>, routing_id: [u8; 32], recipient_hint: Option<[u8; 32]>, blob_ttl: Option<u32>, retain: Option<bool>, blob: Vec<u8> },
+    Publish { ref_id: Option<String>, routing_id: [u8; 32], recipient_hint: Option<[u8; 32]>, blob_ttl: Option<u32>, retain: Option<bool>, nonce: Option<u64>, blob: Vec<u8> },
     Subscribe { ref_id: Option<String>, routing_id: [u8; 32], since: Option<u64> },
     Unsubscribe { ref_id: Option<String>, routing_id: [u8; 32] },
     Query { ref_id: Option<String>, routing_id: [u8; 32], since: Option<u64>, limit: Option<u32>, proof_nonce: Option<[u8; 32]> },
@@ -1216,7 +1217,17 @@ This test proves: identity works, encryption works, the envelope format works, s
 **Status:** Superseded by ADR-063 (2026-08-30)
 **Extends:** ADR-003 (DID Creation)
 
-ADR-063, inception-derived self-certifying identity over a key-event log, replaces the shared-identity structure this record decided. A human identity's key state names one operational role, `#active`, and names no agent key. An agent holds its own identity, whose establishment events the human's key-event log anchors (`09-security-model.md` §9.1 invariant 1). How a controller produces that anchor and how a verifier checks it is unspecified as of 2026-09-10 (`.docs/specs/00-open-questions.md`), and `09-security-model.md` §9.7.4.2 R3 rejects every chain claiming a delegator until it lands. The body below is retained as the historical record that motivated the supersession; the shared identity, the `#agent` verification method, and the category permissions it describes no longer describe SCP's identity model. **Two parts of that body are not the March 2026 text:** its three key slots and its key-continuity-fingerprint sentence were rewritten from Ed25519 to P-256 on 2026-09-10 under Alec's curve ruling, so a reader comparing them against ADR-063's account of where Ed25519 came from is reading a later edit. Every other sentence below is the March 2026 text.
+ADR-063, inception-derived self-certifying identity over a key-event log, replaces the shared-identity structure this record decided. A human identity's key state names one operational role, `#active`, and names no agent key. An agent holds its own identity, whose establishment events the human's key-event log anchors (`09-security-model.md` §9.1 invariant 1). How a controller produces that anchor and how a verifier checks it is unspecified as of 2026-09-10 (`.docs/specs/00-open-questions.md`), and `09-security-model.md` §9.7.4.2 R3 rejects every chain claiming a delegator until it lands. The body below is retained as the historical record that motivated the supersession; the shared identity, the `#agent` verification method, and the category permissions it describes no longer describe SCP's identity model. **The body below carries edits made after March 2026, and this paragraph names every divergence from the text its author wrote.** Seven, in the order they land:
+
+1. The three key slots and the key-continuity-fingerprint sentence were rewritten from Ed25519 to P-256 on 2026-09-10 under Alec's curve ruling, so a reader comparing them against ADR-063's account of where Ed25519 came from is reading a later edit.
+2. Enforcement Stack item 2 was replaced on 2026-06-20 by a paragraph on the persona-source seam, `MessageSigner`, and RFC #2242.
+3. Enforcement Stack item 4 gained the `hardware-pin` custody value and a citation to `27-attestations.md` §27.4.4.
+4. A paragraph headed "KeyPackage attestation is a Category-B action" was added under the Enforcement Stack on 2026-08-02.
+5. The Category-B list reads "outlet invocation" where the March text read "tool invocation"; the rename landed 2026-07-11.
+6. Acceptance criterion 19 read "(PyO3, NAPI, UniFFI, WASM)" and now reads "(PyO3, NAPI, UniFFI)"; the WASM bridge was cut 2026-06-29.
+7. The section headed "Amendment (2026-08-25): an unproven hardware custody declaration reads as software" follows the acceptance criteria and carries Alec's ruling of that date.
+
+Every other sentence below is the March 2026 text.
 
 ### Context
 
@@ -1374,7 +1385,7 @@ Agent key compromise (most common case — agent runtime is less secure than dev
 
 ### Amendment (2026-08-25): an unproven hardware custody declaration reads as software
 
-Alec ruled, verbatim: "either the platform proof is attached and verified, or the custody model reads as software no matter what string was written."
+Alec ruled, verbatim: "either the platform proof is attached and verified, or the custody model reads as software no matter what string was written".
 
 The ruling governs Enforcement Stack layer 4 above, which stated no rule for reading a custody declaration. The ruling binds because Alec made it, not because of which file records it. §27.4.4 of the attestations spec (`.docs/specs/27-attestations.md`) states it in four clauses and §27.3.4 of the same spec restates it beside the record's construction; open question OQ-38 of that spec asks a human which file finally holds F4's normative text, and the ruling travels with those sections wherever that answer sends them. Layer 4 above now cites those clauses and states no reading rule of its own, so this ADR and the spec cannot drift apart on the rule's wording.
 
