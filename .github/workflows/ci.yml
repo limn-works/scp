@@ -15,6 +15,71 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# ── Cargo cache groups ────────────────────────────────────────────────────────
+#
+# Every `Swatinem/rust-cache` step below names a `shared-key` and a `save-if`, and this
+# comment says why both are required rather than left at their defaults.
+#
+# WHAT THE DEFAULTS DID. `add-job-id-key` defaults to true, so each step wrote its own
+# entry: eighteen entries from this workflow, each holding the same ~650 compiled
+# dependencies. GitHub caps a repository at 10 GB and evicts least-recently-used entries
+# over that cap. Measured on 2026-09-13, this repository held 26 entries totalling
+# 13.4 GB, none of them on `refs/heads/main`, so the cap was evicting entries faster
+# than the runs wrote them. A run reads only the caches of its own ref and of the
+# default branch, and a pull-request ref and a `gh-readonly-queue/…` ref are readable by
+# nothing else, so those writes bought their own run nothing and evicted the entries a
+# later run needed. Run 34711741563 missed on all four of its long jobs and took
+# 33.6 minutes; run 34750056435 hit on three of the four and took 19.5 minutes; run
+# 34731762140 hit on two and missed on two, which is eviction landing mid-run.
+#
+# WHAT THE TWO INPUTS DO. `shared-key` replaces the job id in the key, so the jobs that
+# compile the same crate graph into the same target directory read and write one entry.
+# `save-if` restricts writing to a push to `main`, whose entries every pull request and
+# every merge-queue run can read. Together they take this workflow from eighteen entries
+# per generation to six, and they put those six on the ref that every run reads.
+#
+# THE GROUPS, one per (target directory a job writes, runner OS). rust-cache already
+# appends the OS and architecture to every key, so a group name never spells one out:
+#
+#   workspace-debug   `target/debug` — rust-clippy, rust-test (both matrix legs),
+#                     rust-test-napi-production, rust-build-pyo3-production,
+#                     rust-build-uniffi-production, rust-doc, kotlin-test,
+#                     fail-closed-pre-rotation, shipped-feature-graph.
+#   workspace-release `target/release` — python-test and bridge-parity (both run
+#                     `maturin develop --release`), typescript-check and bridge-parity
+#                     (both run `cargo build -p scp-ffi-napi --release`), and
+#                     bridge-parity-kotlin, whose `maturin develop --release` is the
+#                     larger of its two builds.
+#   wasm32            `target/wasm32-unknown-unknown/release` — typescript-wasm-check
+#                     and scaffold-typescript-web-check, which both run
+#                     `wasm-pack build`. Jobs wasm-protocol and wasm-test read this
+#                     group for its registry alone, because both compile under the dev
+#                     profile; each step below says so where it sits.
+#   apple-uniffi      `target/aarch64-apple-darwin/release` — swift-build-test.
+#   apple-parity      that directory plus `target/release` — bridge-parity-swift, the
+#                     one job that builds both the UniFFI dylib and the PyO3 module.
+#   fuzz              `fuzz/target` — fuzz-build, which compiles a separate workspace on
+#                     the nightly `fuzz/rust-toolchain.toml` names.
+#
+# WHICH JOB IN A GROUP WRITES. Exactly one, named below as the group's producer, and
+# every other member carries `save-if: false`. The first job to reach its post step wins
+# the upload and every later job with the same key is told the entry exists, so leaving
+# `save-if` at its default would let the shortest job in a group decide the entry's
+# contents — shipped-feature-graph resolves a feature graph and compiles almost nothing,
+# and it finishes eleven minutes before rust-test. The producers are rust-test
+# (workspace-debug), bridge-parity (workspace-release), typescript-wasm-check (wasm32),
+# swift-build-test (apple-uniffi), bridge-parity-swift (apple-parity) and fuzz-build
+# (fuzz): in each group, the job that compiles the most of that directory.
+#
+# WHAT IS DELIBERATELY LEFT OFF. `cache-workspace-crates` stays false. A checkout writes
+# every source file with the checkout's own mtime, which is newer than any cached
+# artifact, so cargo rebuilds each workspace crate regardless and the entry would carry
+# ~1 GB that never produces a hit.
+#
+# A cache decides how long a job takes and never what it reports: cargo compares
+# fingerprints against every restored artifact and recompiles what does not match. A
+# group named wrong costs a miss, never a wrong result.
+
 jobs:
   check-draft:
     if: >-
@@ -213,6 +278,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: false
       - name: scp-node self-host create paths fail closed
         # nextest, not `cargo test`, because `cargo test <filter>` exits 0 when
         # its filter selects no test. Both tests this lane names carry
@@ -264,6 +332,9 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: false
       - name: G1 — shipped-feature-graph ⊆ permitted-production allowlist (ZERO-nullifier mandate)
         run: bash scripts/check-shipped-feature-graph.sh
 
@@ -656,6 +727,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+      # Reads the `wasm32` group typescript-wasm-check writes. This command compiles
+      # under the dev profile and that job builds under release, so what this restore
+      # supplies is the registry — the crates.io sources every dependency of these nine
+      # crates is compiled from — and not their compiled artifacts. It writes nothing:
+      # a 1-minute job that saved its own entry would hold ~200 MB of the repository's
+      # 10 GB cache budget against the entries the long jobs read.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm32
+          save-if: false
       - run: cargo check -p scp-clock -p scp-crypto -p scp-did -p scp-protocol -p scp-relay-client -p scp-mls -p scp-client -p scp-event-log -p scp-client-wasm --target wasm32-unknown-unknown
 
   wasm-test:
@@ -671,6 +752,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      # Reads the `wasm32` group typescript-wasm-check writes. `wasm-pack test` compiles
+      # scp-client-wasm under the dev profile and that job builds under release, so this
+      # restore supplies the registry rather than compiled artifacts. It writes nothing,
+      # for the reason spelled out on the same step in job wasm-protocol above.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm32
+          save-if: false
       # Pin wasm-pack to a specific version for reproducibility (via the same
       # taiki-e/install-action the nextest job uses), instead of the unpinned
       # `curl … | sh` installer that always pulls latest.
@@ -716,6 +805,9 @@ jobs:
         with:
           python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: false
       - name: Run clippy
         run: |
           export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -773,6 +865,9 @@ jobs:
         with:
           python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
       - name: Run tests
         run: |
@@ -833,6 +928,9 @@ jobs:
         with:
           python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: false
       - name: Run napi tests in production config (no custody/testing features)
         run: |
           export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -885,6 +983,9 @@ jobs:
         with:
           python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: false
       - name: Build pyo3 bridge in production config (no in-memory custody)
         run: |
           # pyo3 links libpython, so LD_LIBRARY_PATH must point at LIBDIR.
@@ -951,6 +1052,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: false
       - name: Build uniffi bridge in production config (no in-memory custody)
         run: |
           # Default features = production: `server` on, no `testing`.
@@ -1037,6 +1141,9 @@ jobs:
         with:
           python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: false
       - name: Run doc tests and build docs
         # `--document-private-items` is what lets this job reject a broken intra-doc
         # link written in a private module. Rustdoc resolves an intra-doc link only
@@ -1175,6 +1282,9 @@ jobs:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-release
+          save-if: false
       - name: Create virtualenv and install dependencies
         run: |
           python -m venv .venv
@@ -1221,6 +1331,9 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-release
+          save-if: false
       - name: Build NAPI native addon
         run: |
           # `scp-ffi-napi/testing` compiles the in-memory DHT seam
@@ -1280,6 +1393,9 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm32
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Pin wasm-pack for reproducibility (same version as the wasm-test job) —
       # the --release-only build guard depends on the shipped wasm being a
       # release build (ADR-057 Prereq-4).
@@ -1338,6 +1454,9 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm32
+          save-if: false
       - name: Install wasm-pack
         uses: taiki-e/install-action@v2
         with:
@@ -1443,6 +1562,9 @@ jobs:
       - run: sdkmanager "platforms;android-35"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: false
       - name: Build UniFFI native library
         run: |
           cargo build -p scp-ffi-uniffi --features testing
@@ -1504,6 +1626,9 @@ jobs:
           swift-version: "6.2"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: apple-uniffi
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build XCFramework (dev mode — macOS arm64 only)
         run: bindings/swift/build-xcframework.sh --dev
       - name: Build Swift package
@@ -1529,6 +1654,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "fuzz -> target"
+          shared-key: fuzz
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # This step names no channel. rustup applies the toolchain file of the directory a
       # command runs in, so running `cargo check` from `fuzz/` resolves
       # `fuzz/rust-toolchain.toml` and installs the nightly it names — the same
@@ -1589,6 +1716,9 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Python deps
         run: |
           python -m venv .venv
@@ -1664,6 +1794,9 @@ jobs:
           java-version: "17"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-release
+          save-if: false
       - uses: gradle/actions/setup-gradle@v4
       - name: Python deps
         run: |
@@ -1739,6 +1872,9 @@ jobs:
           swift-version: "6.2"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: apple-parity
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Python deps
         run: |
           python -m venv .venv
