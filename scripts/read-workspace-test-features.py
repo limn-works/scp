@@ -44,12 +44,31 @@ def run_scripts(job: dict) -> list[str]:
     return [step["run"] for step in job.get("steps", []) if isinstance(step, dict) and "run" in step]
 
 
+def logical_lines(script: str) -> list[str]:
+    """Return the script's lines with backslash continuations joined into one line each.
+
+    A shell command may wrap, and this matcher reads one command per line, so a wrapped
+    invocation has to be rejoined before the match rather than missed by it.
+    """
+    joined: list[str] = []
+    pending = ""
+    for raw in script.splitlines():
+        stripped = raw.strip()
+        if stripped.endswith("\\"):
+            pending += stripped[:-1].rstrip() + " "
+            continue
+        joined.append(pending + stripped)
+        pending = ""
+    if pending:
+        joined.append(pending.rstrip())
+    return joined
+
+
 def invocation_lines(scripts: list[str]) -> list[str]:
     """Return the command lines that invoke nextest over the whole workspace with features."""
     found = []
     for script in scripts:
-        for raw in script.splitlines():
-            line = raw.strip()
+        for line in logical_lines(script):
             if line.startswith("#"):
                 continue
             if "cargo nextest run" in line and "--workspace" in line and "--features" in line:
@@ -95,6 +114,11 @@ SELF_TEST_CASES = [
         "a narrow -p invocation alongside the workspace one does not count",
         "cargo nextest run --workspace --features a/x,b/y\n"
         "cargo nextest run -p scp-transport --features quic\n",
+        "a/x,b/y",
+    ),
+    (
+        "the invocation wrapped across lines with backslash continuations",
+        "cargo nextest run --workspace \\\n  --no-tests=fail \\\n  --features a/x,b/y\n",
         "a/x,b/y",
     ),
 ]
