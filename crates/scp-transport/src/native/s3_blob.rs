@@ -17,13 +17,13 @@
 //!
 //! # Request signing and TLS
 //!
-//! Requests are signed with SigV4. The adapter does not enable the AWS SDK's
+//! Requests are signed with `SigV4`. The adapter does not enable the AWS SDK's
 //! `sigv4a` feature, so it cannot address an S3 Multi-Region Access Point: pass
 //! a bucket name or a regional endpoint, not a Multi-Region Access Point ARN.
 //! §17.7 "Why S3-Compatible" of `.docs/specs/17-persistence-and-storage.md`
 //! scopes this adapter to the S3-compatible ecosystem — AWS S3, `MinIO`, Ceph,
 //! `SeaweedFS`, Garage, Cloudflare R2, Backblaze B2 — and no store on that list
-//! other than AWS implements SigV4A.
+//! other than AWS implements `SigV4A`.
 //!
 //! TLS runs on rustls over ring, matching every other TLS path this crate owns.
 //! rustls offers the X25519MLKEM768 hybrid key exchange only through its aws-lc
