@@ -57,7 +57,7 @@ SCP is governed by nine design principles. Each has a load-bearing consequence f
 
 5. **Legibility before opt-in.** Every context's parameters are visible before joining. *Consequence:* informed consent is mechanical, not social.
 
-6. **No operator dependency.** The protocol must function if its creators disappear. *Consequence:* identity is self-sovereign, every cryptographic operation is local, and relays are substitutable for every act except a first contact, which reads two entries of the shipped community relay list.
+6. **No operator dependency.** The protocol must function if its creators disappear. *Consequence:* identity is self-sovereign, every cryptographic operation is local, and relays are substitutable for every act except a first contact, which reads two entries of the shipped community relay list under distinct operator keys.
 
 7. **Transport independence.** No structural coupling to any single transport. *Consequence:* the protocol defines a transport adapter trait with 17 adapter specifications (Section 9).
 
@@ -297,7 +297,7 @@ A resolver queries two disjoint relay sets in parallel: the relays the identity'
 
 On a first contact, where the resolver holds no earlier chain for the identifier, each relay must also return a proof of control: a signature over the resolver's nonce, the routing id queried, and a digest of the bytes served, verifiable against the P-256 key that operator's community-relay-list entry declares. A relay serving no proof counts as one unattributed source and can never be the second of two, so a first contact that cannot reach two proven operators returns an inconclusive verdict rather than a key state (`03-identity.md` §3.10.1 and §3.10.8).
 
-Publishing to the fallback set is a MUST, which stops the network fragmenting into separate resolution namespaces, and a publish cycle that reached no fallback relay is reported as a failed publication (`03-identity.md` §3.10.6). Freshness rests on the log's own highest-sequence event: a relay re-serves an event the controller already signed and signs none itself, and a resolver rejects a lower sequence on the chain it accepted, so a relay that withholds the newest event denies service and cannot roll a reader back onto a superseded key state (`09-security-model.md` §9.7.4.2 R12).
+Publishing to the fallback set is a MUST, which stops the network fragmenting into separate resolution namespaces, and a publish cycle that no fallback relay accepted is reported as a failed publication, because a relay at its declared budget answers the publisher and stores nothing (`03-identity.md` §3.10.6). Freshness rests on the log's own highest-sequence event: a relay re-serves an event the controller already signed and signs none itself, and a resolver rejects a lower sequence on the chain it accepted, so a relay that withholds the newest event denies service and cannot roll a reader back onto a superseded key state (`09-security-model.md` §9.7.4.2 R12).
 
 An identity may designate relays as **witnesses** that cosign its log head. A witness runs one check — the offered chain carries the head it last cosigned for that identity — then signs or refuses, emitting a signed conflict statement where the chain carries a different event. A witness adjudicates nothing: its cosigned heads and conflict statements are portable evidence of a fork, which a relying party decides under Section 4.2 (`09-security-model.md` §9.7.4.3).
 
