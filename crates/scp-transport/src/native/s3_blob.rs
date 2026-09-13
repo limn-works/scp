@@ -15,6 +15,23 @@
 //! Metadata is stored as S3 object metadata (user-defined `x-amz-meta-*`
 //! headers). Numeric values are serialized as decimal strings.
 //!
+//! # Request signing and TLS
+//!
+//! Requests are signed with SigV4. The adapter does not enable the AWS SDK's
+//! `sigv4a` feature, so it cannot address an S3 Multi-Region Access Point: pass
+//! a bucket name or a regional endpoint, not a Multi-Region Access Point ARN.
+//! §17.7 "Why S3-Compatible" of `.docs/specs/17-persistence-and-storage.md`
+//! scopes this adapter to the S3-compatible ecosystem — AWS S3, `MinIO`, Ceph,
+//! `SeaweedFS`, Garage, Cloudflare R2, Backblaze B2 — and no store on that list
+//! other than AWS implements SigV4A.
+//!
+//! TLS runs on rustls over ring, matching every other TLS path this crate owns.
+//! rustls offers the X25519MLKEM768 hybrid key exchange only through its aws-lc
+//! backend, so an HTTPS session to the object store negotiates X25519. Blob
+//! contents are MLS-encrypted before they reach this adapter, and §17.7 places
+//! no confidentiality requirement on the transport to the store, so no protocol
+//! guarantee rests on that session.
+//!
 //! # Feature flag
 //!
 //! This module is gated behind the `s3-blob` feature:
