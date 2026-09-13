@@ -479,7 +479,7 @@ SHA-256("SCP-CONTEXT-EXPORT-V3:" ‖ scope_tag ‖ key_state_head ‖ JCS(Contex
 
 **Set and map canonicalization.** Any snapshot field whose type is a set or map with non-deterministic iteration order is canonicalized to a deterministic ordering — sorted by key for a map, sorted by element for a set — in the value fed to JCS, so the digest is byte-identical across runs. RFC 8785 fixes object-member ordering by key, and a producing implementation MUST NOT rely on a set's incidental iteration order for an array-valued field.
 
-**Who signs it.** The signer is the snapshot's `creator_did`, through the `#active` key that identity's key state listed `current` at the position `key_state_head` names. An identity's key state names one operational role, so there is one such key and no fallback.
+**Who signs it.** The signer is the snapshot's `creator_did`, through the `#active` key that identity's key state listed `current` at the position `key_state_head` names. An identity's key state names one operational role, so there is one such key and no fallback. **No witness cosignature enters an export's verification, and an export carries none**, so an importer offline at import time reaches the verdict an online importer reaches from the same bytes: the chain the importer replays authenticates the anchored key, and `09-security-model.md` §9.7.4.3's witness layer covers the key-event log alone.
 
 **Importer verification, before any state is restored.**
 
