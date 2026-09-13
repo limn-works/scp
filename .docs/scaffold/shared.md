@@ -74,21 +74,23 @@ All SDKs use language-idiomatic casing for the same logical identifiers.
 | Package name | `scp-core` | `scp-python` | `@limn-works/scp-ts` | `SCP` | `works.limn:scp-kt` | `scp-go` | `Limn.Scp` | `works.limn:scp-java` |
 | Resolve identity | `IdentityBackend::resolve` | `backend.resolve()` | `backend.resolve()` | `backend.resolve()` | `backend.resolve()` | `backend.Resolve()` | `backend.ResolveAsync()` | `backend.resolve()` |
 | Read service record | `IdentityBackend::read_service_record` | `backend.read_service_record()` | `backend.readServiceRecord()` | `backend.readServiceRecord()` | `backend.readServiceRecord()` | `backend.ReadServiceRecord()` | `backend.ReadServiceRecordAsync()` | `backend.readServiceRecord()` |
+| Publish key events | `IdentityBackend::publish` | `backend.publish()` | `backend.publish()` | `backend.publish()` | `backend.publish()` | `backend.Publish()` | `backend.PublishAsync()` | `backend.publish()` |
+| Publish service record | `IdentityBackend::publish_service_record` | `backend.publish_service_record()` | `backend.publishServiceRecord()` | `backend.publishServiceRecord()` | `backend.publishServiceRecord()` | `backend.PublishServiceRecord()` | `backend.PublishServiceRecordAsync()` | `backend.publishServiceRecord()` |
 
-**Name-bound enumerations are the exception to language-idiomatic casing of the identifier itself.** `09-security-model.md` §9.7.4.2's definitions fix the type name and every variant name of each name-bound enumeration — `SignatureForm`, `KeyAlgorithm`, `CustodyType`, `CustodyProfile`, `KeyRole`, `KeyCondition`, `EventKind`, `Continuation`, `StandingRootDeclaration`, `RecoveryHandle`, `RecoveryPhase`, `HeadProvenance`, `ContinuityStanding`, `ResolutionVerdict`, `InconclusiveCause`, `TieClass`, `ContentVerdict`, `UnverifiedReason`, `ContentInvalidCause`, `ServiceRecordVerdict` — and `.docs/standards/conventions.md` states the one recasing rule each language applies to that spelling.
+**Name-bound enumerations are the exception to language-idiomatic casing of the identifier itself.** `09-security-model.md` §9.7.4.2's definitions state the criterion that decides which enumerations are name-bound, and no list of instances stands beside it: an enumeration added later is name-bound the moment it meets the criterion. Each binding carries the type name and every variant name the defining section spells, recased by the one rule per language that `.docs/standards/conventions.md` tabulates. The defining section is the one that introduces the type, which for most of them is §9.7.4.2's definitions and for others is §9.7.1, §9.7.4.1 item 4, §9.11 or `03-identity.md` §3.10.10.
 
 ### Casing rules per language
 
-| Language | Types | Functions/Methods | Constants | Modules/Packages | Files |
-|----------|-------|-------------------|-----------|-------------------|-------|
-| Rust | `PascalCase` | `snake_case` | `SCREAMING_SNAKE` | `snake_case` | `snake_case.rs` |
-| Python | `PascalCase` | `snake_case` | `SCREAMING_SNAKE` | `snake_case` | `snake_case.py` |
-| TypeScript | `PascalCase` | `camelCase` | `SCREAMING_SNAKE` | `camelCase` | `kebab-case.ts` |
-| Swift | `PascalCase` | `camelCase` | `camelCase` | `PascalCase` | `PascalCase.swift` |
-| Kotlin | `PascalCase` | `camelCase` | `SCREAMING_SNAKE` | `lowercase` | `PascalCase.kt` |
-| Go | `PascalCase` (exported) | `PascalCase` (exported) / `camelCase` (unexported) | `PascalCase` (exported) | `lowercase` | `snake_case.go` |
-| C# | `PascalCase` | `PascalCase` | `PascalCase` | `PascalCase` | `PascalCase.cs` |
-| Java | `PascalCase` | `camelCase` | `SCREAMING_SNAKE` | `lowercase` | `PascalCase.java` |
+| Language | Types | Functions/Methods | Constants | Name-bound enum variants | Modules/Packages | Files |
+|----------|-------|-------------------|-----------|--------------------------|-------------------|-------|
+| Rust | `PascalCase` | `snake_case` | `SCREAMING_SNAKE` | `PascalCase` | `snake_case` | `snake_case.rs` |
+| Python | `PascalCase` | `snake_case` | `SCREAMING_SNAKE` | `SCREAMING_SNAKE_CASE` | `snake_case` | `snake_case.py` |
+| TypeScript | `PascalCase` | `camelCase` | `SCREAMING_SNAKE` | `PascalCase` | `camelCase` | `kebab-case.ts` |
+| Swift | `PascalCase` | `camelCase` | `camelCase` | `PascalCase` | `PascalCase` | `PascalCase.swift` |
+| Kotlin | `PascalCase` | `camelCase` | `SCREAMING_SNAKE` | `PascalCase` | `lowercase` | `PascalCase.kt` |
+| Go | `PascalCase` (exported) | `PascalCase` (exported) / `camelCase` (unexported) | `PascalCase` (exported) | the spec's own spelling | `lowercase` | `snake_case.go` |
+| C# | `PascalCase` | `PascalCase` | `PascalCase` | the spec's own spelling | `PascalCase` | `PascalCase.cs` |
+| Java | `PascalCase` | `camelCase` | `SCREAMING_SNAKE` | the spec's own spelling | `lowercase` | `PascalCase.java` |
 
 ## Streaming Types
 

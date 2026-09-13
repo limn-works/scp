@@ -1,6 +1,6 @@
 # Conventions
 
-Naming, structure, and git conventions for all SCP development. Language-specific casing and file naming rules are in `sdk-common.md` (cross-language naming table) and each language's standards file.
+Naming, structure, and git conventions for all SCP development. Language-specific casing and file naming rules are in `.docs/scaffold/shared.md`, which carries the cross-language naming table and the per-language casing table, and in each language's standards file.
 
 ## File Naming Per Language
 
@@ -31,12 +31,22 @@ Naming, structure, and git conventions for all SCP development. Language-specifi
 
 ## Casing Rules
 
-See `sdk-common.md` for the full cross-language casing table. Summary of universal rules:
+See `.docs/scaffold/shared.md` for the full cross-language casing table. Summary of universal rules:
 
 - **Type names** are `PascalCase` in every language
 - **Constants** are `SCREAMING_SNAKE_CASE` in most languages (except Swift: `camelCase`, C#: `PascalCase`)
 - **Acronyms** follow language convention: `URLString` vs `urlString` — see per-language standards
-- **A name-bound enumeration's variants** take the spelling `09-security-model.md` §9.7.4.2's definitions give them, recased by one deterministic rule per language: `PascalCase` in Rust, Swift and Kotlin, `SCREAMING_SNAKE_CASE` in Python, and the language's own convention in TypeScript, each derived by splitting the spec's spelling on word boundaries and recasing. No binding author chooses a spelling, and the shared conformance fixtures compare a variant across languages after that recasing
+- **A name-bound enumeration's variants** take the spelling the specification gives them, recased by one deterministic rule per language. This table is the one home of that mapping, and `09-security-model.md` §9.7.4.2's definitions state the criterion that decides which enumerations it reaches.
+
+| Language | Enum variant spelling | Example, from the spec's `WitnessRead` |
+|---|---|---|
+| Rust | `PascalCase` | `HeadProvenance::WitnessRead` |
+| Python | `SCREAMING_SNAKE_CASE` | `HeadProvenance.WITNESS_READ` |
+| TypeScript | `PascalCase` | `HeadProvenance.WitnessRead` |
+| Swift | `PascalCase` | `HeadProvenance.WitnessRead` |
+| Kotlin | `PascalCase` | `HeadProvenance.WitnessRead` |
+
+Each spelling is derived from the spec's own by splitting on word boundaries and recasing, so no binding author chooses one, and the shared conformance fixtures compare a variant across languages after that recasing. **TypeScript takes `PascalCase` rather than its language's own convention**, because TypeScript fixes no single convention for enum members: naming none leaves `WitnessRead`, `witnessRead`, `WITNESS_READ` and the string-literal union `'WitnessRead'` all defensible, and leaves the fixture unable to compute the TypeScript side of the comparison. A binding in a language this table does not list takes the spec's spelling unchanged until a revision adds its row
 
 ## Git Commits
 

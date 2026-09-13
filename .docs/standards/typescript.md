@@ -75,6 +75,20 @@ async send(message: string | Uint8Array): Promise<void>;
 async *receive(): AsyncIterable<Message>;
 ```
 
+### Enum members of a name-bound enumeration
+
+A name-bound enumeration is one `09-security-model.md` §9.7.4.2's definitions state the criterion for: its type name and every variant name are identical in every SDK binding, recased by one rule per language. **TypeScript takes the specification's own `PascalCase` spelling for an enum member**, and takes neither `camelCase`, nor `SCREAMING_SNAKE_CASE`, nor a string-literal union:
+
+```ts
+export enum HeadProvenance {
+  WitnessRead = "WitnessRead",
+  TwoOperatorRead = "TwoOperatorRead",
+  SingleRelay = "SingleRelay",
+}
+```
+
+TypeScript fixes no single convention for enum members, so naming none here leaves four defensible spellings for one variant and leaves the shared conformance fixtures unable to compute the TypeScript side of a cross-language comparison. `.docs/standards/conventions.md` carries the table this row belongs to.
+
 ### Naming
 
 - Types/interfaces/classes: `PascalCase`

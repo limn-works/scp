@@ -142,6 +142,8 @@ Three names, three jobs — stated once so they are never conflated:
 - **`StorageSlot`** — the **Rust-core config selector enum**. Every core config object carries it (`NodeConfig.storage`, `IdentityConfig.persistence`). It includes the **Rust-only `Custom(concrete)`** variant carrying a caller-supplied Rust `Storage` implementation.
 - **`StorageConfig`** — the **per-FFI-bridge mirror** of `StorageSlot`, exposing only the named/convenience variants (`InMemory`, `Sqlite`). A Rust trait object cannot cross the FFI boundary, so the bridge mirror omits `Custom(concrete)`.
 
+**`IdentityBackendSlot` and `KeyCustodySlot` are the same selector shape for the other two capabilities**, and `IdentityConfig` requires both. `IdentityBackendSlot` carries one named variant, `RelayNetwork`, the `IdentityBackend` of `03-identity.md` §3.10.10 over the SCP relay network, plus the Rust-only `Custom(concrete)`; ADR-063 removed the did:dht backend, so no second named variant exists and a selector with one named variant still states the choice rather than defaulting it. `KeyCustodySlot` carries the named variants the platform row of `17-persistence-and-storage.md` §17.8 admits — `Platform`, `File`, and `Hardware` — plus `Custom(concrete)`. Each bridge mirrors both as `IdentityBackendConfig` and `KeyCustodyConfig`, omitting `Custom(concrete)` for the reason above.
+
 All core shapes use `StorageSlot`; the bridges mirror it as `StorageConfig`. These are the same selector at two layers, not two different concepts.
 
 ## Per-entry-point target shapes
