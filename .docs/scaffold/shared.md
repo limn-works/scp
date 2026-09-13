@@ -77,20 +77,22 @@ All SDKs use language-idiomatic casing for the same logical identifiers.
 | Publish key events | `IdentityBackend::publish` | `backend.publish()` | `backend.publish()` | `backend.publish()` | `backend.publish()` | `backend.Publish()` | `backend.PublishAsync()` | `backend.publish()` |
 | Publish service record | `IdentityBackend::publish_service_record` | `backend.publish_service_record()` | `backend.publishServiceRecord()` | `backend.publishServiceRecord()` | `backend.publishServiceRecord()` | `backend.PublishServiceRecord()` | `backend.PublishServiceRecordAsync()` | `backend.publishServiceRecord()` |
 
-**Name-bound enumerations are the exception to language-idiomatic casing of the identifier itself.** `09-security-model.md` §9.7.4.2's definitions state the criterion that decides which enumerations are name-bound, and no list of instances stands beside it: an enumeration added later is name-bound the moment it meets the criterion. Each binding carries the type name and every variant name the defining section spells, recased by the one rule per language that `.docs/standards/conventions.md` tabulates. The defining section is the one that introduces the type, which for most of them is §9.7.4.2's definitions and for others is §9.7.1, §9.7.4.1 item 4, §9.11 or `03-identity.md` §3.10.10.
+**Name-bound enumerations are the exception to language-idiomatic casing of the identifier itself.** `09-security-model.md` §9.7.4.2's definitions state the criterion that decides which enumerations are name-bound, and no list of instances stands beside it: an enumeration added later is name-bound the moment it meets the criterion. Each binding carries the type name and every variant name the defining section spells, verbatim, and `.docs/standards/conventions.md`'s naming table is where that mapping lives. The defining section is the one that introduces the type.
 
 ### Casing rules per language
 
+The `Name-bound enum variants` column reads `.docs/standards/conventions.md`'s naming table, which states one spelling for every language: the spec's own, verbatim.
+
 | Language | Types | Functions/Methods | Constants | Name-bound enum variants | Modules/Packages | Files |
 |----------|-------|-------------------|-----------|--------------------------|-------------------|-------|
-| Rust | `PascalCase` | `snake_case` | `SCREAMING_SNAKE` | `PascalCase` | `snake_case` | `snake_case.rs` |
-| Python | `PascalCase` | `snake_case` | `SCREAMING_SNAKE` | `SCREAMING_SNAKE_CASE` | `snake_case` | `snake_case.py` |
-| TypeScript | `PascalCase` | `camelCase` | `SCREAMING_SNAKE` | `PascalCase` | `camelCase` | `kebab-case.ts` |
-| Swift | `PascalCase` | `camelCase` | `camelCase` | `PascalCase` | `PascalCase` | `PascalCase.swift` |
-| Kotlin | `PascalCase` | `camelCase` | `SCREAMING_SNAKE` | `PascalCase` | `lowercase` | `PascalCase.kt` |
-| Go | `PascalCase` (exported) | `PascalCase` (exported) / `camelCase` (unexported) | `PascalCase` (exported) | the spec's own spelling | `lowercase` | `snake_case.go` |
-| C# | `PascalCase` | `PascalCase` | `PascalCase` | the spec's own spelling | `PascalCase` | `PascalCase.cs` |
-| Java | `PascalCase` | `camelCase` | `SCREAMING_SNAKE` | the spec's own spelling | `lowercase` | `PascalCase.java` |
+| Rust | `PascalCase` | `snake_case` | `SCREAMING_SNAKE` | `conventions.md`'s naming table | `snake_case` | `snake_case.rs` |
+| Python | `PascalCase` | `snake_case` | `SCREAMING_SNAKE` | `conventions.md`'s naming table | `snake_case` | `snake_case.py` |
+| TypeScript | `PascalCase` | `camelCase` | `SCREAMING_SNAKE` | `conventions.md`'s naming table | `camelCase` | `kebab-case.ts` |
+| Swift | `PascalCase` | `camelCase` | `camelCase` | `conventions.md`'s naming table | `PascalCase` | `PascalCase.swift` |
+| Kotlin | `PascalCase` | `camelCase` | `SCREAMING_SNAKE` | `conventions.md`'s naming table | `lowercase` | `PascalCase.kt` |
+| Go | `PascalCase` (exported) | `PascalCase` (exported) / `camelCase` (unexported) | `PascalCase` (exported) | `conventions.md`'s naming table | `lowercase` | `snake_case.go` |
+| C# | `PascalCase` | `PascalCase` | `PascalCase` | `conventions.md`'s naming table | `PascalCase` | `PascalCase.cs` |
+| Java | `PascalCase` | `camelCase` | `SCREAMING_SNAKE` | `conventions.md`'s naming table | `lowercase` | `PascalCase.java` |
 
 ## Streaming Types
 

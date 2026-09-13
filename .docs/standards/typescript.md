@@ -77,7 +77,7 @@ async *receive(): AsyncIterable<Message>;
 
 ### Enum members of a name-bound enumeration
 
-A name-bound enumeration is one `09-security-model.md` §9.7.4.2's definitions state the criterion for: its type name and every variant name are identical in every SDK binding, recased by one rule per language. **TypeScript takes the specification's own `PascalCase` spelling for an enum member**, and takes neither `camelCase`, nor `SCREAMING_SNAKE_CASE`, nor a string-literal union:
+A name-bound enumeration is one `09-security-model.md` §9.7.4.2's definitions state the criterion for: its type name and every variant name are identical in every SDK binding. **TypeScript takes the specification's own spelling for an enum member**, which is what `.docs/standards/conventions.md`'s naming table states for every language, and takes neither `camelCase`, nor `SCREAMING_SNAKE_CASE`, nor a string-literal union:
 
 ```ts
 export enum HeadProvenance {
@@ -87,7 +87,7 @@ export enum HeadProvenance {
 }
 ```
 
-TypeScript fixes no single convention for enum members, so naming none here leaves four defensible spellings for one variant and leaves the shared conformance fixtures unable to compute the TypeScript side of a cross-language comparison. `.docs/standards/conventions.md` carries the table this row belongs to.
+TypeScript fixes no single convention for enum members, so a rule naming none here would leave `WitnessRead`, `witnessRead`, `WITNESS_READ` and the string-literal union `'WitnessRead'` all defensible for one variant. `.docs/standards/conventions.md`'s naming table is where the mapping lives, and this section states no per-language spelling of its own.
 
 ### Naming
 

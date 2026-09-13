@@ -36,8 +36,6 @@ ScpError (root)
 | Category prefix | Range |
 |-----------------|-------|
 | `SCP-IDENT-` | 1000-1999 |
-
-**The `SCP-IDENT-` band is partitioned between two identity models.** `SCP-IDENT-1000` through `SCP-IDENT-1099` are allocated against the superseded identity model, and the shipped bridge constants in `crates/scp-ffi/common/src/error_codes.rs` occupy 1000 through 1062 of that sub-block. **`SCP-IDENT-1100` through `SCP-IDENT-1199` are the inception-derived key-event-log model's**, and `03-identity.md` §3.10.10 registers `IdentityError`'s eight variants at 1100 through 1107. A redesign variant reusing a number from the first sub-block would fire a caller's handler for a condition it never named, so the two sub-blocks stay disjoint and the first is retired rather than reused as the superseded model's code leaves the tree.
 | `SCP-CTX-` | 2000-2999 |
 | `SCP-PERM-` | 3000-3999 |
 | `SCP-CRYPTO-` | 4000-4999 |
@@ -50,6 +48,8 @@ ScpError (root)
 | `SCP-GOV-` | 11000-11999 |
 | `SCP-ECON-` | 12000-12999 |
 | `SCP-SAGA-` | 13000-13999 |
+
+**The `SCP-IDENT-` band is partitioned between two identity models.** `SCP-IDENT-1000` through `SCP-IDENT-1099` are allocated against the superseded identity model, and the shipped bridge constants in `crates/scp-ffi/common/src/error_codes.rs` occupy 1000 through 1062 of that sub-block. **`SCP-IDENT-1100` through `SCP-IDENT-1199` are the inception-derived key-event-log model's**, and `03-identity.md` §3.10.10 registers `IdentityError`'s eight variants at 1100 through 1107. A redesign variant reusing a number from the first sub-block would fire a caller's handler for a condition it never named, so the two sub-blocks stay disjoint and the first is retired rather than reused as the superseded model's code leaves the tree.
 
 ### Registered SCP-SAGA- codes (cross-context tool-invocation saga, §6.2.4)
 

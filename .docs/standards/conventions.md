@@ -36,17 +36,18 @@ See `.docs/scaffold/shared.md` for the full cross-language casing table. Summary
 - **Type names** are `PascalCase` in every language
 - **Constants** are `SCREAMING_SNAKE_CASE` in most languages (except Swift: `camelCase`, C#: `PascalCase`)
 - **Acronyms** follow language convention: `URLString` vs `urlString` — see per-language standards
-- **A name-bound enumeration's variants** take the spelling the specification gives them, recased by one deterministic rule per language. The table below carries that mapping, and `09-security-model.md` §9.7.4.2's definitions state the criterion that decides which enumerations it reaches.
+- **A name-bound enumeration's variants take the spelling the specification gives them, verbatim, in every language.** `09-security-model.md` §9.7.4.2's definitions state the criterion that decides which enumerations the rule reaches, and this table is where the mapping lives.
 
 | Language | Enum variant spelling | Example, from the spec's `WitnessRead` |
 |---|---|---|
-| Rust | `PascalCase` | `HeadProvenance::WitnessRead` |
-| Python | `SCREAMING_SNAKE_CASE` | `HeadProvenance.WITNESS_READ` |
-| TypeScript | `PascalCase` | `HeadProvenance.WitnessRead` |
-| Swift | `PascalCase` | `HeadProvenance.WitnessRead` |
-| Kotlin | `PascalCase` | `HeadProvenance.WitnessRead` |
+| Rust | the spec's spelling, verbatim | `HeadProvenance::WitnessRead` |
+| Python | the spec's spelling, verbatim | `HeadProvenance.WitnessRead` |
+| TypeScript | the spec's spelling, verbatim | `HeadProvenance.WitnessRead` |
+| Swift | the spec's spelling, verbatim | `HeadProvenance.WitnessRead` |
+| Kotlin | the spec's spelling, verbatim | `HeadProvenance.WitnessRead` |
+| Every other language | the spec's spelling, verbatim | `HeadProvenance.WitnessRead` |
 
-Each spelling is derived from the spec's own by splitting on word boundaries and recasing, so no binding author chooses one, and the shared conformance fixtures compare a variant across languages after that recasing. **TypeScript takes `PascalCase` rather than its language's own convention**, because TypeScript fixes no single convention for enum members: naming none leaves `WitnessRead`, `witnessRead`, `WITNESS_READ` and the string-literal union `'WitnessRead'` all defensible, and leaves the fixture unable to compute the TypeScript side of the comparison. A binding in a language this table does not list takes the spec's spelling unchanged until a revision adds its row
+**No binding recases a variant, and no rule splits one on word boundaries**, so a fixture comparing a variant across languages compares one string. The rule overrides a language's own enum convention wherever the two differ, Python's `SCREAMING_SNAKE_CASE` and Swift's `lowerCamelCase` included: a split-and-recase rule spells `Fido2Token`, `EcdsaP256Sha256`, `Rank1Terminal`, `Rank2Terminal` and `Rank3Pending` two or three defensible ways each, which is the choice a binding author must not be left to make. The rule reaches every language, so a language this table does not name needs no row of its own
 
 ## Git Commits
 
