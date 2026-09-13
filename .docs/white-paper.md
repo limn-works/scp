@@ -57,7 +57,7 @@ SCP is governed by nine design principles. Each has a load-bearing consequence f
 
 5. **Legibility before opt-in.** Every context's parameters are visible before joining. *Consequence:* informed consent is mechanical, not social.
 
-6. **No operator dependency.** The protocol must function if its creators disappear. *Consequence:* identity is self-sovereign, relays are substitutable, and all cryptographic operations are local.
+6. **No operator dependency.** The protocol must function if its creators disappear. *Consequence:* identity is self-sovereign, every cryptographic operation is local, and relays are substitutable for every act except a first contact, which reads two entries of the shipped community relay list.
 
 7. **Transport independence.** No structural coupling to any single transport. *Consequence:* the protocol defines a transport adapter trait with 17 adapter specifications (Section 9).
 
@@ -258,7 +258,7 @@ An SCP identity is an append-only key-event log, and its identifier is the SHA-2
 
 KERI [24] introduced this construction as the autonomic identifier. SCP takes that shape, encodes it in its own format, and adopts none of KERI's wire encodings, discovery protocol, or witness pools. `09-security-model.md` §9.7.4.2 states the derivation and every rule a verifier applies, and ADR-063 records why SCP chose a key-event log over a method that resolved a mutable record.
 
-Key custody stays invisible. The root credential defaults to a passkey no code path exports, and and a root changes only through a `RootRecovery` revealing the standing commitment. Trusted-device, social and platform-backed mechanisms help a controller reach its credentials and authorize no root change (`03-identity.md` §3.3).
+Key custody stays invisible. The root credential defaults to a passkey no code path exports, and a root changes only through a `RootRecovery` revealing the standing commitment. Trusted-device, social and platform-backed mechanisms help a controller reach its credentials and authorize no root change (`03-identity.md` §3.3).
 
 ### 4.2 Root Authority, Operational Key, and Pre-Rotation
 
