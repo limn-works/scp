@@ -605,7 +605,7 @@ impl<S: Storage> ApplicationNode<S> {
     /// Spec §12.10.6 step 1 makes admission the step that turns approvals into
     /// reachable bridges, and this is what the `scp-node` binary calls at
     /// startup when `SCP_NODE_BRIDGE_REGISTRATIONS` names a file. Each record
-    /// rebuilds its own [`ApprovedRegistration`] through `scp_protocol`
+    /// rebuilds its own [`ApprovedRegistration`](scp_core::bridge::registration::ApprovedRegistration) through `scp_protocol`
     /// `register_bridge` and `approve_registration`, so every §12.2.1 rule
     /// applies before this node stores anything.
     ///

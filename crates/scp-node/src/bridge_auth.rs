@@ -479,7 +479,7 @@ pub enum BridgeAdmissionError {
 ///
 /// [`DidMethod`](scp_identity::DidMethod) is not object-safe, because its
 /// methods return `impl Future`. `StorageBridgeLookup` holds this trait instead,
-/// for the reason [`DidPublisher`](crate::DidPublisher) exists: `NodeState`
+/// for the reason [`DidPublisher`](crate::published_state::DidPublisher) exists: `NodeState`
 /// carries the bridge lookup as `Arc<dyn BridgeLookup>` and cannot name a
 /// concrete DID method type.
 ///
