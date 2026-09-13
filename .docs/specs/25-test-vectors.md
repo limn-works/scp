@@ -12,7 +12,7 @@ python3.12 scripts/gen-test-vectors-p256.py
 
 The script uses nothing outside the Python standard library, and it self-gates before it prints a byte: it checks itself against `SHA-256("")`, the RFC 6979 Appendix A.2.5 P-256 nonce and signature, RFC 5869 Appendix A.1 for HKDF-SHA256, and this section's own curve-independent `DataProvenance` hash (Vector 35), and it computes every public key twice by two scalar multiplications sharing no arithmetic, and a third time through the `cryptography` package where that package imports. A mismatch raises before anything prints.
 
-**Identifier strings in the fixtures, recorded 2026-09-10.** A vector that pins bytes over an identifier's textual form prints a fixture string of the shape `"did:dht:z6Mk…"`. That string is a fixture and states nothing about SCP's identifier: the identifier is the 32-byte digest of an inception event (`09-security-model.md` §9.7.4.2 R13), and the routing derivations, both continuity-fingerprint forms and §25.26's key-event vectors consume those 32 bytes. **The fixture strings carry that shape because the generator emitted it when the vectors were pinned, and the shape carries no meaning**: R13 defers the textual form and no section of this corpus decides it, so such a vector pins the construction, the separator and the signature over the bytes it prints, and pins no textual form. `09-security-model.md` §9.5.2 enumerates the sixteen preimages that wait on R13. The generator regenerates each fixture string and every digest below it when a later revision of R13 fixes the encoding.
+**Identifier strings in the fixtures, recorded 2026-09-10.** A vector that pins bytes over an identifier's textual form prints a fixture string of the shape `"did:dht:z6Mk…"`. That string is a fixture and states nothing about SCP's identifier: the identifier is the 32-byte digest of an inception event (`09-security-model.md` §9.7.4.2 R13), and the routing derivations, both continuity-fingerprint forms and §25.26's key-event vectors consume those 32 bytes. **The fixture strings carry that shape because the generator emitted it when the vectors were pinned, and the shape carries no meaning**: R13 defers the textual form and no section of this corpus decides it, so such a vector pins the construction, the separator and the signature over the bytes it prints, and pins no textual form. `09-security-model.md` §9.5.2 enumerates the fifteen preimages that wait on R13. The generator regenerates each fixture string and every digest below it when a later revision of R13 fixes the encoding.
 
 **What a signature covers.** Every SCP signature here is an ECDSA signature over a 32-byte canonical hash, so the ECDSA message digest **is** that canonical hash and no second SHA-256 reaches it. The vectors run RFC 6979 with `h1` set to that same digest, because §9.5 fixes RFC 6979 with SHA-256 for a software signer and states no value for `h1` under a prehashed digest. An implementation that hashes the digest a second time reproduces none of the signature bytes below.
 
@@ -1476,6 +1476,130 @@ slot (raw form, 64):  6e8b92a9e7cc10d9233ab31f0465590526b1096fca8721095322c763f5
 ```
 
 **Conformance procedure.** Rebuild the preimage from the field order and the sentinel rule §9.7.4.2's definitions state, compare it byte for byte, and recompute the digest. An implementation that writes field 9's sentinel as eight bytes, or field 12's as the one byte `0x00`, produces a different digest here and a different `predecessor_digest` at every later event.
+
+### Vector 51: a `KeyState` whose key entries carry every registered `CustodyType` value
+
+Every other one-byte discriminator of the key-event preimage is registered with its value, and `CustodyType`'s nine are too (`09-security-model.md` §9.7.4.2 definitions). The byte rides in every 45-byte key entry of the key-state snapshot, so it sits inside the inception preimage the identifier digests: two bindings numbering the nine differently derive two identifiers for one identity, and R2 then makes each binding reject every identity the other created. **This fixture identity carries a 1-of-8 root and one `#active` key, so its snapshot's nine key entries carry the nine registered values, one each, and pin every byte.** Vector 41's identity carries a 1-of-1 root and pins one value, `Passkey` `0x01`.
+
+Its private scalars are a fixture's, derived from the seeds `SHA-256("scp-25-custody-root-" ‖ index)` for the eight root members, `SHA-256("scp-25-custody-active")` for the `#active` key, and `SHA-256("scp-25-custody-prerotation")` for the pre-rotation key, each run through the §25.2 seed-to-scalar rule.
+
+| Variant | Byte | Key (33-byte SEC1 compressed) | Role |
+|---|---|---|---|
+| `Passkey` | `0x01` | `02b86554ca49a9bb429e555454b0e81c69242defbed440f7dde65e3fd8aabdf33d` | root member 0 |
+| `Fido2Token` | `0x02` | `02f0c2c400b1a26dc597eba50c752ba083ee6f3add7cdbf8049e3024b6c3851e87` | root member 1 |
+| `Hsm` | `0x03` | `02c3d4e2a5c319b9869bef14077411afe34743396ee96376b9e07ce907eceb428b` | root member 2 |
+| `SecureEnclave` | `0x04` | `0278210550385ce3b0449d868909adf411a9531e886d4909063453347d58c2f437` | root member 3 |
+| `AndroidKeystore` | `0x05` | `028669c107174e5219e9a66b15c6d2805610135b853eafad7e0c6f513d4f4b02b7` | root member 4 |
+| `EncryptedOfflineBackup` | `0x06` | `03849d444571033da6292bc75f5561eeed6fc4ee8787400ac6ce9daed756203614` | root member 5 |
+| `ShamirShares` | `0x07` | `03b8d687792d2f1ccbe5cca25609a949fa39ef2c3c2b50c48aeb0ee954c2b96635` | root member 6 |
+| `PaperBackup` | `0x08` | `026656dfeb9ed86ebd1e0b2740d52e9a8f4d69fef61d4157f254dce2fbcd3d2144` | root member 7 |
+| `Software` | `0x09` | `02db931079de36ba5f17d6450a9e26378b05fc89704c32e6f9bc2ea14597fee282` | `#active` |
+
+```
+kind:                 0x02  (KeyState)
+sequence:             1
+root threshold:       1 of 8
+inception digest:     d979b6ff80c44e340ae48ffd16f9748f234226c7a5aaf00c9465fb3e982e4645
+identifier:           9e52f5402e1437a8358eb96f7187bfec7f3f4976d00bdfb999dd2ca8373d30c6
+routing_id:           4e904d784a879f4829dde870dedc1b99a9e8d144669b2c2861193be71d902cc4
+prerotation key:      03f559598152c9e3b313ce1f8c4c606ba94de210265c85490239af871bbadfd52c
+witness operator:     edc22d251051440536a8fb98bf3183ad90a8e0a1b8dec9ca340c24182e550fa0
+witnessing_interval:  7200   (the inception's is 3600, so the snapshots differ)
+field 9 sentinel:     00000000   (4 bytes)
+field 12 sentinel:    00000000   (4 bytes)
+key_state_bytes:      486
+preimage_len:         603
+```
+
+**Preimage (603 bytes), including the `"SCP-KEL-EVENT-V1:"` separator:**
+
+```
+  5343502d4b454c2d4556454e542d56313a029e52f5402e1437a8358eb96f7187
+  bfec7f3f4976d00bdfb999dd2ca8373d30c60000000000000001d979b6ff80c4
+  4e340ae48ffd16f9748f234226c7a5aaf00c9465fb3e982e4645000000000100
+  00000001010000000000000000000000010000000902b86554ca49a9bb429e55
+  5454b0e81c69242defbed440f7dde65e3fd8aabdf33d01010000000000000000
+  010102f0c2c400b1a26dc597eba50c752ba083ee6f3add7cdbf8049e3024b6c3
+  851e8701010000000000000000020102c3d4e2a5c319b9869bef14077411afe3
+  4743396ee96376b9e07ce907eceb428b01010000000000000000030102782105
+  50385ce3b0449d868909adf411a9531e886d4909063453347d58c2f437010100
+  000000000000000401028669c107174e5219e9a66b15c6d2805610135b853eaf
+  ad7e0c6f513d4f4b02b701010000000000000000050103849d444571033da629
+  2bc75f5561eeed6fc4ee8787400ac6ce9daed756203614010100000000000000
+  00060103b8d687792d2f1ccbe5cca25609a949fa39ef2c3c2b50c48aeb0ee954
+  c2b96635010100000000000000000701026656dfeb9ed86ebd1e0b2740d52e9a
+  8f4d69fef61d4157f254dce2fbcd3d214401010000000000000000080102db93
+  1079de36ba5f17d6450a9e26378b05fc89704c32e6f9bc2ea14597fee2820201
+  0000000000000000090100000001edc22d251051440536a8fb98bf3183ad90a8
+  e0a1b8dec9ca340c24182e550fa000001c200200000000000000000000000000
+  000000000000000000000000000000000000000000000000000000
+```
+
+```
+preimage_digest:      0347480558d3cb54f5f6fa1dda9f538cdd750b47aaf5b6de7bdc29c8b6c647fb
+slot (raw form, 64):  a4a831b34dfb353815375f8d300a6f3b58922b36534058a3721c8441e289ef30226405e129dca975e513bc5cb75136f70af85a77e2ccbe236d5d22fe8888a7e2
+```
+
+**Conformance procedure.** Rebuild the snapshot from the key-entry order §9.7.4.2's definitions state, read byte 43 of each 45-byte entry, and compare the nine values against the table above. An implementation that numbers `CustodyType` from `0x00`, or that orders the nine variants differently, produces a different snapshot, a different preimage, a different digest, and a different identifier.
+
+### Vector 52: the context-export signature preimage, with its length-prefixed JCS field
+
+`23-sync-and-offline-strategy.md` §23.16.8 fixes the export preimage as the separator, the one-byte scope tag, the 32-byte `key_state_head` written raw, and `JCS(ContextSnapshot)`. **`JCS(ContextSnapshot)` is a variable-length field, so it carries §9.5.1's 4-byte big-endian length prefix.** Without that pinned, a producer reading the displayed formula literally writes the JCS bytes bare, the two digests differ, and every export one binding signs fails at the other with an import abort naming tampering rather than an encoding split.
+
+The snapshot below is a fixture, not a protocol object: it is the smallest ASCII JSON value that exercises RFC 8785 member ordering.
+
+```
+scope_tag:            0x00   (Full)
+key_state_head:       d979b6ff80c44e340ae48ffd16f9748f234226c7a5aaf00c9465fb3e982e4645
+JCS bytes:            244
+JCS length prefix:    000000f4
+preimage_len:         303
+```
+
+**JCS(ContextSnapshot):**
+
+```
+{"context_id":"b0e0d2ec6d9d4d2f9c4e7a1b3f5c8d90","created_at":1700000000,"creator_did":"<scp-identifier:creator>","event_log_merkle_root":"0000000000000000000000000000000000000000000000000000000000000000","key_boundaries":[],"schema_version":3}
+```
+
+**Preimage (303 bytes):**
+
+```
+  5343502d434f4e544558542d4558504f52542d56333a00d979b6ff80c44e340a
+  e48ffd16f9748f234226c7a5aaf00c9465fb3e982e4645000000f47b22636f6e
+  746578745f6964223a2262306530643265633664396434643266396334653761
+  31623366356338643930222c22637265617465645f6174223a31373030303030
+  3030302c2263726561746f725f646964223a223c7363702d6964656e74696669
+  65723a63726561746f723e222c226576656e745f6c6f675f6d65726b6c655f72
+  6f6f74223a223030303030303030303030303030303030303030303030303030
+  3030303030303030303030303030303030303030303030303030303030303030
+  303030303030222c226b65795f626f756e646172696573223a5b5d2c22736368
+  656d615f76657273696f6e223a337d
+```
+
+```
+preimage_digest:      3cd1bcff5142d268d9aab44a9cbe2b1cc96dfbf8a4905bcd03f8978fee8365f4
+signature (64 raw):   a77d28e5c20b588a75cc18f0891ec9ffea231e21ca23c9aa34bc23c6038c2afd5a278c323cc86817a149de271fe4160e30d45eac71532ea0b149b51663485bcf
+```
+
+The signer is §25.2's secondary key, the `#active` key of Vector 41's identity.
+
+### Vector 53: a proof of work over a key-event PUBLISH
+
+`09-security-model.md` §9.7.4.2 R9 makes a relay declaring `pow_difficulty = N` accept a key-event PUBLISH only where `SHA-256(routing_id ‖ blob_digest ‖ nonce)` carries N leading zero bits, and §9.10.12 fixes `nonce` as an 8-byte big-endian `u64`. This vector pins the concatenation order and the leading-zero-bit test. `blob_digest` is `SHA-256` over the frame bytes the PUBLISH carries, and the fixture digests the ASCII string `scp-25-pow-frame-bytes`.
+
+```
+pow_difficulty:       20
+routing_id:           4e904d784a879f4829dde870dedc1b99a9e8d144669b2c2861193be71d902cc4
+blob_digest:          bf02c47078f94ad0e58fe473d3b73acf272a2fad7f81a7c7f7dfb21d23af41a0
+nonce (u64):          230249
+nonce (8 bytes BE):   0000000000038369
+qualifying hash:      00000d6a6509dd236ec2ad8a737d9bfe538ebeb05a9e188f6016cb81548a7a01
+leading zero bits:    20
+```
+
+**Conformance procedure.** Concatenate the three fields in that order, hash once, and count leading zero bits. An implementation that writes `nonce` little-endian, or that hashes the fields in another order, finds this nonce does not qualify.
+
 
 ## 25.27 Witness-Layer and Relay-Proof Vectors (§9.7.4.2 definitions, §9.7.4.3, §9.18.2)
 

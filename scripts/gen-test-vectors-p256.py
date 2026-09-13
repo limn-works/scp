@@ -1688,6 +1688,272 @@ def emit_key_event_slots() -> None:
     INCEPTION_IDENTIFIER = identifier_41
 
 
+# --- §25.26 Vector 51: one key-state entry per registered `CustodyType` value ---
+#
+# Every other one-byte discriminator of the key-event preimage is registered
+# with its value, and `CustodyType`'s nine are too (§9.7.4.2 definitions). The
+# byte rides in every 45-byte key entry of the key-state snapshot, so it sits
+# inside the inception preimage the identifier digests: two bindings numbering
+# the nine differently derive two identifiers for one identity and each rejects
+# every identity the other created. This fixture identity carries a 1-of-8 root
+# and one `#active` key, so its snapshot's nine entries carry the nine values
+# `0x01` through `0x09`, one each, and pin every byte.
+
+CUSTODY_VALUES = (
+    ("Passkey", 0x01),
+    ("Fido2Token", 0x02),
+    ("Hsm", 0x03),
+    ("SecureEnclave", 0x04),
+    ("AndroidKeystore", 0x05),
+    ("EncryptedOfflineBackup", 0x06),
+    ("ShamirShares", 0x07),
+    ("PaperBackup", 0x08),
+    ("Software", 0x09),
+)
+
+CUSTODY_ROOT_KEYS = tuple(
+    keypair_from_seed(
+        sha256(b"scp-25-custody-root-" + bytes([i])),
+        TEST_VECTOR_KEY_LABEL,
+        f"custody-registry root member {i}",
+    )
+    for i in range(8)
+)
+CUSTODY_ACTIVE_KEY = keypair_from_seed(
+    sha256(b"scp-25-custody-active"), TEST_VECTOR_KEY_LABEL, "custody-registry #active"
+)
+CUSTODY_PREROTATION_KEY = keypair_from_seed(
+    sha256(b"scp-25-custody-prerotation"),
+    TEST_VECTOR_KEY_LABEL,
+    "custody-registry pre-rotation",
+)
+CUSTODY_WITNESS_OPERATOR = sha256(b"scp-25-custody-witness-operator")
+CUSTODY_INTERVAL_INCEPTION = 3600
+CUSTODY_INTERVAL_KEY_STATE = 7200
+
+
+def custody_key_state(witnessing_interval: int) -> bytes:
+    """The custody-registry identity's snapshot: nine entries, nine custody bytes."""
+    entries = b""
+    for index, key in enumerate(CUSTODY_ROOT_KEYS):
+        entries += (
+            fixed_field(key.compressed)
+            + u8(ROLE_ROOT)
+            + u8(CONDITION_CURRENT)
+            + u64(0)
+            + u8(CUSTODY_VALUES[index][1])
+            + u8(KEY_ALGORITHM_ECDSA_P256_SHA256)
+        )
+    entries += (
+        fixed_field(CUSTODY_ACTIVE_KEY.compressed)
+        + u8(ROLE_ACTIVE)
+        + u8(CONDITION_CURRENT)
+        + u64(0)
+        + u8(CUSTODY_VALUES[8][1])
+        + u8(KEY_ALGORITHM_ECDSA_P256_SHA256)
+    )
+    assert len(entries) == 9 * 45, len(entries)
+    return (
+        u32(1)  # root threshold: 1 of 8
+        + u32(9)  # key count
+        + entries
+        + u32(1)  # witness-set count
+        + fixed_field(CUSTODY_WITNESS_OPERATOR)
+        + u32(witnessing_interval)
+        + u8(ROLE_ACTIVE)  # service-key role discriminator
+        + fixed_field(ZERO32)  # delegator: non-delegated
+    )
+
+
+def custody_inception_preimage() -> bytes:
+    commitment = sha256(PREROTATION_SEPARATOR + CUSTODY_PREROTATION_KEY.compressed)
+    installed_root = u32(8)
+    for key in CUSTODY_ROOT_KEYS:
+        installed_root += fixed_field(key.compressed)
+    installed_root += u32(1)
+    return (
+        KEL_EVENT_SEPARATOR
+        + u8(KIND_INCEPTION)
+        + fixed_field(ZERO32)
+        + u64(0)
+        + fixed_field(ZERO32)
+        + u8(0)
+        + u32(1)
+        + u8(0)  # the root group names member 0
+        + u32(1)
+        + u8(0x01)  # the raw form
+        + u32(0)
+        + installed_root
+        + custody_key_state(CUSTODY_INTERVAL_INCEPTION)
+        + u32(0)
+        + u8(CONTINUATION_COMMITMENT)
+        + u32(1)
+        + fixed_field(commitment)
+        + u8(CUSTODY_PASSKEY)
+        + u8(KEY_ALGORITHM_ECDSA_P256_SHA256)
+        + u32(1)
+    )
+
+
+def custody_key_state_preimage(identifier: bytes, predecessor_digest: bytes) -> bytes:
+    return (
+        KEL_EVENT_SEPARATOR
+        + u8(KIND_KEY_STATE)
+        + fixed_field(identifier)
+        + u64(1)
+        + fixed_field(predecessor_digest)
+        + u8(0)
+        + u32(1)
+        + u8(0)
+        + u32(1)
+        + u8(0x01)
+        + u32(0)
+        + u32(0)  # field 9: composite sentinel
+        + custody_key_state(CUSTODY_INTERVAL_KEY_STATE)
+        + u32(0)  # field 11: no seal
+        + u32(0)  # field 12: composite sentinel
+    )
+
+
+def emit_custody_registry_key_state() -> None:
+    inception = custody_inception_preimage()
+    inception_digest = sha256(inception)
+    identifier = identifier_of(inception)
+    preimage = custody_key_state_preimage(identifier, inception_digest)
+    digest = sha256(preimage)
+
+    emit("vector_51.root_set_size", len(CUSTODY_ROOT_KEYS))
+    emit("vector_51.root_threshold", 1)
+    for index, (name, value) in enumerate(CUSTODY_VALUES):
+        key = (
+            CUSTODY_ROOT_KEYS[index] if index < 8 else CUSTODY_ACTIVE_KEY
+        )
+        emit(f"vector_51.custody.{name}", f"0x{value:02x}")
+        emit_hex(f"vector_51.key.{name}", key.compressed)
+    emit_hex("vector_51.prerotation_key_compressed", CUSTODY_PREROTATION_KEY.compressed)
+    emit_hex("vector_51.witness_operator", CUSTODY_WITNESS_OPERATOR)
+    emit_hex("vector_51.inception_preimage_digest", inception_digest)
+    emit_hex("vector_51.identifier", identifier)
+    emit_hex("vector_51.routing_id", sha256(b"scp:did:" + identifier))
+    emit("vector_51.key_state_bytes", len(custody_key_state(CUSTODY_INTERVAL_KEY_STATE)))
+    emit("vector_51.preimage_len", len(preimage))
+    emit_hex("vector_51.preimage", preimage)
+    emit_hex("vector_51.preimage_digest", digest)
+    # Every registered custody byte appears exactly once in the snapshot.
+    snapshot = custody_key_state(CUSTODY_INTERVAL_KEY_STATE)
+    for index, (_name, value) in enumerate(CUSTODY_VALUES):
+        offset = 8 + index * 45 + 33 + 1 + 1 + 8
+        assert snapshot[offset] == value, (index, snapshot[offset], value)
+    sig = ecdsa_sign(CUSTODY_ROOT_KEYS[0].d, digest)
+    assert ecdsa_verify(CUSTODY_ROOT_KEYS[0].point, digest, sig)
+    if _HAVE_CRYPTOGRAPHY:
+        _verify_with_cryptography(CUSTODY_ROOT_KEYS[0], digest, sig, "vector_51")
+    assert int.from_bytes(sig[32:], "big") * 2 <= N, "vector_51: high-s"
+    emit("vector_51.slot_len", len(sig))
+    emit_hex("vector_51.slot", sig)
+
+
+# --- §25.26 Vector 52: the context-export signature preimage ---
+#
+# `23-sync-and-offline-strategy.md` §23.16.8 fixes the preimage as the
+# separator, the one-byte scope tag, the 32-byte `key_state_head` written raw,
+# and `JCS(ContextSnapshot)` under §9.5.1's variable-length rule, which is a
+# 4-byte big-endian length prefix. Without the prefix pinned here a producer
+# that read the displayed formula literally wrote the JCS bytes bare, and every
+# export it signed failed at a producer that read the rule.
+
+EXPORT_SEPARATOR = b"SCP-CONTEXT-EXPORT-V3:"
+EXPORT_SCOPE_FULL = 0x00
+EXPORT_SNAPSHOT = {
+    "context_id": "b0e0d2ec6d9d4d2f9c4e7a1b3f5c8d90",
+    "created_at": 1700000000,
+    "creator_did": "<scp-identifier:creator>",
+    "event_log_merkle_root": "00" * 32,
+    "key_boundaries": [],
+    "schema_version": 3,
+}
+
+
+def jcs(value: object) -> bytes:
+    """RFC 8785 canonical JSON over the ASCII fixture above.
+
+    Members sort by key, no insignificant whitespace, integers as integers.
+    """
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def emit_context_export_preimage() -> None:
+    snapshot_jcs = jcs(EXPORT_SNAPSHOT)
+    key_state_head = sha256(custody_inception_preimage())
+    preimage = (
+        EXPORT_SEPARATOR
+        + u8(EXPORT_SCOPE_FULL)
+        + fixed_field(key_state_head)
+        + var_field(snapshot_jcs)
+    )
+    digest = sha256(preimage)
+    emit("vector_52.scope_tag", "0x00")
+    emit_hex("vector_52.key_state_head", key_state_head)
+    emit("vector_52.jcs_len", len(snapshot_jcs))
+    emit("vector_52.jcs", snapshot_jcs.decode("utf-8"))
+    emit("vector_52.preimage_len", len(preimage))
+    emit_hex("vector_52.preimage", preimage)
+    emit_hex("vector_52.preimage_digest", digest)
+    # The JCS field carries the 4-byte prefix and never runs bare.
+    assert var_field(snapshot_jcs)[:4] == u32(len(snapshot_jcs))
+    sig = ecdsa_sign(REF_KEY_2.d, digest)
+    assert ecdsa_verify(REF_KEY_2.point, digest, sig)
+    if _HAVE_CRYPTOGRAPHY:
+        _verify_with_cryptography(REF_KEY_2, digest, sig, "vector_52")
+    assert int.from_bytes(sig[32:], "big") * 2 <= N, "vector_52: high-s"
+    emit_hex("vector_52.signature", sig)
+
+
+# --- §25.26 Vector 53: a proof of work over a key-event PUBLISH ---
+#
+# `09-security-model.md` §9.7.4.2 R9 makes a relay declaring
+# `pow_difficulty = N` accept a key-event PUBLISH only where
+# `SHA-256(routing_id ‖ blob_digest ‖ nonce)` carries N leading zero bits, with
+# `nonce` an 8-byte big-endian u64 (§9.10.12). This vector pins the
+# concatenation order and the leading-zero-bit test at a difficulty a reader
+# reproduces in about a second.
+
+POW_DIFFICULTY = 20
+
+
+def leading_zero_bits(digest: bytes) -> int:
+    count = 0
+    for byte in digest:
+        if byte == 0:
+            count += 8
+            continue
+        count += 8 - byte.bit_length()
+        break
+    return count
+
+
+def emit_proof_of_work() -> None:
+    inception = custody_inception_preimage()
+    routing_id = sha256(b"scp:did:" + identifier_of(inception))
+    blob_digest = sha256(b"scp-25-pow-frame-bytes")
+    nonce = 0
+    while True:
+        digest = sha256(routing_id + blob_digest + u64(nonce))
+        if leading_zero_bits(digest) >= POW_DIFFICULTY:
+            break
+        nonce += 1
+    assert leading_zero_bits(sha256(routing_id + blob_digest + u64(nonce - 1))) < POW_DIFFICULTY or nonce == 0
+    emit("vector_53.pow_difficulty", POW_DIFFICULTY)
+    emit_hex("vector_53.routing_id", routing_id)
+    emit_hex("vector_53.blob_digest", blob_digest)
+    emit("vector_53.nonce", nonce)
+    emit_hex("vector_53.nonce_bytes", u64(nonce))
+    emit_hex("vector_53.qualifying_hash", digest)
+    emit("vector_53.leading_zero_bits", leading_zero_bits(digest))
+
+
 # --- §25.27 the cosigned head and the relay proof of control ---
 
 WITNESS_ID = sha256(b"scp-25-witness-operator")
@@ -1958,6 +2224,9 @@ def main() -> int:
     emit_trust_attestation()
     emit_keypackage_attestation()
     emit_key_event_slots()
+    emit_custody_registry_key_state()
+    emit_context_export_preimage()
+    emit_proof_of_work()
     emit_witness_and_relay_objects()
     emit_commitment_and_service_record()
     print("\n".join(_LINES))
