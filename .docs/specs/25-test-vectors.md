@@ -1586,19 +1586,20 @@ The signer is §25.2's secondary key, the `#active` key of Vector 41's identity.
 
 ### Vector 53: a proof of work over a key-event PUBLISH
 
-`09-security-model.md` §9.7.4.2 R9 makes a relay declaring `pow_difficulty = N` accept a key-event PUBLISH only where `SHA-256(routing_id ‖ blob_digest ‖ nonce)` carries N leading zero bits, and §9.10.12 fixes `nonce` as an 8-byte big-endian `u64`. This vector pins the concatenation order and the leading-zero-bit test. `blob_digest` is `SHA-256` over the frame bytes the PUBLISH carries, and the fixture digests the ASCII string `scp-25-pow-frame-bytes`.
+`09-security-model.md` §9.7.4.2 R9 states the puzzle and this vector pins its four operands, their order, and the leading-zero-bit test. The fixture's `value_digest` is `SHA-256` over the ASCII string `scp-25-pow-value-bytes`, standing for the `value` bytes a PUBLISH carries; `relay_id` is the `operator` identifier of Vector 49's entry 0, which is the relay this solution serves; and `nonce_be64` is the nonce as 8 bytes big-endian.
 
 ```
 pow_difficulty:       20
 routing_id:           4e904d784a879f4829dde870dedc1b99a9e8d144669b2c2861193be71d902cc4
-blob_digest:          bf02c47078f94ad0e58fe473d3b73acf272a2fad7f81a7c7f7dfb21d23af41a0
-nonce (u64):          230249
-nonce (8 bytes BE):   0000000000038369
-qualifying hash:      00000d6a6509dd236ec2ad8a737d9bfe538ebeb05a9e188f6016cb81548a7a01
-leading zero bits:    20
+value_digest:         f018007a5f6a67bb7bb3babcfab9abaac79c091ceebaa3cde5c2d5729ff459e1
+relay_id:             c45b32c65d25b3d070929aa68fa4532f69fd5ab56fa15173be77d6c5c6d03c18
+nonce (u64):          619446
+nonce (8 bytes BE):   00000000000973b6
+qualifying hash:      000007a1c76ca5e44f488b3e1eb507a15606ab0b1dd0d3904ca610e11f2262cc
+leading zero bits:    21
 ```
 
-**Conformance procedure.** Concatenate the three fields in that order, hash once, and count leading zero bits. An implementation that writes `nonce` little-endian, or that hashes the fields in another order, finds this nonce does not qualify.
+**Conformance procedure.** Concatenate the four fields in that order, hash once, and count leading zero bits. An implementation that writes `nonce` little-endian, or that hashes the fields in another order, finds this nonce does not qualify. **Substituting Vector 49's entry 1 operator, `9d94df95bc0a13f1963f484414c320354c73c75bb86e96559e97765f5bc2d313`, for `relay_id` and keeping every other field yields a digest carrying fewer than 20 leading zero bits**, which is the property that makes one solution serve one relay.
 
 
 ## 25.27 Witness-Layer and Relay-Proof Vectors (§9.7.4.2 definitions, §9.7.4.3, §9.18.2)

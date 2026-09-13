@@ -1915,10 +1915,13 @@ def emit_context_export_preimage() -> None:
 #
 # `09-security-model.md` §9.7.4.2 R9 makes a relay declaring
 # `pow_difficulty = N` accept a key-event PUBLISH only where
-# `SHA-256(routing_id ‖ blob_digest ‖ nonce)` carries N leading zero bits, with
-# `nonce` an 8-byte big-endian u64 (§9.10.12). This vector pins the
-# concatenation order and the leading-zero-bit test at a difficulty a reader
-# reproduces in about a second.
+# `SHA-256(routing_id ‖ value_digest ‖ relay_id ‖ nonce_be64)` carries N
+# leading zero bits, where `value_digest` is SHA-256 over the PUBLISH's `value`
+# bytes, `relay_id` is the 32-byte operator identifier that relay's
+# community-relay-list entry declares, and `nonce_be64` is the nonce as 8 bytes
+# big-endian. The relay term is what makes one solution serve one relay. This
+# vector pins the concatenation order and the leading-zero-bit test at a
+# difficulty a reader reproduces in about a second.
 
 POW_DIFFICULTY = 20
 
@@ -1937,17 +1940,25 @@ def leading_zero_bits(digest: bytes) -> int:
 def emit_proof_of_work() -> None:
     inception = custody_inception_preimage()
     routing_id = sha256(b"scp:did:" + identifier_of(inception))
-    blob_digest = sha256(b"scp-25-pow-frame-bytes")
+    value_digest = sha256(b"scp-25-pow-value-bytes")
+    # Vector 49's entry 0 operator, which is the relay this puzzle binds.
+    relay_id = sha256(b"scp-25-relay-operator")
+    prefix = routing_id + value_digest + relay_id
     nonce = 0
     while True:
-        digest = sha256(routing_id + blob_digest + u64(nonce))
+        digest = sha256(prefix + u64(nonce))
         if leading_zero_bits(digest) >= POW_DIFFICULTY:
             break
         nonce += 1
-    assert leading_zero_bits(sha256(routing_id + blob_digest + u64(nonce - 1))) < POW_DIFFICULTY or nonce == 0
+    assert nonce == 0 or leading_zero_bits(sha256(prefix + u64(nonce - 1))) < POW_DIFFICULTY
+    # The relay term binds one solution to one relay: the same nonce against a
+    # second listed operator does not qualify.
+    other_relay = sha256(b"scp-25-witness-operator")
+    assert leading_zero_bits(sha256(routing_id + value_digest + other_relay + u64(nonce))) < POW_DIFFICULTY
     emit("vector_53.pow_difficulty", POW_DIFFICULTY)
     emit_hex("vector_53.routing_id", routing_id)
-    emit_hex("vector_53.blob_digest", blob_digest)
+    emit_hex("vector_53.value_digest", value_digest)
+    emit_hex("vector_53.relay_id", relay_id)
     emit("vector_53.nonce", nonce)
     emit_hex("vector_53.nonce_bytes", u64(nonce))
     emit_hex("vector_53.qualifying_hash", digest)
