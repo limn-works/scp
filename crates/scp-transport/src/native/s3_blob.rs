@@ -40,10 +40,31 @@ use std::sync::Arc;
 
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_smithy_http_client::tls;
+use aws_smithy_http_client::tls::rustls_provider::CryptoMode;
 
 use super::storage::{
     BlobBodyStream, BlobMetadata, BlobStorage, ClockFn, StorageError, StoredBlob, system_clock,
 };
+
+/// Resolves the AWS SDK configuration over an HTTPS client that uses the ring rustls backend.
+///
+/// The AWS SDK's `default-https-client` feature hardwires `aws-smithy-http-client`'s
+/// `rustls-aws-lc` connector, which brings a second rustls crypto provider into the
+/// process and compiles the `aws-lc-sys` C library. `scp-transport` pins one ring-backed
+/// rustls provider for every other TLS path it owns (see the `quinn`, `rustls` and
+/// `reqwest` notes in this crate's Cargo.toml), so this builds the same connector over
+/// ring and hands it to the loader. Every request the SDK makes goes through it: the S3
+/// calls and the credential-chain calls both.
+async fn load_ring_backed_aws_config() -> aws_config::SdkConfig {
+    let http_client = aws_smithy_http_client::Builder::new()
+        .tls_provider(tls::Provider::Rustls(CryptoMode::Ring))
+        .build_https();
+    aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .http_client(http_client)
+        .load()
+        .await
+}
 
 /// S3-compatible blob storage backend for the SCP native relay.
 ///
@@ -113,7 +134,7 @@ impl S3BlobStore {
         prefix: &str,
         clock: ClockFn,
     ) -> Result<Self, StorageError> {
-        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let config = load_ring_backed_aws_config().await;
         let client = Client::new(&config);
         Ok(Self {
             client,
@@ -138,7 +159,7 @@ impl S3BlobStore {
         endpoint_url: &str,
         clock: ClockFn,
     ) -> Result<Self, StorageError> {
-        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let config = load_ring_backed_aws_config().await;
         let s3_config = aws_sdk_s3::config::Builder::from(&config)
             .endpoint_url(endpoint_url)
             .force_path_style(true)

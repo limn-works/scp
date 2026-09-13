@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Print what a `cargo build --timings=html` report says, as text a log can carry.
 
-`.github/workflows/compile-timings.yml` runs `cargo build --timings=html,json` for each
+`.github/workflows/compile-timings.yml` runs `cargo build --timings` for each
 cargo invocation `ci.yml`'s `rust-test` job runs, then calls this script on the directory
 holding the reports. The HTML report embeds two JavaScript arrays, and this script reads
 both out of it:
@@ -13,9 +13,10 @@ both out of it:
                     were ready but waiting for a core, and how many were blocked on a
                     dependency.
 
-From those two arrays this script reports the wall time, the twenty slowest units, how
-much of the wall time ran fewer units than the machine has cores, and the longest chain of
-units that the schedule actually realised. It reads the reports and writes text; it
+From those two arrays this script reports the wall time, the summed unit time and the
+floor that a four-core runner imposes on it, the twenty slowest units, how much of the
+wall time ran fewer units than the machine has cores, and the longest chain of units that
+the schedule actually realised. It reads the reports and writes text; it
 compiles nothing and it fails no build.
 """
 
@@ -93,6 +94,13 @@ def summarize(report: Path) -> None:
     print(f"wall time:                 {wall:.1f} s")
     print(f"summed unit time:          {cpu_seconds:.1f} s")
     print(f"mean parallelism:          {cpu_seconds / wall:.2f} units")
+    # A 4-vCPU runner cannot finish sooner than the summed unit time divided by 4, whatever
+    # the dependency graph allows. Comparing the wall time against that floor says whether
+    # the build is short of work to run or short of cores to run it on.
+    print(
+        f"{RUNNER_CORES}-core floor (summed/{RUNNER_CORES}): {cpu_seconds / RUNNER_CORES:.1f} s"
+        f"  — wall is {100 * wall / (cpu_seconds / RUNNER_CORES) - 100:+.0f}% against it"
+    )
 
     if concurrency:
         span = concurrency[-1]["t"] / max(len(concurrency) - 1, 1)
@@ -131,11 +139,11 @@ def summarize(report: Path) -> None:
 
     print(f"\nslowest {TOP_N} units:")
     for u in sorted(units, key=lambda u: -u["duration"])[:TOP_N]:
-        target = u.get("target", "")
-        print(
-            f"  {u['duration']:7.1f} s  {u['name']} v{u['version']} "
-            f"({u['mode']}{'/' + target if target else ''})"
-        )
+        # cargo 1.98 writes the literal string "todo" into every unit's `mode` field, so
+        # `target` is the only field that says which target of the package this unit is.
+        # An empty `target` means the package's own library.
+        target = (u.get("target") or "").strip() or "lib"
+        print(f"  {u['duration']:7.1f} s  {u['name']} v{u['version']}  {target}")
     print()
 
 
