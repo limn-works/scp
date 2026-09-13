@@ -4998,6 +4998,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uniffi",
+ "uniffi_bindgen",
  "uuid",
  "z-base-32",
  "zeroize",
