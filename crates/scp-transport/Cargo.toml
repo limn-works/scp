@@ -75,7 +75,18 @@ rusqlite = { workspace = true, optional = true }
 redb = { workspace = true, optional = true }
 zeroize = { workspace = true }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"], optional = true }
-aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["default-https-client", "rt-tokio", "sigv4a", "behavior-version-latest"] }
+# No `sigv4a`. That feature turns on `aws-runtime/sigv4a`, which signs requests addressed
+# to an S3 Multi-Region Access Point, and it is the only edge in this workspace that pulls
+# the superseded RustCrypto generation: p256 0.11, ecdsa 0.14, elliptic-curve 0.12,
+# crypto-bigint 0.4, der 0.6, ff 0.12, group 0.12, pkcs8 0.9, rfc6979 0.3, sec1 0.3,
+# signature 1.6, spki 0.6 and base16ct 0.1 — thirteen crates compiled beside the 0.13
+# generation the rest of the workspace uses. `.docs/specs/17-persistence-and-storage.md`
+# §17.7 "Why S3-Compatible" scopes this adapter to "the entire S3-compatible ecosystem:
+# AWS S3, MinIO, Ceph, SeaweedFS, Garage, Cloudflare R2, Backblaze B2", and no store in
+# that list other than AWS implements SigV4A. `S3BlobStore::open` and
+# `open_with_endpoint` (crates/scp-transport/src/native/s3_blob.rs) take a bucket name and
+# an endpoint URL, never a Multi-Region Access Point ARN.
+aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
 http-body = { version = "1", optional = true }
 # default-features disabled to avoid quinn's `platform-verifier` feature, which
