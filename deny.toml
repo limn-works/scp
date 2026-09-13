@@ -43,6 +43,21 @@ ignore = [
     # scp-client-wasm each declare `js` in a `cfg(target_arch = "wasm32")` section.
     # openmls offers no other wasm32 time source.
     "RUSTSEC-2024-0384",
+    # rand 0.8.5 unsound: an aliased mutable reference when a custom `log` logger calls
+    # `rand::rng()` while ThreadRng reseeds. This workspace pins `rand = "0.8"` in its own
+    # `[workspace.dependencies]` and eleven crates take it from there, so this is a direct
+    # dependency and not only the transitive one through
+    # `openmls_rust_crypto -> hpke-rs-rust-crypto`. The advisory names rand 0.8.6 as the
+    # patched release on that line, and hpke-rs pins `^0.8` as well. SCP logs through
+    # `tracing` rather than `log` and installs no logging callback that generates random
+    # data, so the aliasing the advisory describes cannot occur on any SCP path.
+    #
+    # Do not delete this entry on the strength of a local `cargo deny` run.
+    # cargo-deny 0.19.0 on a developer machine reports it as `advisory-not-detected`,
+    # and `EmbarkStudios/cargo-deny-action@v2` reports it as `error[unsound]` and fails
+    # the `Rust / deny` job. See
+    # .docs/lessons/local-cargo-deny-sees-fewer-advisories-than-ci.md.
+    "RUSTSEC-2026-0097",
     # libcrux-sha3: incorrect incremental SHAKE XOF output. Transitive via
     # openmls_rust_crypto -> hpke-rs -> libcrux-sha3, the SHA-3 backend hpke-rs
     # compiles in. OpenMLS drives hpke-rs through its one-shot AEAD and KDF surface,
