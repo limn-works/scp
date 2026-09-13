@@ -50,6 +50,14 @@ env:
 #                     (both run `cargo build -p scp-ffi-napi --release`), and
 #                     bridge-parity-kotlin, whose `maturin develop --release` is the
 #                     larger of its two builds.
+#   transport-optional
+#                     `target/debug` again, but under a feature resolution no
+#                     other job produces — rust-test-optional-features. Its
+#                     `-p scp-transport` and `-p scp-testing` selections drop
+#                     `scp-runtime/testing` and unify third-party features over a
+#                     subgraph, which gives 337 packages a fingerprint the
+#                     `workspace-debug` entry does not hold. Sharing that entry
+#                     would restore artifacts none of its units match.
 #   wasm32            `target/wasm32-unknown-unknown/release` — typescript-wasm-check
 #                     and scaffold-typescript-web-check, which both run
 #                     `wasm-pack build`. Jobs wasm-protocol and wasm-test read this
@@ -994,6 +1002,35 @@ jobs:
   # processes and takes an `fs2` advisory file lock, whose semantics differ
   # between Darwin and Linux, and the quic/udp lane sets socket options whose
   # kernel behaviour differs between the two.
+  #
+  # ── Why this job gets its own cache group and does not fold into rust-test ──
+  #
+  # `-p scp-transport` resolves a different feature set than `--workspace` does,
+  # and not only for scp-transport: the resolver drops `scp-runtime/testing`,
+  # `scp-runtime/saga-witness-test-mint` and
+  # `scp-core/outlet-capability-test-grant`, then unifies third-party features
+  # over scp-transport's subgraph alone. Measured on run 34750056435's cold
+  # ubuntu leg, that reaches 247 packages for the `combined,local-cache`
+  # invocation and 90 for the scp-testing one, down to `proc-macro2`, every one
+  # of which the workspace invocation had already compiled under its own
+  # resolution.
+  #
+  # That is the reason to give this job its own `shared-key`, and it is also the
+  # reason NOT to fold these three commands into `cargo nextest run --workspace
+  # --features …,scp-transport/quic,…`. One invocation would compile each
+  # package once, and it would compile scp-transport's graph with the workspace's
+  # `testing` features ON and all six optional transport features on together.
+  # These lanes exist because that graph rotted unseen under exactly that
+  # unification — `crates/scp-transport`'s `quic` feature stopped compiling for
+  # months — and because a `--workspace` build compiles a crate's
+  # `#[cfg(not(feature = "testing"))]` items out, which is the defect
+  # `check_testing_unification_readers` in
+  # scripts/tests/ci-gate/ci_gate_selftest.py exists to catch. Folding buys the
+  # compile time back by deleting the configuration under test.
+  #
+  # The cache group buys the same time and deletes nothing: this job's own
+  # artifacts, under its own feature resolution, restore on every later run. It
+  # writes on a push to `main` because it is the only job that builds them.
   rust-test-optional-features:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
@@ -1012,8 +1049,8 @@ jobs:
           python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace-debug
-          save-if: false
+          shared-key: transport-optional
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
       - name: Run tests
         run: |
