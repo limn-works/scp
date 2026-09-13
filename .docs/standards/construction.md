@@ -136,7 +136,7 @@ This is consistent with injection-through-initializers (architecture.md §2.5): 
 
 ## Storage vocabulary
 
-Three names, three jobs — stated once so they are never conflated:
+Three names, three jobs, so a reader never conflates them:
 
 - **`Storage`** — the raw provider **trait** (the persistence capability itself).
 - **`StorageSlot`** — the **Rust-core config selector enum**. Every core config object carries it (`NodeConfig.storage`, `IdentityConfig.persistence`). It includes the **Rust-only `Custom(concrete)`** variant carrying a caller-supplied Rust `Storage` implementation.

@@ -36,7 +36,7 @@ See `.docs/scaffold/shared.md` for the full cross-language casing table. Summary
 - **Type names** are `PascalCase` in every language
 - **Constants** are `SCREAMING_SNAKE_CASE` in most languages (except Swift: `camelCase`, C#: `PascalCase`)
 - **Acronyms** follow language convention: `URLString` vs `urlString` — see per-language standards
-- **A name-bound enumeration's variants** take the spelling the specification gives them, recased by one deterministic rule per language. This table is the one home of that mapping, and `09-security-model.md` §9.7.4.2's definitions state the criterion that decides which enumerations it reaches.
+- **A name-bound enumeration's variants** take the spelling the specification gives them, recased by one deterministic rule per language. The table below carries that mapping, and `09-security-model.md` §9.7.4.2's definitions state the criterion that decides which enumerations it reaches.
 
 | Language | Enum variant spelling | Example, from the spec's `WitnessRead` |
 |---|---|---|
