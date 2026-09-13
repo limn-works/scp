@@ -1258,7 +1258,7 @@ This is a hard requirement, not an aspiration. Every protocol mechanism must be 
 | Infrastructure | Who runs it | Why it works without Limn |
 |---|---|---|
 | Transport relays | Users, communities, anyone | SCP native relay is trivially self-hostable. Existing infrastructure (Nostr relays, Hyperswarm, libp2p, Matrix homeservers) also works. Multiple transports, no single dependency. |
-| Identity resolution | The SCP relay network and the shipped community relay list | Every relay is substitutable and untrusted, and the SDK ships a fixed list of relays under distinct operators (§18.5.1). A verifier recomputes the identifier from the inception bytes, so correctness rests on no relay. |
+| Identity resolution | The SCP relay network and the shipped community relay list | Every relay is untrusted, and a verifier recomputes the identifier from the inception bytes, so **correctness** rests on no relay and any relay substitutes for any other. **Reaching a first contact** is the one exception: a party holding no baseline for an identifier obtains the chain from two entries of the shipped community relay list under distinct operator keys, and a relay outside that list counts for nothing (`09-security-model.md` §9.7.4.2 R11). The list changes only at an SDK release, and who curates it is open (§18.5.1). |
 | SDK packages | PyPI, npm, crates.io | Standard open-source package distribution. Forkable. |
 | Key storage | User devices | Secure Enclave, Android Keystore, WebCrypto. On-device. |
 
@@ -1266,7 +1266,7 @@ This is a hard requirement, not an aspiration. Every protocol mechanism must be 
 
 | Non-infrastructure | Why |
 |---|---|
-| Central relay | No privileged relay. All relays are substitutable and untrusted. |
+| Central relay | No privileged relay. Every relay is untrusted, and any relay substitutes for any other on the correctness of a resolution; the shipped community relay list is privileged for a first contact alone, under the row above. |
 | User database | An identifier is the digest of an inception event its holder composed. No registry of users. |
 | Key server | Keys are in hardware security modules on user devices. |
 | Application server | Apps are client-side. SDK handles everything. |
