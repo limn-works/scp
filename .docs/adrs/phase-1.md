@@ -688,7 +688,7 @@ Every message is a MessagePack map with a required `op` field (string) plus oper
 
 | Op | Fields | When |
 |----|--------|------|
-| `OK` | `ref: string?`, `blob_id: bin32?` | Success response. `blob_id` present only for PUBLISH. |
+| `OK` | `ref: string?`, `blob_id: bin32?`, `relay_config: map?` | Success response. `blob_id` present only for PUBLISH; `relay_config` present only for POLICY, carrying the fields of `18-addressability-and-deployment.md` §18.3.3 verbatim and unsigned. |
 | `ERR` | `ref: string?`, `code: u16`, `msg: string` | Error response. `msg` is for logging, not parsing. |
 | `BLOB` | `routing_id: bin32`, `blob_id: bin32`, `recipient_hint: bin32?`, `blob_ttl: u32?`, `stored_at: u64`, `relay_proof: bin200?`, `blob: bin` | Blob delivery (subscription, backfill, or query). `blob_id = SHA-256(blob)` — clients SHOULD verify. `relay_proof` carries the 200-byte relay proof of control `09-security-model.md` §9.7.4.2's definitions state, returned where the QUERY carried a `proof_nonce`. |
 | `EVENT` | `ref: string?`, `type: string`, type-specific fields | Protocol events: `backfill_complete` (with `routing_id`), `query_complete` (with `count`). |
