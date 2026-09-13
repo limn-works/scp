@@ -431,7 +431,7 @@ Equivocation is detected by the Relay Consistency Protocol: periodic signed `Con
 
 | Scenario | Action |
 |---|---|
-| Active Signing Key compromised | The root signs one `KeyState` carrying a new key `current` and the stolen key's `Compromised{from: N}` (§3.2.1). The identifier is unchanged. MLS Update everywhere. |
+| Active Signing Key compromised | The root signs one `KeyState` carrying a new key `current` and the stolen key's `Compromised{from: N}` drop entry (`03-identity.md` §3.2.1 case 1; `09-security-model.md` §9.7.4.2 R8). The identifier is unchanged. MLS Update everywhere. |
 | Root compromised | `RootRecovery` (`09-security-model.md` §9.7.4.2) — the pre-rotation key authorizes, a fresh root is installed, the identifier does not change. MLS Update in all contexts; key-continuity re-verification (§9.11). |
 | Root and `#active` compromised, pre-rotation key intact | Same as a compromised root — the `RootRecovery` installs fresh operational keys too |
 | All keys compromised | Root cannot be recovered — the person establishes a new identity; context admins remove the old identity and admit the new one |
