@@ -139,6 +139,10 @@ async fn dispatch_inner(
         BroadcastCommand::ReleaseBroadcastReservation { payload, reply } => {
             handle_release_broadcast_reservation(cell, *payload, reply)
         }
+        #[cfg(feature = "testing")]
+        BroadcastCommand::SeedBroadcastAuthor {
+            author_did, reply, ..
+        } => handle_seed_broadcast_author(cell, &author_did, reply),
     }
 }
 
@@ -628,6 +632,31 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
         ContextError::NotImplemented(msg) => ContextError::NotImplemented(msg.clone()),
         other => ContextError::CryptoFailed(format!("{other}")),
     }
+}
+
+/// Handle [`BroadcastCommand::SeedBroadcastAuthor`] (actor-shape, test-only).
+///
+/// Test seam: registers an additional DID as a broadcast author on an existing
+/// broadcast context, bypassing the normal governance round-trip. Mirrors
+/// [`handle_seed_peer_pseudonym`](crate::context::actor::handlers::messaging)
+/// in purpose and gating strategy.
+///
+/// Gated behind `feature = "testing"` — never compiled into production builds.
+#[cfg(feature = "testing")]
+fn handle_seed_broadcast_author(
+    cell: &mut ClassSCell,
+    author_did: &scp_did::DID,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let result = cell.class_c_view().seed_broadcast_author(author_did);
+    // An upward/additive mutation (author ADD): Class-C, coalesced persist via
+    // the run loop's `mutated` flag — same durability class as subscriber ADD.
+    let outcome = match &result {
+        Ok(()) => Outcome::ok_mutated(()),
+        Err(e) => Outcome::err(outcome_error_sketch(e)),
+    };
+    let _ = reply.send(result);
+    outcome
 }
 
 // ---------------------------------------------------------------------------

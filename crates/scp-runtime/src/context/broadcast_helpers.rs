@@ -257,8 +257,9 @@ pub async fn unsubscribe_broadcast(
     // epoch was advanced as a consequence of the unsubscription. Emit one
     // `KeyEpochAdvance` leaf per rotated author so the event log reflects the
     // new epoch state. Best-effort: a failure here does not roll back the
-    // unsubscription. `rotate_sender_key_for_block` (reused internally by
-    // `unsubscribe`) always increments by exactly 1, so `old_epoch =
+    // unsubscription (§5.14.8: voluntary unsubscribe with forward-secrecy key
+    // rotation is authorization-UPWARD-safe and is intentionally coalesced).
+    // `unsubscribe` always increments by exactly 1, so `old_epoch =
     // new_epoch.saturating_sub(1)` is exact.
     //
     // `key_rotations` arrives in DID-lexicographic order by construction (the
@@ -738,8 +739,16 @@ pub async fn block_broadcast_subscriber(
 
     // ADR-007 §5: blocking a subscriber rotates the author's sender-key epoch.
     // Append the KeyEpochAdvance leaf immediately after MemberBlocked so the
-    // two leaves are always co-located in the Merkle log. rotate_sender_key_for_block
-    // always increments by exactly 1, so old = new.saturating_sub(1) is exact.
+    // two leaves sit next to each other in the Merkle log whenever both land.
+    // rotate_sender_key_for_block always increments by exactly 1, so
+    // old = new.saturating_sub(1) is exact.
+    //
+    // The block and the epoch advance are durable before this append runs
+    // (§5.14.8 of the contexts spec, Durability), and `MemberBlocked` is
+    // appended with `?` above because the block is the confidentiality
+    // effect. A failed `KeyEpochAdvance` append logs and leaves the block in
+    // force: returning `Err` here would report a block that landed as one
+    // that did not.
     let old_epoch = result.new_epoch.saturating_sub(1);
     match scp_event_log::payload::encode_payload(&scp_event_log::payload::KeyEpochAdvancePayload {
         old_epoch,

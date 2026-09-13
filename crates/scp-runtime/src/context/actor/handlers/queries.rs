@@ -276,5 +276,14 @@ pub(crate) async fn dispatch(
             let _ = reply.send(Ok(answer));
             Outcome::ok(())
         }
+
+        #[cfg(feature = "testing")]
+        QueriesCommand::CheckpointEventsSince {
+            context_id: _,
+            reply,
+        } => {
+            let _ = reply.send(Ok(state.checkpoint_events_since));
+            Outcome::ok(())
+        }
     }
 }
