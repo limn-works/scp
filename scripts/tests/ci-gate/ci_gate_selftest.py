@@ -545,6 +545,7 @@ RUST_ONLY_RUNS = {
     "rust-doc": True,
     "rust-fmt": True,
     "rust-test": True,
+    "rust-test-optional-features": True,
     "rust-test-napi-production": True,
     "scaffold-typescript-web-check": False,
     "swift-build-test": True,

@@ -87,7 +87,7 @@ Most doc generators can be run locally:
 # Four intra-doc links in crates/scp-node name items that exist only under the
 # features it lists, so a run omitting the list exits 101 over those four.
 cargo doc --workspace --no-deps --document-private-items \
-  --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint
+  --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant
 
 # Python (requires sphinx, furo, sphinx-autodoc-typehints)
 cd bindings/python && sphinx-build -b html docs docs/_build/html

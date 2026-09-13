@@ -399,7 +399,7 @@ cargo deny check
 # in `crates/scp-node` name items that exist only under those features, so a run
 # omitting the list exits 101 on an unmodified `main`.
 cargo doc --workspace --no-deps --document-private-items \
-  --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint
+  --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant
 ```
 
 ## CI Matrix

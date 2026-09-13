@@ -162,8 +162,32 @@ fi
 # ---------------------------------------------------------------------------
 
 log "Generating Swift bindings and C header via uniffi-bindgen"
+
+# Build the bindgen binary out of the artifacts step 1 just produced, wherever the
+# machine can execute what that step built.
+#
+# Cargo keys its artifact directory on the profile and on whether the command passes
+# `--target`, and it shares nothing across two directories. Step 1 compiles this crate
+# and its ~650 dependencies under the release profile into
+# `target/aarch64-apple-darwin/release`. A `cargo run` that passes neither flag compiles
+# the same crate graph a second time, under the dev profile, into `target/debug`.
+# Measured on CI run 34724307976: step 1 took 13m45s and this command took a further
+# 6m02s, of which the bindgen binary itself is a few seconds of the total.
+#
+# `cargo run` executes what it builds, so this holds only where the host runs the triple
+# step 1 named. On an Intel Mac it does not, and the flags stay empty there: the command
+# builds a host binary as before, and the dev XCFramework it goes on to produce is
+# arm64-only on either machine.
+# Written as a word-split string rather than an array because macOS ships bash 3.2,
+# where `"${empty[@]}"` under `set -u` aborts the script.
+BINDGEN_PROFILE_FLAGS=""
+if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
+    BINDGEN_PROFILE_FLAGS="--release --target $TARGET_MACOS_ARM"
+fi
+
 # shellcheck disable=SC2086
 cargo run \
+    $BINDGEN_PROFILE_FLAGS \
     -p scp-ffi-uniffi \
     --bin uniffi-bindgen \
     $EXTRA_FEATURES \

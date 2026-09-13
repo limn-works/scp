@@ -1,0 +1,7 @@
+name: Bad
+on: push
+jobs:
+  swift:
+    runs-on: macos-26
+    steps:
+      - run: cargo run --release -p scp-ffi-uniffi --bin uniffi-bindgen -- generate --language swift

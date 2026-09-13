@@ -1,0 +1,12 @@
+# A second workflow writing the same group: the cap is per repository, so the check
+# counts writers across files.
+name: Bad B
+on: schedule
+jobs:
+  nightly:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: ${{ github.ref == 'refs/heads/main' }}

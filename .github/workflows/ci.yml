@@ -15,6 +15,105 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# ── Cargo cache groups ────────────────────────────────────────────────────────
+#
+# Every `Swatinem/rust-cache` step below names a `shared-key` and a `save-if`, and this
+# comment says why both are required rather than left at their defaults.
+#
+# WHAT THE DEFAULTS DID. `add-job-id-key` defaults to true, so each step wrote its own
+# entry: eighteen entries from this workflow, each holding the same ~650 compiled
+# dependencies. GitHub caps a repository at 10 GB and evicts least-recently-used entries
+# over that cap. Measured on 2026-09-13, this repository held 26 entries totalling
+# 13.4 GB, none of them on `refs/heads/main`, so the cap was evicting entries faster
+# than the runs wrote them. A run reads only the caches of its own ref and of the
+# default branch, and a pull-request ref and a `gh-readonly-queue/…` ref are readable by
+# nothing else, so those writes bought their own run nothing and evicted the entries a
+# later run needed. Run 34711741563 missed on all four of its long jobs and took
+# 33.6 minutes; run 34750056435 hit on three of the four and took 19.5 minutes; run
+# 34731762140 hit on two and missed on two, which is eviction landing mid-run.
+#
+# WHAT THE TWO INPUTS DO. `shared-key` replaces the job id in the key, so the jobs that
+# compile the same crate graph into the same target directory read and write one entry.
+# `save-if` restricts writing to a push to `main`, whose entries every pull request and
+# every merge-queue run can read. Together they take this workflow from eighteen entries
+# per generation to eight, and they put those eight on the ref that every run reads.
+#
+# THE GROUPS, one per (target directory a job writes, compile mode of its dependency
+# units, runner OS). Cargo hashes the compile mode into every artifact's metadata
+# suffix beside the profile and the feature set, so `cargo clippy` and `cargo doc`,
+# which compile each dependency to an `.rmeta` in check mode, share no artifact with
+# `cargo build` and `cargo nextest`, which compile the same dependency to an `.rlib` in
+# build mode: the two land under different `.fingerprint/<crate>-<hash>` names in the
+# same `target/debug`, and a check-mode job that restores a build-mode entry gets the
+# registry and recompiles every dependency. That is why the directory alone does not
+# name a group. rust-cache already appends the OS and architecture to every key, so a
+# group name never spells one out:
+#
+#   workspace-debug   `target/debug` under build mode — rust-test (both matrix legs),
+#                     rust-test-napi-production, rust-build-pyo3-production,
+#                     rust-build-uniffi-production, rust-doc (its `cargo test --doc`),
+#                     kotlin-test, fail-closed-pre-rotation, shipped-feature-graph.
+#   workspace-check   `target/debug` under check mode — rust-clippy, whose two
+#                     `cargo clippy` commands compile every dependency to an `.rmeta`,
+#                     and rust-doc (its `cargo doc --no-deps`, whose dependency units
+#                     cargo compiles in check mode as well). rust-doc restores both
+#                     groups, one rust-cache step each, because its two commands read
+#                     two disjoint artifact sets out of the one directory.
+#   workspace-release `target/release` — python-test and bridge-parity (both run
+#                     `maturin develop --release`), typescript-check and bridge-parity
+#                     (both run `cargo build -p scp-ffi-napi --release`), and
+#                     bridge-parity-kotlin, whose `maturin develop --release` is the
+#                     larger of its two builds.
+#   transport-optional
+#                     `target/debug` again, but under a feature resolution no
+#                     other job produces — rust-test-optional-features. Its
+#                     `-p scp-transport` and `-p scp-testing` selections drop
+#                     `scp-runtime/testing` and unify third-party features over a
+#                     subgraph, which gives 337 packages a fingerprint the
+#                     `workspace-debug` entry does not hold. Sharing that entry
+#                     would restore artifacts none of its units match.
+#   wasm32            `target/wasm32-unknown-unknown/release` — typescript-wasm-check
+#                     and scaffold-typescript-web-check, which both run
+#                     `wasm-pack build`. Jobs wasm-protocol and wasm-test read this
+#                     group for its registry alone, because both compile under the dev
+#                     profile; each step below says so where it sits.
+#   apple-uniffi      `target/aarch64-apple-darwin/release` — swift-build-test.
+#   apple-parity      that directory plus `target/release` — bridge-parity-swift, the
+#                     one job that builds both the UniFFI dylib and the PyO3 module.
+#   fuzz              `fuzz/target/debug` — fuzz-build, whose `cargo check` compiles a
+#                     separate workspace on the nightly `fuzz/rust-toolchain.toml`
+#                     names, under the dev profile.
+#
+# The cap is per repository, so `.github/workflows/fuzz.yml` counts against the same
+# 10 GB: it writes two further groups, `fuzz-run` and `fuzz-run-opt`, both holding
+# `fuzz/target/<host triple>/release` under `cargo fuzz run`'s RUSTFLAGS (its group
+# comment on job fuzz-nightly says why two). Ten groups per generation across the two
+# workflows, where the two together wrote thirty-six entries before.
+# `scripts/check-workflow-compile-steps.py`, run by job toolchain-wiring, fails any
+# rust-cache step in any workflow that names no `shared-key` or no `save-if`, and any
+# group with zero or with two writers or with a writer off `main`.
+#
+# WHICH JOB IN A GROUP WRITES. Exactly one, named below as the group's producer, and
+# every other member carries `save-if: false`. The first job to reach its post step wins
+# the upload and every later job with the same key is told the entry exists, so leaving
+# `save-if` at its default would let the shortest job in a group decide the entry's
+# contents — shipped-feature-graph resolves a feature graph and compiles almost nothing,
+# and it finishes eleven minutes before rust-test. The producers are rust-test
+# (workspace-debug), rust-clippy (workspace-check), rust-test-optional-features
+# (transport-optional), bridge-parity (workspace-release), typescript-wasm-check
+# (wasm32), swift-build-test (apple-uniffi), bridge-parity-swift (apple-parity) and
+# fuzz-build (fuzz): in each group, the job that compiles the most of that directory
+# under that mode.
+#
+# WHAT IS DELIBERATELY LEFT OFF. `cache-workspace-crates` stays false. A checkout writes
+# every source file with the checkout's own mtime, which is newer than any cached
+# artifact, so cargo rebuilds each workspace crate regardless and the entry would carry
+# ~1 GB that never produces a hit.
+#
+# A cache decides how long a job takes and never what it reports: cargo compares
+# fingerprints against every restored artifact and recompiles what does not match. A
+# group named wrong costs a miss, never a wrong result.
+
 jobs:
   check-draft:
     if: >-
@@ -69,9 +168,46 @@ jobs:
           filters: |
             # The files that decide how every lane compiles, rather than what any one lane
             # compiles. The `outputs:` block above ORs this filter into every other lane,
-            # so no other filter repeats an entry listed here.
+            # so no other filter repeats an entry listed here — except `fuzz`, whose
+            # output reads its own filter alone, so the `fuzz` filter lists this workflow
+            # file a second time.
             toolchain:
               - 'rust-toolchain.toml'
+              # This file itself. Every job a filter in this workflow guards takes its
+              # command, its feature list, its matrix and its cache group from this file:
+              # python-test runs `maturin develop`, typescript-check runs
+              # `cargo build -p scp-ffi-napi`, kotlin-test runs
+              # `cargo build -p scp-ffi-uniffi`, swift-build-test runs
+              # `bindings/swift/build-xcframework.sh`, and rust-test runs
+              # `cargo nextest`, each with the arguments written here. A change to this
+              # file decides what every one of those jobs compiles and runs, so it sits
+              # in the filter every output but `fuzz` ORs in.
+              #
+              # It meets the criterion
+              # `.docs/lessons/route-a-changed-file-to-every-lane-it-decides.md` states
+              # for a path that needs routing: omitting it is invisible on an ordinary
+              # pull request. A pull request that rewrites job rust-test's cargo command
+              # and changes nothing else left every filter output false, skipped
+              # rust-test, and merged with the `ci` aggregator green over a command
+              # nothing had run — the rewritten lane first executing on whichever later
+              # pull request happened to touch `crates/`. Listing the file in the `rust`
+              # filter alone closed that hole for the Rust lane and left it open for
+              # python-test, typescript-check, typescript-wasm-check,
+              # scaffold-typescript-web-check, kotlin-test, swift-build-test and
+              # fuzz-build, each of which takes its command from this file too.
+              #
+              # This is not the `'**'`-minus-exclusions filter that lesson rejects. That
+              # alternative runs every lane on every `.docs/` and
+              # `.claude/agent-memory/` commit, which is most of them; this entry names
+              # one file, and a commit that edits it is rare and is exactly the commit
+              # that needs every lane. The other workflows stay out of this filter:
+              # `docs.yml` guards its own `rust-docs` job and lists itself in its own
+              # `toolchain` filter, and `fuzz.yml`, `release.yml` and
+              # `build-matrix.yml` define no job a paths filter guards.
+              # `scripts/check-toolchain-wiring.sh` check 2e reads every output of the
+              # `changes` job of every paths-filtered workflow and fails when one of them
+              # reads no filter that lists the workflow's own path.
+              - '.github/workflows/ci.yml'
               # Cargo reads `.cargo/config.toml` out of every ancestor directory of the
               # one a cargo command runs in, so this file reaches every cargo invocation
               # in this workspace and every `wasm-pack build` under it. Its
@@ -183,6 +319,13 @@ jobs:
               # own `[workspace]` table and cargo resolves this build against
               # fuzz/Cargo.lock, which `fuzz/**` above already covers.
               - 'Cargo.toml'
+              # This file itself, listed a second time because the `fuzz` output above
+              # reads this filter alone and never the `toolchain` filter, which holds
+              # the other copy. Job fuzz-build takes its `cargo check` command, its
+              # working directory and its cache group from this file, so a pull request
+              # that rewrites that command and changes nothing else would otherwise
+              # skip the one job that runs it.
+              - '.github/workflows/ci.yml'
 
   # ── Error codes ───────────────────────────────────────────────────
   error-codes:
@@ -213,6 +356,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: false
       - name: scp-node self-host create paths fail closed
         # nextest, not `cargo test`, because `cargo test <filter>` exits 0 when
         # its filter selects no test. Both tests this lane names carry
@@ -264,6 +410,9 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: false
       - name: G1 — shipped-feature-graph ⊆ permitted-production allowlist (ZERO-nullifier mandate)
         run: bash scripts/check-shipped-feature-graph.sh
 
@@ -468,6 +617,18 @@ jobs:
       - run: bash scripts/check-toolchain-wiring.sh
       - name: Run toolchain-wiring cases
         run: bash scripts/tests/toolchain-wiring/run-tests.sh
+      # The compile-steps check reads every workflow file with PyYAML, which
+      # `actions/setup-python` does not ship, so the step before it installs the library.
+      # The check holds every `Swatinem/rust-cache` step to the group shape the header
+      # comment of this file describes — a `shared-key`, a `save-if`, one writer per group
+      # and that writer on `main` — counted across every workflow, because the 10 GB cap
+      # is per repository; and it holds every uniffi-bindgen step to reading the library
+      # out of the directory its own `cargo run` writes, which is the step shape that
+      # compiled the crate graph twice in build-xcframework.sh and in build-matrix.yml.
+      - run: pip install 'pyyaml>=6,<7'
+      - run: python3.12 scripts/check-workflow-compile-steps.py
+      - name: Run workflow-compile-steps cases
+        run: bash scripts/tests/workflow-compile-steps/run-tests.sh
 
   # ── Mutable shared process-global enforcement (ADR-048, #1549 Phase 4) ──
   # Forward-prevention gates that forbid the DEFAULT_BRIDGE_INSTANCE pattern
@@ -656,6 +817,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+      # Reads the `wasm32` group typescript-wasm-check writes. This command compiles
+      # under the dev profile and that job builds under release, so what this restore
+      # supplies is the registry — the crates.io sources every dependency of these nine
+      # crates is compiled from — and not their compiled artifacts. It writes nothing:
+      # a 1-minute job that saved its own entry would hold ~200 MB of the repository's
+      # 10 GB cache budget against the entries the long jobs read.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm32
+          save-if: false
       - run: cargo check -p scp-clock -p scp-crypto -p scp-did -p scp-protocol -p scp-relay-client -p scp-mls -p scp-client -p scp-event-log -p scp-client-wasm --target wasm32-unknown-unknown
 
   wasm-test:
@@ -671,6 +842,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      # Reads the `wasm32` group typescript-wasm-check writes. `wasm-pack test` compiles
+      # scp-client-wasm under the dev profile and that job builds under release, so this
+      # restore supplies the registry rather than compiled artifacts. It writes nothing,
+      # for the reason spelled out on the same step in job wasm-protocol above.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm32
+          save-if: false
       # Pin wasm-pack to a specific version for reproducibility (via the same
       # taiki-e/install-action the nextest job uses), instead of the unpinned
       # `curl … | sh` installer that always pulls latest.
@@ -705,9 +884,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Free disk space
+      - name: Free disk space when the runner is short of it
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -715,7 +905,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # Writes the `workspace-check` group. Both `cargo clippy` commands below compile
+      # every dependency in check mode, to an `.rmeta` under a metadata hash that
+      # includes the mode, so the `workspace-debug` entry rust-test writes under build
+      # mode holds nothing this job can restore: reading that entry gave this job the
+      # registry and a `Checking` line for every one of the ~650 dependencies on every
+      # run. This job is the one that compiles the most of `target/debug` in check
+      # mode, so it is the group's producer; rust-doc reads the group for its
+      # `cargo doc`.
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-check
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run clippy
         run: |
           export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -745,34 +946,75 @@ jobs:
   # filter-key check in scripts/tests/ci-gate/ci_gate_selftest.py read only
   # job-level conditions, so neither could see it. That self-test now rejects
   # any `needs.changes.outputs.*` reference outside a job-level `if:`.
+  #
+  # ── Why this job is a 2 × 4 matrix ──────────────────────────────────────────
+  #
+  # Measured on run 34721754678, whose log line
+  # `Restored from cache key "v0-rust-rust-test-Linux-x64-…" full match: true.`
+  # makes it the one warm sample in that week's runs: the ubuntu leg spent
+  # 4 min 16 s compiling (26 `Compiling` lines — rust-cache restores the 890
+  # dependency crates and every workspace crate rebuilds, because a checkout
+  # writes each source file with the checkout's own mtime) and 6 min 43 s running
+  # 11314 tests. Execution was the larger half and it divides; compilation does
+  # not, since nextest builds every test binary before it runs any subset.
+  #
+  # `--partition count:k/4` splits the run and not the build, so four shards cost
+  # four compiles and turn 6 min 43 s of execution into 1 min 41 s. Each shard is
+  # therefore about 0.9 + 4.3 + 1.7 minutes rather than 16.8, and the union of
+  # the four shards is the same 11314 tests: nextest assigns each test to exactly
+  # one partition.
+  #
+  # Only shard 1 writes the `workspace-debug` cache. All four legs compile the
+  # same target directory, so any of them could, and naming one keeps the
+  # entry's contents decided rather than raced.
   rust-test:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    name: Rust / test (${{ matrix.os }})
+    name: Rust / test (${{ matrix.os }}, shard ${{ matrix.shard }}/4)
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        shard: [1, 2, 3, 4]
     steps:
-      - name: Free disk space (Ubuntu)
+      - name: Free disk space when the runner is short of it
         if: runner.os == 'Linux'
         run: |
-          # The full Rust workspace (657 deps, 16 crates) needs ~12GB to compile.
-          # Ubuntu runners ship with ~14GB free but pre-installed SDKs consume
-          # most of it. Remove unused toolchains to reclaim ~20GB.
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          df -h /
+          # This step used to delete four preinstalled SDK trees unconditionally,
+          # under a comment reading "Ubuntu runners ship with ~14GB free but
+          # pre-installed SDKs consume most of it". That premise is stale. The
+          # runner image these jobs get reports `/dev/root 145G 40G 105G 28% /`
+          # after the deletions (run 34721754678 and run 34750056435 both print
+          # it), so about 85 GB was free before them, against the ~12 GB this
+          # workspace needs. The deletions bought nothing and cost between 21 s
+          # and 2 min 12 s per job across the six jobs that ran them.
+          #
+          # The guarantee stays and only the work goes: the threshold below is
+          # what the removed comment claimed the runner lacked, plus room for the
+          # restored cache and the test binaries, so a future image with a
+          # smaller disk still reclaims the space and this one skips in under a
+          # second.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet
+            sudo rm -rf /usr/local/lib/android
+            sudo rm -rf /opt/ghc
+            sudo rm -rf /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard == 1 }}
       - uses: taiki-e/install-action@nextest
       - name: Run tests
         run: |
@@ -786,7 +1028,84 @@ jobs:
           # in-memory custody tests run. Mobile production builds (iOS
           # XCFramework, Android .aar) MUST NOT enable this feature.
           # See GitHub issue #88.
-          cargo nextest run --workspace --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/testing,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/testing,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/testing,scp-ffi-uniffi/outlet-capability-test-grant
+          #
+          # `--no-tests=fail` because `--partition` narrows the selection: a
+          # filter that selects nothing must fail this shard rather than report
+          # success over zero assertions, which is the zero-test defect
+          # scripts/tests/ci-gate/ci_gate_selftest.py records.
+          cargo nextest run --workspace --no-tests=fail --partition count:${{ matrix.shard }}/4 --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/testing,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/testing,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/testing,scp-ffi-uniffi/outlet-capability-test-grant
+
+  # ── Optional-feature test lanes ─────────────────────────────────────────────
+  #
+  # Three invocations that job rust-test above used to carry. Each one activates
+  # a feature `--workspace` does not, so each one recompiles its package's graph
+  # under a feature set no other command in that job builds — 2 min 53 s of
+  # compilation and 43 s of execution on the warm run cited above. Sharding
+  # rust-test four ways would have repeated all of it four times per OS.
+  #
+  # Both operating systems, for the same reason rust-test runs on both: the
+  # scp-testing lane below opens a real on-disk SQLite database across two
+  # processes and takes an `fs2` advisory file lock, whose semantics differ
+  # between Darwin and Linux, and the quic/udp lane sets socket options whose
+  # kernel behaviour differs between the two.
+  #
+  # ── Why this job gets its own cache group and does not fold into rust-test ──
+  #
+  # `-p scp-transport` resolves a different feature set than `--workspace` does,
+  # and not only for scp-transport: the resolver drops `scp-runtime/testing`,
+  # `scp-runtime/saga-witness-test-mint` and
+  # `scp-core/outlet-capability-test-grant`, then unifies third-party features
+  # over scp-transport's subgraph alone. Measured on run 34750056435's cold
+  # ubuntu leg, that reaches 247 packages for the `combined,local-cache`
+  # invocation and 90 for the scp-testing one, down to `proc-macro2`, every one
+  # of which the workspace invocation had already compiled under its own
+  # resolution.
+  #
+  # That is the reason to give this job its own `shared-key`, and it is also the
+  # reason NOT to fold these three commands into `cargo nextest run --workspace
+  # --features …,scp-transport/quic,…`. One invocation would compile each
+  # package once, and it would compile scp-transport's graph with the workspace's
+  # `testing` features ON and all six optional transport features on together.
+  # These lanes exist because that graph rotted unseen under exactly that
+  # unification — `crates/scp-transport`'s `quic` feature stopped compiling for
+  # months — and because a `--workspace` build compiles a crate's
+  # `#[cfg(not(feature = "testing"))]` items out, which is the defect
+  # `check_testing_unification_readers` in
+  # scripts/tests/ci-gate/ci_gate_selftest.py exists to catch. Folding buys the
+  # compile time back by deleting the configuration under test.
+  #
+  # The cache group buys the same time and deletes nothing: this job's own
+  # artifacts, under its own feature resolution, restore on every later run. It
+  # writes on a push to `main` because it is the only job that builds them.
+  rust-test-optional-features:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    name: Rust / test (optional features, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: transport-optional
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@nextest
+      - name: Run tests
+        run: |
+          LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            export DYLD_LIBRARY_PATH="${LIBDIR}${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+          else
+            export LD_LIBRARY_PATH="${LIBDIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          fi
           # Test scp-transport with optional features that aren't enabled by
           # --workspace (combined includes rusqlite + scp-platform; local-cache
           # enables caching logic).
@@ -823,16 +1142,29 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Free disk space
+      - name: Free disk space when the runner is short of it
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: false
       - name: Run napi tests in production config (no custody/testing features)
         run: |
           export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -874,10 +1206,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Free disk space
+      - name: Free disk space when the runner is short of it
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
@@ -885,6 +1227,9 @@ jobs:
         with:
           python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: false
       - name: Build pyo3 bridge in production config (no in-memory custody)
         run: |
           # pyo3 links libpython, so LD_LIBRARY_PATH must point at LIBDIR.
@@ -943,14 +1288,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Free disk space
+      - name: Free disk space when the runner is short of it
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: false
       - name: Build uniffi bridge in production config (no in-memory custody)
         run: |
           # Default features = production: `server` on, no `testing`.
@@ -1028,15 +1386,41 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Free disk space
+      - name: Free disk space when the runner is short of it
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # Two restores, one per compile mode this job's commands run under, and both write
+      # nothing. `cargo test --doc` links every doctest against build-mode `.rlib`s, the
+      # artifacts rust-test writes to the `workspace-debug` group; `cargo doc --no-deps`
+      # compiles every dependency to a check-mode `.rmeta`, the artifacts rust-clippy
+      # writes to the `workspace-check` group. Cargo names the two sets under different
+      # metadata hashes in the one `target/debug`, so the second restore adds to the
+      # first and overwrites nothing; each step's key names its own group, so neither
+      # restore can match the other's entry.
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-check
+          save-if: false
       - name: Run doc tests and build docs
         # `--document-private-items` is what lets this job reject a broken intra-doc
         # link written in a private module. Rustdoc resolves an intra-doc link only
@@ -1064,8 +1448,8 @@ jobs:
         # workflow passes a flag this command omits.
         run: |
           export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          cargo test --workspace --doc --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint
-          cargo doc --workspace --no-deps --document-private-items --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint
+          cargo test --workspace --doc --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant
+          cargo doc --workspace --no-deps --document-private-items --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant
 
   rust-deny:
     needs: changes
@@ -1098,8 +1482,20 @@ jobs:
       # The builder stage measures about 6 GB — 2 GB of it the pin's cross-compilation
       # targets — before the buildx cache blobs. `rust-clippy` here and all three jobs in
       # `fuzz.yml` already reclaim this space.
-      - name: Free disk space
-        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Free disk space when the runner is short of it
+        run: |
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
@@ -1166,15 +1562,29 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Free disk space
+      - name: Free disk space when the runner is short of it
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-release
+          save-if: false
       - name: Create virtualenv and install dependencies
         run: |
           python -m venv .venv
@@ -1214,13 +1624,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Free disk space
+      - name: Free disk space when the runner is short of it
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-release
+          save-if: false
       - name: Build NAPI native addon
         run: |
           # `scp-ffi-napi/testing` compiles the in-memory DHT seam
@@ -1271,15 +1695,29 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Free disk space
+      - name: Free disk space when the runner is short of it
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm32
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Pin wasm-pack for reproducibility (same version as the wasm-test job) —
       # the --release-only build guard depends on the shipped wasm being a
       # release build (ADR-057 Prereq-4).
@@ -1329,15 +1767,29 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Free disk space
+      - name: Free disk space when the runner is short of it
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm32
+          save-if: false
       - name: Install wasm-pack
         uses: taiki-e/install-action@v2
         with:
@@ -1370,10 +1822,21 @@ jobs:
       run:
         working-directory: bindings/kotlin
     steps:
-      - name: Free disk space
+      - name: Free disk space when the runner is short of it
         working-directory: /
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: actions/setup-java@v4
         with:
@@ -1420,9 +1883,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Free disk space
+      - name: Free disk space when the runner is short of it
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: actions/setup-java@v4
         with:
@@ -1443,6 +1917,9 @@ jobs:
       - run: sdkmanager "platforms;android-35"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: false
       - name: Build UniFFI native library
         run: |
           cargo build -p scp-ffi-uniffi --features testing
@@ -1504,6 +1981,9 @@ jobs:
           swift-version: "6.2"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: apple-uniffi
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build XCFramework (dev mode — macOS arm64 only)
         run: bindings/swift/build-xcframework.sh --dev
       - name: Build Swift package
@@ -1529,6 +2009,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "fuzz -> target"
+          shared-key: fuzz
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # This step names no channel. rustup applies the toolchain file of the directory a
       # command runs in, so running `cargo check` from `fuzz/` resolves
       # `fuzz/rust-toolchain.toml` and installs the nightly it names — the same
@@ -1553,9 +2035,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Free disk space
+      - name: Free disk space when the runner is short of it
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - name: Check for unresolved issue placeholders
         # Runs immediately after checkout — a 1-second grep should not wait
@@ -1589,6 +2082,9 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Python deps
         run: |
           python -m venv .venv
@@ -1651,9 +2147,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Free disk space
+      - name: Free disk space when the runner is short of it
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
         with:
@@ -1664,6 +2171,9 @@ jobs:
           java-version: "17"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-release
+          save-if: false
       - uses: gradle/actions/setup-gradle@v4
       - name: Python deps
         run: |
@@ -1739,6 +2249,9 @@ jobs:
           swift-version: "6.2"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: apple-parity
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Python deps
         run: |
           python -m venv .venv
@@ -1872,6 +2385,7 @@ jobs:
       - rust-fmt
       - rust-clippy
       - rust-test
+      - rust-test-optional-features
       - rust-test-napi-production
       - rust-build-pyo3-production
       - rust-build-uniffi-production
