@@ -18,7 +18,7 @@ The identifier does not depend on custody, because it is the inception event's d
 
 Custody migration moves the operational signing capability from one custody provider to another — a passkey to a FIDO2 token, a secure element to a self-managed key — and the identifier does not change, because the identifier is the inception event's digest and encodes no key (`09-security-model.md` §9.7.4.2 R13). An operational-key custody migration leaves the root set unchanged; case 2 below is the one case in which the root itself changes.
 
-**Case 1, Active Signing Key migration.** The controller generates a new key in the target custody provider, and the standing root signs a `KeyState` whose key list carries the new key `current` in the `#active` role and does not carry the replaced key at all (`09-security-model.md` §9.7.4.2 R3 for the kind and its signatures, and that section's definitions for what a key list names). A verifier reads the replaced key's condition by replaying the log: `Superseded` where a successor took the role, `Retired` where none did (`09-security-model.md` §9.7.4.2 R8). A `KeyState` names no key it does not list `current`, so it records no `Compromised` entry, and a `RootRecovery` is the one event that names a key `Compromised{from: N}`. A peer that observes the `KeyState` sets no standing against the identifier, because `09-security-model.md` §9.11 reserves `PendingReverify` for an observed `RootRecovery` and for a `Contested` verdict. A routine operational rotation is therefore transparent to peers.
+**Case 1, Active Signing Key migration.** The controller generates a new key in the target custody provider, and the standing root signs a `KeyState` whose key list carries the new key `current` in the `#active` role and carries the replaced key's drop entry naming its new condition — `Superseded` where the new key takes the role, `Retired` where none does (`09-security-model.md` §9.7.4.2 R3 for the kind and its signatures, R8 for what a key list names). **For a compromised `#active` the controller composes one `KeyState`** that drops the stolen key from the key list and carries that key's `Compromised{from: N}` entry, N being that `KeyState`'s own sequence, **and composes no `RootRecovery`**, because an operational-key compromise changes no root (`09-security-model.md` §9.12 step 1). That entry is what arms the first-seen test of the log-anchored evidence class (`09-security-model.md` §9.7.1), which is how a stolen `#active` stops anchoring a forged durable artifact behind the compromise. A peer that observes a migration `KeyState` sets no standing against the identifier, because `09-security-model.md` §9.11 reserves `PendingReverify` for an observed `RootRecovery` and for a `Contested` verdict. A routine operational rotation is therefore transparent to peers.
 
 **Case 2, root key change.** The root changes by a `RootRecovery`: a threshold-satisficing subset of the next set authorizes the event, a fresh root set generated under that recovery's device boundary is installed (`09-security-model.md` §9.7.4.2 R3 and R10), and the identifier does not change. Relying parties re-verify key continuity against the fresh root set (`09-security-model.md` §9.11). A planned root move that follows no compromise — a custody substrate decommissioned while its key stays unexportable — is the same event: a `RootRecovery{CoSigns}` whose key-state snapshot marks nothing compromised. Alec ruled on 2026-09-06 that the planned move is the same event as a recovery, and he gave the reason: an attacker would use a separate benign kind too, so peers could not trust the distinction.
 
@@ -30,7 +30,7 @@ Custody migration moves the operational signing capability from one custody prov
 4. **Re-sign the attestation chain.** Every identity attestation the replaced key signed is re-signed under the new key and republished (§3.5), which the SDK does as one transaction with the steps above.
 5. **Destroy the replaced key material** after confirmed publication, which `09-security-model.md` §9.7.4.2 R10 defines as durable self-retention together with acceptance by at least one relay in the fallback set. A controller that destroyed on a local signature alone would leave every party that never received the event resolving the replaced key as `current`, and the identity could then sign nothing that party accepts.
 
-**A context that watched no retirement holds no boundary.** A context whose log records no retirement Commit for the replaced `#active` holds no boundary for that key, and a member verifying content signed by that key in that context returns `ContentVerdict::Invalid{no_boundary}` (`09-security-model.md` §9.7.1 for the content rule, §9.7.4.2 R14 for the verdict type). Step 3's Updates are what create the boundary, and `09-security-model.md` §9.7.4.2 R4 admits a context the controller cannot reach.
+**A context that watched no retirement holds no boundary.** A context whose log records no retirement Commit for the replaced `#active` holds no boundary for that key, and a member verifying content signed by that key in that context returns `ContentVerdict::Invalid{no_boundary}`, the type `09-security-model.md` §9.7.1 defines together with the content rule. Step 3's Updates are what create the boundary, and `09-security-model.md` §9.7.4.2 R4 admits a context the controller cannot reach.
 
 **Invariant.** At no point during migration are there zero valid signing keys for the identity, and at no point is the service record left signed by a key no reader will accept, because step 3 republishes it under the new key before step 5 destroys the replaced one. A peer that adopted the `KeyState` before step 3's Update reaches one of its contexts waits out `LEAF_REPLACEMENT_GRACE` before it proposes Remove for the not-yet-replaced leaf (`09-security-model.md` §9.12 step 1a, §9.18.17); without that wait the overlap would evict the migrating member from its own context.
 
@@ -262,7 +262,7 @@ Verification procedure depends on the attestation class (§3.5.0).
 - Cache entries: `{ attestation_id, verified: bool, verified_at: u64, expires_at: u64 }`.
 - Class 1 attestations do not require caching, because signature verification is deterministic and fast.
 
-**Renewal intervals.** The provider registry of §3.5.1 carries the interval for every platform and is the one home of those values. A consumer SHOULD re-verify at that interval, and an attestation that is stale but not expired is degraded rather than rejected. The intervals track how fast each proof decays: an OIDC token expires and its account may be revoked, a profile bio is edited and its account suspended, a `ChallengeResponse` leaves no persistent proof at all, and a DNS record or a `.well-known` endpoint changes hands only with its domain. A `ChallengeResponse` attestation that names no platform in that registry renews at 60 days.
+**Renewal intervals.** The provider registry of §3.5.1 carries the interval for every platform. A consumer SHOULD re-verify at that interval, and an attestation that is stale but not expired is degraded rather than rejected. The intervals track how fast each proof decays: an OIDC token expires and its account may be revoked, a profile bio is edited and its account suspended, a `ChallengeResponse` leaves no persistent proof at all, and a DNS record or a `.well-known` endpoint changes hands only with its domain. A `ChallengeResponse` attestation that names no platform in that registry renews at 60 days.
 
 ### 3.5.5 Shadow Identity Claiming Protocol
 
@@ -707,16 +707,18 @@ An identity's key-event log rides in the key-event record frame `09-security-mod
 
 **Slot-exclusivity.** Once a binding-valid frame whose chain verifies establishes a slot at a routing id, that routing id is slot-exclusive:
 
-- **(a)** the relay rejects any later publish there that is not a frame passing steps 1 through 4. A chain that diverges from a stored chain passes step 4, because R9 gives a divergent suffix its own slot; a reject list naming a non-extending chain would hand the routing id to whichever party published first and leave every resolver holding one chain where the root rule needs two. R9's own condition rides with the test: at a routing id already holding `MAX_RETAINED_SUFFIXES` rank-1 suffixes, the relay rejects the further frame, records its head event's preimage digest, and reports the residue;
+- **(a)** the relay rejects any later publish there that is not a frame passing steps 1 through 4. A chain that diverges from a stored chain passes step 4, because R9 gives a divergent suffix its own slot; a reject list naming a non-extending chain would hand the routing id to whichever party published first and leave every resolver holding one chain where the root rule needs two. R9's own condition rides with the test: at a routing id already holding `MAX_RETAINED_SUFFIXES` rank-1 suffixes, the relay rejects the further frame and reports the residue;
 - **(b)** establishing the first slot evicts the opaque blobs already stored at that routing id, which clears junk pre-seeded before the identity's first publish;
 - **(c)** QUERY at that routing id returns every slot the routing id holds and nothing else, a page at a time under R9's walk, because a relay that returned one slot would decide fork precedence for the resolver;
 - **(d)** the relay rejects a client delete of any stored frame whose chain verifies. The gate is **storage-derived rather than index-derived**, because a delete addresses a blob by its own digest while the slot index is a cache a restart leaves cold: the relay re-reads the blob and refuses where it decodes as a frame whose chain recomputes to its `identifier` field and verifies. The gate runs behind the same per-address rate limit as PUBLISH and **fails closed on a storage read error**. It closes an integrity vector and not merely an availability one: an attacker deletes the genuine record, republishes a captured earlier frame carrying a genuine prefix, and a relay with nothing left to compare against stores that prefix as the whole chain.
 
 **A validating relay also stores the witness layer's two records**, at `SHA-256("scp:wit:" ‖ identifier_bytes)` and `SHA-256("scp:wcf:" ‖ identifier_bytes)` (`09-security-model.md` §9.7.4.2 R13), in the frames §9.10.12 states. It accepts one where three things hold: the signature verifies against the P-256 key that operator's community-relay-list entry declares (`18-addressability-and-deployment.md` §18.5.1); the object's `witness` names a member of the witness set the key state at that subject's head carries, on a chain the relay itself holds, so a relay holding no chain for a subject accepts no witness record for it; and the address is not already full for that pair. **The caps**, under `09-security-model.md` §9.18.17: at most one cosigned head per (subject, witness, `event_digest`), replaced only by a strictly higher `sequence`; at most `MAX_RETAINED_SUFFIXES` conflict statements per (subject, witness), evicting the lowest `observed_at` beyond that; and at most `MAX_WITNESS_SET_SIZE` × `MAX_RETAINED_SUFFIXES` objects per subject at each address, because an honest witness emits one successor per baseline and a faulty one occupies at most `MAX_RETAINED_SUFFIXES`. **The `event_digest` term is the exception to strictly-higher replacement**: a fault proof's two cosigned heads carry one `subject`, one `witness` and one `previous_cosigned_digest`, and differ in `event_digest` alone (`09-security-model.md` §9.7.4.3), so the relay keeps both, and without that term one head would replace the other and no party could assemble the pair. Both the filter and the caps are load-bearing: without the filter any party that mints an identity writes cosigned-head records for any public identifier, and without the caps a member of the standing set writes without bound. A relay an identity designates as a witness runs the one check and holds the durable per-subject state `09-security-model.md` §9.7.4.3 states.
 
-**The retention bounds and the storage budget.** A validating relay applies R9's count bound, byte bound and eviction rule per identifier, and refuses a PUBLISH that would exceed any of the three storage budgets R9 states with `IdentityError::StorageBudgetExceeded` (§3.10.10), serving every record it already holds (`09-security-model.md` §9.7.4.2 R9, §9.18.17). A relay that charges refuses an unpaid PUBLISH the same way (`19-economic-governance.md` §19.8).
+**A validating relay applies the same discipline to the service record**, at `SHA-256("scp:svc:" ‖ identifier_bytes)`. It accepts a `retain` PUBLISH there only where it holds a chain for that identifier, the record's signature verifies against the key that chain's key state designates for the service-record role (§3.10.13), and the record's sequence exceeds the one it already holds. **It keeps exactly one record per pair of identifier and designated key bytes**, replacing on a higher sequence, which is §3.10.13's settlement rule read on the relay side. Without that filter any party writes unbounded permanent blobs at any public identifier's service address, and the genuine record sits behind them at every reader's query limit.
 
-**Relay-side validation is an optional capability of SCP-native relays, and witnessing is a separate role a relay takes only where an identity designates it.** A foreign transport that cannot validate stores the frame as an opaque blob and carries content. **First contact and resolution require SCP-native listed relays**, because R11's floor counts only community-relay-list entries serving a relay proof of control, so a party whose only transport is a foreign adapter adopts no head on any first contact. A verifier still depends on no relay for correctness, because it verifies every event itself; KERI calls that property end-verifiability in `spec-body` §End-verifiable, "KERI has no security dependency on any other infrastructure".
+**The retention bounds and the declared write policy.** A validating relay applies R9's count bound, byte bound and eviction rank per identifier. It also applies the write policy it declares in `relay_config` — a rate limit, a per-identifier budget, a total budget, a price, and a proof-of-work difficulty — and refuses a PUBLISH that fails any declared term with `IdentityError::StorageBudgetExceeded{scope}` (§3.10.10), serving every record it already holds (`09-security-model.md` §9.7.4.2 R9, §9.18.17). **A rank-1 reveal-authorized event is never refused for the `Identifier` or the `Total` scope**, so an owner's recovery lands while a flood is running. The relay MAY evict a record it was not paid to hold once the identity has gone silent for `EVICTION_IDLE_INTERVALS` of its own witnessing interval, and it evicts a paid record for no budget.
+
+**Relay-side validation is an optional capability of SCP-native relays, and witnessing is a separate role a relay takes only where an identity designates it.** A relay that cannot validate rejects a PUBLISH carrying `retain: true` and stores a PUBLISH carrying no flag as an opaque blob under the shared TTL (`09-security-model.md` §9.10.12), so a foreign transport carries content and holds no retained kind. **First contact and resolution require SCP-native listed relays**, because R11's floor counts only community-relay-list entries serving a relay proof of control, so a party whose only transport is a foreign adapter adopts no head on any first contact. A verifier still depends on no relay for correctness, because it verifies every event itself; KERI calls that property end-verifiability in `spec-body` §End-verifiable, "KERI has no security dependency on any other infrastructure".
 
 **A resolver MAY QUERY any relay that stores the target identity's key-event log**, whether or not the community relay list or that identity's service record names it. What a relay outside those two sets cannot do is count toward the first-contact floor or toward the fallback set.
 
@@ -728,7 +730,7 @@ The resolution protocol runs seven steps.
 2. **QUERY in parallel** on the identity's own relays and on the fallback set. A resolver holding no accepted baseline MUST set `proof_nonce` on every query of the walk, including every page R9's walk re-issues, to 32 bytes it drew freshly for that query (`09-security-model.md` §9.10.12); a relay answers with a proof only where the query carried one, and step 5 counts an operator proven only while every page it served carried a proof the resolver verified. A resolver holding a baseline MAY omit the field. The two sets go out together and never one after the other: a resolver holding no service record knows no relay of the identity's own, and a resolver holding one still needs a relay outside that list to reach R11's second operator.
 3. **For each response**: (a) decode the frame and assemble the chain segments the slot served, trusting no framing byte; (b) recompute the identifier from the inception event and discard the response where it differs (`09-security-model.md` §9.7.4.2 R2); (c) verify every event under R3, discarding a chain that carries an author-attributable defect; (d) where the response carried a relay proof, apply the five checks `09-security-model.md` §9.7.4.2's definitions state and record whether this relay counts as a proven source.
 4. **Settle the surviving chains.** Where one chain is a prefix of another, take the longer, and discard a head of the accepted chain at a strictly lower sequence without changing accepted state (`09-security-model.md` §9.7.4.2 R12). Where two chains diverge from a shared prefix, apply fork precedence (R6) and return `Contested` where it ties (R7).
-5. **Satisfy the first-contact floor** where the resolver holds no accepted baseline, counting no relay that failed, timed out, served a chain step 3 discarded, or that step 3d did not record as a proven source. Otherwise the resolver returns `Inconclusive{SingleSource}` and adopts no head, and that payload separates the relays reached, the operators proven, and the proofs its own clock rejected (`09-security-model.md` §9.7.4.2 R11). A resolver holding an accepted baseline resolves against one relay and this step does not bind it.
+5. **Satisfy the first-contact floor** where the resolver holds no accepted baseline, **counting a relay only where it both served a chain that survived step 3 and step 3d recorded it as a proven source**, and counting distinct 33-byte operator keys rather than declared operator identifiers (`09-security-model.md` §9.7.4.2 R11). A relay that answered with an empty response failed nothing and served nothing, so it counts toward neither number. Otherwise the resolver returns `Inconclusive{SingleSource}` and adopts no head, and that payload separates the relays reached, the operators proven, and the proofs its own clock rejected (`09-security-model.md` §9.7.4.2 R11). A resolver holding an accepted baseline resolves against one relay and this step does not bind it.
 6. **Optionally read cosigned heads as evidence**, by querying `SHA-256("scp:wit:" ‖ identifier_bytes)`; a resolver that skips it returns the same key state (`09-security-model.md` §9.7.4.3).
 7. **Derive the key state** from the latest state-carrying event at or before the adopted head (`09-security-model.md` §9.7.4.2 R8) and cache it under the §9.10.7 caching policy. Resolution yields key state; the service record is resolved separately (§3.10.13).
 
@@ -740,13 +742,13 @@ The resolution protocol runs seven steps.
 
 On appending a key event the owner builds the chain from the inception event to the new head, splits it into contiguous segments each fitting one frame, publishes the frames to the identity's own relays and to the fallback set in sequence order, and submits the new head to its witness set. A relay accepts a segment whose first event's predecessor it already holds (`09-security-model.md` §9.7.4.2 R9), so a publisher that sent a later segment first has it rejected and re-sends from the last segment the relay acknowledged. Submission to a witness gates nothing: the event takes effect at each relying party the moment that party resolves the extended chain, and an identity that designates no witness skips that step (`09-security-model.md` §9.7.4.2 R10, §9.7.4.3).
 
-**A PUBLISH carrying a key-event record, a service record, a cosigned head or a conflict statement sets the wire's `retain` flag**, which is REQUIRED true at those four kinds (`09-security-model.md` §9.10.12). A validating relay retains all four under `09-security-model.md` §9.7.4.2 R9 and expires none, which is what the flag declares, so no republication cycle makes any of them permanent and the six-day cycle is deleted for all four. A relay that does not validate rejects a PUBLISH at any of the four, because it holds the address digest and never the preimage.
+**A PUBLISH carrying a key-event record, a service record, a cosigned head or a conflict statement sets the wire's `retain` flag**, which is REQUIRED true at those four kinds (`09-security-model.md` §9.10.12). A validating relay retains all four under `09-security-model.md` §9.7.4.2 R9 and expires none, which is what the flag declares, so no republication cycle makes any of them permanent and the six-day cycle is deleted for all four. A relay that does not validate rejects a PUBLISH carrying the flag, because it holds the address digest and never the preimage and can scope no retention.
 
 ### 3.10.6 Anti-Segmentation Invariant
 
-**Publishing to the fallback set is a MUST.** An identity that published only to relays of its own would be resolvable only by a party that already holds its service record, because a first-contact reader knows no relay of that identity to query, so identities would partition into islands reachable by their existing contacts and by nobody else. **A publish cycle that reached no relay in the fallback set MUST therefore be reported to the caller as a failed publication**, never as a success.
+**Publishing to the fallback set is a MUST.** An identity that published only to relays of its own would be resolvable only by a party that already holds its service record, because a first-contact reader knows no relay of that identity to query, so identities would partition into islands reachable by their existing contacts and by nobody else. **A publish cycle that no relay in the fallback set accepted MUST therefore be reported to the caller as a failed publication**, never as a success. Acceptance and not reachability is the term, because a relay at its declared budget answers the publisher and stores nothing, and `09-security-model.md` §9.7.4.2 R10 gates confirmed publication on acceptance by at least one fallback-set entry.
 
-**A relay's refusal is never a verdict about the identity**, and the publisher's recourse is the next entry of its fallback set: a relay refuses a PUBLISH that would exceed one of its storage budgets, and a charging relay refuses an unpaid one (`09-security-model.md` §9.7.4.2 R9). The recourse is mechanical because the fallback set comes from the shipped community relay list rather than from relays the identity itself chose (`18-addressability-and-deployment.md` §18.5.1).
+**A relay's refusal is never a verdict about the identity**, and the publisher's recourse is the next entry of its fallback set: a relay refuses a PUBLISH that would exceed one of its storage budgets, and a charging relay refuses an unpaid one (`09-security-model.md` §9.7.4.2 R9). The recourse is mechanical because the fallback set comes from the shipped community relay list rather than from relays the identity itself chose (`18-addressability-and-deployment.md` §18.5.1). **Where every entry of the fallback set refuses**, the SDK reports the failed publication with the scope each entry named and surfaces the entries to the controller, and a controller holding a signed reveal-authorized event retains it and resumes the ceremony from `PublishSent` when an entry accepts (`09-security-model.md` §9.7.4.2 R10). A reveal-authorized event is never refused for a storage budget, so the refusals a recovery meets are a rate limit, a price, or a proof-of-work difficulty, each of which the publisher can satisfy and retry.
 
 **A publish cycle that reached no witness MUST be reported as degraded and never as a failure.** An identity that publishes everywhere and submits to no witness is still resolvable by every stranger and keeps its `09-security-model.md` §9.11 standing at every peer (§9.7.4.3). What it gives up is portability: a cosigned head travels to a party that did not perform the read, and a peer's own relay read does not.
 
@@ -768,11 +770,11 @@ The sequence orders one chain against its own prefixes, because an event's seque
 
 ### 3.10.9 Privacy Properties
 
-A relay operator that answers a resolution learns that the resolver's network address queried one routing id, and it computes the same derivation, so it can name the identity for any identity it already knows. An identity's own relay operator learns nothing it did not already hold, because it already carries that identity's message traffic (§9.9.1). R11's floor sends a first contact's queries to community relays under distinct declared operators, so no single operator observes a whole first contact. A resolver that requires network-address anonymity takes the transport-layer measures §9.10.11 states, and the §9.10.7 caching policy bounds how often it queries at all.
+A relay operator that answers a resolution learns that the resolver's network address queried one routing id, and it computes the same derivation, so it can name the identity for any identity it already knows. An identity's own relay operator learns nothing it did not already hold, because it already carries that identity's message traffic (§9.9.1). R11's floor sends a first contact's queries to community relays under distinct operator keys, so no single operator observes a whole first contact. A resolver that requires network-address anonymity takes the transport-layer measures §9.10.11 states, and the §9.10.7 caching policy bounds how often it queries at all.
 
 ### 3.10.10 IdentityBackend, the Resolution Trait
 
-**`IdentityBackend` carries four methods and no others**, and ADR-063, the inception-derived key-event-log identity substrate, names that seam. **`IdentityBackend::resolve` is the protocol's one resolution entry point**: it takes the identifier's 32 raw digest bytes and returns a `ResolutionOutcome`, which carries key state and no document. **`IdentityBackend::read_service_record` is the one entry point for the service-record read** every resolution's relay discovery depends on (§3.10.1); it returns a `ServiceRecordVerdict`, whose three variants are `Adopted` carrying the record, `Rejected{cause}` carrying why the reader refused it, and `Absent`, and every SDK binding carries the type name and all three variant names unchanged. `publish` and `publish_service_record` each return a `PublishOutcome`. `.docs/architecture.md` cites this section for the method set and states which crate implements the seam.
+**`IdentityBackend` carries four methods and no others**, and ADR-063, the inception-derived key-event-log identity substrate, names that seam. **`IdentityBackend::resolve` is the protocol's one resolution entry point**: it takes the identifier's 32 raw digest bytes and returns a `ResolutionOutcome`, which carries key state and no document. **`IdentityBackend::read_service_record` is the one entry point for the service-record read** every resolution's relay discovery depends on (§3.10.1); it returns a `ServiceRecordVerdict`, whose four variants are `Adopted` carrying the record, `Rejected{cause}` carrying why the reader refused it, `Absent`, and `Inconclusive{cause}` where the reader holds no accepted record and cannot meet the first-contact floor on its `scp:svc:` query (§3.10.13). `publish` and `publish_service_record` each return a `PublishOutcome`. **`resolve` performs the service-record read itself**, through `read_service_record`, and the backend holds the accepted copy, so a caller never sequences two calls to resolve an identifier and calls `read_service_record` only to read the record's own entries. Every type name and every variant name below is name-bound under the criterion `09-security-model.md` §9.7.4.2's definitions state. `.docs/architecture.md` cites this section for the method set and states which crate implements the seam.
 
 ```rust
 /// Key-state resolution across the SCP relay network (§3.10.4).
@@ -799,51 +801,63 @@ pub trait IdentityBackend: Send + Sync {
 }
 
 /// The error half of every method above. A refusal the protocol mandates
-/// carries one of these variants, each registered in the `SCP-IDENT-` code
-/// range `.docs/standards/sdk-common.md` reserves, so four bindings mint one
-/// code rather than four and a caller tells a custody choice from a network
-/// condition.
+/// carries one of these variants, so four bindings mint one code rather than
+/// four and a caller tells a custody choice from a network condition.
+///
+/// The codes take `SCP-IDENT-1100` through `SCP-IDENT-1199`, the first free
+/// hundred-block of the `SCP-IDENT-` range `.docs/standards/sdk-common.md`
+/// reserves: `SCP-IDENT-1000` through `SCP-IDENT-1062` are allocated against
+/// the superseded identity model, and a redesign variant reusing one of those
+/// numbers would fire a caller's handler for a condition it never named.
 pub enum IdentityError {
-    /// SCP-IDENT-1001. No substrate satisfies the independent-residence
+    /// SCP-IDENT-1100. No substrate satisfies the independent-residence
     /// requirement of `09-security-model.md` §9.7.4.1 item 3a, so identity
     /// creation and every later reveal fail closed.
     NoIndependentSubstrate,
-    /// SCP-IDENT-1002. The SDK holds a threshold of the standing root, so it
+    /// SCP-IDENT-1101. The SDK holds a threshold of the standing root, so it
     /// refuses to sign `standing_root: Lost` (§9.7.4.2 R3).
     RootThresholdHeld,
-    /// SCP-IDENT-1003. The SDK can reach no source in the fallback set, so it
+    /// SCP-IDENT-1102. The SDK can reach no source in the fallback set, so it
     /// refuses to compose a reveal-authorized event (§9.7.4.2 R10).
     NoFallbackSourceReachable,
-    /// SCP-IDENT-1004. The SDK can observe another unpublished
-    /// reveal-authorized event or a pending handle for this identity
-    /// (§9.7.4.2 R10).
+    /// SCP-IDENT-1103. The SDK can observe, in a store of the profile's store
+    /// set, another unpublished reveal-authorized event or a pending
+    /// `RecoveryHandle` for this identity. `load_pending_recovery` reads every
+    /// store of that set, and `abort_recovery` deletes the handle from every
+    /// one of them (`09-security-model.md` §9.7.4.2 R10).
     RevealAlreadyPending,
-    /// SCP-IDENT-1005. The verifier could not persist a contested verdict, its
+    /// SCP-IDENT-1104. The verifier could not persist a contested verdict, its
     /// retained suffixes, or the accepted-head baseline (§9.7.4.2 R14).
     PersistFailed,
-    /// SCP-IDENT-1006. Every relay failed and no cached key state is fresh
+    /// SCP-IDENT-1105. Every relay failed and no cached key state is fresh
     /// enough to return (§3.10.4).
     NoRelayReachable,
-    /// SCP-IDENT-1007. A string reached an admission gate that is not the
+    /// SCP-IDENT-1106. A string reached an admission gate that is not the
     /// canonical form of an inception-derived identifier (§3.8.1).
     NonCanonicalIdentifier,
-    /// SCP-IDENT-1008. A relay refused a PUBLISH that would exceed one of the
-    /// three storage budgets it configures (`09-security-model.md`
-    /// §9.7.4.2 R9). `scope` names which one, so the publisher tells a budget
-    /// its own identity filled from one the relay filled for everyone.
+    /// SCP-IDENT-1107. A relay refused a PUBLISH that failed one term of the
+    /// write policy it declares (`09-security-model.md` §9.7.4.2 R9). `scope`
+    /// names the term, so the publisher tells a refusal it can satisfy and
+    /// retry from one that sends it to the next fallback-set entry.
     StorageBudgetExceeded { scope: BudgetScope },
 }
 
-/// Which of a validating relay's three storage budgets a refusal exceeded
-/// (`09-security-model.md` §9.7.4.2 R9). The type name and all three variant
-/// names are carried unchanged by every SDK binding.
+/// Which term of a validating relay's declared write policy a refusal failed
+/// (`09-security-model.md` §9.7.4.2 R9). A relay that declares no value for a
+/// term never returns that term's scope.
 pub enum BudgetScope {
-    /// The budget the relay holds for the published identifier.
+    /// The storage budget the relay holds for the published identifier.
     Identifier,
-    /// The budget the relay holds for the key that signed the PUBLISH.
-    Publisher,
-    /// The budget the relay holds across every identifier it stores.
+    /// The storage budget the relay holds across every identifier it stores.
     Total,
+    /// The relay's `rate_limit_publish` term.
+    RateLimit,
+    /// The relay charges for this write and the PUBLISH carried no payment
+    /// (`19-economic-governance.md` §19.8).
+    Payment,
+    /// The PUBLISH's `nonce` does not clear the relay's `pow_difficulty`
+    /// (`09-security-model.md` §9.10.12).
+    ProofOfWork,
 }
 
 /// Every resolution returns one of the six verdicts of
@@ -857,25 +871,60 @@ pub struct ResolutionOutcome {
     pub sources: ResolutionSources,
 }
 
-/// What a resolution learned about its sources. R11 counts a declared operator
-/// only where `proven` carries it.
+/// What a resolution learned about its sources, in the units R11's
+/// first-contact floor counts: 33-byte SEC1 compressed operator keys, never
+/// 32-byte declared operator identifiers.
 pub struct ResolutionSources {
     pub relays_reached: Vec<String>,
-    pub declared_operators: Vec<[u8; 32]>,
-    /// The declared operators whose relay proof of control this resolver
-    /// verified under the five checks (`09-security-model.md` §9.7.4.2 definitions).
-    pub proven: Vec<[u8; 32]>,
+    /// The operator key each entry the resolver reached declares.
+    pub declared: Vec<[u8; 33]>,
+    /// The operator key each verified relay proof of control verified under,
+    /// checked by the five checks `09-security-model.md` §9.7.4.2's
+    /// definitions state. R11's floor counts the distinct values here.
+    pub proven: Vec<[u8; 33]>,
     pub head_provenance: HeadProvenance,
+}
+
+/// What a service-record read returned (§3.10.13). `Adopted` carries the
+/// record's encoded bytes, which is the form the designated key's signature
+/// covers and the form `publish_service_record` takes.
+pub enum ServiceRecordVerdict {
+    Adopted(Vec<u8>),
+    Rejected { cause: ServiceRecordRejection },
+    Absent,
+    /// The reader holds no accepted record and could not meet the
+    /// first-contact floor on its `scp:svc:` query (§3.10.13).
+    Inconclusive { cause: InconclusiveCause },
+}
+
+/// Why a reader refused a service record it verified (§3.10.13). Each variant
+/// names one refusal that section states.
+pub enum ServiceRecordRejection {
+    /// The record carries more than `MAX_SERVICE_RECORD_ENTRIES` entries
+    /// (`09-security-model.md` §9.18.17).
+    TooManyEntries,
+    /// The record's sequence is the maximum representable value.
+    SequenceExhausted,
+    /// The record's sequence is at or below the reader's high-water mark for
+    /// this identifier and this designated key.
+    StaleSequence,
+    /// The signature does not verify against the designated key.
+    SignatureInvalid,
+    /// The reader holds two signature-valid records at one sequence.
+    Equivocation,
+    /// The identity's resolution returned `Contested`, so no adopted key state
+    /// authorizes a designation.
+    IdentityContested,
 }
 ```
 
-`ResolutionVerdict` and its six variants, `TieClass`, `InconclusiveCause` and `HeadProvenance` are the types `09-security-model.md` §9.7.4.2's definitions and R14 fix, and every SDK binding carries their names unchanged. A resolver assigns `head_provenance` from the source of the head it adopted, under the assignment those definitions state, so `TwoOperatorRead` counts operator keys and never relay URLs.
+`ResolutionVerdict` and its six variants, `TieClass`, `InconclusiveCause` and `HeadProvenance` are the types `09-security-model.md` §9.7.4.2's definitions and R14 fix. A resolver assigns `head_provenance` from the source of the head it adopted, under the assignment those definitions state, so `TwoOperatorRead` counts the distinct operator keys in `proven` and never declared operator identifiers.
 
-**The outcome carries the verdict rather than an `Option`**, because `09-security-model.md` §9.6.4 maps `Contested`, `Inconclusive` and `Invalid` to three different standings and a caller holding one absent value cannot tell them apart. **It records the declared operators and which of them proved control**, because R11 counts a source only where its proof verified and two relay URLs may sit under one operator key.
+**The outcome carries the verdict rather than an `Option`**, because `09-security-model.md` §9.6.4 maps `Contested`, `Inconclusive` and `Invalid` to three different standings and a caller holding one absent value cannot tell them apart. **It records the operator key each entry declared and the key each proof verified under**, because R11 counts a source only where its proof verified and two relay URLs, or two declared operator identifiers, may sit under one operator key.
 
 ### 3.10.11 Bootstrap and Network Growth
 
-On day one an identity publishes its chain to the community relay list and lists no relay of its own, so every first contact reads two entries of that list under distinct declared operators. As identities publish to relays of their own, a resolver holding a baseline reaches one of those first and the fallback set carries less of the load. A first contact still reads community relays whatever the identity's service record names (`09-security-model.md` §9.7.4.2 R11), so growth changes what R11's floor costs in latency and never whether an identity can meet it.
+On day one an identity publishes its chain to the community relay list and lists no relay of its own, so every first contact reads two entries of that list under distinct operator keys. As identities publish to relays of their own, a resolver holding a baseline reaches one of those first and the fallback set carries less of the load. A first contact still reads community relays whatever the identity's service record names (`09-security-model.md` §9.7.4.2 R11), so growth changes what R11's floor costs in latency and never whether an identity can meet it.
 
 ### 3.10.12 Phase Integration
 
@@ -884,7 +933,7 @@ The routing derivation is a pure function in `scp-core`; the key-event record fr
 ### 3.10.13 The Service Record
 
 
-**What the record carries.** An identity's service record carries at most `MAX_SERVICE_RECORD_ENTRIES` entries, which R3's sibling check on the record rejects it for exceeding, and a resolver opens no more concurrent queries against an identity's own relays than that cap admits; without it a signed record naming one third-party host in five thousand `SCPRelay` entries is a fan-out primitive every resolution fires. It carries every transport and service field that identity publishes: its `SCPRelay` entries, the relays holding its encrypted private state, its broadcast-context advertisements, its self-asserted capability URIs, the pointer to its context-hosted participation statements, and the pointer to its attestation revocation status (`18-addressability-and-deployment.md` §18.2.2 enumerates the entry types). Those capability URIs are the self-asserted third of what the retired `SCPCapabilities` entry carried (`18-addressability-and-deployment.md` §18.2.2A); a verifier-signed challenge-verification record is an attestation (§7.3.4), and economic metadata belongs to `19-economic-governance.md` §19.9. **The record carries no key, no key condition, and no witness parameter**: a root signature covers each of those in the key-event log, and a reader that found one here would be reading key state from a key weaker than the root. KERI draws the same line, carrying endpoint and role metadata in signed reply records outside the log (`spec-body` §Reply Message Body).
+**What the record carries.** An identity's service record carries at most `MAX_SERVICE_RECORD_ENTRIES` entries (`09-security-model.md` §9.18.17). **The record's reader is what enforces that cap**: it rejects a record carrying more entries, whatever its signature, and returns `ServiceRecordVerdict::Rejected{TooManyEntries}` (§3.10.10). The cap binds this reader and no key event, because the record is separately addressed, separately signed, and occupies no position on any chain, so `09-security-model.md` §9.7.4.2 R3 carries no service-record clause. A resolver therefore opens no more concurrent queries against an identity's own relays than the cap admits; without it a signed record naming one third-party host in five thousand `SCPRelay` entries is a fan-out primitive every resolution fires. It carries every transport and service field that identity publishes: its `SCPRelay` entries, the relays holding its encrypted private state, its broadcast-context advertisements, its self-asserted capability URIs, the pointer to its context-hosted participation statements, and the pointer to its attestation revocation status (`18-addressability-and-deployment.md` §18.2.2 enumerates the entry types). Those capability URIs are the self-asserted third of what the retired `SCPCapabilities` entry carried (`18-addressability-and-deployment.md` §18.2.2A); a verifier-signed challenge-verification record is an attestation (§7.3.4), and economic metadata belongs to `19-economic-governance.md` §19.9. **The record carries no key, no key condition, and no witness parameter**: a root signature covers each of those in the key-event log, and a reader that found one here would be reading key state from a key weaker than the root. KERI draws the same line, carrying endpoint and role metadata in signed reply records outside the log (`spec-body` §Reply Message Body).
 
 **The record's bytes.** A service record is `(identifier, sequence, entries)`, and its signature preimage is
 
@@ -898,7 +947,7 @@ under the `09-security-model.md` §9.5.1 construction: the 32-byte identifier ra
 
 **Who signs it.** The record carries a signature by the operational key the latest state-carrying key event designates for the service-record role, never by a root member. A reader verifies in two steps and never one: it verifies the key-event log under `09-security-model.md` §9.7.4.2 R2 and R3, reads the designation out of the verified chain, then verifies the record's signature against the designated key (`09-security-model.md` §9.6.3). R3 rejects a state-carrying event whose designation names a key that event does not list `current`, so the designated key is always one the current key state lists.
 
-**A reader holding no accepted service record applies the first-contact floor to the record**, setting `proof_nonce` on its `scp:svc:` query as §3.10.4 step 2 requires on the key-event one, and returns `Inconclusive{SingleSource}` where it cannot meet the floor. A single relay can serve a genuine record truncated to an older sequence exactly as it can serve a truncated chain, and such a reader holds no high-water mark to compare against.
+**A reader holding no accepted service record applies the first-contact floor to the record**, setting `proof_nonce` on its `scp:svc:` query as §3.10.4 step 2 requires on the key-event one, and returns `ServiceRecordVerdict::Inconclusive{SingleSource}` where it cannot meet the floor (§3.10.10). That verdict says the reader could not read, where `Absent` would say the identity published nothing and `Rejected` would say the reader refused a record it never verified. A single relay can serve a genuine record truncated to an older sequence exactly as it can serve a truncated chain, and such a reader holds no high-water mark to compare against.
 
 **How a reader settles two copies: last writer wins on the record's own sequence**, which is monotonic and unrelated to the log's. A reader rejects a record at the maximum representable value, so no writer exhausts the space. **The high-water mark is keyed to the pair (identifier, the 33 public-key bytes the designation resolved to)**: a mark scoped to the identifier alone would let one record written at a high sequence by a briefly held key block the controller's own recovery record forever. **The mark resets when the key state lists different bytes `current` in the designated role**, so a routine rotation resets it and the reader accepts the first record the new key signs at any sequence. The reset is sound because a root signature covers the event listing those bytes and the replaced key's holder cannot produce one. **Fork precedence does not apply here and MUST NOT be applied**: a service record has no reveal-authorized event class, so no legitimate update lowers the sequence, and two signature-valid records at one sequence are the designated key's holder equivocating. A reader holding two such records rejects both and reports the identity's transport metadata as unresolved.
 
@@ -906,11 +955,11 @@ under the `09-security-model.md` §9.5.1 construction: the 32-byte identifier ra
 
 **A reader MUST NOT route to a relay URL from a cached copy past the caching bound** of §9.10.7: it re-resolves, and where it cannot it reports the identity as unroutable. A stale service record loses an identity its reachability and costs it none of its key state, because key state comes from the log.
 
-**What changing the record costs, and what it does not.** A relay-endpoint change, a private-state relocation, and a capability-URI edit are each one service-record write signed by the designated operational key. Each appends no key event and changes no key state, so the root set stays cold across every change to an identity's transport configuration. KERI draws the same line: changing an endpoint is a reply record and not a key event. **This is the property the split exists to deliver.**
+**What changing the record costs, and what it does not.** A relay-endpoint change, a private-state relocation, and a capability-URI edit are each one service-record write signed by the designated operational key. Each appends no key event and changes no key state, so the root set stays cold across every change to an identity's transport configuration, which is the property the split exists to deliver. KERI draws the same line: changing an endpoint is a reply record and not a key event.
 
 **What an attacker holding the designated key can and cannot do.** It can substitute the relay list and re-point traffic. It cannot empty the fallback set of a first-contact resolver, which takes the whole community relay list, and it cannot change a key, a key's condition, the witness set, or the designation itself. Re-pointing is fail-closed rather than a substitution of identity, because MLS group keys and not relay reachability enforce membership. **It can also deny the identity's transport metadata**: two signature-valid records at one sequence make every reader that holds both report the metadata unresolved, under the settlement rule above. That denial reaches transport metadata and reaches no key, no condition, and no membership, and a first-contact resolver still takes the whole community relay list.
 
-**The witness layer covers the key-event log alone and covers this record not at all** (`09-security-model.md` §9.7.4.3). What defends the record against a relay serving a genuine copy truncated to an older sequence is stated here and nowhere else: the record's own signature under the designated key, its monotonic sequence read against the reader's high-water mark, the first-contact floor above, and the caching bound above.
+**The witness layer covers the key-event log alone and covers this record not at all** (`09-security-model.md` §9.7.4.3). Four things defend the record against a relay serving a genuine copy truncated to an older sequence: the record's own signature under the designated key, its monotonic sequence read against the reader's high-water mark, the first-contact floor above, and the caching bound above.
 
 ## 3.11 Identity Authentication for External Services (SCPID)
 
@@ -1185,7 +1234,7 @@ pub async fn scpid_sign(
 /// (single-use enforcement). The function checks the response against the
 /// challenge but does not track cross-request nonce state.
 pub async fn scpid_verify(
-    backend: &dyn IdentityBackend,
+    backend: &impl IdentityBackend,
     response: &ScpIdResponse,
     challenge: &ScpIdChallenge,
 ) -> Result<ScpIdAuthentication, ScpIdError>;
