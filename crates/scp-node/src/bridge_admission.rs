@@ -21,6 +21,7 @@
 
 use std::path::Path;
 
+use scp_core::bridge::BridgeStatus;
 use scp_core::bridge::registration::{
     ApprovedRegistration, BridgeRegistrationRequest, BridgeRegistry, approve_registration,
     register_bridge,
@@ -140,6 +141,28 @@ pub struct PlatformKeyRotationRecord {
     pub new_platform_key: [u8; 32],
 }
 
+/// One `SuspendBridge`, `ReactivateBridge`, or `RevokeBridge` governance
+/// action, as an operator hands it to a node.
+///
+/// Spec §12.2.2 defines those three actions and §12.2.1 the state machine they
+/// drive: `Active -> Suspended -> Active` through governance, and `Revoked` as
+/// terminal. This record carries one such action across the same process
+/// boundary [`BridgeAdmissionRecord`] carries an approved registration across,
+/// and a node applies it through `ApplicationNode::apply_bridge_status_changes`.
+///
+/// A record whose `status` a node already holds for that bridge changes
+/// nothing, so an operator leaves the file in place across restarts. A record
+/// moving a revoked bridge anywhere is refused, because §12.2.1 makes `Revoked`
+/// terminal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BridgeStatusChangeRecord {
+    /// The bridge whose lifecycle status this action moves.
+    pub bridge_id: String,
+
+    /// The status governance moved the bridge to.
+    pub status: BridgeStatus,
+}
+
 /// Reads a JSON array of admission records from `path`.
 ///
 /// # Errors
@@ -161,6 +184,18 @@ pub fn load_admission_records(
 pub fn load_rotation_records(
     path: &Path,
 ) -> Result<Vec<PlatformKeyRotationRecord>, AdmissionRecordError> {
+    load_json_array(path)
+}
+
+/// Reads a JSON array of bridge status change records from `path`.
+///
+/// # Errors
+///
+/// Returns [`AdmissionRecordError::Read`] when the file cannot be read and
+/// [`AdmissionRecordError::Parse`] when it does not parse.
+pub fn load_status_change_records(
+    path: &Path,
+) -> Result<Vec<BridgeStatusChangeRecord>, AdmissionRecordError> {
     load_json_array(path)
 }
 
@@ -325,6 +360,51 @@ mod tests {
         assert!(
             matches!(err, AdmissionRecordError::Parse { .. }),
             "expected Parse, got {err}"
+        );
+    }
+
+    #[test]
+    fn a_status_change_record_round_trips_through_json() {
+        let change = BridgeStatusChangeRecord {
+            bridge_id: "bridge-1".to_owned(),
+            status: BridgeStatus::Suspended,
+        };
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            serde_json::to_string(&vec![change.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_status_change_records(file.path()).unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].bridge_id, "bridge-1");
+        assert_eq!(loaded[0].status, BridgeStatus::Suspended);
+    }
+
+    #[test]
+    fn a_status_change_record_names_its_status_by_the_spec_string() {
+        // Spec §12.2.1 serializes the three statuses as "Active", "Suspended",
+        // and "Revoked"; an operator writes those words.
+        let loaded: Vec<BridgeStatusChangeRecord> =
+            serde_json::from_str(r#"[{"bridge_id":"b","status":"Revoked"}]"#).unwrap();
+        assert_eq!(loaded[0].status, BridgeStatus::Revoked);
+
+        let err = serde_json::from_str::<Vec<BridgeStatusChangeRecord>>(
+            r#"[{"bridge_id":"b","status":"Deleted"}]"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Deleted"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_status_change_file_reports_a_read_failure() {
+        let err = load_status_change_records(Path::new("/nonexistent/status.json")).unwrap_err();
+
+        assert!(
+            matches!(err, AdmissionRecordError::Read { .. }),
+            "expected Read, got {err}"
         );
     }
 

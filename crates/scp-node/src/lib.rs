@@ -640,7 +640,10 @@ impl<S: Storage> ApplicationNode<S> {
     /// Moves an admitted bridge to a new lifecycle status.
     ///
     /// Spec §12.2.2 drives this from `SuspendBridge`, `ReactivateBridge`, and
-    /// `RevokeBridge` governance actions. A suspended bridge answers
+    /// `RevokeBridge` governance actions, and the `scp-node` binary reaches it
+    /// through [`apply_bridge_status_changes`](Self::apply_bridge_status_changes)
+    /// when `SCP_NODE_BRIDGE_STATUS_CHANGES` names a file. A status the stored
+    /// record already holds changes nothing. A suspended bridge answers
     /// `BRIDGE_SUSPENDED` (403) and a revoked bridge answers
     /// `BRIDGE_NOT_AUTHORIZED` (401) on every endpoint. Revoking also deletes
     /// every webhook signing key stored against that bridge (§12.2.2 step 6),
@@ -733,6 +736,46 @@ impl<S: Storage> ApplicationNode<S> {
             rotated += 1;
         }
         Ok(rotated)
+    }
+
+    /// Applies every `SuspendBridge`, `ReactivateBridge`, or `RevokeBridge`
+    /// action an operator wrote to `path`, and returns how many records this
+    /// call applied.
+    ///
+    /// This is what the `scp-node` binary calls at startup when
+    /// `SCP_NODE_BRIDGE_STATUS_CHANGES` names a file, after it admits whatever
+    /// `SCP_NODE_BRIDGE_REGISTRATIONS` names and applies whatever
+    /// `SCP_NODE_BRIDGE_KEY_ROTATIONS` names, so a status decided by governance
+    /// is the last word at startup. A record naming a status the node already
+    /// holds changes nothing, so an operator leaves the file in place across
+    /// restarts; a revocation an earlier start performed therefore replays as
+    /// a no-op and does not fail the start.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::InvalidConfig`] when the file cannot be read or
+    /// parsed, and whatever [`set_bridge_status`](Self::set_bridge_status)
+    /// returns for a record a node refuses. Nothing after a failure is applied,
+    /// so an operator fixes a record and reruns.
+    pub async fn apply_bridge_status_changes(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<usize, NodeError> {
+        let records = crate::bridge_admission::load_status_change_records(path)
+            .map_err(|e| NodeError::InvalidConfig(e.to_string()))?;
+
+        let mut applied = 0_usize;
+        for record in records {
+            self.set_bridge_status(&record.bridge_id, record.status.clone())
+                .await?;
+            tracing::info!(
+                bridge_id = %record.bridge_id,
+                status = ?record.status,
+                "applied a bridge status change"
+            );
+            applied += 1;
+        }
+        Ok(applied)
     }
 
     /// Returns this node's bridge registration store behind

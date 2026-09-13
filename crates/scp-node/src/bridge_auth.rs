@@ -1196,11 +1196,16 @@ impl<S: Storage> StorageBridgeLookup<S> {
     /// deleting it would let a re-registration under the same bridge id return
     /// that bridge to `Active`.
     ///
+    /// A `status` the stored record already holds writes nothing and returns
+    /// `Ok`, including `Revoked` onto a revoked bridge: the `scp-node` binary
+    /// applies an operator's status file at every start, and a replay of a
+    /// transition an earlier start performed is no transition.
+    ///
     /// # Errors
     ///
     /// Returns [`BridgeAdmissionError::BridgeNotRegistered`] when no stored
     /// record names `bridge_id`, [`BridgeAdmissionError::BridgeRevoked`] when
-    /// that record is already revoked, and
+    /// that record is revoked and `status` is not `Revoked`, and
     /// [`BridgeAdmissionError::Storage`] when a storage write fails.
     pub async fn set_bridge_status(
         &self,
@@ -1217,6 +1222,13 @@ impl<S: Storage> StorageBridgeLookup<S> {
                 bridge_id: bridge_id.to_owned(),
             });
         };
+
+        // A replay of a transition already performed is no transition. For a
+        // revoked bridge this also covers a revocation replayed after step 6
+        // already deleted its keys.
+        if connector.status == status {
+            return Ok(());
+        }
 
         if connector.status == BridgeStatus::Revoked {
             return Err(BridgeAdmissionError::BridgeRevoked {
@@ -3646,6 +3658,16 @@ mod tests {
         // Spec 12.2.2 step 6 destroys a revoked bridge's credentials.
         assert!(lookup.find_webhook_key("pk-1").is_none());
         // Spec 12.2.1 keeps that record so a re-registration cannot revive it.
+        assert_eq!(
+            lookup.find_bridge(&bridge_id).unwrap().status,
+            BridgeStatus::Revoked
+        );
+
+        // Replaying the revocation, which a restart does, is no transition.
+        lookup
+            .set_bridge_status(&bridge_id, BridgeStatus::Revoked)
+            .await
+            .unwrap();
         assert_eq!(
             lookup.find_bridge(&bridge_id).unwrap().status,
             BridgeStatus::Revoked

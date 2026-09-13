@@ -648,6 +648,128 @@ async fn a_rotation_applied_from_an_operator_file_installs_the_incoming_key() {
     node.shutdown();
 }
 
+// ---------------------------------------------------------------------------
+// Bridge status changes reach a live request path (spec §12.2.2)
+// ---------------------------------------------------------------------------
+
+/// A status change an operator writes to the file `SCP_NODE_BRIDGE_STATUS_CHANGES`
+/// names suspends, reactivates, and revokes a bridge on a live request path.
+///
+/// This exercises the shipped entry point rather than the store method:
+/// `ApplicationNode::apply_bridge_status_changes` is what `main` calls at
+/// startup, and a status change reachable only from a test would leave a
+/// shipped node with no way to suspend or revoke a bridge, so the terminal
+/// `Revoked` state §12.2.1 defines would hold only in tests.
+#[tokio::test]
+async fn a_status_change_applied_from_an_operator_file_reaches_the_request_path() {
+    let node = ApplicationNode::dev(0).await.unwrap();
+    let operator = Operator::generate();
+    let platform = SigningKey::from_bytes(&rand_seed());
+    let approval = approved(
+        "bridge-status",
+        &operator.did,
+        "ctx-status",
+        Some(("pk-status", *platform.verifying_key().as_bytes())),
+    );
+    let bridge_id = approval.connector().bridge_id.clone();
+    node.register_bridge(approval, operator.document.clone())
+        .await
+        .unwrap();
+    let token = bearer(&operator, &bridge_id, "ctx-status");
+
+    let write_file = |status: &str| {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            serde_json::to_string(&serde_json::json!([{
+                "bridge_id": bridge_id,
+                "status": status,
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+        file
+    };
+
+    // Suspend: bearer and webhook paths both answer 403 BRIDGE_SUSPENDED.
+    let file = write_file("Suspended");
+    assert_eq!(
+        node.apply_bridge_status_changes(file.path()).await.unwrap(),
+        1
+    );
+    let suspended = bridge_app(&node)
+        .oneshot(status_request(&token))
+        .await
+        .unwrap();
+    assert_eq!(suspended.status(), StatusCode::FORBIDDEN);
+    assert!(body_text(suspended).await.contains("BRIDGE_SUSPENDED"));
+    let suspended_webhook = bridge_app(&node)
+        .oneshot(signed_webhook(&platform, "pk-status", "pk-status"))
+        .await
+        .unwrap();
+    assert_eq!(suspended_webhook.status(), StatusCode::FORBIDDEN);
+
+    // Replaying the file, which a restart does, changes nothing.
+    assert_eq!(
+        node.apply_bridge_status_changes(file.path()).await.unwrap(),
+        1
+    );
+
+    // Reactivate: §12.2.1 `Suspended -> Active` through governance.
+    let file = write_file("Active");
+    assert_eq!(
+        node.apply_bridge_status_changes(file.path()).await.unwrap(),
+        1
+    );
+    let active = bridge_app(&node)
+        .oneshot(status_request(&token))
+        .await
+        .unwrap();
+    assert_eq!(active.status(), StatusCode::OK);
+
+    // Revoke: 401 on both paths, the webhook key is gone, and a replay of the
+    // revocation is a no-op rather than a failed start.
+    let file = write_file("Revoked");
+    assert_eq!(
+        node.apply_bridge_status_changes(file.path()).await.unwrap(),
+        1
+    );
+    let revoked = bridge_app(&node)
+        .oneshot(status_request(&token))
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+    assert!(body_text(revoked).await.contains("BRIDGE_NOT_AUTHORIZED"));
+    let revoked_webhook = bridge_app(&node)
+        .oneshot(signed_webhook(&platform, "pk-status", "pk-status"))
+        .await
+        .unwrap();
+    assert_eq!(revoked_webhook.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        node.apply_bridge_status_changes(file.path()).await.unwrap(),
+        1
+    );
+
+    // §12.2.1 makes `Revoked` terminal: a file moving it back is refused.
+    let file = write_file("Active");
+    let err = node
+        .apply_bridge_status_changes(file.path())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("revoked"), "{err}");
+
+    // A file naming a bridge this node never admitted is refused.
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        file.path(),
+        r#"[{"bridge_id":"bridge-nobody","status":"Suspended"}]"#,
+    )
+    .unwrap();
+    assert!(node.apply_bridge_status_changes(file.path()).await.is_err());
+
+    node.shutdown();
+}
+
 /// A second admission naming a fresh `platform_key_id` for a bridge that
 /// already holds one is refused, so admission never leaves two live webhook
 /// keys behind (spec §12.10.6 step 1, §12.10.2 step 5).

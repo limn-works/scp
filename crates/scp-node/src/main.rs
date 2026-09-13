@@ -888,15 +888,19 @@ fn dht_gateways_from_env() -> Vec<String> {
     )
 }
 
-/// Applies the two operator-supplied bridge governance files this node reads at
-/// startup, and exits the process when it refuses either one.
+/// Applies the three operator-supplied bridge governance files this node reads
+/// at startup, and exits the process when it refuses any one of them.
 ///
 /// `SCP_NODE_BRIDGE_REGISTRATIONS` carries `RegisterBridge` approvals (spec
-/// §12.10.6 step 1) and `SCP_NODE_BRIDGE_KEY_ROTATIONS` carries
-/// `UpdateBridgePlatformKey` actions (§12.10.2 step 5). Admission runs first,
-/// because a rotation names a bridge admission installed. An operator who sets
-/// neither variable gets a node serving `/v1/scp/bridge/*` against an empty
-/// registry, which answers `BRIDGE_NOT_AUTHORIZED` (401) to every request.
+/// §12.10.6 step 1), `SCP_NODE_BRIDGE_KEY_ROTATIONS` carries
+/// `UpdateBridgePlatformKey` actions (§12.10.2 step 5), and
+/// `SCP_NODE_BRIDGE_STATUS_CHANGES` carries `SuspendBridge`,
+/// `ReactivateBridge`, and `RevokeBridge` actions (§12.2.2). Admission runs
+/// first, because a rotation and a status change both name a bridge admission
+/// installed; status changes run last, so a suspension or revocation
+/// governance decided is the last word. An operator who sets none of the
+/// three gets a node serving `/v1/scp/bridge/*` against an empty registry,
+/// which answers `BRIDGE_NOT_AUTHORIZED` (401) to every request.
 ///
 /// A record this node refuses leaves a bridge unreachable, or leaves a key an
 /// operator meant to retire still signing webhook requests, and serving on
@@ -934,6 +938,23 @@ async fn apply_bridge_governance_files<S: EncryptedStorage + 'static>(
             ),
             Err(e) => {
                 tracing::error!(error = %e, path = %path, "bridge platform key rotation failed");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Ok(path) = env::var("SCP_NODE_BRIDGE_STATUS_CHANGES") {
+        match node
+            .apply_bridge_status_changes(std::path::Path::new(&path))
+            .await
+        {
+            Ok(count) => tracing::info!(
+                count,
+                path = %path,
+                "applied bridge status changes from an operator-supplied file"
+            ),
+            Err(e) => {
+                tracing::error!(error = %e, path = %path, "bridge status change failed");
                 std::process::exit(1);
             }
         }
