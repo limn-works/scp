@@ -17,7 +17,9 @@ use axum::{
     Extension, Json, Router,
     routing::{delete, get, post},
 };
-use scp_core::bridge::shadow::{CreateShadowParams, ShadowRegistry, create_shadow};
+use scp_core::bridge::shadow::{
+    CreateShadowParams, ShadowError, ShadowRegistry, create_shadow, retire_shadow,
+};
 use scp_core::bridge::{BridgeMode, ShadowProvenanceStatus};
 use scp_core::crypto::sender_keys::SenderKeyStore;
 use serde::{Deserialize, Serialize};
@@ -67,13 +69,19 @@ pub struct BridgeState {
     /// Platform identity attestations, keyed by attestation ID.
     pub attestations: RwLock<HashMap<String, StoredAttestation>>,
 
-    /// Deleted shadows, keyed by `(context_id, bridge_id, shadow_id)`
-    /// (historical actions remain in event log).
+    /// Shadows a bridge retired, keyed by `(context_id, bridge_id, shadow_id)`.
+    ///
+    /// Retirement removes the registry record and the sender key through
+    /// [`retire_shadow`], so every lookup, count, and roster reads live shadows
+    /// only. This set exists for one answer: spec §12.10.4 makes
+    /// `DELETE /v1/scp/bridge/shadow/{shadow_id}` idempotent, so a second
+    /// delete of a shadow this bridge retired returns 204 where a shadow this
+    /// bridge never held returns 404. Re-creating a retired shadow removes its
+    /// key here. Historical actions remain in the event log.
     ///
     /// Context ID and bridge ID are both part of the key so no caller learns,
-    /// through the idempotent 204 that a delete returns for an already-deleted
-    /// shadow, that a second bridge retired a shadow — whether that bridge sits
-    /// in another context or shares this one.
+    /// through that 204, that a second bridge retired a shadow — whether that
+    /// bridge sits in another context or shares this one.
     pub deleted_shadows: RwLock<HashSet<(String, String, String)>>,
 
     /// Webhook event IDs already processed, keyed by `(bridge_id, event_id)`
@@ -112,8 +120,16 @@ pub struct BridgeState {
 pub struct EmittedMessage {
     /// Unique message ID.
     pub message_id: String,
+    /// The context the message was emitted into.
+    pub context_id: String,
+    /// The bridge that emitted it.
+    pub bridge_id: String,
     /// Shadow ID that emitted the message.
     pub shadow_id: String,
+    /// The platform's own identifier for the message, when the bridge supplied
+    /// one. A `message_edit` or `message_delete` webhook event names a message
+    /// through this identifier (spec §12.10.4).
+    pub platform_message_id: Option<String>,
     /// Message content.
     pub content: String,
     /// Content type.
@@ -491,9 +507,7 @@ async fn create_shadow_handler(
     let shadow_id = derive_shadow_id(bridge_id, &body.platform_user_id);
 
     let mut registries = bridge_state.registries.write().await;
-    // `delete_shadow_handler` retires a shadow by adding its identifier here
-    // and leaves the registry record in place, so every read below filters
-    // this set out. `status_handler` takes these two locks in this order.
+    // `status_handler` takes these two locks in this order.
     let mut deleted = bridge_state.deleted_shadows.write().await;
 
     // Ensure a registry exists for this context.
@@ -501,26 +515,14 @@ async fn create_shadow_handler(
         .entry(context_id.to_owned())
         .or_insert_with(|| ShadowRegistry::new(context_id.to_owned()));
 
-    let retirement_key = (
-        context_id.to_owned(),
-        bridge_id.to_owned(),
-        shadow_id.clone(),
-    );
-
     // Idempotency: if a shadow this bridge owns already carries this ID,
-    // return 200.
-    //
-    // A shadow this bridge retired returns here too, and this call un-retires
-    // it, because a platform user who departs and returns derives the same
-    // identifier from the same `platform_user_id`. Answering 200 while leaving
-    // the retirement in place would hand a caller a record that
-    // `status_handler` omits and `emit_message_handler` answers 404 for.
+    // return 200. Retirement removes a shadow's record, so a record found here
+    // is live.
     if let Some(existing) = registry
         .shadows()
         .iter()
         .find(|s| s.shadow_id == shadow_id && s.bridge_id == bridge_id)
     {
-        deleted.remove(&retirement_key);
         return (
             StatusCode::OK,
             Json(CreateShadowResponse {
@@ -538,39 +540,22 @@ async fn create_shadow_handler(
     // bridge, and `ShadowRegistry` holds one per-bridge limit for a whole
     // context, so it cannot express two bridges with different limits. This
     // check reads the limit governance approved for the calling bridge and
-    // counts that bridge's own shadows against it; the registry's own limit
-    // stays as a second, context-wide bound.
-    //
-    // A retired shadow is not one this bridge manages — `status_handler`
-    // leaves it out of the roster it reports — so counting it would spend a
-    // governance-granted slot on a shadow no endpoint acts on, and a bridge
-    // that creates and retires would exhaust its limit permanently.
+    // counts that bridge's own shadows against it. The registry's own
+    // per-bridge limit stays as a second bound, at the protocol default
+    // §12.4 sets (10,000 per bridge). Both counts read live shadows only,
+    // because retirement removes a shadow's record.
     let owned_shadows = registry
         .shadows()
         .iter()
-        .filter(|shadow| {
-            shadow.bridge_id == bridge_id
-                && !deleted.contains(&(
-                    context_id.to_owned(),
-                    bridge_id.to_owned(),
-                    shadow.shadow_id.clone(),
-                ))
-        })
+        .filter(|shadow| shadow.bridge_id == bridge_id)
         .count();
     if owned_shadows >= auth_ctx.bridge.max_shadows as usize {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ApiError {
-                error: format!(
-                    "bridge has reached its governance-configured shadow limit of {}",
-                    auth_ctx.bridge.max_shadows
-                ),
-                code: "BRIDGE_FORBIDDEN".to_owned(),
-            }),
-        )
-            .into_response();
+        return shadow_cap_reached(format!(
+            "bridge has reached its governance-configured shadow limit of {}",
+            auth_ctx.bridge.max_shadows
+        ))
+        .into_response();
     }
-    drop(deleted);
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -590,19 +575,45 @@ async fn create_shadow_handler(
     let mut sender_key_store = bridge_state.sender_key_store.write().await;
 
     match create_shadow(registry, &mut sender_key_store, &params) {
-        Ok((shadow, _event)) => (
-            StatusCode::CREATED,
-            Json(CreateShadowResponse {
-                shadow_id: shadow.shadow_id,
-                platform_handle: shadow.platform_handle,
-                platform_user_id: body.platform_user_id,
-                attributed_role: shadow.attributed_role,
-                created_at: shadow.created_at,
-            }),
-        )
-            .into_response(),
+        Ok((shadow, _event)) => {
+            // A platform user who departs and returns derives the same
+            // identifier from the same `platform_user_id`, so this creation
+            // ends the earlier retirement: a later delete of this shadow must
+            // retire it again rather than answer the idempotent 204.
+            deleted.remove(&(
+                context_id.to_owned(),
+                bridge_id.to_owned(),
+                shadow.shadow_id.clone(),
+            ));
+            (
+                StatusCode::CREATED,
+                Json(CreateShadowResponse {
+                    shadow_id: shadow.shadow_id,
+                    platform_handle: shadow.platform_handle,
+                    platform_user_id: body.platform_user_id,
+                    attributed_role: shadow.attributed_role,
+                    created_at: shadow.created_at,
+                }),
+            )
+                .into_response()
+        }
+        Err(e @ ShadowError::CapacityExceeded { .. }) => {
+            shadow_cap_reached(e.to_string()).into_response()
+        }
         Err(e) => ApiError::internal_error(e.to_string()).into_response(),
     }
+}
+
+/// The response spec §12.4 defines for a bridge at its shadow cap:
+/// `RATE_LIMITED` (429) "with a message indicating the shadow cap".
+fn shadow_cap_reached(message: String) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(ApiError {
+            error: message,
+            code: "RATE_LIMITED".to_owned(),
+        }),
+    )
 }
 
 /// Validates the `platform_confidence` field value.
@@ -747,23 +758,11 @@ async fn emit_message_handler(
     let bridge_id = auth_ctx.bridge_id();
 
     let registries = bridge_state.registries.read().await;
-    let deleted = bridge_state.deleted_shadows.read().await;
-
-    // A shadow this bridge retired and a shadow this bridge never owned both
-    // resolve to `None`, and both answer with one identical body, so a response
-    // never tells a caller which of those two situations it hit.
-    let retired = deleted.contains(&(
-        context_id.clone(),
-        bridge_id.to_owned(),
-        body.shadow_id.clone(),
-    ));
-    let shadow_info = if retired {
-        None
-    } else {
-        find_scoped_shadow(&registries, &context_id, bridge_id, &body.shadow_id)
-    };
+    // A shadow this bridge retired has no record, so it and a shadow this
+    // bridge never owned both resolve to `None` and answer with one identical
+    // body: a response never tells a caller which of the two it hit.
+    let shadow_info = find_scoped_shadow(&registries, &context_id, bridge_id, &body.shadow_id);
     drop(registries);
-    drop(deleted);
 
     let Some(shadow) = shadow_info else {
         return (
@@ -796,7 +795,7 @@ async fn emit_message_handler(
     };
 
     let mut sequences = bridge_state.message_sequence.write().await;
-    let counter = sequences.entry(context_id).or_insert(0);
+    let counter = sequences.entry(context_id.clone()).or_insert(0);
     *counter += 1;
     let sequence = *counter;
     drop(sequences);
@@ -805,7 +804,10 @@ async fn emit_message_handler(
 
     let emitted = EmittedMessage {
         message_id: message_id.clone(),
+        context_id,
+        bridge_id: bridge_id.to_owned(),
         shadow_id: body.shadow_id,
+        platform_message_id: body.platform_message_id,
         content: body.content,
         content_type: body.content_type,
         sequence,
@@ -847,18 +849,12 @@ async fn status_handler(
     let bridge_id = auth_ctx.bridge_id();
 
     let registries = bridge_state.registries.read().await;
-    let deleted = bridge_state.deleted_shadows.read().await;
 
     let mut shadows = Vec::new();
     if let Some(registry) = registries.get(context_id) {
+        // A retired shadow has no record, so this roster reads live shadows.
         for shadow in registry.shadows() {
-            let out_of_scope = shadow.bridge_id != bridge_id;
-            let removed = deleted.contains(&(
-                context_id.to_owned(),
-                bridge_id.to_owned(),
-                shadow.shadow_id.clone(),
-            ));
-            if out_of_scope || removed {
+            if shadow.bridge_id != bridge_id {
                 continue;
             }
             let status_str = match shadow.provenance_status {
@@ -928,63 +924,115 @@ async fn delete_shadow_handler(
     let context_id = auth_ctx.context_id().to_owned();
     let bridge_id = auth_ctx.bridge_id();
 
-    let deleted = bridge_state.deleted_shadows.read().await;
+    let mut registries = bridge_state.registries.write().await;
+    // `create_shadow_handler` takes these two locks in this order.
+    let mut deleted = bridge_state.deleted_shadows.write().await;
+    let retirement_key = (context_id.clone(), bridge_id.to_owned(), shadow_id.clone());
 
-    // Idempotent: a shadow this bridge already deleted in this context
+    // Idempotent: a shadow this bridge already retired in this context
     // returns 204. Matching on this bridge's own ID keeps a second bridge from
     // reading that 204 as proof that this bridge retired that shadow.
-    if deleted.contains(&(context_id.clone(), bridge_id.to_owned(), shadow_id.clone())) {
+    if deleted.contains(&retirement_key) {
         return StatusCode::NO_CONTENT.into_response();
     }
-    drop(deleted);
 
-    let registries = bridge_state.registries.read().await;
-    let shadow_info = find_scoped_shadow(&registries, &context_id, bridge_id, &shadow_id);
-    drop(registries);
+    let Some(registry) = registries.get_mut(&context_id) else {
+        return shadow_not_found().into_response();
+    };
+    let Some(shadow) = registry
+        .shadows()
+        .iter()
+        .find(|s| s.shadow_id == shadow_id && s.bridge_id == bridge_id)
+    else {
+        return shadow_not_found().into_response();
+    };
 
-    match shadow_info {
-        None => (
-            StatusCode::NOT_FOUND,
+    // Claimed shadows cannot be deleted.
+    if shadow.provenance_status == ShadowProvenanceStatus::Claimed {
+        return (
+            StatusCode::CONFLICT,
             Json(ApiError {
-                error: "shadow not found".to_owned(),
-                code: "SHADOW_NOT_FOUND".to_owned(),
+                error: "shadow has been claimed and cannot be deleted".to_owned(),
+                code: "SHADOW_ALREADY_CLAIMED".to_owned(),
             }),
         )
-            .into_response(),
-        Some(shadow) => {
-            // Claimed shadows cannot be deleted.
-            if shadow.provenance_status == ShadowProvenanceStatus::Claimed {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(ApiError {
-                        error: "shadow has been claimed and cannot be deleted".to_owned(),
-                        code: "SHADOW_ALREADY_CLAIMED".to_owned(),
-                    }),
-                )
-                    .into_response();
-            }
-
-            bridge_state.deleted_shadows.write().await.insert((
-                context_id,
-                bridge_id.to_owned(),
-                shadow_id,
-            ));
-
-            StatusCode::NO_CONTENT.into_response()
-        }
+            .into_response();
     }
+
+    let mut sender_key_store = bridge_state.sender_key_store.write().await;
+    if let Err(e) = retire_shadow(registry, &mut sender_key_store, bridge_id, &shadow_id) {
+        return ApiError::internal_error(e.to_string()).into_response();
+    }
+    drop(sender_key_store);
+    drop(registries);
+    deleted.insert(retirement_key);
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// The 404 every shadow endpoint answers for a shadow outside the caller's
+/// scope, whether that shadow was retired, belongs to another bridge, sits in
+/// another context, or never existed.
+fn shadow_not_found() -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ApiError {
+            error: "shadow not found".to_owned(),
+            code: "SHADOW_NOT_FOUND".to_owned(),
+        }),
+    )
 }
 
 // ---------------------------------------------------------------------------
 // Webhook handler (SCP-BCH-006)
 // ---------------------------------------------------------------------------
 
-/// Extracts the `shadow_id` field from a webhook event payload.
-fn extract_shadow_id(payload: &serde_json::Value) -> &str {
-    payload
-        .get("shadow_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
+/// Reads a string field from a webhook event payload, or `""` when absent.
+fn payload_str<'a>(payload: &'a serde_json::Value, field: &str) -> &'a str {
+    payload.get(field).and_then(|v| v.as_str()).unwrap_or("")
+}
+
+/// Names the shadow a webhook event concerns, or `None` when the payload
+/// names no shadow.
+///
+/// Spec §12.10.4 gives `message`, `presence`, `identity_update`, and
+/// `user_departed` payloads a `platform_user_id`, and a bridge derives a
+/// shadow's identifier from its own `bridge_id` and that user id
+/// ([`derive_shadow_id`]), so the payload's `shadow_id` when present and the
+/// derived identifier otherwise name the same shadow. The identifier this
+/// returns is a name, not proof of a shadow: every caller resolves it inside
+/// the signing bridge's scope, so a payload naming a shadow another bridge
+/// owns, or a shadow this bridge retired, resolves to nothing.
+fn event_shadow_id(bridge_id: &str, payload: &serde_json::Value) -> Option<String> {
+    let named = payload_str(payload, "shadow_id");
+    let platform_user_id = payload_str(payload, "platform_user_id");
+    if !named.is_empty() {
+        Some(named.to_owned())
+    } else if !platform_user_id.is_empty() {
+        Some(derive_shadow_id(bridge_id, platform_user_id))
+    } else {
+        None
+    }
+}
+
+/// Returns whether the signing bridge emitted a message into its context
+/// under `platform_message_id`.
+///
+/// A `message_edit` or `message_delete` event names the message it concerns
+/// through the platform's own identifier (spec §12.10.4), and the node acts on
+/// it only when that identifier names a message this bridge emitted into this
+/// context, so a platform cannot edit or delete another bridge's message.
+async fn bridge_emitted_message(
+    bridge_state: &BridgeState,
+    context_id: &str,
+    bridge_id: &str,
+    platform_message_id: &str,
+) -> bool {
+    bridge_state.messages.read().await.iter().any(|m| {
+        m.context_id == context_id
+            && m.bridge_id == bridge_id
+            && m.platform_message_id.as_deref() == Some(platform_message_id)
+    })
 }
 
 /// Constructs a webhook rejection response (accepted: false).
@@ -1020,72 +1068,74 @@ async fn process_webhook_event(
     event_type: &str,
     payload: &serde_json::Value,
 ) -> Option<String> {
-    // `dispatch` records whether this event reached a shadow the signing
-    // platform owns, which decides whether the node notifies outbound webhook
-    // targets for the authenticated context.
-    let mut dispatch = false;
-
+    // Every event type spec §12.10.4 defines names either a shadow or a
+    // message, and the node acts on an event only when that shadow or message
+    // belongs to the signing bridge in the authenticated context. An event
+    // that names neither carries nothing this node can act on in scope, so it
+    // is rejected rather than forwarded under the bridge's authority.
     match event_type {
-        "message" => {
-            let shadow_id = extract_shadow_id(payload);
-            if shadow_id.is_empty() {
-                return Some("payload.shadow_id is required for message events".to_owned());
-            }
+        "message" | "presence" | "identity_update" => {
+            let Some(shadow_id) = event_shadow_id(bridge_id, payload) else {
+                return Some(format!("shadow not found for {event_type}"));
+            };
             let registries = bridge_state.registries.read().await;
-            let shadow_info = find_scoped_shadow(&registries, context_id, bridge_id, shadow_id);
+            let found = find_scoped_shadow(&registries, context_id, bridge_id, &shadow_id);
             drop(registries);
-            if shadow_info.is_none() {
-                return Some("shadow not found".to_owned());
-            }
-            dispatch = true;
-        }
-        "identity_update" => {
-            let shadow_id = extract_shadow_id(payload);
-            if !shadow_id.is_empty() {
-                let registries = bridge_state.registries.read().await;
-                let shadow_info = find_scoped_shadow(&registries, context_id, bridge_id, shadow_id);
-                drop(registries);
-                if shadow_info.is_none() {
-                    return Some("shadow not found for identity_update".to_owned());
-                }
-                dispatch = true;
+            if found.is_none() {
+                return Some(format!("shadow not found for {event_type}"));
             }
         }
         "user_departed" => {
-            let shadow_id = extract_shadow_id(payload);
-            if !shadow_id.is_empty() {
-                // Confirm the shadow belongs to this bridge in this context
-                // before deleting it.
-                let registries = bridge_state.registries.read().await;
-                let shadow_info = find_scoped_shadow(&registries, context_id, bridge_id, shadow_id);
-                drop(registries);
-                if shadow_info.is_none() {
+            let Some(shadow_id) = event_shadow_id(bridge_id, payload) else {
+                return Some("shadow not found for user_departed".to_owned());
+            };
+            // Retire it exactly as `delete_shadow_handler` does, under the
+            // same locks in the same order: the record and sender key go, and
+            // the retirement key answers a later idempotent delete.
+            // `retire_shadow` matches on this bridge's id, so a shadow outside
+            // its scope, or one already retired, is not found.
+            let mut registries = bridge_state.registries.write().await;
+            let mut deleted = bridge_state.deleted_shadows.write().await;
+            let Some(registry) = registries.get_mut(context_id) else {
+                return Some("shadow not found for user_departed".to_owned());
+            };
+            let mut sender_key_store = bridge_state.sender_key_store.write().await;
+            match retire_shadow(registry, &mut sender_key_store, bridge_id, &shadow_id) {
+                Ok(_) => {}
+                Err(ShadowError::ShadowNotFound { .. }) => {
                     return Some("shadow not found for user_departed".to_owned());
                 }
-
-                bridge_state.deleted_shadows.write().await.insert((
-                    context_id.to_owned(),
-                    bridge_id.to_owned(),
-                    shadow_id.to_owned(),
+                Err(e) => return Some(format!("shadow retirement failed: {e}")),
+            }
+            drop(sender_key_store);
+            drop(registries);
+            deleted.insert((context_id.to_owned(), bridge_id.to_owned(), shadow_id));
+        }
+        "message_edit" | "message_delete" => {
+            let platform_message_id = payload_str(payload, "platform_message_id");
+            if platform_message_id.is_empty() {
+                return Some(format!(
+                    "payload.platform_message_id is required for {event_type} events"
                 ));
-                dispatch = true;
+            }
+            if !bridge_emitted_message(bridge_state, context_id, bridge_id, platform_message_id)
+                .await
+            {
+                return Some(format!("message not found for {event_type}"));
             }
         }
-        // presence, message_edit, message_delete are accepted but
-        // don't require specific state changes in the current impl.
-        _ => {
-            dispatch = true;
-        }
+        // `webhook_handler` checks `event_type` against `VALID_EVENT_TYPES`
+        // first, so this arm answers only a type that list gains before this
+        // match does, and it fails closed.
+        other => return Some(format!("unknown event_type: {other}")),
     }
 
-    // Dispatch outbound webhook for processed events, always to the
-    // authenticated context.
-    if dispatch {
-        bridge_state
-            .webhook_dispatcher
-            .dispatch_event(context_id, event_type, payload.clone())
-            .await;
-    }
+    // Every event that reached a shadow or message the signing bridge owns
+    // notifies the outbound webhook targets of the authenticated context.
+    bridge_state
+        .webhook_dispatcher
+        .dispatch_event(context_id, event_type, payload.clone())
+        .await;
 
     None
 }
@@ -1485,8 +1535,61 @@ mod tests {
             .oneshot(create_shadow_request_for("user-two"))
             .await
             .expect("test");
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        assert_eq!(response_json(resp).await["code"], "BRIDGE_FORBIDDEN");
+        // Spec §12.4: at the cap, creation answers RATE_LIMITED (429).
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response_json(resp).await["code"], "RATE_LIMITED");
+    }
+
+    #[tokio::test]
+    async fn a_retired_shadow_frees_its_slot_under_the_registry_limit() {
+        // The registry's own per-bridge bound (the protocol default) reads
+        // live shadows, so a bridge that creates and retires over its life
+        // never exhausts it.
+        let state = Arc::new(BridgeState::new());
+        state.registries.write().await.insert(
+            "ctx-test-001".to_owned(),
+            ShadowRegistry::with_limits("ctx-test-001".to_owned(), 1, 10),
+        );
+
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(create_shadow_request_for("user-one"))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(create_shadow_request_for("user-two"))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response_json(resp).await["code"], "RATE_LIMITED");
+
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(delete_shadow_request("shadow:bridge-test-001:user-one"))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(
+            state.registries.read().await["ctx-test-001"]
+                .shadows()
+                .is_empty(),
+            "retirement must remove the registry record"
+        );
+        assert!(
+            state
+                .sender_key_store
+                .read()
+                .await
+                .get("ctx-test-001", "shadow:bridge-test-001:user-one")
+                .is_none(),
+            "retirement must remove the sender key"
+        );
+
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(create_shadow_request_for("user-two"))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::CREATED);
     }
 
     #[tokio::test]
@@ -1512,14 +1615,38 @@ mod tests {
             .expect("test");
         assert_eq!(response_json(resp).await["shadow_count"], 0);
 
-        // Re-creating the same platform user derives the same identifier, and
-        // the 200 this returns must name a shadow the other endpoints see.
+        // Re-creating the same platform user derives the same identifier.
+        // Retirement removed the record, so this is a creation (201), and the
+        // shadow it returns must be one the other endpoints see.
         let resp = test_app(Arc::clone(&state))
             .oneshot(create_shadow_request_for("user-one"))
             .await
             .expect("test");
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::CREATED);
         assert_eq!(response_json(resp).await["shadow_id"], shadow_id);
+
+        // A shadow re-created after retirement is live: a message goes through
+        // and a second delete retires it again instead of answering the
+        // idempotent 204 for the earlier retirement.
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(message_request(serde_json::json!({
+                "shadow_id": shadow_id,
+                "content": "back again",
+                "content_type": "text/plain"
+            })))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(delete_shadow_request(shadow_id))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(
+            state.registries.read().await["ctx-test-001"]
+                .shadows()
+                .is_empty()
+        );
 
         let resp = test_app(Arc::clone(&state))
             .oneshot(status_request())
@@ -2091,13 +2218,14 @@ mod tests {
     #[tokio::test]
     async fn webhook_deduplication() {
         let state = Arc::new(BridgeState::new());
+        let shadow_id = create_test_shadow(&state).await;
 
         let app = test_app(Arc::clone(&state));
         let req = webhook_request(serde_json::json!({
             "event_type": "presence",
             "event_id": "evt-dedup-001",
             "timestamp": 1_700_000_500,
-            "payload": {}
+            "payload": { "shadow_id": shadow_id }
         }));
         let resp = app.oneshot(req).await.expect("test");
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2158,13 +2286,193 @@ mod tests {
         let json = response_json(resp).await;
         assert_eq!(json["accepted"], true);
 
-        // Verify shadow was deleted in the authenticated context.
+        // Verify shadow was retired in the authenticated context: the record is
+        // gone and a later delete answers the idempotent 204.
+        assert!(
+            state.registries.read().await["ctx-test-001"]
+                .shadows()
+                .is_empty()
+        );
         let deleted = state.deleted_shadows.read().await;
         assert!(deleted.contains(&(
             "ctx-test-001".to_owned(),
             "bridge-test-001".to_owned(),
             shadow_id
         )));
+    }
+
+    #[tokio::test]
+    async fn webhook_message_rejects_a_shadow_this_bridge_retired() {
+        let state = Arc::new(BridgeState::new());
+        let shadow_id = create_test_shadow(&state).await;
+
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(delete_shadow_request(&shadow_id))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // The JWT sibling answers 404 for this shadow, and the webhook path
+        // must give the same answer.
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(message_request(serde_json::json!({
+                "shadow_id": shadow_id,
+                "content": "x",
+                "content_type": "text/plain"
+            })))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        for event_type in ["message", "presence", "identity_update", "user_departed"] {
+            let resp = test_app(Arc::clone(&state))
+                .oneshot(webhook_request(serde_json::json!({
+                    "event_type": event_type,
+                    "event_id": format!("evt-retired-{event_type}"),
+                    "timestamp": 1_700_000_500,
+                    "payload": { "shadow_id": shadow_id, "content": "x" }
+                })))
+                .await
+                .expect("test");
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                response_json(resp).await["accepted"],
+                false,
+                "a {event_type} event for a retired shadow must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn webhook_shadow_events_reject_a_payload_naming_no_shadow() {
+        let state = Arc::new(BridgeState::new());
+        create_test_shadow(&state).await;
+
+        for event_type in ["message", "presence", "identity_update", "user_departed"] {
+            let resp = test_app(Arc::clone(&state))
+                .oneshot(webhook_request(serde_json::json!({
+                    "event_type": event_type,
+                    "event_id": format!("evt-noshadow-{event_type}"),
+                    "timestamp": 1_700_000_500,
+                    "payload": { "status": "online" }
+                })))
+                .await
+                .expect("test");
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                response_json(resp).await["accepted"],
+                false,
+                "a {event_type} event naming no shadow must be rejected"
+            );
+        }
+        assert!(state.deleted_shadows.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn webhook_resolves_a_shadow_from_its_platform_user_id() {
+        // Spec §12.10.4 payloads carry `platform_user_id`; the node derives the
+        // shadow the way the bridge did when it created it.
+        let state = Arc::new(BridgeState::new());
+        let shadow_id = create_test_shadow(&state).await;
+
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(webhook_request(serde_json::json!({
+                "event_type": "presence",
+                "event_id": "evt-presence-by-user",
+                "timestamp": 1_700_000_500,
+                "payload": { "platform_user_id": "user-emitter-001", "status": "online" }
+            })))
+            .await
+            .expect("test");
+        assert_eq!(response_json(resp).await["accepted"], true);
+
+        // A user id another bridge's shadow was derived from resolves to
+        // nothing under this bridge.
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(webhook_request(serde_json::json!({
+                "event_type": "user_departed",
+                "event_id": "evt-depart-by-user",
+                "timestamp": 1_700_000_500,
+                "payload": { "platform_user_id": "user-emitter-001", "reason": "left" }
+            })))
+            .await
+            .expect("test");
+        assert_eq!(response_json(resp).await["accepted"], true);
+        assert!(
+            !state.registries.read().await["ctx-test-001"]
+                .shadows()
+                .iter()
+                .any(|s| s.shadow_id == shadow_id),
+            "user_departed by platform_user_id must retire the derived shadow"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_message_edit_and_delete_require_a_message_this_bridge_emitted() {
+        let state = Arc::new(BridgeState::new());
+        let shadow_id = create_test_shadow(&state).await;
+
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(message_request(serde_json::json!({
+                "shadow_id": shadow_id,
+                "content": "original",
+                "content_type": "text/plain",
+                "platform_message_id": "msg_ext_1"
+            })))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        for event_type in ["message_edit", "message_delete"] {
+            // The message this bridge emitted: accepted.
+            let resp = test_app(Arc::clone(&state))
+                .oneshot(webhook_request(serde_json::json!({
+                    "event_type": event_type,
+                    "event_id": format!("evt-own-{event_type}"),
+                    "timestamp": 1_700_000_500,
+                    "payload": { "platform_message_id": "msg_ext_1" }
+                })))
+                .await
+                .expect("test");
+            assert_eq!(response_json(resp).await["accepted"], true);
+
+            // A message nobody emitted through this bridge: rejected.
+            let resp = test_app(Arc::clone(&state))
+                .oneshot(webhook_request(serde_json::json!({
+                    "event_type": event_type,
+                    "event_id": format!("evt-foreign-{event_type}"),
+                    "timestamp": 1_700_000_500,
+                    "payload": { "platform_message_id": "msg_ext_other" }
+                })))
+                .await
+                .expect("test");
+            assert_eq!(response_json(resp).await["accepted"], false);
+
+            // No identifier at all: rejected.
+            let resp = test_app(Arc::clone(&state))
+                .oneshot(webhook_request(serde_json::json!({
+                    "event_type": event_type,
+                    "event_id": format!("evt-empty-{event_type}"),
+                    "timestamp": 1_700_000_500,
+                    "payload": {}
+                })))
+                .await
+                .expect("test");
+            assert_eq!(response_json(resp).await["accepted"], false);
+        }
+
+        // Another bridge in the same context cannot name this bridge's message.
+        let app_b = test_app_for(Arc::clone(&state), "bridge-b", "ctx-test-001");
+        let resp = app_b
+            .oneshot(webhook_request(serde_json::json!({
+                "event_type": "message_edit",
+                "event_id": "evt-cross-bridge-edit",
+                "timestamp": 1_700_000_500,
+                "payload": { "platform_message_id": "msg_ext_1" }
+            })))
+            .await
+            .expect("test");
+        assert_eq!(response_json(resp).await["accepted"], false);
     }
 
     #[tokio::test]
@@ -2182,17 +2490,24 @@ mod tests {
         .iter()
         .enumerate()
         {
-            // For message event, we need a shadow; for others, just empty payload.
-            let shadow_id = if *event_type == "message" {
-                create_test_shadow(&state).await
-            } else {
-                String::new()
-            };
-
-            let payload = if *event_type == "message" {
-                serde_json::json!({ "shadow_id": shadow_id, "content": "test" })
-            } else {
-                serde_json::json!({})
+            // Every event names a shadow or a message this bridge owns, because
+            // the node acts on nothing outside the signing bridge's scope.
+            let shadow_id = create_test_shadow(&state).await;
+            let payload = match *event_type {
+                "message_edit" | "message_delete" => {
+                    let resp = test_app(Arc::clone(&state))
+                        .oneshot(message_request(serde_json::json!({
+                            "shadow_id": shadow_id,
+                            "content": "test",
+                            "content_type": "text/plain",
+                            "platform_message_id": format!("msg-{i}")
+                        })))
+                        .await
+                        .expect("test");
+                    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+                    serde_json::json!({ "platform_message_id": format!("msg-{i}") })
+                }
+                _ => serde_json::json!({ "shadow_id": shadow_id, "content": "test" }),
             };
 
             let app = test_app(Arc::clone(&state));
@@ -2293,13 +2608,13 @@ mod tests {
         assert_eq!(shadows.len(), 1);
         assert_eq!(shadows[0]["shadow_id"], shadow_id);
 
-        // 5. Webhook event (presence).
+        // 5. Webhook event (presence) for the shadow this bridge created.
         let app = test_app(Arc::clone(&state));
         let req = webhook_request(serde_json::json!({
             "event_type": "presence",
             "event_id": "evt-lifecycle-001",
             "timestamp": 1_700_001_500,
-            "payload": {}
+            "payload": { "shadow_id": shadow_id }
         }));
         let resp = app.oneshot(req).await.expect("test");
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2729,14 +3044,14 @@ mod tests {
     async fn webhook_ignores_a_context_id_supplied_in_the_payload() {
         let (state, shadow_a, _shadow_b) = two_context_state().await;
 
-        // A `presence` event carries no shadow, and the payload names context B.
+        // The payload names context B alongside bridge A's own shadow.
         // Dispatch must still target the authenticated context A.
         let app = test_app_for(Arc::clone(&state), "bridge-a", "ctx-a");
         let req = webhook_request(serde_json::json!({
             "event_type": "presence",
             "event_id": "evt-payload-context",
             "timestamp": 1_700_000_500,
-            "payload": { "context_id": "ctx-b", "status": "online" },
+            "payload": { "context_id": "ctx-b", "shadow_id": shadow_a, "status": "online" },
         }));
         let resp = app.oneshot(req).await.expect("test");
         assert_eq!(resp.status(), StatusCode::OK);
