@@ -1,0 +1,87 @@
+# Measures how long a cold compile of the Rust workspace takes, and where the time goes.
+#
+# WHY IT EXISTS. `ci.yml`'s `rust-test` job reports one `Finished ... in Xm Ys` line per
+# cargo invocation and nothing about which unit cost what, so an engineer reducing compile
+# time cannot tell a 40-second dependency from a 2-second one. `cargo build --timings`
+# writes a per-unit table and a concurrency plot. This workflow runs the same four cargo
+# invocations `rust-test` runs, each under `--timings=html,json`, and uploads the reports.
+#
+# WHY IT IS COLD. It installs no `Swatinem/rust-cache` step, so every run compiles the
+# whole dependency graph from scratch. The cache-miss path is the number this workflow
+# exists to measure.
+#
+# WHEN IT RUNS. On a push to a branch whose name starts with `perf/`, and on manual
+# dispatch. It never runs on `main`, on a pull request, or in the merge queue, and no job
+# in `ci.yml` lists it under `needs:`, so it gates nothing and blocks no merge.
+name: Compile timings
+
+on:
+  push:
+    branches:
+      - "perf/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The feature list `ci.yml`'s `rust-test` job passes to `cargo nextest run --workspace`.
+  # Keep it identical to that job's list, or the timings measure a different graph.
+  TEST_FEATURES: scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant
+
+jobs:
+  timings:
+    name: Cold compile timings (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Report the compiler this job resolved
+        run: |
+          rustc --version
+          cargo --version
+          nproc
+      - name: Measure each cargo invocation the rust-test job runs
+        run: |
+          set -euo pipefail
+          LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+          export LD_LIBRARY_PATH="${LIBDIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          mkdir -p timings
+
+          # `cargo build --all-targets` compiles what `cargo nextest run` compiles: this
+          # workspace declares no `[[bench]]` target, so `--all-targets` adds nothing
+          # nextest leaves out. Building instead of running separates compile time from
+          # test-execution time, which is what this workflow measures.
+          measure() {
+            local label="$1"; shift
+            rm -rf target/cargo-timings
+            /usr/bin/time -f "${label} wall %e s" cargo build "$@" --timings=html,json
+            mkdir -p "timings/${label}"
+            cp target/cargo-timings/cargo-timing.html "timings/${label}/timing.html"
+            cp target/cargo-timings/cargo-timing.json "timings/${label}/timing.json"
+          }
+
+          measure workspace-test --workspace --all-targets --features "$TEST_FEATURES"
+          measure transport-combined -p scp-transport --all-targets --features combined,local-cache
+          measure transport-network -p scp-transport --all-targets --features quic,http3,udp,coap
+          measure testing-sqlite -p scp-testing --tests --features sqlite
+
+          df -h /
+      - name: Summarise the reports
+        if: always()
+        run: python3 scripts/summarize-cargo-timings.py timings
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cargo-timings
+          path: timings/
+          retention-days: 30
