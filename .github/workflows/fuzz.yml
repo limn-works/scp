@@ -167,10 +167,35 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo +${{ needs.toolchain.outputs.channel }} install cargo-fuzz --locked
 
+      # Cargo cache groups for this workflow. The 10 GB cache cap is per repository, so
+      # these entries compete with the six groups ci.yml writes (its header comment lists
+      # them); before this block, one nightly run plus one weekly run wrote eighteen
+      # entries, one per matrix leg, each a separate copy of the same compiled
+      # dependencies, and every one on `refs/heads/main`, where GitHub's least-recently-
+      # used eviction reads them as fresher than the ci.yml entries every pull request
+      # needs. Two groups replace the eighteen, named by what a job writes:
+      #
+      #   fuzz-run      `fuzz/target/<host triple>/release`, compiled by `cargo fuzz run`
+      #                 with cargo-fuzz's default RUSTFLAGS (AddressSanitizer, coverage,
+      #                 `-Cdebug-assertions`, `-Coverflow-checks`). Every leg of
+      #                 fuzz-nightly and of fuzz-weekly. The writer is fuzz-nightly's
+      #                 `fuzz_outer_envelope` leg; every other leg reads.
+      #   fuzz-run-opt  the same directory, compiled by `cargo fuzz run -O`, whose
+      #                 RUSTFLAGS drop the assertion flags. Cargo writes both flag sets to
+      #                 the same file names and rebuilds every artifact whose fingerprint
+      #                 disagrees, so a job in one group restoring the other group's entry
+      #                 would recompile everything it restored. fuzz-mls-decrypt alone,
+      #                 which writes it.
+      #
+      # Neither group is ci.yml's `fuzz` group: that job runs `cargo check` under the dev
+      # profile into `fuzz/target/debug`, a directory cargo shares nothing with.
+      # `scripts/check-workflow-compile-steps.py` holds every rust-cache step to this
+      # shape: a `shared-key`, a `save-if`, and one writer per group, on main.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "fuzz -> target"
-          key: fuzz-${{ matrix.target }}
+          shared-key: fuzz-run
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.target == 'fuzz_outer_envelope' }}
 
       - name: Restore corpus cache
         uses: actions/cache/restore@v4
@@ -263,10 +288,13 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo +${{ needs.toolchain.outputs.channel }} install cargo-fuzz --locked
 
+      # Group `fuzz-run-opt`: this job alone, because its `-O` changes the RUSTFLAGS
+      # (see the group comment on job fuzz-nightly). This job writes the group.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "fuzz -> target"
-          key: fuzz-mls-decrypt
+          shared-key: fuzz-run-opt
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Restore corpus cache
         uses: actions/cache/restore@v4
@@ -379,10 +407,14 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo +${{ needs.toolchain.outputs.channel }} install cargo-fuzz --locked
 
+      # Reads group `fuzz-run`, which fuzz-nightly writes every night (see the group
+      # comment on that job). Every leg here reads and none writes: the six targets
+      # this job fuzzes are six of the eleven fuzz-nightly builds with the same flags.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "fuzz -> target"
-          key: fuzz-weekly-${{ matrix.target }}
+          shared-key: fuzz-run
+          save-if: false
 
       - name: Restore corpus cache
         uses: actions/cache/restore@v4

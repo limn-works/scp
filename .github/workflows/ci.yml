@@ -58,8 +58,18 @@ env:
 #   apple-uniffi      `target/aarch64-apple-darwin/release` — swift-build-test.
 #   apple-parity      that directory plus `target/release` — bridge-parity-swift, the
 #                     one job that builds both the UniFFI dylib and the PyO3 module.
-#   fuzz              `fuzz/target` — fuzz-build, which compiles a separate workspace on
-#                     the nightly `fuzz/rust-toolchain.toml` names.
+#   fuzz              `fuzz/target/debug` — fuzz-build, whose `cargo check` compiles a
+#                     separate workspace on the nightly `fuzz/rust-toolchain.toml`
+#                     names, under the dev profile.
+#
+# The cap is per repository, so `.github/workflows/fuzz.yml` counts against the same
+# 10 GB: it writes two further groups, `fuzz-run` and `fuzz-run-opt`, both holding
+# `fuzz/target/<host triple>/release` under `cargo fuzz run`'s RUSTFLAGS (its group
+# comment on job fuzz-nightly says why two). Eight groups per generation across the two
+# workflows, where the two together wrote thirty-six entries before.
+# `scripts/check-workflow-compile-steps.py`, run by job toolchain-wiring, fails any
+# rust-cache step in any workflow that names no `shared-key` or no `save-if`, and any
+# group with zero or with two writers or with a writer off `main`.
 #
 # WHICH JOB IN A GROUP WRITES. Exactly one, named below as the group's producer, and
 # every other member carries `save-if: false`. The first job to reach its post step wins
@@ -561,6 +571,18 @@ jobs:
       - run: bash scripts/check-toolchain-wiring.sh
       - name: Run toolchain-wiring cases
         run: bash scripts/tests/toolchain-wiring/run-tests.sh
+      # The compile-steps check reads every workflow file with PyYAML, which
+      # `actions/setup-python` does not ship, so the step before it installs the library.
+      # The check holds every `Swatinem/rust-cache` step to the group shape the header
+      # comment of this file describes — a `shared-key`, a `save-if`, one writer per group
+      # and that writer on `main` — counted across every workflow, because the 10 GB cap
+      # is per repository; and it holds every uniffi-bindgen step to reading the library
+      # out of the directory its own `cargo run` writes, which is the step shape that
+      # compiled the crate graph twice in build-xcframework.sh and in build-matrix.yml.
+      - run: pip install 'pyyaml>=6,<7'
+      - run: python3.12 scripts/check-workflow-compile-steps.py
+      - name: Run workflow-compile-steps cases
+        run: bash scripts/tests/workflow-compile-steps/run-tests.sh
 
   # ── Mutable shared process-global enforcement (ADR-048, #1549 Phase 4) ──
   # Forward-prevention gates that forbid the DEFAULT_BRIDGE_INSTANCE pattern

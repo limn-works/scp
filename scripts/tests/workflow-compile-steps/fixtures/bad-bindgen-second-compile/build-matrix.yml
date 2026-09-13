@@ -1,0 +1,13 @@
+# The shape build-xcframework.sh and the Swift job of build-matrix.yml carried: step 1
+# builds under --release --target, and the bindgen `cargo run` passes neither flag.
+name: Bad
+on: push
+jobs:
+  swift:
+    runs-on: macos-26
+    steps:
+      - run: cargo build --release --target aarch64-apple-darwin -p scp-ffi-uniffi
+      - run: |
+          cargo run -p scp-ffi-uniffi --bin uniffi-bindgen -- generate \
+            --library target/aarch64-apple-darwin/release/libscp_ffi_uniffi.dylib \
+            --language swift

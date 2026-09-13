@@ -12,14 +12,34 @@ repository, evicted each other.
 
 ## Rules
 
-- **Count the entries a workflow writes against the 10 GB a repository gets.**
+- **Count the entries every workflow writes against the 10 GB a repository gets.**
   `Swatinem/rust-cache` defaults `add-job-id-key` to true, so each step writes its own
   entry holding its own copy of the same compiled dependencies. Measured on 2026-09-13,
   this repository held 26 entries totalling 13.4 GB against a 10 GB cap, so GitHub was
   evicting least-recently-used entries faster than the runs wrote them, and a job's hit or
   miss depended on which eviction had run last. `gh api repos/<owner>/<repo>/actions/cache/usage`
   prints the total and `gh api "repos/<owner>/<repo>/actions/caches?per_page=100"` lists
-  every entry with its ref, its size, and when something last read it.
+  every entry with its ref, its size, and when something last read it. The cap is per
+  repository and not per workflow: the first version of this change sized `ci.yml` alone
+  and left `fuzz.yml` writing eighteen per-matrix-leg entries per nightly-plus-weekly
+  generation, all on `refs/heads/main` because a scheduled run's ref is the default
+  branch, and all read fresh every night, so least-recently-used eviction would have
+  removed the six `ci.yml` groups before any of them. `scripts/check-workflow-compile-steps.py`
+  reads every workflow file and counts the groups across all of them.
+- **The `cargo run` that builds a code generator reads the library out of the directory
+  it writes.** `bindings/swift/build-xcframework.sh` built the UniFFI dylib under
+  `--release --target aarch64-apple-darwin` and then ran `cargo run --bin uniffi-bindgen`
+  with neither flag, which compiled the same ~650 dependencies a second time under the dev
+  profile into `target/debug` — six minutes on `macos-26`, measured on run 34724307976.
+  The same command sat at two more sites in `.github/workflows/build-matrix.yml`: the
+  Swift job, where it paid the same second compile, and the Android job, where the
+  `--library` it read was `target/release/libscp_ffi_uniffi.so`, a host release path that
+  no step in the job produced. One test decides both defects: derive from the `cargo run`
+  flags the directory cargo writes (`target/<triple>/<profile>` with `--target`,
+  `target/<profile>` without) and require the `--library` path to sit in it. A path
+  outside it is either a second compile or a file that does not exist, and both are fixed
+  by passing the flags that name the library's directory. The same check script holds
+  every uniffi-bindgen step in every workflow to that.
 - **A cache entry is readable from the ref that wrote it and from the default branch, and
   from nowhere else.** A write on `refs/pull/N/merge` or on
   `refs/heads/gh-readonly-queue/…` buys its own run nothing — the compile already happened

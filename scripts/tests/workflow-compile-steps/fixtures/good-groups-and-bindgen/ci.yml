@@ -1,0 +1,65 @@
+# Two groups, one writer each, on main; three uniffi-bindgen steps whose `cargo run`
+# flags name the directory the `--library` sits in.
+name: Good
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo test
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: false
+      - run: cargo clippy
+  fuzz-nightly:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [a, b]
+    steps:
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "fuzz -> target"
+          shared-key: fuzz-run
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.target == 'a' }}
+  fuzz-weekly:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "fuzz -> target"
+          shared-key: fuzz-run
+          save-if: false
+  swift:
+    runs-on: macos-26
+    steps:
+      - run: cargo build --release --target aarch64-apple-darwin -p scp-ffi-uniffi
+      - run: |
+          cargo run --release --target aarch64-apple-darwin -p scp-ffi-uniffi --bin uniffi-bindgen -- generate \
+            --library target/aarch64-apple-darwin/release/libscp_ffi_uniffi.dylib \
+            --language swift
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          cargo run -p scp-ffi-uniffi --bin uniffi-bindgen -- generate \
+            --library target/debug/libscp_ffi_uniffi.so \
+            --language kotlin
+  profile-flag:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          cargo +stable run \
+            --profile release \
+            --target x86_64-unknown-linux-gnu \
+            -p scp-ffi-uniffi --bin uniffi-bindgen -- generate \
+            --library=target/x86_64-unknown-linux-gnu/release/libscp_ffi_uniffi.so \
+            --language kotlin
