@@ -3313,13 +3313,24 @@ def check_dependency_conditions_detect_a_conditionless_consumer(doc: dict) -> No
 
 PYO3_ARTIFACTS = ("pyo3-module-linux", "pyo3-module-macos")
 
+# The three statements the PyO3 skip guards run: the import the test modules attempt,
+# the construction the `scp` fixture performs, and a read of each feature-gated method
+# whose absence turns a test module into a module-level skip.
+PYO3_ASSERTION_FRAGMENTS = (
+    ("import scp_sdk._scp_core", "imports"),
+    ("SCP(storage=", "constructs"),
+    ("relay_start_in_memory", "carries relay_start_in_memory"),
+    ("fullstack_create_node", "carries fullstack_create_node"),
+)
+
 
 def pyo3_consumers_without_a_construction_assertion(doc: dict) -> list[str]:
     """Return every job that downloads a PyO3 module and does not exercise it first.
 
     CRITERION: a job that downloads a PyO3 extension module runs, before its first
-    pytest invocation, a step that imports `scp_sdk._scp_core` and a step that
-    constructs `SCP(storage=...)` from it.
+    pytest invocation, a step that imports `scp_sdk._scp_core`, a step that constructs
+    `SCP(storage=...)` from it, and a step that reads every feature-gated method named
+    in PYO3_ASSERTION_FRAGMENTS off the native class.
 
     WHY: every real-FFI test module under bindings/python/tests skips itself when
     `from scp_sdk import _scp_core` raises, and the `scp` fixture in
@@ -3327,8 +3338,15 @@ def pyo3_consumers_without_a_construction_assertion(doc: dict) -> list[str]:
     extension is not installed. A downloaded module that imports but cannot be
     constructed therefore leaves pytest exiting 0 over zero executed assertions in
     every one of these jobs at once, which is the `zero-test` shape this file names.
-    The import alone does not close that: it leaves the construction path open, so
-    the criterion names both statements.
+    The import alone does not close that: it leaves the construction path open, so the
+    criterion names both statements. Neither closes the third path: an extension built
+    without `--features testing` imports and constructs, and
+    bindings/python/tests/test_e2e_fullstack.py answers a missing
+    `fullstack_create_node` with `pytest.skip(..., allow_module_level=True)`, which
+    deletes the whole real-MLS full-stack suite from a green run. `crates/scp-ffi/`
+    compiles `fullstack_create_node` only under `testing` and `relay_start_in_memory`
+    only under `server`, so reading both off the constructed object decides whether the
+    downloaded binary carries the feature resolution its consumers need.
     """
     gaps: list[str] = []
     for job_id, job in sorted(doc["jobs"].items()):
@@ -3339,20 +3357,15 @@ def pyo3_consumers_without_a_construction_assertion(doc: dict) -> list[str]:
             for step in steps
         ):
             continue
-        imported = False
-        constructed = False
+        found = {label: False for _, label in PYO3_ASSERTION_FRAGMENTS}
         for step in steps:
             script = str(step.get("run") or "")
             if re.search(r"\bpytest tests", script):
                 break
-            imported = imported or "import scp_sdk._scp_core" in script
-            constructed = constructed or "SCP(storage=" in script
-        if not (imported and constructed):
-            missing = [
-                name
-                for name, present in (("imports", imported), ("constructs", constructed))
-                if not present
-            ]
+            for fragment, label in PYO3_ASSERTION_FRAGMENTS:
+                found[label] = found[label] or fragment in script
+        missing = [label for label, present in found.items() if not present]
+        if missing:
             gaps.append(
                 f"{job_id} downloads a PyO3 module and runs pytest without asserting "
                 f"that it {' and '.join(missing)}"
@@ -3363,7 +3376,8 @@ def pyo3_consumers_without_a_construction_assertion(doc: dict) -> list[str]:
 def check_pyo3_consumers_exercise_the_module(doc: dict) -> None:
     gaps = pyo3_consumers_without_a_construction_assertion(doc)
     check(
-        "ci.yml: every job downloading a PyO3 module imports and constructs it first",
+        "ci.yml: every job downloading a PyO3 module imports it, constructs it, and "
+        "reads its feature-gated methods first",
         not gaps,
         "; ".join(gaps),
     )
@@ -3560,8 +3574,8 @@ def main() -> int:
 
     print("downloaded-module — a PyO3 consumer exercises the module before pytest")
     check_pyo3_consumers_exercise_the_module(workflow)
-    check_pyo3_assertion_control(workflow, "import scp_sdk._scp_core", "imports")
-    check_pyo3_assertion_control(workflow, "SCP(storage=", "constructs")
+    for pyo3_fragment, pyo3_label in PYO3_ASSERTION_FRAGMENTS:
+        check_pyo3_assertion_control(workflow, pyo3_fragment, pyo3_label)
 
     print("downloaded-addon — a NAPI consumer exercises the addon before its tests")
     check_napi_consumers_exercise_the_addon(workflow)

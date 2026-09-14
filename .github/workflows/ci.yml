@@ -1901,13 +1901,34 @@ jobs:
       # scripts/tests/ci-gate/ci_gate_selftest.py names. This step runs both statements
       # those guards run — the import and the construction — so a module that imports
       # but cannot construct fails the job here rather than skipping every test that
-      # requests the fixture. Every consumer of a PyO3 artifact runs it.
-      - name: Assert the downloaded extension imports and constructs
+      # requests the fixture. It then reads the two methods the `server` and `testing`
+      # feature lists compile onto the native class, because the import and the
+      # construction both succeed on a module built without `testing`:
+      # crates/scp-ffi/src/lib.rs gates `pub mod testing` alone, and
+      # bindings/python/tests/test_e2e_fullstack.py answers a missing
+      # `fullstack_create_node` with `pytest.skip(..., allow_module_level=True)`, which
+      # would delete the whole real-MLS full-stack suite from a green run. An extension
+      # that loads but carries a different feature resolution fails the job here instead
+      # of skipping every test that calls those methods. Every consumer of a PyO3
+      # artifact runs this step.
+      - name: Assert the downloaded extension imports, constructs, and carries the gated methods
         run: |
           source .venv/bin/activate
           cd bindings/python
           PYTHONPATH=. python -c "import scp_sdk._scp_core as module; print(module.__file__)"
           PYTHONPATH=. python -c "from scp_sdk import SCP; print(SCP(storage={'type': 'in_memory'}).instance_id)"
+          PYTHONPATH=. python -c "
+          from scp_sdk import _scp_core
+          probe = _scp_core.SCP({'type': 'in_memory'})
+          gated = (
+              'relay_start_in_memory',
+              'fullstack_create_node',
+          )
+          missing = [name for name in gated if not callable(getattr(probe, name, None))]
+          if missing:
+              raise SystemExit('the native SCP class is missing ' + ', '.join(missing) + ', so this extension was built without the feature that method needs')
+          print('PyO3 extension carries the gated methods')
+          "
       - name: Run tests (including real FFI)
         run: |
           source .venv/bin/activate
@@ -2409,12 +2430,24 @@ jobs:
           pip install pytest pytest-asyncio
       # See the step of this name in job python-test for the skip-on-absence defect it
       # closes.
-      - name: Assert the downloaded extension imports and constructs
+      - name: Assert the downloaded extension imports, constructs, and carries the gated methods
         run: |
           source .venv/bin/activate
           cd bindings/python
           PYTHONPATH=. python -c "import scp_sdk._scp_core as module; print(module.__file__)"
           PYTHONPATH=. python -c "from scp_sdk import SCP; print(SCP(storage={'type': 'in_memory'}).instance_id)"
+          PYTHONPATH=. python -c "
+          from scp_sdk import _scp_core
+          probe = _scp_core.SCP({'type': 'in_memory'})
+          gated = (
+              'relay_start_in_memory',
+              'fullstack_create_node',
+          )
+          missing = [name for name in gated if not callable(getattr(probe, name, None))]
+          if missing:
+              raise SystemExit('the native SCP class is missing ' + ', '.join(missing) + ', so this extension was built without the feature that method needs')
+          print('PyO3 extension carries the gated methods')
+          "
       - name: Wire NAPI addon into node_modules
         run: |
           ARCH=$(uname -m)
@@ -2540,12 +2573,24 @@ jobs:
           pip install pytest pytest-asyncio
       # See the step of this name in job python-test for the skip-on-absence defect it
       # closes.
-      - name: Assert the downloaded extension imports and constructs
+      - name: Assert the downloaded extension imports, constructs, and carries the gated methods
         run: |
           source .venv/bin/activate
           cd bindings/python
           PYTHONPATH=. python -c "import scp_sdk._scp_core as module; print(module.__file__)"
           PYTHONPATH=. python -c "from scp_sdk import SCP; print(SCP(storage={'type': 'in_memory'}).instance_id)"
+          PYTHONPATH=. python -c "
+          from scp_sdk import _scp_core
+          probe = _scp_core.SCP({'type': 'in_memory'})
+          gated = (
+              'relay_start_in_memory',
+              'fullstack_create_node',
+          )
+          missing = [name for name in gated if not callable(getattr(probe, name, None))]
+          if missing:
+              raise SystemExit('the native SCP class is missing ' + ', '.join(missing) + ', so this extension was built without the feature that method needs')
+          print('PyO3 extension carries the gated methods')
+          "
       - name: Build UniFFI cdylib
         run: |
           cargo build -p scp-ffi-uniffi --features testing
@@ -2630,12 +2675,24 @@ jobs:
           pip install pytest pytest-asyncio
       # See the step of this name in job python-test for the skip-on-absence defect it
       # closes.
-      - name: Assert the downloaded extension imports and constructs
+      - name: Assert the downloaded extension imports, constructs, and carries the gated methods
         run: |
           source .venv/bin/activate
           cd bindings/python
           PYTHONPATH=. python -c "import scp_sdk._scp_core as module; print(module.__file__)"
           PYTHONPATH=. python -c "from scp_sdk import SCP; print(SCP(storage={'type': 'in_memory'}).instance_id)"
+          PYTHONPATH=. python -c "
+          from scp_sdk import _scp_core
+          probe = _scp_core.SCP({'type': 'in_memory'})
+          gated = (
+              'relay_start_in_memory',
+              'fullstack_create_node',
+          )
+          missing = [name for name in gated if not callable(getattr(probe, name, None))]
+          if missing:
+              raise SystemExit('the native SCP class is missing ' + ', '.join(missing) + ', so this extension was built without the feature that method needs')
+          print('PyO3 extension carries the gated methods')
+          "
       - name: Build Swift parity runner
         run: |
           cd bindings/python/tests/bridge_parity/helpers/swift_bridge_runner
