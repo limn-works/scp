@@ -954,6 +954,11 @@ pub enum BudgetValue {
     /// `Amount` takes the wire form ADR-060 fixes, and `payee` carries the
     /// payee's 32 raw digest bytes, which are the bytes a relay compares the
     /// verified payee against (`09-security-model.md` §9.7.4.2 R9).
+    /// `payment_adapters` is bounded by `MAX_PAYMENT_ADAPTERS`
+    /// (`09-security-model.md` §9.18.17), because a publisher reads it out of
+    /// an untrusted relay's answer. **A `BudgetValue` the publisher cannot
+    /// decode reads as the entry refusing with no retry**, and the publisher
+    /// records `Failed { code: 4041 }` and moves to the next entry.
     Payment {
         currency: CurrencyCode,
         per_publish: Option<Amount>,
@@ -975,7 +980,11 @@ pub struct DeclaredWritePolicy {
     pub storage_budget_identifier: Option<u64>,
     pub storage_budget_total: Option<u64>,
     /// The refusal scopes a verified receipt exempts, empty where the relay
-    /// declares none (`09-security-model.md` §9.7.4.2 R9).
+    /// declares none (`09-security-model.md` §9.7.4.2 R9). **A publisher
+    /// rejects an answer carrying more members than `BudgetScope` has
+    /// variants**, under the parse bound §9.7.4.2's definitions state for every
+    /// count-prefixed list a party reads out of an untrusted answer, and
+    /// records that entry as `Skipped`.
     pub receipt_exempts: Vec<BudgetScope>,
     pub economic: Option<EconomicTerms>,
     /// The rent price, the rent period in seconds, and the quota of stored
