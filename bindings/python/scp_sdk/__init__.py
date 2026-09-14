@@ -30,16 +30,26 @@ from __future__ import annotations
 
 import sys
 
+from scp_sdk._extension import reject_load_failure as _reject_load_failure
+
 # Register the native extension under its bare name so that function-scoped
 # ``import _scp_core`` (used throughout the SDK) resolves correctly.  Maturin
 # installs the extension as ``scp_sdk._scp_core`` (see pyproject.toml
 # module-name), but every call-site does a bare ``import _scp_core``.
+#
+# An absent extension is swallowed, so a pure-Python or mocked environment
+# still imports the package. A present extension that failed to load raises
+# ``SCP-UNKNOWN-0002`` from here, because ``ImportError`` carries both causes
+# and reporting a load failure as absence lets every
+# ``except ImportError: pytest.skip(...)`` guard under ``bindings/python/tests``
+# skip the whole real-FFI suite over a broken artifact. ``ScpError`` is not an
+# ``ImportError``, so no such guard catches it.
 try:
     from scp_sdk import _scp_core
-
+except ImportError as _exc:
+    _reject_load_failure(_exc)
+else:
     sys.modules["_scp_core"] = _scp_core
-except ImportError:
-    pass  # Native extension not available (pure-Python / mocked tests)
 
 from scp_sdk.auth import (
     ScpIdAuthentication,

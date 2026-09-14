@@ -21,16 +21,24 @@ def extension_is_absent(exc: BaseException) -> bool:
     """Report whether one exception means the native extension is not installed.
 
     CRITERION: the exception is the :class:`scp_sdk.errors.ScpError` carrying
-    ``SCP-UNKNOWN-0001``. ``scp_sdk.scp._native_mod`` and
-    ``scp_sdk.scp._native_cls`` raise that code for the two causes that both mean
-    "not installed": ``import _scp_core`` failed, or the extension exports no
-    ``SCP`` class.
+    ``SCP-UNKNOWN-0001``. :func:`scp_sdk._extension.native_module` raises that
+    code for exactly one cause — the compiled extension file is not on the
+    import path, which :func:`scp_sdk._extension.extension_is_installed`
+    decides by locating the file without executing it.
 
-    Every other construction failure — a libpython the module was not built
-    against, a panic in bridge initialisation, a storage backend that refuses to
-    open — raises a different type or carries a different code, and the fixture
-    below re-raises it. Skipping on those would let a CI job that downloaded a
-    broken extension exit 0 over zero executed assertions.
+    A *present* extension that fails to load raises ``SCP-UNKNOWN-0002``
+    instead, and so does an extension that loads without exporting the ``SCP``
+    class (``scp_sdk.scp._native_cls``). The exception type cannot make that
+    separation, because Python raises ``ImportError`` for an absent module and
+    for a ``dlopen`` failure alike — an undefined symbol, a libpython the
+    module was not built against, a missing transitive shared library. The
+    code carries it.
+
+    Every other construction failure — a panic in bridge initialisation, a
+    storage backend that refuses to open — raises a different type or carries a
+    different code, and the fixture below re-raises it. Skipping on any of
+    those would let a CI job that downloaded a broken extension exit 0 over
+    zero executed assertions.
     """
     from scp_sdk.errors import ScpError
 
@@ -55,6 +63,11 @@ def scp() -> Iterator:
     # Skip entire fixture if native extension is unavailable. Tests that
     # use only pure-Python paths (e.g. test_types.py) don't depend on the
     # fixture and remain unaffected.
+    #
+    # Only an ``ImportError`` skips here. ``scp_sdk/__init__.py`` raises
+    # ``SCP-UNKNOWN-0002`` — an ``ScpError``, not an ``ImportError`` — when the
+    # extension file is present and fails to load, so that cause propagates out
+    # of this fixture and fails the test instead of skipping it.
     try:
         from scp_sdk import SCP
     except ImportError:

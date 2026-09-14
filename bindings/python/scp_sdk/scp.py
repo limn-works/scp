@@ -55,6 +55,7 @@ from typing import (
     runtime_checkable,
 )
 
+from scp_sdk._extension import native_module
 from scp_sdk.errors import ScpError, _coded_bridge_error
 from scp_sdk.types import CustodyType
 
@@ -330,15 +331,7 @@ def _native_mod() -> Any:
     Used by SDK wrappers that route to module-level free functions per
     ADR-048 §1 (pure helpers exposed as ``_scp_core.<name>``).
     """
-    try:
-        import _scp_core  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise ScpError(
-            "The _scp_core extension module is not installed. "
-            "Install scp-python with: pip install scp-python",
-            code="SCP-UNKNOWN-0001",
-        ) from exc
-    return _scp_core
+    return native_module()
 
 
 def _native_cls() -> Any:
@@ -352,11 +345,15 @@ def _native_cls() -> Any:
     mod = _native_mod()
     cls = getattr(mod, "SCP", None)
     if cls is None:
+        # The module loaded, so the extension is installed and this is a wrong
+        # or partial build. ``SCP-UNKNOWN-0002`` says so, and the ``scp``
+        # fixture in bindings/python/tests/conftest.py fails on that code
+        # instead of skipping, which ``SCP-UNKNOWN-0001`` would have done.
         raise ScpError(
-            "_scp_core does not export the SCP class — rebuild the native "
-            "extension with `maturin develop --release` from the Phase 4 "
-            "PR 1 codebase.",
-            code="SCP-UNKNOWN-0001",
+            "_scp_core loaded but does not export the SCP class — rebuild the "
+            "native extension with `maturin develop --release` from "
+            "bindings/python.",
+            code="SCP-UNKNOWN-0002",
         )
     return cls
 
