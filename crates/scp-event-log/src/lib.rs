@@ -448,21 +448,26 @@ pub enum EventType {
     // -------------------------------------------------------------------
     // Bridge lifecycle leaves (spec §12.2.1 step 3, §12.2.2; ADR-011). Every
     // one records a governance decision about a bridge, executed by every
-    // member under the context's governance model, so each is a convergent
-    // commit-ordered durable leaf. A bridge node reads bridge admission from
-    // the highest-sequence leaf of this group for a `bridge_id` in the log it
-    // holds as a member (spec §12.10.6 step 1) and from no other input.
+    // member at the same commit position under the context's governance
+    // model, so each is a convergent commit-ordered durable leaf. A bridge
+    // node reads bridge admission from the last leaf of this group for a
+    // `bridge_id` in the log it holds as a member (spec §12.10.6 step 1) and
+    // from no other input.
+    //
+    // An elapsed `SuspendBridge` `duration` appends NO leaf (spec §12.2.2):
+    // the node reads the expiry off the `BridgeSuspended` leaf's `timestamp`
+    // and payload `duration`. A member-local timer that appended a leaf would
+    // race a concurrent commit, so one member would hold a leaf another does
+    // not, which breaks the equal-event-count implies equal-root property
+    // that equivocation detection reads (spec §9.9.3).
     //
     // Payload (`MessagePack` into `EventPayload::data`): a
     // `BridgeRegistrationEvent` (spec §12.12.2, defined in
     // `scp_protocol::bridge::registration`): `action`, `bridge_id`,
-    // `operator_did`, `governance_did`, `context_id`, `timestamp`. The leaf
-    // `actor_did` is the payload's `governance_did`, except the
-    // deadline-triggered `BridgeReactivated` (a `SuspendBridge` `duration`
-    // elapsed), whose `actor_did` is `"system"` and whose leaf timestamp is
-    // the pre-computed suspension deadline (spec §7.3.1). The `Requested` and
-    // `Rejected` actions produce no bridge leaf: `GovernanceProposalCreated`
-    // and `GovernanceProposalResolved` record the proposal and its rejection.
+    // `operator_did`, `governance_did`, `context_id`, `timestamp`. The
+    // `Requested` and `Rejected` actions produce no bridge leaf:
+    // `GovernanceProposalCreated` and `GovernanceProposalResolved` record the
+    // proposal and its rejection.
     // -------------------------------------------------------------------
     /// A `RegisterBridge` proposal was approved (spec §12.2.1 step 3);
     /// payload `action: Approved`.
@@ -470,9 +475,9 @@ pub enum EventType {
     /// A `SuspendBridge` proposal was approved (spec §12.2.2, suspension);
     /// payload `action: Suspended { reason, duration }`.
     BridgeSuspended,
-    /// A `ReactivateBridge` proposal was approved, or the suspension
-    /// `duration` elapsed (spec §12.2.2, suspension); payload
-    /// `action: Reactivated`.
+    /// A `ReactivateBridge` proposal was approved (spec §12.2.2, suspension);
+    /// payload `action: Reactivated`. An elapsed `SuspendBridge` `duration`
+    /// appends no leaf and produces no `BridgeReactivated`.
     BridgeReactivated,
     /// A `RevokeBridge` proposal was approved (spec §12.2.2 step 2); payload
     /// `action: Revoked`. Terminal: no later bridge leaf reactivates it.

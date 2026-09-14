@@ -760,11 +760,9 @@ pub struct Event {
    its source is convergent): the source here is one signed envelope timestamp, not N
    local clocks. For the timer-triggered events that carry no
    commit envelope (TTL expiry/close, governance-freeze expiry, deferred
-   economic-policy application, bridge-suspension expiry per spec §12.2.2), the
-   convergent `timestamp` is the pre-computed deadline already held in
-   convergent context state (the TTL deadline, the freeze-expiry instant, the
-   policy-application time, the suspension deadline `timestamp + duration` of
-   the `BridgeSuspended` leaf), never local `now()` — for the
+   economic-policy application), the convergent `timestamp` is the pre-computed
+   deadline already held in convergent context state (the TTL deadline, the
+   freeze-expiry instant, the policy-application time), never local `now()` — for the
    same reason velocity/rate-triggered consequences are excluded (a wall clock the
    protocol neither has nor needs). The leaf timestamp's convergence does not make it
    authoritative over log *order* (§9.8.3): the Merkle order is the orderer; the
@@ -873,17 +871,20 @@ pub enum EventType {
     // criterion 2, "Registration is a context event in the Merkle log").
     // Payload: a `BridgeRegistrationEvent` (§12.12.2) serialized as MessagePack
     // into EventPayload::data — action, bridge_id, operator_did, governance_did,
-    // context_id, timestamp. actor_did = the payload's governance_did, except
-    // the deadline-triggered BridgeReactivated (a SuspendBridge `duration`
-    // elapsed), where actor_did = "system" and the leaf timestamp is the
-    // pre-computed deadline (§7.3.1). A bridge node admits a bridge from the
-    // highest-sequence leaf of this group for that bridge_id (§12.10.6 step 1).
+    // context_id, timestamp. Every one of the four records a governance
+    // decision that every member executed at its commit position, so all four
+    // are convergent commit-ordered durable leaves. A bridge node admits a
+    // bridge from the last leaf of this group for that bridge_id (§12.10.6
+    // step 1). An elapsed SuspendBridge `duration` appends NO leaf (§12.2.2):
+    // a member-local timer firing against a concurrent commit would append a
+    // leaf on one member and not on another, which breaks the
+    // equal-event-count ⇒ equal-root property of §9.9.3.
     // The Requested and Rejected actions of BridgeRegistrationAction produce no
     // bridge leaf: GovernanceProposalCreated and GovernanceProposalResolved
     // (ADR-031 acceptance criterion 7) record the proposal and its rejection.
     BridgeRegistered,             // RegisterBridge approved; payload action: Approved
     BridgeSuspended,              // SuspendBridge approved; payload action: Suspended { reason, duration }
-    BridgeReactivated,            // ReactivateBridge approved, or the suspension duration elapsed; payload action: Reactivated
+    BridgeReactivated,            // ReactivateBridge approved; payload action: Reactivated
     BridgeRevoked,                // RevokeBridge approved; payload action: Revoked
 }
 ```

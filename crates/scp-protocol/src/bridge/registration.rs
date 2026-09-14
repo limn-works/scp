@@ -250,8 +250,9 @@ pub enum BridgeRegistrationAction {
         /// `ReactivateBridge` governance action.
         duration: Option<u64>,
     },
-    /// The bridge was reactivated, by governance or because the suspension
-    /// `duration` elapsed (spec §12.2.2, suspension).
+    /// Governance reactivated the bridge (spec §12.2.2, suspension). An
+    /// elapsed `Suspended` `duration` expires that suspension without any
+    /// action, and produces no `Reactivated` record.
     Reactivated,
 }
 
