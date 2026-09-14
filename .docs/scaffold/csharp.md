@@ -65,7 +65,7 @@ internal static partial class NativeLib
 
     [LibraryImport(LibName, EntryPoint = "scp_identity_create", StringMarshalling = StringMarshalling.Utf8)]
     internal static partial int IdentityCreate(
-        string custody,
+        IdentityConfig config,
         out nint handle,
         out nint error);
 
@@ -162,15 +162,19 @@ public sealed class Identity : IAsyncDisposable
     private readonly IdentityHandle _handle;
 
     public byte[] Identifier => NativeLib.GetIdentifier(_handle);
-    public string CustodyType => NativeLib.GetCustodyType(_handle);
+    public CustodyType CustodyType => NativeLib.GetCustodyType(_handle);
 
-    public static async Task<Identity> CreateAsync(string custody = "platform")
+    // IdentityConfig is the four-slot config object
+    // `.docs/standards/construction.md` states. `Custody` carries the bridge's
+    // KeyCustodyConfig and carries no default, because that slot decides where
+    // an identity's private key lives.
+    public static async Task<Identity> CreateAsync(IdentityConfig config)
     {
         // Task.Run offloads blocking FFI to thread pool. If FFI throughput becomes
         // a bottleneck, consider a dedicated thread or async FFI callbacks.
         return await Task.Run(() =>
         {
-            var rc = NativeLib.IdentityCreate(custody, out var handle, out var error);
+            var rc = NativeLib.IdentityCreate(config, out var handle, out var error);
             if (rc != 0) throw ExtractException(error);
             return new Identity(new IdentityHandle { handle = handle });
         });

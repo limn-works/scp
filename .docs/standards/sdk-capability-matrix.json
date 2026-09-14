@@ -1086,7 +1086,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Every runtime signs the canonical checkpoint payload in-process with the identity's #active Ed25519 key. On TypeScript the NAPI-backed (Node/Bun) runtime signs and surfaces the signature on Checkpoint.signature via bindings/typescript/src/internal/native.ts. Checkpoint is a flat always-signed interface matching the Python/Swift/Kotlin SDKs; the runtime populates the 64-byte (128-hex-char) signature, which is ECDSA on NIST P-256 with SHA-256 (`09-security-model.md` §9.5) [superseded 2026-09-10: the shipped code signs Ed25519]. There is no `signed` discriminant. The byte layout of the signing payload is identical across all bridges (compute_checkpoint_canonical_hash)."
+          "notes": "Every runtime signs the canonical checkpoint payload in-process with the identity's #active key. On TypeScript the NAPI-backed (Node/Bun) runtime signs and surfaces the signature on Checkpoint.signature via bindings/typescript/src/internal/native.ts. Checkpoint is a flat always-signed interface matching the Python/Swift/Kotlin SDKs; the runtime populates the 64-byte (128-hex-char) signature, which is ECDSA on NIST P-256 with SHA-256 (`09-security-model.md` §9.5) [superseded 2026-09-10: the shipped code signs Ed25519]. There is no `signed` discriminant. The byte layout of the signing payload is identical across all bridges (compute_checkpoint_canonical_hash)."
         },
         {
           "name": "checkpoint_by_did",

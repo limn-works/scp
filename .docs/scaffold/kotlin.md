@@ -53,7 +53,7 @@ Located at `crates/scp-ffi/uniffi/src/scp.udl`:
 ```
 namespace scp {
   [Throws=ScpError]
-  Identity identity_create(string custody);
+  Identity identity_create(IdentityConfig config);
 
   [Throws=ScpError]
   Identity identity_load(bytes identifier);
@@ -64,7 +64,7 @@ namespace scp {
 
 interface Identity {
   bytes identifier();
-  string custody_type();
+  CustodyType custody_type();
 
   [Throws=ScpError]
   Identity rotate_key();
@@ -199,12 +199,16 @@ class ValidationException(message: String, code: String) : ScpException(message,
 ```kotlin
 class Identity private constructor(private val handle: IdentityHandle) {
     val identifier: ByteArray get() = handle.identifier()
-    val custodyType: String get() = handle.custodyType()
+    val custodyType: CustodyType get() = handle.custodyType()
 
     companion object {
-        suspend fun create(custody: String = "platform"): Identity =
+        // IdentityConfig is the four-slot config object
+        // `.docs/standards/construction.md` states. Its `custody` slot carries
+        // the bridge's KeyCustodyConfig and carries no default, because that
+        // slot decides where an identity's private key lives.
+        suspend fun create(config: IdentityConfig): Identity =
             withContext(Dispatchers.IO) {
-                Identity(NativeLib.identityCreate(custody))
+                Identity(NativeLib.identityCreate(config))
             }
 
         suspend fun load(identifier: ByteArray): Identity =

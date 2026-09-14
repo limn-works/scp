@@ -67,7 +67,7 @@ import com.sun.jna.ptr.PointerByReference;
 public interface NativeLib extends Library {
     NativeLib INSTANCE = Native.load("scp_ffi", NativeLib.class);
 
-    int scp_identity_create(String custody, PointerByReference outHandle, PointerByReference outError);
+    int scp_identity_create(IdentityConfig config, PointerByReference outHandle, PointerByReference outError);
     void scp_identity_free(Pointer handle);
     int scp_identity_identifier(Pointer handle, byte[] outIdentifier);
     void scp_string_free(Pointer s);
@@ -234,15 +234,19 @@ public final class Identity implements AutoCloseable {
         return NativeLib.getIdentifier(handle);
     }
 
-    public String custodyType() {
+    public CustodyType custodyType() {
         return NativeLib.getCustodyType(handle);
     }
 
-    public static CompletableFuture<Identity> create(String custody) {
+    // IdentityConfig is the four-slot config object
+    // `.docs/standards/construction.md` states. Its custody slot carries the
+    // bridge's KeyCustodyConfig and carries no default, because that slot
+    // decides where an identity's private key lives.
+    public static CompletableFuture<Identity> create(IdentityConfig config) {
         return CompletableFuture.supplyAsync(() -> {
             var ref = new PointerByReference();
             var err = new PointerByReference();
-            int rc = NativeLib.INSTANCE.scp_identity_create(custody, ref, err);
+            int rc = NativeLib.INSTANCE.scp_identity_create(config, ref, err);
             if (rc != 0) throw extractException(err);
             return new Identity(ref.getValue());
         });

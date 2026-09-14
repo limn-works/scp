@@ -146,12 +146,16 @@ xcodebuild -create-xcframework \
 ```swift
 public struct Identity: Sendable {
     public let identifier: Data
-    public let custodyType: String
+    public let custodyType: CustodyType
 
     private let handle: IdentityHandle
 
-    public static func create(custody: String = "platform") async throws -> Identity {
-        let handle = try await ScpBindings.identityCreate(custody: custody)
+    /// `IdentityConfig` is the four-slot config object
+    /// `.docs/standards/construction.md` states. Its `custody` slot carries the
+    /// bridge's `KeyCustodyConfig` and carries no default, because that slot
+    /// decides where an identity's private key lives.
+    public static func create(config: IdentityConfig) async throws -> Identity {
+        let handle = try await ScpBindings.identityCreate(config: config)
         return Identity(identifier: handle.identifier(), custodyType: handle.custodyType(), handle: handle)
     }
 

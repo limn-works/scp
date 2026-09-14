@@ -77,7 +77,7 @@ async *receive(): AsyncIterable<Message>;
 
 ### Enum members of a name-bound enumeration
 
-A name-bound enumeration is one `09-security-model.md` §9.7.4.2's definitions state the criterion for: its type name and every variant name are identical in every SDK binding. `.docs/standards/conventions.md`'s naming table carries the one mapping that decides the spelling, and this section shows what a TypeScript author writes under it: **a `const` enum member whose name and whose string value are both the specification's own spelling**, and neither `camelCase`, nor `SCREAMING_SNAKE_CASE`, nor a bare string-literal union:
+A name-bound enumeration is one `09-security-model.md` §9.7.4.2's definitions state the criterion for: its type name and every variant name are identical in every SDK binding. `.docs/standards/conventions.md`'s naming table carries the one mapping that decides the spelling, and this section shows what a TypeScript author writes under it: **an enum member whose name and whose string value are both the specification's own spelling**, and neither `camelCase`, nor `SCREAMING_SNAKE_CASE`, nor a bare string-literal union:
 
 ```ts
 export enum HeadProvenance {

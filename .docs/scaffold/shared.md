@@ -61,6 +61,8 @@ All SDKs use language-idiomatic casing for the same logical identifiers.
 | Identity type | `Identity` | `Identity` | `Identity` | `Identity` | `Identity` | `Identity` | `Identity` | `Identity` |
 | Context type | `ContextHandle` | `Context` | `Context` | `Context` | `Context` | `Context` | `Context` | `Context` |
 | Create identity | `Identity::create` | `Identity.create()` | `Identity.create()` | `Identity.create()` | `Identity.create()` | `NewIdentity()` | `Identity.CreateAsync()` | `Identity.create()` |
+| Identity-creation config | `IdentityConfig` | `IdentityConfig` | `IdentityConfig` | `IdentityConfig` | `IdentityConfig` | `IdentityConfig` | `IdentityConfig` | `IdentityConfig` |
+| Payment adapter slot | `IdentityConfig::payment` | `payment` | `payment` | `payment` | `payment` | `Payment` | `Payment` | `payment` |
 | Create context | `ContextManager::create` | `Context.create()` | `Context.create()` | `Context.create()` | `Context.create()` | `NewContext()` | `Context.CreateAsync()` | `Context.create()` |
 | Send message | `ctx.send_message()` | `ctx.send()` | `ctx.send()` | `ctx.send()` | `ctx.send()` | `ctx.Send()` | `ctx.SendAsync()` | `ctx.send()` |
 | Invoke tool | `ctx.invoke_tool()` | `ctx.invoke_tool()` | `ctx.invokeTool()` | `ctx.invokeTool()` | `ctx.invokeTool()` | `ctx.InvokeTool()` | `ctx.InvokeToolAsync()` | `ctx.invokeTool()` |
@@ -76,6 +78,11 @@ All SDKs use language-idiomatic casing for the same logical identifiers.
 | Read service record | `IdentityBackend::read_service_record` | `backend.read_service_record()` | `backend.readServiceRecord()` | `backend.readServiceRecord()` | `backend.readServiceRecord()` | `backend.ReadServiceRecord()` | `backend.ReadServiceRecordAsync()` | `backend.readServiceRecord()` |
 | Publish key events | `IdentityBackend::publish` | `backend.publish()` | `backend.publish()` | `backend.publish()` | `backend.publish()` | `backend.Publish()` | `backend.PublishAsync()` | `backend.publish()` |
 | Publish service record | `IdentityBackend::publish_service_record` | `backend.publish_service_record()` | `backend.publishServiceRecord()` | `backend.publishServiceRecord()` | `backend.publishServiceRecord()` | `backend.PublishServiceRecord()` | `backend.PublishServiceRecordAsync()` | `backend.publishServiceRecord()` |
+| Read a relay's declared policy | `IdentityBackend::read_policy` | `backend.read_policy()` | `backend.readPolicy()` | `backend.readPolicy()` | `backend.readPolicy()` | `backend.ReadPolicy()` | `backend.ReadPolicyAsync()` | `backend.readPolicy()` |
+| Pay rent at a relay | `IdentityBackend::pay_rent` | `backend.pay_rent()` | `backend.payRent()` | `backend.payRent()` | `backend.payRent()` | `backend.PayRent()` | `backend.PayRentAsync()` | `backend.payRent()` |
+| Load a pending recovery | `Recovery::load_pending_recovery` | `Recovery.load_pending_recovery()` | `Recovery.loadPendingRecovery()` | `Recovery.loadPendingRecovery()` | `Recovery.loadPendingRecovery()` | `Recovery.LoadPendingRecovery()` | `Recovery.LoadPendingRecoveryAsync()` | `Recovery.loadPendingRecovery()` |
+| Resume a recovery | `Recovery::resume_recovery` | `Recovery.resume_recovery()` | `Recovery.resumeRecovery()` | `Recovery.resumeRecovery()` | `Recovery.resumeRecovery()` | `Recovery.ResumeRecovery()` | `Recovery.ResumeRecoveryAsync()` | `Recovery.resumeRecovery()` |
+| Abort a recovery | `Recovery::abort_recovery` | `Recovery.abort_recovery()` | `Recovery.abortRecovery()` | `Recovery.abortRecovery()` | `Recovery.abortRecovery()` | `Recovery.AbortRecovery()` | `Recovery.AbortRecoveryAsync()` | `Recovery.abortRecovery()` |
 
 **Name-bound enumerations are the exception to language-idiomatic casing of the identifier itself.** `09-security-model.md` §9.7.4.2's definitions state the criterion that decides which enumerations are name-bound, and no list of instances stands beside it: an enumeration added later is name-bound the moment it meets the criterion. Each binding carries the type name and every variant name the defining section spells, verbatim, and `.docs/standards/conventions.md`'s naming table is where that mapping lives. The defining section is the one that introduces the type.
 

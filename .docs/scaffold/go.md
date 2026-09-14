@@ -60,7 +60,7 @@ Rust → cbindgen → C header → cgo → Go
 /// Returns an opaque handle. Caller must free with scp_identity_free().
 #[no_mangle]
 pub extern "C" fn scp_identity_create(
-    custody: *const c_char,
+    config: *const ScpIdentityConfig,
     out_handle: *mut *mut ScpIdentity,
     out_error: *mut *mut ScpError,
 ) -> i32 {
@@ -159,14 +159,18 @@ func Shutdown() {
     C.scp_runtime_shutdown()
 }
 
-func IdentityCreate(custody string) (*IdentityHandle, error) {
-    cCustody := C.CString(custody)
-    defer C.free(unsafe.Pointer(cCustody))
+// IdentityConfig is the four-slot config object
+// `.docs/standards/construction.md` states. Its Custody slot carries the
+// bridge's KeyCustodyConfig and carries no default, because that slot decides
+// where an identity's private key lives.
+func IdentityCreate(config IdentityConfig) (*IdentityHandle, error) {
+    cConfig := config.toC()
+    defer cConfig.free()
 
     var handle *C.ScpIdentity
     var errPtr *C.ScpError
 
-    rc := C.scp_identity_create(cCustody, &handle, &errPtr)
+    rc := C.scp_identity_create(cConfig, &handle, &errPtr)
     if rc != 0 {
         return nil, extractError(errPtr)
     }
@@ -189,7 +193,7 @@ type Identity struct {
 }
 
 func (i *Identity) Identifier() []byte { return ffi.IdentityIdentifier(i.handle) }
-func (i *Identity) CustodyType() string { return ffi.IdentityCustodyType(i.handle) }
+func (i *Identity) CustodyType() CustodyType { return ffi.IdentityCustodyType(i.handle) }
 
 type Message struct {
     SenderIdentifier []byte
