@@ -68,8 +68,9 @@ from a shifted boundary and required them to differ. An assertion that only comp
 id against a fixed vector would have passed. When a function claims injectivity, test
 injectivity.
 
-The fix length-prefixes each segment with eight big-endian bytes. Commit `017e6c840` had
-already fixed the same class in `derive_shadow_id`, which escapes `%` and `:` in each segment.
+The fix length-prefixes each segment with eight big-endian bytes. An earlier commit on the same
+branch had already fixed the same class in `derive_shadow_id`, which escapes `%` and `:` in each
+segment.
 Two fixes for one class in one file is a signal to look for a third: check every composite
 identifier a system builds.
 

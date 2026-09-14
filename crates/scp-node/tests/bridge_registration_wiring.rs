@@ -385,9 +385,10 @@ async fn suspending_then_revoking_a_bridge_closes_its_endpoints() {
 /// Two bridges registered on one node, in two contexts, cannot read, delete, or
 /// emit as each other's shadow.
 ///
-/// The scope rules under test landed in commit dfe30f64a; this test drives them
-/// through registrations a node admitted, rather than through a hand-built
-/// lookup, so it fails if admission stops reaching the middleware.
+/// `bridge_auth_middleware` computes the scope and `find_scoped_shadow` applies
+/// it (spec §12.10.2). This test drives both through registrations a node
+/// admitted, rather than through a hand-built lookup, so it fails if admission
+/// stops reaching the middleware.
 #[tokio::test]
 async fn one_bridge_cannot_touch_a_second_bridges_shadow() {
     let node = ApplicationNode::dev(0).await.unwrap();
