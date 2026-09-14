@@ -38,14 +38,16 @@ See `.docs/scaffold/shared.md` for the full cross-language casing table. Summary
 - **Acronyms** follow language convention: `URLString` vs `urlString` — see per-language standards
 - **A name-bound enumeration's variants take the spelling the specification gives them, verbatim, in every language.** `09-security-model.md` §9.7.4.2's definitions state the criterion that decides which enumerations the rule reaches, and this table is where the mapping lives.
 
+**Each row below states the criterion in full — the spec's spelling, verbatim, which is PascalCase — rather than the spelling clause alone**, because a row reading "the spec's spelling, verbatim" beside a spec sentence asserting PascalCase left a binding author two instructions and no test for which governs. The rule overrides a language's own enum convention wherever the two differ, Python's `SCREAMING_SNAKE_CASE` and Swift's `lowerCamelCase` included. No binding recases a variant and no rule splits one on word boundaries, so a shared conformance fixture comparing a variant across languages compares one string.
+
 | Language | Enum variant spelling | Example, from the spec's `WitnessRead` |
 |---|---|---|
-| Rust | the spec's spelling, verbatim | `HeadProvenance::WitnessRead` |
-| Python | the spec's spelling, verbatim | `HeadProvenance.WitnessRead` |
-| TypeScript | the spec's spelling, verbatim | `HeadProvenance.WitnessRead` |
-| Swift | the spec's spelling, verbatim | `HeadProvenance.WitnessRead` |
-| Kotlin | the spec's spelling, verbatim | `HeadProvenance.WitnessRead` |
-| Every other language | the spec's spelling, verbatim | `HeadProvenance.WitnessRead` |
+| Rust | the spec's spelling, verbatim: PascalCase | `HeadProvenance::WitnessRead` |
+| Python | the spec's spelling, verbatim: PascalCase, not `SCREAMING_SNAKE_CASE` | `HeadProvenance.WitnessRead` |
+| TypeScript | the spec's spelling, verbatim: PascalCase | `HeadProvenance.WitnessRead` |
+| Swift | the spec's spelling, verbatim: PascalCase, not `lowerCamelCase` | `HeadProvenance.WitnessRead` |
+| Kotlin | the spec's spelling, verbatim: PascalCase | `HeadProvenance.WitnessRead` |
+| Every other language | the spec's spelling, verbatim: PascalCase | `HeadProvenance.WitnessRead` |
 
 **No binding recases a variant, and no rule splits one on word boundaries**, so a fixture comparing a variant across languages compares one string. The rule overrides a language's own enum convention wherever the two differ, Python's `SCREAMING_SNAKE_CASE` and Swift's `lowerCamelCase` included: a split-and-recase rule spells `Fido2Token`, `EcdsaP256Sha256`, `Rank1Terminal`, `Rank2Terminal` and `Rank3Pending` two or three defensible ways each, which is the choice a binding author must not be left to make. The rule reaches every language, so a language this table does not name needs no row of its own
 
