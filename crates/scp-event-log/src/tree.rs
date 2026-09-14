@@ -1396,11 +1396,14 @@ mod tests {
     }
 
     #[test]
-    fn unification_variant_tags_occupy_36_through_81() {
-        // The 39 typed-event unification variants occupy tags 36..=75 in ADR
-        // declaration order, with tag 59 retired (PseudonymAnnounced removed).
-        // The 2 ADR-011 Amendment §6 cross-context-saga variants occupy tags
-        // 76..=77.
+    fn typed_event_variant_tags_occupy_36_through_81() {
+        // Three groups of variants share tags 36..=81, and this test pins the
+        // tag of every variant in all three.
+        // 1. The 39 typed-event unification variants occupy tags 36..=75 in ADR
+        //    declaration order, with tag 59 retired (PseudonymAnnounced removed).
+        // 2. The 2 ADR-011 Amendment §6 cross-context-saga variants occupy tags
+        //    76..=77.
+        // 3. The 4 bridge lifecycle variants occupy tags 78..=81.
         assert_eq!(event_type_tag(&EventType::AdminTransferred), 36);
         assert_eq!(event_type_tag(&EventType::CeilingModified), 37);
         assert_eq!(event_type_tag(&EventType::CeilingModificationPending), 38);
