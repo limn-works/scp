@@ -87,7 +87,7 @@
 #     Case 14 leaves one edit uncommitted and asserts that the summary names
 #     `scripts/check-cross-layer.sh` as the gate whose diff range holds no uncommitted edit.
 #     That gate reads `git diff <merge base>...HEAD` and the other 28 read the working tree,
-#     so its pass counts toward `gates 29/29 passed` over work it did not read.
+#     so its pass counts toward `gates N/N passed` over work it did not read.
 #
 #     Case 15 names one crate on the command line on a branch that changed another, and
 #     asserts that the summary names the package the run left uncompiled.
@@ -106,10 +106,29 @@
 #     run that activates a narrower feature set than the merge gate resolves and prints
 #     `compile ok` says nothing about the modules it skipped.
 #
-#     Case 23 reads every suite invocation out of `.github/workflows/ci.yml` and asserts
-#     that the `scripts/` entry of UNRUN_LANES names each one. That entry is what a fix
-#     agent editing an enforcement gate acts on, and a suite absent from it is a red CI
-#     job the runner's output gave the agent no reason to expect.
+#     Case 23 reads every `scripts/` program a job of `.github/workflows/ci.yml` starts,
+#     subtracts the runner's own GATES array, and asserts that the `scripts/` entry of
+#     UNRUN_LANES names every path that remains. The subtraction is the lane's own
+#     criterion: the lane discloses a command CI runs that no step of the run starts, and
+#     a path in GATES is a command the run does start. That entry is what a fix agent
+#     editing an enforcement gate acts on, and a suite absent from it is a red CI job the
+#     runner's output gave the agent no reason to expect. Two further assertions hold the
+#     case's two inputs non-empty, because an empty lane line matches no suite name and an
+#     empty suite list gives the comparison no iteration.
+#
+#     Case 25 holds the `.github/` entry of UNRUN_LANES to the suites an edit under
+#     `.github/` can turn red, in both directions: a suite that reads a workflow file of
+#     this repository and that the entry omits fails the case, and a suite the entry names
+#     that reads no such file fails it too. A suite reaches a workflow file of this
+#     repository only by resolving a path from the repository root, and the case reads that
+#     evidence out of each suite's own directory rather than pinning a list of names.
+#
+#     Case 24 names a crate on the command line in a fixture whose `origin/main` ref is
+#     deleted, and asserts that the run exits 0 and names `scripts/check-cross-layer.sh`
+#     as a gate whose pass covers no line of the branch. That gate diffs against
+#     `origin/main`, discards the git error an unresolvable range raises, and reads the
+#     empty result as "not applicable", so its pass reaches the `gates N/N passed` count
+#     over code it never read.
 #
 #   * THE MOVE BETWEEN CRATES. Git reports a rename as one filepair, so a runner that
 #     reads `git status --porcelain` or `git diff --name-only` without `--no-renames` sees
@@ -761,7 +780,7 @@ fi
 # `scripts/check-cross-layer.sh` decides from `git diff <merge base with origin/main>…HEAD`
 # and the other 28 gates read the working tree, so on an uncommitted edit — one of the
 # three input shapes the runner's own comment names as supported — that gate passes over
-# work it never read and its pass counts toward `gates 29/29 passed`.
+# work it never read and its pass counts toward `gates N/N passed`.
 #
 # The mutation it kills: deleting the `uncommitted_count` note from
 # `scripts/fix-round-check.sh` leaves that pass unqualified, and every other assertion in
@@ -852,10 +871,13 @@ fi
 
 # ── Case 17: a branch that changed a workflow file ───────────────────────────────────
 #
-# One gate the runner holds, `scripts/check-workflow-compile-steps.py`, reads workflow
-# files for the cache-group and bindgen rules alone. The `ci-workflow-selftest` job runs
-# two suites over the same files that no gate duplicates, so a run whose only output about
-# a changed workflow was `gates 29/29 passed` would read as full coverage of that edit.
+# Three gates the runner holds read a workflow file, each for rules of its own and none as
+# coverage of a workflow edit: `scripts/check-workflow-compile-steps.py` for its
+# cache-group and bindgen rules, `scripts/check-toolchain-wiring.sh` for its
+# container-build and paths-filter rules, and `scripts/check-shipped-feature-graph.sh` for
+# the cargo invocations that ship an artifact. The `ci-workflow-selftest` job runs two
+# suites over those files that no gate duplicates, so a run whose only output about a
+# changed workflow was `gates N/N passed` would read as full coverage of that edit.
 #
 # The mutation it kills: deleting the `.github/` entry from UNRUN_LANES in
 # `scripts/fix-round-check.sh` leaves that run silent, and every other assertion in this
@@ -1041,10 +1063,24 @@ fi
 # to reject is the fixture suite that entry names. A suite the entry omits is a red CI job
 # the output gave the agent no reason to expect.
 #
-# This case reads every suite invocation out of `.github/workflows/ci.yml` and fails when
-# the entry names fewer, so adding a suite to CI without adding it there turns this case
-# red rather than going unnoticed.
+# This case reads every `scripts/` program that a job of `.github/workflows/ci.yml` starts
+# with `bash` or with `python3.12 -m pytest`, subtracts the ones the runner's own GATES
+# array starts, and fails when the entry names fewer than what remains. Adding a suite to
+# CI without adding it there turns this case red rather than going unnoticed.
+#
+# THE SUBTRACTION IS THE CRITERION, and it is the lane's own: `scripts/fix-round-check.sh`
+# admits an entry for a command CI runs that no step of the run starts. A path in GATES is
+# a command the run does start, so the lane owes the reader nothing about it; every other
+# path CI starts under `scripts/` is one the run leaves unread and the lane has to name.
+# Reading the GATES array off the script rather than filtering on a `scripts/test…` name
+# keeps this case closed: a suite a later round files under any other directory name still
+# has to appear in the lane.
 LANE_LINE=$(sed -n '/^UNRUN_LANES=(/,/^)/p' "$SCRIPT" | grep -F '"scripts/|')
+LANE_SUITES=$(comm -23 \
+    <(grep -oE 'run: *(bash|python3\.12 -m pytest) +scripts/[^ ]+' "$REPO_ROOT/.github/workflows/ci.yml" |
+        sed -E 's/^.* //' | sort -u) \
+    <(gate_paths | sort -u))
+LANE_SUITE_COUNT=$(printf '%s' "$LANE_SUITES" | grep -c . || true)
 LANE_MISSING=""
 while IFS= read -r suite; do
     [[ -n $suite ]] || continue
@@ -1052,17 +1088,136 @@ while IFS= read -r suite; do
         *"$suite"*) ;;
         *) LANE_MISSING+=" $suite" ;;
     esac
-done < <(grep -oE 'run: *(bash|python3\.12 -m pytest) +scripts/[^ ]+' "$REPO_ROOT/.github/workflows/ci.yml" |
-    sed -E 's/^.* //' | sort -u)
+done <<< "$LANE_SUITES"
 if [[ -z $LANE_MISSING ]]; then
     report "case 23 names every suite CI runs over scripts/ in the scripts/ lane" 0 ""
 else
     report "case 23 names every suite CI runs over scripts/ in the scripts/ lane" 1 "the scripts/ entry of UNRUN_LANES omits:$LANE_MISSING"
 fi
+# The two inputs the assertion above reads, each asserted non-empty, because an empty one
+# makes that assertion pass over nothing: an empty LANE_LINE matches no suite name, and an
+# empty suite list gives the loop no iteration. A renamed UNRUN_LANES array, a reworded
+# `run:` step in the workflow and a renamed GATES array each empty one of the two, and
+# each would otherwise leave this case green while reading no lane at all.
 if [[ -n $LANE_LINE ]]; then
     report "case 23 found the scripts/ entry it reads" 0 ""
 else
     report "case 23 found the scripts/ entry it reads" 1 "scripts/fix-round-check.sh holds no UNRUN_LANES entry beginning \"scripts/|\", so the assertion above read an empty string and could not fail"
+fi
+if [[ $LANE_SUITE_COUNT -gt 0 ]]; then
+    report "case 23 read a non-empty suite set out of .github/workflows/ci.yml" 0 ""
+else
+    report "case 23 read a non-empty suite set out of .github/workflows/ci.yml" 1 "subtracting the GATES array from the scripts/ programs .github/workflows/ci.yml starts left no path, so the assertion above iterated over nothing and could not fail"
+fi
+
+# ── Case 24: a caller-named run in a checkout that resolves no origin/main ───────────
+#
+# Naming a crate takes the `$# -gt 0` branch, which compiles that set whether or not
+# `changed_files` answered, so this run reaches the gate loop with no merge base. One gate
+# in that loop decides from the same ref: `scripts/check-cross-layer.sh` sets its range to
+# `origin/main...HEAD`, discards the git error an unresolvable range raises, reads the
+# empty result as "not applicable", and exits 0. Its pass then joins the `gates N/N
+# passed` count over code it never read, and the summary has to say so.
+#
+# The mutation it kills: deleting the second NOTES entry of that branch from
+# `scripts/fix-round-check.sh` leaves the run printing `gates N/N passed` with no line
+# about the gate that examined nothing, and every other assertion in this file passes.
+FIXTURE24="$WORK/caller-named-no-origin-main"
+build_fixture "$FIXTURE24"
+fixture_commit "$FIXTURE24" crates/scp-ffi/napi/src/lib.rs
+git -C "$FIXTURE24" update-ref -d refs/remotes/origin/main
+HARNESS24="$FIXTURE24.harness"
+write_stubs "$HARNESS24" "$PIN_CHANNEL" 0 0 ""
+PATH="$HARNESS24/bin:$PATH" bash "$FIXTURE24/scripts/fix-round-check.sh" scp-clock \
+    > "$HARNESS24/out.txt" 2>&1
+printf '%s' $? > "$HARNESS24/rc.txt"
+rc=$(cat "$HARNESS24/rc.txt")
+if [[ $rc -eq 0 ]]; then
+    report "case 24 exits 0, which is why the note below is the only signal" 0 ""
+else
+    report "case 24 exits 0, which is why the note below is the only signal" 1 "the script exited $rc; output tail: $(tail -n 6 "$HARNESS24/out.txt")"
+fi
+if grep -qF 'NOT CHECKED — scripts/check-cross-layer.sh, for the whole of this run' "$HARNESS24/out.txt"; then
+    report "case 24 names the gate whose pass covers no line of the branch" 0 ""
+else
+    report "case 24 names the gate whose pass covers no line of the branch" 1 "the output holds no NOT CHECKED line for scripts/check-cross-layer.sh: $(tail -n 6 "$HARNESS24/out.txt")"
+fi
+if grep -qF 'check -p scp-clock --all-targets' "$HARNESS24/cargo.log"; then
+    report "case 24 compiles the crate the caller named although the ref is missing" 0 ""
+else
+    report "case 24 compiles the crate the caller named although the ref is missing" 1 "the stub cargo log holds: $(tr '\n' '|' < "$HARNESS24/cargo.log")"
+fi
+
+# ── Case 25: the .github/ lane against the suites that read this repository's workflows ─
+#
+# THE CRITERION the `.github/` entry of UNRUN_LANES states, and that this case holds it
+# to: the entry names a suite when an edit under `.github/` can turn that suite red, and
+# names no other. A suite reaches a workflow file of this repository only by resolving a
+# path from the repository root, so a suite that builds its gate's whole input under
+# `mktemp -d` stays green whatever `.github/workflows/` says, and naming it tells a fix
+# agent that an edit to a workflow has coverage it does not have.
+#
+# EVIDENCE, not the criterion: a file of the suite's own directory holds a line naming a
+# repository-root variable and a `workflows/` path together. `scripts/tests/ci-gate/
+# ci_gate_selftest.py` writes `WORKFLOW = REPO / ".github/workflows/ci.yml"` and this file
+# writes `"$REPO_ROOT/.github/workflows/ci.yml"`, while `scripts/tests/toolchain-wiring/
+# run-tests.sh` writes `"$root/.github/workflows/ci.yml"` against a fixture tree it created
+# and `scripts/tests/signing-guard/run-tests.sh` names no workflow path at all. A suite
+# that roots a path at this repository under a variable spelled some other way fails this
+# case rather than passing it, which sends a reader to this comment to widen the pattern.
+#
+# The case reads both sides: every suite that qualifies has to appear in the entry, and
+# every suite the entry names has to qualify. It iterates LANE_SUITES, the set case 23
+# above reads out of `.github/workflows/ci.yml` and subtracts the GATES array from, so a
+# suite CI gains reaches this case too and a gate the run itself starts stays out of it —
+# the `.github/` entry names those three gates in its own trailing sentence, as programs
+# the run did start.
+#
+# The mutation it kills: adding `scripts/tests/signing-guard/run-tests.sh` back to the
+# `.github/` entry of `scripts/fix-round-check.sh`, or dropping
+# `scripts/tests/fix-round-check/run-tests.sh` from it, leaves a workflow edit reported
+# against a suite set that does not match the suites the edit can red, and every other
+# assertion in this file passes.
+GITHUB_LANE_LINE=$(sed -n '/^UNRUN_LANES=(/,/^)/p' "$SCRIPT" | grep -F '".github/|')
+GITHUB_LANE_WRONG=""
+GITHUB_LANE_QUALIFIED=0
+while IFS= read -r suite; do
+    [[ -n $suite ]] || continue
+    scan="$REPO_ROOT/$suite"
+    if [[ -f $scan ]]; then
+        suite_dir=$(dirname "$suite")
+        [[ $suite_dir == scripts/tests/* ]] && scan="$REPO_ROOT/$suite_dir"
+    fi
+    qualifies=0
+    grep -rqE 'REPO[A-Z_]*[^a-zA-Z0-9_].*workflows/' "$scan" 2>/dev/null && qualifies=1
+    named=0
+    case $GITHUB_LANE_LINE in
+        *"$suite"*) named=1 ;;
+    esac
+    if [[ $qualifies -eq 1 && $named -eq 0 ]]; then
+        GITHUB_LANE_WRONG+=" $suite(reads this repository's workflows, unnamed)"
+    elif [[ $qualifies -eq 0 && $named -eq 1 ]]; then
+        GITHUB_LANE_WRONG+=" $suite(named, reads no workflow file of this repository)"
+    fi
+    [[ $qualifies -eq 1 ]] && GITHUB_LANE_QUALIFIED=$((GITHUB_LANE_QUALIFIED + 1))
+done <<< "$LANE_SUITES"
+if [[ -z $GITHUB_LANE_WRONG ]]; then
+    report "case 25 names in the .github/ lane every suite a workflow edit reds, and no other" 0 ""
+else
+    report "case 25 names in the .github/ lane every suite a workflow edit reds, and no other" 1 "the .github/ entry of UNRUN_LANES disagrees with the suites that read this repository's workflow files:$GITHUB_LANE_WRONG"
+fi
+# The two inputs the assertion above reads, each asserted non-empty for the reason case 23
+# gives: an empty lane line matches no suite name, and a suite set holding no qualifying
+# suite leaves the comparison with nothing to disagree about.
+if [[ -n $GITHUB_LANE_LINE ]]; then
+    report "case 25 found the .github/ entry it reads" 0 ""
+else
+    report "case 25 found the .github/ entry it reads" 1 "scripts/fix-round-check.sh holds no UNRUN_LANES entry beginning \".github/|\", so the assertion above read an empty string"
+fi
+if [[ $GITHUB_LANE_QUALIFIED -gt 0 ]]; then
+    report "case 25 found at least one suite that reads this repository's workflow files" 0 ""
+else
+    report "case 25 found at least one suite that reads this repository's workflow files" 1 "no suite .github/workflows/ci.yml starts under scripts/ matched the repository-rooted workflow read this case looks for, so the assertion above compared an empty set and could not fail"
 fi
 
 printf '\n'

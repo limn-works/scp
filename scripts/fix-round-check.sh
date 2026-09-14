@@ -45,9 +45,9 @@
 #              `cargo fmt` resolves the workspace through a full `cargo metadata` first.
 #              rustfmt reads `rustfmt.toml`, so this step checks a change to that file
 #              over every crate the manifests name.
-#   gates      The 29 enforcement scripts that compile nothing and link nothing. Measured
-#              together at 47 seconds on 2026-09-13, one run each, over the 28 the list
-#              held that day.
+#   gates      Every enforcement script the GATES array below names, each of which
+#              compiles nothing and links nothing. Measured together at 47 seconds on
+#              2026-09-13, one run each, over the 28 that array held that day.
 #
 # WHAT THIS SCRIPT CANNOT SHORTEN. Every worktree on this machine compiles into one shared
 # target directory, and that directory has one build lock. Measured on 2026-09-13:
@@ -107,7 +107,7 @@
 #      `scripts/check-cross-layer.sh` decides from
 #      `git diff <merge base with origin/main>...HEAD`, which holds no uncommitted edit,
 #      so its pass covers the committed half alone. It is the one gate in the list below
-#      that reads a diff range, and the other 28 read the working tree.
+#      that reads a diff range, and every other gate in that list reads the working tree.
 #   6. Every compile of a crate source that the native `cargo check` above does not
 #      reach. `cargo check -p … --target wasm32-unknown-unknown` over scp-clock,
 #      scp-crypto, scp-did, scp-protocol, scp-relay-client, scp-mls, scp-client,
@@ -138,9 +138,24 @@
 #      fix-round-check one runs the whole gate list below twice against this repository,
 #      so running it from inside this script would run that list three times in one
 #      invocation.
+#      TWO OF THE ELEVEN read a workflow file of this repository rather than one their
+#      own fixture wrote: `scripts/tests/ci-gate/run-tests.sh`, whose
+#      `ci_gate_selftest.py` resolves `REPO / ".github/workflows/ci.yml"` and asserts the
+#      job structure that file declares, and `scripts/tests/fix-round-check/run-tests.sh`,
+#      whose case 23 reads `.github/workflows/ci.yml` to hold the `scripts/` entry of
+#      UNRUN_LANES to the programs that file starts. The `.github/` entry of UNRUN_LANES
+#      names those two and no other, because a suite whose every workflow input is a file
+#      its own fixture wrote cannot be reddened by a change to `.github/`.
+#      `scripts/tests/signing-guard/run-tests.sh` is the suite that shape excludes: it
+#      creates fixture directories under `mktemp -d`, runs
+#      `scripts/assert-nonempty-signing-set.sh` against them, and reads no file of
+#      `.github/workflows/`, so an edit to the three signing jobs of
+#      `.github/workflows/release.yml` leaves it green. The `scripts/` entry names it,
+#      because the script it tests lives under `scripts/`.
 #      `scripts/tests/fix-round-check/run-tests.sh` holds the `scripts/` entry of
-#      UNRUN_LANES below to this list: it reads every suite invocation out of
-#      `.github/workflows/ci.yml` and fails when that entry names fewer.
+#      UNRUN_LANES below to this list: it reads every `scripts/` program a job of
+#      `.github/workflows/ci.yml` starts, subtracts the GATES array below, and fails when
+#      that entry names fewer than what remains.
 #
 # USAGE
 #   bash scripts/fix-round-check.sh [crate ...]
@@ -476,7 +491,7 @@ UNRUN_LANES=(
     "bindings/kotlin/|ktlint, detekt and the Gradle test task, which the kotlin-lint and kotlin-test jobs of .github/workflows/ci.yml run"
     "bindings/swift/|SwiftLint, SwiftFormat and swift build, which the swift-lint and swift-build-test jobs of .github/workflows/ci.yml run"
     "fuzz/|cargo check inside fuzz/ on the nightly fuzz/rust-toolchain.toml names, which the fuzz-build job of .github/workflows/ci.yml runs"
-    ".github/|scripts/tests/ci-gate/run-tests.sh and scripts/tests/signing-guard/run-tests.sh, which the ci-workflow-selftest job of .github/workflows/ci.yml runs. Three gates this run did start read a workflow file, each for rules of its own and none as coverage of a workflow edit: scripts/check-workflow-compile-steps.py reads every workflow for its cache-group and bindgen rules, scripts/check-toolchain-wiring.sh reads them for its container-build and paths-filter rules, and scripts/check-shipped-feature-graph.sh reads build-matrix.yml and release.yml for the cargo invocations that ship an artifact"
+    ".github/|scripts/tests/ci-gate/run-tests.sh, which the ci-workflow-selftest job of .github/workflows/ci.yml runs and whose ci_gate_selftest.py asserts the job structure this repository's own workflow files declare, and scripts/tests/fix-round-check/run-tests.sh, which the fix-round-check-selftest job runs and whose case 23 reads .github/workflows/ci.yml itself, so adding a suite invocation to that file turns that case red. Those two are every suite a change under .github/ can turn red: every other suite the ci-workflow-selftest, toolchain-wiring and workflow-compile-steps jobs run feeds its gate a workflow file its own fixture wrote. Three gates this run did start read a workflow file, each for rules of its own and none as coverage of a workflow edit: scripts/check-workflow-compile-steps.py reads every workflow for its cache-group and bindgen rules, scripts/check-toolchain-wiring.sh reads them for its container-build and paths-filter rules, and scripts/check-shipped-feature-graph.sh reads build-matrix.yml and release.yml for the cargo invocations that ship an artifact"
     "scripts/|the eleven suites that .github/workflows/ci.yml runs over this directory: scripts/tests/cross-layer/run-tests.sh in the cross-layer job, scripts/tests/bridge-symmetry/run-tests.sh and scripts/tests/enforcement-files-hook/run-tests.sh in the bridge-symmetry job, scripts/test_check_sdk_coverage.py and scripts/tests/call-invariants/ in the sdk-coverage job, scripts/tests/toolchain-wiring/run-tests.sh and scripts/tests/workflow-compile-steps/run-tests.sh in the toolchain-wiring job, scripts/tests/fix-round-check/run-tests.sh in the fix-round-check-selftest job, scripts/tests/agent-verdict-criterion/run-tests.sh in the agent-verdict-criterion job, and scripts/tests/ci-gate/run-tests.sh and scripts/tests/signing-guard/run-tests.sh in the ci-workflow-selftest job. Running a gate below against this repository's own files is not running that gate's fixture suite, which is the program that proves the gate still rejects what it exists to reject"
 )
 
