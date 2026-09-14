@@ -749,7 +749,7 @@ On appending a key event the owner builds the chain from the inception event to 
 
 ### 3.10.6 Anti-Segmentation Invariant
 
-**Publishing to the fallback set is a MUST.** An identity that published only to relays of its own would be resolvable only by a party that already holds its service record, because a first-contact reader knows no relay of that identity to query, so identities would partition into islands reachable by their existing contacts and by nobody else. **A publish cycle that no relay in the fallback set accepted MUST therefore be reported to the caller as a failed publication**, never as a success. Acceptance and not reachability is the term, because a relay at its declared budget answers the publisher and stores nothing, and `09-security-model.md` §9.7.4.2 R10 gates confirmed publication on acceptance by at least one fallback-set entry.
+**Publishing to the fallback set is a MUST.** An identity that published only to relays of its own would be resolvable only by a party that already holds its service record, because a first-contact reader knows no relay of that identity to query, so identities would partition into islands reachable by their existing contacts and by nobody else. **A publish cycle that no relay in the fallback set accepted MUST therefore be reported to the caller as a failed publication**, never as a success. Acceptance and not reachability is the term, because a relay that answers a publisher and refuses the write stores nothing, and `09-security-model.md` §9.7.4.2 R10 gates confirmed publication on acceptance by at least one fallback-set entry. **An acceptance records that the entry stored the bytes and never that the entry still holds them at a later moment**, because R9's ring displaces an identity when the relay needs the bytes. What the controller runs against a later displacement is R10's self-observation cadence, which re-publishes to every entry a fetch shows holding no record for this identity (§3.10.5). The ceremony that destroys spent keys rests on the other half of R10's confirmed publication, the controller's durable retention of the signed event, which no displacement at any relay reaches.
 
 **A refusal is never a verdict about the identity**, which `09-security-model.md` §9.7.4.2 R9 states with the recourse it names. The recourse is mechanical here because the fallback set comes from the shipped community relay list rather than from relays the identity itself chose (`18-addressability-and-deployment.md` §18.5.1). **Where every entry of the fallback set refuses**, the SDK reports the failed publication with the scope and the value each entry named and surfaces the entries to the controller, and a controller holding a signed reveal-authorized event retains it and resumes the ceremony from `PublishSent` when an entry accepts (`09-security-model.md` §9.7.4.2 R10).
 
@@ -862,6 +862,17 @@ pub enum IdentityError {
     /// the publisher reads a number rather than parsing a relay-written
     /// string. The wire code `4041` carries both fields (ADR-004).
     StorageBudgetExceeded { scope: BudgetScope, value: BudgetValue },
+    /// SCP-IDENT-1108. The SDK reached some members of the credential-keyed
+    /// store set and not every member, so it refused to compose a
+    /// reveal-authorized event rather than compose against a partial view: a
+    /// partial read is indistinguishable to the SDK from an empty one, and an
+    /// empty one is what the one-reveal-at-a-time rule treats as no pending
+    /// reveal (`09-security-model.md` §9.7.4.2 R10). The condition is routine
+    /// on a laptop whose pre-rotation authenticator is absent from its port,
+    /// so a caller routes on this code rather than on
+    /// `NoFallbackSourceReachable`, which names a relay the SDK could not
+    /// reach.
+    StorePartiallyUnreadable,
 }
 
 /// Which term of a validating relay's declared write policy a refusal failed
