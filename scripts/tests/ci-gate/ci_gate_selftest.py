@@ -526,8 +526,17 @@ RUST_ONLY = {
 }
 DOCS_ONLY = dict.fromkeys(RUST_ONLY, "false")
 
-# Jobs a `changes` filter output selects. cross-layer reads an event rather
-# than a filter, so each scenario states cross-layer for itself.
+# Jobs whose `if:` reads `github.event_name` rather than a `changes` filter
+# output, so a filter scenario decides nothing about them and each scenario
+# below states them for itself. Both carry
+# `if: github.event_name == 'pull_request'`, and check-cross-layer.sh is why:
+# it reads a declared exemption out of a pull request's body, which a
+# merge_group event does not publish. Job cross-layer runs that script as its
+# own step, and job fix-round-check-selftest runs it as one of the 28 gates
+# scripts/fix-round-check.sh names.
+EVENT_ONLY_JOBS = ("cross-layer", "fix-round-check-selftest")
+
+# Jobs a `changes` filter output selects.
 RUST_ONLY_RUNS = {
     "bridge-parity": True,
     "bridge-parity-kotlin": True,
@@ -560,25 +569,25 @@ SCENARIOS = {
         name="rust-only, pull_request",
         filters=RUST_ONLY,
         event="pull_request",
-        runs=RUST_ONLY_RUNS | {"cross-layer": True},
+        runs=RUST_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, True),
     ),
     "docs-only, pull_request": Scenario(
         name="docs-only, pull_request",
         filters=DOCS_ONLY,
         event="pull_request",
-        runs=DOCS_ONLY_RUNS | {"cross-layer": True},
+        runs=DOCS_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, True),
     ),
     "docs-only, push": Scenario(
         name="docs-only, push",
         filters=DOCS_ONLY,
         event="push",
-        runs=DOCS_ONLY_RUNS | {"cross-layer": False},
+        runs=DOCS_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, False),
     ),
     "rust-only, merge_group": Scenario(
         name="rust-only, merge_group",
         filters=RUST_ONLY,
         event="merge_group",
-        runs=RUST_ONLY_RUNS | {"cross-layer": False},
+        runs=RUST_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, False),
     ),
 }
 

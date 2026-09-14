@@ -28,6 +28,34 @@
 #     next covered three steps and not the gates step, which left a mutation deleting
 #     `FAILED=1` from the gate-failure branch passing every assertion here.
 #
+#   * THE DERIVATION. Naming no crate makes the script read which files this branch
+#     changed and compile the crates that own them, and cases 1, 2, 3, 4, 5 and 6 each name
+#     one, so none of them reaches that code. Cases 7, 8 and 9 run the script with no
+#     argument. Each runs a copy of it inside a fixture repository this harness builds under
+#     a temporary directory, because `scripts/fix-round-check.sh` reads the repository that
+#     holds it and this checkout's changed-file set is whatever the developer running this
+#     suite has edited.
+#
+#     Case 7 asserts the derived set against a fixture holding one uncommitted edit and one
+#     committed edit: both reach the set, `crates/scp-ffi/napi/src/lib.rs` resolves to
+#     `scp-ffi-napi` rather than to `scp-ffi`, and the compile command carries the two
+#     features that package owns and no feature of any other package.
+#
+#     Case 8 removes the fixture's `origin/main` ref and asserts that the run exits
+#     non-zero and starts no `cargo check`. That is the fail-open the comment above
+#     `changed_files` in `scripts/fix-round-check.sh` records: an earlier revision discarded
+#     that git error, derived an empty crate set, skipped the compile step, and exited 0 on
+#     a branch whose commits changed crate sources.
+#
+#     Case 9 changes one file that no crate directory holds and asserts the honest other
+#     half of the same branch: the run skips the compile step, names in its summary that the
+#     branch changed no file inside a workspace crate, and exits 0.
+#
+#   * THE MISSING GATE. A gate the runner's list names but the repository does not hold has
+#     to fail the run. Case 3 runs against this repository, where all 28 exist, so it cannot
+#     reach that branch. Case 10 deletes one gate from a fixture and asserts that the run
+#     names it and exits non-zero.
+#
 # WHAT THE STUBS REPLACE, and what stays real. The cases replace `cargo`, `rustc`, and
 # `rustup` with scripts on a PATH this harness leads with, because the contract clauses
 # above are about what the script does with those three programs' answers, and a real
@@ -39,6 +67,16 @@
 # WHY THE PINNED VERSION IS READ RATHER THAN WRITTEN. Case 2 and case 3 need a `rustc` that
 # agrees with the pin. The harness reads the channel out of `rust-toolchain.toml` at run
 # time, so raising the pin does not turn these two cases into copies of case 1.
+#
+# WHO RUNS THIS SUITE. The `fix-round-check-selftest` job of `.github/workflows/ci.yml`
+# runs it on every pull-request head, which is the head every fix round pushes. That job
+# names no merge_group event, for the reason its own comment gives: one of the 28 gates
+# case 3 runs reads an exemption out of the pull request's body, and a merge_group event
+# publishes no body. The job installs what case 3 needs: the tree-sitter
+# grammars nine Python gates parse with, the ruff `scripts/check-pyi-generated.sh` runs,
+# the jq `scripts/check-bridge-symmetry.sh` requires, a Rust toolchain for the twelve
+# `cargo tree` resolutions two gates run, and the base ref `scripts/check-cross-layer.sh`
+# diffs against. A developer runs the same command by hand.
 #
 # Usage: bash scripts/tests/fix-round-check/run-tests.sh
 # Exit: 0 when every case passes, 1 otherwise.
@@ -72,10 +110,13 @@ FAILURES=0
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
-# Build a stub directory and run the script with it leading PATH.
+# Build a stub directory for one case.
 #
-#   $1 the version string the stub `rustc` reports
-#   $2 the exit code the stub `cargo` returns for `cargo check`
+#   $1 the directory the stubs go under, which also holds that case's cargo.log
+#   $2 the version string the stub `rustc` reports
+#   $3 the exit code the stub `cargo` returns for `cargo check`
+#   $4 the exit code the stub `cargo` returns for `cargo fmt`
+#   $5 the exit code a stub `python3.12` returns, or the empty string for no such stub
 #
 # The stub `cargo` answers `check`, `fmt`, and `metadata` itself and hands every other
 # subcommand to the real cargo this harness found before it led PATH with the stub.
@@ -105,9 +146,8 @@ trap 'rm -rf "$WORK"' EXIT
 # `rustc` and `rustup` are written as two separate files on purpose:
 # `scripts/check-resolved-rustc.sh` skips its comparison only where the two names read one
 # file that rustup installed, and two distinct files put it on the path that compares.
-run_case() {
-    local case_name=$1 rustc_version=$2 cargo_check_rc=$3 cargo_fmt_rc=${4:-0} python_rc=${5:-}
-    local dir="$WORK/$case_name"
+write_stubs() {
+    local dir=$1 rustc_version=$2 cargo_check_rc=$3 cargo_fmt_rc=$4 python_rc=$5
     mkdir -p "$dir/bin"
 
     # A stub `python3.12` fails the gates step and no other.
@@ -156,9 +196,96 @@ exec cargo "\$@"
 EOF
 
     chmod +x "$dir/bin/rustc" "$dir/bin/rustup" "$dir/bin/cargo"
+}
 
+# Run this repository's own `scripts/fix-round-check.sh` against one named crate, under the
+# stubs above.
+run_case() {
+    local case_name=$1 rustc_version=$2 cargo_check_rc=$3 cargo_fmt_rc=${4:-0} python_rc=${5:-}
+    local dir="$WORK/$case_name"
+    write_stubs "$dir" "$rustc_version" "$cargo_check_rc" "$cargo_fmt_rc" "$python_rc"
     PATH="$dir/bin:$PATH" bash "$SCRIPT" scp-clock > "$dir/out.txt" 2>&1
     printf '%s' $? > "$dir/rc.txt"
+}
+
+# The gate paths `scripts/fix-round-check.sh` names, read out of its own GATES array. A
+# fixture repository holds no enforcement gate, and the script counts a gate its list names
+# but the repository does not hold as a failure, so each fixture plants an empty file at
+# every one of those paths. An empty file is a program under both `bash` and `python3.12`,
+# which are the two runners that array selects between, and it exits 0 under each.
+gate_paths() {
+    sed -n '/^GATES=(/,/^)/p' "$SCRIPT" | sed -nE 's|^[[:space:]]+(scripts/[^[:space:]]+)$|\1|p'
+}
+
+# Build a repository that is not this one, so a case decides which files its branch changed.
+#
+#   $1 the fixture directory
+#
+# `scripts/fix-round-check.sh` reads the repository holding it, through
+# `cd "$(dirname "$0")/.."`, so each fixture holds a copy of that script, a copy of the
+# resolved-compiler check that script runs as its first step, and a copy of
+# `rust-toolchain.toml`, which that step reads.
+#
+# The fixture holds three manifests whose directories nest — `crates/scp-ffi` contains
+# `crates/scp-ffi/napi` — because the longest-prefix rule in `crate_of_path` is what maps a
+# napi source file to `scp-ffi-napi`, and a fixture with no nesting cannot separate that
+# answer from `scp-ffi`. It also holds one file under no crate directory, which case 9
+# changes.
+#
+# The commit passes `--no-gpg-sign` and `--no-verify` because a developer's global git
+# configuration may sign every commit and may point `core.hooksPath` at this repository's
+# hooks, and this fixture wants neither. `git update-ref` writes the remote-tracking ref
+# `changed_files` takes its merge base against, so the fixture needs no network.
+build_fixture() {
+    local root=$1 g
+    mkdir -p "$root/scripts" "$root/crates/scp-clock/src" "$root/crates/scp-ffi/src" \
+        "$root/crates/scp-ffi/napi/src" "$root/notes"
+    cp "$SCRIPT" "$root/scripts/fix-round-check.sh"
+    cp "$REPO_ROOT/scripts/check-resolved-rustc.sh" "$root/scripts/check-resolved-rustc.sh"
+    cp "$REPO_ROOT/rust-toolchain.toml" "$root/rust-toolchain.toml"
+
+    while IFS= read -r g; do
+        [[ -n $g ]] || continue
+        mkdir -p "$root/$(dirname "$g")"
+        : > "$root/$g"
+    done < <(gate_paths)
+
+    printf '[package]\nname = "scp-clock"\nversion = "0.0.0"\n' > "$root/crates/scp-clock/Cargo.toml"
+    printf '[package]\nname = "scp-ffi"\nversion = "0.0.0"\n' > "$root/crates/scp-ffi/Cargo.toml"
+    printf '[package]\nname = "scp-ffi-napi"\nversion = "0.0.0"\n' > "$root/crates/scp-ffi/napi/Cargo.toml"
+    printf '// fixture source\n' > "$root/crates/scp-clock/src/lib.rs"
+    printf '// fixture source\n' > "$root/crates/scp-ffi/src/lib.rs"
+    printf '// fixture source\n' > "$root/crates/scp-ffi/napi/src/lib.rs"
+    printf 'fixture note\n' > "$root/notes/note.md"
+
+    git -C "$root" init -q -b main
+    git -C "$root" add -A
+    git -C "$root" -c user.email=fix-round-check@example.invalid -c user.name='fix-round-check tests' \
+        commit -q --no-gpg-sign --no-verify -m 'fixture base'
+    git -C "$root" update-ref refs/remotes/origin/main HEAD
+}
+
+# Append one line to a fixture file and commit it, so the merge-base half of
+# `changed_files` reads that path.
+fixture_commit() {
+    local root=$1 path=$2
+    printf '// committed edit\n' >> "$root/$path"
+    git -C "$root" add -A
+    git -C "$root" -c user.email=fix-round-check@example.invalid -c user.name='fix-round-check tests' \
+        commit -q --no-gpg-sign --no-verify -m 'fixture edit'
+}
+
+# Run a fixture's own copy of the script with no crate argument, under stubs that pass.
+#
+# The stubs, the invocation log, and the two output files sit in `<fixture>.harness`, beside
+# the fixture rather than inside it, because the run derives its crate set from
+# `git status --porcelain` of the fixture and every file this harness wrote there would join
+# that set as an untracked path. Each case reads the three files back from that directory.
+run_fixture() {
+    local root=$1 harness="$1.harness"
+    write_stubs "$harness" "$PIN_CHANNEL" 0 0 ""
+    PATH="$harness/bin:$PATH" bash "$root/scripts/fix-round-check.sh" > "$harness/out.txt" 2>&1
+    printf '%s' $? > "$harness/rc.txt"
 }
 
 report() {
@@ -289,33 +416,144 @@ fi
 # Naming a package the workspace does not hold has to fail rather than check a smaller set,
 # because a fix agent that mistypes a crate name would otherwise read a green result that
 # compiled none of its edits.
-mkdir -p "$WORK/unknown-crate/bin"
-cat > "$WORK/unknown-crate/bin/cargo" <<EOF
-#!/usr/bin/env bash
-printf '%s\n' "\$*" >> "$WORK/unknown-crate/cargo.log"
-case "\$1" in
-    check) exit 0 ;;
-    fmt) exit 0 ;;
-    metadata) printf '{"version":1,"target_directory":"$WORK/unknown-crate/stub-target-dir"}\n'; exit 0 ;;
-esac
-export PATH="\${PATH#"$WORK/unknown-crate/bin:"}"
-exec cargo "\$@"
-EOF
-cat > "$WORK/unknown-crate/bin/rustc" <<EOF
-#!/usr/bin/env bash
-printf 'rustc %s (0000000000 2020-01-01)\n' "$PIN_CHANNEL"
-EOF
-cat > "$WORK/unknown-crate/bin/rustup" <<'EOF'
-#!/usr/bin/env bash
-exit 1
-EOF
-chmod +x "$WORK/unknown-crate/bin/cargo" "$WORK/unknown-crate/bin/rustc" "$WORK/unknown-crate/bin/rustup"
+write_stubs "$WORK/unknown-crate" "$PIN_CHANNEL" 0 0 ""
 PATH="$WORK/unknown-crate/bin:$PATH" bash "$SCRIPT" scp-not-a-crate > "$WORK/unknown-crate/out.txt" 2>&1
 rc=$?
 if [[ $rc -eq 0 ]]; then
     report "case 4 rejects a package the workspace does not hold" 1 "the script exited 0"
 else
     report "case 4 rejects a package the workspace does not hold" 0 ""
+fi
+
+# ── Case 7: the crate set derived from the files the branch changed ──────────────────
+#
+# Cases 1 through 6 each name a crate, so each takes the `$# -gt 0` branch and none of them
+# runs `changed_files` or `crate_of_path`. This case runs the derivation against a fixture
+# whose changed files it chose: one uncommitted edit under `crates/scp-clock`, and one
+# committed edit under `crates/scp-ffi/napi`.
+#
+# The mutations it kills: dropping the `git diff "$base" HEAD` line leaves `scp-ffi-napi`
+# out of the derived set, dropping the `git status --porcelain` line leaves `scp-clock` out,
+# and replacing the longest-prefix comparison in `crate_of_path` with a first-match loop
+# resolves the napi source file to `scp-ffi` and selects a package that owns none of the
+# edits.
+FIXTURE7="$WORK/derives-crates"
+build_fixture "$FIXTURE7"
+fixture_commit "$FIXTURE7" crates/scp-ffi/napi/src/lib.rs
+printf '// uncommitted edit\n' >> "$FIXTURE7/crates/scp-clock/src/lib.rs"
+run_fixture "$FIXTURE7"
+rc=$(cat "$FIXTURE7.harness/rc.txt")
+if [[ $rc -eq 0 ]]; then
+    report "case 7 exits 0 when the derived crates compile" 0 ""
+else
+    report "case 7 exits 0 when the derived crates compile" 1 "the script exited $rc; output tail: $(tail -n 6 "$FIXTURE7.harness/out.txt")"
+fi
+if grep -qF 'crates scp-clock scp-ffi-napi (derived from the files this branch changed)' "$FIXTURE7.harness/out.txt"; then
+    report "case 7 derives both edited crates and neither of the two it did not edit" 0 ""
+else
+    report "case 7 derives both edited crates and neither of the two it did not edit" 1 "the summary names another crate set: $(tail -n 3 "$FIXTURE7.harness/out.txt")"
+fi
+if grep -qF 'check -p scp-clock -p scp-ffi-napi --all-targets --features scp-ffi-napi/testing,scp-ffi-napi/outlet-capability-test-grant' "$FIXTURE7.harness/cargo.log"; then
+    report "case 7 compiles the derived crates with the features they own" 0 ""
+else
+    report "case 7 compiles the derived crates with the features they own" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE7.harness/cargo.log")"
+fi
+
+# ── Case 8: no origin/main ref ───────────────────────────────────────────────────────
+#
+# The fixture holds an uncommitted edit under `crates/scp-clock`, so the working-tree half
+# of `changed_files` would derive a crate, and then the merge-base call fails. The run has
+# to end there: a committed edit this checkout cannot read would otherwise go uncompiled
+# under a green verdict, which is the shape the comment above `changed_files` records.
+#
+# The mutation it kills: dropping the `return 1` from that failure branch, so
+# `changed_files` returns 0 having listed the working tree alone, makes this run derive
+# `scp-clock` by itself, compile it, and exit 0 over an unread committed edit.
+FIXTURE8="$WORK/no-origin-main"
+build_fixture "$FIXTURE8"
+fixture_commit "$FIXTURE8" crates/scp-ffi/napi/src/lib.rs
+printf '// uncommitted edit\n' >> "$FIXTURE8/crates/scp-clock/src/lib.rs"
+git -C "$FIXTURE8" update-ref -d refs/remotes/origin/main
+run_fixture "$FIXTURE8"
+rc=$(cat "$FIXTURE8.harness/rc.txt")
+if [[ $rc -eq 0 ]]; then
+    report "case 8 exits non-zero when the checkout holds no merge base with origin/main" 1 "the script exited 0"
+else
+    report "case 8 exits non-zero when the checkout holds no merge base with origin/main" 0 ""
+fi
+if grep -q '^check ' "$FIXTURE8.harness/cargo.log" 2>/dev/null; then
+    report "case 8 starts no cargo check" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE8.harness/cargo.log")"
+else
+    report "case 8 starts no cargo check" 0 ""
+fi
+if grep -qF 'holds no merge base between HEAD and origin/main' "$FIXTURE8.harness/out.txt"; then
+    report "case 8 names the ref it could not read" 0 ""
+else
+    report "case 8 names the ref it could not read" 1 "the output never names the missing merge base: $(tail -n 3 "$FIXTURE8.harness/out.txt")"
+fi
+
+# ── Case 9: a branch that changed no file inside a crate ─────────────────────────────
+#
+# Case 8 asserts that a derivation which could not read the branch's files fails. This case
+# asserts the other half: a derivation that read them and found no crate source among them
+# skips the compile step, says so, and exits 0. Without it, a script that failed on every
+# empty crate set would satisfy case 8 and tell a fix agent editing only documentation that
+# its round is broken.
+FIXTURE9="$WORK/no-crate-files"
+build_fixture "$FIXTURE9"
+fixture_commit "$FIXTURE9" notes/note.md
+printf 'uncommitted note\n' >> "$FIXTURE9/notes/note.md"
+run_fixture "$FIXTURE9"
+rc=$(cat "$FIXTURE9.harness/rc.txt")
+if [[ $rc -eq 0 ]]; then
+    report "case 9 exits 0 when the branch changed no crate source" 0 ""
+else
+    report "case 9 exits 0 when the branch changed no crate source" 1 "the script exited $rc; output tail: $(tail -n 6 "$FIXTURE9.harness/out.txt")"
+fi
+if grep -qF 'crates none (derived from the files this branch changed)' "$FIXTURE9.harness/out.txt"; then
+    report "case 9 names the empty crate set in its summary" 0 ""
+else
+    report "case 9 names the empty crate set in its summary" 1 "the summary names another crate set: $(tail -n 3 "$FIXTURE9.harness/out.txt")"
+fi
+if grep -qF 'compile: this branch changed no file inside a workspace crate' "$FIXTURE9.harness/out.txt"; then
+    report "case 9 reports the compile step as skipped rather than as run" 0 ""
+else
+    report "case 9 reports the compile step as skipped rather than as run" 1 "the summary holds no skip reason: $(tail -n 3 "$FIXTURE9.harness/out.txt")"
+fi
+if grep -q '^check ' "$FIXTURE9.harness/cargo.log" 2>/dev/null; then
+    report "case 9 starts no cargo check" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE9.harness/cargo.log")"
+else
+    report "case 9 starts no cargo check" 0 ""
+fi
+
+# ── Case 10: a gate the list names and the repository does not hold ──────────────────
+#
+# Every one of the 28 gates exists in this repository, so case 3 exercises the branch that
+# runs a gate and never the branch that finds one absent. Deleting the `MISSING` branch from
+# `scripts/fix-round-check.sh` would leave an absent gate uncounted and unreported: the run
+# would print `gates 27/28 passed` and exit 0, having skipped a gate rather than failing on
+# it. This case deletes one gate from a fixture that is otherwise the passing fixture of
+# case 9.
+FIXTURE10="$WORK/missing-gate"
+build_fixture "$FIXTURE10"
+MISSING_GATE=$(gate_paths | head -n 1)
+rm -f "$FIXTURE10/$MISSING_GATE"
+run_fixture "$FIXTURE10"
+rc=$(cat "$FIXTURE10.harness/rc.txt")
+if [[ $rc -eq 0 ]]; then
+    report "case 10 exits non-zero when a gate the list names is absent" 1 "the script exited 0"
+else
+    report "case 10 exits non-zero when a gate the list names is absent" 0 ""
+fi
+if grep -qF "MISSING $MISSING_GATE" "$FIXTURE10.harness/out.txt"; then
+    report "case 10 names the absent gate" 0 ""
+else
+    report "case 10 names the absent gate" 1 "the output never names $MISSING_GATE: $(tail -n 3 "$FIXTURE10.harness/out.txt")"
+fi
+if grep -qE 'gates [0-9]+/[0-9]+ passed, 1 FAILED' "$FIXTURE10.harness/out.txt"; then
+    report "case 10 counts the absent gate as a failure rather than dropping it" 0 ""
+else
+    report "case 10 counts the absent gate as a failure rather than dropping it" 1 "the summary holds no gate-failure count: $(tail -n 3 "$FIXTURE10.harness/out.txt")"
 fi
 
 printf '\n'
