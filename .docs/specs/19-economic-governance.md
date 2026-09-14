@@ -154,8 +154,8 @@ pub struct PaymentMetadata {
     pub idempotency_key: [u8; 16],         // prevents duplicate authorization
     /// Binds the receipt this authorization produces to one write at one
     /// relay. `None` for every payment outside a retained-kind PUBLISH.
-    /// `09-security-model.md` §9.7.4.2 R9 states the value and the four checks
-    /// a relay runs against it.
+    /// `09-security-model.md` §9.7.4.2 R9 states the value and the checks a
+    /// relay runs against it.
     pub write_binding: Option<[u8; 32]>,
 }
 
@@ -559,7 +559,7 @@ Relay economics are SEPARATE from context economics — different trust model. R
 
 **Payment flow:** the agent reads the relay's declared write policy through ADR-004's `POLICY` query, which the relay answers with the `relay_config` fields of `18-addressability-and-deployment.md` §18.3.3 verbatim, then selects a compatible adapter, authorizes per action, and the relay verifies and captures. **The agent reads that policy through the query and not through `.well-known/scp`**: a community-relay-list entry carries a URL and no domain, and §18.3.2 states that a party holding DNS or a CA chain serves a fraudulent copy of that document. **On a retained-kind PUBLISH the authorization rides on the wire as `payment_receipt`**, the `PaymentReceipt` bytes tagged with the adapter that issued them, and the relay runs `PaymentAdapter::verify` (§19.2.1) on them before it accepts the write (`09-security-model.md` §9.10.12, §9.7.4.2 R9).
 
-**One receipt pins one record at one relay, and the relay checks three bindings beside the adapter's verification**: the receipt's `payee` equals the relay's own declared `economic.payee`, which binds the receipt to this relay; the receipt's `write_binding` equals `SHA-256(payee_identifier ‖ frame_value_digest)`, which binds it to these bytes; and the receipt's `receipt_id` is one this relay has not already spent, which binds it to one use. A fourth check reads `verified_amount` against the declared price for the write's byte count. `09-security-model.md` §9.7.4.2 R9 states all four and this section states no second condition.
+**One receipt pins one record at one relay, and the relay runs the checks `09-security-model.md` §9.7.4.2 R9 states beside the adapter's verification.** Three of those bind the receipt: its `payee` binds it to this relay, its `write_binding` binds it to the bytes this PUBLISH carries, and its unspent `receipt_id` binds it to one use. R9 states each check's own test and this section cites it.
 
 **Free relays MUST exist.** The bootstrap relay list (`18-addressability-and-deployment.md` §18.5.1, priority level 5) MUST include free relays, and that invariant fixes what a relay may charge and fixes nothing about what it stores. **What bounds a free listed relay is the write policy it declares** — a rate limit and a per-identifier storage budget — together with R9's ring buffer, which displaces the oldest-established unpaid retained set when the relay's storage fills. **The total storage budget refuses no unpaid write**, because the ring displaces instead. A charging relay refuses an unpaid PUBLISH for `Payment` under the same rule. Self-hosted relays (§10.2, §10.4), community relays, and bundled relays remain free. Economic config is optional. Absence = free.
 

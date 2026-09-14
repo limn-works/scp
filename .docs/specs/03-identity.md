@@ -700,7 +700,7 @@ An identity's key-event log rides in the key-event record frame `09-security-mod
 
 **Relay-side validation.** `09-security-model.md` §9.7.4.2 R9 states the slot key, what a slot holds, the write rule, the serving order and the eviction rule. On PUBLISH at a routing id an SCP-native relay runs seven checks **in the order below, which is the order and not an enumeration**, cheapest first, so junk is rejected before any expensive work. **This section states the number of checks once, and every other artifact that names the order takes the number by citation to this section.** The three policy checks lead because each reads a field the relay already holds and decodes nothing: a relay that ran chain verification first would perform one P-256 verification per signature slot on a frame the sixth check rejects for free:
 
-1. **The payment verification.** Where the relay declares `per_publish` or `per_byte_stored`, verify the PUBLISH's `payment_receipt` through the adapter it is tagged with and against the four checks `09-security-model.md` §9.7.4.2 R9 states. Refuse `Payment` where the write is charged and the receipt is absent, fails the adapter's verification, or fails one of those four checks; otherwise record the write as paid. **This check leads because a paid write is exempt from the two checks below it**, so a relay that ran either of those first would refuse a write the receipt covers.
+1. **The payment verification.** Where the relay declares `per_publish` or `per_byte_stored`, verify the PUBLISH's `payment_receipt` through the adapter it is tagged with and against the checks `09-security-model.md` §9.7.4.2 R9 states. Refuse `Payment` where the write is charged and the receipt is absent, fails the adapter's verification, or fails one of those checks; otherwise record the write as paid. **This check leads because a paid write is exempt from the two checks below it**, so a relay that ran either of those first would refuse a write the receipt covers.
 2. **The declared rate limit.** Refuse an unpaid PUBLISH that exceeds `rate_limit_publish`. The check reads one counter against the publishing address and decodes nothing.
 3. **Structural decode.** Decode the blob as a key-event record frame (`09-security-model.md` §9.10.12), under the one parse bound §9.7.4.2's definitions state for every count-prefixed list read out of unverified bytes. A blob that does not decode is not a candidate key-event record.
 4. **The identifier-to-routing-id binding.** Confirm that the routing id equals the registered derivation over the frame's `identifier` field. This is a plain hash, cheaper than a signature verification, and it is the discriminant that lets a relay recognize a key-event record with no new wire type.
@@ -950,8 +950,9 @@ pub struct ResolutionOutcome {
     pub verdict: ResolutionVerdict,
     /// Present on `Confirmed` and `Adopted`, absent on every other verdict.
     /// `KeyState` here is the derived key state `09-security-model.md`
-    /// §9.7.4.2's definitions define, with the field list and the type of each
-    /// field this section cites rather than restates. That name also spells the event kind
+    /// §9.7.4.2's definitions define, and this section cites that definition
+    /// and writes no field list and no second definition of it. That same name
+    /// spells the event kind
     /// `EventKind::KeyState`, which is a variant of a different type and is
     /// the event a chain carries rather than the state a chain derives.
     pub key_state: Option<KeyState>,
