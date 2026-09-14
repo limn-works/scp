@@ -3198,9 +3198,19 @@ def dependency_condition_gaps(doc: dict) -> list[str]:
     for job_id, job in sorted(jobs.items()):
         needs = job.get("needs") or []
         needs = [needs] if isinstance(needs, str) else list(needs)
-        condition = job.get("if")
-        if condition is None or not needs:
+        if not needs:
             continue
+        condition = job.get("if")
+        if condition is None:
+            # A job that carries no `if:` runs on every run of this workflow, so the
+            # criterion binds hardest on it: every job in its `needs` list has to run
+            # on every such run too. Stepping over it would exempt exactly the case
+            # the criterion states, so substitute the constant-true expression,
+            # written in the grammar `selects` reads, and compare normally. The 29
+            # jobs in this shape today all depend on check-draft alone, whose own
+            # condition selects it on every event this enumeration presents, so the
+            # substitution reports nothing on the workflow as it stands.
+            condition = "true == 'true'"
         if any(function in str(condition) for function in STATUS_FUNCTIONS):
             continue
         for dependency in needs:
@@ -3240,22 +3250,64 @@ def check_dependency_conditions(doc: dict) -> None:
     )
 
 
+def narrow_condition(expression: str, clause_fragment: str) -> str:
+    """Drop every `||` clause of one `if:` expression that names a fragment.
+
+    Splitting on `||` rather than on newlines, because `if: >-` folds an expression
+    onto one line before yaml.safe_load returns it: a line-wise filter deletes the
+    whole expression, and an empty expression makes `selects` raise, which
+    `dependency_condition_gaps` reports as a clause it cannot read. A control whose
+    mutant reaches that branch passes however the union comparison behaves, so it
+    proves nothing about the comparison it exists to guard.
+    """
+    kept = [
+        clause
+        for clause in str(expression).split("||")
+        if clause_fragment not in clause
+    ]
+    narrowed = " || ".join(clause.strip() for clause in kept)
+    if not narrowed or narrowed == " ".join(str(expression).split()):
+        raise ValueError(
+            f"narrowing {expression!r} by {clause_fragment!r} dropped every clause or "
+            f"none, and a mutant has to stay readable and has to differ"
+        )
+    return narrowed
+
+
 def check_dependency_conditions_detect_a_narrowed_producer(doc: dict) -> None:
     """Narrowing one producer's condition by one clause is caught above."""
     narrowed = copy.deepcopy(doc)
     producer = narrowed["jobs"]["pyo3-module"]
-    producer["if"] = "\n".join(
-        line
-        for line in str(producer["if"]).splitlines()
-        if "outputs.kotlin" not in line
-    ).rstrip(" |\n")
+    producer["if"] = narrow_condition(producer["if"], "outputs.kotlin")
+    gaps = dependency_condition_gaps(narrowed)
     check(
         "dropping the kotlin clause from pyo3-module is reported",
-        any(
-            "bridge-parity-kotlin" in gap
-            for gap in dependency_condition_gaps(narrowed)
-        ),
-        "a producer that no longer covers bridge-parity-kotlin went unreported",
+        any("bridge-parity-kotlin runs and pyo3-module skips" in gap for gap in gaps),
+        f"a producer that no longer covers bridge-parity-kotlin went unreported: {gaps}",
+    )
+    # The mutant has to reach the union comparison, not the branch that reports an
+    # expression this grammar cannot read: that branch names every dependant of the
+    # mutated job whatever the comparison answers, which would let this control pass
+    # over a comparison that had been deleted.
+    check(
+        "the narrowed producer is reported by the comparison, not by a parse refusal",
+        not any("cannot decide" in gap for gap in gaps),
+        f"the mutant expression went unread: {gaps}",
+    )
+
+
+def check_dependency_conditions_detect_a_conditionless_consumer(doc: dict) -> None:
+    """A job with no `if:` whose dependency carries one is compared, not exempted."""
+    mutated = copy.deepcopy(doc)
+    # Job error-codes carries `needs: [check-draft]` and no `if:`, so it runs on every
+    # run. Pointing it at a producer selected by one filter output gives the shape a
+    # later change would create by having a gate job download a built artifact.
+    mutated["jobs"]["error-codes"]["needs"] = ["check-draft", "pyo3-module"]
+    gaps = dependency_condition_gaps(mutated)
+    check(
+        "a conditionless job whose dependency can skip is reported",
+        any("error-codes runs and pyo3-module skips" in gap for gap in gaps),
+        f"a job with no `if:` was exempted from the comparison: {gaps}",
     )
 
 
@@ -3341,6 +3393,7 @@ def main() -> int:
     print("needs-condition — a job's dependencies run wherever the job does")
     check_dependency_conditions(workflow)
     check_dependency_conditions_detect_a_narrowed_producer(workflow)
+    check_dependency_conditions_detect_a_conditionless_consumer(workflow)
 
     print("coverage — every job reaches a required status check")
     defined = set(jobs) - {"ci"}
