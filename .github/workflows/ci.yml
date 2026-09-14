@@ -151,6 +151,7 @@ jobs:
     outputs:
       rust: ${{ steps.filter.outputs.rust == 'true' || steps.filter.outputs.toolchain == 'true' }}
       python: ${{ steps.filter.outputs.python == 'true' || steps.filter.outputs.toolchain == 'true' }}
+      python-wheel: ${{ steps.filter.outputs.python-wheel == 'true' || steps.filter.outputs.toolchain == 'true' }}
       typescript: ${{ steps.filter.outputs.typescript == 'true' || steps.filter.outputs.toolchain == 'true' }}
       typescript-wasm: ${{ steps.filter.outputs.typescript-wasm == 'true' || steps.filter.outputs.toolchain == 'true' }}
       scaffold-typescript-web: ${{ steps.filter.outputs.scaffold-typescript-web == 'true' || steps.filter.outputs.toolchain == 'true' }}
@@ -241,6 +242,56 @@ jobs:
               - 'bindings/python/**'
               - 'crates/scp-ffi/src/**'
               - 'crates/scp-ffi/common/**'
+            # Job python-wheel-build compiles the cargo configuration the released
+            # wheel compiles — `extension-module`, which activates
+            # `pyo3/abi3-py310`, and `vendored-openssl`, which compiles OpenSSL
+            # from source. `.github/workflows/build-matrix.yml` runs that
+            # compilation on no pull request (it triggers on a `scp-*@*` tag push,
+            # on `workflow_call` and on `workflow_dispatch`), and job python-test's
+            # `maturin develop --features testing` replaces the feature list rather
+            # than adding to it, so before this lane existed the two features were
+            # compiled for the first time by a release. These files decide what
+            # this lane compiles, which is what
+            # `.docs/lessons/route-a-changed-file-to-every-lane-it-decides.md`
+            # requires of the filter guarding a job: it lists every file that
+            # decides the job's behaviour, whether or not a pull request editing
+            # that file alone is rare.
+            python-wheel:
+              - 'bindings/python/pyproject.toml'
+              - 'crates/scp-ffi/Cargo.toml'
+              - 'crates/scp-platform/Cargo.toml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              # The PyO3 sources this lane compiles under `Py_LIMITED_API`, and the
+              # only files that decide whether every C API the crate calls exists
+              # there. Job python-test compiles these same files without
+              # `extension-module`, and job rust-build-pyo3-production compiles them
+              # with `--features server`, so neither one rejects a call pyo3 exposes
+              # only outside the limited ABI. While this filter named no source path,
+              # such a call reached an abi3 compile for the first time on the tag push
+              # that cut a release, which is the failure this lane exists to move onto
+              # a pull request. `scripts/tests/ci-gate/ci_gate_selftest.py` derives
+              # these two entries from the `python` filter above and fails when one is
+              # absent here.
+              - 'crates/scp-ffi/src/**'
+              - 'crates/scp-ffi/common/**'
+              # The pure-Python package this lane's last step imports. That step
+              # walks the installed package inside a CPython 3.10 virtual
+              # environment and imports every module it holds, so every file under
+              # this directory compiles on the oldest interpreter
+              # `bindings/python/pyproject.toml` admits with
+              # `requires-python = ">=3.10"`. Every other python-version key in this
+              # workflow reads "3.12", so no other job compiles these modules on
+              # 3.10. Job python-lint rejects a construct CPython added after 3.10
+              # because `[tool.ruff] target-version` in that project file reads
+              # py310; this lane compiles the package on 3.10 itself, which also
+              # rejects a 3.11-or-later standard-library name that ruff reads as an
+              # ordinary import. `scripts/tests/ci-gate/ci_gate_selftest.py` derives
+              # this entry from the `[tool.maturin] module-name` key of
+              # `bindings/python/pyproject.toml` and fails when it is absent here.
+              - 'bindings/python/scp_sdk/**'
+              # The matrix legs this lane stands in for on a pull request.
+              - '.github/workflows/build-matrix.yml'
             typescript:
               - 'bindings/typescript/**'
               - 'crates/scp-ffi/napi/**'
@@ -1625,50 +1676,113 @@ jobs:
           # available in this job — they run in dedicated parity jobs below.
           PYTHONPATH=. pytest tests/ -v -m "not parity"
 
-  # Compile the wheel with the cargo configuration a release compiles it with, so
-  # an `openssl-src` build failure fails a pull request instead of a tag push.
-  # `.github/workflows/build-matrix.yml` triggers on a `scp-*@*` tag push and on
-  # `workflow_call`, and job python-test above runs `maturin develop --release
-  # --features testing`, which REPLACES the `[tool.maturin] features` array rather
-  # than adding to it, so until this job existed the first compile of
-  # `rusqlite/bundled-sqlcipher-vendored-openssl` was the run that cut a release.
-  # The two gates that read that feature — `scripts/check-shipped-feature-graph.sh`
-  # and `scripts/check-vendored-openssl-scope.sh` — resolve dependency graphs and
+  # Compile the cargo configuration the released wheel compiles, and prove the
+  # wheel it produces installs on a CPython it was not built against.
+  #
+  # No other job on a pull request compiles it. `.github/workflows/build-matrix.yml`
+  # builds the five release wheels on a `scp-*@*` tag push, on `workflow_call` and
+  # on `workflow_dispatch`, and job python-test above runs
+  # `maturin develop --release --features testing`, which REPLACES the
+  # `[tool.maturin] features` array rather than adding to it — that job's log
+  # carries maturin's "building a library without activating pyo3's
+  # `extension-module` feature" warning and no `openssl` line at all. So
+  # `pyo3/abi3-py310` and `rusqlite/bundled-sqlcipher-vendored-openssl` were first
+  # compiled by a release: an API the limited ABI omits, or an `openssl-src` build
+  # failure, surfaced after the tag was cut and blocked the publish rather than a
+  # pull request. The two gates that read these features —
+  # `scripts/check-shipped-feature-graph.sh` and
+  # `scripts/check-vendored-openssl-scope.sh` — resolve dependency graphs and
   # compile nothing.
   #
-  # This job carries no path filter, so it runs on every pull request and cannot be
-  # skipped for a change that breaks the build. It compiles in debug and on one
-  # target, so it is not the release matrix: it exercises neither the
-  # manylinux_2_28 container and its `dnf install -y perl` step, nor NASM on
-  # Windows, nor the aarch64 cross image. Run build-matrix.yml through
-  # `workflow_dispatch` to exercise those before cutting a tag.
+  # This lane compiles in debug and on one target, so it is not the release
+  # matrix: it does not exercise the manylinux_2_28 container, the `dnf install -y
+  # perl` step the x86_64 container needs, NASM on Windows, or the aarch64 cross
+  # image. Run build-matrix.yml through its `workflow_dispatch` trigger to exercise
+  # those before cutting a tag.
   python-wheel-build:
-    needs: check-draft
-    name: Python / wheel (vendored OpenSSL)
+    needs: changes
+    if: needs.changes.outputs.python-wheel == 'true'
+    name: Python / wheel (abi3 + vendored OpenSSL)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
+      # 3.12 builds the wheel and 3.10 installs it, which is what makes the last
+      # step a test of the stable ABI rather than of the interpreter that built it.
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: |
+            3.10
+            3.12
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-debug
           save-if: false
       # The same range `bindings/python/pyproject.toml` names in its
-      # `[build-system] requires`, so this job runs the maturin a `pip install`
+      # `[build-system] requires`, so this lane runs the maturin a `pip install`
       # from the sdist would run.
       - name: Install maturin
         run: python3.12 -m pip install 'maturin>=1.0,<2.0'
       # No --features and no --manifest-path: maturin reads both from the
-      # `[tool.maturin]` table of bindings/python/pyproject.toml, which is where the
-      # release reads them, so this step compiles what the release compiles.
+      # `[tool.maturin]` table of bindings/python/pyproject.toml, which is what the
+      # release does, so this step compiles what the release compiles.
       - name: Build the wheel from the project file the release builds from
         run: |
           cd bindings/python
           maturin build --out dist -i python3.12 --locked
+      - name: The wheel carries the abi3 tag, so one wheel serves 3.10 and later
+        run: |
+          shopt -s nullglob
+          wheels=(bindings/python/dist/*.whl)
+          if [[ "${#wheels[@]}" -ne 1 ]]; then
+            echo "expected one wheel in bindings/python/dist, found ${#wheels[@]}"
+            exit 1
+          fi
+          name="$(basename "${wheels[0]}")"
+          echo "built $name"
+          case "$name" in
+            *-cp310-abi3-*) echo "ok — tagged cp310-abi3" ;;
+            *)
+              echo "FAIL — this wheel is tagged for one CPython, not for the stable ABI."
+              echo "       bindings/python/pyproject.toml declares requires-python >= 3.10"
+              echo "       and classifiers through 3.13, and build-matrix.yml builds one"
+              echo "       wheel per platform, so a pip install on any other CPython would"
+              echo "       match no wheel and compile the Rust workspace from the sdist."
+              echo "       Restore pyo3/abi3-py310 to the extension-module feature in"
+              echo "       crates/scp-ffi/Cargo.toml."
+              exit 1
+              ;;
+          esac
+      # Every module of the package, not only the extension: `import scp_sdk`
+      # compiles the nineteen submodules `bindings/python/scp_sdk/__init__.py`
+      # names and no others, so a module nothing imports — `scp_sdk.provenance`
+      # today — would never be compiled on 3.10 and a construct CPython added
+      # after 3.10 would reach a released wheel. The walk below imports every
+      # module the installed package holds, and `onerror` re-raises rather than
+      # letting `walk_packages` swallow a failure while descending a subpackage.
+      - name: A CPython the wheel was never built against compiles every module it holds
+        run: |
+          python3.10 -m venv /tmp/abi3-venv
+          /tmp/abi3-venv/bin/pip install bindings/python/dist/*.whl
+          /tmp/abi3-venv/bin/python - <<'PY'
+          import importlib
+          import pkgutil
+          import sys
+
+          import scp_sdk
+          import scp_sdk._scp_core
+
+
+          def onerror(name: str) -> None:
+              raise
+
+
+          for module in pkgutil.walk_packages(scp_sdk.__path__, "scp_sdk.", onerror):
+              importlib.import_module(module.name)
+              print("imported", module.name)
+          print("imported scp_sdk and its extension on", sys.version)
+          PY
 
   # ── TypeScript ──────────────────────────────────────────────────────
   # ORs on `rust` for a reason spelled out above python-test: a NAPI addon
@@ -2378,6 +2492,11 @@ jobs:
       # Whether that script rejects an empty set is a separate question, which
       # these fixtures answer by running it against real directories.
       - run: bash scripts/tests/signing-guard/run-tests.sh
+      # A ci-gate assertion pins job version-tags of release.yml to running
+      # scripts/check-release-version-parity.py before it creates the release
+      # tags. Whether that script rejects a project file naming another version is
+      # a separate question, which its own fixtures answer.
+      - run: python3.12 scripts/check-release-version-parity.py --self-test
       # Two fuzz.yml jobs size `timeout-minutes` by selecting a whole-minute
       # budget per `fuzz_time` option, because GitHub expressions carry no
       # arithmetic. scripts/tests/ci-gate reads those chains and assumes an
