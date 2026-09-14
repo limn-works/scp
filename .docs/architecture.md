@@ -273,7 +273,7 @@ scp/
 │   ├── scp-core/              # Facade re-exporting scp-protocol + scp-runtime
 │   │
 │   ├── scp-identity/          # Native identity subsystem — key-event log, publication, lifecycle;
-│   │                          #   IdentityBackend::resolve is the one resolution entry point (03-identity.md §3.10.10)
+│   │                          #   IdentityBackend::resolve returns a ResolutionOutcome (03-identity.md §3.10.10)
 │   │
 │   ├── scp-dht/               # Retired DHT transport leaf — no resolution path reads it
 │   │
@@ -766,7 +766,7 @@ Each replaceable trait imposes invariants that every implementation must uphold.
 - `delete` is best-effort — untrusted transports may ignore it.
 - Adapters map transport-specific semantics (WebSocket, Nostr relay, libp2p, etc.) onto this uniform interface.
 
-**`IdentityBackend`** (scp-identity) — `Send + Sync`, async. `03-identity.md` §3.10.10 declares the trait's four methods with their return types and their error type, and this entry lists none of its own. ADR-063 names the seam.
+**`IdentityBackend`** (scp-identity) — `Send + Sync`, async. `03-identity.md` §3.10.10 declares the trait's methods with their return types and their error type, and this entry lists none of its own. ADR-063 names the seam.
 
 **`MlsBackend`** (scp-runtime/crypto/mls) — `Send + Sync`, async methods (via `#[async_trait]`). Replaces the deleted `ContextCryptoProvider` (ADR-049).
 - Stateless MLS primitives: `create_group`, `add_member_raw`, `remove_member_raw`, `encrypt`, `decrypt`, `process_commit`, `advance_epoch`, `validate_key_package`, `generate_key_package`, `join_from_welcome`.
