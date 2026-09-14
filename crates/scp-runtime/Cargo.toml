@@ -97,6 +97,18 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"
 # `scp-dht/testing`); activate it for this crate's own test build (ADR-062
 # §Decision 1). `scp-dht/testing` never appears in a non-testing feature list.
 scp-dht = { path = "../scp-dht", features = ["testing"] }
+# `tests/identity_config_cross_path.rs` calls `Identity::create` and
+# `Identity::create_ephemeral`, whose only succeeding arm is the in-memory
+# pre-rotation mint that `scp-identity/testing` compiles; the other arm fails closed
+# with `NoPreRotationBackend`. This crate's `testing` feature does NOT forward
+# `scp-identity/testing`, because that feature reaches every bridge test build
+# through `scp-ffi/testing → scp-core/testing → scp-runtime/testing`. The feature
+# rides on this dev-dependency edge instead, which only this crate's own test build
+# activates. A `--workspace` run gets the feature anyway, through `scp-testing`'s
+# self dev-dependency; this line is what makes
+# `cargo nextest run -p scp-runtime --features testing` pass. The manifest test in
+# that file asserts this line stays.
+scp-identity = { path = "../scp-identity", features = ["testing"] }
 scp-mls = { path = "../scp-mls", features = ["testing"] }
 scp-protocol = { path = "../scp-protocol", features = ["testing"] }
 # `filesystem` backs ADR-052 §AC-9 `EncryptedStorage` seal doctests on
@@ -108,6 +120,9 @@ openmls_basic_credential = { workspace = true, features = ["test-utils"] }
 proptest = "1"
 scp-media = { path = "../scp-media" }
 static_assertions = { workspace = true }
+# `tests/identity_config_cross_path.rs` parses this manifest to assert the
+# `scp-identity` dev-dependency edge above keeps `testing`.
+toml_edit = { workspace = true }
 metrics-util = "0.19"
 # ADR-049 Decision 14 `perf_baseline` harness only. `scp-testing` re-exports the
 # `FullStackNetwork`/`FullStackNode` two-node MLS harness needed to drive the six

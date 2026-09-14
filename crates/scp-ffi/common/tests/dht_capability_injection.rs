@@ -282,3 +282,53 @@ fn live_mainline_pkarr_roundtrip() {
         assert_eq!(record.seq, seq);
     });
 }
+
+// ---------------------------------------------------------------------------
+// The dev-dependency edge that compiles the in-memory double above
+// ---------------------------------------------------------------------------
+
+/// `rotation_is_reflected_by_resolve_through_shared_resolver` calls
+/// `DidDht::with_in_memory_custody`, which scp-identity compiles only under its
+/// own `testing` feature (`crates/scp-identity/src/dht.rs`). This crate's `testing`
+/// feature does not forward `scp-identity/testing`, on purpose: it reaches every
+/// bridge test build, and the forward would compile scp-identity's in-memory
+/// pre-rotation mint arm there. The edge that carries the feature is this crate's
+/// own `[dev-dependencies]` entry for `scp-identity`, which only this crate's test
+/// build activates.
+///
+/// A `cargo nextest run --workspace` also builds `scp-testing`'s dev-dependencies,
+/// whose self-edge enables `scp-testing/helpers` and through it
+/// `scp-identity/testing`, and cargo unifies that feature into this test binary.
+/// So the test above compiles in every workspace lane whether or not this crate's
+/// own entry exists, and only
+/// `cargo nextest run -p scp-ffi-common --features testing --test dht_capability_injection`
+/// exposes its loss. This test reads the manifest instead, so the loss turns red in
+/// the workspace lanes too, and it runs under the default feature set as well.
+#[test]
+fn own_dev_dependency_on_scp_identity_enables_testing() {
+    let manifest = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
+    let doc: toml_edit::DocumentMut = manifest.parse().expect("scp-ffi-common Cargo.toml parses");
+
+    let dev_features = doc["dev-dependencies"]["scp-identity"]["features"]
+        .as_array()
+        .expect("`[dev-dependencies] scp-identity` carries a `features` array");
+    assert!(
+        dev_features.iter().any(|f| f.as_str() == Some("testing")),
+        "`[dev-dependencies] scp-identity` must enable `testing`: without it, \
+         `DidDht::with_in_memory_custody` does not exist on a standalone \
+         `-p scp-ffi-common --features testing` build and the rotation test above \
+         fails to compile"
+    );
+
+    let testing_feature = doc["features"]["testing"]
+        .as_array()
+        .expect("`[features] testing` is an array");
+    assert!(
+        testing_feature
+            .iter()
+            .all(|f| f.as_str() != Some("scp-identity/testing")),
+        "`scp-ffi-common/testing` must not forward `scp-identity/testing`: that \
+         feature reaches every bridge test build and would compile the in-memory \
+         pre-rotation mint arm there"
+    );
+}

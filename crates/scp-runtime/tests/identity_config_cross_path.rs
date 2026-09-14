@@ -175,3 +175,52 @@ async fn both_paths_write_byte_identical_documents() {
          documents to the identity document slot"
     );
 }
+
+/// Every test above passes only when `scp-identity/testing` compiles the mint arm
+/// of `Identity::create` and `Identity::create_ephemeral`
+/// (`crates/scp-identity/src/config.rs`). With that feature off, both return
+/// `IdentityError::NoPreRotationBackend`, and `IdentityConfig` has no field through
+/// which a test could supply a real pre-rotation backend.
+///
+/// This crate's `testing` feature does not forward `scp-identity/testing`, on
+/// purpose: `scp-ffi/testing → scp-core/testing → scp-runtime/testing` reaches
+/// every bridge test build, and the forward would compile the mint arm there. The
+/// edge that carries the feature is this crate's own `[dev-dependencies]` entry for
+/// `scp-identity`, which only this crate's test build activates.
+///
+/// A `cargo nextest run --workspace` also builds `scp-testing`'s dev-dependencies,
+/// whose self-edge enables `scp-testing/helpers` and through it
+/// `scp-identity/testing`, and cargo unifies that feature into this test binary.
+/// So the tests above pass in every workspace lane whether or not this crate's own
+/// entry exists, and only
+/// `cargo nextest run -p scp-runtime --features testing --test identity_config_cross_path`
+/// exposes its loss. This test reads the manifest instead, so the loss turns red
+/// in the workspace lanes too.
+#[test]
+fn own_dev_dependency_on_scp_identity_enables_testing() {
+    let manifest = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
+    let doc: toml_edit::DocumentMut = manifest.parse().expect("scp-runtime Cargo.toml parses");
+
+    let dev_features = doc["dev-dependencies"]["scp-identity"]["features"]
+        .as_array()
+        .expect("`[dev-dependencies] scp-identity` carries a `features` array");
+    assert!(
+        dev_features.iter().any(|f| f.as_str() == Some("testing")),
+        "`[dev-dependencies] scp-identity` must enable `testing`: without it, the \
+         three `Identity::create*` tests in this file take the fail-closed \
+         `NoPreRotationBackend` arm on a standalone `-p scp-runtime` build"
+    );
+
+    let testing_feature = doc["features"]["testing"]
+        .as_array()
+        .expect("`[features] testing` is an array");
+    assert!(
+        testing_feature
+            .iter()
+            .all(|f| f.as_str() != Some("scp-identity/testing")),
+        "`scp-runtime/testing` must not forward `scp-identity/testing`: that feature \
+         reaches every bridge test build through `scp-ffi/testing → scp-core/testing \
+         → scp-runtime/testing` and would compile the in-memory pre-rotation mint arm \
+         there"
+    );
+}

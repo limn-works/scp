@@ -108,8 +108,20 @@ tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
 scp-event-log = { path = "../../scp-event-log" }
-scp-identity = { path = "../../scp-identity" }
+# `tests/dht_capability_injection.rs` calls `DidDht::with_in_memory_custody` under
+# `#[cfg(feature = "testing")]`, and scp-identity compiles that constructor only
+# under its own `testing` feature. This crate's `testing` feature does NOT forward
+# `scp-identity/testing`, because that feature reaches every bridge test build; the
+# feature rides on this dev-dependency edge instead, which only this crate's own
+# test build activates. A `--workspace` run gets the feature anyway, through
+# `scp-testing`'s self dev-dependency; this line is what makes
+# `cargo nextest run -p scp-ffi-common --features testing` compile. The manifest
+# test in that file asserts this line stays.
+scp-identity = { path = "../../scp-identity", features = ["testing"] }
 scp-platform = { path = "../../scp-platform", features = ["testing"] }
+# `tests/dht_capability_injection.rs` parses this manifest to assert the
+# `scp-identity` dev-dependency edge above keeps `testing`.
+toml_edit = { workspace = true }
 # The crate's own tests (resolvers.rs, dht_capability_injection.rs) construct
 # `InMemoryDhtClient`; activate `scp-dht/testing` for this crate's test build.
 scp-dht = { path = "../../scp-dht", features = ["testing"] }
