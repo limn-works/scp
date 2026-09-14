@@ -67,9 +67,20 @@ env:
 #                     only members: python-test, typescript-check, bridge-parity and
 #                     bridge-parity-swift ran one of those commands each and now
 #                     download what the producers upload, so none of them runs cargo
-#                     and none of them reads a cargo cache. The two producers write
-#                     one directory under two feature resolutions and share one entry,
-#                     the arrangement typescript-check and bridge-parity already had.
+#                     and none of them reads a cargo cache. The two members write one
+#                     directory under two feature resolutions and share one entry,
+#                     which pyo3-module writes. `maturin develop` builds package
+#                     scp-ffi, so that entry holds the dependency tree both bridges
+#                     share and omits three direct dependencies
+#                     crates/scp-ffi/napi/Cargo.toml names that reach no other member
+#                     of this workspace — napi, napi-derive and napi-build — which
+#                     napi-addon compiles each run. Giving napi-addon a second group
+#                     would cache those three and would also store a second copy of
+#                     the shared tree, which is nearly all of `target/release`,
+#                     against the 10 GB repository cap the paragraph below counts, so
+#                     the group keeps one writer. bridge-parity wrote this entry
+#                     before this arrangement and ran both commands, so what it wrote
+#                     did cover the NAPI dependencies.
 #   transport-optional
 #                     `target/debug` again, but under a feature resolution no
 #                     other job produces — rust-test-optional-features. Its
