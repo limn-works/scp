@@ -325,7 +325,10 @@ PYTHON_PACKAGE_PROJECT_FILE = "bindings/python/pyproject.toml"
 VERSION_PARITY_JOB = "version-tags"
 VERSION_PARITY_SCRIPT = "scripts/check-release-version-parity.py"
 TAG_COMMAND = "git tag"
-VERSION_PARITY_NON_CHECKING = ("--pep440", "--self-test")
+# The modes of that script which print one string and check nothing. A step
+# running only one of these satisfies no criterion, so the check below must not
+# read it as the parity check that guards the tag push.
+VERSION_PARITY_NON_CHECKING = ("--pep440", "--dist-name", "--self-test")
 
 # CRITERION for check_workspace_scoped_filters: a cargo command carrying
 # `--workspace` compiles every member the root manifest lists, so a path filter

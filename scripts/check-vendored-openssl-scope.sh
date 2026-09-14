@@ -5,11 +5,18 @@
 # CRITERION
 # ---------
 # Exactly one shipped configuration selects the `vendored-openssl` feature, that
-# configuration builds the package the PyPI wheel builds, `openssl-src` — the crate
-# whose build script compiles OpenSSL from source so `openssl-sys` links it
-# statically — appears in that configuration's shipped dependency graph, and
-# `openssl-src` appears in the shipped dependency graph of no other configuration
-# this repository ships.
+# configuration is character for character the configuration maturin builds the
+# PyPI wheel with, `openssl-src` — the crate whose build script compiles OpenSSL
+# from source so `openssl-sys` links it statically — appears in that
+# configuration's shipped dependency graph, and `openssl-src` appears in the
+# shipped dependency graph of no other configuration this repository ships.
+#
+# The comparison reads the whole `<package>|<feature arguments>` entry, not its
+# package half. Three entries of the `ARTIFACTS` array build package `scp-ffi` —
+# the `--no-default-features --features server` bridge cdylib, the
+# default-features bridge cdylib, and the wheel — so a package-name comparison
+# admits a tree that moved the vendored build from the wheel onto either bridge,
+# which is one of the two outcomes this gate exists to reject.
 #
 # WHERE EACH FACT COMES FROM
 # --------------------------
@@ -21,10 +28,12 @@
 #     records what it ships. A configuration added there is checked here on the
 #     commit that adds it; a list this file copied by hand would leave that
 #     configuration unchecked until someone remembered to edit two files.
-#   * The wheel's package comes from the `[tool.maturin] manifest-path` key of
+#   * The wheel's configuration comes from the `[tool.maturin]` table of
 #     `bindings/python/pyproject.toml` — the project file the maturin step of
-#     `.github/workflows/build-matrix.yml` builds the wheel from — resolved to the
-#     `[package] name` of the Cargo.toml it names.
+#     `.github/workflows/build-matrix.yml` builds the wheel from. Its package is
+#     the `[package] name` of the Cargo.toml its `manifest-path` key names, and its
+#     feature arguments are the `features`, `no-default-features` and
+#     `all-features` keys spelled the way `ARTIFACTS` spells them.
 #   * Which configuration carries the vendored build comes from the feature
 #     arguments of each entry, so that answer tracks the `ARTIFACTS` array too.
 #     `scripts/check-shipped-feature-graph.sh`'s
@@ -152,6 +161,24 @@ configuration_selects_feature() {
   printf '%s\n' "$1" | grep -qE "(^|[[:space:],=])$2([[:space:],]|\$)"
 }
 
+# maturin_table_text <pyproject.toml>
+#   Emit the lines of the file's `[tool.maturin]` table. FAILS when the file does
+#   not exist.
+maturin_table_text() {
+  local file="$1"
+  if [[ ! -f "$file" ]]; then
+    echo "the wheel's project file does not exist: $file" >&2
+    return 1
+  fi
+  awk '
+    /^[[:space:]]*\[/ {
+      in_table = ($0 ~ /^[[:space:]]*\[[[:space:]]*tool[[:space:]]*\.[[:space:]]*maturin[[:space:]]*\][[:space:]]*(#.*)?$/)
+      next
+    }
+    in_table { print }
+  ' "$file"
+}
+
 # wheel_package <pyproject.toml>
 #   Emit the `[package] name` of the Cargo.toml the file's `[tool.maturin]
 #   manifest-path` names, resolved against the pyproject.toml's directory, or of
@@ -160,17 +187,7 @@ configuration_selects_feature() {
 #   Cargo.toml does not exist, or when it carries no `[package] name`.
 wheel_package() {
   local file="$1" text dir manifest pkg
-  if [[ ! -f "$file" ]]; then
-    echo "the wheel's project file does not exist: $file" >&2
-    return 1
-  fi
-  text="$(awk '
-    /^[[:space:]]*\[/ {
-      in_table = ($0 ~ /^[[:space:]]*\[[[:space:]]*tool[[:space:]]*\.[[:space:]]*maturin[[:space:]]*\][[:space:]]*(#.*)?$/)
-      next
-    }
-    in_table { print }
-  ' "$file")"
+  text="$(maturin_table_text "$file")" || return 1
   dir="$(dirname "$file")"
   local re_mp='(^|[[:space:]])manifest-path[[:space:]]*=[[:space:]]*["'"'"']([^"'"'"']+)["'"'"']'
   if [[ "$text" =~ $re_mp ]]; then
@@ -194,6 +211,68 @@ wheel_package() {
     return 1
   fi
   printf '%s\n' "$pkg"
+}
+
+# wheel_feature_args <pyproject.toml>
+#   Emit the cargo feature arguments the file's `[tool.maturin]` table selects,
+#   spelled the way the ARTIFACTS array spells them: `--all-features`, then
+#   `--no-default-features`, then `--features a,b`, each present only when the
+#   table selects it; an empty line when the table selects nothing. This mirrors
+#   `maturin_feature_args` of scripts/check-shipped-feature-graph.sh, which is
+#   what makes the entry this gate derives comparable, character for character,
+#   against the ARTIFACTS entries it reads out of that same file. FAILS on a
+#   `features` key that is not a TOML array of strings and on an `all-features`
+#   or `no-default-features` key that is not a TOML boolean, so a table this
+#   reader cannot reproduce fails the gate rather than yielding a short argument
+#   string that matches the wrong ARTIFACTS entry.
+wheel_feature_args() {
+  local file="$1" text args="" list features
+  text="$(maturin_table_text "$file")" || return 1
+  local re_all='(^|[[:space:]])all-features[[:space:]]*=[[:space:]]*(true|false)([[:space:]]|$)'
+  local re_nodef='(^|[[:space:]])no-default-features[[:space:]]*=[[:space:]]*(true|false)([[:space:]]|$)'
+  local re_feat='(^|[[:space:]])features[[:space:]]*=[[:space:]]*\[([^]]*)\]'
+  if [[ "$text" =~ (^|[[:space:]])all-features[[:space:]]*= ]]; then
+    if [[ ! "$text" =~ $re_all ]]; then
+      echo "$file: all-features is not a TOML boolean" >&2; return 1
+    fi
+    if [[ "${BASH_REMATCH[2]}" == "true" ]]; then args="--all-features"; fi
+  fi
+  if [[ "$text" =~ (^|[[:space:]])no-default-features[[:space:]]*= ]]; then
+    if [[ ! "$text" =~ $re_nodef ]]; then
+      echo "$file: no-default-features is not a TOML boolean" >&2; return 1
+    fi
+    if [[ "${BASH_REMATCH[2]}" == "true" ]]; then args="${args:+$args }--no-default-features"; fi
+  fi
+  if [[ "$text" =~ (^|[[:space:]])features[[:space:]]*= ]]; then
+    if [[ ! "$text" =~ $re_feat ]]; then
+      echo "$file: features is not a TOML array" >&2; return 1
+    fi
+    list="${BASH_REMATCH[2]}"
+    local re_bad='[^-A-Za-z0-9_./@:+, "'"'"']'
+    if [[ "$list" =~ $re_bad ]]; then
+      echo "$file: features carries a character no quoted cargo feature name uses: $list" >&2; return 1
+    fi
+    features="$(printf '%s\n' "$list" | tr -d "\"'" | tr ',' '\n' \
+      | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; /^$/d' | paste -sd, -)"
+    if [[ -n "$features" ]]; then args="${args:+$args }--features $features"; fi
+  fi
+  printf '%s\n' "$args"
+}
+
+# wheel_configuration <pyproject.toml>
+#   Emit the whole `<package>|<feature arguments>` entry the file's
+#   `[tool.maturin]` table makes maturin build — the ARTIFACTS entry that names
+#   the wheel. run_gate compares this entry against the one configuration that
+#   selects the vendored feature, so a package name alone is not enough: the
+#   ARTIFACTS array holds three entries whose package is `scp-ffi`, and two of
+#   them are the bridge cdylibs `.github/workflows/build-matrix.yml` uploads and
+#   `.github/workflows/release.yml` signs. FAILS on anything wheel_package or
+#   wheel_feature_args fails on.
+wheel_configuration() {
+  local file="$1" pkg args
+  pkg="$(wheel_package "$file")" || return 1
+  args="$(wheel_feature_args "$file")" || return 1
+  printf '%s|%s\n' "$pkg" "$args"
 }
 
 # vendor_crate_occurrences <package> <feature-argument-string>
@@ -322,6 +401,45 @@ run_fixtures() {
   same_string "$out" "the-bridge"; rc=$?
   expect "that package is the [package] name of the manifest the key names" "PASS" "$rc"
 
+  # The whole entry, which is what run_gate compares. A package-name comparison
+  # admitted any of the three ARTIFACTS entries that build `scp-ffi`, two of which
+  # are the bridge cdylibs build-matrix.yml uploads; these fixtures prove the
+  # reader carries the feature arguments through as well.
+  out="$(wheel_configuration "$file")"; rc=$?
+  expect "the wheel's whole ARTIFACTS entry is derived from the [tool.maturin] table" "PASS" "$rc"
+  same_string "$out" "the-bridge|--features extension-module,vendored-openssl"; rc=$?
+  expect "that entry carries the feature arguments, not the package alone" "PASS" "$rc"
+
+  printf '%s\n' \
+    '[tool.maturin]' \
+    'no-default-features = true' \
+    'features = ["server"]' \
+    'manifest-path = "../../crates/the-bridge/Cargo.toml"' > "$file"
+  out="$(wheel_configuration "$file")"; rc=$?
+  same_string "$out" "the-bridge|--no-default-features --features server"; rc=$?
+  expect "no-default-features is spelled the way ARTIFACTS spells it" "PASS" "$rc"
+
+  printf '%s\n' \
+    '[tool.maturin]' \
+    'manifest-path = "../../crates/the-bridge/Cargo.toml"' > "$file"
+  out="$(wheel_configuration "$file")"; rc=$?
+  same_string "$out" "the-bridge|"; rc=$?
+  expect "a table selecting no feature yields the default-features entry" "PASS" "$rc"
+
+  printf '%s\n' \
+    '[tool.maturin]' \
+    'features = "extension-module"' \
+    'manifest-path = "../../crates/the-bridge/Cargo.toml"' > "$file"
+  wheel_configuration "$file" >/dev/null 2>&1; rc=$?
+  expect "a features key that is not a TOML array FAILS" "FAIL" "$rc"
+
+  printf '%s\n' \
+    '[tool.maturin]' \
+    'no-default-features = "yes"' \
+    'manifest-path = "../../crates/the-bridge/Cargo.toml"' > "$file"
+  wheel_configuration "$file" >/dev/null 2>&1; rc=$?
+  expect "a no-default-features key that is not a TOML boolean FAILS" "FAIL" "$rc"
+
   printf '%s\n' '[tool.maturin]' 'manifest-path = "nowhere/Cargo.toml"' > "$file"
   wheel_package "$file" >/dev/null 2>&1; rc=$?
   expect "a manifest-path naming no file FAILS" "FAIL" "$rc"
@@ -333,6 +451,8 @@ run_fixtures() {
 
   wheel_package "$dir/bindings/python/absent.toml" >/dev/null 2>&1; rc=$?
   expect "a missing wheel project file FAILS" "FAIL" "$rc"
+  wheel_configuration "$dir/bindings/python/absent.toml" >/dev/null 2>&1; rc=$?
+  expect "a missing wheel project file FAILS the whole-entry reader too" "FAIL" "$rc"
 
   # `vendor_crate_occurrences` counts lines of a resolved graph, and these three
   # fixtures run it against a `cargo` that prints a chosen graph or refuses to
@@ -381,6 +501,59 @@ run_fixtures() {
   PATH="$saved_path"
   expect "a cargo tree that exits non-zero FAILS rather than counting zero" "FAIL" "$rc"
 
+  # run_gate end to end, against a planted ARTIFACTS array and a planted maturin
+  # table. The negative control is the edit a package-name comparison admitted:
+  # `vendored-openssl` moves off the wheel's entry onto the `--features server`
+  # bridge cdylib, whose package is `scp-ffi` as well. The positive control is the
+  # same tree with the feature back on the wheel, which proves the assertion goes
+  # green for a reason other than every input failing.
+  local gate_file pyproject_file
+  mkdir -p "$dir/scenario/crates/the-bridge" "$dir/scenario/bindings/python"
+  printf '%s\n' '[package]' 'name = "scp-ffi"' 'version = "0.1.0"' \
+    > "$dir/scenario/crates/the-bridge/Cargo.toml"
+  gate_file="$dir/scenario/gate.sh"
+  pyproject_file="$dir/scenario/bindings/python/pyproject.toml"
+
+  # A cargo whose tree names openssl-src exactly when the arguments select the
+  # vendored feature, so the counter reports what the configuration asked for.
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'echo "scp-ffi v0.1.0"' \
+    'case "$*" in' \
+    "  *vendored-openssl*) echo \"${VENDOR_CRATE} v300.5.1+3.5.1\" ;;" \
+    'esac' > "$dir/fakebin/cargo"
+  chmod +x "$dir/fakebin/cargo"
+
+  printf '%s\n' \
+    'ARTIFACTS=(' \
+    '  "scp-ffi|--no-default-features --features server,vendored-openssl"' \
+    '  "scp-ffi|"' \
+    '  "scp-ffi|--features extension-module"' \
+    ')' > "$gate_file"
+  printf '%s\n' \
+    '[tool.maturin]' \
+    'features = ["extension-module"]' \
+    'manifest-path = "../../crates/the-bridge/Cargo.toml"' > "$pyproject_file"
+  PATH="$dir/fakebin:$saved_path"
+  ( FEATURE_GRAPH_GATE="$gate_file" PYPROJECT="$pyproject_file" run_gate ) >/dev/null 2>&1; rc=$?
+  PATH="$saved_path"
+  expect "run_gate FAILS when the vendored feature moves onto a sibling scp-ffi configuration" "FAIL" "$rc"
+
+  printf '%s\n' \
+    'ARTIFACTS=(' \
+    '  "scp-ffi|--no-default-features --features server"' \
+    '  "scp-ffi|"' \
+    '  "scp-ffi|--features extension-module,vendored-openssl"' \
+    ')' > "$gate_file"
+  printf '%s\n' \
+    '[tool.maturin]' \
+    'features = ["extension-module", "vendored-openssl"]' \
+    'manifest-path = "../../crates/the-bridge/Cargo.toml"' > "$pyproject_file"
+  PATH="$dir/fakebin:$saved_path"
+  ( FEATURE_GRAPH_GATE="$gate_file" PYPROJECT="$pyproject_file" run_gate ) >/dev/null 2>&1; rc=$?
+  PATH="$saved_path"
+  expect "run_gate PASSES when that same tree keeps the vendored feature on the wheel" "PASS" "$rc"
+
   if [[ "$fixture_failures" -eq 0 ]]; then
     echo "   FIXTURES: all behavioural proofs passed."
     return 0
@@ -391,7 +564,7 @@ run_fixtures() {
 
 # ---------------------------------------------------------------------------
 run_gate() {
-  local failures=0 configuration pkg feature_args count wheel_pkg raw
+  local failures=0 configuration pkg feature_args count wheel_entry raw
   local -a configurations=() vendoring=() absent=()
 
   # A `while read` loop rather than `mapfile`, which bash 3.2 — the interpreter
@@ -405,11 +578,11 @@ run_gate() {
   done <<<"$raw"
   echo "--> ${#configurations[@]} shipped configurations read from $FEATURE_GRAPH_GATE"
 
-  wheel_pkg="$(wheel_package "$PYPROJECT")" || {
-    echo "FAIL — the wheel's package could not be read from $PYPROJECT, so no graph was resolved."
+  wheel_entry="$(wheel_configuration "$PYPROJECT")" || {
+    echo "FAIL — the wheel's configuration could not be read from $PYPROJECT, so no graph was resolved."
     return 1
   }
-  echo "--> the wheel builds package '$wheel_pkg', read from $PYPROJECT"
+  echo "--> the wheel builds configuration '$wheel_entry', read from $PYPROJECT"
   echo
 
   for configuration in "${configurations[@]}"; do
@@ -439,10 +612,17 @@ run_gate() {
 
   pkg="${vendoring[0]%%|*}"
   feature_args="${vendoring[0]#*|}"
-  if [[ "$pkg" != "$wheel_pkg" ]]; then
-    echo "FAIL — the one configuration selecting '$VENDOR_FEATURE' builds package '$pkg',"
-    echo "       and $PYPROJECT builds the wheel from package '$wheel_pkg'."
-    echo "       The vendored OpenSSL has moved off the wheel onto another artifact."
+  if [[ "${vendoring[0]}" != "$wheel_entry" ]]; then
+    echo "FAIL — the one configuration selecting '$VENDOR_FEATURE' is"
+    echo "           ${vendoring[0]}"
+    echo "       and $PYPROJECT builds the wheel from"
+    echo "           $wheel_entry"
+    echo "       The vendored OpenSSL sits on a configuration that is not the wheel's."
+    echo "       Comparing the whole entry rather than its package half is what makes"
+    echo "       this branch reachable: three ARTIFACTS entries build package 'scp-ffi',"
+    echo "       and two of them are the bridge cdylibs build-matrix.yml uploads and"
+    echo "       release.yml signs. Name '$VENDOR_FEATURE' in the [tool.maturin]"
+    echo "       features array of $PYPROJECT and nowhere else."
     return 1
   fi
 

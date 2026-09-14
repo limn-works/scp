@@ -147,8 +147,12 @@ check-vendored-openssl-scope.sh (the one gate holding OpenSSL's static link to t
 PyPI wheel; every other shipped artifact — the scp-node and scp-relay binaries and
 the three FFI bridges — links the host's libcrypto, which is how an operator patches
 OpenSSL by upgrading the runtime container's libssl3),
-check-release-version-parity.py (the release refuses to push a tag while a project
-file names a version other than the one the operator asked for),
+check-release-version-parity.py (the release refuses to push a tag while any
+publishable crate manifest — every workspace member whose `publish` key is neither
+`false` nor an empty list — or the Python project file names a version other than
+the one the operator asked for, and refuses while release.yml's `TAGS` array or its
+`cargo publish -p` commands name a set of crates other than the one the workspace
+publishes),
 check-toolchain-wiring.sh (every container build asserts which compiler it resolved;
 the changes job of every paths-filtered workflow routes a pin change to every lane that
 compiles on it, and ci.yml routes every root-level file and every cargo configuration
