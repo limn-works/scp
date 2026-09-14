@@ -2238,7 +2238,10 @@ def write_unification_fixture(root: Path) -> None:
              crates/scp-testing/Cargo.toml's `helpers` feature carries against
              scp-identity. It sorts after enabler, so a reader that returns one
              edge returns enabler's and never names this one — which is why the
-             live positive control below reads command_testing_edges.
+             live positive control below reads command_testing_edges. No
+             manifest here turns `implier/helpers` on, which is what
+             unconditional_feature_activators must report about it: a feature
+             whose value names an edge is not a feature some build enables.
     middle   depends on enabler and never names leaf.
     selfdev  dev-depends on itself with `features = ["testing"]`, the spelling
              crates/scp-dht/Cargo.toml uses to turn its own feature on in its

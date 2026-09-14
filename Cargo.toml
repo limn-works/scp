@@ -34,10 +34,15 @@ members = [
 #
 # `scp-testing` is a `publish = false` test harness. Its `scp-core` and
 # `scp-platform` edges carry `allow_unencrypted_storage` / `testing` as NORMAL
-# dependencies, because `builder.rs`, `fullstack/node.rs`, `simulator/identity.rs`
-# and `simulator/mod.rs` name `scp_platform::testing`, `scp_platform::in_memory`
-# and `ProtocolRepository::new_for_testing` at lib level, outside any feature
-# gate. Its `scp-identity`, `scp-dht` and `scp-node` edges carry no such feature:
+# dependencies, because four modules name testing-gated items at lib level,
+# outside any feature gate: `fullstack/node.rs` calls
+# `Supervisor::test_install_access_key`, `handle_sender_key_request`,
+# `land_sender_key_response` and `inspect_incoming_inner`, each
+# `#[cfg(feature = "testing")]` in scp-runtime; `simulator/identity.rs` calls
+# `ProtocolRepository::new_for_testing`; and `builder.rs`, `fullstack/node.rs`
+# and `simulator/mod.rs` name `scp_platform::testing` and
+# `scp_platform::in_memory`. Its `scp-identity`, `scp-dht` and `scp-node` edges
+# carry no such feature:
 # `helpers.rs` is the only module naming `scp_identity` and `scp_dht`, `lib.rs`
 # compiles it under this crate's `helpers` feature, and that feature names
 # `scp-identity/testing` and `scp-dht/testing`; `scp-node/allow_unencrypted_storage`
