@@ -908,7 +908,12 @@ pub enum BudgetScope {
 
 /// The refused term's own value, one variant per `BudgetScope` and never a
 /// string (`09-security-model.md` §9.7.4.2 R9). Every SDK binding carries the
-/// type name and all four variant names verbatim.
+/// type name and all four variant names verbatim. A charging relay's
+/// `receipt_exempts` declaration names `Identifier` and `RateLimit` and names
+/// neither `Total` nor `Payment`; an implementer reads that set from
+/// `relay_config` through ADR-004's `POLICY` query
+/// (`18-addressability-and-deployment.md` §18.3.3), because this enumeration
+/// types a refusal's value and never a relay's policy declaration.
 pub enum BudgetValue {
     /// The declared per-identifier storage budget, in bytes.
     Identifier(u64),
