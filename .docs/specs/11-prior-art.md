@@ -492,7 +492,7 @@ Freenet's storage model has a striking structural parallel with SCP's relay mode
 |-----------|-------------------|-----------|
 | What is stored | Encrypted content blocks (32 KB CHK, 1 KB SSK) | Encrypted MLS messages and relay blobs (up to 256 KB) |
 | Who decides storage | Network demand (automatic caching) | Explicit publish by context members |
-| Storage duration | Demand-driven LRU; unpopular content expires | A key-event record carries no TTL; a validating relay's ring buffer displaces the oldest-established unpaid retained set when it needs the bytes, and a payment pins a set outside that ring (`09-security-model.md` §9.7.4.2 R9); context-governed for messages |
+| Storage duration | Demand-driven LRU; unpopular content expires | A key-event record carries no TTL; a validating relay's ring buffer displaces the oldest-established unpaid identity when it needs the bytes, taking everything it holds for that identity together, and a payment pins an identity outside that ring (`09-security-model.md` §9.7.4.2 R9); context-governed for messages |
 | Provider can read content | No (encrypted with key not available to node) | No (MLS-encrypted; relay has no group key) |
 | Provider can identify content | Partially (key is visible; content is not) | Partially (routing_id is visible; content is not) |
 | Plausible deniability | Yes — design goal | Not a goal — relays are service providers, not anonymous participants |

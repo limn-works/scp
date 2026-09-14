@@ -1312,9 +1312,9 @@ The regenerator is `#[ignore]` by default so the default `cargo test` run does n
 
 **These vectors are gone and this heading records why.** The identity-substrate plan of record marks the custody-violation record and the counter-attestation CUT, on Alec's ruling of 2026-08-25 reconfirmed on 2026-08-31, and its Track U4 owns the teardown of their §9.5.2 preimage tables and of the code that still carries them. Re-signing those preimages onto P-256 would widen a teardown already scoped, so the vectors were deleted rather than carried forward and the generator builds neither.
 
-## 25.26 Key-Event Preimage and Signature Slot Vectors (§9.7.4.2 definitions, §9.5)
+## 25.26 Key-Event Preimage and Indexed-Signature Vectors (§9.7.4.2 definitions, §9.5)
 
-**What these vectors pin.** §9.7.4.2's definitions fix the key-event preimage's field order, so these vectors pin an inception event's own bytes, the digest of those bytes, the identifier that digest derives, and the routing id that identifier derives, then the signature slot each of the two forms produces over the same event.
+**What these vectors pin.** §9.7.4.2's definitions fix the key-event preimage's field order, so these vectors pin an inception event's own bytes, the digest of those bytes, the identifier that digest derives, and the routing id that identifier derives, then the indexed signature each of the two forms produces over the same event.
 
 **The vector identity.** A one-member root set holding §25.2's reference key, one `#active` key which is §25.2's secondary key, a one-member next set whose pre-rotation key is §25.2's tertiary key, one designated witness, and a witnessing interval of 3600 seconds. Every key carries `KeyAlgorithm` `0x01` and `CustodyType` `Passkey` (`0x01`). The key-state snapshot is 171 bytes and the preimage is 364 bytes.
 
@@ -1330,7 +1330,7 @@ Designated witness operator identifier:
   9d94df95bc0a13f1963f484414c320354c73c75bb86e96559e97765f5bc2d313
 ```
 
-### Vector 41: an inception whose one root slot carries the raw form (`form = 0x01`)
+### Vector 41: an inception whose one root signature takes the raw form (`form = 0x01`)
 
 ```
 Preimage (364 bytes), in §9.7.4.2's field order:
@@ -1359,13 +1359,13 @@ Root-set member 0, 33-byte SEC1 compressed point:
   27
 
 Signature form: 0x01
-Slot length: 64 bytes
-Slot:
+Indexed signature length: 64 bytes
+Indexed signature:
   274e7cf73b6807ec53619491a1cc094a5fa2a649b4a04a043965597c7faa5e96
   7e7b499be2e9750521b4bfec6fa65bfdd14c8e5c940bb60884d040da9d1e70a0
 ```
 
-### Vector 42: an inception whose one root slot carries the WebAuthn assertion form (`form = 0x02`)
+### Vector 42: an inception whose one root signature takes the WebAuthn assertion form (`form = 0x02`)
 
 **The preimage differs from Vector 41's in one byte**, the signature-form list's entry, so the two events carry different digests and different identifiers.
 
@@ -1421,8 +1421,8 @@ Signature (64 raw bytes, low-s normalized):
   315de3e854e0669d355b4968b5c2bc8075a5630e3c980844049ebcbf9716c424
 
 Signature form: 0x02
-Slot length: 264 bytes
-Slot, BE32(len(authenticatorData)) || authenticatorData || BE32(len(clientDataJSON)) || clientDataJSON || signature:
+Indexed signature length: 264 bytes
+Indexed signature, BE32(len(authenticatorData)) || authenticatorData || BE32(len(clientDataJSON)) || clientDataJSON || signature:
   00000025aee39d05bf6e1cbe288aedd7ead156f1d67399382d7a110e8f6c495d
   11689d7605000000000000009b7b2274797065223a22776562617574686e2e67
   6574222c226368616c6c656e6765223a2255304e514c55744657533146566b56
@@ -1434,7 +1434,7 @@ Slot, BE32(len(authenticatorData)) || authenticatorData || BE32(len(clientDataJS
   049ebcbf9716c424
 ```
 
-**Conformance procedure.** Rebuild the preimage from the field order §9.7.4.2's definitions state and compare it byte for byte, recompute the digest, the identifier and the routing id, then run against Vector 42's slot every assertion-slot check those same definitions state.
+**Conformance procedure.** Rebuild the preimage from the field order §9.7.4.2's definitions state and compare it byte for byte, recompute the digest, the identifier and the routing id, then run against Vector 42's indexed signature every assertion-signature check those same definitions state.
 
 
 ### Vector 50: a `KeyState` that pins both composite absent-field sentinels
@@ -1471,8 +1471,8 @@ preimage_len:         320
 ```
 
 ```
-preimage_digest:      4b56f7b97027fdcd5e480ecb88528441e30186b5e2b54db0fefd7b53ad1a120d
-slot (raw form, 64):  6e8b92a9e7cc10d9233ab31f0465590526b1096fca8721095322c763f5d4e01c58b75ee1398787f3c6dd372b7fcf8929380e24c70d072d0588f43bbf2a7c567c
+preimage_digest:                   4b56f7b97027fdcd5e480ecb88528441e30186b5e2b54db0fefd7b53ad1a120d
+indexed signature (raw form, 64):  6e8b92a9e7cc10d9233ab31f0465590526b1096fca8721095322c763f5d4e01c58b75ee1398787f3c6dd372b7fcf8929380e24c70d072d0588f43bbf2a7c567c
 ```
 
 **Conformance procedure.** Rebuild the preimage from the field order and the sentinel rule §9.7.4.2's definitions state, compare it byte for byte, and recompute the digest. An implementation that writes field 9's sentinel as eight bytes, or field 12's as the one byte `0x00`, produces a different digest here and a different `predecessor_digest` at every later event.
@@ -1536,8 +1536,8 @@ preimage_len:         603
 ```
 
 ```
-preimage_digest:      0347480558d3cb54f5f6fa1dda9f538cdd750b47aaf5b6de7bdc29c8b6c647fb
-slot (raw form, 64):  a4a831b34dfb353815375f8d300a6f3b58922b36534058a3721c8441e289ef30226405e129dca975e513bc5cb75136f70af85a77e2ccbe236d5d22fe8888a7e2
+preimage_digest:                   0347480558d3cb54f5f6fa1dda9f538cdd750b47aaf5b6de7bdc29c8b6c647fb
+indexed signature (raw form, 64):  a4a831b34dfb353815375f8d300a6f3b58922b36534058a3721c8441e289ef30226405e129dca975e513bc5cb75136f70af85a77e2ccbe236d5d22fe8888a7e2
 ```
 
 **Conformance procedure.** Rebuild the snapshot from the key-entry order §9.7.4.2's definitions state, read byte 43 of each 45-byte entry, and compare the nine values against the table above. An implementation that numbers `CustodyType` from `0x00`, or that orders the nine variants differently, produces a different snapshot, a different preimage, a different digest, and a different identifier.
@@ -1667,7 +1667,7 @@ Signature, secondary key (216 bytes on the wire):
 
 ### Vector 46: the two-heads fault proof
 
-Two cosigned heads of one witness, over one subject, carrying one shared `previous_cosigned_digest`, two different `event_digest` values, and `seed` clear on both. **Those five conditions are the fault proof §9.7.4.3 defines**, and a relay keys its cosigned-head slot on (subject, witness, `event_digest`) so that both survive at one address (`03-identity.md` §3.10.2). A conforming implementation assembles the pair, verifies both signatures against the P-256 key the witness operator's community-relay-list entry declares, and reports a valid fault proof. **Substituting Vector 43, whose `seed` carries `0x01`, for either head yields no proof**, which is how a declared re-seed stays outside the predicate.
+Two cosigned heads of one witness, over one subject, carrying one shared `previous_cosigned_digest`, two different `event_digest` values, and `seed` clear on both. **Those five conditions are the fault proof §9.7.4.3 defines**, and a relay keys its cosigned-head store on (subject, witness, `event_digest`) so that both survive at one address (`03-identity.md` §3.10.2). A conforming implementation assembles the pair, verifies both signatures against the P-256 key the witness operator's community-relay-list entry declares, and reports a valid fault proof. **Substituting Vector 43, whose `seed` carries `0x01`, for either head yields no proof**, which is how a declared re-seed stays outside the predicate.
 
 ```
 Shared previous_cosigned_digest:

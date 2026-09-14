@@ -1399,13 +1399,13 @@ def emit_keypackage_attestation() -> None:
 
 
 # ---------------------------------------------------------------------------
-# §25.26 Key-event signature slots, the cosigned head, and the relay proof
+# §25.26 Key-event indexed signatures, the cosigned head, and the relay proof
 # (§9.7.4.2 definitions, §9.7.4.3, §9.18.2)
 # ---------------------------------------------------------------------------
 
 # The inception event's preimage is built here, in the field order §9.7.4.2's
 # definitions fix. Vectors 41 and 42 pin its bytes, its digest, and the identifier
-# that digest derives, then pin the slot each signature form produces over it.
+# that digest derives, then pin the indexed signature each form produces over it.
 
 KIND_INCEPTION = 0x01
 KIND_KEY_STATE = 0x02
@@ -1534,7 +1534,7 @@ def identifier_of(preimage: bytes) -> bytes:
     return sha256(KEL_ID_SEPARATOR + preimage)
 
 
-# Set by emit_key_event_slots(); §25.27's objects name Vector 41's event and identifier.
+# Set by emit_key_event_signatures(); §25.27's objects name Vector 41's event and identifier.
 INCEPTION_DIGEST = b""
 INCEPTION_IDENTIFIER = b""
 
@@ -1544,7 +1544,7 @@ WEBAUTHN_RP_ID = b"ctx.network"
 #   rpIdHash (32) || flags (1) || signCount (4 big-endian).
 # flags 0x05 sets user present (0x01) and user verified (0x04). §9.7.4.2's
 # definitions require the user-presence bit and state no rule about the
-# user-verification bit, so a conforming slot may carry 0x01 here instead.
+# user-verification bit, so a conforming indexed signature may carry 0x01 here instead.
 WEBAUTHN_FLAGS = 0x05
 WEBAUTHN_SIGN_COUNT = 0
 # Synthesized clientDataJSON: the exact byte string a browser serializes, with no
@@ -1575,10 +1575,10 @@ def webauthn_client_data_json(challenge: bytes) -> bytes:
     ).encode()
 
 
-def emit_key_event_slots() -> None:
-    section("§25.26 Key-event preimage and signature slots")
+def emit_key_event_signatures() -> None:
+    section("§25.26 Key-event preimage and indexed signatures")
 
-    # --- Vector 41: an inception whose one root slot carries the raw form. ---
+    # --- Vector 41: an inception whose one root signature takes the raw form. ---
     preimage_41 = inception_preimage(0x01)
     digest_41 = sha256(preimage_41)
     identifier_41 = identifier_of(preimage_41)
@@ -1603,10 +1603,10 @@ def emit_key_event_slots() -> None:
     if _HAVE_CRYPTOGRAPHY:
         _verify_with_cryptography(REF_KEY_1, digest_41, raw_sig, "vector_41")
     assert int.from_bytes(raw_sig[32:], "big") * 2 <= N, "vector_41: high-s"
-    emit("vector_41.slot_len", len(raw_sig))
-    emit_hex("vector_41.slot", raw_sig)
+    emit("vector_41.indexed_signature_len", len(raw_sig))
+    emit_hex("vector_41.indexed_signature", raw_sig)
 
-    # --- Vector 42: an inception whose one root slot carries the assertion form. ---
+    # --- Vector 42: an inception whose one root signature takes the assertion form. ---
     preimage_42 = inception_preimage(0x02)
     digest_42 = sha256(preimage_42)
     identifier_42 = identifier_of(preimage_42)
@@ -1623,7 +1623,7 @@ def emit_key_event_slots() -> None:
             REF_KEY_1, assertion_digest, assertion_sig, "vector_42"
         )
     assert int.from_bytes(assertion_sig[32:], "big") * 2 <= N, "vector_42: high-s"
-    slot = (
+    indexed_signature = (
         u32(len(auth_data))
         + auth_data
         + u32(len(client_data))
@@ -1650,8 +1650,8 @@ def emit_key_event_slots() -> None:
     emit_hex("vector_42.signed_message", signed_message)
     emit_hex("vector_42.ecdsa_digest", assertion_digest)
     emit_hex("vector_42.signature", assertion_sig)
-    emit("vector_42.slot_len", len(slot))
-    emit_hex("vector_42.slot", slot)
+    emit("vector_42.indexed_signature_len", len(indexed_signature))
+    emit_hex("vector_42.indexed_signature", indexed_signature)
 
     # --- Vector 50: a `KeyState` that pins both composite sentinels. ---
     preimage_50 = key_state_preimage(identifier_41, digest_41)
@@ -1680,8 +1680,8 @@ def emit_key_event_slots() -> None:
     if _HAVE_CRYPTOGRAPHY:
         _verify_with_cryptography(REF_KEY_1, digest_50, sig_50, "vector_50")
     assert int.from_bytes(sig_50[32:], "big") * 2 <= N, "vector_50: high-s"
-    emit("vector_50.slot_len", len(sig_50))
-    emit_hex("vector_50.slot", sig_50)
+    emit("vector_50.indexed_signature_len", len(sig_50))
+    emit_hex("vector_50.indexed_signature", sig_50)
 
     global INCEPTION_DIGEST, INCEPTION_IDENTIFIER
     INCEPTION_DIGEST = digest_41
@@ -1849,8 +1849,8 @@ def emit_custody_registry_key_state() -> None:
     if _HAVE_CRYPTOGRAPHY:
         _verify_with_cryptography(CUSTODY_ROOT_KEYS[0], digest, sig, "vector_51")
     assert int.from_bytes(sig[32:], "big") * 2 <= N, "vector_51: high-s"
-    emit("vector_51.slot_len", len(sig))
-    emit_hex("vector_51.slot", sig)
+    emit("vector_51.indexed_signature_len", len(sig))
+    emit_hex("vector_51.indexed_signature", sig)
 
 
 # --- §25.26 Vector 52: the context-export signature preimage ---
@@ -2195,7 +2195,7 @@ def main() -> int:
     emit_pseudonym_announcement()
     emit_trust_attestation()
     emit_keypackage_attestation()
-    emit_key_event_slots()
+    emit_key_event_signatures()
     emit_custody_registry_key_state()
     emit_context_export_preimage()
     emit_witness_and_relay_objects()
