@@ -1891,7 +1891,7 @@ TREE
     'requires = ["maturin>=1.0,<2.0"]' \
     '' \
     '[tool.maturin]' \
-    'features = ["extension-module"] # the pyo3 feature the wheel selects' \
+    'features = ["extension-module", "vendored-openssl"] # the features the wheel selects' \
     "manifest-path = \"$wheel_manifest\"" \
     'module-name = "scp_sdk._scp_core"' \
     '' \
@@ -1902,8 +1902,8 @@ TREE
     'features = ["not-read-from-another-table"]' > "$wheel_file"
   wheel_entry="$(maturin_artifact_entry "$wheel_file" 2>/dev/null)"; rc=$?
   expect "(wheel-drift) a [tool.maturin] table matching the shipped one derives an entry" "PASS" "$rc"
-  same_string "$wheel_entry" "scp-ffi|--features extension-module"; rc=$?
-  expect "(wheel-drift) that entry is 'scp-ffi|--features extension-module', read from the main table only" "PASS" "$rc"
+  same_string "$wheel_entry" "scp-ffi|--features extension-module,vendored-openssl"; rc=$?
+  expect "(wheel-drift) that entry is 'scp-ffi|--features extension-module,vendored-openssl', read from the main table only" "PASS" "$rc"
   ( fixture_failures=0; assert_wheel_feature_selection_is_gated "$wheel_file" >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
   expect "(wheel-drift) the assertion ACCEPTS a table whose configuration ARTIFACTS gates" "PASS" "$rc"
 
