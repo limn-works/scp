@@ -517,6 +517,11 @@ class Scenario(NamedTuple):
 RUST_ONLY = {
     "rust": "true",
     "python": "false",
+    # Job python-wheel-build reads this output alone and no other, because the
+    # files that decide the wheel's cargo configuration are the ones its filter
+    # names. A Rust-only change that touches none of them leaves the wheel's
+    # configuration as it was, so the lane stays skipped.
+    "python-wheel": "false",
     "typescript": "false",
     "typescript-wasm": "false",
     "scaffold-typescript-web": "false",
@@ -538,6 +543,7 @@ RUST_ONLY_RUNS = {
     "kotlin-test": True,
     "python-lint": False,
     "python-test": True,
+    "python-wheel-build": False,
     "rust-build-pyo3-production": True,
     "rust-build-uniffi-production": True,
     "rust-clippy": True,

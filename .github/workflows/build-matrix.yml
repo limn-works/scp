@@ -19,6 +19,20 @@ on:
         description: "scp-core version (source of truth for all SDK versions)"
         required: true
         type: string
+  # Run the release matrix on a branch, before a tag exists. Every leg below
+  # compiles for the first time on the run that cuts a release otherwise: job
+  # python-wheels is where `pyo3/abi3-py310`, the vendored-OpenSSL build, the
+  # manylinux_2_28 container prep and the Windows NASM step meet a real build, and
+  # a failure there blocks the publish rather than a pull request. Job
+  # python-wheel-build in `.github/workflows/ci.yml` compiles the wheel's cargo
+  # configuration on every pull request that changes it; this trigger is how the
+  # container, the cross image and the five-target matrix get exercised.
+  workflow_dispatch:
+    inputs:
+      scp-core-version:
+        description: "scp-core version to stamp on the artifacts (defaults to the branch name)"
+        required: false
+        type: string
 
 permissions:
   contents: read
