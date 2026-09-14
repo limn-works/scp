@@ -129,8 +129,23 @@ shipped_configurations() {
     echo "the shipped-artifact list does not exist: $file" >&2
     return 1
   fi
+  local openers appenders
+  openers="$(grep -cE '^ARTIFACTS(\+)?=\(' "$file" || true)"
+  appenders="$(grep -cE '^ARTIFACTS\+=\(' "$file" || true)"
+  # Exactly one assignment, and no `+=` appender. The awk below stops at the first
+  # `)` at column 0, so a second block is invisible to it while bash expands every
+  # one. A tree that split the array would hide every entry after the first block
+  # and still clear MINIMUM_SHIPPED_CONFIGURATIONS, which is the one bypass of this
+  # gate that no other check compensates for: the sibling gate's PERMITTED_ALLOWLIST
+  # is one repo-wide union applied to every artifact, so it cannot say which
+  # artifact owns the vendored row. Requiring the single spelling this reader
+  # reproduces is closed by construction; chasing each new spelling would not be.
+  if [[ "$openers" -ne 1 || "$appenders" -ne 0 ]]; then
+    echo "$file must carry exactly one 'ARTIFACTS=(' assignment and no 'ARTIFACTS+=(' appender; found $openers assignment(s) and $appenders appender(s), and this reader takes only the first block while bash expands them all" >&2
+    return 1
+  fi
   if ! grep -qE '^ARTIFACTS=\([[:space:]]*$' "$file"; then
-    echo "$file carries no 'ARTIFACTS=(' array opener, so this gate read no shipped configurations" >&2
+    echo "$file carries no 'ARTIFACTS=(' array opener on a line of its own, so this gate read no shipped configurations" >&2
     return 1
   fi
   body="$(awk '
@@ -176,12 +191,17 @@ maturin_table_text() {
     echo "the wheel's project file does not exist: $file" >&2
     return 1
   fi
+  # The `sub` strips a comment before the key regexes below read the joined text.
+  # Those regexes take the FIRST match, so a commented-out `features` or
+  # `manifest-path` key placed above the live one would otherwise decide what this
+  # gate believes the wheel builds. `maturin_table_text` of
+  # scripts/check-shipped-feature-graph.sh strips the same way.
   awk '
     /^[[:space:]]*\[/ {
       in_table = ($0 ~ /^[[:space:]]*\[[[:space:]]*tool[[:space:]]*\.[[:space:]]*maturin[[:space:]]*\][[:space:]]*(#.*)?$/)
       next
     }
-    in_table { print }
+    in_table { sub(/(^|[[:space:]])#.*$/, ""); print }
   ' "$file"
 }
 
@@ -379,6 +399,17 @@ run_fixtures() {
   shipped_configurations "$dir/absent.sh" >/dev/null 2>&1; rc=$?
   expect "a missing shipped-artifact list FAILS" "FAIL" "$rc"
 
+  # The two bypasses a planted tree proved against an earlier revision.
+  printf '%s\n' 'ARTIFACTS=(' '  "scp-node|"' '  "scp-relay|"' ')' \
+    'ARTIFACTS+=(' '  "scp-ffi|--features extension-module,vendored-openssl"' ')' > "$file"
+  shipped_configurations "$file" >/dev/null 2>&1; rc=$?
+  expect "an ARTIFACTS array split across an 'ARTIFACTS+=(' appender FAILS" "FAIL" "$rc"
+
+  printf '%s\n' 'ARTIFACTS=(' '  "scp-node|"' '  "scp-relay|"' ')' \
+    'ARTIFACTS=(' '  "scp-ffi|--features extension-module,vendored-openssl"' ')' > "$file"
+  shipped_configurations "$file" >/dev/null 2>&1; rc=$?
+  expect "a file carrying two 'ARTIFACTS=(' assignments FAILS" "FAIL" "$rc"
+
   configuration_selects_feature "--features extension-module,vendored-openssl" "vendored-openssl"; rc=$?
   expect "a comma-separated feature list selects the feature" "PASS" "$rc"
   configuration_selects_feature "--features=vendored-openssl" "vendored-openssl"; rc=$?
@@ -449,6 +480,19 @@ run_fixtures() {
   printf '%s\n' '[tool.maturin]' 'manifest-path = "nowhere/Cargo.toml"' > "$file"
   wheel_package "$file" >/dev/null 2>&1; rc=$?
   expect "a manifest-path naming no file FAILS" "FAIL" "$rc"
+
+  # A commented-out key above the live one. The key regexes take the first match,
+  # so an unstripped comment decided what this gate believed the wheel builds.
+  printf '%s\n' \
+    '[tool.maturin]' \
+    '# features = ["extension-module", "vendored-openssl"]' \
+    'features = ["extension-module"]' \
+    'manifest-path = "../../crates/the-bridge/Cargo.toml"' > "$file"
+  printf '%s\n' '[package]' 'name = "the-bridge"' 'version = "0.1.0"' \
+    > "$dir/crates/the-bridge/Cargo.toml"
+  out="$(wheel_configuration "$file")"; rc=$?
+  same_string "$out" "the-bridge|--features extension-module"; rc=$?
+  expect "a commented-out features key does NOT decide the wheel's configuration" "PASS" "$rc"
 
   printf '%s\n' '[workspace]' 'members = []' > "$dir/crates/the-bridge/Cargo.toml"
   printf '%s\n' '[tool.maturin]' 'manifest-path = "../../crates/the-bridge/Cargo.toml"' > "$file"
