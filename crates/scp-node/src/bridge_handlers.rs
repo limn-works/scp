@@ -20,7 +20,7 @@ use axum::{
 use scp_core::bridge::shadow::{
     CreateShadowParams, ShadowError, ShadowRegistry, create_shadow, retire_shadow,
 };
-use scp_core::bridge::{BridgeMode, ShadowProvenanceStatus};
+use scp_core::bridge::{BridgeMode, ShadowIdentity, ShadowProvenanceStatus};
 use scp_core::crypto::sender_keys::SenderKeyStore;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -306,6 +306,29 @@ const MAX_MESSAGE_CONTENT_BYTES: usize = 262_144;
 /// Maximum size of the processed webhook event ID dedup set (BLACK-302).
 const MAX_PROCESSED_EVENT_IDS: usize = 10_000;
 
+/// Maximum size of the retired-shadow set [`BridgeState::deleted_shadows`]
+/// holds.
+///
+/// A bridge creates and retires a shadow per platform user, so a bridge that
+/// churns users grows this set without a bound of its own. Evicting a
+/// retirement key turns the idempotent 204 that spec §12.10.4 gives a second
+/// `DELETE` of a shadow this bridge retired into the 404 it gives a shadow this
+/// bridge never held, which discloses nothing the 404 did not already disclose
+/// and deletes nothing. The set therefore takes the same bound
+/// [`MAX_PROCESSED_EVENT_IDS`] puts on the dedup set beside it.
+const MAX_DELETED_SHADOWS: usize = 10_000;
+
+/// Maximum number of emitted messages [`BridgeState::messages`] holds.
+///
+/// `message_edit` and `message_delete` act only on a `platform_message_id` this
+/// bridge emitted into this context (spec §12.10.4), and this list is what
+/// records that. It lives in this process and outlives no restart, so a node
+/// that restarted, or that emitted more than this many messages since, answers
+/// `accepted: false` to an edit or a delete naming a message it no longer
+/// holds. That is the same answer it gives a message another bridge emitted, so
+/// eviction narrows what the node acts on and widens nothing.
+const MAX_EMITTED_MESSAGES: usize = 10_000;
+
 // ---------------------------------------------------------------------------
 // Message endpoint types (SCP-BCH-003)
 // ---------------------------------------------------------------------------
@@ -507,7 +530,9 @@ async fn create_shadow_handler(
     let shadow_id = derive_shadow_id(bridge_id, &body.platform_user_id);
 
     let mut registries = bridge_state.registries.write().await;
-    // `status_handler` takes these two locks in this order.
+    // `delete_shadow_handler` and the `user_departed` arm of
+    // `process_webhook_event` are the other two callers that hold both, and both
+    // take them in this order. `status_handler` takes `registries` alone.
     let mut deleted = bridge_state.deleted_shadows.write().await;
 
     // Ensure a registry exists for this context.
@@ -814,7 +839,16 @@ async fn emit_message_handler(
         bridge_provenance: provenance_resp.clone(),
     };
 
-    bridge_state.messages.write().await.push(emitted);
+    {
+        let mut messages = bridge_state.messages.write().await;
+        messages.push(emitted);
+        // Oldest first, so the messages a `message_edit` or `message_delete`
+        // is likeliest to name are the ones that survive.
+        if messages.len() > MAX_EMITTED_MESSAGES {
+            let excess = messages.len() - MAX_EMITTED_MESSAGES;
+            messages.drain(..excess);
+        }
+    }
 
     (
         StatusCode::ACCEPTED,
@@ -925,7 +959,8 @@ async fn delete_shadow_handler(
     let bridge_id = auth_ctx.bridge_id();
 
     let mut registries = bridge_state.registries.write().await;
-    // `create_shadow_handler` takes these two locks in this order.
+    // `create_shadow_handler` and the `user_departed` arm of
+    // `process_webhook_event` take these two locks in this order too.
     let mut deleted = bridge_state.deleted_shadows.write().await;
     let retirement_key = (context_id.clone(), bridge_id.to_owned(), shadow_id.clone());
 
@@ -965,9 +1000,32 @@ async fn delete_shadow_handler(
     }
     drop(sender_key_store);
     drop(registries);
-    deleted.insert(retirement_key);
+    record_retirement(&mut deleted, retirement_key);
+    drop(deleted);
 
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// Records a retirement key, and evicts down to [`MAX_DELETED_SHADOWS`] when
+/// recording it puts the set over that bound.
+///
+/// `HashSet` orders nothing, so this drains an arbitrary half rather than the
+/// oldest half. A caller whose key this drops reads the 404 of a shadow it never
+/// held instead of the 204 of one it retired, and the retirement itself already
+/// removed the registry record and the sender key, so the eviction changes no
+/// shadow's liveness.
+fn record_retirement(
+    deleted: &mut HashSet<(String, String, String)>,
+    retirement_key: (String, String, String),
+) {
+    deleted.insert(retirement_key);
+    if deleted.len() > MAX_DELETED_SHADOWS {
+        let to_remove: Vec<(String, String, String)> =
+            deleted.iter().take(deleted.len() / 2).cloned().collect();
+        for key in to_remove {
+            deleted.remove(&key);
+        }
+    }
 }
 
 /// The 404 every shadow endpoint answers for a shadow outside the caller's
@@ -1013,6 +1071,25 @@ fn event_shadow_id(bridge_id: &str, payload: &serde_json::Value) -> Option<Strin
     } else {
         None
     }
+}
+
+/// Returns whether `shadows` holds a shadow that `bridge_id` owns under
+/// `shadow_id` and that a DID has claimed.
+///
+/// Spec §12.10.4 answers the bearer `DELETE` of a claimed shadow with 409
+/// `SHADOW_ALREADY_CLAIMED` and states why: the claimant owns a claimed shadow,
+/// and the bridge operator does not. §12.5 makes claiming one-way and
+/// irreversible, so no later action by that operator undoes it. A
+/// `user_departed` webhook is the bridge operator acting through its own
+/// platform, so `process_webhook_event` refuses to retire a claimed shadow for
+/// the reason the `DELETE` path refuses it. `delete_shadow_handler` applies the
+/// same criterion to the record it already resolved.
+fn claimed_by_this_bridge(shadows: &[ShadowIdentity], bridge_id: &str, shadow_id: &str) -> bool {
+    shadows.iter().any(|s| {
+        s.shadow_id == shadow_id
+            && s.bridge_id == bridge_id
+            && s.provenance_status == ShadowProvenanceStatus::Claimed
+    })
 }
 
 /// Returns whether the signing bridge emitted a message into its context
@@ -1099,6 +1176,11 @@ async fn process_webhook_event(
             let Some(registry) = registries.get_mut(context_id) else {
                 return Some("shadow not found for user_departed".to_owned());
             };
+            if claimed_by_this_bridge(registry.shadows(), bridge_id, &shadow_id) {
+                return Some(
+                    "shadow has been claimed and cannot be retired by user_departed".to_owned(),
+                );
+            }
             let mut sender_key_store = bridge_state.sender_key_store.write().await;
             match retire_shadow(registry, &mut sender_key_store, bridge_id, &shadow_id) {
                 Ok(_) => {}
@@ -1109,7 +1191,11 @@ async fn process_webhook_event(
             }
             drop(sender_key_store);
             drop(registries);
-            deleted.insert((context_id.to_owned(), bridge_id.to_owned(), shadow_id));
+            record_retirement(
+                &mut deleted,
+                (context_id.to_owned(), bridge_id.to_owned(), shadow_id),
+            );
+            drop(deleted);
         }
         "message_edit" | "message_delete" => {
             let platform_message_id = payload_str(payload, "platform_message_id");
@@ -1637,6 +1723,22 @@ mod tests {
             .await
             .expect("test");
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // The re-created shadow is on the roster the status endpoint reports.
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(status_request())
+            .await
+            .expect("test");
+        let json = response_json(resp).await;
+        assert_eq!(
+            json["shadow_count"], 1,
+            "a re-created shadow must appear in the roster the status endpoint reports"
+        );
+        assert_eq!(json["shadows"][0]["shadow_id"], shadow_id);
+
+        // A second retirement removes it again, and the roster drops back to
+        // zero, so re-creation returned a shadow every endpoint sees rather
+        // than a record only the create path knew about.
         let resp = test_app(Arc::clone(&state))
             .oneshot(delete_shadow_request(shadow_id))
             .await
@@ -1654,10 +1756,9 @@ mod tests {
             .expect("test");
         let json = response_json(resp).await;
         assert_eq!(
-            json["shadow_count"], 1,
-            "a re-created shadow must appear in the roster the status endpoint reports"
+            json["shadow_count"], 0,
+            "a second retirement must take the shadow off the roster again"
         );
-        assert_eq!(json["shadows"][0]["shadow_id"], shadow_id);
     }
 
     fn create_request(body: serde_json::Value) -> Request<Body> {
@@ -1951,10 +2052,19 @@ mod tests {
 
     /// Creates a shadow in the state and returns its `shadow_id`.
     async fn create_test_shadow(state: &Arc<BridgeState>) -> String {
+        create_test_shadow_for(state, "user-emitter-001").await
+    }
+
+    /// Creates one shadow for `platform_user_id` and returns its identifier.
+    ///
+    /// Asserts 201, so every caller passes a `platform_user_id` no earlier call
+    /// in the same test used: spec §12.10.4 makes a repeat creation idempotent
+    /// and answers 200, which is a different assertion than this one.
+    async fn create_test_shadow_for(state: &Arc<BridgeState>, platform_user_id: &str) -> String {
         let app = test_app(Arc::clone(state));
         let req = create_request(serde_json::json!({
-            "platform_handle": "@emitter#1234",
-            "platform_user_id": "user-emitter-001"
+            "platform_handle": format!("@{platform_user_id}#1234"),
+            "platform_user_id": platform_user_id
         }));
         let resp = app.oneshot(req).await.expect("test");
         assert_eq!(resp.status(), StatusCode::CREATED);
@@ -2491,8 +2601,12 @@ mod tests {
         .enumerate()
         {
             // Every event names a shadow or a message this bridge owns, because
-            // the node acts on nothing outside the signing bridge's scope.
-            let shadow_id = create_test_shadow(&state).await;
+            // the node acts on nothing outside the signing bridge's scope. Each
+            // iteration names its own platform user, so every creation is a
+            // creation: the `user_departed` iteration retires the shadow it
+            // creates, and a shared platform user would make every later
+            // iteration an idempotent 200 instead.
+            let shadow_id = create_test_shadow_for(&state, &format!("user-event-type-{i}")).await;
             let payload = match *event_type {
                 "message_edit" | "message_delete" => {
                     let resp = test_app(Arc::clone(&state))
@@ -2526,6 +2640,101 @@ mod tests {
                 "event type '{event_type}' should be accepted"
             );
         }
+    }
+
+    fn shadow_record(
+        shadow_id: &str,
+        bridge_id: &str,
+        provenance_status: ShadowProvenanceStatus,
+    ) -> ShadowIdentity {
+        ShadowIdentity {
+            shadow_id: shadow_id.to_owned(),
+            platform_handle: "@claimed#1234".to_owned(),
+            bridge_id: bridge_id.to_owned(),
+            attributed_role: "observer".to_owned(),
+            provenance_status,
+            created_at: 1_700_000_000,
+        }
+    }
+
+    /// Spec §12.10.4 refuses to delete a claimed shadow, and §12.5 makes
+    /// claiming irreversible, so the `user_departed` webhook arm refuses one
+    /// too — and refuses nothing outside the signing bridge's scope, because a
+    /// claimed shadow another bridge owns is not this bridge's to read.
+    #[test]
+    fn a_claimed_shadow_this_bridge_owns_blocks_a_user_departed_retirement() {
+        let shadows = vec![
+            shadow_record("shadow:b1:u1", "b1", ShadowProvenanceStatus::Claimed),
+            shadow_record("shadow:b1:u2", "b1", ShadowProvenanceStatus::Shadow),
+            shadow_record("shadow:b2:u3", "b2", ShadowProvenanceStatus::Claimed),
+        ];
+
+        assert!(claimed_by_this_bridge(&shadows, "b1", "shadow:b1:u1"));
+        assert!(
+            !claimed_by_this_bridge(&shadows, "b1", "shadow:b1:u2"),
+            "an unclaimed shadow this bridge owns retires normally"
+        );
+        assert!(
+            !claimed_by_this_bridge(&shadows, "b1", "shadow:b2:u3"),
+            "a claimed shadow another bridge owns is outside this bridge's scope"
+        );
+        assert!(!claimed_by_this_bridge(&shadows, "b1", "shadow:b1:absent"));
+    }
+
+    /// `deleted_shadows` answers the idempotent 204 spec §12.10.4 gives a
+    /// second delete, and a bridge that churns platform users would otherwise
+    /// grow it without a bound.
+    #[tokio::test]
+    async fn the_retirement_set_stays_under_its_bound() {
+        let mut deleted = HashSet::new();
+        for i in 0..=MAX_DELETED_SHADOWS {
+            record_retirement(
+                &mut deleted,
+                ("ctx".to_owned(), "bridge".to_owned(), format!("shadow-{i}")),
+            );
+        }
+
+        assert!(
+            deleted.len() <= MAX_DELETED_SHADOWS,
+            "the retirement set grew past its bound: {}",
+            deleted.len()
+        );
+        assert!(!deleted.is_empty(), "eviction must not empty the set");
+    }
+
+    /// The emitted-message list backs the `message_edit` and `message_delete`
+    /// scope decision, so it takes a bound of its own rather than growing with
+    /// every message a bridge emits.
+    #[tokio::test]
+    async fn the_emitted_message_list_stays_under_its_bound() {
+        let state = Arc::new(BridgeState::new());
+        let shadow_id = create_test_shadow(&state).await;
+
+        for i in 0..=MAX_EMITTED_MESSAGES {
+            let resp = test_app(Arc::clone(&state))
+                .oneshot(message_request(serde_json::json!({
+                    "shadow_id": shadow_id,
+                    "content": "x",
+                    "content_type": "text/plain",
+                    "platform_message_id": format!("pm-{i}")
+                })))
+                .await
+                .expect("test");
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        }
+
+        let messages = state.messages.read().await;
+        assert_eq!(messages.len(), MAX_EMITTED_MESSAGES);
+        // Eviction drops the oldest, so the newest message is still the one a
+        // `message_edit` or `message_delete` finds.
+        assert_eq!(
+            messages
+                .last()
+                .expect("test")
+                .platform_message_id
+                .as_deref(),
+            Some(format!("pm-{MAX_EMITTED_MESSAGES}").as_str())
+        );
     }
 
     // -----------------------------------------------------------------------

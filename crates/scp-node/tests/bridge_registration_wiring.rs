@@ -1,13 +1,8 @@
-//! End-to-end proof that a governance-approved bridge registration reaches a
-//! node's bridge endpoints (spec §12.2.1, §12.10.2, §12.10.6 step 1).
+//! End-to-end proof that an admitted bridge registration reaches a node's
+//! bridge endpoints, and that every §12.10.2 scope rule decides on what that
+//! admission stored (spec §12.2.1, §12.10.2, §12.10.6 step 1).
 //!
-//! Before this wire existed, `StorageBridgeLookup::register_bridge`,
-//! `register_did_document`, and `register_webhook_key` had call sites only in
-//! `#[cfg(test)]` code, so a shipped node hydrated an empty cache at startup and
-//! answered `BRIDGE_NOT_AUTHORIZED` (401) to every bridge request forever. Every
-//! scope rule the handlers enforce sat behind that 401 and never ran.
-//!
-//! Each test here drives one path a shipped node runs:
+//! Each test drives this chain:
 //!
 //! ```text
 //! scp_protocol register_bridge + approve_registration   (governance, §12.2.1)
@@ -18,11 +13,27 @@
 //!         → webhook_auth_middleware_dyn                 (§12.10.2 signature)
 //! ```
 //!
-//! `ApplicationNode::dev` is a test-harness constructor gated behind
-//! `feature = "testing"` (ADR-062 §Decision 1), so these tests run in the
-//! testing lane. What they exercise is not gated: `register_bridge`,
-//! `set_bridge_status`, `bridge_lookup`, `bridge_state`, and
-//! `build_bridge_routers` all ship in a default build.
+//! # Why a shipped node runs no part of the first two rows
+//!
+//! Spec §12.10.6 step 1 states the criterion a bridge node applies before it
+//! admits a bridge: among the bridge lifecycle leaves in the event log the node
+//! holds as a member of the context, the highest-sequence leaf naming that
+//! bridge is a `BridgeRegistered` or `BridgeReactivated` leaf. A node reads
+//! admission out of that log and out of no other input, and it refuses a
+//! registration that reaches it by any other path. `ApplicationNode` joins no
+//! context and derives no such log, so `register_bridge`, `set_bridge_status`,
+//! and `rotate_bridge_platform_key` compile only under `feature = "testing"`,
+//! and a shipped node answers `BRIDGE_NOT_AUTHORIZED` (401) to every bridge
+//! request — which §12.10.6 step 1 gives as the answer for a bridge that fails
+//! the criterion.
+//!
+//! These tests therefore stand in for the governance action the node will
+//! execute once it derives that log: they put a bridge in the store the same
+//! way the leaf-reading path will, and then assert on the shipped middlewares
+//! and handlers, which are not gated. `ApplicationNode::dev`, `bridge_lookup`,
+//! `bridge_state`, and `build_bridge_routers` behave here as they do in a
+//! shipped build (ADR-062 §Decision 1 keeps `testing` out of every default
+//! feature list).
 
 #![cfg(feature = "testing")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -36,11 +47,11 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signer, SigningKey};
 use http_body_util::BodyExt;
-use scp_core::bridge::BridgeMode;
 use scp_core::bridge::registration::{
     ApprovedRegistration, BridgeRegistrationMetadata, BridgeRegistrationRequest, BridgeRegistry,
     approve_registration, derive_bridge_id, register_bridge,
 };
+use scp_core::bridge::{BridgeMode, BridgeStatus};
 use scp_did::{DidDocument, VerificationMethod};
 use scp_node::ApplicationNode;
 use scp_node::bridge_auth::{BridgeJwtClaims, create_bridge_jwt};
@@ -326,8 +337,6 @@ async fn a_registration_admitted_through_a_node_turns_401_into_200() {
 /// Suspension and revocation reach the same request path (spec §12.2.2).
 #[tokio::test]
 async fn suspending_then_revoking_a_bridge_closes_its_endpoints() {
-    use scp_core::bridge::BridgeStatus;
-
     let node = ApplicationNode::dev(0).await.unwrap();
     let operator = Operator::generate();
     node.register_bridge(
@@ -361,8 +370,10 @@ async fn suspending_then_revoking_a_bridge_closes_its_endpoints() {
         .oneshot(status_request(&token))
         .await
         .unwrap();
-    assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
-    assert!(body_text(revoked).await.contains("BRIDGE_NOT_AUTHORIZED"));
+    // §12.2.2 step 7: a revoked bridge reads `BRIDGE_FORBIDDEN` on every
+    // subsequent API call.
+    assert_eq!(revoked.status(), StatusCode::FORBIDDEN);
+    assert!(body_text(revoked).await.contains("BRIDGE_FORBIDDEN"));
 
     node.shutdown();
 }
@@ -569,17 +580,17 @@ async fn a_malformed_platform_key_id_is_rejected() {
 // Platform key rotation reaches a live request path (spec §12.10.2 step 5)
 // ---------------------------------------------------------------------------
 
-/// A rotation an operator writes to the file `SCP_NODE_BRIDGE_KEY_ROTATIONS`
-/// names installs the incoming key on a live request path, and the outgoing key
-/// keeps working for the 24-hour window §12.10.2 step 5 defines.
+/// An `UpdateBridgePlatformKey` rotation installs the incoming key on a live
+/// request path, and the outgoing key keeps working for the 24-hour window
+/// §12.10.2 step 5 defines.
 ///
-/// This exercises the shipped entry point rather than the store method:
-/// `ApplicationNode::rotate_bridge_platform_keys` is what `main` calls at
-/// startup, and a rotation reachable only from a test would leave a shipped
-/// node with no way to retire a leaked platform key short of revoking the
-/// bridge, which §12.2.1 makes terminal.
+/// A shipped node admits no bridge, because §12.10.6 step 1 reads admission out
+/// of a context event log `ApplicationNode` does not hold, so it holds no key to
+/// rotate and `rotate_bridge_platform_key` carries the same `feature = "testing"`
+/// gate admission carries. This test drives the rotation the node will perform
+/// once it reads that log.
 #[tokio::test]
-async fn a_rotation_applied_from_an_operator_file_installs_the_incoming_key() {
+async fn a_rotation_installs_the_incoming_key_and_keeps_the_outgoing_one_live() {
     let node = ApplicationNode::dev(0).await.unwrap();
     let operator = Operator::generate();
     let outgoing = SigningKey::from_bytes(&rand_seed());
@@ -603,20 +614,9 @@ async fn a_rotation_applied_from_an_operator_file_installs_the_incoming_key() {
         .unwrap();
     assert_eq!(before.status(), StatusCode::UNAUTHORIZED);
 
-    let file = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(
-        file.path(),
-        serde_json::to_string(&serde_json::json!([{
-            "bridge_id": bridge_id,
-            "new_platform_key_id": "pk-new",
-            "new_platform_key": incoming.verifying_key().as_bytes(),
-        }]))
-        .unwrap(),
-    )
-    .unwrap();
-
-    let rotated = node.rotate_bridge_platform_keys(file.path()).await.unwrap();
-    assert_eq!(rotated, 1);
+    node.rotate_bridge_platform_key(&bridge_id, "pk-new", *incoming.verifying_key().as_bytes())
+        .await
+        .unwrap();
 
     let after = bridge_app(&node)
         .oneshot(signed_webhook(&incoming, "pk-new", "pk-new"))
@@ -636,14 +636,48 @@ async fn a_rotation_applied_from_an_operator_file_installs_the_incoming_key() {
         .unwrap();
     assert_eq!(outgoing_still_works.status(), StatusCode::OK);
 
-    // Re-running the same file, which is what a restart does, changes nothing.
-    let replayed = node.rotate_bridge_platform_keys(file.path()).await.unwrap();
-    assert_eq!(replayed, 1);
+    // Replaying the identical rotation writes nothing and returns `Ok`, which
+    // is how an operator reruns one after a partial failure. Both identifiers
+    // keep the state the first rotation left them in.
+    node.rotate_bridge_platform_key(&bridge_id, "pk-new", *incoming.verifying_key().as_bytes())
+        .await
+        .unwrap();
     let after_replay = bridge_app(&node)
         .oneshot(signed_webhook(&incoming, "pk-new", "pk-new"))
         .await
         .unwrap();
     assert_eq!(after_replay.status(), StatusCode::OK);
+    let outgoing_after_replay = bridge_app(&node)
+        .oneshot(signed_webhook(&outgoing, "pk-old", "pk-old"))
+        .await
+        .unwrap();
+    assert_eq!(outgoing_after_replay.status(), StatusCode::OK);
+
+    // A second bridge cannot claim an identifier this bridge holds.
+    let other_operator = Operator::generate();
+    let other = SigningKey::from_bytes(&rand_seed());
+    let other_approval = approved(
+        "bridge-rot-two",
+        &other_operator.did,
+        "ctx-rot",
+        Some(("pk-other", *other.verifying_key().as_bytes())),
+    );
+    let other_bridge_id = other_approval.connector().bridge_id.clone();
+    node.register_bridge(other_approval, other_operator.document.clone())
+        .await
+        .unwrap();
+    let contested = node
+        .rotate_bridge_platform_key(
+            &other_bridge_id,
+            "pk-new",
+            *other.verifying_key().as_bytes(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        contested.to_string().contains("pk-new"),
+        "expected a refusal naming the contested identifier, got: {contested}"
+    );
 
     node.shutdown();
 }
@@ -652,16 +686,17 @@ async fn a_rotation_applied_from_an_operator_file_installs_the_incoming_key() {
 // Bridge status changes reach a live request path (spec §12.2.2)
 // ---------------------------------------------------------------------------
 
-/// A status change an operator writes to the file `SCP_NODE_BRIDGE_STATUS_CHANGES`
-/// names suspends, reactivates, and revokes a bridge on a live request path.
+/// Suspending, reactivating, and revoking a bridge each reach a live request
+/// path, and §12.2.1 refuses every transition out of `Revoked`.
 ///
-/// This exercises the shipped entry point rather than the store method:
-/// `ApplicationNode::apply_bridge_status_changes` is what `main` calls at
-/// startup, and a status change reachable only from a test would leave a
-/// shipped node with no way to suspend or revoke a bridge, so the terminal
-/// `Revoked` state §12.2.1 defines would hold only in tests.
+/// §12.10.6 step 1 makes the `BridgeSuspended`, `BridgeReactivated`, and
+/// `BridgeRevoked` leaves in a node's own event log the only input from which a
+/// node learns of a transition, and `ApplicationNode` derives no such log, so
+/// `set_bridge_status` carries the same `feature = "testing"` gate admission
+/// carries. This test drives the transitions the node will perform once it reads
+/// those leaves.
 #[tokio::test]
-async fn a_status_change_applied_from_an_operator_file_reaches_the_request_path() {
+async fn a_status_change_reaches_the_request_path() {
     let node = ApplicationNode::dev(0).await.unwrap();
     let operator = Operator::generate();
     let platform = SigningKey::from_bytes(&rand_seed());
@@ -677,26 +712,10 @@ async fn a_status_change_applied_from_an_operator_file_reaches_the_request_path(
         .unwrap();
     let token = bearer(&operator, &bridge_id, "ctx-status");
 
-    let write_file = |status: &str| {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            file.path(),
-            serde_json::to_string(&serde_json::json!([{
-                "bridge_id": bridge_id,
-                "status": status,
-            }]))
-            .unwrap(),
-        )
-        .unwrap();
-        file
-    };
-
     // Suspend: bearer and webhook paths both answer 403 BRIDGE_SUSPENDED.
-    let file = write_file("Suspended");
-    assert_eq!(
-        node.apply_bridge_status_changes(file.path()).await.unwrap(),
-        1
-    );
+    node.set_bridge_status(&bridge_id, BridgeStatus::Suspended)
+        .await
+        .unwrap();
     let suspended = bridge_app(&node)
         .oneshot(status_request(&token))
         .await
@@ -709,63 +728,63 @@ async fn a_status_change_applied_from_an_operator_file_reaches_the_request_path(
         .unwrap();
     assert_eq!(suspended_webhook.status(), StatusCode::FORBIDDEN);
 
-    // Replaying the file, which a restart does, changes nothing.
-    assert_eq!(
-        node.apply_bridge_status_changes(file.path()).await.unwrap(),
-        1
-    );
+    // Re-applying the status the record already holds changes nothing.
+    node.set_bridge_status(&bridge_id, BridgeStatus::Suspended)
+        .await
+        .unwrap();
 
     // Reactivate: §12.2.1 `Suspended -> Active` through governance.
-    let file = write_file("Active");
-    assert_eq!(
-        node.apply_bridge_status_changes(file.path()).await.unwrap(),
-        1
-    );
+    node.set_bridge_status(&bridge_id, BridgeStatus::Active)
+        .await
+        .unwrap();
     let active = bridge_app(&node)
         .oneshot(status_request(&token))
         .await
         .unwrap();
     assert_eq!(active.status(), StatusCode::OK);
 
-    // Revoke: 401 on both paths, the webhook key is gone, and a replay of the
-    // revocation is a no-op rather than a failed start.
-    let file = write_file("Revoked");
-    assert_eq!(
-        node.apply_bridge_status_changes(file.path()).await.unwrap(),
-        1
-    );
+    // Revoke: the bearer path answers 403 BRIDGE_FORBIDDEN (§12.2.2 step 7),
+    // and re-revoking a revoked bridge changes nothing.
+    node.set_bridge_status(&bridge_id, BridgeStatus::Revoked)
+        .await
+        .unwrap();
     let revoked = bridge_app(&node)
         .oneshot(status_request(&token))
         .await
         .unwrap();
-    assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
-    assert!(body_text(revoked).await.contains("BRIDGE_NOT_AUTHORIZED"));
+    assert_eq!(revoked.status(), StatusCode::FORBIDDEN);
+    assert!(body_text(revoked).await.contains("BRIDGE_FORBIDDEN"));
+    // §12.2.2 step 6 destroys a revoked bridge's credentials, so the webhook
+    // path answers 401 before it reaches the status check: the signature names
+    // a key identifier this node no longer stores.
     let revoked_webhook = bridge_app(&node)
         .oneshot(signed_webhook(&platform, "pk-status", "pk-status"))
         .await
         .unwrap();
     assert_eq!(revoked_webhook.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(
-        node.apply_bridge_status_changes(file.path()).await.unwrap(),
-        1
+    assert!(
+        body_text(revoked_webhook)
+            .await
+            .contains("BRIDGE_NOT_AUTHORIZED")
     );
+    node.set_bridge_status(&bridge_id, BridgeStatus::Revoked)
+        .await
+        .unwrap();
 
-    // §12.2.1 makes `Revoked` terminal: a file moving it back is refused.
-    let file = write_file("Active");
+    // §12.2.1 makes `Revoked` terminal: a transition back to `Active` is
+    // refused.
     let err = node
-        .apply_bridge_status_changes(file.path())
+        .set_bridge_status(&bridge_id, BridgeStatus::Active)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("revoked"), "{err}");
 
-    // A file naming a bridge this node never admitted is refused.
-    let file = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(
-        file.path(),
-        r#"[{"bridge_id":"bridge-nobody","status":"Suspended"}]"#,
-    )
-    .unwrap();
-    assert!(node.apply_bridge_status_changes(file.path()).await.is_err());
+    // A transition naming a bridge this node never admitted is refused.
+    assert!(
+        node.set_bridge_status("bridge-nobody", BridgeStatus::Suspended)
+            .await
+            .is_err()
+    );
 
     node.shutdown();
 }

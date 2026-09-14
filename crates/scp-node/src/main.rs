@@ -888,77 +888,32 @@ fn dht_gateways_from_env() -> Vec<String> {
     )
 }
 
-/// Applies the three operator-supplied bridge governance files this node reads
-/// at startup, and exits the process when it refuses any one of them.
+/// Logs that this node admits no bridge, and states what would admit one.
 ///
-/// `SCP_NODE_BRIDGE_REGISTRATIONS` carries `RegisterBridge` approvals (spec
-/// §12.10.6 step 1), `SCP_NODE_BRIDGE_KEY_ROTATIONS` carries
-/// `UpdateBridgePlatformKey` actions (§12.10.2 step 5), and
-/// `SCP_NODE_BRIDGE_STATUS_CHANGES` carries `SuspendBridge`,
-/// `ReactivateBridge`, and `RevokeBridge` actions (§12.2.2). Admission runs
-/// first, because a rotation and a status change both name a bridge admission
-/// installed; status changes run last, so a suspension or revocation
-/// governance decided is the last word. An operator who sets none of the
-/// three gets a node serving `/v1/scp/bridge/*` against an empty registry,
-/// which answers `BRIDGE_NOT_AUTHORIZED` (401) to every request.
+/// Spec §12.10.6 step 1 gives bridge admission to a context's governance model:
+/// a bridge node admits a bridge only on a governance approval the node itself
+/// verifies, which it does by reading the `BridgeRegistered`,
+/// `BridgeSuspended`, `BridgeReactivated`, and `BridgeRevoked` leaves out of
+/// the event log it holds as a member of that context, and out of no other
+/// input. This binary joins no context and derives no context event log, so it
+/// verifies no approval and admits no bridge. Every `/v1/scp/bridge/*` endpoint
+/// it mounts answers `BRIDGE_NOT_AUTHORIZED` (401), which §12.10.6 step 1 makes
+/// the answer for a bridge that fails the admission criterion.
 ///
-/// A record this node refuses leaves a bridge unreachable, or leaves a key an
-/// operator meant to retire still signing webhook requests, and serving on
-/// would hide either from that operator until a platform reported it. This
-/// exits instead.
-async fn apply_bridge_governance_files<S: EncryptedStorage + 'static>(
-    node: &scp_node::ApplicationNode<S>,
-) {
-    if let Ok(path) = env::var("SCP_NODE_BRIDGE_REGISTRATIONS") {
-        match node
-            .admit_bridge_registrations(std::path::Path::new(&path))
-            .await
-        {
-            Ok(count) => tracing::info!(
-                count,
-                path = %path,
-                "admitted bridge registrations from an operator-supplied file"
-            ),
-            Err(e) => {
-                tracing::error!(error = %e, path = %path, "bridge registration admission failed");
-                std::process::exit(1);
-            }
-        }
-    }
-
-    if let Ok(path) = env::var("SCP_NODE_BRIDGE_KEY_ROTATIONS") {
-        match node
-            .rotate_bridge_platform_keys(std::path::Path::new(&path))
-            .await
-        {
-            Ok(count) => tracing::info!(
-                count,
-                path = %path,
-                "applied bridge platform key rotations from an operator-supplied file"
-            ),
-            Err(e) => {
-                tracing::error!(error = %e, path = %path, "bridge platform key rotation failed");
-                std::process::exit(1);
-            }
-        }
-    }
-
-    if let Ok(path) = env::var("SCP_NODE_BRIDGE_STATUS_CHANGES") {
-        match node
-            .apply_bridge_status_changes(std::path::Path::new(&path))
-            .await
-        {
-            Ok(count) => tracing::info!(
-                count,
-                path = %path,
-                "applied bridge status changes from an operator-supplied file"
-            ),
-            Err(e) => {
-                tracing::error!(error = %e, path = %path, "bridge status change failed");
-                std::process::exit(1);
-            }
-        }
-    }
+/// §12.10.6 step 1 requires a node to refuse a registration that reaches it by
+/// any path other than that log, and names a file the node's operator writes
+/// among the paths it refuses. A file, an environment variable, and a request
+/// body each assert that governance approved something this node cannot check,
+/// so this binary reads none of them. This line puts the absence in the startup
+/// log, where an operator reads it before a platform reports a 401.
+fn log_bridge_admission_absent() {
+    tracing::info!(
+        "this node admits no bridge: a node reads bridge admission from the \
+         BridgeRegistered leaf in the context event log it holds as a member \
+         (spec 12.10.6 step 1), this binary holds no context membership, and no \
+         operator-supplied file, variable, or request body substitutes for that \
+         leaf, so every /v1/scp/bridge/* request answers BRIDGE_NOT_AUTHORIZED (401)"
+    );
 }
 
 /// Shared implementation for `run_full_node`, parameterized over DID method
@@ -1081,7 +1036,7 @@ async fn run_node_with<
         }
     };
 
-    apply_bridge_governance_files(&node).await;
+    log_bridge_admission_absent();
 
     // The BEP44 sequence counter was bootstrapped inside the builder ahead of
     // the startup publish (SCP-RELAYRES-004), so `Node::start` above already

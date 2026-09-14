@@ -64,11 +64,11 @@ Two things generalize from this second occurrence:
    error, nothing panics, and every negative test still passes. Ask instead which production
    call makes an authorized request succeed, and require a test that performs it.
 
-The fix made `admit_registration` the one entry point that writes a connector and gave it two
-production callers: `ApplicationNode::register_bridge`, which an embedder calls, and
-`ApplicationNode::admit_bridge_registrations`, which the shipped `scp-node` binary calls at
-startup when `SCP_NODE_BRIDGE_REGISTRATIONS` names a file of operator-supplied approvals.
-`crates/scp-node/tests/bridge_registration_wiring.rs` requires 401 before that call and 200
+The first fix made `admit_registration` the one entry point that writes a connector and gave it
+two callers reachable from a shipped build: `ApplicationNode::register_bridge`, which an embedder
+calls, and `ApplicationNode::admit_bridge_registrations`, which the `scp-node` binary called at
+startup when `SCP_NODE_BRIDGE_REGISTRATIONS` named a file of operator-supplied approvals.
+`crates/scp-node/tests/bridge_registration_wiring.rs` required 401 before that call and 200
 after it.
 
 A third lesson came out of a review of that first fix. Moving a writer from `#[cfg(test)]` to a
@@ -76,6 +76,34 @@ A third lesson came out of a review of that first fix. Moving a writer from `#[c
 shipped binary in the same state the original defect described. Ask which shipped entry point —
 a binary's `main`, a request handler, a startup sequence — reaches that writer, and name it.
 "Callable from outside the crate" is not an answer.
+
+## The operator file was the wrong entry point, and the fourth lesson says why
+
+Review of that operator file withdrew it. Spec §12.10.6 step 1 states the criterion a bridge node
+applies before it admits a bridge: among the bridge lifecycle leaves in the event log the node
+holds as a member of the context, the highest-sequence leaf naming that bridge is a
+`BridgeRegistered` or `BridgeReactivated` leaf. The node reads admission out of that log and out
+of no other input, and §12.10.6 step 1 names "a file the node's operator writes" among the paths
+it MUST refuse. §12.2 gives admission to the context's governance model and gives it to no node
+operator.
+
+A file states that governance approved something. It proves nothing, because the node that reads
+it verifies nothing. Running `register_bridge` and `approve_registration` over a fresh registry
+built out of the file's own fields re-applies every §12.2.1 shape rule to the file's contents and
+establishes nothing about governance, so the node ended up storing an approval its operator
+asserted. That is the false guarantee the CLAUDE.md builder tenet forbids: a capability that is
+honestly absent is detectable, and a stand-in for it lies.
+
+**The fourth lesson: a shipped entry point that asserts is not a fix for a writer that nothing
+calls.** The third lesson asks which shipped entry point reaches the writer. Ask a second
+question after it: does that entry point *verify* what the writer stores, or does it *assert* it?
+When the verifier is unbuilt, the capability fails closed — here `scp-node` admits no bridge,
+`admit_registration` and the two lifecycle writers compile only under `feature = "testing"`, and
+every `/v1/scp/bridge/*` endpoint answers `BRIDGE_NOT_AUTHORIZED` (401), which §12.10.6 step 1
+itself gives as the answer for a bridge that fails the criterion. The 401-on-everything state the
+original defect produced by accident is the correct state until the node derives a context event
+log, and the second lesson above still holds: it looks identical to the defect, so
+`crates/scp-node/src/main.rs` logs the absence and its reason at startup.
 
 ## Related
 

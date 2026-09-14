@@ -11,7 +11,6 @@
 
 #![forbid(unsafe_code)]
 
-pub mod bridge_admission;
 pub mod bridge_auth;
 pub mod bridge_handlers;
 pub mod config;
@@ -193,6 +192,11 @@ pub enum NodeError {
 ///
 /// A storage failure keeps [`NodeError::Storage`]; every other variant reports
 /// a registration a node refused, which [`NodeError::InvalidConfig`] carries.
+///
+/// Its three callers compile only under `feature = "testing"`, because spec
+/// §12.10.6 step 1 reads bridge admission out of a context event log
+/// [`ApplicationNode`] does not hold, so this mapper compiles with them.
+#[cfg(any(test, feature = "testing"))]
 fn bridge_admission_to_node_error(err: bridge_auth::BridgeAdmissionError) -> NodeError {
     match err {
         bridge_auth::BridgeAdmissionError::Storage(inner) => NodeError::Storage(inner.to_string()),
@@ -323,7 +327,14 @@ pub struct ApplicationNode<S: Storage> {
     ///
     /// `http::NodeState` holds this same object behind `dyn BridgeLookup`, so a
     /// registration admitted through [`register_bridge`](Self::register_bridge)
-    /// is visible to the middleware on the next request.
+    /// is visible to the middleware on the next request. That method and the
+    /// two lifecycle methods beside it are the only readers of this field, and
+    /// all three compile only under `feature = "testing"` because spec §12.10.6
+    /// step 1 reads admission out of a context event log this node does not
+    /// hold. A production build reaches the same store through
+    /// [`bridge_lookup`](Self::bridge_lookup), which serves the read-only
+    /// endpoints, so it needs no second handle and carries none.
+    #[cfg(any(test, feature = "testing"))]
     bridge_registry: Arc<bridge_auth::StorageBridgeLookup<S>>,
     /// Handle to the periodic tier re-evaluation background task (§10.12.1, SCP-243).
     /// `None` in domain mode with successful TLS (Tier 4 doesn't need NAT re-eval).
@@ -564,15 +575,29 @@ impl<S: Storage> ApplicationNode<S> {
 
     /// Admits a governance-approved bridge registration onto this node.
     ///
-    /// Spec §12.2.1 gates bridge registration behind a `RegisterBridge`
-    /// governance proposal, and `scp_protocol::bridge::registration`'s
-    /// `approve_registration` produces the `ApprovedRegistration` this method
-    /// takes. Spec §12.10.6 step 1 makes admission the step that turns that
-    /// approval into a bridge a platform can reach: until a node holds these
-    /// records, every request naming that bridge answers
-    /// `BRIDGE_NOT_AUTHORIZED` (401), because `bridge_auth_middleware` finds no
-    /// registration for the JWT `scp_bridge_id` and no DID document for its
-    /// `iss`.
+    /// # This node admits no bridge outside a test
+    ///
+    /// Spec §12.10.6 step 1 states the criterion a bridge node applies before
+    /// it admits a bridge: among the bridge lifecycle leaves in the event log
+    /// the node holds as a member of the context, the highest-sequence leaf
+    /// naming that bridge is a `BridgeRegistered` or `BridgeReactivated` leaf.
+    /// The node reads admission from that log and from no other input, and it
+    /// refuses a registration that reaches it by any other path.
+    ///
+    /// [`ApplicationNode`] joins no context, holds no membership, and derives
+    /// no context event log, so it can apply no part of that criterion. This
+    /// method therefore compiles only under `feature = "testing"`, which
+    /// `scripts/check-shipped-feature-graph.sh` rejects in a shipped feature
+    /// set (ADR-062 §Decision 6). A shipped binary reaches no caller of it, so
+    /// a shipped node stores no bridge connector and answers
+    /// `BRIDGE_NOT_AUTHORIZED` (401) to every bridge request — the answer
+    /// §12.10.6 step 1 gives for a bridge that fails the criterion.
+    ///
+    /// A caller mints the [`ApprovedRegistration`](scp_core::bridge::registration::ApprovedRegistration)
+    /// this takes by running `approve_registration` itself, which asserts an
+    /// approval rather than verifying one. That assertion is what confines this
+    /// method to a test lane: admitting on it in production would add an
+    /// admission authority §12.2 gives to context governance alone.
     ///
     /// `operator_document` is the bridge operator's resolved DID document, and
     /// §12.10.2 bearer-token verification checks every JWT signature against
@@ -588,6 +613,7 @@ impl<S: Storage> ApplicationNode<S> {
     /// another bridge already holds this webhook key identifier, or when a
     /// cooperative registration carries no key material. Returns
     /// [`NodeError::Storage`] when a storage write fails.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn register_bridge(
         &self,
         approved: scp_core::bridge::registration::ApprovedRegistration,
@@ -599,62 +625,29 @@ impl<S: Storage> ApplicationNode<S> {
             .map_err(bridge_admission_to_node_error)
     }
 
-    /// Admits every governance-approved registration an operator wrote to
-    /// `path`, and returns how many bridges this call admitted.
-    ///
-    /// Spec §12.10.6 step 1 makes admission the step that turns approvals into
-    /// reachable bridges, and this is what the `scp-node` binary calls at
-    /// startup when `SCP_NODE_BRIDGE_REGISTRATIONS` names a file. Each record
-    /// rebuilds its own [`ApprovedRegistration`](scp_core::bridge::registration::ApprovedRegistration) through `scp_protocol`
-    /// `register_bridge` and `approve_registration`, so every §12.2.1 rule
-    /// applies before this node stores anything.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NodeError::InvalidConfig`] when the file cannot be read or
-    /// parsed, or when a record fails a §12.2.1 rule, and whatever
-    /// [`register_bridge`](Self::register_bridge) returns for a record that
-    /// reaches admission and is refused there. Nothing is admitted after a
-    /// failure, so an operator fixes a record and reruns.
-    pub async fn admit_bridge_registrations(
-        &self,
-        path: &std::path::Path,
-    ) -> Result<usize, NodeError> {
-        let records = crate::bridge_admission::load_admission_records(path)
-            .map_err(|e| NodeError::InvalidConfig(e.to_string()))?;
-
-        let mut admitted = 0_usize;
-        for record in records {
-            let approved = record
-                .rebuild_approval()
-                .map_err(|e| NodeError::InvalidConfig(e.to_string()))?;
-            let bridge_id = approved.connector().bridge_id.clone();
-            self.register_bridge(approved, record.operator_document)
-                .await?;
-            tracing::info!(bridge_id = %bridge_id, "admitted a bridge registration");
-            admitted += 1;
-        }
-        Ok(admitted)
-    }
-
     /// Moves an admitted bridge to a new lifecycle status.
     ///
     /// Spec §12.2.2 drives this from `SuspendBridge`, `ReactivateBridge`, and
-    /// `RevokeBridge` governance actions, and the `scp-node` binary reaches it
-    /// through [`apply_bridge_status_changes`](Self::apply_bridge_status_changes)
-    /// when `SCP_NODE_BRIDGE_STATUS_CHANGES` names a file. A status the stored
-    /// record already holds changes nothing. A suspended bridge answers
-    /// `BRIDGE_SUSPENDED` (403) and a revoked bridge answers
-    /// `BRIDGE_NOT_AUTHORIZED` (401) on every endpoint. Revoking also deletes
-    /// every webhook signing key stored against that bridge (§12.2.2 step 6),
-    /// and §12.2.1 makes `Revoked` terminal, so a revoked bridge accepts no
-    /// further transition.
+    /// `RevokeBridge` governance actions, and §12.10.6 step 1 makes the
+    /// `BridgeSuspended`, `BridgeReactivated`, and `BridgeRevoked` leaves in
+    /// the event log a node holds as a member the only input a node reads to
+    /// learn of one. This node derives no such log, so this method compiles
+    /// only under `feature = "testing"` for the same reason
+    /// [`register_bridge`](Self::register_bridge) does, and a shipped node
+    /// performs no lifecycle transition at all.
+    ///
+    /// A suspended bridge answers `BRIDGE_SUSPENDED` (403) and a revoked bridge
+    /// answers `BRIDGE_FORBIDDEN` (403) on every endpoint (§12.2.2 step 7).
+    /// Revoking also deletes every webhook signing key stored against that
+    /// bridge (§12.2.2 step 6), and §12.2.1 makes `Revoked` terminal, so a
+    /// revoked bridge accepts no further transition.
     ///
     /// # Errors
     ///
     /// Returns [`NodeError::InvalidConfig`] when no record names `bridge_id`
     /// or when that record is already revoked, and [`NodeError::Storage`] when
     /// a storage write fails.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn set_bridge_status(
         &self,
         bridge_id: &str,
@@ -677,6 +670,12 @@ impl<S: Storage> ApplicationNode<S> {
     /// platform key without revoking the bridge, since §12.2.1 makes `Revoked`
     /// terminal.
     ///
+    /// A rotation names a bridge this node admitted, and §12.10.6 step 1 makes
+    /// the node's own event log the only input that admits one. This node
+    /// derives no such log and admits no bridge, so this method compiles only
+    /// under `feature = "testing"` for the same reason
+    /// [`register_bridge`](Self::register_bridge) does.
+    ///
     /// # Errors
     ///
     /// Returns [`NodeError::InvalidConfig`] when no record names `bridge_id`,
@@ -684,6 +683,7 @@ impl<S: Storage> ApplicationNode<S> {
     /// any bridge already stores `new_key_id`, or when the system clock reports
     /// a time before the Unix epoch. Returns [`NodeError::Storage`] when a
     /// storage read or write fails.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn rotate_bridge_platform_key(
         &self,
         bridge_id: &str,
@@ -694,88 +694,6 @@ impl<S: Storage> ApplicationNode<S> {
             .rotate_platform_key(bridge_id, new_key_id, new_platform_key)
             .await
             .map_err(bridge_admission_to_node_error)
-    }
-
-    /// Applies every `UpdateBridgePlatformKey` action an operator wrote to
-    /// `path`, and returns how many rotations this call performed.
-    ///
-    /// This is what the `scp-node` binary calls at startup when
-    /// `SCP_NODE_BRIDGE_KEY_ROTATIONS` names a file, after it admits whatever
-    /// `SCP_NODE_BRIDGE_REGISTRATIONS` names — a rotation names a bridge
-    /// admission already installed. Re-running a rotation an earlier start
-    /// already performed changes nothing, so an operator leaves the file in
-    /// place across restarts.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NodeError::InvalidConfig`] when the file cannot be read or
-    /// parsed, and whatever
-    /// [`rotate_bridge_platform_key`](Self::rotate_bridge_platform_key)
-    /// returns for a record a node refuses. Nothing after a failure is applied,
-    /// so an operator fixes a record and reruns.
-    pub async fn rotate_bridge_platform_keys(
-        &self,
-        path: &std::path::Path,
-    ) -> Result<usize, NodeError> {
-        let records = crate::bridge_admission::load_rotation_records(path)
-            .map_err(|e| NodeError::InvalidConfig(e.to_string()))?;
-
-        let mut rotated = 0_usize;
-        for record in records {
-            self.rotate_bridge_platform_key(
-                &record.bridge_id,
-                &record.new_platform_key_id,
-                record.new_platform_key,
-            )
-            .await?;
-            tracing::info!(
-                bridge_id = %record.bridge_id,
-                key_id = %record.new_platform_key_id,
-                "applied a bridge platform key rotation"
-            );
-            rotated += 1;
-        }
-        Ok(rotated)
-    }
-
-    /// Applies every `SuspendBridge`, `ReactivateBridge`, or `RevokeBridge`
-    /// action an operator wrote to `path`, and returns how many records this
-    /// call applied.
-    ///
-    /// This is what the `scp-node` binary calls at startup when
-    /// `SCP_NODE_BRIDGE_STATUS_CHANGES` names a file, after it admits whatever
-    /// `SCP_NODE_BRIDGE_REGISTRATIONS` names and applies whatever
-    /// `SCP_NODE_BRIDGE_KEY_ROTATIONS` names, so a status decided by governance
-    /// is the last word at startup. A record naming a status the node already
-    /// holds changes nothing, so an operator leaves the file in place across
-    /// restarts; a revocation an earlier start performed therefore replays as
-    /// a no-op and does not fail the start.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NodeError::InvalidConfig`] when the file cannot be read or
-    /// parsed, and whatever [`set_bridge_status`](Self::set_bridge_status)
-    /// returns for a record a node refuses. Nothing after a failure is applied,
-    /// so an operator fixes a record and reruns.
-    pub async fn apply_bridge_status_changes(
-        &self,
-        path: &std::path::Path,
-    ) -> Result<usize, NodeError> {
-        let records = crate::bridge_admission::load_status_change_records(path)
-            .map_err(|e| NodeError::InvalidConfig(e.to_string()))?;
-
-        let mut applied = 0_usize;
-        for record in records {
-            self.set_bridge_status(&record.bridge_id, record.status.clone())
-                .await?;
-            tracing::info!(
-                bridge_id = %record.bridge_id,
-                status = ?record.status,
-                "applied a bridge status change"
-            );
-            applied += 1;
-        }
-        Ok(applied)
     }
 
     /// Returns this node's bridge registration store behind
@@ -3404,6 +3322,43 @@ pub(crate) fn resolve_nat(
 ///
 /// The DHT client comes from the node's own [`DidMethod`], so the client that
 /// keeps the record alive is the client that signed the publish.
+/// Builds this node's bridge registration store and hydrates its cache from
+/// storage.
+///
+/// Spec §12.10.2 verifies a bearer token against the operator's DID document,
+/// and this store resolves that document through `did_method` rather than
+/// trusting a copy an operator handed the node at admission time, so a rotated
+/// or revoked signing key stops authenticating within one TTL.
+///
+/// `audience` is the base URL a bearer token's `aud` claim must name: the
+/// domain builder passes `https://<domain>` and the no-domain builder passes the
+/// relay URL.
+///
+/// # Errors
+///
+/// Returns [`NodeError::Storage`] when the cache cannot hydrate, which stops the
+/// node before it serves a bridge endpoint. Starting with an empty cache over
+/// populated storage would make every §12.10.2 authentication decision from a
+/// record set missing whatever storage holds, which returns a revoked bridge to
+/// `Active` on its next admission and moves one bridge's webhook key identifier
+/// onto another bridge.
+async fn build_bridge_store<D: DidMethod + 'static, S: Storage + 'static>(
+    storage: &Arc<ProtocolRepository<S>>,
+    audience: String,
+    did_method: &Arc<D>,
+) -> Result<Arc<bridge_auth::StorageBridgeLookup<S>>, NodeError> {
+    let lookup = Arc::new(bridge_auth::StorageBridgeLookup::new(
+        Arc::clone(storage),
+        audience,
+        Arc::new(bridge_auth::DidMethodResolver::new(Arc::clone(did_method))),
+    ));
+    lookup
+        .load_from_storage()
+        .await
+        .map_err(|e| NodeError::Storage(format!("failed to load bridge registry: {e}")))?;
+    Ok(lookup)
+}
+
 async fn start_node_republish_cycle<D: DidMethod + 'static>(
     did_method: &Arc<D>,
     live_state: &LiveSlot<NodePublishedState>,
@@ -3523,29 +3478,12 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
 
     // Build the production bridge auth lookup, hydrating from storage.
     // The audience URL is the HTTPS base URL for this node (spec 12.10.2).
-    let audience = format!("https://{domain}");
-    // §12.10.2 verifies a bearer token against the operator's DID document, and
-    // this node resolves that document rather than trusting a copy an operator
-    // handed it at admission time, so a rotated or revoked signing key stops
-    // authenticating within one TTL.
-    let bridge_lookup = Arc::new(bridge_auth::StorageBridgeLookup::new(
-        Arc::clone(&storage),
-        audience,
-        Arc::new(bridge_auth::DidMethodResolver::new(Arc::clone(&did_method))),
-    ));
-    // A node that cannot read its own bridge registry must not start serving
-    // bridge endpoints. Starting with an empty cache over populated storage
-    // makes every §12.10.2 authentication decision from a record set that is
-    // missing whatever storage holds, which returns a revoked bridge to
-    // `Active` on its next admission and moves one bridge's webhook key
-    // identifier onto another bridge.
-    bridge_lookup
-        .load_from_storage()
-        .await
-        .map_err(|e| NodeError::Storage(format!("failed to load bridge registry: {e}")))?;
-    // One object serves two roles: `NodeState` reads it through
-    // `dyn BridgeLookup` to authenticate a request, and `ApplicationNode`
-    // keeps a typed handle so `register_bridge` writes into that same store.
+    let bridge_lookup =
+        build_bridge_store(&storage, format!("https://{domain}"), &did_method).await?;
+    // `NodeState` reads this object through `dyn BridgeLookup` to authenticate
+    // a request. The typed handle below serves the write half, which
+    // `ApplicationNode::bridge_registry` documents and a production build omits.
+    #[cfg(any(test, feature = "testing"))]
     let bridge_registry = Arc::clone(&bridge_lookup);
 
     // Start this node's self-DID republish cycle (ADR-003 §2). Below every
@@ -3592,6 +3530,7 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     });
 
     Ok(ApplicationNode {
+        #[cfg(any(test, feature = "testing"))]
         bridge_registry,
         domain: Some(domain),
         relay: RelayHandle {
@@ -3915,24 +3854,12 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
     // `https://<domain>`, which is not the relay URL at all.
     //
     // The resolver is here for the reason `build_domain_inner` states.
-    let bridge_lookup = Arc::new(bridge_auth::StorageBridgeLookup::new(
-        Arc::clone(&storage),
-        live_state.get().relay_url,
-        Arc::new(bridge_auth::DidMethodResolver::new(Arc::clone(&did_method))),
-    ));
-    // A node that cannot read its own bridge registry must not start serving
-    // bridge endpoints. Starting with an empty cache over populated storage
-    // makes every §12.10.2 authentication decision from a record set that is
-    // missing whatever storage holds, which returns a revoked bridge to
-    // `Active` on its next admission and moves one bridge's webhook key
-    // identifier onto another bridge.
-    bridge_lookup
-        .load_from_storage()
-        .await
-        .map_err(|e| NodeError::Storage(format!("failed to load bridge registry: {e}")))?;
-    // One object serves two roles: `NodeState` reads it through
-    // `dyn BridgeLookup` to authenticate a request, and `ApplicationNode`
-    // keeps a typed handle so `register_bridge` writes into that same store.
+    let bridge_lookup =
+        build_bridge_store(&storage, live_state.get().relay_url, &did_method).await?;
+    // `NodeState` reads this object through `dyn BridgeLookup` to authenticate
+    // a request. The typed handle below serves the write half, which
+    // `ApplicationNode::bridge_registry` documents and a production build omits.
+    #[cfg(any(test, feature = "testing"))]
     let bridge_registry = Arc::clone(&bridge_lookup);
 
     let state = Arc::new(http::NodeState {
@@ -3976,6 +3903,7 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
     });
 
     Ok(ApplicationNode {
+        #[cfg(any(test, feature = "testing"))]
         bridge_registry,
         domain: None,
         relay: RelayHandle {

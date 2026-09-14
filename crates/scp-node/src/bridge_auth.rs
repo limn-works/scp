@@ -14,6 +14,7 @@
 //! | Code | HTTP Status | Description |
 //! |------|-------------|-------------|
 //! | `BRIDGE_NOT_AUTHORIZED` | 401 | Bearer token invalid or expired |
+//! | `BRIDGE_FORBIDDEN` | 403 | Bridge has been revoked by context governance |
 //! | `BRIDGE_SUSPENDED` | 403 | Bridge is suspended by context governance |
 //!
 //! See ADR-023 in `.docs/adrs/phase-5.md` and spec section 12.10.3.
@@ -31,9 +32,16 @@ use axum::response::IntoResponse;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signature, VerifyingKey};
-use scp_core::bridge::registration::ApprovedRegistration;
-use scp_core::bridge::{BridgeConnector, BridgeMode, BridgeStatus};
+use scp_core::bridge::{BridgeConnector, BridgeStatus};
 use scp_core::store::ProtocolRepository;
+// `ApprovedRegistration` and `BridgeMode` are read by the write half of this
+// store — `admit_registration`, `set_bridge_status`, and `rotate_platform_key`.
+// Spec §12.10.6 step 1 reads admission out of a context event log this store
+// does not hold, so that half compiles only under `feature = "testing"`.
+#[cfg(any(test, feature = "testing"))]
+use scp_core::bridge::BridgeMode;
+#[cfg(any(test, feature = "testing"))]
+use scp_core::bridge::registration::ApprovedRegistration;
 use scp_did::{DidDocument, decode_multibase_key};
 use scp_platform::traits::Storage;
 use serde::{Deserialize, Serialize};
@@ -66,6 +74,13 @@ const JWT_TYP: &str = "JWT";
 /// Spec §12.10.2 step 5: "During a 24-hour rotation period, a bridge node
 /// accepts signatures under either identifier; at rotation close, a bridge node
 /// deletes an outgoing identifier."
+///
+/// `rotate_platform_key` is what stamps this deadline onto an outgoing
+/// identifier, and it compiles only under `feature = "testing"` for the reason
+/// [`StorageBridgeLookup::admit_registration`] does, so this constant compiles
+/// with it. `verify_webhook_signature` reads each stored deadline and needs no
+/// constant of its own.
+#[cfg(any(test, feature = "testing"))]
 const PLATFORM_KEY_ROTATION_WINDOW_SECS: u64 = 86_400;
 
 /// Maximum allowed timestamp drift for webhook signature verification
@@ -116,6 +131,31 @@ fn bridge_suspended(reason: impl Into<String>) -> (StatusCode, Json<ApiError>) {
         Json(ApiError {
             error: "bridge is suspended by context governance".to_owned(),
             code: "BRIDGE_SUSPENDED".to_owned(),
+        }),
+    )
+}
+
+/// Returns a 403 error response with the `BRIDGE_FORBIDDEN` error code.
+///
+/// Spec §12.2.2 step 7 gives a revoked bridge `BRIDGE_SUSPENDED` or
+/// `BRIDGE_FORBIDDEN` on every subsequent API call, and §12.10.3 maps
+/// `BRIDGE_FORBIDDEN` to 403 with the description "Bridge not authorized for
+/// this operation". Suspension already answers `BRIDGE_SUSPENDED`, so
+/// revocation answers this one.
+///
+/// This body names a bridge a node stores, which the 401
+/// [`BRIDGE_NOT_AUTHORIZED_MESSAGE`] withholds. Only a caller whose bearer token
+/// verified against that bridge's own operator DID document, or whose webhook
+/// signature verified under that bridge's own registered platform key, reaches
+/// this function, so it discloses a bridge's revocation to the operator of that
+/// bridge and to nobody else.
+fn bridge_forbidden(reason: impl Into<String>) -> (StatusCode, Json<ApiError>) {
+    tracing::debug!(reason = %reason.into(), "rejected a request for a revoked bridge");
+    (
+        StatusCode::FORBIDDEN,
+        Json(ApiError {
+            error: "bridge has been revoked by context governance".to_owned(),
+            code: "BRIDGE_FORBIDDEN".to_owned(),
         }),
     )
 }
@@ -674,6 +714,11 @@ pub struct StorageBridgeLookup<S: Storage> {
     /// stored webhook key, and lets two rotations each read one live identifier
     /// and each write a second. Holding this lock across each whole method
     /// makes both interleavings impossible.
+    ///
+    /// Those three methods compile only under `feature = "testing"`, because
+    /// spec §12.10.6 step 1 reads admission out of a context event log this
+    /// store does not hold, so this lock compiles with them.
+    #[cfg(any(test, feature = "testing"))]
     lifecycle: tokio::sync::Mutex<()>,
 }
 
@@ -725,6 +770,7 @@ impl<S: Storage> StorageBridgeLookup<S> {
             did_resolution_attempts: std::sync::RwLock::new(HashMap::new()),
             resolver,
             audience,
+            #[cfg(any(test, feature = "testing"))]
             lifecycle: tokio::sync::Mutex::new(()),
         }
     }
@@ -898,6 +944,11 @@ impl<S: Storage> StorageBridgeLookup<S> {
     /// check what spec §12.2.1 and §12.10.2 require, so it stays private: a
     /// caller reaching it directly would skip an operator-document match, a
     /// terminal-`Revoked` check, and cooperative key registration.
+    // Reached only from `admit_registration`, `set_bridge_status`, and
+    // `rotate_platform_key`, which spec §12.10.6 step 1 confines to a test lane
+    // because this store reads no context event log. A production build writes
+    // no bridge record, so it calls none of them.
+    #[cfg(any(test, feature = "testing"))]
     async fn store_connector(
         &self,
         connector: BridgeConnector,
@@ -957,6 +1008,18 @@ impl<S: Storage> StorageBridgeLookup<S> {
     /// [`BridgeAdmissionError::CooperativeRegistrationMissingKey`] when a
     /// cooperative registration carries no key material, and
     /// [`BridgeAdmissionError::Storage`] when a storage write fails.
+    ///
+    /// # Compiled for a test lane only
+    ///
+    /// Spec §12.10.6 step 1 admits a bridge on one input: the bridge lifecycle
+    /// leaves in the event log the node holds as a member of the context. This
+    /// store reads no event log, and `approved` is what its caller asserts
+    /// governance decided, so admitting on it in a shipped binary would add an
+    /// admission authority §12.2 gives to context governance alone. This method
+    /// therefore compiles only under `feature = "testing"`, which
+    /// `scripts/check-shipped-feature-graph.sh` rejects in a shipped feature
+    /// set, and a shipped node stores no bridge connector.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn admit_registration(
         &self,
         approved: ApprovedRegistration,
@@ -1114,6 +1177,11 @@ impl<S: Storage> StorageBridgeLookup<S> {
     /// A delete that itself fails is logged rather than returned, because the
     /// caller is already returning the earlier failure and that failure is what
     /// an operator acts on.
+    // Reached only from `admit_registration`, `set_bridge_status`, and
+    // `rotate_platform_key`, which spec §12.10.6 step 1 confines to a test lane
+    // because this store reads no context event log. A production build writes
+    // no bridge record, so it calls none of them.
+    #[cfg(any(test, feature = "testing"))]
     async fn undo_webhook_key(&self, key_id: Option<&str>) {
         let Some(key_id) = key_id else { return };
         if let Err(e) = self.deregister_webhook_key(key_id).await {
@@ -1138,6 +1206,11 @@ impl<S: Storage> StorageBridgeLookup<S> {
     /// Returns `Err` when the storage read fails, and when a stored record does
     /// not deserialize. An unreadable record still occupies its identifier, so
     /// treating it as absent would let a second bridge claim that identifier.
+    // Reached only from `admit_registration`, `set_bridge_status`, and
+    // `rotate_platform_key`, which spec §12.10.6 step 1 confines to a test lane
+    // because this store reads no context event log. A production build writes
+    // no bridge record, so it calls none of them.
+    #[cfg(any(test, feature = "testing"))]
     async fn stored_webhook_key(
         &self,
         key_id: &str,
@@ -1168,6 +1241,11 @@ impl<S: Storage> StorageBridgeLookup<S> {
     /// Returns `Err` when the storage read fails, so a lifecycle decision made
     /// on unreadable storage fails closed rather than proceeding on an
     /// assumed-absent record.
+    // Reached only from `admit_registration`, `set_bridge_status`, and
+    // `rotate_platform_key`, which spec §12.10.6 step 1 confines to a test lane
+    // because this store reads no context event log. A production build writes
+    // no bridge record, so it calls none of them.
+    #[cfg(any(test, feature = "testing"))]
     async fn stored_bridge(
         &self,
         bridge_id: &str,
@@ -1197,9 +1275,8 @@ impl<S: Storage> StorageBridgeLookup<S> {
     /// that bridge to `Active`.
     ///
     /// A `status` the stored record already holds writes nothing and returns
-    /// `Ok`, including `Revoked` onto a revoked bridge: the `scp-node` binary
-    /// applies an operator's status file at every start, and a replay of a
-    /// transition an earlier start performed is no transition.
+    /// `Ok`, including `Revoked` onto a revoked bridge, so replaying a
+    /// transition an earlier call performed is no transition.
     ///
     /// # Errors
     ///
@@ -1207,6 +1284,18 @@ impl<S: Storage> StorageBridgeLookup<S> {
     /// record names `bridge_id`, [`BridgeAdmissionError::BridgeRevoked`] when
     /// that record is revoked and `status` is not `Revoked`, and
     /// [`BridgeAdmissionError::Storage`] when a storage write fails.
+    ///
+    /// # Compiled for a test lane only
+    ///
+    /// Spec §12.10.6 step 1 makes the `BridgeSuspended`, `BridgeReactivated`,
+    /// and `BridgeRevoked` leaves in the event log a node holds as a member the
+    /// only input from which a node learns of a lifecycle transition. This
+    /// store reads no event log, so `status` is what its caller asserts
+    /// governance decided. This method compiles only under
+    /// `feature = "testing"` for the same reason
+    /// [`admit_registration`](Self::admit_registration) does, and a shipped node
+    /// performs no lifecycle transition.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn set_bridge_status(
         &self,
         bridge_id: &str,
@@ -1407,6 +1496,11 @@ impl<S: Storage> StorageBridgeLookup<S> {
     /// read-then-write is not atomic, and a write landing between revocation's
     /// status change and its key deletion would leave a revoked bridge holding
     /// a signing key.
+    // Reached only from `admit_registration`, `set_bridge_status`, and
+    // `rotate_platform_key`, which spec §12.10.6 step 1 confines to a test lane
+    // because this store reads no context event log. A production build writes
+    // no bridge record, so it calls none of them.
+    #[cfg(any(test, feature = "testing"))]
     async fn register_webhook_key(
         &self,
         key_id: &str,
@@ -1454,6 +1548,11 @@ impl<S: Storage> StorageBridgeLookup<S> {
     /// # Errors
     ///
     /// Returns `Err` when serialization or the storage write fails.
+    // Reached only from `admit_registration`, `set_bridge_status`, and
+    // `rotate_platform_key`, which spec §12.10.6 step 1 confines to a test lane
+    // because this store reads no context event log. A production build writes
+    // no bridge record, so it calls none of them.
+    #[cfg(any(test, feature = "testing"))]
     async fn store_webhook_key_binding(
         &self,
         key_id: &str,
@@ -1485,6 +1584,11 @@ impl<S: Storage> StorageBridgeLookup<S> {
     ///
     /// Returns `Err` when a storage read fails, so revocation reports a failure
     /// rather than reporting that it destroyed keys it could not see.
+    // Reached only from `admit_registration`, `set_bridge_status`, and
+    // `rotate_platform_key`, which spec §12.10.6 step 1 confines to a test lane
+    // because this store reads no context event log. A production build writes
+    // no bridge record, so it calls none of them.
+    #[cfg(any(test, feature = "testing"))]
     async fn stored_webhook_keys_for_bridge(
         &self,
         bridge_id: &str,
@@ -1544,6 +1648,16 @@ impl<S: Storage> StorageBridgeLookup<S> {
     /// bridge holds `new_key_id`, [`BridgeAdmissionError::ClockBeforeEpoch`]
     /// when the system clock reports a time before the Unix epoch, and
     /// [`BridgeAdmissionError::Storage`] when a storage read or write fails.
+    ///
+    /// # Compiled for a test lane only
+    ///
+    /// A rotation names a bridge this store admitted, and
+    /// [`admit_registration`](Self::admit_registration) compiles only under
+    /// `feature = "testing"` because spec §12.10.6 step 1 reads admission out of
+    /// a context event log this store does not hold. A shipped node admits no
+    /// bridge, so it holds no key to rotate, and this method carries the same
+    /// gate rather than standing as a writer no admitted record backs.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn rotate_platform_key(
         &self,
         bridge_id: &str,
@@ -1910,7 +2024,7 @@ fn reject_inactive_bridge(bridge: &BridgeConnector) -> Option<(StatusCode, Json<
             "bridge {} is suspended by context governance",
             bridge.bridge_id
         ))),
-        BridgeStatus::Revoked => Some(bridge_not_authorized(format!(
+        BridgeStatus::Revoked => Some(bridge_forbidden(format!(
             "bridge {} has been revoked",
             bridge.bridge_id
         ))),
@@ -1993,6 +2107,8 @@ async fn authorize_bearer_request(
 ///   signature verification failure; bridge not found.
 /// - **403 `BRIDGE_SUSPENDED`** — The bridge exists but is suspended by
 ///   context governance.
+/// - **403 `BRIDGE_FORBIDDEN`** — The bridge exists and context governance
+///   revoked it (spec §12.2.2 step 7).
 ///
 /// See spec sections 12.10.2 and 12.10.3.
 pub async fn bridge_auth_middleware<L: BridgeLookup>(
@@ -2239,8 +2355,9 @@ fn authorize_webhook_request(
 /// On success, inserts a [`WebhookAuthContext`] into the request extensions so
 /// the webhook handler can restrict its work to the signing platform's bridge
 /// and context. On failure, returns 401 with error code
-/// `BRIDGE_NOT_AUTHORIZED`, or 403 with `BRIDGE_SUSPENDED` when the bound
-/// bridge is suspended.
+/// `BRIDGE_NOT_AUTHORIZED`, 403 with `BRIDGE_SUSPENDED` when the bound bridge
+/// is suspended, or 403 with `BRIDGE_FORBIDDEN` when context governance revoked
+/// it (spec §12.2.2 step 7).
 ///
 /// See spec section 12.10.2.
 pub async fn webhook_auth_middleware<L: BridgeLookup>(
@@ -2912,10 +3029,11 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
+        // Spec §12.2.2 step 7 gives a revoked bridge `BRIDGE_FORBIDDEN`.
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let body = response_body(resp).await;
-        assert!(body.contains("BRIDGE_NOT_AUTHORIZED"));
+        assert!(body.contains("BRIDGE_FORBIDDEN"));
     }
 
     #[tokio::test]
@@ -3381,9 +3499,10 @@ mod tests {
         let app = webhook_test_app(Arc::new(lookup));
         let req = signed_webhook_request(&signing_key, "platform-key-1", "{}");
 
+        // Spec §12.2.2 step 7 gives a revoked bridge `BRIDGE_FORBIDDEN`.
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert!(response_body(resp).await.contains("BRIDGE_NOT_AUTHORIZED"));
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(response_body(resp).await.contains("BRIDGE_FORBIDDEN"));
     }
 
     // -------------------------------------------------------------------
