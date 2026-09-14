@@ -83,7 +83,6 @@ serde-wasm-bindgen = { workspace = true }
 # transitive openmls stack has a getrandom backend under wasm32.
 getrandom = { version = "0.2", features = ["js"] }
 getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
-getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 
 [dev-dependencies]
 # The host-surface integration test drives did:key fixtures through the exposed
@@ -110,9 +109,10 @@ scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
 # encoding-determinism test, NOT a comparison of two independent constructions.
 # `openmls` arrives transitively via `scp-client`; naming it (and `tls_codec`)
 # directly as a dev-dep makes `MlsMessageIn`/`MlsMessageOut`/`KeyPackageIn` and
-# the `tls_codec::{Serialize, Deserialize}` traits reachable from the test. The
-# feature set mirrors `scp-client` so the transitive build stays unified.
-openmls = { workspace = true, features = ["libcrux-provider", "js"] }
+# the `tls_codec::{Serialize, Deserialize}` traits reachable from the test. The feature
+# set mirrors `scp-client`, so `js` sits in the wasm32 dev-dependency section below and
+# `libcrux-provider` is absent — see the note in crates/scp-mls/Cargo.toml.
+openmls = { workspace = true }
 tls_codec = "0.4"
 
 # The single-sourced faithful in-memory relay mock (the fidelity anchor for the
@@ -129,6 +129,10 @@ scp-relay-mock = { path = "../scp-relay-mock" }
 # integration test instead.
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = { workspace = true }
+# openmls refuses to compile for wasm32 without `js`; see the note in
+# crates/scp-mls/Cargo.toml. `wasm-pack test --node crates/scp-client-wasm` builds this
+# crate's dev-dependencies for wasm32, so the dev edge needs the feature too.
+openmls = { workspace = true, features = ["js"] }
 
 [lints]
 workspace = true

@@ -17,7 +17,7 @@ local-cache = []
 combined = ["dep:rusqlite", "dep:scp-platform"]
 relay-persistence = ["dep:scp-platform"]
 postgres-blob = ["dep:sqlx"]
-s3-blob = ["dep:aws-sdk-s3", "dep:aws-config", "dep:http-body"]
+s3-blob = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-smithy-http-client", "dep:http-body"]
 quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:webpki-roots", "dep:reqwest"]
 udp = ["dep:openssl", "dep:socket2"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:rustls", "dep:http"]
@@ -75,8 +75,32 @@ rusqlite = { workspace = true, optional = true }
 redb = { workspace = true, optional = true }
 zeroize = { workspace = true }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"], optional = true }
-aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["default-https-client", "rt-tokio", "sigv4a", "behavior-version-latest"] }
-aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
+# No `sigv4a`. That feature turns on `aws-runtime/sigv4a`, which signs requests addressed
+# to an S3 Multi-Region Access Point, and it is the only edge in this workspace that pulls
+# the superseded RustCrypto generation: p256 0.11, ecdsa 0.14, elliptic-curve 0.12,
+# crypto-bigint 0.4, der 0.6, ff 0.12, group 0.12, pkcs8 0.9, rfc6979 0.3, sec1 0.3,
+# signature 1.6, spki 0.6 and base16ct 0.1 — thirteen crates compiled beside the 0.13
+# generation the rest of the workspace uses. `.docs/specs/17-persistence-and-storage.md`
+# §17.7 "Why S3-Compatible" scopes this adapter to "the entire S3-compatible ecosystem:
+# AWS S3, MinIO, Ceph, SeaweedFS, Garage, Cloudflare R2, Backblaze B2", and no store in
+# that list other than AWS implements SigV4A. `S3BlobStore::open` and
+# `open_with_endpoint` (crates/scp-transport/src/native/s3_blob.rs) take a bucket name and
+# an endpoint URL, never a Multi-Region Access Point ARN.
+aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# No `default-https-client` on either AWS crate, and `aws-smithy-http-client` named directly
+# instead. `aws-sdk-s3`'s `default-https-client` forwards to
+# `aws-smithy-runtime/default-https-client`, which forwards to
+# `aws-smithy-http-client/rustls-aws-lc`, which turns on `rustls/aws_lc_rs` and compiles
+# `aws-lc-sys` — a C library whose build script ran for 70 of the 1485 CPU-seconds the
+# workspace test build spent on run 34762016253, the single most expensive third-party
+# unit in it. This crate is ring-only (see the `rustls` note below), the workspace already
+# compiles `ring`, and `aws-smithy-http-client` exposes the same connector over ring
+# through `rustls-ring`, so `S3BlobStore` builds the connector itself and hands it to
+# `ConfigLoader::http_client`. `aws-config`'s default feature set carries
+# `default-https-client` too, hence `default-features = false` with its other three
+# defaults named back.
+aws-config = { version = "1", optional = true, default-features = false, features = ["behavior-version-latest", "rt-tokio", "credentials-process", "sso"] }
+aws-smithy-http-client = { version = "1", optional = true, default-features = false, features = ["rustls-ring"] }
 http-body = { version = "1", optional = true }
 # default-features disabled to avoid quinn's `platform-verifier` feature, which
 # pulls in `aws-lc-rs`. scp-transport is ring-only (see the `rustls` dep below),

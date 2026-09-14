@@ -41,7 +41,9 @@ scp-relay-client = { path = "../scp-relay-client", version = "=0.1.0-beta.2" }
 # openmls is needed directly for the wire (de)serialization of KeyPackages and
 # MLS messages at the driver boundary (KeyPackageIn::tls_deserialize and
 # friends); scp-mls exposes its op surface in terms of these openmls types.
-openmls = { workspace = true, features = ["libcrux-provider", "js"] }
+# `js` is declared in the wasm32 section below, and `libcrux-provider` nowhere — see the
+# note on the same dependency in crates/scp-mls/Cargo.toml.
+openmls = { workspace = true }
 tls_codec = "0.4"
 
 # MessagePack is the codebase's name-tagged, width-/endianness-independent wire
@@ -57,11 +59,11 @@ thiserror = { workspace = true }
 # The root .cargo/config.toml already sets getrandom_backend="wasm_js"
 # globally for the wasm32 target. See ADR-057 Prerequisite 1.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+# openmls's `js` feature is mandatory on wasm32 and dead weight elsewhere; see the note in
+# crates/scp-mls/Cargo.toml.
+openmls = { workspace = true, features = ["js"] }
 getrandom = { version = "0.2", features = ["js"] }
 getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
-# getrandom 0.4 arrives transitively via the openmls libcrux provider and needs
-# its own wasm_js backend enabled (openmls's `js` feature only wires 0.3).
-getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 uuid = { version = "1", features = ["v4", "js"] }
 
 [dev-dependencies]

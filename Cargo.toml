@@ -94,7 +94,17 @@ hmac = "0.12"
 sha2 = "0.10"
 hkdf = "0.12"
 uuid = { version = "1", features = ["v4", "v7"] }
-openmls = { version = "0.8", features = ["libcrux-provider"] }
+# No `libcrux-provider`. That feature does one thing — add the optional dependency
+# `openmls_libcrux_crypto` (openmls 0.8.1 Cargo.toml, `[features] libcrux-provider`) — and
+# openmls itself names that crate only under `#[cfg(test)]` and
+# `#[cfg(feature = "libcrux-provider")]`. No file in this repository names libcrux, and
+# every SCP call site takes a provider: `scp-runtime`'s `ScpMlsProvider` wraps
+# `openmls_rust_crypto::RustCrypto` (crates/scp-runtime/src/crypto/mls/storage.rs) and
+# `scp-mls`'s `InMemoryMlsProvider` aliases `openmls_rust_crypto::OpenMlsRustCrypto`
+# (crates/scp-mls/src/lib.rs). Enabling it compiled 23 libcrux crates, 2 hax crates,
+# `openmls_libcrux_crypto` and `hpke-rs-libcrux` into every build, and carried eleven
+# RUSTSEC advisories that `deny.toml` had to ignore.
+openmls = { version = "0.8" }
 openmls_traits = "0.5"
 openmls_basic_credential = "0.5"
 openmls_rust_crypto = "0.5"

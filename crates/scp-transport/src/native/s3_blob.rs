@@ -15,6 +15,23 @@
 //! Metadata is stored as S3 object metadata (user-defined `x-amz-meta-*`
 //! headers). Numeric values are serialized as decimal strings.
 //!
+//! # Request signing and TLS
+//!
+//! Requests are signed with `SigV4`. The adapter does not enable the AWS SDK's
+//! `sigv4a` feature, so it cannot address an S3 Multi-Region Access Point: pass
+//! a bucket name or a regional endpoint, not a Multi-Region Access Point ARN.
+//! §17.7 "Why S3-Compatible" of `.docs/specs/17-persistence-and-storage.md`
+//! scopes this adapter to the S3-compatible ecosystem — AWS S3, `MinIO`, Ceph,
+//! `SeaweedFS`, Garage, Cloudflare R2, Backblaze B2 — and no store on that list
+//! other than AWS implements `SigV4A`.
+//!
+//! TLS runs on rustls over ring, matching every other TLS path this crate owns.
+//! rustls offers the X25519MLKEM768 hybrid key exchange only through its aws-lc
+//! backend, so an HTTPS session to the object store negotiates X25519. Blob
+//! contents are MLS-encrypted before they reach this adapter, and §17.7 places
+//! no confidentiality requirement on the transport to the store, so no protocol
+//! guarantee rests on that session.
+//!
 //! # Feature flag
 //!
 //! This module is gated behind the `s3-blob` feature:
@@ -40,10 +57,31 @@ use std::sync::Arc;
 
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_smithy_http_client::tls;
+use aws_smithy_http_client::tls::rustls_provider::CryptoMode;
 
 use super::storage::{
     BlobBodyStream, BlobMetadata, BlobStorage, ClockFn, StorageError, StoredBlob, system_clock,
 };
+
+/// Resolves the AWS SDK configuration over an HTTPS client that uses the ring rustls backend.
+///
+/// The AWS SDK's `default-https-client` feature hardwires `aws-smithy-http-client`'s
+/// `rustls-aws-lc` connector, which brings a second rustls crypto provider into the
+/// process and compiles the `aws-lc-sys` C library. `scp-transport` pins one ring-backed
+/// rustls provider for every other TLS path it owns (see the `quinn`, `rustls` and
+/// `reqwest` notes in this crate's Cargo.toml), so this builds the same connector over
+/// ring and hands it to the loader. Every request the SDK makes goes through it: the S3
+/// calls and the credential-chain calls both.
+async fn load_ring_backed_aws_config() -> aws_config::SdkConfig {
+    let http_client = aws_smithy_http_client::Builder::new()
+        .tls_provider(tls::Provider::Rustls(CryptoMode::Ring))
+        .build_https();
+    aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .http_client(http_client)
+        .load()
+        .await
+}
 
 /// S3-compatible blob storage backend for the SCP native relay.
 ///
@@ -113,7 +151,7 @@ impl S3BlobStore {
         prefix: &str,
         clock: ClockFn,
     ) -> Result<Self, StorageError> {
-        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let config = load_ring_backed_aws_config().await;
         let client = Client::new(&config);
         Ok(Self {
             client,
@@ -138,7 +176,7 @@ impl S3BlobStore {
         endpoint_url: &str,
         clock: ClockFn,
     ) -> Result<Self, StorageError> {
-        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let config = load_ring_backed_aws_config().await;
         let s3_config = aws_sdk_s3::config::Builder::from(&config)
             .endpoint_url(endpoint_url)
             .force_path_style(true)
