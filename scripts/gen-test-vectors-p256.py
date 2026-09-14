@@ -1911,60 +1911,6 @@ def emit_context_export_preimage() -> None:
     emit_hex("vector_52.signature", sig)
 
 
-# --- §25.26 Vector 53: a proof of work over a key-event PUBLISH ---
-#
-# `09-security-model.md` §9.7.4.2 R9 makes a relay declaring
-# `pow_difficulty = N` accept a key-event PUBLISH only where
-# `SHA-256(routing_id ‖ value_digest ‖ relay_id ‖ nonce_be64)` carries N
-# leading zero bits, where `value_digest` is SHA-256 over the PUBLISH's `value`
-# bytes, `relay_id` is the 32-byte operator identifier that relay's
-# community-relay-list entry declares, and `nonce_be64` is the nonce as 8 bytes
-# big-endian. The relay term is what makes one solution serve one relay. This
-# vector pins the concatenation order and the leading-zero-bit test at a
-# difficulty a reader reproduces in about a second.
-
-POW_DIFFICULTY = 20
-
-
-def leading_zero_bits(digest: bytes) -> int:
-    count = 0
-    for byte in digest:
-        if byte == 0:
-            count += 8
-            continue
-        count += 8 - byte.bit_length()
-        break
-    return count
-
-
-def emit_proof_of_work() -> None:
-    inception = custody_inception_preimage()
-    routing_id = sha256(b"scp:did:" + identifier_of(inception))
-    value_digest = sha256(b"scp-25-pow-value-bytes")
-    # Vector 49's entry 0 operator, which is the relay this puzzle binds.
-    relay_id = sha256(b"scp-25-relay-operator")
-    prefix = routing_id + value_digest + relay_id
-    nonce = 0
-    while True:
-        digest = sha256(prefix + u64(nonce))
-        if leading_zero_bits(digest) >= POW_DIFFICULTY:
-            break
-        nonce += 1
-    assert nonce == 0 or leading_zero_bits(sha256(prefix + u64(nonce - 1))) < POW_DIFFICULTY
-    # The relay term binds one solution to one relay: the same nonce against a
-    # second listed operator does not qualify.
-    other_relay = sha256(b"scp-25-witness-operator")
-    assert leading_zero_bits(sha256(routing_id + value_digest + other_relay + u64(nonce))) < POW_DIFFICULTY
-    emit("vector_53.pow_difficulty", POW_DIFFICULTY)
-    emit_hex("vector_53.routing_id", routing_id)
-    emit_hex("vector_53.value_digest", value_digest)
-    emit_hex("vector_53.relay_id", relay_id)
-    emit("vector_53.nonce", nonce)
-    emit_hex("vector_53.nonce_bytes", u64(nonce))
-    emit_hex("vector_53.qualifying_hash", digest)
-    emit("vector_53.leading_zero_bits", leading_zero_bits(digest))
-
-
 # --- §25.27 the cosigned head and the relay proof of control ---
 
 WITNESS_ID = sha256(b"scp-25-witness-operator")
@@ -1987,23 +1933,30 @@ def emit_witness_and_relay_objects() -> None:
     designating_digest = INCEPTION_DIGEST
 
     def cosigned_head(
-        label, sequence, event_digest, previous, observed_at, key=REF_KEY_2
+        label, sequence, event_digest, previous, observed_at, seed, key=REF_KEY_2
     ):
+        # §9.7.4.3: `seed` is 0x01 on the first head a witness cosigns for a
+        # subject after a designation or a store loss, and 0x00 on every later
+        # head. A head carrying 0x01 makes no fault proof, which is what
+        # separates a declared re-seed from an equivocation.
+        assert seed in (0x00, 0x01), seed
         fields = (
             fixed_field(WITNESS_ID)
             + fixed_field(subject)
             + u64(sequence)
             + fixed_field(event_digest)
             + fixed_field(previous)
+            + bytes([seed])
             + u64(observed_at)
         )
-        assert len(fields) == 144, len(fields)
+        assert len(fields) == 145, len(fields)
         assert previous != bytes(32), "previous_cosigned_digest is never zero"
         emit_hex(f"{label}.witness", WITNESS_ID)
         emit_hex(f"{label}.subject", subject)
         emit(f"{label}.sequence", sequence)
         emit_hex(f"{label}.event_digest", event_digest)
         emit_hex(f"{label}.previous_cosigned_digest", previous)
+        emit(f"{label}.seed", seed)
         emit(f"{label}.observed_at", observed_at)
         emit(f"{label}.field_bytes", len(fields))
         digest = sign_and_emit(
@@ -2015,7 +1968,12 @@ def emit_witness_and_relay_objects() -> None:
     # Vector 43: a witness's first cosigned head after seeding at the event that
     # designated it. previous_cosigned_digest names that event, never zero.
     cosigned_head(
-        "vector_43", 0, designating_digest, designating_digest, COSIGN_OBSERVED_AT
+        "vector_43",
+        0,
+        designating_digest,
+        designating_digest,
+        COSIGN_OBSERVED_AT,
+        seed=0x01,
     )
 
     # Vector 44: the relay proof of control. It carries no key-state position:
@@ -2071,13 +2029,16 @@ def emit_witness_and_relay_objects() -> None:
     emit("vector_45.object_bytes", len(conflict_fields) + 64)
 
     # Vector 46: the two-heads fault proof — one witness, one subject, one
-    # non-zero previous_cosigned_digest, two different event_digests.
+    # shared previous_cosigned_digest, two different event_digests, and `seed`
+    # clear on both heads. Those are the five conditions §9.7.4.3 states.
     baseline = sha256(b"scp-25-fault-proof-baseline-head")
     head_a = sha256(b"scp-25-fault-proof-successor-a")
     head_b = sha256(b"scp-25-fault-proof-successor-b")
     emit_hex("vector_46.shared_previous_cosigned_digest", baseline)
-    cosigned_head("vector_46a", 21, head_a, baseline, COSIGN_OBSERVED_AT)
-    cosigned_head("vector_46b", 21, head_b, baseline, COSIGN_OBSERVED_AT + 1)
+    cosigned_head("vector_46a", 21, head_a, baseline, COSIGN_OBSERVED_AT, seed=0x00)
+    cosigned_head(
+        "vector_46b", 21, head_b, baseline, COSIGN_OBSERVED_AT + 1, seed=0x00
+    )
     assert head_a != head_b, "vector_46: the two heads must differ"
 
     emit_community_relay_list()
@@ -2237,7 +2198,6 @@ def main() -> int:
     emit_key_event_slots()
     emit_custody_registry_key_state()
     emit_context_export_preimage()
-    emit_proof_of_work()
     emit_witness_and_relay_objects()
     emit_commitment_and_service_record()
     print("\n".join(_LINES))

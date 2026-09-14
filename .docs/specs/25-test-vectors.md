@@ -1584,31 +1584,13 @@ signature (64 raw):   a77d28e5c20b588a75cc18f0891ec9ffea231e21ca23c9aa34bc23c603
 
 The signer is §25.2's secondary key, the `#active` key of Vector 41's identity.
 
-### Vector 53: a proof of work over a key-event PUBLISH
-
-`09-security-model.md` §9.7.4.2 R9 states the puzzle and this vector pins its four operands, their order, and the leading-zero-bit test. The fixture's `value_digest` is `SHA-256` over the ASCII string `scp-25-pow-value-bytes`, standing for the `value` bytes a PUBLISH carries; `relay_id` is the `operator` identifier of Vector 49's entry 0, which is the relay this solution serves; and `nonce_be64` is the nonce as 8 bytes big-endian.
-
-```
-pow_difficulty:       20
-routing_id:           4e904d784a879f4829dde870dedc1b99a9e8d144669b2c2861193be71d902cc4
-value_digest:         f018007a5f6a67bb7bb3babcfab9abaac79c091ceebaa3cde5c2d5729ff459e1
-relay_id:             c45b32c65d25b3d070929aa68fa4532f69fd5ab56fa15173be77d6c5c6d03c18
-nonce (u64):          619446
-nonce (8 bytes BE):   00000000000973b6
-qualifying hash:      000007a1c76ca5e44f488b3e1eb507a15606ab0b1dd0d3904ca610e11f2262cc
-leading zero bits:    21
-```
-
-**Conformance procedure.** Concatenate the four fields in that order, hash once, and count leading zero bits. An implementation that writes `nonce` little-endian, or that hashes the fields in another order, finds this nonce does not qualify. **Substituting Vector 49's entry 1 operator, `9d94df95bc0a13f1963f484414c320354c73c75bb86e96559e97765f5bc2d313`, for `relay_id` and keeping every other field yields a digest carrying fewer than 20 leading zero bits**, which is the property that makes one solution serve one relay.
-
-
 ## 25.27 Witness-Layer and Relay-Proof Vectors (§9.7.4.2 definitions, §9.7.4.3, §9.18.2)
 
 The witness objects below name Vector 41's identity as their subject and Vector 41's event as the event a witness seeded at. **No object below names a position in a signer's own key state**, because a community-relay-list operator's key is non-transferable and has no position to name: a verifier reads that key from the operator's list entry, which Vector 49 pins.
 
 ### Vector 43: a witness's first cosigned head after a seed
 
-`previous_cosigned_digest` names the event the witness seeded at, which is Vector 41's inception event, the latest event whose key state names this witness. **It is never the all-zero placeholder** (§9.7.4.3).
+`previous_cosigned_digest` names the event the witness seeded at, which is Vector 41's inception event, the latest event whose key state names this witness. **It is never the all-zero placeholder** (§9.7.4.3). **`seed` carries `0x01`**, because this is the first head the witness cosigned for this subject after its designation; a head carrying `0x01` makes no fault proof.
 
 ```
 witness:                    9d94df95bc0a13f1963f484414c320354c73c75bb86e96559e97765f5bc2d313
@@ -1616,20 +1598,21 @@ subject:                    2c0f7f4478be94db0078311ef51ba3cc9934362b0f154dcbf9c5
 sequence:                   0
 event_digest:               d8ba4ebad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7
 previous_cosigned_digest:   d8ba4ebad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7
+seed:                       0x01
 observed_at:                1700000000
 
-Preimage (165 bytes = 21-byte separator + 144 field bytes):
+Preimage (166 bytes = 21-byte separator + 145 field bytes):
   5343502d434f5349474e45442d484541442d56313a9d94df95bc0a13f1963f48
   4414c320354c73c75bb86e96559e97765f5bc2d3132c0f7f4478be94db007831
   1ef51ba3cc9934362b0f154dcbf9c597572e46cf320000000000000000d8ba4e
   bad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7d8ba4e
-  bad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7000000
-  006553f100
+  bad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7010000
+  00006553f100
 Canonical hash:
-  65e8132e2c131ed3e1709f19f623e29ef7cc6fdd3fddf7e04bb59acb41423e26
-Signature, secondary key (208 bytes on the wire):
-  7f96801cf4f21a6d78b0d669c8833b7aeb50e5db1d6f1cf2c4e9779fc86be1d8
-  72e9606fa7d9237dfd809dda3b89a531b9c8497c41d868cd036784cdacc6837c
+  b83c123f20135cc5c691d4a4eb0a5f71959b15771452a92ceaa94a80a8cbea5d
+Signature, secondary key (209 bytes on the wire):
+  f9093276a1f268910dc69103e6c9609d282c47e30c613f94be03aa7678a7eaa8
+  5fbda73bc17d627a9c54631a47b4d3e9f2e3117f301d8969f43014cc8b78d0f6
 ```
 
 ### Vector 44: a relay proof of control over a served QUERY response
@@ -1684,41 +1667,41 @@ Signature, secondary key (216 bytes on the wire):
 
 ### Vector 46: the two-heads fault proof
 
-Two cosigned heads of one witness, over one subject, naming one non-zero `previous_cosigned_digest` and two different `event_digest` values. **Those two objects together are the fault proof §9.7.4.3 defines**, and a relay keys its cosigned-head slot on (subject, witness, `event_digest`) so that both survive at one address (`03-identity.md` §3.10.2). A conforming implementation assembles the pair, verifies both signatures against the P-256 key the witness operator's community-relay-list entry declares, and reports a valid fault proof.
+Two cosigned heads of one witness, over one subject, carrying one shared `previous_cosigned_digest`, two different `event_digest` values, and `seed` clear on both. **Those five conditions are the fault proof §9.7.4.3 defines**, and a relay keys its cosigned-head slot on (subject, witness, `event_digest`) so that both survive at one address (`03-identity.md` §3.10.2). A conforming implementation assembles the pair, verifies both signatures against the P-256 key the witness operator's community-relay-list entry declares, and reports a valid fault proof. **Substituting Vector 43, whose `seed` carries `0x01`, for either head yields no proof**, which is how a declared re-seed stays outside the predicate.
 
 ```
-Shared previous_cosigned_digest (non-zero):
+Shared previous_cosigned_digest:
   5ec440e45bc301ca80bda9c235036ef19f3fbf833eb5f09960cfac1f1098af54
 
 46a — event_digest: 3dacf98cadc7a299e6f0b25f83aec640c34d5c16a2ba2252d1efcf246aebf0a0
-      sequence: 21, observed_at: 1700000000
-      preimage (165 bytes):
+      sequence: 21, seed: 0x00, observed_at: 1700000000
+      preimage (166 bytes):
       5343502d434f5349474e45442d484541442d56313a9d94df95bc0a13f1963f48
       4414c320354c73c75bb86e96559e97765f5bc2d3132c0f7f4478be94db007831
       1ef51ba3cc9934362b0f154dcbf9c597572e46cf3200000000000000153dacf9
       8cadc7a299e6f0b25f83aec640c34d5c16a2ba2252d1efcf246aebf0a05ec440
       e45bc301ca80bda9c235036ef19f3fbf833eb5f09960cfac1f1098af54000000
-      006553f100
+      00006553f100
       canonical hash:
-  a01ab83078ac16e02b2b33fd4c32a9f8990bb688642f6d8dcc9bdb0639fb8e87
+  70c45b6e43fe7922a92d59b82bfc3dc2cc58c57beb5d109d0531d4e462254176
       signature:
-  946ffa7b48b54d15fee4b42dc474b02966ca931ec37f890d3b01199b5290771c
-  6d5cb2d6f8abd0c4a364447aa4aef92a61dbdf49f6a992647c5485597b2615eb
+  ef8f2c3364495498d82e1fba47c5cc5f945a95c52545e1ba027f2df46a02a86e
+  551a0badcb11405ececba6fc007e5443e5d9364151494977564c1cd7726f5adc
 
 46b — event_digest: 53adb5551ff17eb6349a13afc7155a42b0496a7b9889e268eabe6d0c5f60f8a6
-      sequence: 21, observed_at: 1700000001
-      preimage (165 bytes):
+      sequence: 21, seed: 0x00, observed_at: 1700000001
+      preimage (166 bytes):
       5343502d434f5349474e45442d484541442d56313a9d94df95bc0a13f1963f48
       4414c320354c73c75bb86e96559e97765f5bc2d3132c0f7f4478be94db007831
       1ef51ba3cc9934362b0f154dcbf9c597572e46cf32000000000000001553adb5
       551ff17eb6349a13afc7155a42b0496a7b9889e268eabe6d0c5f60f8a65ec440
       e45bc301ca80bda9c235036ef19f3fbf833eb5f09960cfac1f1098af54000000
-      006553f101
+      00006553f101
       canonical hash:
-  bf022c662d5842a169bda54c5578f06c08774e3bf8153605cf5da4f7fdbbc14c
+  7dd96da1e28f420cb727caa34b29b54d1ab8fb09f97921188a8157020719d1d4
       signature:
-  a1d4602aeeef9be0ef10f13794a439d16e82e7f4a6ae1db68b5f7c2fbd707a6f
-  7c01169980aa038d1b47d9964da04a50a7b7bebf9fd1345245fe173a44c26eb4
+  4f3b9eb1add56bd34f3914f7addbc37026ed8ba8ef20247e065f766fdb6a7d14
+  2f6f219050c1525bf6fe2d71e3b0056e6db05a1b9ec6b059ecd39e3c1e25d0ea
 ```
 
 ### Vector 49: the community relay list's encoding
