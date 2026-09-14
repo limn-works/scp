@@ -1,6 +1,6 @@
 # ADR-063: Inception-Derived Self-Certifying Identity over a Key-Event Log
 
-**Status:** Accepted 2026-08-30, the day Alec settled the identity form and delegated the choice of a freshness anchor. He confirmed the witness and watcher layer in scope on 2026-08-31. Four later rulings by Alec changed decisions this record already carried, one executor call rewrote a fifth, his relay-storage ruling of 2026-09-13 added a sixth decision under its own heading below, and his four rulings of 2026-09-14 changed that sixth decision under a heading of their own. Each amendment sits beside the decision it changed, with its date. Accepted records that the identity model is settled and not that the code exists.
+**Status:** Accepted 2026-08-30, the day Alec settled the identity form and delegated the choice of a freshness anchor. He confirmed the witness and watcher layer in scope on 2026-08-31. Four later rulings by Alec changed decisions this record already carried, one executor call rewrote a fifth, his relay-storage ruling of 2026-09-13 added a sixth decision under its own heading below, and his five rulings of 2026-09-14 changed that sixth decision under a heading of their own. Each amendment sits beside the decision it changed, with its date. Accepted records that the identity model is settled and not that the code exists.
 
 **Supersedes:** ADR-003, DID creation over did:dht, and ADR-039, the shared-DID human-agent identity model. Each flips to `Superseded by ADR-063` and keeps its body as the historical record.
 
@@ -100,9 +100,9 @@ The split is what keeps the root cold across a transport change, which `03-ident
 
 `MAX_ACCEPTED_CHAIN_BYTES` is withdrawn. `MAX_RETAINED_BYTES` stays, and R9 states the two bounds that read it.
 
-### Alec's four rulings of 2026-09-14
+### Alec's five rulings of 2026-09-14
 
-He gave four rulings that day, each of which changed the storage decision above or removed a mechanism the corpus carried.
+He gave five rulings that day. Four changed the storage decision above or removed a mechanism the corpus carried, and the fifth renamed what the first four are about.
 
 | Ruling | What it decided |
 |---|---|
@@ -110,6 +110,9 @@ He gave four rulings that day, each of which changed the storage decision above 
 | "that is a bad rule. remove it." | The free-entry inception obligation goes. An entry's `free` member asserts the price property alone, a free listed relay accepts writes under its whole declared policy, and the curator keeps enough free capacity under distinct operators that a flood at one entry does not take first contact with the list. |
 | "cut it" | Proof of work leaves the protocol. No relay declares a difficulty, no PUBLISH carries a puzzle nonce, and no budget scope names one. |
 | "ok ring buffer." | A relay's retained storage is a first-in-first-out ring of the total budget's bytes, whose unit of displacement is one identity — everything the relay holds for it, displaced together — and whose order is each identity's establishment time. A paid identity is pinned outside the ring. There is no idle clock, no refresh write and no pressure ordering, so `EVICTION_IDLE_SECONDS` is deleted. |
+| "slot is a bad name for the chain unit. why do we need special names? identity, and chain, no?" | The per-fork unit a relay stores is a **chain**, and the unit the ring buffer displaces is everything the relay holds for one **identity**. The corpus coins no replacement for either word: it states what may open or extend a chain at a routing id rather than naming that rule, and it writes out the divergent suffixes a verifier retains rather than naming that set. The same ruling reaches the name the corpus gave a per-index signature, which is the indexed signature §9.7.4.2's definitions already name. |
+
+**The word the fifth ruling deleted covered two different objects, and the corpus now distinguishes them**: every record a relay holds for one identity, which is what the ring displaces, and the divergent suffixes a verifier retains under R9's count and byte bounds, which the ring never reaches. A sentence that named the first is rewritten around the identity, and a sentence that named the second is rewritten around the suffixes the party holds.
 
 **Alec was told the bandwidth residue before he ruled on the ring**: a party minting distinct identities displaces every unpaid identity at a free relay by writing binding-valid frames at that relay's full ingest rate, the per-address rate limit bounds the rate, no rule bounds the duration, and the curator is the party that answers it. R9 states that residue where a reader meets the ring.
 
