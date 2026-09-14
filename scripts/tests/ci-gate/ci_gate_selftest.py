@@ -90,6 +90,15 @@ nothing:
                reading ci.yml green — the aggregate reads "false" as "this job
                was not supposed to run", the verdict a genuine docs-only change
                earns.
+  abi3-source  The `python-wheel` filter, which guards the only job a pull
+               request runs that compiles crates/scp-ffi with
+               `extension-module` and therefore with `pyo3/abi3-py310`, named
+               six manifest and workflow files and no source path. A pull
+               request that added a pyo3 call the limited ABI omits skipped
+               that job, passed job python-test, which compiles the same files
+               without the feature, and passed job rust-build-pyo3-production,
+               which compiles them with `--features server`, so the abi3
+               compile first ran on the tag push that cut the release.
   event-name   An aggregate read an absent GITHUB_EVENT_NAME as "", so
                `if: github.event_name == 'pull_request'` on job cross-layer
                judged false and a skipped cross-layer passed on a pull request.
@@ -282,6 +291,22 @@ PATH_DEP_CLOSURE_FILTERS = {
     "fuzz": "fuzz/Cargo.toml",
     "typescript-wasm": "crates/scp-client-wasm/Cargo.toml",
 }
+
+# CRITERION for check_pyo3_source_reaches_the_abi3_lane: job python-wheel-build is
+# the only job a pull request runs that compiles crates/scp-ffi with
+# `extension-module`, and crates/scp-ffi/Cargo.toml makes that feature activate
+# `pyo3/abi3-py310`. Whether every C API the crate calls exists under
+# `Py_LIMITED_API` is decided by that crate's own sources, so the filter guarding
+# that job lists every crates/scp-ffi source path the `python` filter lists. Job
+# python-test compiles those same files without the feature and job
+# rust-build-pyo3-production compiles them with `--features server`, so a call pyo3
+# exposes only outside the limited ABI passes both of them. The check derives the
+# path list from the `python` filter rather than holding a copy, so a source
+# directory added there later is covered without editing this file, and it fails on
+# an empty derivation rather than reporting a filter complete against nothing.
+ABI3_LANE_FILTER = "python-wheel"
+ABI3_LANE_SOURCE_DONOR = "python"
+ABI3_LANE_SOURCE_PREFIX = "crates/scp-ffi/"
 
 # CRITERION for check_workspace_scoped_filters: a cargo command carrying
 # `--workspace` compiles every member the root manifest lists, so a path filter
@@ -1497,6 +1522,45 @@ def check_path_dep_closures(jobs: dict) -> None:
             f"missing {unlisted} — a change confined to one of those changes what "
             f"this filter's jobs compile while every one of them skips",
         )
+
+
+def check_pyo3_source_reaches_the_abi3_lane(jobs: dict) -> None:
+    """The abi3 lane's filter lists every PyO3 source path the python filter lists."""
+    label = (
+        f"filter {ABI3_LANE_FILTER!r} lists the PyO3 sources it compiles "
+        f"under the limited ABI"
+    )
+    filters = path_filters(jobs)
+    for name in (ABI3_LANE_FILTER, ABI3_LANE_SOURCE_DONOR):
+        if name not in filters:
+            check(
+                label,
+                False,
+                f"job `changes` declares no {name!r} filter, so either someone renamed "
+                f"that filter or this check is stale",
+            )
+            return
+    wanted = {
+        pattern
+        for pattern in filters[ABI3_LANE_SOURCE_DONOR]
+        if pattern.startswith(ABI3_LANE_SOURCE_PREFIX)
+    }
+    check(
+        f"filter {ABI3_LANE_SOURCE_DONOR!r} names the PyO3 crate's own sources",
+        bool(wanted),
+        f"no pattern under {ABI3_LANE_SOURCE_PREFIX!r}; the check below derives the "
+        f"abi3 lane's source list from this filter, and an empty derivation would "
+        f"report that lane covered while it named no source at all",
+    )
+    missing = sorted(wanted - set(filters[ABI3_LANE_FILTER]))
+    check(
+        label,
+        not missing,
+        f"missing {missing} — a pull request that adds PyO3 code there skips job "
+        f"python-wheel-build, the only job it runs that compiles the crate with "
+        f"`pyo3/abi3-py310`, so a call the limited ABI omits merges green and fails "
+        f"the release wheel build after the tag is cut",
+    )
 
 
 def write_inheritance_fixture(root: Path, publish_leaf: bool) -> Path:
@@ -3195,6 +3259,7 @@ def main() -> int:
     check_closure_reads_workspace_inheritance()
     check_resolution_manifests_reach_the_workspace()
     check_path_dep_closures(jobs)
+    check_pyo3_source_reaches_the_abi3_lane(jobs)
 
     print(
         "workspace-scope — a filter gating a `--workspace` compile covers every member"

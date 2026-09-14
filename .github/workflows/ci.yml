@@ -251,16 +251,30 @@ jobs:
             # `maturin develop --features testing` replaces the feature list rather
             # than adding to it, so before this lane existed the two features were
             # compiled for the first time by a release. These files decide what
-            # this lane compiles, and a pull request that edits one and nothing
-            # else is rare, which is the criterion
+            # this lane compiles, which is what
             # `.docs/lessons/route-a-changed-file-to-every-lane-it-decides.md`
-            # states.
+            # requires of the filter guarding a job: it lists every file that
+            # decides the job's behaviour, whether or not a pull request editing
+            # that file alone is rare.
             python-wheel:
               - 'bindings/python/pyproject.toml'
               - 'crates/scp-ffi/Cargo.toml'
               - 'crates/scp-platform/Cargo.toml'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              # The PyO3 sources this lane compiles under `Py_LIMITED_API`, and the
+              # only files that decide whether every C API the crate calls exists
+              # there. Job python-test compiles these same files without
+              # `extension-module`, and job rust-build-pyo3-production compiles them
+              # with `--features server`, so neither one rejects a call pyo3 exposes
+              # only outside the limited ABI. While this filter named no source path,
+              # such a call reached an abi3 compile for the first time on the tag push
+              # that cut a release, which is the failure this lane exists to move onto
+              # a pull request. `scripts/tests/ci-gate/ci_gate_selftest.py` derives
+              # these two entries from the `python` filter above and fails when one is
+              # absent here.
+              - 'crates/scp-ffi/src/**'
+              - 'crates/scp-ffi/common/**'
               # The matrix legs this lane stands in for on a pull request.
               - '.github/workflows/build-matrix.yml'
             typescript:
