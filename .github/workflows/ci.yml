@@ -680,7 +680,19 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
       - uses: dtolnay/rust-toolchain@stable
+      # This job reads the `workspace-debug` cache group for its registry alone,
+      # the way job shipped-feature-graph does: the twelve `cargo tree`
+      # resolutions the suite drives download the index and the `.crate` files,
+      # and no step here compiles a crate into `target/debug`. `save-if: false`
+      # keeps job rust-test the group's one writer, which is the shape the
+      # header comment of this file describes and
+      # scripts/check-workflow-compile-steps.py enforces: every rust-cache step
+      # names a `shared-key` and a `save-if`, and each group has exactly one
+      # writer, on `main`.
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: false
       - name: Run the fix-round-check cases
         env:
           GITHUB_BASE_REF: ${{ github.base_ref }}
