@@ -346,8 +346,9 @@ the same answer, the check tests the literal and not the repository. Either hand
 check an input that can produce the other answer, or fold the constant conjunct into a
 check that can go red and let a fixture control carry the property — the fix here
 folded `live_unresolved is None` into the positive control below it, which names a
-manifest it expects in the edge map, and left the two `cargo test -p ghost` fixture
-controls to prove that both readers report an unresolvable selection.
+manifest it expects in the edge map, and left the three `cargo test -p ghost` fixture
+controls to prove that `command_unifies_testing`, `command_testing_edges` and
+`unconditional_feature_activators` each report an unresolvable selection.
 
 ## Tests holding these closed
 
@@ -387,13 +388,19 @@ controls to prove that both readers report an unresolvable selection.
   unfiltered command selects everything, a filterset carrying a difference is refused
   rather than guessed at, and `package_test_functions` separates a
   `#[cfg(not(feature = "testing"))]` test from an un-gated one in this tree — that
-  `command_unifies_testing` reads a `testing` edge out of a five-crate fixture
-  workspace in each spelling (a member's
+  `command_unifies_testing` reads a `testing` edge out of an eight-crate fixture
+  workspace in each of five spellings (a member's
   normal dependency, a `[features]` table value naming `leaf/testing`, an edge reached
   through a `-p` package's dependency closure, a self
   dev-dependency, an `--exclude`d member a selected member still compiles) and out of
   this repository's own `crates/scp-testing/Cargo.toml` against scp-identity, while
-  reporting a `-p scp-identity` build clean — that the `fuzz` and
+  reporting a `-p scp-identity` build clean, that the three remaining members of that
+  fixture hold `unconditional_feature_activators` to reading a `[dev-dependencies]`
+  entry only for the build that compiles that manifest's own test targets, because
+  devholder's entry naming `gadget/gated` activates that feature for
+  `cargo test -p devholder` and activates it for no `cargo test -p devuser` build, which
+  reads devholder's manifest as a library dependency and compiles no test target of it —
+  that the `fuzz` and
   `typescript-wasm` filters cover the path-dependency
   closure of the manifests they guard, that every release.yml job uploading a `-signed`
   artifact runs its non-empty-input guard before that upload and that all three known
@@ -407,9 +414,11 @@ controls to prove that both readers report an unresolvable selection.
   once one exists, and holds no enclosing lockfile for a crate carrying its own
   `[workspace]` table.
 - `scripts/check-shipped-feature-graph.sh --self-test` — four fixtures pad a synthetic
-  `cargo tree` past 200 KB and assert `tree_names_scp_testing_crate` returns one verdict
-  whether the `scp-testing v0.1.0` line sits first or last, and a fifth reads the gate's
-  own source and rejects any pipeline stage that stops before its writer finishes.
+  `cargo tree` past 200 KB and assert that `tree_names_scp_testing_crate` reports the
+  `scp-testing v0.1.0` line FOUND on a first line and on a last line of that tree,
+  reports a padded tree carrying no such line ABSENT, and does not match a crate named
+  `my-scp-testing`; a fifth fixture reads the gate's own source and rejects any pipeline
+  stage that stops before its writer finishes.
 - `scripts/tests/cross-layer/run-tests.sh` — plants an FFI export at a first line and at
   a last line of a 155 KB diff, proves that gate finds both, then plants a missing export
   and proves it still rejects that.
