@@ -59,7 +59,7 @@ On reconnection (at least one relay WebSocket connection re-established), the SD
 
 Each context is synced concurrently, with an overall timeout (RECOMMENDED default: **120 seconds**, configurable via `SyncPolicy`). Contexts that timeout are marked as `Failed`.
 
-**The identity's own self-check runs beside these six phases and is not one of them.** `09-security-model.md` §9.7.4.2 R10 obliges the SDK to fetch its own identity's key-event log on every launch and at the witnessing interval its key state names. **Where that fetch shows a fallback-set entry holding no record for this identity, the SDK re-publishes its chain and its service record to that entry**, which is how an identity a relay's ring buffer displaced returns to that relay (R9). The six phases above reconcile context state and reach no identity record.
+**The identity's own self-check runs beside these six phases and is not one of them.** `09-security-model.md` §9.7.4.2 R10 obliges the SDK to fetch its own identity's key-event log **from every entry of its fallback set**, on every launch and at the witnessing interval its key state names. **For every entry that fetch showed holding no record for this identity, the SDK re-publishes its chain and its service record to that entry**, which is how an identity a relay's ring buffer displaced returns to that relay (R9). The six phases above reconcile context state and reach no identity record.
 
 ## 23.4 MLS Epoch Catch-Up (Tier 1 and Tier 2)
 
@@ -106,11 +106,11 @@ Any one of the following triggers a group state reset:
 
 ### 23.5.2 Reset Protocol
 
-1. The reconnecting member publishes a `ResetRequest` via the relay (not MLS-encrypted -- the member may not be able to encrypt at the current epoch). The request includes context_id, member_did, last_known_epoch, reset reason, a 16-byte random nonce (CSPRNG), and a timestamp (Unix seconds). A responder verifies the request's signature against the key the member's key state lists `current` in the role the message names, under the canonical hash construction (`09-security-model.md` §9.5.1) and the separator `"SCP-RESET-REQUEST-V1:"`. The signed preimage includes: `context_id || member_did || last_known_epoch || reason_tag || nonce || timestamp`.
+1. The reconnecting member publishes a `ResetRequest` via the relay (not MLS-encrypted -- the member may not be able to encrypt at the current epoch). The request includes context_id, member_did, last_known_epoch, reset reason, a 16-byte random nonce (CSPRNG), and a timestamp (Unix seconds). A responder verifies the request's signature against the key the member's key state lists `Current` in the role the message names, under the canonical hash construction (`09-security-model.md` §9.5.1) and the separator `"SCP-RESET-REQUEST-V1:"`. The signed preimage includes: `context_id || member_did || last_known_epoch || reason_tag || nonce || timestamp`.
 
    **Anti-replay validation.** Because the ResetRequest is transmitted as plaintext (not MLS-encrypted), it is visible to relays and network observers. An attacker who captures a valid ResetRequest could replay it to force-remove and re-add the member repeatedly, disrupting their session at low cost. To prevent this, the relay (or any recipient processing the request) MUST validate all three of the following before forwarding or acting on the request:
 
-   - **(a) Signature validity.** Verify the P-256 signature against the key the member's key state lists `current` in the role the message names (`09-security-model.md` §9.5, §9.7.1).
+   - **(a) Signature validity.** Verify the P-256 signature against the key the member's key state lists `Current` in the role the message names (`09-security-model.md` §9.5, §9.7.1).
    - **(b) Timestamp freshness.** Reject requests where `|relay_clock - timestamp| > 30 seconds` (matching the freshness window used for SenderKeyRequest in section 9.16.2 and AccessKeyRequest in section 9.17).
    - **(c) Nonce uniqueness.** Maintain a deduplication cache of `(member_did, nonce)` pairs with a 60-second TTL. Reject any request whose nonce has been seen within the TTL window. The 60-second TTL is 2x the freshness window to prevent replay after nonce eviction at the window boundary. Cache capacity: bounded at 10,000 entries with oldest-first eviction.
 
@@ -228,7 +228,7 @@ Consistency checkpoints (ADR-011, section 23.7) are exchanged between members du
 
 **Verification requirements:**
 
-1. Clients MUST verify the signature on every received `ConsistencyCheckpoint` before accepting it for comparison. The signature is verified against the key the author's key state lists `current` in the role `signing_key_id` names, derived by replaying that author's key-event log (`03-identity.md` §3.10.4).
+1. Clients MUST verify the signature on every received `ConsistencyCheckpoint` before accepting it for comparison. The signature is verified against the key the author's key state lists `Current` in the role `signing_key_id` names, derived by replaying that author's key-event log (`03-identity.md` §3.10.4).
 
 2. If signature verification fails, the checkpoint MUST be rejected entirely. The client MUST NOT use the checkpoint's Merkle root or event count for any comparison or reconciliation decision. A failed verification SHOULD be reported as a `CheckpointSignatureFailure` event to the application layer, indicating a potential relay compromise or peer impersonation.
 
@@ -244,7 +244,7 @@ During event log reconciliation (section 23.7, Phase 3 of the reconnection proto
 
 **Per-event signature verification:**
 
-1. During reconciliation, each received event MUST be verified against the claimed sender's signing key before being accepted into the local event log. The verification reads the `actor_did` and `signing_key_id` fields of the `Event` struct (ADR-011), derives the actor's key state by replaying that actor's key-event log (`03-identity.md` §3.10.4), and takes the key that state names in the role. An event is content, so its signature verifies against a key the state lists retired as well as one it lists `current` (`09-security-model.md` §9.7.1). Events that fail signature verification MUST be rejected and MUST NOT be added to the local log.
+1. During reconciliation, each received event MUST be verified against the claimed sender's signing key before being accepted into the local event log. The verification reads the `actor_did` and `signing_key_id` fields of the `Event` struct (ADR-011), derives the actor's key state by replaying that actor's key-event log (`03-identity.md` §3.10.4), and takes the key that state names in the role. An event is content, so its signature verifies against a key the state lists retired as well as one it lists `Current` (`09-security-model.md` §9.7.1). Events that fail signature verification MUST be rejected and MUST NOT be added to the local log.
 
 2. The SDK MUST log rejected events with the reason (`InvalidSignature`) and the claimed actor DID. If more than 3 events from the same peer fail verification in a single reconciliation session, the SDK MUST abort reconciliation with that peer and attempt reconciliation with a different online member.
 
@@ -333,7 +333,7 @@ Exchanged between members as MLS application messages during event log reconcili
 
 **Signature construction.** Domain separator `"SCP-CHECKPOINT-V1:"` (§9.18.2). The canonical hash is `SHA-256("SCP-CHECKPOINT-V1:" ‖ BE32(len(context_id)) ‖ context_id ‖ BE32(len(sender_did)) ‖ sender_did ‖ event_count ‖ merkle_root ‖ epoch_flag ‖ epoch ‖ timestamp)`, with every integer 8-byte big-endian, `merkle_root` carried raw as a fixed-length field, and `epoch_flag` one byte, `0x01` followed by the epoch when present and `0x00` alone when null. `sender_did` sits in the preimage so a checkpoint cannot be misattributed.
 
-**Who signs it.** The checkpoint verifies against the key the member's key state lists `current` in the role the message names (`09-security-model.md` §9.7.1). An identity's key state names one operational role, `#active`, so there is one such key and no fallback.
+**Who signs it.** The checkpoint verifies against the key the member's key state lists `Current` in the role the message names (`09-security-model.md` §9.7.1). An identity's key state names one operational role, `#active`, so there is one such key and no fallback.
 
 ### 23.16.2 CommitRangeRequest
 
@@ -385,7 +385,7 @@ Self-contained context state at a point in time, used for the Tier 2 delta sync 
 
 **Signature construction.** Domain separator `"SCP-CONTEXT-SNAPSHOT-V3:"` (§9.18.2), over `BE32(len(context_id)) ‖ context_id ‖ timestamp ‖ mls_epoch_flag ‖ mls_epoch ‖ event_log_merkle_root ‖ event_count ‖ members_hash ‖ role_definitions_hash ‖ params_hash ‖ outlet_names_hash ‖ key_boundaries_hash ‖ BE32(len(creator_did)) ‖ creator_did ‖ key_state_head ‖ sequence`, with `key_state_head` raw as a fixed-length field. **The separator carries `-V3` because the preimage gained `key_state_head` and then `key_boundaries_hash`**, and §9.5.1 requires a version bump on any added field. Each of the four component hashes is `SHA-256` over its collection under §9.5.1's rules, in key order for a map and array order for a list: a member emits `BE32(len(did)) ‖ did ‖ BE32(len(role_name)) ‖ role_name ‖ sequence_number`, a role `BE32(len(role)) ‖ role ‖ BE32(count) ‖ [BE32(len(cap)) ‖ cap …]`, an outlet name `BE32(len(name)) ‖ name` behind a `BE32` count, and a key boundary `BE32(len(did)) ‖ did ‖ key_bytes ‖ boundary_epoch ‖ first_commit_epoch ‖ retirement_commit_epoch ‖ commit_transcript_hash`.
 
-**Who signs it, and against which key a verifier checks it.** The signer is the `#active` key the `creator_did`'s key state listed `current` at the position `key_state_head` names. A verifier checks the signature under the log-anchored evidence class of `09-security-model.md` §9.7.1 and never against the creator's present `current` key: a snapshot is durable evidence a later joiner reads to learn a boundary, so a routine rotation by the creator would otherwise void every snapshot it ever signed.
+**Who signs it, and against which key a verifier checks it.** The signer is the `#active` key the `creator_did`'s key state listed `Current` at the position `key_state_head` names. A verifier checks the signature under the log-anchored evidence class of `09-security-model.md` §9.7.1 and never against the creator's present `Current` key: a snapshot is durable evidence a later joiner reads to learn a boundary, so a routine rotation by the creator would otherwise void every snapshot it ever signed.
 
 **KeyBoundaryEntry:**
 
@@ -398,7 +398,7 @@ Self-contained context state at a point in time, used for the Tier 2 delta sync 
 | `retirement_commit_epoch` | u64 | The epoch of the retirement Commit itself |
 | `commit_transcript_hash` | bytes (32) | SHA-256 over the `confirmed_transcript_hash` of the two Commits those epochs name, in that order |
 
-A producer emits an entry only for a key whose retirement Commit it holds, and none for a key it never watched sign in this context. A member adopts a `boundary_epoch` only where the entry's evidence supports it and returns `ContentVerdict::Invalid{no_boundary}` for the span otherwise (`09-security-model.md` §9.7.1). Without the evidence field a member syncing one snapshot would adopt whatever boundary the producer asserted.
+A producer emits an entry only for a key whose retirement Commit it holds, and none for a key it never watched sign in this context. A member adopts a `boundary_epoch` only where the entry's evidence supports it and returns `ContentVerdict::Invalid{NoBoundary}` for the span otherwise (`09-security-model.md` §9.7.1). Without the evidence field a member syncing one snapshot would adopt whatever boundary the producer asserted.
 
 **MembershipEntry:**
 
@@ -481,11 +481,11 @@ SHA-256("SCP-CONTEXT-EXPORT-V3:" ‖ scope_tag ‖ key_state_head ‖ BE32(len(J
 
 **Set and map canonicalization.** Any snapshot field whose type is a set or map with non-deterministic iteration order is canonicalized to a deterministic ordering — sorted by key for a map, sorted by element for a set — in the value fed to JCS, so the digest is byte-identical across runs. RFC 8785 fixes object-member ordering by key, and a producing implementation MUST NOT rely on a set's incidental iteration order for an array-valued field.
 
-**Who signs it.** The signer is the snapshot's `creator_did`, through the `#active` key that identity's key state listed `current` at the position `key_state_head` names. An identity's key state names one operational role, so there is one such key and no fallback. **No witness cosignature enters an export's verification, and an export carries none**, so an importer offline at import time reaches the verdict an online importer reaches from the same bytes: the chain the importer replays authenticates the anchored key, and `09-security-model.md` §9.7.4.3's witness layer covers the key-event log alone.
+**Who signs it.** The signer is the snapshot's `creator_did`, through the `#active` key that identity's key state listed `Current` at the position `key_state_head` names. An identity's key state names one operational role, so there is one such key and no fallback. **No witness cosignature enters an export's verification, and an export carries none**, so an importer offline at import time reaches the verdict an online importer reaches from the same bytes: the chain the importer replays authenticates the anchored key, and `09-security-model.md` §9.7.4.3's witness layer covers the key-event log alone.
 
 **Importer verification, before any state is restored.**
 
-1. **Resolve the verifying key under the log-anchored evidence class.** Replay the `creator_did`'s key-event log (`03-identity.md` §3.10.4), because establishing control authority takes the sequence of key events, which KERI requires of a validator in `spec-body` §Verifier. Accept the signature under the log-anchored evidence class of `09-security-model.md` §9.7.1, whose row states both conditions: the signing key was `current` at the position `key_state_head` names, and where the key state lists that key `Compromised{from: N}`, the further first-seen test that row's paragraph states. The verifying key comes from `creator_did` and the signed anchor, never from an unauthenticated envelope field and never from the creator's present `current` key. An importer holding neither the creator's chain up to that position nor a network path to fetch one MUST reject the import rather than restore state under an unverified key.
+1. **Resolve the verifying key under the log-anchored evidence class.** Replay the `creator_did`'s key-event log (`03-identity.md` §3.10.4), because establishing control authority takes the sequence of key events, which KERI requires of a validator in `spec-body` §Verifier. Accept the signature under the log-anchored evidence class of `09-security-model.md` §9.7.1, whose row states both conditions: the signing key was `Current` at the position `key_state_head` names, and where the key state lists that key `Compromised{from: N}`, the further first-seen test that row's paragraph states. The verifying key comes from `creator_did` and the signed anchor, never from an unauthenticated envelope field and never from the creator's present `Current` key. An importer holding neither the creator's chain up to that position nor a network path to fetch one MUST reject the import rather than restore state under an unverified key.
 2. **Assert that the envelope's `exporter_did` equals the snapshot's `creator_did`**, and reject the export where they differ. This binds the signing authority to the creator and stops a non-creator re-wrapping a snapshot under its own key.
 3. **Verify the signature before restore.** Recompute the digest over the received envelope, sourcing `scope_tag` from its `scope` field and `key_state_head` from the snapshot, and verify the P-256 signature against the resolved key. Verification happens before any snapshot field reaches authoritative state, and a failed signature aborts the import with a signature error (`SCP-CTX-2093`) distinct from the version error (`SCP-CTX-2094`).
 
