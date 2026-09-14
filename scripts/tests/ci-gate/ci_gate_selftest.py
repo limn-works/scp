@@ -308,6 +308,25 @@ ABI3_LANE_FILTER = "python-wheel"
 ABI3_LANE_SOURCE_DONOR = "python"
 ABI3_LANE_SOURCE_PREFIX = "crates/scp-ffi/"
 
+# CRITERION for check_python_package_reaches_the_abi3_lane: the last step of job
+# python-wheel-build walks the installed package inside a CPython 3.10 virtual
+# environment and imports every module it holds, so every file of the pure-Python
+# package compiles on the oldest interpreter bindings/python/pyproject.toml admits.
+# Every other python-version key in ci.yml reads "3.12", so the filter guarding that
+# job decides on its own whether the package is ever compiled on 3.10, and it must
+# therefore match a change to any file that walk imports. The check derives the
+# package directory from the `[tool.maturin] module-name` key of that project file
+# instead of holding a copy, so renaming the package moves the requirement with it,
+# and it fails when the project file names no package rather than reporting the
+# filter complete against nothing.
+PYTHON_PACKAGE_PROJECT_FILE = "bindings/python/pyproject.toml"
+
+# CRITERION for check_release_version_parity_wiring: see that function's docstring.
+VERSION_PARITY_JOB = "version-tags"
+VERSION_PARITY_SCRIPT = "scripts/check-release-version-parity.py"
+TAG_COMMAND = "git tag"
+VERSION_PARITY_NON_CHECKING = ("--pep440", "--self-test")
+
 # CRITERION for check_workspace_scoped_filters: a cargo command carrying
 # `--workspace` compiles every member the root manifest lists, so a path filter
 # deciding whether that command runs must match a change to any file of any
@@ -1563,6 +1582,50 @@ def check_pyo3_source_reaches_the_abi3_lane(jobs: dict) -> None:
     )
 
 
+def check_python_package_reaches_the_abi3_lane(jobs: dict) -> None:
+    """The abi3 lane's filter matches the package its last step imports on 3.10."""
+    project = REPO / PYTHON_PACKAGE_PROJECT_FILE
+    module_name = ""
+    if project.is_file():
+        maturin = tomllib.loads(project.read_text()).get("tool", {}).get("maturin", {})
+        module_name = str(maturin.get("module-name", ""))
+    package = module_name.split(".")[0]
+    check(
+        f"{PYTHON_PACKAGE_PROJECT_FILE} names the package the abi3 lane imports",
+        bool(package),
+        f"no `[tool.maturin] module-name` key; the check below derives the package "
+        f"directory from it, and an empty derivation would report the abi3 lane's "
+        f"filter complete against no package at all",
+    )
+    if not package:
+        return
+    wanted = f"{Path(PYTHON_PACKAGE_PROJECT_FILE).parent.as_posix()}/{package}/**"
+    directory = REPO / Path(PYTHON_PACKAGE_PROJECT_FILE).parent / package
+    check(
+        f"{wanted} is a directory this repository holds",
+        directory.is_dir(),
+        f"{directory} does not exist, so the pattern below would name nothing and "
+        f"the filter would satisfy this check while matching no file",
+    )
+    filters = path_filters(jobs)
+    if ABI3_LANE_FILTER not in filters:
+        check(
+            f"filter {ABI3_LANE_FILTER!r} matches {wanted}",
+            False,
+            f"job `changes` declares no {ABI3_LANE_FILTER!r} filter, so either "
+            f"someone renamed that filter or this check is stale",
+        )
+        return
+    check(
+        f"filter {ABI3_LANE_FILTER!r} matches {wanted}",
+        wanted in filters[ABI3_LANE_FILTER],
+        f"a pull request that changes {package} alone skips job python-wheel-build, "
+        f"the only job in this workflow that runs any of that package on CPython "
+        f"3.10, so a construct CPython added after 3.10 merges green and raises "
+        f"SyntaxError on the interpreters the wheel's `requires-python` admits",
+    )
+
+
 def write_inheritance_fixture(root: Path, publish_leaf: bool) -> Path:
     """Write a two-crate workspace whose consumer inherits its leaf dependency.
 
@@ -2638,6 +2701,53 @@ def check_signing_guard(documents: list[tuple[Path, dict]]) -> None:
     )
 
 
+def check_release_version_parity_wiring(documents: list[tuple[Path, dict]]) -> None:
+    """release.yml verifies every project file's version before it creates a tag.
+
+    CRITERION: in release.yml, the job that creates the release tags runs
+    VERSION_PARITY_SCRIPT at a step index below the step that creates them.
+    `.github/workflows/build-matrix.yml` builds the five Python wheels straight
+    from bindings/python/pyproject.toml and stamps nothing onto them, so a version
+    left stale in that file publishes a wheel named for another release, and the
+    PyPI upload step passes no `skip-existing`. Running the check after the tag
+    step would leave those tags behind on a tree the release then refuses to
+    publish.
+
+    This pins wiring and nothing else. Whether the script rejects a mismatch is a
+    separate question, which its own `--self-test` answers against fixture trees.
+    """
+    # Looked up by key, not filtered for: a renamed workflow raises a KeyError here
+    # rather than leaving this check running over nothing and reporting a pass.
+    jobs = {path.name: doc for path, doc in documents}["release.yml"]["jobs"]
+    steps = jobs[VERSION_PARITY_JOB].get("steps") or []
+    # The parity invocation, not every mention of the script: the same job runs it
+    # a second time with `--pep440`, which prints one version and checks nothing,
+    # so a check counting mentions would pass with the parity step deleted.
+    verify = [
+        index
+        for index, step in enumerate(steps)
+        if isinstance(step, dict)
+        and VERSION_PARITY_SCRIPT in str(step.get("run") or "")
+        and not any(
+            flag in str(step.get("run") or "") for flag in VERSION_PARITY_NON_CHECKING
+        )
+    ]
+    tagging = [
+        index
+        for index, step in enumerate(steps)
+        if isinstance(step, dict) and TAG_COMMAND in str(step.get("run") or "")
+    ]
+    check(
+        f"release.yml:{VERSION_PARITY_JOB} runs {VERSION_PARITY_SCRIPT} before it "
+        f"creates the release tags",
+        bool(verify) and bool(tagging) and min(verify) < min(tagging),
+        f"check at steps {verify}, tag creation at steps {tagging} — a project file "
+        f"naming another version otherwise reaches the wheel build, and the PyPI "
+        f"upload fails after the crates, the npm packages, the Maven artifacts and "
+        f"the Apple XCFramework have published",
+    )
+
+
 def cargo_doc_commands(doc: dict) -> list[tuple[str, str]]:
     """Return (job_id, command) for every `cargo doc` a workflow's steps run."""
     found = []
@@ -3235,6 +3345,7 @@ def main() -> int:
         "input set first"
     )
     check_signing_guard(documents)
+    check_release_version_parity_wiring(documents)
 
     print("coverage — every job reaches a required status check")
     defined = set(jobs) - {"ci"}
@@ -3260,6 +3371,7 @@ def main() -> int:
     check_resolution_manifests_reach_the_workspace()
     check_path_dep_closures(jobs)
     check_pyo3_source_reaches_the_abi3_lane(jobs)
+    check_python_package_reaches_the_abi3_lane(jobs)
 
     print(
         "workspace-scope — a filter gating a `--workspace` compile covers every member"

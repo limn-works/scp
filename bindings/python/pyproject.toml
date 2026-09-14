@@ -4,7 +4,11 @@ build-backend = "maturin"
 
 [project]
 name = "scp-python"
-version = "0.1.0b3"
+# The PEP 440 spelling of the version `crates/scp-core/Cargo.toml` names.
+# `scripts/check-release-version-parity.py`, which job version-tags of
+# `.github/workflows/release.yml` runs before it pushes a tag, fails the release
+# when this string names a version other than the one the operator asked for.
+version = "0.1.0b2"
 description = "SCP (Shared Context Protocol) Python SDK — cryptographic identity, governed contexts, and trust for AI agents"
 requires-python = ">=3.10"
 license = { text = "MIT OR Apache-2.0" }
@@ -46,7 +50,13 @@ markers = [
 ]
 
 [tool.ruff]
-target-version = "py312"
+# The same floor `requires-python` names above. ruff reads this value to decide
+# which syntax it accepts, so a PEP 695 construct CPython added in 3.12 —
+# `type X = ...`, `def f[T](...)`, `class C[T]` — fails `ruff check`. Job
+# python-lint in `.github/workflows/ci.yml` runs that check on every pull request
+# touching `bindings/python/**`, so such a construct cannot reach a wheel whose
+# `requires-python` admits CPython 3.10.
+target-version = "py310"
 line-length = 100
 
 [tool.ruff.lint]
@@ -56,7 +66,10 @@ select = ["E", "F", "W", "I", "UP", "RUF"]
 ignore = ["UP040", "UP047"]
 
 [tool.mypy]
-python_version = "3.12"
+# The floor `requires-python` names above, so mypy resolves
+# `sys.version_info` branches and standard-library signatures the way CPython
+# 3.10 resolves them.
+python_version = "3.10"
 strict = true
 warn_return_any = true
 warn_unused_configs = true

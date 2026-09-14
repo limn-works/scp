@@ -275,6 +275,21 @@ jobs:
               # absent here.
               - 'crates/scp-ffi/src/**'
               - 'crates/scp-ffi/common/**'
+              # The pure-Python package this lane's last step imports. That step
+              # walks the installed package inside a CPython 3.10 virtual
+              # environment and imports every module it holds, so every file under
+              # this directory compiles on the oldest interpreter
+              # `bindings/python/pyproject.toml` admits with
+              # `requires-python = ">=3.10"`. Every other python-version key in this
+              # workflow reads "3.12", so no other job compiles these modules on
+              # 3.10. Job python-lint rejects a construct CPython added after 3.10
+              # because `[tool.ruff] target-version` in that project file reads
+              # py310; this lane compiles the package on 3.10 itself, which also
+              # rejects a 3.11-or-later standard-library name that ruff reads as an
+              # ordinary import. `scripts/tests/ci-gate/ci_gate_selftest.py` derives
+              # this entry from the `[tool.maturin] module-name` key of
+              # `bindings/python/pyproject.toml` and fails when it is absent here.
+              - 'bindings/python/scp_sdk/**'
               # The matrix legs this lane stands in for on a pull request.
               - '.github/workflows/build-matrix.yml'
             typescript:
@@ -1739,11 +1754,35 @@ jobs:
               exit 1
               ;;
           esac
-      - name: A CPython the wheel was never built against loads the extension
+      # Every module of the package, not only the extension: `import scp_sdk`
+      # compiles the nineteen submodules `bindings/python/scp_sdk/__init__.py`
+      # names and no others, so a module nothing imports — `scp_sdk.provenance`
+      # today — would never be compiled on 3.10 and a construct CPython added
+      # after 3.10 would reach a released wheel. The walk below imports every
+      # module the installed package holds, and `onerror` re-raises rather than
+      # letting `walk_packages` swallow a failure while descending a subpackage.
+      - name: A CPython the wheel was never built against compiles every module it holds
         run: |
           python3.10 -m venv /tmp/abi3-venv
           /tmp/abi3-venv/bin/pip install bindings/python/dist/*.whl
-          /tmp/abi3-venv/bin/python -c "import scp_sdk._scp_core; print('imported on', __import__('sys').version)"
+          /tmp/abi3-venv/bin/python - <<'PY'
+          import importlib
+          import pkgutil
+          import sys
+
+          import scp_sdk
+          import scp_sdk._scp_core
+
+
+          def onerror(name: str) -> None:
+              raise
+
+
+          for module in pkgutil.walk_packages(scp_sdk.__path__, "scp_sdk.", onerror):
+              importlib.import_module(module.name)
+              print("imported", module.name)
+          print("imported scp_sdk and its extension on", sys.version)
+          PY
 
   # ── TypeScript ──────────────────────────────────────────────────────
   # ORs on `rust` for a reason spelled out above python-test: a NAPI addon
@@ -2453,6 +2492,11 @@ jobs:
       # Whether that script rejects an empty set is a separate question, which
       # these fixtures answer by running it against real directories.
       - run: bash scripts/tests/signing-guard/run-tests.sh
+      # A ci-gate assertion pins job version-tags of release.yml to running
+      # scripts/check-release-version-parity.py before it creates the release
+      # tags. Whether that script rejects a project file naming another version is
+      # a separate question, which its own fixtures answer.
+      - run: python3.12 scripts/check-release-version-parity.py --self-test
       # Two fuzz.yml jobs size `timeout-minutes` by selecting a whole-minute
       # budget per `fuzz_time` option, because GitHub expressions carry no
       # arithmetic. scripts/tests/ci-gate reads those chains and assumes an

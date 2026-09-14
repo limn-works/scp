@@ -81,7 +81,13 @@ manifest-path = "../../crates/scp-ffi/Cargo.toml"
 features = ["extension-module", "vendored-openssl"]
 
 [tool.ruff]
-target-version = "py312"
+# The same floor `requires-python` names above. ruff reads this value to decide
+# which syntax it accepts, so `type X = ...` and the other PEP 695 forms, which
+# CPython added in 3.12, fail `ruff check` here. Job python-lint in
+# `.github/workflows/ci.yml` runs that check on every pull request touching
+# `bindings/python/**`, which is what stops a 3.12-only construct from reaching a
+# wheel whose `requires-python` admits CPython 3.10.
+target-version = "py310"
 line-length = 100
 
 [tool.ruff.lint]
@@ -105,7 +111,10 @@ known-first-party = ["scp_sdk"]
 
 [tool.mypy]
 strict = true
-python_version = "3.12"
+# The floor `requires-python` names above, so mypy resolves
+# `sys.version_info` branches and standard-library signatures the way the oldest
+# interpreter a wheel installs on resolves them.
+python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
