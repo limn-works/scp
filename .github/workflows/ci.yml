@@ -1582,6 +1582,14 @@ jobs:
   #     depends on that task, so each job's Gradle build compiles the crate again
   #     whatever a download placed in `target/debug`. The explicit cargo step in each
   #     job is what makes that second compile a fingerprint hit.
+  #   * typescript-wasm-check and scaffold-typescript-web-check both run
+  #     `bun run build` in bindings/typescript-wasm, which runs one `wasm-pack build`,
+  #     on one runner OS. A producer would not pay for itself: that build took 1.8 min
+  #     and 1.7 min in run 34805871209 against job totals of 4.1 min and 2.5 min, so a
+  #     producer job's own checkout, toolchain and cache steps cost about what the
+  #     second build costs, and both consumers would then start after it instead of at
+  #     the top of the run. The measurement, not the shape, is what decides: a wasm
+  #     build that grew past a few minutes would be worth splitting out.
   #
   # Each upload names `if-no-files-found: error`. An upload over an empty set succeeds
   # and publishes an empty artifact, which reaches a consumer as a missing file rather
