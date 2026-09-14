@@ -263,11 +263,12 @@ with it.
 `NON_BRIDGE_SHIPPED_ASSERTION_LANES` paired `scp-identity` with job `rust-test` under a
 comment claiming nothing in this repository enables `scp-identity/testing`, and
 `command_enables_testing` confirmed that claim by reading the command's `--features`
-text alone. The claim was false one manifest away: `crates/scp-testing/Cargo.toml`
-declares a normal dependency `scp-identity = { path = "../scp-identity", features =
-["testing"] }`, and one cargo invocation resolves one feature set per package, so job
-rust-test's `cargo nextest run --workspace` built scp-identity with `testing` on and
-compiled out both of its `#[cfg(not(feature = "testing"))]` assertions
+text alone. The claim was false one manifest away: on the tree that revision read,
+`crates/scp-testing/Cargo.toml` declared a normal dependency `scp-identity = { path =
+"../scp-identity", features = ["testing"] }`, and one cargo invocation resolves one
+feature set per package, so job rust-test's `cargo nextest run --workspace` built
+scp-identity with `testing` on and compiled out both of its
+`#[cfg(not(feature = "testing"))]` assertions
 (`ephemeral_create_fails_closed_without_pre_rotation_backend` and
 `persisted_create_fails_closed_without_pre_rotation_backend` in
 `crates/scp-identity/src/config.rs`) — the two SCP-IDENT-1059 proofs that

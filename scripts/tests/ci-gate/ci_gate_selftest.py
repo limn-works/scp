@@ -72,14 +72,20 @@ nothing:
                job's note in place.
   unified-feature
                A table here paired scp-identity with job rust-test under a
-               comment claiming nothing enables `scp-identity/testing`.
-               crates/scp-testing/Cargo.toml declares a normal dependency
+               comment claiming nothing enables `scp-identity/testing`. At that
+               time crates/scp-testing/Cargo.toml declared a normal dependency
                `scp-identity = { path = "../scp-identity", features =
                ["testing"] }`, and one cargo invocation resolves one feature
                set per package, so that job's `cargo nextest run --workspace`
                built scp-identity with `testing` on and compiled its two
                `#[cfg(not(feature = "testing"))]` assertions out — while the
                check reading that table reported each one running by name.
+               That normal-dependency line is now the `helpers` feature of the
+               same manifest, which that crate's own `[dev-dependencies]` turn
+               on, and crates/scp-runtime/Cargo.toml and
+               crates/scp-ffi/common/Cargo.toml each carry the same edge in
+               their `[dev-dependencies]`. A workspace build reads all three,
+               so the pairing this entry records stays rejected.
   filter-source
                A `changes` job publishes each output from a
                `steps.filter.outputs.<key>` expression, and dorny/paths-filter
@@ -438,10 +444,12 @@ SHIPPED_CONFIG_LANES = {
 #
 # Job fail-closed-pre-rotation selects each crate with `-p` and names its two
 # assertions in an `-E` filter. A workspace-wide command cannot serve as
-# scp-identity's lane: crates/scp-testing/Cargo.toml declares a normal
-# dependency `scp-identity = { path = "../scp-identity", features =
-# ["testing"] }`, and one cargo invocation resolves one feature set per
-# package, so every build that includes scp-testing compiles scp-identity's
+# scp-identity's lane: three manifests turn `scp-identity/testing` on —
+# crates/scp-testing/Cargo.toml, whose `helpers` feature names it and whose own
+# `[dev-dependencies]` turn `helpers` on, and the `[dev-dependencies]` entries
+# of crates/scp-runtime/Cargo.toml and crates/scp-ffi/common/Cargo.toml — and
+# one cargo invocation resolves one feature set per package, so a build reading
+# any one of them compiles scp-identity's
 # `#[cfg(not(feature = "testing"))]` assertions out. An earlier revision of
 # this table paired scp-identity with job rust-test under a comment claiming
 # nothing enables `scp-identity/testing`; command_unifies_testing below now
@@ -1814,6 +1822,66 @@ def test_build_manifests(manifest: Path, root: Path) -> set[Path]:
     return manifests
 
 
+def command_build_manifests(
+    tokens: list[str], root: Path = REPO
+) -> tuple[set[Path], str | None]:
+    """Return every manifest this command's build reads, and the first `-p`
+    package name no workspace member declares.
+
+    A `--workspace`/`--all` build includes every non-excluded member's
+    test-build manifests (an `--exclude`d member still gets built, and
+    scanned, when a selected member depends on it), and a `-p` build includes
+    each named package's. An unresolvable `-p` name comes back as the second
+    element with an empty manifest set, so each caller reports it as its own
+    finding rather than scanning a build it could not resolve.
+    """
+    members = member_manifests(root)
+    if {"--workspace", "--all"} & set(tokens):
+        selected = [
+            manifest
+            for name, manifest in members.items()
+            if name not in command_excludes(tokens)
+        ]
+    else:
+        selected = []
+        for name in sorted(command_packages(tokens)):
+            if name not in members:
+                return set(), name
+            selected.append(members[name])
+    manifests: set[Path] = set()
+    for manifest in selected:
+        manifests |= test_build_manifests(manifest, root)
+    return manifests, None
+
+
+def command_testing_edges(
+    tokens: list[str], package: str, root: Path = REPO
+) -> dict[Path, str]:
+    """Return EVERY manifest in this command's build that turns
+    `package/testing` on, each mapped to how it turns it on.
+
+    CRITERION for why this reader exists beside command_unifies_testing: a
+    FLOOR check needs one bit — is any edge present — and a POSITIVE CONTROL
+    needs to name the manifest it expects to see. command_unifies_testing
+    answers the bit by returning the first edge in sorted-path order, so a
+    control written against its return value asserts a sort position rather
+    than a fact about a manifest: it goes red when an unrelated, earlier-
+    sorting crate gains an edge, and green when the manifest it names drops
+    its edge while a later-sorting one keeps the answer non-None. That is what
+    happened when crates/scp-ffi/common/Cargo.toml gained an
+    `scp-identity = { features = ["testing"] }` dev-dependency and sorted
+    ahead of crates/scp-testing/Cargo.toml. A control written against this
+    map names the manifest and cannot be moved by either event.
+    """
+    manifests, _ = command_build_manifests(tokens, root)
+    edges: dict[Path, str] = {}
+    for manifest in sorted(manifests):
+        edge = testing_edge(manifest, package)
+        if edge is not None:
+            edges[manifest] = edge
+    return edges
+
+
 def command_unifies_testing(
     tokens: list[str], package: str, root: Path = REPO
 ) -> str | None:
@@ -1829,27 +1897,16 @@ def command_unifies_testing(
     test-build manifests (an `--exclude`d member still gets built, and
     scanned, when a selected member depends on it), and a `-p` build includes
     each named package's. A `-p` package no workspace member declares comes
-    back as its own finding rather than as a pass.
+    back as its own finding rather than as a pass. Which of several edges the
+    return value names is an artifact of sorted-path order; a caller that
+    cares which manifest carries an edge reads command_testing_edges instead.
     """
-    members = member_manifests(root)
-    if {"--workspace", "--all"} & set(tokens):
-        selected = [
-            manifest
-            for name, manifest in members.items()
-            if name not in command_excludes(tokens)
-        ]
-    else:
-        selected = []
-        for name in sorted(command_packages(tokens)):
-            if name not in members:
-                return (
-                    f"no workspace member is named {name}, so no manifest "
-                    f"scan can prove `testing` off for its build"
-                )
-            selected.append(members[name])
-    manifests: set[Path] = set()
-    for manifest in selected:
-        manifests |= test_build_manifests(manifest, root)
+    manifests, unresolved = command_build_manifests(tokens, root)
+    if unresolved is not None:
+        return (
+            f"no workspace member is named {unresolved}, so no manifest "
+            f"scan can prove `testing` off for its build"
+        )
     for manifest in sorted(manifests):
         edge = testing_edge(manifest, package)
         if edge is not None:
@@ -2101,25 +2158,39 @@ def check_shipped_assertion_readers() -> None:
 
 
 def write_unification_fixture(root: Path) -> None:
-    """Write a four-crate workspace holding each spelling of a manifest edge
+    """Write a five-crate workspace holding each spelling of a manifest edge
     that turns a sibling's `testing` feature on.
 
     leaf     declares the feature and no dependencies.
-    enabler  depends on leaf with `features = ["testing"]`, the edge
-             crates/scp-testing/Cargo.toml carries against scp-identity.
+    enabler  depends on leaf with `features = ["testing"]` — the
+             dependency-entry spelling that crates/scp-runtime/Cargo.toml and
+             crates/scp-ffi/common/Cargo.toml write against scp-identity in
+             their `[dev-dependencies]`; testing_edge reads the three
+             dependency sections identically.
+    implier  declares a feature naming `"leaf/testing"`, the spelling
+             crates/scp-testing/Cargo.toml's `helpers` feature carries against
+             scp-identity. It sorts after enabler, so a reader that returns one
+             edge returns enabler's and never names this one — which is why the
+             live positive control below reads command_testing_edges.
     middle   depends on enabler and never names leaf.
     selfdev  dev-depends on itself with `features = ["testing"]`, the spelling
              crates/scp-dht/Cargo.toml uses to turn its own feature on in its
              tests.
     """
     (root / "Cargo.toml").write_text(
-        '[workspace]\nmembers = ["leaf", "enabler", "middle", "selfdev"]\n'
+        "[workspace]\n"
+        'members = ["leaf", "enabler", "implier", "middle", "selfdev"]\n'
     )
     bodies = {
         "leaf": "[features]\ntesting = []\n",
         "enabler": (
             "[dependencies]\n"
             'leaf = { path = "../leaf", features = ["testing"] }\n'
+        ),
+        "implier": (
+            '[features]\nhelpers = ["leaf/testing"]\n\n'
+            "[dependencies]\n"
+            'leaf = { path = "../leaf" }\n'
         ),
         "middle": '[dependencies]\nenabler = { path = "../enabler" }\n',
         "selfdev": (
@@ -2143,8 +2214,11 @@ def check_testing_unification_readers() -> None:
     manifest the command's text never mentions. A reader answering "no edge"
     to every question would re-green the pairing this file's unified-feature
     entry records: scp-identity paired with job rust-test, whose workspace
-    build reads crates/scp-testing/Cargo.toml and compiles both of that
-    crate's fail-closed assertions out.
+    build reads every manifest turning `scp-identity/testing` on —
+    crates/scp-testing/Cargo.toml's `helpers` feature and the
+    `[dev-dependencies]` of crates/scp-runtime/Cargo.toml and
+    crates/scp-ffi/common/Cargo.toml — and compiles both of scp-identity's
+    fail-closed assertions out.
     """
     workspace = split_command("cargo nextest run --workspace")
     with tempfile.TemporaryDirectory() as scratch:
@@ -2199,13 +2273,33 @@ def check_testing_unification_readers() -> None:
             command_unifies_testing(
                 split_command(
                     "cargo nextest run --workspace --exclude enabler "
-                    "--exclude middle"
+                    "--exclude implier --exclude middle"
                 ),
                 "leaf",
                 root,
             )
             is None,
-            "leaf and selfdev remain, and neither reaches enabler's manifest",
+            "leaf and selfdev remain, and neither reaches enabler's manifest "
+            "nor implier's feature table",
+        )
+        check(
+            "a feature-table value naming `leaf/testing` is an edge",
+            command_unifies_testing(
+                split_command("cargo test -p implier"), "leaf", root
+            )
+            is not None,
+            "implier's `helpers` feature names \"leaf/testing\", the spelling "
+            "crates/scp-testing/Cargo.toml carries against scp-identity",
+        )
+        check(
+            "command_testing_edges names every edge, not the first in sort order",
+            {
+                manifest.parent.name
+                for manifest in command_testing_edges(workspace, "leaf", root)
+            }
+            == {"enabler", "implier"},
+            "a reader that stops at the first edge lets a positive control "
+            "pinning a later-sorting manifest pass on an earlier one",
         )
         check(
             "a -p package no workspace member declares is a finding, not a pass",
@@ -2218,14 +2312,19 @@ def check_testing_unification_readers() -> None:
 
     # This repository is the live fixture for the defect this reader exists to
     # catch: the edge is real, and so is the lane that avoids it.
-    live_edge = command_unifies_testing(workspace, "scp-identity")
+    live_edges = command_testing_edges(workspace, "scp-identity")
+    scp_testing_manifest = REPO / "crates" / "scp-testing" / "Cargo.toml"
     check(
         "a workspace build turns scp-identity/testing on through scp-testing",
-        live_edge is not None and "scp-testing" in str(live_edge),
-        f"got {live_edge!r} — crates/scp-testing/Cargo.toml declares "
-        f'`scp-identity = {{ features = ["testing"] }}` as a normal '
-        f"dependency, and a reader that misses it re-greens pairing "
-        f"scp-identity's assertions with a workspace lane",
+        scp_testing_manifest in live_edges,
+        f"got {sorted(str(manifest) for manifest in live_edges)} — "
+        f"crates/scp-testing/Cargo.toml gives its `helpers` feature the value "
+        f'"scp-identity/testing", its own `[dev-dependencies]` turn `helpers` '
+        f"on, and a reader that misses that edge re-greens pairing "
+        f"scp-identity's assertions with a workspace lane. This control names "
+        f"the manifest rather than reading whichever edge sorts first, because "
+        f"crates/scp-runtime/Cargo.toml and crates/scp-ffi/common/Cargo.toml "
+        f"each carry their own such dev-dependency and sort ahead of it",
     )
     check(
         "a -p scp-identity build leaves scp-identity/testing off",
