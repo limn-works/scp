@@ -873,7 +873,16 @@ pub enum EventType {
     // into EventPayload::data — action, bridge_id, operator_did, governance_did,
     // context_id, timestamp. Every one of the four records a governance
     // decision that every member executed at its commit position, so all four
-    // are convergent commit-ordered durable leaves. A bridge node reads bridge
+    // are convergent commit-ordered durable leaves. ADR-030 §2c
+    // (event-type-based retention tiers) classifies all four as structural
+    // events and none of them as an operational event, because each one
+    // records a governance decision and a member reconstructs the context's
+    // set of assigned bridge_id values from the BridgeRegistered leaves
+    // (§12.2.1 step 3). That classification sets how long a member that
+    // prunes retains the payload, and it decides no bridge's admission:
+    // §12.10.6 step 1 obliges a bridge node to retain the lifecycle payloads
+    // of every bridge it operates whatever the context's pruning policy sets.
+    // A bridge node reads bridge
     // admission from this group of leaves for that bridge_id, from the
     // MemberJoined and MemberLeft leaves of that same log that record whether
     // the bridge's operator is still a member of the context, and from no
