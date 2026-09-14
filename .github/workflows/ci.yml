@@ -1126,6 +1126,27 @@ jobs:
           # SqliteStorage Arc past the test's reopen). That is unrelated to this
           # journal swap and is left to its own focused fix.
           cargo nextest run -p scp-testing --features sqlite --test saga_bridge_journal_swap
+          # The PostgreSQL and S3 blob backends moved behind the off-by-default
+          # `cloud-blobs` feature of scp-node and scp-relay, so --workspace no
+          # longer compiles postgres_blob.rs, s3_blob.rs, or the two arms of
+          # storage_from_env that construct them. Those files are now in the
+          # same class as the quic line above, and nothing else in CI reaches
+          # them: the workflows that also lost them (build-matrix.yml, docs.yml,
+          # release.yml) run after merge, so this job is the merge gate for that
+          # code.
+          cargo nextest run -p scp-transport --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob
+          # scp-relay's three backend-selection tests each assert one of two
+          # outcomes, chosen by whether this build compiled the arm. Every other
+          # invocation reaches their not-compiled half; this one reaches the
+          # other half, and it is the only place the relay binary's postgres and
+          # s3 startup paths run at all.
+          cargo nextest run --no-tests=fail -p scp-relay --features cloud-blobs
+          # Resolution only, no compile: scp-node/cloud-blobs forwards to two
+          # scp-transport features, and cargo rejects a forwarding target that
+          # does not exist. Nothing else in CI activates scp-node's copy of the
+          # feature, so without this line a typo there would surface only when
+          # an operator built with it.
+          cargo tree -q --target all -e no-dev -p scp-node --features cloud-blobs > /dev/null
 
   # Exercises the napi bridge in its PRODUCTION configuration: default features
   # (`server` on) but WITHOUT `testing` / `scp-core/testing` /
