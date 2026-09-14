@@ -113,7 +113,7 @@ _LABELS = {
 
 # The `TAGS=(` array of the "Create version tags" step, read as the shell literal
 # it is: one double-quoted `<crate>@${{ env.VERSION }}` entry per line.
-_TAGS_BLOCK = re.compile(r"^\s*TAGS=\(\s*$(.*?)^\s*\)\s*$", re.M | re.S)
+_TAGS_BLOCK = re.compile(r"^\s*TAGS=\(\s*$(.*?)^\s*\)\s*$", re.MULTILINE | re.DOTALL)
 _TAG_ENTRY = re.compile(r'"([A-Za-z0-9_.-]+)@\$\{\{\s*env\.VERSION\s*\}\}"')
 
 # The commands that upload a crate. Reading the command rather than the step name
@@ -154,8 +154,8 @@ def workspace_members(root: Path) -> list[str]:
     members = tomllib.loads(path.read_text()).get("workspace", {}).get("members")
     if not isinstance(members, list) or not members:
         raise Unreadable(
-            f"Cargo.toml carries no '[workspace] members' array, so this script "
-            f"enumerated no crate manifest"
+            "Cargo.toml carries no '[workspace] members' array, so this script "
+            "enumerated no crate manifest"
         )
     return [str(member) for member in members]
 
@@ -177,11 +177,9 @@ def publishes_to_a_registry(package: dict) -> bool:
     every other manifest is checked.
     """
     publish = package.get("publish", True)
-    if publish is False:
-        return False
-    if isinstance(publish, list) and not publish:
-        return False
-    return True
+    if isinstance(publish, list):
+        return bool(publish)
+    return publish is not False
 
 
 def publishable_crates(root: Path) -> list[tuple[str, str]]:
@@ -375,7 +373,7 @@ def write_fixture(
     workflow = root / RELEASE_WORKFLOW
     workflow.parent.mkdir(parents=True, exist_ok=True)
     tags = "".join(
-        '            "%s@${{ env.VERSION }}"\n' % name for name in tag_entries
+        '            "' + name + '@${{ env.VERSION }}"\n' for name in tag_entries
     )
     steps = "".join(
         f"      - name: Publish {name}\n"

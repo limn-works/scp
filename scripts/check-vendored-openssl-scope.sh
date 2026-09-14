@@ -34,6 +34,12 @@
 #     the `[package] name` of the Cargo.toml its `manifest-path` key names, and its
 #     feature arguments are the `features`, `no-default-features` and
 #     `all-features` keys spelled the way `ARTIFACTS` spells them.
+#     `MATURIN_PROJECT_FILES` of that same gate holds this one file, so `PYPROJECT`
+#     below names every wheel this repository builds. A second wheel added there
+#     and not here fails this gate rather than passing it: the entry derived from
+#     the file `PYPROJECT` still names would not equal the one vendoring entry
+#     whenever the new wheel is the vendoring one, and two vendoring wheels trip
+#     the exactly-one check.
 #   * Which configuration carries the vendored build comes from the feature
 #     arguments of each entry, so that answer tracks the `ARTIFACTS` array too.
 #     `scripts/check-shipped-feature-graph.sh`'s
