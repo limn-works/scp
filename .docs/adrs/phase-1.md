@@ -550,7 +550,7 @@ The SCP native relay exists because no external transport (Nostr, Matrix, etc.) 
 
 ### Decision
 
-Implement a WebSocket-based store-and-forward relay server and its corresponding client adapter. The relay protocol has exactly 6 operations.
+Implement a WebSocket-based store-and-forward relay server and its corresponding client adapter. The relay protocol has exactly seven client operations: `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`, `QUERY`, `POLICY`, `DELETE` and `ACK`.
 
 ### Rationale
 
@@ -576,13 +576,12 @@ Implement a WebSocket-based store-and-forward relay server and its corresponding
 
 **Relay server operations:**
 
-1. **`PUBLISH { routing_id, recipient_hint, blob_ttl, retain, nonce, payment_receipt, blob }`**
+1. **`PUBLISH { routing_id, recipient_hint, blob_ttl, retain, payment_receipt, blob }`**
    - Accept an opaque blob associated with a `routing_id`.
    - `recipient_hint` (optional): a per-context pseudonym (§9.10.4) indicating the intended recipient for directed delivery. If absent, the blob is broadcast to all subscribers of this `routing_id`.
-   - `retain` (optional boolean, **amended 2026-09-11**): REQUIRED true at the four retained kinds `scp:did:`, `scp:svc:`, `scp:wit:` and `scp:wcf:`, and absent at every other kind (`09-security-model.md` §9.10.12). A validating relay stores a `retain` write under §9.7.4.2 R9's retention rules and expires it never, rejects a write at one of those four kinds that omits the flag, and rejects the flag at any other kind; a relay that does not validate rejects a write carrying `retain: true`, which is the one test it can run, because it holds the address digest and never the preimage. `blob_ttl` is absent on a `retain` write.
-   - `nonce` (optional `u64`, **amended 2026-09-13**): the proof-of-work nonce a key-event PUBLISH carries, and no other kind (`09-security-model.md` §9.10.12). `09-security-model.md` §9.7.4.2 R9 states the puzzle's four operands, the leading-zero-bit test, the `MAX_POW_DIFFICULTY` ceiling and the publisher's refusal to solve above it; a relay declaring `pow_difficulty = 0` requires nothing of the field. Alec settled the proof-of-work rule on 2026-09-13.
-   - `payment_receipt` (optional `bin`, **added 2026-09-13**): the `PaymentReceipt` bytes of `19-economic-governance.md` §19.2.1, tagged with the adapter that issued them. A relay declaring `per_publish` or `per_byte_stored` runs `PaymentAdapter::verify` on them through that adapter and refuses the write with `4041` scope `payment` where the field is absent or the verification fails. "Paid" names a receipt this relay verified, which is the term `09-security-model.md` §9.7.4.2 R9's eviction and rent rules read.
-   - Store it for `blob_ttl` seconds **where the write carries one**; a `retain` write carries none and a validating relay expires it never.
+   - `retain` (optional boolean, **amended 2026-09-11**): REQUIRED true at the four retained kinds `scp:did:`, `scp:svc:`, `scp:wit:` and `scp:wcf:`, and absent at every other kind (`09-security-model.md` §9.10.12). A validating relay stores a `retain` write under §9.7.4.2 R9's retention rules and gives it no TTL, and R9's ring buffer is what removes such a record. It rejects a write at one of those four kinds that omits the flag, and rejects the flag at any other kind; a relay that does not validate rejects a write carrying `retain: true`, which is the one test it can run, because it holds the address digest and never the preimage. `blob_ttl` is absent on a `retain` write.
+   - `payment_receipt` (optional `bin`, **added 2026-09-13**): the `PaymentReceipt` bytes of `19-economic-governance.md` §19.2.1, tagged with the adapter that issued them. A relay declaring `per_publish` or `per_byte_stored` runs `PaymentAdapter::verify` on them through that adapter and runs the three bindings `09-security-model.md` §9.7.4.2 R9 states beside it, refusing the write with `4041` scope `payment` where the field is absent, the verification fails, or a binding fails. "Paid" names a receipt this relay verified and bound to this write, which is the term R9's ring buffer and rent rules read.
+   - Store it for `blob_ttl` seconds **where the write carries one**; a `retain` write carries none, and `09-security-model.md` §9.7.4.2 R9's ring buffer is what removes such a record: the relay displaces the oldest-established unpaid retained set when it needs the bytes, and a payment pins a set outside the ring.
    - Return a `blob_id` (SHA-256 hash of the blob) as confirmation.
    - Deliver immediately to any active subscribers of this `routing_id`. If `recipient_hint` is present, deliver only to the matching subscriber (optimization — the blob is still encrypted and opaque to non-recipients).
 
@@ -602,7 +601,8 @@ Implement a WebSocket-based store-and-forward relay server and its corresponding
 5. **`POLICY { }`** (**added 2026-09-13**)
    - Return the relay's declared write policy: the `relay_config` fields of `18-addressability-and-deployment.md` §18.3.3, verbatim.
    - The answer carries no signature, because the relay is the authority on its own policy and no third party attests it. A client that cannot reach this operation, or that reads a term it will not honour, publishes anyway and lets the relay's own typed refusal be the authority.
-   - This is the path by which a publisher obtains `pow_difficulty` and every price. A community-relay-list entry carries a relay URL and no domain, `18-addressability-and-deployment.md` §18.3 calls `.well-known/scp` an optional web on-ramp the core protocol operates without, and §18.3.2 states that a party holding DNS or a CA chain serves a fraudulent copy of that document.
+   - This is the path by which a publisher obtains every declared price and every declared budget. A community-relay-list entry carries a relay URL and no domain, `18-addressability-and-deployment.md` §18.3 calls `.well-known/scp` an optional web on-ramp the core protocol operates without, and §18.3.2 states that a party holding DNS or a CA chain serves a fraudulent copy of that document.
+   - **`economic.payee` is the one field an unsigned answer cannot carry safely, and this is the residue** (**added 2026-09-14**): a party on the network path of a relay running without TLS (`18-addressability-and-deployment.md` §18.6.3) rewrites the payee, the publisher pays that party, the receipt verifies on the payment rail, and the relay refuses `payment` because the receipt names a payee that is not its own. A publisher that has not confirmed a relay's payee through a channel it authenticates publishes to that relay without paying and takes the refusal.
 
 6. **`DELETE { blob_id }`**
    - Request deletion of a specific blob by its `blob_id`.
@@ -616,7 +616,7 @@ Implement a WebSocket-based store-and-forward relay server and its corresponding
 
 **Relay server requirements:**
 
-- TTL enforcement: a background task deletes expired blobs, and it skips a blob stored under `retain` (**amended 2026-09-11**), because such a blob carries no TTL and a validating relay expires it never (`09-security-model.md` §9.10.12).
+- TTL enforcement: a background task deletes expired blobs, and it skips a blob stored under `retain` (**amended 2026-09-11**), because such a blob carries no TTL and `09-security-model.md` §9.7.4.2 R9's ring buffer is what removes it instead (`09-security-model.md` §9.10.12).
 - No blob inspection of encrypted content: the relay never parses, validates, or inspects the contents of *encrypted, opaque* blobs (`OuterEnvelope`s and any other ciphertext). It routes by `routing_id`, stores for `blob_ttl`, and delivers — it learns nothing about who sent a message, what context it belongs to, or what it contains. The **sole, narrow exception** is the OPTIONAL key-event-record validation below: a validating SCP-native relay MAY validate *public, self-certifying* identifier-record frames (which carry no confidential content — they are signed, plaintext identity records) for availability / anti-suppression. This exception never applies to encrypted content and is never a trust dependency (the client always re-verifies, §3.10.2). "Untrusted dumb pipe," not "does zero validation," is the invariant.
 - No client authentication: any WebSocket client can connect, publish, subscribe, query.
 - Connection multiplexing: one WebSocket connection supports multiple subscriptions.
@@ -673,7 +673,7 @@ Every message is a MessagePack map with a required `op` field (string) plus oper
 
 | Op | Fields | Response |
 |----|--------|----------|
-| `PUBLISH` | `routing_id: bin32`, `recipient_hint: bin32?`, `blob_ttl: u32?`, `retain: bool?`, `nonce: u64?`, `payment_receipt: bin?`, `blob: bin` | OK with `blob_id` |
+| `PUBLISH` | `routing_id: bin32`, `recipient_hint: bin32?`, `blob_ttl: u32?`, `retain: bool?`, `payment_receipt: bin?`, `blob: bin` | OK with `blob_id` |
 | `SUBSCRIBE` | `routing_id: bin32`, `since: u64?` | OK, then BLOB stream, then EVENT `backfill_complete` |
 | `UNSUBSCRIBE` | `routing_id: bin32` | OK |
 | `QUERY` | `routing_id: bin32`, `since: u64?`, `limit: u32?` (default 100, max 1000), `proof_nonce: bin32?` | BLOB stream, then EVENT `query_complete` |
@@ -689,18 +689,18 @@ Every message is a MessagePack map with a required `op` field (string) plus oper
 | Op | Fields | When |
 |----|--------|------|
 | `OK` | `ref: string?`, `blob_id: bin32?`, `relay_config: map?` | Success response. `blob_id` present only for PUBLISH; `relay_config` present only for POLICY, carrying the fields of `18-addressability-and-deployment.md` §18.3.3 verbatim and unsigned. |
-| `ERR` | `ref: string?`, `code: u16`, `msg: string` | Error response. `msg` is for logging, not parsing. |
+| `ERR` | `ref: string?`, `code: u16`, `msg: string`, `scope: string?`, `value` | Error response. `msg` is for logging, not parsing, which is why `4041`'s two fields ride beside it: `scope` names the term the refusal failed and `value` carries that term's own value, typed per scope as `03-identity.md` §3.10.10's `BudgetValue` declares. The retry rule below, a publisher's decision to attach a receipt, and `PublishOutcome`'s per-entry list each read one of those two fields (**amended 2026-09-14**). |
 | `BLOB` | `routing_id: bin32`, `blob_id: bin32`, `recipient_hint: bin32?`, `blob_ttl: u32?`, `stored_at: u64`, `relay_proof: bin200?`, `blob: bin` | Blob delivery (subscription, backfill, or query). `blob_id = SHA-256(blob)` — clients SHOULD verify. `relay_proof` carries the 200-byte relay proof of control `09-security-model.md` §9.7.4.2's definitions state, returned where the QUERY carried a `proof_nonce`. |
 | `EVENT` | `ref: string?`, `type: string`, type-specific fields | Protocol events: `backfill_complete` (with `routing_id`), `query_complete` (with `count`). |
 | `PONG` | `ts: u64` | Keepalive response. |
 
 #### Error Codes
 
-**Client errors (4xxx):** `4000` INVALID_MESSAGE, `4001` UNKNOWN_OP, `4002` MISSING_FIELD, `4003` INVALID_FIELD, `4010` BLOB_TOO_LARGE, `4011` TTL_TOO_LONG, `4012` LIMIT_EXCEEDED, `4020` RATE_LIMITED, `4021` TOO_MANY_SUBSCRIPTIONS, `4041` STORAGE_POLICY_REFUSED (a validating SCP-native relay refused a PUBLISH that failed one term of the write policy it declares, carrying a `scope` field whose value is one of `identifier`, `total`, `rate_limit`, `payment` or `proof_of_work`, and a `value` field carrying that term exactly as the relay declares it in `relay_config`, so a publisher told it may retry holds the figure to retry against; the SDK surfaces both as `IdentityError::StorageBudgetExceeded{scope, value}`, `03-identity.md` §3.10.10. **Added 2026-09-13** under Alec's storage ruling, **`value` amended 2026-09-13**: the refusal is never a verdict about the identity, and a publisher that read it as `4040` would tell a controller its own recovery event is malformed. **A refusal under any term of a declared write policy takes `4041` and takes no other code**, so `4020` covers a rate limit on an operation that declares no policy and `5001` covers a relay out of room rather than at a declared ceiling), `4040` DID_RECORD_REJECTED (a validating SCP-native relay rejected an operation at an identity-domain `routing_id`: a PUBLISH of a frame that failed the identifier-to-routing-id binding or chain verification, a non-superseding slot placement, any blob published to a slot-claimed `routing_id` that is not a frame passing the four validation steps, or a DELETE of a stored frame whose chain verifies — see the Key-Event-Record Slot-Exclusivity subsection. **Amended 2026-09-10:** the code's name carries the retired identifier-record vocabulary, and this ADR names the wire constant as it ships rather than inventing one).
+**Client errors (4xxx):** `4000` INVALID_MESSAGE, `4001` UNKNOWN_OP, `4002` MISSING_FIELD, `4003` INVALID_FIELD, `4010` BLOB_TOO_LARGE, `4011` TTL_TOO_LONG, `4012` LIMIT_EXCEEDED, `4020` RATE_LIMITED, `4021` TOO_MANY_SUBSCRIPTIONS, `4041` STORAGE_POLICY_REFUSED (a validating SCP-native relay refused a PUBLISH that failed one term of the write policy it declares, carrying a `scope` field whose value is one of `identifier`, `total`, `rate_limit` or `payment`, and a `value` field carrying that term's own value typed per scope, which `03-identity.md` §3.10.10 declares as `BudgetValue`, so a publisher told it may retry holds the figure to retry against (**`proof_of_work` removed 2026-09-14**); the SDK surfaces both as `IdentityError::StorageBudgetExceeded{scope, value}`, `03-identity.md` §3.10.10. **Added 2026-09-13** under Alec's storage ruling, **`value` amended 2026-09-13**: the refusal is never a verdict about the identity, and a publisher that read it as `4040` would tell a controller its own recovery event is malformed. **A refusal under any term of a declared write policy takes `4041` and takes no other code**, so `4020` covers a rate limit on an operation that declares no policy and `5001` covers a relay out of room rather than at a declared ceiling), `4040` DID_RECORD_REJECTED (a validating SCP-native relay rejected an operation at an identity-domain `routing_id`: a PUBLISH of a frame that failed the identifier-to-routing-id binding or chain verification, a non-superseding slot placement, any blob published to a slot-claimed `routing_id` that is not a frame passing every validation step `03-identity.md` §3.10.2 orders, or a DELETE of a stored frame whose chain verifies — see the Key-Event-Record Slot-Exclusivity subsection. **`03-identity.md` §3.10.2 states the number of those steps and this ADR states no figure of its own** (**amended 2026-09-14**); the policy checks that section orders first answer `4041` and never `4040`, so a relay that returned `4040` for a budget or a price told a controller its own recovery event was malformed. **Amended 2026-09-10:** the code's name carries the retired identifier-record vocabulary, and this ADR names the wire constant as it ships rather than inventing one).
 
 **Server errors (5xxx):** `5000` INTERNAL_ERROR, `5001` STORAGE_FULL, `5002` SHUTTING_DOWN.
 
-Clients MUST handle unknown codes by category: 4xxx = do not retry same request, 5xxx = retry with backoff or switch relay. Codes are extensible within these ranges. **`4041` is the one 4xxx code a client retries at the same relay**, and only after changing the request to satisfy the term its `value` names — solving to the declared difficulty, attaching a receipt for the declared price, or waiting out the declared rate. A retry that repeats the refused request unchanged is the act the category rule forbids.
+Clients MUST handle unknown codes by category: 4xxx = do not retry same request, 5xxx = retry with backoff or switch relay. Codes are extensible within these ranges. **`4041` is the one 4xxx code a client retries at the same relay** (**amended 2026-09-14**). A retry is permitted where the publisher changed the request to satisfy the term the `value` names, which means attaching a receipt for the declared price, **or where it waited the seconds a `rate_limit` value states**. The category rule's prohibition binds a retry that repeats the refused request without either act.
 
 #### Keepalive
 
@@ -729,7 +729,7 @@ Published out-of-band (relay metadata page, a service-record entry). Relay MAY i
 ```rust
 /// Client-to-relay operations (scp-transport/src/native/protocol.rs)
 pub enum ClientMessage {
-    Publish { ref_id: Option<String>, routing_id: [u8; 32], recipient_hint: Option<[u8; 32]>, blob_ttl: Option<u32>, retain: Option<bool>, nonce: Option<u64>, blob: Vec<u8> },
+    Publish { ref_id: Option<String>, routing_id: [u8; 32], recipient_hint: Option<[u8; 32]>, blob_ttl: Option<u32>, retain: Option<bool>, payment_receipt: Option<Vec<u8>>, blob: Vec<u8> },
     Subscribe { ref_id: Option<String>, routing_id: [u8; 32], since: Option<u64> },
     Unsubscribe { ref_id: Option<String>, routing_id: [u8; 32] },
     Query { ref_id: Option<String>, routing_id: [u8; 32], since: Option<u64>, limit: Option<u32>, proof_nonce: Option<[u8; 32]> },
