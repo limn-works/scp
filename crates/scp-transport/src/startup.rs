@@ -217,11 +217,11 @@ pub const VALID_BACKENDS: &str = concat!(
 /// constructs `name`, for a caller that has to predict which of two outcomes a
 /// binary linking this crate will produce.
 ///
-/// This reads the `compiled` column of [`BACKENDS`], which is a [`cfg!`] read
-/// of the same feature that gates the arm. It deliberately does not parse
-/// [`VALID_BACKENDS`]: a test that compared a binary's diagnostic against a
-/// prediction parsed out of the very constant that diagnostic is built from
-/// would assert a tautology, and would stay green through a revert of
+/// This reads the `compiled` column of the private `BACKENDS` table, which is a
+/// [`cfg!`] read of the same feature that gates the arm. It deliberately does
+/// not parse [`VALID_BACKENDS`]: a test that compared a binary's diagnostic
+/// against a prediction parsed out of the very constant that diagnostic is
+/// built from would assert a tautology, and would stay green through a revert of
 /// `VALID_BACKENDS` to the hardcoded list that named backends a default build
 /// cannot construct.
 #[must_use]
@@ -267,8 +267,8 @@ fn reject_backend_message(requested: &str) -> String {
 ///
 /// Reads `SCP_RELAY_STORAGE_BACKEND` (default: `sqlite`) and delegates to the
 /// backend constructor that value names. On a value this build cannot
-/// construct, it prints the message [`reject_backend_message`] writes and calls
-/// [`std::process::exit`].
+/// construct, it prints the message the private `reject_backend_message` writes
+/// and calls [`std::process::exit`].
 ///
 /// # Storage backend selection
 ///
