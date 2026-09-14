@@ -35,7 +35,7 @@ dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.8", "mypy>=1.13"]
 scp-mcp = "scp_sdk.mcp:cli_main"
 
 [project.urls]
-Repository = "https://github.com/limn-scp/scp-protocol-core"
+Repository = "https://github.com/limn-works/scp"
 Documentation = "https://scp.dev/docs"
 
 [tool.pytest.ini_options]
@@ -62,7 +62,13 @@ warn_return_any = true
 warn_unused_configs = true
 
 [tool.maturin]
-features = ["extension-module"]
+# Features of `scp-ffi`, the package `manifest-path` below names. `extension-module`
+# forwards `pyo3/extension-module`. `vendored-openssl` forwards
+# `scp-platform/vendored-openssl`, which compiles OpenSSL from source into
+# SQLCipher: a `pip install` runs no linker, and this wheel installs onto a machine
+# whose OpenSSL the build never saw. `scripts/check-vendored-openssl-scope.sh` fails
+# when any second shipped artifact selects that feature.
+features = ["extension-module", "vendored-openssl"]
 manifest-path = "../../crates/scp-ffi/Cargo.toml"
 module-name = "scp_sdk._scp_core"
 python-source = "."

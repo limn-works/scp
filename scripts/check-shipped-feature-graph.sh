@@ -131,7 +131,7 @@ cd "$REPO_ROOT"
 # a future dependency edge pull plaintext key-per-file storage back into a
 # shipped graph with no gate failure to announce it.
 #
-# NINE ROWS NAME A FEATURE A ROOT PACKAGE ACTIVATES THROUGH ITS OWN `[features]`
+# TEN ROWS NAME A FEATURE A ROOT PACKAGE ACTIVATES THROUGH ITS OWN `[features]`
 # TABLE. `cargo tree -e features` renders no feature EDGE for any of them (see
 # "TWO RENDERINGS" in the header), so this gate could not observe one until it
 # began reading the per-package resolved-feature rendering. Their classification:
@@ -147,28 +147,40 @@ cd "$REPO_ROOT"
 #     is `["server"]`, which a bare `cargo build` at this root and the three
 #     default-feature bridge ARTIFACTS entries resolve.
 #   - `scp-ffi/extension-module` — `["pyo3/extension-module"]`, which tells pyo3
-#     to leave the Python symbols to the interpreter that loads the cdylib. The
-#     `scp-ffi|--features extension-module` ARTIFACTS entry, the PyPI wheel's
-#     configuration read from `[tool.maturin]`, resolves it. It activates no
-#     SCP-crate feature and no dependency edge.
+#     to leave the Python symbols to the interpreter that loads the cdylib. It
+#     activates no SCP-crate feature and no dependency edge.
+#   - `scp-ffi/vendored-openssl` — `["scp-platform/vendored-openssl"]`, which adds
+#     `rusqlite/bundled-sqlcipher-vendored-openssl` and compiles the same
+#     SQLCipher against an OpenSSL this build produces rather than one the host
+#     supplies. `scp-platform/vendored-openssl` carries its own row below, and
+#     `scripts/check-vendored-openssl-scope.sh` holds the property this gate does
+#     not read — that `openssl-src` reaches the wheel and reaches no other shipped
+#     artifact.
 #   - `scp-client-wasm/default` — an EMPTY feature list. Cargo reports `default`
 #     as enabled on that default member and it activates nothing.
-# None of the eight forwards a `testing` edge or an `allow_unencrypted_storage`
+# The `scp-ffi|--features extension-module,vendored-openssl` ARTIFACTS entry, the
+# PyPI wheel's configuration read from `[tool.maturin]`, resolves the two
+# `scp-ffi` rows above that no other entry reaches.
+# None of the ten forwards a `testing` edge or an `allow_unencrypted_storage`
 # edge. The reader reports cargo's RESOLVED list, so every feature a `default`
 # row expands to appears as its own row and meets this ⊆ check on its own —
 # permitting a `default` row therefore admits nothing beyond that row.
 # NULLIFIER_CONTROL_FEATURES names all five bridge/binary `testing` features, so
 # `assert_allowlist_has_no_nullifier` rejects an edit that adds one here.
 #
-# Nine artifact configurations are gated: the three shipped FFI bridges under
+# Ten artifact configurations are gated: the three shipped FFI bridges under
 # `--no-default-features --features server`, the same three under their DEFAULT
-# features, `scp-core`, and the scp-node and scp-relay binaries (built with
-# DEFAULT features — neither binary has a `server` feature). Each artifact's
-# resolved set is the UNION of the two renderings the header describes. This
-# single allowlist is a SUPERSET covering all nine plus the bare default-members
-# build — one list suffices. `cargo tree` DERIVES each artifact's resolved set
-# (never a hand-list); this allowlist is the hand-maintained set of what is
-# PERMITTED.
+# features, `scp-core`, the scp-node and scp-relay binaries (built with DEFAULT
+# features — neither binary has a `server` feature), and the PyPI wheel under
+# `--features extension-module,vendored-openssl`. Each artifact's resolved set is
+# the UNION of the two renderings the header describes. This single allowlist is a
+# SUPERSET covering all ten plus the bare default-members build — one list
+# suffices. `cargo tree` DERIVES each artifact's resolved set (never a hand-list);
+# this allowlist is the hand-maintained set of what is PERMITTED. An allowlist
+# covering every artifact says nothing about which artifact resolves which row, so
+# `scripts/check-vendored-openssl-scope.sh` decides that for the vendored-OpenSSL
+# rows: it reads the ARTIFACTS array below and fails unless exactly one entry
+# selects `vendored-openssl` and that entry builds the wheel's package.
 # ---------------------------------------------------------------------------
 PERMITTED_ALLOWLIST="$(cat <<'EOF'
 scp-client-wasm/default
@@ -191,6 +203,7 @@ scp-ffi-uniffi/server
 scp-ffi/default
 scp-ffi/extension-module
 scp-ffi/server
+scp-ffi/vendored-openssl
 scp-identity/default
 scp-identity/production-dht
 scp-mcp/default
@@ -204,6 +217,7 @@ scp-platform/in-memory-push
 scp-platform/in-memory-storage
 scp-platform/software_platform
 scp-platform/sqlite
+scp-platform/vendored-openssl
 scp-protocol/default
 scp-relay-client/default
 scp-runtime/default
@@ -235,7 +249,7 @@ EOF
 # build — the Dockerfile
 # `cargo build --release -p scp-relay -p scp-node`, a
 # `.github/workflows/release.yml` `cargo publish` step, `maturin`'s
-# `--manifest-path crates/scp-ffi/Cargo.toml` wheel build, and a
+# `working-directory: bindings/python` wheel build, and a
 # `.github/workflows/build-matrix.yml` "Build shipped bridge artifacts" step,
 # which builds one package per invocation into `target-shipped` so its uploaded
 # cdylibs resolve those same per-package sets these entries name. Three
@@ -251,8 +265,16 @@ EOF
 # maturin takes the wheel's cargo feature list from that table, and fails
 # unless ARTIFACTS carries the exact configuration that table selects. Today
 # that table selects `extension-module`, a pyo3-only feature that changes no
-# SCP-crate edge, and the `scp-ffi|--features extension-module` entry below is
-# the wheel's configuration.
+# SCP-crate edge, and `vendored-openssl`, which reaches
+# `scp-platform/vendored-openssl` and from there adds
+# `rusqlite/bundled-sqlcipher-vendored-openssl`. Neither nullifies a security
+# property: the first selects a Python linkage, and the second compiles the same
+# SQLCipher against an OpenSSL this build produced rather than one the host
+# supplies. The
+# `scp-ffi|--features extension-module,vendored-openssl` entry below is the
+# wheel's configuration, and `scripts/check-vendored-openssl-scope.sh` holds
+# the complementary property this gate does not read — that `openssl-src`
+# reaches the wheel and reaches no other shipped artifact.
 #
 # uniffi-bindgen (the third workspace `[[bin]]`, in `crates/scp-ffi/uniffi`) is
 # deliberately NOT a separate ARTIFACTS entry: it is a build-time code-generation
@@ -269,6 +291,13 @@ EOF
 # package's DEFAULT feature set — a different resolution from the
 # `--no-default-features --features server` one the three bridge entries above
 # gate, and one nothing gated until these entries existed.
+#
+# `scripts/check-vendored-openssl-scope.sh` reads this array as its list of what
+# this repository ships, so an entry added here is checked there on the same
+# commit. That reader accepts a comment line, a blank line, and a line holding one
+# double-quoted entry, and fails on anything else rather than skipping it, so a
+# line continuation or a shell expansion written into this array fails that gate
+# until someone spells the entry out.
 ARTIFACTS=(
   "scp-ffi|--no-default-features --features server"
   "scp-ffi-napi|--no-default-features --features server"
@@ -284,7 +313,7 @@ ARTIFACTS=(
   # `assert_wheel_feature_selection_is_gated` fails when the string it derives
   # is not in this list, so an edit to that table changes what this gate
   # resolves or fails the gate.
-  "scp-ffi|--features extension-module"
+  "scp-ffi|--features extension-module,vendored-openssl"
 )
 
 # ---------------------------------------------------------------------------
@@ -301,10 +330,17 @@ SHIPPING_FILES=(
 # Maturin project files: every pyproject.toml whose `[tool.maturin]` table
 # maturin can read when a shipping file runs it. maturin reads the pyproject.toml
 # of its working directory when one exists, and otherwise the one beside the
-# Cargo.toml its `--manifest-path` names, so both files below are inputs of the
-# wheel build: build-matrix.yml runs maturin with
-# `working-directory: bindings/python` and `--manifest-path
-# crates/scp-ffi/Cargo.toml`. That table's `features`, `all-features`, and
+# Cargo.toml its `--manifest-path` names. build-matrix.yml runs maturin with
+# `working-directory: bindings/python` and passes no `--manifest-path`, because
+# `bindings/python/pyproject.toml` carries a `[tool.maturin] manifest-path` key,
+# so that one file is the wheel build's only input. `crates/scp-ffi/pyproject.toml`
+# sat in this list while the maturin step still passed `--manifest-path
+# crates/scp-ffi/Cargo.toml`; the step no longer does, and
+# `assert_maturin_project_files_are_complete` fails on the stale entry rather than
+# leaving a reader to notice. Restoring that argument, or adding any other line a
+# shipping file runs maturin from, fails the same assertion until this list names
+# the pyproject.toml the new line reaches. That table's `features`,
+# `all-features`, and
 # `no-default-features` keys select the wheel's cargo features, and the maturin
 # step passes no `--features` of its own, so a `testing` entry added to either
 # table compiles `scp-platform/testing`, `scp-dht/testing`, and `scp-testing`
@@ -318,7 +354,6 @@ SHIPPING_FILES=(
 # ---------------------------------------------------------------------------
 MATURIN_PROJECT_FILES=(
   "bindings/python/pyproject.toml"
-  "crates/scp-ffi/pyproject.toml"
 )
 
 # Every line of a SHIPPING_FILES file that lines_carrying_cargo_feature_selection
@@ -1876,7 +1911,7 @@ TREE
     'requires = ["maturin>=1.0,<2.0"]' \
     '' \
     '[tool.maturin]' \
-    'features = ["extension-module"] # the pyo3 feature the wheel selects' \
+    'features = ["extension-module", "vendored-openssl"] # the features the wheel selects' \
     "manifest-path = \"$wheel_manifest\"" \
     'module-name = "scp_sdk._scp_core"' \
     '' \
@@ -1887,8 +1922,8 @@ TREE
     'features = ["not-read-from-another-table"]' > "$wheel_file"
   wheel_entry="$(maturin_artifact_entry "$wheel_file" 2>/dev/null)"; rc=$?
   expect "(wheel-drift) a [tool.maturin] table matching the shipped one derives an entry" "PASS" "$rc"
-  same_string "$wheel_entry" "scp-ffi|--features extension-module"; rc=$?
-  expect "(wheel-drift) that entry is 'scp-ffi|--features extension-module', read from the main table only" "PASS" "$rc"
+  same_string "$wheel_entry" "scp-ffi|--features extension-module,vendored-openssl"; rc=$?
+  expect "(wheel-drift) that entry is 'scp-ffi|--features extension-module,vendored-openssl', read from the main table only" "PASS" "$rc"
   ( fixture_failures=0; assert_wheel_feature_selection_is_gated "$wheel_file" >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
   expect "(wheel-drift) the assertion ACCEPTS a table whose configuration ARTIFACTS gates" "PASS" "$rc"
 
@@ -1954,21 +1989,41 @@ TREE
   expect "(wheel-drift) the assertion REJECTS a maturin project file it cannot read" "FAIL" "$rc"
   rm -rf "$wheel_dir"
 
-  # (wheel-drift, reach) the two places maturin looks for its pyproject.toml.
-  local reach_lines reached
+  # (wheel-drift, reach) the two places maturin looks for its pyproject.toml,
+  # proved on a planted tree rather than on this repository's own files. The
+  # earlier revision named `crates/scp-ffi/pyproject.toml` and
+  # `bindings/python/pyproject.toml`, so deleting either file turned a positive
+  # proof into a vacuous one — the reader would emit nothing and the fixture would
+  # report that it had stopped reaching a file that no longer existed. A planted
+  # tree states what the reader does for any tree.
+  local reach_lines reached reach_dir
+  reach_dir="$(mktemp -d)"
+  mkdir -p "$reach_dir/crates/a-bridge" "$reach_dir/crates/b-bridge" \
+           "$reach_dir/crates/no-project" "$reach_dir/bindings/a-binding" \
+           "$reach_dir/bindings/no-project"
+  : > "$reach_dir/crates/a-bridge/Cargo.toml"
+  : > "$reach_dir/crates/a-bridge/pyproject.toml"
+  : > "$reach_dir/crates/b-bridge/Cargo.toml"
+  : > "$reach_dir/crates/b-bridge/pyproject.toml"
+  : > "$reach_dir/crates/no-project/Cargo.toml"
+  : > "$reach_dir/bindings/a-binding/pyproject.toml"
   reach_lines="$(printf '%s\n' \
-    '            --manifest-path crates/scp-ffi/Cargo.toml' \
-    '          working-directory: bindings/python' \
-    '          working-directory: bindings/kotlin' \
-    '        run: cargo publish --manifest-path=crates/scp-node/Cargo.toml' \
+    "            --manifest-path $reach_dir/crates/a-bridge/Cargo.toml" \
+    "        run: maturin build --manifest-path=$reach_dir/crates/b-bridge/Cargo.toml" \
+    "          working-directory: $reach_dir/bindings/a-binding" \
+    "          working-directory: $reach_dir/bindings/no-project" \
+    "        run: cargo publish --manifest-path=$reach_dir/crates/no-project/Cargo.toml" \
     'echo not a maturin invocation at all')"
   reached="$(maturin_project_files_named_by_shipping_lines "$reach_lines")"
-  printf '%s\n' "$reached" | grep -xF 'crates/scp-ffi/pyproject.toml' >/dev/null; rc=$?
+  printf '%s\n' "$reached" | grep -xF "$reach_dir/crates/a-bridge/pyproject.toml" >/dev/null; rc=$?
   expect "(wheel-drift, reach) the pyproject.toml beside a --manifest-path Cargo.toml is reached" "PASS" "$rc"
-  printf '%s\n' "$reached" | grep -xF 'bindings/python/pyproject.toml' >/dev/null; rc=$?
+  printf '%s\n' "$reached" | grep -xF "$reach_dir/crates/b-bridge/pyproject.toml" >/dev/null; rc=$?
+  expect "(wheel-drift, reach) the --manifest-path=<file> spelling reaches it too" "PASS" "$rc"
+  printf '%s\n' "$reached" | grep -xF "$reach_dir/bindings/a-binding/pyproject.toml" >/dev/null; rc=$?
   expect "(wheel-drift, reach) the pyproject.toml of a working-directory: is reached" "PASS" "$rc"
-  printf '%s\n' "$reached" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 2 >/dev/null; rc=$?
+  printf '%s\n' "$reached" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 3 >/dev/null; rc=$?
   expect "(wheel-drift, reach) a directory with no pyproject.toml and a non-maturin line reach nothing" "PASS" "$rc"
+  rm -rf "$reach_dir"
 
   assert_every_pipeline_reader_consumes_its_input
 

@@ -416,6 +416,21 @@ jobs:
       - name: G1 — shipped-feature-graph ⊆ permitted-production allowlist (ZERO-nullifier mandate)
         run: bash scripts/check-shipped-feature-graph.sh
 
+  vendored-openssl-scope:
+    needs: check-draft
+    name: Vendored-OpenSSL scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: false
+      - name: openssl-src reaches the PyPI wheel and no other shipped artifact
+        run: bash scripts/check-vendored-openssl-scope.sh
+
   # ── Cross-layer ──────────────────────────────────────────────────────
   cross-layer:
     needs: check-draft
@@ -1610,6 +1625,51 @@ jobs:
           # available in this job — they run in dedicated parity jobs below.
           PYTHONPATH=. pytest tests/ -v -m "not parity"
 
+  # Compile the wheel with the cargo configuration a release compiles it with, so
+  # an `openssl-src` build failure fails a pull request instead of a tag push.
+  # `.github/workflows/build-matrix.yml` triggers on a `scp-*@*` tag push and on
+  # `workflow_call`, and job python-test above runs `maturin develop --release
+  # --features testing`, which REPLACES the `[tool.maturin] features` array rather
+  # than adding to it, so until this job existed the first compile of
+  # `rusqlite/bundled-sqlcipher-vendored-openssl` was the run that cut a release.
+  # The two gates that read that feature — `scripts/check-shipped-feature-graph.sh`
+  # and `scripts/check-vendored-openssl-scope.sh` — resolve dependency graphs and
+  # compile nothing.
+  #
+  # This job carries no path filter, so it runs on every pull request and cannot be
+  # skipped for a change that breaks the build. It compiles in debug and on one
+  # target, so it is not the release matrix: it exercises neither the
+  # manylinux_2_28 container and its `dnf install -y perl` step, nor NASM on
+  # Windows, nor the aarch64 cross image. Run build-matrix.yml through
+  # `workflow_dispatch` to exercise those before cutting a tag.
+  python-wheel-build:
+    needs: check-draft
+    name: Python / wheel (vendored OpenSSL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: false
+      # The same range `bindings/python/pyproject.toml` names in its
+      # `[build-system] requires`, so this job runs the maturin a `pip install`
+      # from the sdist would run.
+      - name: Install maturin
+        run: python3.12 -m pip install 'maturin>=1.0,<2.0'
+      # No --features and no --manifest-path: maturin reads both from the
+      # `[tool.maturin]` table of bindings/python/pyproject.toml, which is where the
+      # release reads them, so this step compiles what the release compiles.
+      - name: Build the wheel from the project file the release builds from
+        run: |
+          cd bindings/python
+          maturin build --out dist -i python3.12 --locked
+
   # ── TypeScript ──────────────────────────────────────────────────────
   # ORs on `rust` for a reason spelled out above python-test: a NAPI addon
   # this job compiles reaches every Rust workspace crate through scp-core, while
@@ -2352,6 +2412,7 @@ jobs:
       - changes
       - error-codes
       - shipped-feature-graph
+      - vendored-openssl-scope
       - fail-closed-pre-rotation
       - cross-layer
       - bridge-symmetry
@@ -2393,6 +2454,7 @@ jobs:
       - rust-deny
       - python-lint
       - python-test
+      - python-wheel-build
       - typescript-check
       - typescript-wasm-check
       - scaffold-typescript-web-check
