@@ -456,18 +456,11 @@ pub enum EventType {
     // Payload (`MessagePack` into `EventPayload::data`): a
     // `BridgeRegistrationEvent` (spec §12.12.2, defined in
     // `scp_protocol::bridge::registration`): `action`, `bridge_id`,
-    // `operator_did`, `governance_did`, `context_id`, `timestamp`. The
-    // `governance_did` is the `executor_did` of the `GovernanceActionExecuted`
-    // leaf for the same proposal (ADR-031 acceptance criterion 7; spec §12.2.1
-    // step 3), one DID under every governance model. The leaf `actor_did` is
-    // the payload's `governance_did`, except the deadline-triggered
-    // `BridgeReactivated` (a `SuspendBridge` `duration` elapsed while that
-    // `BridgeSuspended` leaf was still the bridge's highest-sequence lifecycle
-    // leaf, spec §12.2.2), whose `actor_did` is
-    // `system_actors::SYSTEM_TIMER_ACTOR` (`"system:timer"`), whose
-    // `governance_did` copies the `BridgeSuspended` leaf's, and whose leaf
-    // timestamp is the pre-computed suspension deadline (spec §7.3.1). The
-    // `Requested` and
+    // `operator_did`, `governance_did`, `context_id`, `timestamp`. The leaf
+    // `actor_did` is the payload's `governance_did`, except the
+    // deadline-triggered `BridgeReactivated` (a `SuspendBridge` `duration`
+    // elapsed), whose `actor_did` is `"system"` and whose leaf timestamp is
+    // the pre-computed suspension deadline (spec §7.3.1). The `Requested` and
     // `Rejected` actions produce no bridge leaf: `GovernanceProposalCreated`
     // and `GovernanceProposalResolved` record the proposal and its rejection.
     // -------------------------------------------------------------------
@@ -478,10 +471,8 @@ pub enum EventType {
     /// payload `action: Suspended { reason, duration }`.
     BridgeSuspended,
     /// A `ReactivateBridge` proposal was approved, or the suspension
-    /// `duration` elapsed while the `BridgeSuspended` leaf that set it was
-    /// still the bridge's highest-sequence lifecycle leaf (spec §12.2.2,
-    /// suspension); payload `action: Reactivated`. The deadline-triggered leaf
-    /// carries [`system_actors::SYSTEM_TIMER_ACTOR`] as `actor_did`.
+    /// `duration` elapsed (spec §12.2.2, suspension); payload
+    /// `action: Reactivated`.
     BridgeReactivated,
     /// A `RevokeBridge` proposal was approved (spec §12.2.2 step 2); payload
     /// `action: Revoked`. Terminal: no later bridge leaf reactivates it.

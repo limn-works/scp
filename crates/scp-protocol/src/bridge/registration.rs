@@ -218,12 +218,7 @@ pub struct BridgeRegistrationEvent {
     /// DID of the bridge operator.
     pub operator_did: DID,
 
-    /// The `executor_did` of the `GovernanceActionExecuted` leaf for the
-    /// proposal that produced this event (ADR-031 acceptance criterion 7; spec
-    /// §12.2.1 step 3):
-    /// one convergent DID under every governance model. A deadline-triggered
-    /// `Reactivated` copies the `governance_did` of the `BridgeSuspended` leaf
-    /// whose `duration` elapsed (spec §12.2.2).
+    /// DID of the governance actor who approved, rejected, or revoked.
     pub governance_did: DID,
 
     /// The context this event belongs to.
