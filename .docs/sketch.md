@@ -1744,7 +1744,7 @@ SCP.Identity.fetchKeyPackage(
   keyPackageID: String,
   identifier: Identifier,
   hpkeInitKey: PublicKey,             // HPKE init key for Welcome message encryption
-  signatureKey: PublicKey,            // the key their key state lists `current` in `#active`
+  signatureKey: PublicKey,            // the key their key state lists `Current` in `#active`
   credential: MLSCredential,
   signature: P256Signature
 }
