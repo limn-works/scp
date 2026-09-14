@@ -165,9 +165,12 @@ Both `scp-relay` and `scp-node` (in relay-only mode) select a blob storage backe
 ### Building for PostgreSQL or S3
 
 The released `scp-relay` and `scp-node` binaries, and the Docker image, leave the
-`cloud-blobs` cargo feature off: the PostgreSQL and S3 clients resolve 78 crates
-that a relay on `sqlite`, `redb` or `memory` never links. Build with the feature
-to run against either:
+`cloud-blobs` cargo feature off, because a relay running on `sqlite`, `redb` or
+`memory` never links the PostgreSQL and S3 clients. Enabling the feature resolves
+75 extra crates into `scp-relay` and 56 into `scp-node`, 23 of them `aws-*` in
+both graphs. Run `cargo tree -e no-dev -p scp-relay` and the same command with
+`--features cloud-blobs` to reproduce the first of those two counts. Build with
+the feature to run against PostgreSQL or S3:
 
 ```bash
 cargo build --release -p scp-relay --features cloud-blobs

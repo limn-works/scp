@@ -136,9 +136,12 @@ allow_unencrypted_storage = ["scp-core/allow_unencrypted_storage"]
 # from shipped artifacts.
 testing = ["scp-dht/testing", "scp-platform/testing", "allow_unencrypted_storage"]
 # The two cloud blob backends, OFF by default. Enabling `postgres-blob` and
-# `s3-blob` unconditionally resolved 78 extra crates into every artifact that
-# depends on this one — 23 of them `aws-*`, which is every `aws-*` crate in the
-# workspace graph — although no code in this crate constructs either backend:
+# `s3-blob` unconditionally resolved 56 extra crates into this crate's own graph,
+# and 53 to 55 into each of the three FFI bridges that depend on it — 23 of them
+# `aws-*` in every one of those four graphs, which is every `aws-*` crate in the
+# workspace graph. `cargo tree -e no-dev -p scp-node` against the same command
+# carrying `--features cloud-blobs` reports the first of those counts. No code in
+# this crate constructs either backend:
 # `storage_from_env` in `scp-transport` is their only caller, and it reaches
 # them only when an operator sets `SCP_RELAY_STORAGE_BACKEND=postgres` or `=s3`.
 # A build that leaves this feature off rejects those two values with a typed
