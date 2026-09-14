@@ -1715,11 +1715,20 @@ def command_enables_testing(tokens: list[str], package: str) -> bool:
     return False
 
 
-# Every dependency section a Cargo manifest may carry. testing_edge scans all
-# three in every manifest it reads: a dev-dependency joins feature unification
-# whenever cargo builds that manifest's own test targets, and counting it in a
-# dependency's manifest too errs toward reporting a gap rather than toward
-# passing one.
+# Every dependency section a Cargo manifest may carry. A dev-dependency joins
+# feature unification only when cargo builds that manifest's own test targets,
+# and the two readers below treat that condition differently BECAUSE their
+# answers are read in opposite directions:
+#
+# testing_edge scans all three sections in every manifest it reads. Its callers
+# use a found edge to REJECT a lane, so counting a dev section in a crate the
+# build reaches as a plain dependency errs toward reporting a gap rather than
+# toward passing one.
+#
+# unconditional_feature_activators scans the dev section only on a manifest
+# whose test targets the build compiles. Its caller uses a found entry to
+# ASSERT a feature is on, so the same over-count would attest a feature no
+# build enables — see that function's CRITERION.
 DEPENDENCY_SECTIONS = ("dependencies", "dev-dependencies", "build-dependencies")
 
 
@@ -1768,38 +1777,72 @@ def testing_edge(manifest: Path, package: str) -> str | None:
 
 
 def unconditional_feature_activators(
-    package: str, feature: str, manifests: set[Path]
-) -> dict[Path, str]:
-    """Return each manifest in `manifests` that turns `package`'s `feature` on
-    in every build reading that manifest, mapped to the entry that turns it on.
+    package: str, feature: str, tokens: list[str], root: Path = REPO
+) -> tuple[dict[Path, str], str | None]:
+    """Return each manifest in THIS COMMAND'S build that turns `package`'s
+    `feature` on in that build, mapped to the entry that turns it on, and the
+    finding for a `-p` package name no workspace member declares.
 
-    CRITERION: the manifest carries a dependency entry on `package` that names
-    `feature` in its `features` list and sets no `optional = true`. Cargo
-    resolves such an entry whenever it builds that manifest's own targets — for
-    a `[dev-dependencies]` entry, that package's test targets — so the
-    activation rests on no second condition this reader would have to
-    establish.
+    CRITERION: cargo, building this command, resolves a dependency entry that
+    names `feature` on `package` and sets no `optional = true`. Two facts
+    decide that, and this reader establishes both from the command rather than
+    assuming either: which packages the command SELECTS, whose test targets
+    cargo therefore builds (command_selected_manifests), and which manifests
+    each selection pulls into the build at all (test_build_manifests, the same
+    walk command_build_manifests runs). A `[dependencies]` or a
+    `[build-dependencies]` entry resolves in every build that compiles its
+    crate, so it counts on any manifest in the build. A `[dev-dependencies]`
+    entry resolves only when cargo builds that manifest's own test targets, so
+    it counts only on a SELECTED manifest — a crate the build reaches through
+    another crate's dependency closure has its dev sections skipped, and
+    counting one there would report an activator for a build that compiles no
+    test target of it.
+
+    That is why this reader takes the command rather than a manifest set: the
+    set alone cannot say which half a given manifest sits in, so a caller
+    handing one over would supply the missing condition silently.
 
     A `[features]` table value spelling `"{package}/{feature}"` is deliberately
     NOT counted, though testing_edge counts one: that value fires only when its
     own feature is enabled, which is the very question this reader answers.
     Counting it would let a feature attest to its own activation, which is the
     hole that made a positive control pass on a manifest no build read.
+
+    The second element carries command_selected_manifests's unresolvable-`-p`
+    finding, for the reason command_testing_edges states: an empty map is also
+    what a scanned-and-clean build returns, so a caller reading the map alone
+    could not tell a proven absence from a scan that never ran.
     """
+    selected, unresolved = command_selected_manifests(tokens, root)
+    if unresolved is not None:
+        return {}, (
+            f"no workspace member is named {unresolved}, so no manifest "
+            f"scan can prove `{package}/{feature}` on or off for its build"
+        )
+    builds_test_targets = {manifest.resolve() for manifest in selected}
+    manifests: set[Path] = set()
+    for manifest in selected:
+        manifests |= test_build_manifests(manifest, root)
     found: dict[Path, str] = {}
     for manifest in sorted(manifests):
         document = tomllib.loads(manifest.read_text())
         inherited, _ = workspace_dependency_specs(manifest)
         tables = [
-            (section, document.get(section) or {})
+            (section, section == "dev-dependencies", document.get(section) or {})
             for section in DEPENDENCY_SECTIONS
         ]
         for cfg, target in (document.get("target") or {}).items():
             tables += [
-                (f"target.{cfg}.{section}", target.get(section) or {})
+                (
+                    f"target.{cfg}.{section}",
+                    section == "dev-dependencies",
+                    target.get(section) or {},
+                )
                 for section in DEPENDENCY_SECTIONS
             ]
-        for section, table in tables:
+        for section, is_dev, table in tables:
+            if is_dev and manifest.resolve() not in builds_test_targets:
+                continue
             for name, spec in table.items():
                 if not isinstance(spec, dict):
                     continue
@@ -1819,7 +1862,7 @@ def unconditional_feature_activators(
                         f"{manifest} [{section}] `{name}` names "
                         f"`{feature}` in its `features` list"
                     )
-    return found
+    return found, None
 
 
 def member_manifests(root: Path) -> dict[str, Path]:
@@ -1877,6 +1920,39 @@ def test_build_manifests(manifest: Path, root: Path) -> set[Path]:
     return manifests
 
 
+def command_selected_manifests(
+    tokens: list[str], root: Path = REPO
+) -> tuple[list[Path], str | None]:
+    """Return the manifest of every package this command SELECTS, and the first
+    `-p` package name no workspace member declares.
+
+    A selected package is one whose own targets cargo builds, test targets
+    included — which is the distinction command_build_manifests erases: that
+    reader adds each selected package's dev-dependencies and their no-dev
+    closures, and cargo builds no test target for a crate it reaches that way.
+    A caller whose question turns on whether a manifest's `[dev-dependencies]`
+    resolve reads this list; a caller asking only which crates get compiled
+    reads command_build_manifests.
+
+    `--workspace`/`--all` selects every non-excluded member, and `-p` selects
+    each named package. An unresolvable `-p` name comes back as the second
+    element with an empty list.
+    """
+    members = member_manifests(root)
+    if {"--workspace", "--all"} & set(tokens):
+        return [
+            manifest
+            for name, manifest in members.items()
+            if name not in command_excludes(tokens)
+        ], None
+    selected: list[Path] = []
+    for name in sorted(command_packages(tokens)):
+        if name not in members:
+            return [], name
+        selected.append(members[name])
+    return selected, None
+
+
 def command_build_manifests(
     tokens: list[str], root: Path = REPO
 ) -> tuple[set[Path], str | None]:
@@ -1890,19 +1966,9 @@ def command_build_manifests(
     element with an empty manifest set, so each caller reports it as its own
     finding rather than scanning a build it could not resolve.
     """
-    members = member_manifests(root)
-    if {"--workspace", "--all"} & set(tokens):
-        selected = [
-            manifest
-            for name, manifest in members.items()
-            if name not in command_excludes(tokens)
-        ]
-    else:
-        selected = []
-        for name in sorted(command_packages(tokens)):
-            if name not in members:
-                return set(), name
-            selected.append(members[name])
+    selected, unresolved = command_selected_manifests(tokens, root)
+    if unresolved is not None:
+        return set(), unresolved
     manifests: set[Path] = set()
     for manifest in selected:
         manifests |= test_build_manifests(manifest, root)
@@ -2225,8 +2291,9 @@ def check_shipped_assertion_readers() -> None:
 
 
 def write_unification_fixture(root: Path) -> None:
-    """Write a five-crate workspace holding each spelling of a manifest edge
-    that turns a sibling's `testing` feature on.
+    """Write an eight-crate workspace holding each spelling of a manifest edge
+    that turns a sibling's `testing` feature on, plus the pair that separates a
+    dev-dependency cargo resolves from one it never reads.
 
     leaf     declares the feature and no dependencies.
     enabler  depends on leaf with `features = ["testing"]` — the
@@ -2246,10 +2313,22 @@ def write_unification_fixture(root: Path) -> None:
     selfdev  dev-depends on itself with `features = ["testing"]`, the spelling
              crates/scp-dht/Cargo.toml uses to turn its own feature on in its
              tests.
+    gadget   declares `gated` and no dependencies.
+    devholder
+             dev-depends on gadget with `features = ["gated"]`. Cargo resolves
+             that entry when it builds devholder's own test targets and never
+             when it builds devholder as a library.
+    devuser  depends on devholder, so a `-p devuser` build reads devholder's
+             manifest and compiles no test target of it. The pair is what
+             separates unconditional_feature_activators's two halves: the
+             manifest set a build reads, and the subset whose test targets it
+             builds. A reader that counted a dev section on every manifest in
+             the set would name devholder an activator for devuser's build.
     """
     (root / "Cargo.toml").write_text(
         "[workspace]\n"
-        'members = ["leaf", "enabler", "implier", "middle", "selfdev"]\n'
+        'members = ["leaf", "enabler", "implier", "middle", "selfdev", '
+        '"gadget", "devholder", "devuser"]\n'
     )
     bodies = {
         "leaf": "[features]\ntesting = []\n",
@@ -2268,6 +2347,12 @@ def write_unification_fixture(root: Path) -> None:
             "[dev-dependencies]\n"
             'selfdev = { path = ".", features = ["testing"] }\n'
         ),
+        "gadget": "[features]\ngated = []\n",
+        "devholder": (
+            "[dev-dependencies]\n"
+            'gadget = { path = "../gadget", features = ["gated"] }\n'
+        ),
+        "devuser": '[dependencies]\ndevholder = { path = "../devholder" }\n',
     }
     for name, body in bodies.items():
         (root / name).mkdir(parents=True)
@@ -2389,13 +2474,12 @@ def check_testing_unification_readers() -> None:
             "caller cannot read a proven absence out of a scan that never ran "
             "unless this reader hands back the finding beside it",
         )
-        fixture_manifests, _ = command_build_manifests(workspace, root)
         check(
             "a self dev-dependency naming a feature activates it",
             set(
                 unconditional_feature_activators(
-                    "selfdev", "testing", fixture_manifests
-                )
+                    "selfdev", "testing", workspace, root
+                )[0]
             )
             == {(root / "selfdev" / "Cargo.toml").resolve()},
             "selfdev's own `[dev-dependencies]` entry names `testing`, which "
@@ -2404,21 +2488,57 @@ def check_testing_unification_readers() -> None:
         check(
             "a feature no dependency entry names activates nothing",
             unconditional_feature_activators(
-                "implier", "helpers", fixture_manifests
-            )
+                "implier", "helpers", workspace, root
+            )[0]
             == {},
             "implier declares `helpers` and no manifest in this workspace "
             "turns it on, so a reader that answered otherwise would let a "
             "positive control pass on a feature no build enables",
+        )
+        check(
+            "a dev-dependency counts for the build that compiles its tests",
+            set(
+                unconditional_feature_activators(
+                    "gadget",
+                    "gated",
+                    split_command("cargo test -p devholder"),
+                    root,
+                )[0]
+            )
+            == {(root / "devholder" / "Cargo.toml").resolve()},
+            "`cargo test -p devholder` compiles devholder's test targets, so "
+            "cargo resolves the `[dev-dependencies]` entry naming "
+            "`gadget/gated`",
+        )
+        check(
+            "a dev-dependency reached through a closure activates nothing",
+            unconditional_feature_activators(
+                "gadget", "gated", split_command("cargo test -p devuser"), root
+            )[0]
+            == {},
+            "devuser's build reads devholder's manifest as a library "
+            "dependency and compiles no test target of it, so devholder's "
+            "`[dev-dependencies]` entry turns `gadget/gated` on in no build "
+            "this command runs — reporting it would attest a feature the "
+            "build never enables",
+        )
+        check(
+            "an unresolvable -p selection is a finding, not an empty answer",
+            unconditional_feature_activators(
+                "gadget", "gated", split_command("cargo test -p ghost"), root
+            )[1]
+            is not None,
+            "an empty map is also what a scanned-and-clean build returns, so "
+            "a caller reading the map alone could not tell a proven absence "
+            "from a scan that never ran",
         )
 
     # This repository is the live fixture for the defect this reader exists to
     # catch: the edge is real, and so is the lane that avoids it.
     live_edges, live_unresolved = command_testing_edges(workspace, "scp-identity")
     scp_testing_manifest = REPO / "crates" / "scp-testing" / "Cargo.toml"
-    live_manifests, _ = command_build_manifests(workspace)
-    helpers_activators = unconditional_feature_activators(
-        "scp-testing", "helpers", live_manifests
+    helpers_activators, helpers_unresolved = unconditional_feature_activators(
+        "scp-testing", "helpers", workspace
     )
     # Two facts make the premise true, and testing_edge answers only the first:
     # crates/scp-testing/Cargo.toml's `helpers` feature names
@@ -2429,22 +2549,24 @@ def check_testing_unification_readers() -> None:
     # that enables `helpers` — it would read the surviving string and report a
     # property the workspace no longer has.
     #
-    # command_testing_edges hands its unresolvable-`-p` finding to every caller,
-    # and this caller reports it as the first conjunct rather than as a check of
-    # its own. command_build_manifests returns that finding only from the branch
-    # a command naming neither `--workspace` nor `--all` takes, and `workspace`
-    # above is a literal naming `--workspace`, so a check reading that conjunct
-    # alone would print ok on every state this repository can reach — one green
-    # line carrying no coverage, which is the class
-    # .docs/lessons/a-green-check-that-asserted-nothing.md names. The two
-    # `cargo test -p ghost` controls over the fixture workspace above are what
-    # hold both readers to reporting an unresolvable selection.
+    # command_testing_edges and unconditional_feature_activators each hand their
+    # unresolvable-`-p` finding to every caller, and this caller reports both as
+    # conjuncts rather than as checks of their own. Each reader returns that
+    # finding only from the branch a command naming neither `--workspace` nor
+    # `--all` takes, and `workspace` above is a literal naming `--workspace`, so
+    # a check reading either conjunct alone would print ok on every state this
+    # repository can reach — one green line carrying no coverage, which is the
+    # class .docs/lessons/a-green-check-that-asserted-nothing.md names. The
+    # three `cargo test -p ghost` controls over the fixture workspace above are
+    # what hold both readers to reporting an unresolvable selection.
     check(
         "a workspace build turns scp-identity/testing on through scp-testing",
         live_unresolved is None
+        and helpers_unresolved is None
         and scp_testing_manifest in live_edges
         and bool(helpers_activators),
-        f"got selection finding {live_unresolved!r}, edges "
+        f"got selection findings {live_unresolved!r} and "
+        f"{helpers_unresolved!r}, edges "
         f"{sorted(str(manifest) for manifest in live_edges)} and "
         f"`helpers` activators {sorted(helpers_activators.values())} — "
         f"crates/scp-testing/Cargo.toml gives its `helpers` feature the value "
