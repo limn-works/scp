@@ -1528,9 +1528,11 @@ jobs:
           push: false
           # Read the cache everywhere; write it only from a push to `main`. A cache
           # written on a pull-request ref is readable only by that pull request, and it
-          # would evict entries from the 10 GB budget the 24 `Swatinem/rust-cache` steps
-          # in this workflow share. `ignore-error` so a cache-service failure cannot fail
-          # the build check: this job answers whether the image builds.
+          # would evict entries from the 10 GB repository cap that the 21
+          # `Swatinem/rust-cache` steps in this workflow and the 3 in
+          # `.github/workflows/fuzz.yml` share. `ignore-error` so a cache-service
+          # failure cannot fail the build check: this job answers whether the image
+          # builds.
           cache-from: type=gha,scope=docker-image
           cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=docker-image,ignore-error=true' || '' }}
 
