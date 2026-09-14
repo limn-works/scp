@@ -85,7 +85,7 @@ Most doc generators can be run locally:
 ```bash
 # Rust. Job `rust-doc` in ci.yml runs this command, and a merge waits on it.
 # Four intra-doc links in crates/scp-node name items that exist only under the
-# testing features it lists, so a run omitting the list exits 101 over those four.
+# features it lists, so a run omitting the list exits 101 over those four.
 # The two scp-transport members compile native/postgres_blob.rs and
 # native/s3_blob.rs, which a --workspace resolution leaves out because scp-node
 # and scp-relay put both behind their off-by-default cloud-blobs feature.
