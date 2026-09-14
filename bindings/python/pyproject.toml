@@ -62,7 +62,7 @@ warn_return_any = true
 warn_unused_configs = true
 
 [tool.maturin]
-features = ["extension-module"]
+features = ["extension-module", "vendored-openssl"]
 manifest-path = "../../crates/scp-ffi/Cargo.toml"
 module-name = "scp_sdk._scp_core"
 python-source = "."

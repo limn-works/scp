@@ -191,6 +191,7 @@ scp-ffi-uniffi/server
 scp-ffi/default
 scp-ffi/extension-module
 scp-ffi/server
+scp-ffi/vendored-openssl
 scp-identity/default
 scp-identity/production-dht
 scp-mcp/default
@@ -204,6 +205,7 @@ scp-platform/in-memory-push
 scp-platform/in-memory-storage
 scp-platform/software_platform
 scp-platform/sqlite
+scp-platform/vendored-openssl
 scp-protocol/default
 scp-relay-client/default
 scp-runtime/default
@@ -235,7 +237,7 @@ EOF
 # build — the Dockerfile
 # `cargo build --release -p scp-relay -p scp-node`, a
 # `.github/workflows/release.yml` `cargo publish` step, `maturin`'s
-# `--manifest-path crates/scp-ffi/Cargo.toml` wheel build, and a
+# `working-directory: bindings/python` wheel build, and a
 # `.github/workflows/build-matrix.yml` "Build shipped bridge artifacts" step,
 # which builds one package per invocation into `target-shipped` so its uploaded
 # cdylibs resolve those same per-package sets these entries name. Three
@@ -250,9 +252,17 @@ EOF
 # because the maturin step in build-matrix.yml passes no `--features` and
 # maturin takes the wheel's cargo feature list from that table, and fails
 # unless ARTIFACTS carries the exact configuration that table selects. Today
-# that table selects `extension-module`, a pyo3-only feature that changes no
-# SCP-crate edge, and the `scp-ffi|--features extension-module` entry below is
-# the wheel's configuration.
+# that table selects `extension-module`, which activates pyo3's
+# `extension-module` and `abi3-py310` and changes no SCP-crate edge, and
+# `vendored-openssl`, which reaches `scp-platform/vendored-openssl` and from
+# there adds `rusqlite/bundled-sqlcipher-vendored-openssl`. Neither nullifies a
+# security property: the first two select a Python linkage and ABI, and the
+# third compiles the same SQLCipher against an OpenSSL this build produced
+# rather than one the host supplies. The
+# `scp-ffi|--features extension-module,vendored-openssl` entry below is the
+# wheel's configuration, and `scripts/check-vendored-openssl-scope.sh` holds
+# the complementary property this gate does not read — that `openssl-src`
+# reaches the wheel and reaches no other shipped artifact.
 #
 # uniffi-bindgen (the third workspace `[[bin]]`, in `crates/scp-ffi/uniffi`) is
 # deliberately NOT a separate ARTIFACTS entry: it is a build-time code-generation
@@ -284,7 +294,7 @@ ARTIFACTS=(
   # `assert_wheel_feature_selection_is_gated` fails when the string it derives
   # is not in this list, so an edit to that table changes what this gate
   # resolves or fails the gate.
-  "scp-ffi|--features extension-module"
+  "scp-ffi|--features extension-module,vendored-openssl"
 )
 
 # ---------------------------------------------------------------------------
@@ -301,10 +311,16 @@ SHIPPING_FILES=(
 # Maturin project files: every pyproject.toml whose `[tool.maturin]` table
 # maturin can read when a shipping file runs it. maturin reads the pyproject.toml
 # of its working directory when one exists, and otherwise the one beside the
-# Cargo.toml its `--manifest-path` names, so both files below are inputs of the
-# wheel build: build-matrix.yml runs maturin with
-# `working-directory: bindings/python` and `--manifest-path
-# crates/scp-ffi/Cargo.toml`. That table's `features`, `all-features`, and
+# Cargo.toml its `--manifest-path` names. build-matrix.yml runs maturin with
+# `working-directory: bindings/python` and passes no `--manifest-path`, because
+# `bindings/python/pyproject.toml` carries a `[tool.maturin] manifest-path` key,
+# so that one file is the wheel build's only input. `crates/scp-ffi/pyproject.toml`
+# sat in this list while the maturin step still passed `--manifest-path
+# crates/scp-ffi/Cargo.toml`; the step no longer does, and
+# `assert_maturin_project_files_are_complete` fails on the stale entry rather than
+# leaving a reader to notice. Restoring that argument, or adding any other line a
+# shipping file runs maturin from, fails the same assertion until this list names
+# the pyproject.toml the new line reaches. That table's `features`, `all-features`, and
 # `no-default-features` keys select the wheel's cargo features, and the maturin
 # step passes no `--features` of its own, so a `testing` entry added to either
 # table compiles `scp-platform/testing`, `scp-dht/testing`, and `scp-testing`
@@ -318,7 +334,6 @@ SHIPPING_FILES=(
 # ---------------------------------------------------------------------------
 MATURIN_PROJECT_FILES=(
   "bindings/python/pyproject.toml"
-  "crates/scp-ffi/pyproject.toml"
 )
 
 # Every line of a SHIPPING_FILES file that lines_carrying_cargo_feature_selection

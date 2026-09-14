@@ -50,6 +50,26 @@ apple = ["dep:rusqlite", "dep:hex", "dep:fs2"]
 # of the Argon2id parameterization. `fs2` provides advisory file locking for
 # the per-database salt sidecar (fail-closed on lock contention).
 sqlite = ["dep:rusqlite", "dep:hex", "dep:argon2", "dep:rand", "dep:fs2"]
+# Compile OpenSSL from source into SQLCipher instead of linking the host's
+# libcrypto. Exactly one shipped artifact selects this: the PyPI wheel, whose
+# `[tool.maturin] features` list in `bindings/python/pyproject.toml` names
+# `scp-ffi/vendored-openssl`, because a wheel installs onto a machine whose
+# OpenSSL this build never saw and a `pip install` runs no linker.
+#
+# WHY EVERY OTHER ARTIFACT LEAVES IT OFF. `openssl-sys/vendored` statically links
+# the OpenSSL that `Cargo.lock` pins, so the patch level of the crypto inside a
+# binary changes only when someone bumps that lockfile. The `scp-relay` and
+# `scp-node` binaries ship in a container whose operator patches OpenSSL by
+# upgrading `libssl3` in the runtime layer, and `Dockerfile` and
+# `templates/personal-relay/README.md` both state that dynamic link as the reason
+# they install `libssl3`. `scripts/check-vendored-openssl-scope.sh` fails when
+# `openssl-src` enters the shipped dependency graph of either binary or of any of
+# the three FFI bridges in their shipped configurations.
+#
+# `rusqlite?/` rather than `rusqlite/`: this feature adds a build mode to a
+# SQLCipher that some other feature already asked for, and never pulls rusqlite
+# into a build that enabled neither `sqlite` nor `apple`.
+vendored-openssl = ["rusqlite?/bundled-sqlcipher-vendored-openssl"]
 # Encrypted file-backed key custody (Argon2id + AES-256-GCM).
 # Universal fallback for non-HSM platforms. See GitHub issue #391.
 file = ["software_platform", "dep:aes-gcm", "dep:argon2"]
@@ -93,7 +113,7 @@ uuid = { workspace = true, optional = true }
 scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2", optional = true }
 
 # sqlite dependencies, gated behind the `sqlite` feature flag.
-rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"], optional = true }
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher"], optional = true }
 hex = { workspace = true, optional = true }
 # fs2 provides advisory POSIX / Windows file locking — used by SqliteStorage
 # to refuse a second process/instance trying to open the same database

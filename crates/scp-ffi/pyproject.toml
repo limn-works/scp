@@ -6,7 +6,11 @@ build-backend = "maturin"
 name = "scp-python"
 version = "0.1.0"
 description = "SCP (Shared Context Protocol) Python SDK — cryptographic identity, governed contexts, and trust for AI agents"
-requires-python = ">=3.9"
+# `extension-module` activates `pyo3/abi3-py310`, so the cdylib a maturin run from
+# this directory produces uses CPython's stable ABI as of 3.10 and loads on no
+# earlier interpreter. `bindings/python/pyproject.toml` is the project file every
+# published wheel is built from and declares the same floor.
+requires-python = ">=3.10"
 license = { text = "MIT OR Apache-2.0" }
 
 [tool.maturin]

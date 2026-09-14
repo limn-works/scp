@@ -416,6 +416,21 @@ jobs:
       - name: G1 — shipped-feature-graph ⊆ permitted-production allowlist (ZERO-nullifier mandate)
         run: bash scripts/check-shipped-feature-graph.sh
 
+  vendored-openssl-scope:
+    needs: check-draft
+    name: Vendored-OpenSSL scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: false
+      - name: openssl-src reaches the PyPI wheel and no other shipped artifact
+        run: bash scripts/check-vendored-openssl-scope.sh
+
   # ── Cross-layer ──────────────────────────────────────────────────────
   cross-layer:
     needs: check-draft
@@ -2352,6 +2367,7 @@ jobs:
       - changes
       - error-codes
       - shipped-feature-graph
+      - vendored-openssl-scope
       - fail-closed-pre-rotation
       - cross-layer
       - bridge-symmetry
