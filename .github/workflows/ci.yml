@@ -933,6 +933,21 @@ jobs:
           # udp/coap alongside ring-backed quic/http3), so a single combined
           # invocation covers all four.
           cargo clippy -p scp-transport --features quic,http3,udp,coap --all-targets -- -D warnings
+          # The PostgreSQL and S3 blob backends left the sweep above for the
+          # same reason: scp-node and scp-relay put them behind an
+          # off-by-default `cloud-blobs` feature, so --workspace resolves
+          # scp-transport without `postgres-blob` or `s3-blob` and compiles
+          # neither postgres_blob.rs nor s3_blob.rs nor the two arms of
+          # storage_from_env that construct them. Nothing else in this
+          # repository lints them: no workflow passes --all-features, and the
+          # only other clippy commands are the sweep above, the quic line above,
+          # and release.yml's post-tag `--workspace` run, none of which resolves
+          # either feature. Clippy is the only tool that reads the workspace's
+          # `unwrap_used`/`panic`/`todo` denials, so without this line those
+          # 2,187 lines stop being read by the Rust half of the stub policy. The
+          # feature list is the one an operator ships with
+          # `--features cloud-blobs`.
+          cargo clippy -p scp-transport --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob --all-targets -- -D warnings
 
   # This job runs `cargo nextest run --workspace`, so a merge gate rests on it.
   # It gates on `rust` at job level, never at step level. It carried seven
@@ -1130,11 +1145,18 @@ jobs:
           # `cloud-blobs` feature of scp-node and scp-relay, so --workspace no
           # longer compiles postgres_blob.rs, s3_blob.rs, or the two arms of
           # storage_from_env that construct them. Those files are now in the
-          # same class as the quic line above, and nothing else in CI reaches
-          # them: the workflows that also lost them (build-matrix.yml, docs.yml,
-          # release.yml) run after merge, so this job is the merge gate for that
-          # code.
+          # same class as the quic line above, and that class is covered by one
+          # command per dimension, not by one command: the `rust-clippy` job
+          # carries the matching `cargo clippy -p scp-transport` line, and the
+          # doctest line below carries the doctests, which cargo-nextest does
+          # not run. This line is the unit- and integration-test dimension.
           cargo nextest run -p scp-transport --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob
+          # cargo-nextest runs no doctests, so the `rust,no_run` snippet at the
+          # head of postgres_blob.rs — which calls PostgresBlobStore::open —
+          # left CI with the workspace resolution that used to compile it. The
+          # `cargo test --workspace --doc` command in the `rust-doc` job no
+          # longer reaches either module.
+          cargo test -p scp-transport --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob --doc
           # scp-relay's three backend-selection tests each assert one of two
           # outcomes, chosen by whether this build compiled the arm. Every other
           # invocation reaches their not-compiled half; this one reaches the

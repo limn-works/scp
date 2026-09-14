@@ -29,14 +29,20 @@ use std::process::Command;
 /// turn on `scp-transport/postgres-blob`, and cargo unifies `scp-transport`'s
 /// features across every package a single invocation builds, so another package
 /// in the same build can enable that feature while `scp-relay/cloud-blobs`
-/// stays off. `VALID_BACKENDS` is assembled from the same `cfg` reads that gate
-/// the arms, and this test binary links the same `scp-transport` the relay
-/// binary links, so the answer here is the relay's behaviour rather than a
-/// proxy for it.
+/// stays off. `scp_transport::startup::backend_is_compiled` reads the `cfg!`
+/// flag that gates the arm, and this test binary links the same `scp-transport`
+/// the relay binary links, so the answer here is the relay's behaviour rather
+/// than a proxy for it.
+///
+/// It reads that flag rather than parsing `VALID_BACKENDS`, which is the
+/// constant the relay prints. Predicting the message out of the constant the
+/// message is assembled from would make `invalid_backend_exits_with_error`
+/// below compare `VALID_BACKENDS` against itself, and that comparison stays
+/// green through the exact regression that test's doc comment names: a
+/// `VALID_BACKENDS` reverted to the hardcoded `"sqlite, redb, postgres, s3,
+/// memory"` while the arms stay `cfg`-gated.
 fn backend_is_compiled(name: &str) -> bool {
-    scp_transport::startup::VALID_BACKENDS
-        .split(", ")
-        .any(|compiled| compiled == name)
+    scp_transport::startup::backend_is_compiled(name)
 }
 
 /// Returns the path to the compiled `scp-relay` binary.

@@ -223,10 +223,16 @@ EOF
 #   - Binaries (scp-node / scp-relay): built with DEFAULT features, so the
 #     feature-arg string is EMPTY. This matches the Dockerfile
 #     `cargo build --release -p scp-relay -p scp-node` and the `cargo publish`
-#     shipping config. NEITHER binary has a `server` feature (scp-node has no
-#     `default` block wiring one; scp-relay has no `[features]` table at all),
-#     so passing `--features server` here would ERROR — they are correctly gated
-#     with an empty feature-arg string, not with `--features server`.
+#     shipping config. NEITHER binary declares a `server` feature, and neither
+#     declares a `default` block that could wire one: scp-node's `[features]`
+#     table has no `default` key, and scp-relay's holds one entry,
+#     `cloud-blobs`, which a shipped build leaves off. So passing
+#     `--features server` here would ERROR — they are correctly gated with an
+#     empty feature-arg string, not with `--features server`. The absence of a
+#     `default` block is what makes the empty string the shipped resolution;
+#     the presence or absence of a `[features]` table decides nothing, so a new
+#     feature on either crate still needs its own judgement about whether a
+#     shipped build selects it.
 #
 # DRIFT, NOW ASSERTED RATHER THAN CAVEATED: each entry's build-invocation string
 # above must stay in lockstep with the actual shipped build config, and

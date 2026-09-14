@@ -213,6 +213,22 @@ pub const VALID_BACKENDS: &str = concat!(
     "memory"
 );
 
+/// Reports whether this build compiled the arm of [`storage_from_env`] that
+/// constructs `name`, for a caller that has to predict which of two outcomes a
+/// binary linking this crate will produce.
+///
+/// This reads the `compiled` column of [`BACKENDS`], which is a [`cfg!`] read
+/// of the same feature that gates the arm. It deliberately does not parse
+/// [`VALID_BACKENDS`]: a test that compared a binary's diagnostic against a
+/// prediction parsed out of the very constant that diagnostic is built from
+/// would assert a tautology, and would stay green through a revert of
+/// `VALID_BACKENDS` to the hardcoded list that named backends a default build
+/// cannot construct.
+#[must_use]
+pub fn backend_is_compiled(name: &str) -> bool {
+    BACKENDS.iter().any(|b| b.name == name && b.compiled)
+}
+
 /// Writes the message [`storage_from_env`] prints before it exits, for a
 /// `SCP_RELAY_STORAGE_BACKEND` value it will not construct.
 ///
@@ -486,7 +502,7 @@ pub async fn start_relay_from_env() -> (
 
 #[cfg(test)]
 mod tests {
-    use super::{BACKENDS, VALID_BACKENDS, reject_backend_message};
+    use super::{BACKENDS, VALID_BACKENDS, backend_is_compiled, reject_backend_message};
 
     /// A value naming no backend reads as a typo, and the message lists what
     /// this build accepts instead of naming a rebuild.
@@ -541,8 +557,13 @@ mod tests {
         assert_eq!(VALID_BACKENDS, from_table);
     }
 
-    /// Every row of the table matches an arm of `storage_from_env`, so the two
-    /// diagnostics and the constructor agree on what a value means.
+    /// No two rows of the table claim the same name, and the set of rows is the
+    /// one this module was written against.
+    ///
+    /// This compares the table against a literal, so it fails when a row is
+    /// added or dropped and says nothing about the arms of
+    /// [`storage_from_env`]. `every_constructor_arm_has_a_table_row` below is
+    /// what ties the two together.
     #[test]
     fn every_table_row_names_a_distinct_backend() {
         let mut names: Vec<&str> = BACKENDS.iter().map(|b| b.name).collect();
@@ -554,6 +575,92 @@ mod tests {
             names,
             ["memory", "postgres", "redb", "s3", "sqlite"],
             "BACKENDS must name every value storage_from_env matches on"
+        );
+    }
+
+    /// The arms of [`storage_from_env`] and the rows of [`BACKENDS`] name the
+    /// same set of values.
+    ///
+    /// The test above compares the table against a literal, so it catches a row
+    /// added without an arm and cannot catch an arm added without a row. That
+    /// second direction reproduces the defect this module exists to remove: a
+    /// `match` arm no row names is a backend [`reject_backend_message`] reports
+    /// as unknown rather than as uncompiled, so an operator who asked for a real
+    /// backend is told the value names nothing and is handed no feature to
+    /// rebuild with.
+    ///
+    /// The scan reads this file's own text, so it sees every arm whatever
+    /// features this build enabled: a `cfg` attribute removes an arm from the
+    /// compiled match, never from the source.
+    #[test]
+    fn every_constructor_arm_has_a_table_row() {
+        let source = include_str!("startup.rs");
+        let dispatch = source
+            .split_once("    match backend.as_str() {")
+            .map(|(_, rest)| rest);
+        assert!(
+            dispatch.is_some(),
+            "storage_from_env no longer dispatches on `match backend.as_str()`, \
+             so this scan reads nothing"
+        );
+        let body = dispatch
+            .unwrap_or_default()
+            .split_once("\n        other =>")
+            .map(|(head, _)| head);
+        assert!(
+            body.is_some(),
+            "the dispatch no longer ends in a catch-all `other` arm, so this \
+             scan has no end marker"
+        );
+        let body = body.unwrap_or_default();
+
+        let mut arms: Vec<&str> = body
+            .lines()
+            .filter_map(|line| line.trim_start().strip_prefix('"'))
+            .filter_map(|rest| rest.split_once("\" =>"))
+            .map(|(name, _)| name)
+            .collect();
+        assert!(
+            !arms.is_empty(),
+            "the scan matched no arm, so it would pass over any drift"
+        );
+
+        let mut rows: Vec<&str> = BACKENDS.iter().map(|b| b.name).collect();
+        arms.sort_unstable();
+        rows.sort_unstable();
+        assert_eq!(
+            arms, rows,
+            "every arm of storage_from_env needs a BACKENDS row and every row \
+             needs an arm; an arm with no row reports as an unknown backend"
+        );
+    }
+
+    /// [`backend_is_compiled`] answers from the `cfg!` reads in [`BACKENDS`],
+    /// not from [`VALID_BACKENDS`].
+    ///
+    /// That is what makes `scp-relay`'s `invalid_backend_exits_with_error` a
+    /// comparison between the binary's message and this build's features. A
+    /// predicate that parsed `VALID_BACKENDS` would make that test compare the
+    /// constant against itself, which stays green through a revert of the
+    /// constant to a hardcoded list.
+    #[test]
+    fn the_compiled_predicate_answers_from_the_features() {
+        for (name, enabled) in [
+            ("sqlite", cfg!(feature = "sqlite-blob")),
+            ("redb", cfg!(feature = "redb-blob")),
+            ("postgres", cfg!(feature = "postgres-blob")),
+            ("s3", cfg!(feature = "s3-blob")),
+            ("memory", true),
+        ] {
+            assert_eq!(
+                backend_is_compiled(name),
+                enabled,
+                "'{name}' is compiled in exactly when its feature is enabled"
+            );
+        }
+        assert!(
+            !backend_is_compiled("banana"),
+            "a value naming no backend is not compiled in"
         );
     }
 

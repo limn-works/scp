@@ -410,7 +410,11 @@ pub struct NodeConfig<
     /// boundary. [`BlobStorageBackend::in_memory`] is a durability-only
     /// development arm (SCP-CAPSEL-8010/8011) — legitimately selectable here, but
     /// only ever by explicit choice, never by omission. Production nodes select a
-    /// durable backend (Sqlite/redb/Postgres/S3; see spec §17.7).
+    /// durable backend (see spec §17.7). `Sqlite` and `Redb` exist in every
+    /// build of this crate; the `Postgres` and `S3` variants exist only in a
+    /// build that enables this crate's `cloud-blobs` feature, which is off by
+    /// default, so a consumer naming either variant without it gets a
+    /// no-such-variant error rather than a runtime fallback.
     pub blob_storage: BlobStorageBackend,
 }
 
