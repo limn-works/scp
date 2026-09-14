@@ -21,11 +21,14 @@ scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
 scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
 scp-identity = { path = "../scp-identity", version = "=0.1.0-beta.2", features = ["production-dht"] }
 scp-dht = { path = "../scp-dht", version = "=0.1.0-beta.2", features = ["production-dht"] }
+# `sqlite-blob` is ungated on purpose. §17.17 of the persistence spec requires a
+# shipped relay to retain a durable blob backend, and `build_host_site_node`
+# calls `BlobStorageBackend::sqlite` unconditionally, so every `host_site()`
+# consumer funnels through it. The two cloud backends sit behind `cloud-blobs`
+# below instead.
 scp-transport = { path = "../scp-transport", version = "=0.1.0-beta.2", features = [
     "sqlite-blob",
     "redb-blob",
-    "postgres-blob",
-    "s3-blob",
     "startup",
 ] }
 # Durability-only + real backends ONLY (ADR-062 §Decision 6). `testing` is NO
@@ -132,6 +135,16 @@ allow_unencrypted_storage = ["scp-core/allow_unencrypted_storage"]
 # a shipped node build never enables it, so an in-memory DHT nullifier is absent
 # from shipped artifacts.
 testing = ["scp-dht/testing", "scp-platform/testing", "allow_unencrypted_storage"]
+# The two cloud blob backends, OFF by default. Enabling `postgres-blob` and
+# `s3-blob` unconditionally resolved 78 extra crates into every artifact that
+# depends on this one — 23 of them `aws-*`, which is every `aws-*` crate in the
+# workspace graph — although no code in this crate constructs either backend:
+# `storage_from_env` in `scp-transport` is their only caller, and it reaches
+# them only when an operator sets `SCP_RELAY_STORAGE_BACKEND=postgres` or `=s3`.
+# A build that leaves this feature off rejects those two values with a typed
+# "not compiled in" diagnostic naming this feature, rather than falling back to
+# another backend. `sqlite`, `redb` and `memory` are unaffected.
+cloud-blobs = ["scp-transport/postgres-blob", "scp-transport/s3-blob"]
 quic = ["scp-transport/quic", "dep:quinn"]
 http3 = ["scp-transport/http3"]
 udp = ["scp-transport/udp"]

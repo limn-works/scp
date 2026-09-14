@@ -75,31 +75,162 @@ pub fn relay_config_from_env() -> RelayConfig {
 // Blob storage backend from environment
 // ---------------------------------------------------------------------------
 
-/// Valid backend names for error messages.
-pub const VALID_BACKENDS: &str = "sqlite, redb, postgres, s3, memory";
+/// One row of [`BACKENDS`]: a value an operator can write into
+/// `SCP_RELAY_STORAGE_BACKEND`, and what it takes to compile the arm of
+/// [`storage_from_env`] that constructs it.
+struct Backend {
+    /// The value an operator writes into `SCP_RELAY_STORAGE_BACKEND`.
+    name: &'static str,
+    /// The `scp-transport` feature that compiles this backend's arm, or `None`
+    /// for an arm no feature gates.
+    transport_feature: Option<&'static str>,
+    /// Whether this build enabled that feature.
+    compiled: bool,
+    /// The `scp-node` / `scp-relay` feature an operator enables to get
+    /// `transport_feature`, or `None` when no binary feature gates it. This
+    /// module compiles only under `startup`, which `scp-node` and `scp-relay`
+    /// are the only two crates to enable, so naming their feature here tells a
+    /// reader of the diagnostic what to pass to `cargo build`.
+    binary_feature: Option<&'static str>,
+}
+
+/// Every value [`storage_from_env`] recognizes, paired with whether this build
+/// compiled the arm that constructs it.
+///
+/// [`storage_from_env`] gates each arm on the `transport_feature` named here
+/// and `compiled` reads the same feature through [`cfg!`], so a row reads as
+/// compiled-in exactly when the arm exists. Both diagnostics derive from this
+/// table, which is why neither can name a backend the binary cannot construct.
+const BACKENDS: &[Backend] = &[
+    Backend {
+        name: "sqlite",
+        transport_feature: Some("sqlite-blob"),
+        compiled: cfg!(feature = "sqlite-blob"),
+        binary_feature: None,
+    },
+    Backend {
+        name: "redb",
+        transport_feature: Some("redb-blob"),
+        compiled: cfg!(feature = "redb-blob"),
+        binary_feature: None,
+    },
+    Backend {
+        name: "postgres",
+        transport_feature: Some("postgres-blob"),
+        compiled: cfg!(feature = "postgres-blob"),
+        binary_feature: Some("cloud-blobs"),
+    },
+    Backend {
+        name: "s3",
+        transport_feature: Some("s3-blob"),
+        compiled: cfg!(feature = "s3-blob"),
+        binary_feature: Some("cloud-blobs"),
+    },
+    Backend {
+        name: "memory",
+        transport_feature: None,
+        compiled: true,
+        binary_feature: None,
+    },
+];
+
+/// The `SCP_RELAY_STORAGE_BACKEND` values this build can construct, comma
+/// separated, for diagnostics and help text.
+///
+/// A build that leaves `postgres-blob` and `s3-blob` off returns
+/// `"sqlite, redb, memory"`.
+#[must_use]
+pub fn compiled_backends() -> String {
+    BACKENDS
+        .iter()
+        .filter(|b| b.compiled)
+        .map(|b| b.name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Writes the message [`storage_from_env`] prints before it exits, for a
+/// `SCP_RELAY_STORAGE_BACKEND` value it will not construct.
+///
+/// The message separates two cases an operator has to tell apart:
+///
+/// - `requested` names no backend at all, so the operator mistyped a value and
+///   the message lists what this build accepts.
+/// - `requested` names a backend this build did not compile, so the operator
+///   wrote a real value and needs the cargo feature that compiles it.
+fn reject_backend_message(requested: &str) -> String {
+    let uncompiled = BACKENDS.iter().find(|b| b.name == requested && !b.compiled);
+
+    let Some(backend) = uncompiled else {
+        return format!(
+            "error: unknown storage backend '{requested}'. Valid options: {}",
+            compiled_backends()
+        );
+    };
+
+    let rebuild = match (backend.binary_feature, backend.transport_feature) {
+        (Some(binary), Some(transport)) => format!(
+            "Rebuild the binary with `--features {binary}`, which enables `scp-transport/{transport}`."
+        ),
+        (None, Some(transport)) => {
+            format!("Rebuild with `scp-transport/{transport}` enabled.")
+        }
+        (_, None) => String::from("Rebuild with that backend's cargo feature enabled."),
+    };
+
+    format!(
+        "error: storage backend '{requested}' is not compiled into this binary. \
+         {rebuild} Compiled-in options: {}",
+        compiled_backends()
+    )
+}
 
 /// Constructs the blob storage backend from environment configuration.
 ///
 /// Reads `SCP_RELAY_STORAGE_BACKEND` (default: `sqlite`) and delegates to the
-/// appropriate backend constructor. Calls [`std::process::exit`] on
-/// misconfiguration with a descriptive error naming the valid options.
+/// backend constructor that value names. On a value this build cannot
+/// construct, it prints the message [`reject_backend_message`] writes and calls
+/// [`std::process::exit`].
 ///
 /// # Storage backend selection
 ///
-/// | Value | Backend | Config env vars | Default |
+/// | Value | Backend | Config env vars | Compiled in by |
 /// |---|---|---|---|
-/// | `sqlite` | `SQLite` | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.db`) | **yes** |
-/// | `redb` | redb | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.redb`) | |
-/// | `postgres` | `PostgreSQL` | `SCP_RELAY_DATABASE_URL` (required) | |
-/// | `s3` | S3-compat | `SCP_RELAY_S3_BUCKET` (required) + AWS env | |
-/// | `memory` | In-memory | — | |
+/// | `sqlite` | `SQLite` | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.db`) | always; the default value |
+/// | `redb` | redb | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.redb`) | always |
+/// | `postgres` | `PostgreSQL` | `SCP_RELAY_DATABASE_URL` (required) | `cloud-blobs` |
+/// | `s3` | S3-compat | `SCP_RELAY_S3_BUCKET` (required) + AWS env | `cloud-blobs` |
+/// | `memory` | In-memory | — | always |
 ///
-/// # Panics
+/// # Exit codes
 ///
-/// Backend arms are compiled only when the corresponding feature is enabled
-/// (`sqlite-blob`, `redb-blob`, `postgres-blob`, `s3-blob`). If a backend
-/// is requested but the feature is not compiled in, the function prints an
-/// error and exits.
+/// Every failure path here exits the process with code 1 rather than returning,
+/// because a relay that cannot open its blob store has nothing to serve. The
+/// function exits when the requested backend names nothing, when it names a
+/// backend this build did not compile, when a required env var is absent, and
+/// when the backend constructor fails.
+///
+/// Each arm compiles only under its `scp-transport` feature (`sqlite-blob`,
+/// `redb-blob`, `postgres-blob`, `s3-blob`), and `scp-node` and `scp-relay`
+/// leave `postgres-blob` and `s3-blob` off unless a build passes
+/// `--features cloud-blobs`. A request for an uncompiled backend prints the
+/// feature to rebuild with; it never falls back to another backend.
+///
+/// The `postgres` and `s3` arms are the only ones that await, so a build that
+/// compiles neither leaves this function with nothing to await and
+/// `clippy::unused_async` fires. The attribute below silences the lint in
+/// exactly that configuration and nowhere else, which keeps the workspace's
+/// rule — an async function with no await justifies itself at every
+/// free-function site — answered here rather than waived. The signature keeps
+/// `async`: a `cloud-blobs` build does await inside it, and
+/// [`start_relay_from_env`] awaits the call either way.
+#[cfg_attr(
+    not(any(feature = "postgres-blob", feature = "s3-blob")),
+    expect(
+        clippy::unused_async,
+        reason = "the only two arms that await are compiled out of this build"
+    )
+)]
 pub async fn storage_from_env() -> BlobStorageBackend {
     let backend = env::var("SCP_RELAY_STORAGE_BACKEND")
         .unwrap_or_else(|_| "sqlite".to_owned())
@@ -168,7 +299,7 @@ pub async fn storage_from_env() -> BlobStorageBackend {
             BlobStorageBackend::in_memory()
         }
         other => {
-            eprintln!("error: unknown storage backend '{other}'. Valid options: {VALID_BACKENDS}");
+            eprintln!("{}", reject_backend_message(other));
             std::process::exit(1);
         }
     }
@@ -289,4 +420,111 @@ pub async fn start_relay_from_env() -> (
     tracing::info!(addr = %local_addr, "relay listening");
 
     (handle, local_addr, storage)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BACKENDS, compiled_backends, reject_backend_message};
+
+    /// A value naming no backend reads as a typo, and the message lists what
+    /// this build accepts instead of naming a rebuild.
+    #[test]
+    fn an_unrecognized_value_is_reported_as_unknown() {
+        let message = reject_backend_message("banana");
+        assert!(
+            message.contains("unknown storage backend 'banana'"),
+            "{message}"
+        );
+        assert!(!message.contains("not compiled"), "{message}");
+        assert!(message.contains("memory"), "{message}");
+    }
+
+    /// The options list names a backend exactly when this build compiled that
+    /// backend's arm. A hardcoded list — which this diagnostic carried until
+    /// `postgres-blob` and `s3-blob` stopped being unconditional — fails this
+    /// test on any build that leaves a backend feature off.
+    #[test]
+    fn the_options_list_names_every_compiled_backend_and_no_other() {
+        let listed = compiled_backends();
+        let names: Vec<&str> = listed.split(", ").collect();
+
+        for (name, enabled) in [
+            ("sqlite", cfg!(feature = "sqlite-blob")),
+            ("redb", cfg!(feature = "redb-blob")),
+            ("postgres", cfg!(feature = "postgres-blob")),
+            ("s3", cfg!(feature = "s3-blob")),
+            ("memory", true),
+        ] {
+            assert_eq!(
+                names.contains(&name),
+                enabled,
+                "'{name}' should appear in the options list exactly when its \
+                 feature is enabled; list was '{listed}'"
+            );
+        }
+    }
+
+    /// Every row of the table matches an arm of `storage_from_env`, so the two
+    /// diagnostics and the constructor agree on what a value means.
+    #[test]
+    fn every_table_row_names_a_distinct_backend() {
+        let mut names: Vec<&str> = BACKENDS.iter().map(|b| b.name).collect();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count, "duplicate backend name in BACKENDS");
+        assert_eq!(
+            names,
+            ["memory", "postgres", "redb", "s3", "sqlite"],
+            "BACKENDS must name every value storage_from_env matches on"
+        );
+    }
+
+    /// `postgres` is a real backend, so a build without `postgres-blob` must
+    /// say the arm is absent and name the feature that compiles it, rather than
+    /// calling the value unknown.
+    #[cfg(not(feature = "postgres-blob"))]
+    #[test]
+    fn an_uncompiled_postgres_names_the_feature_to_rebuild_with() {
+        let message = reject_backend_message("postgres");
+        assert!(
+            message.contains("'postgres' is not compiled into this binary"),
+            "{message}"
+        );
+        assert!(message.contains("--features cloud-blobs"), "{message}");
+        assert!(message.contains("scp-transport/postgres-blob"), "{message}");
+        assert!(!message.contains("unknown storage backend"), "{message}");
+        assert!(
+            !message.contains("Valid options"),
+            "an absent arm is not a typo; {message}"
+        );
+    }
+
+    /// The `s3` twin of the `postgres` case above.
+    #[cfg(not(feature = "s3-blob"))]
+    #[test]
+    fn an_uncompiled_s3_names_the_feature_to_rebuild_with() {
+        let message = reject_backend_message("s3");
+        assert!(
+            message.contains("'s3' is not compiled into this binary"),
+            "{message}"
+        );
+        assert!(message.contains("--features cloud-blobs"), "{message}");
+        assert!(message.contains("scp-transport/s3-blob"), "{message}");
+        assert!(!message.contains("unknown storage backend"), "{message}");
+    }
+
+    /// A build that compiled an arm never routes that value to either
+    /// diagnostic, so neither message may advertise a rebuild for it.
+    #[test]
+    fn a_compiled_backend_never_reads_as_absent() {
+        for backend in BACKENDS.iter().filter(|b| b.compiled) {
+            let message = reject_backend_message(backend.name);
+            assert!(
+                !message.contains("not compiled into this binary"),
+                "'{}' is compiled in; {message}",
+                backend.name
+            );
+        }
+    }
 }

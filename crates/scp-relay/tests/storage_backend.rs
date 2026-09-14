@@ -8,8 +8,36 @@
 //! - Invalid backend names produce a non-zero exit and descriptive error (AC 9)
 //! - `postgres` without `SCP_RELAY_DATABASE_URL` produces a non-zero exit (AC 10)
 //! - `s3` without `SCP_RELAY_S3_BUCKET` produces a non-zero exit (AC 6)
+//!
+//! The `postgres` and `s3` arms compile only when this crate's `cloud-blobs`
+//! feature — off by default — enables `scp-transport/postgres-blob` and
+//! `scp-transport/s3-blob`. Each test below that drives one of those two values
+//! therefore asserts one of two outcomes, chosen by [`backend_is_compiled`]:
+//! when the arm exists the relay reaches it and reports the env var the backend
+//! needs; when it does not, the relay reports that the arm is not compiled in
+//! and names the feature to rebuild with. Branching inside the test rather than
+//! gating the whole test out keeps every test running in every configuration
+//! CI builds.
 
 use std::process::Command;
+
+/// Reports whether this build compiled the `storage_from_env` arm that
+/// constructs `name`.
+///
+/// This reads `scp-transport`'s resolved features rather than `scp-relay`'s
+/// `cloud-blobs`, because the two can disagree. `cloud-blobs` is one way to
+/// turn on `scp-transport/postgres-blob`, and cargo unifies `scp-transport`'s
+/// features across every package a single invocation builds, so another package
+/// in the same build can enable that feature while `scp-relay/cloud-blobs`
+/// stays off. `compiled_backends` derives its answer from the same `cfg!`
+/// reads that gate the arms, and this test binary links the same
+/// `scp-transport` the relay binary links, so the answer here is the relay's
+/// behaviour rather than a proxy for it.
+fn backend_is_compiled(name: &str) -> bool {
+    scp_transport::startup::compiled_backends()
+        .split(", ")
+        .any(|compiled| compiled == name)
+}
 
 /// Returns the path to the compiled `scp-relay` binary.
 ///
@@ -25,6 +53,11 @@ fn relay_bin() -> std::path::PathBuf {
 
 /// AC 9: An invalid backend value causes a non-zero exit with an error
 /// message naming the valid options.
+///
+/// The options list must name exactly the arms this build compiled. Before
+/// `postgres-blob` and `s3-blob` moved behind `cloud-blobs`, the message read
+/// its list from a hardcoded constant, so a default build rejected `postgres`
+/// and then listed `postgres` among the valid options.
 #[test]
 fn invalid_backend_exits_with_error() {
     let output = Command::new(relay_bin())
@@ -51,10 +84,20 @@ fn invalid_backend_exits_with_error() {
         stderr.contains("memory"),
         "error should list valid options; got: {stderr}"
     );
+
+    for backend in ["postgres", "s3"] {
+        assert_eq!(
+            stderr.contains(backend),
+            backend_is_compiled(backend),
+            "the options list must offer '{backend}' exactly when this build \
+             compiled its arm; got: {stderr}"
+        );
+    }
 }
 
 /// AC 10: Selecting `postgres` without `SCP_RELAY_DATABASE_URL` exits with
-/// a descriptive error.
+/// a descriptive error — on a build that compiled the postgres arm. A default
+/// build compiled no postgres arm, and exits naming the feature that would.
 #[test]
 fn postgres_without_url_exits_with_error() {
     let output = Command::new(relay_bin())
@@ -70,14 +113,26 @@ fn postgres_without_url_exits_with_error() {
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("SCP_RELAY_DATABASE_URL"),
-        "error should mention the required env var; got: {stderr}"
-    );
+    if backend_is_compiled("postgres") {
+        assert!(
+            stderr.contains("SCP_RELAY_DATABASE_URL"),
+            "error should mention the required env var; got: {stderr}"
+        );
+    } else {
+        assert!(
+            stderr.contains("'postgres' is not compiled into this binary"),
+            "a default build should say the postgres arm is absent; got: {stderr}"
+        );
+        assert!(
+            stderr.contains("--features cloud-blobs"),
+            "error should name the feature that compiles the arm; got: {stderr}"
+        );
+    }
 }
 
 /// AC 6: Selecting `s3` without `SCP_RELAY_S3_BUCKET` exits with a
-/// descriptive error.
+/// descriptive error — on a build that compiled the s3 arm. A default build
+/// compiled no s3 arm, and exits naming the feature that would.
 #[test]
 fn s3_without_bucket_exits_with_error() {
     let output = Command::new(relay_bin())
@@ -93,10 +148,21 @@ fn s3_without_bucket_exits_with_error() {
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("SCP_RELAY_S3_BUCKET"),
-        "error should mention the required env var; got: {stderr}"
-    );
+    if backend_is_compiled("s3") {
+        assert!(
+            stderr.contains("SCP_RELAY_S3_BUCKET"),
+            "error should mention the required env var; got: {stderr}"
+        );
+    } else {
+        assert!(
+            stderr.contains("'s3' is not compiled into this binary"),
+            "a default build should say the s3 arm is absent; got: {stderr}"
+        );
+        assert!(
+            stderr.contains("--features cloud-blobs"),
+            "error should name the feature that compiles the arm; got: {stderr}"
+        );
+    }
 }
 
 /// AC 8: `SQLite` blob persistence across reopens.
