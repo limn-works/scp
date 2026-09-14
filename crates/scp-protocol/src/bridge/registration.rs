@@ -242,6 +242,17 @@ pub enum BridgeRegistrationAction {
     },
     /// The bridge was revoked by governance.
     Revoked,
+    /// The bridge was suspended by governance (spec §12.2.2, suspension).
+    Suspended {
+        /// Governance justification for the suspension.
+        reason: String,
+        /// Seconds until automatic reactivation; `None` until an explicit
+        /// `ReactivateBridge` governance action.
+        duration: Option<u64>,
+    },
+    /// The bridge was reactivated, by governance or because the suspension
+    /// `duration` elapsed (spec §12.2.2, suspension).
+    Reactivated,
 }
 
 // ---------------------------------------------------------------------------
@@ -1514,12 +1525,50 @@ mod tests {
                 reason: "test".to_owned(),
             },
             BridgeRegistrationAction::Revoked,
+            BridgeRegistrationAction::Suspended {
+                reason: "spam".to_owned(),
+                duration: Some(3600),
+            },
+            BridgeRegistrationAction::Suspended {
+                reason: "review".to_owned(),
+                duration: None,
+            },
+            BridgeRegistrationAction::Reactivated,
         ];
         for action in &actions {
             let json = serde_json::to_string(action).unwrap();
             let restored: BridgeRegistrationAction = serde_json::from_str(&json).unwrap();
             assert_eq!(&restored, action);
         }
+    }
+
+    /// The wire table (spec §12.12.2) tags `Suspended` and `Reactivated` by
+    /// variant name, like the four earlier actions, so a leaf written by one
+    /// implementation parses on another.
+    #[test]
+    fn suspension_actions_use_the_wire_table_tags() {
+        let suspended = BridgeRegistrationAction::Suspended {
+            reason: "spam".to_owned(),
+            duration: Some(3600),
+        };
+        let json: serde_json::Value = serde_json::to_value(&suspended).unwrap();
+        assert_eq!(json["Suspended"]["reason"], "spam");
+        assert_eq!(json["Suspended"]["duration"], 3600);
+        let reactivated: serde_json::Value =
+            serde_json::to_value(BridgeRegistrationAction::Reactivated).unwrap();
+        assert_eq!(
+            reactivated,
+            serde_json::Value::String("Reactivated".to_owned())
+        );
+        let parsed: BridgeRegistrationAction =
+            serde_json::from_str(r#"{"Suspended":{"reason":"x","duration":null}}"#).unwrap();
+        assert_eq!(
+            parsed,
+            BridgeRegistrationAction::Suspended {
+                reason: "x".to_owned(),
+                duration: None,
+            }
+        );
     }
 
     // -------------------------------------------------------------------

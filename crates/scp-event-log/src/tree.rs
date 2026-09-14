@@ -492,6 +492,12 @@ pub const fn event_type_tag(event_type: &EventType) -> u16 {
         // stays retired. These are convergent commit-ordered durable leaves.
         EventType::CrossContextOutletInvoked => 76,
         EventType::CrossContextDivergenceMarker => 77,
+        // Bridge lifecycle leaves (spec §12.2; ADR-011). Tags 78..=81 are the
+        // next free values after 77; tag 59 stays retired.
+        EventType::BridgeRegistered => 78,
+        EventType::BridgeSuspended => 79,
+        EventType::BridgeReactivated => 80,
+        EventType::BridgeRevoked => 81,
     }
 }
 
@@ -1315,7 +1321,7 @@ mod tests {
 
     /// The complete `EventType` taxonomy in ADR declaration order, used to
     /// cross-check against `event_type_tag`.
-    const ALL_EVENT_TYPES: [EventType; 77] = [
+    const ALL_EVENT_TYPES: [EventType; 81] = [
         EventType::ContextCreated,
         EventType::ContextClosing,
         EventType::ContextClosed,
@@ -1393,6 +1399,10 @@ mod tests {
         EventType::AppUnbound,
         EventType::CrossContextOutletInvoked,
         EventType::CrossContextDivergenceMarker,
+        EventType::BridgeRegistered,
+        EventType::BridgeSuspended,
+        EventType::BridgeReactivated,
+        EventType::BridgeRevoked,
     ];
 
     #[test]
@@ -1511,6 +1521,12 @@ mod tests {
         // tags after 75 (tag 59 stays retired).
         assert_eq!(event_type_tag(&EventType::CrossContextOutletInvoked), 76);
         assert_eq!(event_type_tag(&EventType::CrossContextDivergenceMarker), 77);
+        // Bridge lifecycle group (spec §12.2; ADR-011): the next free tags
+        // after 77, in the order a bridge passes through them.
+        assert_eq!(event_type_tag(&EventType::BridgeRegistered), 78);
+        assert_eq!(event_type_tag(&EventType::BridgeSuspended), 79);
+        assert_eq!(event_type_tag(&EventType::BridgeReactivated), 80);
+        assert_eq!(event_type_tag(&EventType::BridgeRevoked), 81);
     }
 
     #[test]

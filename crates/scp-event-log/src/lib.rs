@@ -88,7 +88,7 @@ pub trait EventLogSigner: Send + Sync {
 // EventType
 // ---------------------------------------------------------------------------
 
-/// The 77 event type variants for SCP context event logs.
+/// The 81 event type variants for SCP context event logs.
 ///
 /// Every protocol action that mutates context state is represented as one of
 /// these variants. See ADR-011 for the base enumeration and ADR-031 for
@@ -98,7 +98,9 @@ pub trait EventLogSigner: Send + Sync {
 /// consequence-enforcement, commit-broadcast-reconciliation, compromise-recovery,
 /// and app-sandbox-binding variants; the cross-context-saga event model
 /// (ADR-011 Amendment §6 for `CrossContextOutletInvoked`; spec §6.2.4 for
-/// `CrossContextDivergenceMarker`) added the 2 `CrossContext*` variants. This is a CLOSED set with no catch-all
+/// `CrossContextDivergenceMarker`) added the 2 `CrossContext*` variants; the
+/// bridge lifecycle group (ADR-011; spec §12.2) added the 4 `Bridge*`
+/// variants. This is a CLOSED set with no catch-all
 /// variant: every protocol action that produces a verifiable Merkle-log entry
 /// is one of these variants.
 ///
@@ -442,6 +444,39 @@ pub enum EventType {
     /// [`EventType::OutletInvoked`] leaf carries), so the marker leaf is
     /// byte-identical across honest members.
     CrossContextDivergenceMarker,
+
+    // -------------------------------------------------------------------
+    // Bridge lifecycle leaves (spec §12.2.1 step 3, §12.2.2; ADR-011). Every
+    // one records a governance decision about a bridge, executed by every
+    // member under the context's governance model, so each is a convergent
+    // commit-ordered durable leaf. A bridge node reads bridge admission from
+    // the highest-sequence leaf of this group for a `bridge_id` in the log it
+    // holds as a member (spec §12.10.6 step 1) and from no other input.
+    //
+    // Payload (`MessagePack` into `EventPayload::data`): a
+    // `BridgeRegistrationEvent` (spec §12.12.2, defined in
+    // `scp_protocol::bridge::registration`): `action`, `bridge_id`,
+    // `operator_did`, `governance_did`, `context_id`, `timestamp`. The leaf
+    // `actor_did` is the payload's `governance_did`, except the
+    // deadline-triggered `BridgeReactivated` (a `SuspendBridge` `duration`
+    // elapsed), whose `actor_did` is `"system"` and whose leaf timestamp is
+    // the pre-computed suspension deadline (spec §7.3.1). The `Requested` and
+    // `Rejected` actions produce no bridge leaf: `GovernanceProposalCreated`
+    // and `GovernanceProposalResolved` record the proposal and its rejection.
+    // -------------------------------------------------------------------
+    /// A `RegisterBridge` proposal was approved (spec §12.2.1 step 3);
+    /// payload `action: Approved`.
+    BridgeRegistered,
+    /// A `SuspendBridge` proposal was approved (spec §12.2.2, suspension);
+    /// payload `action: Suspended { reason, duration }`.
+    BridgeSuspended,
+    /// A `ReactivateBridge` proposal was approved, or the suspension
+    /// `duration` elapsed (spec §12.2.2, suspension); payload
+    /// `action: Reactivated`.
+    BridgeReactivated,
+    /// A `RevokeBridge` proposal was approved (spec §12.2.2 step 2); payload
+    /// `action: Revoked`. Terminal: no later bridge leaf reactivates it.
+    BridgeRevoked,
 }
 
 // ---------------------------------------------------------------------------
@@ -818,19 +853,23 @@ mod tests {
             EventType::AppUnbound,
             EventType::CrossContextOutletInvoked,
             EventType::CrossContextDivergenceMarker,
+            EventType::BridgeRegistered,
+            EventType::BridgeSuspended,
+            EventType::BridgeReactivated,
+            EventType::BridgeRevoked,
         ]
     }
 
     #[test]
-    fn event_type_taxonomy_is_closed_at_77_distinct_variants() {
+    fn event_type_taxonomy_is_closed_at_81_distinct_variants() {
         // Pins the closed-set count and asserts wire-distinctness, independent
         // of the round-trip test (which would otherwise exceed the function
         // line limit).
         let event_types = all_event_types();
         assert_eq!(
             event_types.len(),
-            77,
-            "closed EventType taxonomy must enumerate exactly 77 variants"
+            81,
+            "closed EventType taxonomy must enumerate exactly 81 variants"
         );
 
         let mut serialized: Vec<String> = event_types
@@ -841,8 +880,8 @@ mod tests {
         serialized.dedup();
         assert_eq!(
             serialized.len(),
-            77,
-            "all 77 EventType variants must serialize to distinct values"
+            81,
+            "all 81 EventType variants must serialize to distinct values"
         );
     }
 

@@ -760,9 +760,11 @@ pub struct Event {
    its source is convergent): the source here is one signed envelope timestamp, not N
    local clocks. For the timer-triggered events that carry no
    commit envelope (TTL expiry/close, governance-freeze expiry, deferred
-   economic-policy application), the convergent `timestamp` is the pre-computed
-   deadline already held in convergent context state (the TTL deadline, the
-   freeze-expiry instant, the policy-application time), never local `now()` — for the
+   economic-policy application, bridge-suspension expiry per spec §12.2.2), the
+   convergent `timestamp` is the pre-computed deadline already held in
+   convergent context state (the TTL deadline, the freeze-expiry instant, the
+   policy-application time, the suspension deadline `timestamp + duration` of
+   the `BridgeSuspended` leaf), never local `now()` — for the
    same reason velocity/rate-triggered consequences are excluded (a wall clock the
    protocol neither has nor needs). The leaf timestamp's convergence does not make it
    authoritative over log *order* (§9.8.3): the Merkle order is the orderer; the
@@ -867,6 +869,22 @@ pub enum EventType {
     // visible in the event log"). Parameters live in EventPayload.
     AppBound,                     // §8 app bound to context; payload: app_did, app_name, app_version, capabilities
     AppUnbound,                   // §8 app unbound from context; payload: app_did
+    // Bridge lifecycle leaves (§12.2.1 step 3; §12.2.2; ADR-023 acceptance
+    // criterion 2, "Registration is a context event in the Merkle log").
+    // Payload: a `BridgeRegistrationEvent` (§12.12.2) serialized as MessagePack
+    // into EventPayload::data — action, bridge_id, operator_did, governance_did,
+    // context_id, timestamp. actor_did = the payload's governance_did, except
+    // the deadline-triggered BridgeReactivated (a SuspendBridge `duration`
+    // elapsed), where actor_did = "system" and the leaf timestamp is the
+    // pre-computed deadline (§7.3.1). A bridge node admits a bridge from the
+    // highest-sequence leaf of this group for that bridge_id (§12.10.6 step 1).
+    // The Requested and Rejected actions of BridgeRegistrationAction produce no
+    // bridge leaf: GovernanceProposalCreated and GovernanceProposalResolved
+    // (ADR-031 §8) record the proposal and its rejection.
+    BridgeRegistered,             // RegisterBridge approved; payload action: Approved
+    BridgeSuspended,              // SuspendBridge approved; payload action: Suspended { reason, duration }
+    BridgeReactivated,            // ReactivateBridge approved, or the suspension duration elapsed; payload action: Reactivated
+    BridgeRevoked,                // RevokeBridge approved; payload action: Revoked
 }
 ```
 
@@ -879,13 +897,14 @@ pub enum EventType {
    content-access per §5, economic per §19.6.1, consequence-enforcement per
    §7.3.7, commit-broadcast reconciliation per §9.9.4, compromise recovery per
    §9.12, and app-sandbox binding per §8) were added by the native↔WASM
-   unification amendment below.
+   unification amendment below; the bridge lifecycle group per §12.2 was added
+   when §12.10.6 step 1 made a bridge node read admission from these leaves.
    The closure obligation spans **every** source that appends to the Merkle log —
    governance actions (ADR-031 §3), lifecycle/migration transitions (ADR-049 §9 /
    §5.11A), membership and access changes (§5), media (ADR-024), economic actions
    (§19), consequence enforcement (phase-4 trust engine / §7.3.7), app-sandbox
-   binding (§8), compromise recovery (§9.12 step 2 MLS group-epoch advance), and
-   provenance (§7.3) — not governance actions alone. Each new
+   binding (§8), compromise recovery (§9.12 step 2 MLS group-epoch advance),
+   bridge lifecycle (§12.2), and provenance (§7.3) — not governance actions alone. Each new
    variant carries its parameters in `EventPayload`; no parameter is ever baked
    into the type name. The canonical Merkle log carries only **convergent**
    events; per-member-observed emissions are kept out of it (see the convergence
@@ -992,7 +1011,7 @@ pub enum EventType {
    >    even under ADR-051** (a transport-send outcome is not a causal-DAG
    >    application event; it has no cross-member referent to linearize), so they
    >    are excluded **permanently**, not interim. They remain in the closed
-   >    `EventType` set (the 77-variant set is not narrowed) but are NEVER passed to
+   >    `EventType` set (the 81-variant set is not narrowed) but are NEVER passed to
    >    `append_context_event`; the three retry-sweep lifecycle states
    >    (`CommitBroadcastSucceeded` / `CommitBroadcastPending` /
    >    `CommitBroadcastFailed`) and the enqueue-time `CommitBroadcastPending` are

@@ -451,6 +451,14 @@ pub const fn is_structural_event(event_type: &EventType) -> bool {
         | EventType::ConsequenceEscalatedToSuspendAll
         | EventType::AppBound
         | EventType::AppUnbound
+        // Bridge lifecycle (spec §12.2; ADR-011): the governance decisions that
+        // admit, suspend, reactivate, and revoke a bridge — the record a bridge
+        // node reads admission from (spec §12.10.6 step 1). Governance /
+        // lifecycle class, structural per ADR-030 §2c.
+        | EventType::BridgeRegistered
+        | EventType::BridgeSuspended
+        | EventType::BridgeReactivated
+        | EventType::BridgeRevoked
         // Cross-context-saga divergence marker (ADR-011 Amendment §6): a durable
         // non-repudiation/accountability record of a one-sided saga commit,
         // essential for operator repair and state-reconstruction verification —
@@ -1225,15 +1233,20 @@ mod tests {
             // --- Cross-context-saga carve-out (ADR-011 Amendment §6) ---
             (EventType::CrossContextOutletInvoked, false),
             (EventType::CrossContextDivergenceMarker, true),
+            // --- Bridge lifecycle (spec §12.2; ADR-011) ---
+            (EventType::BridgeRegistered, true),
+            (EventType::BridgeSuspended, true),
+            (EventType::BridgeReactivated, true),
+            (EventType::BridgeRevoked, true),
         ];
 
         // Exhaustiveness guard: the table must cover the full closed taxonomy
-        // (exactly 77 variants). Adding a variant to `EventType` without adding
+        // (exactly 81 variants). Adding a variant to `EventType` without adding
         // it here leaves it unclassified-by-test, so this count is pinned.
         assert_eq!(
             EXPECTED.len(),
-            77,
-            "classification table must cover all 77 EventType variants"
+            81,
+            "classification table must cover all 81 EventType variants"
         );
 
         for (event_type, expected_structural) in &EXPECTED {
