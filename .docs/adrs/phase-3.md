@@ -1187,11 +1187,12 @@ pub struct PaymentReceipt {
     pub signature: P256Signature,
 }
 
-pub struct VerificationResult {
-    pub valid: bool, pub adapter_id: String,
-    pub verified_amount: Amount, pub verified_currency: CurrencyCode,
-    pub verification_timestamp: u64,
-}
+// VerificationResult: `19-economic-governance.md` §19.2.1 declares it field by
+// field. A relay passes its own declared payee, currency and price into
+// `PaymentAdapter::verify` and reads the terms the adapter answers with, so the
+// type carries answers to the relay's questions rather than the receipt's own
+// fields.
+pub struct VerificationResult { /* §19.2.1 */ }
 
 pub struct RefundConfirmation {
     pub refund_id: [u8; 32], pub original_receipt_id: [u8; 32],

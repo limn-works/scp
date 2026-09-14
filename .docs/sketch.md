@@ -1990,27 +1990,7 @@ Spending UCANs are AND-composed with action UCANs. Agent needs both `messagesWri
 
 ### Configure Payment Adapter (§19.2.4, §19.11)
 
-Register a payment adapter with the identity's SDK instance.
-
-```
-SCP.Identity.configureAdapter(
-  adapter: PaymentAdapter {
-    adapterId: String,             // "x402" | "lightning" | "spl" | "stripe" | custom
-    capabilities: AdapterCapabilities {
-      supportedCurrencies: [CurrencyCode],
-      supportsStreaming: Bool,
-      supportsBatchAuth: Bool,
-      supportsSingleStep: Bool,
-      minAmount: Amount?,
-      maxAmount: Amount?,
-      typicalSettlementMs: Int,
-      requiresFacilitator: Bool
-    }
-  }
-) → ()
-```
-
-Adapter credentials are identity-private state (§3.7) — encrypted, stored alongside identity keys. Never exposed to contexts or relays.
+An identity's payment adapter is installed at construction, through `IdentityConfig`'s `payment` slot (`.docs/standards/construction.md`, `19-economic-governance.md` §19.11). No later call installs one, so a reader of a config that carries `payment: None` concludes that this identity spends nothing.
 
 ### Context Creation with Economic Policy (§19.3, §19.11)
 
