@@ -1257,6 +1257,10 @@ mod tests {
     /// `EventType` and left out of the table fails the coverage assertion
     /// below. Comparing the table's own `len()` against a literal equal to its
     /// declared length, which is what this test did before, could not fail.
+    /// The count assertion below therefore reads `crate::ALL_EVENT_TYPES`,
+    /// whose length the macro derives from the variant list, so adding a
+    /// variant turns it red and sends the author to the documents that print
+    /// the count.
     #[test]
     fn structural_classification_table_covers_every_event_type() {
         assert_eq!(
@@ -1265,7 +1269,7 @@ mod tests {
             "classification table must classify every EventType variant"
         );
         assert_eq!(
-            EXPECTED_STRUCTURAL_CLASSIFICATION.len(),
+            crate::ALL_EVENT_TYPES.len(),
             81,
             "the closed taxonomy stands at 81 variants; raising it means \
              updating ADR-011, spec §25 vector 32, and the crate docs"

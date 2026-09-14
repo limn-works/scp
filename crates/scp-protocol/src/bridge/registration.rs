@@ -218,10 +218,8 @@ pub struct BridgeRegistrationEvent {
     /// DID of the bridge operator.
     pub operator_did: DID,
 
-    /// DID of the governance actor whose decision this event records. Every
-    /// `BridgeRegistrationAction` variant carries one such decider, the
-    /// `Suspended` and `Reactivated` variants included (bridge registration
-    /// wire table, spec §12.12.2).
+    /// DID of the governance actor who approved, rejected, suspended,
+    /// reactivated, or revoked.
     pub governance_did: DID,
 
     /// The context this event belongs to.
@@ -794,6 +792,24 @@ mod tests {
         assert_eq!(event.operator_did, OPERATOR_DID);
         assert_eq!(event.context_id, CTX_A);
         assert_eq!(registry.events().len(), 1);
+    }
+
+    /// `register_bridge` fills `governance_did` with the requesting operator's
+    /// own value, because no governance actor has decided a `Requested` record.
+    /// The doc comment on that field therefore enumerates the five decision
+    /// actions and names `Requested` in none of them: a reader that took
+    /// `governance_did` to name a governance decider on every
+    /// `BridgeRegistrationEvent` would read a submission as a decision.
+    #[test]
+    fn requested_event_carries_the_requester_in_governance_did() {
+        let mut registry = BridgeRegistry::new(CTX_A.to_owned());
+        let request = make_request("bridge-001", CTX_A);
+        let event = register_bridge(&mut registry, request).unwrap();
+        assert_eq!(event.action, BridgeRegistrationAction::Requested);
+        assert_eq!(
+            event.governance_did, event.operator_did,
+            "a Requested record names the submitting operator, not a decider"
+        );
     }
 
     #[test]
