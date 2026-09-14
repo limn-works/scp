@@ -2415,12 +2415,6 @@ def check_testing_unification_readers() -> None:
     # This repository is the live fixture for the defect this reader exists to
     # catch: the edge is real, and so is the lane that avoids it.
     live_edges, live_unresolved = command_testing_edges(workspace, "scp-identity")
-    check(
-        "the live workspace command resolves every package it selects",
-        live_unresolved is None,
-        f"got {live_unresolved!r} — an unresolved selection makes every edge "
-        f"answer below a report about a build this reader never scanned",
-    )
     scp_testing_manifest = REPO / "crates" / "scp-testing" / "Cargo.toml"
     live_manifests, _ = command_build_manifests(workspace)
     helpers_activators = unconditional_feature_activators(
@@ -2434,10 +2428,24 @@ def check_testing_unification_readers() -> None:
     # someone deleted the self dev-dependency at crates/scp-testing/Cargo.toml
     # that enables `helpers` — it would read the surviving string and report a
     # property the workspace no longer has.
+    #
+    # command_testing_edges hands its unresolvable-`-p` finding to every caller,
+    # and this caller reports it as the first conjunct rather than as a check of
+    # its own. command_build_manifests returns that finding only from the branch
+    # a command naming neither `--workspace` nor `--all` takes, and `workspace`
+    # above is a literal naming `--workspace`, so a check reading that conjunct
+    # alone would print ok on every state this repository can reach — one green
+    # line carrying no coverage, which is the class
+    # .docs/lessons/a-green-check-that-asserted-nothing.md names. The two
+    # `cargo test -p ghost` controls over the fixture workspace above are what
+    # hold both readers to reporting an unresolvable selection.
     check(
         "a workspace build turns scp-identity/testing on through scp-testing",
-        scp_testing_manifest in live_edges and bool(helpers_activators),
-        f"got edges {sorted(str(manifest) for manifest in live_edges)} and "
+        live_unresolved is None
+        and scp_testing_manifest in live_edges
+        and bool(helpers_activators),
+        f"got selection finding {live_unresolved!r}, edges "
+        f"{sorted(str(manifest) for manifest in live_edges)} and "
         f"`helpers` activators {sorted(helpers_activators.values())} — "
         f"crates/scp-testing/Cargo.toml gives its `helpers` feature the value "
         f'"scp-identity/testing" AND its own `[dev-dependencies]` turn '
@@ -2445,7 +2453,8 @@ def check_testing_unification_readers() -> None:
         f"scp-identity's assertions with a workspace lane. This control names "
         f"the manifest rather than reading whichever edge sorts first, because "
         f"crates/scp-runtime/Cargo.toml and crates/scp-ffi/common/Cargo.toml "
-        f"each carry their own such dev-dependency and sort ahead of it",
+        f"each carry their own such dev-dependency and sort ahead of it. A "
+        f"non-None selection finding means this reader scanned no build at all",
     )
     check(
         "a -p scp-identity build leaves scp-identity/testing off",

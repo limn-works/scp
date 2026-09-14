@@ -1,6 +1,6 @@
-# A Green Check That Asserted Nothing: Fifteen Ways CI Reported Success Over Zero Work
+# A Green Check That Asserted Nothing: Sixteen Ways CI Reported Success Over Zero Work
 
-**Date:** 2026-08-16, extended 2026-08-17, 2026-08-22, 2026-08-25, 2026-08-31, 2026-09-01, 2026-09-03 and 2026-09-07
+**Date:** 2026-08-16, extended 2026-08-17, 2026-08-22, 2026-08-25, 2026-08-31, 2026-09-01, 2026-09-03, 2026-09-07 and 2026-09-14
 **Source:** branch `fix/ci-enforces-what-it-claims` — `.github/workflows/ci.yml`, `.github/workflows/fuzz.yml`, `.github/workflows/release.yml`, `scripts/check-cross-layer.sh`, `scripts/check-shipped-feature-graph.sh`
 
 ## Rule
@@ -10,7 +10,7 @@ fail on whichever defect it exists to catch, and keep that failure as a test. Ev
 defect below produced a green check while work behind it never ran, and every one passed
 review because a check *looked* like it was doing its job.
 
-## Fifteen failure shapes
+## Sixteen failure shapes
 
 **1. A command that treats "nothing matched" as success.** `cargo test -p scp-node --lib
 pre_rotation_severance` exits 0 when a filter selects no test. Two tests it named
@@ -329,6 +329,25 @@ later edit to the same command. Run tests that vanish on a feature flip in their
 `scripts/tests/ci-gate/ci_gate_selftest.py` now reads every filtered command in a
 shipped-config lane, and fails the workflow when a command that selects a shipped-build
 assertion also selects a test that a `testing` flip leaves compiled.
+
+**16. A check whose condition its own hard-coded input makes constant.** A fix agent
+gave `check_testing_unification_readers` in `scripts/tests/ci-gate/ci_gate_selftest.py` a
+control named "the live workspace command resolves every package it selects", whose
+condition read `live_unresolved is None`. `command_build_manifests` returns that finding
+only from the branch it takes for a command naming neither `--workspace` nor `--all`, and
+the command under test was the literal `cargo nextest run --workspace`, so the condition
+held on every state this repository can reach. No edit to the readers, to any manifest,
+or to `[workspace] members` could turn it red. The control printed one green line and
+covered nothing, in a file whose subject is checks that cover nothing. Shape 8 above
+describes a loop that iterates over nothing; this one describes a condition that
+evaluates the same way whatever the inputs are, which no amount of iterating fixes. Read
+the path a value takes from the literal input to the condition: when every path ends at
+the same answer, the check tests the literal and not the repository. Either hand the
+check an input that can produce the other answer, or fold the constant conjunct into a
+check that can go red and let a fixture control carry the property — the fix here
+folded `live_unresolved is None` into the positive control below it, which names a
+manifest it expects in the edge map, and left the two `cargo test -p ghost` fixture
+controls to prove that both readers report an unresolvable selection.
 
 ## Tests holding these closed
 
