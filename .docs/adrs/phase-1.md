@@ -550,7 +550,7 @@ The SCP native relay exists because no external transport (Nostr, Matrix, etc.) 
 
 ### Decision
 
-Implement a WebSocket-based store-and-forward relay server and its corresponding client adapter. The relay protocol has exactly seven client operations: `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`, `QUERY`, `POLICY`, `DELETE` and `ACK`.
+Implement a WebSocket-based store-and-forward relay server and its corresponding client adapter. The relay protocol has exactly eight client operations: `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`, `QUERY`, `POLICY`, `RENT`, `DELETE` and `ACK`.
 
 ### Rationale
 
@@ -599,16 +599,23 @@ Implement a WebSocket-based store-and-forward relay server and its corresponding
    - Does not create a subscription.
 
 5. **`POLICY { }`** (**added 2026-09-13**)
-   - Return the relay's declared write policy: the `relay_config` fields of `18-addressability-and-deployment.md` §18.3.3, verbatim. **That answer carries `receipt_exempts`** (**added 2026-09-14**), the set of refusal scopes a receipt this relay verified exempts the write from, so a publisher reads what its money buys at this relay before it spends; an absent or empty set exempts no scope.
+   - Return the relay's declared write policy: the `relay_config` fields of `18-addressability-and-deployment.md` §18.3.3. **The answer's declared type is `DeclaredWritePolicy`, which `03-identity.md` §3.10.10 declares** (**amended 2026-09-14**), and **it carries no field of the relay's own operational configuration**. `RelayConfig`, declared by `.docs/standards/construction.md` §Relay and homed one module from this ADR's reference types, is the relay server's own flat configuration object and carries `bridge_secret`, the internal-relay connection-admission secret, so a relay that answered this query with that type would serialize its admission secret to a party that opened a socket and sent one unauthenticated message.
+   - **That answer carries `receipt_exempts`** (**added 2026-09-14**), the set of refusal scopes a receipt this relay verified exempts an identity from, so a publisher reads what its money buys at this relay before it spends; an absent or empty set exempts no scope. It also carries the three rent terms a relay that sells coverage declares (`09-security-model.md` §9.7.4.2 R9).
    - The answer carries no signature, because the relay is the authority on its own policy and no third party attests it. A client that cannot reach this operation, or that reads a term it will not honour, publishes anyway and lets the relay's own typed refusal be the authority.
    - This is the path by which a publisher obtains every declared price and every declared budget. A community-relay-list entry carries a relay URL and no domain, `18-addressability-and-deployment.md` §18.3 calls `.well-known/scp` an optional web on-ramp the core protocol operates without, and §18.3.2 states that a party holding DNS or a CA chain serves a fraudulent copy of that document.
-   - **`economic.payee` is the one field an unsigned answer cannot carry safely, and this is the residue** (**added 2026-09-14**): a party on the network path of a relay running without TLS (`18-addressability-and-deployment.md` §18.6.3) rewrites the payee, the publisher pays that party, the receipt verifies on the payment rail, and the relay refuses `payment` because the receipt names a payee that is not its own. A publisher that has not confirmed a relay's payee through a channel it authenticates publishes to that relay without paying and takes the refusal.
+   - **The residue an unsigned answer leaves reaches every field a publisher spends money against** (**amended 2026-09-14**). A party on the network path of a relay running without TLS (`18-addressability-and-deployment.md` §18.6.3) rewrites `economic.payee`, the publisher pays that party, the receipt verifies on the payment rail, and the relay refuses `payment` because the receipt names a payee that is not its own. The same party rewrites an empty `receipt_exempts` into `["identifier"]`, and the publisher pays the genuine price to the genuine payee believing it bought an exemption the relay does not honour; the rewrite in the other direction makes a publisher decline to pay at a relay that would have exempted it. It rewrites a rent term the same way, and the controller's rent buys a quota or a period the relay never declared. A publisher that has not confirmed a relay's declared terms through a channel it authenticates publishes without paying and takes the refusal.
 
-6. **`DELETE { blob_id }`**
+6. **`RENT { identifier, payment_receipt }`** (**added 2026-09-14**)
+   - Pay rent for one identity at this relay. `identifier` is the 32 raw digest bytes of the identity the rent is credited to, and `payment_receipt` is the `PaymentReceipt` bytes of `19-economic-governance.md` §19.2.1 tagged with the adapter that issued them. **The operation carries nothing else.**
+   - The relay runs the four receipt checks `09-security-model.md` §9.7.4.2 R9 states, credits that identity's quota and rent expiry, and answers `OK` with a `RentState` (`03-identity.md` §3.10.10) carrying the quota now current and the instant that rent expires, so a controller learns what it now holds without a second round trip. It refuses with `4041` scope `payment` where the receipt is absent, where the verification fails, or where any of the four checks fails.
+   - **`RENT` stores no bytes**, so no storage budget, no retained kind and no ring rule reads it, and it displaces nothing. **The declared rate limit counts it like every other message**, because a relay sells storage and never traffic, so no payment buys a party a higher message rate.
+   - The carrier exists because Alec's rent ruling of 2026-09-14 reaches an identity that publishes nothing for a whole rent period, which a receipt riding on a PUBLISH cannot serve. The rejected alternative was a PUBLISH whose blob is absent: three checks of the retained-kind path read that blob, so each would need an arm for a frame that is not there.
+
+7. **`DELETE { blob_id }`**
    - Request deletion of a specific blob by its `blob_id`.
    - Best-effort: the relay SHOULD delete but is not trusted to comply (relays are untrusted, spec section 9.9.1).
 
-7. **`ACK { blob_id }`**
+8. **`ACK { blob_id }`**
    - Delivery receipt. Client acknowledges receipt of a blob.
    - The relay MAY use ACKs from all known subscribers to garbage-collect blobs before TTL expiry.
 
@@ -678,25 +685,26 @@ Every message is a MessagePack map with a required `op` field (string) plus oper
 | `UNSUBSCRIBE` | `routing_id: bin32` | OK |
 | `QUERY` | `routing_id: bin32`, `since: u64?`, `limit: u32?` (default 100, max 1000), `proof_nonce: bin32?` | BLOB stream, then EVENT `query_complete` |
 | `POLICY` | none | OK with `relay_config` |
+| `RENT` | `identifier: bin32`, `payment_receipt: bin` | OK with `rent_state` |
 | `DELETE` | `blob_id: bin32` | OK (best-effort, does not confirm existence) |
 | `ACK` | `blob_id: bin32` | None (fire-and-forget) |
 | `PING` | `ts: u64` | PONG |
 
-**Constraints:** `blob_ttl` 1–604800 (7 days), and absent on a `retain` write. `blob` 1–262144 bytes (256KB). `payment_receipt` 1–8192 bytes, so the field a charging relay decodes carries a declared ceiling as `blob` and `ref` do. `routing_id`, `recipient_hint`, `blob_id` are exactly 32 bytes, encoded as MessagePack `bin 32` (not hex/base64 strings).
+**Constraints:** `blob_ttl` 1–604800 (7 days), and absent on a `retain` write. `blob` 1–262144 bytes (256KB). `payment_receipt` 1–8192 bytes on PUBLISH and on RENT alike, so the field a charging relay decodes carries a declared ceiling as `blob` and `ref` do. `routing_id`, `recipient_hint`, `blob_id` are exactly 32 bytes, encoded as MessagePack `bin 32` (not hex/base64 strings).
 
 #### Relay-to-Client Messages
 
 | Op | Fields | When |
 |----|--------|------|
-| `OK` | `ref: string?`, `blob_id: bin32?`, `relay_config: map?` | Success response. `blob_id` present only for PUBLISH; `relay_config` present only for POLICY, carrying the fields of `18-addressability-and-deployment.md` §18.3.3 verbatim and unsigned. |
-| `ERR` | `ref: string?`, `code: u16`, `msg: string`, `scope: string?`, `value` | Error response. `msg` is for logging, not parsing, which is why `4041`'s two fields ride beside it: `scope` names the term the refusal failed and `value` carries that term's own value, typed per scope as `03-identity.md` §3.10.10's `BudgetValue` declares. The retry rule below, a publisher's decision to attach a receipt, and `PublishOutcome`'s per-entry list each read one of those two fields (**amended 2026-09-14**). |
+| `OK` | `ref: string?`, `blob_id: bin32?`, `relay_config: map?`, `rent_state: map?` | Success response. `blob_id` present only for PUBLISH; `relay_config` present only for POLICY, carrying the `DeclaredWritePolicy` of `03-identity.md` §3.10.10 and unsigned; `rent_state` present only for RENT, carrying that section's `RentState` (**amended 2026-09-14**). |
+| `ERR` | `ref: string?`, `code: u16`, `msg: string`, `scope: BudgetScope?`, `value` | Error response. `msg` is for logging, not parsing, which is why `4041`'s two fields ride beside it: `scope` names the term the refusal failed and `value` carries that term's own value, typed per scope as `03-identity.md` §3.10.10's `BudgetValue` declares. The retry rule below, a publisher's decision to attach a receipt, and `PublishOutcome`'s per-entry list each read one of those two fields (**amended 2026-09-14**). |
 | `BLOB` | `routing_id: bin32`, `blob_id: bin32`, `recipient_hint: bin32?`, `blob_ttl: u32?`, `stored_at: u64`, `relay_proof: bin200?`, `blob: bin` | Blob delivery (subscription, backfill, or query). `blob_id = SHA-256(blob)` — clients SHOULD verify. `relay_proof` carries the 200-byte relay proof of control `09-security-model.md` §9.7.4.2's definitions state, returned where the QUERY carried a `proof_nonce`. |
 | `EVENT` | `ref: string?`, `type: string`, type-specific fields | Protocol events: `backfill_complete` (with `routing_id`), `query_complete` (with `count`). |
 | `PONG` | `ts: u64` | Keepalive response. |
 
 #### Error Codes
 
-**Client errors (4xxx):** `4000` INVALID_MESSAGE, `4001` UNKNOWN_OP, `4002` MISSING_FIELD, `4003` INVALID_FIELD, `4010` BLOB_TOO_LARGE, `4011` TTL_TOO_LONG, `4012` LIMIT_EXCEEDED, `4020` RATE_LIMITED, `4021` TOO_MANY_SUBSCRIPTIONS, `4041` STORAGE_POLICY_REFUSED (a validating SCP-native relay refused a PUBLISH that failed one term of the write policy it declares, carrying a `scope` field whose value is one of `identifier`, `total`, `rate_limit` or `payment`, and a `value` field carrying that term's own value typed per scope, which `03-identity.md` §3.10.10 declares as `BudgetValue`, so a publisher told it may retry holds the figure to retry against (**`proof_of_work` removed 2026-09-14**); the SDK surfaces both as `IdentityError::StorageBudgetExceeded{scope, value}`, `03-identity.md` §3.10.10. **Added 2026-09-13** under Alec's storage ruling, **`value` amended 2026-09-13**: the refusal is never a verdict about the identity, and a publisher that read it as `4040` would tell a controller its own recovery event is malformed. **A refusal under any term of a declared write policy takes `4041` and takes no other code**, so `4020` covers a rate limit on an operation that declares no policy and `5001` covers a relay out of room rather than at a declared ceiling), `4040` DID_RECORD_REJECTED (a validating SCP-native relay rejected an operation at an identity-domain `routing_id`: a PUBLISH of a frame that failed the identifier-to-routing-id binding or chain verification, a frame the relay could place on no chain, any blob published to a `routing_id` that already holds a chain and that is not a frame passing every validation step `03-identity.md` §3.10.2 orders, or a DELETE of a stored frame whose chain verifies — see the subsection below on what may open or extend a key-event chain at a routing id. **`03-identity.md` §3.10.2 orders those steps** (**amended 2026-09-14**); the policy checks that section orders first answer `4041` and never `4040`, so a relay that returned `4040` for a budget or a price told a controller its own recovery event was malformed. **Amended 2026-09-10:** the code's name carries the retired identifier-record vocabulary, and this ADR names the wire constant as it ships rather than inventing one).
+**Client errors (4xxx):** `4000` INVALID_MESSAGE, `4001` UNKNOWN_OP, `4002` MISSING_FIELD, `4003` INVALID_FIELD, `4010` BLOB_TOO_LARGE, `4011` TTL_TOO_LONG, `4012` LIMIT_EXCEEDED, `4020` RATE_LIMITED, `4021` TOO_MANY_SUBSCRIPTIONS, `4041` STORAGE_POLICY_REFUSED (a validating SCP-native relay refused a PUBLISH that failed one term of the write policy it declares, carrying a `scope` field typed as `03-identity.md` §3.10.10's `BudgetScope`, whose wire token that section pairs with each variant — `identifier`, `total`, `rate_limit` and `payment` — and a `value` field carrying that term's own value typed per scope, which the same section declares as `BudgetValue`, so a publisher told it may retry holds the figure to retry against (**`proof_of_work` removed 2026-09-14**); the SDK surfaces both as `IdentityError::StorageBudgetExceeded{scope, value}`, `03-identity.md` §3.10.10. **Added 2026-09-13** under Alec's storage ruling, **`value` amended 2026-09-13**: the refusal is never a verdict about the identity, and a publisher that read it as `4040` would tell a controller its own recovery event is malformed. **A refusal under any term of a declared write policy takes `4041` and takes no other code**, so `4020` covers a rate limit on an operation that declares no policy and `5001` covers a relay out of room rather than at a declared ceiling), `4040` DID_RECORD_REJECTED (a validating SCP-native relay rejected an operation at an identity-domain `routing_id`: a PUBLISH of a frame that failed the identifier-to-routing-id binding or chain verification, a frame the relay could place on no chain, any blob published to a `routing_id` that already holds a chain and that is not a frame passing every validation step `03-identity.md` §3.10.2 orders, or a DELETE of a stored frame whose chain verifies — see the subsection below on what may open or extend a key-event chain at a routing id. **`03-identity.md` §3.10.2 orders those steps** (**amended 2026-09-14**); the policy checks that section orders first answer `4041` and never `4040`, so a relay that returned `4040` for a budget or a price told a controller its own recovery event was malformed. **Amended 2026-09-10:** the code's name carries the retired identifier-record vocabulary, and this ADR names the wire constant as it ships rather than inventing one).
 
 **Server errors (5xxx):** `5000` INTERNAL_ERROR, `5001` STORAGE_FULL, `5002` SHUTTING_DOWN.
 
@@ -734,6 +742,7 @@ pub enum ClientMessage {
     Unsubscribe { ref_id: Option<String>, routing_id: [u8; 32] },
     Query { ref_id: Option<String>, routing_id: [u8; 32], since: Option<u64>, limit: Option<u32>, proof_nonce: Option<[u8; 32]> },
     Policy { ref_id: Option<String> },
+    Rent { ref_id: Option<String>, identifier: [u8; 32], payment_receipt: Vec<u8> },
     Delete { ref_id: Option<String>, blob_id: [u8; 32] },
     Ack { blob_id: [u8; 32] },
     Ping { ts: u64 },
@@ -741,8 +750,17 @@ pub enum ClientMessage {
 
 /// Relay-to-client operations
 pub enum RelayMessage {
-    Ok { ref_id: Option<String>, blob_id: Option<[u8; 32]>, relay_config: Option<RelayConfig> },
-    Err { ref_id: Option<String>, code: u16, msg: String, scope: Option<String>, value: Option<BudgetValue> },
+    /// `relay_config` carries `DeclaredWritePolicy` and never the relay
+    /// server's own `RelayConfig`, which `.docs/standards/construction.md`
+    /// §Relay declares one module away and which carries `bridge_secret`
+    /// (`03-identity.md` §3.10.10).
+    Ok {
+        ref_id: Option<String>,
+        blob_id: Option<[u8; 32]>,
+        relay_config: Option<DeclaredWritePolicy>,
+        rent_state: Option<RentState>,
+    },
+    Err { ref_id: Option<String>, code: u16, msg: String, scope: Option<BudgetScope>, value: Option<BudgetValue> },
     Blob { routing_id: [u8; 32], blob_id: [u8; 32], recipient_hint: Option<[u8; 32]>, blob_ttl: Option<u32>, stored_at: u64, relay_proof: Option<[u8; 200]>, blob: Vec<u8> },
     Event { ref_id: Option<String>, event_type: String },
     Pong { ts: u64 },
@@ -1225,15 +1243,17 @@ This test proves: identity works, encryption works, the envelope format works, s
 **Status:** Superseded by ADR-063 (2026-08-30)
 **Extends:** ADR-003 (DID Creation)
 
-ADR-063, inception-derived self-certifying identity over a key-event log, replaces the shared-identity structure this record decided. A human identity's key state names one operational role, `#active`, and names no agent key. An agent holds its own identity, whose establishment events the human's key-event log anchors (`09-security-model.md` §9.1 invariant 1). How a controller produces that anchor and how a verifier checks it is unspecified as of 2026-09-10 (`.docs/specs/00-open-questions.md`), and `09-security-model.md` §9.7.4.2 R3 rejects every chain claiming a delegator until it lands. The body below is retained as the historical record that motivated the supersession; the shared identity, the `#agent` verification method, and the category permissions it describes no longer describe SCP's identity model. **The body below carries edits made after March 2026, and this paragraph names every divergence from the text its author wrote.** Seven, in the order they land:
+ADR-063, inception-derived self-certifying identity over a key-event log, replaces the shared-identity structure this record decided. A human identity's key state names one operational role, `#active`, and names no agent key. An agent holds its own identity, whose establishment events the human's key-event log anchors (`09-security-model.md` §9.1 invariant 1). How a controller produces that anchor and how a verifier checks it is unspecified as of 2026-09-10 (`.docs/specs/00-open-questions.md`), and `09-security-model.md` §9.7.4.2 R3 rejects every chain claiming a delegator until it lands. The body below is retained as the historical record that motivated the supersession; the shared identity, the `#agent` verification method, and the category permissions it describes no longer describe SCP's identity model. **The body below carries edits made after March 2026, and this paragraph names every divergence from the text its author wrote.** Nine, in the order they land:
 
 1. The three key slots and the key-continuity-fingerprint sentence were rewritten from Ed25519 to P-256 on 2026-09-10 under Alec's curve ruling, so a reader comparing them against ADR-063's account of where Ed25519 came from is reading a later edit.
 2. Enforcement Stack item 2 was replaced on 2026-06-20 by a paragraph on the persona-source seam, `MessageSigner`, and RFC #2242.
-3. Enforcement Stack item 4 gained the `hardware-pin` custody value and a citation to `27-attestations.md` §27.4.4.
+3. Enforcement Stack item 4 gained the `hardware-pin` custody value and a citation to `27-attestations.md` §27.4.4, and lost the clause "this layer states no reading rule of its own" on 2026-09-14.
 4. A paragraph headed "KeyPackage attestation is a Category-B action" was added under the Enforcement Stack on 2026-08-02.
 5. The Category-B list reads "outlet invocation" where the March text read "tool invocation"; the rename landed 2026-07-11.
 6. Acceptance criterion 19 read "(PyO3, NAPI, UniFFI, WASM)" and now reads "(PyO3, NAPI, UniFFI)"; the WASM bridge was cut 2026-06-29.
-7. The section headed "Amendment (2026-08-25): an unproven hardware custody declaration reads as software" follows the acceptance criteria and carries Alec's ruling of that date.
+7. The section headed "Amendment (2026-08-25): an unproven hardware custody declaration reads as software" follows the acceptance criteria and carries the ruling of that date.
+8. That Amendment's first sentence was rewritten on 2026-09-14: it printed a sentence under Alec's name as his verbatim words, and the record supports the orchestrator having proposed that sentence and Alec having approved it with "yes do that." The rewrite states which party wrote which.
+9. That Amendment's last sentence read "Layer 4 above now cites those clauses and states no reading rule of its own, so this ADR and the spec cannot drift apart on the rule's wording" and now reads "Layer 4 above cites those clauses"; the shortening landed 2026-09-14.
 
 Every other sentence below is the March 2026 text.
 
@@ -1393,7 +1413,7 @@ Agent key compromise (most common case — agent runtime is less secure than dev
 
 ### Amendment (2026-08-25): an unproven hardware custody declaration reads as software
 
-Alec ruled, verbatim: "either the platform proof is attached and verified, or the custody model reads as software no matter what string was written".
+The orchestrator proposed the sentence "either the platform proof is attached and verified, or the custody model reads as software no matter what string was written." on 2026-08-25, and Alec approved it that day with his own three words, "yes do that."
 
 The ruling governs Enforcement Stack layer 4 above, which stated no rule for reading a custody declaration. The ruling binds because Alec made it, not because of which file records it. §27.4.4 of the attestations spec (`.docs/specs/27-attestations.md`) states it in four clauses and §27.3.4 of the same spec restates it beside the record's construction; open question OQ-38 of that spec asks a human which file finally holds F4's normative text, and the ruling travels with those sections wherever that answer sends them. Layer 4 above cites those clauses.
 

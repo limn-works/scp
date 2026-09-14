@@ -1126,7 +1126,7 @@
         "crates/scp-transport/src/native/protocol.rs",
         "crates/scp-transport/src/native/error.rs"
       ],
-      "description": "Define the SCP native relay protocol message types (ClientMessage, RelayMessage) and MessagePack serialization over WebSocket binary frames. The relay protocol has exactly 6 client operations (PUBLISH, SUBSCRIBE, UNSUBSCRIBE, QUERY, DELETE, ACK) plus PING, and 5 relay response types (OK, ERR, BLOB, EVENT, PONG) with defined error codes. Note, 2026-09-14: this story records what shipped. ADR-004 now states seven client operations, the seventh being POLICY, and the criteria below are not rewritten to it; the story that adds POLICY owns that work.",
+      "description": "Define the SCP native relay protocol message types (ClientMessage, RelayMessage) and MessagePack serialization over WebSocket binary frames. The relay protocol has exactly 6 client operations (PUBLISH, SUBSCRIBE, UNSUBSCRIBE, QUERY, DELETE, ACK) plus PING, and 5 relay response types (OK, ERR, BLOB, EVENT, PONG) with defined error codes. Note, 2026-09-14: this story records what shipped. ADR-004 now states eight client operations, adding POLICY and RENT, and the criteria below are not rewritten to them; the stories that add those two operations own that work.",
       "acceptanceCriteria": [
         "ClientMessage enum defined with variants: Publish, Subscribe, Unsubscribe, Query, Delete, Ack, Ping — matching reference Rust types",
         "RelayMessage enum defined with variants: Ok, Err, Blob, Event, Pong — matching reference Rust types",
