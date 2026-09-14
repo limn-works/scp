@@ -198,14 +198,38 @@ wheel_package() {
 
 # vendor_crate_occurrences <package> <feature-argument-string>
 #   Emit the number of times the vendored crate appears in the package's shipped
-#   dependency graph. `-e no-dev` drops dev-dependencies, which no shipped artifact
-#   compiles; `--target all` resolves every target triple, so a cfg-gated edge that
-#   is false on this runner stays visible.
+#   dependency graph, and return non-zero when cargo resolved no graph. `-e no-dev`
+#   drops dev-dependencies, which no shipped artifact compiles; `--target all`
+#   resolves every target triple, so a cfg-gated edge that is false on this runner
+#   stays visible.
+#
+#   Cargo's exit status decides whether the count means anything, so this function
+#   reads that status. A count taken from a resolution that failed is the number
+#   zero, and `run_gate` reads zero as the proof that an artifact reaches no
+#   `openssl-src`: an earlier version of this function discarded the status, so a
+#   renamed package or a renamed feature in one `ARTIFACTS` entry made every absent
+#   configuration print `ok` and made the run print `PASS` while cargo had resolved
+#   nothing. Both call sites treat a non-zero return as a gate failure.
 vendor_crate_occurrences() {
-  local pkg="$1" feature_args="$2" tree
+  local pkg="$1" feature_args="$2" tree count cargo_rc=0 grep_rc=0
   # shellcheck disable=SC2086  # feature_args carries several cargo arguments.
-  tree="$(cargo tree -p "$pkg" $feature_args -e no-dev --target all --prefix none --format '{p}')"
-  printf '%s\n' "$tree" | grep -cE "^${VENDOR_CRATE} v" || true
+  tree="$(cargo tree -p "$pkg" $feature_args -e no-dev --target all --prefix none --format '{p}' 2>&1)" || cargo_rc=$?
+  if [[ "$cargo_rc" -ne 0 ]]; then
+    {
+      echo "cargo tree exited $cargo_rc for package '$pkg' with feature arguments '${feature_args:-none}':"
+      printf '%s\n' "$tree"
+    } >&2
+    return 1
+  fi
+  # grep exits 1 when the graph names the crate zero times, which is the answer
+  # every absent configuration must give, and exits above 1 when grep itself
+  # failed. `|| grep_rc=$?` keeps those two apart, where `|| true` merged them.
+  count="$(printf '%s\n' "$tree" | grep -cE "^${VENDOR_CRATE} v")" || grep_rc=$?
+  if [[ "$grep_rc" -gt 1 ]]; then
+    echo "grep exited $grep_rc while counting $VENDOR_CRATE in the graph of '$pkg'" >&2
+    return 1
+  fi
+  printf '%s\n' "$count"
 }
 
 # ---------------------------------------------------------------------------
@@ -310,6 +334,53 @@ run_fixtures() {
   wheel_package "$dir/bindings/python/absent.toml" >/dev/null 2>&1; rc=$?
   expect "a missing wheel project file FAILS" "FAIL" "$rc"
 
+  # `vendor_crate_occurrences` counts lines of a resolved graph, and these three
+  # fixtures run it against a `cargo` that prints a chosen graph or refuses to
+  # resolve one. They prove the counter reports a present crate, reports an absent
+  # crate as zero, and reports a refusal as a failure rather than as a zero. The
+  # third one is what makes the absent-configuration half of this gate able to
+  # fail: a `cargo tree` that exits non-zero prints no line, and a counter that
+  # discarded cargo's status returned zero, which that loop reads as the proof it
+  # was asking for.
+  local saved_path
+  mkdir -p "$dir/fakebin"
+  saved_path="$PATH"
+
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'echo "scp-ffi v0.1.0"' \
+    "echo \"${VENDOR_CRATE} v300.5.1+3.5.1\"" \
+    'echo "openssl-sys v0.9.109"' > "$dir/fakebin/cargo"
+  chmod +x "$dir/fakebin/cargo"
+  PATH="$dir/fakebin:$saved_path"
+  out="$(vendor_crate_occurrences "scp-ffi" "--features extension-module,vendored-openssl")"; rc=$?
+  PATH="$saved_path"
+  expect "a graph naming the vendored crate is counted" "PASS" "$rc"
+  same_string "$out" "1"; rc=$?
+  expect "that count is the number of $VENDOR_CRATE lines the graph holds" "PASS" "$rc"
+
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'echo "scp-node v0.1.0"' \
+    'echo "openssl-sys v0.9.109"' > "$dir/fakebin/cargo"
+  chmod +x "$dir/fakebin/cargo"
+  PATH="$dir/fakebin:$saved_path"
+  out="$(vendor_crate_occurrences "scp-node" "")"; rc=$?
+  PATH="$saved_path"
+  expect "a graph naming no $VENDOR_CRATE is counted" "PASS" "$rc"
+  same_string "$out" "0"; rc=$?
+  expect "that count is zero, which is what an absent configuration must report" "PASS" "$rc"
+
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'echo "error: none of the selected packages contains these features" >&2' \
+    'exit 101' > "$dir/fakebin/cargo"
+  chmod +x "$dir/fakebin/cargo"
+  PATH="$dir/fakebin:$saved_path"
+  vendor_crate_occurrences "scp-node" "--features gone" >/dev/null 2>&1; rc=$?
+  PATH="$saved_path"
+  expect "a cargo tree that exits non-zero FAILS rather than counting zero" "FAIL" "$rc"
+
   if [[ "$fixture_failures" -eq 0 ]]; then
     echo "   FIXTURES: all behavioural proofs passed."
     return 0
@@ -376,7 +447,12 @@ run_gate() {
   fi
 
   echo "--> the wheel's configuration: $pkg ${feature_args:-default features}"
-  count="$(vendor_crate_occurrences "$pkg" "$feature_args")"
+  if ! count="$(vendor_crate_occurrences "$pkg" "$feature_args")"; then
+    echo "FAIL — cargo resolved no dependency graph for the wheel's configuration,"
+    echo "       so this run proved nothing about what the wheel carries. The stderr"
+    echo "       above names what cargo rejected."
+    return 1
+  fi
   if [[ "$count" -gt 0 ]]; then
     echo "    ok   — the wheel's graph reaches $VENDOR_CRATE, so the wheel carries its own OpenSSL"
   else
@@ -392,7 +468,15 @@ run_gate() {
   for configuration in "${absent[@]}"; do
     pkg="${configuration%%|*}"
     feature_args="${configuration#*|}"
-    count="$(vendor_crate_occurrences "$pkg" "$feature_args")"
+    if ! count="$(vendor_crate_occurrences "$pkg" "$feature_args")"; then
+      echo "    FAIL — cargo resolved no dependency graph for $pkg [${feature_args:-default features}],"
+      echo "           so this run proved nothing about that artifact. An entry of the"
+      echo "           ARTIFACTS array of $FEATURE_GRAPH_GATE names a package or a feature"
+      echo "           a manifest no longer defines, or the workspace does not resolve at"
+      echo "           all. The stderr above names what cargo rejected."
+      failures=$((failures + 1))
+      continue
+    fi
     if [[ "$count" -eq 0 ]]; then
       echo "    ok   — $pkg [${feature_args:-default features}]"
     else
