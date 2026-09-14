@@ -20,7 +20,7 @@
 //!
 //! - [`EventLog`] -- The append-only Merkle tree per context.
 //! - [`Event`] -- A protocol event with actor, type, payload, and signature.
-//! - [`EventType`] -- The 81 event type variants.
+//! - [`EventType`] -- The 77 event type variants.
 //! - [`EventPayload`] -- Type-specific event data.
 //! - [`EventLogError`] -- Error type for event log operations.
 //! - [`EventLogSigner`] -- Trait abstracting signing for checkpoint generation.
@@ -88,7 +88,7 @@ pub trait EventLogSigner: Send + Sync {
 // EventType
 // ---------------------------------------------------------------------------
 
-/// The 81 event type variants for SCP context event logs.
+/// The 77 event type variants for SCP context event logs.
 ///
 /// Every protocol action that mutates context state is represented as one of
 /// these variants. See ADR-011 for the base enumeration and ADR-031 for
@@ -98,9 +98,7 @@ pub trait EventLogSigner: Send + Sync {
 /// consequence-enforcement, commit-broadcast-reconciliation, compromise-recovery,
 /// and app-sandbox-binding variants; the cross-context-saga event model
 /// (ADR-011 Amendment §6 for `CrossContextOutletInvoked`; spec §6.2.4 for
-/// `CrossContextDivergenceMarker`) added the 2 `CrossContext*` variants; the
-/// bridge lifecycle group (ADR-011; spec §12.2) added the 4 `Bridge*`
-/// variants. This is a CLOSED set with no catch-all
+/// `CrossContextDivergenceMarker`) added the 2 `CrossContext*` variants. This is a CLOSED set with no catch-all
 /// variant: every protocol action that produces a verifiable Merkle-log entry
 /// is one of these variants.
 ///
@@ -444,187 +442,7 @@ pub enum EventType {
     /// [`EventType::OutletInvoked`] leaf carries), so the marker leaf is
     /// byte-identical across honest members.
     CrossContextDivergenceMarker,
-
-    // -------------------------------------------------------------------
-    // Bridge lifecycle leaves (spec §12.2.1 step 3, §12.2.2; ADR-011). Every
-    // one records a governance decision about a bridge, executed by every
-    // member at the same commit position under the context's governance
-    // model, so each is a convergent commit-ordered durable leaf. A bridge
-    // node reads bridge admission from this group of leaves for a `bridge_id`
-    // in the log it holds as a member (spec §12.10.6 step 1), from the
-    // `MemberJoined` and `MemberLeft` leaves of that same log that record
-    // whether the bridge's operator is still a member of the context, and
-    // from no other input. That criterion scans EVERY one of the bridge's
-    // lifecycle leaves for a `BridgeRevoked` leaf, which is terminal, and reads the
-    // LAST leaf only to decide whether a suspension still stands, so a
-    // `BridgeReactivated` leaf appended after a `BridgeRevoked` leaf readmits
-    // no bridge.
-    //
-    // An elapsed `SuspendBridge` `duration` appends NO leaf (spec §12.2.2),
-    // because that expiry records no fact: the operator's own node is the
-    // only node that evaluates admission, and it computes the deadline from
-    // the `BridgeSuspended` leaf's `timestamp` and payload `duration`, which
-    // it already holds. That deadline is the LATER of the leaf `timestamp`
-    // plus `duration` and the node's own commit-execution instant plus
-    // `duration`, each sum saturating (spec §12.2.2): spec §9.8.2(c) bounds an
-    // envelope `created_at` only in the future direction, so a committing
-    // member can backdate the leaf, and the leaf `timestamp` alone therefore
-    // carries no lower bound on the deadline. The node records that
-    // commit-execution instant durably once per leaf and reads the recorded
-    // value on every later evaluation (spec §12.2.2), so a restart moves no
-    // deadline the node already computed. A node that holds no recorded
-    // instant for a leaf substitutes and records its first-read instant,
-    // which moves that leaf's deadline later and never earlier, so the node
-    // readmits no bridge early and may hold a suspension late (spec §12.2.2).
-    // Spec §7.3.1 does admit leaves that a member-local timer triggers — TTL expiry/close, governance-freeze expiry, deferred
-    // economic-policy application — and keeps each convergent by stamping it
-    // with the pre-computed deadline that convergent context state holds.
-    //
-    // Payload (`MessagePack` into `EventPayload::data`): a
-    // `BridgeRegistrationEvent` (spec §12.12.2, defined in
-    // `scp_protocol::bridge::registration`): `action`, `bridge_id`,
-    // `operator_did`, `governance_did`, `context_id`, `timestamp`. The
-    // `Requested` and `Rejected` actions produce no bridge leaf:
-    // `GovernanceProposalCreated` and `GovernanceProposalResolved` record the
-    // proposal and its rejection.
-    // -------------------------------------------------------------------
-    /// A `RegisterBridge` proposal was approved (spec §12.2.1 step 3);
-    /// payload `action: Approved`.
-    BridgeRegistered,
-    /// A `SuspendBridge` proposal was approved (spec §12.2.2, suspension);
-    /// payload `action: Suspended { reason, duration }`.
-    BridgeSuspended,
-    /// A `ReactivateBridge` proposal was approved (spec §12.2.2, suspension);
-    /// payload `action: Reactivated`. An elapsed `SuspendBridge` `duration`
-    /// appends no leaf and produces no `BridgeReactivated`.
-    BridgeReactivated,
-    /// A `RevokeBridge` proposal was approved (spec §12.2.2 step 2); payload
-    /// `action: Revoked`. Terminal: no later bridge leaf reactivates it.
-    BridgeRevoked,
 }
-
-// ---------------------------------------------------------------------------
-// Canonical enumeration of the closed taxonomy
-// ---------------------------------------------------------------------------
-
-/// Declares `ALL_EVENT_TYPES` and, from the same variant list, a wildcard-free
-/// match over [`EventType`] that the compiler checks for exhaustiveness.
-///
-/// Adding a variant to [`EventType`] without naming it in the invocation below
-/// fails to compile at that invocation (`non-exhaustive patterns`), and naming a
-/// variant twice raises `unreachable_patterns`. `ALL_EVENT_TYPES` is therefore
-/// complete by construction, which is what makes a count assertion over it able
-/// to fail: the three tests that pin the taxonomy count each compared a
-/// hand-written array's `len()` against a literal equal to that same array's
-/// declared length, so none of the three could ever go red, and each of them now
-/// counts this compiler-checked list instead.
-macro_rules! declare_event_type_taxonomy {
-    ($($variant:ident),+ $(,)?) => {
-        /// Every variant of the closed [`EventType`] taxonomy, in declaration
-        /// order. Complete by construction: see `declare_event_type_taxonomy`.
-        /// Only the taxonomy tests read it; the exhaustiveness proof below
-        /// compiles in every profile, test or not.
-        #[cfg(test)]
-        pub(crate) const ALL_EVENT_TYPES: &[EventType] = &[$(EventType::$variant),+];
-
-        /// Proves at compile time that `ALL_EVENT_TYPES` names every
-        /// [`EventType`] variant. The match carries no `_` arm.
-        const fn assert_event_type_taxonomy_is_exhaustive(event_type: &EventType) {
-            match *event_type {
-                $(EventType::$variant => ()),+
-            }
-        }
-    };
-}
-
-declare_event_type_taxonomy!(
-    ContextCreated,
-    ContextClosing,
-    ContextClosed,
-    ContextExpired,
-    MemberJoined,
-    MemberLeft,
-    RoleAssigned,
-    TokenRevoked,
-    MessageSent,
-    OutletRegistered,
-    OutletUpdated,
-    OutletInvoked,
-    OutletVerified,
-    OutletInterfaceEstablished,
-    GovernanceAction,
-    ConsistencyCheckpoint,
-    AbsenceProofRequested,
-    MemberBlocked,
-    KeyEpochAdvance,
-    MediaSessionStarted,
-    MediaSessionEnded,
-    PaymentReceived,
-    EconomicPolicyChanged,
-    EconomicPolicyApplied,
-    SpendingUcanGranted,
-    SpendingUcanRevoked,
-    GovernanceProposalCreated,
-    GovernanceVoteCast,
-    GovernanceVoteWithdrawn,
-    GovernanceProposalResolved,
-    GovernanceConflictDetected,
-    GovernanceConflictResolved,
-    GovernanceDeadlockRecovery,
-    GovernanceActionExecuted,
-    ProvenanceAttached,
-    ProvenanceReceived,
-    AdminTransferred,
-    CeilingModified,
-    CeilingModificationPending,
-    ThresholdModified,
-    SignerAdded,
-    SignerRemoved,
-    ChildContextCreated,
-    ContextPromoted,
-    ContentKeysRotated,
-    MemberReset,
-    MemberSuspended,
-    MemberSuspendedAll,
-    MemberUnblocked,
-    AccessRestored,
-    GovernanceReconfigured,
-    GovernanceFreezeExpired,
-    HardRateLimitModified,
-    EconomicPolicyLocked,
-    ContextMigrationStarted,
-    OutletRemoved,
-    PruningPolicyModified,
-    CommitBroadcasted,
-    CommitBroadcastPending,
-    ContextTombstoned,
-    ContextMigrationCancelled,
-    TtlExtended,
-    TtlExtensionRejected,
-    AccessRevoked,
-    SpendApproved,
-    PaymentCaptureFailed,
-    ConsequenceTriggered,
-    ConsequenceEnforced,
-    ConsequenceEnforcementFailed,
-    ConsequenceEscalatedToSuspendAll,
-    CommitBroadcastSucceeded,
-    CommitBroadcastFailed,
-    RecoveryEpochAdvanced,
-    AppBound,
-    AppUnbound,
-    CrossContextOutletInvoked,
-    CrossContextDivergenceMarker,
-    BridgeRegistered,
-    BridgeSuspended,
-    BridgeReactivated,
-    BridgeRevoked,
-);
-
-/// Holds the exhaustiveness proof live in every build profile, so a variant
-/// added to [`EventType`] without an entry in `ALL_EVENT_TYPES` fails the
-/// library build rather than only the test build.
-const _: fn(&EventType) = assert_event_type_taxonomy_is_exhaustive;
 
 // ---------------------------------------------------------------------------
 // EventPayload
@@ -908,8 +726,8 @@ mod tests {
     #[test]
     fn event_type_serialization_roundtrip_all_variants() {
         // Round-trips every variant of the closed taxonomy through serde JSON.
-        // The 81-variant count and wire-distinctness are pinned separately in
-        // `event_type_taxonomy_is_closed_at_81_distinct_variants`.
+        // The 77-variant count and wire-distinctness are pinned separately in
+        // `event_type_taxonomy_is_closed_at_77_distinct_variants`.
         for event_type in all_event_types() {
             let json = serde_json::to_string(&event_type).expect("serialize");
             let deserialized: EventType = serde_json::from_str(&json).expect("deserialize");
@@ -920,23 +738,99 @@ mod tests {
         }
     }
     /// Returns the complete closed `EventType` taxonomy in ADR declaration
-    /// order, as a `Vec` the round-trip and distinctness tests sort and dedup.
-    /// The list itself is [`crate::ALL_EVENT_TYPES`], which the
-    /// `declare_event_type_taxonomy!` invocation proves exhaustive.
+    /// order. Used by the round-trip and distinctness coverage tests.
     fn all_event_types() -> Vec<EventType> {
-        crate::ALL_EVENT_TYPES.to_vec()
+        vec![
+            EventType::ContextCreated,
+            EventType::ContextClosing,
+            EventType::ContextClosed,
+            EventType::ContextExpired,
+            EventType::MemberJoined,
+            EventType::MemberLeft,
+            EventType::RoleAssigned,
+            EventType::TokenRevoked,
+            EventType::MessageSent,
+            EventType::OutletRegistered,
+            EventType::OutletUpdated,
+            EventType::OutletInvoked,
+            EventType::OutletVerified,
+            EventType::OutletInterfaceEstablished,
+            EventType::GovernanceAction,
+            EventType::ConsistencyCheckpoint,
+            EventType::AbsenceProofRequested,
+            EventType::MemberBlocked,
+            EventType::KeyEpochAdvance,
+            EventType::MediaSessionStarted,
+            EventType::MediaSessionEnded,
+            EventType::PaymentReceived,
+            EventType::EconomicPolicyChanged,
+            EventType::EconomicPolicyApplied,
+            EventType::SpendingUcanGranted,
+            EventType::SpendingUcanRevoked,
+            EventType::GovernanceProposalCreated,
+            EventType::GovernanceVoteCast,
+            EventType::GovernanceVoteWithdrawn,
+            EventType::GovernanceProposalResolved,
+            EventType::GovernanceConflictDetected,
+            EventType::GovernanceConflictResolved,
+            EventType::GovernanceDeadlockRecovery,
+            EventType::GovernanceActionExecuted,
+            EventType::ProvenanceAttached,
+            EventType::ProvenanceReceived,
+            EventType::AdminTransferred,
+            EventType::CeilingModified,
+            EventType::CeilingModificationPending,
+            EventType::ThresholdModified,
+            EventType::SignerAdded,
+            EventType::SignerRemoved,
+            EventType::ChildContextCreated,
+            EventType::ContextPromoted,
+            EventType::ContentKeysRotated,
+            EventType::MemberReset,
+            EventType::MemberSuspended,
+            EventType::MemberSuspendedAll,
+            EventType::MemberUnblocked,
+            EventType::AccessRestored,
+            EventType::GovernanceReconfigured,
+            EventType::GovernanceFreezeExpired,
+            EventType::HardRateLimitModified,
+            EventType::EconomicPolicyLocked,
+            EventType::ContextMigrationStarted,
+            EventType::OutletRemoved,
+            EventType::PruningPolicyModified,
+            EventType::CommitBroadcasted,
+            EventType::CommitBroadcastPending,
+            EventType::ContextTombstoned,
+            EventType::ContextMigrationCancelled,
+            EventType::TtlExtended,
+            EventType::TtlExtensionRejected,
+            EventType::AccessRevoked,
+            EventType::SpendApproved,
+            EventType::PaymentCaptureFailed,
+            EventType::ConsequenceTriggered,
+            EventType::ConsequenceEnforced,
+            EventType::ConsequenceEnforcementFailed,
+            EventType::ConsequenceEscalatedToSuspendAll,
+            EventType::CommitBroadcastSucceeded,
+            EventType::CommitBroadcastFailed,
+            EventType::RecoveryEpochAdvanced,
+            EventType::AppBound,
+            EventType::AppUnbound,
+            EventType::CrossContextOutletInvoked,
+            EventType::CrossContextDivergenceMarker,
+        ]
     }
 
     #[test]
-    fn event_type_taxonomy_is_closed_at_81_distinct_variants() {
+    fn event_type_taxonomy_is_closed_at_77_distinct_variants() {
         // Pins the closed-set count and asserts wire-distinctness, independent
         // of the round-trip test (which would otherwise exceed the function
         // line limit).
         let event_types = all_event_types();
         assert_eq!(
             event_types.len(),
-            81,
-            "closed EventType taxonomy must enumerate exactly 81 variants"
+            77,
+            "closed EventType taxonomy must enumerate exactly 77 variants"
         );
 
         let mut serialized: Vec<String> = event_types
@@ -947,8 +841,8 @@ mod tests {
         serialized.dedup();
         assert_eq!(
             serialized.len(),
-            81,
-            "all 81 EventType variants must serialize to distinct values"
+            77,
+            "all 77 EventType variants must serialize to distinct values"
         );
     }
 

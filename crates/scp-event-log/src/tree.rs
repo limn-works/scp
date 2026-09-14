@@ -492,12 +492,6 @@ pub const fn event_type_tag(event_type: &EventType) -> u16 {
         // stays retired. These are convergent commit-ordered durable leaves.
         EventType::CrossContextOutletInvoked => 76,
         EventType::CrossContextDivergenceMarker => 77,
-        // Bridge lifecycle leaves (spec §12.2; ADR-011). Tags 78..=81 are the
-        // next free values after 77; tag 59 stays retired.
-        EventType::BridgeRegistered => 78,
-        EventType::BridgeSuspended => 79,
-        EventType::BridgeReactivated => 80,
-        EventType::BridgeRevoked => 81,
     }
 }
 
@@ -1316,35 +1310,104 @@ mod tests {
     //   - the 39 unification variants occupy tags 36..=75 with tag 59 retired
     //     (PseudonymAnnounced removed — a routing-bootstrap ContextEvent signal);
     //   - the 2 ADR-011 Amendment §6 cross-context-saga variants occupy 76..=77;
-    //   - the 4 bridge lifecycle variants (spec §12.2) occupy 78..=81;
-    //   - all 81 tags are distinct.
+    //   - all 77 tags are distinct.
     // -----------------------------------------------------------------------
 
     /// The complete `EventType` taxonomy in ADR declaration order, used to
-    /// cross-check against `event_type_tag`. The list lives in `lib.rs`, where
-    /// the `declare_event_type_taxonomy!` invocation proves by a wildcard-free
-    /// match that it names every variant; a literal count asserted against a
-    /// list declared in this module could not have failed when a variant was
-    /// added.
-    use crate::ALL_EVENT_TYPES;
+    /// cross-check against `event_type_tag`.
+    const ALL_EVENT_TYPES: [EventType; 77] = [
+        EventType::ContextCreated,
+        EventType::ContextClosing,
+        EventType::ContextClosed,
+        EventType::ContextExpired,
+        EventType::MemberJoined,
+        EventType::MemberLeft,
+        EventType::RoleAssigned,
+        EventType::TokenRevoked,
+        EventType::MessageSent,
+        EventType::OutletRegistered,
+        EventType::OutletUpdated,
+        EventType::OutletInvoked,
+        EventType::OutletVerified,
+        EventType::OutletInterfaceEstablished,
+        EventType::GovernanceAction,
+        EventType::ConsistencyCheckpoint,
+        EventType::AbsenceProofRequested,
+        EventType::MemberBlocked,
+        EventType::KeyEpochAdvance,
+        EventType::MediaSessionStarted,
+        EventType::MediaSessionEnded,
+        EventType::PaymentReceived,
+        EventType::EconomicPolicyChanged,
+        EventType::EconomicPolicyApplied,
+        EventType::SpendingUcanGranted,
+        EventType::SpendingUcanRevoked,
+        EventType::GovernanceProposalCreated,
+        EventType::GovernanceVoteCast,
+        EventType::GovernanceVoteWithdrawn,
+        EventType::GovernanceProposalResolved,
+        EventType::GovernanceConflictDetected,
+        EventType::GovernanceConflictResolved,
+        EventType::GovernanceDeadlockRecovery,
+        EventType::GovernanceActionExecuted,
+        EventType::ProvenanceAttached,
+        EventType::ProvenanceReceived,
+        EventType::AdminTransferred,
+        EventType::CeilingModified,
+        EventType::CeilingModificationPending,
+        EventType::ThresholdModified,
+        EventType::SignerAdded,
+        EventType::SignerRemoved,
+        EventType::ChildContextCreated,
+        EventType::ContextPromoted,
+        EventType::ContentKeysRotated,
+        EventType::MemberReset,
+        EventType::MemberSuspended,
+        EventType::MemberSuspendedAll,
+        EventType::MemberUnblocked,
+        EventType::AccessRestored,
+        EventType::GovernanceReconfigured,
+        EventType::GovernanceFreezeExpired,
+        EventType::HardRateLimitModified,
+        EventType::EconomicPolicyLocked,
+        EventType::ContextMigrationStarted,
+        EventType::OutletRemoved,
+        EventType::PruningPolicyModified,
+        EventType::CommitBroadcasted,
+        EventType::CommitBroadcastPending,
+        EventType::ContextTombstoned,
+        EventType::ContextMigrationCancelled,
+        EventType::TtlExtended,
+        EventType::TtlExtensionRejected,
+        EventType::AccessRevoked,
+        EventType::SpendApproved,
+        EventType::PaymentCaptureFailed,
+        EventType::ConsequenceTriggered,
+        EventType::ConsequenceEnforced,
+        EventType::ConsequenceEnforcementFailed,
+        EventType::ConsequenceEscalatedToSuspendAll,
+        EventType::CommitBroadcastSucceeded,
+        EventType::CommitBroadcastFailed,
+        EventType::RecoveryEpochAdvanced,
+        EventType::AppBound,
+        EventType::AppUnbound,
+        EventType::CrossContextOutletInvoked,
+        EventType::CrossContextDivergenceMarker,
+    ];
 
     #[test]
     fn all_event_type_tags_are_distinct() {
         let mut tags: Vec<u16> = ALL_EVENT_TYPES.iter().map(event_type_tag).collect();
-        assert_eq!(
-            tags.len(),
-            81,
-            "taxonomy must enumerate all 81 variants; ALL_EVENT_TYPES is compiler-checked complete, so a new variant raises this count"
-        );
+        assert_eq!(tags.len(), 77, "taxonomy must enumerate all 77 variants");
         tags.sort_unstable();
         tags.dedup();
         assert_eq!(
             tags.len(),
-            81,
-            "all 81 EventType tags must be distinct (no two variants share a tag)"
+            77,
+            "all 77 EventType tags must be distinct (no two variants share a tag)"
         );
         // Tag 59 is intentionally retired (PseudonymAnnounced removed); the tag
-        // space is therefore 0..=81 minus {59}. This is the only gap.
+        // space is therefore 0..=75 minus {59}. This is the only gap.
         assert!(
             !tags.contains(&59),
             "tag 59 is retired and must not be reused (PseudonymAnnounced removal)"
@@ -1396,14 +1459,11 @@ mod tests {
     }
 
     #[test]
-    fn typed_event_variant_tags_occupy_36_through_81() {
-        // Three groups of variants share tags 36..=81, and this test pins the
-        // tag of every variant in all three.
-        // 1. The 39 typed-event unification variants occupy tags 36..=75 in ADR
-        //    declaration order, with tag 59 retired (PseudonymAnnounced removed).
-        // 2. The 2 ADR-011 Amendment §6 cross-context-saga variants occupy tags
-        //    76..=77.
-        // 3. The 4 bridge lifecycle variants occupy tags 78..=81.
+    fn unification_variant_tags_occupy_36_through_77() {
+        // The 39 typed-event unification variants occupy tags 36..=75 in ADR
+        // declaration order, with tag 59 retired (PseudonymAnnounced removed).
+        // The 2 ADR-011 Amendment §6 cross-context-saga variants occupy tags
+        // 76..=77.
         assert_eq!(event_type_tag(&EventType::AdminTransferred), 36);
         assert_eq!(event_type_tag(&EventType::CeilingModified), 37);
         assert_eq!(event_type_tag(&EventType::CeilingModificationPending), 38);
@@ -1451,12 +1511,6 @@ mod tests {
         // tags after 75 (tag 59 stays retired).
         assert_eq!(event_type_tag(&EventType::CrossContextOutletInvoked), 76);
         assert_eq!(event_type_tag(&EventType::CrossContextDivergenceMarker), 77);
-        // Bridge lifecycle group (spec §12.2; ADR-011): the next free tags
-        // after 77, in the order a bridge passes through them.
-        assert_eq!(event_type_tag(&EventType::BridgeRegistered), 78);
-        assert_eq!(event_type_tag(&EventType::BridgeSuspended), 79);
-        assert_eq!(event_type_tag(&EventType::BridgeReactivated), 80);
-        assert_eq!(event_type_tag(&EventType::BridgeRevoked), 81);
     }
 
     #[test]
