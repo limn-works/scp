@@ -21,7 +21,8 @@
         "SCP-BCH-017",
         "SCP-BCH-018",
         "SCP-BCH-019",
-        "SCP-BCH-020"
+        "SCP-BCH-020",
+        "SCP-BCH-021"
       ]
     },
     {
@@ -823,14 +824,14 @@
         "A test calls the identifier derivation twice with one leaf timestamp and asserts the two results are equal, and the doc comment claiming non-determinism by design is deleted rather than reworded",
         "No FFI registration path calls approve_registration with a caller-supplied approver and a hardcoded timestamp: each of crates/scp-ffi/src/bridge_connector.rs, crates/scp-ffi/napi/src/bridge_connector.rs and crates/scp-ffi/uniffi/src/bridge.rs submits a RegisterBridge governance proposal and returns the identifier the executed approval assigned, or returns a typed error naming the governance decision it lacks",
         "A test on each of the three bridges asserts that a registration call for a context whose governance approved nothing returns no active bridge and assigns no identifier",
-        "A cross-bridge test asserts the three bridges derive one identifier from one (context_id, operator_did, platform, leaf timestamp) tuple, so the PyO3, napi and UniFFI paths agree byte for byte",
+        "A cross-bridge test asserts that each of the three bridges returns, for one (context_id, operator_did, platform, leaf timestamp) tuple, the 64-character hex string that the byte-level known-answer test below pins, comparing each returned string against that pinned constant and against no other bridge's return value. All three bridges reach one derivation — crates/scp-ffi/src/bridge_connector.rs, crates/scp-ffi/napi/src/bridge_connector.rs and crates/scp-ffi/uniffi/src/bridge.rs each call scp_ffi_common::generate_bridge_id — so an assertion that compared the three return values with each other would compare one implementation with itself and could not go red. Comparing each return value against the pinned constant goes red when a bridge re-cases, truncates or re-encodes the identifier it returns",
         "The bridge_id preimage encodes each string component as its UTF-8 bytes and the timestamp component as the 8 bytes of its u64 value in big-endian order, asserted by a byte-level known-answer test that names the four inputs and the expected 64-character hex output, so two implementations cannot encode the timestamp differently and derive two identifiers for one leaf (spec 12.2.1 step 3)"
       ],
       "actionItems": [
         "Take the approval leaf timestamp as a parameter of the identifier derivation, or delete generate_bridge_id and derive the identifier where the leaf is appended",
         "Re-point crates/scp-ffi/src/bridge_connector.rs, crates/scp-ffi/napi/src/bridge_connector.rs and crates/scp-ffi/uniffi/src/bridge.rs at the governance execution path, and delete the approve_registration call with the hardcoded timestamp from each",
         "Delete the non-determinism-by-design doc comment rather than rewording it, because spec 12.2.1 step 3 requires the opposite property",
-        "Add a cross-bridge parity test that derives one identifier from one tuple on all three bridges"
+        "Add a cross-bridge parity test that asserts each of the three bridges returns the pinned known-answer identifier for one tuple, rather than asserting the three return values equal each other"
       ],
       "blockedBy": [
         "SCP-BCH-015"
@@ -860,18 +861,18 @@
         "crates/scp-event-log/src/pruning.rs",
         "crates/scp-protocol/src/bridge/registration.rs"
       ],
-      "description": "ADR-011, the verifiable event log, declares four bridge lifecycle EventType variants — BridgeRegistered, BridgeSuspended, BridgeReactivated and BridgeRevoked — and states that all four are convergent commit-ordered durable leaves. Vector 32 of the test-vector spec assigns them tags 78, 79, 80 and 81 and states that the specified taxonomy holds 81 variants. Spec §12.12.2 declares BridgeRegistrationEvent as the payload of all four leaves, and declares the BridgeRegistrationAction variants Suspended { reason, duration } and Reactivated that a suspension and a reactivation carry. The shipped crates carry none of that: EventType in crates/scp-event-log/src/lib.rs enumerates 77 variants, the tag map in crates/scp-event-log/src/tree.rs stops at tag 77, three separate assertions pin the count at 77 (crates/scp-event-log/src/lib.rs, crates/scp-event-log/src/tree.rs and the classification table of crates/scp-event-log/src/pruning.rs), and BridgeRegistrationAction in crates/scp-protocol/src/bridge/registration.rs declares Requested, Approved, Rejected and Revoked and neither Suspended nor Reactivated. This story declares the four event types, their tags and their pruning classification, and the two missing action variants, so the leaves that SCP-BCH-015 appends and the criterion that SCP-BCH-014 reads have types to name. Appending the leaves from the governance execution path is SCP-BCH-015, not this story, and reading them for admission is SCP-BCH-014. ADR-011 classifies all four bridge lifecycle leaves as structural events under ADR-030 §2c, because each one records a governance decision and a member reconstructs the context's set of assigned bridge_id values from the BridgeRegistered leaves, so this story enters the structural classification for each of the four. That classification sets how long a member that prunes retains the payload, and it decides no bridge's admission: spec §12.10.6 step 1 obliges a bridge node to retain the lifecycle payloads of every bridge it operates whatever the context's pruning policy sets.",
+      "description": "ADR-011, the verifiable event log, declares four bridge lifecycle EventType variants — BridgeRegistered, BridgeSuspended, BridgeReactivated and BridgeRevoked — and states that all four are convergent commit-ordered durable leaves. Vector 32 of the test-vector spec assigns them tags 78, 79, 80 and 81 and states that the specified taxonomy holds 81 variants. Spec §12.12.2 declares BridgeRegistrationEvent as the payload of all four leaves, and declares the BridgeRegistrationAction variants Suspended { reason, duration } and Reactivated that a suspension and a reactivation carry. The shipped crates carry none of that: EventType in crates/scp-event-log/src/lib.rs enumerates 77 variants, the tag map in crates/scp-event-log/src/tree.rs stops at tag 77, five assertions across three files pin the count at 77 — two in crates/scp-event-log/src/lib.rs, two in crates/scp-event-log/src/tree.rs, and one on the classification table of crates/scp-event-log/src/pruning.rs — two array lengths pin it at compile time (ALL_EVENT_TYPES in crates/scp-event-log/src/tree.rs and the EXPECTED classification table in crates/scp-event-log/src/pruning.rs), and six comments and one test name state the same count in prose, and BridgeRegistrationAction in crates/scp-protocol/src/bridge/registration.rs declares Requested, Approved, Rejected and Revoked and neither Suspended nor Reactivated. This story declares the four event types, their tags and their pruning classification, and the two missing action variants, so the leaves that SCP-BCH-015 appends and the criterion that SCP-BCH-014 reads have types to name. Appending the leaves from the governance execution path is SCP-BCH-015, not this story, and reading them for admission is SCP-BCH-014. ADR-011 classifies all four bridge lifecycle leaves as structural events under ADR-030 §2c, because each one records a governance decision and a member reconstructs the context's set of assigned bridge_id values from the BridgeRegistered leaves, so this story enters the structural classification for each of the four. That classification sets how long a member that prunes retains the payload, and it decides no bridge's admission: spec §12.10.6 step 1 obliges a bridge node to retain the lifecycle payloads of every bridge it operates whatever the context's pruning policy sets.",
       "acceptanceCriteria": [
         "EventType in crates/scp-event-log/src/lib.rs declares BridgeRegistered, BridgeSuspended, BridgeReactivated and BridgeRevoked, each documented with the governance action that appends it (ADR-011)",
         "The tag map in crates/scp-event-log/src/tree.rs maps BridgeRegistered to 78, BridgeSuspended to 79, BridgeReactivated to 80 and BridgeRevoked to 81, and a test asserts the four tags against those four literals (spec 25, Vector 32)",
-        "Every assertion that pins the size of the closed taxonomy reads 81 and not 77: the variant count and the distinctness count in crates/scp-event-log/src/lib.rs, the ALL_EVENT_TYPES array and both count assertions in crates/scp-event-log/src/tree.rs, and the classification-table length assertion in crates/scp-event-log/src/pruning.rs",
+        "No assertion, assertion message, array length, doc comment, code comment or test name under crates/scp-event-log/src/ gives the size of the closed EventType taxonomy, or the number of distinct wire tags, as 77; each one gives 81. Every occurrence of the literal 77 that remains under that directory is a wire tag value rather than a count: the tag of CrossContextDivergenceMarker, the comments that place the two cross-context-saga variants at 76..=77, and the test name unification_variant_tags_occupy_36_through_77. The counts to change sit in the module doc comment and the EventType doc comment of crates/scp-event-log/src/lib.rs, the comment in that file that names the test pinning the variant count and the distinctness count, that test's own name event_type_taxonomy_is_closed_at_77_distinct_variants, its two assertions and their two messages, the ALL_EVENT_TYPES array length and both count assertions and the comment \"all 77 tags are distinct\" in crates/scp-event-log/src/tree.rs, and the EXPECTED table length, its length assertion and its message, and the two comments that give that table's size in crates/scp-event-log/src/pruning.rs",
         "The classification table in crates/scp-event-log/src/pruning.rs classifies each of the four variants as structural, so is_structural_event returns true for BridgeRegistered, BridgeSuspended, BridgeReactivated and BridgeRevoked, a test asserts that return value for each of the four, and the exhaustiveness guard covers 81 entries (ADR-011, which classifies the four leaves; ADR-030 §2c)",
         "BridgeRegistrationAction in crates/scp-protocol/src/bridge/registration.rs declares Suspended with the fields reason: String and duration: Option<u64> and declares Reactivated, each with the serde tag spec 12.12.2 names, asserted by a round-trip test that pins the two tag strings \"Suspended\" and \"Reactivated\""
       ],
       "actionItems": [
         "Declare the four variants at the end of EventType in crates/scp-event-log/src/lib.rs, after the two cross-context-saga variants, and document each with its governance action",
         "Add the four tag arms to the event_type_tag map in crates/scp-event-log/src/tree.rs at 78, 79, 80 and 81",
-        "Update every taxonomy-size assertion from 77 to 81 and extend ALL_EVENT_TYPES with the four variants",
+        "Update every statement of the taxonomy size from 77 to 81 — the five assertions and their messages, the two array lengths, the module doc comment and the EventType doc comment of crates/scp-event-log/src/lib.rs, the comments that give the classification table's size and the tag-distinctness count, and the test name event_type_taxonomy_is_closed_at_77_distinct_variants — and extend ALL_EVENT_TYPES with the four variants",
         "Add the four variants to the structural-versus-operational classification table in crates/scp-event-log/src/pruning.rs and raise its exhaustiveness count to 81",
         "Declare Suspended { reason, duration } and Reactivated on BridgeRegistrationAction in crates/scp-protocol/src/bridge/registration.rs and add an arm for each to every match over that enum"
       ],
@@ -905,7 +906,7 @@
         "crates/scp-node/src/http.rs",
         "crates/scp-node/tests/bridge_integration.rs"
       ],
-      "description": "The shipped webhook path consults no bridge at all: WebhookRequest (crates/scp-node/src/bridge_handlers.rs) carries event_type, event_id, timestamp and payload and no bridge identifier, and webhook_handler answers accepted: true after an event-type whitelist and a dedup check, so a suspended or revoked bridge's deliveries still enter SCP. The shipped path also answers the wrong shape: webhook_auth_middleware_dyn verifies the signature before webhook_handler runs and returns 401 BRIDGE_NOT_AUTHORIZED when find_webhook_key resolves no key, so an unauthenticated caller reads a node's key set off the response code; spec §12.10.6 step 1 requires the route to answer every failure of the criterion with the one rejected webhook response. This story resolves a webhook delivery to a bridge through the X-SCP-Platform-Key-Id identifier that §12.10.2 step 6 defines — the SHA-256 of the 64 ASCII bytes of the bridge's lowercase hex bridge_id followed by the 32 registered platform_key bytes — and applies the admission criterion that SCP-BCH-014 writes before the route verifies any signature. The identifier covers the bridge_id because one platform publishes one signing key and one node may run one bridge into each of two contexts against that platform, so a digest over the key bytes alone names two bridges and therefore two contexts. Writing the criterion and enforcing it on the JWT-authenticated bridge routes is SCP-BCH-014, not this story; this story applies that function on the webhook route.",
+      "description": "The shipped webhook path consults no bridge at all: WebhookRequest (crates/scp-node/src/bridge_handlers.rs) carries event_type, event_id, timestamp and payload and no bridge identifier, and webhook_handler answers accepted: true after an event-type whitelist and a dedup check, so a suspended or revoked bridge's deliveries still enter SCP. The shipped path also answers the wrong shape: webhook_auth_middleware_dyn verifies the signature before webhook_handler runs and returns 401 BRIDGE_NOT_AUTHORIZED when find_webhook_key resolves no key, so an unauthenticated caller reads a node's key set off the response code; spec §12.10.6 step 1 requires the route to answer every failure of the criterion with the one rejected webhook response. This story resolves a webhook delivery to a bridge through the X-SCP-Platform-Key-Id identifier that §12.10.2 step 6 defines — the SHA-256 of the 64 ASCII bytes of the bridge's lowercase hex bridge_id followed by the 32 registered platform_key bytes — and applies the admission criterion that SCP-BCH-014 writes before the route verifies any signature. The identifier covers the bridge_id because one platform publishes one signing key and one node may run one bridge into each of two contexts against that platform, so a digest over the key bytes alone names two bridges and therefore two contexts. Writing the criterion and enforcing it on the JWT-authenticated bridge routes is SCP-BCH-014, not this story; this story applies that function on the webhook route, against the stored (bridge, key) pairs that SCP-BCH-021 writes from the governance approval; giving the node's webhook key store that writer, removing its caller-supplied writer, and recording each pair's bridge_id are SCP-BCH-021 and not this story.",
       "acceptanceCriteria": [
         "WebhookRequest gains no bridge field; the webhook route resolves the bridge from the X-SCP-Platform-Key-Id header, which carries the lowercase hex SHA-256 of the 64 ASCII bytes of the bridge's lowercase hex bridge_id followed by the 32 registered platform_key bytes (spec 12.10.2 step 6), asserted by a test whose header is that digest and by a test whose header is the digest of the platform_key bytes alone, which resolves to no bridge",
         "the webhook route answers a delivery whose X-SCP-Platform-Key-Id matches the key identifier of no stored (bridge, key) pair with HTTP 200 and accepted: false, verifies no signature for it, and returns no 401 and no 403; the test drives the router that http.rs builds, so it covers webhook_auth_middleware_dyn and not the generic form alone",
@@ -924,7 +925,8 @@
         "Drive every new integration test through the router that crates/scp-node/src/http.rs builds, so the tests cover the _dyn middleware the deployed node mounts"
       ],
       "blockedBy": [
-        "SCP-BCH-014"
+        "SCP-BCH-014",
+        "SCP-BCH-021"
       ],
       "sources": [
         {
@@ -1007,6 +1009,52 @@
         {
           "file": ".docs/specs/12-platform-bridge-connectors.md",
           "section": "### 12.10.6 Bridge Node Lifecycle"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-BCH-021",
+      "title": "Write the webhook platform-key store from the governance approval and remove its caller-supplied write path",
+      "gate": "gate-bridge-http-binding",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/bridge_auth.rs",
+        "crates/scp-node/src/lib.rs"
+      ],
+      "description": "Step 3 of spec 12.10.2 states that the bridge node stores the platform key associated with the bridge instance on governance approval; step 5 states that the node accepts signatures from a superseded key for 24 hours after an approved UpdateBridgePlatformKey action; step 6 derives the X-SCP-Platform-Key-Id header from the 64 ASCII bytes of the bridge's lowercase hex bridge_id followed by the 32 registered platform_key bytes. Spec 12.10.6 step 1 states that a node holding no BridgeRegistered leaf for a bridge holds no platform key for that bridge, because the node stores the platform key when governance approves the registration. The shipped key store satisfies none of those four statements. StorageBridgeLookup::register_webhook_key (crates/scp-node/src/bridge_auth.rs) takes a caller-supplied key_id and 32 key bytes, writes them under the bridge/webhook_key/ storage prefix, and records no bridge; deregister_webhook_key removes an entry by that same caller-supplied identifier; BridgeLookup::find_webhook_key returns the 32 bytes and names no bridge. A search of crates/ and bindings/ for register_webhook_key returns its declaration as an inherent method on StorageBridgeLookup, one doc comment that names it, and three tests, all in crates/scp-node/src/bridge_auth.rs, and no other caller, so no production path writes that store at all and the webhook route resolves every delivery against an empty store. This store is the structural twin of the bridge/registry/ write path that SCP-BCH-014 removes, and it is the resolution input that SCP-BCH-018 reads. This story gives the store its governance-approval writer, removes its caller-supplied writer, and keys it so the identifier of spec 12.10.2 step 6 resolves a stored pair to the one bridge whose approval registered it. Resolving a delivery through that identifier and applying the admission criterion to the bridge it names is SCP-BCH-018, not this story.",
+      "acceptanceCriteria": [
+        "StorageBridgeLookup::register_webhook_key, which writes 32 platform-key bytes under the bridge/webhook_key/ storage prefix against a caller-supplied key identifier and records no bridge, is removed, and deregister_webhook_key with it, or every caller of each is removed, so no scp-node code path writes or deletes a webhook platform key from a caller-supplied identifier",
+        "Every entry the node writes under the bridge/webhook_key/ storage prefix carries the bridge_id of the approved RegisterBridge or UpdateBridgePlatformKey action that registered its 32 key bytes, asserted by a test that reads the stored entry back and compares its bridge_id against the approving proposal",
+        "The node writes a (bridge_id, platform_key) pair into that store when it executes an approved RegisterBridge action carrying a platform_key and when it executes an approved UpdateBridgePlatformKey action, and on no other path (spec 12.10.2 step 3 and step 5), asserted by one test per approval that reads the pair back, by a test that asserts the store gains no pair for a rejected RegisterBridge proposal, and by a test that asserts it gains no pair for an approved RegisterBridge action whose platform_key is None",
+        "BridgeLookup::find_webhook_key resolves an X-SCP-Platform-Key-Id value to the bridge whose approval registered the pair, returning that bridge_id alongside the 32 key bytes rather than the key bytes alone, and resolves an identifier that no stored pair produces to nothing, asserted by one test per outcome",
+        "The node computes the key identifier of spec 12.10.2 step 6 as the lowercase hex SHA-256 of the 64 ASCII bytes of the bridge's lowercase hex bridge_id followed by the 32 platform_key bytes, asserted by a byte-level known-answer test against Vector 40 of the test-vector spec, which pins the two identifiers its two bridge_id values produce over one 32-byte key and pins the digest of those key bytes alone that step 6 refuses",
+        "For the 24 hours after the node executes an approved UpdateBridgePlatformKey action, the store resolves both that bridge's superseded pair and its new pair to that one bridge, and after those 24 hours it resolves the superseded pair's identifier to no bridge (spec 12.10.2 step 5), asserted by two calls with an injected clock"
+      ],
+      "actionItems": [
+        "Delete StorageBridgeLookup::register_webhook_key and StorageBridgeLookup::deregister_webhook_key with their caller-supplied key_id parameter, and delete or re-point every caller, the twin of the bridge/registry/ write path SCP-BCH-014 removes",
+        "Write the (bridge_id, platform_key) pair from the path on which the node executes an approved RegisterBridge or UpdateBridgePlatformKey action for a context it holds membership in, and give StorageBridgeLookup that writer through its constructor rather than a singleton",
+        "Key each stored entry by the identifier of spec 12.10.2 step 6, carry the bridge_id in its value, and widen BridgeLookup::find_webhook_key to return that bridge_id with the key bytes",
+        "Retain a superseded pair for 24 hours after the node executes the UpdateBridgePlatformKey approval that replaced it, measured from the node's commit-execution instant for that leaf, and stop resolving it after",
+        "Pin the step 6 identifier against Vector 40 of the test-vector spec in a test in crates/scp-node/src/bridge_auth.rs"
+      ],
+      "blockedBy": [
+        "SCP-BCH-015"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/12-platform-bridge-connectors.md",
+          "section": "### 12.10.2 Authentication"
+        },
+        {
+          "file": ".docs/specs/12-platform-bridge-connectors.md",
+          "section": "### 12.10.6 Bridge Node Lifecycle"
+        },
+        {
+          "file": ".docs/specs/25-test-vectors.md",
+          "section": "### Vector 40: `X-SCP-Platform-Key-Id`"
         }
       ],
       "details": {}
