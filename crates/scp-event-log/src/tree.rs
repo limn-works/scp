@@ -1321,95 +1321,21 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// The complete `EventType` taxonomy in ADR declaration order, used to
-    /// cross-check against `event_type_tag`.
-    const ALL_EVENT_TYPES: [EventType; 81] = [
-        EventType::ContextCreated,
-        EventType::ContextClosing,
-        EventType::ContextClosed,
-        EventType::ContextExpired,
-        EventType::MemberJoined,
-        EventType::MemberLeft,
-        EventType::RoleAssigned,
-        EventType::TokenRevoked,
-        EventType::MessageSent,
-        EventType::OutletRegistered,
-        EventType::OutletUpdated,
-        EventType::OutletInvoked,
-        EventType::OutletVerified,
-        EventType::OutletInterfaceEstablished,
-        EventType::GovernanceAction,
-        EventType::ConsistencyCheckpoint,
-        EventType::AbsenceProofRequested,
-        EventType::MemberBlocked,
-        EventType::KeyEpochAdvance,
-        EventType::MediaSessionStarted,
-        EventType::MediaSessionEnded,
-        EventType::PaymentReceived,
-        EventType::EconomicPolicyChanged,
-        EventType::EconomicPolicyApplied,
-        EventType::SpendingUcanGranted,
-        EventType::SpendingUcanRevoked,
-        EventType::GovernanceProposalCreated,
-        EventType::GovernanceVoteCast,
-        EventType::GovernanceVoteWithdrawn,
-        EventType::GovernanceProposalResolved,
-        EventType::GovernanceConflictDetected,
-        EventType::GovernanceConflictResolved,
-        EventType::GovernanceDeadlockRecovery,
-        EventType::GovernanceActionExecuted,
-        EventType::ProvenanceAttached,
-        EventType::ProvenanceReceived,
-        EventType::AdminTransferred,
-        EventType::CeilingModified,
-        EventType::CeilingModificationPending,
-        EventType::ThresholdModified,
-        EventType::SignerAdded,
-        EventType::SignerRemoved,
-        EventType::ChildContextCreated,
-        EventType::ContextPromoted,
-        EventType::ContentKeysRotated,
-        EventType::MemberReset,
-        EventType::MemberSuspended,
-        EventType::MemberSuspendedAll,
-        EventType::MemberUnblocked,
-        EventType::AccessRestored,
-        EventType::GovernanceReconfigured,
-        EventType::GovernanceFreezeExpired,
-        EventType::HardRateLimitModified,
-        EventType::EconomicPolicyLocked,
-        EventType::ContextMigrationStarted,
-        EventType::OutletRemoved,
-        EventType::PruningPolicyModified,
-        EventType::CommitBroadcasted,
-        EventType::CommitBroadcastPending,
-        EventType::ContextTombstoned,
-        EventType::ContextMigrationCancelled,
-        EventType::TtlExtended,
-        EventType::TtlExtensionRejected,
-        EventType::AccessRevoked,
-        EventType::SpendApproved,
-        EventType::PaymentCaptureFailed,
-        EventType::ConsequenceTriggered,
-        EventType::ConsequenceEnforced,
-        EventType::ConsequenceEnforcementFailed,
-        EventType::ConsequenceEscalatedToSuspendAll,
-        EventType::CommitBroadcastSucceeded,
-        EventType::CommitBroadcastFailed,
-        EventType::RecoveryEpochAdvanced,
-        EventType::AppBound,
-        EventType::AppUnbound,
-        EventType::CrossContextOutletInvoked,
-        EventType::CrossContextDivergenceMarker,
-        EventType::BridgeRegistered,
-        EventType::BridgeSuspended,
-        EventType::BridgeReactivated,
-        EventType::BridgeRevoked,
-    ];
+    /// cross-check against `event_type_tag`. The list lives in `lib.rs`, where
+    /// the `declare_event_type_taxonomy!` invocation proves by a wildcard-free
+    /// match that it names every variant; a literal count asserted against a
+    /// list declared in this module could not have failed when a variant was
+    /// added.
+    use crate::ALL_EVENT_TYPES;
 
     #[test]
     fn all_event_type_tags_are_distinct() {
         let mut tags: Vec<u16> = ALL_EVENT_TYPES.iter().map(event_type_tag).collect();
-        assert_eq!(tags.len(), 81, "taxonomy must enumerate all 81 variants");
+        assert_eq!(
+            tags.len(),
+            81,
+            "taxonomy must enumerate all 81 variants; ALL_EVENT_TYPES is compiler-checked complete, so a new variant raises this count"
+        );
         tags.sort_unstable();
         tags.dedup();
         assert_eq!(

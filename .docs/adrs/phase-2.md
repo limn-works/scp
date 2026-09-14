@@ -873,12 +873,19 @@ pub enum EventType {
     // into EventPayload::data — action, bridge_id, operator_did, governance_did,
     // context_id, timestamp. Every one of the four records a governance
     // decision that every member executed at its commit position, so all four
-    // are convergent commit-ordered durable leaves. A bridge node admits a
-    // bridge from the last leaf of this group for that bridge_id (§12.10.6
-    // step 1). An elapsed SuspendBridge `duration` appends NO leaf (§12.2.2):
-    // a member-local timer firing against a concurrent commit would append a
-    // leaf on one member and not on another, which breaks the
-    // equal-event-count ⇒ equal-root property of §9.9.3.
+    // are convergent commit-ordered durable leaves. A bridge node reads bridge
+    // admission from this group of leaves for that bridge_id, and from no
+    // other input (§12.10.6 step 1). That criterion scans EVERY one of the
+    // bridge's leaves for a BridgeRevoked leaf, which is terminal, and reads
+    // the LAST leaf only to decide whether a suspension still stands; a
+    // BridgeReactivated leaf appended after a BridgeRevoked leaf readmits
+    // nothing. An elapsed SuspendBridge `duration` appends NO leaf (§12.2.2),
+    // because the expiry records no fact: the operator's own node computes the
+    // deadline from the BridgeSuspended leaf it already holds. §7.3.1 does
+    // admit leaves that a member-local timer triggers — TTL expiry/close,
+    // governance-freeze expiry, deferred economic-policy application — and
+    // keeps each convergent by stamping it with a pre-computed deadline that
+    // convergent context state already holds.
     // The Requested and Rejected actions of BridgeRegistrationAction produce no
     // bridge leaf: GovernanceProposalCreated and GovernanceProposalResolved
     // (ADR-031 acceptance criterion 7) record the proposal and its rejection.

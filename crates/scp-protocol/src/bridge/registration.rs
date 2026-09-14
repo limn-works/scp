@@ -248,6 +248,14 @@ pub enum BridgeRegistrationAction {
         reason: String,
         /// Seconds until automatic reactivation; `None` until an explicit
         /// `ReactivateBridge` governance action.
+        ///
+        /// A bridge node adds this value to two instants and takes the later
+        /// sum as the suspension deadline: the leaf `timestamp`, and the
+        /// instant at which the node executed the commit that appended the
+        /// leaf (spec §12.2.2). Each sum saturates. The leaf `timestamp`
+        /// alone carries no lower bound, because spec §9.8.2(c) bounds an
+        /// envelope `created_at` only in the future direction, so a
+        /// committing member can backdate its own suspension.
         duration: Option<u64>,
     },
     /// Governance reactivated the bridge (spec §12.2.2, suspension). An
@@ -1543,9 +1551,12 @@ mod tests {
         }
     }
 
-    /// The wire table (spec §12.12.2) tags `Suspended` and `Reactivated` by
-    /// variant name, like the four earlier actions, so a leaf written by one
-    /// implementation parses on another.
+    /// The §12.12.2 wire table prints `Suspended` and `Reactivated` under
+    /// their variant names, like the four earlier actions; this test pins the
+    /// JSON representation of those names. JSON carries field names, so it
+    /// cannot pin the field ORDER that the positional-MessagePack leaf reads
+    /// by position; `registration_action_positional_messagepack_pins_variant_names`
+    /// and `registration_event_positional_messagepack_pins_field_order` pin that.
     #[test]
     fn suspension_actions_use_the_wire_table_tags() {
         let suspended = BridgeRegistrationAction::Suspended {
@@ -1570,6 +1581,150 @@ mod tests {
                 duration: None,
             }
         );
+    }
+
+    /// The leaf payload is POSITIONAL `MessagePack`, never JSON: spec §12.12.2
+    /// serializes a `BridgeRegistrationEvent` into `EventPayload::data`, and
+    /// `scp_event_log::payload` encodes that data with `rmp_serde::to_vec`
+    /// (positional, NOT `to_vec_named`). A positional encoder writes a struct
+    /// as an array, so FIELD ORDER is the wire contract and the JSON
+    /// round-trips above cannot see a reordered or inserted field: JSON
+    /// carries field names. This test pins the six fields by position.
+    #[test]
+    fn registration_event_positional_messagepack_pins_field_order() {
+        let event = BridgeRegistrationEvent {
+            action: BridgeRegistrationAction::Suspended {
+                reason: "spam".to_owned(),
+                duration: Some(3600),
+            },
+            bridge_id: "bridge-001".to_owned(),
+            operator_did: OPERATOR_DID.into(),
+            governance_did: GOVERNANCE_DID.into(),
+            context_id: CTX_A.to_owned(),
+            timestamp: 1_700_000_001,
+        };
+        let bytes = rmp_serde::to_vec(&event).expect("positional encode");
+        let decoded: rmpv::Value = rmp_serde::from_slice(&bytes).expect("decode to a value");
+        let fields = decoded
+            .as_array()
+            .expect("positional MessagePack writes a struct as an array");
+        assert_eq!(
+            fields.len(),
+            6,
+            "a BridgeRegistrationEvent leaf carries six fields, read by position"
+        );
+        assert_eq!(
+            fields[1].as_str(),
+            Some("bridge-001"),
+            "position 1 is bridge_id"
+        );
+        assert_eq!(
+            fields[2].as_str(),
+            Some(OPERATOR_DID),
+            "position 2 is operator_did"
+        );
+        assert_eq!(
+            fields[3].as_str(),
+            Some(GOVERNANCE_DID),
+            "position 3 is governance_did"
+        );
+        assert_eq!(fields[4].as_str(), Some(CTX_A), "position 4 is context_id");
+        assert_eq!(
+            fields[5].as_u64(),
+            Some(1_700_000_001),
+            "position 5 is timestamp"
+        );
+        assert_ne!(
+            fields[2], fields[3],
+            "the fixture must distinguish operator_did from governance_did, or a \
+             swap of the two would leave every assertion above green"
+        );
+
+        let restored: BridgeRegistrationEvent =
+            rmp_serde::from_slice(&bytes).expect("positional decode");
+        assert_eq!(restored.action, event.action);
+        assert_eq!(restored.bridge_id, event.bridge_id);
+        assert_eq!(restored.operator_did, event.operator_did);
+        assert_eq!(restored.governance_did, event.governance_did);
+        assert_eq!(restored.context_id, event.context_id);
+        assert_eq!(restored.timestamp, event.timestamp);
+    }
+
+    /// The leaf carries the action under the same variant NAME the §12.12.2
+    /// wire table prints, and carries a `Suspended` variant's two fields
+    /// positionally. Positional `MessagePack` writes a struct variant's fields
+    /// as an array, so `reason` before `duration` is the wire contract for
+    /// the two variants this change adds, and the JSON round-trips above
+    /// cannot see that order.
+    #[test]
+    fn registration_action_positional_messagepack_pins_variant_names() {
+        let actions = [
+            (BridgeRegistrationAction::Requested, "Requested"),
+            (BridgeRegistrationAction::Approved, "Approved"),
+            (
+                BridgeRegistrationAction::Rejected {
+                    reason: "no".to_owned(),
+                },
+                "Rejected",
+            ),
+            (BridgeRegistrationAction::Revoked, "Revoked"),
+            (
+                BridgeRegistrationAction::Suspended {
+                    reason: "spam".to_owned(),
+                    duration: Some(3600),
+                },
+                "Suspended",
+            ),
+            (BridgeRegistrationAction::Reactivated, "Reactivated"),
+        ];
+        for (action, expected_name) in &actions {
+            let bytes = rmp_serde::to_vec(action).expect("positional encode");
+            let decoded: rmpv::Value = rmp_serde::from_slice(&bytes).expect("decode to a value");
+            let (name, _) = variant_name_and_payload(&decoded);
+            assert_eq!(
+                name, *expected_name,
+                "{action:?} must carry the §12.12.2 wire-table name on the leaf"
+            );
+            let restored: BridgeRegistrationAction =
+                rmp_serde::from_slice(&bytes).expect("positional decode");
+            assert_eq!(&restored, action);
+        }
+
+        let suspended = BridgeRegistrationAction::Suspended {
+            reason: "spam".to_owned(),
+            duration: Some(3600),
+        };
+        let bytes = rmp_serde::to_vec(&suspended).expect("positional encode");
+        let decoded: rmpv::Value = rmp_serde::from_slice(&bytes).expect("decode to a value");
+        let (_, payload) = variant_name_and_payload(&decoded);
+        let payload = payload.expect("Suspended carries a payload");
+        let fields = payload
+            .as_array()
+            .expect("positional MessagePack writes a struct variant as an array");
+        assert_eq!(fields.len(), 2, "Suspended carries reason then duration");
+        assert_eq!(fields[0].as_str(), Some("spam"), "position 0 is reason");
+        assert_eq!(fields[1].as_u64(), Some(3600), "position 1 is duration");
+    }
+
+    /// Reads the externally-tagged variant name, and the payload when the
+    /// variant has one, out of a decoded positional-MessagePack value.
+    /// rmp-serde writes a unit variant as its bare name and a variant with
+    /// fields as a one-entry map from that name to the field array.
+    fn variant_name_and_payload(value: &rmpv::Value) -> (String, Option<rmpv::Value>) {
+        match value {
+            rmpv::Value::String(name) => (
+                name.as_str().expect("variant name is UTF-8").to_owned(),
+                None,
+            ),
+            rmpv::Value::Map(entries) => {
+                let (name, payload) = entries.first().expect("a variant map carries one entry");
+                (
+                    name.as_str().expect("variant name is UTF-8").to_owned(),
+                    Some(payload.clone()),
+                )
+            }
+            other => panic!("unexpected MessagePack shape for a variant: {other:?}"),
+        }
     }
 
     // -------------------------------------------------------------------

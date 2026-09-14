@@ -1143,118 +1143,140 @@ mod tests {
     // is_structural_event tests
     // ===================================================================
 
+    /// The full closed `EventType` taxonomy (81 variants) paired with its
+    /// EXPECTED structural/operational classification. `true` = structural
+    /// (retained longer per ADR-030 §2c); `false` = operational. This pins the
+    /// CORRECT decision for every variant — not merely that a decision exists —
+    /// so a future re-classification of any variant must update this table
+    /// deliberately. The expected values mirror the cryptographer-confirmed
+    /// classification in `is_structural_event`.
+    const EXPECTED_STRUCTURAL_CLASSIFICATION: [(EventType, bool); 81] = [
+        // --- Base variants ---
+        (EventType::ContextCreated, true),
+        (EventType::ContextClosing, true),
+        (EventType::ContextClosed, true),
+        (EventType::ContextExpired, true),
+        (EventType::MemberJoined, true),
+        (EventType::MemberLeft, true),
+        (EventType::RoleAssigned, true),
+        (EventType::TokenRevoked, false),
+        (EventType::MessageSent, false),
+        (EventType::OutletRegistered, false),
+        (EventType::OutletUpdated, false),
+        (EventType::OutletInvoked, false),
+        (EventType::OutletVerified, false),
+        (EventType::OutletInterfaceEstablished, false),
+        (EventType::GovernanceAction, true),
+        (EventType::ConsistencyCheckpoint, true),
+        (EventType::AbsenceProofRequested, false),
+        (EventType::MemberBlocked, true),
+        (EventType::KeyEpochAdvance, false),
+        (EventType::MediaSessionStarted, false),
+        (EventType::MediaSessionEnded, false),
+        (EventType::PaymentReceived, false),
+        (EventType::EconomicPolicyChanged, false),
+        (EventType::EconomicPolicyApplied, false),
+        (EventType::SpendingUcanGranted, false),
+        (EventType::SpendingUcanRevoked, false),
+        (EventType::GovernanceProposalCreated, false),
+        (EventType::GovernanceVoteCast, false),
+        (EventType::GovernanceVoteWithdrawn, false),
+        (EventType::GovernanceProposalResolved, false),
+        (EventType::GovernanceConflictDetected, false),
+        (EventType::GovernanceConflictResolved, false),
+        (EventType::GovernanceDeadlockRecovery, false),
+        (EventType::GovernanceActionExecuted, false),
+        (EventType::ProvenanceAttached, false),
+        (EventType::ProvenanceReceived, false),
+        // --- Unification variants (ADR-011 Amendment) ---
+        (EventType::AdminTransferred, true),
+        (EventType::CeilingModified, true),
+        (EventType::CeilingModificationPending, true),
+        (EventType::ThresholdModified, true),
+        (EventType::SignerAdded, true),
+        (EventType::SignerRemoved, true),
+        (EventType::ChildContextCreated, true),
+        (EventType::ContextPromoted, true),
+        (EventType::ContentKeysRotated, true),
+        (EventType::MemberReset, true),
+        (EventType::MemberSuspended, true),
+        (EventType::MemberSuspendedAll, true),
+        (EventType::MemberUnblocked, true),
+        (EventType::AccessRestored, true),
+        (EventType::GovernanceReconfigured, true),
+        (EventType::GovernanceFreezeExpired, true),
+        (EventType::HardRateLimitModified, true),
+        (EventType::EconomicPolicyLocked, true),
+        (EventType::ContextMigrationStarted, true),
+        (EventType::OutletRemoved, true),
+        (EventType::PruningPolicyModified, true),
+        (EventType::CommitBroadcasted, false),
+        (EventType::CommitBroadcastPending, false),
+        (EventType::ContextTombstoned, true),
+        (EventType::ContextMigrationCancelled, true),
+        (EventType::TtlExtended, true),
+        (EventType::TtlExtensionRejected, true),
+        (EventType::AccessRevoked, true),
+        (EventType::SpendApproved, true),
+        (EventType::PaymentCaptureFailed, false),
+        (EventType::ConsequenceTriggered, true),
+        (EventType::ConsequenceEnforced, true),
+        (EventType::ConsequenceEnforcementFailed, true),
+        (EventType::ConsequenceEscalatedToSuspendAll, true),
+        (EventType::CommitBroadcastSucceeded, false),
+        (EventType::CommitBroadcastFailed, false),
+        (EventType::RecoveryEpochAdvanced, true),
+        (EventType::AppBound, true),
+        (EventType::AppUnbound, true),
+        // --- Cross-context-saga carve-out (ADR-011 Amendment §6) ---
+        (EventType::CrossContextOutletInvoked, false),
+        (EventType::CrossContextDivergenceMarker, true),
+        // --- Bridge lifecycle (spec §12.2; ADR-011) ---
+        (EventType::BridgeRegistered, true),
+        (EventType::BridgeSuspended, true),
+        (EventType::BridgeReactivated, true),
+        (EventType::BridgeRevoked, true),
+    ];
+
     #[test]
     fn structural_events_classified_correctly() {
-        // The full closed `EventType` taxonomy (81 variants) paired with its
-        // EXPECTED structural/operational classification. `true` = structural
-        // (retained longer per ADR-030 §2c); `false` = operational. This pins
-        // the CORRECT decision for every variant — not merely that a decision
-        // exists — so a future re-classification of any variant must update this
-        // table deliberately. The expected values mirror the cryptographer-
-        // confirmed classification in `is_structural_event`.
-        const EXPECTED: [(EventType, bool); 81] = [
-            // --- Base variants ---
-            (EventType::ContextCreated, true),
-            (EventType::ContextClosing, true),
-            (EventType::ContextClosed, true),
-            (EventType::ContextExpired, true),
-            (EventType::MemberJoined, true),
-            (EventType::MemberLeft, true),
-            (EventType::RoleAssigned, true),
-            (EventType::TokenRevoked, false),
-            (EventType::MessageSent, false),
-            (EventType::OutletRegistered, false),
-            (EventType::OutletUpdated, false),
-            (EventType::OutletInvoked, false),
-            (EventType::OutletVerified, false),
-            (EventType::OutletInterfaceEstablished, false),
-            (EventType::GovernanceAction, true),
-            (EventType::ConsistencyCheckpoint, true),
-            (EventType::AbsenceProofRequested, false),
-            (EventType::MemberBlocked, true),
-            (EventType::KeyEpochAdvance, false),
-            (EventType::MediaSessionStarted, false),
-            (EventType::MediaSessionEnded, false),
-            (EventType::PaymentReceived, false),
-            (EventType::EconomicPolicyChanged, false),
-            (EventType::EconomicPolicyApplied, false),
-            (EventType::SpendingUcanGranted, false),
-            (EventType::SpendingUcanRevoked, false),
-            (EventType::GovernanceProposalCreated, false),
-            (EventType::GovernanceVoteCast, false),
-            (EventType::GovernanceVoteWithdrawn, false),
-            (EventType::GovernanceProposalResolved, false),
-            (EventType::GovernanceConflictDetected, false),
-            (EventType::GovernanceConflictResolved, false),
-            (EventType::GovernanceDeadlockRecovery, false),
-            (EventType::GovernanceActionExecuted, false),
-            (EventType::ProvenanceAttached, false),
-            (EventType::ProvenanceReceived, false),
-            // --- Unification variants (ADR-011 Amendment) ---
-            (EventType::AdminTransferred, true),
-            (EventType::CeilingModified, true),
-            (EventType::CeilingModificationPending, true),
-            (EventType::ThresholdModified, true),
-            (EventType::SignerAdded, true),
-            (EventType::SignerRemoved, true),
-            (EventType::ChildContextCreated, true),
-            (EventType::ContextPromoted, true),
-            (EventType::ContentKeysRotated, true),
-            (EventType::MemberReset, true),
-            (EventType::MemberSuspended, true),
-            (EventType::MemberSuspendedAll, true),
-            (EventType::MemberUnblocked, true),
-            (EventType::AccessRestored, true),
-            (EventType::GovernanceReconfigured, true),
-            (EventType::GovernanceFreezeExpired, true),
-            (EventType::HardRateLimitModified, true),
-            (EventType::EconomicPolicyLocked, true),
-            (EventType::ContextMigrationStarted, true),
-            (EventType::OutletRemoved, true),
-            (EventType::PruningPolicyModified, true),
-            (EventType::CommitBroadcasted, false),
-            (EventType::CommitBroadcastPending, false),
-            (EventType::ContextTombstoned, true),
-            (EventType::ContextMigrationCancelled, true),
-            (EventType::TtlExtended, true),
-            (EventType::TtlExtensionRejected, true),
-            (EventType::AccessRevoked, true),
-            (EventType::SpendApproved, true),
-            (EventType::PaymentCaptureFailed, false),
-            (EventType::ConsequenceTriggered, true),
-            (EventType::ConsequenceEnforced, true),
-            (EventType::ConsequenceEnforcementFailed, true),
-            (EventType::ConsequenceEscalatedToSuspendAll, true),
-            (EventType::CommitBroadcastSucceeded, false),
-            (EventType::CommitBroadcastFailed, false),
-            (EventType::RecoveryEpochAdvanced, true),
-            (EventType::AppBound, true),
-            (EventType::AppUnbound, true),
-            // --- Cross-context-saga carve-out (ADR-011 Amendment §6) ---
-            (EventType::CrossContextOutletInvoked, false),
-            (EventType::CrossContextDivergenceMarker, true),
-            // --- Bridge lifecycle (spec §12.2; ADR-011) ---
-            (EventType::BridgeRegistered, true),
-            (EventType::BridgeSuspended, true),
-            (EventType::BridgeReactivated, true),
-            (EventType::BridgeRevoked, true),
-        ];
-
-        // Exhaustiveness guard: the table must cover the full closed taxonomy
-        // (exactly 81 variants). Adding a variant to `EventType` without adding
-        // it here leaves it unclassified-by-test, so this count is pinned.
-        assert_eq!(
-            EXPECTED.len(),
-            81,
-            "classification table must cover all 81 EventType variants"
-        );
-
-        for (event_type, expected_structural) in &EXPECTED {
+        for (event_type, expected_structural) in &EXPECTED_STRUCTURAL_CLASSIFICATION {
             assert_eq!(
                 is_structural_event(event_type),
                 *expected_structural,
                 "{event_type:?} classification mismatch: \
                  expected structural={expected_structural}"
+            );
+        }
+    }
+
+    /// The classification table must carry a row for every variant of the
+    /// closed taxonomy. `crate::ALL_EVENT_TYPES` is complete by construction —
+    /// the `declare_event_type_taxonomy!` invocation in `lib.rs` matches over
+    /// the same variant list without a `_` arm — so a variant added to
+    /// `EventType` and left out of the table fails the coverage assertion
+    /// below. Comparing the table's own `len()` against a literal equal to its
+    /// declared length, which is what this test did before, could not fail.
+    #[test]
+    fn structural_classification_table_covers_every_event_type() {
+        assert_eq!(
+            EXPECTED_STRUCTURAL_CLASSIFICATION.len(),
+            crate::ALL_EVENT_TYPES.len(),
+            "classification table must classify every EventType variant"
+        );
+        assert_eq!(
+            EXPECTED_STRUCTURAL_CLASSIFICATION.len(),
+            81,
+            "the closed taxonomy stands at 81 variants; raising it means \
+             updating ADR-011, spec §25 vector 32, and the crate docs"
+        );
+        for event_type in crate::ALL_EVENT_TYPES {
+            assert!(
+                EXPECTED_STRUCTURAL_CLASSIFICATION
+                    .iter()
+                    .any(|(listed, _)| listed == event_type),
+                "EventType::{event_type:?} carries no expected structural \
+                 classification in this table"
             );
         }
     }
