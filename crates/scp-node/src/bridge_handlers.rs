@@ -843,10 +843,13 @@ async fn emit_message_handler(
         let mut messages = bridge_state.messages.write().await;
         messages.push(emitted);
         // Oldest first, so the messages a `message_edit` or `message_delete`
-        // is likeliest to name are the ones that survive.
+        // is likeliest to name are the ones that survive. Half the list goes at
+        // once, for the reason the dedup set beside it drops half: draining one
+        // element per message past the bound would shift the whole list on
+        // every message, and draining half amortizes that to one shift per
+        // half-list of messages.
         if messages.len() > MAX_EMITTED_MESSAGES {
-            let excess = messages.len() - MAX_EMITTED_MESSAGES;
-            messages.drain(..excess);
+            messages.drain(..MAX_EMITTED_MESSAGES / 2);
         }
     }
 
@@ -2724,9 +2727,14 @@ mod tests {
         }
 
         let messages = state.messages.read().await;
-        assert_eq!(messages.len(), MAX_EMITTED_MESSAGES);
+        assert!(
+            messages.len() <= MAX_EMITTED_MESSAGES,
+            "the emitted-message list grew past its bound: {}",
+            messages.len()
+        );
+        assert!(!messages.is_empty(), "eviction must not empty the list");
         // Eviction drops the oldest, so the newest message is still the one a
-        // `message_edit` or `message_delete` finds.
+        // `message_edit` or `message_delete` finds, and the oldest is gone.
         assert_eq!(
             messages
                 .last()
@@ -2734,6 +2742,12 @@ mod tests {
                 .platform_message_id
                 .as_deref(),
             Some(format!("pm-{MAX_EMITTED_MESSAGES}").as_str())
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.platform_message_id.as_deref() == Some("pm-0")),
+            "eviction must drop the oldest message first"
         );
     }
 

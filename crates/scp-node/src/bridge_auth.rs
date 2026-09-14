@@ -104,6 +104,19 @@ const WEBHOOK_TIMESTAMP_TOLERANCE_SECS: u64 = 300;
 /// operator reads it and a caller does not.
 const BRIDGE_NOT_AUTHORIZED_MESSAGE: &str = "bridge request is not authorized";
 
+/// What a node holds no bridge record means, appended to the two debug lines an
+/// operator reads while diagnosing a 401.
+///
+/// Spec §12.10.6 step 1 gives a node one input for bridge admission: the bridge
+/// lifecycle leaves in the event log the node holds as a member of the context.
+/// An operator who sees this line has a node holding no `BridgeRegistered` leaf
+/// for that bridge — because the node holds no membership in that context, or
+/// because governance registered no such bridge — and no file, variable, or
+/// request body substitutes for that leaf.
+const BRIDGE_ADMISSION_SOURCE: &str = "a node holds a bridge only while the highest-sequence \
+     bridge lifecycle leaf in the context event log it holds as a member admits that bridge \
+     (spec 12.10.6 step 1), and reads admission from no other input";
+
 /// Returns the one 401 response every bearer-token and webhook rejection uses.
 ///
 /// `reason` names what failed, and this function logs it at debug level rather
@@ -2065,7 +2078,7 @@ async fn authorize_bearer_request(
 
     let Some(bridge) = lookup.find_bridge(&claims.scp_bridge_id) else {
         return Err(bridge_not_authorized(format!(
-            "bridge not found: {}",
+            "bridge not found: {}; {BRIDGE_ADMISSION_SOURCE}",
             claims.scp_bridge_id
         )));
     };
@@ -2334,7 +2347,7 @@ fn authorize_webhook_request(
     // it reads or mutates to that context.
     let Some(bridge) = lookup.find_bridge(&binding.bridge_id) else {
         return Err(bridge_not_authorized(format!(
-            "webhook key {key_id} is bound to unregistered bridge {}",
+            "webhook key {key_id} is bound to unregistered bridge {}; {BRIDGE_ADMISSION_SOURCE}",
             binding.bridge_id
         )));
     };

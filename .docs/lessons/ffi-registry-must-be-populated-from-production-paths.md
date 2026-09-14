@@ -79,7 +79,8 @@ a binary's `main`, a request handler, a startup sequence — reaches that writer
 
 ## The operator file was the wrong entry point, and the fourth lesson says why
 
-Review of that operator file withdrew it. Spec §12.10.6 step 1 states the criterion a bridge node
+A fourth review round of pull request #2373, the bridge-handler authorization-scope branch,
+withdrew that operator file. Spec §12.10.6 step 1 states the criterion a bridge node
 applies before it admits a bridge: among the bridge lifecycle leaves in the event log the node
 holds as a member of the context, the highest-sequence leaf naming that bridge is a
 `BridgeRegistered` or `BridgeReactivated` leaf. The node reads admission out of that log and out
