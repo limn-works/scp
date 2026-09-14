@@ -1,7 +1,9 @@
 //! In-memory [`DeviceAttestation`] implementation for testing.
 //!
-//! Returns synthetic attestation tokens that always verify. No actual device
-//! verification is performed. See ADR-006 in `.docs/adrs/phase-1.md`.
+//! Mints synthetic attestation tokens carrying a fixed byte prefix, and accepts
+//! exactly the tokens carrying that prefix. This adapter contacts no attestation
+//! service, so a token it accepts establishes nothing about the device. See
+//! ADR-006, the platform abstraction, in `.docs/adrs/phase-1.md`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -14,9 +16,8 @@ const SYNTHETIC_ATTESTATION_PREFIX: &[u8] = b"scp-test-attestation-v1:";
 
 /// In-memory implementation of [`DeviceAttestation`] for testing and development.
 ///
-/// Produces synthetic attestation tokens that always verify. This adapter
-/// exists to satisfy the trait requirements for Phase 1 testing where no
-/// actual device attestation hardware is available.
+/// This adapter satisfies the [`DeviceAttestation`] trait for Phase 1 testing,
+/// where the test host offers no device attestation hardware.
 ///
 /// Tokens produced by this adapter carry a known prefix
 /// (`scp-test-attestation-v1:`) followed by a monotonically increasing
