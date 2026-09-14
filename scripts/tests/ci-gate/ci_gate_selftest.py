@@ -532,7 +532,7 @@ DOCS_ONLY = dict.fromkeys(RUST_ONLY, "false")
 # `if: github.event_name == 'pull_request'`, and check-cross-layer.sh is why:
 # it reads a declared exemption out of a pull request's body, which a
 # merge_group event does not publish. Job cross-layer runs that script as its
-# own step, and job fix-round-check-selftest runs it as one of the 28 gates
+# own step, and job fix-round-check-selftest runs it as one of the 29 gates
 # scripts/fix-round-check.sh names.
 EVENT_ONLY_JOBS = ("cross-layer", "fix-round-check-selftest")
 

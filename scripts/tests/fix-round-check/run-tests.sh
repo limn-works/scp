@@ -52,17 +52,58 @@
 #     branch changed no file inside a workspace crate, and exits 0.
 #
 #   * THE MISSING GATE. A gate the runner's list names but the repository does not hold has
-#     to fail the run. Case 3 runs against this repository, where all 28 exist, so it cannot
+#     to fail the run. Case 3 runs against this repository, where all 29 exist, so it cannot
 #     reach that branch. Case 10 deletes one gate from a fixture and asserts that the run
 #     names it and exits non-zero.
+#
+#   * THE CHANGES THE RUNNER READS NO FILE OF. Cases 7, 8, 9 and 10 cover what the runner
+#     compiles. Cases 11 through 15 cover what it says about what it did not compile,
+#     because a fix agent pushes on the last lines of this output.
+#
+#     Case 11 changes one root-level file every workspace member compiles against and no
+#     file under `crates/`, and asserts that the run exits non-zero and starts no `cargo
+#     check`. That branch derived an empty crate set, recorded the compile step as skipped
+#     and exited 0, which is a green verdict over zero compiled lines on a branch that
+#     recompiles every member — the shape a compiler pin bump and a
+#     `[workspace.dependencies]` bump both take.
+#
+#     Case 12 changes a file under `bindings/python/` and asserts that the summary names
+#     that directory and the lint that no step ran. The runner reaches four of that
+#     directory's files through its gates, so a reader who saw a green verdict without this
+#     line would take the Python half of a round to have been checked.
+#
+#     Case 13 changes a file under `crates/scp-transport/` and asserts that the run issues
+#     the second `cargo check` the `rust-clippy` job's second command mirrors. Without it,
+#     an edit inside a `#[cfg(feature = "quic")]` module compiles nothing and reports
+#     `compile ok`.
+#
+#     Case 14 leaves one edit uncommitted and asserts that the summary names
+#     `scripts/check-cross-layer.sh` as the gate whose diff range holds no uncommitted edit.
+#     That gate reads `git diff <merge base>...HEAD` and the other 28 read the working tree,
+#     so its pass counts toward `gates 29/29 passed` over work it did not read.
+#
+#     Case 15 names one crate on the command line on a branch that changed another, and
+#     asserts that the summary names the package the run left uncompiled.
+#
+#     Case 16 changes a file under `crates/scp-clock/`, one of the nine packages the
+#     `wasm-protocol` job compiles for `wasm32-unknown-unknown`, and asserts that the
+#     summary names that target and starts no wasm compile of its own. A host `cargo
+#     check` accepts an API that target rejects.
+#
+#     Case 17 changes a workflow file and asserts that the summary names the two suites
+#     the `ci-workflow-selftest` job runs over it. One gate the runner holds reads
+#     workflow files for two rules of its own, which is not coverage of that edit.
 #
 # WHAT THE STUBS REPLACE, and what stays real. The cases replace `cargo`, `rustc`, and
 # `rustup` with scripts on a PATH this harness leads with, because the contract clauses
 # above are about what the script does with those three programs' answers, and a real
 # `cargo check` of this workspace costs between ten minutes and an hour on a developer
-# machine. Everything else stays real: case 3 runs the 28 enforcement gates
+# machine. Everything else stays real: case 3 runs the 29 enforcement gates
 # `scripts/fix-round-check.sh` names against this repository's own files, so a gate the
 # list names but the repository does not hold fails this test rather than being skipped.
+# One of those 29 gates imports PyYAML, which the standard library does not carry, so a
+# developer whose interpreter lacks it sees case 3 fail on that gate; the runner prints the
+# install command when it cannot import the library.
 #
 # WHY THE PINNED VERSION IS READ RATHER THAN WRITTEN. Case 2 and case 3 need a `rustc` that
 # agrees with the pin. The harness reads the channel out of `rust-toolchain.toml` at run
@@ -70,10 +111,12 @@
 #
 # WHO RUNS THIS SUITE. The `fix-round-check-selftest` job of `.github/workflows/ci.yml`
 # runs it on every pull-request head, which is the head every fix round pushes. That job
-# names no merge_group event, for the reason its own comment gives: one of the 28 gates
+# names no merge_group event, for the reason its own comment gives: one of the 29 gates
 # case 3 runs reads an exemption out of the pull request's body, and a merge_group event
 # publishes no body. The job installs what case 3 needs: the tree-sitter
-# grammars nine Python gates parse with, the ruff `scripts/check-pyi-generated.sh` runs,
+# grammars nine Python gates parse with, the PyYAML
+# `scripts/check-workflow-compile-steps.py` reads every workflow file with, the ruff
+# `scripts/check-pyi-generated.sh` runs,
 # the jq `scripts/check-bridge-symmetry.sh` requires, a Rust toolchain for the twelve
 # `cargo tree` resolutions two gates run, and the base ref `scripts/check-cross-layer.sh`
 # diffs against. A developer runs the same command by hand.
@@ -152,7 +195,7 @@ write_stubs() {
 
     # A stub `python3.12` fails the gates step and no other.
     # `scripts/fix-round-check.sh` resolves its interpreter through
-    # `command -v python3.12`, and nine of the 28 entries in its gate list run under it, so
+    # `command -v python3.12`, and ten of the 29 entries in its gate list run under it, so
     # a case that plants a failing one makes the gates step fail while the compile and
     # format steps pass. Cases that pass nothing here plant no such file and run the real
     # interpreter.
@@ -232,6 +275,13 @@ gate_paths() {
 # answer from `scp-ffi`. It also holds one file under no crate directory, which case 9
 # changes.
 #
+# It holds a fourth manifest, `crates/scp-transport`, because two of the three entries in
+# the runner's EXTRA_FEATURE_CHECKS array name that package, and case 13 reads both
+# `cargo check` commands they produce. It holds `bindings/python/scp_sdk/context.py` for
+# case 12, `Cargo.toml` for case 11 and `.github/workflows/ci.yml` for case 17, and the
+# fixture's base commit holds all three, so each case decides for itself whether its own
+# edit to them is committed.
+#
 # The commit passes `--no-gpg-sign` and `--no-verify` because a developer's global git
 # configuration may sign every commit and may point `core.hooksPath` at this repository's
 # hooks, and this fixture wants neither. `git update-ref` writes the remote-tracking ref
@@ -239,7 +289,8 @@ gate_paths() {
 build_fixture() {
     local root=$1 g
     mkdir -p "$root/scripts" "$root/crates/scp-clock/src" "$root/crates/scp-ffi/src" \
-        "$root/crates/scp-ffi/napi/src" "$root/notes"
+        "$root/crates/scp-ffi/napi/src" "$root/crates/scp-transport/src" \
+        "$root/bindings/python/scp_sdk" "$root/.github/workflows" "$root/notes"
     cp "$SCRIPT" "$root/scripts/fix-round-check.sh"
     cp "$REPO_ROOT/scripts/check-resolved-rustc.sh" "$root/scripts/check-resolved-rustc.sh"
     cp "$REPO_ROOT/rust-toolchain.toml" "$root/rust-toolchain.toml"
@@ -253,6 +304,11 @@ build_fixture() {
     printf '[package]\nname = "scp-clock"\nversion = "0.0.0"\n' > "$root/crates/scp-clock/Cargo.toml"
     printf '[package]\nname = "scp-ffi"\nversion = "0.0.0"\n' > "$root/crates/scp-ffi/Cargo.toml"
     printf '[package]\nname = "scp-ffi-napi"\nversion = "0.0.0"\n' > "$root/crates/scp-ffi/napi/Cargo.toml"
+    printf '[package]\nname = "scp-transport"\nversion = "0.0.0"\n' > "$root/crates/scp-transport/Cargo.toml"
+    printf '// fixture source\n' > "$root/crates/scp-transport/src/lib.rs"
+    printf '# fixture binding source\n' > "$root/bindings/python/scp_sdk/context.py"
+    printf 'name: fixture\n' > "$root/.github/workflows/ci.yml"
+    printf '[workspace]\nmembers = ["crates/*"]\n' > "$root/Cargo.toml"
     printf '// fixture source\n' > "$root/crates/scp-clock/src/lib.rs"
     printf '// fixture source\n' > "$root/crates/scp-ffi/src/lib.rs"
     printf '// fixture source\n' > "$root/crates/scp-ffi/napi/src/lib.rs"
@@ -356,10 +412,10 @@ if grep -q 'format ok' "$WORK/passing/out.txt"; then
 else
     report "case 3 names the format step as passing" 1 "the summary holds no 'format ok': $(tail -n 3 "$WORK/passing/out.txt")"
 fi
-if grep -q 'gates 28/28 passed' "$WORK/passing/out.txt"; then
-    report "case 3 ran all 28 gates against this repository" 0 ""
+if grep -q 'gates 29/29 passed' "$WORK/passing/out.txt"; then
+    report "case 3 ran all 29 gates against this repository" 0 ""
 else
-    report "case 3 ran all 28 gates against this repository" 1 "the summary holds no 'gates 28/28 passed': $(tail -n 3 "$WORK/passing/out.txt")"
+    report "case 3 ran all 29 gates against this repository" 1 "the summary holds no 'gates 29/29 passed': $(tail -n 3 "$WORK/passing/out.txt")"
 fi
 
 # ── Case 5: the format step's failure reaches the exit code ──────────────────────────
@@ -528,10 +584,10 @@ fi
 
 # ── Case 10: a gate the list names and the repository does not hold ──────────────────
 #
-# Every one of the 28 gates exists in this repository, so case 3 exercises the branch that
+# Every one of the 29 gates exists in this repository, so case 3 exercises the branch that
 # runs a gate and never the branch that finds one absent. Deleting the `MISSING` branch from
 # `scripts/fix-round-check.sh` would leave an absent gate uncounted and unreported: the run
-# would print `gates 27/28 passed` and exit 0, having skipped a gate rather than failing on
+# would print `gates 28/29 passed` and exit 0, having skipped a gate rather than failing on
 # it. This case deletes one gate from a fixture that is otherwise the passing fixture of
 # case 9.
 FIXTURE10="$WORK/missing-gate"
@@ -554,6 +610,225 @@ if grep -qE 'gates [0-9]+/[0-9]+ passed, 1 FAILED' "$FIXTURE10.harness/out.txt";
     report "case 10 counts the absent gate as a failure rather than dropping it" 0 ""
 else
     report "case 10 counts the absent gate as a failure rather than dropping it" 1 "the summary holds no gate-failure count: $(tail -n 3 "$FIXTURE10.harness/out.txt")"
+fi
+
+# ── Case 11: a branch that changed only a workspace-wide input ───────────────────────
+#
+# `Cargo.toml` sits under no crate directory, so `crate_of_path` maps it to no package and
+# the derived crate set is empty — the same branch case 9 takes. Case 9's branch changed a
+# note, which no cargo command compiles; this one changed the table every member's manifest
+# inherits from, which recompiles all 26. Exiting 0 there reports a green verdict over zero
+# compiled lines, and this case asserts the run refuses it.
+#
+# The mutation it kills: deleting the `wide_list` branch of the empty-crate-set block in
+# `scripts/fix-round-check.sh` restores the skip line and exit 0, and every other assertion
+# in this file still passes.
+FIXTURE11="$WORK/workspace-wide-input"
+build_fixture "$FIXTURE11"
+fixture_commit "$FIXTURE11" Cargo.toml
+run_fixture "$FIXTURE11"
+rc=$(cat "$FIXTURE11.harness/rc.txt")
+if [[ $rc -eq 0 ]]; then
+    report "case 11 exits non-zero when the branch changed only a workspace-wide input" 1 "the script exited 0; output tail: $(tail -n 6 "$FIXTURE11.harness/out.txt")"
+else
+    report "case 11 exits non-zero when the branch changed only a workspace-wide input" 0 ""
+fi
+if grep -qF 'which every workspace member compiles against' "$FIXTURE11.harness/out.txt"; then
+    report "case 11 names the file no narrowed cargo check covers" 0 ""
+else
+    report "case 11 names the file no narrowed cargo check covers" 1 "the output never says why it compiled nothing: $(tail -n 3 "$FIXTURE11.harness/out.txt")"
+fi
+if grep -q '^check ' "$FIXTURE11.harness/cargo.log" 2>/dev/null; then
+    report "case 11 starts no cargo check it cannot narrow" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE11.harness/cargo.log")"
+else
+    report "case 11 starts no cargo check it cannot narrow" 0 ""
+fi
+
+# ── Case 12: a branch that changed a file under bindings/ ────────────────────────────
+#
+# The runner runs no ruff, no biome, no detekt and no SwiftLint, and four of its gates read
+# files under `bindings/`, so a summary that named only its two cargo omissions would tell
+# a fix agent editing `bindings/python/` that CI has nothing left to reject.
+#
+# The mutation it kills: deleting the LANGUAGE_LANES loop from
+# `scripts/fix-round-check.sh` leaves the run exiting 0 with no line about the directory it
+# read no file of, and every other assertion in this file still passes.
+FIXTURE12="$WORK/bindings-only"
+build_fixture "$FIXTURE12"
+fixture_commit "$FIXTURE12" bindings/python/scp_sdk/context.py
+run_fixture "$FIXTURE12"
+rc=$(cat "$FIXTURE12.harness/rc.txt")
+if [[ $rc -eq 0 ]]; then
+    report "case 12 exits 0 when the branch changed a binding source alone" 0 ""
+else
+    report "case 12 exits 0 when the branch changed a binding source alone" 1 "the script exited $rc; output tail: $(tail -n 6 "$FIXTURE12.harness/out.txt")"
+fi
+if grep -qF 'NOT CHECKED — 1 file(s) under bindings/python/' "$FIXTURE12.harness/out.txt"; then
+    report "case 12 names the directory it read no file of" 0 ""
+else
+    report "case 12 names the directory it read no file of" 1 "the output holds no NOT CHECKED line for bindings/python/: $(tail -n 4 "$FIXTURE12.harness/out.txt")"
+fi
+if grep -qF 'ruff and pytest, which the python-lint and python-test jobs' "$FIXTURE12.harness/out.txt"; then
+    report "case 12 names the programs and the CI jobs that run them" 0 ""
+else
+    report "case 12 names the programs and the CI jobs that run them" 1 "the NOT CHECKED line names no program: $(tail -n 4 "$FIXTURE12.harness/out.txt")"
+fi
+
+# ── Case 13: the optional-feature compile the workspace command does not reach ───────
+#
+# `.github/workflows/ci.yml` runs `cargo clippy -p scp-transport --features
+# quic,http3,udp,coap --all-targets` as a second command of its `rust-clippy` job, under a
+# comment recording that those transports "rotted undetected for months". A `cargo check`
+# carrying no feature compiles none of the four modules, so an edit inside one of them
+# reports `compile ok` having compiled nothing.
+#
+# The mutation it kills: emptying EXTRA_FEATURE_CHECKS in `scripts/fix-round-check.sh`
+# leaves the run issuing one featureless `cargo check` and reporting `compile ok`, and
+# every other assertion in this file still passes.
+FIXTURE13="$WORK/optional-features"
+build_fixture "$FIXTURE13"
+fixture_commit "$FIXTURE13" crates/scp-transport/src/lib.rs
+run_fixture "$FIXTURE13"
+rc=$(cat "$FIXTURE13.harness/rc.txt")
+if [[ $rc -eq 0 ]]; then
+    report "case 13 exits 0 when both transport compiles pass" 0 ""
+else
+    report "case 13 exits 0 when both transport compiles pass" 1 "the script exited $rc; output tail: $(tail -n 6 "$FIXTURE13.harness/out.txt")"
+fi
+if grep -qF 'check -p scp-transport --all-targets --features quic,http3,udp,coap' "$FIXTURE13.harness/cargo.log"; then
+    report "case 13 compiles the optional transports the workspace command never activates" 0 ""
+else
+    report "case 13 compiles the optional transports the workspace command never activates" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13.harness/cargo.log")"
+fi
+if grep -qF 'check -p scp-transport --all-targets --features combined,local-cache' "$FIXTURE13.harness/cargo.log"; then
+    report "case 13 compiles the blob-backend features the optional-feature test lane names" 0 ""
+else
+    report "case 13 compiles the blob-backend features the optional-feature test lane names" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13.harness/cargo.log")"
+fi
+
+# ── Case 14: the gate whose diff range holds no uncommitted edit ─────────────────────
+#
+# `scripts/check-cross-layer.sh` decides from `git diff <merge base with origin/main>…HEAD`
+# and the other 28 gates read the working tree, so on an uncommitted edit — one of the
+# three input shapes the runner's own comment names as supported — that gate passes over
+# work it never read and its pass counts toward `gates 29/29 passed`.
+#
+# The mutation it kills: deleting the `uncommitted_count` note from
+# `scripts/fix-round-check.sh` leaves that pass unqualified, and every other assertion in
+# this file still passes.
+FIXTURE14="$WORK/uncommitted-edit"
+build_fixture "$FIXTURE14"
+printf '// uncommitted edit\n' >> "$FIXTURE14/crates/scp-clock/src/lib.rs"
+run_fixture "$FIXTURE14"
+rc=$(cat "$FIXTURE14.harness/rc.txt")
+if [[ $rc -eq 0 ]]; then
+    report "case 14 exits 0 on an uncommitted edit that compiles" 0 ""
+else
+    report "case 14 exits 0 on an uncommitted edit that compiles" 1 "the script exited $rc; output tail: $(tail -n 6 "$FIXTURE14.harness/out.txt")"
+fi
+if grep -qF 'NOT CHECKED — the 1 uncommitted path(s) in this working tree' "$FIXTURE14.harness/out.txt"; then
+    report "case 14 counts the uncommitted paths one gate did not read" 0 ""
+else
+    report "case 14 counts the uncommitted paths one gate did not read" 1 "the output holds no NOT CHECKED line for the working tree: $(tail -n 4 "$FIXTURE14.harness/out.txt")"
+fi
+if grep -qF 'scripts/check-cross-layer.sh decides from git diff' "$FIXTURE14.harness/out.txt"; then
+    report "case 14 names the gate and the range it decides from" 0 ""
+else
+    report "case 14 names the gate and the range it decides from" 1 "the NOT CHECKED line names no gate: $(tail -n 4 "$FIXTURE14.harness/out.txt")"
+fi
+
+# ── Case 15: a caller-named crate set narrower than the branch's own edits ───────────
+#
+# Naming a crate takes the `$# -gt 0` branch, which compiles the set the caller asked for.
+# A fix agent that names one crate and edits two reads `compile ok` over a package the run
+# never compiled, and no other line of the output names it.
+#
+# The mutation it kills: deleting the UNNAMED loop from `scripts/fix-round-check.sh` leaves
+# that run silent about the second package, and every other assertion in this file passes.
+FIXTURE15="$WORK/narrower-than-edits"
+build_fixture "$FIXTURE15"
+fixture_commit "$FIXTURE15" crates/scp-ffi/napi/src/lib.rs
+HARNESS15="$FIXTURE15.harness"
+write_stubs "$HARNESS15" "$PIN_CHANNEL" 0 0 ""
+PATH="$HARNESS15/bin:$PATH" bash "$FIXTURE15/scripts/fix-round-check.sh" scp-clock \
+    > "$HARNESS15/out.txt" 2>&1
+printf '%s' $? > "$HARNESS15/rc.txt"
+rc=$(cat "$HARNESS15/rc.txt")
+if [[ $rc -eq 0 ]]; then
+    report "case 15 exits 0 when the crate the caller named compiles" 0 ""
+else
+    report "case 15 exits 0 when the crate the caller named compiles" 1 "the script exited $rc; output tail: $(tail -n 6 "$HARNESS15/out.txt")"
+fi
+if grep -qF 'NOT CHECKED — scp-ffi-napi: this branch changed files these packages own' "$HARNESS15/out.txt"; then
+    report "case 15 names the package the caller's crate set left out" 0 ""
+else
+    report "case 15 names the package the caller's crate set left out" 1 "the output holds no NOT CHECKED line for scp-ffi-napi: $(tail -n 4 "$HARNESS15/out.txt")"
+fi
+if grep -qF 'check -p scp-clock --all-targets' "$HARNESS15/cargo.log"; then
+    report "case 15 compiles the crate set the caller asked for and no other" 0 ""
+else
+    report "case 15 compiles the crate set the caller asked for and no other" 1 "the stub cargo log holds: $(tr '\n' '|' < "$HARNESS15/cargo.log")"
+fi
+
+# ── Case 16: the wasm target the host compile does not reach ─────────────────────────
+#
+# The `wasm-protocol` job of `.github/workflows/ci.yml` runs one `cargo check` over nine
+# packages for `wasm32-unknown-unknown`. `scp-clock` is one of them, and a host `cargo
+# check` accepts an API that target rejects, so a run that compiled `scp-clock` for the
+# host alone and printed `compile ok` would tell a fix agent that the wasm build is safe.
+#
+# The mutation it kills: deleting the SELECTED_WASM block from
+# `scripts/fix-round-check.sh` leaves that run silent about the target it never compiled
+# for, and every other assertion in this file still passes.
+FIXTURE16="$WORK/wasm-target-crate"
+build_fixture "$FIXTURE16"
+fixture_commit "$FIXTURE16" crates/scp-clock/src/lib.rs
+run_fixture "$FIXTURE16"
+if grep -qF 'NOT CHECKED — scp-clock against wasm32-unknown-unknown' "$FIXTURE16.harness/out.txt"; then
+    report "case 16 names the package it compiled for the host target alone" 0 ""
+else
+    report "case 16 names the package it compiled for the host target alone" 1 "the output holds no NOT CHECKED line for wasm32-unknown-unknown: $(tail -n 5 "$FIXTURE16.harness/out.txt")"
+fi
+if grep -qF 'wasm-protocol job' "$FIXTURE16.harness/out.txt"; then
+    report "case 16 names the CI job that compiles for that target" 0 ""
+else
+    report "case 16 names the CI job that compiles for that target" 1 "the NOT CHECKED line names no job: $(tail -n 5 "$FIXTURE16.harness/out.txt")"
+fi
+if grep -qF -- '--target wasm32-unknown-unknown' "$FIXTURE16.harness/cargo.log"; then
+    report "case 16 starts no wasm compile of its own" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE16.harness/cargo.log")"
+else
+    report "case 16 starts no wasm compile of its own" 0 ""
+fi
+
+# ── Case 17: a branch that changed a workflow file ───────────────────────────────────
+#
+# One gate the runner holds, `scripts/check-workflow-compile-steps.py`, reads workflow
+# files for the cache-group and bindgen rules alone. The `ci-workflow-selftest` job runs
+# two suites over the same files that no gate duplicates, so a run whose only output about
+# a changed workflow was `gates 29/29 passed` would read as full coverage of that edit.
+#
+# The mutation it kills: deleting the `.github/` entry from UNRUN_LANES in
+# `scripts/fix-round-check.sh` leaves that run silent, and every other assertion in this
+# file still passes.
+FIXTURE17="$WORK/workflow-edit"
+build_fixture "$FIXTURE17"
+fixture_commit "$FIXTURE17" .github/workflows/ci.yml
+run_fixture "$FIXTURE17"
+rc=$(cat "$FIXTURE17.harness/rc.txt")
+if [[ $rc -eq 0 ]]; then
+    report "case 17 exits 0 when the branch changed a workflow file alone" 0 ""
+else
+    report "case 17 exits 0 when the branch changed a workflow file alone" 1 "the script exited $rc; output tail: $(tail -n 6 "$FIXTURE17.harness/out.txt")"
+fi
+if grep -qF 'NOT CHECKED — 1 file(s) under .github/' "$FIXTURE17.harness/out.txt"; then
+    report "case 17 names the workflow directory it ran no suite over" 0 ""
+else
+    report "case 17 names the workflow directory it ran no suite over" 1 "the output holds no NOT CHECKED line for .github/: $(tail -n 5 "$FIXTURE17.harness/out.txt")"
+fi
+if grep -qF 'ci-workflow-selftest job' "$FIXTURE17.harness/out.txt"; then
+    report "case 17 names the suites and the CI job that runs them" 0 ""
+else
+    report "case 17 names the suites and the CI job that runs them" 1 "the NOT CHECKED line names no job: $(tail -n 5 "$FIXTURE17.harness/out.txt")"
 fi
 
 printf '\n'

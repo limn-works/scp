@@ -33,16 +33,21 @@
 #   toolchain  `scripts/check-resolved-rustc.sh`, which compares the compiler this shell
 #              resolves against the channel `rust-toolchain.toml` names. Measured at under
 #              a second.
-#   compile    `cargo check -p <crate> --all-targets` over the crates the caller names,
-#              with the subset of the CI feature list those crates own. This is the step
+#   compile    `cargo check -p <crate> --all-targets` over the crates this run selects,
+#              with the subset of the CI feature list those crates own, and one further
+#              `cargo check` for each optional feature set a cargo command in
+#              `.github/workflows/ci.yml` names for a selected package. This is the step
 #              that takes minutes, and the one whose cost the summary line reports.
 #   format     `cargo fmt --all -- --check`, the command the `rust-fmt` job of
 #              `.github/workflows/ci.yml` runs. Measured at 2.83 seconds over the whole
 #              workspace on 2026-09-13, and at more than three and a half minutes the same
 #              day while another worktree's `cargo check` held the build lock, because
 #              `cargo fmt` resolves the workspace through a full `cargo metadata` first.
-#   gates      The 28 enforcement scripts that compile nothing and link nothing. Measured
-#              together at 47 seconds on 2026-09-13, one run each.
+#              rustfmt reads `rustfmt.toml`, so this step checks a change to that file
+#              over every crate the manifests name.
+#   gates      The 29 enforcement scripts that compile nothing and link nothing. Measured
+#              together at 47 seconds on 2026-09-13, one run each, over the 28 the list
+#              held that day.
 #
 # WHAT THIS SCRIPT CANNOT SHORTEN. Every worktree on this machine compiles into one shared
 # target directory, and that directory has one build lock. Measured on 2026-09-13:
@@ -55,26 +60,86 @@
 # queue. `.docs/lessons/the-shared-target-directory-has-one-lock.md` records the whole
 # decomposition, including the editor that queues on the same lock from another project.
 #
-# WHAT THIS SCRIPT DOES NOT RUN, and why. `cargo nextest run --workspace` links one binary
-# per test target, and every freshly written executable on macOS pays a Gatekeeper
-# assessment on its first exec: measured on 2026-09-13, 203 ms from queue to scan finished
-# for a 16 KB binary, and 0 further assessments on later execs of the same bytes. That cost
-# per binary is small, but the link step is not, and a workspace nextest links dozens. On
-# 2026-09-11 that queue reached 31 minutes per item and a fix round died inside it.
-# Workspace clippy is the merge gate named above. The `rust-test` and `rust-clippy` jobs of
-# `.github/workflows/ci.yml` run both on the pushed head, so a fix round that pushes a
-# green result from this script and reads CI has run both exactly once.
+# WHAT THIS SCRIPT DOES NOT RUN. THE CRITERION for this list: a command that a job of
+# `.github/workflows/ci.yml` runs over a file a fix round can change, and that no step
+# above starts. A green result from this script establishes nothing about any of them.
+# After the summary, this script prints one line under the literal prefix `NOT CHECKED`
+# for each entry below that this branch's changed files or this run's crate set reach,
+# naming the directory and the file count or the packages, so a fix agent reads which of
+# its own edits went unread rather than inferring it from this comment. Items 1, 2 and the
+# `cargo doc`, `cargo deny` and `docker build` half of item 6 hold for every run whatever
+# the branch changed, so the summary's `skipped` clause names them once instead.
+#
+#   1. `cargo nextest`, `cargo test` and `cargo build`, in every form, narrowed or not.
+#      Each links one binary per test target, and every freshly written executable on
+#      macOS pays a Gatekeeper assessment on its first exec: measured on 2026-09-13,
+#      203 ms from queue to scan finished for a 16 KB binary, and 0 further assessments
+#      on later execs of the same bytes. That cost per binary is small, but the link step
+#      is not, and a workspace nextest links dozens. On 2026-09-11 that queue reached 31
+#      minutes per item and a fix round died inside it. Nine jobs run one of those three
+#      commands on the pushed head: `rust-test`, `rust-test-optional-features`,
+#      `rust-test-napi-production`, `rust-build-pyo3-production`,
+#      `rust-build-uniffi-production`, `fail-closed-pre-rotation`, and the three
+#      `bridge-parity` jobs.
+#   2. `cargo clippy`, in every form. The compile step runs `cargo check`, which reports
+#      no clippy lint at all, so a `clippy::needless_borrow` in the file this round edited
+#      passes here and fails in the `rust-clippy` job. That job is the merge gate, and it
+#      also reads `.clippy.toml`, which is why this script treats no change to that file
+#      as checkable.
+#   3. The reverse dependencies of the crates the compile step selects. `cargo check -p`
+#      compiles the named packages alone, so a changed public signature in `scp-protocol`
+#      compiles here and fails to compile `scp-runtime` in CI.
+#   4. Every per-language lint, type check and test lane: ruff and pytest over
+#      `bindings/python/`, biome and `tsc` and `bun test` over `bindings/typescript/` and
+#      `bindings/typescript-wasm/`, the scaffold build over `scaffolds/`, ktlint and
+#      detekt and the Gradle test task over `bindings/kotlin/`, SwiftLint and SwiftFormat
+#      and `swift build` over `bindings/swift/`, and `cargo check` inside `fuzz/` on the
+#      nightly `fuzz/rust-toolchain.toml` names. Four of the gates below read files under
+#      those directories, each for one property of its own, and a gate that reads one
+#      property is not a lint of that language.
+#   5. The uncommitted half of a working tree, for one gate.
+#      `scripts/check-cross-layer.sh` decides from
+#      `git diff <merge base with origin/main>...HEAD`, which holds no uncommitted edit,
+#      so its pass covers the committed half alone. It is the one gate in the list below
+#      that reads a diff range, and the other 28 read the working tree.
+#   6. Every compile of a crate source that the native `cargo check` above does not
+#      reach. `cargo check -p … --target wasm32-unknown-unknown` over scp-clock,
+#      scp-crypto, scp-did, scp-protocol, scp-relay-client, scp-mls, scp-client,
+#      scp-event-log and scp-client-wasm, which the `wasm-protocol` job runs and which
+#      rejects a host-only API a native check accepts; `wasm-pack test` over
+#      scp-client-wasm, which the `wasm-test` job runs; `cargo doc --workspace --no-deps
+#      --document-private-items`, which the `rust-doc` job runs and which reports the
+#      broken intra-doc links `cargo check` never reports; `cargo deny`, which the
+#      `rust-deny` job runs over `deny.toml` and the lockfile; and the `docker build` of
+#      `Dockerfile`, which the `docker-image` job runs. Each compiles a crate graph into
+#      a target directory this script's `cargo check` never writes, so each costs a cold
+#      build on first use, and the step criterion above admits a step a fix agent's edit
+#      falsifies in seconds.
+#   7. The suites that read `.github/` and `scripts/` and that no gate below duplicates:
+#      `scripts/tests/ci-gate/run-tests.sh` and `scripts/tests/signing-guard/run-tests.sh`
+#      in the `ci-workflow-selftest` job, `scripts/tests/toolchain-wiring/run-tests.sh`
+#      and `scripts/tests/workflow-compile-steps/run-tests.sh` in the `toolchain-wiring`
+#      job, and `scripts/tests/fix-round-check/run-tests.sh` in the
+#      `fix-round-check-selftest` job. The last one runs the whole gate list below twice
+#      against this repository, so running it from inside this script would run that list
+#      three times in one invocation.
 #
 # USAGE
 #   bash scripts/fix-round-check.sh [crate ...]
 #
 # Naming no crate makes the script derive the crate set from the files this branch
 # changed, and print which crates it derived. Naming a crate that the workspace does not
-# hold fails the run rather than checking a smaller set than the caller asked for.
+# hold fails the run rather than checking a smaller set than the caller asked for. Naming
+# a set narrower than the branch's own changed files compiles the set the caller asked
+# for, and names in the summary every package the branch changed that this run left
+# uncompiled.
 #
 # EXIT. 0 when every step this script ran exited 0. 1 when any step exited non-zero, when
-# a named crate is absent from the workspace, and when a gate script this list names does
-# not exist.
+# a named crate is absent from the workspace, when a gate script this list names does not
+# exist, and when this branch changed a file that every workspace member compiles against
+# while changing no file inside a workspace crate. No `-p`-narrowed `cargo check` covers
+# that last shape, so a run that reported it as a skip would exit 0 having compiled zero
+# lines of a change that recompiles all 26 members.
 #
 # The toolchain step is a precondition rather than one failure among several: a compile on
 # a compiler the pin does not name reports lints that CI will not report and misses lints
@@ -113,12 +178,12 @@ if ! command -v cargo >/dev/null 2>&1; then
     exit 1
 fi
 
-# `timeout` bounds the `cargo metadata` call below and each of the 28 gates, so 29 call
+# `timeout` bounds the `cargo metadata` call below and each of the 29 gates, so 30 call
 # sites depend on it. macOS ships neither `timeout` nor `gtimeout`, Homebrew's coreutils
 # supplies both names, and `.mise.toml` provisions neither, so a checkout that installed
 # only the prerequisites README.md lists has no such program. Without this guard every gate
-# would exit 127, and the run would print 28 blocks reading "timeout: command not found"
-# and report 28 enforcement violations that do not exist.
+# would exit 127, and the run would print 29 blocks reading "timeout: command not found"
+# and report 29 enforcement violations that do not exist.
 TIMEOUT=timeout
 command -v "$TIMEOUT" >/dev/null 2>&1 || TIMEOUT=gtimeout
 if ! command -v "$TIMEOUT" >/dev/null 2>&1; then
@@ -214,11 +279,13 @@ crate_of_path() {
 # HEAD, plus every file the commits since the merge base with origin/main touched. A fix
 # round runs this script with edits uncommitted, with edits committed, and with both.
 #
-# EVERY FAILURE HERE ENDS THE RUN. An earlier revision discarded both git errors, so a
-# checkout holding no `origin/main` ref — a single-branch clone, or an extracted tarball —
-# produced an empty file list, an empty crate set, a skipped compile step, and exit 0. That
-# is the shape this whole script exists to prevent: a green result that compiled nothing,
-# on a branch whose commits changed crate sources.
+# A FAILURE HERE ENDS A RUN THAT NAMED NO CRATE. An earlier revision discarded both git
+# errors, so a checkout holding no `origin/main` ref — a single-branch clone, or an
+# extracted tarball — produced an empty file list, an empty crate set, a skipped compile
+# step, and exit 0. That is the shape this whole script exists to prevent: a green result
+# that compiled nothing, on a branch whose commits changed crate sources. A run that named
+# its own crates compiles that set either way, and states in its summary that it could not
+# read the branch's files, so its NOT CHECKED lines are absent rather than empty.
 changed_files() {
     local status base
     if ! status=$(git -C "$REPO_ROOT" status --porcelain); then
@@ -227,11 +294,53 @@ changed_files() {
     fi
     printf '%s\n' "$status" | sed -E 's/^.{3}//; s/^.* -> //'
     if ! base=$(git -C "$REPO_ROOT" merge-base HEAD origin/main 2>/dev/null); then
-        printf 'fix-round-check: this checkout holds no merge base between HEAD and origin/main, so a committed edit would go unread and unchecked. Fetch origin/main, or name the crates on the command line.\n' >&2
+        printf 'fix-round-check: this checkout holds no merge base between HEAD and origin/main, so this script could not read which files this branch changed. Fetch origin/main, and this run derives its crate set and names every change it leaves unchecked.\n' >&2
         return 1
     fi
     git -C "$REPO_ROOT" diff --name-only "$base" HEAD
 }
+
+# The paths the working tree holds uncommitted, counted for the cross-layer note below.
+uncommitted_count=0
+if uncommitted=$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null); then
+    uncommitted_count=$(printf '%s\n' "$uncommitted" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')
+fi
+
+# NOTES holds one entry per change of this branch that no step of this run reads. The
+# summary prints each under the literal prefix `NOT CHECKED`, because a fix agent reads the
+# last lines of this output and pushes on them.
+declare -a NOTES=()
+
+# `changed_files` runs on every invocation rather than only on the derivation, because
+# every NOT CHECKED line is computed from its answer. `set -o pipefail` is on, so a failing
+# `changed_files` propagates through `sort -u`.
+changed_rc=0
+CHANGED=$(changed_files | sort -u) || changed_rc=$?
+
+# The packages that own a newline-separated list of paths, each package named once.
+crates_from_paths() {
+    local paths=$1 f owner seen c
+    declare -a found=()
+    while IFS= read -r f; do
+        [[ -n $f ]] || continue
+        owner=$(crate_of_path "$f")
+        [[ -n $owner ]] || continue
+        seen=0
+        for c in ${found[@]+"${found[@]}"}; do
+            [[ $c == "$owner" ]] && seen=1
+        done
+        [[ $seen -eq 0 ]] && found+=("$owner")
+    done <<< "$paths"
+    printf '%s\n' ${found[@]+"${found[@]}"}
+}
+
+declare -a DERIVED=()
+if [[ $changed_rc -eq 0 ]]; then
+    while IFS= read -r c; do
+        [[ -n $c ]] || continue
+        DERIVED+=("$c")
+    done < <(crates_from_paths "$CHANGED")
+fi
 
 declare -a CRATES=()
 crate_source=""
@@ -244,23 +353,103 @@ if [[ $# -gt 0 ]]; then
         fi
         CRATES+=("$c")
     done
+    if [[ $changed_rc -ne 0 ]]; then
+        NOTES+=("which files this branch changed: the line above states why this run could not read them, so this run names no unchecked change of its own")
+    else
+        # A caller-named set narrower than the branch's own edits compiles less than the
+        # branch changed. The caller asked for that set, and no other line of this output
+        # would say which of the branch's packages went uncompiled.
+        declare -a UNNAMED=()
+        for d in ${DERIVED[@]+"${DERIVED[@]}"}; do
+            seen=0
+            for c in "${CRATES[@]}"; do
+                [[ $c == "$d" ]] && seen=1
+            done
+            [[ $seen -eq 0 ]] && UNNAMED+=("$d")
+        done
+        if [[ ${#UNNAMED[@]} -gt 0 ]]; then
+            NOTES+=("$(IFS=' '; printf '%s' "${UNNAMED[*]}"): this branch changed files these packages own, and the caller named a crate set that leaves them out, so this run compiled none of them")
+        fi
+    fi
 else
     crate_source="derived from the files this branch changed"
-    # `set -o pipefail` is on, so a failing `changed_files` propagates through `sort -u`.
-    if ! CHANGED=$(changed_files | sort -u); then
+    if [[ $changed_rc -ne 0 ]]; then
         printf 'fix-round-check: the line above names why this script could not derive a crate set, so it compiled nothing and ran no gate.\n' >&2
         exit 1
     fi
+    CRATES=(${DERIVED[@]+"${DERIVED[@]}"})
+fi
+
+# ── The changes this run reads no file of ────────────────────────────────────────────
+#
+# THE CRITERION for this list: a file that no `crates/<member>` directory holds and that
+# every workspace member's compile reads, so a `cargo check` narrowed with `-p` proves
+# nothing about a change to it. `Cargo.toml` carries the `[workspace.dependencies]` table
+# every member's manifest inherits from, `Cargo.lock` fixes the version cargo resolves for
+# each of those, `rust-toolchain.toml` names the compiler every member compiles on, and
+# `.cargo/config.toml` sets the flags cargo passes to every rustc it starts.
+#
+# `rustfmt.toml` and `.clippy.toml` are absent from this list on purpose. The format step
+# runs `cargo fmt --all` over every crate the manifests name, so this script checks a
+# `rustfmt.toml` change in full. `.clippy.toml` changes what `cargo clippy` reports, and
+# item 2 of the DOES-NOT-RUN list above already states that this script runs no clippy.
+WORKSPACE_WIDE_INPUTS=(
+    Cargo.toml
+    Cargo.lock
+    rust-toolchain.toml
+    .cargo/config.toml
+)
+
+declare -a CHANGED_WIDE=()
+if [[ $changed_rc -eq 0 ]]; then
     while IFS= read -r f; do
         [[ -n $f ]] || continue
-        owner=$(crate_of_path "$f")
-        [[ -n $owner ]] || continue
-        seen=0
-        for c in ${CRATES[@]+"${CRATES[@]}"}; do
-            [[ $c == "$owner" ]] && seen=1
+        for w in "${WORKSPACE_WIDE_INPUTS[@]}"; do
+            [[ $f == "$w" ]] && CHANGED_WIDE+=("$f")
         done
-        [[ $seen -eq 0 ]] && CRATES+=("$owner")
     done <<< "$CHANGED"
+fi
+wide_list=""
+[[ ${#CHANGED_WIDE[@]} -gt 0 ]] && wide_list=$(IFS=' '; printf '%s' "${CHANGED_WIDE[*]}")
+
+# THE CRITERION for this list: a directory whose sources a job of
+# `.github/workflows/ci.yml` lints, type-checks, or tests with a program no step of this
+# script starts. Each entry names the directory, then the programs, then the jobs that run
+# them, so a reader acts on the line without opening the workflow file.
+#
+# `crates/` is absent because the compile, format and gate steps above read it, and the
+# Rust commands they still leave unrun are the same for every run, which is why items 1,
+# 2, 3 and 6 of the DOES-NOT-RUN list state them once rather than per changed file. The
+# reverse-dependency line and the wasm line below are the two that name the packages a
+# given run selected, so both are computed rather than listed here.
+UNRUN_LANES=(
+    "bindings/python/|ruff and pytest, which the python-lint and python-test jobs of .github/workflows/ci.yml run"
+    "bindings/typescript/|biome, tsc and bun test, which the typescript-check job of .github/workflows/ci.yml runs"
+    "bindings/typescript-wasm/|the wasm build and its lint, which the typescript-wasm-check job of .github/workflows/ci.yml runs"
+    "scaffolds/|the scaffold build, check and lint, which the scaffold-typescript-web-check job of .github/workflows/ci.yml runs"
+    "bindings/kotlin/|ktlint, detekt and the Gradle test task, which the kotlin-lint and kotlin-test jobs of .github/workflows/ci.yml run"
+    "bindings/swift/|SwiftLint, SwiftFormat and swift build, which the swift-lint and swift-build-test jobs of .github/workflows/ci.yml run"
+    "fuzz/|cargo check inside fuzz/ on the nightly fuzz/rust-toolchain.toml names, which the fuzz-build job of .github/workflows/ci.yml runs"
+    ".github/|scripts/tests/ci-gate/run-tests.sh and scripts/tests/signing-guard/run-tests.sh, which the ci-workflow-selftest job of .github/workflows/ci.yml runs. One gate this run did start, scripts/check-workflow-compile-steps.py, read these files for its cache-group and bindgen rules alone"
+    "scripts/|scripts/tests/ci-gate/run-tests.sh, scripts/tests/toolchain-wiring/run-tests.sh, scripts/tests/workflow-compile-steps/run-tests.sh and scripts/tests/fix-round-check/run-tests.sh, which the ci-workflow-selftest, toolchain-wiring and fix-round-check-selftest jobs of .github/workflows/ci.yml run"
+)
+
+if [[ $changed_rc -eq 0 ]]; then
+    for lane in "${UNRUN_LANES[@]}"; do
+        lane_prefix=${lane%%|*}
+        lane_tools=${lane#*|}
+        lane_count=0
+        while IFS= read -r f; do
+            [[ -n $f ]] || continue
+            [[ $f == "$lane_prefix"* ]] && lane_count=$((lane_count + 1))
+        done <<< "$CHANGED"
+        [[ $lane_count -eq 0 ]] && continue
+        NOTES+=("$lane_count file(s) under $lane_prefix: this run started none of $lane_tools")
+    done
+fi
+
+if [[ $uncommitted_count -gt 0 ]]; then
+    NOTES+=("the $uncommitted_count uncommitted path(s) in this working tree, for one gate: scripts/check-cross-layer.sh decides from git diff <merge base with origin/main>...HEAD, which holds no uncommitted edit, so its pass read the committed half alone. Commit those paths and run this script again to have that gate read them")
 fi
 
 # ── The steps ────────────────────────────────────────────────────────────────────────
@@ -302,8 +491,63 @@ CI_FEATURES=(
     scp-ffi-uniffi/outlet-capability-test-grant
 )
 
+# Packages a cargo command in `.github/workflows/ci.yml` compiles under a feature the
+# workspace command does not activate.
+#
+# THE CRITERION for this list: no `default` entry of the package's manifest activates the
+# feature, and a cargo command in that workflow names it, so the module the feature gates
+# compiles in CI and never in the `cargo check` above. The `rust-clippy` job records what
+# the gap costs, on the command this list's first entry mirrors: the optional transports
+# "rotted undetected for months (the quic feature stopped compiling)".
+#
+# Each entry runs as its own `cargo check`, the way CI runs each as its own command. One
+# invocation carrying every feature would resolve a feature unification no CI command
+# resolves, so a failure it reported would answer a question the merge gate never asks.
+#
+# `server` is absent from this list although three CI commands name it: `default =
+# ["server"]` in the manifest of each of scp-ffi, scp-ffi-napi and scp-ffi-uniffi, so the
+# `cargo check` above already compiles every module that feature gates.
+EXTRA_FEATURE_CHECKS=(
+    "scp-transport|quic,http3,udp,coap"
+    "scp-transport|combined,local-cache"
+    "scp-testing|sqlite"
+)
+
+# The packages the `wasm-protocol` job of `.github/workflows/ci.yml` compiles for
+# `wasm32-unknown-unknown`, copied from the one `cargo check` that job runs. An edit to
+# any of them can use an API that target does not carry — a thread, a file handle, a
+# `std::time::SystemTime::now` — which the native `cargo check` above accepts and that job
+# rejects. This script starts no wasm compile, for the reason item 6 of the DOES-NOT-RUN
+# list gives, so a run that selects one of these names it in a NOT CHECKED line instead.
+WASM_TARGET_CRATES=(
+    scp-clock
+    scp-crypto
+    scp-did
+    scp-protocol
+    scp-relay-client
+    scp-mls
+    scp-client
+    scp-event-log
+    scp-client-wasm
+)
+
+crate_list="none"
+[[ ${#CRATES[@]} -gt 0 ]] && crate_list=$(IFS=' '; printf '%s' "${CRATES[*]}")
+
 if [[ ${#CRATES[@]} -eq 0 ]]; then
-    SKIPPED+=("compile: this branch changed no file inside a workspace crate, and naming none left nothing to check")
+    # A branch that changed one of WORKSPACE_WIDE_INPUTS and no file under a crate
+    # directory fails here rather than recording a skip. `cargo check -p` takes a package
+    # name, this run has none to pass, and every one of the 26 members compiles against
+    # each of those four files, so the only command that covers the change is the
+    # workspace one this script refuses to start. Exit 1 says that the script reached no
+    # verdict; exit 0 with a skip line would say that the change needed no compile.
+    if [[ -n $wide_list ]]; then
+        printf '\nfix-round-check: this branch changed %s, which every workspace member compiles against, and changed no file inside a workspace crate. `cargo check -p` needs a package name and this run derived none, so this script compiled zero lines of a change that recompiles all 26 members and it reports no compile verdict. Run `cargo check --workspace --all-targets` yourself, and read the rust-clippy job of .github/workflows/ci.yml on the pushed head.\n' "$wide_list" >&2
+        RAN+=("compile FAILED 0s")
+        FAILED=1
+    else
+        SKIPPED+=("compile: this branch changed no file inside a workspace crate, and naming none left nothing to check")
+    fi
 else
     declare -a PKG_ARGS=()
     for c in "${CRATES[@]}"; do PKG_ARGS+=(-p "$c"); done
@@ -325,6 +569,33 @@ else
     else
         run_step compile cargo check "${PKG_ARGS[@]}" --all-targets
     fi
+
+    for entry in "${EXTRA_FEATURE_CHECKS[@]}"; do
+        extra_pkg=${entry%%|*}
+        extra_features=${entry#*|}
+        for c in "${CRATES[@]}"; do
+            [[ $c == "$extra_pkg" ]] || continue
+            run_step "compile($extra_pkg:$extra_features)" \
+                cargo check -p "$extra_pkg" --all-targets --features "$extra_features"
+            break
+        done
+    done
+
+    NOTES+=("the reverse dependencies of $crate_list: cargo check -p compiles the packages it names and none of their dependents, so a changed public signature compiles here and fails to compile its dependents in the rust-clippy job of .github/workflows/ci.yml")
+
+    declare -a SELECTED_WASM=()
+    for c in "${CRATES[@]}"; do
+        for w in "${WASM_TARGET_CRATES[@]}"; do
+            [[ $c == "$w" ]] && SELECTED_WASM+=("$c")
+        done
+    done
+    if [[ ${#SELECTED_WASM[@]} -gt 0 ]]; then
+        wasm_list=$(IFS=' '; printf '%s' "${SELECTED_WASM[*]}")
+        NOTES+=("$wasm_list against wasm32-unknown-unknown: the compile above ran on this machine's host target alone, and the wasm-protocol job of .github/workflows/ci.yml compiles these packages for wasm32-unknown-unknown, which rejects a host-only API that compile accepted")
+    fi
+    if [[ -n $wide_list ]]; then
+        NOTES+=("$wide_list: every workspace member compiles against these files, and this run compiled $crate_list alone")
+    fi
 fi
 
 # Step 3 — format.
@@ -345,6 +616,11 @@ run_step format cargo fmt --all -- --check
 # cost is reading repository files and, for one gate, resolving a dependency graph. Every
 # gate that compiles or links belongs to CI, which runs it on the pushed head.
 #
+# WHAT THIS LIST HOLDS, against the repository: `scripts/` holds 31 files named
+# `check-*`. This list names 29 of them. `scripts/check-resolved-rustc.sh` is the
+# toolchain precondition this script runs before any cargo command, above, rather than one
+# gate among these. The 31st is the one the criterion above excludes, named next.
+#
 # THE ONE GATE THIS LIST LEAVES OUT, and the measurement that decided it.
 # `scripts/check-pure-helpers.sh` runs `cargo test -p scp-testing --test ffi_conformance`,
 # which links a test binary and takes the build lock. Run on 2026-09-13 while another
@@ -357,7 +633,12 @@ run_step format cargo fmt --all -- --check
 # one, and `cargo tree` compiles nothing and takes no build lock: the same 2026-09-13 run
 # measured them at 12.9 seconds and 391 ms while another worktree held that lock.
 #
-# Measured on 2026-09-13, one run each, in the order below: 47 seconds for all 28.
+# Measured on 2026-09-13, one run each, in the order below: 47 seconds for the 28 this
+# list held that day. `scripts/check-workflow-compile-steps.py` joined it afterwards: the
+# `toolchain-wiring` job of `.github/workflows/ci.yml` runs it beside
+# `scripts/check-toolchain-wiring.sh`, which this list already held, and it reads every
+# workflow file with PyYAML while starting no subprocess. It rejected this script's own CI
+# job once, for a `Swatinem/rust-cache` step that named no cache group.
 GATES=(
     scripts/check-agent-verdict-criterion.sh
     scripts/check-block-in-place.py
@@ -387,10 +668,20 @@ GATES=(
     scripts/check-sdk-coverage.py
     scripts/check-shipped-feature-graph.sh
     scripts/check-toolchain-wiring.sh
+    scripts/check-workflow-compile-steps.py
 )
 
 PYTHON=python3.12
 command -v "$PYTHON" >/dev/null 2>&1 || PYTHON=python3
+
+# `scripts/check-workflow-compile-steps.py` imports PyYAML, which the standard library does
+# not carry, so an interpreter without it fails that gate for a missing library rather than
+# for a workflow defect. The run still counts the failure, because a gate that did not
+# execute proved nothing; this line names the cause so a reader installs the library
+# instead of reading a traceback as an enforcement violation.
+if ! "$PYTHON" -c 'import yaml' >/dev/null 2>&1; then
+    printf 'fix-round-check: %s cannot import yaml, which scripts/check-workflow-compile-steps.py parses every workflow file with, so that gate fails below for the missing library. Install it with: pip install '"'"'pyyaml>=6,<7'"'"'\n' "$PYTHON" >&2
+fi
 
 gates_t0=$(date +%s)
 gate_failures=0
@@ -434,8 +725,8 @@ else
 fi
 
 # ── The summary ──────────────────────────────────────────────────────────────────────
-crate_list="none"
-[[ ${#CRATES[@]} -gt 0 ]] && crate_list=$(IFS=' '; printf '%s' "${CRATES[*]}")
+# `crate_list` is set above the compile step, because two of the NOT CHECKED lines name it.
+#
 # `IFS` joins an array on its FIRST character alone, so "; " would separate on ";" and drop
 # the space. The loop writes the two-character separator the summary line reads with.
 ran_list=""
@@ -443,10 +734,31 @@ for r in "${RAN[@]}"; do
     [[ -n $ran_list ]] && ran_list+="; "
     ran_list+="$r"
 done
-skip_list="cargo nextest and workspace cargo clippy, which the rust-test and rust-clippy jobs of .github/workflows/ci.yml run on the pushed head"
+# The compile step runs `cargo check`, which emits no clippy lint at all, so this line
+# names clippy in every form rather than the workspace one: a reader who saw "workspace
+# cargo clippy" would take a narrowed clippy to have run over the crates it edited.
+#
+# This line names the two commands every run skips, and it closes by pointing at the NOT
+# CHECKED lines below rather than by listing the rest, because the rest depends on which
+# files the branch changed. An earlier revision ended the sentence after the two commands,
+# which told a fix agent editing a binding source that nothing else was left to fail.
+skip_list="cargo nextest, cargo test and cargo build in every form, and cargo clippy in every form, which the rust-test and rust-clippy jobs of .github/workflows/ci.yml run on the pushed head; the NOT CHECKED lines below name what this branch's own changed files reached, and the DOES-NOT-RUN section of this script states all seven kinds, cargo doc and cargo deny and the docker build among them"
 for s in ${SKIPPED[@]+"${SKIPPED[@]}"}; do skip_list+="; $s"; done
 
 printf '\nfix-round-check: crates %s (%s); target dir %s; %s; %s; ran %s; skipped %s.\n' \
     "$crate_list" "$crate_source" "$target_dir" "$toolchain_note" "$target_note" "$ran_list" "$skip_list"
+
+# One line per change of this branch that no step above read, printed after the summary
+# because a fix agent reads the end of this output and pushes on it. Each names what went
+# unread and the CI job that reads it, so the line is actionable without this file.
+if [[ ${#NOTES[@]} -eq 0 ]]; then
+    # The summary above points a reader at these lines, so a run that produced none says
+    # so rather than leaving the reader looking for output that is absent.
+    printf 'fix-round-check: NOT CHECKED — no entry: this run compiled no crate and this branch changed no file any unrun lane reads.\n'
+else
+    for n in "${NOTES[@]}"; do
+        printf 'fix-round-check: NOT CHECKED — %s.\n' "$n"
+    done
+fi
 
 exit "$FAILED"

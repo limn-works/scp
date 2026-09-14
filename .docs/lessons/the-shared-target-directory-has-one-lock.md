@@ -38,7 +38,8 @@ having never acquired the lock, and one was killed after 22 minutes still waitin
 When the lock is free, the whole local check is fast. Measured the same day with nothing
 else compiling, `bash scripts/fix-round-check.sh scp-protocol` took 49 seconds end to end:
 under a second for the toolchain comparison, 0 seconds for a `cargo check` against warm
-artifacts, 3 seconds for `cargo fmt --all -- --check`, and 46 seconds for all 28 gates. The
+artifacts, 3 seconds for `cargo fmt --all -- --check`, and 46 seconds for the 28 gates the
+runner's list held that day. The
 same script with no argument took 50 seconds. So the queue, not the work, is what a fix
 round waits on.
 
