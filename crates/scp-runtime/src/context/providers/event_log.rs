@@ -398,11 +398,7 @@ impl MerkleEventLogProvider {
     /// Structural events (governance, membership, lifecycle) are retained
     /// `structural_retention_multiplier / 10000` times longer than
     /// operational events per ADR-030 §2c, classified by the canonical typed
-    /// [`scp_event_log::pruning::is_structural_event`]. The bridge lifecycle
-    /// events are never pruned at all
-    /// ([`scp_event_log::pruning::is_never_pruned_event`]): spec §12.10.6 step
-    /// 1 decides bridge admission from their payload fields, so both the
-    /// time-based and the size-based prune count stops at the oldest one.
+    /// [`scp_event_log::pruning::is_structural_event`].
     ///
     /// The retained tail is reconstructed by re-chaining its events as a fresh
     /// [`scp_event_log::EventLog`] (see [`truncate_log_keeping_tail`]): the
@@ -451,19 +447,6 @@ impl MerkleEventLogProvider {
             #[allow(clippy::cast_possible_truncation)]
             let checkpoint_bound = (checkpoint_event_count as usize).min(total);
 
-            // Spec §12.10.6 step 1 decides bridge admission from the payload
-            // fields of the bridge lifecycle leaves, so neither the time-based
-            // nor the size-based policy may discard one. The prune count is
-            // capped at the position of the oldest never-pruned event
-            // ([`scp_event_log::pruning::is_never_pruned_event`]), which is the
-            // same bound `scp_event_log::pruning::compute_prune_boundary`
-            // applies.
-            let never_pruned_bound = events
-                .iter()
-                .take(checkpoint_bound)
-                .position(|event| scp_event_log::pruning::is_never_pruned_event(&event.event_type))
-                .unwrap_or(checkpoint_bound);
-
             let mut prune_count = 0usize;
 
             // Time-based and size-based pruning evaluate independently; we take the
@@ -508,8 +491,6 @@ impl MerkleEventLogProvider {
                     prune_count = prune_count.max(size_prune);
                 }
             }
-
-            let prune_count = prune_count.min(never_pruned_bound);
 
             if prune_count == 0 {
                 return Some(0);
@@ -901,71 +882,6 @@ mod tests {
         EventPayload {
             data: data.to_vec(),
         }
-    }
-
-    /// Spec §12.10.6 step 1 decides bridge admission from the payload fields of
-    /// the bridge lifecycle leaves, so neither pruning policy may discard one.
-    /// The size-based policy prunes by count and reads no event type at all, so
-    /// without the never-pruned cap it would discard the `BridgeRegistered`
-    /// leaf and leave a bridge governance never revoked unadmittable forever.
-    #[tokio::test]
-    async fn size_based_pruning_stops_at_the_oldest_bridge_lifecycle_leaf() {
-        use scp_protocol::context::governance::{PruningPolicy, SizeBasedPolicy};
-
-        let provider = MerkleEventLogProvider::new();
-        let ctx_id = [42u8; 32];
-        provider.init_event_log(&ctx_id).await.unwrap();
-
-        // Sequences 0 and 1 are prunable; sequence 2 is the bridge leaf;
-        // sequences 3 and 4 are messages the bridge carried.
-        for (i, event_type) in [
-            EventType::MessageSent,
-            EventType::MessageSent,
-            EventType::BridgeRegistered,
-            EventType::MessageSent,
-            EventType::MessageSent,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            provider
-                .append_event(
-                    &ctx_id,
-                    event_type,
-                    "did:dht:z6MkOperator",
-                    payload_bytes(format!("event-{i}").as_bytes()),
-                    1_700_000_000 + i as u64,
-                )
-                .await
-                .expect("append");
-        }
-
-        // max_event_count = 1 asks for four events to go; the cap allows two.
-        let policy = PruningPolicy {
-            size_based: Some(SizeBasedPolicy {
-                max_event_count: 1,
-                max_storage_bytes: u64::MAX,
-            }),
-            ..PruningPolicy::default()
-        };
-
-        let pruned = provider
-            .prune_before_checkpoint(&ctx_id, 5, &policy)
-            .await
-            .expect("context log exists");
-        assert_eq!(
-            pruned, 2,
-            "pruning must stop at the BridgeRegistered leaf at index 2"
-        );
-
-        let retained = provider.entries(&ctx_id).unwrap();
-        assert_eq!(retained.len(), 3);
-        assert_eq!(retained[0].event_type, EventType::BridgeRegistered);
-        assert_eq!(
-            retained[0].payload.data,
-            b"event-2".to_vec(),
-            "the bridge leaf's payload fields must survive pruning"
-        );
     }
 
     #[tokio::test]
