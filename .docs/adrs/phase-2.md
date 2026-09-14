@@ -873,14 +873,21 @@ pub enum EventType {
     // criterion 2, "Registration is a context event in the Merkle log").
     // Payload: a `BridgeRegistrationEvent` (§12.12.2) serialized as MessagePack
     // into EventPayload::data — action, bridge_id, operator_did, governance_did,
-    // context_id, timestamp. actor_did = the payload's governance_did, except
-    // the deadline-triggered BridgeReactivated (a SuspendBridge `duration`
-    // elapsed), where actor_did = "system" and the leaf timestamp is the
+    // context_id, timestamp. governance_did copies the executor_did of the
+    // GovernanceActionExecuted leaf for the same proposal (ADR-031 acceptance
+    // criterion 7): one
+    // convergent DID under every governance model. actor_did = the payload's
+    // governance_did, except the deadline-triggered BridgeReactivated (a
+    // SuspendBridge `duration` elapsed while that BridgeSuspended leaf was
+    // still the bridge's highest-sequence lifecycle leaf, spec §12.2.2), where
+    // actor_did = "system:timer" (SYSTEM_TIMER_ACTOR, the sentinel the
+    // TTL-expiry ContextExpired leaf carries), governance_did copies the
+    // BridgeSuspended leaf's governance_did, and the leaf timestamp is the
     // pre-computed deadline (§7.3.1). A bridge node admits a bridge from the
     // highest-sequence leaf of this group for that bridge_id (§12.10.6 step 1).
     // The Requested and Rejected actions of BridgeRegistrationAction produce no
     // bridge leaf: GovernanceProposalCreated and GovernanceProposalResolved
-    // (ADR-031 §8) record the proposal and its rejection.
+    // (ADR-031 acceptance criterion 7) record the proposal and its rejection.
     BridgeRegistered,             // RegisterBridge approved; payload action: Approved
     BridgeSuspended,              // SuspendBridge approved; payload action: Suspended { reason, duration }
     BridgeReactivated,            // ReactivateBridge approved, or the suspension duration elapsed; payload action: Reactivated

@@ -1145,14 +1145,14 @@ mod tests {
 
     #[test]
     fn structural_events_classified_correctly() {
-        // The full closed `EventType` taxonomy (77 variants) paired with its
+        // The full closed `EventType` taxonomy (81 variants) paired with its
         // EXPECTED structural/operational classification. `true` = structural
         // (retained longer per ADR-030 §2c); `false` = operational. This pins
         // the CORRECT decision for every variant — not merely that a decision
         // exists — so a future re-classification of any variant must update this
         // table deliberately. The expected values mirror the cryptographer-
         // confirmed classification in `is_structural_event`.
-        const EXPECTED: [(EventType, bool); 77] = [
+        const EXPECTED: [(EventType, bool); 81] = [
             // --- Base variants ---
             (EventType::ContextCreated, true),
             (EventType::ContextClosing, true),

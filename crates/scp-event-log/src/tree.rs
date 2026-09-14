@@ -1316,7 +1316,8 @@ mod tests {
     //   - the 39 unification variants occupy tags 36..=75 with tag 59 retired
     //     (PseudonymAnnounced removed — a routing-bootstrap ContextEvent signal);
     //   - the 2 ADR-011 Amendment §6 cross-context-saga variants occupy 76..=77;
-    //   - all 77 tags are distinct.
+    //   - the 4 bridge lifecycle variants (spec §12.2) occupy 78..=81;
+    //   - all 81 tags are distinct.
     // -----------------------------------------------------------------------
 
     /// The complete `EventType` taxonomy in ADR declaration order, used to
@@ -1408,16 +1409,16 @@ mod tests {
     #[test]
     fn all_event_type_tags_are_distinct() {
         let mut tags: Vec<u16> = ALL_EVENT_TYPES.iter().map(event_type_tag).collect();
-        assert_eq!(tags.len(), 77, "taxonomy must enumerate all 77 variants");
+        assert_eq!(tags.len(), 81, "taxonomy must enumerate all 81 variants");
         tags.sort_unstable();
         tags.dedup();
         assert_eq!(
             tags.len(),
-            77,
-            "all 77 EventType tags must be distinct (no two variants share a tag)"
+            81,
+            "all 81 EventType tags must be distinct (no two variants share a tag)"
         );
         // Tag 59 is intentionally retired (PseudonymAnnounced removed); the tag
-        // space is therefore 0..=75 minus {59}. This is the only gap.
+        // space is therefore 0..=81 minus {59}. This is the only gap.
         assert!(
             !tags.contains(&59),
             "tag 59 is retired and must not be reused (PseudonymAnnounced removal)"
