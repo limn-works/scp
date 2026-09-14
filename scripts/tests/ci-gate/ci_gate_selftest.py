@@ -2559,11 +2559,23 @@ def check_shipped_build_assertions_run(jobs: dict) -> None:
     # least four tests in every feature configuration.
     #
     # A command carrying NO name filter is outside this criterion, and job
-    # rust-build-pyo3-production's `cargo test -p scp-ffi-common` is one: it
-    # runs every test the package compiles, so no filter can be written that
-    # empties on a flip, and it claims no `--no-tests=fail` tripwire.
-    # command_unifies_testing above is what holds that command's build to
-    # `testing` off.
+    # rust-test-napi-production's `cargo test -p scp-ffi-common` is one: it runs
+    # every test the package compiles, so no filter can be written that empties
+    # on a flip, and it claims no `--no-tests=fail` tripwire.
+    # command_unifies_testing above reads that command's build for a `testing`
+    # edge, and it reads it out of manifest TEXT, which means enumerating the
+    # spellings cargo accepts — a denylist, and one this repository has already
+    # watched fail to converge (.docs/lessons/
+    # ast-gate-checks-definition-not-name-resolution.md). Two spellings escape
+    # it today: `default = ["testing"]` and any other feature list naming
+    # `"testing"`, both written inside scp-ffi-common's own manifest, where the
+    # reader looks for a dependency entry on scp-ffi-common and for the string
+    # "scp-ffi-common/testing" and finds neither. So that reader is a fast
+    # secondary, not the guarantee. check_shipped_assertion_tripwires below
+    # states the guarantee: every package carrying shipped-build assertions is
+    # also run by a `--no-tests=fail` command that selects those assertions
+    # alone, which empties and exits 4 on any spelling because it reads the
+    # build cargo resolved rather than a manifest.
     all_tests = package_test_functions()
     for package, commands in sorted(executing.items()):
         tests = all_tests.get(package, {})
@@ -2606,6 +2618,80 @@ def check_shipped_build_assertions_run(jobs: dict) -> None:
                 f"no command in {named} selects it, so this fail-closed proof "
                 f"executes nowhere",
             )
+
+
+def check_shipped_assertion_tripwires(jobs: dict) -> None:
+    """Every package with shipped-build assertions is run by an empty-selection
+    tripwire: a `--no-tests=fail` command selecting those assertions alone.
+
+    CRITERION: for each package that shipped_build_assertions names, some job
+    either lane table pairs it with runs a command that carries
+    `--no-tests=fail`, carries a name filter this file models, selects at least
+    one of that package's shipped-build assertions, and selects no test that
+    survives a `testing` flip. Such a command decides the question from the
+    build cargo resolved: a shipped-build assertion compiles into a build
+    carrying no `testing` feature and out of every other build, so a build that
+    turned the feature on selects zero tests and nextest exits 4.
+
+    WHY THIS CHECK EXISTS BESIDE check_shipped_build_assertions_run. That check
+    asks whether a lane's command leaves `testing` off, and answers it with
+    command_enables_testing (the command's own `--features` text) and
+    command_unifies_testing (the manifests the build reads). The second reader
+    parses manifest text, so it answers correctly only for the spellings it
+    enumerates, and two spellings escape it — a package's own
+    `default = ["testing"]`, and any other feature of that package whose list
+    names `"testing"`, neither of which is a dependency entry on the package
+    nor the string `"<package>/testing"`. A tripwire cannot be escaped that
+    way, because it reads no manifest.
+
+    Four of the five packages shipped_build_assertions names already had one:
+    job rust-build-pyo3-production for scp-ffi, job
+    rust-build-uniffi-production for scp-ffi-uniffi, and job
+    fail-closed-pre-rotation for scp-identity and scp-node. scp-ffi-common had
+    only the unfiltered `cargo test -p scp-ffi-common` of job
+    rust-test-napi-production, which exits 0 over the package's un-gated tests
+    when both of its assertions compiled out. This check is what keeps the
+    command that closed that hole from being deleted again.
+    """
+    lanes: dict[str, set[str]] = {}
+    for job_id, packages in sorted(SHIPPED_CONFIG_LANES.items()):
+        for package in sorted(packages):
+            lanes.setdefault(package, set()).add(job_id)
+    for package, job_id in sorted(NON_BRIDGE_SHIPPED_ASSERTION_LANES.items()):
+        lanes.setdefault(package, set()).add(job_id)
+
+    all_tests = package_test_functions()
+    for package, assertions in sorted(shipped_build_assertions().items()):
+        tests = all_tests.get(package, {})
+        job_ids = sorted(lanes.get(package, set()))
+        # Looked up by key so a renamed job raises a KeyError here rather than
+        # leaving this check running over no commands and reporting a pass.
+        tripwires: list[str] = []
+        for job_id in job_ids:
+            for tokens in cargo_test_commands(jobs[job_id]):
+                if "--no-tests=fail" not in tokens:
+                    continue
+                if not command_covers_package(tokens, package):
+                    continue
+                patterns, unmodelled = command_filters(tokens)
+                if not patterns or unmodelled:
+                    continue
+                selected = {name for name in tests if command_selects(tokens, name)}
+                if not selected & set(assertions):
+                    continue
+                if any(not tests[name][1] for name in selected):
+                    continue
+                tripwires.append(" ".join(tokens))
+        check(
+            f"{package}'s shipped-build assertions run under an empty-selection tripwire",
+            bool(tripwires),
+            f"no command in {job_ids or ['(no lane named)']} carries "
+            f"`--no-tests=fail`, a name filter, and a selection holding "
+            f"{sorted(assertions)} and nothing that survives a `testing` flip, "
+            f"so a build that turned `{package}/testing` on by a spelling "
+            f"command_unifies_testing does not parse would compile every one of "
+            f"those assertions out and still exit 0",
+        )
 
 
 def check_filter_keys_agree(path: Path, doc: dict) -> None:
@@ -3456,6 +3542,7 @@ def main() -> int:
     check_shipped_assertion_readers()
     check_testing_unification_readers()
     check_shipped_build_assertions_run(jobs)
+    check_shipped_assertion_tripwires(jobs)
 
     print(
         "zero-test — a filtered test selection that matches nothing must exit non-zero"

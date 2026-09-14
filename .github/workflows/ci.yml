@@ -1160,6 +1160,7 @@ jobs:
           fi
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -1186,6 +1187,27 @@ jobs:
           # Slice 1). ci.yml is not an enforcement file; this is an added
           # positive test lane.
           cargo test -p scp-ffi-common
+          # `cargo test -p scp-ffi-common` above carries no name filter, so it
+          # exits 0 over the package's un-gated tests even when the two
+          # assertions named below compiled out. Nothing in that command
+          # observes whether the build it ran had `scp-ffi-common/testing` on:
+          # a manifest anywhere in the build can turn the feature on, and
+          # `command_unifies_testing` in scripts/tests/ci-gate/ci_gate_selftest.py
+          # answers that question by reading manifest text, which means
+          # enumerating the spellings cargo accepts — the non-convergent shape
+          # .docs/lessons/ast-gate-checks-definition-not-name-resolution.md
+          # names. This command answers it from the build cargo actually
+          # resolved instead: both tests are
+          # `#[cfg(not(feature = "testing"))]`, so a build carrying the feature
+          # selects zero tests and `--no-tests=fail` exits 4 whatever spelling
+          # turned the feature on. Jobs rust-build-pyo3-production,
+          # rust-build-uniffi-production and fail-closed-pre-rotation already
+          # carried such a command for their packages; scp-ffi-common was the
+          # one package with shipped-build assertions and no such command, and
+          # `check_shipped_assertion_tripwires` in the self-test now requires
+          # one for every package that has them.
+          cargo nextest run --no-tests=fail -p scp-ffi-common \
+            -E 'test(ffi_dht_client_is_pkarr_only_in_shipped_build) + test(disabled_node_resolution_returns_ok_none_for_unknown_did)'
 
   # Builds the pyo3 bridge (`scp-ffi`) in its PRODUCTION configuration: default
   # features (`server` on) but WITHOUT `testing`. This is the
