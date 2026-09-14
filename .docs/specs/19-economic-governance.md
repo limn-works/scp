@@ -495,7 +495,7 @@ pub struct PaymentReceipt {
 }
 ```
 
-**PaymentReceipt signature scope.** The `signature` field is a P-256 signature by the `#active` key of the identity that initiated the payment — the payer's own, or the agent identity's where an agent initiated it under a spending UCAN. **§19.15.5's Receipt Signature Construction states the preimage this section's `signature` field covers**, and one section states it because the two sites carried two preimages that differed in the domain separator, in which operands take a length prefix, in whether the concatenation is hashed, and in the absent form of `context_id`, so an SDK signing under one and a relay verifying under the other agreed on nothing.
+**PaymentReceipt signature scope.** The `signature` field is a P-256 signature by the `#active` key of the identity that initiated the payment — the payer's own, or the agent identity's where an agent initiated it under a spending UCAN. **§19.15.5's Receipt Signature Construction states the preimage this section's `signature` field covers**, and this section cites that construction and restates no operand, so an SDK that signs and a relay that verifies read one preimage.
 
 The `adapter_proof` field is deliberately excluded from the signature scope — it is adapter-specific opaque data that may not be available at signing time (e.g., Lightning preimage is revealed after payment, not before). Verification of payment integrity uses `adapter.verify(receipt)` against the payment rail; the payer's signature proves the payer authorized this specific payment.
 
