@@ -322,13 +322,13 @@
       "acceptanceCriteria": [
         "A single pure sync extraction helper exists in scp-identity and is keyed by `KeyRole`: CI command `grep -q 'fn verifying_key_from_key_state' crates/scp-identity/src/resolver.rs` returns true",
         "The FFI bridge consumes the hoisted helper rather than a private re-implementation: CI command `grep -q 'verifying_key_from_key_state' crates/scp-ffi/common/src/resolvers.rs` returns true",
-        "The hoisted helper resolves the requested key and rejects unknowns: test `verifying_key_from_key_state_resolves_active_and_root_and_rejects_missing` asserts Some(active_key) for `KeyRole::Active`, Some(root_member_key) for `KeyRole::RootMember` (distinct from the active key — the role is honored, not ignored), and None where the key state lists no key `current` in the requested role",
+        "The hoisted helper resolves the requested key and rejects unknowns: test `verifying_key_from_key_state_resolves_active_and_root_and_rejects_missing` asserts Some(active_key) for `KeyRole::Active`, Some(root_member_key) for `KeyRole::RootMember` (distinct from the active key — the role is honored, not ignored), and None where the key state lists no key `Current` in the requested role",
         "No dependency cycle is introduced: `cargo build -p scp-node` and `cargo build -p scp-ffi-common` both succeed (no cyclic-dependency error)",
         "FFI bridge behavior is unchanged: test `bridge_keyresolver_resolves_via_hoisted_helper` asserts the bridge KeyResolver returns Some(verifying_key) for a registered key state's Active key",
         "`DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test -p scp-identity verifying_key_from_key_state_resolves_active_and_root_and_rejects_missing` passes"
       ],
       "actionItems": [
-        "Add `pub fn verifying_key_from_key_state(key_state: &KeyState, role: KeyRole) -> Option<VerifyingKey>` to scp-identity (resolver.rs), reading the key entry that key state lists `current` in `role` and parsing its 33-byte SEC1 compressed point into a P-256 `VerifyingKey` (`09-security-model.md` §9.5)",
+        "Add `pub fn verifying_key_from_key_state(key_state: &KeyState, role: KeyRole) -> Option<VerifyingKey>` to scp-identity (resolver.rs), reading the key entry that key state lists `Current` in `role` and parsing its 33-byte SEC1 compressed point into a P-256 `VerifyingKey` (`09-security-model.md` §9.5)",
         "Rewire `IdentityBackedDidResolver::verifying_key_for` in scp-ffi-common to call the hoisted helper instead of re-implementing extraction",
         "Confirm scp-node depends on scp-identity (it already does) and add no scp-ffi-common edge; verify no cycle",
         "Add tests: verifying_key_from_key_state_resolves_active_and_root_and_rejects_missing (scp-identity), bridge_keyresolver_resolves_via_hoisted_helper (scp-ffi-common)"
