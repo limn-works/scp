@@ -599,7 +599,7 @@
     },
     {
       "id": "SCP-006",
-      "title": "Implement identity creation, verification, and the DidMethod trait",
+      "title": "Implement identity creation, verification, and the identity-creation path",
       "gate": "gate-1",
       "priority": "P0",
       "severity": "critical",
@@ -610,17 +610,16 @@
         "crates/scp-identity/src/config.rs",
         "crates/scp-did/src/document.rs"
       ],
-      "description": "Implement identity creation in the scp-identity crate, over the wasm-safe identity data model in scp-did. The module handles creation, verification, and key-state management. An identity's first key event is its inception event, and the identifier is SHA-256(\"SCP-KEL-ID-V1:\" || inception_signed_preimage) — 32 raw digest bytes that encode no key, which is what makes the identifier self-certifying (security spec §9.7.4.2 R13). The module abstracts the identity backend behind a DidMethod trait. Creation takes two custody providers: key_custody holds the operational keys, and pre_rotation_custody holds the pre-rotation key, because §9.7.4.1 item 3 forbids the operational provider from holding the recovery key. No production PreRotationCustody backend exists, so every creation path fails closed with IdentityError::NoPreRotationBackend (SCP-IDENT-1059), which §9.7.4.1 item 3a requires; ADR-062 §Decision 6 gates the mint path behind the testing feature. Publication and resolution are SCP-007; rotation is SCP-008.",
+      "description": "Implement identity creation in the scp-identity crate, over the wasm-safe identity data model in scp-did. The module handles creation, verification, and key-state management. An identity's first key event is its inception event, and the identifier is SHA-256(\"SCP-KEL-ID-V1:\" || inception_signed_preimage) — 32 raw digest bytes that encode no key, which is what makes the identifier self-certifying (security spec §9.7.4.2 R13). The module abstracts the identity backend behind the `IdentityBackend` seam `03-identity.md` §3.10.10 states, whose four methods are resolve, publish, read_service_record and publish_service_record. The shipped crate carries `generate_ephemeral_ed25519_seed`, which names the superseded curve; the code workstream that moves the key material to P-256 renames it, and this story names it as it ships today rather than inventing a name no author chose (ADR-054). Creation takes two custody providers: key_custody holds the operational keys, and pre_rotation_custody holds the pre-rotation key, because §9.7.4.1 item 3 forbids the operational provider from holding the recovery key. No production PreRotationCustody backend exists, so every creation path fails closed with IdentityError::NoPreRotationBackend (SCP-IDENT-1059), which §9.7.4.1 item 3a requires; ADR-062 §Decision 6 gates the mint path behind the testing feature. Publication and resolution are SCP-007; rotation is SCP-008.",
       "acceptanceCriteria": [
-        "DidMethod::create(key_custody, pre_rotation_custody) returns Result<(ScpIdentity, KeyEvent, PreRotationKeyHandle), IdentityError> and generates the root member (#0) and the Active Signing Key (#active) as ECDSA P-256 keypairs in key_custody (§9.5, §9.7.4.2 definitions)",
-        "DidMethod::create draws the pre-rotation seed from key_custody.generate_ephemeral_ed25519_seed(), hands it to pre_rotation_custody.store_committed_pre_rotation_key, and never writes the pre-rotation private key into key_custody — §9.7.4.1 item 3 (storage isolation) forbids the operational provider from holding it",
-        "DidMethod::create computes the pre-rotation commitment as SHA-256(\"SCP-PREROTATION-COMMITMENT-V1:\" || pre_rotation_public_key) over the 33-byte SEC1 compressed point (§9.7.4.2 definitions)",
-        "DidMethod::create derives the identifier as SHA-256(\"SCP-KEL-ID-V1:\" || inception_signed_preimage), with the preimage's identifier and predecessor-digest fields all-zero, and stores those 32 raw digest bytes on the ScpIdentity (§9.7.4.2 R13)",
-        "DidMethod::create builds the key state the inception event carries: the standing root with its threshold and each member's custody type, the Active Signing Key in the #active role, the standing commitment list with its next threshold, the witness set with its interval, the service-key designation, and the all-zero delegator (§9.7.4.2 definitions)",
-        "DidMethod::create returns an ScpIdentity carrying the identifier, the operational key handles (never raw private keys), and the pre-rotation commitment, plus the signed inception event and the PreRotationKeyHandle; the caller persists all three",
+        "The identity-creation path takes key_custody and pre_rotation_custody, returns Result<(ScpIdentity, KeyEvent, PreRotationKeyHandle), IdentityError>, and generates the root member (#0) and the Active Signing Key (#active) as ECDSA P-256 keypairs in key_custody (§9.5, §9.7.4.2 definitions)",
+        "The identity-creation path draws the pre-rotation seed from key_custody.generate_ephemeral_ed25519_seed(), hands it to pre_rotation_custody.store_committed_pre_rotation_key, and never writes the pre-rotation private key into key_custody — §9.7.4.1 item 3 (storage isolation) forbids the operational provider from holding it",
+        "The identity-creation path computes the pre-rotation commitment as SHA-256(\"SCP-PREROTATION-COMMITMENT-V1:\" || pre_rotation_public_key) over the 33-byte SEC1 compressed point (§9.7.4.2 definitions)",
+        "The identity-creation path derives the identifier as SHA-256(\"SCP-KEL-ID-V1:\" || inception_signed_preimage), with the preimage's identifier and predecessor-digest fields all-zero, and stores those 32 raw digest bytes on the ScpIdentity (§9.7.4.2 R13)",
+        "The identity-creation path builds the key state the inception event carries: the standing root with its threshold and each member's custody type, the Active Signing Key in the #active role, the standing commitment list with its next threshold, the witness set with its interval, the service-key designation, and the all-zero delegator (§9.7.4.2 definitions)",
+        "The identity-creation path returns an ScpIdentity carrying the identifier, the operational key handles (never raw private keys), and the pre-rotation commitment, plus the signed inception event and the PreRotationKeyHandle; the caller persists all three",
         "verify_did(identifier, inception_event) -> bool recomputes SHA-256(\"SCP-KEL-ID-V1:\" || inception_signed_preimage) and compares it to the identifier (§9.7.4.2 R2 — local, no network call)",
-        "DidMethod trait defined with methods: create, publish, resolve, rotate, verify",
-        "DidDht struct implements the DidMethod trait",
+              "The identity backend seam is `IdentityBackend`, carrying the four methods `03-identity.md` §3.10.10 names and no others",
         "ScpIdentity declares exactly four public fields: identity_key (KeyHandle), active_signing_key (KeyHandle), pre_rotation_commitment ([u8; 32]), identifier ([u8; 32])",
         "Every identity-creation entry point that supplies its own pre-rotation custody — Identity::create, Identity::create_ephemeral, the scp-node identity resolvers, and the identity_create paths of the PyO3, napi-rs, and UniFFI bridges — returns IdentityError::NoPreRotationBackend on a build without the testing feature, and the three bridges surface it as error code SCP-IDENT-1059, because no production PreRotationCustody backend exists — §9.7.4.1 item 3a requires the typed error and forbids any dev stand-in",
         "An identity publishes no W3C DID Core document: key material and each key's condition live in the key-event log, and every transport and service field is a service-record entry",
@@ -629,15 +628,15 @@
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
-        "Create crates/scp-identity/src/lib.rs with the crate root, the ScpIdentity struct, the DidMethod trait, the IdentityError enum, and re-exports",
+        "Create crates/scp-identity/src/lib.rs with the crate root, the ScpIdentity struct, the IdentityBackend trait, the IdentityError enum, and re-exports",
         "Define ScpIdentity with identity_key, active_signing_key, pre_rotation_commitment, and identifier fields",
-        "Define DidMethod with create, publish, resolve, rotate, and verify; create takes both custody providers and returns (ScpIdentity, KeyEvent, PreRotationKeyHandle)",
-        "Implement DidDht in crates/scp-identity/src/dht.rs with DidMethod::create signing the inception event under the root member it installs",
+        "Define IdentityBackend with the four methods `03-identity.md` §3.10.10 names, and the identity-creation path taking both custody providers and returning (ScpIdentity, KeyEvent, PreRotationKeyHandle)",
+        "Implement the relay-network IdentityBackend in crates/scp-identity/src/dht.rs, with the identity-creation path signing the inception event under the root member it installs",
         "Implement verify_did in crates/scp-identity/src/dht.rs — recompute the identifier from the inception preimage and compare",
         "Implement the key-state snapshot in crates/scp-did/src/document.rs — standing root, operational roles, standing commitment, witness set, designation, delegator",
         "Add the IdentityError::NoPreRotationBackend variant and the SCP-IDENT-1059 error code, and return them from every production creation path on a build without the testing feature",
         "Add the P-256 and SHA-256 dependencies the inception preimage and its signature need",
-        "Write unit tests for DidMethod::create covering the two keypairs, the cold-stored pre-rotation key, the identifier derivation, and the key-state snapshot",
+        "Write unit tests for the identity-creation path covering the two keypairs, the cold-stored pre-rotation key, the identifier derivation, and the key-state snapshot",
         "Write unit tests for verify_did with valid and invalid inception events",
         "Write unit tests for key-state serialization and deserialization",
         "Write unit tests asserting that creation fails closed with NoPreRotationBackend on a build without the testing feature"
@@ -675,17 +674,17 @@
         "crates/scp-core/src/identity/dht.rs",
         "crates/scp-core/src/identity/cache.rs"
       ],
-      "description": "Implement publishing an identity's key-event log to SCP relays and resolving it back, with caching, staleness detection, and automatic republishing. A publisher splits the chain into frame-sized segments and publishes them to the identity's own relays and to the fallback set (§3.10.5). A validating relay honors the PUBLISH's `retain` flag and expires the record never, so the cycle keeps alive only the opaquely stored copies (§9.10.12).",
+      "description": "Implement publishing an identity's key-event log to SCP relays and resolving it back, with caching, staleness detection, and automatic republishing. A publisher splits the chain into frame-sized segments and publishes them to the identity's own relays and to the fallback set (§3.10.5). A validating relay honors the PUBLISH's `retain` flag and gives the record no TTL; §9.7.4.2 R9's ring buffer displaces the oldest-established unpaid retained set when the relay needs the bytes, and a payment pins a set outside that ring. The cycle keeps alive the copies a transport that cannot validate stores as opaque blobs under the shared TTL (§9.10.12).",
       "acceptanceCriteria": [
-        "DidMethod::publish splits the chain into frame-sized segments and publishes them to both relay sets in sequence order (§3.10.5)",
+        "IdentityBackend::publish splits the chain into frame-sized segments and publishes them to both relay sets in sequence order (§3.10.5)",
         "The root signs every establishment event and an operational key signs none (§9.7.4.2)",
         "An event's sequence is its predecessor's plus one, and the inception event's is zero (§9.7.4.2)",
-        "Idempotent: a frame whose event digests all match the slot's is a TTL refresh (§9.7.4.2 R9)",
-        "A PUBLISH at the `scp:did:` kind sets `retain: true`, and a validating relay expires the record never (§9.10.12)",
+        "Idempotent: a frame whose event digests all match the slot's leaves the relay's stored state unchanged and leaves that retained set at the ring position its first write gave it (§9.7.4.2 R9)",
+        "A PUBLISH at the `scp:did:` kind sets `retain: true`, a validating relay gives the record no TTL, and §9.7.4.2 R9's ring buffer is what removes it (§9.10.12)",
         "Failure handling: exponential backoff on publish failure: 30s, 1m, 2m, 4m, 8m, 16m, capped at 30m",
         "Each retry re-reads the fallback set from the shipped community relay list (§18.5.1)",
         "After 6 consecutive failures, emit a publish-degraded warning to the application layer",
-        "Republishing starts when identity is loaded (Identity::load or Identity::create) and stops when identity is unloaded or SDK shuts down",
+        "The self-observation cadence starts when identity is loaded (Identity::load or Identity::create) and stops when identity is unloaded or SDK shuts down, and it re-publishes to a fallback-set entry only where its own fetch shows that entry holding no record for this identity (§9.7.4.2 R10)",
         "Republish task is a background tokio task the identity module owns",
         "On SDK initialization, all persisted active identities are republished immediately (startup republish)",
         "resolve(identifier) returns a ResolutionOutcome from the SCP relay network, the one resolution layer (§3.10.4)",
@@ -701,8 +700,8 @@
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
-        "Implement DidMethod::publish in dht.rs — split the chain into frame-sized segments, publish to both relay sets in sequence order with `retain: true`",
-        "Implement automatic republishing as a background tokio task",
+        "Implement IdentityBackend::publish in dht.rs — split the chain into frame-sized segments, publish to both relay sets in sequence order with `retain: true`",
+        "Implement the self-observation cadence as a background tokio task that fetches and re-publishes only what its fetch found absent",
         "Implement exponential backoff for publish failures (30s, 1m, 2m, 4m, 8m, 16m, cap 30m)",
         "Implement the publish-degraded warning after six consecutive failures",
         "Implement startup republish on identity load",
@@ -725,7 +724,7 @@
         }
       ],
       "details": {
-        "republishStrategy": "A validating relay stores a `retain` PUBLISH under §9.7.4.2 R9 and expires it never, so no republication cycle makes the record permanent there. A transport that cannot validate stores the frame as an opaque blob under the shared blob TTL, and the cycle keeps that copy alive.",
+        "republishStrategy": "A validating relay stores a `retain` PUBLISH under §9.7.4.2 R9 and gives it no TTL, so no republication cycle makes the record permanent there; R9's ring buffer displaces the oldest-established unpaid retained set when the relay needs the bytes, and the SDK re-publishes to an entry its own self-check found holding no record. A transport that cannot validate stores the frame as an opaque blob under the shared blob TTL, and the cycle keeps that copy alive.",
         "cacheStrategy": "Resolution cache — TTL-based, 24h active / 7d inactive, head-sequence comparison for staleness (§9.10.7)",
         "stalenessIndicator": "A cached result the resolver has not refreshed within its window carries a staleness indicator. Callers SHOULD treat a stale result as valid but degraded. UCAN validation and MLS credential verification SHOULD resolve fresh first, and §9.7.1 check 2 bounds how stale a key state may be when it satisfies an attestation's current-key check."
       },
@@ -1127,7 +1126,7 @@
         "crates/scp-transport/src/native/protocol.rs",
         "crates/scp-transport/src/native/error.rs"
       ],
-      "description": "Define the SCP native relay protocol message types (ClientMessage, RelayMessage) and MessagePack serialization over WebSocket binary frames. The relay protocol has exactly 6 client operations (PUBLISH, SUBSCRIBE, UNSUBSCRIBE, QUERY, DELETE, ACK) plus PING, and 5 relay response types (OK, ERR, BLOB, EVENT, PONG) with defined error codes.",
+      "description": "Define the SCP native relay protocol message types (ClientMessage, RelayMessage) and MessagePack serialization over WebSocket binary frames. The relay protocol has exactly 6 client operations (PUBLISH, SUBSCRIBE, UNSUBSCRIBE, QUERY, DELETE, ACK) plus PING, and 5 relay response types (OK, ERR, BLOB, EVENT, PONG) with defined error codes. Note, 2026-09-14: this story records what shipped. ADR-004 now states seven client operations, the seventh being POLICY, and the criteria below are not rewritten to it; the story that adds POLICY owns that work.",
       "acceptanceCriteria": [
         "ClientMessage enum defined with variants: Publish, Subscribe, Unsubscribe, Query, Delete, Ack, Ping — matching reference Rust types",
         "RelayMessage enum defined with variants: Ok, Err, Blob, Event, Pong — matching reference Rust types",
