@@ -44,7 +44,7 @@ asyncio.run(main())
 
 ## Requirements
 
-- Python >= 3.10
+- Python >= 3.12
 - Rust toolchain (build only -- wheels are pre-built for Linux, macOS, Windows)
 
 ## API Reference

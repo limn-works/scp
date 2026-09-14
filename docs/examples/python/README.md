@@ -10,12 +10,7 @@ context lifecycle, messaging, and tool invocation.
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    ```
 
-2. **Python 3.10 or later** (via mise). `crates/scp-ffi/Cargo.toml` builds the
-   extension against CPython's stable ABI as of 3.10, and
-   `bindings/python/pyproject.toml` declares `requires-python = ">=3.10"`, so one
-   wheel per platform installs on 3.10 and every later release. The command below
-   installs the interpreter this repository develops against, which the examples
-   run on as well:
+2. **Python 3.12+** (via mise):
    ```bash
    mise install python@3.12
    ```

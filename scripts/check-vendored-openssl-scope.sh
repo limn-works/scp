@@ -80,11 +80,11 @@
 #     the answer means changing what those artifacts select, which fails this gate
 #     by name, so that change is a decision someone made rather than a side effect.
 #
-# Pull request #2119 set the vendored feature in the workspace dependency table,
-# which reached both binaries — the `Docker / relay and node image` job failed
-# inside `openssl-src`'s build script — and left both recipes asserting a linkage
-# the build no longer performed. This gate reports the next such edit by name
-# rather than by a Docker build breaking.
+# Pull request #2119, the Python wheel CI fix, set the vendored feature in the
+# workspace dependency table, which reached both binaries — the
+# `Docker / relay and node image` job failed inside `openssl-src`'s build script —
+# and left both recipes asserting a linkage the build no longer performed. This
+# gate reports the next such edit by name rather than by a Docker build breaking.
 #
 # WHAT THIS GATE DOES NOT DECIDE
 # ------------------------------

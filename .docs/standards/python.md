@@ -6,7 +6,7 @@ Python conventions, toolchain, and CI for the SCP Python SDK. References `sdk-co
 
 | Tool | Version | Purpose |
 |------|---------|---------|
-| Python | 3.10+ | Minimum supported version. `crates/scp-ffi/Cargo.toml` activates `pyo3/abi3-py310` alongside `extension-module`, so one wheel per platform installs on CPython 3.10 and every later release, and `bindings/python/pyproject.toml` declares `requires-python = ">=3.10"`. `match` and `X \| Y` union syntax, which CPython added in 3.10, are therefore available. PEP 695 type parameter syntax — `type X = ...`, `def f[T]`, `class C[T]` — is not, because CPython added it in 3.12; write `X: TypeAlias = ...` and `TypeVar` instead. `[tool.ruff] target-version = "py310"` in that same project file makes `ruff check` reject the 3.12 forms, and job python-lint in `.github/workflows/ci.yml` runs that check on every pull request touching `bindings/python/**`. |
+| Python | 3.12+ | Minimum supported version (for PEP 695 type parameter syntax, `type X` statements, `ParamSpec`). `match` (3.10), `X \| Y` union syntax (3.10) are available but 3.12 is the floor for type parameter syntax. |
 | maturin | latest | Build tool for PyO3 Rust extension |
 | ruff | latest | Linter + formatter (replaces flake8, isort, black) |
 | mypy | latest | Static type checker (`--strict` mode) |
@@ -229,8 +229,7 @@ maturin build --release --target x86_64-pc-windows-msvc
 | pyi-generated (`.pyi` ↔ PyO3 signature parity) | ubuntu-latest | 3.12 | Every PR |
 | pip-audit | ubuntu-latest | 3.12 | Every PR |
 | test | ubuntu-latest, macos-latest | 3.12, 3.13 | Every PR |
-| python-wheel-build (abi3 + vendored OpenSSL) | ubuntu-latest | builds on 3.12, installs and imports on 3.10 | Every PR that changes a file the wheel's cargo configuration reads |
-| python-wheels (the five release wheels) | ubuntu-latest, macos-latest, windows-latest | 3.12 | `scp-*@*` tag push, `workflow_call`, `workflow_dispatch` |
+| build-wheel | ubuntu-latest, macos-latest, windows-latest | 3.12+ | Every PR |
 | conformance | ubuntu-latest | 3.12 | Every PR |
 | publish (PyPI) | ubuntu-latest | 3.12 | Tagged release |
 

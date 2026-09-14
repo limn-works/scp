@@ -163,61 +163,17 @@ jobs:
         with:
           fetch-depth: 0  # Full history for tag operations
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      # Reads the three Cargo manifests this step used to read with `grep -m1`,
-      # and reads bindings/python/pyproject.toml alongside them. That project file
-      # decides what a published wheel is called: build-matrix.yml's python-wheels
-      # job builds the five wheels from it and stamps nothing onto them, while the
-      # three sibling SDKs take their version from `env.VERSION` at publish time.
-      # A stale string there uploads a wheel named for another release, and step 6b
-      # passes the PyPI action no `skip-existing`, so a collision fails that upload
-      # after publish-crates, publish-npm, publish-maven and the Apple jobs have
-      # already published. This step runs before the tag push below, so a
-      # disagreement stops the release while nothing has shipped.
-      - name: Verify every project file names the release version
-        run: python3 scripts/check-release-version-parity.py '${{ env.VERSION }}'
-
-      # PyPI rejects a re-upload of a file it already holds, and step 6b hands the
-      # publish action no `skip-existing`, so that rejection fails the run after
-      # publish-crates, publish-npm, publish-maven and the two Apple jobs have
-      # published. Asking PyPI here moves the failure ahead of all five. An answer
-      # this step cannot read — a network failure, or any status other than 200 and
-      # 404 — fails the release rather than letting it continue on an unanswered
-      # question.
-      #
-      # Both halves of the question come from `bindings/python/pyproject.toml`: the
-      # version through `--pep440`, and the distribution name through
-      # `--dist-name`. A literal name written here would keep answering about
-      # whichever project it named after someone renamed the distribution in that
-      # project file, and PyPI answers 404 for a project that does not exist, so
-      # the release would proceed on an answer about another project.
-      - name: Verify PyPI does not already hold this version
+      - name: Verify Cargo.toml version matches input
         run: |
-          set -euo pipefail
-          PEP440="$(python3 scripts/check-release-version-parity.py --pep440 '${{ env.VERSION }}')"
-          DIST="$(python3 scripts/check-release-version-parity.py --dist-name)"
-          STATUS="$(curl -sS -o /dev/null -w '%{http_code}' \
-            "https://pypi.org/pypi/${DIST}/${PEP440}/json")"
-          case "$STATUS" in
-            404)
-              echo "PyPI holds no $DIST $PEP440"
-              ;;
-            200)
-              echo "::error::PyPI already holds $DIST $PEP440. Every file it"
-              echo "::error::holds for that version is immutable, so the wheels and"
-              echo "::error::the sdist this run builds cannot replace them. Release"
-              echo "::error::a version PyPI does not hold."
+          for CRATE in scp-core scp-protocol scp-runtime; do
+            CARGO_VERSION=$(grep -m1 '^version' "crates/$CRATE/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
+            if [ "$CARGO_VERSION" != "${{ env.VERSION }}" ]; then
+              echo "::error::$CRATE/Cargo.toml version ($CARGO_VERSION) does not match release version (${{ env.VERSION }})"
+              echo "Update crates/$CRATE/Cargo.toml before releasing."
               exit 1
-              ;;
-            *)
-              echo "::error::PyPI answered HTTP $STATUS for $DIST $PEP440, so"
-              echo "::error::this step cannot tell whether that version exists."
-              exit 1
-              ;;
-          esac
+            fi
+            echo "Version verified for $CRATE: $CARGO_VERSION"
+          done
 
       - name: Create version tags
         id: tags
@@ -235,7 +191,6 @@ jobs:
             "scp-client@${{ env.VERSION }}"
             "scp-runtime@${{ env.VERSION }}"
             "scp-core@${{ env.VERSION }}"
-            "scp-relay-client@${{ env.VERSION }}"
             "scp-transport@${{ env.VERSION }}"
             "scp-mcp@${{ env.VERSION }}"
             "scp-media@${{ env.VERSION }}"

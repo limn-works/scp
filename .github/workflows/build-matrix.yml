@@ -19,20 +19,6 @@ on:
         description: "scp-core version (source of truth for all SDK versions)"
         required: true
         type: string
-  # Run the release matrix on a branch, before a tag exists. Every leg below
-  # compiles for the first time on the run that cuts a release otherwise: job
-  # python-wheels is where `pyo3/abi3-py310`, the vendored-OpenSSL build, the
-  # manylinux_2_28 container prep and the Windows NASM step meet a real build, and
-  # a failure there blocks the publish rather than a pull request. Job
-  # python-wheel-build in `.github/workflows/ci.yml` compiles the wheel's cargo
-  # configuration on every pull request that changes it; this trigger is how the
-  # container, the cross image and the five-target matrix get exercised.
-  workflow_dispatch:
-    inputs:
-      scp-core-version:
-        description: "scp-core version to stamp on the artifacts (defaults to the branch name)"
-        required: false
-        type: string
 
 permissions:
   contents: read
@@ -150,14 +136,7 @@ jobs:
   # first CI wheel build — this job previously carried latent bugs because no
   # run had ever reached it):
   #   - maturin in CI finds no python by itself; each leg pins an explicit
-  #     interpreter (`-i`). One interpreter per leg is enough because
-  #     `crates/scp-ffi/Cargo.toml` activates `pyo3/abi3-py310` alongside
-  #     `extension-module`, so the cdylib each leg builds carries the `abi3` tag
-  #     and installs on CPython 3.10 and every later release — which is what
-  #     `bindings/python/pyproject.toml` promises with `requires-python = ">=3.10"`
-  #     and its 3.10-through-3.13 classifiers. Without abi3 each leg would emit a
-  #     wheel for the single CPython named here and `pip install` on the other
-  #     three would fall back to compiling the Rust workspace from the sdist.
+  #     interpreter (`-i`).
   #   - manylinux 2_28, not 2014: CentOS 7 (EOL) can build neither
   #     ring/aws-lc-sys (glibc >= 2.18, newer gcc) nor vendored OpenSSL.
   #   - x86_64 2_28 container ships a minimal perl that openssl-src's

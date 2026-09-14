@@ -48,11 +48,7 @@ build-backend = "maturin"
 [project]
 name = "scp-python"
 description = "Shared Context Protocol SDK — identity, encryption, contexts, tools for AI agents"
-# The floor the `extension-module` feature of `crates/scp-ffi` enforces: it
-# activates `pyo3/abi3-py310`, so the cdylib compiles against CPython's stable
-# ABI as of 3.10 and one wheel per platform installs on 3.10 and every later
-# release. A floor above it would promise less than the wheel delivers.
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 # license = TBD
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -72,7 +68,7 @@ python-source = "."
 module-name = "scp_sdk._scp_core"
 manifest-path = "../../crates/scp-ffi/Cargo.toml"
 # Features of `scp-ffi`, not of pyo3: `extension-module` forwards
-# `pyo3/extension-module` and `pyo3/abi3-py310`, and `vendored-openssl` forwards
+# `pyo3/extension-module`, and `vendored-openssl` forwards
 # `scp-platform/vendored-openssl`, which compiles OpenSSL from source into
 # SQLCipher because a `pip install` runs no linker and the wheel installs onto a
 # machine whose OpenSSL the build never saw. This is the one shipped artifact
@@ -81,13 +77,7 @@ manifest-path = "../../crates/scp-ffi/Cargo.toml"
 features = ["extension-module", "vendored-openssl"]
 
 [tool.ruff]
-# The same floor `requires-python` names above. ruff reads this value to decide
-# which syntax it accepts, so `type X = ...` and the other PEP 695 forms, which
-# CPython added in 3.12, fail `ruff check` here. Job python-lint in
-# `.github/workflows/ci.yml` runs that check on every pull request touching
-# `bindings/python/**`, which is what stops a 3.12-only construct from reaching a
-# wheel whose `requires-python` admits CPython 3.10.
-target-version = "py310"
+target-version = "py312"
 line-length = 100
 
 [tool.ruff.lint]
@@ -111,10 +101,7 @@ known-first-party = ["scp_sdk"]
 
 [tool.mypy]
 strict = true
-# The floor `requires-python` names above, so mypy resolves
-# `sys.version_info` branches and standard-library signatures the way the oldest
-# interpreter a wheel installs on resolves them.
-python_version = "3.10"
+python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true

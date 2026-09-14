@@ -146,11 +146,9 @@ cd "$REPO_ROOT"
 #   - `scp-ffi/default`, `scp-ffi-napi/default`, `scp-ffi-uniffi/default` — each
 #     is `["server"]`, which a bare `cargo build` at this root and the three
 #     default-feature bridge ARTIFACTS entries resolve.
-#   - `scp-ffi/extension-module` — `["pyo3/extension-module", "pyo3/abi3-py310"]`,
-#     which tells pyo3 to leave the Python symbols to the interpreter that loads
-#     the cdylib and to compile against CPython's stable ABI as of 3.10. Both are
-#     pyo3 features: the row activates no SCP-crate feature and no dependency
-#     edge.
+#   - `scp-ffi/extension-module` — `["pyo3/extension-module"]`, which tells pyo3
+#     to leave the Python symbols to the interpreter that loads the cdylib. It
+#     activates no SCP-crate feature and no dependency edge.
 #   - `scp-ffi/vendored-openssl` — `["scp-platform/vendored-openssl"]`, which adds
 #     `rusqlite/bundled-sqlcipher-vendored-openssl` and compiles the same
 #     SQLCipher against an OpenSSL this build produces rather than one the host
@@ -266,13 +264,13 @@ EOF
 # because the maturin step in build-matrix.yml passes no `--features` and
 # maturin takes the wheel's cargo feature list from that table, and fails
 # unless ARTIFACTS carries the exact configuration that table selects. Today
-# that table selects `extension-module`, which activates pyo3's
-# `extension-module` and `abi3-py310` and changes no SCP-crate edge, and
-# `vendored-openssl`, which reaches `scp-platform/vendored-openssl` and from
-# there adds `rusqlite/bundled-sqlcipher-vendored-openssl`. Neither nullifies a
-# security property: the first two select a Python linkage and ABI, and the
-# third compiles the same SQLCipher against an OpenSSL this build produced
-# rather than one the host supplies. The
+# that table selects `extension-module`, a pyo3-only feature that changes no
+# SCP-crate edge, and `vendored-openssl`, which reaches
+# `scp-platform/vendored-openssl` and from there adds
+# `rusqlite/bundled-sqlcipher-vendored-openssl`. Neither nullifies a security
+# property: the first selects a Python linkage, and the second compiles the same
+# SQLCipher against an OpenSSL this build produced rather than one the host
+# supplies. The
 # `scp-ffi|--features extension-module,vendored-openssl` entry below is the
 # wheel's configuration, and `scripts/check-vendored-openssl-scope.sh` holds
 # the complementary property this gate does not read — that `openssl-src`
@@ -341,7 +339,8 @@ SHIPPING_FILES=(
 # `assert_maturin_project_files_are_complete` fails on the stale entry rather than
 # leaving a reader to notice. Restoring that argument, or adding any other line a
 # shipping file runs maturin from, fails the same assertion until this list names
-# the pyproject.toml the new line reaches. That table's `features`, `all-features`, and
+# the pyproject.toml the new line reaches. That table's `features`,
+# `all-features`, and
 # `no-default-features` keys select the wheel's cargo features, and the maturin
 # step passes no `--features` of its own, so a `testing` entry added to either
 # table compiles `scp-platform/testing`, `scp-dht/testing`, and `scp-testing`
