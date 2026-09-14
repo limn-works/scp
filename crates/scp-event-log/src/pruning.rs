@@ -364,6 +364,39 @@ pub fn verify_compact_proof(proof: &CompactProof) -> bool {
 // is_structural_event
 // ---------------------------------------------------------------------------
 
+/// Whether an event's payload must survive log pruning for as long as the log
+/// holds it.
+///
+/// Pruning discards event payloads and keeps leaf hashes (ADR-030 §4-5), so a
+/// protocol rule that reads a payload field of an old leaf stops working once
+/// that leaf's payload is gone. The bridge lifecycle leaves are the leaves a
+/// bridge node reads bridge admission from: spec §12.10.6 step 1 makes the node
+/// decide admission from the `bridge_id`, `context_id`, `action`, and
+/// `operator_did` fields of those payloads and from no other input, and the
+/// registration leaf of a live bridge is older than every message the bridge
+/// carried. A pruned `BridgeRegistered` payload would therefore fail a bridge
+/// that governance never revoked, silently and permanently.
+///
+/// [`compute_prune_boundary`] stops the prune boundary at the oldest event this
+/// function accepts, so a context that holds a bridge lifecycle leaf prunes the
+/// events below that leaf and prunes no event from that leaf onward.
+///
+/// This is a positive whitelist: a variant is never-pruned only when a protocol
+/// rule reads its payload out of an arbitrarily old leaf. `retention_secs` and
+/// `structural_retention_multiplier` govern every other variant.
+#[must_use]
+pub const fn is_never_pruned_event(event_type: &EventType) -> bool {
+    matches!(
+        event_type,
+        // Bridge lifecycle (spec §12.2; ADR-011): the admission input of
+        // spec §12.10.6 step 1.
+        EventType::BridgeRegistered
+            | EventType::BridgeSuspended
+            | EventType::BridgeReactivated
+            | EventType::BridgeRevoked
+    )
+}
+
 /// Returns `true` if the event type is a structural event.
 ///
 /// Structural events (governance / membership / lifecycle / structural
@@ -524,36 +557,47 @@ fn compute_prune_boundary(
     now: u64,
 ) -> u64 {
     let max_boundary = checkpoint_event_count;
+    let retention = config.effective_retention_secs();
 
-    config
-        .effective_retention_secs()
-        .map_or(max_boundary, |retention_secs| {
-            // Find the latest event that is outside the retention window,
-            // considering structural event multiplier.
-            let mut boundary: u64 = 0;
+    // Pruning cuts a PREFIX of the log: `prune_before_checkpoint` discards the
+    // payload of every event below the boundary. The boundary therefore stops
+    // at the first event the log must keep, and never advances past it. An
+    // earlier revision set the boundary from the LAST event outside its own
+    // retention window, which discarded every event below that one whatever
+    // its own window said, so `structural_retention_multiplier` multiplied a
+    // window that the prefix cut then ignored.
+    let mut boundary: u64 = 0;
 
-            #[allow(clippy::cast_possible_truncation)] // event counts fit in usize
-            let take_count = max_boundary as usize;
-            for event in events.iter().take(take_count) {
-                let effective_retention = if is_structural_event(&event.event_type) {
-                    // effective = retention_secs * multiplier_bp / 10000
-                    retention_secs.saturating_mul(u64::from(config.structural_retention_multiplier))
-                        / 10_000
-                } else {
-                    retention_secs
-                };
+    #[allow(clippy::cast_possible_truncation)] // event counts fit in usize
+    let take_count = max_boundary as usize;
+    for event in events.iter().take(take_count) {
+        if is_never_pruned_event(&event.event_type) {
+            break;
+        }
 
-                let cutoff = now.saturating_sub(effective_retention);
+        if let Some(retention_secs) = retention {
+            let effective_retention = if is_structural_event(&event.event_type) {
+                // effective = retention_secs * multiplier_bp / 10000
+                retention_secs.saturating_mul(u64::from(config.structural_retention_multiplier))
+                    / 10_000
+            } else {
+                retention_secs
+            };
 
-                if event.timestamp < cutoff {
-                    // This event is outside the retention window.
-                    boundary = event.sequence + 1;
-                }
+            let cutoff = now.saturating_sub(effective_retention);
+
+            if event.timestamp >= cutoff {
+                // This event is inside its own retention window, and every
+                // event above it sits above the cut, so the boundary stops.
+                break;
             }
+        }
 
-            // Cannot prune beyond the checkpoint boundary.
-            boundary.min(max_boundary)
-        })
+        boundary = event.sequence + 1;
+    }
+
+    // Cannot prune beyond the checkpoint boundary.
+    boundary.min(max_boundary)
 }
 
 /// Estimates the serialized size of an event for storage reclamation metrics.
@@ -706,6 +750,45 @@ mod tests {
         }
 
         (log, events, leaf_hashes)
+    }
+
+    /// Builds a log whose event types are exactly `types`, one event per
+    /// entry, timestamps `start_timestamp + i * step`, sequences `0..`.
+    fn build_log_with_types(
+        types: &[EventType],
+        start_timestamp: u64,
+        step: u64,
+    ) -> (EventLog, Vec<Event>) {
+        let (verifying_key, signing_key) = test_keypair();
+        let did = did_from_pubkey(&verifying_key);
+        let mut log = EventLog::new("ctx-prune-test".to_owned());
+        let mut prev_hash = GENESIS_PREV_HASH;
+        let mut events = Vec::new();
+
+        for (i, event_type) in types.iter().enumerate() {
+            let i = i as u64;
+            let event = sign_event(
+                *event_type,
+                &did,
+                start_timestamp + i * step,
+                i,
+                format!("event-{i}").into_bytes(),
+                prev_hash,
+                &signing_key,
+            );
+            tree::append(&mut log, &event).unwrap();
+
+            let serialized = rmp_serde::to_vec(&event).unwrap();
+            let mut hasher = Sha256::new();
+            hasher.update([0x00]);
+            hasher.update(&serialized);
+            let leaf_hash: [u8; 32] = hasher.finalize().into();
+
+            events.push(event);
+            prev_hash = leaf_hash;
+        }
+
+        (log, events)
     }
 
     /// Creates a mock checkpoint at the given event count.
@@ -1143,6 +1226,126 @@ mod tests {
     // is_structural_event tests
     // ===================================================================
 
+    /// Spec 12.10.6 step 1 decides bridge admission from the payload fields of
+    /// the bridge lifecycle leaves, and a live bridge's `BridgeRegistered` leaf
+    /// is older than every message the bridge carried. The prune boundary
+    /// therefore stops at the oldest bridge lifecycle leaf, whatever
+    /// `retention_secs` says about the events around it.
+    #[test]
+    fn prune_boundary_stops_at_the_oldest_bridge_lifecycle_leaf() {
+        // Sequence 0..=2 are prunable events; sequence 3 is the
+        // BridgeRegistered leaf; sequence 4..=9 are messages the bridge carried.
+        let mut types = vec![
+            EventType::ContextCreated,
+            EventType::MessageSent,
+            EventType::MessageSent,
+            EventType::BridgeRegistered,
+        ];
+        types.extend(std::iter::repeat_n(EventType::MessageSent, 6));
+        let (log, events) = build_log_with_types(&types, 100, 100);
+        let checkpoint = make_checkpoint(&log, 10, 1_100);
+
+        // Every event is far outside the retention window, so without the
+        // never-pruned rule the boundary would reach the checkpoint at 10.
+        let config = PruningConfig {
+            retain_last_n_checkpoints: None,
+            retention_secs: Some(MIN_RETENTION_SECS),
+            structural_retention_multiplier: 10_000,
+        };
+        let now = MIN_RETENTION_SECS * 100;
+
+        let boundary = compute_prune_boundary(&events, 10, &config, now);
+        assert_eq!(
+            boundary, 3,
+            "the boundary must stop at the BridgeRegistered leaf at sequence 3"
+        );
+
+        let (_, result) = prune_before_checkpoint(&log, &checkpoint, &events, &config, now)
+            .expect("three events below the bridge leaf are prunable");
+        assert_eq!(result.events_pruned, 3);
+        assert_eq!(result.oldest_retained_seq, 3);
+    }
+
+    /// The same rule holds for the other three bridge lifecycle variants, and
+    /// holds when `retention_secs` is `None` (pruning bounded only by the
+    /// checkpoint).
+    #[test]
+    fn every_bridge_lifecycle_variant_stops_the_prune_boundary() {
+        for bridge_type in [
+            EventType::BridgeRegistered,
+            EventType::BridgeSuspended,
+            EventType::BridgeReactivated,
+            EventType::BridgeRevoked,
+        ] {
+            assert!(
+                is_never_pruned_event(&bridge_type),
+                "{bridge_type:?} must be never-pruned (spec 12.10.6 step 1)"
+            );
+
+            let types = [
+                EventType::MessageSent,
+                EventType::MessageSent,
+                bridge_type,
+                EventType::MessageSent,
+            ];
+            let (_, events) = build_log_with_types(&types, 100, 100);
+
+            let config = PruningConfig {
+                retain_last_n_checkpoints: None,
+                retention_secs: None,
+                structural_retention_multiplier: 10_000,
+            };
+
+            assert_eq!(
+                compute_prune_boundary(&events, 4, &config, 10_000_000),
+                2,
+                "{bridge_type:?} at sequence 2 must stop the boundary"
+            );
+        }
+    }
+
+    /// `structural_retention_multiplier` extends a structural event's retention
+    /// window, and the prefix cut must honour that window. An earlier revision
+    /// set the boundary from the LAST event outside its own window, so an
+    /// expired `MessageSent` above a still-retained structural event pruned
+    /// that structural event's payload with it.
+    #[test]
+    fn a_later_expired_operational_event_does_not_prune_a_retained_structural_event() {
+        // now - MIN_RETENTION_SECS is the operational cutoff; 3x that is the
+        // structural cutoff. Place the structural event between the two.
+        let now = MIN_RETENTION_SECS * 10;
+        let operational_cutoff = now - MIN_RETENTION_SECS;
+        let structural_cutoff = now - MIN_RETENTION_SECS * 3;
+
+        let types = [
+            // Sequence 0: outside even the structural window.
+            EventType::RoleAssigned,
+            // Sequence 1: inside the structural window, outside the operational one.
+            EventType::RoleAssigned,
+            // Sequence 2: outside the operational window.
+            EventType::MessageSent,
+        ];
+        let (_, mut events) = build_log_with_types(&types, 0, 0);
+        events[0].timestamp = structural_cutoff - 1;
+        events[1].timestamp = structural_cutoff + 1;
+        events[2].timestamp = operational_cutoff - 1;
+
+        assert!(is_structural_event(&EventType::RoleAssigned));
+        assert!(!is_structural_event(&EventType::MessageSent));
+
+        let config = PruningConfig {
+            retain_last_n_checkpoints: None,
+            retention_secs: Some(MIN_RETENTION_SECS),
+            structural_retention_multiplier: 30_000,
+        };
+
+        assert_eq!(
+            compute_prune_boundary(&events, 3, &config, now),
+            1,
+            "the retained structural event at sequence 1 must stop the boundary"
+        );
+    }
+
     #[test]
     fn structural_events_classified_correctly() {
         // The full closed `EventType` taxonomy (81 variants) paired with its
@@ -1264,7 +1467,7 @@ mod tests {
     // ===================================================================
 
     #[test]
-    fn structural_events_retained_longer_with_multiplier() {
+    fn a_retained_structural_event_stops_the_prefix_cut_below_it() {
         // Create events where structural events are at timestamps that
         // would be pruned with 1x retention but kept with 3x.
         let (verifying_key, signing_key) = test_keypair();
@@ -1339,28 +1542,25 @@ mod tests {
         let now = MIN_RETENTION_SECS + 10_000;
         let boundary = compute_prune_boundary(&events, 2, &config, now);
 
-        // Only event 1 (operational at ts=200) should be pruned.
-        // Event 0 (structural at ts=100) is within the structural retention.
-        // But wait: structural cutoff = now - 3*MIN_RETENTION_SECS.
-        // 3 * 2_592_000 = 7_776_000. now = 2_602_000. cutoff = -(5_174_000) => 0.
-        // So event 0's timestamp 100 is NOT less than 0. Not pruned.
-        // Event 1's timestamp 200 IS less than 10_000. Pruned.
-        // boundary = event1.sequence + 1 = 2. Both events pruned in sequence.
-        // Actually boundary goes up to highest pruned + 1.
-        // The boundary is the highest contiguous prunable sequence.
-        // We iterate and set boundary = seq + 1 for each prunable event.
-        // Event 0: structural, NOT prunable (cutoff is 0, ts 100 >= 0).
-        // Event 1: operational, prunable (cutoff is 10_000, ts 200 < 10_000).
-        // So boundary ends at 2, meaning events 0 and 1 are both prunable.
-        // Wait -- boundary is set to max(current, event.sequence+1) when prunable.
-        // Since event 0 is NOT prunable, boundary stays at 0.
-        // Event 1 IS prunable, boundary = 1 + 1 = 2.
-        // This means events 0-1 are marked as prunable, but event 0 is structural.
-        // The implementation prunes ALL events up to boundary, not selectively.
-        // This is by design: structural retention only extends how long before
-        // the event becomes prunable, but once the boundary is set, everything
-        // up to it is pruned.
-        assert_eq!(boundary, 2);
+        // Structural cutoff = now - 3 * MIN_RETENTION_SECS, which saturates to
+        // 0, so event 0 (structural, ts=100) is INSIDE its retention window.
+        // Event 1 (operational, ts=200) is outside the operational cutoff of
+        // 10_000.
+        //
+        // Pruning cuts a PREFIX: `prune_before_checkpoint` discards every
+        // payload below the boundary. A boundary of 2 would therefore discard
+        // event 0, the structural event the multiplier just retained. ADR-030
+        // step 2125 of the pruning algorithm says the opposite -- "if the event
+        // is structural and within the structural retention window, skip" --
+        // and ADR-030 §2a's structural-event floor keeps governance history for
+        // at least 90 days. So the boundary stops at event 0 and prunes
+        // nothing, which is also what the runtime's provider already did
+        // (`MerkleEventLogProvider::prune_before_checkpoint` breaks at the
+        // first retained event).
+        assert_eq!(
+            boundary, 0,
+            "a retained structural event at sequence 0 leaves nothing prunable below it"
+        );
     }
     // NOTE: Test moved to scp-core integration tests
     // (depends on trust::participation::compute_participation_record).
