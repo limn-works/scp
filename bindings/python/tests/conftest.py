@@ -17,6 +17,26 @@ from collections.abc import Iterator
 import pytest
 
 
+def extension_is_absent(exc: BaseException) -> bool:
+    """Report whether one exception means the native extension is not installed.
+
+    CRITERION: the exception is the :class:`scp_sdk.errors.ScpError` carrying
+    ``SCP-UNKNOWN-0001``. ``scp_sdk.scp._native_mod`` and
+    ``scp_sdk.scp._native_cls`` raise that code for the two causes that both mean
+    "not installed": ``import _scp_core`` failed, or the extension exports no
+    ``SCP`` class.
+
+    Every other construction failure — a libpython the module was not built
+    against, a panic in bridge initialisation, a storage backend that refuses to
+    open — raises a different type or carries a different code, and the fixture
+    below re-raises it. Skipping on those would let a CI job that downloaded a
+    broken extension exit 0 over zero executed assertions.
+    """
+    from scp_sdk.errors import ScpError
+
+    return isinstance(exc, ScpError) and exc.code == "SCP-UNKNOWN-0001"
+
+
 @pytest.fixture
 def scp() -> Iterator:
     """Fresh ``scp_sdk.SCP`` wrapper per test.
@@ -43,7 +63,9 @@ def scp() -> Iterator:
     try:
         instance = SCP(storage={"type": "in_memory"})
     except Exception as exc:
-        pytest.skip(f"SCP() construction failed — extension not built: {exc}")
+        if not extension_is_absent(exc):
+            raise
+        pytest.skip(f"native _scp_core extension not installed: {exc}")
 
     try:
         yield instance

@@ -3311,6 +3311,87 @@ def check_dependency_conditions_detect_a_conditionless_consumer(doc: dict) -> No
     )
 
 
+PYO3_ARTIFACTS = ("pyo3-module-linux", "pyo3-module-macos")
+
+
+def pyo3_consumers_without_a_construction_assertion(doc: dict) -> list[str]:
+    """Return every job that downloads a PyO3 module and does not exercise it first.
+
+    CRITERION: a job that downloads a PyO3 extension module runs, before its first
+    pytest invocation, a step that imports `scp_sdk._scp_core` and a step that
+    constructs `SCP(storage=...)` from it.
+
+    WHY: every real-FFI test module under bindings/python/tests skips itself when
+    `from scp_sdk import _scp_core` raises, and the `scp` fixture in
+    bindings/python/tests/conftest.py skips every test that requests it when the
+    extension is not installed. A downloaded module that imports but cannot be
+    constructed therefore leaves pytest exiting 0 over zero executed assertions in
+    every one of these jobs at once, which is the `zero-test` shape this file names.
+    The import alone does not close that: it leaves the construction path open, so
+    the criterion names both statements.
+    """
+    gaps: list[str] = []
+    for job_id, job in sorted(doc["jobs"].items()):
+        steps = job.get("steps") or []
+        if not any(
+            str(step.get("uses") or "").startswith("actions/download-artifact")
+            and (step.get("with") or {}).get("name") in PYO3_ARTIFACTS
+            for step in steps
+        ):
+            continue
+        imported = False
+        constructed = False
+        for step in steps:
+            script = str(step.get("run") or "")
+            if re.search(r"\bpytest tests", script):
+                break
+            imported = imported or "import scp_sdk._scp_core" in script
+            constructed = constructed or "SCP(storage=" in script
+        if not (imported and constructed):
+            missing = [
+                name
+                for name, present in (("imports", imported), ("constructs", constructed))
+                if not present
+            ]
+            gaps.append(
+                f"{job_id} downloads a PyO3 module and runs pytest without asserting "
+                f"that it {' and '.join(missing)}"
+            )
+    return gaps
+
+
+def check_pyo3_consumers_exercise_the_module(doc: dict) -> None:
+    gaps = pyo3_consumers_without_a_construction_assertion(doc)
+    check(
+        "ci.yml: every job downloading a PyO3 module imports and constructs it first",
+        not gaps,
+        "; ".join(gaps),
+    )
+
+
+def check_pyo3_assertion_control(doc: dict, fragment: str, label: str) -> None:
+    """Deleting one half of one job's assertion is reported."""
+    mutated = copy.deepcopy(doc)
+    steps = mutated["jobs"]["python-test"]["steps"]
+    hits = [step for step in steps if fragment in str(step.get("run") or "")]
+    if len(hits) != 1:
+        check(
+            f"the control can delete the {label} assertion from python-test",
+            False,
+            f"{len(hits)} steps carry {fragment!r}, so the mutant is not the one intended",
+        )
+        return
+    hits[0]["run"] = "\n".join(
+        line for line in str(hits[0]["run"]).splitlines() if fragment not in line
+    )
+    gaps = pyo3_consumers_without_a_construction_assertion(mutated)
+    check(
+        f"a python-test that no longer asserts it {label} is reported",
+        any("python-test downloads a PyO3 module" in gap and label in gap for gap in gaps),
+        f"deleting the {label} assertion went unreported: {gaps}",
+    )
+
+
 def main() -> int:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     jobs = workflow["jobs"]
@@ -3389,6 +3470,11 @@ def main() -> int:
         "input set first"
     )
     check_signing_guard(documents)
+
+    print("downloaded-module — a PyO3 consumer exercises the module before pytest")
+    check_pyo3_consumers_exercise_the_module(workflow)
+    check_pyo3_assertion_control(workflow, "import scp_sdk._scp_core", "imports")
+    check_pyo3_assertion_control(workflow, "SCP(storage=", "constructs")
 
     print("needs-condition — a job's dependencies run wherever the job does")
     check_dependency_conditions(workflow)

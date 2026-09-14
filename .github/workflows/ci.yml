@@ -1889,18 +1889,25 @@ jobs:
           python -m venv .venv
           source .venv/bin/activate
           pip install pytest pytest-asyncio
-      # THE DEFECT THIS CLOSES: every real-FFI test under bindings/python/tests
-      # carries `pytest.skip("Native _scp_core extension not available — run maturin
-      # develop first")`, and conftest.py skips the whole session on the same
-      # condition. A download that landed the module anywhere but beside the package
-      # would therefore leave pytest exiting 0 over zero executed assertions, which is
-      # the `zero-test` shape scripts/tests/ci-gate/ci_gate_selftest.py names. This
-      # import fails the job instead. Every consumer of a PyO3 artifact runs it.
-      - name: Assert the downloaded extension imports
+      # THE DEFECT THIS CLOSES: every real-FFI test module under
+      # bindings/python/tests opens with `pytest.skip("Native _scp_core extension not
+      # available — run maturin develop first", allow_module_level=True)` when
+      # `from scp_sdk import _scp_core` raises, and the `scp` fixture in
+      # bindings/python/tests/conftest.py skips every test that requests it when
+      # `scp_sdk` does not import or when `SCP(storage={"type": "in_memory"})` raises
+      # the not-installed error. A download that landed the module anywhere but beside
+      # the package would therefore leave pytest exiting 0 over zero executed
+      # assertions, which is the `zero-test` shape
+      # scripts/tests/ci-gate/ci_gate_selftest.py names. This step runs both statements
+      # those guards run — the import and the construction — so a module that imports
+      # but cannot construct fails the job here rather than skipping every test that
+      # requests the fixture. Every consumer of a PyO3 artifact runs it.
+      - name: Assert the downloaded extension imports and constructs
         run: |
           source .venv/bin/activate
           cd bindings/python
-          PYTHONPATH=. python -c "import scp_sdk._scp_core as m; print(m.__file__)"
+          PYTHONPATH=. python -c "import scp_sdk._scp_core as module; print(module.__file__)"
+          PYTHONPATH=. python -c "from scp_sdk import SCP; print(SCP(storage={'type': 'in_memory'}).instance_id)"
       - name: Run tests (including real FFI)
         run: |
           source .venv/bin/activate
@@ -2365,11 +2372,12 @@ jobs:
           pip install pytest pytest-asyncio
       # See the step of this name in job python-test for the skip-on-absence defect it
       # closes.
-      - name: Assert the downloaded extension imports
+      - name: Assert the downloaded extension imports and constructs
         run: |
           source .venv/bin/activate
           cd bindings/python
-          PYTHONPATH=. python -c "import scp_sdk._scp_core as m; print(m.__file__)"
+          PYTHONPATH=. python -c "import scp_sdk._scp_core as module; print(module.__file__)"
+          PYTHONPATH=. python -c "from scp_sdk import SCP; print(SCP(storage={'type': 'in_memory'}).instance_id)"
       - name: Wire NAPI addon into node_modules
         run: |
           ARCH=$(uname -m)
@@ -2470,11 +2478,12 @@ jobs:
           pip install pytest pytest-asyncio
       # See the step of this name in job python-test for the skip-on-absence defect it
       # closes.
-      - name: Assert the downloaded extension imports
+      - name: Assert the downloaded extension imports and constructs
         run: |
           source .venv/bin/activate
           cd bindings/python
-          PYTHONPATH=. python -c "import scp_sdk._scp_core as m; print(m.__file__)"
+          PYTHONPATH=. python -c "import scp_sdk._scp_core as module; print(module.__file__)"
+          PYTHONPATH=. python -c "from scp_sdk import SCP; print(SCP(storage={'type': 'in_memory'}).instance_id)"
       - name: Build UniFFI cdylib
         run: |
           cargo build -p scp-ffi-uniffi --features testing
@@ -2559,11 +2568,12 @@ jobs:
           pip install pytest pytest-asyncio
       # See the step of this name in job python-test for the skip-on-absence defect it
       # closes.
-      - name: Assert the downloaded extension imports
+      - name: Assert the downloaded extension imports and constructs
         run: |
           source .venv/bin/activate
           cd bindings/python
-          PYTHONPATH=. python -c "import scp_sdk._scp_core as m; print(m.__file__)"
+          PYTHONPATH=. python -c "import scp_sdk._scp_core as module; print(module.__file__)"
+          PYTHONPATH=. python -c "from scp_sdk import SCP; print(SCP(storage={'type': 'in_memory'}).instance_id)"
       - name: Build Swift parity runner
         run: |
           cd bindings/python/tests/bridge_parity/helpers/swift_bridge_runner
