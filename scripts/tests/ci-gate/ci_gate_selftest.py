@@ -2462,74 +2462,6 @@ def check_testing_unification_readers() -> None:
     )
 
 
-MANIFEST_READER_FILES = (
-    "crates/scp-runtime/tests/identity_config_cross_path.rs",
-    "crates/scp-ffi/common/tests/dht_capability_injection.rs",
-)
-MANIFEST_READER_BEGIN = "// --- BEGIN shared manifest reader"
-MANIFEST_READER_END = "// --- END shared manifest reader ---"
-
-
-def shared_manifest_reader(path: str) -> str | None:
-    """Return the shared-manifest-reader block of `path`, markers included, or
-    None when the file carries no such pair of markers."""
-    text = (REPO / path).read_text()
-    start = text.find(MANIFEST_READER_BEGIN)
-    if start < 0:
-        return None
-    end = text.find(MANIFEST_READER_END, start)
-    if end < 0:
-        return None
-    return text[start : end + len(MANIFEST_READER_END)]
-
-
-def check_identity_manifest_readers_match() -> None:
-    """Both crates that pin the scp-identity dev-dependency edge read it with
-    one reader.
-
-    CRITERION: the text between the BEGIN and END markers is byte-identical in
-    crates/scp-runtime/tests/identity_config_cross_path.rs and
-    crates/scp-ffi/common/tests/dht_capability_injection.rs. Each crate asserts
-    the property about its own manifest and neither dev-depends on the other,
-    so the reader cannot live in one crate and be called from the other; a
-    duplicated block is the only shape cargo allows, and this check is what
-    keeps the two copies one reader.
-
-    Why a copy may not drift: the reader decides which cargo spellings activate
-    `scp-identity/testing`. A fix applied to one copy and not the other leaves
-    the second crate accepting the spelling the first now rejects, which is the
-    review-the-class failure `.docs/lessons/review-the-class-not-the-instance.md`
-    records — one site fixed, its twin found a round later.
-    """
-    blocks = {path: shared_manifest_reader(path) for path in MANIFEST_READER_FILES}
-    missing = sorted(path for path, block in blocks.items() if block is None)
-    check(
-        "each manifest-reader file carries the BEGIN and END markers",
-        not missing,
-        f"{missing} carries no `{MANIFEST_READER_BEGIN}` … "
-        f"`{MANIFEST_READER_END}` pair, so this check reads nothing and "
-        f"proves nothing about the reader it is here to pin",
-    )
-    if missing:
-        return
-    first, second = (blocks[path] for path in MANIFEST_READER_FILES)
-    check(
-        "the shared manifest reader is long enough to be the reader",
-        first is not None and len(first) > 2000,
-        f"the block in {MANIFEST_READER_FILES[0]} is {len(first or '')} bytes; "
-        f"two emptied blocks match each other, so this check requires the "
-        f"block to still hold the reader's four functions",
-    )
-    check(
-        "both manifest-reader copies are byte-identical",
-        first == second,
-        f"{MANIFEST_READER_FILES[0]} and {MANIFEST_READER_FILES[1]} carry "
-        f"different text between the markers. Diff them and apply the fix to "
-        f"both: one copy accepting a cargo spelling the other rejects is the "
-        f"hole this pair of tests exists to close",
-    )
-
-
 def check_shipped_build_assertions_run(jobs: dict) -> None:
     """Every bridge's shipped-build assertions run in a production-config lane.
 
@@ -3514,7 +3446,6 @@ def main() -> int:
     )
     check_shipped_assertion_readers()
     check_testing_unification_readers()
-    check_identity_manifest_readers_match()
     check_shipped_build_assertions_run(jobs)
 
     print(

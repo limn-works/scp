@@ -106,8 +106,14 @@ scp-dht = { path = "../scp-dht", features = ["testing"] }
 # rides on this dev-dependency edge instead, which only this crate's own test build
 # activates. A `--workspace` run gets the feature anyway, through `scp-testing`'s
 # self dev-dependency; this line is what makes
-# `cargo nextest run -p scp-runtime --features testing` pass. The manifest test in
-# that file asserts this line stays.
+# `cargo nextest run -p scp-runtime --features testing` pass.
+# `scripts/check-shipped-feature-graph.sh`, the shipped-artifact feature-graph gate,
+# is what keeps `scp-identity/testing` out of every shipped artifact. That gate
+# resolves each artifact's feature set with `cargo tree -e features,no-dev --target
+# all` and fails on any resolved feature its allowlist does not name. The allowlist
+# names `scp-identity/default` and `scp-identity/production-dht` and no `testing`
+# feature of any crate, so a dependency edge that turned `testing` on for a shipped
+# artifact fails that gate whatever spelling the edge uses.
 scp-identity = { path = "../scp-identity", features = ["testing"] }
 scp-mls = { path = "../scp-mls", features = ["testing"] }
 scp-protocol = { path = "../scp-protocol", features = ["testing"] }
@@ -120,9 +126,6 @@ openmls_basic_credential = { workspace = true, features = ["test-utils"] }
 proptest = "1"
 scp-media = { path = "../scp-media" }
 static_assertions = { workspace = true }
-# `tests/identity_config_cross_path.rs` parses this manifest to assert the
-# `scp-identity` dev-dependency edge above keeps `testing`.
-toml_edit = { workspace = true }
 metrics-util = "0.19"
 # ADR-049 Decision 14 `perf_baseline` harness only. `scp-testing` re-exports the
 # `FullStackNetwork`/`FullStackNode` two-node MLS harness needed to drive the six

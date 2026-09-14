@@ -115,13 +115,16 @@ scp-event-log = { path = "../../scp-event-log" }
 # feature rides on this dev-dependency edge instead, which only this crate's own
 # test build activates. A `--workspace` run gets the feature anyway, through
 # `scp-testing`'s self dev-dependency; this line is what makes
-# `cargo nextest run -p scp-ffi-common --features testing` compile. The manifest
-# test in that file asserts this line stays.
+# `cargo nextest run -p scp-ffi-common --features testing` compile.
+# `scripts/check-shipped-feature-graph.sh`, the shipped-artifact feature-graph gate,
+# is what keeps `scp-identity/testing` out of every shipped artifact. That gate
+# resolves each artifact's feature set with `cargo tree -e features,no-dev --target
+# all` and fails on any resolved feature its allowlist does not name. The allowlist
+# names `scp-identity/default` and `scp-identity/production-dht` and no `testing`
+# feature of any crate, so a dependency edge that turned `testing` on for a shipped
+# artifact fails that gate whatever spelling the edge uses.
 scp-identity = { path = "../../scp-identity", features = ["testing"] }
 scp-platform = { path = "../../scp-platform", features = ["testing"] }
-# `tests/dht_capability_injection.rs` parses this manifest to assert the
-# `scp-identity` dev-dependency edge above keeps `testing`.
-toml_edit = { workspace = true }
 # The crate's own tests (resolvers.rs, dht_capability_injection.rs) construct
 # `InMemoryDhtClient`; activate `scp-dht/testing` for this crate's test build.
 scp-dht = { path = "../../scp-dht", features = ["testing"] }

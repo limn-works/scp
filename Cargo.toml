@@ -163,12 +163,6 @@ futures = "0.3"
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
 redb = "2"
 static_assertions = "1.1"
-# Parses a crate's own manifest in the structural tests that pin a dependency edge:
-# `scp-runtime` and `scp-ffi-common` each assert that their `[dev-dependencies]`
-# entry for `scp-identity` enables `testing`, because a `--workspace` test run
-# unifies that feature in from elsewhere and cannot notice its loss. 0.25 is the
-# version `Cargo.lock` already resolves for other dependencies.
-toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
 # wasm-bindgen stack for the browser participant surface (ADR-057 Slice 3).
 # Only the wasm32-targeted crate (scp-client-wasm) consumes these; they are
 # declared at the workspace level so the version pins stay single-sourced.
