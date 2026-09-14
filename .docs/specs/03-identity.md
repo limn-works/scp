@@ -700,12 +700,12 @@ An identity's key-event log rides in the key-event record frame `09-security-mod
 
 **Relay-side validation.** `09-security-model.md` §9.7.4.2 R9 states what a relay keeps for one identity, what a chain holds, the write rule, the serving order and the ring buffer. On PUBLISH at a routing id an SCP-native relay runs seven checks **in the order below, which is the order and not an enumeration**, so junk is rejected before any expensive work. **Every check that reads bytes the relay already holds runs ahead of the one call that leaves the relay's host**: `PaymentAdapter::verify` is an asynchronous query to a payment rail, a PUBLISH carries no key and the relay authenticates no client, so a relay that called the rail first drove one outbound query per request an unauthenticated party sent and reached its own rate limit never:
 
-1. **The declared rate limit.** Refuse an unpaid PUBLISH that exceeds `rate_limit_publish`. The check reads one counter against the publishing address and decodes nothing. **It reads whether the PUBLISH carries a `payment_receipt` field and never whether that receipt is valid**, which is what lets the limit run ahead of every receipt check without refusing a write a receipt would have covered.
+1. **The declared rate limit.** Refuse a PUBLISH that exceeds `rate_limit_publish`. The check reads one counter against the publishing address and decodes nothing. **It reads whether the PUBLISH carries a `payment_receipt` field and never whether that receipt is valid**, which is what lets the limit run ahead of every receipt check without refusing a write a receipt would have covered. **Where the relay declared `RateLimit` in `receipt_exempts` and check 5 below verified this write's receipt, the relay does not count that write against the address's rate**, and it runs this check on every PUBLISH whatever `receipt_exempts` declares, because a relay that skipped the check would have to verify the receipt before it ran the check (`09-security-model.md` §9.7.4.2 R9).
 2. **Structural decode.** Decode the blob as a key-event record frame (`09-security-model.md` §9.10.12), under the one parse bound §9.7.4.2's definitions state for every count-prefixed list read out of unverified bytes. **A blob shorter than the frame's 33-byte fixed prefix is refused here, before any rule digests its `value` bytes.** A blob that does not decode is not a candidate key-event record.
 3. **The identifier-to-routing-id binding.** Confirm that the routing id equals the registered derivation over the frame's `identifier` field. This is a plain hash, cheaper than a signature verification, and it is the discriminant that lets a relay recognize a key-event record with no new wire type.
 4. **The receipt's four byte-local checks.** Where the relay declares `per_publish` or `per_byte_stored` and the PUBLISH carries a `payment_receipt`, run the write binding, the unspent receipt identifier, the amount and the currency — the four of R9's five checks that read bytes the relay already holds and compare integers. Refuse `Payment` where any of the four fails. The relay spends the receipt identifier at check 7 and at no earlier check, so a frame it rejects costs the publisher no receipt.
 5. **`PaymentAdapter::verify`, the payee comparison, and recording the write as paid.** Call the adapter the receipt is tagged with (`19-economic-governance.md` §19.2.1), compare the verified payee it returns against this relay's declared `economic.payee`, and record the write as paid. Refuse `Payment` where the write is charged and the receipt is absent, where the verification fails, or where the payee differs. **This is the one check that leaves the relay's host**, which is why every check above it runs first.
-6. **The declared storage budgets.** **No event kind is exempt from either budget.** Under `Identifier` pressure the relay evicts that identifier's retained divergent suffixes in R9's eviction-rank order, lowest-ranked first, and refuses `Identifier` only where evicting every suffix it may evict still leaves the budget exceeded. **`Total` refuses an unpaid write where the relay holds no unpaid identity it may displace, and refuses a paid write where the pinned set already fills the declared total budget and the ring holds no unpaid identity to displace**, R9's ring buffer displacing instead in every other case. A paid write is exempt from `Identifier`. The check runs here because it reads the identifier check 3 bound and no verified chain.
+6. **The declared storage budgets.** **No event kind is exempt from either budget.** Under `Identifier` pressure the relay evicts that identifier's retained divergent suffixes in R9's eviction-rank order, lowest-ranked first, and refuses `Identifier` only where evicting every suffix it may evict still leaves the budget exceeded. **Where the relay declared `Identifier` in `receipt_exempts` and check 5 above verified this write's receipt, both arms of that budget stop for this write** — the suffix eviction and the refusal alike — because both read the one term the exemption names (`09-security-model.md` §9.7.4.2 R9). **`Total` refuses a write where displacing every uncovered identity the relay may displace still leaves the retained capacity short of the arriving frame's bytes**, R9's ring buffer displacing instead in every other case. The check runs here because it reads the identifier check 3 bound and no verified chain.
 7. **Chain verification and placement, on whichever of two branches the frame's first event selects.** Where that event is an inception event, the relay recomputes the identifier from it, rejects a frame that recomputes to anything but the `identifier` field check 3 read, and verifies every event under `09-security-model.md` §9.7.4.2 R2 and R3. Where that event's predecessor digest names an event the relay already holds at this routing id, the relay verifies the frame's events against the standing root the assembled chain carries at that position and recomputes no identifier. A frame whose first event selects neither branch is rejected. **The chain authorizes the write, and no key the writer supplies does.** The relay then places the frame's events on a chain under `09-security-model.md` §9.7.4.2 R9.
 
 **What may open or extend a chain at a routing id.** Once a binding-valid frame whose chain verifies establishes a chain at a routing id, four rules govern that routing id:
@@ -719,7 +719,7 @@ An identity's key-event log rides in the key-event record frame `09-security-mod
 
 **A validating relay applies the same discipline to the service record**, at `SHA-256("scp:svc:" ‖ identifier_bytes)`. It accepts a `retain` PUBLISH there only where it holds a chain for that identifier, the record's signature verifies against the key that chain's key state designates for the service-record role (§3.10.13), and the record's sequence exceeds the one it already holds. **It keeps one record per identifier**, on the count and the key R9 fixes (`09-security-model.md` §9.7.4.2 R9). Without that filter any party writes unbounded permanent blobs at any public identifier's service address, and the genuine record sits behind them at every reader's query limit.
 
-**The retention bounds and the declared write policy.** A validating relay applies R9's count bound, byte bound and eviction rank per identifier. It also applies the write policy it declares in `relay_config` — a rate limit, a per-identifier budget, a total budget, and a price — and refuses a PUBLISH that fails a declared term with `IdentityError::StorageBudgetExceeded{scope, value}` (§3.10.10), serving every record it already holds (`09-security-model.md` §9.7.4.2 R9). **What lets an owner's recovery land is R9's ring buffer**, whose displacement rule and whose two `Total` refusal arms R9 states, and no event kind is exempt from any budget scope. **Payment pins an identity outside that ring and buys exemption from the `Identifier` and `RateLimit` scopes and none from `Total`**, so the total budget the operator declared bounds what that operator stores against a funded party.
+**The retention bounds and the declared write policy.** A validating relay applies R9's count bound, byte bound and eviction rank per identifier. It also applies the write policy it declares in `relay_config` — a rate limit, a per-identifier budget, a total budget, and a price — and refuses a PUBLISH that fails a declared term with `IdentityError::StorageBudgetExceeded{scope, value}` (§3.10.10), serving every record it already holds (`09-security-model.md` §9.7.4.2 R9). **What lets an owner's recovery land is R9's ring buffer**, whose displacement rule and whose one `Total` refusal R9 states, and no event kind is exempt from any budget scope. **A relay that charges declares in `receipt_exempts` which refusal scopes a verified receipt exempts, and a relay that charges and declares nothing exempts nothing** (`09-security-model.md` §9.7.4.2 R9, `18-addressability-and-deployment.md` §18.3.3). **A receipt also covers the identity it names up to the bytes it paid for, which no relay declares and R9 states**, and it buys no exemption from `Total`, so the total budget the operator declared bounds what that operator stores against a funded party.
 
 **Relay-side validation is an optional capability of SCP-native relays, and witnessing is a separate role a relay takes only where an identity designates it.** A relay that cannot validate rejects a PUBLISH carrying `retain: true` and stores a PUBLISH carrying no flag as an opaque blob under the shared TTL (`09-security-model.md` §9.10.12), so a foreign transport carries content and holds no retained kind. **First contact and resolution require SCP-native listed relays**, because R11's floor counts only community-relay-list entries serving a relay proof of control, so a party whose only transport is a foreign adapter adopts no head on any first contact. A verifier still depends on no relay for correctness, because it verifies every event itself; KERI calls that property end-verifiability in `spec-body` §End-verifiable, "KERI has no security dependency on any other infrastructure".
 
@@ -745,7 +745,7 @@ The resolution protocol runs seven steps.
 
 On appending a key event the owner builds the chain from the inception event to the new head, splits it into contiguous segments each fitting one frame, publishes the frames to the identity's own relays and to the fallback set in sequence order, and submits the new head to its witness set. A relay accepts a segment whose first event's predecessor it already holds, and R9 states the publisher's remedy for a rejected segment, which reads the relay's current state rather than the publisher's memory of an acknowledgement (`09-security-model.md` §9.7.4.2 R9). Submission to a witness gates nothing: the event takes effect at each relying party the moment that party resolves the extended chain, and an identity that designates no witness skips that step (`09-security-model.md` §9.7.4.2 R10, §9.7.4.3). **Appending a key event is not the only publication.** On every self-observation cadence the SDK fetches its own identity's log **from every entry of its fallback set**, and **for every entry that fetch showed holding no record for this identity the SDK re-publishes its chain and its service record to that entry** (`09-security-model.md` §9.7.4.2 R10). **The cadence carries no unconditional re-PUBLISH**: a re-PUBLISH of bytes the relay already holds moves nothing, for the reason R9's three write outcomes state, so it costs the publisher a rate-limit allowance and buys the identity nothing.
 
-**A PUBLISH carrying a key-event record, a service record, a cosigned head or a conflict statement sets the wire's `retain` flag**, which is REQUIRED true at those four kinds (`09-security-model.md` §9.10.12). A validating relay retains all four under `09-security-model.md` §9.7.4.2 R9 and gives none of them a TTL, which is what the flag declares, so no republication cycle makes any of them permanent and the six-day cycle is deleted for all four. **R9's ring buffer is what removes such a record**: the relay displaces the oldest-established unpaid identity when it needs the bytes, and a payment pins an identity outside the ring. A relay that does not validate rejects a PUBLISH carrying the flag, because it holds the address digest and never the preimage and can scope no retention.
+**A PUBLISH carrying a key-event record, a service record, a cosigned head or a conflict statement sets the wire's `retain` flag**, which is REQUIRED true at those four kinds (`09-security-model.md` §9.10.12). A validating relay retains all four under `09-security-model.md` §9.7.4.2 R9 and gives none of them a TTL, which is what the flag declares, so no republication cycle makes any of them permanent and the six-day cycle is deleted for all four. **R9's ring buffer is what removes such a record**, and R9 states the coverage a verified receipt gives the identity it names. A relay that does not validate rejects a PUBLISH carrying the flag, because it holds the address digest and never the preimage and can scope no retention.
 
 ### 3.10.6 Anti-Segmentation Invariant
 
@@ -757,10 +757,10 @@ On appending a key event the owner builds the chain from the inception event to 
 
 | Scope | What `value` carries | What the publisher does |
 |---|---|---|
-| `Payment` | The relay's declared `economic` terms: the currency, `per_publish`, `per_byte_stored`, the accepted adapters, and the payee | Mint a receipt for the declared price through a configured adapter and retry at the same relay |
+| `Payment` | The relay's declared `economic` terms: the currency, `per_publish`, `per_byte_stored`, the accepted adapters, and the payee | Mint a receipt for the declared price through a configured adapter and retry at the same relay. What that receipt then exempts is the `receipt_exempts` set the relay declares and the `POLICY` query returns, whose members a relay draws from `Identifier` and `RateLimit` (`18-addressability-and-deployment.md` §18.3.3, `09-security-model.md` §9.7.4.2 R9) |
 | `RateLimit` | The declared ceiling per minute and the seconds to wait | Wait the stated seconds and retry at the same relay |
 | `Identifier` | The declared per-identifier budget in bytes | Move to the next fallback-set entry; no change to this request satisfies the term |
-| `Total` | The declared total budget in bytes | Move to the next fallback-set entry; a relay returns this scope against an unpaid write where it holds no unpaid identity it may displace, and against a paid write where the pinned set already fills the declared total budget and the ring holds no unpaid identity to displace (`09-security-model.md` §9.7.4.2 R9) |
+| `Total` | The declared total budget in bytes | Move to the next fallback-set entry; a relay returns this scope where displacing every uncovered identity it may displace still leaves its retained capacity short of the arriving frame's bytes (`09-security-model.md` §9.7.4.2 R9) |
 
 **The three MUSTs above read `PublishOutcome`'s per-entry list** (§3.10.10), which names every entry of the fallback set exactly once with what that entry answered under one of `EntryResult`'s five variants — `Accepted`, `Refused`, `Skipped`, `Failed` and `Unreachable` — so a cycle mixing an acceptance, a refusal, a skip, an answer that named no declared term and an unreachable entry lands in no gap between arms.
 
@@ -877,19 +877,32 @@ pub enum IdentityError {
 
 /// Which term of a validating relay's declared write policy a refusal failed
 /// (`09-security-model.md` §9.7.4.2 R9). A relay that declares no value for a
-/// term never returns that term's scope.
+/// term never returns that term's scope. A charging relay names the scopes a
+/// verified receipt exempts in `relay_config`'s `receipt_exempts` set
+/// (`18-addressability-and-deployment.md` §18.3.3), drawing its members from
+/// `Identifier` and `RateLimit`; `Total` and `Payment` are the two variants
+/// that set may not carry.
 pub enum BudgetScope {
-    /// The storage budget the relay holds for the published identifier.
+    /// The storage budget the relay holds for the published identifier. A
+    /// relay may name this variant in `receipt_exempts`, and the declaration
+    /// stops both arms of that budget for a write whose receipt it verified.
     Identifier,
     /// The storage budget the relay holds across every identifier it stores.
+    /// A `receipt_exempts` set may not carry this variant, because the
+    /// declared total budget is the whole capacity the operator's host holds.
     Total,
-    /// The relay's `rate_limit_publish` term.
+    /// The relay's `rate_limit_publish` term. A relay may name this variant
+    /// in `receipt_exempts`, and the declaration stops the relay counting a
+    /// write whose receipt it verified against that address's rate; the
+    /// rate-limit check itself runs on every PUBLISH.
     RateLimit,
     /// The relay charges for this write, and one of three grounds holds: the
     /// PUBLISH carried no `payment_receipt`; it carried one the relay's named
     /// adapter did not verify; or it carried one that failed a receipt check
     /// `09-security-model.md` §9.7.4.2 R9 states (`09-security-model.md`
-    /// §9.10.12, `19-economic-governance.md` §19.2.1, §19.8).
+    /// §9.10.12, `19-economic-governance.md` §19.2.1, §19.8). A
+    /// `receipt_exempts` set may not carry this variant, because the receipt
+    /// is the object a `Payment` refusal reads.
     Payment,
 }
 
@@ -900,8 +913,8 @@ pub enum BudgetValue {
     /// The declared per-identifier storage budget, in bytes.
     Identifier(u64),
     /// The declared total storage budget, in bytes, which is the whole
-    /// retained capacity the relay declares and the one figure both of
-    /// `Total`'s refusal arms carry (`09-security-model.md` §9.7.4.2 R9).
+    /// retained capacity the relay declares and the figure `Total`'s one
+    /// refusal carries (`09-security-model.md` §9.7.4.2 R9).
     Total(u64),
     /// The declared ceiling, and the wait this publisher's own counter needs.
     /// The ceiling alone tells a publisher what the relay allows and never
