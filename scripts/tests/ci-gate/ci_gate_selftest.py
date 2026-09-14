@@ -3369,6 +3369,93 @@ def check_pyo3_consumers_exercise_the_module(doc: dict) -> None:
     )
 
 
+NAPI_ARTIFACTS = ("napi-addon-linux",)
+
+# Both statements the NAPI skip guards run: the SDK loader that `createRequire`s the
+# platform package, and the construction of the native class the loader returns.
+NAPI_ASSERTION_FRAGMENTS = (
+    ("loadNativeAddon(", "loads"),
+    ("new NativeScp(", "constructs"),
+)
+
+
+def napi_consumers_without_a_construction_assertion(doc: dict) -> list[str]:
+    """Return every job that downloads a NAPI addon and does not exercise it first.
+
+    CRITERION: a job that downloads a NAPI native addon runs, before its first test
+    invocation, a step that calls `loadNativeAddon()` and a step that constructs the
+    native `SCP` class the loader returns.
+
+    WHY: every real-NAPI test file under bindings/typescript/tests wraps its addon load
+    and its first construction in one `try`, writes the caught error into a skip reason,
+    and resolves its whole `describe` block to `describe.skip` or to a lone `test.skip`
+    — tests/real-napi.test.ts, tests/e2e-fullstack.test.ts and tests/persistence.test.ts
+    among them. A downloaded addon that does not load therefore leaves `bun test`
+    exiting 0 over zero executed NAPI assertions, which is the same `zero-test` shape
+    the PyO3 criterion above names. Checking that the downloaded file exists does not
+    close that, because a file that is present can still fail to load, so the criterion
+    names the load and the construction.
+    """
+    gaps: list[str] = []
+    for job_id, job in sorted(doc["jobs"].items()):
+        steps = job.get("steps") or []
+        if not any(
+            str(step.get("uses") or "").startswith("actions/download-artifact")
+            and (step.get("with") or {}).get("name") in NAPI_ARTIFACTS
+            for step in steps
+        ):
+            continue
+        found = {label: False for _, label in NAPI_ASSERTION_FRAGMENTS}
+        for step in steps:
+            script = str(step.get("run") or "")
+            if re.search(r"\bbun test\b|\bpytest tests", script):
+                break
+            for fragment, label in NAPI_ASSERTION_FRAGMENTS:
+                found[label] = found[label] or fragment in script
+        missing = [label for label, present in found.items() if not present]
+        if missing:
+            gaps.append(
+                f"{job_id} downloads a NAPI addon and runs its tests without asserting "
+                f"that it {' and '.join(missing)}"
+            )
+    return gaps
+
+
+def check_napi_consumers_exercise_the_addon(doc: dict) -> None:
+    gaps = napi_consumers_without_a_construction_assertion(doc)
+    check(
+        "ci.yml: every job downloading a NAPI addon loads and constructs it first",
+        not gaps,
+        "; ".join(gaps),
+    )
+
+
+def check_napi_assertion_control(doc: dict, fragment: str, label: str) -> None:
+    """Deleting one half of one job's assertion is reported."""
+    mutated = copy.deepcopy(doc)
+    steps = mutated["jobs"]["typescript-check"]["steps"]
+    hits = [step for step in steps if fragment in str(step.get("run") or "")]
+    if len(hits) != 1:
+        check(
+            f"the control can delete the {label} assertion from typescript-check",
+            False,
+            f"{len(hits)} steps carry {fragment!r}, so the mutant is not the one intended",
+        )
+        return
+    hits[0]["run"] = "\n".join(
+        line for line in str(hits[0]["run"]).splitlines() if fragment not in line
+    )
+    gaps = napi_consumers_without_a_construction_assertion(mutated)
+    check(
+        f"a typescript-check that no longer asserts it {label} is reported",
+        any(
+            "typescript-check downloads a NAPI addon" in gap and label in gap
+            for gap in gaps
+        ),
+        f"deleting the {label} assertion went unreported: {gaps}",
+    )
+
+
 def check_pyo3_assertion_control(doc: dict, fragment: str, label: str) -> None:
     """Deleting one half of one job's assertion is reported."""
     mutated = copy.deepcopy(doc)
@@ -3475,6 +3562,11 @@ def main() -> int:
     check_pyo3_consumers_exercise_the_module(workflow)
     check_pyo3_assertion_control(workflow, "import scp_sdk._scp_core", "imports")
     check_pyo3_assertion_control(workflow, "SCP(storage=", "constructs")
+
+    print("downloaded-addon — a NAPI consumer exercises the addon before its tests")
+    check_napi_consumers_exercise_the_addon(workflow)
+    for napi_fragment, napi_label in NAPI_ASSERTION_FRAGMENTS:
+        check_napi_assertion_control(workflow, napi_fragment, napi_label)
 
     print("needs-condition — a job's dependencies run wherever the job does")
     check_dependency_conditions(workflow)

@@ -1966,6 +1966,43 @@ jobs:
           cp "$LIB_FILE" "$PKG_DIR/index.node"
           # Create a minimal package.json so require() resolves
           echo '{"name":"'"$NAPI_PKG"'","version":"0.1.0","main":"index.node"}' > "$PKG_DIR/package.json"
+      # THE DEFECT THIS CLOSES: every real-NAPI test file under
+      # bindings/typescript/tests wraps its addon load and its first construction in
+      # one `try`, writes the caught error into a skip reason, and resolves its whole
+      # `describe` block to `describe.skip` or to a lone `test.skip` — see
+      # tests/real-napi.test.ts, tests/e2e-fullstack.test.ts, tests/persistence.test.ts
+      # and the nine files that copy that shape. A downloaded addon that does not load
+      # therefore leaves `bun test` exiting 0 over zero executed NAPI assertions, which
+      # is the `zero-test` shape scripts/tests/ci-gate/ci_gate_selftest.py names, and
+      # which the `[ ! -f ]` check above cannot see because that check reads whether the
+      # file is present and never loads it. This step runs the statements those guards
+      # run — the SDK loader and the native constructor — and reads the two methods the
+      # `server` and `testing` feature lists compile onto the native class, so an addon
+      # that loads but carries a different feature resolution fails the job here instead
+      # of skipping every test that calls those methods. Every consumer of a NAPI
+      # artifact runs this step.
+      - name: Assert the downloaded addon loads and constructs
+        working-directory: bindings/typescript
+        run: |
+          bun -e '
+            import { loadNativeAddon } from "./src/internal/native.ts";
+            const addon = loadNativeAddon();
+            const NativeScp = addon.SCP;
+            if (typeof NativeScp !== "function") {
+              throw new Error("the native addon exports no SCP class");
+            }
+            const probe = new NativeScp(JSON.stringify({ type: "in_memory" }));
+            for (const method of ["relayStartInMemory", "fullstackCreateNode"]) {
+              if (typeof probe[method] !== "function") {
+                throw new Error(
+                  "the native SCP class is missing " + method +
+                  ", so this addon was built without the feature that method needs"
+                );
+              }
+            }
+            console.log("NAPI addon loaded, constructed, and carries the gated methods");
+            process.exit(0);
+          '
       - name: Run checks
         working-directory: bindings/typescript
         run: |
@@ -2399,6 +2436,31 @@ jobs:
       - name: Install TypeScript workspace deps
         working-directory: bindings/typescript
         run: bun install
+      # See the step of this name in job typescript-check for the skip-on-absence
+      # defect it closes. This job drives the NAPI half of the parity harness through a
+      # Bun child process, so an addon that does not load surfaces in this step.
+      - name: Assert the downloaded addon loads and constructs
+        working-directory: bindings/typescript
+        run: |
+          bun -e '
+            import { loadNativeAddon } from "./src/internal/native.ts";
+            const addon = loadNativeAddon();
+            const NativeScp = addon.SCP;
+            if (typeof NativeScp !== "function") {
+              throw new Error("the native addon exports no SCP class");
+            }
+            const probe = new NativeScp(JSON.stringify({ type: "in_memory" }));
+            for (const method of ["relayStartInMemory", "fullstackCreateNode"]) {
+              if (typeof probe[method] !== "function") {
+                throw new Error(
+                  "the native SCP class is missing " + method +
+                  ", so this addon was built without the feature that method needs"
+                );
+              }
+            }
+            console.log("NAPI addon loaded, constructed, and carries the gated methods");
+            process.exit(0);
+          '
       - name: Run parity tests (NAPI only)
         # The Kotlin and Swift alt-bridge cases are covered by dedicated
         # jobs (`bridge-parity-kotlin`, `bridge-parity-swift`) that own
