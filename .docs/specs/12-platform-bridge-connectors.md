@@ -329,7 +329,7 @@ This section specifies the concrete HTTP API that a cooperating external platfor
 
 - **Platform implements, bridge node consumes.** The platform exposes these endpoints. The bridge node calls them and also exposes a webhook receiver for platform-initiated events. The platform never calls SCP directly.
 - **Minimal surface area.** Six endpoints. No SCP-specific data structures leak into the platform's API — all SCP envelope construction, sender key encryption (§12.6.1), and provenance marking happen on the bridge node.
-- **Authentication via identity-signed tokens.** The bridge operator signs bearer tokens used for all requests. The platform verifies each signature against that operator's `current` `#active` key (§12.10.2).
+- **Authentication via identity-signed tokens.** The bridge operator signs bearer tokens used for all requests. The platform verifies each signature against the key that operator's key state lists `Current` in the `#active` role (§12.10.2).
 - **Idempotent where possible.** Shadow creation and deletion are idempotent to tolerate retries.
 - **JSON over HTTPS.** All requests and responses use `Content-Type: application/json`. TLS 1.3 required per §9.13.
 - **Versioned.** All paths are prefixed with `/v1/`. Future breaking changes increment the version prefix.
@@ -355,7 +355,7 @@ The JWT payload contains:
 }
 ```
 
-The platform verifies the JWT signature against the operator's `current` `#active` key (`03-identity.md` §3.10.4). Token lifetime SHOULD NOT exceed 1 hour. The platform MAY cache a resolved key state (§9.10.7).
+The platform verifies the JWT signature against the key the operator's key state lists `Current` in the `#active` role (`03-identity.md` §3.10.4). Token lifetime SHOULD NOT exceed 1 hour. The platform MAY cache a resolved key state (§9.10.7).
 
 **JWT signing algorithm.** The JWT `alg` header MUST be `ES256` (RFC 7518) — ECDSA on P-256 with SHA-256 — which is the signature algorithm §9.5 of the security-model spec mandates for every SCP key. An SDK MUST reject a JWT whose header names any other algorithm.
 
