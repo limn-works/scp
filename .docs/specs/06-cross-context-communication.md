@@ -198,7 +198,7 @@ These are conventions, not mandates — contexts with discovery outlets can add 
 
 1. **Request signing.** The requester constructs a request payload containing the operation type (`register`, `update`, `deregister`), the entry data, and a freshness tuple `(timestamp, nonce)`. The payload is signed with the requester's Active Signing Key (`#active`), using the canonical hash construction (§9.5.1) with domain separator `"SCP-DISCOVERY-REQUEST-V1:"`. The signed preimage includes: `context_id || requester_did || operation_tag || entry_data_hash || nonce || timestamp`, where `entry_data_hash` is `SHA-256(serialized_entry_data)` and `nonce` is a 16-byte CSPRNG value.
 
-2. **Signature verification.** Writers MUST derive the requester's key state by replaying its key-event log (`03-identity.md` §3.10.4) and verify the P-256 signature against the key that state lists `current` in the `#active` role. Where the log does not resolve or the signature is invalid, the request is rejected.
+2. **Signature verification.** Writers MUST derive the requester's key state by replaying its key-event log (`03-identity.md` §3.10.4) and verify the P-256 signature against the key that state lists `Current` in the `#active` role. Where the log does not resolve or the signature is invalid, the request is rejected.
 
 3. **Replay protection.** Writers MUST validate that the request timestamp is within 5 minutes of local time (consistent with §9.14 clock skew tolerance) and that the `nonce` has not been previously seen. Writers maintain a nonce deduplication cache with a 5-minute TTL, bounded at 10,000 entries with oldest-first eviction. Requests with expired timestamps or duplicate nonces are rejected.
 
