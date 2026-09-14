@@ -234,7 +234,7 @@ The inner signature is included inside the encrypted blob. Relays never see it. 
    - Returns the verified inner envelope.
 
 6. **`verify_inner_signature(inner_envelope, sender_did_document) -> bool`**
-   - Resolves the public key from the sender's key state using `inner_envelope.signing_key_id`: `"#active"` resolves to the key that state lists `current` in the `#active` role (`09-security-model.md` §9.7.4.2 definitions).
+   - Resolves the public key from the sender's key state using `inner_envelope.signing_key_id`: `"#active"` resolves to the key that state lists `Current` in the `#active` role (`09-security-model.md` §9.7.4.2 definitions).
    - Computes `provenance_hash = SHA256(serialize(provenance))` if provenance is present, or `SHA256(0x00)` if absent.
    - Recomputes `SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash || signing_key_id)`.
    - Verifies the P-256 signature against the resolved public key.
@@ -580,7 +580,7 @@ Implement a WebSocket-based store-and-forward relay server and its corresponding
    - Accept an opaque blob associated with a `routing_id`.
    - `recipient_hint` (optional): a per-context pseudonym (§9.10.4) indicating the intended recipient for directed delivery. If absent, the blob is broadcast to all subscribers of this `routing_id`.
    - `retain` (optional boolean, **amended 2026-09-11**): REQUIRED true at the four retained kinds `scp:did:`, `scp:svc:`, `scp:wit:` and `scp:wcf:`, and absent at every other kind (`09-security-model.md` §9.10.12). A validating relay stores a `retain` write under §9.7.4.2 R9's retention rules and gives it no TTL, and R9's ring buffer is what removes such a record. It rejects a write at one of those four kinds that omits the flag, and rejects the flag at any other kind; a relay that does not validate rejects a write carrying `retain: true`, which is the one test it can run, because it holds the address digest and never the preimage. `blob_ttl` is absent on a `retain` write.
-   - `payment_receipt` (optional `bin`, **added 2026-09-13**): the `PaymentReceipt` bytes of `19-economic-governance.md` §19.2.1, tagged with the adapter that issued them. A relay declaring `per_publish` or `per_byte_stored` runs `PaymentAdapter::verify` on them through that adapter and runs the three bindings `09-security-model.md` §9.7.4.2 R9 states beside it, refusing the write with `4041` scope `payment` where the field is absent, the verification fails, or a binding fails. "Paid" names a receipt this relay verified and bound to this write, which is the term R9's ring buffer and rent rules read.
+   - `payment_receipt` (optional `bin`, **added 2026-09-13**): the `PaymentReceipt` bytes of `19-economic-governance.md` §19.2.1, tagged with the adapter that issued them. A relay declaring `per_publish` or `per_byte_stored` runs every check `09-security-model.md` §9.7.4.2 R9 states, in the order `03-identity.md` §3.10.2 gives, and refuses the write with `4041` scope `payment` where the field is absent, where the verification fails, or where any of those checks fails. "Paid" names a receipt this relay verified and bound to this write, which is the term R9's ring buffer and rent rules read.
    - Store it for `blob_ttl` seconds **where the write carries one**; a `retain` write carries none, and `09-security-model.md` §9.7.4.2 R9's ring buffer is what removes such a record: the relay displaces the oldest-established unpaid identity when it needs the bytes, and a payment pins an identity outside the ring.
    - Return a `blob_id` (SHA-256 hash of the blob) as confirmation.
    - Deliver immediately to any active subscribers of this `routing_id`. If `recipient_hint` is present, deliver only to the matching subscriber (optimization — the blob is still encrypted and opaque to non-recipients).
@@ -682,7 +682,7 @@ Every message is a MessagePack map with a required `op` field (string) plus oper
 | `ACK` | `blob_id: bin32` | None (fire-and-forget) |
 | `PING` | `ts: u64` | PONG |
 
-**Constraints:** `blob_ttl` 1–604800 (7 days), and absent on a `retain` write. `blob` 1–262144 bytes (256KB). `routing_id`, `recipient_hint`, `blob_id` are exactly 32 bytes, encoded as MessagePack `bin 32` (not hex/base64 strings).
+**Constraints:** `blob_ttl` 1–604800 (7 days), and absent on a `retain` write. `blob` 1–262144 bytes (256KB). `payment_receipt` 1–8192 bytes, so the field a charging relay decodes carries a declared ceiling as `blob` and `ref` do. `routing_id`, `recipient_hint`, `blob_id` are exactly 32 bytes, encoded as MessagePack `bin 32` (not hex/base64 strings).
 
 #### Relay-to-Client Messages
 
@@ -733,6 +733,7 @@ pub enum ClientMessage {
     Subscribe { ref_id: Option<String>, routing_id: [u8; 32], since: Option<u64> },
     Unsubscribe { ref_id: Option<String>, routing_id: [u8; 32] },
     Query { ref_id: Option<String>, routing_id: [u8; 32], since: Option<u64>, limit: Option<u32>, proof_nonce: Option<[u8; 32]> },
+    Policy { ref_id: Option<String> },
     Delete { ref_id: Option<String>, blob_id: [u8; 32] },
     Ack { blob_id: [u8; 32] },
     Ping { ts: u64 },
@@ -740,8 +741,8 @@ pub enum ClientMessage {
 
 /// Relay-to-client operations
 pub enum RelayMessage {
-    Ok { ref_id: Option<String>, blob_id: Option<[u8; 32]> },
-    Err { ref_id: Option<String>, code: u16, msg: String },
+    Ok { ref_id: Option<String>, blob_id: Option<[u8; 32]>, relay_config: Option<RelayConfig> },
+    Err { ref_id: Option<String>, code: u16, msg: String, scope: Option<String>, value: Option<BudgetValue> },
     Blob { routing_id: [u8; 32], blob_id: [u8; 32], recipient_hint: Option<[u8; 32]>, blob_ttl: Option<u32>, stored_at: u64, relay_proof: Option<[u8; 200]>, blob: Vec<u8> },
     Event { ref_id: Option<String>, event_type: String },
     Pong { ts: u64 },
