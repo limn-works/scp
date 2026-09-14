@@ -29,12 +29,12 @@ use std::process::Command;
 /// turn on `scp-transport/postgres-blob`, and cargo unifies `scp-transport`'s
 /// features across every package a single invocation builds, so another package
 /// in the same build can enable that feature while `scp-relay/cloud-blobs`
-/// stays off. `compiled_backends` derives its answer from the same `cfg!`
-/// reads that gate the arms, and this test binary links the same
-/// `scp-transport` the relay binary links, so the answer here is the relay's
-/// behaviour rather than a proxy for it.
+/// stays off. `VALID_BACKENDS` is assembled from the same `cfg` reads that gate
+/// the arms, and this test binary links the same `scp-transport` the relay
+/// binary links, so the answer here is the relay's behaviour rather than a
+/// proxy for it.
 fn backend_is_compiled(name: &str) -> bool {
-    scp_transport::startup::compiled_backends()
+    scp_transport::startup::VALID_BACKENDS
         .split(", ")
         .any(|compiled| compiled == name)
 }

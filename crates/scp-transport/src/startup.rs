@@ -134,20 +134,84 @@ const BACKENDS: &[Backend] = &[
     },
 ];
 
+// `VALID_BACKENDS` below stays a `&'static str`, because `scp-transport`
+// publishes that name and that type. Selecting one whole literal per feature
+// state would need a definition per combination, and four gated backends give
+// sixteen; these four macro pairs produce the same string from a list that
+// grows by one pair per backend instead. Each pair expands to its backend's
+// name and a separator when the `scp-transport` feature that compiles that
+// backend's arm of `storage_from_env` is enabled, and to nothing when it is
+// not, so every combination comes out exact. `memory` needs no pair: no feature
+// gates it, and it closes the list, so it carries no separator.
+#[cfg(feature = "sqlite-blob")]
+macro_rules! sqlite_entry {
+    () => {
+        "sqlite, "
+    };
+}
+#[cfg(not(feature = "sqlite-blob"))]
+macro_rules! sqlite_entry {
+    () => {
+        ""
+    };
+}
+#[cfg(feature = "redb-blob")]
+macro_rules! redb_entry {
+    () => {
+        "redb, "
+    };
+}
+#[cfg(not(feature = "redb-blob"))]
+macro_rules! redb_entry {
+    () => {
+        ""
+    };
+}
+#[cfg(feature = "postgres-blob")]
+macro_rules! postgres_entry {
+    () => {
+        "postgres, "
+    };
+}
+#[cfg(not(feature = "postgres-blob"))]
+macro_rules! postgres_entry {
+    () => {
+        ""
+    };
+}
+#[cfg(feature = "s3-blob")]
+macro_rules! s3_entry {
+    () => {
+        "s3, "
+    };
+}
+#[cfg(not(feature = "s3-blob"))]
+macro_rules! s3_entry {
+    () => {
+        ""
+    };
+}
+
 /// The `SCP_RELAY_STORAGE_BACKEND` values this build can construct, comma
 /// separated, for diagnostics and help text.
 ///
-/// A build that leaves `postgres-blob` and `s3-blob` off returns
-/// `"sqlite, redb, memory"`.
-#[must_use]
-pub fn compiled_backends() -> String {
-    BACKENDS
-        .iter()
-        .filter(|b| b.compiled)
-        .map(|b| b.name)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
+/// A name appears here only when the `scp-transport` feature that compiles its
+/// arm of [`storage_from_env`] is enabled, so this constant never offers a
+/// backend the binary cannot open. A build with neither cloud feature reads
+/// `"sqlite, redb, memory"`; one with both reads
+/// `"sqlite, redb, postgres, s3, memory"`.
+///
+/// This was the hardcoded string `"sqlite, redb, postgres, s3, memory"` until
+/// `scp-node` and `scp-relay` stopped enabling `postgres-blob` and `s3-blob` by
+/// default, at which point a default build rejected `postgres` and then listed
+/// `postgres` among the valid options.
+pub const VALID_BACKENDS: &str = concat!(
+    sqlite_entry!(),
+    redb_entry!(),
+    postgres_entry!(),
+    s3_entry!(),
+    "memory"
+);
 
 /// Writes the message [`storage_from_env`] prints before it exits, for a
 /// `SCP_RELAY_STORAGE_BACKEND` value it will not construct.
@@ -163,8 +227,7 @@ fn reject_backend_message(requested: &str) -> String {
 
     let Some(backend) = uncompiled else {
         return format!(
-            "error: unknown storage backend '{requested}'. Valid options: {}",
-            compiled_backends()
+            "error: unknown storage backend '{requested}'. Valid options: {VALID_BACKENDS}"
         );
     };
 
@@ -180,8 +243,7 @@ fn reject_backend_message(requested: &str) -> String {
 
     format!(
         "error: storage backend '{requested}' is not compiled into this binary. \
-         {rebuild} Compiled-in options: {}",
-        compiled_backends()
+         {rebuild} Compiled-in options: {VALID_BACKENDS}"
     )
 }
 
@@ -424,7 +486,7 @@ pub async fn start_relay_from_env() -> (
 
 #[cfg(test)]
 mod tests {
-    use super::{BACKENDS, compiled_backends, reject_backend_message};
+    use super::{BACKENDS, VALID_BACKENDS, reject_backend_message};
 
     /// A value naming no backend reads as a typo, and the message lists what
     /// this build accepts instead of naming a rebuild.
@@ -439,14 +501,13 @@ mod tests {
         assert!(message.contains("memory"), "{message}");
     }
 
-    /// The options list names a backend exactly when this build compiled that
-    /// backend's arm. A hardcoded list — which this diagnostic carried until
-    /// `postgres-blob` and `s3-blob` stopped being unconditional — fails this
-    /// test on any build that leaves a backend feature off.
+    /// `VALID_BACKENDS` names a backend exactly when this build compiled that
+    /// backend's arm. The constant was hardcoded until `postgres-blob` and
+    /// `s3-blob` stopped being unconditional, and this test fails on that
+    /// hardcoded value for any build leaving a backend feature off.
     #[test]
     fn the_options_list_names_every_compiled_backend_and_no_other() {
-        let listed = compiled_backends();
-        let names: Vec<&str> = listed.split(", ").collect();
+        let names: Vec<&str> = VALID_BACKENDS.split(", ").collect();
 
         for (name, enabled) in [
             ("sqlite", cfg!(feature = "sqlite-blob")),
@@ -458,10 +519,26 @@ mod tests {
             assert_eq!(
                 names.contains(&name),
                 enabled,
-                "'{name}' should appear in the options list exactly when its \
-                 feature is enabled; list was '{listed}'"
+                "'{name}' should appear in VALID_BACKENDS exactly when its \
+                 feature is enabled; the constant read '{VALID_BACKENDS}'"
             );
         }
+    }
+
+    /// Two places read the same four `cfg` flags: the macro pairs that build
+    /// `VALID_BACKENDS`, and the `compiled` column of [`BACKENDS`] that decides
+    /// whether a name reads as absent or as a typo. Adding a backend to one and
+    /// forgetting the other would let the constant offer a name that
+    /// `reject_backend_message` calls uncompiled, so this pins the two together.
+    #[test]
+    fn the_constant_and_the_table_agree_on_what_is_compiled() {
+        let from_table = BACKENDS
+            .iter()
+            .filter(|b| b.compiled)
+            .map(|b| b.name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(VALID_BACKENDS, from_table);
     }
 
     /// Every row of the table matches an arm of `storage_from_env`, so the two
