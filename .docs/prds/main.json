@@ -674,7 +674,7 @@
         "crates/scp-core/src/identity/dht.rs",
         "crates/scp-core/src/identity/cache.rs"
       ],
-      "description": "Implement publishing an identity's key-event log to SCP relays and resolving it back, with caching, staleness detection, and automatic republishing. A publisher splits the chain into frame-sized segments and publishes them to the identity's own relays and to the fallback set (§3.10.5). A validating relay honors the PUBLISH's `retain` flag and gives the record no TTL, and §9.7.4.2 R9's ring buffer is what removes the record. The cycle keeps alive the copies a transport that cannot validate stores as opaque blobs under the shared TTL (§9.10.12).",
+      "description": "Implement publishing an identity's key-event log to SCP relays and resolving it back, with caching, staleness detection, and automatic republishing. A publisher splits the chain into frame-sized segments and publishes them to the identity's own relays and to the fallback set (§3.10.5). A validating relay honors the PUBLISH's `retain` flag and gives the record no TTL; §9.7.4.2 R9 states when its ring buffer displaces the record and what a controller does to keep it. The cycle keeps alive the copies a transport that cannot validate stores as opaque blobs under the shared TTL (§9.10.12).",
       "acceptanceCriteria": [
         "IdentityBackend::publish splits the chain into frame-sized segments and publishes them to both relay sets in sequence order (§3.10.5)",
         "The root signs every establishment event and an operational key signs none (§9.7.4.2)",
@@ -724,7 +724,7 @@
         }
       ],
       "details": {
-        "republishStrategy": "A validating relay stores a `retain` PUBLISH under §9.7.4.2 R9 and gives it no TTL, so no republication cycle makes the record permanent there; R9's ring buffer removes it when the relay needs the bytes, and the SDK re-publishes to an entry its own self-check found holding no record. A transport that cannot validate stores the frame as an opaque blob under the shared blob TTL, and the cycle keeps that copy alive.",
+        "republishStrategy": "A validating relay stores a `retain` PUBLISH under §9.7.4.2 R9 and gives it no TTL, so no republication cycle makes the record permanent there; §9.7.4.2 R9 states when its ring buffer displaces the record, and the SDK re-publishes to an entry its own self-check found holding no record. A transport that cannot validate stores the frame as an opaque blob under the shared blob TTL, and the cycle keeps that copy alive.",
         "cacheStrategy": "Resolution cache — TTL-based, 24h active / 7d inactive, head-sequence comparison for staleness (§9.10.7)",
         "stalenessIndicator": "A cached result the resolver has not refreshed within its window carries a staleness indicator. Callers SHOULD treat a stale result as valid but degraded. UCAN validation and MLS credential verification SHOULD resolve fresh first, and §9.7.1 check 2 bounds how stale a key state may be when it satisfies an attestation's current-key check."
       },
