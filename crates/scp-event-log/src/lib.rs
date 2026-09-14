@@ -451,9 +451,11 @@ pub enum EventType {
     // member at the same commit position under the context's governance
     // model, so each is a convergent commit-ordered durable leaf. A bridge
     // node reads bridge admission from this group of leaves for a `bridge_id`
-    // in the log it holds as a member (spec §12.10.6 step 1) and from no
-    // other input. That criterion scans EVERY one of the bridge's lifecycle
-    // leaves for a `BridgeRevoked` leaf, which is terminal, and reads the
+    // in the log it holds as a member (spec §12.10.6 step 1), from the
+    // `MemberJoined` and `MemberLeft` leaves of that same log that record
+    // whether the bridge's operator is still a member of the context, and
+    // from no other input. That criterion scans EVERY one of the bridge's
+    // lifecycle leaves for a `BridgeRevoked` leaf, which is terminal, and reads the
     // LAST leaf only to decide whether a suspension still stands, so a
     // `BridgeReactivated` leaf appended after a `BridgeRevoked` leaf readmits
     // no bridge.
@@ -470,9 +472,11 @@ pub enum EventType {
     // carries no lower bound on the deadline. The node records that
     // commit-execution instant durably once per leaf and reads the recorded
     // value on every later evaluation (spec §12.2.2), so a restart moves no
-    // deadline and a bounded suspension expires at one instant.
-    // Spec §7.3.1 does admit leaves that a member-local
-    // timer triggers — TTL expiry/close, governance-freeze expiry, deferred
+    // deadline the node already computed. A node that holds no recorded
+    // instant for a leaf substitutes and records its first-read instant,
+    // which moves that leaf's deadline later and never earlier, so the node
+    // readmits no bridge early and may hold a suspension late (spec §12.2.2).
+    // Spec §7.3.1 does admit leaves that a member-local timer triggers — TTL expiry/close, governance-freeze expiry, deferred
     // economic-policy application — and keeps each convergent by stamping it
     // with the pre-computed deadline that convergent context state holds.
     //

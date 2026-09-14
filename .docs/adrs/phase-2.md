@@ -874,7 +874,9 @@ pub enum EventType {
     // context_id, timestamp. Every one of the four records a governance
     // decision that every member executed at its commit position, so all four
     // are convergent commit-ordered durable leaves. A bridge node reads bridge
-    // admission from this group of leaves for that bridge_id, and from no
+    // admission from this group of leaves for that bridge_id, from the
+    // MemberJoined and MemberLeft leaves of that same log that record whether
+    // the bridge's operator is still a member of the context, and from no
     // other input (§12.10.6 step 1). That criterion scans EVERY one of the
     // bridge's leaves for a BridgeRevoked leaf, which is terminal, and reads
     // the LAST leaf only to decide whether a suspension still stands; a
@@ -883,7 +885,10 @@ pub enum EventType {
     // because the expiry records no fact: the operator's own node computes the
     // deadline from the BridgeSuspended leaf it already holds and from its own
     // commit-execution instant for that leaf, which the node records durably
-    // once per leaf so that a restart moves no deadline (§12.2.2). §7.3.1 does
+    // once per leaf so that a restart moves no deadline the node already
+    // computed; a node holding no recorded instant substitutes and records
+    // its first-read instant, which moves that deadline later and never
+    // earlier (§12.2.2). §7.3.1 does
     // admit leaves that a member-local timer triggers — TTL expiry/close,
     // governance-freeze expiry, deferred economic-policy application — and
     // keeps each convergent by stamping it with a pre-computed deadline that
