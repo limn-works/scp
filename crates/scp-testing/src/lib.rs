@@ -19,8 +19,11 @@
 //! - [`assertions`] — Protocol-level assertion primitives (delivery, ordering,
 //!   suppression detection, pseudonym unlinkability, blocking, epoch consistency).
 //! - [`presets`] — 8 pre-configured scenarios for common test patterns.
-//! - [`helpers`] — Test doubles for `ApplicationNode` (TLS providers, NAT
-//!   strategies, DID methods).
+//! - `helpers` — Test doubles for `ApplicationNode` (TLS providers, NAT
+//!   strategies, DID methods). Compiled only under this crate's `helpers`
+//!   feature, which this crate's own `[dev-dependencies]` turn on, so a
+//!   `cargo doc` run that builds no dev-dependencies documents no such module
+//!   and this line carries no link.
 //!
 //! # Conformance macros
 //!
@@ -64,6 +67,18 @@ pub mod builder;
 pub mod clock;
 pub mod conformance;
 pub mod fullstack;
+// `helpers` is the only module in this crate that names `scp_identity` or `scp_dht`, and
+// both crates compile what it calls behind a nullifier feature:
+// `DidDht::with_in_memory_custody` and `DidDht::create_in_memory` are
+// `#[cfg(any(test, feature = "testing"))]` in crates/scp-identity/src/dht.rs, and
+// `InMemoryDhtClient` is `#[cfg(feature = "testing")]` in crates/scp-dht/src/lib.rs.
+// Declaring the module unconditionally forced both features into every build that pulls
+// this crate as a normal dependency, `scp-ffi`'s `testing` feature among them, which is
+// how the maturin and XCFramework builds of the `bridge-parity-swift` job came to resolve
+// `scp-identity` differently from each other and recompile seven shared crates. Behind
+// the feature, the integration tests that use the module still get it — this crate's own
+// `[dev-dependencies]` turn the feature on — and no other build carries it.
+#[cfg(feature = "helpers")]
 pub mod helpers;
 pub mod presets;
 pub mod relay;

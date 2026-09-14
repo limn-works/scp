@@ -1,6 +1,6 @@
-# A Green Check That Asserted Nothing: Fifteen Ways CI Reported Success Over Zero Work
+# A Green Check That Asserted Nothing: Sixteen Ways CI Reported Success Over Zero Work
 
-**Date:** 2026-08-16, extended 2026-08-17, 2026-08-22, 2026-08-25, 2026-08-31, 2026-09-01, 2026-09-03 and 2026-09-07
+**Date:** 2026-08-16, extended 2026-08-17, 2026-08-22, 2026-08-25, 2026-08-31, 2026-09-01, 2026-09-03, 2026-09-07 and 2026-09-14
 **Source:** branch `fix/ci-enforces-what-it-claims` — `.github/workflows/ci.yml`, `.github/workflows/fuzz.yml`, `.github/workflows/release.yml`, `scripts/check-cross-layer.sh`, `scripts/check-shipped-feature-graph.sh`
 
 ## Rule
@@ -10,7 +10,7 @@ fail on whichever defect it exists to catch, and keep that failure as a test. Ev
 defect below produced a green check while work behind it never ran, and every one passed
 review because a check *looked* like it was doing its job.
 
-## Fifteen failure shapes
+## Sixteen failure shapes
 
 **1. A command that treats "nothing matched" as success.** `cargo test -p scp-node --lib
 pre_rotation_severance` exits 0 when a filter selects no test. Two tests it named
@@ -263,11 +263,12 @@ with it.
 `NON_BRIDGE_SHIPPED_ASSERTION_LANES` paired `scp-identity` with job `rust-test` under a
 comment claiming nothing in this repository enables `scp-identity/testing`, and
 `command_enables_testing` confirmed that claim by reading the command's `--features`
-text alone. The claim was false one manifest away: `crates/scp-testing/Cargo.toml`
-declares a normal dependency `scp-identity = { path = "../scp-identity", features =
-["testing"] }`, and one cargo invocation resolves one feature set per package, so job
-rust-test's `cargo nextest run --workspace` built scp-identity with `testing` on and
-compiled out both of its `#[cfg(not(feature = "testing"))]` assertions
+text alone. The claim was false one manifest away: on the tree that revision read,
+`crates/scp-testing/Cargo.toml` declared a normal dependency `scp-identity = { path =
+"../scp-identity", features = ["testing"] }`, and one cargo invocation resolves one
+feature set per package, so job rust-test's `cargo nextest run --workspace` built
+scp-identity with `testing` on and compiled out both of its
+`#[cfg(not(feature = "testing"))]` assertions
 (`ephemeral_create_fails_closed_without_pre_rotation_backend` and
 `persisted_create_fails_closed_without_pre_rotation_backend` in
 `crates/scp-identity/src/config.rs`) — the two SCP-IDENT-1059 proofs that
@@ -329,6 +330,26 @@ later edit to the same command. Run tests that vanish on a feature flip in their
 shipped-config lane, and fails the workflow when a command that selects a shipped-build
 assertion also selects a test that a `testing` flip leaves compiled.
 
+**16. A check whose condition its own hard-coded input makes constant.** A fix agent
+gave `check_testing_unification_readers` in `scripts/tests/ci-gate/ci_gate_selftest.py` a
+control named "the live workspace command resolves every package it selects", whose
+condition read `live_unresolved is None`. `command_build_manifests` returns that finding
+only from the branch it takes for a command naming neither `--workspace` nor `--all`, and
+the command under test was the literal `cargo nextest run --workspace`, so the condition
+held on every state this repository can reach. No edit to the readers, to any manifest,
+or to `[workspace] members` could turn it red. The control printed one green line and
+covered nothing, in a file whose subject is checks that cover nothing. Shape 8 above
+describes a loop that iterates over nothing; this one describes a condition that
+evaluates the same way whatever the inputs are, which no amount of iterating fixes. Read
+the path a value takes from the literal input to the condition: when every path ends at
+the same answer, the check tests the literal and not the repository. Either hand the
+check an input that can produce the other answer, or fold the constant conjunct into a
+check that can go red and let a fixture control carry the property — the fix here
+folded `live_unresolved is None` into the positive control below it, which names a
+manifest it expects in the edge map, and left the three `cargo test -p ghost` fixture
+controls to prove that `command_unifies_testing`, `command_testing_edges` and
+`unconditional_feature_activators` each report an unresolvable selection.
+
 ## Tests holding these closed
 
 - `scripts/check-shipped-feature-graph.sh` — `assert_resolver_sees_own_feature_table_activation`
@@ -367,12 +388,19 @@ assertion also selects a test that a `testing` flip leaves compiled.
   unfiltered command selects everything, a filterset carrying a difference is refused
   rather than guessed at, and `package_test_functions` separates a
   `#[cfg(not(feature = "testing"))]` test from an un-gated one in this tree — that
-  `command_unifies_testing` reads a `testing` edge out of a four-crate fixture
-  workspace in each spelling (a member's
-  normal dependency, an edge reached through a `-p` package's dependency closure, a self
+  `command_unifies_testing` reads a `testing` edge out of an eight-crate fixture
+  workspace in each of five spellings (a member's
+  normal dependency, a `[features]` table value naming `leaf/testing`, an edge reached
+  through a `-p` package's dependency closure, a self
   dev-dependency, an `--exclude`d member a selected member still compiles) and out of
   this repository's own `crates/scp-testing/Cargo.toml` against scp-identity, while
-  reporting a `-p scp-identity` build clean — that the `fuzz` and
+  reporting a `-p scp-identity` build clean, that the three remaining members of that
+  fixture hold `unconditional_feature_activators` to reading a `[dev-dependencies]`
+  entry only for the build that compiles that manifest's own test targets, because
+  devholder's entry naming `gadget/gated` activates that feature for
+  `cargo test -p devholder` and activates it for no `cargo test -p devuser` build, which
+  reads devholder's manifest as a library dependency and compiles no test target of it —
+  that the `fuzz` and
   `typescript-wasm` filters cover the path-dependency
   closure of the manifests they guard, that every release.yml job uploading a `-signed`
   artifact runs its non-empty-input guard before that upload and that all three known
@@ -386,9 +414,11 @@ assertion also selects a test that a `testing` flip leaves compiled.
   once one exists, and holds no enclosing lockfile for a crate carrying its own
   `[workspace]` table.
 - `scripts/check-shipped-feature-graph.sh --self-test` — four fixtures pad a synthetic
-  `cargo tree` past 200 KB and assert `tree_names_scp_testing_crate` returns one verdict
-  whether the `scp-testing v0.1.0` line sits first or last, and a fifth reads the gate's
-  own source and rejects any pipeline stage that stops before its writer finishes.
+  `cargo tree` past 200 KB and assert that `tree_names_scp_testing_crate` reports the
+  `scp-testing v0.1.0` line FOUND on a first line and on a last line of that tree,
+  reports a padded tree carrying no such line ABSENT, and does not match a crate named
+  `my-scp-testing`; a fifth fixture reads the gate's own source and rejects any pipeline
+  stage that stops before its writer finishes.
 - `scripts/tests/cross-layer/run-tests.sh` — plants an FFI export at a first line and at
   a last line of a 155 KB diff, proves that gate finds both, then plants a missing export
   and proves it still rejects that.
