@@ -10,20 +10,27 @@
 # whole dependency graph from scratch. The cache-miss path is the number this workflow
 # exists to measure.
 #
-# WHEN IT RUNS. On a push to one of the branches named below, and on manual dispatch
-# against any ref. It never runs on `main`, on a pull request, or in the merge queue, and
-# no job in `ci.yml` lists it under `needs:`, so it gates nothing and blocks no merge.
+# WHEN IT RUNS. Only when someone dispatches it, and then against whatever ref that person
+# names. No push starts it, and it never runs on `main`, on a pull request, or in the merge
+# queue. No job in `ci.yml` lists it under `needs:`, so it gates nothing and blocks no
+# merge.
 name: Compile timings
 
 on:
-  push:
-    branches:
-      # Named one by one rather than matched with `perf/**`. Several agents branch under
-      # that prefix at once, and a glob would give each of their pushes a 25-minute
-      # four-build job none of them asked for. Add a branch here to measure it, or reach
-      # the same job on any ref through `workflow_dispatch`.
-      - perf/cold-compile-root-cause
-      - perf/cold-compile-baseline
+  # HOW TO MEASURE A BRANCH. Dispatch this workflow against that branch — run
+  # `gh workflow run compile-timings.yml --ref <branch>`, or pick the branch from the
+  # "Run workflow" menu the Actions tab shows for this workflow. GitHub reads this dispatch
+  # entry from the copy of the file on the default branch, then runs the copy that the ref
+  # you named carries, so the job compiles that branch's tree.
+  #
+  # WHY NO `push:` TRIGGER. A `push:` trigger here listed two branch names one by one
+  # rather than matching them with `perf/**`: several agents branch under that prefix at
+  # once, and a glob would give each of their pushes a 25-minute four-build job none of
+  # them asked for. Both named branches were later deleted — one of them merged, and the
+  # other was a one-off measurement baseline — which left a trigger that fired for nothing.
+  # A dispatch reaches this job on any ref without editing this file, so adding a `push:`
+  # trigger back pays off only for a branch that someone pushes to repeatedly, and such a
+  # trigger must name a branch that exists.
   workflow_dispatch:
 
 permissions:
