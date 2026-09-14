@@ -881,7 +881,9 @@ pub enum EventType {
     // BridgeReactivated leaf appended after a BridgeRevoked leaf readmits
     // nothing. An elapsed SuspendBridge `duration` appends NO leaf (§12.2.2),
     // because the expiry records no fact: the operator's own node computes the
-    // deadline from the BridgeSuspended leaf it already holds. §7.3.1 does
+    // deadline from the BridgeSuspended leaf it already holds and from its own
+    // commit-execution instant for that leaf, which the node records durably
+    // once per leaf so that a restart moves no deadline (§12.2.2). §7.3.1 does
     // admit leaves that a member-local timer triggers — TTL expiry/close,
     // governance-freeze expiry, deferred economic-policy application — and
     // keeps each convergent by stamping it with a pre-computed deadline that

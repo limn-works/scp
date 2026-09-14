@@ -467,7 +467,11 @@ pub enum EventType {
     // `duration`, each sum saturating (spec §12.2.2): spec §9.8.2(c) bounds an
     // envelope `created_at` only in the future direction, so a committing
     // member can backdate the leaf, and the leaf `timestamp` alone therefore
-    // carries no lower bound on the deadline. Spec §7.3.1 does admit leaves that a member-local
+    // carries no lower bound on the deadline. The node records that
+    // commit-execution instant durably once per leaf and reads the recorded
+    // value on every later evaluation (spec §12.2.2), so a restart moves no
+    // deadline and a bounded suspension expires at one instant.
+    // Spec §7.3.1 does admit leaves that a member-local
     // timer triggers — TTL expiry/close, governance-freeze expiry, deferred
     // economic-policy application — and keeps each convergent by stamping it
     // with the pre-computed deadline that convergent context state holds.
@@ -499,12 +503,12 @@ pub enum EventType {
 // Canonical enumeration of the closed taxonomy
 // ---------------------------------------------------------------------------
 
-/// Declares [`ALL_EVENT_TYPES`] and, from the same variant list, a wildcard-free
+/// Declares `ALL_EVENT_TYPES` and, from the same variant list, a wildcard-free
 /// match over [`EventType`] that the compiler checks for exhaustiveness.
 ///
 /// Adding a variant to [`EventType`] without naming it in the invocation below
 /// fails to compile at that invocation (`non-exhaustive patterns`), and naming a
-/// variant twice raises `unreachable_patterns`. [`ALL_EVENT_TYPES`] is therefore
+/// variant twice raises `unreachable_patterns`. `ALL_EVENT_TYPES` is therefore
 /// complete by construction, which is what makes a count assertion over it able
 /// to fail: the three tests that pin the taxonomy count each compared a
 /// hand-written array's `len()` against a literal equal to that same array's
@@ -519,7 +523,7 @@ macro_rules! declare_event_type_taxonomy {
         #[cfg(test)]
         pub(crate) const ALL_EVENT_TYPES: &[EventType] = &[$(EventType::$variant),+];
 
-        /// Proves at compile time that [`ALL_EVENT_TYPES`] names every
+        /// Proves at compile time that `ALL_EVENT_TYPES` names every
         /// [`EventType`] variant. The match carries no `_` arm.
         const fn assert_event_type_taxonomy_is_exhaustive(event_type: &EventType) {
             match *event_type {
@@ -614,7 +618,7 @@ declare_event_type_taxonomy!(
 );
 
 /// Holds the exhaustiveness proof live in every build profile, so a variant
-/// added to [`EventType`] without an entry in [`ALL_EVENT_TYPES`] fails the
+/// added to [`EventType`] without an entry in `ALL_EVENT_TYPES` fails the
 /// library build rather than only the test build.
 const _: fn(&EventType) = assert_event_type_taxonomy_is_exhaustive;
 

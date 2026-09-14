@@ -218,7 +218,10 @@ pub struct BridgeRegistrationEvent {
     /// DID of the bridge operator.
     pub operator_did: DID,
 
-    /// DID of the governance actor who approved, rejected, or revoked.
+    /// DID of the governance actor whose decision this event records. Every
+    /// `BridgeRegistrationAction` variant carries one such decider, the
+    /// `Suspended` and `Reactivated` variants included (bridge registration
+    /// wire table, spec §12.12.2).
     pub governance_did: DID,
 
     /// The context this event belongs to.
@@ -255,7 +258,12 @@ pub enum BridgeRegistrationAction {
         /// leaf (spec §12.2.2). Each sum saturates. The leaf `timestamp`
         /// alone carries no lower bound, because spec §9.8.2(c) bounds an
         /// envelope `created_at` only in the future direction, so a
-        /// committing member can backdate its own suspension.
+        /// committing member can backdate its own suspension. The node records
+        /// that execution instant durably once per leaf and reads the recorded
+        /// value on every later evaluation, because a node that re-derived the
+        /// instant after each restart would push the deadline another
+        /// `duration` seconds out on each one and a bounded suspension would
+        /// never expire.
         duration: Option<u64>,
     },
     /// Governance reactivated the bridge (spec §12.2.2, suspension). An

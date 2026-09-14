@@ -1396,7 +1396,7 @@ mod tests {
     }
 
     #[test]
-    fn unification_variant_tags_occupy_36_through_77() {
+    fn unification_variant_tags_occupy_36_through_81() {
         // The 39 typed-event unification variants occupy tags 36..=75 in ADR
         // declaration order, with tag 59 retired (PseudonymAnnounced removed).
         // The 2 ADR-011 Amendment §6 cross-context-saga variants occupy tags
