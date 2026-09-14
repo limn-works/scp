@@ -123,7 +123,12 @@ nothing:
                which shortened time-to-detection and left the required check
                still unable to produce the diagnostic. Reading the two flag sets
                against each other names that gap for any flag, not for
-               `--document-private-items` alone.
+               `--document-private-items` alone. Reading them in the other
+               direction names the reverse gap: docs.yml's `rust-docs` uploads
+               the `target/doc/` that `publish-docs` deploys to GitHub Pages, so
+               a `--features` member job rust-doc carries and that command omits
+               is a module the published API reference loses, and dropping a
+               module breaks no intra-doc link, so no job reds over the loss.
   merge-queue  docs.yml carried a header calling its jobs safe to promote to a
                required status check while the workflow triggered on `push` and
                `pull_request` only. A merge queue evaluates a required check
@@ -2640,6 +2645,25 @@ def rustdoc_surface_gaps(
     return gaps
 
 
+def rustdoc_surface_shortfalls(
+    documents: list[tuple[Path, dict]], required: set[str]
+) -> list[tuple[Path, str, set[str]]]:
+    """Return each rustdoc outside the required workflow and the flags it omits.
+
+    A returned entry names a `cargo doc` command, and the flags `required`
+    carries that the command does not. Each such flag decides which items
+    rustdoc resolves, so a flag missing from a command narrows the item set that
+    command documents against the item set the required check documents.
+    """
+    shortfalls = []
+    for path, doc in documents:
+        if path == WORKFLOW:
+            continue
+        for job_id, command in cargo_doc_commands(doc):
+            shortfalls.append((path, job_id, required - command_flags(command)))
+    return shortfalls
+
+
 def check_required_rustdoc_surface(documents: list[tuple[Path, dict]]) -> None:
     """The required check's rustdoc reads whatever any other workflow's reads.
 
@@ -2654,6 +2678,19 @@ def check_required_rustdoc_surface(documents: list[tuple[Path, dict]]) -> None:
     diagnostic class the required check cannot produce. This check compares the
     two flag sets rather than naming `--document-private-items`, so a flag added
     to docs.yml later fails here until ci.yml carries it too.
+
+    THE SECOND CRITERION, the same comparison read the other way: an item the
+    required check's rustdoc documents, every other workflow's rustdoc
+    documents. `rust-docs` in .github/workflows/docs.yml uploads its
+    `target/doc/` as the `docs-rust` artifact and `publish-docs` deploys that
+    artifact to GitHub Pages, so a `--features` member ci.yml passes and that
+    command omits is a module the published Rust API reference loses — and
+    losing a module breaks no intra-doc link, so every gate stays green over the
+    loss. That is what happened when `scp-node` and `scp-relay` put
+    `scp-transport/postgres-blob` and `scp-transport/s3-blob` behind their
+    off-by-default `cloud-blobs` feature: ci.yml's rustdoc took the two members
+    and docs.yml's did not, which would have dropped `PostgresBlobStore` and
+    `S3BlobStore` from the published reference under a green `ci`.
     """
     required = required_rustdoc_flags(documents)
     check(
@@ -2668,6 +2705,15 @@ def check_required_rustdoc_surface(documents: list[tuple[Path, dict]]) -> None:
             not missing,
             f"{sorted(missing)} enlarge what rustdoc reads in a workflow the "
             f"ruleset does not require, and nothing in `ci` reads it",
+        )
+    for path, job_id, omitted in rustdoc_surface_shortfalls(documents, required):
+        check(
+            f"{path.name}:{job_id} rustdoc surface covers {WORKFLOW.name}'s",
+            not omitted,
+            f"{sorted(omitted)} narrow what that rustdoc reads against what the "
+            f"required check reads; this job's rustdoc is the one this "
+            f"repository publishes, so a member it omits is an item the "
+            f"published API reference loses under a green `ci`",
         )
 
 
@@ -2718,6 +2764,40 @@ def check_rustdoc_surface_detects_a_dropped_flag(
             f"reported {sorted(reported)}, want [{flag!r}] — a required check "
             f"omitting that flag would otherwise pass this self-test",
         )
+
+
+def check_rustdoc_surface_detects_an_omitted_flag(
+    documents: list[tuple[Path, dict]],
+) -> None:
+    """Adding a flag to the required rustdoc fails the second criterion above.
+
+    CRITERION: rustdoc_surface_shortfalls reports a flag the required
+    workflow's rustdoc passes and another workflow's rustdoc does not. Adding
+    one flag no command carries proves the comparison runs over the commands
+    these workflows carry rather than over an empty list — a comparison reading
+    no command reports no shortfall and passes the check above, which is the
+    shape every check in this file's docstring shares.
+    """
+    required = required_rustdoc_flags(documents)
+    check(
+        "the rustdoc-shortfall scan reads a command outside the required workflow",
+        bool(rustdoc_surface_shortfalls(documents, required)),
+        "no `cargo doc` outside ci.yml — this mutation would perturb nothing",
+    )
+    invented = "--nonexistent-rustdoc-flag"
+    reported = {
+        flag
+        for _, _, omitted in rustdoc_surface_shortfalls(
+            documents, required | {invented}
+        )
+        for flag in omitted
+    }
+    check(
+        f"a required flag no other workflow's rustdoc carries reports as {invented}",
+        reported == {invented},
+        f"reported {sorted(reported)}, want [{invented!r}] — a workflow rustdoc "
+        f"omitting a required flag would otherwise pass the check above",
+    )
 
 
 def tracked_markdown_paths() -> list[str]:
@@ -3149,6 +3229,7 @@ def main() -> int:
     print("doc-flag — the required check's rustdoc reads every other rustdoc's surface")
     check_required_rustdoc_surface(documents)
     check_rustdoc_surface_detects_a_dropped_flag(documents)
+    check_rustdoc_surface_detects_an_omitted_flag(documents)
 
     print("doc-command — a documented rustdoc reports what the merge waits on")
     check_documented_rustdoc_reproduces_the_required_job(documents)
