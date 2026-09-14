@@ -698,27 +698,28 @@ Parallel query makes resolution latency the latency of the fastest relay that an
 
 An identity's key-event log rides in the key-event record frame `09-security-model.md` §9.10.12 states, at `routing_id = SHA-256("scp:did:" ‖ identifier_bytes)` over the identifier's 32 raw digest bytes (`09-security-model.md` §9.7.4.2 R13). That separator keeps the address from colliding with every other routing derivation the protocol runs (§9.10.4, §5.14), and it is why the frame carries no record-kind byte: the address is the type discriminant.
 
-**Relay-side validation.** `09-security-model.md` §9.7.4.2 R9 states the slot key, what a slot holds, the write rule, the serving order and the eviction rule. On PUBLISH at a routing id an SCP-native relay runs six checks **in the order below, which is the order and not an enumeration**, cheapest first, so junk is rejected before any expensive work. The two policy checks lead because each reads a field the relay already holds and decodes nothing: a relay that ran chain verification first would perform one P-256 verification per signature slot on a frame the sixth check rejects for free:
+**Relay-side validation.** `09-security-model.md` §9.7.4.2 R9 states the slot key, what a slot holds, the write rule, the serving order and the eviction rule. On PUBLISH at a routing id an SCP-native relay runs seven checks **in the order below, which is the order and not an enumeration**, cheapest first, so junk is rejected before any expensive work. **This section states the number of checks once, and every other artifact that names the order takes the number by citation to this section.** The three policy checks lead because each reads a field the relay already holds and decodes nothing: a relay that ran chain verification first would perform one P-256 verification per signature slot on a frame the sixth check rejects for free:
 
-1. **The declared rate limit and the proof of work.** Refuse a PUBLISH that exceeds `rate_limit_publish`, and refuse a key-event PUBLISH whose `nonce` does not clear the relay's `pow_difficulty` under the four-operand puzzle `09-security-model.md` §9.7.4.2 R9 states. Both read one hash over bytes the request already carries and decode nothing.
-2. **Structural decode.** Decode the blob as a key-event record frame (`09-security-model.md` §9.10.12), under the one parse bound §9.7.4.2's definitions state for every count-prefixed list read out of unverified bytes. A blob that does not decode is not a candidate key-event record.
-3. **The identifier-to-routing-id binding.** Confirm that the routing id equals the registered derivation over the frame's `identifier` field. This is a plain hash, cheaper than a signature verification, and it is the discriminant that lets a relay recognize a key-event record with no new wire type.
-4. **The declared storage budgets.** Refuse a PUBLISH that would exceed the per-identifier or the total budget, except where the event's kind exempts it under R9. The check runs here because it reads the identifier check 3 bound and no verified chain.
-5. **Chain verification, on whichever of two branches the frame's first event selects.** Where that event is an inception event, the relay recomputes the identifier from it, rejects a frame that recomputes to anything but the `identifier` field step 2 read, and verifies every event under `09-security-model.md` §9.7.4.2 R2 and R3. Where that event's predecessor digest names an event the relay already holds at this routing id, the relay verifies the frame's events against the standing root the assembled chain carries at that position and recomputes no identifier. A frame whose first event selects neither branch is rejected. **The chain authorizes the write, and no key the writer supplies does.**
-6. **Slot placement** under `09-security-model.md` §9.7.4.2 R9.
+1. **The payment verification.** Where the relay declares `per_publish` or `per_byte_stored`, verify the PUBLISH's `payment_receipt` through the adapter it is tagged with and against the four checks `09-security-model.md` §9.7.4.2 R9 states. Refuse `Payment` where the write is charged and the receipt is absent, fails the adapter's verification, or fails one of those four checks; otherwise record the write as paid. **This check leads because a paid write is exempt from the two checks below it**, so a relay that ran either of those first would refuse a write the receipt covers.
+2. **The declared rate limit.** Refuse an unpaid PUBLISH that exceeds `rate_limit_publish`. The check reads one counter against the publishing address and decodes nothing.
+3. **Structural decode.** Decode the blob as a key-event record frame (`09-security-model.md` §9.10.12), under the one parse bound §9.7.4.2's definitions state for every count-prefixed list read out of unverified bytes. A blob that does not decode is not a candidate key-event record.
+4. **The identifier-to-routing-id binding.** Confirm that the routing id equals the registered derivation over the frame's `identifier` field. This is a plain hash, cheaper than a signature verification, and it is the discriminant that lets a relay recognize a key-event record with no new wire type.
+5. **The declared storage budgets.** **No event kind is exempt from either budget.** Under `Identifier` pressure the relay evicts that identifier's retained divergent suffixes in R9's eviction-rank order, lowest-ranked first, and refuses `Identifier` only where evicting every suffix it may evict still leaves the budget exceeded. `Total` refuses no unpaid write: R9's ring buffer displaces the oldest-established unpaid retained set instead, and `Total` refuses a paid write only where the relay's declared pinned capacity is full. A paid write is exempt from `Identifier`. The check runs here because it reads the identifier check 4 bound and no verified chain.
+6. **Chain verification, on whichever of two branches the frame's first event selects.** Where that event is an inception event, the relay recomputes the identifier from it, rejects a frame that recomputes to anything but the `identifier` field step 2 read, and verifies every event under `09-security-model.md` §9.7.4.2 R2 and R3. Where that event's predecessor digest names an event the relay already holds at this routing id, the relay verifies the frame's events against the standing root the assembled chain carries at that position and recomputes no identifier. A frame whose first event selects neither branch is rejected. **The chain authorizes the write, and no key the writer supplies does.**
+7. **Slot placement** under `09-security-model.md` §9.7.4.2 R9.
 
 **Slot-exclusivity.** Once a binding-valid frame whose chain verifies establishes a slot at a routing id, that routing id is slot-exclusive:
 
-- **(a)** the relay rejects any later publish there that is not a frame passing all six checks. A chain that diverges from a stored chain passes step 4, because R9 gives a divergent suffix its own slot; a reject list naming a non-extending chain would hand the routing id to whichever party published first and leave every resolver holding one chain where the root rule needs two. R9's own condition rides with the test: at a routing id already holding `MAX_RETAINED_SUFFIXES` rank-1 suffixes, the relay rejects the further frame and reports the residue;
+- **(a)** the relay rejects any later publish there that is not a frame passing every check the order above lists. A chain that diverges from a stored chain passes step 5, because R9 gives a divergent suffix its own slot; a reject list naming a non-extending chain would hand the routing id to whichever party published first and leave every resolver holding one chain where the root rule needs two. R9's own condition rides with the test: at a routing id already holding `MAX_RETAINED_SUFFIXES` rank-1 suffixes, the relay rejects the further frame and reports the residue;
 - **(b)** establishing the first slot evicts the opaque blobs already stored at that routing id, which clears junk pre-seeded before the identity's first publish;
 - **(c)** QUERY at that routing id returns every slot the routing id holds and nothing else, a page at a time under R9's walk, because a relay that returned one slot would decide fork precedence for the resolver;
 - **(d)** the relay rejects a client delete of any stored frame whose chain verifies. The gate is **storage-derived rather than index-derived**, because a delete addresses a blob by its own digest while the slot index is a cache a restart leaves cold: the relay re-reads the blob and refuses where it decodes as a frame whose chain recomputes to its `identifier` field and verifies. The gate runs behind the same per-address rate limit as PUBLISH and **fails closed on a storage read error**. It closes an integrity vector and not merely an availability one: an attacker deletes the genuine record, republishes a captured earlier frame carrying a genuine prefix, and a relay with nothing left to compare against stores that prefix as the whole chain.
 
 **A validating relay also stores the witness layer's two records**, at `SHA-256("scp:wit:" ‖ identifier_bytes)` and `SHA-256("scp:wcf:" ‖ identifier_bytes)` (`09-security-model.md` §9.7.4.2 R13), in the frames §9.10.12 states. It accepts one where three things hold: the signature verifies against the P-256 key that operator's community-relay-list entry declares (`18-addressability-and-deployment.md` §18.5.1); the object's `witness` names a member of the witness set the key state at that subject's head carries, on a chain the relay itself holds, so a relay holding no chain for a subject accepts no witness record for it; and the address is not already full for that pair. **The caps**, under `09-security-model.md` §9.18.17: at most one cosigned head per (subject, witness, `event_digest`), replaced only by a strictly higher `sequence`; at most `MAX_RETAINED_SUFFIXES` conflict statements per (subject, witness), evicting the lowest `observed_at` beyond that; and at most `MAX_WITNESS_SET_SIZE` × `MAX_RETAINED_SUFFIXES` objects per subject at each address, because an honest witness emits one successor per baseline and a faulty one occupies at most `MAX_RETAINED_SUFFIXES`. **The `event_digest` term is the exception to strictly-higher replacement**: a fault proof's two cosigned heads carry one `subject`, one `witness` and one `previous_cosigned_digest`, and differ in `event_digest` alone (`09-security-model.md` §9.7.4.3), so the relay keeps both, and without that term one head would replace the other and no party could assemble the pair. Both the filter and the caps are load-bearing: without the filter any party that mints an identity writes cosigned-head records for any public identifier, and without the caps a member of the standing set writes without bound. A relay an identity designates as a witness runs the one check and holds the durable per-subject state `09-security-model.md` §9.7.4.3 states. **Where the relay has evicted an identifier's key-event record it accepts no further witness record at that identifier**, because the filter above reads a chain the relay holds; it serves the cosigned heads and conflict statements it already stores, each on its own idle clock, and a witness whose submission it refuses reads that refusal as it reads any other and publishes to the next entry of its own set.
 
-**A validating relay applies the same discipline to the service record**, at `SHA-256("scp:svc:" ‖ identifier_bytes)`. It accepts a `retain` PUBLISH there only where it holds a chain for that identifier, the record's signature verifies against the key that chain's key state designates for the service-record role (§3.10.13), and the record's sequence exceeds the one it already holds. **It keeps exactly one record per pair of identifier and designated key bytes**, replacing on a higher sequence, which is §3.10.13's settlement rule read on the relay side. Without that filter any party writes unbounded permanent blobs at any public identifier's service address, and the genuine record sits behind them at every reader's query limit.
+**A validating relay applies the same discipline to the service record**, at `SHA-256("scp:svc:" ‖ identifier_bytes)`. It accepts a `retain` PUBLISH there only where it holds a chain for that identifier, the record's signature verifies against the key that chain's key state designates for the service-record role (§3.10.13), and the record's sequence exceeds the one it already holds. **It keeps one record per identifier**, replacing the record it holds when a record signed by the key the adopted key state lists `current` in the designated role arrives at a higher sequence, and dropping a record signed under a key that key state no longer lists `current` in that role (`09-security-model.md` §9.7.4.2 R9). **The relay's count is keyed on the identifier and never on the pair of identifier and designated key bytes**, so a party signing a `KeyState` that designates a fresh key for the role plants no second record; §3.10.13's reader-side high-water mark stays keyed on the pair, because that mark decides which of two records a reader accepts rather than how many records a relay stores. Without that filter any party writes unbounded permanent blobs at any public identifier's service address, and the genuine record sits behind them at every reader's query limit.
 
-**The retention bounds and the declared write policy.** A validating relay applies R9's count bound, byte bound and eviction rank per identifier. It also applies the write policy it declares in `relay_config` — a rate limit, a per-identifier budget, a total budget, a price, and a proof-of-work difficulty — and refuses a PUBLISH that fails any declared term with `IdentityError::StorageBudgetExceeded{scope, value}` (§3.10.10), serving every record it already holds (`09-security-model.md` §9.7.4.2 R9, §9.18.17). **The exemption that lets an owner's recovery land reads the event's kind, which R9 states and this section states no second condition for.** The relay MAY evict a retained record it was not paid to hold once it has held that record for `EVICTION_IDLE_SECONDS` without the identity re-publishing it, which reaches the four retained kinds and reads the relay's own clock (`09-security-model.md` §9.18.17). **Payment buys exemption from eviction and from the `Identifier` and `RateLimit` scopes and buys none from `Total`**, so the total budget the operator declared bounds what that operator stores against a funded party.
+**The retention bounds and the declared write policy.** A validating relay applies R9's count bound, byte bound and eviction rank per identifier. It also applies the write policy it declares in `relay_config` — a rate limit, a per-identifier budget, a total budget, and a price — and refuses a PUBLISH that fails a declared term with `IdentityError::StorageBudgetExceeded{scope, value}` (§3.10.10), serving every record it already holds (`09-security-model.md` §9.7.4.2 R9). **What lets an owner's recovery land is R9's ring buffer**: a relay whose retained storage is full displaces the oldest-established unpaid retained set rather than refusing the arrival, and no event kind is exempt from any budget scope. **Payment pins a retained set outside that ring and buys exemption from the `Identifier` and `RateLimit` scopes and none from `Total`**, so the total budget the operator declared bounds what that operator stores against a funded party.
 
 **Relay-side validation is an optional capability of SCP-native relays, and witnessing is a separate role a relay takes only where an identity designates it.** A relay that cannot validate rejects a PUBLISH carrying `retain: true` and stores a PUBLISH carrying no flag as an opaque blob under the shared TTL (`09-security-model.md` §9.10.12), so a foreign transport carries content and holds no retained kind. **First contact and resolution require SCP-native listed relays**, because R11's floor counts only community-relay-list entries serving a relay proof of control, so a party whose only transport is a foreign adapter adopts no head on any first contact. A verifier still depends on no relay for correctness, because it verifies every event itself; KERI calls that property end-verifiability in `spec-body` §End-verifiable, "KERI has no security dependency on any other infrastructure".
 
@@ -729,7 +730,7 @@ An identity's key-event log rides in the key-event record frame `09-security-mod
 The resolution protocol runs seven steps.
 
 1. **Compute the routing id**, `SHA-256("scp:did:" ‖ identifier_bytes)`.
-2. **QUERY in parallel** on the identity's own relays and on the fallback set. The identity's own relays come from the service-record copy the backend holds; `resolve` refreshes that copy through `read_service_record` where it holds none or where the copy is past §9.10.7's caching bound, and where that read returns `Rejected` or `Inconclusive` this step queries the fallback set alone. **The page walk over an accepted chain runs newest-first**, its cursor running backward from the `stored_at` of the head the relay serves, so a verifier reads the events nearest the head before any event a party appended earlier and reaches a reveal-authorized event ahead of any pad below it (`09-security-model.md` §9.7.4.2 R9). A resolver holding no accepted baseline MUST set `proof_nonce` on every query of the walk, including every page R9's walk re-issues, to 32 bytes it drew freshly for that query (`09-security-model.md` §9.10.12); a relay answers with a proof only where the query carried one, and step 5 counts an operator proven only while every page it served carried a proof the resolver verified. A resolver holding a baseline MAY omit the field. The two sets go out together and never one after the other: a resolver holding no service record knows no relay of the identity's own, and a resolver holding one still needs a relay outside that list to reach R11's second operator.
+2. **QUERY in parallel** on the identity's own relays and on the fallback set. The identity's own relays come from the service-record copy the backend holds; `resolve` refreshes that copy through `read_service_record` where it holds none or where the copy is past §9.10.7's caching bound, and where that read returns `Rejected` or `Inconclusive` this step queries the fallback set alone. **The page walk over an accepted chain states no read direction and names no cursor of its own**: the resolver re-issues QUERY with `since` set to the `stored_at` of the last frame it accepted, which is the walk `09-security-model.md` §9.10.12 states, and R9's fetch bound stops it at `MAX_RETAINED_BYTES` for one identifier from one source in one resolution. A resolver holding no accepted baseline MUST set `proof_nonce` on every query of the walk, including every page R9's walk re-issues, to 32 bytes it drew freshly for that query (`09-security-model.md` §9.10.12); a relay answers with a proof only where the query carried one, and step 5 counts an operator proven only while every page it served carried a proof the resolver verified. A resolver holding a baseline MAY omit the field. The two sets go out together and never one after the other: a resolver holding no service record knows no relay of the identity's own, and a resolver holding one still needs a relay outside that list to reach R11's second operator.
 3. **For each response**: (a) decode the frame and assemble the chain segments the slot served, trusting no framing byte; (b) recompute the identifier from the inception event and discard the response where it differs (`09-security-model.md` §9.7.4.2 R2); (c) verify every event under R3, discarding a chain that carries an author-attributable defect; (d) where the response carried a relay proof, apply the five checks `09-security-model.md` §9.7.4.2's definitions state and record whether this relay counts as a proven source.
 4. **Settle the surviving chains.** Where one chain is a prefix of another, take the longer, and discard a head of the accepted chain at a strictly lower sequence without changing accepted state (`09-security-model.md` §9.7.4.2 R12). Where two chains diverge from a shared prefix, apply fork precedence (R6) and return `Contested` where it ties (R7).
 5. **Satisfy the first-contact floor** where the resolver holds no accepted baseline, **counting a relay only where it both served a chain that survived step 3 and step 3d recorded it as a proven source**, and counting distinct 33-byte operator keys rather than declared operator identifiers (`09-security-model.md` §9.7.4.2 R11). A relay that answered with an empty response failed nothing and served nothing, so it counts toward neither number. Otherwise the resolver returns `Inconclusive{SingleSource}` and adopts no head, and that payload separates the relays reached, the operators proven, and the proofs its own clock rejected (`09-security-model.md` §9.7.4.2 R11). A resolver holding an accepted baseline resolves against one relay and this step does not bind it.
@@ -742,15 +743,26 @@ The resolution protocol runs seven steps.
 
 ### 3.10.5 Publishing Protocol
 
-On appending a key event the owner builds the chain from the inception event to the new head, splits it into contiguous segments each fitting one frame, publishes the frames to the identity's own relays and to the fallback set in sequence order, and submits the new head to its witness set. A relay accepts a segment whose first event's predecessor it already holds (`09-security-model.md` §9.7.4.2 R9), so a publisher that sent a later segment first has it rejected and re-sends from the last segment the relay acknowledged. Submission to a witness gates nothing: the event takes effect at each relying party the moment that party resolves the extended chain, and an identity that designates no witness skips that step (`09-security-model.md` §9.7.4.2 R10, §9.7.4.3). **Appending a key event is not the only publication.** On every self-observation cadence the SDK also re-PUBLISHes the current head to every entry of its fallback set, which a validating relay takes as a refresh — no budget term, no proof of work, no new bytes, and that record's idle clock reset — and which is what R9's eviction window reads (`09-security-model.md` §9.7.4.2 R9, R10).
+On appending a key event the owner builds the chain from the inception event to the new head, splits it into contiguous segments each fitting one frame, publishes the frames to the identity's own relays and to the fallback set in sequence order, and submits the new head to its witness set. A relay accepts a segment whose first event's predecessor it already holds (`09-security-model.md` §9.7.4.2 R9), so a publisher that sent a later segment first has it rejected and re-sends from the last segment the relay acknowledged. Submission to a witness gates nothing: the event takes effect at each relying party the moment that party resolves the extended chain, and an identity that designates no witness skips that step (`09-security-model.md` §9.7.4.2 R10, §9.7.4.3). **Appending a key event is not the only publication.** On every self-observation cadence the SDK fetches its own identity's log, and **where that fetch shows a fallback-set entry holding no record for this identity the SDK re-publishes its chain and its service record to that entry** (`09-security-model.md` §9.7.4.2 R10). **The cadence carries no unconditional re-PUBLISH**: R9's ring buffer displaces a retained set when a newer write arrives rather than when a clock runs out, so a write that changes nothing moves the identity to the newest position in the ring and buys it nothing.
 
-**A PUBLISH carrying a key-event record, a service record, a cosigned head or a conflict statement sets the wire's `retain` flag**, which is REQUIRED true at those four kinds (`09-security-model.md` §9.10.12). A validating relay retains all four under `09-security-model.md` §9.7.4.2 R9 and expires none, which is what the flag declares, so no republication cycle makes any of them permanent and the six-day cycle is deleted for all four. A relay that does not validate rejects a PUBLISH carrying the flag, because it holds the address digest and never the preimage and can scope no retention.
+**A PUBLISH carrying a key-event record, a service record, a cosigned head or a conflict statement sets the wire's `retain` flag**, which is REQUIRED true at those four kinds (`09-security-model.md` §9.10.12). A validating relay retains all four under `09-security-model.md` §9.7.4.2 R9 and gives none of them a TTL, which is what the flag declares, so no republication cycle makes any of them permanent and the six-day cycle is deleted for all four. **R9's ring buffer is what removes such a record**: the relay displaces the oldest-established unpaid retained set when it needs the bytes, and a payment pins a set outside the ring. A relay that does not validate rejects a PUBLISH carrying the flag, because it holds the address digest and never the preimage and can scope no retention.
 
 ### 3.10.6 Anti-Segmentation Invariant
 
 **Publishing to the fallback set is a MUST.** An identity that published only to relays of its own would be resolvable only by a party that already holds its service record, because a first-contact reader knows no relay of that identity to query, so identities would partition into islands reachable by their existing contacts and by nobody else. **A publish cycle that no relay in the fallback set accepted MUST therefore be reported to the caller as a failed publication**, never as a success. Acceptance and not reachability is the term, because a relay at its declared budget answers the publisher and stores nothing, and `09-security-model.md` §9.7.4.2 R10 gates confirmed publication on acceptance by at least one fallback-set entry.
 
-**A refusal is never a verdict about the identity**, which `09-security-model.md` §9.7.4.2 R9 states with the recourse it names. The recourse is mechanical here because the fallback set comes from the shipped community relay list rather than from relays the identity itself chose (`18-addressability-and-deployment.md` §18.5.1). **Where every entry of the fallback set refuses**, the SDK reports the failed publication with the scope and the value each entry named and surfaces the entries to the controller, and a controller holding a signed reveal-authorized event retains it and resumes the ceremony from `PublishSent` when an entry accepts (`09-security-model.md` §9.7.4.2 R10). R9's kind-keyed exemption covers a recovery against `Identifier` and `Total` and states no second condition, so the refusals a recovery meets are a rate limit, a price, or a proof-of-work difficulty. **Each of those three carries the declared figure that would satisfy it** in `StorageBudgetExceeded`'s `value` field (§3.10.10) — the rate, the price, or the difficulty in bits — so a publisher told it may retry holds the number to retry against, and a publisher that reads a difficulty above `MAX_POW_DIFFICULTY` solves nothing and moves to the next entry.
+**A refusal is never a verdict about the identity**, which `09-security-model.md` §9.7.4.2 R9 states with the recourse it names. The recourse is mechanical here because the fallback set comes from the shipped community relay list rather than from relays the identity itself chose (`18-addressability-and-deployment.md` §18.5.1). **Where every entry of the fallback set refuses**, the SDK reports the failed publication with the scope and the value each entry named and surfaces the entries to the controller, and a controller holding a signed reveal-authorized event retains it and resumes the ceremony from `PublishSent` when an entry accepts (`09-security-model.md` §9.7.4.2 R10).
+
+**Which refusals a publisher can satisfy, and what each one's value carries.** Every refusal carries a `BudgetValue` typed for its scope (§3.10.10), so a publisher reads the term it failed rather than a string of it.
+
+| Scope | What `value` carries | What the publisher does |
+|---|---|---|
+| `Payment` | The relay's declared `economic` terms: the currency, `per_publish`, `per_byte_stored`, the accepted adapters, and the payee | Mint a receipt for the declared price through a configured adapter and retry at the same relay |
+| `RateLimit` | The declared ceiling per minute and the seconds to wait | Wait the stated seconds and retry at the same relay |
+| `Identifier` | The declared per-identifier budget in bytes | Move to the next fallback-set entry; no change to this request satisfies the term |
+| `Total` | The declared total budget in bytes | Move to the next fallback-set entry; a relay returns this scope only against a paid write whose pinned capacity is full |
+
+**The three MUSTs above read `PublishOutcome`'s per-entry list** (§3.10.10), which names every entry of the fallback set exactly once with what that entry answered, so a cycle mixing an acceptance, a refusal, a skip and an unreachable entry lands in no gap between arms.
 
 **A publish cycle that reached no witness MUST be reported as degraded and never as a failure.** An identity that publishes everywhere and submits to no witness is still resolvable by every stranger and keeps its `09-security-model.md` §9.11 standing at every peer (§9.7.4.3). What it gives up is portability: a cosigned head travels to a party that did not perform the read, and a peer's own relay read does not.
 
@@ -822,14 +834,16 @@ pub enum IdentityError {
     /// SCP-IDENT-1102. The SDK can reach no source in the fallback set, so it
     /// refuses to compose a reveal-authorized event (§9.7.4.2 R10).
     NoFallbackSourceReachable,
-    /// SCP-IDENT-1103. The SDK can observe, in a store of the profile's store
-    /// set, another unpublished reveal-authorized event or a pending
+    /// SCP-IDENT-1103. The SDK can observe, in a store of the credential-keyed
+    /// store set, another unpublished reveal-authorized event or a pending
     /// `RecoveryHandle` for this identity. `load_pending_recovery` reads every
     /// store of that set and returns a handle at every phase from `Composed`
-    /// through `Submitted`; `abort_recovery` deletes the handle from every one
-    /// of those stores, and a `resume_recovery` that completes deletes it the
-    /// same way, so no finished ceremony leaves an object that raises this
-    /// error (`09-security-model.md` §9.7.4.2 R10).
+    /// through `Confirmed`, and returns nothing at `Submitted`.
+    /// `abort_recovery` reaches a handle over that same range and deletes it
+    /// from every store it was written to; `resume_recovery` deletes it the
+    /// same way once the ceremony completes at `Confirmed` plus destruction of
+    /// the spent keys, so no finished ceremony leaves an object that raises
+    /// this error (`09-security-model.md` §9.7.4.2 R10).
     RevealAlreadyPending,
     /// SCP-IDENT-1104. The verifier could not persist a contested verdict, its
     /// retained suffixes, or the accepted-head baseline (§9.7.4.2 R14).
@@ -844,12 +858,10 @@ pub enum IdentityError {
     /// write policy it declares (`09-security-model.md` §9.7.4.2 R9). `scope`
     /// names the term, so the publisher tells a refusal it can satisfy and
     /// retry from one that sends it to the next fallback-set entry, and
-    /// `value` carries that term exactly as the relay declares it in
-    /// `relay_config` — the difficulty in bits, the price, the budget figure,
-    /// or the rate. It is a string because it echoes the declared term
-    /// verbatim, so the publisher holds what ADR-004's `POLICY` query would
-    /// have returned for that term and parses it against the scope beside it.
-    StorageBudgetExceeded { scope: BudgetScope, value: String },
+    /// `value` carries that term as `BudgetValue`, which types it per scope so
+    /// the publisher reads a number rather than parsing a relay-written
+    /// string. The wire code `4041` carries both fields (ADR-004).
+    StorageBudgetExceeded { scope: BudgetScope, value: BudgetValue },
 }
 
 /// Which term of a validating relay's declared write policy a refusal failed
@@ -867,25 +879,67 @@ pub enum BudgetScope {
     /// verify (`09-security-model.md` §9.10.12,
     /// `19-economic-governance.md` §19.2.1, §19.8).
     Payment,
-    /// The PUBLISH's `nonce` does not clear the relay's `pow_difficulty`
-    /// (`09-security-model.md` §9.7.4.2 R9).
-    ProofOfWork,
+}
+
+/// The refused term's own value, one variant per `BudgetScope` and never a
+/// string (`09-security-model.md` §9.7.4.2 R9). Every SDK binding carries the
+/// type name and all four variant names verbatim.
+pub enum BudgetValue {
+    /// The declared per-identifier storage budget, in bytes.
+    Identifier(u64),
+    /// The declared total storage budget, in bytes.
+    Total(u64),
+    /// The declared ceiling, and the wait this publisher's own counter needs.
+    /// The ceiling alone tells a publisher what the relay allows and never
+    /// when its own counter clears, and waiting is the recourse ADR-004 names
+    /// for this scope.
+    RateLimit { ceiling_per_minute: u64, retry_after_seconds: u64 },
+    /// The five `economic` members of `relay_config`
+    /// (`18-addressability-and-deployment.md` §18.3.3). A publisher cannot
+    /// mint a receipt from a price alone, so the variant carries all five.
+    /// `Amount` takes the wire form ADR-060 fixes.
+    Payment {
+        currency: CurrencyCode,
+        per_publish: Option<Amount>,
+        per_byte_stored: Option<Amount>,
+        payment_adapters: Vec<String>,
+        payee: Identifier,
+    },
 }
 
 /// What one publish cycle over the fallback set did (§3.10.6). The cycle
-/// addresses every entry, so the outcome is per entry.
-pub enum PublishOutcome {
-    /// At least one entry accepted. `entries` names every entry that did, and
-    /// `witnessed` is false where no designated witness accepted the head this
-    /// cycle, which the SDK reports as degraded and never as a failure.
-    Accepted { entries: Vec<String>, witnessed: bool },
-    /// Every entry answered and every answer was a refusal. Each tuple carries
-    /// the entry, the scope it named, and that term's declared value, which is
-    /// what §3.10.6 obliges the SDK to surface to the controller.
-    Refused { per_entry: Vec<(String, BudgetScope, String)> },
-    /// No entry accepted, for any other reason: every entry was unreachable,
-    /// timed out, or answered with a transport error.
-    Failed,
+/// addresses every entry, so the outcome is one per-entry list and no
+/// partition of whole-cycle arms: every entry of the fallback set appears
+/// exactly once, and "did any entry accept" is a question the caller derives
+/// from the list rather than an arm this type has to choose.
+pub struct PublishOutcome {
+    pub per_entry: Vec<EntryOutcome>,
+    /// False where no designated witness accepted the head this cycle. The SDK
+    /// reports such a cycle as degraded and never as a failure, which is the
+    /// third MUST of §3.10.6 and the one a value on an error arm cannot carry.
+    pub witnessed: bool,
+}
+
+/// One fallback-set entry's answer. `entry` holds the relay URL, which is the
+/// unit `ResolutionSources::relays_reached` holds.
+pub struct EntryOutcome {
+    pub entry: String,
+    pub result: EntryResult,
+}
+
+/// What one entry answered. Every SDK binding carries the type name and all
+/// four variant names verbatim.
+pub enum EntryResult {
+    /// The entry stored the write.
+    Accepted,
+    /// The entry answered with a refusal, naming the term it failed and that
+    /// term's value, which is what §3.10.6 obliges the SDK to surface.
+    Refused { scope: BudgetScope, value: BudgetValue },
+    /// The publisher did not write to this entry, because the entry's `POLICY`
+    /// answer declared a term the publisher would not satisfy.
+    Skipped { term: BudgetScope, value: BudgetValue },
+    /// The entry answered nothing.
+    Unreachable,
 }
 
 /// Every resolution returns one of the six verdicts of
@@ -896,8 +950,8 @@ pub struct ResolutionOutcome {
     pub verdict: ResolutionVerdict,
     /// Present on `Confirmed` and `Adopted`, absent on every other verdict.
     /// `KeyState` here is the derived key state `09-security-model.md`
-    /// §9.7.4.2's definitions define, and this section writes no field list
-    /// and no second definition of it. That same name spells the event kind
+    /// §9.7.4.2's definitions define, with the field list and the type of each
+    /// field this section cites rather than restates. That name also spells the event kind
     /// `EventKind::KeyState`, which is a variant of a different type and is
     /// the event a chain carries rather than the state a chain derives.
     pub key_state: Option<KeyState>,
@@ -973,7 +1027,71 @@ pub enum ServiceRecordRejection {
 }
 ```
 
-`ResolutionVerdict` and its six variants, `TieClass`, `InconclusiveCause` and `HeadProvenance` are the types `09-security-model.md` §9.7.4.2's definitions and R14 fix. A resolver assigns `head_provenance` from the source of the head it adopted, under the assignment those definitions state, so `TwoOperatorRead` counts the distinct operator keys in `proven` and never declared operator identifiers.
+**This section declares `ResolutionVerdict`, `InconclusiveCause`, `TieClass` and `SequenceRange`, each field carrying a type, and `09-security-model.md` §9.7.4.2 R14 states the rule that selects a verdict and declares no type.** A head is named by its 32-byte preimage digest and a position by its sequence, so `at_event` and `fork_position` are sequences and `head`, `heads`, `shared_prefix_head` and `accepted_head` are digests.
+
+```rust
+/// The six verdicts a resolution returns (`09-security-model.md` §9.7.4.2
+/// R14). Every SDK binding carries the type name and all six variant names
+/// verbatim.
+pub enum ResolutionVerdict {
+    /// The candidate head equals the accepted head at an equal sequence.
+    Confirmed,
+    /// The verifier replaced its baseline. `baseline_decreased` is true where
+    /// the adopted head sits at a lower sequence than the head it replaced.
+    Adopted { head: [u8; 32], baseline_decreased: bool },
+    /// R6 ranked two suffixes as a tie and R7 classified it. `residue` counts
+    /// the candidates the verifier could not retain under R9's bounds.
+    Contested {
+        tie: TieClass,
+        heads: Vec<[u8; 32]>,
+        shared_prefix_head: [u8; 32],
+        fork_position: u64,
+        residue: u32,
+    },
+    /// The verifier reached no verdict on the bytes it read.
+    Inconclusive { cause: InconclusiveCause },
+    /// An event failed R1 through R4 at this sequence.
+    Invalid { at_event: u64 },
+    /// The candidate head sat at a strictly lower sequence on the accepted
+    /// chain, so the verifier changed no stored state.
+    Discarded { accepted_head: [u8; 32] },
+}
+
+/// Why a resolution was inconclusive (`09-security-model.md` §9.7.4.2 R14).
+pub enum InconclusiveCause {
+    /// The verifier holds no event for the sequences `range` names.
+    /// `failed_sources` holds the relay URLs that failed to serve, and it is
+    /// empty where R9's fetch bound stopped the verifier itself.
+    MissingEvents { range: SequenceRange, failed_sources: Vec<String> },
+    /// A copy-level defect sits at this sequence.
+    CopyDefect { at_event: u64 },
+    /// The resolution did not meet R11's first-contact floor.
+    SingleSource {
+        reached_sources: u32,
+        proven_sources: u32,
+        clock_skew_rejected: u32,
+    },
+}
+
+/// How R7 classified a tie (`09-security-model.md` §9.7.4.2 R7).
+pub enum TieClass {
+    Rank1Terminal,
+    Rank2Terminal,
+    Rank3Pending,
+}
+
+/// The sequences a verifier holds no event for. `to` is absent where the stop
+/// left the chain's head sequence unknown (`09-security-model.md` §9.7.4.2
+/// R9's fetch bound).
+pub struct SequenceRange {
+    pub from: u64,
+    pub to: Option<u64>,
+}
+```
+
+`HeadProvenance` is the type `09-security-model.md` §9.7.4.2's definitions fix. A resolver assigns `head_provenance` from the source of the head it adopted, under the assignment those definitions state, so `TwoOperatorRead` counts the distinct operator keys in `proven` and never declared operator identifiers.
+
+**How the backend pays a charging entry.** `IdentityConfig` carries a fourth slot, `payment: Option<PaymentAdapterSlot>`, under the selector shape `.docs/standards/construction.md` gives `IdentityBackendSlot` and `KeyCustodySlot`. `publish` and `publish_service_record` keep their parameter lists: the backend reads each entry's declared policy through ADR-004's `POLICY` query, and for an entry whose policy carries a price it mints a `payment_receipt` through the configured adapter and attaches it to the PUBLISH (`09-security-model.md` §9.7.4.2 R9). **Where `payment` is `None` the backend attaches no receipt**, the charging entry refuses `Payment`, and that entry appears in the per-entry list as `Refused` or `Skipped`. That is the fail-safe default, because minting a payment is never reached by omission.
 
 **The outcome carries the verdict rather than an `Option`**, because `09-security-model.md` §9.6.4 maps `Contested`, `Inconclusive` and `Invalid` to three different standings and a caller holding one absent value cannot tell them apart. **It records the operator key each entry declared and the key each proof verified under**, because R11 counts a source only where its proof verified and two relay URLs, or two declared operator identifiers, may sit under one operator key.
 
@@ -1002,9 +1120,9 @@ under the `09-security-model.md` §9.5.1 construction: the 32-byte identifier ra
 
 **Who signs it.** The record carries a signature by the operational key the latest state-carrying key event designates for the service-record role, never by a root member. A reader verifies in two steps and never one: it verifies the key-event log under `09-security-model.md` §9.7.4.2 R2 and R3, reads the designation out of the verified chain, then verifies the record's signature against the designated key (`09-security-model.md` §9.6.3). R3 rejects a state-carrying event whose designation names a key that event does not list `current`, so the designated key is always one the current key state lists.
 
-**A reader holding no accepted service record applies the first-contact floor to the record**, setting `proof_nonce` on its `scp:svc:` query as §3.10.4 step 2 requires on the key-event one, and returns `ServiceRecordVerdict::Inconclusive` where it cannot meet the floor, carrying the relays it reached, the operators it proved and the proofs its own clock rejected (§3.10.10). That verdict says the reader could not read, where `Absent` would say the identity published nothing and `Rejected` would say the reader refused a record it never verified. A single relay can serve a genuine record truncated to an older sequence exactly as it can serve a truncated chain, and such a reader holds no high-water mark to compare against.
+**A reader holding no accepted service record applies the first-contact floor to the record**, setting `proof_nonce` on its `scp:svc:` query as §3.10.4 step 2 requires on the key-event one, and returns `ServiceRecordVerdict::Inconclusive` where it cannot meet the floor. §3.10.10 declares that variant's payload and this section states no field of its own. That verdict says the reader could not read, where `Absent` would say the identity published nothing and `Rejected` would say the reader refused a record it never verified. A single relay can serve a genuine record truncated to an older sequence exactly as it can serve a truncated chain, and such a reader holds no high-water mark to compare against.
 
-**How a reader settles two copies: last writer wins on the record's own sequence**, which is monotonic and unrelated to the log's. A reader rejects a record at the maximum representable value, so no writer exhausts the space. **The high-water mark is keyed to the pair (identifier, the 33 public-key bytes the designation resolved to)**: a mark scoped to the identifier alone would let one record written at a high sequence by a briefly held key block the controller's own recovery record forever. **The mark resets when the key state lists different bytes `current` in the designated role**, so a routine rotation resets it and the reader accepts the first record the new key signs at any sequence. The reset is sound because a root signature covers the event listing those bytes and the replaced key's holder cannot produce one. **Fork precedence does not apply here and MUST NOT be applied**: a service record has no reveal-authorized event class, so no legitimate update lowers the sequence, and two signature-valid records at one sequence are the designated key's holder equivocating. A reader holding two such records rejects both and reports the identity's transport metadata as unresolved.
+**How a reader settles two copies: last writer wins on the record's own sequence**, which is monotonic and unrelated to the log's. A reader rejects a record at the maximum representable value, so no writer exhausts the space. **The high-water mark is keyed to the pair (identifier, the 33 public-key bytes the designation resolved to)**: a mark scoped to the identifier alone would let one record written at a high sequence by a briefly held key block the controller's own recovery record forever. **The mark resets when the key state lists different bytes `current` in the designated role**, so a routine rotation resets it and the reader accepts the first record the new key signs at any sequence. **This pair key is a reader's acceptance test and never a relay's storage count**: a relay keeps one record per identifier, keyed on the identifier alone (§3.10.2, `09-security-model.md` §9.7.4.2 R9), so a party designating a fresh key on every `KeyState` plants no second stored record while each reader still refuses a stale one. The reset is sound because a root signature covers the event listing those bytes and the replaced key's holder cannot produce one. **Fork precedence does not apply here and MUST NOT be applied**: a service record has no reveal-authorized event class, so no legitimate update lowers the sequence, and two signature-valid records at one sequence are the designated key's holder equivocating. A reader holding two such records rejects both and reports the identity's transport metadata as unresolved.
 
 **A reader holding a `Contested` verdict accepts no new service record** for that identity, because a contested identity has no adopted key state and therefore no authorized designation. It keeps routing on the last record it accepted before it observed any divergent-suffix event, and only while that record's designated key is `current` in the shared prefix's key state; `read_service_record` returns that retained record as `Adopted` (§3.10.10), and the caller reads the contest off the resolution verdict it already holds. Where no record it holds meets both conditions it routes on nothing and says so, returning `Rejected{IdentityContested}`, with the caching bound suspended for that identity. Freezing on a record the divergence's author wrote would hand routing to whichever claimant published last, and reporting every contested identity unroutable would let any party that contests an identity cut its transport.
 
