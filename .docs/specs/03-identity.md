@@ -1067,11 +1067,13 @@ pub enum EntryResult {
     /// in one enumeration and a binding author transposed them without a
     /// compiler objecting.
     Skipped { scope: BudgetScope, value: BudgetValue },
-    /// The entry answered and named no declared policy term, carrying the wire
-    /// code it sent: `4040` DID_RECORD_REJECTED, which a publisher meets when it
-    /// sends a later segment first; `4010` BLOB_TOO_LARGE, which it meets when
-    /// it segmented against a stale `max_blob_size`; and `5000`, `5001`
-    /// STORAGE_FULL and `5002`. Without this variant one binding recorded such
+    /// The entry answered and the publisher holds no declared policy term from
+    /// it, carrying the wire code it sent: `4040` DID_RECORD_REJECTED, which a
+    /// publisher meets when it sends a later segment first; `4010`
+    /// BLOB_TOO_LARGE, which it meets when it segmented against a stale
+    /// `max_blob_size`; `5000`, `5001` STORAGE_FULL and `5002`; and a `4041`
+    /// whose `value` the publisher could not decode, which leaves it the code
+    /// and no term to satisfy. Without this variant one binding recorded such
     /// an answer as `Unreachable`, which says the entry answered nothing, and
     /// another recorded it as `Refused` with a scope the relay never sent.
     Failed { code: u16 },
