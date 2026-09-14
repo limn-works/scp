@@ -17,10 +17,12 @@ that no filter lists therefore merges with every job that reads it skipped.
 - **Route a file to every lane that guards a job whose behaviour the file decides, not to
   the lane whose name matches the file.** `rust-toolchain.toml` sits at the repository root
   and names a Rust version, which makes the `rust` filter the obvious single destination,
-  and the compiler it selects reaches six other lanes: `python-test` runs
-  `maturin develop`, `typescript-check` runs `cargo build -p scp-ffi-napi`,
+  and the compiler it selects reaches six other lanes: the `python` lane's
+  `pyo3-module` and `pyo3-module-macos` run `maturin develop`, the `typescript` lane's
+  `napi-addon` runs `cargo build -p scp-ffi-napi`,
   `typescript-wasm-check` and `scaffold-typescript-web-check` run `wasm-pack build`,
-  `kotlin-test` runs `cargo build -p scp-ffi-uniffi`, and `swift-build-test` runs
+  `kotlin-test` runs `cargo build -p scp-ffi-uniffi`, and the `swift` lane's
+  `xcframework` runs
   `bindings/swift/build-xcframework.sh`, which calls `cargo build`. A second workflow,
   `.github/workflows/docs.yml`, guards `rust-docs` the same way, and that job runs
   `cargo doc --workspace --no-deps --document-private-items`, which compiles every crate in

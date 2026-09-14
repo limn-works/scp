@@ -104,10 +104,11 @@
 # against the repository rather than against a list of paths someone remembered to add.
 #
 #   2a/2b — THE PIN, ROUTED BY CONSTRUCTION. `rust-toolchain.toml` selects the compiler
-#   for every lane, not only the Rust lane: `python-test` runs `maturin develop`,
-#   `typescript-check` runs `cargo build -p scp-ffi-napi`, `typescript-wasm-check` and
-#   `scaffold-typescript-web-check` run `wasm-pack build`, `kotlin-test` runs
-#   `cargo build -p scp-ffi-uniffi`, `swift-build-test` runs `build-xcframework.sh`, and
+#   for every lane, not only the Rust lane: `pyo3-module` and `pyo3-module-macos` run
+#   `maturin develop`, `napi-addon` runs `cargo build -p scp-ffi-napi`,
+#   `typescript-wasm-check` and `scaffold-typescript-web-check` run `wasm-pack build`,
+#   `kotlin-test` and `bridge-parity-kotlin` run
+#   `cargo build -p scp-ffi-uniffi`, `xcframework` runs `build-xcframework.sh`, and
 #   `docs.yml`'s `rust-docs` runs `cargo doc`. Listing the pin in each of those filters is
 #   a list that grows with the lanes. Instead each workflow declares one `toolchain`
 #   filter holding the pin, and every output of its `changes` job ORs that filter in. The

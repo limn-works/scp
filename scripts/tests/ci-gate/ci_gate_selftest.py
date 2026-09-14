@@ -129,6 +129,19 @@ nothing:
                `pull_request` only. A merge queue evaluates a required check
                against the `merge_group` ref, so following that header would
                have left every queue entry waiting on a status no run reports.
+  needs-condition
+               Four jobs build one bridge artifact each and upload it, and six
+               jobs download what they build instead of compiling their own.
+               GitHub skips a job when any job in its `needs` list is skipped,
+               and both the aggregate below and branch protection read a skipped
+               job as a pass, so a producer whose `if:` is narrower than one
+               consumer's deletes that consumer from the run under a green `ci`.
+               Job napi-addon is the case: bridge-parity reads
+               `python || typescript || rust`, so a producer reading
+               `typescript || rust` — the condition typescript-check alone
+               needs — would skip the NAPI half of the parity harness on every
+               change confined to bindings/python. A diff of either job alone
+               shows nothing.
   lint-scope   One crate declared the lint the two rustdoc jobs exist to fire:
                crates/scp-runtime/src/lib.rs carried
                `#![deny(rustdoc::broken_intra_doc_links)]` and none of the other
@@ -169,6 +182,7 @@ Run: python3 scripts/tests/ci-gate/ci_gate_selftest.py
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -536,6 +550,9 @@ RUST_ONLY_RUNS = {
     "fuzz-build": False,
     "kotlin-lint": False,
     "kotlin-test": True,
+    "napi-addon": True,
+    "pyo3-module": True,
+    "pyo3-module-macos": True,
     "python-lint": False,
     "python-test": True,
     "rust-build-pyo3-production": True,
@@ -552,6 +569,7 @@ RUST_ONLY_RUNS = {
     "swift-lint": False,
     "typescript-check": True,
     "typescript-wasm-check": False,
+    "xcframework": True,
 }
 DOCS_ONLY_RUNS = dict.fromkeys(RUST_ONLY_RUNS, False)
 
@@ -3087,6 +3105,160 @@ def collect_pinned_nightlies(doc: dict) -> set[str]:
     return pinned
 
 
+def selects(expression: str, outputs: dict[str, str], event_name: str) -> bool:
+    """Report whether one `if:` expression selects a job under one set of inputs.
+
+    Written here rather than imported from scripts/ci-aggregate-result.py for the
+    reason this file's closing paragraph gives: an assertion that calls the function
+    it judges agrees with that function however it behaves. The grammar is the one
+    every `if:` in these workflows uses — `LHS == 'literal'` clauses joined by `||`.
+    An expression outside it raises, which stops this check rather than guessing.
+    """
+    normalised = " ".join(str(expression).split())
+    if any(token in normalised for token in ("&&", "!", "(")):
+        raise ValueError(f"expression this check cannot read: {normalised!r}")
+
+    def operand(token: str) -> str:
+        token = token.strip()
+        quoted = re.fullmatch(r"'([^']*)'", token)
+        if quoted:
+            return quoted.group(1)
+        if token in ("true", "false"):
+            return token
+        if token == "github.event_name":
+            return event_name
+        if token == "github.event.pull_request.draft":
+            # Held at false, so the enumeration covers the runs in which check-draft
+            # runs. On a draft pull request check-draft skips, every job that needs it
+            # skips with it, and scripts/ci-aggregate-result.py returns 0 on exactly
+            # that state, because GitHub blocks merging a draft and a merge queue
+            # re-runs this workflow on a merge_group event where the gate applies. A
+            # draft run therefore has no job whose skip a merge could ride, which is
+            # the state this check looks for.
+            return "false"
+        prefix = "needs.changes.outputs."
+        if token.startswith(prefix):
+            key = token[len(prefix) :]
+            if key not in outputs:
+                raise ValueError(f"filter output `changes` never published: {key!r}")
+            return outputs[key]
+        raise ValueError(f"operand this check cannot read: {token!r}")
+
+    for clause in normalised.split("||"):
+        sides = clause.split("==")
+        if len(sides) != 2:
+            raise ValueError(f"clause this check cannot read: {clause!r}")
+        if operand(sides[0]) == operand(sides[1]):
+            return True
+    return False
+
+
+def condition_assignments(doc: dict) -> list[tuple[dict[str, str], str]]:
+    """Every (filter-output assignment, event) pair a run of one workflow can present."""
+    keys = sorted((doc["jobs"].get("changes") or {}).get("outputs") or {})
+    events = ("pull_request", "push", "merge_group")
+    assignments = []
+    for mask in range(2 ** len(keys)):
+        outputs = {
+            key: "true" if mask >> index & 1 else "false"
+            for index, key in enumerate(keys)
+        }
+        assignments.extend((outputs, event) for event in events)
+    return assignments
+
+
+# GitHub runs a job whose `if:` calls one of these regardless of what its
+# dependencies reported, a skipped dependency included, so skip propagation does not
+# reach such a job. Job `ci` is the one that calls one: it aggregates results and has
+# to run over a skipped dependency to judge it.
+STATUS_FUNCTIONS = ("always(", "success(", "failure(", "cancelled(")
+
+
+def dependency_condition_gaps(doc: dict) -> list[str]:
+    """Return every (dependant, dependency) pair whose conditions can disagree.
+
+    CRITERION: wherever a job's own `if:` selects it, the `if:` of every job in its
+    `needs` list must select that job too.
+
+    WHY: GitHub skips a job when any job in its `needs` list is skipped, and both
+    scripts/ci-aggregate-result.py and GitHub's own branch protection read a skipped
+    job as a pass. A dependency selected by a narrower condition than its dependant
+    therefore deletes the dependant from the run under a green `ci`. The shape this
+    check exists for is a producer job that builds an artifact for several consumers:
+    its condition has to be the union of theirs, and an edit that narrows it, or that
+    widens one consumer's, is invisible in a diff of either job alone.
+
+    SCOPE: ci.yml, the workflow this file's aggregate judges, because that aggregate
+    is what reads a skipped job as a pass and it is a required status check. A
+    condition inside it that this grammar cannot read is reported rather than
+    stepped over, so the check cannot pass by failing to parse.
+    """
+    jobs = doc["jobs"]
+    gaps: list[str] = []
+    for job_id, job in sorted(jobs.items()):
+        needs = job.get("needs") or []
+        needs = [needs] if isinstance(needs, str) else list(needs)
+        condition = job.get("if")
+        if condition is None or not needs:
+            continue
+        if any(function in str(condition) for function in STATUS_FUNCTIONS):
+            continue
+        for dependency in needs:
+            upstream = jobs.get(dependency, {}).get("if")
+            if upstream is None:
+                continue
+            try:
+                pairs = [
+                    (outputs, event)
+                    for outputs, event in condition_assignments(doc)
+                    if selects(condition, outputs, event)
+                    and not selects(upstream, outputs, event)
+                ]
+            except ValueError as unreadable:
+                gaps.append(
+                    f"{job_id} needs {dependency} and this check cannot decide whether "
+                    f"{dependency} runs wherever {job_id} does ({unreadable})"
+                )
+                continue
+            if pairs:
+                outputs, event = pairs[0]
+                selected = sorted(key for key, on in outputs.items() if on == "true")
+                gaps.append(
+                    f"{job_id} runs and {dependency} skips on event {event} with "
+                    f"filters {selected or ['none']} true, which skips {job_id} "
+                    f"under a green `ci`"
+                )
+    return gaps
+
+
+def check_dependency_conditions(doc: dict) -> None:
+    gaps = dependency_condition_gaps(doc)
+    check(
+        "ci.yml: every job's `needs` are selected wherever the job is",
+        not gaps,
+        "; ".join(gaps),
+    )
+
+
+def check_dependency_conditions_detect_a_narrowed_producer(doc: dict) -> None:
+    """Narrowing one producer's condition by one clause is caught above."""
+    narrowed = copy.deepcopy(doc)
+    producer = narrowed["jobs"]["pyo3-module"]
+    producer["if"] = "\n".join(
+        line
+        for line in str(producer["if"]).splitlines()
+        if "outputs.kotlin" not in line
+    ).rstrip(" |\n")
+    check(
+        "dropping the kotlin clause from pyo3-module is reported",
+        any(
+            "bridge-parity-kotlin" in gap
+            for gap in dependency_condition_gaps(narrowed)
+        ),
+        "a producer that no longer covers bridge-parity-kotlin went unreported",
+    )
+
+
 def main() -> int:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     jobs = workflow["jobs"]
@@ -3165,6 +3337,10 @@ def main() -> int:
         "input set first"
     )
     check_signing_guard(documents)
+
+    print("needs-condition — a job's dependencies run wherever the job does")
+    check_dependency_conditions(workflow)
+    check_dependency_conditions_detect_a_narrowed_producer(workflow)
 
     print("coverage — every job reaches a required status check")
     defined = set(jobs) - {"ci"}
