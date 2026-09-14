@@ -81,7 +81,7 @@ All SDKs use language-idiomatic casing for the same logical identifiers.
 
 ### Casing rules per language
 
-The `Name-bound enum variants` column reads `.docs/standards/conventions.md`'s naming table, which states one spelling for every language: the spec's own, verbatim.
+The `Name-bound enum variants` column reads `.docs/standards/conventions.md`'s naming table, which states one spelling for every language, and this file states no per-language spelling of its own.
 
 | Language | Types | Functions/Methods | Constants | Name-bound enum variants | Modules/Packages | Files |
 |----------|-------|-------------------|-----------|--------------------------|-------------------|-------|
