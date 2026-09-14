@@ -1498,10 +1498,14 @@ jobs:
         # dimension, and `cargo test --doc` does not substitute for it — the three
         # links pull request #2274 broke were live while this job already ran
         # `cargo test --workspace --doc`, which is why the `cargo doc` line below
-        # exists at all.
+        # exists at all. Both commands in this step carry the pair, because cargo
+        # keys a compilation unit on its feature set: one command resolving
+        # `scp-transport` two features wider than the other would compile every
+        # crate downstream of it a second time under a second metadata hash, and
+        # this is already the slowest doc lane.
         run: |
           export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          cargo test --workspace --doc --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant
+          cargo test --workspace --doc --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant,scp-transport/postgres-blob,scp-transport/s3-blob
           cargo doc --workspace --no-deps --document-private-items --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant,scp-transport/postgres-blob,scp-transport/s3-blob
 
   rust-deny:
