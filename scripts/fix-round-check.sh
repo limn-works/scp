@@ -76,11 +76,17 @@
 #      203 ms from queue to scan finished for a 16 KB binary, and 0 further assessments
 #      on later execs of the same bytes. That cost per binary is small, but the link step
 #      is not, and a workspace nextest links dozens. On 2026-09-11 that queue reached 31
-#      minutes per item and a fix round died inside it. Nine jobs run one of those three
-#      commands on the pushed head: `rust-test`, `rust-test-optional-features`,
+#      minutes per item and a fix round died inside it. Thirteen jobs of
+#      `.github/workflows/ci.yml` run one of those three commands on the pushed head.
+#      Eleven name the command themselves: `rust-test`, `rust-test-optional-features`,
 #      `rust-test-napi-production`, `rust-build-pyo3-production`,
-#      `rust-build-uniffi-production`, `fail-closed-pre-rotation`, and the three
-#      `bridge-parity` jobs.
+#      `rust-build-uniffi-production`, `rust-doc` (which runs `cargo test --workspace
+#      --doc`), `fail-closed-pre-rotation`, `kotlin-test` and `typescript-check` (each of
+#      which runs `cargo build -p scp-ffi-uniffi` or `cargo build -p scp-ffi-napi` to
+#      produce the library its own lane loads), `bridge-parity` and
+#      `bridge-parity-kotlin`. Two more reach a cargo command through a script:
+#      `swift-build-test` and `bridge-parity-swift` each run
+#      `bindings/swift/build-xcframework.sh`, which runs `cargo build` twice.
 #   2. `cargo clippy`, in every form. The compile step runs `cargo check`, which reports
 #      no clippy lint at all, so a `clippy::needless_borrow` in the file this round edited
 #      passes here and fails in the `rust-clippy` job. That job is the merge gate, and it
@@ -115,14 +121,26 @@
 #      a target directory this script's `cargo check` never writes, so each costs a cold
 #      build on first use, and the step criterion above admits a step a fix agent's edit
 #      falsifies in seconds.
-#   7. The suites that read `.github/` and `scripts/` and that no gate below duplicates:
-#      `scripts/tests/ci-gate/run-tests.sh` and `scripts/tests/signing-guard/run-tests.sh`
-#      in the `ci-workflow-selftest` job, `scripts/tests/toolchain-wiring/run-tests.sh`
-#      and `scripts/tests/workflow-compile-steps/run-tests.sh` in the `toolchain-wiring`
-#      job, and `scripts/tests/fix-round-check/run-tests.sh` in the
-#      `fix-round-check-selftest` job. The last one runs the whole gate list below twice
-#      against this repository, so running it from inside this script would run that list
-#      three times in one invocation.
+#   7. Every suite a job of `.github/workflows/ci.yml` runs over `.github/` or over
+#      `scripts/`. Running a gate below against this repository's own files does not
+#      duplicate that gate's fixture suite: the gate reads a clean tree and passes, and
+#      the suite feeds it the planted violation that proves it still rejects. The eleven,
+#      by the job that runs each: `scripts/tests/cross-layer/run-tests.sh` in
+#      `cross-layer`; `scripts/tests/bridge-symmetry/run-tests.sh` and
+#      `scripts/tests/enforcement-files-hook/run-tests.sh` in `bridge-symmetry`;
+#      `scripts/test_check_sdk_coverage.py` and `scripts/tests/call-invariants/` in
+#      `sdk-coverage`; `scripts/tests/toolchain-wiring/run-tests.sh` and
+#      `scripts/tests/workflow-compile-steps/run-tests.sh` in `toolchain-wiring`;
+#      `scripts/tests/fix-round-check/run-tests.sh` in `fix-round-check-selftest`;
+#      `scripts/tests/agent-verdict-criterion/run-tests.sh` in `agent-verdict-criterion`;
+#      and `scripts/tests/ci-gate/run-tests.sh` and
+#      `scripts/tests/signing-guard/run-tests.sh` in `ci-workflow-selftest`. The
+#      fix-round-check one runs the whole gate list below twice against this repository,
+#      so running it from inside this script would run that list three times in one
+#      invocation.
+#      `scripts/tests/fix-round-check/run-tests.sh` holds the `scripts/` entry of
+#      UNRUN_LANES below to this list: it reads every suite invocation out of
+#      `.github/workflows/ci.yml` and fails when that entry names fewer.
 #
 # USAGE
 #   bash scripts/fix-round-check.sh [crate ...]
@@ -190,6 +208,12 @@ if ! command -v "$TIMEOUT" >/dev/null 2>&1; then
     printf 'fix-round-check: neither timeout nor gtimeout is on PATH, and this script bounds its cargo metadata call and every gate with one of them, so it checked nothing. Install GNU coreutils (brew install coreutils), then run this script again.\n' >&2
     exit 1
 fi
+
+# The interpreter ten of the gates below run under, and the one that reads the dependency
+# declarations out of `cargo metadata`'s JSON for the compile step's feature set. It is
+# resolved here rather than beside the gate list because the compile step runs first.
+PYTHON=python3.12
+command -v "$PYTHON" >/dev/null 2>&1 || PYTHON=python3
 
 # ── Precondition: the compiler this shell resolves ───────────────────────────────────
 #
@@ -286,23 +310,37 @@ crate_of_path() {
 # that compiled nothing, on a branch whose commits changed crate sources. A run that named
 # its own crates compiles that set either way, and states in its summary that it could not
 # read the branch's files, so its NOT CHECKED lines are absent rather than empty.
+#
+# BOTH HALVES PASS `--no-renames`, AND A MOVE BETWEEN CRATES IS WHY. Git reports a rename
+# as one filepair: `git status --porcelain` prints `R  <origin> -> <destination>`, and
+# `git diff --name-only` prints the destination alone. An earlier revision read both that
+# way and dropped every origin path, so `git mv crates/scp-protocol/src/foo.rs
+# crates/scp-runtime/src/foo.rs` derived `scp-runtime` alone: `scp-protocol` kept the
+# `mod foo;` naming a file it no longer holds, this script compiled none of it, no
+# NOT CHECKED line named it, and the run exited 0. `--no-renames` makes git report the
+# move as a delete of the origin and an addition of the destination, so `crate_of_path`
+# sees both paths and both packages reach the derived set. The origin path also stops the
+# `sed` below from having to strip a ` -> ` separator, which a file name holding that
+# three-character sequence would otherwise lose its own prefix to.
 changed_files() {
     local status base
-    if ! status=$(git -C "$REPO_ROOT" status --porcelain); then
+    if ! status=$(git -C "$REPO_ROOT" status --porcelain --no-renames); then
         printf 'fix-round-check: git status failed in %s, so this script could not read which files this branch changed.\n' "$REPO_ROOT" >&2
         return 1
     fi
-    printf '%s\n' "$status" | sed -E 's/^.{3}//; s/^.* -> //'
+    printf '%s\n' "$status" | sed -E 's/^.{3}//'
     if ! base=$(git -C "$REPO_ROOT" merge-base HEAD origin/main 2>/dev/null); then
         printf 'fix-round-check: this checkout holds no merge base between HEAD and origin/main, so this script could not read which files this branch changed. Fetch origin/main, and this run derives its crate set and names every change it leaves unchecked.\n' >&2
         return 1
     fi
-    git -C "$REPO_ROOT" diff --name-only "$base" HEAD
+    git -C "$REPO_ROOT" diff --name-only --no-renames "$base" HEAD
 }
 
 # The paths the working tree holds uncommitted, counted for the cross-layer note below.
+# `--no-renames` for the reason `changed_files` above gives: a staged move counts as the
+# two paths the gate below reads neither of, rather than as one.
 uncommitted_count=0
-if uncommitted=$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null); then
+if uncommitted=$(git -C "$REPO_ROOT" status --porcelain --no-renames 2>/dev/null); then
     uncommitted_count=$(printf '%s\n' "$uncommitted" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')
 fi
 
@@ -355,6 +393,14 @@ if [[ $# -gt 0 ]]; then
     done
     if [[ $changed_rc -ne 0 ]]; then
         NOTES+=("which files this branch changed: the line above states why this run could not read them, so this run names no unchecked change of its own")
+        # One gate below decides from the same ref this derivation could not read, and it
+        # reads an unresolvable range as an empty diff rather than as an error:
+        # `scripts/check-cross-layer.sh` sets its range to `origin/main...HEAD`, runs
+        # `git diff "$DIFF_RANGE" … 2>/dev/null || true`, and on the empty result prints
+        # "PASSED: Cross-layer check not applicable." and exits 0. A checkout that
+        # resolves no `origin/main` therefore contributes that gate's pass to the count
+        # below over code the gate never read, and no other line of this output says so.
+        NOTES+=("scripts/check-cross-layer.sh, for the whole of this run: that gate diffs against origin/main, this checkout resolves no such ref, and the gate reads the empty diff a missing ref yields as 'not applicable' and exits 0, so its pass in the gate count below covers no line of this branch")
     else
         # A caller-named set narrower than the branch's own edits compiles less than the
         # branch changed. The caller asked for that set, and no other line of this output
@@ -430,8 +476,8 @@ UNRUN_LANES=(
     "bindings/kotlin/|ktlint, detekt and the Gradle test task, which the kotlin-lint and kotlin-test jobs of .github/workflows/ci.yml run"
     "bindings/swift/|SwiftLint, SwiftFormat and swift build, which the swift-lint and swift-build-test jobs of .github/workflows/ci.yml run"
     "fuzz/|cargo check inside fuzz/ on the nightly fuzz/rust-toolchain.toml names, which the fuzz-build job of .github/workflows/ci.yml runs"
-    ".github/|scripts/tests/ci-gate/run-tests.sh and scripts/tests/signing-guard/run-tests.sh, which the ci-workflow-selftest job of .github/workflows/ci.yml runs. One gate this run did start, scripts/check-workflow-compile-steps.py, read these files for its cache-group and bindgen rules alone"
-    "scripts/|scripts/tests/ci-gate/run-tests.sh, scripts/tests/toolchain-wiring/run-tests.sh, scripts/tests/workflow-compile-steps/run-tests.sh and scripts/tests/fix-round-check/run-tests.sh, which the ci-workflow-selftest, toolchain-wiring and fix-round-check-selftest jobs of .github/workflows/ci.yml run"
+    ".github/|scripts/tests/ci-gate/run-tests.sh and scripts/tests/signing-guard/run-tests.sh, which the ci-workflow-selftest job of .github/workflows/ci.yml runs. Three gates this run did start read a workflow file, each for rules of its own and none as coverage of a workflow edit: scripts/check-workflow-compile-steps.py reads every workflow for its cache-group and bindgen rules, scripts/check-toolchain-wiring.sh reads them for its container-build and paths-filter rules, and scripts/check-shipped-feature-graph.sh reads build-matrix.yml and release.yml for the cargo invocations that ship an artifact"
+    "scripts/|the eleven suites that .github/workflows/ci.yml runs over this directory: scripts/tests/cross-layer/run-tests.sh in the cross-layer job, scripts/tests/bridge-symmetry/run-tests.sh and scripts/tests/enforcement-files-hook/run-tests.sh in the bridge-symmetry job, scripts/test_check_sdk_coverage.py and scripts/tests/call-invariants/ in the sdk-coverage job, scripts/tests/toolchain-wiring/run-tests.sh and scripts/tests/workflow-compile-steps/run-tests.sh in the toolchain-wiring job, scripts/tests/fix-round-check/run-tests.sh in the fix-round-check-selftest job, scripts/tests/agent-verdict-criterion/run-tests.sh in the agent-verdict-criterion job, and scripts/tests/ci-gate/run-tests.sh and scripts/tests/signing-guard/run-tests.sh in the ci-workflow-selftest job. Running a gate below against this repository's own files is not running that gate's fixture suite, which is the program that proves the gate still rejects what it exists to reject"
 )
 
 if [[ $changed_rc -eq 0 ]]; then
@@ -491,14 +537,79 @@ CI_FEATURES=(
     scp-ffi-uniffi/outlet-capability-test-grant
 )
 
-# Packages a cargo command in `.github/workflows/ci.yml` compiles under a feature the
-# workspace command does not activate.
+# ── The features a sibling manifest activates on a selected package ──────────────────
+#
+# `cargo clippy --workspace --all-targets`, the command the `rust-clippy` job of
+# `.github/workflows/ci.yml` runs, resolves one feature set across all 26 members, so a
+# non-default feature that ANY member's dependency declaration requests is on for that
+# dependency. `cargo check -p <crate> --all-targets` resolves that crate and its own
+# dependencies alone, so none of those sibling requests reaches it, and every module the
+# feature gates compiles in CI and nowhere in this run.
+#
+# Measured against this workspace on 2026-09-14: `crates/scp-platform/src/lib.rs` gates
+# seven modules on `apple`, `encrypting`, `file`, `filesystem`, `sqlite` and `sync`, its
+# manifest declares no `default` key at all, and `crates/scp-ffi/Cargo.toml`,
+# `crates/scp-node/Cargo.toml`, `crates/scp-ffi/napi/Cargo.toml` and
+# `crates/scp-ffi/uniffi/Cargo.toml` each request a subset of those features. An earlier
+# revision selected features from a hand-written list of the `--features` strings CI's
+# commands name literally, which admitted none of them: an edit to
+# `crates/scp-platform/src/sqlite.rs` produced `cargo check -p scp-platform --all-targets`
+# with no feature at all, rustc read zero lines of the edited file, and the run printed
+# `compile ok`. Seven packages took that shape — scp-platform, scp-transport, scp-core,
+# scp-node, scp-dht, scp-identity and scp-ffi-common.
+#
+# WHICH DECLARATIONS COUNT, and why each restriction. The helper below unions the
+# `features` array of every dependency declaration of every workspace member that names a
+# selected package and that is neither optional nor target-specific. An optional
+# declaration contributes nothing until the feature that enables it is on, and a
+# target-specific one contributes nothing on a platform the build is not for, so counting
+# either would activate a feature the workspace command leaves off and report a failure
+# the merge gate never asks about. This workspace holds no target-specific declaration of
+# a member today, and the restriction is written for the one added tomorrow.
+#
+# Dev-dependency declarations DO count: `--all-targets` builds every test target, and
+# cargo's v2 resolver unifies a dev-dependency's features with a normal dependency's for
+# the build that compiles those targets.
+#
+# WHEN THIS CANNOT BE READ. The `cargo metadata` call above carries a 60-second bound, and
+# the interpreter below may be absent. Either way this run compiles a narrower feature set
+# than CI, so it records a NOT CHECKED line naming that rather than passing silently.
+SIBLING_FEATURE_READER=$(cat <<'PYEOF'
+import json
+import sys
+
+try:
+    meta = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+packages = meta.get("packages")
+if not packages:
+    sys.exit(1)
+selected = set(sys.argv[1:])
+found = {}
+for package in packages:
+    for dep in package.get("dependencies", []):
+        name = dep.get("name")
+        if name not in selected:
+            continue
+        if dep.get("optional") or dep.get("target"):
+            continue
+        for feature in dep.get("features", []):
+            found.setdefault(name, set()).add(feature)
+for name in sorted(found):
+    for feature in sorted(found[name]):
+        print("%s/%s" % (name, feature))
+PYEOF
+)
+
+# Packages a cargo command in `.github/workflows/ci.yml` compiles under a feature that
+# neither the workspace command nor a sibling manifest activates.
 #
 # THE CRITERION for this list: no `default` entry of the package's manifest activates the
-# feature, and a cargo command in that workflow names it, so the module the feature gates
-# compiles in CI and never in the `cargo check` above. The `rust-clippy` job records what
-# the gap costs, on the command this list's first entry mirrors: the optional transports
-# "rotted undetected for months (the quic feature stopped compiling)".
+# feature, no workspace member's dependency declaration requests it — which is the set the
+# helper above computes — and a cargo command in that workflow names it. The `rust-clippy`
+# job records what the gap costs, on the command this list's first entry mirrors: the
+# optional transports "rotted undetected for months (the quic feature stopped compiling)".
 #
 # Each entry runs as its own `cargo check`, the way CI runs each as its own command. One
 # invocation carrying every feature would resolve a feature unification no CI command
@@ -563,6 +674,31 @@ else
         done
     done
 
+    # The sibling half of the feature set, appended to the command-line half above. A
+    # feature both halves name is added once, because a reader compares this command
+    # against the workflow's and a repeated name reads as a second activation.
+    sibling_rc=0
+    sibling_out=""
+    if [[ $metadata_rc -ne 0 ]]; then
+        sibling_rc=1
+    else
+        sibling_out=$(printf '%s' "$metadata" | "$PYTHON" -c "$SIBLING_FEATURE_READER" "${CRATES[@]}" 2>/dev/null) || sibling_rc=$?
+    fi
+    if [[ $sibling_rc -eq 0 ]]; then
+        while IFS= read -r f; do
+            [[ -n $f ]] || continue
+            seen=0
+            for s in ${SELECTED_FEATURES[@]+"${SELECTED_FEATURES[@]}"}; do
+                [[ $s == "$f" ]] && seen=1 && break
+            done
+            [[ $seen -eq 0 ]] && SELECTED_FEATURES+=("$f")
+        done <<< "$sibling_out"
+    elif [[ $metadata_rc -ne 0 ]]; then
+        NOTES+=("the features a sibling manifest activates on $crate_list: the cargo metadata call this script makes did not answer, for the reason the target-directory clause of the summary above gives, so this run read no dependency declaration and compiled the packages above under their own default features and the CI command line alone. The rust-clippy job of .github/workflows/ci.yml resolves one feature set across all 26 members, so every module gated on a feature another member requests compiled nowhere in this run")
+    else
+        NOTES+=("the features a sibling manifest activates on $crate_list: $PYTHON could not read the dependency declarations out of cargo metadata's output, so this run compiled the packages above under their own default features and the CI command line alone. The rust-clippy job of .github/workflows/ci.yml resolves one feature set across all 26 members, so every module gated on a feature another member requests compiled nowhere in this run")
+    fi
+
     if [[ ${#SELECTED_FEATURES[@]} -gt 0 ]]; then
         feature_arg=$(IFS=,; printf '%s' "${SELECTED_FEATURES[*]}")
         run_step compile cargo check "${PKG_ARGS[@]}" --all-targets --features "$feature_arg"
@@ -617,9 +753,11 @@ run_step format cargo fmt --all -- --check
 # gate that compiles or links belongs to CI, which runs it on the pushed head.
 #
 # WHAT THIS LIST HOLDS, against the repository: `scripts/` holds 31 files named
-# `check-*`. This list names 29 of them. `scripts/check-resolved-rustc.sh` is the
-# toolchain precondition this script runs before any cargo command, above, rather than one
-# gate among these. The 31st is the one the criterion above excludes, named next.
+# `check-*`. This list names 29 of them, and GATES_NOT_RUN below names the other two with
+# the reason each is absent. Neither count is load-bearing: the loop below globs
+# `scripts/check-*` off the disk and fails the run on any file neither array names, so a
+# gate this repository gains and this list does not reports itself instead of going
+# unnoticed.
 #
 # THE ONE GATE THIS LIST LEAVES OUT, and the measurement that decided it.
 # `scripts/check-pure-helpers.sh` runs `cargo test -p scp-testing --test ffi_conformance`,
@@ -671,8 +809,24 @@ GATES=(
     scripts/check-workflow-compile-steps.py
 )
 
-PYTHON=python3.12
-command -v "$PYTHON" >/dev/null 2>&1 || PYTHON=python3
+# The `scripts/check-*` files this run deliberately does not execute, each with the reason
+# the paragraphs above give in full.
+#
+# WHY THIS ARRAY EXISTS RATHER THAN THE PROSE ALONE. GATES above is written by hand, and a
+# hand-written list of a directory's contents goes stale the first time someone adds a file
+# to that directory. The loop below reads `scripts/check-*` off the disk and rejects any
+# entry that neither array names, so a gate added to this repository and not to this list
+# fails the next fix round with the path it has to be added to, rather than being absent
+# from a run that reports `gates N/N passed` and reads as a complete enforcement set. The
+# count in that summary line comes from GATES, so nothing inside it can report this gap.
+GATES_NOT_RUN=(
+    # The toolchain precondition this script runs before any cargo command, above.
+    scripts/check-resolved-rustc.sh
+    # Runs `cargo test -p scp-testing --test ffi_conformance`, which links a test binary
+    # and takes the shared target directory's build lock, for the reason and the
+    # measurement the paragraph above gives. Its own CI job runs the underlying test.
+    scripts/check-pure-helpers.sh
+)
 
 # `scripts/check-workflow-compile-steps.py` imports PyYAML, which the standard library does
 # not carry, so an interpreter without it fails that gate for a missing library rather than
@@ -686,6 +840,22 @@ fi
 gates_t0=$(date +%s)
 gate_failures=0
 gate_ran=0
+
+# The closure check for the two arrays above, run before the gates themselves so its
+# failure reaches the same count and the same exit code. An unclassified `scripts/check-*`
+# file is a gate this run did not start and did not name, which is the one failure the
+# gate count cannot express.
+for f in scripts/check-*; do
+    [[ -f $f ]] || continue
+    classified=0
+    for g in "${GATES[@]}" "${GATES_NOT_RUN[@]}"; do
+        [[ $g == "$f" ]] && classified=1 && break
+    done
+    [[ $classified -eq 1 ]] && continue
+    printf '  UNCLASSIFIED %s — this repository holds an enforcement gate that the GATES array of scripts/fix-round-check.sh does not run and its GATES_NOT_RUN array does not excuse, so this run neither started it nor named it. Add the path to one of those two arrays.\n' "$f" >&2
+    gate_failures=$((gate_failures + 1))
+done
+
 printf '\n── gates: %d enforcement scripts that compile nothing and take no build lock\n' "${#GATES[@]}"
 for g in "${GATES[@]}"; do
     if [[ ! -f $g ]]; then

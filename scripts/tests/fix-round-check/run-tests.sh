@@ -51,10 +51,17 @@
 #     half of the same branch: the run skips the compile step, names in its summary that the
 #     branch changed no file inside a workspace crate, and exits 0.
 #
-#   * THE MISSING GATE. A gate the runner's list names but the repository does not hold has
-#     to fail the run. Case 3 runs against this repository, where all 29 exist, so it cannot
-#     reach that branch. Case 10 deletes one gate from a fixture and asserts that the run
-#     names it and exits non-zero.
+#   * THE GATE LIST AGAINST THE REPOSITORY, in both directions. A gate the runner's list
+#     names and the repository does not hold has to fail the run, and so does a
+#     `scripts/check-*` file the repository holds and neither of the runner's two arrays
+#     names. Case 3 runs against this repository, where every gate the list names exists
+#     and every check script is classified, so it reaches neither branch. Case 10 deletes
+#     one gate from a fixture and asserts that the run names it and exits non-zero. Case 20
+#     adds a check script to a fixture and asserts the same, which is the direction nothing
+#     inside the runner's summary can report: both halves of the `N/N` it prints come from
+#     its own GATES array, so a gate missing from that array shortens the pair rather than
+#     failing the run. Case 3's assertion reads that count out of the array for the same
+#     reason, rather than writing the literal.
 #
 #   * THE CHANGES THE RUNNER READS NO FILE OF. Cases 7, 8, 9 and 10 cover what the runner
 #     compiles. Cases 11 through 15 cover what it says about what it did not compile,
@@ -93,6 +100,32 @@
 #     Case 17 changes a workflow file and asserts that the summary names the two suites
 #     the `ci-workflow-selftest` job runs over it. One gate the runner holds reads
 #     workflow files for two rules of its own, which is not coverage of that edit.
+#
+#     Case 22 answers `cargo metadata` with an object holding no package list and asserts
+#     that the summary names the feature set the compile step could not read, because a
+#     run that activates a narrower feature set than the merge gate resolves and prints
+#     `compile ok` says nothing about the modules it skipped.
+#
+#     Case 23 reads every suite invocation out of `.github/workflows/ci.yml` and asserts
+#     that the `scripts/` entry of UNRUN_LANES names each one. That entry is what a fix
+#     agent editing an enforcement gate acts on, and a suite absent from it is a red CI
+#     job the runner's output gave the agent no reason to expect.
+#
+#   * THE MOVE BETWEEN CRATES. Git reports a rename as one filepair, so a runner that
+#     reads `git status --porcelain` or `git diff --name-only` without `--no-renames` sees
+#     the destination path alone and derives the destination package alone. Case 18
+#     commits a move from one crate directory to another and case 19 leaves the same move
+#     staged, and each asserts that both packages reach the derived set. Without them, a
+#     round that moves a module leaves the origin crate's dangling `mod` item uncompiled
+#     under a green verdict.
+#
+#   * THE FEATURES NO COMMAND LINE NAMES. `cargo clippy --workspace` resolves one feature
+#     set across every member, and `cargo check -p <crate>` resolves that crate alone, so
+#     a feature a sibling manifest requests is on in CI and off here. Case 21 answers
+#     `cargo metadata` with three declarations of one dependency and asserts that the
+#     compile command carries the features of the plain declaration and neither the
+#     optional nor the target-specific one, because the workspace command activates
+#     neither of those two either.
 #
 # WHAT THE STUBS REPLACE, and what stays real. The cases replace `cargo`, `rustc`, and
 # `rustup` with scripts on a PATH this harness leads with, because the contract clauses
@@ -226,7 +259,19 @@ printf '%s\n' "\$*" >> "$dir/cargo.log"
 case "\$1" in
     check) exit $cargo_check_rc ;;
     fmt) exit $cargo_fmt_rc ;;
-    metadata) printf '{"version":1,"target_directory":"$dir/stub-target-dir"}\n'; exit 0 ;;
+    metadata)
+        # The runner reads two things out of this answer: the target directory its summary
+        # names, and the dependency declarations its compile step derives a feature set
+        # from. A case that wants the second writes its own JSON to metadata.json beside
+        # these stubs; every other case gets the object below, which carries no package
+        # list and drives the runner's "this run could not read them" branch.
+        if [[ -f "$dir/metadata.json" ]]; then
+            cat "$dir/metadata.json"
+        else
+            printf '{"version":1,"target_directory":"$dir/stub-target-dir"}\n'
+        fi
+        exit 0
+        ;;
 esac
 # Delegating means removing this directory from PATH first. The cargo on PATH here is a
 # mise shim, and a shim re-resolves its tool through PATH, so a stub that kept itself on
@@ -412,10 +457,15 @@ if grep -q 'format ok' "$WORK/passing/out.txt"; then
 else
     report "case 3 names the format step as passing" 1 "the summary holds no 'format ok': $(tail -n 3 "$WORK/passing/out.txt")"
 fi
-if grep -q 'gates 29/29 passed' "$WORK/passing/out.txt"; then
-    report "case 3 ran all 29 gates against this repository" 0 ""
+# The expected count is read out of the runner's own GATES array rather than written here,
+# so this assertion reports a gate the array lost. Writing the literal would let a deletion
+# from that array satisfy this case: both halves of the `N/N` the runner prints come from
+# the array's own length, so a shorter array prints a shorter pair that still matches.
+GATE_COUNT=$(gate_paths | wc -l | tr -d ' ')
+if grep -q "gates $GATE_COUNT/$GATE_COUNT passed" "$WORK/passing/out.txt"; then
+    report "case 3 ran all $GATE_COUNT gates against this repository" 0 ""
 else
-    report "case 3 ran all 29 gates against this repository" 1 "the summary holds no 'gates 29/29 passed': $(tail -n 3 "$WORK/passing/out.txt")"
+    report "case 3 ran all $GATE_COUNT gates against this repository" 1 "the summary holds no 'gates $GATE_COUNT/$GATE_COUNT passed': $(tail -n 3 "$WORK/passing/out.txt")"
 fi
 
 # ── Case 5: the format step's failure reaches the exit code ──────────────────────────
@@ -650,7 +700,7 @@ fi
 # files under `bindings/`, so a summary that named only its two cargo omissions would tell
 # a fix agent editing `bindings/python/` that CI has nothing left to reject.
 #
-# The mutation it kills: deleting the LANGUAGE_LANES loop from
+# The mutation it kills: deleting the UNRUN_LANES loop from
 # `scripts/fix-round-check.sh` leaves the run exiting 0 with no line about the directory it
 # read no file of, and every other assertion in this file still passes.
 FIXTURE12="$WORK/bindings-only"
@@ -829,6 +879,190 @@ if grep -qF 'ci-workflow-selftest job' "$FIXTURE17.harness/out.txt"; then
     report "case 17 names the suites and the CI job that runs them" 0 ""
 else
     report "case 17 names the suites and the CI job that runs them" 1 "the NOT CHECKED line names no job: $(tail -n 5 "$FIXTURE17.harness/out.txt")"
+fi
+
+# ── Case 18: a file moved from one crate to another ──────────────────────────────────
+#
+# Git reports a rename as one filepair, so `git status --porcelain` prints
+# `R  <origin> -> <destination>` and `git diff --name-only` prints the destination alone.
+# A runner that read either without `--no-renames` derives the destination package by
+# itself: the origin package keeps a `mod` item naming a file it no longer holds, this run
+# compiles none of it, no NOT CHECKED line names it, and the run exits 0 — a green verdict
+# over a branch the merge gate rejects.
+#
+# The mutation it kills: dropping `--no-renames` from either half of `changed_files` in
+# `scripts/fix-round-check.sh` leaves `scp-ffi` out of the derived set, and every other
+# assertion in this file still passes. Both halves are exercised, because git loses the
+# origin path in a different place for each: this case commits the move, and case 19
+# leaves it staged.
+FIXTURE18="$WORK/committed-rename"
+build_fixture "$FIXTURE18"
+git -C "$FIXTURE18" mv crates/scp-ffi/src/lib.rs crates/scp-clock/src/moved.rs
+git -C "$FIXTURE18" -c user.email=fix-round-check@example.invalid -c user.name='fix-round-check tests' \
+    commit -q --no-gpg-sign --no-verify -m 'fixture rename'
+run_fixture "$FIXTURE18"
+rc=$(cat "$FIXTURE18.harness/rc.txt")
+if [[ $rc -eq 0 ]]; then
+    report "case 18 exits 0 when both sides of a committed rename compile" 0 ""
+else
+    report "case 18 exits 0 when both sides of a committed rename compile" 1 "the script exited $rc; output tail: $(tail -n 6 "$FIXTURE18.harness/out.txt")"
+fi
+if grep -qF 'crates scp-clock scp-ffi (derived from the files this branch changed)' "$FIXTURE18.harness/out.txt"; then
+    report "case 18 derives the crate a committed rename moved the file out of" 0 ""
+else
+    report "case 18 derives the crate a committed rename moved the file out of" 1 "the summary names another crate set: $(tail -n 3 "$FIXTURE18.harness/out.txt")"
+fi
+if grep -qF 'check -p scp-clock -p scp-ffi --all-targets' "$FIXTURE18.harness/cargo.log"; then
+    report "case 18 compiles both sides of the move" 0 ""
+else
+    report "case 18 compiles both sides of the move" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE18.harness/cargo.log")"
+fi
+
+# ── Case 19: a staged move the working-tree half has to report ───────────────────────
+#
+# Case 18 covers the `git diff` half of `changed_files`. This one covers the
+# `git status --porcelain` half, which is the half a fix round hits: an agent stages a
+# move and runs this script before committing.
+FIXTURE19="$WORK/staged-rename"
+build_fixture "$FIXTURE19"
+git -C "$FIXTURE19" mv crates/scp-ffi/src/lib.rs crates/scp-clock/src/moved.rs
+run_fixture "$FIXTURE19"
+if grep -qF 'crates scp-clock scp-ffi (derived from the files this branch changed)' "$FIXTURE19.harness/out.txt"; then
+    report "case 19 derives the crate a staged rename moved the file out of" 0 ""
+else
+    report "case 19 derives the crate a staged rename moved the file out of" 1 "the summary names another crate set: $(tail -n 3 "$FIXTURE19.harness/out.txt")"
+fi
+
+# ── Case 20: an enforcement gate the runner's list does not classify ─────────────────
+#
+# The GATES array of `scripts/fix-round-check.sh` is written by hand, and both halves of
+# the `N/N` it prints come from that array's own length, so nothing inside that summary
+# can report a gate the repository holds and the array lost. A fix round that read
+# `gates N/N passed` would take it for the enforcement set and push into the job that runs
+# the gate nobody added.
+#
+# The mutation it kills: deleting the `scripts/check-*` loop from
+# `scripts/fix-round-check.sh` lets the unclassified gate below go unrun and unnamed, and
+# every other assertion in this file still passes.
+FIXTURE20="$WORK/unclassified-gate"
+build_fixture "$FIXTURE20"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$FIXTURE20/scripts/check-brand-new-rule.sh"
+run_fixture "$FIXTURE20"
+rc=$(cat "$FIXTURE20.harness/rc.txt")
+if [[ $rc -eq 0 ]]; then
+    report "case 20 exits non-zero on a check script neither array names" 1 "the script exited 0; output tail: $(tail -n 6 "$FIXTURE20.harness/out.txt")"
+else
+    report "case 20 exits non-zero on a check script neither array names" 0 ""
+fi
+if grep -qF 'UNCLASSIFIED scripts/check-brand-new-rule.sh' "$FIXTURE20.harness/out.txt"; then
+    report "case 20 names the gate it neither ran nor excused" 0 ""
+else
+    report "case 20 names the gate it neither ran nor excused" 1 "the output never names the unclassified gate: $(tail -n 5 "$FIXTURE20.harness/out.txt")"
+fi
+
+# ── Case 21: the features a sibling manifest activates on the selected package ───────
+#
+# `cargo clippy --workspace` resolves one feature set across every member, so a
+# non-default feature that any member's dependency declaration requests is on for that
+# dependency. `cargo check -p <crate>` resolves that crate alone and activates none of
+# them, so a module gated on such a feature compiles in CI and nowhere in a fix round.
+# Measured against this workspace: `crates/scp-platform/src/lib.rs` gates seven modules on
+# features four sibling manifests request and no CI command names literally.
+#
+# The fixture's metadata answer carries three declarations of the same dependency, so this
+# case pins the restriction as well as the rule: the plain one contributes, and the
+# optional one and the target-specific one contribute nothing, because the workspace
+# command activates neither and compiling under them would report a failure the merge gate
+# never asks about.
+#
+# The mutation it kills: deleting the SIBLING_FEATURE_READER block from
+# `scripts/fix-round-check.sh` leaves the run issuing a featureless `cargo check` over a
+# package whose gated modules it then compiles no line of, and every other assertion in
+# this file still passes.
+FIXTURE21="$WORK/sibling-features"
+build_fixture "$FIXTURE21"
+fixture_commit "$FIXTURE21" crates/scp-clock/src/lib.rs
+HARNESS21="$FIXTURE21.harness"
+write_stubs "$HARNESS21" "$PIN_CHANNEL" 0 0 ""
+cat > "$HARNESS21/metadata.json" <<'JSON'
+{"version":1,"target_directory":"/stub-target-dir","packages":[
+ {"name":"scp-clock","dependencies":[]},
+ {"name":"scp-ffi","dependencies":[
+  {"name":"scp-clock","features":["sqlite","apple"],"optional":false,"target":null},
+  {"name":"scp-clock","features":["only-when-optional"],"optional":true,"target":null},
+  {"name":"scp-clock","features":["only-on-ios"],"optional":false,"target":"cfg(target_os = \"ios\")"}
+ ]}
+]}
+JSON
+PATH="$HARNESS21/bin:$PATH" bash "$FIXTURE21/scripts/fix-round-check.sh" > "$HARNESS21/out.txt" 2>&1
+printf '%s' $? > "$HARNESS21/rc.txt"
+if grep -qF 'check -p scp-clock --all-targets --features scp-clock/apple,scp-clock/sqlite' "$HARNESS21/cargo.log"; then
+    report "case 21 compiles the package under the features a sibling manifest requests" 0 ""
+else
+    report "case 21 compiles the package under the features a sibling manifest requests" 1 "the stub cargo log holds: $(tr '\n' '|' < "$HARNESS21/cargo.log")"
+fi
+if grep -qF 'only-when-optional' "$HARNESS21/cargo.log"; then
+    report "case 21 activates no feature an optional declaration alone requests" 1 "the stub cargo log holds: $(tr '\n' '|' < "$HARNESS21/cargo.log")"
+else
+    report "case 21 activates no feature an optional declaration alone requests" 0 ""
+fi
+if grep -qF 'only-on-ios' "$HARNESS21/cargo.log"; then
+    report "case 21 activates no feature a target-specific declaration alone requests" 1 "the stub cargo log holds: $(tr '\n' '|' < "$HARNESS21/cargo.log")"
+else
+    report "case 21 activates no feature a target-specific declaration alone requests" 0 ""
+fi
+
+# ── Case 22: the run that could not read those declarations says so ──────────────────
+#
+# Case 21 covers the run that read them. `cargo metadata` carries a 60-second bound and
+# the interpreter that parses its output may be absent, and either way the compile step
+# activates a narrower feature set than the merge gate resolves. Reporting `compile ok`
+# over that difference without a line naming it is the shape this whole runner exists to
+# prevent, so the fixture below answers `cargo metadata` with an object holding no package
+# list and this case asserts the line.
+#
+# The mutation it kills: deleting the two NOTES branches beside the SIBLING_FEATURE_READER
+# call leaves that run silent about the features it did not activate.
+FIXTURE22="$WORK/unreadable-metadata"
+build_fixture "$FIXTURE22"
+fixture_commit "$FIXTURE22" crates/scp-clock/src/lib.rs
+run_fixture "$FIXTURE22"
+if grep -qF 'NOT CHECKED — the features a sibling manifest activates on scp-clock' "$FIXTURE22.harness/out.txt"; then
+    report "case 22 names the feature set it could not read" 0 ""
+else
+    report "case 22 names the feature set it could not read" 1 "the output holds no NOT CHECKED line for the sibling feature set: $(tail -n 5 "$FIXTURE22.harness/out.txt")"
+fi
+
+# ── Case 23: the scripts/ lane against the suites CI runs over that directory ────────
+#
+# The `scripts/` entry of UNRUN_LANES is a hand-written enumeration, and a fix agent that
+# edits an enforcement gate acts on it: the runner starts that gate against a clean tree,
+# the gate passes, and the only program that proves the gate still rejects what it exists
+# to reject is the fixture suite that entry names. A suite the entry omits is a red CI job
+# the output gave the agent no reason to expect.
+#
+# This case reads every suite invocation out of `.github/workflows/ci.yml` and fails when
+# the entry names fewer, so adding a suite to CI without adding it there turns this case
+# red rather than going unnoticed.
+LANE_LINE=$(sed -n '/^UNRUN_LANES=(/,/^)/p' "$SCRIPT" | grep -F '"scripts/|')
+LANE_MISSING=""
+while IFS= read -r suite; do
+    [[ -n $suite ]] || continue
+    case $LANE_LINE in
+        *"$suite"*) ;;
+        *) LANE_MISSING+=" $suite" ;;
+    esac
+done < <(grep -oE 'run: *(bash|python3\.12 -m pytest) +scripts/[^ ]+' "$REPO_ROOT/.github/workflows/ci.yml" |
+    sed -E 's/^.* //' | sort -u)
+if [[ -z $LANE_MISSING ]]; then
+    report "case 23 names every suite CI runs over scripts/ in the scripts/ lane" 0 ""
+else
+    report "case 23 names every suite CI runs over scripts/ in the scripts/ lane" 1 "the scripts/ entry of UNRUN_LANES omits:$LANE_MISSING"
+fi
+if [[ -n $LANE_LINE ]]; then
+    report "case 23 found the scripts/ entry it reads" 0 ""
+else
+    report "case 23 found the scripts/ entry it reads" 1 "scripts/fix-round-check.sh holds no UNRUN_LANES entry beginning \"scripts/|\", so the assertion above read an empty string and could not fail"
 fi
 
 printf '\n'
