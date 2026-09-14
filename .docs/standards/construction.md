@@ -144,6 +144,8 @@ Three names, three jobs, so a reader never conflates them:
 
 **`IdentityBackendSlot` and `KeyCustodySlot` are the same selector shape for the other two capabilities**, and `IdentityConfig` requires both. `IdentityBackendSlot` carries one named variant, `RelayNetwork`, the `IdentityBackend` of `03-identity.md` §3.10.10 over the SCP relay network, plus the Rust-only `Custom(concrete)`; ADR-063 removed the did:dht backend, so no second named variant exists and a selector with one named variant still states the choice rather than defaulting it. `KeyCustodySlot` carries three named variants plus `Custom(concrete)`: **`Platform`**, the operating system's own key store, which is the Secure Enclave, the Android Keystore or WebCrypto according to the platform; **`File`**, a software key in an encrypted file, which is `FileKeyCustody`; and **`Hardware`**, a key under a separate principal the operational path holds no grant to assume, which is an HSM. `17-persistence-and-storage.md` §17.8's platform table states which substrate each variant selects on each platform, and states no variant name of its own. Each bridge mirrors both as `IdentityBackendConfig` and `KeyCustodyConfig`, omitting `Custom(concrete)` for the reason above.
 
+**`PaymentAdapterSlot` is the same selector shape for the fourth capability**, and `IdentityConfig` carries it as an `Option`. Its named variants are the payment adapters `19-economic-governance.md` §19.2.7 registers, plus the Rust-only `Custom(concrete)` carrying a caller-supplied `PaymentAdapter`. Each bridge mirrors it as **`PaymentAdapterConfig`**, omitting `Custom(concrete)` for the reason `StorageConfig` omits it. The slot is `Option` rather than required because a relay that charges nothing needs no adapter, and **`None` is the fail-safe default**: with no adapter the backend attaches no `payment_receipt`, a charging relay refuses `Payment`, and that entry appears in `PublishOutcome`'s per-entry list as a refusal a caller can act on (`03-identity.md` §3.10.10). Minting a payment is never reached by omission.
+
 All core shapes use `StorageSlot`; the bridges mirror it as `StorageConfig`. These are the same selector at two layers, not two different concepts.
 
 ## Per-entry-point target shapes
@@ -218,6 +220,7 @@ IdentityConfig<S> {                       // generic over the storage type S, ex
     backend: IdentityBackendSlot,         // required
     custody: KeyCustodySlot,              // required
     persistence: Option<StorageSlot<S>>,  // None = ephemeral identity (fail-safe default; M2). Some(slot) carries S, giving the EncryptedStorage bound somewhere to attach: on the production `Identity::create<S: EncryptedStorage>` path the slot is EncryptedStorage-bound — persisting is encrypted-only, the same seal as `Node::start`.
+    payment: Option<PaymentAdapterSlot>,  // None = no adapter (fail-safe default). Some(slot) names the adapter the backend mints a `payment_receipt` through for a relay that declares a price (09 §9.7.4.2 R9).
 }
 ```
 

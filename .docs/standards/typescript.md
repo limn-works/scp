@@ -77,7 +77,7 @@ async *receive(): AsyncIterable<Message>;
 
 ### Enum members of a name-bound enumeration
 
-A name-bound enumeration is one `09-security-model.md` §9.7.4.2's definitions state the criterion for: its type name and every variant name are identical in every SDK binding. **TypeScript takes the specification's own spelling for an enum member**, which is what `.docs/standards/conventions.md`'s naming table states for every language, and takes neither `camelCase`, nor `SCREAMING_SNAKE_CASE`, nor a string-literal union:
+A name-bound enumeration is one `09-security-model.md` §9.7.4.2's definitions state the criterion for: its type name and every variant name are identical in every SDK binding. `.docs/standards/conventions.md`'s naming table carries the one mapping that decides the spelling, and this section shows what a TypeScript author writes under it: **a `const` enum member whose name and whose string value are both the specification's own spelling**, and neither `camelCase`, nor `SCREAMING_SNAKE_CASE`, nor a bare string-literal union:
 
 ```ts
 export enum HeadProvenance {
@@ -87,7 +87,7 @@ export enum HeadProvenance {
 }
 ```
 
-TypeScript fixes no single convention for enum members, so a rule naming none here would leave `WitnessRead`, `witnessRead`, `WITNESS_READ` and the string-literal union `'WitnessRead'` all defensible for one variant. `.docs/standards/conventions.md`'s naming table is where the mapping lives, and this section states no per-language spelling of its own.
+TypeScript fixes no single convention for enum members, so a rule naming none would leave `WitnessRead`, `witnessRead`, `WITNESS_READ` and the string-literal union `'WitnessRead'` all defensible for one variant, and a conformance fixture comparing a variant across languages would compare two strings. Writing the member's name and its value as one spelling makes the value a TypeScript author serializes identical to the name a Rust author matches on.
 
 ### Naming
 
