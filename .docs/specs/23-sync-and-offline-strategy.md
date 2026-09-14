@@ -59,6 +59,8 @@ On reconnection (at least one relay WebSocket connection re-established), the SD
 
 Each context is synced concurrently, with an overall timeout (RECOMMENDED default: **120 seconds**, configurable via `SyncPolicy`). Contexts that timeout are marked as `Failed`.
 
+**The identity's own self-check runs beside these six phases and is not one of them.** `09-security-model.md` §9.7.4.2 R10 obliges the SDK to fetch its own identity's key-event log on every launch and at the witnessing interval its key state names. **Where that fetch shows a fallback-set entry holding no record for this identity, the SDK re-publishes its chain and its service record to that entry**, which is how an identity a relay's ring buffer displaced returns to that relay (R9). The six phases above reconcile context state and reach no identity record.
+
 ## 23.4 MLS Epoch Catch-Up (Tier 1 and Tier 2)
 
 MLS requires sequential epoch processing -- each Commit depends on the previous epoch's key schedule. An offline member at epoch E who reconnects to find the group at epoch E+N must process all N intermediate Commits in order.
