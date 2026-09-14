@@ -397,9 +397,13 @@ cargo deny check
 # same job exited 0 over 271 unresolved links in the other crate directories.
 # The `--features` list is the one job `rust-doc` passes: four intra-doc links
 # in `crates/scp-node` name items that exist only under those features, so a run
-# omitting the list exits 101 on an unmodified `main`.
+# omitting the list exits 101 on an unmodified `main`. The last two members are
+# not test gates — they compile `native/postgres_blob.rs` and `native/s3_blob.rs`
+# of `scp-transport`, which a `--workspace` resolution leaves out because
+# `scp-node` and `scp-relay` put both behind their off-by-default `cloud-blobs`
+# feature, so rustdoc reads no link either module writes without them.
 cargo doc --workspace --no-deps --document-private-items \
-  --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant
+  --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant,scp-transport/postgres-blob,scp-transport/s3-blob
 ```
 
 ## CI Matrix
