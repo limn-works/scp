@@ -368,9 +368,10 @@ assertion also selects a test that a `testing` flip leaves compiled.
   unfiltered command selects everything, a filterset carrying a difference is refused
   rather than guessed at, and `package_test_functions` separates a
   `#[cfg(not(feature = "testing"))]` test from an un-gated one in this tree — that
-  `command_unifies_testing` reads a `testing` edge out of a four-crate fixture
+  `command_unifies_testing` reads a `testing` edge out of a five-crate fixture
   workspace in each spelling (a member's
-  normal dependency, an edge reached through a `-p` package's dependency closure, a self
+  normal dependency, a `[features]` table value naming `leaf/testing`, an edge reached
+  through a `-p` package's dependency closure, a self
   dev-dependency, an `--exclude`d member a selected member still compiles) and out of
   this repository's own `crates/scp-testing/Cargo.toml` against scp-identity, while
   reporting a `-p scp-identity` build clean — that the `fuzz` and

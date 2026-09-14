@@ -67,16 +67,17 @@ pub mod builder;
 pub mod clock;
 pub mod conformance;
 pub mod fullstack;
-// `helpers` is the only module in this crate that names `scp_identity`, and the two items
-// it calls — `DidDht::with_in_memory_custody` and `DidDht::create_in_memory`, at
-// crates/scp-identity/src/dht.rs:274 and :320 — are both
-// `#[cfg(any(test, feature = "testing"))]`. Declaring the module unconditionally forced
-// `scp-identity/testing` into every build that pulls this crate as a normal dependency,
-// `scp-ffi`'s `testing` feature among them, which is how the maturin and XCFramework
-// builds of the `bridge-parity-swift` job came to resolve `scp-identity` differently from
-// each other and recompile seven shared crates. Behind the feature, the two integration
-// tests that use the module still get it — this crate's own `[dev-dependencies]` turn the
-// feature on — and no other build carries it.
+// `helpers` is the only module in this crate that names `scp_identity` or `scp_dht`, and
+// both crates compile what it calls behind a nullifier feature:
+// `DidDht::with_in_memory_custody` and `DidDht::create_in_memory` are
+// `#[cfg(any(test, feature = "testing"))]` in crates/scp-identity/src/dht.rs, and
+// `InMemoryDhtClient` is `#[cfg(feature = "testing")]` in crates/scp-dht/src/lib.rs.
+// Declaring the module unconditionally forced both features into every build that pulls
+// this crate as a normal dependency, `scp-ffi`'s `testing` feature among them, which is
+// how the maturin and XCFramework builds of the `bridge-parity-swift` job came to resolve
+// `scp-identity` differently from each other and recompile seven shared crates. Behind
+// the feature, the integration tests that use the module still get it — this crate's own
+// `[dev-dependencies]` turn the feature on — and no other build carries it.
 #[cfg(feature = "helpers")]
 pub mod helpers;
 pub mod presets;

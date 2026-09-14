@@ -1767,6 +1767,61 @@ def testing_edge(manifest: Path, package: str) -> str | None:
     return None
 
 
+def unconditional_feature_activators(
+    package: str, feature: str, manifests: set[Path]
+) -> dict[Path, str]:
+    """Return each manifest in `manifests` that turns `package`'s `feature` on
+    in every build reading that manifest, mapped to the entry that turns it on.
+
+    CRITERION: the manifest carries a dependency entry on `package` that names
+    `feature` in its `features` list and sets no `optional = true`. Cargo
+    resolves such an entry whenever it builds that manifest's own targets — for
+    a `[dev-dependencies]` entry, that package's test targets — so the
+    activation rests on no second condition this reader would have to
+    establish.
+
+    A `[features]` table value spelling `"{package}/{feature}"` is deliberately
+    NOT counted, though testing_edge counts one: that value fires only when its
+    own feature is enabled, which is the very question this reader answers.
+    Counting it would let a feature attest to its own activation, which is the
+    hole that made a positive control pass on a manifest no build read.
+    """
+    found: dict[Path, str] = {}
+    for manifest in sorted(manifests):
+        document = tomllib.loads(manifest.read_text())
+        inherited, _ = workspace_dependency_specs(manifest)
+        tables = [
+            (section, document.get(section) or {})
+            for section in DEPENDENCY_SECTIONS
+        ]
+        for cfg, target in (document.get("target") or {}).items():
+            tables += [
+                (f"target.{cfg}.{section}", target.get(section) or {})
+                for section in DEPENDENCY_SECTIONS
+            ]
+        for section, table in tables:
+            for name, spec in table.items():
+                if not isinstance(spec, dict):
+                    continue
+                features = list(spec.get("features") or [])
+                renamed = spec.get("package")
+                optional = spec.get("optional") is True
+                if spec.get("workspace") is True and isinstance(
+                    inherited.get(name), dict
+                ):
+                    features += inherited[name].get("features") or []
+                    renamed = renamed or inherited[name].get("package")
+                    optional = optional or inherited[name].get("optional") is True
+                if (renamed or name) != package or optional:
+                    continue
+                if feature in features:
+                    found[manifest] = (
+                        f"{manifest} [{section}] `{name}` names "
+                        f"`{feature}` in its `features` list"
+                    )
+    return found
+
+
 def member_manifests(root: Path) -> dict[str, Path]:
     """Return each workspace member's package name mapped to its manifest.
 
@@ -1856,9 +1911,10 @@ def command_build_manifests(
 
 def command_testing_edges(
     tokens: list[str], package: str, root: Path = REPO
-) -> dict[Path, str]:
+) -> tuple[dict[Path, str], str | None]:
     """Return EVERY manifest in this command's build that turns
-    `package/testing` on, each mapped to how it turns it on.
+    `package/testing` on, each mapped to how it turns it on, and the finding
+    for a `-p` package name no workspace member declares.
 
     CRITERION for why this reader exists beside command_unifies_testing: a
     FLOOR check needs one bit — is any edge present — and a POSITIVE CONTROL
@@ -1872,14 +1928,25 @@ def command_testing_edges(
     `scp-identity = { features = ["testing"] }` dev-dependency and sorted
     ahead of crates/scp-testing/Cargo.toml. A control written against this
     map names the manifest and cannot be moved by either event.
+
+    The second element carries command_build_manifests's unresolvable-`-p`
+    finding. An empty map alone cannot carry it: a build this reader scanned
+    and found clean returns the same empty map, so a caller reading the map
+    alone cannot tell a proven absence from a scan that never happened. Every
+    caller reports the second element rather than reading the map past it.
     """
-    manifests, _ = command_build_manifests(tokens, root)
+    manifests, unresolved = command_build_manifests(tokens, root)
+    if unresolved is not None:
+        return {}, (
+            f"no workspace member is named {unresolved}, so no manifest "
+            f"scan can prove `testing` off for its build"
+        )
     edges: dict[Path, str] = {}
     for manifest in sorted(manifests):
         edge = testing_edge(manifest, package)
         if edge is not None:
             edges[manifest] = edge
-    return edges
+    return edges, None
 
 
 def command_unifies_testing(
@@ -2295,7 +2362,7 @@ def check_testing_unification_readers() -> None:
             "command_testing_edges names every edge, not the first in sort order",
             {
                 manifest.parent.name
-                for manifest in command_testing_edges(workspace, "leaf", root)
+                for manifest in command_testing_edges(workspace, "leaf", root)[0]
             }
             == {"enabler", "implier"},
             "a reader that stops at the first edge lets a positive control "
@@ -2309,18 +2376,69 @@ def check_testing_unification_readers() -> None:
             is not None,
             "an unresolvable package must fail toward reporting a gap",
         )
+        check(
+            "command_testing_edges reports an unresolvable -p name too",
+            command_testing_edges(
+                split_command("cargo test -p ghost"), "leaf", root
+            )[1]
+            is not None,
+            "an empty edge map is what a scanned-and-clean build returns, so a "
+            "caller cannot read a proven absence out of a scan that never ran "
+            "unless this reader hands back the finding beside it",
+        )
+        fixture_manifests, _ = command_build_manifests(workspace, root)
+        check(
+            "a self dev-dependency naming a feature activates it",
+            set(
+                unconditional_feature_activators(
+                    "selfdev", "testing", fixture_manifests
+                )
+            )
+            == {(root / "selfdev" / "Cargo.toml").resolve()},
+            "selfdev's own `[dev-dependencies]` entry names `testing`, which "
+            "cargo resolves whenever it builds selfdev's test targets",
+        )
+        check(
+            "a feature no dependency entry names activates nothing",
+            unconditional_feature_activators(
+                "implier", "helpers", fixture_manifests
+            )
+            == {},
+            "implier declares `helpers` and no manifest in this workspace "
+            "turns it on, so a reader that answered otherwise would let a "
+            "positive control pass on a feature no build enables",
+        )
 
     # This repository is the live fixture for the defect this reader exists to
     # catch: the edge is real, and so is the lane that avoids it.
-    live_edges = command_testing_edges(workspace, "scp-identity")
+    live_edges, live_unresolved = command_testing_edges(workspace, "scp-identity")
+    check(
+        "the live workspace command resolves every package it selects",
+        live_unresolved is None,
+        f"got {live_unresolved!r} — an unresolved selection makes every edge "
+        f"answer below a report about a build this reader never scanned",
+    )
     scp_testing_manifest = REPO / "crates" / "scp-testing" / "Cargo.toml"
+    live_manifests, _ = command_build_manifests(workspace)
+    helpers_activators = unconditional_feature_activators(
+        "scp-testing", "helpers", live_manifests
+    )
+    # Two facts make the premise true, and testing_edge answers only the first:
+    # crates/scp-testing/Cargo.toml's `helpers` feature names
+    # "scp-identity/testing", and a manifest in this build turns `helpers` on.
+    # testing_edge counts a feature-table value unconditionally (see its
+    # docstring), so on the first fact alone this control would stay green after
+    # someone deleted the self dev-dependency at crates/scp-testing/Cargo.toml
+    # that enables `helpers` — it would read the surviving string and report a
+    # property the workspace no longer has.
     check(
         "a workspace build turns scp-identity/testing on through scp-testing",
-        scp_testing_manifest in live_edges,
-        f"got {sorted(str(manifest) for manifest in live_edges)} — "
+        scp_testing_manifest in live_edges and bool(helpers_activators),
+        f"got edges {sorted(str(manifest) for manifest in live_edges)} and "
+        f"`helpers` activators {sorted(helpers_activators.values())} — "
         f"crates/scp-testing/Cargo.toml gives its `helpers` feature the value "
-        f'"scp-identity/testing", its own `[dev-dependencies]` turn `helpers` '
-        f"on, and a reader that misses that edge re-greens pairing "
+        f'"scp-identity/testing" AND its own `[dev-dependencies]` turn '
+        f"`helpers` on, and a reader that misses either half re-greens pairing "
         f"scp-identity's assertions with a workspace lane. This control names "
         f"the manifest rather than reading whichever edge sorts first, because "
         f"crates/scp-runtime/Cargo.toml and crates/scp-ffi/common/Cargo.toml "
@@ -2338,6 +2456,74 @@ def check_testing_unification_readers() -> None:
         is None,
         "job fail-closed-pre-rotation's scp-identity step rests on a -p "
         "selection leaving scp-testing out of the build",
+    )
+
+
+MANIFEST_READER_FILES = (
+    "crates/scp-runtime/tests/identity_config_cross_path.rs",
+    "crates/scp-ffi/common/tests/dht_capability_injection.rs",
+)
+MANIFEST_READER_BEGIN = "// --- BEGIN shared manifest reader"
+MANIFEST_READER_END = "// --- END shared manifest reader ---"
+
+
+def shared_manifest_reader(path: str) -> str | None:
+    """Return the shared-manifest-reader block of `path`, markers included, or
+    None when the file carries no such pair of markers."""
+    text = (REPO / path).read_text()
+    start = text.find(MANIFEST_READER_BEGIN)
+    if start < 0:
+        return None
+    end = text.find(MANIFEST_READER_END, start)
+    if end < 0:
+        return None
+    return text[start : end + len(MANIFEST_READER_END)]
+
+
+def check_identity_manifest_readers_match() -> None:
+    """Both crates that pin the scp-identity dev-dependency edge read it with
+    one reader.
+
+    CRITERION: the text between the BEGIN and END markers is byte-identical in
+    crates/scp-runtime/tests/identity_config_cross_path.rs and
+    crates/scp-ffi/common/tests/dht_capability_injection.rs. Each crate asserts
+    the property about its own manifest and neither dev-depends on the other,
+    so the reader cannot live in one crate and be called from the other; a
+    duplicated block is the only shape cargo allows, and this check is what
+    keeps the two copies one reader.
+
+    Why a copy may not drift: the reader decides which cargo spellings activate
+    `scp-identity/testing`. A fix applied to one copy and not the other leaves
+    the second crate accepting the spelling the first now rejects, which is the
+    review-the-class failure `.docs/lessons/review-the-class-not-the-instance.md`
+    records — one site fixed, its twin found a round later.
+    """
+    blocks = {path: shared_manifest_reader(path) for path in MANIFEST_READER_FILES}
+    missing = sorted(path for path, block in blocks.items() if block is None)
+    check(
+        "each manifest-reader file carries the BEGIN and END markers",
+        not missing,
+        f"{missing} carries no `{MANIFEST_READER_BEGIN}` … "
+        f"`{MANIFEST_READER_END}` pair, so this check reads nothing and "
+        f"proves nothing about the reader it is here to pin",
+    )
+    if missing:
+        return
+    first, second = (blocks[path] for path in MANIFEST_READER_FILES)
+    check(
+        "the shared manifest reader is long enough to be the reader",
+        first is not None and len(first) > 2000,
+        f"the block in {MANIFEST_READER_FILES[0]} is {len(first or '')} bytes; "
+        f"two emptied blocks match each other, so this check requires the "
+        f"block to still hold the reader's four functions",
+    )
+    check(
+        "both manifest-reader copies are byte-identical",
+        first == second,
+        f"{MANIFEST_READER_FILES[0]} and {MANIFEST_READER_FILES[1]} carry "
+        f"different text between the markers. Diff them and apply the fix to "
+        f"both: one copy accepting a cargo spelling the other rejects is the "
+        f"hole this pair of tests exists to close",
     )
 
 
@@ -3325,6 +3511,7 @@ def main() -> int:
     )
     check_shipped_assertion_readers()
     check_testing_unification_readers()
+    check_identity_manifest_readers_match()
     check_shipped_build_assertions_run(jobs)
 
     print(

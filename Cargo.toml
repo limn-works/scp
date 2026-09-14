@@ -32,15 +32,22 @@ members = [
 # Every member except `crates/scp-testing`, which a bare `cargo build` at this
 # root must not compile.
 #
-# `scp-testing` is a `publish = false` test harness whose `helpers.rs` names
-# `InMemoryDhtClient` and `TestDidDht` at lib level, so its `scp-core`,
-# `scp-identity`, `scp-platform`, `scp-dht`, and `scp-node` edges carry
-# `testing` / `allow_unencrypted_storage` as NORMAL dependencies rather than
-# dev-dependencies. Resolver 2 unifies normal-dependency features across every
-# package one invocation builds, so a workspace-wide `cargo build` compiles
-# `InMemoryKeyCustody`, `InMemoryDhtClient`, `InMemoryPreRotationCustody`, and
-# `ProtocolRepository::new_for_testing` into each FFI bridge cdylib — binaries
-# `.github/workflows/build-matrix.yml` uploads and
+# `scp-testing` is a `publish = false` test harness. Its `scp-core` and
+# `scp-platform` edges carry `allow_unencrypted_storage` / `testing` as NORMAL
+# dependencies, because `builder.rs`, `fullstack/node.rs`, `simulator/identity.rs`
+# and `simulator/mod.rs` name `scp_platform::testing`, `scp_platform::in_memory`
+# and `ProtocolRepository::new_for_testing` at lib level, outside any feature
+# gate. Its `scp-identity`, `scp-dht` and `scp-node` edges carry no such feature:
+# `helpers.rs` is the only module naming `scp_identity` and `scp_dht`, `lib.rs`
+# compiles it under this crate's `helpers` feature, and that feature names
+# `scp-identity/testing` and `scp-dht/testing`; `scp-node/allow_unencrypted_storage`
+# rides on a `[dev-dependencies]` entry, because only this crate's own integration
+# tests call the `Node::start_for_testing` it gates. Only `crates/scp-testing`'s own
+# `[dev-dependencies]` turn `helpers` on, so no other build resolves any of the three.
+# Resolver 2 unifies normal-dependency features across every package one
+# invocation builds, so a workspace-wide `cargo build` still compiles
+# `InMemoryKeyCustody` and `ProtocolRepository::new_for_testing` into each FFI
+# bridge cdylib — binaries `.github/workflows/build-matrix.yml` uploads and
 # `.github/workflows/release.yml` Authenticode-signs. Excluding one member here
 # removes that unification path, and
 # `scripts/check-shipped-feature-graph.sh` asserts a default-members build
