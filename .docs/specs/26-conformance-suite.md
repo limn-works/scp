@@ -57,8 +57,8 @@ Each test specifies:
 | **Tier** | Core |
 | **Spec Sections** | `03-identity.md` §3.2.1 case 1, §9.11, `09-security-model.md` §9.7.4.2 R3, R8 |
 | **Preconditions** | An identity with an established `#active` key. Existing messages signed with the old key. |
-| **Steps** | 1. Generate a new P-256 `#active` keypair. 2. Compose a `KeyState` carrying the new key `current` in the `#active` role and the old key's `Superseded` drop entry. 3. Sign it with the standing root, publish the chain, and resolve the identity again. 4. Verify the old key reads `Superseded` and the fingerprint changed. |
-| **Expected Outcome** | The derived key state lists the new key `current`, and a replay reads the old key `Superseded` from that event's drop entry: a condition retires a key, not an absence. The key continuity fingerprint (§9.11) reflects the change. Messages signed with the old key still verify, because a content signature verifies against a retired key (§9.7.1). |
+| **Steps** | 1. Generate a new P-256 `#active` keypair. 2. Compose a `KeyState` carrying the new key `Current` in the `#active` role and the old key's `Superseded` drop entry. 3. Sign it with the standing root, publish the chain, and resolve the identity again. 4. Verify the old key reads `Superseded` and the fingerprint changed. |
+| **Expected Outcome** | The derived key state lists the new key `Current`, and a replay reads the old key `Superseded` from that event's drop entry: a condition retires a key, not an absence. The key continuity fingerprint (§9.11) reflects the change. Messages signed with the old key still verify, because a content signature verifies against a retired key (§9.7.1). |
 
 ### CONF-004: A Chain Claiming Delegation Is Rejected
 
@@ -80,7 +80,7 @@ Each test specifies:
 | **Spec Sections** | `10-infrastructure-and-self-hosting.md` §10.8.1, `09-security-model.md` §9.7.1 |
 | **Preconditions** | An identity established on device A. |
 | **Steps** | 1. On device B, generate an ephemeral context-scoped MLS leaf key for the same identity. 2. Sign a KeyPackage attestation over each device's leaf key with the identity's `#active` key. 3. Verify both attestations. |
-| **Expected Outcome** | Both attestations verify against the key the identity's key state lists `current` in the `#active` role, so both devices act for one identity. An attestation and never a document binds a leaf key to an identity. |
+| **Expected Outcome** | Both attestations verify against the key the identity's key state lists `Current` in the `#active` role, so both devices act for one identity. An attestation and never a document binds a leaf key to an identity. |
 
 ## 26.4 Context Tests (§5, §6)
 
