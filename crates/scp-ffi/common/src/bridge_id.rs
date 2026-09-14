@@ -3,7 +3,6 @@
 //! Bridge ID per spec section 12.2.1: `SHA-256(context_id || operator_did || platform || timestamp)`.
 
 use scp_clock::Clock;
-use sha2::{Digest, Sha256};
 
 /// Generates a bridge ID per spec section 12.2.1.
 ///
@@ -24,13 +23,17 @@ use sha2::{Digest, Sha256};
 pub fn generate_bridge_id(context_id: &str, operator_did: &str, platform: &str) -> (String, u64) {
     let now_secs = scp_clock::SystemClock.now_secs();
 
-    let mut hasher = Sha256::new();
-    hasher.update(context_id.as_bytes());
-    hasher.update(operator_did.as_bytes());
-    hasher.update(platform.as_bytes());
-    hasher.update(now_secs.to_be_bytes());
+    // One derivation lives in scp-protocol, because `register_bridge` rejects
+    // a request whose `bridge_id` differs from what it derives. Computing a
+    // second copy here would let these two drift and reject every request.
+    let bridge_id = scp_protocol::bridge::registration::derive_bridge_id(
+        context_id,
+        operator_did,
+        platform,
+        now_secs,
+    );
 
-    (hex::encode(hasher.finalize()), now_secs)
+    (bridge_id, now_secs)
 }
 
 #[cfg(test)]
@@ -67,11 +70,14 @@ mod tests {
         assert_ne!(id1, id2);
     }
 
+    /// This bridge derives an id exactly as spec §12.2.1 step 3 does.
+    ///
+    /// Step 3 hashes a length-prefixed concatenation, so a request built here
+    /// passes the derivation check `scp_protocol` `register_bridge` applies.
+    /// This test recomputes that preimage by hand rather than calling
+    /// `derive_bridge_id`, so a change to that function shows up here.
     #[test]
-    fn matches_spec_raw_concatenation() {
-        // Verify the hash uses raw concatenation per spec §12.2.1:
-        // SHA-256(context_id || operator_did || platform || timestamp).
-        // Manually compute the expected hash for a known timestamp.
+    fn matches_the_spec_length_prefixed_derivation() {
         use sha2::{Digest, Sha256};
 
         let ctx = "ctx-test";
@@ -80,11 +86,36 @@ mod tests {
         let (id, ts) = generate_bridge_id(ctx, op, plat);
 
         let mut hasher = Sha256::new();
-        hasher.update(ctx.as_bytes());
-        hasher.update(op.as_bytes());
-        hasher.update(plat.as_bytes());
+        for segment in [ctx, op, plat] {
+            hasher.update((segment.len() as u64).to_be_bytes());
+            hasher.update(segment.as_bytes());
+        }
         hasher.update(ts.to_be_bytes());
 
         assert_eq!(id, hex::encode(hasher.finalize()));
+    }
+
+    /// A shifted boundary between two inputs derives a different id.
+    ///
+    /// Raw concatenation would flatten these two into one preimage, and a
+    /// bridge id decides which context a request acts inside.
+    #[test]
+    fn a_shifted_boundary_between_inputs_derives_a_different_id() {
+        use sha2::{Digest, Sha256};
+
+        let derive = |ctx: &str, op: &str, ts: u64| {
+            let mut hasher = Sha256::new();
+            for segment in [ctx, op, "discord"] {
+                hasher.update((segment.len() as u64).to_be_bytes());
+                hasher.update(segment.as_bytes());
+            }
+            hasher.update(ts.to_be_bytes());
+            hex::encode(hasher.finalize())
+        };
+
+        assert_ne!(
+            derive("ctx-a", "bc", 1_700_000_000),
+            derive("ctx-ab", "c", 1_700_000_000)
+        );
     }
 }

@@ -888,6 +888,34 @@ fn dht_gateways_from_env() -> Vec<String> {
     )
 }
 
+/// Logs that this node admits no bridge, and states what would admit one.
+///
+/// Spec §12.10.6 step 1 gives bridge admission to a context's governance model:
+/// a bridge node admits a bridge only on a governance approval the node itself
+/// verifies, which it does by reading the `BridgeRegistered`,
+/// `BridgeSuspended`, `BridgeReactivated`, and `BridgeRevoked` leaves out of
+/// the event log it holds as a member of that context, and out of no other
+/// input. This binary joins no context and derives no context event log, so it
+/// verifies no approval and admits no bridge. Every `/v1/scp/bridge/*` endpoint
+/// it mounts answers `BRIDGE_NOT_AUTHORIZED` (401), which §12.10.6 step 1 makes
+/// the answer for a bridge that fails the admission criterion.
+///
+/// §12.10.6 step 1 requires a node to refuse a registration that reaches it by
+/// any path other than that log, and names a file the node's operator writes
+/// among the paths it refuses. A file, an environment variable, and a request
+/// body each assert that governance approved something this node cannot check,
+/// so this binary reads none of them. This line puts the absence in the startup
+/// log, where an operator reads it before a platform reports a 401.
+fn log_bridge_admission_absent() {
+    tracing::info!(
+        "this node admits no bridge: a node reads bridge admission from the \
+         BridgeRegistered leaf in the context event log it holds as a member \
+         (spec 12.10.6 step 1), this binary holds no context membership, and no \
+         operator-supplied file, variable, or request body substitutes for that \
+         leaf, so every /v1/scp/bridge/* request answers BRIDGE_NOT_AUTHORIZED (401)"
+    );
+}
+
 /// Shared implementation for `run_full_node`, parameterized over DID method
 /// and storage type.
 ///
@@ -1007,6 +1035,8 @@ async fn run_node_with<
             std::process::exit(1);
         }
     };
+
+    log_bridge_admission_absent();
 
     // The BEP44 sequence counter was bootstrapped inside the builder ahead of
     // the startup publish (SCP-RELAYRES-004), so `Node::start` above already

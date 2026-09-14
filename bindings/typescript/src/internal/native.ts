@@ -1282,7 +1282,21 @@ export function createNativeBridge(scp: SCP): Bridge {
       governanceDid: string,
       platform: string,
       mode: BridgeMode,
+      webhookUrl: string | undefined,
+      platformKey: Uint8Array | undefined,
+      platformKeyId: string | undefined,
+      maxShadows: number | undefined,
+      displayName: string | undefined,
+      description: string | undefined,
+      operatorContact: string | undefined,
     ) {
+      // NAPI Vec<u8> maps to number[] in JS, not Uint8Array. `bridge_register`
+      // declares `platform_key: Option<Vec<u8>>`, and napi-rs validates that
+      // parameter with `napi_is_array`, which reports false for a typed array,
+      // so a Uint8Array passed straight through throws `InvalidArg` before the
+      // Rust function runs.
+      const platformKeyArray =
+        platformKey === undefined ? undefined : (Array.from(platformKey) as unknown as number[]);
       // napi-rs #[napi(object)] returns camelCase keys; Bridge interface expects snake_case.
       const raw = (
         addon.bridgeRegister as (
@@ -1291,6 +1305,13 @@ export function createNativeBridge(scp: SCP): Bridge {
           g: string,
           p: string,
           m: BridgeMode,
+          webhookUrl?: string,
+          platformKey?: number[],
+          platformKeyId?: string,
+          maxShadows?: number,
+          displayName?: string,
+          description?: string,
+          operatorContact?: string,
         ) => {
           bridgeId: string;
           operatorDid: string;
@@ -1299,7 +1320,20 @@ export function createNativeBridge(scp: SCP): Bridge {
           status: string;
           contextId: string;
         }
-      )(contextId, operatorDid, governanceDid, platform, mode);
+      )(
+        contextId,
+        operatorDid,
+        governanceDid,
+        platform,
+        mode,
+        webhookUrl,
+        platformKeyArray,
+        platformKeyId,
+        maxShadows,
+        displayName,
+        description,
+        operatorContact,
+      );
       return {
         bridge_id: raw.bridgeId,
         operator_did: raw.operatorDid,

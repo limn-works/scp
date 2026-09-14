@@ -45,6 +45,67 @@ succeeds. It needs a routing ID (derived from the context ID or provided by the 
 the active relay URL (from `runtime::get_relay_connection` URL tracking). The `KnownContext`
 struct is already defined; the wiring just needs to happen at the right call site.
 
+## Second occurrence, outside the FFI layer (2026-08-17)
+
+`crates/scp-node/src/bridge_auth.rs` repeated this shape at a different layer. A
+`StorageBridgeLookup` held every registered bridge, every operator DID document, and every
+platform webhook key that §12.10.2 authentication reads. Its three writers —
+`register_bridge`, `register_did_document`, `register_webhook_key` — had call sites only past
+`#[cfg(test)]`. Both node build paths constructed that store and hydrated it from storage, which
+held nothing, so a shipped node answered `BRIDGE_NOT_AUTHORIZED` (401) to every bridge request
+forever. Twenty-seven tests covering per-bridge and per-context scope rules all passed, because
+each one seeded that store directly and none of them ran a registration through a node.
+
+Two things generalize from this second occurrence:
+
+1. **A store is not FFI-specific.** Apply the invariant to any read-side cache or registry
+   an authorization decision consults, whatever layer holds it.
+2. **A 401-on-everything failure looks like correct fail-closed behaviour.** Nothing logs an
+   error, nothing panics, and every negative test still passes. Ask instead which production
+   call makes an authorized request succeed, and require a test that performs it.
+
+The first fix made `admit_registration` the one entry point that writes a connector and gave it
+two callers reachable from a shipped build: `ApplicationNode::register_bridge`, which an embedder
+calls, and `ApplicationNode::admit_bridge_registrations`, which the `scp-node` binary called at
+startup when `SCP_NODE_BRIDGE_REGISTRATIONS` named a file of operator-supplied approvals.
+`crates/scp-node/tests/bridge_registration_wiring.rs` required 401 before that call and 200
+after it.
+
+A third lesson came out of a review of that first fix. Moving a writer from `#[cfg(test)]` to a
+`pub` method is not the same as wiring it: a public method whose only callers are tests leaves a
+shipped binary in the same state the original defect described. Ask which shipped entry point —
+a binary's `main`, a request handler, a startup sequence — reaches that writer, and name it.
+"Callable from outside the crate" is not an answer.
+
+## The operator file was the wrong entry point, and the fourth lesson says why
+
+A fourth review round of pull request #2373, the bridge-handler authorization-scope branch,
+withdrew that operator file. Spec §12.10.6 step 1 states the criterion a bridge node
+applies before it admits a bridge: among the bridge lifecycle leaves in the event log the node
+holds as a member of the context, the highest-sequence leaf naming that bridge is a
+`BridgeRegistered` or `BridgeReactivated` leaf. The node reads admission out of that log and out
+of no other input, and §12.10.6 step 1 names "a file the node's operator writes" among the paths
+it MUST refuse. §12.2 gives admission to the context's governance model and gives it to no node
+operator.
+
+A file states that governance approved something. It proves nothing, because the node that reads
+it verifies nothing. Running `register_bridge` and `approve_registration` over a fresh registry
+built out of the file's own fields re-applies every §12.2.1 shape rule to the file's contents and
+establishes nothing about governance, so the node ended up storing an approval its operator
+asserted. That is the false guarantee the CLAUDE.md builder tenet forbids: a capability that is
+honestly absent is detectable, and a stand-in for it lies.
+
+**The fourth lesson: a shipped entry point that asserts is not a fix for a writer that nothing
+calls.** The third lesson asks which shipped entry point reaches the writer. Ask a second
+question after it: does that entry point *verify* what the writer stores, or does it *assert* it?
+When the verifier is unbuilt, the capability fails closed — here `scp-node` admits no bridge,
+`admit_registration` and the two lifecycle writers compile only under `feature = "testing"`, and
+every `/v1/scp/bridge/*` endpoint answers `BRIDGE_NOT_AUTHORIZED` (401), which §12.10.6 step 1
+itself gives as the answer for a bridge that fails the criterion. The 401-on-everything state the
+original defect produced by accident is the correct state until the node derives a context event
+log, and the second lesson above still holds: it looks identical to the defect, so
+`crates/scp-node/src/main.rs` logs the absence and its reason at startup.
+
 ## Related
 
 - `context_ids_for_member` reads `CONTEXT_REGISTRY`, which IS populated from `py_context_create`.
