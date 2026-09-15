@@ -2041,6 +2041,30 @@ def emit_witness_and_relay_objects() -> None:
     )
     assert head_a != head_b, "vector_46: the two heads must differ"
 
+    # Vector 47: the `RENT` beneficiary signature (`09-security-model.md`
+    # §9.7.4.2 R9). The preimage is the separator, the 32-byte identifier of
+    # the identity the rent is credited to, `units` as a 4-byte big-endian
+    # integer, and the SHA-256 digest of the receipt bytes. The signer is the
+    # key the key state at the head of the chain the relay holds lists
+    # `Current` in the `#active` role, which is §25.2's secondary key here.
+    rent_receipt = b"scp-25-rent-receipt-bytes"
+    rent_receipt_digest = sha256(rent_receipt)
+    rent_units = 3
+    rent_fields = (
+        fixed_field(subject) + u32(rent_units) + fixed_field(rent_receipt_digest)
+    )
+    assert len(rent_fields) == 68, len(rent_fields)
+    emit_hex("vector_53.identifier", subject)
+    emit("vector_53.units", rent_units)
+    emit_hex("vector_53.payment_receipt", rent_receipt)
+    emit_hex("vector_53.payment_receipt_digest", rent_receipt_digest)
+    emit("vector_53.field_bytes", len(rent_fields))
+    sign_and_emit(
+        "vector_53",
+        canonical_preimage("SCP-RENT-V1:", rent_fields),
+        REF_KEY_2,
+    )
+
     emit_community_relay_list()
 
 

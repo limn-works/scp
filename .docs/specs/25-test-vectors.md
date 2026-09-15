@@ -1704,6 +1704,28 @@ Shared previous_cosigned_digest:
   2f6f219050c1525bf6fe2d71e3b0056e6db05a1b9ec6b059ecd39e3c1e25d0ea
 ```
 
+### Vector 53: the `RENT` beneficiary signature preimage
+
+`09-security-model.md` §9.7.4.2 R9 obliges a `RENT` message to carry a signature by the key the key state at the head of the chain the relay holds for that identifier lists `Current` in the `#active` role. The preimage carries the separator `"SCP-RENT-V1:"`, the identity's 32 raw digest bytes, `units` as a 4-byte big-endian integer, and the SHA-256 digest of the `payment_receipt` bytes, each under §9.5.1's rule for a fixed-length field. The signer here is §25.2's secondary key, which Vector 41's key state lists `Current` in the `#active` role.
+
+```
+identifier:             2c0f7f4478be94db0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf32
+units:                  3
+payment_receipt:        7363702d32352d72656e742d726563656970742d6279746573
+SHA-256(payment_receipt):
+  127e7a5428dc10a934ec982638c0987fdc4222d68a88d74b2720360191d90beb
+field bytes:            68
+preimage (80 bytes):
+  5343502d52454e542d56313a2c0f7f4478be94db0078311ef51ba3cc9934362b
+  0f154dcbf9c597572e46cf3200000003127e7a5428dc10a934ec982638c0987f
+  dc4222d68a88d74b2720360191d90beb
+canonical hash:
+  1e356ef6426ab30b33c087a0e8a08f5d285f74a5bd68bd471f6f347e3488bb15
+signature:
+  54f379da4a09112ff812b1803575ed2d869d33b061715f675b5302b4acec4505
+  1990eb7859ffe6edca41e0293d0f25052d9cd11ec111431d0691fafdbe71d513
+```
+
 ### Vector 49: the community relay list's encoding
 
 `18-addressability-and-deployment.md` §18.5.1 fixes the artifact: one JSON document named `community-relays.json`, holding a JSON array of entries, each an object carrying `operator`, `key`, `url` and `free` in that order. **The two entries below are a fixture and are never the shipped list.** Each operator identifier is `SHA-256` over a stated ASCII label, and the two keys are §25.2's reference and secondary keys, whose private scalars §25.2 prints. This vector pins the document's encoding — member order, lowercase hexadecimal, no insignificant whitespace, and the digest construction — and pins no byte a binding ships. The shipped `community-relays.json` is a release artifact the curator publishes; a release process computes this digest over the four bindings' copies and compares them to each other, never to the digest below, and an entry whose `key` appears anywhere in this corpus MUST NOT ship.
