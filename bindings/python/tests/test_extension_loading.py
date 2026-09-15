@@ -15,10 +15,10 @@ These tests import no native symbol: they drive the separation with
 
 from __future__ import annotations
 
+import ast
 import importlib
 import importlib.machinery
 import importlib.util
-import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -273,26 +273,102 @@ def test_a_module_built_for_another_interpreter_raises_the_load_failure_code(
 # ---------------------------------------------------------------------------
 
 
+#: The leaf name of the extension module, as an import statement spells it.
+EXTENSION_LEAF = "_scp_core"
+
+#: Every file under ``scp_sdk`` permitted to import the extension, mapped to the
+#: number of import statements it is permitted to hold. ``_extension.py`` holds
+#: the one loader. ``__init__.py`` registers the extension under its bare name
+#: and hands the failure to ``reject_load_failure``, which tells a load failure
+#: apart from an absence. This mapping is the whole permission: a file it does
+#: not name, and a second import inside a file it does name, are both offenders.
+PERMITTED_EXTENSION_IMPORTS = {"__init__.py": 1, "_extension.py": 1}
+
+
+def _count_extension_imports(source: str) -> int:
+    """Count the statements in ``source`` that import the extension.
+
+    Walks the parsed syntax tree rather than matching the source text, so the
+    count covers every spelling an author can write: ``import _scp_core``,
+    ``from scp_sdk import _scp_core``, ``from . import _scp_core``,
+    ``import scp_sdk._scp_core`` and ``from scp_sdk._scp_core import SCP``. A
+    pattern over the text counts the one spelling its author wrote it for and
+    passes every other spelling, which is the hole this function closes.
+    """
+    total = 0
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            names = [alias.name for alias in node.names] + [node.module or ""]
+        else:
+            continue
+        if any(name == EXTENSION_LEAF or name.endswith(f".{EXTENSION_LEAF}") for name in names):
+            total += 1
+    return total
+
+
 def test_the_loader_is_the_only_sdk_module_that_imports_the_extension() -> None:
-    """CRITERION: exactly one module under ``scp_sdk`` imports ``_scp_core``.
+    """CRITERION: the files in `PERMITTED_EXTENSION_IMPORTS`, and no others,
+    import ``_scp_core``, each exactly as many times as that mapping states.
 
     `BRIDGE_ACCESSORS` above is written by hand, so it holds the accessors
     somebody remembered to list and says nothing about a module added later. A
-    module that keeps its own `import _scp_core` / `except ImportError` block
-    reports a load failure as an absence, which is the defect this file
-    exists to keep out, and it does so whether or not anyone lists it.
+    module that keeps its own ``_scp_core`` import and its own
+    ``except ImportError`` block reports a load failure as an absence, which is
+    the defect this file exists to keep out, and it does so whether or not
+    anyone lists it.
 
-    This assertion reads the package's source instead of its list: every
-    `.py` file under `scp_sdk` other than `_extension.py` must contain no
-    `import _scp_core` statement. `scp_sdk/__init__.py` registers the
-    extension under its bare name with `from scp_sdk import _scp_core`, which
-    is a different statement and passes.
+    This assertion reads the package's source instead of its list, and compares
+    the whole per-file count against the mapping, so a new importer fails the
+    assertion whichever spelling it uses and whichever file it sits in.
     """
     package_directory = Path(_extension.__file__).parent
-    statement = re.compile(r"^\s*import _scp_core\b", re.MULTILINE)
-    offenders = sorted(
-        path.name
+    counts = {
+        path.relative_to(package_directory).as_posix(): _count_extension_imports(path.read_text())
         for path in package_directory.rglob("*.py")
-        if path.name != "_extension.py" and statement.search(path.read_text())
-    )
-    assert offenders == []
+    }
+    importers = {name: count for name, count in counts.items() if count}
+    assert importers == PERMITTED_EXTENSION_IMPORTS
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import _scp_core\n",
+        "from scp_sdk import _scp_core\n",
+        "from scp_sdk import SCP, _scp_core\n",
+        "from . import _scp_core\n",
+        "import scp_sdk._scp_core\n",
+        "import scp_sdk._scp_core as core\n",
+        "from scp_sdk._scp_core import SCP\n",
+        "from _scp_core import SCP\n",
+        "def _bridge():\n    from scp_sdk import _scp_core\n    return _scp_core\n",
+    ],
+)
+def test_the_detector_counts_every_spelling_of_the_import(source: str) -> None:
+    """NEGATIVE CONTROL: the scan above fails on the spellings the SDK uses.
+
+    The scan it guards passes when it finds nothing, so a scan that reads no
+    spelling passes for the wrong reason. Each source below is one statement an
+    author can write to reach the extension, including the
+    ``from scp_sdk import _scp_core`` form that ``scp_sdk/__init__.py`` writes
+    and that the pattern this scan replaced did not match.
+    """
+    assert _count_extension_imports(source) == 1
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import _scp_core_helper\n",
+        "from scp_sdk import _scp_core_helper\n",
+        "from json import loads\n",
+        '"""A docstring naming import _scp_core."""\n',
+        'MESSAGE = "import _scp_core"\n',
+    ],
+)
+def test_the_detector_counts_no_statement_that_imports_something_else(source: str) -> None:
+    """A name that starts with the extension's name is a different module, and
+    prose that quotes the statement imports nothing."""
+    assert _count_extension_imports(source) == 0
