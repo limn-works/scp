@@ -76,6 +76,11 @@ pub enum PaidActionType {
     ContextJoin,
     SubscriptionPeriod,
     ByteStored,
+    /// Rent paid on ADR-004's `RENT` operation, which buys an identity a
+    /// quota of stored bytes for a declared period (`09-security-model.md`
+    /// §9.7.4.2 R9). Without a variant of its own a payer signing a rent
+    /// receipt tags an act it did not pay for, and two SDKs pick two.
+    Rent,
 }
 ```
 
@@ -127,20 +132,17 @@ pub trait PaymentAdapter: Send + Sync {
     /// composed. **The relay's checks read the returned values and never the
     /// receipt's own fields**, since the payer's signature over those fields
     /// reaches no rule on the relay's path. **A relay refuses the write under
-    /// `BudgetScope::Payment` on three grounds**: the PUBLISH carried no
-    /// receipt, this method failed the verification, or one of the four checks
-    /// `09-security-model.md` §9.7.4.2 R9 states failed. **What the verified
-    /// receipt then buys is what R9 states.**
+    /// `BudgetScope::Payment` on the grounds `09-security-model.md` §9.7.4.2
+    /// R9 states.** **What a current rent then buys is what R9 states.**
     async fn verify(
         &self,
         receipt: &PaymentReceipt,
-        /// This relay's declared `economic.payee`, as 32 raw digest bytes.
-        relay_payee: &[u8; 32],
         /// This relay's declared `economic.currency`.
         relay_currency: &CurrencyCode,
-        /// The declared price for what this receipt pays: the `per_publish`
-        /// fee for a write, the declared rent price for a rent payment, or
-        /// their sum where one receipt pays both.
+        /// The price this relay computed for what this receipt pays: the
+        /// `per_publish` fee on a PUBLISH, and `units` times the declared rent
+        /// price on a `RENT` (`09-security-model.md` §9.7.4.2 R9). A receipt
+        /// pays one thing and the operation carrying it says which.
         declared_price: &Amount,
     ) -> Result<VerificationResult, PaymentError>;
 
@@ -196,9 +198,6 @@ pub struct PaymentAuthorization {
 pub struct VerificationResult {
     pub valid: bool,
     pub adapter_id: String,
-    /// True where the settlement the rail holds pays the `relay_payee` this
-    /// relay supplied.
-    pub payee_matches: bool,
     /// True where the settled amount covers the `declared_price` this relay
     /// supplied.
     pub amount_covers: bool,
@@ -555,7 +554,7 @@ Relay economics are SEPARATE from context economics — different trust model. R
     "max_blob_size": 262144,
     "max_blob_ttl": 86400,
     "rate_limit_publish": 6000,
-    "storage_budget_identifier": 1073741824,
+    "storage_budget_identifier": 268435456,
     "storage_budget_total": 107374182400,
     "receipt_exempts": ["identifier"],
     "economic": {
@@ -574,15 +573,15 @@ Relay economics are SEPARATE from context economics — different trust model. R
 }
 ```
 
-**`per_byte_stored` billing model.** The `per_byte_stored` amount is a **one-time storage fee** charged when a blob is published to the relay. The fee is `per_byte_stored * blob_size_bytes`, charged once at publish time. There is no recurring charge. **The TTL clause reaches a blob the relay expires and reaches no retained kind:** once paid, a blob is stored until its TTL expires, while a validating relay retains a key-event record, a service record, a cosigned head and a conflict statement and gives none of them a TTL (`09-security-model.md` §9.7.4.2 R9). **Storage of a retained kind is rented rather than bought once**, so "There is no recurring charge" reaches the blob fees above and reaches no retained kind: an operator selling coverage of a retained kind declares the three `rent` terms above, and `09-security-model.md` §9.7.4.2 R9 states what rent covers and when it lapses. **What a verified receipt exempts an identity from is the set the operator declared in `relay_config`'s `receipt_exempts`**, and `09-security-model.md` §9.7.4.2 R9 states which member that set may carry and what an absent set buys. **A receipt buys no exemption from `Total`**, so the capacity ceiling the operator declared bounds what that operator stores whoever offers to pay. Example: with `per_byte_stored: "1"` (1 cent) and `currency: "USD"`, a 256 KiB blob costs `1 * 262144 = 262144 cents = $2,621.44`. Relay operators SHOULD set `per_byte_stored` to values appropriate for their cost structure — the example value of `"1"` is illustrative, not recommended. A more realistic value for a USD-denominated relay might be `per_byte_stored: "0"` (free, subsidized by `per_publish`) or use sub-cent amounts via a different currency unit (e.g., SAT with `per_byte_stored: "1"` = 1 satoshi per byte = ~$0.0004 per byte at $40k/BTC).
+**`per_byte_stored` billing model.** The `per_byte_stored` amount is a **one-time storage fee** charged when a blob is published to the relay. The fee is `per_byte_stored * blob_size_bytes`, charged once at publish time. There is no recurring charge. **The TTL clause reaches a blob the relay expires and reaches no retained kind:** once paid, a blob is stored until its TTL expires, while a validating relay retains a key-event record, a service record, a cosigned head and a conflict statement and gives none of them a TTL (`09-security-model.md` §9.7.4.2 R9). **Storage of a retained kind is rented rather than bought once**, so "There is no recurring charge" reaches the blob fees above and reaches no retained kind: an operator selling coverage of a retained kind declares the three `rent` terms above, and `09-security-model.md` §9.7.4.2 R9 states what rent covers and when it lapses. **What a current rent exempts an identity from is the set the operator declared in `relay_config`'s `receipt_exempts`**, and `09-security-model.md` §9.7.4.2 R9 states which member that set may carry, what an absent set buys, and how far a declared exemption reaches. **A receipt and a current rent buy no exemption from `Total`** (R9), so the capacity ceiling the operator declared bounds what that operator stores whoever offers to pay. Example: with `per_byte_stored: "1"` (1 cent) and `currency: "USD"`, a 256 KiB blob costs `1 * 262144 = 262144 cents = $2,621.44`. Relay operators SHOULD set `per_byte_stored` to values appropriate for their cost structure — the example value of `"1"` is illustrative, not recommended. A more realistic value for a USD-denominated relay might be `per_byte_stored: "0"` (free, subsidized by `per_publish`) or use sub-cent amounts via a different currency unit (e.g., SAT with `per_byte_stored: "1"` = 1 satoshi per byte = ~$0.0004 per byte at $40k/BTC).
 
 **Amount wire serialization (ADR-060):** `Amount` values in `.well-known/scp` — a JSON document, and everywhere monetary values cross the wire in a **human-readable (JSON)** encoding — are serialized as a **canonical base-10 decimal string** of the smallest-unit integer specified by `currency`. For USD (unit: cent), `"10"` = $0.10. For BTC (unit: satoshi), `"100"` = 100 satoshis. The string encodes the smallest-unit integer directly — it is NOT a human decimal like `"1.50"` (the scale stays with `currency`). JSON parsers accept ONLY the canonical form (digits only; no leading zeros except the lone `"0"`; no sign, separators, whitespace, decimal point, or exponent) and reject bare JSON numbers, so encode/decode are byte-identical and reproducible across reimplementations. In **binary (MessagePack)** encodings the value is the native `u64` — MessagePack round-trips an exact 64-bit integer, so it needs no string safeguard. This supersedes the earlier JSON-integer representation: the JSON wire form is a string, so reimplementations (notably JS `JSON.parse`, which cannot round-trip a `u64`) reproduce values exactly.
 
 **Payment flow:** the agent reads the relay's declared write policy through ADR-004's `POLICY` query, which the relay answers with the `relay_config` fields of `18-addressability-and-deployment.md` §18.3.3 verbatim, then selects a compatible adapter, authorizes per action, and the relay verifies and captures. **The agent reads that policy through the query and not through `.well-known/scp`**: a community-relay-list entry carries a URL and no domain, and §18.3.2 states that a party holding DNS or a CA chain serves a fraudulent copy of that document. **On a retained-kind PUBLISH the authorization rides on the wire as `payment_receipt`**, the `PaymentReceipt` bytes tagged with the adapter that issued them, and the relay runs `PaymentAdapter::verify` (§19.2.1) on them before it accepts the write (`09-security-model.md` §9.10.12, §9.7.4.2 R9).
 
-**The relay runs the four receipt checks `09-security-model.md` §9.7.4.2 R9 states, each one reading a term `PaymentAdapter::verify` returned rather than a field the presenting party composed.** An operator setting a price therefore prices what the rail settles and never what a receipt asserts.
+**The relay runs the receipt checks `09-security-model.md` §9.7.4.2 R9 states, each one reading a term `PaymentAdapter::verify` returned rather than a field the presenting party composed.** An operator setting a price therefore prices what the rail settles and never what a receipt asserts.
 
-**Free relays MUST exist.** The bootstrap relay list (`18-addressability-and-deployment.md` §18.5.1, priority level 5) MUST include free relays, and that invariant fixes what a relay may charge and fixes nothing about what it stores. **What bounds a free listed relay is the write policy it declares**, together with R9's ring buffer, which `09-security-model.md` §9.7.4.2 R9 states along with the one condition under which the total budget refuses. A charging relay refuses a PUBLISH carrying no receipt for `Payment` under the same rule. Self-hosted relays (§10.2, §10.4), community relays, and bundled relays remain free. Economic config is optional. Absence = free.
+**Free relays MUST exist.** The bootstrap relay list (`18-addressability-and-deployment.md` §18.5.1, priority level 5) MUST include free relays, and that invariant fixes what a relay may charge and fixes nothing about what it stores. **What bounds a free listed relay is the write policy it declares**, together with R9's ring buffer, which `09-security-model.md` §9.7.4.2 R9 states along with the one condition under which the total budget refuses. A charging relay refuses a PUBLISH carrying no receipt for `Payment` under the same rule, and it charges a retained-kind PUBLISH where it declares `per_publish` and on no other declaration (R9). Self-hosted relays (§10.2, §10.4), community relays, and bundled relays remain free. Economic config is optional. Absence = free.
 
 **Relay selection:** `TransportManager` (ADR-012) already selects by reliability + latency. Economic governance adds cost as a third criterion. Market pressure: agents prefer cheaper relays, creating competition.
 
@@ -633,6 +632,9 @@ SCP.Context.inspect() → { ..., economicPolicy? }     // extended
 
 SCP.Identity.grantSpending(agent, SpendingCapability, expiry) → UcanToken
 SCP.Identity.create(IdentityConfig { ..., payment })      // installs the adapter
+
+SCP.Identity.readRentState(entry, identifier) → RentState  // costs nothing
+SCP.Identity.payRent(entry, identifier, units) → RentState
 ```
 
 `estimateCost` evaluates the context's pricing formula against current observable metrics. `paymentHistory` retrieves receipts (per-payee `ContextEvent`s in the interim; convergent Merkle leaves under ADR-051 — see the ADR-011 amendment, exclusion taxonomy §2). `grantSpending` mints a spending UCAN.
@@ -669,7 +671,7 @@ Community payment adapters (x402, Lightning, SPL, Stripe) are **Phase 4+** — e
 6. **Economic policy mutable by default, optional immutability lock is voluntary.** Unlike ceiling policy (immutable by default), economic policy is governed by default. Creators may voluntarily lock pricing at creation.
 7. **Payment data inside encrypted envelope — relays never see payment metadata** for context-level economics. Relay-level payments are visible to the relay (necessary for relay to verify) but not to other relays or contexts.
 8. **Free relays MUST always exist in bootstrap list.** The SDK's fallback relay list (`18-addressability-and-deployment.md` §18.5.1) MUST include free relays. This is a protocol invariant that puts no price on basic protocol operation (§19.8). **An entry's `free` member asserts the price property alone** — that the relay charges nothing for basic protocol operation — and asserts nothing about which writes that relay accepts (§18.5.1).
-9. **Auto-accept never applies to paid contexts.** No auto-accept policy configuration (§5.12.2) can override this. Agents never silently incur costs. **That invariant also reaches an identity's own self-observation duty**: where satisfying it at a charging fallback-set entry would cost money, the SDK surfaces the condition to the controller and mints no receipt, which `09-security-model.md` §9.7.4.2 R10 states and cites this invariant for.
+9. **Auto-accept never applies to paid contexts.** No auto-accept policy configuration (§5.12.2) can override this. Agents never silently incur costs. **That invariant also reaches an identity's own self-observation duty**: where satisfying it at a charging fallback-set entry would cost money, the SDK surfaces the condition to the controller and mints no receipt, which `09-security-model.md` §9.7.4.2 R10 states and cites this invariant for. **`IdentityBackend::read_rent_state` costs no money and satisfies this invariant by construction** (`03-identity.md` §3.10.10): it sends a `RENT` whose receipt is absent, the entry credits nothing, and a controller therefore reads whether it is covered without an act that spends.
 
 ## 19.15 Wire Format Tables
 
@@ -740,6 +742,7 @@ This section tabulates the wire format for all economy protocol types that cross
 | `OutletCall` | `"OutletCall"` | Invoking an Action outlet. |
 | `ContextJoin` | `"ContextJoin"` | Joining a context. |
 | `SubscriptionPeriod` | `"SubscriptionPeriod"` | Recurring subscription payment. |
+| `Rent` | `"Rent"` | Rent on ADR-004's `RENT` operation (`09-security-model.md` §9.7.4.2 R9). |
 | `ByteStored` | `"ByteStored"` | Data storage. |
 
 ### 19.15.3 Dynamic Pricing
@@ -785,13 +788,7 @@ This section tabulates the wire format for all economy protocol types that cross
 
 ### 19.15.5 Payment Authorization and Receipt
 
-**`PaymentMetadata`** — Metadata for a payment request.
-
-| Field | Type | Required | Semantics |
-|-------|------|----------|-----------|
-| `action_type` | `PaidActionType` | Yes | What action this payment authorizes. |
-| `context_id` | `String` | No | Context ID if the action is context-scoped. |
-| `idempotency_key` | `[u8; 16]` | Yes | CSPRNG, prevents duplicate payments. |
+**`PaymentMetadata`** — Metadata for a payment request. **§19.2.1 declares this type, and this section declares no second variant set of it.** Two declarations of one type carried two field lists, so a binding author generating the wire form from a table emitted tags the Rust type could not construct.
 
 **`PaymentAuthorization`** — Authorization from payer to proceed with payment.
 
@@ -838,17 +835,7 @@ This section tabulates the wire format for all economy protocol types that cross
 | `typical_settlement_ms` | `u64` | Yes | Typical settlement time in milliseconds. |
 | `requires_facilitator` | `bool` | Yes | Whether a third-party facilitator is needed. |
 
-**`VerificationResult`** — Result of verifying a payment receipt.
-
-| Field | Type | Required | Semantics |
-|-------|------|----------|-----------|
-| `valid` | `bool` | Yes | Whether the receipt verified successfully. |
-| `adapter_id` | `String` | Yes | Adapter that performed verification. |
-| `payee_matches` | `bool` | Yes | Whether the settlement pays the payee the relay supplied. |
-| `amount_covers` | `bool` | Yes | Whether the settled amount covers the price the relay supplied. |
-| `currency_matches` | `bool` | Yes | Whether the settlement is denominated in the currency the relay supplied. |
-| `verified_receipt_id` | `[u8; 32]` | Yes | The identifier the rail bound to this settlement, which the relay spends once. §19.2.7's registry table states each rail's construction for it. |
-| `verification_timestamp` | `u64` | Yes | Unix timestamp (seconds) of verification. |
+**`VerificationResult`** — Result of verifying a payment receipt. **§19.2.1 declares this type, and this section declares no second field list of it.**
 
 **`RefundConfirmation`** — Confirmation of a payment refund.
 
@@ -860,15 +847,7 @@ This section tabulates the wire format for all economy protocol types that cross
 | `currency` | `CurrencyCode` ([u8; 4]) | Yes | Currency. |
 | `adapter_proof` | `Vec<u8>` (serde_bytes) | Yes | Adapter-specific refund proof. |
 
-**`PaymentError`** — Tagged enum for payment failure reasons.
-
-| Variant | Tag | Fields | Semantics |
-|---------|-----|--------|-----------|
-| `InsufficientBalance` | `"InsufficientBalance"` | `available: Amount`, `requested: Amount` | Payer lacks funds. |
-| `UnsupportedCurrency` | `"UnsupportedCurrency"` | `currency: CurrencyCode` | Adapter does not handle this currency. |
-| `AuthorizationExpired` | `"AuthorizationExpired"` | `auth_id: [u8; 32]`, `expired_at: u64` | Authorization timed out. |
-| `AdapterUnavailable` | `"AdapterUnavailable"` | `adapter_id: String` | Payment adapter is unreachable. |
-| `DuplicatePayment` | `"DuplicatePayment"` | `idempotency_key: [u8; 16]` | Payment already processed for this key. |
+**`PaymentError`** — Tagged enum for payment failure reasons. **§19.2.1 declares this type, and this section declares no second variant set of it.** The two declarations named eight variants between them, with three in this table alone, four in the enumeration alone, and the one variant both carried disagreeing on its field count, so a relay author distinguishing an invalid settlement from an unreachable adapter read a type two sections disagreed on.
 
 ### 19.15.6 Spending Capability (UCAN Extension)
 
