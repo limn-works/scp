@@ -3360,7 +3360,52 @@ def check_dependency_conditions_read_a_status_guarded_consumer(doc: dict) -> Non
             )
 
 
-PYO3_ARTIFACTS = ("pyo3-module-linux", "pyo3-module-macos")
+# The file each bridge producer uploads, named by the build that writes it rather
+# than by the artifact name a workflow author chooses. maturin writes the PyO3
+# extension module that `bindings/python/scp_sdk/__init__.py` imports as
+# `_scp_core`, and crates/scp-ffi-napi links its cdylib as `scp_ffi_napi`, so a
+# producer's `path:` carries the substring below whatever it calls the artifact.
+PYO3_UPLOAD_FILENAME = "_scp_core"
+NAPI_UPLOAD_FILENAME = "scp_ffi_napi"
+
+
+def uploaded_artifact_names(doc: dict, filename: str) -> tuple[str, ...]:
+    """Return every artifact name `doc` uploads whose path carries `filename`.
+
+    CRITERION: an artifact holds a bridge binary when the `actions/upload-artifact`
+    step that publishes it names a path carrying that binary's filename.
+
+    WHY: the two consumer gates below select the jobs they judge by matching a
+    download step's artifact name. Reading those names off ci.yml's own upload steps
+    closes the set by construction: a producer added under a name nobody wrote here
+    still publishes `_scp_core` or `scp_ffi_napi`, so the gate selects its consumers.
+    A tuple written in this file instead holds the names somebody remembered to list,
+    and says nothing about a producer added later — the shape
+    bindings/python/tests/test_extension_loading.py names of its own hand-written
+    accessor list, and closes there by reading the package's source.
+    """
+    names = set()
+    for job in doc["jobs"].values():
+        for step in job.get("steps") or []:
+            if not str(step.get("uses") or "").startswith("actions/upload-artifact"):
+                continue
+            uploaded = step.get("with") or {}
+            if uploaded.get("name") and filename in str(uploaded.get("path") or ""):
+                names.add(str(uploaded["name"]))
+    return tuple(sorted(names))
+
+
+def check_a_bridge_upload_reaches_the_gate(
+    doc: dict, filename: str, artifacts: tuple[str, ...]
+) -> None:
+    """A derivation returning nothing selects no consumer and reports nothing."""
+    check(
+        f"ci.yml uploads at least one artifact carrying {filename}",
+        bool(artifacts),
+        f"no `actions/upload-artifact` step names a path carrying {filename!r}, so "
+        f"the gate over its consumers selects no job and reports nothing",
+    )
+
 
 # The three statements the PyO3 skip guards run: the import the test modules attempt,
 # the construction the `scp` fixture performs, and a read of each feature-gated method
@@ -3373,7 +3418,9 @@ PYO3_ASSERTION_FRAGMENTS = (
 )
 
 
-def pyo3_consumers_without_a_construction_assertion(doc: dict) -> list[str]:
+def pyo3_consumers_without_a_construction_assertion(
+    doc: dict, artifacts: tuple[str, ...]
+) -> list[str]:
     """Return every job that downloads a PyO3 module and does not exercise it first.
 
     CRITERION: a job that downloads a PyO3 extension module runs, before its first
@@ -3402,7 +3449,7 @@ def pyo3_consumers_without_a_construction_assertion(doc: dict) -> list[str]:
         steps = job.get("steps") or []
         if not any(
             str(step.get("uses") or "").startswith("actions/download-artifact")
-            and (step.get("with") or {}).get("name") in PYO3_ARTIFACTS
+            and (step.get("with") or {}).get("name") in artifacts
             for step in steps
         ):
             continue
@@ -3422,8 +3469,10 @@ def pyo3_consumers_without_a_construction_assertion(doc: dict) -> list[str]:
     return gaps
 
 
-def check_pyo3_consumers_exercise_the_module(doc: dict) -> None:
-    gaps = pyo3_consumers_without_a_construction_assertion(doc)
+def check_pyo3_consumers_exercise_the_module(
+    doc: dict, artifacts: tuple[str, ...]
+) -> None:
+    gaps = pyo3_consumers_without_a_construction_assertion(doc, artifacts)
     check(
         "ci.yml: every job downloading a PyO3 module imports it, constructs it, and "
         "reads its feature-gated methods first",
@@ -3431,8 +3480,6 @@ def check_pyo3_consumers_exercise_the_module(doc: dict) -> None:
         "; ".join(gaps),
     )
 
-
-NAPI_ARTIFACTS = ("napi-addon-linux",)
 
 # Both statements the NAPI skip guards run: the SDK loader that `createRequire`s the
 # platform package, and the construction of the native class the loader returns.
@@ -3442,7 +3489,9 @@ NAPI_ASSERTION_FRAGMENTS = (
 )
 
 
-def napi_consumers_without_a_construction_assertion(doc: dict) -> list[str]:
+def napi_consumers_without_a_construction_assertion(
+    doc: dict, artifacts: tuple[str, ...]
+) -> list[str]:
     """Return every job that downloads a NAPI addon and does not exercise it first.
 
     CRITERION: a job that downloads a NAPI native addon runs, before its first test
@@ -3464,7 +3513,7 @@ def napi_consumers_without_a_construction_assertion(doc: dict) -> list[str]:
         steps = job.get("steps") or []
         if not any(
             str(step.get("uses") or "").startswith("actions/download-artifact")
-            and (step.get("with") or {}).get("name") in NAPI_ARTIFACTS
+            and (step.get("with") or {}).get("name") in artifacts
             for step in steps
         ):
             continue
@@ -3484,8 +3533,10 @@ def napi_consumers_without_a_construction_assertion(doc: dict) -> list[str]:
     return gaps
 
 
-def check_napi_consumers_exercise_the_addon(doc: dict) -> None:
-    gaps = napi_consumers_without_a_construction_assertion(doc)
+def check_napi_consumers_exercise_the_addon(
+    doc: dict, artifacts: tuple[str, ...]
+) -> None:
+    gaps = napi_consumers_without_a_construction_assertion(doc, artifacts)
     check(
         "ci.yml: every job downloading a NAPI addon loads and constructs it first",
         not gaps,
@@ -3494,7 +3545,7 @@ def check_napi_consumers_exercise_the_addon(doc: dict) -> None:
 
 
 def check_napi_assertion_control(
-    doc: dict, job_id: str, fragment: str, label: str
+    doc: dict, artifacts: tuple[str, ...], job_id: str, fragment: str, label: str
 ) -> None:
     """Deleting one half of job `job_id`'s assertion is reported."""
     mutated = copy.deepcopy(doc)
@@ -3510,7 +3561,7 @@ def check_napi_assertion_control(
     hits[0]["run"] = "\n".join(
         line for line in str(hits[0]["run"]).splitlines() if fragment not in line
     )
-    gaps = napi_consumers_without_a_construction_assertion(mutated)
+    gaps = napi_consumers_without_a_construction_assertion(mutated, artifacts)
     check(
         f"a {job_id} that no longer asserts it {label} is reported",
         any(f"{job_id} downloads a NAPI addon" in gap and label in gap for gap in gaps),
@@ -3519,7 +3570,7 @@ def check_napi_assertion_control(
 
 
 def check_pyo3_assertion_control(
-    doc: dict, job_id: str, fragment: str, label: str
+    doc: dict, artifacts: tuple[str, ...], job_id: str, fragment: str, label: str
 ) -> None:
     """Deleting one half of job `job_id`'s assertion is reported."""
     mutated = copy.deepcopy(doc)
@@ -3535,7 +3586,7 @@ def check_pyo3_assertion_control(
     hits[0]["run"] = "\n".join(
         line for line in str(hits[0]["run"]).splitlines() if fragment not in line
     )
-    gaps = pyo3_consumers_without_a_construction_assertion(mutated)
+    gaps = pyo3_consumers_without_a_construction_assertion(mutated, artifacts)
     check(
         f"a {job_id} that no longer asserts it {label} is reported",
         any(
@@ -3563,35 +3614,35 @@ def artifact_names_without_a_consumer(
 ) -> list[str]:
     """Return every name in `artifacts` that no job in `doc` downloads.
 
-    CRITERION: each artifact name the two consumer gates above select jobs by is a
-    name some job in ci.yml passes to `actions/download-artifact`.
+    CRITERION: each artifact name a bridge producer in ci.yml uploads is a name some
+    job in ci.yml passes to `actions/download-artifact`.
 
-    WHY: both gates read their job set by matching a download step's `name` against a
-    tuple written here. A rename in ci.yml that this file does not follow removes
-    every consumer of the renamed artifact from the gate's set, the gate then reports
-    nothing about those jobs, and the self-test stays green — the silent drop-out the
+    WHY: both gates above select the jobs they judge by matching a download step's
+    `name` against the names `uploaded_artifact_names` reads off ci.yml's upload
+    steps. A download renamed away from the upload that publishes it therefore leaves
+    the gate selecting no job for that artifact, and leaves the producer building a
+    binary no job reads, while the self-test stays green — the silent drop-out the
     gates exist to prevent. `pyo3-module-macos` reaches exactly one consumer,
-    bridge-parity-swift, so a rename of that one name deletes a whole job from the
+    bridge-parity-swift, so renaming that one download deletes a whole job from the
     checked set.
     """
     return [artifact for artifact in artifacts if not artifact_consumers(doc, artifact)]
 
 
 def check_artifact_names_reach_a_consumer(
-    doc: dict, artifacts: tuple[str, ...], tuple_name: str
+    doc: dict, artifacts: tuple[str, ...], filename: str
 ) -> None:
     unreached = artifact_names_without_a_consumer(doc, artifacts)
     check(
-        f"ci.yml: every artifact name in {tuple_name} names an artifact some job "
-        f"downloads",
+        f"ci.yml: every artifact uploading {filename} reaches a job that downloads it",
         not unreached,
-        f"no job downloads {unreached}, so the gate reading {tuple_name} checks no "
-        f"job for that artifact",
+        f"no job downloads {unreached}, so the gate over consumers of {filename} "
+        f"checks no job for that artifact",
     )
 
 
 def check_artifact_name_control(
-    doc: dict, artifacts: tuple[str, ...], tuple_name: str, artifact: str
+    doc: dict, artifacts: tuple[str, ...], artifact: str
 ) -> None:
     """Renaming every download of one artifact is reported."""
     mutated = copy.deepcopy(doc)
@@ -3604,9 +3655,82 @@ def check_artifact_name_control(
             ):
                 step["with"]["name"] = renamed
     check(
-        f"renaming every download of {artifact} is reported against {tuple_name}",
+        f"renaming every download of {artifact} is reported",
         artifact in artifact_names_without_a_consumer(mutated, artifacts),
         f"a ci.yml that downloads {renamed} instead of {artifact} went unreported",
+    )
+
+
+def a_producer_and_an_unguarded_consumer(
+    doc: dict, artifact: str, upload_path: str, test_command: str
+) -> dict:
+    """Return `doc` with one producer of `artifact` and one consumer that skips it.
+
+    The consumer downloads `artifact` and runs `test_command` without importing,
+    loading or constructing what it downloaded, which is the shape both consumer
+    gates report.
+    """
+    mutated = copy.deepcopy(doc)
+    mutated["jobs"]["producer-added-by-the-control"] = {
+        "runs-on": "windows-latest",
+        "steps": [
+            {
+                "uses": "actions/upload-artifact@v4",
+                "with": {"name": artifact, "path": upload_path},
+            }
+        ],
+    }
+    mutated["jobs"]["consumer-added-by-the-control"] = {
+        "runs-on": "windows-latest",
+        "steps": [
+            {
+                "uses": "actions/download-artifact@v4",
+                "with": {"name": artifact, "path": "."},
+            },
+            {"run": test_command},
+        ],
+    }
+    return mutated
+
+
+def check_a_new_producer_reaches_the_pyo3_gate(doc: dict) -> None:
+    """A PyO3 producer added under a name no line of this file writes is still gated.
+
+    A tuple of artifact names written in this file holds the names somebody
+    remembered to list, and says nothing about a producer added later. This control
+    adds the producer and the consumer a Windows leg would add, names the artifact
+    something this file never mentions, and requires the gate to report the consumer
+    that runs pytest without exercising the module it downloaded.
+    """
+    artifact = "pyo3-module-added-by-the-control"
+    mutated = a_producer_and_an_unguarded_consumer(
+        doc, artifact, "bindings/python/scp_sdk/_scp_core*.pyd", "pytest tests -v"
+    )
+    gaps = pyo3_consumers_without_a_construction_assertion(
+        mutated, uploaded_artifact_names(mutated, PYO3_UPLOAD_FILENAME)
+    )
+    check(
+        "a PyO3 consumer of a producer added under an unlisted name is reported",
+        any(gap.startswith("consumer-added-by-the-control ") for gap in gaps),
+        f"a job downloading {artifact} and running pytest without exercising the "
+        f"module went unreported: {gaps}",
+    )
+
+
+def check_a_new_producer_reaches_the_napi_gate(doc: dict) -> None:
+    """A NAPI producer added under a name no line of this file writes is still gated."""
+    artifact = "napi-addon-added-by-the-control"
+    mutated = a_producer_and_an_unguarded_consumer(
+        doc, artifact, "target/release/scp_ffi_napi.dll", "bun test"
+    )
+    gaps = napi_consumers_without_a_construction_assertion(
+        mutated, uploaded_artifact_names(mutated, NAPI_UPLOAD_FILENAME)
+    )
+    check(
+        "a NAPI consumer of a producer added under an unlisted name is reported",
+        any(gap.startswith("consumer-added-by-the-control ") for gap in gaps),
+        f"a job downloading {artifact} and running its tests without loading the "
+        f"addon went unreported: {gaps}",
     )
 
 
@@ -3690,33 +3814,43 @@ def main() -> int:
     check_signing_guard(documents)
 
     print("downloaded-module — a PyO3 consumer exercises the module before pytest")
-    check_pyo3_consumers_exercise_the_module(workflow)
-    check_artifact_names_reach_a_consumer(workflow, PYO3_ARTIFACTS, "PYO3_ARTIFACTS")
+    pyo3_artifacts = uploaded_artifact_names(workflow, PYO3_UPLOAD_FILENAME)
+    check_a_bridge_upload_reaches_the_gate(
+        workflow, PYO3_UPLOAD_FILENAME, pyo3_artifacts
+    )
+    check_pyo3_consumers_exercise_the_module(workflow, pyo3_artifacts)
+    check_artifact_names_reach_a_consumer(
+        workflow, pyo3_artifacts, PYO3_UPLOAD_FILENAME
+    )
+    check_a_new_producer_reaches_the_pyo3_gate(workflow)
     # Every consumer of every name, read off ci.yml rather than written here: a control
     # that mutates one hardcoded job proves the gate goes red for that job's artifact
     # name alone, which left `pyo3-module-macos` — and so job bridge-parity-swift, its
     # one consumer — tied to nothing this file executes.
-    for pyo3_artifact in PYO3_ARTIFACTS:
-        check_artifact_name_control(
-            workflow, PYO3_ARTIFACTS, "PYO3_ARTIFACTS", pyo3_artifact
-        )
+    for pyo3_artifact in pyo3_artifacts:
+        check_artifact_name_control(workflow, pyo3_artifacts, pyo3_artifact)
         for pyo3_job in artifact_consumers(workflow, pyo3_artifact):
             for pyo3_fragment, pyo3_label in PYO3_ASSERTION_FRAGMENTS:
                 check_pyo3_assertion_control(
-                    workflow, pyo3_job, pyo3_fragment, pyo3_label
+                    workflow, pyo3_artifacts, pyo3_job, pyo3_fragment, pyo3_label
                 )
 
     print("downloaded-addon — a NAPI consumer exercises the addon before its tests")
-    check_napi_consumers_exercise_the_addon(workflow)
-    check_artifact_names_reach_a_consumer(workflow, NAPI_ARTIFACTS, "NAPI_ARTIFACTS")
-    for napi_artifact in NAPI_ARTIFACTS:
-        check_artifact_name_control(
-            workflow, NAPI_ARTIFACTS, "NAPI_ARTIFACTS", napi_artifact
-        )
+    napi_artifacts = uploaded_artifact_names(workflow, NAPI_UPLOAD_FILENAME)
+    check_a_bridge_upload_reaches_the_gate(
+        workflow, NAPI_UPLOAD_FILENAME, napi_artifacts
+    )
+    check_napi_consumers_exercise_the_addon(workflow, napi_artifacts)
+    check_artifact_names_reach_a_consumer(
+        workflow, napi_artifacts, NAPI_UPLOAD_FILENAME
+    )
+    check_a_new_producer_reaches_the_napi_gate(workflow)
+    for napi_artifact in napi_artifacts:
+        check_artifact_name_control(workflow, napi_artifacts, napi_artifact)
         for napi_job in artifact_consumers(workflow, napi_artifact):
             for napi_fragment, napi_label in NAPI_ASSERTION_FRAGMENTS:
                 check_napi_assertion_control(
-                    workflow, napi_job, napi_fragment, napi_label
+                    workflow, napi_artifacts, napi_job, napi_fragment, napi_label
                 )
 
     print("needs-condition — a job's dependencies run wherever the job does")
