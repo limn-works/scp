@@ -213,7 +213,9 @@ fn the_binary_feature_the_message_names_is_declared_by_both_manifests() {
             );
             assert!(
                 features_table_declares(&manifest, feature),
-                "the rejection message for '{backend}' names                  `--features {feature}`, and the [features] table of {} declares                  no such feature",
+                "the rejection message for '{backend}' names \
+                 `--features {feature}`, and the [features] table of {} \
+                 declares no such feature",
                 path.display()
             );
         }
@@ -231,7 +233,8 @@ fn binary_feature(backend: &str) -> &'static str {
     let feature = scp_transport::startup::backend_binary_feature(backend);
     assert!(
         feature.is_some(),
-        "the BACKENDS table gives '{backend}' no binary feature, so no message          can tell an operator what to rebuild with"
+        "the BACKENDS table gives '{backend}' no binary feature, so no message \
+         can tell an operator what to rebuild with"
     );
     feature.unwrap_or_default()
 }
