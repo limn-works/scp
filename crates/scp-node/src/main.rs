@@ -126,9 +126,19 @@ fn parse_cli_from(
     }
 }
 
-/// Prints usage information and exits with code 0.
-fn print_help() -> ! {
-    eprintln!(
+/// Writes the usage text `--help` prints.
+///
+/// The `SCP_RELAY_STORAGE_BACKEND` line interpolates
+/// [`scp_transport::startup::VALID_BACKENDS`] instead of naming the backends,
+/// because that constant resolves from the same `scp-transport` features that
+/// compile the arms of `scp_transport::startup::storage_from_env`, and the
+/// relay interpolates the same constant when it rejects a value. A list
+/// written out here drifts the moment a backend's gating feature changes: this
+/// line named `postgres` and `s3` unconditionally until `scp-node` put both
+/// behind its off-by-default `cloud-blobs` feature, so a default build told an
+/// operator to use a backend it then refused to construct.
+fn help_text() -> String {
+    format!(
         "\
 scp-node — SCP application node
 
@@ -180,9 +190,11 @@ ENVIRONMENT VARIABLES:
     SCP_STORAGE_KEY             Hex-encoded 32-byte SQLCipher encryption key
                                 (auto-generated and stored if not set)
     SCP_RELAY_BIND_ADDR         Relay bind address (default: 0.0.0.0:9000)
-    SCP_RELAY_STORAGE_BACKEND   Blob storage backend for relay: sqlite (default), redb,
-                                memory; also postgres and s3 on a binary built
-                                with --features cloud-blobs
+    SCP_RELAY_STORAGE_BACKEND   Blob storage backend for relay, one of: {backends}
+                                (default: sqlite). On any other value the relay prints
+                                the cargo feature that compiles that backend, or reports
+                                the value as unknown, then exits 1. See
+                                docs/guides/relay-operations.md for the cloud backends.
     SCP_RELAY_STORAGE_PATH      Path for sqlite/redb blob storage (default: ./scp-relay.db)
     SCP_RELAY_DATABASE_URL      PostgreSQL connection URL (required when backend=postgres)
     SCP_RELAY_S3_BUCKET         S3 bucket name (required when backend=s3)
@@ -194,8 +206,14 @@ ENVIRONMENT VARIABLES:
     SCP_RELAY_RATE_LIMIT        Publish rate limit per second (default: 100)
     SCP_RELAY_LOG_LEVEL         Log level (default: info)
     SCP_RELAY_LOG_FORMAT        Log format: 'json' or 'pretty' (default: pretty)
-    RUST_LOG                    Override log level (takes precedence over SCP_RELAY_LOG_LEVEL)"
-    );
+    RUST_LOG                    Override log level (takes precedence over SCP_RELAY_LOG_LEVEL)",
+        backends = startup::VALID_BACKENDS
+    )
+}
+
+/// Prints usage information and exits with code 0.
+fn print_help() -> ! {
+    eprintln!("{}", help_text());
     std::process::exit(0);
 }
 
@@ -1136,6 +1154,38 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--help` offers exactly the blob backends this build compiled, because
+    /// the help text interpolates the same `startup::VALID_BACKENDS` that
+    /// `startup::storage_from_env` interpolates when it rejects a value.
+    ///
+    /// `startup.rs` pins four sites that name a backend's gating feature, and
+    /// every one of its scanning tests reads `include_str!("startup.rs")`, so
+    /// none of them reaches this binary's help text. That help text held its own
+    /// hardcoded list of backend names until this assertion existed, which is
+    /// the drift that made a default build print `postgres` among the accepted
+    /// values while `storage_from_env` refused to construct it.
+    ///
+    /// The assertion goes red when someone writes the names out here again,
+    /// whatever features the build resolves, and it stays green when a new
+    /// backend joins the `BACKENDS` table, because the help text and the
+    /// expectation read the one constant.
+    #[test]
+    fn the_help_text_offers_exactly_the_backends_this_build_compiled() {
+        let help = help_text();
+        let derived = format!(
+            "Blob storage backend for relay, one of: {}",
+            startup::VALID_BACKENDS
+        );
+
+        assert!(
+            help.contains(&derived),
+            "the --help line for SCP_RELAY_STORAGE_BACKEND must interpolate \
+             startup::VALID_BACKENDS, so it names a backend exactly when this \
+             build compiled that backend's constructor; expected a line \
+             reading '{derived}', and the help text read:\n{help}"
+        );
+    }
 
     /// Regression guard (SCP-CAPINJECT-010): ephemeral mode MUST select the
     /// in-memory blob backend — no persistence, env overrides ignored. This pins
