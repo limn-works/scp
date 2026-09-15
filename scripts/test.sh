@@ -30,6 +30,20 @@ run_rust() (
     cargo test --workspace
   fi
   cargo test --workspace --doc
+
+  # `--workspace` resolves `scp-transport` without `postgres-blob` or
+  # `s3-blob`, because `scp-node` and `scp-relay` put both behind their
+  # off-by-default `cloud-blobs` feature, so the three commands above run no
+  # test in `crates/scp-transport/src/native/postgres_blob.rs` or
+  # `crates/scp-transport/src/native/s3_blob.rs` and compile neither module's
+  # doctests. Job rust-test-optional-features in .github/workflows/ci.yml
+  # carries both lines below.
+  if command -v cargo-nextest &>/dev/null; then
+    cargo nextest run -p scp-transport --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob
+  else
+    cargo test -p scp-transport --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob
+  fi
+  cargo test -p scp-transport --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob --doc
 )
 
 run_python() (
