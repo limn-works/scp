@@ -56,7 +56,7 @@ RegisterBridge {
   webhook_url:     Option<String>,   // for cooperative mode: platform's webhook receiver URL
   platform_key:    Option<[u8; 32]>, // for cooperative mode: platform's Ed25519 public key
   max_shadows:     u32,              // governance-configured shadow limit for this bridge
-  metadata:        BridgeMetadata,   // display name, description, operator contact
+  metadata:        BridgeRegistrationMetadata, // display name, description, operator contact
 }
 ```
 
@@ -417,8 +417,8 @@ Standard error codes:
 | `SHADOW_ALREADY_EXISTS` | 409 | Shadow with this platform_user_id already exists |
 | `SHADOW_ALREADY_CLAIMED` | 409 | Shadow has been claimed and cannot be modified |
 | `BRIDGE_NOT_AUTHORIZED` | 401 | The node did not verify the caller's bearer token — the call carried none, or the token's signature failed verification, or the token expired — or the node verified the token and then failed to bind the verified caller to the bridge the token names, under the two claim bindings of §12.10.6 step 1 |
-| `BRIDGE_FORBIDDEN` | 403 | Bridge not authorized for this operation |
-| `BRIDGE_SUSPENDED` | 403 | Bridge is suspended by context governance |
+| `BRIDGE_FORBIDDEN` | 403 | The node verified the caller's bearer token and bound the verified caller to the bridge the token names, under the two claim bindings of §12.10.6 step 1, and that bridge then failed the admission criterion of that step on a clause other than the suspension clause. A bridge any of whose lifecycle leaves is a `BridgeRevoked` leaf receives this code whatever its last lifecycle leaf is, a `BridgeSuspended` leaf that a member appended after the revocation included (§12.2.2 step 7). The node reports this code on an authenticated bridge API call and reports it on no webhook delivery |
+| `BRIDGE_SUSPENDED` | 403 | The node verified and bound the caller as the `BRIDGE_FORBIDDEN` row above states, and the bridge's last lifecycle leaf is then a `BridgeSuspended` leaf whose payload `duration` is `None`, or is `Some(d)` whose suspension deadline (§12.2.2) has not passed, while none of that bridge's lifecycle leaves is a `BridgeRevoked` leaf (§12.10.6 step 1). The node reports this code on an authenticated bridge API call and reports it on no webhook delivery |
 | `RATE_LIMITED` | 429 | Request rate exceeds platform-configured limit |
 | `INVALID_REQUEST` | 400 | Malformed request body |
 | `INTERNAL_ERROR` | 500 | Unexpected server error |
@@ -957,16 +957,25 @@ This section tabulates the wire format for all bridge protocol types that cross 
 | `platform` | `String` | Yes | Target platform. |
 | `mode` | `BridgeMode` | Yes | Requested operating mode. |
 | `context_id` | `String` | Yes | Context to register with. |
-| `requested_at` | `u64` | Yes | Unix timestamp (seconds) at which the operator built this request. No derivation in this specification reads this value, and §12.2.1 step 3 reads the approval leaf's own `timestamp` in its place. |
 | `self_hosted` | `bool` | Yes | Whether the operator runs bridge infrastructure. |
 | `webhook_url` | `Option<String>` | Yes | The platform's webhook receiver URL. The operator fills this field for a cooperative-mode bridge and writes `None` into it for every other mode (`RegisterBridge` payload, §12.2.1). |
 | `platform_key` | `Option<[u8; 32]>` | Yes | The platform's Ed25519 public key. The bridge node stores this key when governance approves the registration, and verifies the signature of each webhook delivery under it (authentication, §12.10.2 step 3). The operator fills this field for a cooperative-mode bridge and writes `None` into it for every other mode. |
 | `max_shadows` | `u32` | Yes | The shadow limit the context's governance sets for this bridge. It overrides the shadow registry's own default (`RegisterBridge` payload, §12.2.1). |
-| `metadata` | `BridgeMetadata` | Yes | Display name, description, and operator contact. The context's governance model reads these three values while it decides the proposal (`RegisterBridge` payload, §12.2.1). |
+| `metadata` | `BridgeRegistrationMetadata` | Yes | Display name, description, and operator contact (§12.12.2, `BridgeRegistrationMetadata`). The context's governance model reads these three values while it decides the proposal (`RegisterBridge` payload, §12.2.1). |
 
-Seven of these ten rows — `operator_did`, `platform`, `mode`, `webhook_url`, `platform_key`, `max_shadows` and `metadata` — carry the `RegisterBridge` payload §12.2.1 declares, and the remaining three — `context_id`, `requested_at` and `self_hosted` — carry what the operator states about the request itself. This table lists every field of the type: a `BridgeRegistrationRequest` that declared an eleventh field would carry a value no rule in this specification reads.
+Seven of these nine rows — `operator_did`, `platform`, `mode`, `webhook_url`, `platform_key`, `max_shadows` and `metadata` — carry the `RegisterBridge` payload §12.2.1 declares, and the remaining two — `context_id` and `self_hosted` — carry what the operator states about the request itself. This table lists every field of the type: a `BridgeRegistrationRequest` that declared a tenth field would carry a value no rule in this specification reads.
 
 `BridgeRegistrationRequest` carries no bridge identifier. §12.2.1 step 3 derives the `bridge_id` from the `timestamp` of the leaf that records the approval, and that leaf does not exist while the operator is building the request, so the operator can put no assigned identifier in the request and the context reads none out of it. A requester that filled such a field would name the bridge by one value while the approval filed its lifecycle leaves under another, and the criterion of §12.10.6 step 1 reads the leaves. A pending registration is the governance proposal that carries the `RegisterBridge` action (governance, §5.9), and that proposal's identifier names the pending registration until the approval assigns a `bridge_id`.
+
+`BridgeRegistrationRequest` carries no requester-supplied timestamp either. Every rule this specification states over a bridge registration reads a leaf `timestamp` that event sequencing assigned (§7.3.1): §12.2.1 step 3 derives the `bridge_id` from the approval leaf's own `timestamp`, and §12.2.2 computes a suspension deadline from the `BridgeSuspended` leaf's own `timestamp`. A requester-supplied timestamp feeds neither derivation, so a `BridgeRegistrationRequest` that declared one would carry a value every member ignores, and an operator reading that value would take it for the timestamp the registration is filed under.
+
+**`BridgeRegistrationMetadata`** — The human-readable values the `metadata` field of a `BridgeRegistrationRequest` carries. It is a different type from the `BridgeMetadata` of §5.7, which the context publishes in the `bridges` structural field and which carries the platform, the operator, the bridge's capabilities and its directionality mode (§12.2, §12.6.1). A member reads `BridgeRegistrationMetadata` while governance decides the proposal, and reads `BridgeMetadata` off the published context metadata after the approval.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `display_name` | `String` | Yes | The name the proposal shows a member deciding it (e.g. `"Acme Discord Bridge"`). |
+| `description` | `String` | Yes | What the operator states the bridge does in this context. |
+| `operator_contact` | `String` | Yes | The address at which a member reaches the operator (e.g. an email address or a URL). |
 
 **`RegistrationDecision`** — Governance decision on bridge registration.
 
