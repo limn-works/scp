@@ -1843,6 +1843,21 @@ jobs:
           distribution: zulu
           java-version: "17"
       - uses: android-actions/setup-android@v3
+        with:
+          # Google withdrew `tools`, the obsolete Android SDK Tools package,
+          # from the SDK repository, and `tools platform-tools` is this
+          # action's default package list. sdkmanager prints `Warning: Failed
+          # to find package 'tools'` and exits 1, so the action throws before
+          # it appends the command-line-tools bin directory to PATH, the
+          # `continue-on-error` below swallows that failure, and the
+          # `sdkmanager "platforms;android-35"` step further down dies with
+          # `sdkmanager: command not found`. Naming the list drops the
+          # withdrawn package and leaves the rest of the default. The two
+          # Kotlin jobs, the Android build job in build-matrix.yml, and the
+          # Maven publish job in release.yml each carry this input for the
+          # same reason. First observed 2026-09-15 in the `Kotlin / test` job
+          # of workflow run 34915608875.
+          packages: platform-tools
         continue-on-error: true
       - name: Accept Android SDK licenses
         run: |
@@ -1903,6 +1918,21 @@ jobs:
           distribution: zulu
           java-version: "17"
       - uses: android-actions/setup-android@v3
+        with:
+          # Google withdrew `tools`, the obsolete Android SDK Tools package,
+          # from the SDK repository, and `tools platform-tools` is this
+          # action's default package list. sdkmanager prints `Warning: Failed
+          # to find package 'tools'` and exits 1, so the action throws before
+          # it appends the command-line-tools bin directory to PATH, the
+          # `continue-on-error` below swallows that failure, and the
+          # `sdkmanager "platforms;android-35"` step further down dies with
+          # `sdkmanager: command not found`. Naming the list drops the
+          # withdrawn package and leaves the rest of the default. The two
+          # Kotlin jobs, the Android build job in build-matrix.yml, and the
+          # Maven publish job in release.yml each carry this input for the
+          # same reason. First observed 2026-09-15 in the `Kotlin / test` job
+          # of workflow run 34915608875.
+          packages: platform-tools
         continue-on-error: true
       - name: Accept Android SDK licenses
         run: |
