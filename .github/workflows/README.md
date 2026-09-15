@@ -86,8 +86,11 @@ Most doc generators can be run locally:
 # Rust. Job `rust-doc` in ci.yml runs this command, and a merge waits on it.
 # Four intra-doc links in crates/scp-node name items that exist only under the
 # features it lists, so a run omitting the list exits 101 over those four.
+# The two scp-transport members compile native/postgres_blob.rs and
+# native/s3_blob.rs, which a --workspace resolution leaves out because scp-node
+# and scp-relay put both behind their off-by-default cloud-blobs feature.
 cargo doc --workspace --no-deps --document-private-items \
-  --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant
+  --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant,scp-transport/postgres-blob,scp-transport/s3-blob
 
 # Python (requires sphinx, furo, sphinx-autodoc-typehints)
 cd bindings/python && sphinx-build -b html docs docs/_build/html

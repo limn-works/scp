@@ -303,11 +303,11 @@ Not a replacement for `.docs/architecture.md` — a reading guide for it:
 ### 21.10.2 Rust (rustdoc)
 
 1. Add `#![doc = include_str!("../README.md")]` to each crate's `lib.rs` so the crate-level doc page shows the README.
-2. Generate with the command below. Job `rust-doc` in `.github/workflows/ci.yml` runs that command and a merge waits on it, so every command this specification names carries the same flags: `--document-private-items` makes rustdoc resolve a link a private module writes, and the six features gate items that four intra-doc links in `crates/scp-node` name. A fenced shell block holds the command because `scripts/tests/ci-gate/ci_gate_selftest.py` compares a documented `cargo doc` against job `rust-doc` only where a shell block encloses it, so an inline copy of these flags goes stale under a green self-test.
+2. Generate with the command below. Job `rust-doc` in `.github/workflows/ci.yml` runs that command and a merge waits on it, so every command this specification names carries the same flags: `--document-private-items` makes rustdoc resolve a link a private module writes, the six features gate items that four intra-doc links in `crates/scp-node` name, and the two `scp-transport` members compile `native/postgres_blob.rs` and `native/s3_blob.rs`, which no `--workspace` resolution reaches since `scp-node` and `scp-relay` put both behind their off-by-default `cloud-blobs` feature. A fenced shell block holds the command because `scripts/tests/ci-gate/ci_gate_selftest.py` compares a documented `cargo doc` against job `rust-doc` only where a shell block encloses it, so an inline copy of these flags goes stale under a green self-test.
 
    ```bash
    cargo doc --workspace --no-deps --document-private-items \
-     --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant
+     --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant,scp-transport/postgres-blob,scp-transport/s3-blob
    ```
 
 3. Cross-crate links use `[`item`](crate_name::path::to::item)` syntax.
@@ -368,7 +368,7 @@ Developers and agents can generate docs locally:
 # here. `--open` opens a browser over output rustdoc already wrote, so it
 # changes no diagnostic.
 cargo doc --workspace --no-deps --document-private-items --open \
-  --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant
+  --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant,scp-transport/postgres-blob,scp-transport/s3-blob
 
 # Python (requires sphinx, furo, sphinx-autodoc-typehints)
 cd bindings/python && sphinx-build -b html docs docs/_build/html
