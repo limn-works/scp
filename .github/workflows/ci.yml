@@ -52,18 +52,35 @@ env:
 #   workspace-debug   `target/debug` under build mode — rust-test (both matrix legs),
 #                     rust-test-napi-production, rust-build-pyo3-production,
 #                     rust-build-uniffi-production, rust-doc (its `cargo test --doc`),
-#                     kotlin-test, fail-closed-pre-rotation, shipped-feature-graph.
+#                     kotlin-test, bridge-parity-kotlin (whose one cargo command builds
+#                     `scp-ffi-uniffi` under the dev profile), fail-closed-pre-rotation,
+#                     shipped-feature-graph.
 #   workspace-check   `target/debug` under check mode — rust-clippy, whose two
 #                     `cargo clippy` commands compile every dependency to an `.rmeta`,
 #                     and rust-doc (its `cargo doc --no-deps`, whose dependency units
 #                     cargo compiles in check mode as well). rust-doc restores both
 #                     groups, one rust-cache step each, because its two commands read
 #                     two disjoint artifact sets out of the one directory.
-#   workspace-release `target/release` — python-test and bridge-parity (both run
-#                     `maturin develop --release`), typescript-check and bridge-parity
-#                     (both run `cargo build -p scp-ffi-napi --release`), and
-#                     bridge-parity-kotlin, whose `maturin develop --release` is the
-#                     larger of its two builds.
+#   workspace-release `target/release` on Linux — pyo3-module, which runs
+#                     `maturin develop --release`, and napi-addon, which runs
+#                     `cargo build -p scp-ffi-napi --release`. Those two jobs are the
+#                     only members: python-test, typescript-check, bridge-parity and
+#                     bridge-parity-swift ran one of those commands each and now
+#                     download what the producers upload, so none of them runs cargo
+#                     and none of them reads a cargo cache. The two members write one
+#                     directory under two feature resolutions and share one entry,
+#                     which pyo3-module writes. `maturin develop` builds package
+#                     scp-ffi, so that entry holds the dependency tree both bridges
+#                     share and omits three direct dependencies
+#                     crates/scp-ffi/napi/Cargo.toml names that reach no other member
+#                     of this workspace — napi, napi-derive and napi-build — which
+#                     napi-addon compiles each run. Giving napi-addon a second group
+#                     would cache those three and would also store a second copy of
+#                     the shared tree, which is nearly all of `target/release`,
+#                     against the 10 GB repository cap the paragraph below counts, so
+#                     the group keeps one writer. bridge-parity wrote this entry
+#                     before this arrangement and ran both commands, so what it wrote
+#                     did cover the NAPI dependencies.
 #   transport-optional
 #                     `target/debug` again, but under a feature resolution no
 #                     other job produces — rust-test-optional-features. Its
@@ -77,9 +94,16 @@ env:
 #                     `wasm-pack build`. Jobs wasm-protocol and wasm-test read this
 #                     group for its registry alone, because both compile under the dev
 #                     profile; each step below says so where it sits.
-#   apple-uniffi      `target/aarch64-apple-darwin/release` — swift-build-test.
-#   apple-parity      that directory plus `target/release` — bridge-parity-swift, the
-#                     one job that builds both the UniFFI dylib and the PyO3 module.
+#   apple-uniffi      `target/aarch64-apple-darwin/release` — xcframework, which runs
+#                     `bindings/swift/build-xcframework.sh --dev` for both macOS jobs
+#                     that read an XCFramework. swift-build-test ran that script and
+#                     wrote this entry; it downloads the result instead and reads no
+#                     cargo cache.
+#   apple-parity      `target/release` on macOS — pyo3-module-macos, which runs
+#                     `maturin develop --release` for bridge-parity-swift. The name
+#                     stays as bridge-parity-swift wrote it, because renaming a group
+#                     abandons the entry `main` holds under the old name and makes the
+#                     next run compile cold.
 #   fuzz              `fuzz/target/debug` — fuzz-build, whose `cargo check` compiles a
 #                     separate workspace on the nightly `fuzz/rust-toolchain.toml`
 #                     names, under the dev profile.
@@ -100,8 +124,8 @@ env:
 # contents — shipped-feature-graph resolves a feature graph and compiles almost nothing,
 # and it finishes eleven minutes before rust-test. The producers are rust-test
 # (workspace-debug), rust-clippy (workspace-check), rust-test-optional-features
-# (transport-optional), bridge-parity (workspace-release), typescript-wasm-check
-# (wasm32), swift-build-test (apple-uniffi), bridge-parity-swift (apple-parity) and
+# (transport-optional), pyo3-module (workspace-release), typescript-wasm-check
+# (wasm32), xcframework (apple-uniffi), pyo3-module-macos (apple-parity) and
 # fuzz-build (fuzz): in each group, the job that compiles the most of that directory
 # under that mode.
 #
@@ -131,10 +155,10 @@ jobs:
     needs: check-draft
     runs-on: ubuntu-latest
     # `rust-toolchain.toml` selects the compiler for every lane below, not only the Rust
-    # one: `python-test` runs `maturin develop`, `typescript-check` runs
+    # one: `pyo3-module` and `pyo3-module-macos` run `maturin develop`, `napi-addon` runs
     # `cargo build -p scp-ffi-napi`, the two wasm jobs run `wasm-pack build`, `kotlin-test`
-    # runs `cargo build -p scp-ffi-uniffi`, and `swift-build-test` runs
-    # `build-xcframework.sh`. Every job those outputs guard is written
+    # and `bridge-parity-kotlin` run `cargo build -p scp-ffi-uniffi`, and `xcframework`
+    # runs `build-xcframework.sh`. Every job those outputs guard is written
     # `if: needs.changes.outputs.<lane> == 'true'`, and the `ci` job that aggregates every
     # other job's result counts a skipped job as a pass, so a lane the pin does not reach
     # lets a version bump merge with nothing compiling on the new compiler.
@@ -175,9 +199,9 @@ jobs:
               - 'rust-toolchain.toml'
               # This file itself. Every job a filter in this workflow guards takes its
               # command, its feature list, its matrix and its cache group from this file:
-              # python-test runs `maturin develop`, typescript-check runs
+              # pyo3-module runs `maturin develop`, napi-addon runs
               # `cargo build -p scp-ffi-napi`, kotlin-test runs
-              # `cargo build -p scp-ffi-uniffi`, swift-build-test runs
+              # `cargo build -p scp-ffi-uniffi`, xcframework runs
               # `bindings/swift/build-xcframework.sh`, and rust-test runs
               # `cargo nextest`, each with the arguments written here. A change to this
               # file decides what every one of those jobs compiles and runs, so it sits
@@ -1504,11 +1528,298 @@ jobs:
           push: false
           # Read the cache everywhere; write it only from a push to `main`. A cache
           # written on a pull-request ref is readable only by that pull request, and it
-          # would evict entries from the 10 GB budget the ~18 `Swatinem/rust-cache` steps
-          # in this workflow share. `ignore-error` so a cache-service failure cannot fail
-          # the build check: this job answers whether the image builds.
+          # would evict entries from the 10 GB repository cap that the 21
+          # `Swatinem/rust-cache` steps in this workflow and the 3 in
+          # `.github/workflows/fuzz.yml` share. `ignore-error` so a cache-service
+          # failure cannot fail the build check: this job answers whether the image
+          # builds.
           cache-from: type=gha,scope=docker-image
           cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=docker-image,ignore-error=true' || '' }}
+
+  # ── Shared bridge artifacts ─────────────────────────────────────────
+  #
+  # THE CRITERION: a run compiles each bridge artifact once per runner OS, and every
+  # other job that needs that artifact downloads it. Two jobs may share one build only
+  # when both would run the same command with the same cargo feature resolution on the
+  # same runner OS, because cargo hashes the feature set into every artifact's metadata
+  # and a bridge built with `testing` behaves differently from one built without it.
+  #
+  # WHAT THE DUPLICATES COST. Profiled on run 34805871209, the push to `main` for the
+  # commit that cut 46 crates from the cold workspace test compile: `maturin develop
+  # --release` ran in four jobs (8.8 min on macos-latest, and 7.6, 7.5 and 6.7 min on
+  # ubuntu-latest), `bindings/swift/build-xcframework.sh --dev` ran in two macOS jobs
+  # (9.2 and 7.4 min), and `cargo build -p scp-ffi-napi --release` ran in two
+  # ubuntu-latest jobs (7.4 and 2.1 min). Those eight steps took 56.7 runner-minutes
+  # to produce four distinct binaries, and the longest job in the run —
+  # bridge-parity-swift at 22.2 min — spent 18.0 of those minutes on two of them, which
+  # set the run's 22.8-minute wall.
+  #
+  # WHY EACH ARTIFACT GETS ITS OWN JOB rather than a build added to one consumer that
+  # the others then wait on. A consumer starts only after every job in its `needs` list
+  # finishes, so putting both macOS builds in one job makes bridge-parity-swift wait
+  # for the whole of it and finish later than it does today. Job xcframework and job
+  # pyo3-module-macos run concurrently instead, and bridge-parity-swift starts when the
+  # slower of the two ends.
+  #
+  # WHICH FEATURE SETS ARE THE SAME, read out of the manifests rather than off the
+  # command lines, because the four consumers spell one set three ways:
+  #
+  #   * crates/scp-ffi/Cargo.toml gives `testing` the list
+  #     `scp-core/testing, scp-dht/testing, scp-ffi-common/testing,
+  #     scp-platform/testing, dep:scp-testing`. python-test passed
+  #     `--features testing` and the three parity jobs passed
+  #     `--features scp-core/testing,testing`, so the second spelling names a feature
+  #     the first already forwards and the two resolve to one graph.
+  #   * crates/scp-ffi/napi/Cargo.toml gives `testing` a list that opens with
+  #     `scp-core/testing`. typescript-check passed
+  #     `--features scp-ffi-napi/testing,scp-ffi-napi/testing` and bridge-parity passed
+  #     that pair plus `scp-core/testing`, so both resolve to `scp-ffi-napi/testing`.
+  #   * Both macOS jobs ran `bindings/swift/build-xcframework.sh --dev` with no
+  #     argument of their own, and that script's `--dev` branch sets
+  #     `EXTRA_FEATURES="--features testing"` and builds the single target
+  #     aarch64-apple-darwin.
+  #
+  # WHICH PAIRS DO NOT SHARE, and why:
+  #
+  #   * rust-build-pyo3-production, rust-build-uniffi-production and
+  #     rust-test-napi-production each build a bridge with NO testing feature, to assert
+  #     that a shipped build fails closed where a test build does not. An artifact built
+  #     here carries `scp-platform/testing`, which compiles the in-memory custody and
+  #     attestation nullifiers, so handing one to those jobs would delete the property
+  #     they exist to prove. They keep building their own.
+  #   * kotlin-test and bridge-parity-kotlin both run
+  #     `cargo build -p scp-ffi-uniffi --features testing` into `target/debug`, one
+  #     feature set on one runner OS. Neither consumes an uploaded copy, because
+  #     `generateUniffiBindings` in bindings/kotlin/scp-kt/build.gradle.kts runs
+  #     `scripts/generate-uniffi-kotlin.sh` WITHOUT `--skip-build` and `compileKotlin`
+  #     depends on that task, so each job's Gradle build compiles the crate again
+  #     whatever a download placed in `target/debug`. The explicit cargo step in each
+  #     job is what makes that second compile a fingerprint hit.
+  #   * typescript-wasm-check and scaffold-typescript-web-check both run
+  #     `bun run build` in bindings/typescript-wasm, which runs one `wasm-pack build`,
+  #     on one runner OS. A producer would not pay for itself: that build took 1.8 min
+  #     and 1.7 min in run 34805871209 against job totals of 4.1 min and 2.5 min, so a
+  #     producer job's own checkout, toolchain and cache steps cost about what the
+  #     second build costs, and both consumers would then start after it instead of at
+  #     the top of the run. The measurement, not the shape, is what decides: a wasm
+  #     build that grew past a few minutes would be worth splitting out.
+  #
+  # Each upload names `if-no-files-found: error`. An upload over an empty set succeeds
+  # and publishes an empty artifact, which reaches a consumer as a missing file rather
+  # than as a failed producer — the shape `.github/workflows/release.yml` hit when a
+  # signing job published an artifact named as signed that held nothing.
+  pyo3-module:
+    needs: changes
+    # The union of the three consumers' conditions: python-test reads
+    # `python || rust`, bridge-parity reads `python || typescript || rust`, and
+    # bridge-parity-kotlin reads `python || kotlin || rust`. GitHub skips a job whose
+    # `needs` holds a skipped job, so a producer selected by anything narrower than
+    # that union would turn a consumer that was supposed to run into a skip, and the
+    # `ci` aggregator counts a skip as a pass.
+    if: >-
+      needs.changes.outputs.python == 'true' ||
+      needs.changes.outputs.typescript == 'true' ||
+      needs.changes.outputs.kotlin == 'true' ||
+      needs.changes.outputs.rust == 'true'
+    name: Bridge artifact / PyO3 module (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Free disk space when the runner is short of it
+        run: |
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Create virtualenv and install maturin
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install maturin
+      - name: Build PyO3 native module
+        run: |
+          source .venv/bin/activate
+          cd bindings/python
+          # `testing` forwards `scp-dht/testing`, which compiles the in-memory
+          # DHT seam (`FfiDhtClient::InMemory`) the co-located multi-party tests
+          # rely on to resolve each participant's DID within one process. Without
+          # it the bridge would build the real Mainline Pkarr client for DID
+          # resolution, and same-process governance vote verification would
+          # fail-close to "unknown voter" (ADR-062 §Decision 1 gated the in-memory
+          # DHT nullifier behind `testing`; the functional test harness opts in).
+          maturin develop --release --features testing
+      - name: Upload PyO3 native module
+        uses: actions/upload-artifact@v4
+        with:
+          # `[tool.maturin]` in bindings/python/pyproject.toml sets
+          # `python-source = "."` and `module-name = "scp_sdk._scp_core"`, so
+          # `maturin develop` writes the extension into the source tree beside the
+          # Python package and every consumer runs pytest with `PYTHONPATH=.` from
+          # bindings/python, which resolves `scp_sdk` out of that same tree. The
+          # glob covers the interpreter tag in the filename
+          # (`_scp_core.cpython-312-x86_64-linux-gnu.so`). Nothing else maturin
+          # installs is read: every module under bindings/python/scp_sdk imports
+          # the standard library and `scp_sdk` alone.
+          name: pyo3-module-linux
+          path: bindings/python/scp_sdk/_scp_core*.so
+          retention-days: 1
+          if-no-files-found: error
+
+  napi-addon:
+    needs: changes
+    # The union of typescript-check (`typescript || rust`) and bridge-parity
+    # (`python || typescript || rust`). Dropping the `python` clause would skip this
+    # job on a change confined to bindings/python, skip bridge-parity with it, and
+    # leave the NAPI half of the parity harness unrun under a green `ci`.
+    if: >-
+      needs.changes.outputs.python == 'true' ||
+      needs.changes.outputs.typescript == 'true' ||
+      needs.changes.outputs.rust == 'true'
+    name: Bridge artifact / NAPI addon (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Free disk space when the runner is short of it
+        run: |
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-release
+          save-if: false
+      - name: Build NAPI native addon
+        run: |
+          # `scp-ffi-napi/testing` compiles the in-memory DHT seam
+          # (`FfiDhtClient::InMemory`) the co-located multi-party TypeScript tests
+          # and the parity harness rely on to resolve each participant's DID within
+          # one process. Without it the addon builds the real Mainline Pkarr client
+          # for DID resolution, and same-process resolution and governance flows
+          # would block on the network or fail-close to "unknown voter"
+          # (ADR-062 §Decision 1 gated the in-memory DHT nullifier behind `testing`).
+          # crates/scp-ffi/napi/Cargo.toml opens that feature's list with
+          # `scp-core/testing`, so this one flag is the set both consumers spelled.
+          cargo build -p scp-ffi-napi --release --features scp-ffi-napi/testing
+      - name: Upload NAPI native addon
+        uses: actions/upload-artifact@v4
+        with:
+          name: napi-addon-linux
+          path: target/release/libscp_ffi_napi.so
+          retention-days: 1
+          if-no-files-found: error
+
+  xcframework:
+    needs: changes
+    # The union of swift-build-test (`swift || rust`) and bridge-parity-swift
+    # (`python || swift || rust`).
+    if: >-
+      needs.changes.outputs.python == 'true' ||
+      needs.changes.outputs.swift == 'true' ||
+      needs.changes.outputs.rust == 'true'
+    name: Bridge artifact / Swift XCFramework (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      # No `swift-actions/setup-swift` step: `build-xcframework.sh` runs cargo,
+      # `xcodebuild -create-xcframework` and `lipo`, and compiles no Swift. The two
+      # consumers install the Swift toolchain, because they are the jobs that run
+      # `swift build`. Leaving it out of this job saves the 1.0-1.1 min that step took
+      # in each macOS job of run 34805871209.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: apple-uniffi
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build XCFramework (dev mode — macOS arm64 only)
+        run: bindings/swift/build-xcframework.sh --dev
+      - name: Upload XCFramework and generated bindings
+        uses: actions/upload-artifact@v4
+        with:
+          # Three outputs, all under bindings/swift, which upload-artifact takes as
+          # the artifact root: the binary target Package.swift names by path, the C
+          # header and module map the script regenerates, and the Swift bindings
+          # uniffi-bindgen emits. ScpBindings.swift is tracked, and a `--dev` build
+          # regenerates it over the tracked copy with the `testing`-gated surface the
+          # parity harness calls (`signed_at_override`), so a consumer that kept the
+          # checkout's copy would compile against a narrower API than the dylib
+          # exports.
+          name: swift-xcframework-dev
+          path: |
+            bindings/swift/ScpFFI.xcframework
+            bindings/swift/Headers
+            bindings/swift/Sources/SCP/Internal/ScpBindings.swift
+          retention-days: 1
+          if-no-files-found: error
+
+  pyo3-module-macos:
+    needs: changes
+    # bridge-parity-swift is the only consumer, and this job repeats its condition.
+    # An Ubuntu build cannot serve it: a Python extension module is a native shared
+    # object, and the one job pyo3-module publishes is an ELF `.so` built against
+    # glibc for x86_64.
+    if: >-
+      needs.changes.outputs.python == 'true' ||
+      needs.changes.outputs.swift == 'true' ||
+      needs.changes.outputs.rust == 'true'
+    name: Bridge artifact / PyO3 module (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: apple-parity
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Create virtualenv and install maturin
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install maturin
+      - name: Build PyO3 native module
+        run: |
+          source .venv/bin/activate
+          cd bindings/python
+          maturin develop --release --features testing
+      - name: Upload PyO3 native module
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyo3-module-macos
+          path: bindings/python/scp_sdk/_scp_core*.so
+          retention-days: 1
+          if-no-files-found: error
 
   # ── Python ──────────────────────────────────────────────────────────
   python-lint:
@@ -1537,10 +1848,10 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: python3.12 scripts/check-python-falsy-optionals.py
 
-  # A `rust` clause is load-bearing. `scp-ffi`, a PyO3 bridge this job
-  # builds through maturin, depends on scp-core, scp-runtime, scp-transport,
-  # scp-mls, scp-node and eleven more workspace crates (`cargo tree -p scp-ffi
-  # -e no-dev`). A `python` filter lists only bindings/python/**,
+  # A `rust` clause is load-bearing. `scp-ffi`, the PyO3 bridge job pyo3-module
+  # builds through maturin for this job, depends on scp-core, scp-runtime,
+  # scp-transport, scp-mls, scp-node and eleven more workspace crates
+  # (`cargo tree -p scp-ffi -e no-dev`). A `python` filter lists only bindings/python/**,
   # crates/scp-ffi/src/** and crates/scp-ffi/common/**, so a pull request that
   # changed crates/scp-runtime/ alone skipped this job and every assertion in
   # bindings/python/tests/ went unexecuted under a green check.
@@ -1554,7 +1865,9 @@ jobs:
   # dependency edge. bridge-parity below already ORs on `rust` for that same
   # reason.
   python-test:
-    needs: changes
+    # Job pyo3-module builds the extension module this job imports. This job runs no
+    # cargo command, so it installs no Rust toolchain and reads no cargo cache.
+    needs: [changes, pyo3-module]
     if: >-
       needs.changes.outputs.python == 'true' ||
       needs.changes.outputs.rust == 'true'
@@ -1562,46 +1875,60 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Free disk space when the runner is short of it
-        run: |
-          # Conditional for the reason job rust-test's copy of this step states in
-          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
-          # AFTER the deletions, so about 85 GB was free before them, against the
-          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
-          # short of and cost between 21 s and 2 min 12 s per job.
-          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
-          echo "available: ${AVAILABLE_GB}G"
-          if [ "$AVAILABLE_GB" -lt 40 ]; then
-            echo "under 40G — reclaiming the preinstalled SDK trees"
-            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-            df -h /
-          fi
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - name: Download PyO3 native module
+        uses: actions/download-artifact@v4
         with:
-          shared-key: workspace-release
-          save-if: false
+          name: pyo3-module-linux
+          path: bindings/python/scp_sdk
       - name: Create virtualenv and install dependencies
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install pytest pytest-asyncio maturin
-      - name: Build PyO3 native module
+          pip install pytest pytest-asyncio
+      # THE DEFECT THIS CLOSES: every real-FFI test module under
+      # bindings/python/tests opens with `pytest.skip("Native _scp_core extension not
+      # available — run maturin develop first", allow_module_level=True)` when
+      # `from scp_sdk import _scp_core` raises, and the `scp` fixture in
+      # bindings/python/tests/conftest.py skips every test that requests it when
+      # `scp_sdk` does not import or when `SCP(storage={"type": "in_memory"})` raises
+      # the not-installed error. A download that landed the module anywhere but beside
+      # the package would therefore leave pytest exiting 0 over zero executed
+      # assertions, which is the `zero-test` shape
+      # scripts/tests/ci-gate/ci_gate_selftest.py names. This step runs both statements
+      # those guards run — the import and the construction — so a module that imports
+      # but cannot construct fails the job here rather than skipping every test that
+      # requests the fixture. It then reads the two methods the `server` and `testing`
+      # feature lists compile onto the native class, because the import and the
+      # construction both succeed on a module built without `testing`:
+      # crates/scp-ffi/src/lib.rs gates `pub mod testing` alone, and
+      # bindings/python/tests/test_e2e_fullstack.py answers a missing
+      # `fullstack_create_node` with `pytest.skip(..., allow_module_level=True)`, which
+      # would delete the whole real-MLS full-stack suite from a green run. An extension
+      # that loads but carries a different feature resolution fails the job here instead
+      # of skipping every test that calls those methods. Every consumer of a PyO3
+      # artifact runs this step.
+      - name: Assert the downloaded extension imports, constructs, and carries the gated methods
         run: |
           source .venv/bin/activate
           cd bindings/python
-          # `testing` forwards `scp-dht/testing`, which compiles the in-memory
-          # DHT seam (`FfiDhtClient::InMemory`) the co-located multi-party tests
-          # rely on to resolve each participant's DID within one process. Without
-          # it the bridge would build the real Mainline Pkarr client for DID
-          # resolution, and same-process governance vote verification would
-          # fail-close to "unknown voter" (ADR-062 §Decision 1 gated the in-memory
-          # DHT nullifier behind `testing`; the functional test harness opts in).
-          maturin develop --release --features testing
+          PYTHONPATH=. python -c "import scp_sdk._scp_core as module; print(module.__file__)"
+          PYTHONPATH=. python -c "from scp_sdk import SCP; print(SCP(storage={'type': 'in_memory'}).instance_id)"
+          PYTHONPATH=. python -c "
+          from scp_sdk import _scp_core
+          probe = _scp_core.SCP({'type': 'in_memory'})
+          gated = (
+              'relay_start_in_memory',
+              'fullstack_create_node',
+          )
+          missing = [name for name in gated if not callable(getattr(probe, name, None))]
+          if missing:
+              raise SystemExit('the native SCP class is missing ' + ', '.join(missing) + ', so this extension was built without the feature that method needs')
+          print('PyO3 extension carries the gated methods')
+          "
       - name: Run tests (including real FFI)
         run: |
           source .venv/bin/activate
@@ -1611,12 +1938,14 @@ jobs:
           PYTHONPATH=. pytest tests/ -v -m "not parity"
 
   # ── TypeScript ──────────────────────────────────────────────────────
-  # ORs on `rust` for a reason spelled out above python-test: a NAPI addon
-  # this job compiles reaches every Rust workspace crate through scp-core, while
-  # a `typescript` filter names only bindings/typescript/**,
+  # ORs on `rust` for a reason spelled out above python-test: the NAPI addon job
+  # napi-addon compiles for this job reaches every Rust workspace crate through
+  # scp-core, while a `typescript` filter names only bindings/typescript/**,
   # crates/scp-ffi/napi/** and crates/scp-ffi/common/**.
   typescript-check:
-    needs: changes
+    # Job napi-addon builds the native addon this job loads. This job runs no cargo
+    # command, so it installs no Rust toolchain and reads no cargo cache.
+    needs: [changes, napi-addon]
     if: >-
       needs.changes.outputs.typescript == 'true' ||
       needs.changes.outputs.rust == 'true'
@@ -1624,37 +1953,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Free disk space when the runner is short of it
-        run: |
-          # Conditional for the reason job rust-test's copy of this step states in
-          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
-          # AFTER the deletions, so about 85 GB was free before them, against the
-          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
-          # short of and cost between 21 s and 2 min 12 s per job.
-          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
-          echo "available: ${AVAILABLE_GB}G"
-          if [ "$AVAILABLE_GB" -lt 40 ]; then
-            echo "under 40G — reclaiming the preinstalled SDK trees"
-            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-            df -h /
-          fi
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - name: Download NAPI native addon
+        uses: actions/download-artifact@v4
         with:
-          shared-key: workspace-release
-          save-if: false
-      - name: Build NAPI native addon
-        run: |
-          # `scp-ffi-napi/testing` compiles the in-memory DHT seam
-          # (`FfiDhtClient::InMemory`) the co-located multi-party TypeScript tests
-          # rely on to resolve each participant's DID within one process. Without
-          # it the addon builds the real Mainline Pkarr client for DID resolution,
-          # and same-process resolution/governance flows would block on the network
-          # (test timeouts) or fail-close to "unknown voter" (ADR-062 §Decision 1
-          # gated the in-memory DHT nullifier behind `testing`).
-          cargo build -p scp-ffi-napi --release --features scp-ffi-napi/testing,scp-ffi-napi/testing
+          # Into the directory the wiring step below reads, so that step keeps its
+          # one source of truth for the cdylib's path.
+          name: napi-addon-linux
+          path: target/release
       - name: Install TypeScript dependencies
         working-directory: bindings/typescript
         run: bun install
@@ -1680,6 +1987,43 @@ jobs:
           cp "$LIB_FILE" "$PKG_DIR/index.node"
           # Create a minimal package.json so require() resolves
           echo '{"name":"'"$NAPI_PKG"'","version":"0.1.0","main":"index.node"}' > "$PKG_DIR/package.json"
+      # THE DEFECT THIS CLOSES: every real-NAPI test file under
+      # bindings/typescript/tests wraps its addon load and its first construction in
+      # one `try`, writes the caught error into a skip reason, and resolves its whole
+      # `describe` block to `describe.skip` or to a lone `test.skip` — see
+      # tests/real-napi.test.ts, tests/e2e-fullstack.test.ts, tests/persistence.test.ts
+      # and the nine files that copy that shape. A downloaded addon that does not load
+      # therefore leaves `bun test` exiting 0 over zero executed NAPI assertions, which
+      # is the `zero-test` shape scripts/tests/ci-gate/ci_gate_selftest.py names, and
+      # which the `[ ! -f ]` check above cannot see because that check reads whether the
+      # file is present and never loads it. This step runs the statements those guards
+      # run — the SDK loader and the native constructor — and reads the two methods the
+      # `server` and `testing` feature lists compile onto the native class, so an addon
+      # that loads but carries a different feature resolution fails the job here instead
+      # of skipping every test that calls those methods. Every consumer of a NAPI
+      # artifact runs this step.
+      - name: Assert the downloaded addon loads and constructs
+        working-directory: bindings/typescript
+        run: |
+          bun -e '
+            import { loadNativeAddon } from "./src/internal/native.ts";
+            const addon = loadNativeAddon();
+            const NativeScp = addon.SCP;
+            if (typeof NativeScp !== "function") {
+              throw new Error("the native addon exports no SCP class");
+            }
+            const probe = new NativeScp(JSON.stringify({ type: "in_memory" }));
+            for (const method of ["relayStartInMemory", "fullstackCreateNode"]) {
+              if (typeof probe[method] !== "function") {
+                throw new Error(
+                  "the native SCP class is missing " + method +
+                  ", so this addon was built without the feature that method needs"
+                );
+              }
+            }
+            console.log("NAPI addon loaded, constructed, and carries the gated methods");
+            process.exit(0);
+          '
       - name: Run checks
         working-directory: bindings/typescript
         run: |
@@ -1843,6 +2187,21 @@ jobs:
           distribution: zulu
           java-version: "17"
       - uses: android-actions/setup-android@v3
+        with:
+          # Google withdrew `tools`, the obsolete Android SDK Tools package,
+          # from the SDK repository, and `tools platform-tools` is this
+          # action's default package list. sdkmanager prints `Warning: Failed
+          # to find package 'tools'` and exits 1, so the action throws before
+          # it appends the command-line-tools bin directory to PATH, the
+          # `continue-on-error` below swallows that failure, and the
+          # `sdkmanager "platforms;android-35"` step further down dies with
+          # `sdkmanager: command not found`. Naming the list drops the
+          # withdrawn package and leaves the rest of the default. The two
+          # Kotlin jobs, the Android build job in build-matrix.yml, and the
+          # Maven publish job in release.yml each carry this input for the
+          # same reason. First observed 2026-09-15 in the `Kotlin / test` job
+          # of workflow run 34915608875.
+          packages: platform-tools
         continue-on-error: true
       - name: Accept Android SDK licenses
         run: |
@@ -1903,6 +2262,21 @@ jobs:
           distribution: zulu
           java-version: "17"
       - uses: android-actions/setup-android@v3
+        with:
+          # Google withdrew `tools`, the obsolete Android SDK Tools package,
+          # from the SDK repository, and `tools platform-tools` is this
+          # action's default package list. sdkmanager prints `Warning: Failed
+          # to find package 'tools'` and exits 1, so the action throws before
+          # it appends the command-line-tools bin directory to PATH, the
+          # `continue-on-error` below swallows that failure, and the
+          # `sdkmanager "platforms;android-35"` step further down dies with
+          # `sdkmanager: command not found`. Naming the list drops the
+          # withdrawn package and leaves the rest of the default. The two
+          # Kotlin jobs, the Android build job in build-matrix.yml, and the
+          # Maven publish job in release.yml each carry this input for the
+          # same reason. First observed 2026-09-15 in the `Kotlin / test` job
+          # of workflow run 34915608875.
+          packages: platform-tools
         continue-on-error: true
       - name: Accept Android SDK licenses
         run: |
@@ -1961,13 +2335,15 @@ jobs:
       - run: swiftlint lint --strict
       - run: swiftformat --lint Sources/ Tests/
 
-  # ORs on `rust` for a reason spelled out above python-test: this job builds
-  # an XCFramework and runs a Swift suite against it, and that XCFramework
-  # reaches every Rust workspace crate through scp-core, while a `swift` filter
-  # names only bindings/swift/**, crates/scp-ffi/uniffi/** and
-  # crates/scp-ffi/common/**.
+  # ORs on `rust` for a reason spelled out above python-test: this job runs a Swift
+  # suite against an XCFramework, and that XCFramework reaches every Rust workspace
+  # crate through scp-core, while a `swift` filter names only bindings/swift/**,
+  # crates/scp-ffi/uniffi/** and crates/scp-ffi/common/**.
   swift-build-test:
-    needs: changes
+    # Job xcframework builds ScpFFI.xcframework and regenerates ScpBindings.swift for
+    # this job. This job runs no cargo command, so it installs no Rust toolchain and
+    # reads no cargo cache.
+    needs: [changes, xcframework]
     if: >-
       needs.changes.outputs.swift == 'true' ||
       needs.changes.outputs.rust == 'true'
@@ -1979,13 +2355,11 @@ jobs:
       - uses: swift-actions/setup-swift@v2
         with:
           swift-version: "6.2"
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - name: Download XCFramework and generated bindings
+        uses: actions/download-artifact@v4
         with:
-          shared-key: apple-uniffi
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Build XCFramework (dev mode — macOS arm64 only)
-        run: bindings/swift/build-xcframework.sh --dev
+          name: swift-xcframework-dev
+          path: bindings/swift
       - name: Build Swift package
         working-directory: bindings/swift
         run: swift build
@@ -2026,7 +2400,10 @@ jobs:
   # equality. Layer C of the bridge enforcement stack (Layer A = FFI
   # conformance, Layer B = SDK capability matrix).
   bridge-parity:
-    needs: changes
+    # Jobs pyo3-module and napi-addon build the two bridges this harness drives. This
+    # job runs no cargo command, so it installs no Rust toolchain and reads no cargo
+    # cache.
+    needs: [changes, pyo3-module, napi-addon]
     if: >-
       needs.changes.outputs.python == 'true' ||
       needs.changes.outputs.typescript == 'true' ||
@@ -2035,20 +2412,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Free disk space when the runner is short of it
-        run: |
-          # Conditional for the reason job rust-test's copy of this step states in
-          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
-          # AFTER the deletions, so about 85 GB was free before them, against the
-          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
-          # short of and cost between 21 s and 2 min 12 s per job.
-          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
-          echo "available: ${AVAILABLE_GB}G"
-          if [ "$AVAILABLE_GB" -lt 40 ]; then
-            echo "under 40G — reclaiming the preinstalled SDK trees"
-            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-            df -h /
-          fi
       - uses: actions/checkout@v5
       - name: Check for unresolved issue placeholders
         # Runs immediately after checkout — a 1-second grep should not wait
@@ -2080,25 +2443,41 @@ jobs:
         with:
           python-version: "3.12"
       - uses: oven-sh/setup-bun@v2
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - name: Download PyO3 native module
+        uses: actions/download-artifact@v4
         with:
-          shared-key: workspace-release
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          name: pyo3-module-linux
+          path: bindings/python/scp_sdk
+      - name: Download NAPI native addon
+        uses: actions/download-artifact@v4
+        with:
+          name: napi-addon-linux
+          path: target/release
       - name: Python deps
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install pytest pytest-asyncio maturin
-      - name: Build PyO3 native module
+          pip install pytest pytest-asyncio
+      # See the step of this name in job python-test for the skip-on-absence defect it
+      # closes.
+      - name: Assert the downloaded extension imports, constructs, and carries the gated methods
         run: |
           source .venv/bin/activate
           cd bindings/python
-          maturin develop --release --features scp-core/testing,testing
-      - name: Build NAPI native addon
-        run: |
-          cargo build -p scp-ffi-napi --release \
-            --features scp-ffi-napi/testing,scp-ffi-napi/testing,scp-core/testing
+          PYTHONPATH=. python -c "import scp_sdk._scp_core as module; print(module.__file__)"
+          PYTHONPATH=. python -c "from scp_sdk import SCP; print(SCP(storage={'type': 'in_memory'}).instance_id)"
+          PYTHONPATH=. python -c "
+          from scp_sdk import _scp_core
+          probe = _scp_core.SCP({'type': 'in_memory'})
+          gated = (
+              'relay_start_in_memory',
+              'fullstack_create_node',
+          )
+          missing = [name for name in gated if not callable(getattr(probe, name, None))]
+          if missing:
+              raise SystemExit('the native SCP class is missing ' + ', '.join(missing) + ', so this extension was built without the feature that method needs')
+          print('PyO3 extension carries the gated methods')
+          "
       - name: Wire NAPI addon into node_modules
         run: |
           ARCH=$(uname -m)
@@ -2120,6 +2499,31 @@ jobs:
       - name: Install TypeScript workspace deps
         working-directory: bindings/typescript
         run: bun install
+      # See the step of this name in job typescript-check for the skip-on-absence
+      # defect it closes. This job drives the NAPI half of the parity harness through a
+      # Bun child process, so an addon that does not load surfaces in this step.
+      - name: Assert the downloaded addon loads and constructs
+        working-directory: bindings/typescript
+        run: |
+          bun -e '
+            import { loadNativeAddon } from "./src/internal/native.ts";
+            const addon = loadNativeAddon();
+            const NativeScp = addon.SCP;
+            if (typeof NativeScp !== "function") {
+              throw new Error("the native addon exports no SCP class");
+            }
+            const probe = new NativeScp(JSON.stringify({ type: "in_memory" }));
+            for (const method of ["relayStartInMemory", "fullstackCreateNode"]) {
+              if (typeof probe[method] !== "function") {
+                throw new Error(
+                  "the native SCP class is missing " + method +
+                  ", so this addon was built without the feature that method needs"
+                );
+              }
+            }
+            console.log("NAPI addon loaded, constructed, and carries the gated methods");
+            process.exit(0);
+          '
       - name: Run parity tests (NAPI only)
         # The Kotlin and Swift alt-bridge cases are covered by dedicated
         # jobs (`bridge-parity-kotlin`, `bridge-parity-swift`) that own
@@ -2138,7 +2542,13 @@ jobs:
   # a pre-built UniFFI Kotlin binding tree on top of the Python + Rust
   # stack the parent bridge-parity job already carries.
   bridge-parity-kotlin:
-    needs: changes
+    # Job pyo3-module builds the PyO3 half of this harness. The UniFFI half stays in
+    # this job: `generateUniffiBindings` in bindings/kotlin/scp-kt/build.gradle.kts
+    # runs `scripts/generate-uniffi-kotlin.sh` without `--skip-build`, and
+    # `compileKotlin` depends on that task, so the installDist step below compiles
+    # `scp-ffi-uniffi` whatever a download placed in `target/debug`. The explicit
+    # cargo step is what turns that second compile into a fingerprint hit.
+    needs: [changes, pyo3-module]
     if: >-
       needs.changes.outputs.python == 'true' ||
       needs.changes.outputs.kotlin == 'true' ||
@@ -2172,19 +2582,45 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace-release
+          # `workspace-debug`, not `workspace-release`: the one cargo command left in
+          # this job builds `scp-ffi-uniffi` under the dev profile into `target/debug`,
+          # which is the directory and the compile mode that group holds. It read
+          # `workspace-release` while it also ran `maturin develop --release`, and job
+          # pyo3-module now runs that command instead. kotlin-test, which runs the same
+          # `cargo build -p scp-ffi-uniffi --features testing`, reads this group too.
+          shared-key: workspace-debug
           save-if: false
       - uses: gradle/actions/setup-gradle@v4
+      - name: Download PyO3 native module
+        uses: actions/download-artifact@v4
+        with:
+          name: pyo3-module-linux
+          path: bindings/python/scp_sdk
       - name: Python deps
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install pytest pytest-asyncio maturin
-      - name: Build PyO3 native module
+          pip install pytest pytest-asyncio
+      # See the step of this name in job python-test for the skip-on-absence defect it
+      # closes.
+      - name: Assert the downloaded extension imports, constructs, and carries the gated methods
         run: |
           source .venv/bin/activate
           cd bindings/python
-          maturin develop --release --features scp-core/testing,testing
+          PYTHONPATH=. python -c "import scp_sdk._scp_core as module; print(module.__file__)"
+          PYTHONPATH=. python -c "from scp_sdk import SCP; print(SCP(storage={'type': 'in_memory'}).instance_id)"
+          PYTHONPATH=. python -c "
+          from scp_sdk import _scp_core
+          probe = _scp_core.SCP({'type': 'in_memory'})
+          gated = (
+              'relay_start_in_memory',
+              'fullstack_create_node',
+          )
+          missing = [name for name in gated if not callable(getattr(probe, name, None))]
+          if missing:
+              raise SystemExit('the native SCP class is missing ' + ', '.join(missing) + ', so this extension was built without the feature that method needs')
+          print('PyO3 extension carries the gated methods')
+          "
       - name: Build UniFFI cdylib
         run: |
           cargo build -p scp-ffi-uniffi --features testing
@@ -2231,7 +2667,12 @@ jobs:
   # Swift bindings. Pinned to macos-latest because UniFFI Swift ships
   # as an .xcframework that targets Apple platforms.
   bridge-parity-swift:
-    needs: changes
+    # Jobs pyo3-module-macos and xcframework build the two bridges this harness
+    # drives, and they run concurrently, so this job starts when the slower of the two
+    # ends. Both producers are macOS jobs: an ELF `.so` and an aarch64-apple-darwin
+    # static library are not interchangeable. This job runs no cargo command, so it
+    # installs no Rust toolchain and reads no cargo cache.
+    needs: [changes, pyo3-module-macos, xcframework]
     if: >-
       needs.changes.outputs.python == 'true' ||
       needs.changes.outputs.swift == 'true' ||
@@ -2247,23 +2688,41 @@ jobs:
       - uses: swift-actions/setup-swift@v2
         with:
           swift-version: "6.2"
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - name: Download PyO3 native module
+        uses: actions/download-artifact@v4
         with:
-          shared-key: apple-parity
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          name: pyo3-module-macos
+          path: bindings/python/scp_sdk
+      - name: Download XCFramework and generated bindings
+        uses: actions/download-artifact@v4
+        with:
+          name: swift-xcframework-dev
+          path: bindings/swift
       - name: Python deps
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install pytest pytest-asyncio maturin
-      - name: Build PyO3 native module
+          pip install pytest pytest-asyncio
+      # See the step of this name in job python-test for the skip-on-absence defect it
+      # closes.
+      - name: Assert the downloaded extension imports, constructs, and carries the gated methods
         run: |
           source .venv/bin/activate
           cd bindings/python
-          maturin develop --release --features scp-core/testing,testing
-      - name: Build XCFramework (dev mode — macOS arm64 only)
-        run: bindings/swift/build-xcframework.sh --dev
+          PYTHONPATH=. python -c "import scp_sdk._scp_core as module; print(module.__file__)"
+          PYTHONPATH=. python -c "from scp_sdk import SCP; print(SCP(storage={'type': 'in_memory'}).instance_id)"
+          PYTHONPATH=. python -c "
+          from scp_sdk import _scp_core
+          probe = _scp_core.SCP({'type': 'in_memory'})
+          gated = (
+              'relay_start_in_memory',
+              'fullstack_create_node',
+          )
+          missing = [name for name in gated if not callable(getattr(probe, name, None))]
+          if missing:
+              raise SystemExit('the native SCP class is missing ' + ', '.join(missing) + ', so this extension was built without the feature that method needs')
+          print('PyO3 extension carries the gated methods')
+          "
       - name: Build Swift parity runner
         run: |
           cd bindings/python/tests/bridge_parity/helpers/swift_bridge_runner
@@ -2391,6 +2850,10 @@ jobs:
       - rust-build-uniffi-production
       - rust-doc
       - rust-deny
+      - pyo3-module
+      - napi-addon
+      - xcframework
+      - pyo3-module-macos
       - python-lint
       - python-test
       - typescript-check

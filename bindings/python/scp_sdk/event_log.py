@@ -21,6 +21,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from scp_sdk._extension import native_module
+
 logger = logging.getLogger("scp_sdk")
 
 # Standard library practice: add NullHandler so that library logging
@@ -32,9 +34,9 @@ logger.addHandler(logging.NullHandler())
 def _init_pyo3_log_bridge() -> None:
     """Forward Rust ``tracing`` output to Python logging via pyo3 log bridge.
 
-    Attempts to import ``_scp_core`` and call its log bridge
-    initializer.  If the extension is not installed or does not expose
-    a log bridge function, this is a silent no-op.
+    Asks :func:`scp_sdk._extension.native_module` for the extension and
+    calls its log bridge initializer. If the extension is not installed or
+    does not expose a log bridge function, this is a silent no-op.
 
     The bridge maps Rust ``tracing`` levels to Python logging levels:
 
@@ -48,14 +50,21 @@ def _init_pyo3_log_bridge() -> None:
         logging.getLogger("scp_sdk").setLevel(logging.DEBUG)
     """
     try:
-        import _scp_core  # type: ignore[import-not-found]
+        native = native_module()
 
-        if hasattr(_scp_core, "init_pyo3_log"):
-            _scp_core.init_pyo3_log()
-    except (ImportError, Exception):
+        if hasattr(native, "init_pyo3_log"):
+            native.init_pyo3_log()
+    except Exception:
         # Extension not installed or log bridge not available -- this
         # is expected during development or testing without the Rust
-        # extension compiled.
+        # extension compiled. Forwarding Rust ``tracing`` output to Python
+        # logging is the only thing this function does, so a failure here
+        # costs log lines and nothing else.
+        #
+        # A *present* extension that failed to load never reaches this
+        # swallow: ``scp_sdk/__init__.py`` raises ``SCP-UNKNOWN-0002`` for
+        # that cause while importing the package, which happens before
+        # Python executes this module.
         pass
 
 
