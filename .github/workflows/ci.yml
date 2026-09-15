@@ -564,6 +564,29 @@ jobs:
       - name: Real scan
         run: python3.12 scripts/check-doc-citations.py
 
+  # A `[mirror]` site of the identity-substrate plan carries an include directive and
+  # the Owner's bytes, and this job re-runs the resolver into a temporary tree and
+  # fails where a site's bytes differ from the fragment its directive names. It runs on
+  # every pull request, without a paths filter, because the `ci` aggregator counts a
+  # skipped job as a pass.
+  doc-includes:
+    needs: check-draft
+    name: Docs / transcluded fragments match their owner
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Self-test MUST run first: it plants each of the five failure conditions and
+      # asserts the checker reports it, so a green real scan means the checker read the
+      # tree rather than that it can no longer fail.
+      - name: Self-test include checker
+        run: python3.12 scripts/check-doc-includes.py --self-test
+      - name: Real scan
+        run: python3.12 scripts/check-doc-includes.py
+
   # Every agent definition in `.claude/agents/` opens with a `## Verdict criterion`
   # section carrying a `**Criterion:**` line and an `**Indicators, not the criterion.**`
   # line, so the sentence in the Agent execution rules of CLAUDE.md describes the tree
@@ -1858,6 +1881,7 @@ jobs:
       - saga-gating-granularity
       - block-in-place
       - doc-citations
+      - doc-includes
       - agent-verdict-criterion
       - deleted-primitives
       - bridge-instance-lifecycle
