@@ -131,6 +131,20 @@ cd "$REPO_ROOT"
 # a future dependency edge pull plaintext key-per-file storage back into a
 # shipped graph with no gate failure to announce it.
 #
+# `scp-transport/postgres-blob` and `scp-transport/s3-blob` were two more such
+# rows until `scp-node` and `scp-relay` put both behind their off-by-default
+# `cloud-blobs` feature. No entry in ARTIFACTS passes that feature and no
+# `default` block wires it, so no shipped artifact resolves either transport
+# feature. `postgres-blob` pulls the `sqlx` PostgreSQL client and `s3-blob`
+# pulls the AWS S3 client: the two together resolve 75 extra packages into
+# `scp-relay`'s graph, 23 of them `aws-*`, measured with `cargo tree -e no-dev`
+# and recorded in `crates/scp-relay/src/main.rs`. Both rows are dropped for the
+# reason the `scp-platform/filesystem` row was dropped: cargo unifies
+# `scp-transport`'s features across every package one invocation builds, so a
+# later dependency edge that enables either feature for any default member pulls
+# those clients back into the node binary, the relay binary and the three FFI
+# cdylibs, and a permitted row would leave this gate silent over that return.
+#
 # NINE ROWS NAME A FEATURE A ROOT PACKAGE ACTIVATES THROUGH ITS OWN `[features]`
 # TABLE. `cargo tree -e features` renders no feature EDGE for any of them (see
 # "TWO RENDERINGS" in the header), so this gate could not observe one until it
@@ -208,9 +222,7 @@ scp-protocol/default
 scp-relay-client/default
 scp-runtime/default
 scp-transport/default
-scp-transport/postgres-blob
 scp-transport/redb-blob
-scp-transport/s3-blob
 scp-transport/sqlite-blob
 scp-transport/startup
 EOF
