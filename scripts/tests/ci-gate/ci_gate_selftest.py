@@ -3507,6 +3507,13 @@ def napi_consumers_without_a_construction_assertion(
     the PyO3 criterion above names. Checking that the downloaded file exists does not
     close that, because a file that is present can still fail to load, so the criterion
     names the load and the construction.
+
+    The step's `loadNativeAddon()` call speaks for those test files only while they
+    load the addon through that same loader: a file that builds its own
+    `@limn-works/scp-ts-napi-*` specifier names a package the wiring step never
+    creates, so it skips while the step reports success.
+    `bindings/typescript/tests/dispatcher-invariant.test.ts` asserts that no file under
+    `bindings/typescript/tests/` names a platform package itself.
     """
     gaps: list[str] = []
     for job_id, job in sorted(doc["jobs"].items()):

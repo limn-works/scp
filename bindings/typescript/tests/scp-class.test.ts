@@ -17,9 +17,9 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { createRequire } from "node:module";
 
 import { ValidationError } from "../src/errors";
+import { loadNativeAddon } from "../src/internal/native";
 import { __clampShutdownMillisForTests, __serializeStorageConfigForTests, SCP } from "../src/scp";
 
 // ---------------------------------------------------------------------------
@@ -92,23 +92,12 @@ let addon: any = null;
 let skipReason = "";
 
 try {
-  const platform = process.platform;
-  const arch = process.arch;
-  const platformMap: Record<string, string> = {
-    darwin: "darwin",
-    linux: "linux",
-    win32: "win32",
-  };
-  const archMap: Record<string, string> = {
-    arm64: "arm64",
-    x64: "x64",
-  };
-  const os = platformMap[platform] ?? platform;
-  const cpu = archMap[arch] ?? arch;
-  const packageName = `@limn-works/scp-ts-napi-${os}-${cpu}`;
-
-  const req = createRequire(import.meta.url);
-  addon = req(packageName);
+  // `loadNativeAddon` is the SDK's one loader, and this file resolves the addon
+  // through it so the load this file performs is the load CI's "Assert the
+  // downloaded addon loads and constructs" step performs. A specifier built here
+  // would name a package that step never installs, which skips this whole suite
+  // over an addon CI just verified.
+  addon = loadNativeAddon();
 
   if (typeof addon.SCP !== "function") {
     throw new Error("SCP class not exported from native addon — rebuild with the Phase 4 changes");
