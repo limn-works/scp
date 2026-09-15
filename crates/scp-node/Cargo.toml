@@ -144,9 +144,14 @@ testing = ["scp-dht/testing", "scp-platform/testing", "allow_unencrypted_storage
 # this crate constructs either backend:
 # `storage_from_env` in `scp-transport` is their only caller, and it reaches
 # them only when an operator sets `SCP_RELAY_STORAGE_BACKEND=postgres` or `=s3`.
-# A build that leaves this feature off rejects those two values with a typed
-# "not compiled in" diagnostic naming this feature, rather than falling back to
-# another backend. `sqlite`, `redb` and `memory` are unaffected.
+# A build that leaves this feature off writes a "not compiled in" message
+# naming this feature to stderr and exits the process with code 1, rather than
+# falling back to another backend. `reject_backend_message` in
+# `crates/scp-transport/src/startup.rs` builds that message as a `String`, and
+# `storage_from_env` prints it and calls `std::process::exit(1)`; no error type
+# carries it, because `storage_from_env` returns the storage the caller asked
+# for and every failure path in it terminates the process. `sqlite`, `redb` and
+# `memory` are unaffected.
 cloud-blobs = ["scp-transport/postgres-blob", "scp-transport/s3-blob"]
 quic = ["scp-transport/quic", "dep:quinn"]
 http3 = ["scp-transport/http3"]
