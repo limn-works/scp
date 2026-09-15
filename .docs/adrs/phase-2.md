@@ -911,6 +911,10 @@ pub enum EventType {
     // The Requested and Rejected actions of BridgeRegistrationAction produce no
     // bridge leaf: GovernanceProposalCreated and GovernanceProposalResolved
     // (ADR-031 acceptance criterion 7) record the proposal and its rejection.
+    // An approved RegisterBridge action whose approving actor is the operator
+    // the proposal names produces no BridgeRegistered leaf either: ADR-023
+    // acceptance criterion 2 forbids self-approval, so §12.2.1 step 2 has the
+    // context record that proposal's resolution alone and assign no bridge_id.
     BridgeRegistered,             // RegisterBridge approved; payload action: Approved
     BridgeSuspended,              // SuspendBridge approved; payload action: Suspended { reason, duration }
     BridgeReactivated,            // ReactivateBridge approved; payload action: Reactivated
