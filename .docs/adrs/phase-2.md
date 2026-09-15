@@ -911,6 +911,11 @@ pub enum EventType {
     // The Requested and Rejected actions of BridgeRegistrationAction produce no
     // bridge leaf: GovernanceProposalCreated and GovernanceProposalResolved
     // (ADR-031 acceptance criterion 7) record the proposal and its rejection.
+    // An approved UpdateBridgePlatformKey action (§12.10.2 step 5) produces no
+    // bridge leaf either: the GovernanceActionExecuted variant above records
+    // that execution, and §12.10.2 step 5 computes the webhook-key rotation
+    // deadline from that leaf's timestamp and from the node's own
+    // commit-execution instant for that leaf.
     // An approved RegisterBridge action whose approving actor is the operator
     // the proposal names produces no BridgeRegistered leaf either: ADR-023
     // acceptance criterion 2 forbids self-approval, so §12.2.1 step 2 has the
