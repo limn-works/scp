@@ -411,10 +411,14 @@ pub struct NodeConfig<
     /// development arm (SCP-CAPSEL-8010/8011) — legitimately selectable here, but
     /// only ever by explicit choice, never by omission. Production nodes select a
     /// durable backend (see spec §17.7). `Sqlite` and `Redb` exist in every
-    /// build of this crate; the `Postgres` and `S3` variants exist only in a
-    /// build that enables this crate's `cloud-blobs` feature, which is off by
-    /// default, so a consumer naming either variant without it gets a
-    /// no-such-variant error rather than a runtime fallback.
+    /// build of this crate. `BlobStorageBackend` gates the `Postgres` and `S3`
+    /// variants on `scp-transport`'s `postgres-blob` and `s3-blob` features, and
+    /// this crate's off-by-default `cloud-blobs` feature is one way to enable
+    /// that pair: cargo unifies `scp-transport`'s features across every package
+    /// one invocation builds, so another package in the same build enables the
+    /// pair too, and the variants then exist with `cloud-blobs` off. A build
+    /// that resolves neither feature rejects either variant at compile time
+    /// with a no-such-variant error rather than falling back at run time.
     pub blob_storage: BlobStorageBackend,
 }
 

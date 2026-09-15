@@ -53,8 +53,9 @@ env:
 #                     rust-test-napi-production, rust-build-pyo3-production,
 #                     rust-build-uniffi-production, rust-doc (its `cargo test --doc`),
 #                     kotlin-test, fail-closed-pre-rotation, shipped-feature-graph.
-#   workspace-check   `target/debug` under check mode — rust-clippy, whose two
-#                     `cargo clippy` commands compile every dependency to an `.rmeta`,
+#   workspace-check   `target/debug` under check mode — rust-clippy, whose three
+#                     `cargo clippy` commands compile each dependency they resolve to
+#                     an `.rmeta`, the first of them every dependency in the workspace,
 #                     and rust-doc (its `cargo doc --no-deps`, whose dependency units
 #                     cargo compiles in check mode as well). rust-doc restores both
 #                     groups, one rust-cache step each, because its two commands read
@@ -905,8 +906,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # Writes the `workspace-check` group. Both `cargo clippy` commands below compile
-      # every dependency in check mode, to an `.rmeta` under a metadata hash that
+      # Writes the `workspace-check` group. The first of the three `cargo clippy`
+      # commands below compiles every dependency in check mode, and the other two
+      # compile `scp-transport`'s graph under two feature sets `--workspace` does not
+      # resolve. Each of the three writes an `.rmeta` under a metadata hash that
       # includes the mode, so the `workspace-debug` entry rust-test writes under build
       # mode holds nothing this job can restore: reading that entry gave this job the
       # registry and a `Checking` line for every one of the ~650 dependencies on every
@@ -1077,10 +1080,11 @@ jobs:
   # resolution.
   #
   # That is the reason to give this job its own `shared-key`, and it is also the
-  # reason NOT to fold these three commands into `cargo nextest run --workspace
+  # reason NOT to fold this job's commands into `cargo nextest run --workspace
   # --features …,scp-transport/quic,…`. One invocation would compile each
   # package once, and it would compile scp-transport's graph with the workspace's
-  # `testing` features ON and all six optional transport features on together.
+  # `testing` features ON and every optional scp-transport feature these commands
+  # name on together.
   # These lanes exist because that graph rotted unseen under exactly that
   # unification — `crates/scp-transport`'s `quic` feature stopped compiling for
   # months — and because a `--workspace` build compiles a crate's
@@ -1151,11 +1155,17 @@ jobs:
           # doctest line below carries the doctests, which cargo-nextest does
           # not run. This line is the unit- and integration-test dimension.
           cargo nextest run -p scp-transport --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob
-          # cargo-nextest runs no doctests, so the `rust,no_run` snippet at the
-          # head of postgres_blob.rs — which calls PostgresBlobStore::open —
-          # left CI with the workspace resolution that used to compile it. The
-          # `cargo test --workspace --doc` command in the `rust-doc` job no
-          # longer reaches either module.
+          # cargo-nextest runs no doctests, so the line above never compiles the
+          # `rust,no_run` snippet at the head of postgres_blob.rs, which calls
+          # PostgresBlobStore::open. The `cargo test --workspace --doc` command
+          # in the `rust-doc` job carries
+          # `scp-transport/postgres-blob,scp-transport/s3-blob`, so that command
+          # compiles both modules' doctests too. This line runs those doctests a
+          # second time, inside the job that owns the pair, because no gate reads
+          # the rust-doc command's feature list: `check_required_rustdoc_surface`
+          # in scripts/tests/ci-gate/ci_gate_selftest.py compares `cargo doc`
+          # commands and reads no `cargo test --doc`, so an edit dropping the
+          # pair from the rust-doc doctest command alone fails no gate.
           cargo test -p scp-transport --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob --doc
           # scp-relay's three backend-selection tests each assert one of two
           # outcomes, chosen by whether this build compiled the arm. Every other

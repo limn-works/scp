@@ -9,9 +9,12 @@
 //! - `postgres` without `SCP_RELAY_DATABASE_URL` produces a non-zero exit (AC 10)
 //! - `s3` without `SCP_RELAY_S3_BUCKET` produces a non-zero exit (AC 6)
 //!
-//! The `postgres` and `s3` arms compile only when this crate's `cloud-blobs`
-//! feature — off by default — enables `scp-transport/postgres-blob` and
-//! `scp-transport/s3-blob`. Each test below that drives one of those two values
+//! `scp-transport`'s `postgres-blob` and `s3-blob` features gate the `postgres`
+//! and `s3` arms. This crate's off-by-default `cloud-blobs` feature is one way
+//! to enable that pair: cargo unifies `scp-transport`'s features across every
+//! package one invocation builds, so another package in the same build enables
+//! the pair too, and the arms then compile with `cloud-blobs` off. Each test
+//! below that drives one of those two values
 //! therefore asserts one of two outcomes, chosen by [`backend_is_compiled`]:
 //! when the arm exists the relay reaches it and reports the env var the backend
 //! needs; when it does not, the relay reports that the arm is not compiled in
