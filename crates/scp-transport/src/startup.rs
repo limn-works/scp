@@ -629,6 +629,16 @@ mod tests {
             .map(|(feature, _)| feature)
     }
 
+    /// The feature name in a line that reads `#[cfg(not(feature = "…"))]`, and
+    /// `None` for any other line — `#[cfg(feature = "…")]` included, since that
+    /// prefix does not match.
+    fn negative_cfg_feature(line: &str) -> Option<&str> {
+        line.trim_start()
+            .strip_prefix("#[cfg(not(feature = \"")
+            .and_then(|rest| rest.split_once("\"))]"))
+            .map(|(feature, _)| feature)
+    }
+
     /// No two rows of the table claim the same name, and the set of rows is the
     /// one this module was written against.
     ///
@@ -846,6 +856,117 @@ mod tests {
             "each `*_entry` macro pair must be gated on the feature the row it \
              names carries in `transport_feature`; a pair reading a sibling's \
              feature makes VALID_BACKENDS offer a backend this build cannot open"
+        );
+    }
+
+    /// Both halves of every `*_entry` macro pair read one feature, and the
+    /// negative half expands to nothing.
+    ///
+    /// `every_site_names_the_same_feature_for_a_backend` above holds site 4 —
+    /// the `#[cfg]` on the macro pair that contributes a name to
+    /// [`VALID_BACKENDS`] — by reading the positive half of each pair. Each
+    /// pair carries two `#[cfg]` attributes, `positive_cfg_feature` returns
+    /// `None` for the negative one, and the negative half expands to `""`,
+    /// which fails that scan's `", "` suffix test, so four of the eight
+    /// attributes on the four pairs go unread there.
+    ///
+    /// The argument that test makes for scanning source text applies to those
+    /// four attributes. The two feature states CI compiles are all four blob
+    /// features off and all four on. A negative half gated on a sibling
+    /// backend's feature reads identically to a correct one in both: with every
+    /// blob feature off, the sibling-gated negative half is present and expands
+    /// to `""`, which is what the correct half does; with every blob feature
+    /// on, it is absent, which is also what the correct half does. The two
+    /// states that distinguish them are mixed states no CI command builds. In
+    /// one of them both definitions of the macro exist, the second shadows the
+    /// first, and `VALID_BACKENDS` drops a backend whose arm this build
+    /// compiled, so the relay refuses to offer an option it can open. In the
+    /// other neither definition exists and the crate does not compile.
+    ///
+    /// A negative half expands to `""`, which carries no backend name, so this
+    /// test ties a pair's two halves to each other through the macro's own
+    /// name. The test above ties the positive half to the [`BACKENDS`] row, so
+    /// the two tests together tie both halves to that row.
+    #[test]
+    fn both_halves_of_a_macro_pair_read_one_feature() {
+        let entry_region = source_region(
+            "const BACKENDS: &[Backend] = &[",
+            "pub const VALID_BACKENDS",
+        );
+
+        // Each definition, as `(macro name, feature, negated, expansion)`. A
+        // `#[cfg]` line sets the pending feature, the `macro_rules!` line below
+        // it consumes that feature and opens a definition, and the expansion
+        // line inside the body attaches to the definition most recently opened.
+        let mut halves: Vec<(&str, &str, bool, Option<&str>)> = Vec::new();
+        let mut pending: Option<(&str, bool)> = None;
+        for line in entry_region.lines() {
+            if let Some(feature) = positive_cfg_feature(line) {
+                pending = Some((feature, false));
+                continue;
+            }
+            if let Some(feature) = negative_cfg_feature(line) {
+                pending = Some((feature, true));
+                continue;
+            }
+            if let Some(name) = line
+                .trim_start()
+                .strip_prefix("macro_rules! ")
+                .and_then(|rest| rest.split_once(' '))
+                .map(|(name, _)| name)
+            {
+                assert!(
+                    pending.is_some(),
+                    "`macro_rules! {name}` carries no `#[cfg(feature = \"…\")]` \
+                     and no `#[cfg(not(feature = \"…\"))]` line above it, so \
+                     this scan cannot read the feature that definition gates on"
+                );
+                let (feature, negated) = pending.take().unwrap_or_default();
+                halves.push((name, feature, negated, None));
+                continue;
+            }
+            if let Some(expansion) = line
+                .trim_start()
+                .strip_prefix('"')
+                .and_then(|rest| rest.strip_suffix('"'))
+                && let Some(half) = halves.last_mut()
+            {
+                half.3 = Some(expansion);
+            }
+        }
+        assert!(
+            !halves.is_empty(),
+            "the macro-pair scan matched no definition, so it would pass over \
+             any drift"
+        );
+
+        let mut positives: Vec<(&str, &str)> = Vec::new();
+        let mut negatives: Vec<(&str, &str)> = Vec::new();
+        for &(name, feature, negated, expansion) in &halves {
+            if negated {
+                assert_eq!(
+                    expansion,
+                    Some(""),
+                    "the `#[cfg(not(feature = \"{feature}\"))]` half of \
+                     `{name}` must expand to the empty string, so a build \
+                     without that feature leaves the backend out of \
+                     VALID_BACKENDS"
+                );
+                negatives.push((name, feature));
+            } else {
+                positives.push((name, feature));
+            }
+        }
+        positives.sort_unstable();
+        negatives.sort_unstable();
+        assert_eq!(
+            negatives, positives,
+            "each `*_entry` macro pair must gate both of its halves on one \
+             feature, and must carry exactly one half of each sign; halves \
+             naming two features leave one feature state with both definitions, \
+             where the second shadows the first and VALID_BACKENDS omits a \
+             backend whose arm compiled, and another state with neither, where \
+             this crate does not compile"
         );
     }
 
