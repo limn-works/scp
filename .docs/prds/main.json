@@ -619,7 +619,7 @@
         "The identity-creation path builds the key state the inception event carries: the standing root with its threshold and each member's custody type, the Active Signing Key in the #active role, the standing commitment list with its next threshold, the witness set with its interval, the service-key designation, and the all-zero delegator (§9.7.4.2 definitions)",
         "The identity-creation path returns an ScpIdentity carrying the identifier, the operational key handles (never raw private keys), and the pre-rotation commitment, plus the signed inception event and the PreRotationKeyHandle; the caller persists all three",
         "verify_did(identifier, inception_event) -> bool recomputes SHA-256(\"SCP-KEL-ID-V1:\" || inception_signed_preimage) and compares it to the identifier (§9.7.4.2 R2 — local, no network call)",
-              "The identity backend seam is `IdentityBackend`, carrying the four methods `03-identity.md` §3.10.10 names and no others",
+        "The identity backend seam is `IdentityBackend`, carrying the four methods `03-identity.md` §3.10.10 names and no others",
         "ScpIdentity declares exactly four public fields: identity_key (KeyHandle), active_signing_key (KeyHandle), pre_rotation_commitment ([u8; 32]), identifier ([u8; 32])",
         "Every identity-creation entry point that supplies its own pre-rotation custody — Identity::create, Identity::create_ephemeral, the scp-node identity resolvers, and the identity_create paths of the PyO3, napi-rs, and UniFFI bridges — returns IdentityError::NoPreRotationBackend on a build without the testing feature, and the three bridges surface it as error code SCP-IDENT-1059, because no production PreRotationCustody backend exists — §9.7.4.1 item 3a requires the typed error and forbids any dev stand-in",
         "An identity publishes no W3C DID Core document: key material and each key's condition live in the key-event log, and every transport and service field is a service-record entry",
@@ -674,13 +674,13 @@
         "crates/scp-core/src/identity/dht.rs",
         "crates/scp-core/src/identity/cache.rs"
       ],
-      "description": "Implement publishing an identity's key-event log to SCP relays and resolving it back, with caching, staleness detection, and automatic republishing. A publisher splits the chain into frame-sized segments and publishes them to the identity's own relays and to the fallback set (§3.10.5). A validating relay honors the PUBLISH's `retain` flag and gives the record no TTL; §9.7.4.2 R9 states when its ring buffer displaces the record and what a controller does to keep it. The cycle keeps alive the copies a transport that cannot validate stores as opaque blobs under the shared TTL (§9.10.12).",
+      "description": "Implement publishing an identity's key-event log to SCP relays and resolving it back, with caching, staleness detection, and automatic republishing. A publisher splits the chain into frame-sized segments and publishes them to the identity's own relays and to the fallback set (§3.10.5). A validating relay honors the PUBLISH's `retain` flag and gives the record no TTL; §9.7.4.2 R9 states when its ring buffer displaces the record, and that what keeps an identity covered against that ring is rent and never republication. The cycle keeps alive the copies a transport that cannot validate stores as opaque blobs under the shared TTL (§9.10.12).",
       "acceptanceCriteria": [
         "IdentityBackend::publish splits the chain into frame-sized segments and publishes them to both relay sets in sequence order (§3.10.5)",
         "The root signs every establishment event and an operational key signs none (§9.7.4.2)",
         "An event's sequence is its predecessor's plus one, and the inception event's is zero (§9.7.4.2)",
         "Idempotent: a frame whose event digests all match the chain's leaves the relay's stored state unchanged and leaves that identity at the ring position its first write gave it (§9.7.4.2 R9)",
-        "A PUBLISH at the `scp:did:` kind sets `retain: true`, a validating relay gives the record no TTL, and §9.7.4.2 R9's ring buffer is what removes it (§9.10.12)",
+        "A PUBLISH at the `scp:did:` kind sets `retain: true`, a validating relay gives the record no TTL, and §9.7.4.2 R9's ring buffer is what removes it; rent and never republication is what keeps that identity covered against the ring (§9.10.12, §9.7.4.2 R9)",
         "Failure handling: exponential backoff on publish failure: 30s, 1m, 2m, 4m, 8m, 16m, capped at 30m",
         "Each retry re-reads the fallback set from the shipped community relay list (§18.5.1)",
         "After 6 consecutive failures, emit a publish-degraded warning to the application layer",
@@ -909,7 +909,10 @@
       "details": {
         "sealPath": "seal_envelope: serialize inner envelope -> MLS encrypt -> wrap in outer envelope with routing_id, recipient_hint, blob_ttl",
         "openPath": "open_envelope: MLS decrypt -> deserialize inner envelope -> strip padding -> verify payload_hash == SHA256(stripped_payload) -> verify inner signature -> verify generation number -> return verified inner envelope",
-        "superseded_by": ["SCP-OUT-002", "SCP-OUT-003"]
+        "superseded_by": [
+          "SCP-OUT-002",
+          "SCP-OUT-003"
+        ]
       },
       "result": "seal_envelope and open_envelope with full integrity verification. 13 tests (12 + 1 proptest). All passing."
     },
@@ -1110,7 +1113,9 @@
         "hpkeAssembly": "HPKE: (1) generate an ephemeral keypair (software-generated), (2) ECDH between ephemeral secret and requester wrapping pubkey, (3) HKDF to derive encryption key, (4) AES-128-GCM encrypt the sender key. Ephemeral public key included in response.",
         "hpkeOpen": "Uses key_custody.dh_agree(wrapping_key_handle, ephemeral_pk) to compute shared secret inside custody boundary, then KDF + AEAD in software to recover sender key. Wrapping private key never leaves KeyCustody.",
         "blockNotificationVerification": "The receiver MUST verify the signature by resolving the key signing_key_id names (#active) in the blocker's key state per §9.16.3 and ADR-039. Discard without action if verification fails. Log discarded notification for anomaly detection.",
-        "superseded_by": ["SCP-OUT-002"]
+        "superseded_by": [
+          "SCP-OUT-002"
+        ]
       },
       "result": "Implemented pull-based sender key protocol: SenderKeyEpochAdvance, SenderKeyRequest/Response with HPKE, block notifications, rotate_sender_key_for_block. 15 tests."
     },
@@ -1441,7 +1446,9 @@
         "TemplateId enum": "```rust\npub enum TemplateId {\n    BilateralEphemeral,\n    BilateralPersistent,\n    Coordination,\n    GroupDiscussion,\n    PublicBroadcast,\n    GatedBroadcast,\n}\n```\nTemplates are protocol constants — not user-extensible. When present, all other ContextParams fields must match the template definition exactly.",
         "Implementation notes": "Language: Rust. Crate: scp-core. Module: scp-core/context/. Async runtime: tokio (TTL timers, MLS operations, transport). State persistence: Via ProtocolRepository (§17.4), which wraps the scp-platform Storage trait with typed domain methods. Context state is serialized and persisted on every transition so contexts survive process restarts. Key convention follows §17.3.",
         "Concurrency model": "All public handle types (Identity, Context, TransportManager) are safe to share across threads/tasks. In Rust: Send + Sync. In Python: safe to use from any asyncio task on the same event loop. In Swift: Sendable. In Go: safe for concurrent use. In Kotlin: safe across coroutines. Individual operations are serialized internally — concurrent sends on the same context are safe and ordered. No SDK user should ever need an external lock to use SCP types safely.",
-        "superseded_by": ["SCP-OUT-002"]
+        "superseded_by": [
+          "SCP-OUT-002"
+        ]
       },
       "result": "Implemented context types: ContextState FSM, ContextHandle, ContextParams, all parameter enums. 52 tests."
     },
@@ -2568,7 +2575,9 @@
         }
       ],
       "details": {
-        "superseded_by": ["SCP-OUT-005"]
+        "superseded_by": [
+          "SCP-OUT-005"
+        ]
       },
       "result": "PyOutletRegistration, PyOutletVerificationResult, PyTransportStatus, PyUcanToken, PyEvent, PyProof types + 10 bridge functions across outlets.rs, transport.rs, ucan.rs, event_log.rs"
     },
@@ -2607,7 +2616,10 @@
         }
       ],
       "details": {
-        "superseded_by": ["SCP-OUT-005", "SCP-OUT-006"]
+        "superseded_by": [
+          "SCP-OUT-005",
+          "SCP-OUT-006"
+        ]
       },
       "result": "Implemented in iteration 3"
     },
@@ -9217,7 +9229,7 @@
     },
     {
       "id": "SCP-162",
-      "title": "Implement adapter credential management and configureAdapter SDK function",
+      "title": "Implement adapter credential management behind IdentityConfig's payment slot",
       "gate": "gate-econ",
       "priority": "P1",
       "severity": "major",
@@ -9227,7 +9239,7 @@
         "crates/scp-core/src/economy/mod.rs",
         "crates/scp-core/src/store/economy.rs"
       ],
-      "description": "Adapter credential management (§19.2.5): Each payment adapter requires credentials to operate (wallet private key, LND macaroon, Stripe API key, SPL delegate keypair). Credentials are distinct from spending UCANs. Spending UCAN = authorization ('you may spend $X'). Adapter credential = capability ('here's how to move money'). Both required for any payment. UCAN without credential = can't pay. Credential without UCAN = not authorized to pay. Credentials are bound to the human identity, not the agent. An agent never holds raw payment credentials — it holds a spending UCAN that authorizes the SDK (which holds the credential) to execute payments on its behalf. This separation is critical: revoking the spending UCAN instantly cuts off the agent's ability to spend, without needing to rotate the underlying payment credential. Credential rotation follows identity key rotation (§9.12). SPL-specific: human calls ApproveChecked granting agent's keypair delegate authority on their USDC ATA — single delegate per account, amount-capped. Also implements SCP.Identity.configureAdapter(adapter) SDK function (§19.11) and adapter discovery per identity (§19.2.4).",
+      "description": "Adapter credential management (§19.2.5): Each payment adapter requires credentials to operate (wallet private key, LND macaroon, Stripe API key, SPL delegate keypair). Credentials are distinct from spending UCANs. Spending UCAN = authorization ('you may spend $X'). Adapter credential = capability ('here's how to move money'). Both required for any payment. UCAN without credential = can't pay. Credential without UCAN = not authorized to pay. Credentials are bound to the human identity, not the agent. An agent never holds raw payment credentials — it holds a spending UCAN that authorizes the SDK (which holds the credential) to execute payments on its behalf. This separation is critical: revoking the spending UCAN instantly cuts off the agent's ability to spend, without needing to rotate the underlying payment credential. Credential rotation follows identity key rotation (§9.12). SPL-specific: human calls ApproveChecked granting agent's keypair delegate authority on their USDC ATA — single delegate per account, amount-capped. The adapter an identity pays through is named by IdentityConfig's payment slot, which §19.11 and .docs/standards/construction.md state is the one entry point that installs an identity's payment capability; no second entry point installs one, and this story builds none. Adapter discovery per identity follows §19.2.4.",
       "acceptanceCriteria": [
         "Adapter credentials stored as identity-private state (§3.7) — encrypted, stored alongside identity keys",
         "Adapter credentials never exposed to contexts or relays",
@@ -9238,14 +9250,14 @@
         "Credential rotation follows identity key rotation (§9.12)",
         "Adapters configured per-identity in SDK (not per-context)",
         "Identity may have multiple adapters simultaneously (e.g., x402 + Lightning + SPL)",
-        "SCP.Identity.configureAdapter(adapter) function registers a payment adapter with the identity's SDK instance",
-        "configureAdapter stores adapter credentials via ProtocolRepository.store_adapter_credentials (§17.3)",
-        "configureAdapter validates adapter implements PaymentAdapter trait before accepting",
+        "IdentityConfig's payment slot names the adapter an identity pays through, and no SDK function registers one after construction (§19.11)",
+        "Adapter credentials are stored against the adapter the config's payment slot names, via ProtocolRepository.store_adapter_credentials (§17.3)",
+        "Identity::create rejects a config whose payment slot names an adapter the build does not carry",
         "Adapter credential retrieval via ProtocolRepository.load_adapter_credentials for payment execution",
         "list_adapter_credentials returns all configured adapter IDs for an identity",
         "Unit test: store and load adapter credentials roundtrip",
         "Unit test: credentials not accessible from context operations (isolation test)",
-        "Unit test: configureAdapter rejects invalid adapter (missing trait implementation)"
+        "Unit test: Identity::create rejects a config naming an adapter the build does not carry"
       ],
       "actionItems": [
         "Create credentials.rs in economy module",
