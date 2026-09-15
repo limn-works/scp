@@ -18,7 +18,7 @@ Two authorities sign:
 - **The root** — at most 16 public keys with a signing threshold, so one person runs a 1-of-1 root and an organization runs a threshold its officers jointly satisfy. It signs establishment events and nothing else, which keeps it cold (§9.7.4.2 R3, §9.18.17).
 - **The Active Signing Key** (`#active`) — the one operational key: inner envelopes, MLS credentials, UCAN issuance, the service record. An event the root signs retires it, and the identifier does not change.
 
-Every establishment event commits to the digests of the next root keys before anyone uses them, so a thief holding the current root cannot rotate the identity away. Rotating takes the **pre-rotation** private key, which lives in a substrate the daily operational path cannot reach. Where no such substrate exists, the SDK fails closed (§9.7.4.1).
+Every establishment event commits to the digests of the next root keys before anyone uses them, so a thief holding the current root cannot install a new root set. Installing one takes the **pre-rotation** private key, which lives in a substrate the daily operational path cannot reach. **A thief holding the root does install its own operational keys, and pre-rotation does not stop that** (§9.7.4.2 R8). Where no independent substrate exists, the SDK fails closed (§9.7.4.1).
 
 **The root decides a fork.** Given two valid chains for one identifier, a verifier ranks them by the root authority behind each, and arrival order decides nothing (§9.7.4.2 R6, R7).
 
