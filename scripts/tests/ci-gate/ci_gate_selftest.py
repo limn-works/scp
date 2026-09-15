@@ -3493,14 +3493,16 @@ def check_napi_consumers_exercise_the_addon(doc: dict) -> None:
     )
 
 
-def check_napi_assertion_control(doc: dict, fragment: str, label: str) -> None:
-    """Deleting one half of one job's assertion is reported."""
+def check_napi_assertion_control(
+    doc: dict, job_id: str, fragment: str, label: str
+) -> None:
+    """Deleting one half of job `job_id`'s assertion is reported."""
     mutated = copy.deepcopy(doc)
-    steps = mutated["jobs"]["typescript-check"]["steps"]
+    steps = mutated["jobs"][job_id]["steps"]
     hits = [step for step in steps if fragment in str(step.get("run") or "")]
     if len(hits) != 1:
         check(
-            f"the control can delete the {label} assertion from typescript-check",
+            f"the control can delete the {label} assertion from {job_id}",
             False,
             f"{len(hits)} steps carry {fragment!r}, so the mutant is not the one intended",
         )
@@ -3510,23 +3512,22 @@ def check_napi_assertion_control(doc: dict, fragment: str, label: str) -> None:
     )
     gaps = napi_consumers_without_a_construction_assertion(mutated)
     check(
-        f"a typescript-check that no longer asserts it {label} is reported",
-        any(
-            "typescript-check downloads a NAPI addon" in gap and label in gap
-            for gap in gaps
-        ),
+        f"a {job_id} that no longer asserts it {label} is reported",
+        any(f"{job_id} downloads a NAPI addon" in gap and label in gap for gap in gaps),
         f"deleting the {label} assertion went unreported: {gaps}",
     )
 
 
-def check_pyo3_assertion_control(doc: dict, fragment: str, label: str) -> None:
-    """Deleting one half of one job's assertion is reported."""
+def check_pyo3_assertion_control(
+    doc: dict, job_id: str, fragment: str, label: str
+) -> None:
+    """Deleting one half of job `job_id`'s assertion is reported."""
     mutated = copy.deepcopy(doc)
-    steps = mutated["jobs"]["python-test"]["steps"]
+    steps = mutated["jobs"][job_id]["steps"]
     hits = [step for step in steps if fragment in str(step.get("run") or "")]
     if len(hits) != 1:
         check(
-            f"the control can delete the {label} assertion from python-test",
+            f"the control can delete the {label} assertion from {job_id}",
             False,
             f"{len(hits)} steps carry {fragment!r}, so the mutant is not the one intended",
         )
@@ -3536,9 +3537,76 @@ def check_pyo3_assertion_control(doc: dict, fragment: str, label: str) -> None:
     )
     gaps = pyo3_consumers_without_a_construction_assertion(mutated)
     check(
-        f"a python-test that no longer asserts it {label} is reported",
-        any("python-test downloads a PyO3 module" in gap and label in gap for gap in gaps),
+        f"a {job_id} that no longer asserts it {label} is reported",
+        any(
+            f"{job_id} downloads a PyO3 module" in gap and label in gap for gap in gaps
+        ),
         f"deleting the {label} assertion went unreported: {gaps}",
+    )
+
+
+def artifact_consumers(doc: dict, artifact: str) -> list[str]:
+    """Return every job id that downloads the artifact named `artifact`."""
+    return sorted(
+        job_id
+        for job_id, job in doc["jobs"].items()
+        if any(
+            str(step.get("uses") or "").startswith("actions/download-artifact")
+            and (step.get("with") or {}).get("name") == artifact
+            for step in (job.get("steps") or [])
+        )
+    )
+
+
+def artifact_names_without_a_consumer(
+    doc: dict, artifacts: tuple[str, ...]
+) -> list[str]:
+    """Return every name in `artifacts` that no job in `doc` downloads.
+
+    CRITERION: each artifact name the two consumer gates above select jobs by is a
+    name some job in ci.yml passes to `actions/download-artifact`.
+
+    WHY: both gates read their job set by matching a download step's `name` against a
+    tuple written here. A rename in ci.yml that this file does not follow removes
+    every consumer of the renamed artifact from the gate's set, the gate then reports
+    nothing about those jobs, and the self-test stays green — the silent drop-out the
+    gates exist to prevent. `pyo3-module-macos` reaches exactly one consumer,
+    bridge-parity-swift, so a rename of that one name deletes a whole job from the
+    checked set.
+    """
+    return [artifact for artifact in artifacts if not artifact_consumers(doc, artifact)]
+
+
+def check_artifact_names_reach_a_consumer(
+    doc: dict, artifacts: tuple[str, ...], tuple_name: str
+) -> None:
+    unreached = artifact_names_without_a_consumer(doc, artifacts)
+    check(
+        f"ci.yml: every artifact name in {tuple_name} names an artifact some job "
+        f"downloads",
+        not unreached,
+        f"no job downloads {unreached}, so the gate reading {tuple_name} checks no "
+        f"job for that artifact",
+    )
+
+
+def check_artifact_name_control(
+    doc: dict, artifacts: tuple[str, ...], tuple_name: str, artifact: str
+) -> None:
+    """Renaming every download of one artifact is reported."""
+    mutated = copy.deepcopy(doc)
+    renamed = f"{artifact}-renamed-by-the-control"
+    for job in mutated["jobs"].values():
+        for step in job.get("steps") or []:
+            if (
+                str(step.get("uses") or "").startswith("actions/download-artifact")
+                and (step.get("with") or {}).get("name") == artifact
+            ):
+                step["with"]["name"] = renamed
+    check(
+        f"renaming every download of {artifact} is reported against {tuple_name}",
+        artifact in artifact_names_without_a_consumer(mutated, artifacts),
+        f"a ci.yml that downloads {renamed} instead of {artifact} went unreported",
     )
 
 
@@ -3623,13 +3691,33 @@ def main() -> int:
 
     print("downloaded-module — a PyO3 consumer exercises the module before pytest")
     check_pyo3_consumers_exercise_the_module(workflow)
-    for pyo3_fragment, pyo3_label in PYO3_ASSERTION_FRAGMENTS:
-        check_pyo3_assertion_control(workflow, pyo3_fragment, pyo3_label)
+    check_artifact_names_reach_a_consumer(workflow, PYO3_ARTIFACTS, "PYO3_ARTIFACTS")
+    # Every consumer of every name, read off ci.yml rather than written here: a control
+    # that mutates one hardcoded job proves the gate goes red for that job's artifact
+    # name alone, which left `pyo3-module-macos` — and so job bridge-parity-swift, its
+    # one consumer — tied to nothing this file executes.
+    for pyo3_artifact in PYO3_ARTIFACTS:
+        check_artifact_name_control(
+            workflow, PYO3_ARTIFACTS, "PYO3_ARTIFACTS", pyo3_artifact
+        )
+        for pyo3_job in artifact_consumers(workflow, pyo3_artifact):
+            for pyo3_fragment, pyo3_label in PYO3_ASSERTION_FRAGMENTS:
+                check_pyo3_assertion_control(
+                    workflow, pyo3_job, pyo3_fragment, pyo3_label
+                )
 
     print("downloaded-addon — a NAPI consumer exercises the addon before its tests")
     check_napi_consumers_exercise_the_addon(workflow)
-    for napi_fragment, napi_label in NAPI_ASSERTION_FRAGMENTS:
-        check_napi_assertion_control(workflow, napi_fragment, napi_label)
+    check_artifact_names_reach_a_consumer(workflow, NAPI_ARTIFACTS, "NAPI_ARTIFACTS")
+    for napi_artifact in NAPI_ARTIFACTS:
+        check_artifact_name_control(
+            workflow, NAPI_ARTIFACTS, "NAPI_ARTIFACTS", napi_artifact
+        )
+        for napi_job in artifact_consumers(workflow, napi_artifact):
+            for napi_fragment, napi_label in NAPI_ASSERTION_FRAGMENTS:
+                check_napi_assertion_control(
+                    workflow, napi_job, napi_fragment, napi_label
+                )
 
     print("needs-condition — a job's dependencies run wherever the job does")
     check_dependency_conditions(workflow)
