@@ -245,6 +245,29 @@ pub fn backend_is_compiled(name: &str) -> bool {
     BACKENDS.iter().any(|b| b.name == name && b.compiled)
 }
 
+/// Names the `scp-node` / `scp-relay` cargo feature that compiles `name`'s arm.
+///
+/// Returns `None` when no binary feature gates the arm of [`storage_from_env`]
+/// that constructs `name`, and when `name` names no backend at all.
+///
+/// `reject_backend_message` prints this name in the rebuild instruction it
+/// writes for an uncompiled backend, and the binary reading that instruction
+/// declares the name in its own `Cargo.toml`. Nothing in the type system holds
+/// the table row and the two manifests in agreement, so a rename in one place
+/// alone would send an operator to `cargo build --features <name>` that cargo
+/// answers with "none of the selected packages contains this feature".
+/// `the_binary_feature_the_message_names_is_declared_by_both_manifests` in
+/// `crates/scp-relay/tests/storage_backend.rs` reads this function and the
+/// `[features]` table of each manifest, and fails when either manifest omits
+/// what this table names.
+#[must_use]
+pub fn backend_binary_feature(name: &str) -> Option<&'static str> {
+    BACKENDS
+        .iter()
+        .find(|b| b.name == name)
+        .and_then(|b| b.binary_feature)
+}
+
 /// Writes the message [`storage_from_env`] prints before it exits, for a
 /// `SCP_RELAY_STORAGE_BACKEND` value it will not construct.
 ///

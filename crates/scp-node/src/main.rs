@@ -128,16 +128,41 @@ fn parse_cli_from(
 
 /// Writes the usage text `--help` prints.
 ///
-/// The `SCP_RELAY_STORAGE_BACKEND` line interpolates
-/// [`scp_transport::startup::VALID_BACKENDS`] instead of naming the backends,
-/// because that constant resolves from the same `scp-transport` features that
-/// compile the arms of `scp_transport::startup::storage_from_env`, and the
-/// relay interpolates the same constant when it rejects a value. A list
-/// written out here drifts the moment a backend's gating feature changes: this
-/// line named `postgres` and `s3` unconditionally until `scp-node` put both
-/// behind its off-by-default `cloud-blobs` feature, so a default build told an
-/// operator to use a backend it then refused to construct.
+/// Two parts of the `ENVIRONMENT VARIABLES` section vary with the features this
+/// build resolved, and both read `scp_transport::startup` rather than naming a
+/// backend:
+///
+/// 1. The `SCP_RELAY_STORAGE_BACKEND` line interpolates
+///    [`scp_transport::startup::VALID_BACKENDS`], the constant
+///    `scp_transport::startup::storage_from_env` interpolates when it rejects a
+///    value, so the accepted list and the rejection message cannot disagree.
+/// 2. The three variables that configure the two cloud backends —
+///    `SCP_RELAY_DATABASE_URL`, `SCP_RELAY_S3_BUCKET` and `SCP_RELAY_S3_PREFIX`
+///    — print only when [`scp_transport::startup::backend_is_compiled`] answers
+///    that this build compiled the arm each one configures.
+///
+/// A list written out here drifts the moment a backend's gating feature
+/// changes: the backend line named `postgres` and `s3` unconditionally until
+/// `scp-node` put both behind its off-by-default `cloud-blobs` feature, so a
+/// default build told an operator to use a backend it then refused to
+/// construct, and the three cloud variables went on documenting how to
+/// configure `backend=postgres` two lines under a list that no longer offered
+/// `postgres`.
 fn help_text() -> String {
+    // Each string opens with a newline, so an absent backend leaves no blank
+    // line behind in the rendered help.
+    let postgres_vars = if startup::backend_is_compiled("postgres") {
+        "\n    SCP_RELAY_DATABASE_URL      PostgreSQL connection URL (required when backend=postgres)"
+    } else {
+        ""
+    };
+    let s3_vars = if startup::backend_is_compiled("s3") {
+        "\n    SCP_RELAY_S3_BUCKET         S3 bucket name (required when backend=s3)\
+         \n    SCP_RELAY_S3_PREFIX         S3 key prefix (default: blobs/)"
+    } else {
+        ""
+    };
+
     format!(
         "\
 scp-node — SCP application node
@@ -195,10 +220,7 @@ ENVIRONMENT VARIABLES:
                                 the cargo feature that compiles that backend, or reports
                                 the value as unknown, then exits 1. See
                                 docs/guides/relay-operations.md for the cloud backends.
-    SCP_RELAY_STORAGE_PATH      Path for sqlite/redb blob storage (default: ./scp-relay.db)
-    SCP_RELAY_DATABASE_URL      PostgreSQL connection URL (required when backend=postgres)
-    SCP_RELAY_S3_BUCKET         S3 bucket name (required when backend=s3)
-    SCP_RELAY_S3_PREFIX         S3 key prefix (default: blobs/)
+    SCP_RELAY_STORAGE_PATH      Path for sqlite/redb blob storage (default: ./scp-relay.db){postgres_vars}{s3_vars}
     SCP_RELAY_MAX_BLOB_SIZE     Max blob size in bytes (default: 262144)
     SCP_RELAY_MAX_BLOB_TTL      Max blob TTL in seconds (default: 604800)
     SCP_RELAY_MAX_CONNECTIONS   Max total connections (default: 1000)
@@ -1166,8 +1188,15 @@ mod tests {
     /// the drift that made a default build print `postgres` among the accepted
     /// values while `storage_from_env` refused to construct it.
     ///
-    /// The assertion goes red when someone writes the names out here again,
-    /// whatever features the build resolves, and it stays green when a new
+    /// The assertion goes red when someone writes the names out here again in
+    /// any build that leaves a backend feature off, because the hardcoded list
+    /// then offers a name `VALID_BACKENDS` omits. Job rust-test in
+    /// `.github/workflows/ci.yml` runs this test at default features, where
+    /// `postgres-blob` and `s3-blob` are both off, so a hardcoded five-name
+    /// list fails there. A build that resolves both cloud features makes
+    /// `VALID_BACKENDS` equal that same five-name list, and this assertion
+    /// cannot separate an interpolation from a literal that matches it, so it
+    /// passes in that configuration either way. It stays green when a new
     /// backend joins the `BACKENDS` table, because the help text and the
     /// expectation read the one constant.
     #[test]
@@ -1184,6 +1213,65 @@ mod tests {
              startup::VALID_BACKENDS, so it names a backend exactly when this \
              build compiled that backend's constructor; expected a line \
              reading '{derived}', and the help text read:\n{help}"
+        );
+    }
+
+    /// `--help` documents a cloud backend's configuration variables exactly when
+    /// this build compiled that backend's arm of `startup::storage_from_env`.
+    ///
+    /// The three lines below `SCP_RELAY_STORAGE_PATH` described how to
+    /// configure `backend=postgres` and `backend=s3` in every build, including
+    /// the default build whose `SCP_RELAY_STORAGE_BACKEND` line two lines above
+    /// them offers neither value and whose relay exits 1 on either. An operator
+    /// who read `SCP_RELAY_DATABASE_URL` as available set it, set the backend,
+    /// and got "'postgres' is not compiled into this binary".
+    ///
+    /// Each assertion is an equality rather than a presence check, so it fails
+    /// in both directions: a line reinstated unconditionally fails at default
+    /// features, and a line dropped from a `cloud-blobs` build fails there. Job
+    /// rust-test-optional-features in `.github/workflows/ci.yml` runs this
+    /// binary's unit tests under `--features cloud-blobs`, which is the lane
+    /// that reaches the second direction.
+    #[test]
+    fn the_help_text_documents_a_cloud_backend_only_when_it_is_compiled() {
+        let help = help_text();
+
+        assert_eq!(
+            help.contains("SCP_RELAY_DATABASE_URL"),
+            startup::backend_is_compiled("postgres"),
+            "--help must document SCP_RELAY_DATABASE_URL exactly when this \
+             build compiled the postgres arm; the help text read:\n{help}"
+        );
+
+        for var in ["SCP_RELAY_S3_BUCKET", "SCP_RELAY_S3_PREFIX"] {
+            assert_eq!(
+                help.contains(var),
+                startup::backend_is_compiled("s3"),
+                "--help must document {var} exactly when this build compiled \
+                 the s3 arm; the help text read:\n{help}"
+            );
+        }
+
+        // A conditional line is spliced into the format string rather than
+        // written in it, so the splice carries the four-space indent every
+        // other ENVIRONMENT VARIABLES line starts with, and leaves no blank
+        // line behind when a backend is absent.
+        for var in [
+            "SCP_RELAY_DATABASE_URL",
+            "SCP_RELAY_S3_BUCKET",
+            "SCP_RELAY_S3_PREFIX",
+        ] {
+            assert_eq!(
+                help.contains(&format!("\n    {var}")),
+                help.contains(var),
+                "{var} must start at the same column as every other \
+                 environment variable; the help text read:\n{help}"
+            );
+        }
+        assert!(
+            !help.contains("\n\n    SCP_RELAY_MAX_BLOB_SIZE"),
+            "an absent cloud backend must leave no blank line behind; the help \
+             text read:\n{help}"
         );
     }
 

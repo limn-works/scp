@@ -133,7 +133,7 @@ fn postgres_without_url_exits_with_error() {
             "a default build should say the postgres arm is absent; got: {stderr}"
         );
         assert!(
-            stderr.contains("--features cloud-blobs"),
+            stderr.contains(&format!("--features {}", binary_feature("postgres"))),
             "error should name the feature that compiles the arm; got: {stderr}"
         );
     }
@@ -168,10 +168,92 @@ fn s3_without_bucket_exits_with_error() {
             "a default build should say the s3 arm is absent; got: {stderr}"
         );
         assert!(
-            stderr.contains("--features cloud-blobs"),
+            stderr.contains(&format!("--features {}", binary_feature("s3"))),
             "error should name the feature that compiles the arm; got: {stderr}"
         );
     }
+}
+
+/// The feature name the rejection message tells an operator to pass to
+/// `cargo build` is a feature both binaries declare.
+///
+/// `BACKENDS` in `crates/scp-transport/src/startup.rs` carries that name in its
+/// `binary_feature` column, `crates/scp-relay/Cargo.toml` and
+/// `crates/scp-node/Cargo.toml` each declare it in their `[features]` table,
+/// and until this test existed no check compared the three. The four scanning
+/// tests beside that table all read `include_str!("startup.rs")`, so each one
+/// pins the `scp-transport` feature a backend needs and none of them opens
+/// either manifest. A rename carried through one manifest and not the column,
+/// or through the column and neither manifest, left every one of them green
+/// while a default-build relay sent an operator to a `--features` value cargo
+/// rejects with "none of the selected packages contains this feature".
+///
+/// This test reads both manifests, because the gating is one invariant across
+/// two crates rather than two independent ones: cargo unifies `scp-transport`'s
+/// features across every package a single invocation builds, so a `scp-node`
+/// that stopped gating `postgres-blob` would re-resolve it into `scp-relay`,
+/// which is the reason `crates/scp-relay/Cargo.toml` states beside its own
+/// declaration.
+#[test]
+fn the_binary_feature_the_message_names_is_declared_by_both_manifests() {
+    let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+
+    for backend in ["postgres", "s3"] {
+        let feature = binary_feature(backend);
+        for package in ["scp-relay", "scp-node"] {
+            let path = crates_dir.join(package).join("Cargo.toml");
+            let manifest = std::fs::read_to_string(&path).unwrap_or_default();
+            assert!(
+                !manifest.is_empty(),
+                "failed to read {} while checking that it declares '{feature}'",
+                path.display()
+            );
+            assert!(
+                features_table_declares(&manifest, feature),
+                "the rejection message for '{backend}' names                  `--features {feature}`, and the [features] table of {} declares                  no such feature",
+                path.display()
+            );
+        }
+    }
+}
+
+/// The `scp-node` / `scp-relay` feature that compiles `backend`'s arm of
+/// `storage_from_env`, read out of the table the rejection message is built
+/// from.
+///
+/// Panics when the table gives `backend` no binary feature, which is the
+/// answer for `sqlite`, `redb` and `memory`. Every caller here passes
+/// `postgres` or `s3`.
+fn binary_feature(backend: &str) -> &'static str {
+    let feature = scp_transport::startup::backend_binary_feature(backend);
+    assert!(
+        feature.is_some(),
+        "the BACKENDS table gives '{backend}' no binary feature, so no message          can tell an operator what to rebuild with"
+    );
+    feature.unwrap_or_default()
+}
+
+/// Reports whether the `[features]` table of a `Cargo.toml` declares `feature`.
+///
+/// Reads the lines between the `[features]` header and the next table header,
+/// and compares the text left of the first `=` against `feature`. A comment
+/// line and a continuation line inside an array value both fail that
+/// comparison. An absent `[features]` header leaves nothing to iterate, so this
+/// returns `false` and the caller's assertion names the manifest.
+fn features_table_declares(manifest: &str, feature: &str) -> bool {
+    manifest
+        .lines()
+        .skip_while(|line| line.trim() != "[features]")
+        .skip(1)
+        .take_while(|line| !line.trim_start().starts_with('['))
+        .any(|line| {
+            line.split('=')
+                .next()
+                .is_some_and(|key| key.trim() == feature)
+        })
 }
 
 /// AC 8: `SQLite` blob persistence across reopens.

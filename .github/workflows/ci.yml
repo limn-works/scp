@@ -946,10 +946,9 @@ jobs:
           # only other clippy commands are the sweep above, the quic line above,
           # and release.yml's post-tag `--workspace` run, none of which resolves
           # either feature. Clippy is the only tool that reads the workspace's
-          # `unwrap_used`/`panic`/`todo` denials, so without this line those
-          # 2,187 lines stop being read by the Rust half of the stub policy. The
-          # feature list is the one an operator ships with
-          # `--features cloud-blobs`.
+          # `unwrap_used`/`panic`/`todo` denials, so without this line neither
+          # module is read by the Rust half of the stub policy. The feature list
+          # is the one an operator ships with `--features cloud-blobs`.
           cargo clippy -p scp-transport --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob --all-targets -- -D warnings
 
   # This job runs `cargo nextest run --workspace`, so a merge gate rests on it.
@@ -1157,7 +1156,18 @@ jobs:
           # command per dimension, not by one command: the `rust-clippy` job
           # carries the matching `cargo clippy -p scp-transport` line, and the
           # doctest line below carries the doctests, which cargo-nextest does
-          # not run. This line is the unit- and integration-test dimension.
+          # not run. This line is the unit- and integration-test dimension, and
+          # what it covers in those two modules is the compile: every test
+          # `postgres_blob.rs` and `s3_blob.rs` define carries `#[ignore]` and
+          # opens a connection to a live `PostgreSQL` server or S3-compatible
+          # endpoint, no workflow in this directory declares a `services:` block
+          # that starts either one, and this line passes no `--ignored`, so it
+          # builds all 36 of those test bodies and runs none of them. It does
+          # run every other test `scp-transport` defines, under the two cloud
+          # features. Running the 36 needs a job that provisions a `PostgreSQL`
+          # service container and a `MinIO` endpoint, which no pull request has
+          # written yet; until one does, a behavioural change inside either
+          # module reaches CI as a compile only.
           cargo nextest run -p scp-transport --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob
           # cargo-nextest runs no doctests, so the line above never compiles the
           # `rust,no_run` snippet at the head of postgres_blob.rs, which calls
@@ -1190,8 +1200,15 @@ jobs:
           # `cargo tree` renders a graph whose code no longer compiles and exits
           # 0. The compile also rejects a typo in either forwarding target,
           # which is every failure the `cargo tree` line it replaced could
-          # report.
-          cargo check -p scp-node --features cloud-blobs
+          # report. It runs the binary's own unit tests rather than stopping at
+          # `cargo check`, because two of them read `help_text()` and assert
+          # which `SCP_RELAY_*` lines it prints, and both assertions name the
+          # opposite text in a `cloud-blobs` build from the one every other
+          # command in this workflow reaches. `--bin scp-node` keeps the seven
+          # integration-test binaries in `crates/scp-node/tests/` out of this
+          # lane: each one is covered by job rust-test at default features, and
+          # none of them reads a cloud backend.
+          cargo nextest run --no-tests=fail -p scp-node --features cloud-blobs --bin scp-node
 
   # Exercises the napi bridge in its PRODUCTION configuration: default features
   # (`server` on) but WITHOUT `testing` / `scp-core/testing` /

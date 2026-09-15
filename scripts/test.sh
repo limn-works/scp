@@ -37,7 +37,13 @@ run_rust() (
   # test in `crates/scp-transport/src/native/postgres_blob.rs` or
   # `crates/scp-transport/src/native/s3_blob.rs` and compile neither module's
   # doctests. Job rust-test-optional-features in .github/workflows/ci.yml
-  # carries the two lines below, and carries the two after them.
+  # carries the two lines below, and carries the two after them. What those two
+  # lines cover inside the two modules is the compile: every test both modules
+  # define carries `#[ignore]` and opens a connection to a live `PostgreSQL`
+  # server or S3-compatible endpoint, and neither line passes `--ignored`, so
+  # they build all 36 of those test bodies and run none of them. Start a server
+  # yourself and run them with `-- --ignored`; the `# Testing` section at the
+  # head of each module names the environment variables it reads.
   if command -v cargo-nextest &>/dev/null; then
     cargo nextest run -p scp-transport --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob
   else
@@ -64,8 +70,19 @@ run_rust() (
   # No other command in this script compiles that graph: `--workspace` stopped
   # resolving `postgres-blob` and `s3-blob` when scp-node's manifest stopped
   # enabling them. The compile rejects a typo in either forwarding target of
-  # `crates/scp-node/Cargo.toml`.
-  cargo check -p scp-node --features cloud-blobs
+  # `crates/scp-node/Cargo.toml`. It runs the binary's own unit tests rather
+  # than stopping at `cargo check`, because two of them read `help_text()` and
+  # assert which `SCP_RELAY_*` lines it prints, and both assertions name the
+  # opposite text in a `cloud-blobs` build from the one every other command in
+  # this script reaches. `--bin scp-node` keeps the seven integration-test
+  # binaries in `crates/scp-node/tests/` out of this run: the `--workspace`
+  # commands above already run each one at default features, and none of them
+  # reads a cloud backend.
+  if command -v cargo-nextest &>/dev/null; then
+    cargo nextest run --no-tests=fail -p scp-node --features cloud-blobs --bin scp-node
+  else
+    cargo test -p scp-node --features cloud-blobs --bin scp-node
+  fi
 )
 
 run_python() (

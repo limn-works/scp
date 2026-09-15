@@ -954,6 +954,11 @@ mod tests {
     //! - `S3_TEST_BUCKET` — bucket name (default: `scp-test`)
     //!
     //! The bucket must exist before running tests.
+    //!
+    //! Every test below is `#[ignore]`d, and CI runs none of them: no workflow
+    //! in .github/workflows/ starts a `MinIO` container, and job
+    //! rust-test-optional-features in .github/workflows/ci.yml compiles this
+    //! module and its test bodies without passing `--ignored`.
 
     use super::*;
     use sha2::{Digest, Sha256};
