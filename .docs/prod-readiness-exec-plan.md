@@ -65,7 +65,7 @@ Every capability above must work through at least one SDK binding (Python).
 | content-access.json | 10 (SCP-CAC-001–010) | 0 | 0 | Block list, access keys, CEK wrapping, state destruction | #309, #356, Phase 0 S-A (canonical serialization for key wrapping AAD) |
 | governance-integration.json | 8 (SCP-267–274) | 0 | 0 | GovernanceEngine wiring, proposal lifecycle, conflict detection, cosignatures | #356 (ContextManager), #320 (actions) |
 | capability-registry.json | 7 (SCP-ACR-001–007) | 0 | 0 | URI parser, challenge unification, DID capabilities, admission | — (independent) |
-| bridge-cooperative.json | 13 (SCP-BCH-001–013) | 0 | 0 | Auth, endpoints, webhook, credential lifecycle, sender key encryption | **Phase 0 S-D** (bridge MLS model) |
+| bridge-cooperative.json | 8 (SCP-BCH-014–021) | 1 (SCP-BCH-007) | 12 (SCP-BCH-001–006, 008–013) | Auth, endpoints, webhook, credential lifecycle, sender key encryption, governance-decided admission | — (S-D resolved) |
 | participation-admission.json | 6 (SCP-BA-001–006) | 0 | 0 | Types, context integration, blind verification, FFI, production | Phase 0 S-A (canonical serialization for profiles) |
 | main.json | 9 | 3 | 173 | Kotlin SDK, FFI wiring, signaling | #356 (FFI), #306/#307 (bridges) |
 
@@ -435,7 +435,7 @@ SCP-267 → SCP-268 → SCP-269 → SCP-270 → SCP-271 → SCP-272 → SCP-273 
 ### Phase 10: New Features — MOSTLY COMPLETE
 
 **Lane A:** SCP-ACR-001 — **COMPLETE** → ad83cef. SCP-ACR-002 — **COMPLETE** → 5b26f18. SCP-ACR-003 — **COMPLETE**. SCP-ACR-004 — **COMPLETE**. SCP-ACR-005 — **COMPLETE** → d99f7860. SCP-ACR-006 — **COMPLETE**. SCP-ACR-007 — **COMPLETE**.
-**Lane B:** SCP-BCH-001 — **COMPLETE**. BCH-002 — **COMPLETE**. BCH-003 — **COMPLETE** → 73b5ed70. BCH-004 — **COMPLETE**. BCH-005 — **COMPLETE** → 73b5ed70. BCH-006 — **COMPLETE** → 73b5ed70. BCH-007 — **COMPLETE** → 1629dd2c. BCH-008 — **COMPLETE**. BCH-009 — **COMPLETE** → a6558a5d. BCH-010 — **COMPLETE**. BCH-011 — **COMPLETE**. BCH-012 — **COMPLETE** → f468fc35. BCH-013 — **COMPLETE**.
+**Lane B:** SCP-BCH-001 — **COMPLETE**. BCH-002 — **COMPLETE**. BCH-003 — **COMPLETE** → 73b5ed70. BCH-004 — **COMPLETE**. BCH-005 — **COMPLETE** → 73b5ed70. BCH-006 — **COMPLETE** → 73b5ed70. BCH-007 — **IN PROGRESS**: five of its eight acceptance criteria are unmet, because the tree carries no `crates/scp-node/tests/bridge_integration.rs` and each of those five opens "Integration test", beginning with "Integration test exercises full lifecycle: register bridge -> create shadow -> emit message -> attest identity -> check status -> webhook event -> delete shadow"; SCP-BCH-014 (bridge admission decided from the context event log) creates that file. BCH-008 — **COMPLETE**. BCH-009 — **COMPLETE** → a6558a5d. BCH-010 — **COMPLETE**. BCH-011 — **COMPLETE**. BCH-012 — **COMPLETE** → f468fc35. BCH-013 — **COMPLETE**.
 **Lane C:** SCP-BA-001 — **COMPLETE**. BA-002 — **COMPLETE**. BA-003 — **COMPLETE** → 074c90af. BA-004 — **COMPLETE**. BA-005 — **COMPLETE** → 9e86eacb. BA-006 — **COMPLETE** → 4605d808.
 **Lane D:** #362 — **COMPLETE** → 7d3a3a9c. #363 — **COMPLETE** → eb5c8276. #364 — **COMPLETE** (212 tests). #365 — **COMPLETE** → 61a4cdc7. #366 — **COMPLETE**. #367 — **COMPLETE** → a7def106.
 **Lane E:** SCP-038 — **COMPLETE** (PyO3 identity bridge — all 5 functions in scp-ffi/src/identity.rs). SCP-092 — **COMPLETE** (signaling — 521-line signaling.rs with 8 tests in scp-media).
@@ -624,7 +624,7 @@ PHASE 12: #291,#301,#303,#343,#344
 | content-access.json | 10 | #309 (Phase 6), #356 |
 | governance-integration.json | 8 | #356, #320 (Phase 2) |
 | capability-registry.json | 7 | — (independent) |
-| bridge-cooperative.json | 13 (SCP-BCH-001–013) | — (S-D resolved) |
+| bridge-cooperative.json | 9 (SCP-BCH-007, 014–021) | — (S-D resolved) |
 | participation-admission.json | 6 | CRYPTO-14 (signing key KDF) |
 
 ---
