@@ -416,7 +416,7 @@ Standard error codes:
 | `SHADOW_NOT_FOUND` | 404 | Shadow identity does not exist |
 | `SHADOW_ALREADY_EXISTS` | 409 | Shadow with this platform_user_id already exists |
 | `SHADOW_ALREADY_CLAIMED` | 409 | Shadow has been claimed and cannot be modified |
-| `BRIDGE_NOT_AUTHORIZED` | 401 | Bearer token invalid or expired |
+| `BRIDGE_NOT_AUTHORIZED` | 401 | The node did not verify the caller's bearer token — the call carried none, or the token's signature failed verification, or the token expired — or the node verified the token and then failed to bind the verified caller to the bridge the token names, under the two claim bindings of §12.10.6 step 1 |
 | `BRIDGE_FORBIDDEN` | 403 | Bridge not authorized for this operation |
 | `BRIDGE_SUSPENDED` | 403 | Bridge is suspended by context governance |
 | `RATE_LIMITED` | 429 | Request rate exceeds platform-configured limit |
@@ -959,6 +959,12 @@ This section tabulates the wire format for all bridge protocol types that cross 
 | `context_id` | `String` | Yes | Context to register with. |
 | `requested_at` | `u64` | Yes | Unix timestamp (seconds) at which the operator built this request. No derivation in this specification reads this value, and §12.2.1 step 3 reads the approval leaf's own `timestamp` in its place. |
 | `self_hosted` | `bool` | Yes | Whether the operator runs bridge infrastructure. |
+| `webhook_url` | `Option<String>` | Yes | The platform's webhook receiver URL. The operator fills this field for a cooperative-mode bridge and writes `None` into it for every other mode (`RegisterBridge` payload, §12.2.1). |
+| `platform_key` | `Option<[u8; 32]>` | Yes | The platform's Ed25519 public key. The bridge node stores this key when governance approves the registration, and verifies the signature of each webhook delivery under it (authentication, §12.10.2 step 3). The operator fills this field for a cooperative-mode bridge and writes `None` into it for every other mode. |
+| `max_shadows` | `u32` | Yes | The shadow limit the context's governance sets for this bridge. It overrides the shadow registry's own default (`RegisterBridge` payload, §12.2.1). |
+| `metadata` | `BridgeMetadata` | Yes | Display name, description, and operator contact. The context's governance model reads these three values while it decides the proposal (`RegisterBridge` payload, §12.2.1). |
+
+Seven of these ten rows — `operator_did`, `platform`, `mode`, `webhook_url`, `platform_key`, `max_shadows` and `metadata` — carry the `RegisterBridge` payload §12.2.1 declares, and the remaining three — `context_id`, `requested_at` and `self_hosted` — carry what the operator states about the request itself. This table lists every field of the type: a `BridgeRegistrationRequest` that declared an eleventh field would carry a value no rule in this specification reads.
 
 `BridgeRegistrationRequest` carries no bridge identifier. §12.2.1 step 3 derives the `bridge_id` from the `timestamp` of the leaf that records the approval, and that leaf does not exist while the operator is building the request, so the operator can put no assigned identifier in the request and the context reads none out of it. A requester that filled such a field would name the bridge by one value while the approval filed its lifecycle leaves under another, and the criterion of §12.10.6 step 1 reads the leaves. A pending registration is the governance proposal that carries the `RegisterBridge` action (governance, §5.9), and that proposal's identifier names the pending registration until the approval assigns a `bridge_id`.
 
