@@ -22,9 +22,12 @@ def extension_is_absent(exc: BaseException) -> bool:
 
     CRITERION: the exception is the :class:`scp_sdk.errors.ScpError` carrying
     ``SCP-UNKNOWN-0001``. :func:`scp_sdk._extension.native_module` raises that
-    code for exactly one cause — the compiled extension file is not on the
-    import path, which :func:`scp_sdk._extension.extension_is_installed`
-    decides by locating the file without executing it.
+    code for exactly one cause — no compiled extension file is present, which
+    :func:`scp_sdk._extension.extension_is_installed` decides by looking for
+    the file without executing it, on the import path and in the ``scp_sdk``
+    package directory alike. The second look is what sees a module another
+    interpreter built, whose filename carries that interpreter's tag and so
+    matches none of this one's ``importlib.machinery.EXTENSION_SUFFIXES``.
 
     A *present* extension that fails to load raises ``SCP-UNKNOWN-0002``
     instead, and so does an extension that loads without exporting the ``SCP``

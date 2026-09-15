@@ -32,11 +32,36 @@ import unicodedata
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from scp_sdk._extension import native_module
 from scp_sdk.errors import ContextError, ValidationError
 
 if TYPE_CHECKING:
     from scp_sdk.outlets import Outlets
     from scp_sdk.scp import SCP
+
+
+# ---------------------------------------------------------------------------
+# Bridge accessor
+# ---------------------------------------------------------------------------
+
+
+def _bridge() -> Any:
+    """Return the ``_scp_core`` extension module, imported lazily.
+
+    Used by the pure-function bridge operations at module scope
+    (``validate_capability_declaration``, ``metadata_record_to_json``,
+    ``metadata_record_from_json``, ``template_get_params``,
+    ``validate_against_template``, ``validate_context_params``), none of which
+    takes an :class:`SCP` instance.
+
+    Raises:
+        ScpError: ``SCP-UNKNOWN-0001`` when no extension is installed,
+            ``SCP-UNKNOWN-0002`` when one is installed and failed to load. A
+            bare ``import _scp_core`` here would instead raise
+            ``ModuleNotFoundError`` for both causes, which every other entry
+            point on this SDK does not.
+    """
+    return native_module()
 
 
 # ---------------------------------------------------------------------------
@@ -579,7 +604,7 @@ def validate_capability_declaration(
     validation state in the Rust bridge — it does not depend on an
     :class:`SCP` instance.
     """
-    import _scp_core
+    _scp_core = _bridge()
 
     result_json = _scp_core.py_validate_capability_declaration(
         declaration_json, ceiling_capabilities, role_capabilities
@@ -613,7 +638,7 @@ def metadata_record_to_json(
     Raises:
         ValidationError: If any input is malformed.
     """
-    import _scp_core
+    _scp_core = _bridge()
 
     return _scp_core.metadata_record_to_json(
         context_id,
@@ -638,7 +663,7 @@ def metadata_record_from_json(json_str: str) -> dict[str, Any]:
     Raises:
         ValidationError: If the JSON is malformed or does not match the schema.
     """
-    import _scp_core
+    _scp_core = _bridge()
 
     validated = _scp_core.metadata_record_from_json(json_str)
     return json.loads(validated)
@@ -659,7 +684,7 @@ def template_get_params(template_id: str) -> dict[str, Any]:
     Raises:
         ValidationError: If the template ID is not recognized.
     """
-    import _scp_core
+    _scp_core = _bridge()
 
     result = _scp_core.template_get_params(template_id)
     return json.loads(result)
@@ -680,7 +705,7 @@ def validate_against_template(params: dict[str, Any]) -> str | None:
     Raises:
         ValidationError: If the params dict cannot be serialized to JSON.
     """
-    import _scp_core
+    _scp_core = _bridge()
 
     return _scp_core.validate_against_template(json.dumps(params))
 
@@ -700,7 +725,7 @@ def validate_context_params(params: dict[str, Any]) -> str | None:
     Raises:
         ValidationError: If the params dict cannot be serialized to JSON.
     """
-    import _scp_core
+    _scp_core = _bridge()
 
     return _scp_core.validate_context_params(json.dumps(params))
 
