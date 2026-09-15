@@ -37,13 +37,35 @@ run_rust() (
   # test in `crates/scp-transport/src/native/postgres_blob.rs` or
   # `crates/scp-transport/src/native/s3_blob.rs` and compile neither module's
   # doctests. Job rust-test-optional-features in .github/workflows/ci.yml
-  # carries both lines below.
+  # carries the two lines below, and carries the two after them.
   if command -v cargo-nextest &>/dev/null; then
     cargo nextest run -p scp-transport --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob
   else
     cargo test -p scp-transport --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob
   fi
   cargo test -p scp-transport --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob --doc
+
+  # The two lines above compile `scp-transport`'s own test targets and link no
+  # relay binary, so neither runs the three backend-selection tests in
+  # `crates/scp-relay/tests/storage_backend.rs` against a relay that compiled
+  # the `postgres` and `s3` arms of `storage_from_env`. Those three tests each
+  # assert one of two outcomes, chosen by
+  # `scp_transport::startup::backend_is_compiled`, and every command above
+  # reaches their not-compiled half. This line reaches the other half, and it is
+  # the only place in this script where the relay binary's postgres and s3
+  # startup paths run.
+  if command -v cargo-nextest &>/dev/null; then
+    cargo nextest run --no-tests=fail -p scp-relay --features cloud-blobs
+  else
+    cargo test -p scp-relay --features cloud-blobs
+  fi
+  # The same feature on `scp-node`, which docs/guides/relay-operations.md hands
+  # an operator as `cargo build --release -p scp-node --features cloud-blobs`.
+  # No other command in this script compiles that graph: `--workspace` stopped
+  # resolving `postgres-blob` and `s3-blob` when scp-node's manifest stopped
+  # enabling them. The compile rejects a typo in either forwarding target of
+  # `crates/scp-node/Cargo.toml`.
+  cargo check -p scp-node --features cloud-blobs
 )
 
 run_python() (

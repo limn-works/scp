@@ -1033,8 +1033,31 @@ mod tests {
         assert!(!message.contains("unknown storage backend"), "{message}");
     }
 
-    /// A build that compiled an arm never routes that value to either
-    /// diagnostic, so neither message may advertise a rebuild for it.
+    /// [`reject_backend_message`] names a rebuild only for a backend whose
+    /// `compiled` column reads false.
+    ///
+    /// The edit this test catches is the `&& !b.compiled` filter dropping out
+    /// of that function's `find`. Without the filter the function matches the
+    /// row of a backend this build did compile, and hands an operator who typed
+    /// a working value the rebuild instruction written for an absent arm, which
+    /// reports a capability as gone from a binary that holds it. No other test
+    /// in this module reads that filter:
+    /// `an_unrecognized_value_is_reported_as_unknown` passes a name no row
+    /// carries, and the two `an_uncompiled_*` tests pass names whose rows
+    /// already read false, so removing the filter changes none of those three
+    /// results.
+    ///
+    /// This loop reads the `compiled` column rather than checking it, so it
+    /// says nothing about a row whose column reads a sibling backend's feature:
+    /// such a row agrees with itself on both sides of the comparison and stays
+    /// green here. `the_compiled_predicate_answers_from_the_features` and
+    /// `every_site_names_the_same_feature_for_a_backend` fail on that row.
+    /// Which values [`storage_from_env`] routes to this function is held
+    /// elsewhere too: `every_constructor_arm_has_a_table_row` pairs each arm
+    /// with a row, and `every_site_names_the_same_feature_for_a_backend` pins
+    /// each arm's `#[cfg]` to the feature its row names, so a value whose arm
+    /// this build compiled reaches a constructor and never reaches either
+    /// diagnostic.
     #[test]
     fn a_compiled_backend_never_reads_as_absent() {
         for backend in BACKENDS.iter().filter(|b| b.compiled) {
