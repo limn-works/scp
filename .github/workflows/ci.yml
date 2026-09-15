@@ -1055,11 +1055,15 @@ jobs:
 
   # ── Optional-feature test lanes ─────────────────────────────────────────────
   #
-  # Three invocations that job rust-test above used to carry. Each one activates
-  # a feature `--workspace` does not, so each one recompiles its package's graph
-  # under a feature set no other command in that job builds — 2 min 53 s of
-  # compilation and 43 s of execution on the warm run cited above. Sharding
-  # rust-test four ways would have repeated all of it four times per OS.
+  # Seven invocations. Each one activates a feature `--workspace` does not, so
+  # each one recompiles its package's graph under a feature set no other command
+  # in job rust-test above builds. Job rust-test carried the first three of the
+  # seven until they moved here, where they cost 2 min 53 s of compilation and
+  # 43 s of execution on the warm run cited above. Sharding rust-test four ways
+  # would have repeated those three commands four times per OS. The other four
+  # commands compile the PostgreSQL and S3 blob backends. Those two backends
+  # pull the `sqlx` PostgreSQL client and 23 `aws-*` crates, which no other
+  # command in this job resolves.
   #
   # Both operating systems, for the same reason rust-test runs on both: the
   # scp-testing lane below opens a real on-disk SQLite database across two
@@ -1173,12 +1177,21 @@ jobs:
           # other half, and it is the only place the relay binary's postgres and
           # s3 startup paths run at all.
           cargo nextest run --no-tests=fail -p scp-relay --features cloud-blobs
-          # Resolution only, no compile: scp-node/cloud-blobs forwards to two
-          # scp-transport features, and cargo rejects a forwarding target that
-          # does not exist. Nothing else in CI activates scp-node's copy of the
-          # feature, so without this line a typo there would surface only when
-          # an operator built with it.
-          cargo tree -q --target all -e no-dev -p scp-node --features cloud-blobs > /dev/null
+          # The same feature on scp-node, which
+          # docs/guides/relay-operations.md hands an operator as
+          # `cargo build --release -p scp-node --features cloud-blobs`. Nothing
+          # else in this repository compiles that graph: `--workspace` stopped
+          # resolving `postgres-blob` and `s3-blob` when scp-node's manifest
+          # stopped enabling them, job docker-image builds both release binaries
+          # at default features, and release.yml publishes scp-node at default
+          # features. This line compiles the graph instead of resolving it,
+          # because the rot this job's header describes for
+          # `crates/scp-transport`'s `quic` feature is a compile failure, and
+          # `cargo tree` renders a graph whose code no longer compiles and exits
+          # 0. The compile also rejects a typo in either forwarding target,
+          # which is every failure the `cargo tree` line it replaced could
+          # report.
+          cargo check -p scp-node --features cloud-blobs
 
   # Exercises the napi bridge in its PRODUCTION configuration: default features
   # (`server` on) but WITHOUT `testing` / `scp-core/testing` /
@@ -1510,8 +1523,9 @@ jobs:
         # `postgres-blob` and `s3-blob` gate `native/postgres_blob.rs` and
         # `native/s3_blob.rs`, and `scp-node` and `scp-relay` stopped enabling them,
         # so a `--workspace` resolution compiles neither module and rustdoc reads no
-        # link either one writes. The `rust-test-optional-features` job carries this
-        # pair's clippy, test and doctest lines; this command is the rustdoc
+        # link either one writes. Job rust-clippy carries this pair's clippy line
+        # and job rust-test-optional-features carries its test and doctest lines,
+        # one command per dimension; this command is the rustdoc
         # dimension, and `cargo test --doc` does not substitute for it — the three
         # links pull request #2274 broke were live while this job already ran
         # `cargo test --workspace --doc`, which is why the `cargo doc` line below
