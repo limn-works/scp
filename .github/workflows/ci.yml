@@ -1511,14 +1511,17 @@ jobs:
         # `check_rustdoc_documents_private_items` rejects a `cargo doc` command in any
         # workflow of this repository that omits the flag, and
         # `check_required_rustdoc_surface` fails when a `cargo doc` in any other
-        # workflow passes a flag this command omits. That second check reads the
-        # same two flag sets the other way too: `rust-docs` in docs.yml uploads
-        # the `target/doc/` that `publish-docs` deploys to GitHub Pages, so a
-        # `--features` member this command carries and that one omits is a module
-        # the published API reference loses, and dropping a module breaks no
-        # intra-doc link, so no job reds over the loss. The two commands carry one
-        # feature list for that reason as well as for the compilation-unit reason
-        # below.
+        # workflow passes a flag this command omits. Job `rust-docs` in docs.yml
+        # uploads the `target/doc/` that `publish-docs` deploys to GitHub Pages,
+        # and it carries this list minus the three
+        # `outlet-capability-test-grant` members: those three ungate
+        # `Supervisor::test_grant_member_capability`, which this command reads so
+        # rustdoc resolves that seam's intra-doc links and which no shipped
+        # artifact compiles, so the published reference does not document it.
+        # An edit that drops
+        # `scp-transport/postgres-blob,scp-transport/s3-blob` from docs.yml
+        # alone drops `PostgresBlobStore` and `S3BlobStore` from the published
+        # reference and reds no job, so change the two commands together.
         # The last two `--features` members are not test gates. `scp-transport`'s
         # `postgres-blob` and `s3-blob` gate `native/postgres_blob.rs` and
         # `native/s3_blob.rs`, and `scp-node` and `scp-relay` stopped enabling them,
