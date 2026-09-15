@@ -1,4 +1,5 @@
-"""Guard the `scp` fixture's skip condition in bindings/python/tests/conftest.py.
+"""Guard the `scp` fixture's skip condition and its teardown in
+bindings/python/tests/conftest.py.
 
 The fixture skips when the native extension is not installed and re-raises every
 other construction failure. Skipping on a construction failure the extension can
@@ -14,16 +15,26 @@ causes — rather than hand-building an exception and asserting against it. An
 assertion over a shape the fixture never receives passes without exercising the
 scenario it names.
 
+The teardown test at the end of this file guards the other half of the fixture:
+a teardown that calls the coroutine function `SCP.shutdown` from its synchronous
+`finally` block builds a coroutine nothing runs, so no test in the suite shuts its
+native instance down. That test replaces `scp_sdk.SCP` with a recording stand-in.
+
 These tests import no native symbol, so they run wherever the pure-Python SDK
 imports and cannot themselves be skipped by a missing extension.
 """
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
+import scp_sdk
 from scp_sdk import _extension
 from scp_sdk.errors import ScpError, StorageError, ValidationError
+from scp_sdk.scp import SCP as RealSCP
+from tests import conftest
 from tests.conftest import extension_is_absent
 
 
@@ -82,3 +93,58 @@ def test_non_scp_exceptions_are_not_absence() -> None:
     """A PyO3 panic reaches the fixture unwrapped and must fail the test."""
     assert not extension_is_absent(RuntimeError("panic in bridge init"))
     assert not extension_is_absent(BaseException("bare"))
+
+
+def test_fixture_teardown_uses_the_synchronous_shutdown_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The `scp` fixture's teardown must shut its instance down, not build a coroutine.
+
+    `scp_sdk.SCP.shutdown` is a coroutine function, so the fixture's synchronous
+    teardown cannot call it: the call returns a coroutine that nothing runs, every
+    test's native instance stays alive for the rest of the pytest process, and no
+    test in the suite exercises the shutdown path. `SCP.__exit__` is the
+    synchronous path, and this test drives the fixture's generator to exhaustion —
+    which runs the `finally` block — and reads which path the teardown took off a
+    stand-in that records both.
+
+    The stand-in replaces `scp_sdk.SCP`, so this test needs no native extension and
+    runs wherever the pure-Python SDK imports.
+    """
+    assert inspect.iscoroutinefunction(RealSCP.shutdown), (
+        "this test guards the fixture against calling a coroutine function from a "
+        "synchronous teardown; SCP.shutdown is no longer one, so re-read conftest"
+    )
+
+    class _RecordingScp:
+        """Records which of the two shutdown paths the fixture's teardown took."""
+
+        def __init__(self, storage: dict[str, str]) -> None:
+            self.storage = storage
+            self.exit_calls: list[tuple[object, object, object]] = []
+            self.coroutines_built = 0
+
+        async def shutdown(self, timeout: float = 5.0) -> None:
+            self.coroutines_built += 1
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            self.exit_calls.append((exc_type, exc, tb))
+
+    monkeypatch.setattr(scp_sdk, "SCP", _RecordingScp)
+
+    # `@pytest.fixture` wraps the generator function and exposes the original as
+    # `__wrapped__`, which is the only handle on the fixture body a test can call.
+    fixture_body = conftest.scp.__wrapped__  # type: ignore[attr-defined]
+    generator = fixture_body()
+    instance = next(generator)
+    with pytest.raises(StopIteration):
+        next(generator)
+
+    assert instance.exit_calls == [(None, None, None)], (
+        "the scp fixture's teardown must call SCP.__exit__ so the native instance "
+        f"actually shuts down; recorded __exit__ calls: {instance.exit_calls}"
+    )
+    assert instance.coroutines_built == 0, (
+        "the teardown called the coroutine function SCP.shutdown, which builds a "
+        "coroutine nothing runs and leaves the native instance alive"
+    )

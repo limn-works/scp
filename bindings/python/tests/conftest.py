@@ -86,8 +86,16 @@ def scp() -> Iterator:
     try:
         yield instance
     finally:
-        # Matches SCP.__exit__: 5-second graceful shutdown.
-        try:
-            instance.shutdown(5.0)
-        except Exception:
-            pass
+        # `SCP.__exit__` is the shutdown path a synchronous caller uses, and this
+        # teardown is synchronous, so it calls `__exit__`. `SCP.shutdown` is a
+        # coroutine function: calling it here would build a coroutine that nothing
+        # runs, the native instance would stay alive for the rest of the pytest
+        # process, and CPython would print `RuntimeWarning: coroutine
+        # 'SCP.shutdown' was never awaited` when it collected that coroutine.
+        # `__exit__` passes the same 5-second deadline to `_native.shutdown`, and a
+        # second native shutdown is a documented no-op that
+        # `tests/test_scp_class.py::test_shutdown_is_idempotent` asserts, so a test
+        # that shut its own instance down does not fail here. An error this call
+        # raises fails the test rather than being swallowed: a shutdown that cannot
+        # complete is a defect this suite exists to surface.
+        instance.__exit__(None, None, None)
