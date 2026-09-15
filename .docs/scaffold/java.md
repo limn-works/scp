@@ -252,10 +252,6 @@ public final class Identity implements AutoCloseable {
         });
     }
 
-    public static CompletableFuture<Identity> create() {
-        return create("platform");
-    }
-
     @Override
     public void close() {
         if (handle != null) {
