@@ -3167,11 +3167,21 @@ def condition_assignments(doc: dict) -> list[tuple[dict[str, str], str]]:
     return assignments
 
 
-# GitHub runs a job whose `if:` calls one of these regardless of what its
-# dependencies reported, a skipped dependency included, so skip propagation does not
-# reach such a job. Job `ci` is the one that calls one: it aggregates results and has
-# to run over a skipped dependency to judge it.
-STATUS_FUNCTIONS = ("always(", "success(", "failure(", "cancelled(")
+# GitHub applies `success()` to every job that does not name a status check function,
+# and a skipped dependency fails `success()`, so skip propagation reaches every job
+# except the two this pattern matches: `always()` evaluates true whatever every
+# dependency reported, and `!cancelled()` evaluates true unless someone cancelled the
+# run. `success()`, `failure()` and `cancelled()` each evaluate false over a skipped
+# dependency, so a job naming one of those three still skips when a job in its `needs`
+# list skips, and the union comparison below still binds it. Job `ci` is the only job
+# in ci.yml that names a status check function today: it aggregates results and has to
+# run over a skipped dependency to judge it, so it writes `always()`.
+#
+# A job whose `if:` this pattern does not match, and that `selects` cannot parse,
+# reaches the report branch below rather than an exemption, which is why this pattern
+# names the two expressions that defeat skip propagation instead of every expression
+# that contains a status check function.
+RUNS_OVER_A_SKIPPED_DEPENDENCY = re.compile(r"always\s*\(|!\s*cancelled\s*\(")
 
 
 def dependency_condition_gaps(doc: dict) -> list[str]:
@@ -3211,7 +3221,7 @@ def dependency_condition_gaps(doc: dict) -> list[str]:
             # condition selects it on every event this enumeration presents, so the
             # substitution reports nothing on the workflow as it stands.
             condition = "true == 'true'"
-        if any(function in str(condition) for function in STATUS_FUNCTIONS):
+        if RUNS_OVER_A_SKIPPED_DEPENDENCY.search(str(condition)):
             continue
         for dependency in needs:
             upstream = jobs.get(dependency, {}).get("if")
@@ -3309,6 +3319,45 @@ def check_dependency_conditions_detect_a_conditionless_consumer(doc: dict) -> No
         any("error-codes runs and pyo3-module skips" in gap for gap in gaps),
         f"a job with no `if:` was exempted from the comparison: {gaps}",
     )
+
+
+def check_dependency_conditions_read_a_status_guarded_consumer(doc: dict) -> None:
+    """Only `always()` and `!cancelled()` exempt a consumer from the comparison.
+
+    A consumer that writes `success()`, `failure()` or `cancelled()` still skips when
+    a job in its `needs` list skips, because each of those three evaluates false over
+    a skipped dependency. Exempting such a consumer would delete it from the run under
+    a green `ci` exactly as an unexempted gap would, and would delete it silently,
+    since the exemption runs before the branch that reports an expression this grammar
+    cannot read. Job `error-codes` carries `needs: [check-draft]` and no `if:`; adding
+    a producer selected by one filter output gives each mutant a pair to compare.
+    """
+    for expression, exempt in (
+        ("success()", False),
+        ("failure()", False),
+        ("cancelled()", False),
+        ("always()", True),
+        ("!cancelled()", True),
+    ):
+        mutated = copy.deepcopy(doc)
+        mutated["jobs"]["error-codes"]["needs"] = ["check-draft", "pyo3-module"]
+        mutated["jobs"]["error-codes"]["if"] = expression
+        gaps = dependency_condition_gaps(mutated)
+        named = [gap for gap in gaps if "error-codes" in gap]
+        if exempt:
+            check(
+                f"a consumer written `if: {expression}` is exempted",
+                not named,
+                f"an expression that runs over a skipped dependency was "
+                f"compared: {named}",
+            )
+        else:
+            check(
+                f"a consumer written `if: {expression}` is still compared",
+                bool(named),
+                "a consumer that skips with its dependency was exempted, and "
+                "the gate reported nothing about it",
+            )
 
 
 PYO3_ARTIFACTS = ("pyo3-module-linux", "pyo3-module-macos")
@@ -3586,6 +3635,7 @@ def main() -> int:
     check_dependency_conditions(workflow)
     check_dependency_conditions_detect_a_narrowed_producer(workflow)
     check_dependency_conditions_detect_a_conditionless_consumer(workflow)
+    check_dependency_conditions_read_a_status_guarded_consumer(workflow)
 
     print("coverage — every job reaches a required status check")
     defined = set(jobs) - {"ci"}
