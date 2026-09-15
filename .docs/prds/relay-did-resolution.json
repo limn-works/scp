@@ -221,7 +221,7 @@
         "phase": "2",
         "feature": "issue #482 — relay-based DID resolution (Model B)",
         "companion": "ADR-004 storage-semantics update (what may open or extend a key-event chain at a routing id) — spec-mandated upstream dependency, done as step 1 of this story",
-        "merged": "3b2460f95 on origin/main, whose commit subject reads \"feat(relay-res): relay-side DID-record validation + slot-exclusivity (SCP-RELAYRES-003, #482) (#2270)\" and predates Alec's renaming of the rule on 2026-09-14; crates/scp-transport/src/relay/did_record_validation.rs and ADR-004's subsection \"What may open or extend a key-event chain at a routing id\" are both present on origin/main"
+        "merged": "pull request #2270 on origin/main, whose commit subject reads \"feat(relay-res): relay-side DID-record validation + slot-exclusivity (SCP-RELAYRES-003, #482) (#2270)\" and predates the 2026-09-14 deletion of the word that subject uses for the unit; crates/scp-transport/src/relay/did_record_validation.rs and ADR-004's subsection \"What may open or extend a key-event chain at a routing id\" are both present on origin/main"
       }
     },
     {
