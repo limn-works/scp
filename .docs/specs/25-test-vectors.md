@@ -1232,9 +1232,9 @@ Ed25519 is deterministic (RFC 8032), so a conformant implementation reproduces b
 
 ### Vector 40: `X-SCP-Platform-Key-Id`
 
-Step 6 of §12.10.2 derives the `X-SCP-Platform-Key-Id` header from the 64 ASCII bytes of a bridge's lowercase hex `bridge_id` followed by the 32 `platform_key` bytes that an approved `RegisterBridge` or `UpdateBridgePlatformKey` action registered for that bridge. The preimage carries no domain separator, no length prefix, and no separator between the two components. This vector pins that digest and pins no derivation of the `bridge_id` itself: each `bridge_id` below is a literal 64-character lowercase hex string.
+Step 6 of §12.10.2 derives the `X-SCP-Platform-Key-Id` header as `SHA-256("SCP-BRIDGE-PLATFORM-KEY-ID-V1:" || bridge_id || platform_key)`, where `bridge_id` contributes the 64 ASCII bytes of a bridge's lowercase hex `bridge_id` and `platform_key` contributes the 32 bytes that an approved `RegisterBridge` or `UpdateBridgePlatformKey` action registered for that bridge. That preimage follows the canonical hash construction (§9.5.1 of the security-model spec): the domain separator carries no length prefix, and the schema fixes the length of both components, so neither component carries a length prefix either. This vector pins that digest and pins no derivation of the `bridge_id` itself: each `bridge_id` below is a literal 64-character lowercase hex string.
 
-Inputs A and B give two bridges that registered one 32-byte key, which is the state §12.10.2 step 6 covers the `bridge_id` for: one platform publishes one webhook signing key, one operator may run one bridge into each of two contexts against that platform, and both approvals register the same 32 bytes. The two inputs produce two identifiers. Input C digests the key bytes alone, which §12.10.2 step 6 refuses as an identifier; this vector pins its value so an implementation that omits the `bridge_id` from the preimage fails against a named digest rather than against no digest.
+Inputs A and B give two bridges that registered one 32-byte key, which is the state §12.10.2 step 6 covers the `bridge_id` for: one platform publishes one webhook signing key, one operator may run one bridge into each of two contexts against that platform, and both approvals register the same 32 bytes. The two inputs produce two identifiers. Inputs C and D are the two digests §12.10.2 step 6 refuses as an identifier, and this vector pins both so that an implementation which drops a component of the preimage fails against a named digest rather than against no digest: C omits the `bridge_id` and keeps the domain separator, and D omits both.
 
 ```
 Input A:
@@ -1242,32 +1242,41 @@ Input A:
   platform_key:  0xa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf
 
 Canonical hash input:
-  the 64 ASCII bytes of bridge_id               (64 bytes, no length prefix)
-  || platform_key                                (32 bytes, no length prefix)
+  the 30 UTF-8 bytes of "SCP-BRIDGE-PLATFORM-KEY-ID-V1:" (30 bytes, no length prefix)
+  || the 64 ASCII bytes of bridge_id                     (64 bytes, no length prefix)
+  || platform_key                                        (32 bytes, no length prefix)
 
-Total: 64 + 32 = 96 bytes
+Total: 30 + 64 + 32 = 126 bytes
 
-Preimage (hex, 96 bytes):
-  31613262336334643565366637303831393261336234633564366537663830
-  39316132623363346435653666373038313932613362346335643665376638
-  3039
-  a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf
+Preimage (hex, 126 bytes):
+  5343502d4252494447452d504c4154464f524d2d4b45592d49442d56313a3161
+  3262336334643565366637303831393261336234633564366537663830393161
+  326233633464356536663730383139326133623463356436653766383039a0a1
+  a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf
 
 Expected SHA-256 (the `X-SCP-Platform-Key-Id` value, lowercase hex):
-  0xe8021fbd350a5dc599bc831e7390e5285c1c2f8cff62966e45c225f5fa42d857
+  0xf2bbde44d165aafbf08e36eb46971da6fbeb9d06edbbbb1b9ba27efec15a415d
 
 Input B (a second bridge that registered the same 32 key bytes):
   bridge_id:     "f0e1d2c3b4a5968778695a4b3c2d1e0ff0e1d2c3b4a5968778695a4b3c2d1e0f"
   platform_key:  0xa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf
 
 Expected SHA-256:
-  0x12bda04ffe741266ca1ef3e1a0342ff316decece6589297c7c78653745fdf178
+  0x96c0ee582dcc80f5371e76bfe780cdfb62f2ce8ed53872ef8e52e1f3208ca5ad
 
-Input C (the platform key alone, which §12.10.2 step 6 refuses as an identifier):
+Input C (the domain separator and the platform key, with the bridge_id omitted,
+which §12.10.2 step 6 refuses as an identifier):
+  preimage:      "SCP-BRIDGE-PLATFORM-KEY-ID-V1:" || platform_key   (62 bytes)
+
+SHA-256 of those 62 bytes:
+  0xcc7dba48ca07928f8031da297b41cb30d7e8d8c6546cad09b339952a8ebd9e9f
+
+Input D (the platform key alone, with the domain separator and the bridge_id both
+omitted, which §12.10.2 step 6 refuses as an identifier):
   platform_key:  0xa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf
 
 SHA-256 of those 32 bytes:
   0x00e988677eecf94c0bb9233371c7c0d6f4db8ebdcdecb7c5ebaa666f17249227
 ```
 
-A node that resolves a delivery stamped with the Input A digest reaches the first bridge, and a node that resolves a delivery stamped with the Input B digest reaches the second, so one registered key does not move a platform event across a context boundary. The shipped node reads the `X-SCP-Platform-Key-Id` header as an opaque lookup key into its webhook key store (`crates/scp-node/src/bridge_auth.rs`) and derives this digest nowhere. SCP-BCH-021, the story that writes that key store from the governance approval, pins these three digests in a test.
+A node that resolves a delivery stamped with the Input A digest reaches the first bridge, and a node that resolves a delivery stamped with the Input B digest reaches the second, so one registered key does not move a platform event across a context boundary. The shipped node reads the `X-SCP-Platform-Key-Id` header as an opaque lookup key into its webhook key store (`crates/scp-node/src/bridge_auth.rs`) and derives this digest nowhere. SCP-BCH-021, the story that writes that key store from the governance approval, requires a test that pins these four digests, and no test in the tree pins them yet.

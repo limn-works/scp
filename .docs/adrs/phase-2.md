@@ -886,10 +886,13 @@ pub enum EventType {
     // §12.10.6 step 1 obliges a bridge node to retain the lifecycle payloads
     // of every bridge it operates whatever the context's pruning policy sets.
     // A bridge node reads bridge
-    // admission from this group of leaves for that bridge_id, from the
-    // MemberJoined and MemberLeft leaves of that same log that record whether
-    // the bridge's operator is still a member of the context, and from no
-    // other input (§12.10.6 step 1). That criterion scans EVERY one of the
+    // admission from this group of leaves for that bridge_id, from the leaves
+    // of that same log that record whether governance has withdrawn the
+    // bridge operator's authority to act as a member of the context, and from
+    // no other input (§12.10.6 step 1). §12.10.6 step 1 states that clause as
+    // a property of the operator's authority rather than as a list of leaf
+    // names, so a member-governance leaf this ADR adds later fails that clause
+    // when it records a withdrawal. That criterion scans EVERY one of the
     // bridge's leaves for a BridgeRevoked leaf, which is terminal, and reads
     // the LAST leaf only to decide whether a suspension still stands; a
     // BridgeReactivated leaf appended after a BridgeRevoked leaf readmits
