@@ -698,14 +698,14 @@ Parallel query makes resolution latency the latency of the fastest relay that an
 
 An identity's key-event log rides in the key-event record frame `09-security-model.md` §9.10.12 states, at `routing_id = SHA-256("scp:did:" ‖ identifier_bytes)` over the identifier's 32 raw digest bytes (`09-security-model.md` §9.7.4.2 R13). That separator keeps the address from colliding with every other routing derivation the protocol runs (§9.10.4, §5.14), and it is why the frame carries no record-kind byte: the address is the type discriminant.
 
-**Relay-side validation.** `09-security-model.md` §9.7.4.2 R9 states what a relay keeps for one identity, what a chain holds, the write rule, the serving order and the ring buffer. On PUBLISH at a routing id an SCP-native relay runs six checks **in the order below, which is the order and not an enumeration**, so junk is rejected before any expensive work. **Every check a relay can run before it decides whether to spend an outbound query runs ahead of `PaymentAdapter::verify`, and every check after that call reads a value the call returned or a decision it produced.** That call is an asynchronous query to a payment rail; a PUBLISH carries no key and the relay authenticates no client, so a relay that called the rail first drove one outbound query per request an unauthenticated party sent and reached its own rate limit never:
+**Relay-side validation.** `09-security-model.md` §9.7.4.2 R9 states what a relay keeps for one identity, what a chain holds, the write rule, the serving order and the ring buffer. On PUBLISH at a routing id an SCP-native relay runs six checks **in the order below, which is the order and not an enumeration**, so junk is rejected before any expensive work. **The universal above the list: every check a relay can run before it decides whether to spend an outbound query runs ahead of `PaymentAdapter::verify`, and every check after that call reads a value the call returned or a decision it produced.** That call is an asynchronous query to a payment rail; a PUBLISH carries no key and the relay authenticates no client, so a relay that called the rail first drove one outbound query per request an unauthenticated party sent and reached its own rate limit never. **The storage budgets sit ahead of the call because every term they read is local**: the declared budget figures, the bytes the relay already holds, and whether this identity's rent is current, which is durable relay state that a receipt on this write does not change. **This section states the number of checks once, and every site that cites the order takes the number by citation and states no figure of its own.** The six:
 
-1. **The declared rate limit.** Refuse a PUBLISH that exceeds `rate_limit_publish`. **The check counts every PUBLISH against the publishing address, reads no field of a receipt, and decodes nothing.** **No declaration exempts any party from it**, because a relay sells storage and never traffic (`09-security-model.md` §9.7.4.2 R9). A check that admitted a PUBLISH for carrying a `payment_receipt` field would admit every PUBLISH carrying arbitrary bytes under that name, and each one would reach the rail query check 4 makes.
+1. **The declared rate limit.** Refuse a PUBLISH that exceeds `rate_limit_publish`. **The check counts every PUBLISH against the publishing address, reads no field of a receipt, and decodes nothing.** **No declaration exempts any party from it**, because a relay sells relief from a storage refusal and sells no relief from the rate limit (`09-security-model.md` §9.7.4.2 R9). A check that admitted a PUBLISH for carrying a `payment_receipt` field would admit every PUBLISH carrying arbitrary bytes under that name, and each one would reach the rail query check 5 makes.
 2. **Structural decode.** Decode the blob as a key-event record frame (`09-security-model.md` §9.10.12), under the one parse bound §9.7.4.2's definitions state for every count-prefixed list read out of unverified bytes. **A blob shorter than the frame's 33-byte fixed prefix is refused here, before any rule digests its `value` bytes.** A blob that does not decode is not a candidate key-event record.
 3. **The identifier-to-routing-id binding.** Confirm that the routing id equals the registered derivation over the frame's `identifier` field. This is a plain hash, cheaper than a signature verification, and it is the discriminant that lets a relay recognize a key-event record with no new wire type.
-4. **`PaymentAdapter::verify`, its four comparisons, and recording the write as paid.** Where the relay declares `per_publish` or `per_byte_stored`, call the adapter the receipt is tagged with (`19-economic-governance.md` §19.2.1), passing it the receipt together with this relay's declared payee, currency and price. Compare the four terms it returns: the verified payee against this relay's declared `economic.payee`, the rail-bound receipt identifier against the set of identifiers this relay has already spent, the verified amount against the declared price for what the receipt pays, and the verified currency against this relay's declared `economic.currency`. Record the write as paid. Refuse `Payment` where the write is charged and the receipt is absent, where the verification fails, or where any of the four comparisons fails. **Every one of the four reads a term the call returned and none reads a field of the receipt**, because a presenting party composes every field of the receipt. **This is the one check that leaves the relay's host**, which is why every check above it runs first. The relay spends the receipt identifier at check 6, where it places the frame's events on a chain, and at no earlier check, so a frame it rejects costs the publisher no receipt.
-5. **The declared storage budgets.** **No event kind is exempt from either budget.** The relay evicts or refuses under `Identifier` and refuses under `Total` as `09-security-model.md` §9.7.4.2 R9 states, and it reads that section for what a declared exemption stops and for how long. The check runs here because it reads the identifier check 3 bound and no verified chain, and it runs after check 4 because R9's `Identifier` exemption reads whether this identity's rent is current.
-6. **Chain verification and placement, on whichever of two branches the frame's first event selects.** Where that event is an inception event, the relay recomputes the identifier from it, rejects a frame that recomputes to anything but the `identifier` field check 3 read, and verifies every event under `09-security-model.md` §9.7.4.2 R2 and R3. Where that event's predecessor digest names an event the relay already holds at this routing id, the relay verifies the frame's events against the standing root the assembled chain carries at that position and recomputes no identifier. A frame whose first event selects neither branch is rejected. **The chain authorizes the write, and no key the writer supplies does.** The relay then places the frame's events on a chain under `09-security-model.md` §9.7.4.2 R9, and spends the receipt identifier check 4 verified.
+4. **The declared storage budgets.** **No event kind is exempt from any scope.** The relay evicts or refuses under `Identifier` and refuses under `Total` as `09-security-model.md` §9.7.4.2 R9 states, and it reads that section for what a declared exemption stops and for how long. The check runs here because every term it reads is one the relay already holds.
+5. **`PaymentAdapter::verify`, its three comparisons, and recording the write as paid.** Where the relay declares `per_publish`, call the adapter the receipt is tagged with (`19-economic-governance.md` §19.2.1), passing it the receipt together with this relay's declared currency and the price it computed. Read the three answers it returns: the rail-bound receipt identifier against the set of identifiers this relay has already spent, whether the verified amount covers the price this relay supplied, and whether the verified currency equals the currency this relay supplied. Record the write as paid. Refuse `Payment` where the write is charged and the receipt is absent, where the call returns invalid, where any of the three answers fails, or where the receipt's adapter tag names no member of this relay's declared `economic.payment_adapters`. **Every one of the three reads a term the call returned and none reads a field of the receipt**, because a presenting party composes every field of the receipt. **This is the one check that leaves the relay's host**, which is why every check above it runs first. The relay spends the receipt identifier at check 6, where it places the frame's events on a chain, and at no earlier check, so a frame it rejects costs the publisher no receipt.
+6. **Chain verification and placement, on whichever of two branches the frame's first event selects.** Where that event is an inception event, the relay recomputes the identifier from it, rejects a frame that recomputes to anything but the `identifier` field check 3 read, and verifies every event under `09-security-model.md` §9.7.4.2 R2 and R3. Where that event's predecessor digest names an event the relay already holds at this routing id, the relay verifies the frame's events against the standing root the assembled chain carries at that position and recomputes no identifier. A frame whose first event selects neither branch is rejected. **The chain authorizes the write, and no key the writer supplies does.** The relay then places the frame's events on a chain under `09-security-model.md` §9.7.4.2 R9, and spends the receipt identifier check 5 verified.
 
 **What may open or extend a chain at a routing id.** Once a binding-valid frame whose chain verifies establishes a chain at a routing id, four rules govern that routing id:
 
@@ -713,6 +713,8 @@ An identity's key-event log rides in the key-event record frame `09-security-mod
 - **(b)** establishing the first chain evicts the opaque blobs already stored at that routing id, which clears junk pre-seeded before the identity's first publish;
 - **(c)** QUERY at that routing id returns every chain the routing id holds and nothing else, a page at a time under R9's walk, because a relay that returned one chain would decide fork precedence for the resolver;
 - **(d)** the relay rejects a client delete of any stored frame whose chain verifies. The gate is **storage-derived rather than index-derived**, because a delete addresses a blob by its own digest while the relay's index of which frames make which chain is a cache a restart leaves cold: the relay re-reads the blob and refuses where it decodes as a frame whose chain recomputes to its `identifier` field and verifies. The gate runs behind the same per-address rate limit as PUBLISH and **fails closed on a storage read error**. It closes an integrity vector and not merely an availability one: an attacker deletes the genuine record, republishes a captured earlier frame carrying a genuine prefix, and a relay with nothing left to compare against stores that prefix as the whole chain.
+
+**A PUBLISH at `scp:svc:`, `scp:wit:` or `scp:wcf:` runs the same six checks in the same order, with that kind's own acceptance test standing where chain verification and placement stand at check 6, and the relay spends the receipt identifier there.** The two witness kinds carry no payment check at all: **a relay charges no `scp:wit:` and no `scp:wcf:` write** (`09-security-model.md` §9.7.4.3), because the witness filter below already proves the write is one a designated witness made about a subject whose chain this relay holds.
 
 **A validating relay also stores the witness layer's two records**, at `SHA-256("scp:wit:" ‖ identifier_bytes)` and `SHA-256("scp:wcf:" ‖ identifier_bytes)` (`09-security-model.md` §9.7.4.2 R13), in the frames §9.10.12 states. It accepts one where three things hold: the signature verifies against the P-256 key that operator's community-relay-list entry declares (`18-addressability-and-deployment.md` §18.5.1); the object's `witness` names a member of the witness set the key state at that subject's head carries, on a chain the relay itself holds, so a relay holding no chain for a subject accepts no witness record for it; and the address is not already full for that pair. **The caps**, under `09-security-model.md` §9.18.17: at most one cosigned head per (subject, witness, `event_digest`), replaced only by a strictly higher `sequence`; at most `MAX_RETAINED_SUFFIXES` conflict statements per (subject, witness), evicting the lowest `observed_at` beyond that; and at most `MAX_WITNESS_SET_SIZE` × `MAX_RETAINED_SUFFIXES` objects per subject at each address, because an honest witness emits one successor per baseline and a faulty one occupies at most `MAX_RETAINED_SUFFIXES`. **The `event_digest` term is the exception to strictly-higher replacement**: a fault proof's two cosigned heads carry one `subject`, one `witness` and one `previous_cosigned_digest`, and differ in `event_digest` alone (`09-security-model.md` §9.7.4.3), so the relay keeps both, and without that term one head would replace the other and no party could assemble the pair. Both the filter and the caps are load-bearing: without the filter any party that mints an identity writes cosigned-head records for any public identifier, and without the caps a member of the standing set writes without bound. A relay an identity designates as a witness runs the one check and holds the durable per-subject state `09-security-model.md` §9.7.4.3 states. **Where the relay holds no chain for a subject it accepts no witness record naming that subject**, because the filter above reads a chain the relay holds, and a witness whose submission it refuses reads that refusal as it reads any other and publishes to the next entry of its own set. R9's ring displaces every record a relay holds for one identity together, so a relay that dropped a subject's chain holds none of that subject's witness records either, and the controller's re-publication of the chain is what lets a witness record land there again.
 
@@ -744,7 +746,7 @@ The resolution protocol runs seven steps.
 
 On appending a key event the owner builds the chain from the inception event to the new head, hands that chain to `publish` (§3.10.10), and submits the new head to its witness set. **The backend segments per entry**: it reads each entry's declared `max_blob_size` through `read_policy` and splits the chain into contiguous segments each fitting one frame at that entry, then publishes those frames to that entry in sequence order. `18-addressability-and-deployment.md` §18.3.3 states that the value is the relay's own, so one segmentation for the whole fallback set costs the publisher every entry that declares a smaller frame. A relay accepts a segment whose first event's predecessor it already holds, and R9 states the publisher's remedy for a rejected segment, which reads the relay's current state rather than the publisher's memory of an acknowledgement (`09-security-model.md` §9.7.4.2 R9). Submission to a witness gates nothing: the event takes effect at each relying party the moment that party resolves the extended chain, and an identity that designates no witness skips that step (`09-security-model.md` §9.7.4.2 R10, §9.7.4.3). **Appending a key event is not the only publication.** On every self-observation cadence the SDK fetches its own identity's log **from every entry of its fallback set**, and **for every entry that fetch showed holding no record for this identity the SDK re-publishes its chain and its service record to that entry** (`09-security-model.md` §9.7.4.2 R10). **The cadence carries no unconditional re-PUBLISH**: a re-PUBLISH of bytes the relay already holds moves no position, stores no byte and buys the identity nothing, for the reason R9's three write outcomes state, so it costs the publisher a rate-limit allowance and nothing else. **What keeps an identity covered is rent and never republication** (`09-security-model.md` §9.7.4.2 R9): a controller pays rent against a relay's declared terms on ADR-004's `RENT` operation, through `pay_rent` (§3.10.10), and publishes no byte to do it.
 
-**A PUBLISH carrying a key-event record, a service record, a cosigned head or a conflict statement sets the wire's `retain` flag**, which is REQUIRED true at those four kinds (`09-security-model.md` §9.10.12). A validating relay retains all four under `09-security-model.md` §9.7.4.2 R9 and gives none of them a TTL, which is what the flag declares, so no republication cycle makes any of them permanent and the six-day cycle is deleted for all four. **R9's ring buffer is what removes such a record**, and R9 states the coverage a verified receipt gives the identity it names. A relay that does not validate rejects a PUBLISH carrying the flag, because it holds the address digest and never the preimage and can scope no retention.
+**A PUBLISH carrying a key-event record, a service record, a cosigned head or a conflict statement sets the wire's `retain` flag**, which is REQUIRED true at those four kinds (`09-security-model.md` §9.10.12). A validating relay retains all four under `09-security-model.md` §9.7.4.2 R9 and gives none of them a TTL, which is what the flag declares, so no republication cycle makes any of them permanent and the six-day cycle is deleted for all four. **R9's ring buffer is what removes such a record**, and **what keeps an identity covered against that ring is rent and never republication** (`09-security-model.md` §9.7.4.2 R9), so a controller that republishes its chain buys the identity no protection from displacement. A relay that does not validate rejects a PUBLISH carrying the flag, because it holds the address digest and never the preimage and can scope no retention.
 
 ### 3.10.6 Anti-Segmentation Invariant
 
@@ -754,13 +756,13 @@ On appending a key event the owner builds the chain from the inception event to 
 
 **Which refusals a publisher can satisfy, and what each one's value carries.** Every refusal carries a `BudgetValue` typed for its scope (§3.10.10), so a publisher reads the term it failed rather than a string of it.
 
-| Scope | What `value` carries | What the publisher does |
+| What the entry answered | What `value` carries | What the publisher does |
 |---|---|---|
-| `Payment` | The relay's declared `economic` terms: the currency, `per_publish`, `per_byte_stored`, the accepted adapters, and the payee | Mint a receipt for the declared price through a configured adapter and retry at the same relay. `09-security-model.md` §9.7.4.2 R9 states what a verified receipt then exempts, and `18-addressability-and-deployment.md` §18.3.3 states which member a `receipt_exempts` set may carry |
-| `RateLimit` | The declared ceiling per minute and the seconds to wait | Wait the stated seconds and retry at the same relay. **No receipt and no declaration changes this refusal**, because a relay sells storage and never traffic (`09-security-model.md` §9.7.4.2 R9) |
-| `Identifier` | The declared per-identifier budget in bytes | **Where the entry's `receipt_exempts` names `Identifier`**, pay rent against that entry's declared rent terms on ADR-004's `RENT` operation, which raises the identity's quota, and retry at the same entry. **Otherwise** move to the next fallback-set entry, because no change to this request satisfies the term |
+| `Payment` | The relay's declared `economic` terms — the currency, `per_publish`, `per_byte_stored`, the accepted adapters and the payee — together with that entry's three rent terms | Mint a receipt for the declared price through a configured adapter and retry at the same relay (`09-security-model.md` §9.7.4.2 R9) |
+| `RateLimit` | The declared ceiling per minute and the seconds to wait | Wait the stated seconds and retry at the same relay (`09-security-model.md` §9.7.4.2 R9) |
+| `Identifier` | The declared per-identifier budget in bytes | **Where the entry's `receipt_exempts` names `Identifier`**, pay rent on ADR-004's `RENT` operation against that entry's declared rent terms and retry at the same entry, because a current rent is what stops the term binding this identity (`09-security-model.md` §9.7.4.2 R9). **Otherwise** move to the next fallback-set entry, because no change to this request satisfies the term |
 | `Total` | The declared total budget in bytes | Move to the next fallback-set entry; `09-security-model.md` §9.7.4.2 R9 states the one condition under which a relay returns this scope |
-| `Skipped` records no refusal | The `economic` terms the entry's `POLICY` answer declared | The publisher evaluated the entry's declared policy and wrote nothing, because its `IdentityConfig` carries no `payment` slot or because its configured adapters appear in none of the entry's `payment_adapters` (§3.10.10). It moves to the next fallback-set entry and contacts this one on no later frame of this cycle |
+| `Skipped`, which answers no refusal scope | The `economic` terms the entry's `POLICY` answer declared | The publisher evaluated the entry's declared policy and wrote nothing, because its `IdentityConfig` carries no `payment` slot or because its configured adapters appear in none of the entry's `payment_adapters` (§3.10.10). It moves to the next fallback-set entry and contacts this one on no later frame of this cycle |
 
 **The three MUSTs above read `PublishOutcome`'s per-entry list** (§3.10.10), which names every entry of the fallback set exactly once with what that entry answered under one of `EntryResult`'s five variants — `Accepted`, `Refused`, `Skipped`, `Failed` and `Unreachable` — so a cycle mixing an acceptance, a refusal, a skip, an answer that named no declared term and an unreachable entry lands in no gap between arms. **One entry answers once per frame, and its `EntryResult` carries the strictest of those answers**: `Accepted` names an entry that stored every frame the cycle sent it, and an entry that refused, failed on, or could not be reached for any one frame carries that answer instead. Without that rule an entry that stored the first three frames of a five-frame chain and refused the fourth reads as `Accepted` under one binding and as `Refused` under another, and the `Accepted` reading reports a confirmed publication for a chain no relay holds whole.
 
@@ -788,7 +790,7 @@ A relay operator that answers a resolution learns that the resolver's network ad
 
 ### 3.10.10 IdentityBackend, the Resolution Trait
 
-**`IdentityBackend` carries six methods and no others**, and ADR-063, the inception-derived key-event-log identity substrate, names that seam. **`IdentityBackend::resolve` takes the identifier's 32 raw digest bytes and returns a `ResolutionOutcome`**, which carries key state and no document. **`IdentityBackend::read_service_record` performs the service-record read** every resolution's relay discovery depends on (§3.10.1); it returns a `ServiceRecordVerdict`, whose four variants are `Adopted` carrying the record, `Rejected{cause}` carrying why the reader refused it, `Absent`, and `Inconclusive` where the reader holds no accepted record and cannot meet the first-contact floor on its `scp:svc:` query (§3.10.13). **`publish` and `publish_service_record` each return a `PublishOutcome`, defined below beside the other types the trait returns**: a publish cycle addresses the whole fallback set, so its result is a per-entry list and a single error variant carrying one scope cannot express it. **`resolve` performs the service-record read itself**, through `read_service_record`, at the point §3.10.4 step 2 names, and the backend holds the accepted copy, so a caller never sequences two calls to resolve an identifier and calls `read_service_record` only to read the record's own entries. **`read_policy` returns the `DeclaredWritePolicy` one fallback-set entry declares**, which is what a publisher reads before it spends, and **`pay_rent` sends ADR-004's `RENT` operation to one entry and returns the `RentState` that entry answered with**, which is the act that keeps an identity covered (`09-security-model.md` §9.7.4.2 R9). Every type name and every variant name below is name-bound under the criterion `09-security-model.md` §9.7.4.2's definitions state. `.docs/architecture.md` cites this section for the method set and states which crate implements the seam.
+**`IdentityBackend` carries eight methods and no others**, and ADR-063, the inception-derived key-event-log identity substrate, names that seam. **`IdentityBackend::resolve` takes the identifier's 32 raw digest bytes and returns a `ResolutionOutcome`**, which carries key state and no document. **`IdentityBackend::read_service_record` performs the service-record read** every resolution's relay discovery depends on (§3.10.1); it returns a `ServiceRecordVerdict`, whose four variants are `Adopted` carrying the record, `Rejected{cause}` carrying why the reader refused it, `Absent`, and `Inconclusive` where the reader holds no accepted record and cannot meet the first-contact floor on its `scp:svc:` query (§3.10.13). **`publish` and `publish_service_record` each return a `PublishOutcome`, defined below beside the other types the trait returns**: a publish cycle addresses the whole fallback set, so its result is a per-entry list and a single error variant carrying one scope cannot express it. **`resolve` performs the service-record read itself**, through `read_service_record`, at the point §3.10.4 step 2 names, and the backend holds the accepted copy, so a caller never sequences two calls to resolve an identifier and calls `read_service_record` only to read the record's own entries. **`read_policy` returns the `DeclaredWritePolicy` one fallback-set entry declares**, which is what a publisher reads before it spends; **`pay_rent` sends ADR-004's `RENT` operation to one entry and returns the `RentState` that entry answered with**, which is the act that keeps an identity covered; **`read_rent_state` sends a `RENT` whose receipt is absent and returns that entry's answer**, which is how a controller reads whether it is covered without paying; and **`fallback_set` returns the entries the other three take**, because no other method returns one (`09-security-model.md` §9.7.4.2 R9). **Where `IdentityConfig`'s `payment` slot is `None` the backend attaches no receipt, writes nothing to a charging entry, and records that entry as `Skipped`**, which is the fail-safe default, because minting a payment is never reached by omission (`.docs/standards/construction.md`). Every type name and every variant name below is name-bound under the criterion `09-security-model.md` §9.7.4.2's definitions state. `.docs/architecture.md` cites this section for the method set and states which crate implements the seam.
 
 ```rust
 /// Key-state resolution across the SCP relay network (§3.10.4).
@@ -826,13 +828,35 @@ pub trait IdentityBackend: Send + Sync {
     fn read_policy(&self, entry: &str)
         -> impl Future<Output = Result<DeclaredWritePolicy, IdentityError>> + Send;
 
-    /// Mints a receipt through the configured adapter against `entry`'s
-    /// declared rent price, sends ADR-004's `RENT` operation carrying
-    /// `identifier` and that receipt, and returns the rent state the entry
-    /// answered with. `RENT` stores no bytes, so no storage budget and no ring
-    /// rule reads it (`09-security-model.md` §9.7.4.2 R9).
-    fn pay_rent(&self, entry: &str, identifier: &[u8; 32])
+    /// Mints a receipt through the configured adapter against `units` times
+    /// `entry`'s declared rent price, sends ADR-004's `RENT` operation
+    /// carrying `identifier`, `units`, that receipt and the beneficiary
+    /// signature, and returns the rent state the entry answered with. `RENT`
+    /// stores no bytes, so no storage budget and no ring rule reads it
+    /// (`09-security-model.md` §9.7.4.2 R9).
+    ///
+    /// Returns `NoPaymentAdapterConfigured` where this identity's
+    /// `IdentityConfig` carries no `payment` slot, and `EntrySellsNoCoverage`
+    /// where the entry declares no rent terms. Neither condition returns an
+    /// `Ok` carrying a zero quota and a zero expiry, which would be a
+    /// placeholder standing in for data no real path produced.
+    fn pay_rent(&self, entry: &str, identifier: &[u8; 32], units: NonZeroU32)
         -> impl Future<Output = Result<RentState, IdentityError>> + Send;
+
+    /// Reads one identity's current rent state at one entry, by sending a
+    /// `RENT` whose `payment_receipt` is absent. The entry credits nothing and
+    /// answers with the state it holds, so a controller reads whether it is
+    /// covered without paying for the answer (`09-security-model.md`
+    /// §9.7.4.2 R9).
+    fn read_rent_state(&self, entry: &str, identifier: &[u8; 32])
+        -> impl Future<Output = Result<RentState, IdentityError>> + Send;
+
+    /// The fallback-set entries this backend's `IdentityBackendSlot` resolved
+    /// (`18-addressability-and-deployment.md` §18.5.1). `read_policy`,
+    /// `pay_rent` and `read_rent_state` each take an entry and no other method
+    /// returns one, and an identity that publishes nothing — which is the case
+    /// rent exists for — holds no `PublishOutcome` to mine one out of.
+    fn fallback_set(&self) -> Vec<String>;
 }
 
 /// The error half of every method above. A refusal the protocol mandates
@@ -875,8 +899,9 @@ pub enum IdentityError {
     /// SCP-IDENT-1106. A string reached an admission gate that is not the
     /// canonical form of an inception-derived identifier (§3.8.1).
     NonCanonicalIdentifier,
-    /// SCP-IDENT-1107. A relay refused a PUBLISH that failed one term of the
-    /// write policy it declares (`09-security-model.md` §9.7.4.2 R9). `scope`
+    /// SCP-IDENT-1107. A relay refused a PUBLISH or a `RENT` that failed one
+    /// term of the write policy it declares (`09-security-model.md` §9.7.4.2
+    /// R9). `scope`
     /// names the term, so the publisher tells a refusal it can satisfy and
     /// retry from one that sends it to the next fallback-set entry, and
     /// `value` carries that term as `BudgetValue`, which types it per scope so
@@ -894,6 +919,16 @@ pub enum IdentityError {
     /// `NoFallbackSourceReachable`, which names a relay the SDK could not
     /// reach.
     StorePartiallyUnreadable,
+    /// SCP-IDENT-1109. This identity's `IdentityConfig` carries no `payment`
+    /// slot, so `pay_rent` can mint no receipt
+    /// (`.docs/standards/construction.md`). The slot is the one entry point
+    /// that installs an identity's payment capability.
+    NoPaymentAdapterConfigured,
+    /// SCP-IDENT-1110. The entry declares no rent terms, so it sells no
+    /// coverage and there is no price to mint against
+    /// (`09-security-model.md` §9.7.4.2 R9). A controller reads
+    /// `DeclaredWritePolicy::rent` through `read_policy` before it calls.
+    EntrySellsNoCoverage,
 }
 
 /// Which term of a validating relay's declared write policy a refusal failed
@@ -922,11 +957,10 @@ pub enum BudgetScope {
     Total,
     /// The relay's `rate_limit_publish` term.
     RateLimit,
-    /// The relay charges for this write, and one of three grounds holds: the
-    /// PUBLISH carried no `payment_receipt`; it carried one the relay's named
-    /// adapter did not verify; or it carried one that failed a receipt check
-    /// `09-security-model.md` §9.7.4.2 R9 states (`09-security-model.md`
-    /// §9.10.12, `19-economic-governance.md` §19.2.1, §19.8).
+    /// The relay charges for the message and one of the grounds
+    /// `09-security-model.md` §9.7.4.2 R9 states holds. Both a PUBLISH and a
+    /// `RENT` can take this refusal (`09-security-model.md` §9.10.12,
+    /// `19-economic-governance.md` §19.2.1, §19.8).
     Payment,
 }
 
@@ -948,12 +982,14 @@ pub enum BudgetValue {
     /// when its own counter clears, and waiting is the recourse ADR-004 names
     /// for this scope.
     RateLimit { ceiling_per_minute: u64, retry_after_seconds: u64 },
-    /// The five `economic` members of `relay_config`
-    /// (`18-addressability-and-deployment.md` §18.3.3). A publisher cannot
-    /// mint a receipt from a price alone, so the variant carries all five.
-    /// `Amount` takes the wire form ADR-060 fixes, and `payee` carries the
-    /// payee's 32 raw digest bytes, which are the bytes a relay compares the
-    /// verified payee against (`09-security-model.md` §9.7.4.2 R9).
+    /// The five `economic` members of `relay_config` together with that
+    /// entry's three rent terms (`18-addressability-and-deployment.md`
+    /// §18.3.3). A publisher cannot mint a receipt from a price alone, and a
+    /// controller refused for underpaying rent holds no other object naming
+    /// what rent costs, so the variant carries all of them. `Amount` takes the
+    /// wire form ADR-060 fixes, and `payee` carries the payee's 32 raw digest
+    /// bytes, which the wire renders as 64 lowercase hexadecimal characters
+    /// (`18-addressability-and-deployment.md` §18.3.3).
     /// `payment_adapters` is bounded by `MAX_PAYMENT_ADAPTERS`
     /// (`09-security-model.md` §9.18.17), because a publisher reads it out of
     /// an untrusted relay's answer. **A `BudgetValue` the publisher cannot
@@ -965,57 +1001,119 @@ pub enum BudgetValue {
         per_byte_stored: Option<Amount>,
         payment_adapters: Vec<String>,
         payee: [u8; 32],
+        rent: Option<RentTerms>,
     },
 }
 
 /// One fallback-set entry's declared write policy, as ADR-004's `POLICY`
-/// query returns it: one field per `relay_config` row
-/// (`18-addressability-and-deployment.md` §18.3.3). **The answer carries no
-/// field of the relay's own operational configuration**, so a relay that
-/// serializes this type discloses its declared terms and nothing else.
+/// query returns it: **one field per `relay_config` row that states a term of
+/// the relay's write policy, and no field of the relay's own operational
+/// configuration** (`18-addressability-and-deployment.md` §18.3.3). A relay
+/// that serializes this type discloses its declared terms and nothing else.
+/// Every field's doc names what its absence means, because three of the
+/// `Option<u64>` fields mean three different things when absent.
+///
+/// **Where a field's spelling differs from its `relay_config` row's, this
+/// type states the mapping**, the way `BudgetScope`'s declaration states its
+/// own: `max_blob_ttl_seconds` carries the row `max_blob_ttl`, spelled with
+/// the unit that row declares.
 pub struct DeclaredWritePolicy {
+    /// The largest blob one PUBLISH may carry, in bytes. Absent means the
+    /// relay declares no ceiling of its own.
     pub max_blob_size: Option<u64>,
+    /// The longest TTL the relay accepts on an expiring blob, in seconds.
+    /// Absent means the relay declares no ceiling of its own.
     pub max_blob_ttl_seconds: Option<u64>,
+    /// Messages per minute per publishing address. **Absent is the
+    /// 6,000-per-minute default** `18-addressability-and-deployment.md`
+    /// §18.3.3 states, and zero turns the term off.
     pub rate_limit_publish: Option<u64>,
+    /// Retained-kind bytes the relay stores for one identifier. **Absent or
+    /// zero means the term is off.**
     pub storage_budget_identifier: Option<u64>,
+    /// The whole retained capacity the relay declares, in bytes. **Absent is
+    /// the retained capacity the operator's own host holds with the ring
+    /// beneath it, and it is not "no limit"** (`09-security-model.md`
+    /// §9.7.4.2 R9).
     pub storage_budget_total: Option<u64>,
-    /// The refusal scopes a verified receipt exempts, empty where the relay
-    /// declares none (`09-security-model.md` §9.7.4.2 R9). **A publisher
-    /// rejects an answer carrying more members than `BudgetScope` has
-    /// variants**, under the parse bound §9.7.4.2's definitions state for every
-    /// count-prefixed list a party reads out of an untrusted answer, and
-    /// records that entry as `Skipped`.
+    /// Concurrent subscriptions per connection. Absent means the relay
+    /// declares no ceiling of its own. The `POLICY` answer carries it because
+    /// `4021` TOO_MANY_SUBSCRIPTIONS reads it and a client that learned it
+    /// from the HTTPS on-ramp would read a term
+    /// `18-addressability-and-deployment.md` §18.3.2 calls not
+    /// self-certifying.
+    pub rate_limit_subscribe: Option<u64>,
+    /// The refusal scopes a current rent exempts an identity from, empty where
+    /// the relay declares none (`09-security-model.md` §9.7.4.2 R9). **A
+    /// publisher rejects an answer carrying a member other than `Identifier`,
+    /// or more members than one**, because that is the one member a relay may
+    /// declare, and records that entry as `Skipped`.
     pub receipt_exempts: Vec<BudgetScope>,
+    /// The relay's economic terms. Absent means the relay charges nothing and
+    /// sells no coverage; a declaration carrying `rent` and no `economic` is
+    /// invalid (`09-security-model.md` §9.7.4.2 R9).
     pub economic: Option<EconomicTerms>,
     /// The rent price, the rent period in seconds, and the quota of stored
-    /// bytes one rent payment covers. A relay that declares none sells no
+    /// bytes one rent payment covers. Absent means the relay sells no
     /// coverage (`09-security-model.md` §9.7.4.2 R9).
     pub rent: Option<RentTerms>,
 }
 
-/// The five `economic` members of `relay_config`.
+/// The five `economic` members of `relay_config`
+/// (`18-addressability-and-deployment.md` §18.3.3).
 pub struct EconomicTerms {
+    /// The currency every price below is denominated in, and the currency a
+    /// relay supplies to `PaymentAdapter::verify`.
     pub currency: CurrencyCode,
+    /// The fee for one PUBLISH. Absent means the relay charges no per-write
+    /// fee, and a relay that declares none charges no retained-kind write
+    /// (`09-security-model.md` §9.7.4.2 R9).
     pub per_publish: Option<Amount>,
+    /// The fee per byte of a blob the relay expires under a TTL. Absent means
+    /// the relay charges none. It prices no retained kind, which the rent
+    /// terms supersede (`09-security-model.md` §9.7.4.2 R9).
     pub per_byte_stored: Option<Amount>,
+    /// The `adapter_id` strings this relay verifies receipts through
+    /// (`19-economic-governance.md` §19.2.7). Bounded by
+    /// `MAX_PAYMENT_ADAPTERS` (`09-security-model.md` §9.18.17).
     pub payment_adapters: Vec<String>,
+    /// The identifier the relay declares as the party it receives payments
+    /// under, as its 32 raw digest bytes. **The wire carries it as 64
+    /// lowercase hexadecimal characters and a party that reads it decodes
+    /// those 32 bytes** (`18-addressability-and-deployment.md` §18.3.3). No
+    /// check on the relay's path reads it (`09-security-model.md` §9.7.4.2
+    /// R9).
     pub payee: [u8; 32],
 }
 
 /// The three rent terms a relay that sells coverage declares.
 pub struct RentTerms {
+    /// The price of one unit of rent.
     pub price: Amount,
+    /// The duration one unit of rent buys, in seconds.
     pub period_seconds: u64,
+    /// The stored bytes one unit of rent covers.
     pub quota_bytes: u64,
 }
 
 /// What one identity's rent buys at one relay, as that relay answers a `RENT`
-/// operation and as `pay_rent` returns it (`09-security-model.md` §9.7.4.2
-/// R9). `expires_at` is the relay's own clock reading past which the identity
-/// is uncovered.
+/// operation and as `pay_rent` and `read_rent_state` return it
+/// (`09-security-model.md` §9.7.4.2 R9). **The three fields of the coverage
+/// test ride together with the relay's own clock reading at the moment it
+/// answered**, so a controller reads the deficit and the remaining duration in
+/// the relay's own frame rather than comparing an absolute instant against a
+/// clock it never sampled.
 pub struct RentState {
+    /// The identity's current quota, in bytes.
     pub quota_bytes: u64,
-    pub expires_at: u64,
+    /// The bytes this relay holds for the identity under the coverage test.
+    pub held_bytes: u64,
+    /// The relay's own clock reading past which the identity is uncovered, in
+    /// Unix seconds.
+    pub expires_at_seconds: u64,
+    /// The relay's own clock reading at the moment it composed this answer, in
+    /// Unix seconds.
+    pub as_of_seconds: u64,
 }
 
 /// What one publish cycle over the fallback set did (§3.10.6). The cycle
@@ -1262,7 +1360,7 @@ under the `09-security-model.md` §9.5.1 construction: the 32-byte identifier ra
 
 **Who signs it.** The record carries a signature by the operational key the latest state-carrying key event designates for the service-record role, never by a root member. A reader verifies in two steps and never one: it verifies the key-event log under `09-security-model.md` §9.7.4.2 R2 and R3, reads the designation out of the verified chain, then verifies the record's signature against the designated key (`09-security-model.md` §9.6.3). R3 rejects a state-carrying event whose designation names a key that event does not list `Current`, so the designated key is always one the current key state lists.
 
-**A reader holding no accepted service record applies the first-contact floor to the record**, setting `proof_nonce` on its `scp:svc:` query as §3.10.4 step 2 requires on the key-event one, and returns `ServiceRecordVerdict::Inconclusive` where it cannot meet the floor. That verdict says the reader could not read, where `Absent` would say the identity published nothing and `Rejected` would say the reader refused a record it never verified. A single relay can serve a genuine record truncated to an older sequence exactly as it can serve a truncated chain, and such a reader holds no high-water mark to compare against.
+**A reader holding no accepted service record applies the first-contact floor to the record**, setting `proof_nonce` on its `scp:svc:` query as §3.10.4 step 2 requires on the key-event one, and returns the verdict §3.10.10 declares for a reader that cannot meet the floor. §3.10.10 states that verdict's shape and this paragraph states no field of it. A single relay can serve a genuine record truncated to an older sequence exactly as it can serve a truncated chain, and such a reader holds no high-water mark to compare against.
 
 **How a reader settles two copies: last writer wins on the record's own sequence**, which is monotonic and unrelated to the log's. A reader rejects a record at the maximum representable value, so no writer exhausts the space. **The high-water mark is keyed to the pair (identifier, the 33 public-key bytes the designation resolved to)**: a mark scoped to the identifier alone would let one record written at a high sequence by a briefly held key block the controller's own recovery record forever. **The mark resets when the key state lists different bytes `Current` in the designated role**, so a routine rotation resets it and the reader accepts the first record the new key signs at any sequence. **This pair key is a reader's acceptance test and never a relay's storage count** (§3.10.2, `09-security-model.md` §9.7.4.2 R9), so a party designating a fresh key on every `KeyState` plants no second stored record while each reader still refuses a stale one. The reset is sound because a root signature covers the event listing those bytes and the replaced key's holder cannot produce one. **Fork precedence does not apply here and MUST NOT be applied**: a service record has no reveal-authorized event class, so no legitimate update lowers the sequence, and two signature-valid records at one sequence are the designated key's holder equivocating. A reader holding two such records rejects both and reports the identity's transport metadata as unresolved.
 
