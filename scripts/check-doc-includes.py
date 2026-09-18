@@ -2,21 +2,26 @@
 """Fail where a transcluding site's bytes differ from the fragment its directive names.
 
 The check copies `.docs/` into a temporary tree, re-runs the resolver there, and
-compares. It fails on five conditions, which are the five the identity-substrate
-plan states for the `[mirror]` disposition:
+compares. It fails on six conditions. The first five are the five the
+identity-substrate plan states for the `[mirror]` disposition:
 
 1. a file differs after the expansion, so a site's bytes have drifted from its Owner;
 2. a directive names a fragment id no file under `.docs/` defines;
 3. two files define one fragment id;
 4. a directive's two delimiters do not pair;
-5. a site's include body carries a byte the fragment does not.
+5. a site's include body carries a byte the fragment does not;
+6. a one-line directive names a fragment whose body spans more than one line.
 
 Condition 5 is condition 1 read from the site's side, and the check reports it in
 the site's own terms so a writer reads which line drifted rather than which file.
+Condition 6 belongs to the one-line marker form, which a Markdown table cell needs
+because a cell holds no line break: flattening a multi-line fragment into a cell
+would put bytes at the site that the Owner does not carry in that order.
 
-`--self-test` plants each of the five conditions in a scratch tree and asserts that
-the checker reports it, so a green real scan means the checker read the tree rather
-than that it can no longer fail.
+`--self-test` plants each of the six conditions in a scratch tree and asserts that
+the checker reports it, and pairs them with two conforming controls, one block and
+one inline, so a green real scan means the checker read the tree rather than that
+it can no longer fail.
 
 Usage:
     python3.12 scripts/check-doc-includes.py
@@ -150,6 +155,35 @@ def self_test() -> int:
             },
             "differs from the fragment",
         ),
+        (
+            "a table cell's inline include drifted from its Owner",
+            {
+                "owner.md": (
+                    "| term | default |\n|---|---|\n"
+                    '| `rate_limit_publish` | <!-- scp:fragment id="probe-five" -->'
+                    "6,000 per minute<!-- scp:end id=\"probe-five\" --> |\n"
+                ),
+                "site.md": (
+                    "| term | default |\n|---|---|\n"
+                    '| `rate_limit_publish` | <!-- scp:include id="probe-five" from="owner.md" -->'
+                    "6,000 a minute<!-- scp:end id=\"probe-five\" --> |\n"
+                ),
+            },
+            "differs from the fragment",
+        ),
+        (
+            "an inline include names a fragment that spans more than one line",
+            {
+                "owner.md": (
+                    '<!-- scp:fragment id="probe-six" -->\nline a\nline b\n<!-- scp:end id="probe-six" -->\n'
+                ),
+                "site.md": (
+                    '| cell | <!-- scp:include id="probe-six" from="owner.md" -->'
+                    "line a<!-- scp:end id=\"probe-six\" --> |\n"
+                ),
+            },
+            "spans more than one line",
+        ),
     ]
 
     failed = False
@@ -167,21 +201,36 @@ def self_test() -> int:
             else:
                 print(f"self-test ok: {name}")
 
-    with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw) / ".docs"
-        _write(root / "owner.md", '<!-- scp:fragment id="probe-clean" -->\nA.\n<!-- scp:end id="probe-clean" -->\n')
-        _write(
-            root / "site.md",
-            '<!-- scp:include id="probe-clean" from="owner.md" -->\nA.\n<!-- scp:end id="probe-clean" -->\n',
-        )
-        failures = run_scan(root)
-        if failures:
-            print("SELF-TEST FAILED: a conforming pair reported a failure", file=sys.stderr)
-            for failure in failures:
-                print(f"  reported: {failure}", file=sys.stderr)
-            failed = True
-        else:
-            print("self-test ok: a conforming pair reports nothing")
+    clean_cases: list[tuple[str, dict[str, str]]] = [
+        (
+            "a conforming block pair reports nothing",
+            {
+                "owner.md": '<!-- scp:fragment id="probe-clean" -->\nA.\n<!-- scp:end id="probe-clean" -->\n',
+                "site.md": '<!-- scp:include id="probe-clean" from="owner.md" -->\nA.\n<!-- scp:end id="probe-clean" -->\n',
+            },
+        ),
+        (
+            "a conforming inline pair in a table row reports nothing",
+            {
+                "owner.md": '| t | <!-- scp:fragment id="probe-inline-clean" -->A.<!-- scp:end id="probe-inline-clean" --> |\n',
+                "site.md": '| t | <!-- scp:include id="probe-inline-clean" from="owner.md" -->A.<!-- scp:end id="probe-inline-clean" --> |\n',
+            },
+        ),
+    ]
+
+    for name, files in clean_cases:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".docs"
+            for relative, text in files.items():
+                _write(root / relative, text)
+            failures = run_scan(root)
+            if failures:
+                print(f"SELF-TEST FAILED: {name}", file=sys.stderr)
+                for failure in failures:
+                    print(f"  reported: {failure}", file=sys.stderr)
+                failed = True
+            else:
+                print(f"self-test ok: {name}")
 
     return 1 if failed else 0
 

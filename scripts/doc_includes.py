@@ -32,6 +32,22 @@ INCLUDE_OPEN = re.compile(
 MARKER_END = re.compile(r'^[ \t]*<!--[ \t]+scp:end[ \t]+id="([A-Za-z0-9._-]+)"[ \t]+-->[ \t]*$')
 ANY_MARKER = re.compile(r"<!--\s*scp:(fragment|include|end)\b")
 
+# A Markdown table cell holds no line break, so a configuration-table row and a
+# wire-format table row — two of the five artifact classes the identity-substrate
+# plan names for the `[mirror]` disposition — cannot carry the block form above.
+# Both markers therefore have a one-line form, and a fragment whose body spans more
+# than one line is refused at an inline site rather than flattened into it.
+FRAGMENT_INLINE = re.compile(
+    r'<!--[ \t]+scp:fragment[ \t]+id="([A-Za-z0-9._-]+)"[ \t]+-->'
+    r"(.*?)"
+    r'<!--[ \t]+scp:end[ \t]+id="\1"[ \t]+-->'
+)
+INCLUDE_INLINE = re.compile(
+    r'<!--[ \t]+scp:include[ \t]+id="([A-Za-z0-9._-]+)"[ \t]+from="([^"]+)"[ \t]+-->'
+    r"(.*?)"
+    r'<!--[ \t]+scp:end[ \t]+id="\1"[ \t]+-->'
+)
+
 DOC_SUFFIXES = (".md", ".json")
 
 
@@ -98,6 +114,26 @@ def scan_file(path: Path, text: str) -> tuple[list[Fragment], list[Include]]:
     body: list[str] = []
 
     for index, line in enumerate(lines, start=1):
+        # An inline pair closes on its own line, so it never opens the block state
+        # below and a line carrying one is not an unparsed marker.
+        if open_marker is None:
+            inline_fragments = list(FRAGMENT_INLINE.finditer(line))
+            inline_includes = list(INCLUDE_INLINE.finditer(line))
+            if inline_fragments or inline_includes:
+                for match in inline_fragments:
+                    fragments.append(Fragment(match.group(1), path, index, match.group(2)))
+                for match in inline_includes:
+                    includes.append(
+                        Include(match.group(1), match.group(2), path, index, index, match.group(3))
+                    )
+                stripped = INCLUDE_INLINE.sub("", FRAGMENT_INLINE.sub("", line))
+                if ANY_MARKER.search(stripped):
+                    raise MarkerError(
+                        f"{path}:{index}: a line carries an `scp:` marker the scanner does not "
+                        f"parse beside an inline pair: {line.strip()}"
+                    )
+                continue
+
         fragment_match = FRAGMENT_OPEN.match(line)
         include_match = INCLUDE_OPEN.match(line)
         end_match = MARKER_END.match(line)
@@ -200,6 +236,39 @@ def collect(root: Path) -> tuple[dict[str, Fragment], list[Include], list[str]]:
     return fragments, includes, errors
 
 
+def _expand_inline(
+    line: str, fragments: dict[str, Fragment], path: Path, line_number: int, errors: list[str]
+) -> str:
+    """Rewrite every one-line include on `line` with the bytes its fragment holds."""
+
+    def replace(match: re.Match[str]) -> str:
+        fragment_id, declared = match.group(1), match.group(2)
+        fragment = fragments.get(fragment_id)
+        if fragment is None:
+            errors.append(
+                f"{path}:{line_number}: include names fragment id `{fragment_id}`, "
+                f"which no file under `.docs/` defines"
+            )
+            return match.group(0)
+        if "\n" in fragment.body:
+            errors.append(
+                f"{path}:{line_number}: include `{fragment_id}` is inline and the fragment "
+                f"{fragment.path}:{fragment.open_line} defines spans more than one line"
+            )
+            return match.group(0)
+        owner = str(fragment.path)
+        if not owner.endswith(declared.lstrip("./")):
+            errors.append(
+                f'{path}:{line_number}: include names `from="{declared}"` and fragment '
+                f"`{fragment_id}` sits in {fragment.path}"
+            )
+        opener = match.group(0)[: match.start(3) - match.start(0)]
+        closer = match.group(0)[match.end(3) - match.start(0) :]
+        return f"{opener}{fragment.body}{closer}"
+
+    return INCLUDE_INLINE.sub(replace, line)
+
+
 def expand(text: str, fragments: dict[str, Fragment], path: Path) -> tuple[str, list[str]]:
     """Rewrite every include body in `text` with the bytes its fragment holds."""
     errors: list[str] = []
@@ -210,6 +279,8 @@ def expand(text: str, fragments: dict[str, Fragment], path: Path) -> tuple[str, 
         line = lines[index]
         include_match = INCLUDE_OPEN.match(line)
         if include_match is None:
+            if INCLUDE_INLINE.search(line):
+                line = _expand_inline(line, fragments, path, index + 1, errors)
             out.append(line)
             index += 1
             continue
