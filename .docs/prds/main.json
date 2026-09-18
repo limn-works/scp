@@ -684,7 +684,7 @@
         "Failure handling: exponential backoff on publish failure: 30s, 1m, 2m, 4m, 8m, 16m, capped at 30m",
         "Each retry re-reads the fallback set from the shipped community relay list (§18.5.1)",
         "After 6 consecutive failures, emit a publish-degraded warning to the application layer",
-        "The self-observation cadence starts when identity is loaded (Identity::load or Identity::create) and stops when identity is unloaded or SDK shuts down, and it re-publishes to a fallback-set entry only where its own fetch shows that entry holding no record for this identity (§9.7.4.2 R10)",
+        "The self-observation cadence starts when identity is loaded (Identity::load or Identity::create) and stops when identity is unloaded or SDK shuts down, and it decides all four relations an entry's head can hold to the controller's own retained log — absent, superseded, extending and diverged — publishing under the first, the second and the fourth and publishing nothing under the third (`09-security-model.md` §9.7.4.2 R10)",
         "Republish task is a background tokio task the identity module owns",
         "On SDK initialization, all persisted active identities are republished immediately (startup republish)",
         "resolve(identifier) returns a ResolutionOutcome from the SCP relay network, the one resolution layer (§3.10.4)",
@@ -701,7 +701,7 @@
       ],
       "actionItems": [
         "Implement IdentityBackend::publish in dht.rs — split the chain into frame-sized segments, publish to both relay sets in sequence order with `retain: true`",
-        "Implement the self-observation cadence as a background tokio task that fetches and re-publishes only what its fetch found absent",
+        "Implement the self-observation cadence as a background tokio task that fetches from every fallback-set entry and takes the act R10 names for the relation that entry's head holds to the controller's own retained log",
         "Implement exponential backoff for publish failures (30s, 1m, 2m, 4m, 8m, 16m, cap 30m)",
         "Implement the publish-degraded warning after six consecutive failures",
         "Implement startup republish on identity load",
@@ -724,7 +724,7 @@
         }
       ],
       "details": {
-        "republishStrategy": "A validating relay stores a `retain` PUBLISH under §9.7.4.2 R9 and gives it no TTL, so no republication cycle makes the record permanent there; §9.7.4.2 R9 states when its ring buffer displaces the record, and the SDK re-publishes to an entry its own self-check found holding no record. A transport that cannot validate stores the frame as an opaque blob under the shared blob TTL, and the cycle keeps that copy alive.",
+        "republishStrategy": "A validating relay stores a `retain` PUBLISH under §9.7.4.2 R9 and gives it no TTL, so no republication cycle makes the record permanent there; §9.7.4.2 R9 states when its ring buffer displaces the record, and §9.7.4.2 R10 states which of the four relations an entry's head can hold to the controller's own retained log carry a publication and what each one publishes. A transport that cannot validate stores the frame as an opaque blob under the shared blob TTL, and the cycle keeps that copy alive.",
         "cacheStrategy": "Resolution cache — TTL-based, 24h active / 7d inactive, head-sequence comparison for staleness (§9.10.7)",
         "stalenessIndicator": "A cached result the resolver has not refreshed within its window carries a staleness indicator. Callers SHOULD treat a stale result as valid but degraded. UCAN validation and MLS credential verification SHOULD resolve fresh first, and §9.7.1 check 2 bounds how stale a key state may be when it satisfies an attestation's current-key check."
       },
@@ -754,7 +754,7 @@
         "The ceremony persists before it signs: a test drives each reveal-authorized kind, asserts the `RecoveryHandle` reaches every store of the running profile's store set before the signature, and asserts a controller that crashes between the two resumes from that handle rather than composing a fresh next set (`09-security-model.md` §9.7.4.2 R10).",
         "One reveal at a time: a test asserts the SDK refuses with `IdentityError::RevealAlreadyPending` while it can observe an unpublished reveal-authorized event or a pending `RecoveryHandle` for that identity in any store of the set, and asserts a `resume_recovery` that completes removes the handle from every one of those stores (`09-security-model.md` §9.7.4.2 R10).",
         "The controller durably retains the signed event byte for byte before it destroys the spent keys, and destroys every key the reveal revealed and no unexposed member the superseding list re-commits; a test asserts both (`09-security-model.md` §9.7.4.2 R5, R10, §9.7.4.1 item 8).",
-        "The self-observation cadence fetches from every entry and re-publishes only where an entry holds no record: a test advances a paused clock by one witnessing interval, serves a record from one fallback-set entry and nothing from a second, and asserts the SDK fetched from both, re-PUBLISHed its chain and its service record to the second alone, and sent no write to the first (`09-security-model.md` §9.7.4.2 R10).",
+        "The self-observation cadence fetches from every entry and publishes under three of the four relations R10 names: a test advances a paused clock by one witnessing interval, serves from the first fallback-set entry a head the controller's own log supersedes and serves nothing from a second, and asserts the SDK fetched from both, re-PUBLISHed to the first from the first event that entry does not hold, and re-PUBLISHed its chain from the inception event and its service record to the second (`09-security-model.md` §9.7.4.2 R10).",
         "No unwrap() or expect() in library code."
       ],
       "actionItems": [
@@ -763,7 +763,7 @@
         "Implement compose_root_recovery for both `standing_root` values: generate K' and the operational keys under the device boundary §9.7.4.1 states, carry the standing-root group at `CoSigns` and omit it at `Lost`, and refuse `Lost` with `IdentityError::RootThresholdHeld` where the SDK holds a threshold of the standing root.",
         "Implement the ceremony order of §9.7.4.2 R10: read from the retained log, generate the next set, persist the `RecoveryHandle` into every store of the profile's store set, sign, publish, retain, destroy — with the persist before the signature.",
         "Implement the one-reveal-at-a-time rule: write the pending handle and the signed event into every store before signing, read every store before composing, and remove the handle from every store on abort and on a completing resume.",
-        "Implement the self-observation cadence: fetch the identity's own log no less often than the witnessing interval and on every launch, and re-PUBLISH the current head to every fallback-set entry on each cadence.",
+        "Implement the self-observation cadence: fetch the identity's own log from every fallback-set entry no less often than the witnessing interval and on every launch, and publish under the absent, superseded and diverged relations alone (`09-security-model.md` §9.7.4.2 R10).",
         "Write tests for rotation (identifier and root-set invariance, the one-current-key rule, the unchanged commitment), for each reveal-authorized kind (commitment match at the named index, the `Lost` refusal), for the ceremony (persist before signature, crash resume, handle removal), and for the re-publication cadence."
       ],
       "blockedBy": [
@@ -9262,7 +9262,7 @@
       "actionItems": [
         "Create credentials.rs in economy module",
         "Implement AdapterCredentialStore wrapping ProtocolRepository economic methods",
-        "Implement configure_adapter function with validation",
+        "Implement credential storage and validation against the adapter the config's payment slot names, and register no adapter after construction",
         "Implement credential retrieval for payment execution flow",
         "Add credential isolation tests",
         "Build the `payment` slot of `IdentityConfig`, which `.docs/standards/construction.md` and §19.11 state is the one entry point that installs an identity's payment capability. Build no second installer: an `SCP.Identity.configureAdapter` entry point would install a payment capability outside the config the identity was created from, which this story's own description forbids."

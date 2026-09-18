@@ -538,7 +538,7 @@ pub struct PaymentReceipt {
 
 **PaymentReceipt signature scope.** The `signature` field is a P-256 signature by the `#active` key of the identity that initiated the payment — the payer's own, or the agent identity's where an agent initiated it under a spending UCAN. **§19.15.5's Receipt Signature Construction states the preimage this section's `signature` field covers**, and this section cites that construction and restates no operand, so an SDK that signs and a relay that verifies read one preimage.
 
-The `adapter_proof` field is deliberately excluded from the signature scope — it is adapter-specific opaque data that may not be available at signing time (e.g., Lightning preimage is revealed after payment, not before). Verification of payment integrity uses `adapter.verify(receipt)` against the payment rail; the payer's signature proves the payer authorized this specific payment.
+**The `adapter_proof` field is inside the signature scope, length-prefixed** (§19.15.5), because §19.2.7's registry derives each rail's rail-bound receipt identifier from it, and a signature that left it out covered one payer, one payee and one amount while the settlement it named stayed swappable. A signer therefore composes the receipt after the rail returns the proof. Verification of payment integrity uses `adapter.verify(receipt)` against the payment rail; the payer's signature proves the payer authorized this specific settlement.
 
 **Verification:** Any party calls `adapter.verify(receipt)` — adapter checks proof against the payment rail (on-chain state, preimage hash, etc.).
 
@@ -844,7 +844,7 @@ variants differently would compute two preimages for one receipt.
 
 ### 19.15.5 Payment Authorization and Receipt
 
-**`PaymentMetadata`** — Metadata for a payment request. **§19.2.1 declares this type; the table below states its wire tags and declares no field of its own.** A binding author generating the wire form from a table that had drifted from the declaration emitted tags the Rust type could not construct.
+**`PaymentMetadata`** — Metadata for a payment request. **§19.2.1 declares this type and the table below states its wire tags.** A binding author generating the wire form from a table that had drifted from the declaration emitted tags the Rust type could not construct.
 
 **`PaymentAuthorization`** — Authorization from payer to proceed with payment.
 
@@ -876,7 +876,7 @@ variants differently would compute two preimages for one receipt.
 | `timestamp` | `u64` | Yes | Unix timestamp (seconds) of payment. |
 | `signature` | `Vec<u8>` (64 bytes) | Yes | P-256 signature by payer over canonical receipt fields (§19.6). |
 
-**Receipt Signature Construction.** **A signer builds the receipt's signature preimage here, and §19.6 cites this construction.** The receipt signature covers: `SHA-256("SCP-RECEIPT-V1:" || receipt_id || len(payer) || payer || len(payee) || payee || amount_BE || currency || action_type_tag || len(context_id) || context_id || len(adapter_id) || adapter_id || timestamp_BE)`. **`action_type_tag` is the one byte §19.15.2's table assigns that variant**, written bare, because §9.5.1 gives a fixed-length field no length prefix. **The construction carries no write-binding operand**, because no rule on a relay's path reads one (`09-security-model.md` §9.7.4.2 R9). **Each optional 32-byte operand takes the 32 bytes `SHA-256(0x00)` in its absent form**, per §9.5.1, which reaches `context_id` when the action is not context-scoped and reaches every optional 32-byte operand a later revision adds, so the preimage stays injective whatever it gains. The payer's and payee's identifier operands wait on the identifier's textual form (`09-security-model.md` §9.5.2), which is why no relay verifies this signature on its own path (§9.7.4.2 R9).
+**Receipt Signature Construction.** **A signer builds the receipt's signature preimage here, and §19.6 cites this construction.** The receipt signature covers: `SHA-256("SCP-RECEIPT-V1:" || receipt_id || len(payer) || payer || len(payee) || payee || amount_BE || currency || action_type_tag || len(context_id) || context_id || len(adapter_id) || adapter_id || len(adapter_proof) || adapter_proof || timestamp_BE)`. **`action_type_tag` is one byte wide, the byte §19.15.2's table assigns that variant**, written bare, because §9.5.1 gives a fixed-length field no length prefix. **`adapter_proof` is an operand and takes a length prefix**, because §19.2.7's registry computes every registered rail's rail-bound receipt identifier from that field: a receipt whose signature did not cover it is a receipt a party re-points at a settlement it did not make while the signature still verifies over one payer, one payee and one amount. Nothing on a relay's path reads this signature, so the operand costs a relay nothing; the readers it protects are §19.6 and ADR-011's provenance record, which read the receipt as an attestation rather than as a relay's input. **The construction carries no write-binding operand**, because no rule on a relay's path reads one (`09-security-model.md` §9.7.4.2 R9). **Each optional 32-byte operand takes the 32 bytes `SHA-256(0x00)` in its absent form**, per §9.5.1, which reaches `context_id` when the action is not context-scoped and reaches every optional 32-byte operand a later revision adds, so the preimage stays injective whatever it gains. The payer's and payee's identifier operands wait on the identifier's textual form (`09-security-model.md` §9.5.2), which is why no relay verifies this signature on its own path (§9.7.4.2 R9).
 
 **`AdapterCapabilities`** — Advertised capabilities of a payment adapter.
 
@@ -891,7 +891,7 @@ variants differently would compute two preimages for one receipt.
 | `typical_settlement_ms` | `u64` | Yes | Typical settlement time in milliseconds. |
 | `requires_facilitator` | `bool` | Yes | Whether a third-party facilitator is needed. |
 
-**`VerificationResult`** — Result of verifying a payment receipt. **§19.2.1 declares this type; the table below states its wire tags and declares no field of its own.** <!-- scp:include id="verification-result-fields" from=".docs/specs/19-economic-governance.md" -->`VerificationResult` carries `valid`, `adapter_id`, `amount_covers` against the price the relay supplied, `currency_matches` against the currency it supplied, the rail-bound receipt identifier and `verification_timestamp`, and it carries no verified payee, no `payee_matches` and no `verified_payer`.<!-- scp:end id="verification-result-fields" -->
+**`VerificationResult`** — Result of verifying a payment receipt. **§19.2.1 declares this type and the table below states its wire tags.** <!-- scp:include id="verification-result-fields" from=".docs/specs/19-economic-governance.md" -->`VerificationResult` carries `valid`, `adapter_id`, `amount_covers` against the price the relay supplied, `currency_matches` against the currency it supplied, the rail-bound receipt identifier and `verification_timestamp`, and it carries no verified payee, no `payee_matches` and no `verified_payer`.<!-- scp:end id="verification-result-fields" -->
 
 **`RefundConfirmation`** — Confirmation of a payment refund.
 
@@ -903,7 +903,7 @@ variants differently would compute two preimages for one receipt.
 | `currency` | `CurrencyCode` ([u8; 4]) | Yes | Currency. |
 | `adapter_proof` | `Vec<u8>` (serde_bytes) | Yes | Adapter-specific refund proof. |
 
-**`PaymentError`** — Tagged enum for payment failure reasons. **§19.2.1 declares this type; the table below states its wire tags and declares no variant of its own.** A relay author distinguishing an invalid settlement from an unreachable adapter had read a table that named variants the declaration did not and gave a shared variant a different field count.
+**`PaymentError`** — Tagged enum for payment failure reasons. **§19.2.1 declares this type and the table below states its wire tags.** A relay author distinguishing an invalid settlement from an unreachable adapter had read a table that named variants the declaration did not and gave a shared variant a different field count.
 
 ### 19.15.6 Spending Capability (UCAN Extension)
 
