@@ -838,10 +838,19 @@ pub trait IdentityBackend: Send + Sync {
     /// (`09-security-model.md` §9.7.4.2 R9).
     ///
     /// Returns `NoPaymentAdapterConfigured` where this identity's
-    /// `IdentityConfig` carries no `payment` slot, and `EntrySellsNoCoverage`
-    /// where the entry declares no rent terms. Neither condition returns an
-    /// `Ok` carrying a zero quota and a zero expiry, which would be a
-    /// placeholder standing in for data no real path produced.
+    /// `IdentityConfig` carries no `payment` slot, `EntrySellsNoCoverage`
+    /// where the entry declares no rent terms, and `RentRefused` where the
+    /// entry refused on one of the four grounds no payment satisfies. None of
+    /// the three returns an `Ok` carrying a zero quota and a zero expiry,
+    /// which would be a placeholder standing in for data no real path
+    /// produced.
+    ///
+    /// **How a caller's adapter learns the rail-native address it settles to
+    /// is an open clause this revision does not write** (`09-security-model.md`
+    /// §9.7.4.2 R9, which states the two candidate shapes and chooses
+    /// neither). An implementer of this method reads that clause before it
+    /// wires an address, because the relay's declared `payee` is an SCP
+    /// identifier that no registered rail pays.
     fn pay_rent(&self, entry: &str, identifier: &[u8; 32], units: NonZeroU32)
         -> impl Future<Output = Result<RentState, IdentityError>> + Send;
 
@@ -850,6 +859,12 @@ pub trait IdentityBackend: Send + Sync {
     /// answers with the state it holds, so a controller reads whether it is
     /// covered without paying for the answer (`09-security-model.md`
     /// §9.7.4.2 R9).
+    ///
+    /// **This message carries a signature like any other `RENT`**, and R9
+    /// states the preimage it signs and the key it resolves against, so an
+    /// implementer composes it from that section and not from this signature.
+    /// Returns `RentRefused` where the entry refused on one of the four
+    /// grounds no payment satisfies.
     fn read_rent_state(&self, entry: &str, identifier: &[u8; 32])
         -> impl Future<Output = Result<RentState, IdentityError>> + Send;
 
@@ -931,6 +946,29 @@ pub enum IdentityError {
     /// (`09-security-model.md` §9.7.4.2 R9). A controller reads
     /// `DeclaredWritePolicy::rent` through `read_policy` before it calls.
     EntrySellsNoCoverage,
+    /// SCP-IDENT-1111. The entry refused a `RENT` on a ground no payment
+    /// satisfies, and `ground` says which (`09-security-model.md` §9.7.4.2 R9).
+    /// It rides on ADR-004's `4042`. A controller that read this refusal as a
+    /// price would settle again on a rail for a message no payment reaches.
+    RentRefused { ground: RentRefusalGround },
+}
+
+/// Why an entry refused a `RENT` for a reason no payment satisfies
+/// (`09-security-model.md` §9.7.4.2 R9, which states the four grounds and what
+/// a controller does about each). Each variant rides as one token on ADR-004's
+/// `4042`, under the same one-token rule `BudgetScope` takes below.
+pub enum RentRefusalGround {
+    /// The message carried no signature.
+    SignatureAbsent,
+    /// The signature did not verify against the key the key state at the head
+    /// of the accepted chain lists `Current` in the `#active` role.
+    SignatureInvalid,
+    /// `not_after` has passed on the relay's own clock, or it names an instant
+    /// further ahead of that clock than the clock-skew tolerance admits.
+    FreshnessWindowMissed,
+    /// The relay holds neither a chain nor a rent record for the identifier the
+    /// message names.
+    IdentifierUnknownToEntry,
 }
 
 /// Which term of a validating relay's declared write policy a refusal failed
@@ -1038,13 +1076,6 @@ pub struct DeclaredWritePolicy {
     /// beneath it, and it is not "no limit"** (`09-security-model.md`
     /// §9.7.4.2 R9).
     pub storage_budget_total: Option<u64>,
-    /// Concurrent subscriptions per connection. Absent means the relay
-    /// declares no ceiling of its own. The `POLICY` answer carries it because
-    /// `4021` TOO_MANY_SUBSCRIPTIONS reads it and a client that learned it
-    /// from the HTTPS on-ramp would read a term
-    /// `18-addressability-and-deployment.md` §18.3.2 calls not
-    /// self-certifying.
-    pub rate_limit_subscribe: Option<u64>,
     /// The refusal scopes a current rent exempts an identity from, empty where
     /// the relay declares none (`09-security-model.md` §9.7.4.2 R9). **A
     /// publisher rejects an answer carrying a member other than `Identifier`,
