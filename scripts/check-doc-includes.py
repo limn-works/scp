@@ -2,7 +2,7 @@
 """Fail where a transcluding site's bytes differ from the fragment its directive names.
 
 The check copies `.docs/` into a temporary tree, re-runs the resolver there, and
-compares. It fails on six conditions. The first five are the five the
+compares. It fails on seven conditions. The first five are the five the
 identity-substrate plan states for the `[mirror]` disposition:
 
 1. a file differs after the expansion, so a site's bytes have drifted from its Owner;
@@ -10,15 +10,22 @@ identity-substrate plan states for the `[mirror]` disposition:
 3. two files define one fragment id;
 4. a directive's two delimiters do not pair;
 5. a site's include body carries a byte the fragment does not;
-6. a one-line directive names a fragment whose body spans more than one line.
+6. a one-line directive names a fragment whose body spans more than one line;
+7. an Owner defines a fragment no include directive names.
 
 Condition 5 is condition 1 read from the site's side, and the check reports it in
 the site's own terms so a writer reads which line drifted rather than which file.
 Condition 6 belongs to the one-line marker form, which a Markdown table cell needs
 because a cell holds no line break: flattening a multi-line fragment into a cell
 would put bytes at the site that the Owner does not carry in that order.
+Condition 7 takes the fragment as its subject where the first six take the
+directive as theirs. A site that ought to carry a directive and carries prose
+instead matches no directive, so the first six conditions read nothing at it; the
+Owner's unconsumed fragment is the trace that site leaves, and the failure names
+the fragment id, which names the site. A writer that means to stop mirroring a
+unit deletes the Owner's marker.
 
-`--self-test` plants each of the six conditions in a scratch tree and asserts that
+`--self-test` plants each of the seven conditions in a scratch tree and asserts that
 the checker reports it, and pairs them with two conforming controls, one block and
 one inline, so a green real scan means the checker read the tree rather than that
 it can no longer fail.
@@ -46,9 +53,18 @@ DOCS_ROOT = REPO_ROOT / ".docs"
 
 
 def run_scan(root: Path) -> list[str]:
-    """Return every failure the five conditions produce over the tree at `root`."""
+    """Return every failure the seven conditions produce over the tree at `root`."""
     fragments, includes, failures = collect(root)
     failures = list(failures)
+
+    named = {include.fragment_id for include in includes}
+    for fragment_id, fragment in fragments.items():
+        if fragment_id in named:
+            continue
+        failures.append(
+            f"{fragment.path}:{fragment.open_line}: the Owner defines fragment "
+            f"`{fragment_id}` and no include directive names it"
+        )
 
     for include in includes:
         path = include.path
@@ -92,7 +108,7 @@ def _write(path: Path, text: str) -> None:
 
 
 def self_test() -> int:
-    """Plant each of the five conditions and assert the checker reports it."""
+    """Plant each of the seven conditions and assert the checker reports it."""
     cases: list[tuple[str, dict[str, str], str]] = [
         (
             "a site's bytes drifted from its Owner",
@@ -170,6 +186,17 @@ def self_test() -> int:
                 ),
             },
             "differs from the fragment",
+        ),
+        (
+            "an Owner defines a fragment no include directive names",
+            {
+                "owner.md": (
+                    '<!-- scp:fragment id="probe-seven" -->\n'
+                    "A relay counts every PUBLISH.\n"
+                    '<!-- scp:end id="probe-seven" -->\n'
+                ),
+            },
+            "no include directive names it",
         ),
         (
             "an inline include names a fragment that spans more than one line",
