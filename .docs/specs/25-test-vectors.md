@@ -12,7 +12,7 @@ python3.12 scripts/gen-test-vectors-p256.py
 
 The script uses nothing outside the Python standard library, and it self-gates before it prints a byte: it checks itself against `SHA-256("")`, the RFC 6979 Appendix A.2.5 P-256 nonce and signature, RFC 5869 Appendix A.1 for HKDF-SHA256, and this section's own curve-independent `DataProvenance` hash (Vector 35), and it computes every public key twice by two scalar multiplications sharing no arithmetic, and a third time through the `cryptography` package where that package imports. A mismatch raises before anything prints.
 
-**Identifier strings in the fixtures, recorded 2026-09-10.** A vector that pins bytes over an identifier's textual form prints a fixture string of the shape `"did:dht:z6Mk…"`. That string is a fixture and states nothing about SCP's identifier: the identifier is the 32-byte digest of an inception event (`09-security-model.md` §9.7.4.2 R13), and the routing derivations, both continuity-fingerprint forms and §25.26's key-event vectors consume those 32 bytes. **The fixture strings carry that shape because the generator emitted it when the vectors were pinned, and the shape carries no meaning**: R13 defers the textual form, so such a vector pins the construction, the separator and the signature over the bytes it prints, and pins no textual form. `09-security-model.md` §9.5.2 enumerates the fifteen preimages that wait on R13. The generator regenerates each fixture string and every digest below it when a later revision of R13 fixes the encoding.
+**Identifier strings in the fixtures, recorded 2026-09-10.** A vector that pins bytes over an identifier's textual form prints a fixture string of the shape `"did:dht:z6Mk…"`. That string is a fixture and states nothing about SCP's identifier: the identifier is the 32-byte digest of an inception event (`09-security-model.md` §9.7.4.2 R13), and the routing derivations, both continuity-fingerprint forms and §25.26's key-event vectors consume those 32 bytes. **The fixture strings carry that shape because the generator emitted it when the vectors were pinned, and the shape carries no meaning**: R13 defers the textual form, so such a vector pins the construction, the separator and the signature over the bytes it prints, and pins no textual form. `09-security-model.md` §9.5.2 enumerates the sixteen preimages that wait on R13. The generator regenerates each fixture string and every digest below it when a later revision of R13 fixes the encoding.
 
 **What a signature covers.** Every SCP signature here is an ECDSA signature over a 32-byte canonical hash, so the ECDSA message digest **is** that canonical hash and no second SHA-256 reaches it. The vectors run RFC 6979 with `h1` set to that same digest, because §9.5 fixes RFC 6979 with SHA-256 for a software signer and states no value for `h1` under a prehashed digest. An implementation that hashes the digest a second time reproduces none of the signature bytes below.
 
@@ -1584,7 +1584,7 @@ signature (64 raw):   a77d28e5c20b588a75cc18f0891ec9ffea231e21ca23c9aa34bc23c603
 
 The signer is §25.2's secondary key, the `#active` key of Vector 41's identity.
 
-## 25.27 Witness-Layer and Relay-Proof Vectors (§9.7.4.2 definitions, §9.7.4.3, §9.18.2)
+## 25.27 Witness-Layer, Relay-Proof and `RENT` Signature Vectors (§9.7.4.2 definitions, §9.7.4.2 R9, §9.7.4.3, §9.18.2)
 
 The witness objects below name Vector 41's identity as their subject and Vector 41's event as the event a witness seeded at. **No object below names a position in a signer's own key state**, because a community-relay-list operator's key is non-transferable and has no position to name: a verifier reads that key from the operator's list entry, which Vector 49 pins.
 
@@ -1704,9 +1704,13 @@ Shared previous_cosigned_digest:
   2f6f219050c1525bf6fe2d71e3b0056e6db05a1b9ec6b059ecd39e3c1e25d0ea
 ```
 
-### Vector 53: the `RENT` beneficiary signature preimage
+### Vector 53: the `RENT` beneficiary signature preimage, with a receipt
 
-`09-security-model.md` §9.7.4.2 R9 obliges a `RENT` message to carry a signature by the key the key state at the head of the chain the relay holds for that identifier lists `Current` in the `#active` role. The preimage carries the separator `"SCP-RENT-V1:"`, the identity's 32 raw digest bytes, `units` as a 4-byte big-endian integer, and the SHA-256 digest of the `payment_receipt` bytes, each under §9.5.1's rule for a fixed-length field. The signer here is §25.2's secondary key, which Vector 41's key state lists `Current` in the `#active` role.
+`09-security-model.md` §9.7.4.2 R9 obliges a `RENT` message to carry a signature by the key the key state at the head of the accepted chain lists `Current` in the `#active` role. The operand list is R9's:
+
+<!-- scp:include id="rent-preimage-operands" from=".docs/specs/09-security-model.md" -->**The `RENT` signature preimage is `SHA-256("SCP-RENT-V1:" ‖ identifier ‖ BE32(units) ‖ receipt_digest ‖ operator_key ‖ BE64(not_after_seconds))`, and each operand is stated here so two implementations compose one preimage.** `identifier` is the 32 raw digest bytes. `BE32(units)` is the count as a four-byte big-endian integer, at least 1 on a message carrying a receipt and 0 on a message carrying none. **`receipt_digest` is `SHA-256(payment_receipt)` where the receipt is present and the 32 bytes `SHA-256(0x00)` where it is absent**, under §9.5.1's rule for an absent fixed-length optional field. `operator_key` is the 33-byte SEC1 compressed operator key the addressed entry's community-relay-list entry declares, which the controller reads from that list before it sends and which the relay already holds as the key it proves control of. `BE64(not_after_seconds)` is a Unix-seconds instant the signer chooses.<!-- scp:end id="rent-preimage-operands" -->
+
+The signer here is §25.2's secondary key, and the operator key is the first community-relay-list entry's, which Vector 49 below prints.
 
 ```
 identifier:             2c0f7f4478be94db0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf32
@@ -1714,17 +1718,50 @@ units:                  3
 payment_receipt:        7363702d32352d72656e742d726563656970742d6279746573
 SHA-256(payment_receipt):
   127e7a5428dc10a934ec982638c0987fdc4222d68a88d74b2720360191d90beb
-field bytes:            68
-preimage (80 bytes):
+operator_key:
+  033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f30
+  27
+not_after:              1760000000
+field bytes:            109
+preimage (121 bytes):
   5343502d52454e542d56313a2c0f7f4478be94db0078311ef51ba3cc9934362b
   0f154dcbf9c597572e46cf3200000003127e7a5428dc10a934ec982638c0987f
-  dc4222d68a88d74b2720360191d90beb
+  dc4222d68a88d74b2720360191d90beb033b1cac23f45cf1cdfdf0b32f8f777b
+  99166c1b69649c2295b1517883d47f30270000000068e77800
 canonical hash:
-  1e356ef6426ab30b33c087a0e8a08f5d285f74a5bd68bd471f6f347e3488bb15
+  b6c36371110f9aa34ce9b4cb3b7db9e247d471eb5be2f8e8c79ede5871ceb490
 signature:
-  54f379da4a09112ff812b1803575ed2d869d33b061715f675b5302b4acec4505
-  1990eb7859ffe6edca41e0293d0f25052d9cd11ec111431d0691fafdbe71d513
+  cf45f2b9803fd1ef81c7b56a4d5d490f6ba01e1694370ede15ecfe15d00f3628
+  066add92080336ec03c70f4a5006683af78d07afa20e07552cc07e503567d363
 ```
+
+### Vector 54: the `RENT` beneficiary signature preimage, with no receipt
+
+This is the message `read_rent_state` sends (`03-identity.md` §3.10.10), which every controller runs every period to read whether it is covered. **`units` is exactly 0** (ADR-004, the SCP native relay protocol, Constraints line) **and the receipt operand takes its absent form**, the 32 bytes `SHA-256(0x00)` that §9.5.1 gives an absent fixed-length optional field. The two vectors differ in those two operands and in nothing else.
+
+```
+identifier:             2c0f7f4478be94db0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf32
+units:                  0
+payment_receipt:        absent
+receipt digest, absent form:
+  6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d
+operator_key:
+  033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f30
+  27
+not_after:              1760000000
+field bytes:            109
+preimage (121 bytes):
+  5343502d52454e542d56313a2c0f7f4478be94db0078311ef51ba3cc9934362b
+  0f154dcbf9c597572e46cf32000000006e340b9cffb37a989ca544e6bb780a2c
+  78901d3fb33738768511a30617afa01d033b1cac23f45cf1cdfdf0b32f8f777b
+  99166c1b69649c2295b1517883d47f30270000000068e77800
+canonical hash:
+  b76294ed0deb9b79f62eda16f7b301ecd2b09caa789b4ba76b13c78b8053179f
+signature:
+  bfa5477e6a3dab95268687bd07df6e8399d3500d1a538ffbffa112729d329c94
+  598a5cc18823015975fcf2c1df6bb43d4460494c2ce897e88f8f40be55748c80
+```
+
 
 ### Vector 49: the community relay list's encoding
 
