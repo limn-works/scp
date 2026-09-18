@@ -907,6 +907,8 @@ On a non-copyable substrate no private key ever entered the SDK's memory, so ste
 
 **8. Retention.** The controller MUST retain every standing pre-rotation private key from the moment the commitment list is fixed until a reveal-authorized event supersedes that list, on every code path, and that obligation covers every member of the set whether a reveal named it or not. Loss of a standing key forecloses both reveal-authorized kinds, because the standing root alone cannot fix a new commitment. At the superseding event the obligation ends for each key the reveal revealed and for each member the superseding list drops, and it continues for each unexposed member the superseding list re-commits.
 
+**What a party that held a continuity fingerprint does when a row below changes an identity's `#active` key is `03-identity.md` §3.2.1's**, so a reader tracing an outcome here reads that section for the act it obliges.
+
 **Failure modes.** Each row follows from the root rule of §9.7.4.2 R6 and from nothing else, so the table carries every outcome that rule produces and carries no witness outcome: a witness decides nothing, and a controller reading what to do about silent witnesses reads R10's situation table instead. "P" names the pre-rotation key.
 
 | What happened | Outcome |
@@ -1434,6 +1436,8 @@ Each example names the one table row it traces and states the order of the parti
 5. **An identity whose witnesses go silent**, tracing R10's situation row "Finds its designated witnesses unreachable, silent, or refusing". The controller's designated witnesses stop answering, and the controller signs a `KeyState` naming a fresh witness set while the identity resolves and ranks throughout.
 
 ### 9.7.4.3 Witness and Watcher Layer (Layer B)
+
+**What a community-relay-list entry binds about an operator is `18-addressability-and-deployment.md` §18.5.1's**, so a reader weighing a cosignature here reads that section for what the key it verified against is bound to. **The frames a witness's two object kinds travel in are §9.10.12's**, so an implementer reads that section for their bytes.
 
 **A witness watches and reports and decides nothing.** It runs one check, signs or refuses, and never adjudicates between two chains. Alec ruled the layer's scope on 2026-09-10: "watch and report as well". The residual the earlier required-witnessing model rested on — a lost root together with a leaked copy of a spent pre-rotation key — survives on the default profile only through takeover of the one platform account that holds both credentials, which §9.7.4.1 item 4 states.
 
@@ -2032,6 +2036,8 @@ A cosigned-head record is published at `SHA-256("scp:wit:" || subject_identifier
 
 ## 9.11 Key Continuity Verification
 
+**What a party does when an identity's `#active` key changes under it is `03-identity.md` §3.2.1's**, and this section states only what the fingerprint lets a party observe, so a reader wiring a response to a changed key reads that section for the act.
+
 **The fingerprint.** The key-continuity fingerprint is
 
 ```
@@ -2126,6 +2132,8 @@ This PCS bound is **in-group only**, and it does NOT bound a second vector: the 
 **Self-hosted relay exception:** **a relay URL may use `ws://` if and only if the resolver took it from a service record whose signature it verified against the designated service key of a key-event log it verified under §9.7.4.2 R2 and R3** — the log authenticates the designated key and that key authenticates the relay list, so the two verifications together make the URL self-certifying, whichever relay served either object (§9.6.1, §9.6.3, `03-identity.md` §3.10.13). The SDK MUST reject a `ws://` relay URL from every other source, `.well-known/scp` and an unverified service record among them, because such a source carries no signature binding the URL to the identity and a substituted URL would downgrade the transport unnoticed. Such relays have no domain and cannot obtain CA-signed certificates; MLS provides the confidentiality boundary, and TLS on a dumb pipe protects already-encrypted traffic.
 
 ## 9.14 Clock and Ordering Model
+
+**§9.7.4.2 R11 is the one rule of the key-event log that reads a wall clock**, and it states which of its answers a verifier returns where its own clock leaves it unable to decide, so a reader sizing a tolerance here reads that rule for what a missed window costs.
 
 **Clock model:** SCP does not require synchronized clocks. Timestamps are best-effort for message-ordering hints and replay detection.
 

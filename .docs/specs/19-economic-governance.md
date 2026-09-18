@@ -36,6 +36,8 @@ SCP's existing primitives (identifiers, UCANs, contexts, governance, transport a
 
 ### 19.1.1 Core Economic Types
 
+**The two types a relay's storage refusal carries — the scope it failed and that term's own value — are `03-identity.md` §3.10.10's**, so a reader assembling an economic type set here takes them from that section rather than declaring a pair of its own.
+
 ```rust
 /// Amount in smallest currency unit. USD: cents (1 USD = 100). BTC: satoshis (1 BTC = 100_000_000).
 /// Always integer — no floating-point in economic calculations. Cross-party determinism guaranteed.
@@ -97,6 +99,8 @@ pub enum PaidActionType {
 Payment adapters are the backbone of economic governance. They abstract over concrete payment rails, following the same pattern as transport adapters (ADR-005, §16.12.1): a trait that any payment rail can implement, a conformance macro that validates correctness, and a reference adapter for testing.
 
 ### 19.2.1 Adapter Trait
+
+**The receipt's wire form and its signature preimage are §19.15.5's**, so an adapter author implementing this trait reads that section for the bytes a receipt travels in and signs over.
 
 ```rust
 #[async_trait]

@@ -36,6 +36,8 @@ Custody migration moves the operational signing capability from one custody prov
 
 ## 3.3 Recovery
 
+**Where the root cannot be recovered by key material at all, the person establishes a new identity**, and `09-security-model.md` §9.7.4.1's failure-mode table states that outcome, so a reader of this section does not look here for a mechanism that re-establishes custody of the same identity.
+
 **A root changes only through a `RootRecovery`**, which carries an indexed signature group from a threshold-satisficing subset of the standing next set (`09-security-model.md` §9.7.4.2 R3 for the kind and its signature groups, R10 for the procedure the controller follows).
 
 **The three mechanisms below help a controller reach its own credentials, and none of them authorizes a root change**, because no trusted contact and no platform account holds a member of the next set.
@@ -778,6 +780,8 @@ The sequence orders one chain against its own prefixes, because an event's seque
 
 ### 3.10.8 Security Analysis
 
+**What a community-relay-list entry carries, and what a party may conclude from an operator's key, are `18-addressability-and-deployment.md` §18.5.1's**, so an analysis here of what a misbehaving relay reaches rests on that section's statement of what the list binds.
+
 **Relay misbehavior is availability-only and never integrity on a warm-cache or multi-relay resolution.** Three controls hold that together, each covering one failure mode: the resolver's own chain verification rejects a forged record (`09-security-model.md` §9.6.1, §9.7.4.2 R2 and R3); its sequence check plus fork precedence across relays rejects a stale or replayed genuine record (§3.10.4, §3.10.7); and R9's write rule read against storage, with the storage-derived delete gate of §3.10.2 rule (d), raises the cost of the cold-cache purge-then-replay rollback on a relay that runs them.
 
 **On a single-relay first contact the integrity control is the two-proven-operator floor and nothing on the relay.** The last two controls above are relay-side code, so they close nothing against a relay whose operator omits them, and a reader holding no accepted service record takes the whole community relay list as its fallback set, which makes R11's floor a count of distinct proven operators rather than a test against a record that reader has not accepted.
@@ -787,6 +791,8 @@ The sequence orders one chain against its own prefixes, because an event's seque
 **Suppression takes every relay.** To prevent resolution an attacker must suppress the chain on all of an identity's validating relays and on the fallback set, because a resolver reads both. A flood at the routing id is inert on a validating relay, and `09-security-model.md` §9.7.4.2 R9 states each variant's outcome. Over a foreign transport that accumulates many blobs at one address, suppression resistance is best-effort: such storage contributes availability, and the resolver's own chain verification discards the junk.
 
 ### 3.10.9 Privacy Properties
+
+**What a resolver can conclude from the relays that answered it is `09-security-model.md` §9.7.4.2 R11's**, and `03-identity.md` §3.10.10's `ResolutionSources` is the value it surfaces, so the exposure this section analyses is the exposure that value records.
 
 A relay operator that answers a resolution learns that the resolver's network address queried one routing id, and it computes the same derivation, so it can name the identity for any identity it already knows. An identity's own relay operator learns nothing it did not already hold, because it already carries that identity's message traffic (§9.9.1). R11's floor sends a first contact's queries to community relays under distinct operator keys, so no single operator observes a whole first contact. A resolver that requires network-address anonymity takes the transport-layer measures §9.10.11 states, and the §9.10.7 caching policy bounds how often it queries at all.
 
@@ -1379,6 +1385,8 @@ The routing derivation is a pure function in `scp-core`; the key-event record fr
 
 ### 3.10.13 The Service Record
 
+
+**The wire frame that carries this record, and the two further retained frames beside it, are `09-security-model.md` §9.10.12's**, so an implementer reading this section for the record's contents reads that one for the bytes it travels in.
 
 **What the record carries.** An identity's service record carries at most `MAX_SERVICE_RECORD_ENTRIES` entries (`09-security-model.md` §9.18.17). **The record's reader is what enforces that cap**: it rejects a record carrying more entries, whatever its signature, and returns `ServiceRecordVerdict::Rejected{TooManyEntries}` (§3.10.10). The cap binds this reader and no key event, because the record is separately addressed, separately signed, and occupies no position on any chain, so `09-security-model.md` §9.7.4.2 R3 carries no service-record clause. A resolver therefore opens no more concurrent queries against an identity's own relays than the cap admits; without it a signed record naming one third-party host in five thousand `SCPRelay` entries is a fan-out primitive every resolution fires. It carries every transport and service field that identity publishes: its `SCPRelay` entries, the relays holding its encrypted private state, its broadcast-context advertisements, its self-asserted capability URIs, the pointer to its context-hosted participation statements, and the pointer to its attestation revocation status (`18-addressability-and-deployment.md` §18.2.2 enumerates the entry types). Those capability URIs are the self-asserted third of what the retired `SCPCapabilities` entry carried (`18-addressability-and-deployment.md` §18.2.2A); a verifier-signed challenge-verification record is an attestation (§7.3.4), and economic metadata belongs to `19-economic-governance.md` §19.9. **The record carries no key, no key condition, and no witness parameter**: a root signature covers each of those in the key-event log, and a reader that found one here would be reading key state from a key weaker than the root. KERI draws the same line, carrying endpoint and role metadata in signed reply records outside the log (`spec-body` §Reply Message Body).
 
