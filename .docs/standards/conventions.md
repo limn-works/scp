@@ -38,6 +38,8 @@ See `.docs/scaffold/shared.md` for the full cross-language casing table. Summary
 - **Acronyms** follow language convention: `URLString` vs `urlString` — see per-language standards
 - **A name-bound enumeration's variants take the spelling the specification gives them, verbatim, in every language.** `09-security-model.md` §9.7.4.2's definitions state the criterion that decides which enumerations the rule reaches, and this table is where the mapping lives.
 
+<!-- scp:include id="name-binding-criterion" from=".docs/specs/09-security-model.md" -->**An enumeration this design defines is name-bound — its type name and every variant name identical in every SDK binding — where a binding surfaces it to callers or where it serializes on the wire, and a name is bound as the spec spells it, PascalCase, which every binding carries verbatim.** No binding recases a variant and no rule splits one on word boundaries, so a shared conformance fixture comparing a variant across languages compares one string.<!-- scp:end id="name-binding-criterion" -->
+
 **Each row below states the criterion in full — the spec's spelling, verbatim, which is PascalCase — rather than the spelling clause alone**, because a row reading "the spec's spelling, verbatim" beside a spec sentence asserting PascalCase left a binding author two instructions and no test for which governs.
 
 | Language | Enum variant spelling | Example, from the spec's `WitnessRead` |
