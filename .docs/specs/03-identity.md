@@ -1123,7 +1123,8 @@ pub struct EconomicTerms {
 pub struct RentTerms {
     /// The price of one unit of rent.
     pub price: Amount,
-    /// The duration one unit of rent buys, in seconds.
+    /// The duration one rent payment buys, in seconds, whatever `units`
+    /// that payment names (`09-security-model.md` §9.7.4.2 R9).
     pub period_seconds: u64,
     /// The stored bytes one unit of rent covers.
     pub quota_bytes: u64,
