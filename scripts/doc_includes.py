@@ -69,11 +69,20 @@ def iter_doc_files(root: Path) -> list[Path]:
     return sorted(files)
 
 
-def _relative(path: Path, root: Path) -> str:
-    try:
-        return str(path.relative_to(root.parent if root.name == ".docs" else root))
-    except ValueError:
-        return str(path)
+@dataclass(frozen=True)
+class _OpenMarker:
+    """The delimiter the scanner has opened and not yet closed.
+
+    The scanner holds one of these or holds `None`, so a reader that has checked for
+    `None` reads `fragment_id` and `source` as the strings they are. Four parallel
+    optional variables gave the same state four independent nullities, and a
+    constructor call then took a `str | None` where the dataclass declares a `str`.
+    """
+
+    kind: str
+    fragment_id: str
+    source: str | None
+    open_line: int
 
 
 def scan_file(path: Path, text: str) -> tuple[list[Fragment], list[Include]]:
@@ -85,10 +94,7 @@ def scan_file(path: Path, text: str) -> tuple[list[Fragment], list[Include]]:
     lines = text.split("\n")
     fragments: list[Fragment] = []
     includes: list[Include] = []
-    open_kind: str | None = None
-    open_id: str | None = None
-    open_source: str | None = None
-    open_index: int = -1
+    open_marker: _OpenMarker | None = None
     body: list[str] = []
 
     for index, line in enumerate(lines, start=1):
@@ -96,55 +102,66 @@ def scan_file(path: Path, text: str) -> tuple[list[Fragment], list[Include]]:
         include_match = INCLUDE_OPEN.match(line)
         end_match = MARKER_END.match(line)
 
-        if fragment_match or include_match:
-            if open_kind is not None:
+        if fragment_match is not None or include_match is not None:
+            if open_marker is not None:
                 raise MarkerError(
-                    f"{path}:{index}: a marker opens while `{open_id}` is still open at line {open_index}"
+                    f"{path}:{index}: a marker opens while `{open_marker.fragment_id}` "
+                    f"is still open at line {open_marker.open_line}"
                 )
-            open_kind = "fragment" if fragment_match else "include"
-            if fragment_match:
-                open_id = fragment_match.group(1)
-                open_source = None
+            if fragment_match is not None:
+                open_marker = _OpenMarker("fragment", fragment_match.group(1), None, index)
             else:
                 assert include_match is not None
-                open_id = include_match.group(1)
-                open_source = include_match.group(2)
-            open_index = index
+                open_marker = _OpenMarker(
+                    "include", include_match.group(1), include_match.group(2), index
+                )
             body = []
             continue
 
-        if end_match:
-            if open_kind is None:
+        if end_match is not None:
+            if open_marker is None:
                 raise MarkerError(
                     f"{path}:{index}: `scp:end id=\"{end_match.group(1)}\"` closes a marker nothing opened"
                 )
-            if end_match.group(1) != open_id:
+            if end_match.group(1) != open_marker.fragment_id:
                 raise MarkerError(
-                    f"{path}:{index}: `scp:end id=\"{end_match.group(1)}\"` closes `{open_id}`, "
-                    f"opened at line {open_index}"
+                    f"{path}:{index}: `scp:end id=\"{end_match.group(1)}\"` closes "
+                    f"`{open_marker.fragment_id}`, opened at line {open_marker.open_line}"
                 )
             joined = "\n".join(body)
-            if open_kind == "fragment":
-                fragments.append(Fragment(open_id, path, open_index, joined))
+            if open_marker.kind == "fragment":
+                fragments.append(
+                    Fragment(open_marker.fragment_id, path, open_marker.open_line, joined)
+                )
             else:
-                assert open_source is not None
-                includes.append(Include(open_id, open_source, path, open_index, index, joined))
-            open_kind = None
-            open_id = None
-            open_source = None
-            open_index = -1
+                source = open_marker.source
+                assert source is not None
+                includes.append(
+                    Include(
+                        open_marker.fragment_id,
+                        source,
+                        path,
+                        open_marker.open_line,
+                        index,
+                        joined,
+                    )
+                )
+            open_marker = None
             body = []
             continue
 
-        if open_kind is not None:
+        if open_marker is not None:
             body.append(line)
         elif ANY_MARKER.search(line):
             raise MarkerError(
                 f"{path}:{index}: a line carries an `scp:` marker the scanner does not parse: {line.strip()}"
             )
 
-    if open_kind is not None:
-        raise MarkerError(f"{path}:{open_index}: `{open_id}` opens and no `scp:end` closes it")
+    if open_marker is not None:
+        raise MarkerError(
+            f"{path}:{open_marker.open_line}: `{open_marker.fragment_id}` opens "
+            f"and no `scp:end` closes it"
+        )
 
     return fragments, includes
 

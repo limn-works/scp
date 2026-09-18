@@ -200,6 +200,10 @@ def main() -> int:
         mirror = Path(raw) / source.name
         shutil.copytree(source, mirror)
         failures = run_scan(mirror)
+        # The scan reads the copy, so every path it names sits under the temporary
+        # tree, which no reader of a CI log can open. Rewrite each one to the file the
+        # writer edits before the failure leaves this function.
+        failures = [failure.replace(str(mirror), str(source)) for failure in failures]
 
     if failures:
         for failure in failures:
