@@ -2001,7 +2001,7 @@ The fixed prefix is `1 + 32 = 33` bytes, and the total frame length is `33 + len
 1. **Read and check `version` before any subsequent byte.** The `version` field gates the *entire* grammar. A decoder MUST read and validate `version` before interpreting any subsequent byte, and MUST reject (discard, no partial parse) any `version` it does not implement.
 2. **Require the fixed prefix in full.** A decoder MUST reject any frame shorter than the 33-byte fixed prefix (`version + identifier`) — truncation is never a partially-valid frame.
 3. **Bound-check the `value` length only after the prefix check.** `value` is the trailing remainder, `len(value) = total_frame_len − 33`. A decoder MUST NOT compute `total_frame_len − 33` before rule 2 has confirmed `total_frame_len >= 33`: computing it first can underflow, which diverges between a debug-build panic and a release-build wrap across bindings. With rule 2 satisfied the subtraction cannot underflow. A decoder MUST reject an empty `value` (`total_frame_len == 33`) and MUST reject `len(value) > Max blob size (262144, §9.18.11) − 33`. No widening is required: `len(value)` is an actual buffer length (a valid `usize`, already bounded by the transport's Max blob size) and the bound is a compile-time constant, so the frame itself carries no wire-supplied length field to overflow. **`value`'s own contents are a length-prefixed layout and carry three**, and the `value`-layout paragraph above bounds each one.
-4. **Decode-and-verify at exactly one site.** One site decodes a frame and verifies the chain its `value` carries, mirroring SCPM's decode-and-verify site (§9.16.1). No other layer may test, branch on, or depend on the framing bytes.
+4. **Decoding and verification happen together.** One site decodes a frame and verifies the chain its `value` carries, mirroring SCPM's decode-and-verify site (§9.16.1). No other layer may test, branch on, or depend on the framing bytes.
 
 **Publish / query contract.**
 
@@ -2133,7 +2133,7 @@ This PCS bound is **in-group only**, and it does NOT bound a second vector: the 
 
 ## 9.14 Clock and Ordering Model
 
-**§9.7.4.2 R11 is the one rule of the key-event log that reads a wall clock**, and it states which of its answers a verifier returns where its own clock leaves it unable to decide, so a reader sizing a tolerance here reads that rule for what a missed window costs.
+**§9.7.4.2 R11 reads a wall clock, and it states which of its answers a verifier returns where its own clock leaves it unable to decide**, so a reader sizing a tolerance here reads that rule for what a missed window costs.
 
 **Clock model:** SCP does not require synchronized clocks. Timestamps are best-effort for message-ordering hints and replay detection.
 
