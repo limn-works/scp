@@ -102,20 +102,28 @@ Payment adapters are the backbone of economic governance. They abstract over con
 
 **The receipt's wire form and its signature preimage are §19.15.5's**, so an adapter author implementing this trait reads that section for the bytes a receipt travels in and signs over.
 
+The three units a section outside this one reproduces, delimited here so it reproduces bytes rather than a paraphrase:
+
+- <!-- scp:fragment id="verify-call-inputs" -->`PaymentAdapter::verify` takes the receipt, the relay's declared `economic.currency` and the price the relay computed for what the receipt pays, because an adapter holding the receipt alone holds nothing but fields the presenting party composed.<!-- scp:end id="verify-call-inputs" -->
+- <!-- scp:fragment id="verification-result-fields" -->`VerificationResult` carries `valid`, `adapter_id`, `amount_covers` against the price the relay supplied, `currency_matches` against the currency it supplied, the rail-bound receipt identifier and `verification_timestamp`, and it carries no verified payee, no `payee_matches` and no `verified_payer`.<!-- scp:end id="verification-result-fields" -->
+- <!-- scp:fragment id="adapter-recipient-obligation" -->`verify` returns `valid: false` where the settlement paid any account other than the receiving account this adapter's operator configured, so `valid` is never the answer to whether a settlement exists on the rail.<!-- scp:end id="adapter-recipient-obligation" -->
+
+
 ```rust
 #[async_trait]
 pub trait PaymentAdapter: Send + Sync {
     fn adapter_id(&self) -> &str;
     fn capabilities(&self) -> AdapterCapabilities;
 
+    /// Authorize a payment from `payer` to `payee`. **How a caller learns the
+    /// rail-native address a relay settles to is an open clause**
+    /// (`09-security-model.md` §9.7.4.2 R9, which states the two candidate
+    /// shapes and chooses neither). The `payee` parameter is an SCP
+    /// identifier, and no rail §19.2.7 registers pays one, so an adapter reads
+    /// that clause before it maps the value to an address.
     async fn authorize(
         &self,
         payer: &Identifier,
-        /// **How a caller learns the rail-native address a relay settles to is
-        /// an open clause** (`09-security-model.md` §9.7.4.2 R9, which states
-        /// the two candidate shapes and chooses neither). This parameter is an
-        /// SCP identifier, and no rail §19.2.7 registers pays one, so an
-        /// adapter reads that clause before it maps this value to an address.
         payee: &Identifier,
         amount: Amount,
         currency: CurrencyCode,
@@ -162,15 +170,15 @@ pub trait PaymentAdapter: Send + Sync {
     /// it leaves. An implementer reads that disclosure before it returns any
     /// term about the payer, because the two candidate shapes differ on what
     /// this call returns.
+    /// `relay_currency` is this relay's declared `economic.currency`.
+    /// `declared_price` is the price this relay computed for what this receipt
+    /// pays: the `per_publish` fee on a PUBLISH, and `units` times the
+    /// declared rent price on a `RENT` (`09-security-model.md` §9.7.4.2 R9).
+    /// A receipt pays one thing and the operation carrying it says which.
     async fn verify(
         &self,
         receipt: &PaymentReceipt,
-        /// This relay's declared `economic.currency`.
         relay_currency: &CurrencyCode,
-        /// The price this relay computed for what this receipt pays: the
-        /// `per_publish` fee on a PUBLISH, and `units` times the declared rent
-        /// price on a `RENT` (`09-security-model.md` §9.7.4.2 R9). A receipt
-        /// pays one thing and the operation carrying it says which.
         declared_price: &Amount,
     ) -> Result<VerificationResult, PaymentError>;
 
