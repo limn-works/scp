@@ -452,6 +452,13 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # Google withdrew `tools`, the obsolete Android SDK Tools package,
+          # from the SDK repository, and `tools platform-tools` is this
+          # action's default package list, so the action exits 1 and never
+          # puts sdkmanager on PATH. The two Kotlin jobs in ci.yml carry the
+          # same input and state the failure in full.
+          packages: platform-tools
 
       - name: Install Android NDK
         run: sdkmanager "ndk;27.2.12479018"
