@@ -1843,7 +1843,31 @@ jobs:
           distribution: zulu
           java-version: "17"
       - uses: android-actions/setup-android@v3
-        continue-on-error: true
+        with:
+          # Google withdrew `tools`, the obsolete Android SDK Tools package,
+          # from the SDK repository, and `tools platform-tools` is this
+          # action's default package list. sdkmanager prints `Warning: Failed
+          # to find package 'tools'` and exits 1, so the action throws before
+          # it appends the command-line-tools bin directory to PATH, and the
+          # job stops at this step. Naming the list drops the withdrawn
+          # package and leaves the rest of the default. The two Kotlin jobs,
+          # the Android build job in build-matrix.yml, and the Maven publish
+          # job in release.yml each carry this input for the same reason.
+          # First observed 2026-09-15 in the `Kotlin / test` job of workflow
+          # run 34915608875.
+          #
+          # This step also carried `continue-on-error: true`, which pull
+          # request #1352, the deployId return-value change, added so that
+          # the action could fail while the sdkmanager the runner image
+          # preinstalls served the steps below. The image stopped putting
+          # that copy on PATH, so in workflow run 34915608875 the swallowed
+          # failure reappeared three steps later as exit 127 against the
+          # `sdkmanager "platforms;android-35"` step, which had run correct
+          # code. A failed setup ends the job either way, so removing the key
+          # turns no passing job red, and the job now stops at the step that
+          # failed. The Android build job in build-matrix.yml and the Maven
+          # publish job in release.yml stop there already.
+          packages: platform-tools
       - name: Accept Android SDK licenses
         run: |
           mkdir -p $ANDROID_HOME/licenses
@@ -1903,7 +1927,31 @@ jobs:
           distribution: zulu
           java-version: "17"
       - uses: android-actions/setup-android@v3
-        continue-on-error: true
+        with:
+          # Google withdrew `tools`, the obsolete Android SDK Tools package,
+          # from the SDK repository, and `tools platform-tools` is this
+          # action's default package list. sdkmanager prints `Warning: Failed
+          # to find package 'tools'` and exits 1, so the action throws before
+          # it appends the command-line-tools bin directory to PATH, and the
+          # job stops at this step. Naming the list drops the withdrawn
+          # package and leaves the rest of the default. The two Kotlin jobs,
+          # the Android build job in build-matrix.yml, and the Maven publish
+          # job in release.yml each carry this input for the same reason.
+          # First observed 2026-09-15 in the `Kotlin / test` job of workflow
+          # run 34915608875.
+          #
+          # This step also carried `continue-on-error: true`, which pull
+          # request #1352, the deployId return-value change, added so that
+          # the action could fail while the sdkmanager the runner image
+          # preinstalls served the steps below. The image stopped putting
+          # that copy on PATH, so in workflow run 34915608875 the swallowed
+          # failure reappeared three steps later as exit 127 against the
+          # `sdkmanager "platforms;android-35"` step, which had run correct
+          # code. A failed setup ends the job either way, so removing the key
+          # turns no passing job red, and the job now stops at the step that
+          # failed. The Android build job in build-matrix.yml and the Maven
+          # publish job in release.yml stop there already.
+          packages: platform-tools
       - name: Accept Android SDK licenses
         run: |
           mkdir -p $ANDROID_HOME/licenses
