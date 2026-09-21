@@ -48,6 +48,7 @@ specs/09-security-model.md	total-scope	1
 specs/17-persistence-and-storage.md	recovery-handle-declaration	1
 specs/18-addressability-and-deployment.md	budget-scope-token-mapping	1
 specs/18-addressability-and-deployment.md	coverage-test	1
+specs/18-addressability-and-deployment.md	economic-object-declaration	1
 specs/18-addressability-and-deployment.md	identifier-bound	1
 specs/18-addressability-and-deployment.md	identifier-eviction	1
 specs/18-addressability-and-deployment.md	identifier-exemption	1

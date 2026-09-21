@@ -356,7 +356,7 @@ Reference adapter: `TestAdapter` — in-memory ledger, no real money, ships with
 
 ### 19.2.7 Known Adapter Patterns
 
-**This table registers the adapter set `PaymentAdapterSlot` selects from.** The `payment` set of `IdentityConfig` (`.docs/standards/construction.md`) takes its members from one named variant per row below, plus the Rust-only `Custom(concrete)` that takes a caller-supplied `PaymentAdapter`; each bridge mirrors the selector as `PaymentAdapterConfig` and omits `Custom`. The `adapter_id` strings the rows imply are what a relay's `economic.payment_adapters` lists and what a `PaymentReceipt` is tagged with.
+**This table registers the adapter set `PaymentAdapterSlot` selects from.** The `payment` set of `IdentityConfig` (`.docs/standards/construction.md`) takes its members from one named variant per row below, plus the Rust-only `Custom(concrete)` that takes a caller-supplied `PaymentAdapter`; each bridge mirrors the selector as `PaymentAdapterConfig` and omits `Custom`. **A caller names its members in its own order, and a backend addressing an entry mints through the first member that entry's `economic.payment_adapters` names**, so a controller holding credentials on two rails reaches every entry that verifies either. The `adapter_id` strings the rows imply are what a relay's `economic.payment_adapters` lists and what a `PaymentReceipt` is tagged with.
 
 The columns below the adapter name are documented for implementers and are not protocol-specified:
 
