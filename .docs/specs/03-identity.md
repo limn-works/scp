@@ -836,28 +836,55 @@ pub trait IdentityBackend: Send + Sync {
     fn publish_service_record(&self, identifier: &[u8; 32], record: &[u8])
         -> impl Future<Output = Result<PublishOutcome, IdentityError>> + Send;
 
-    /// Reads one fallback-set entry's declared write policy through ADR-004's
+    /// Reads one relay entry's declared write policy through ADR-004's
     /// `POLICY` query. A publisher calls this before it mints anything, so it
     /// reads what its money buys before it spends (`09-security-model.md`
-    /// §9.7.4.2 R9).
+    /// §9.7.4.2 R9). **`entry` names any relay the caller can address**, which
+    /// `fallback_set` below is one source of rather than the bound on.
+    /// Returns `InvalidRelayConfig` where that entry's declaration is one of
+    /// the six `18-addressability-and-deployment.md` §18.3.3 names invalid,
+    /// and `RelayAnswered` where the entry answered a wire code naming no
+    /// declared term.
     fn read_policy(&self, entry: &str)
         -> impl Future<Output = Result<DeclaredWritePolicy, IdentityError>> + Send;
 
-    /// Mints a receipt through the configured adapter against `units` times
-    /// `entry`'s declared rent price, sends ADR-004's `RENT` operation
-    /// carrying `identifier`, `units`, that receipt and the beneficiary
-    /// signature, and returns the rent state the entry answered with. `RENT`
-    /// stores no bytes, so no storage budget and no ring rule reads it
-    /// (`09-security-model.md` §9.7.4.2 R9).
+    /// Runs its four local checks, mints a receipt through the configured
+    /// adapter against `units` times `entry`'s declared rent price, sends
+    /// ADR-004's `RENT` operation carrying `identifier`, `units`, that receipt
+    /// and the beneficiary signature, and returns the rent state the entry
+    /// answered with. `RENT` stores no bytes, so no storage budget and no ring
+    /// rule reads it (`09-security-model.md` §9.7.4.2 R9).
     ///
-    /// Returns `NoPaymentAdapterConfigured` where this identity's
-    /// `IdentityConfig` carries no `payment` slot, `EntrySellsNoCoverage`
-    /// where the entry declares no rent terms, `RentRefused` where the entry
-    /// refused on one of the three grounds no payment satisfies, and
-    /// `StorageBudgetExceeded` where it refused under `RateLimit` or
-    /// `Payment`. None of the four returns an `Ok` carrying a zero quota and a
-    /// zero expiry, which would be a placeholder standing in for data no real
-    /// path produced.
+    /// **The four checks run in this order and every one of them precedes the
+    /// mint**, so no path that spends money reaches the rail on a condition
+    /// the caller could have read for nothing: that `entry`'s `relay_config`
+    /// is valid; that `entry` declares rent terms; that `entry`'s
+    /// `economic.payment_adapters` names an adapter this identity's `payment`
+    /// slot installs, which is the comparison `SkipGround::NoSharedAdapter`
+    /// makes on the publish path; and that `units` times `entry`'s declared
+    /// rent price does not exceed `max_settlement`.
+    ///
+    /// **`max_settlement` is the ceiling on what this call may settle, and it
+    /// is required rather than optional**, because the price arrives in an
+    /// unsigned `POLICY` answer (§9.10.12) and a caller that supplied no
+    /// ceiling would authorize whatever figure that answer carries.
+    /// `19-economic-governance.md` §19.14's invariant that an agent never
+    /// silently incurs a cost reaches this call through it.
+    ///
+    /// Returns `InvalidRelayConfig` where `entry`'s declaration is one of the
+    /// six `18-addressability-and-deployment.md` §18.3.3 names invalid,
+    /// `NoPaymentAdapterConfigured` where this identity's `IdentityConfig`
+    /// installs no payment adapter, `EntrySellsNoCoverage` where the entry
+    /// declares no rent terms, `NoSharedPaymentAdapter` where none of this
+    /// identity's configured adapters appears in the entry's
+    /// `payment_adapters`, and `SettlementCeilingExceeded` carrying the price
+    /// where `units` times the declared rent price passes `max_settlement`.
+    /// Past the mint it returns `RentRefused` where the entry refused on one
+    /// of the three grounds no payment satisfies, `StorageBudgetExceeded`
+    /// where it refused under `RateLimit` or `Payment`, and `RelayAnswered`
+    /// where it answered a wire code naming no declared term. None of them
+    /// returns an `Ok` carrying a zero quota and a zero expiry, which would be
+    /// a placeholder standing in for data no real path produced.
     ///
     /// **How a caller's adapter learns the rail-native address it settles to
     /// is an open clause this revision does not write** (`09-security-model.md`
@@ -865,7 +892,13 @@ pub trait IdentityBackend: Send + Sync {
     /// neither). An implementer of this method reads that clause before it
     /// wires an address, because the relay's declared `payee` is an SCP
     /// identifier that no registered rail pays.
-    fn pay_rent(&self, entry: &str, identifier: &[u8; 32], units: NonZeroU32)
+    fn pay_rent(
+        &self,
+        entry: &str,
+        identifier: &[u8; 32],
+        units: NonZeroU32,
+        max_settlement: Amount,
+    )
         -> impl Future<Output = Result<RentState, IdentityError>> + Send;
 
     /// Reads one identity's current rent state at one entry, by sending a
@@ -877,9 +910,12 @@ pub trait IdentityBackend: Send + Sync {
     /// **This message carries a signature like any other `RENT`**, and R9
     /// states the preimage it signs and the key it resolves against, so an
     /// implementer composes it from that section and not from this signature.
-    /// Returns `RentRefused` where the entry refused on one of the three
-    /// grounds no payment satisfies, and `StorageBudgetExceeded` where it
-    /// refused under `RateLimit`.
+    /// **`entry` names any relay the caller can address.** Returns
+    /// `RentRefused` where the entry refused on one of the three grounds no
+    /// payment satisfies, `StorageBudgetExceeded` where it refused under
+    /// `RateLimit`, `InvalidRelayConfig` where that entry's declaration is one
+    /// of the six the addressability spec names invalid, and `RelayAnswered`
+    /// where it answered a wire code naming no declared term.
     fn read_rent_state(&self, entry: &str, identifier: &[u8; 32])
         -> impl Future<Output = Result<RentState, IdentityError>> + Send;
 
@@ -972,8 +1008,46 @@ pub enum IdentityError {
     /// price would settle again on a rail for a message no payment reaches.
     /// `terms` carries the entry's rent terms where its `POLICY` answer
     /// declared them, so a controller that fixes the ground retries without a
-    /// second read.
-    RentRefused { ground: RentRefusalGround, terms: Option<RentTerms> },
+    /// second read. `operator_key` is present on the signature-that-did-not-
+    /// verify ground and absent on the other two, carrying the 33-byte SEC1
+    /// compressed key the relay reconstructed the preimage with, so a
+    /// controller whose shipped community-relay-list entry predates an
+    /// operator-key replacement composes its next message against the relay's
+    /// current key rather than rotating a key that was never stale. The key
+    /// sits here and not inside the ground, because ADR-004's `4042` carries
+    /// the ground as one token and the key as a field of the same message, so
+    /// a ground carrying a payload would give an SDK a value the wire never
+    /// puts inside that token.
+    RentRefused {
+        ground: RentRefusalGround,
+        terms: Option<RentTerms>,
+        operator_key: Option<[u8; 33]>,
+    },
+    /// SCP-IDENT-1112. The entry answered with a wire code that names no term
+    /// of its declared write policy, and this variant carries that code. The
+    /// rent path holds no `PublishOutcome` to record one in, which is where
+    /// the publish path records the same class as `EntryResult::Failed`
+    /// (§3.10.6), so without this variant an SDK maps such an answer onto a
+    /// ground the relay never sent.
+    RelayAnswered { code: u16 },
+    /// SCP-IDENT-1113. The entry's `relay_config` is one of the six
+    /// `18-addressability-and-deployment.md` §18.3.3 names invalid, so it
+    /// declares a policy no publisher can satisfy. `read_policy` returns it,
+    /// and `SkipGround::InvalidRelayConfig` is the publish path's own name for
+    /// the same condition, so one condition reaches a caller under one name on
+    /// both paths.
+    InvalidRelayConfig,
+    /// SCP-IDENT-1114. None of this identity's configured payment adapters
+    /// appears in the entry's `economic.payment_adapters`, so no adapter this
+    /// identity holds can mint a receipt the entry verifies.
+    /// `SkipGround::NoSharedAdapter` is the publish path's own name for the
+    /// same comparison.
+    NoSharedPaymentAdapter,
+    /// SCP-IDENT-1115. `units` times the entry's declared rent price passes
+    /// the `max_settlement` the caller supplied, and `price` carries that
+    /// product so the caller decides whether to raise the ceiling or write to
+    /// another entry. The check runs before `pay_rent` mints anything.
+    SettlementCeilingExceeded { price: Amount },
 }
 
 /// Why an entry refused a `RENT` for a reason no payment satisfies
@@ -984,13 +1058,11 @@ pub enum RentRefusalGround {
     /// The message carried no signature.
     SignatureAbsent,
     /// The signature did not verify against the key the key state at the head
-    /// of the accepted chain lists `Current` in the `#active` role.
-    /// `operator_key` is the 33-byte SEC1 compressed key the relay
-    /// reconstructed the preimage with, so a controller whose shipped
-    /// community-relay-list entry predates an operator-key replacement composes
-    /// its next message against the relay's current key rather than rotating a
-    /// key that was never stale.
-    SignatureInvalid { operator_key: [u8; 33] },
+    /// of the accepted chain lists `Current` in the `#active` role. The key
+    /// the relay reconstructed the preimage with rides on
+    /// `IdentityError::RentRefused`'s own `operator_key` field, because this
+    /// ground rides on ADR-004's `4042` as one token.
+    SignatureInvalid,
     /// The relay holds no chain for the identifier the message names, so it
     /// resolves no key state and no signing key.
     IdentifierUnknownToEntry,
@@ -1095,17 +1167,24 @@ pub struct DeclaredWritePolicy {
     pub rate_limit_publish: Option<u64>,
     /// Retained-kind bytes the relay stores for one identifier. **Absent or
     /// zero means the term is off.** A declared figure clears the floor
-    /// `MIN_STORAGE_BUDGET_IDENTIFIER` registers, whose own figure
-    /// `09-security-model.md` §9.18.17 discloses as open.
+    /// `MIN_STORAGE_BUDGET_IDENTIFIER` registers
+    /// (`09-security-model.md` §9.18.17), so the bytes other parties write
+    /// about an identity and that identity's own inception event always fit.
     pub storage_budget_identifier: Option<u64>,
-    /// The whole retained capacity the relay declares, in bytes. **Absent is
-    /// the retained capacity the operator's own host holds with the ring
-    /// beneath it, and it is not "no limit"** (`09-security-model.md`
-    /// §9.7.4.2 R9).
+    /// The whole retained capacity the relay declares, in bytes. What an
+    /// absent value means is stated once, in
+    /// `18-addressability-and-deployment.md` §18.3.3's `relay_config` table,
+    /// and a publisher that reads this field absent reads it there: the
+    /// consequence for a caller of this method is that the entry still runs a
+    /// ring and still refuses, so an absent value is no reason to send it more
+    /// than a declared one.
     pub storage_budget_total: Option<u64>,
     /// The refusal scopes a current rent exempts an identity from, empty where
-    /// the relay declares none (`09-security-model.md` §9.7.4.2 R9). **A
-    /// publisher rejects an answer naming a member other than `Identifier`**,
+    /// the relay declares none (`09-security-model.md` §9.7.4.2 R9). **An
+    /// absent or empty set exempts no scope**, so a caller reading one from a
+    /// charging entry reads that the entry sells relief from nothing and pays
+    /// rent for coverage alone. **A publisher rejects an answer naming a
+    /// member other than `Identifier`**,
     /// because that is the one member a relay may declare, and records that
     /// entry as `Skipped`. **The field is read as a set, so a declaration
     /// naming one token twice names one member and no rule reads its
@@ -1115,12 +1194,13 @@ pub struct DeclaredWritePolicy {
     /// second member then changes a rule and changes no type.
     pub receipt_exempts: Vec<BudgetScope>,
     /// The SEC1 compressed operator key the answering relay proves control of.
-    /// **No `relay_config` row states it, and the `POLICY` answer carries it**,
-    /// because it is an operand of the `RENT` signature preimage
-    /// (`09-security-model.md` §9.7.4.2 R9) and a relay outside the community
-    /// relay list declares it nowhere else; without it an identity's own
-    /// self-hosted relays run the ring, displace that identity, and sell it no
-    /// coverage it can buy.
+    /// **It is a `relay_config` term like every field above**
+    /// (`18-addressability-and-deployment.md` §18.3.3), and it is the one row
+    /// a validating relay's declaration must carry, because it is an operand
+    /// of the `RENT` signature preimage (`09-security-model.md` §9.7.4.2 R9);
+    /// without it an identity's own self-hosted relays run the ring, displace
+    /// that identity, and sell it no coverage it can buy. The field takes no
+    /// absent form, so an implementer never fills the slot with a constant.
     pub operator_key: [u8; 33],
     /// The relay's economic terms. Absent means the relay charges nothing and
     /// sells no coverage; a declaration carrying `rent` and no `economic` is
@@ -1178,9 +1258,23 @@ pub struct RentTerms {
 /// the relay's own frame rather than comparing an absolute instant against a
 /// clock it never sampled.
 pub struct RentState {
-    /// The identity's current quota, in bytes.
+    /// The identity's current quota, in bytes. Zero where the relay holds no
+    /// rent record for the identity, which is the state a lapse and a drop
+    /// each leave; a controller tells that state from a current one by
+    /// comparing `expires_at_seconds` against `as_of_seconds`.
     pub quota_bytes: u64,
-    /// The bytes this relay holds for the identity under the coverage test.
+    /// The bytes the coverage test counts for the identity: the accepted
+    /// chain, the service record, and every rank-1 divergent suffix
+    /// (`09-security-model.md` §9.7.4.2 R9). This is the figure the coverage
+    /// test reads and never the figure the `Identifier` refusal test reads.
+    pub counted_bytes: u64,
+    /// Every byte this relay holds for the identity at that routing id, the
+    /// two witness kinds and every rank-2 and rank-3 divergent suffix
+    /// included. **The `Identifier` refusal test reads this figure less the
+    /// smaller of `counted_bytes` and `quota_bytes`**
+    /// (`09-security-model.md` §9.7.4.2 R9), so a controller holding
+    /// `counted_bytes` alone could not compute whether any `units` clears a
+    /// refusal.
     pub held_bytes: u64,
     /// The relay's own clock reading past which the identity is uncovered, in
     /// Unix seconds.
@@ -1215,8 +1309,10 @@ pub enum SkipGround {
     /// None of this identity's configured adapters appears in the entry's
     /// `payment_adapters`.
     NoSharedAdapter,
-    /// The entry's `relay_config` is one of the four the addressability spec
+    /// The entry's `relay_config` is one of the six the addressability spec
     /// names invalid, so it declares a policy no publisher can satisfy.
+    /// `IdentityError::InvalidRelayConfig` is the rent path's own name for the
+    /// same condition.
     InvalidRelayConfig,
 }
 
