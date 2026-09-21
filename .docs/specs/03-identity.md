@@ -1176,9 +1176,10 @@ pub struct DeclaredWritePolicy {
     /// about an identity and that identity's own inception event always fit.
     pub storage_budget_identifier: Option<u64>,
     /// The whole retained capacity the relay declares, in bytes. What an
-    /// absent value means is stated once, in
-    /// `18-addressability-and-deployment.md` §18.3.3's `relay_config` table,
-    /// and a publisher that reads this field absent reads it there: the
+    /// absent value means is
+    /// `18-addressability-and-deployment.md` §18.3.3's `relay_config` table's
+    /// own statement, and a publisher that reads this field absent reads it
+    /// there: the
     /// consequence for a caller of this method is that the entry still runs a
     /// ring and still refuses, so an absent value is no reason to send it more
     /// than a declared one.
