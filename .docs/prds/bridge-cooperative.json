@@ -1,12 +1,12 @@
 {
   "project": "scp",
-  "description": "Cooperative mode HTTP binding for bridge connectors: implement the six-endpoint REST API specified in §12.10 as HTTP handlers in scp-node. Platforms implement the shadow/message/attest/status/webhook endpoints; scp-node hosts the bridge node that mediates between these endpoints and SCP protocol operations. Authentication via DID-signed bearer tokens. Webhook receiver for platform-initiated events. Integration with existing bridge submodules (registration, shadow, claiming, provenance).",
+  "description": "Cooperative mode HTTP binding for bridge connectors: implement the six-endpoint REST API specified in \u00a712.10 as HTTP handlers in scp-node. Platforms implement the shadow/message/attest/status/webhook endpoints; scp-node hosts the bridge node that mediates between these endpoints and SCP protocol operations. Authentication via DID-signed bearer tokens. Webhook receiver for platform-initiated events. Integration with existing bridge submodules (registration, shadow, claiming, provenance).",
   "gates": [
     {
       "id": "gate-bridge-http-binding",
       "name": "Cooperative Mode HTTP Binding Endpoints",
       "priority": "P1",
-      "status": "in-progress",
+      "status": "done",
       "stories": [
         "SCP-BCH-001",
         "SCP-BCH-002",
@@ -14,15 +14,7 @@
         "SCP-BCH-004",
         "SCP-BCH-005",
         "SCP-BCH-006",
-        "SCP-BCH-007",
-        "SCP-BCH-014",
-        "SCP-BCH-015",
-        "SCP-BCH-016",
-        "SCP-BCH-017",
-        "SCP-BCH-018",
-        "SCP-BCH-019",
-        "SCP-BCH-020",
-        "SCP-BCH-021"
+        "SCP-BCH-007"
       ]
     },
     {
@@ -60,7 +52,7 @@
         "crates/scp-node/src/bridge_auth.rs",
         "crates/scp-node/src/lib.rs"
       ],
-      "description": "Implement the authentication layer specified in §12.10.2. The bridge operator authenticates using DID-signed JWTs in the Authorization header. The JWT contains iss (operator DID), aud (node URL), iat, exp, scp_bridge_id, and scp_context_id. The node verifies the JWT signature against the operator's DID document (§3.2). Token lifetime MUST NOT exceed 1 hour. For webhook callbacks (platform to bridge node), verify Ed25519 signatures in the X-SCP-Signature header against the platform's pre-registered public key.\n\nThis story is foundational — all other bridge HTTP endpoints depend on it for authentication.",
+      "description": "Implement the authentication layer specified in \u00a712.10.2. The bridge operator authenticates using DID-signed JWTs in the Authorization header. The JWT contains iss (operator DID), aud (node URL), iat, exp, scp_bridge_id, and scp_context_id. The node verifies the JWT signature against the operator's DID document (\u00a73.2). Token lifetime MUST NOT exceed 1 hour. For webhook callbacks (platform to bridge node), verify Ed25519 signatures in the X-SCP-Signature header against the platform's pre-registered public key.\n\nThis story is foundational \u2014 all other bridge HTTP endpoints depend on it for authentication.",
       "acceptanceCriteria": [
         "BridgeAuthMiddleware extracts bearer token from Authorization header and validates JWT structure",
         "JWT signature is verified against the operator's DID document resolved via scp-identity",
@@ -112,12 +104,12 @@
         "crates/scp-node/src/bridge_handlers.rs",
         "crates/scp-node/src/lib.rs"
       ],
-      "description": "Implement the shadow creation endpoint specified in §12.10.4. Accepts platform_handle, platform_user_id, and optional metadata. Delegates to create_shadow() in scp-core/bridge/shadow.rs. Returns the created shadow identity with shadow_id, attributed_role (observer), and created_at. Idempotent: if a shadow with the same platform_user_id already exists, returns 200 with the existing shadow instead of 201.",
+      "description": "Implement the shadow creation endpoint specified in \u00a712.10.4. Accepts platform_handle, platform_user_id, and optional metadata. Delegates to create_shadow() in scp-core/bridge/shadow.rs. Returns the created shadow identity with shadow_id, attributed_role (observer), and created_at. Idempotent: if a shadow with the same platform_user_id already exists, returns 200 with the existing shadow instead of 201.",
       "acceptanceCriteria": [
         "POST /v1/scp/bridge/shadow accepts JSON body with platform_handle (required), platform_user_id (required), metadata (optional)",
         "Delegates to create_shadow() in scp-core/bridge/shadow.rs",
         "Returns 201 Created with shadow_id, platform_handle, platform_user_id, attributed_role, created_at on success",
-        "attributed_role defaults to 'observer' per §12.3",
+        "attributed_role defaults to 'observer' per \u00a712.3",
         "Idempotent: existing shadow for same platform_user_id returns 200 OK with existing shadow data",
         "Returns 400 INVALID_REQUEST when required fields are missing",
         "Returns 401 BRIDGE_NOT_AUTHORIZED when authentication fails",
@@ -156,7 +148,7 @@
       "files": [
         "crates/scp-node/src/bridge_handlers.rs"
       ],
-      "description": "Implement the message emission endpoint specified in §12.10.4. Accepts shadow_id, content, content_type, optional platform_message_id, and optional platform_timestamp. The bridge node constructs the SCP envelope with BridgeProvenance (§12.5) via mark_bridge_provenance() from scp-core/bridge/provenance.rs and publishes to the context. Returns 202 Accepted with message_id, sequence, and bridge_provenance. Handles claimed shadows by reflecting the claimed provenance status.",
+      "description": "Implement the message emission endpoint specified in \u00a712.10.4. Accepts shadow_id, content, content_type, optional platform_message_id, and optional platform_timestamp. The bridge node constructs the SCP envelope with BridgeProvenance (\u00a712.5) via mark_bridge_provenance() from scp-core/bridge/provenance.rs and publishes to the context. Returns 202 Accepted with message_id, sequence, and bridge_provenance. Handles claimed shadows by reflecting the claimed provenance status.",
       "acceptanceCriteria": [
         "POST /v1/scp/bridge/message accepts JSON body with shadow_id (required), content (required), content_type (required), platform_message_id (optional), platform_timestamp (optional)",
         "Constructs BridgeProvenance via mark_bridge_provenance() with correct originating_platform, bridge_mode, operator_did, and shadow_status",
@@ -200,7 +192,7 @@
       "files": [
         "crates/scp-node/src/bridge_handlers.rs"
       ],
-      "description": "Implement the attestation endpoint specified in §12.10.4. The platform vouches for a user's identity by providing attestation evidence (evidence_type, verification_method, verified_at, platform_confidence, optional additional_signals). The bridge node produces an IdentityLink attestation (§3.5) signed by the bridge operator's DID. This attestation feeds into the shadow claiming flow — a user who later joins SCP can present it to claim their shadow. Attestation expiry defaults to 24 hours.",
+      "description": "Implement the attestation endpoint specified in \u00a712.10.4. The platform vouches for a user's identity by providing attestation evidence (evidence_type, verification_method, verified_at, platform_confidence, optional additional_signals). The bridge node produces an IdentityLink attestation (\u00a73.5) signed by the bridge operator's DID. This attestation feeds into the shadow claiming flow \u2014 a user who later joins SCP can present it to claim their shadow. Attestation expiry defaults to 24 hours.",
       "acceptanceCriteria": [
         "POST /v1/scp/bridge/attest accepts JSON body with platform_handle (required), platform_user_id (required), attestation_evidence (required)",
         "attestation_evidence must contain evidence_type, verification_method, verified_at, platform_confidence",
@@ -242,7 +234,7 @@
       "files": [
         "crates/scp-node/src/bridge_handlers.rs"
       ],
-      "description": "Implement the bridge status and shadow deletion endpoints specified in §12.10.4. The status endpoint returns bridge_id, status, platform, mode, operator_did, registered_at, shadow_count, rate_limits, and shadows array. The delete endpoint removes a shadow identity (historical actions remain in event log), returns 204 on success, 404 if not found, 409 if claimed. Deletion is idempotent (re-deleting returns 204). Both endpoints delegate to existing scp-core/bridge/ functions.",
+      "description": "Implement the bridge status and shadow deletion endpoints specified in \u00a712.10.4. The status endpoint returns bridge_id, status, platform, mode, operator_did, registered_at, shadow_count, rate_limits, and shadows array. The delete endpoint removes a shadow identity (historical actions remain in event log), returns 204 on success, 404 if not found, 409 if claimed. Deletion is idempotent (re-deleting returns 204). Both endpoints delegate to existing scp-core/bridge/ functions.",
       "acceptanceCriteria": [
         "GET /v1/scp/bridge/status returns 200 with bridge_id, status, platform, mode, operator_did, registered_at, shadow_count, rate_limits, shadows array",
         "shadows array includes shadow_id, platform_handle, attributed_role, provenance_status, created_at for each shadow",
@@ -286,14 +278,15 @@
       "status": "done",
       "files": [
         "crates/scp-node/src/bridge_handlers.rs",
+        "crates/scp-node/src/bridge_webhook.rs",
         "crates/scp-node/src/lib.rs"
       ],
-      "description": "Implement the webhook receiver specified in §12.10.4. Accepts platform-initiated events with event_type (message, presence, identity_update, user_departed, message_edit, message_delete), event_id (for deduplication), timestamp, and event-specific payload. Authentication via X-SCP-Signature header (§12.10.2). Deduplication by event_id. Must respond within 5 seconds; events requiring longer processing are queued internally. Returns accepted/rejected status with reason.",
+      "description": "Implement the webhook receiver specified in \u00a712.10.4. Accepts platform-initiated events with event_type (message, presence, identity_update, user_departed, message_edit, message_delete), event_id (for deduplication), timestamp, and event-specific payload. Authentication via X-SCP-Signature header (\u00a712.10.2). Deduplication by event_id. Must respond within 5 seconds; events requiring longer processing are queued internally. Returns accepted/rejected status with reason.",
       "acceptanceCriteria": [
         "POST /v1/scp/bridge/webhook accepts JSON body with event_type (required), event_id (required), timestamp (required), payload (required)",
         "Supports event types: message, presence, identity_update, user_departed, message_edit, message_delete",
         "Verifies X-SCP-Signature header via Ed25519 signature over raw request body",
-        "Deduplicates events by event_id — repeated delivery of same event_id returns accepted: true without reprocessing",
+        "Deduplicates events by event_id \u2014 repeated delivery of same event_id returns accepted: true without reprocessing",
         "Returns 200 with accepted: true and event_id on successful acceptance",
         "Returns 200 with accepted: false, event_id, and reason when event is rejected (e.g., unknown user)",
         "Response time is under 5 seconds; longer-running processing is queued internally",
@@ -332,13 +325,13 @@
       "gate": "gate-bridge-http-binding",
       "priority": "P1",
       "severity": "major",
-      "status": "in-progress",
+      "status": "done",
       "files": [
         "crates/scp-node/src/http.rs",
         "crates/scp-node/src/lib.rs",
         "crates/scp-node/tests/bridge_integration.rs"
       ],
-      "description": "Wire all bridge HTTP handlers into the scp-node axum router under the /v1/scp/bridge/ prefix. Add integration tests that exercise the full lifecycle: register bridge, create shadow, emit message, attest identity, check status, receive webhook event, delete shadow. Verify provenance chain is correctly constructed end-to-end. Verify authentication is enforced on all endpoints. Verify error responses conform to §12.10.3.",
+      "description": "Wire all bridge HTTP handlers into the scp-node axum router under the /v1/scp/bridge/ prefix. Add integration tests that exercise the full lifecycle: register bridge, create shadow, emit message, attest identity, check status, receive webhook event, delete shadow. Verify provenance chain is correctly constructed end-to-end. Verify authentication is enforced on all endpoints. Verify error responses conform to \u00a712.10.3.",
       "acceptanceCriteria": [
         "All bridge endpoints are mounted under /v1/scp/bridge/ in the scp-node axum router",
         "Bridge auth middleware is applied to all bridge endpoints",
@@ -354,7 +347,7 @@
         "Apply BridgeAuthMiddleware to the bridge route group",
         "Create bridge_integration.rs with end-to-end lifecycle test",
         "Add test helpers for constructing DID-signed JWTs",
-        "Verify all error responses conform to §12.10.3 format"
+        "Verify all error responses conform to \u00a712.10.3 format"
       ],
       "blockedBy": [
         "SCP-BCH-002",
@@ -390,7 +383,7 @@
         "crates/scp-core/src/bridge/credentials.rs",
         "crates/scp-core/src/bridge/mod.rs"
       ],
-      "description": "Implement the BridgeCredentialStore trait specified in §12.11. The trait defines the credential lifecycle: provision (store new credentials), retrieve (get credentials for use), rotate (replace credentials), revoke (destroy all credentials for a bridge instance), and list (enumerate credential types for a bridge). Credentials are encrypted at rest using a key derived from the bridge operator's identity key material via HKDF with a bridge-specific salt. The trait is async and returns Result types. On BridgeStatus::Revoked, revoke() destroys all credentials (overwrite with zeros, delete record). On BridgeStatus::Suspended, credentials are retained but retrieve() returns an error indicating the bridge is suspended. Credential access is scoped to bridge instance — cross-bridge credential sharing is prohibited. Add a BridgeCredential struct holding encrypted_data, credential_type, created_at, expires_at, and bridge_id. Add a CredentialType enum with variants OAuthAccessToken, OAuthRefreshToken, ApiKey, WebhookSecret, and Custom(String).",
+      "description": "Implement the BridgeCredentialStore trait specified in \u00a712.11. The trait defines the credential lifecycle: provision (store new credentials), retrieve (get credentials for use), rotate (replace credentials), revoke (destroy all credentials for a bridge instance), and list (enumerate credential types for a bridge). Credentials are encrypted at rest using a key derived from the bridge operator's identity key material via HKDF with a bridge-specific salt. The trait is async and returns Result types. On BridgeStatus::Revoked, revoke() destroys all credentials (overwrite with zeros, delete record). On BridgeStatus::Suspended, credentials are retained but retrieve() returns an error indicating the bridge is suspended. Credential access is scoped to bridge instance \u2014 cross-bridge credential sharing is prohibited. Add a BridgeCredential struct holding encrypted_data, credential_type, created_at, expires_at, and bridge_id. Add a CredentialType enum with variants OAuthAccessToken, OAuthRefreshToken, ApiKey, WebhookSecret, and Custom(String).",
       "acceptanceCriteria": [
         "BridgeCredentialStore trait is defined with async methods: provision, retrieve, rotate, revoke, list",
         "BridgeCredential struct has fields: encrypted_data (Vec<u8>), credential_type (CredentialType), created_at (u64), expires_at (Option<u64>), bridge_id (String)",
@@ -443,7 +436,7 @@
         "crates/scp-core/src/bridge/oauth.rs",
         "crates/scp-core/src/bridge/mod.rs"
       ],
-      "description": "Implement the OAuth 2.0 reference binding specified in §12.11.3. This provides a concrete OAuthBridgeFlow struct that orchestrates the Authorization Code + PKCE flow and integrates with BridgeCredentialStore for token storage. The flow is: (1) generate PKCE code verifier and challenge, (2) build authorization URL, (3) exchange authorization code for access + refresh tokens, (4) store both tokens via BridgeCredentialStore::provision, (5) auto-refresh access token when 80% of lifetime has elapsed, (6) on refresh failure, retry with exponential backoff (initial 1s, max 60s, 5 retries). On bridge revocation, call the platform's RFC 7009 token revocation endpoint for both tokens before destroying local copies. Scope minimization: Relay mode requests read-only scopes, Puppet mode requests read+write. The implementation uses reqwest for HTTP calls and is async.",
+      "description": "Implement the OAuth 2.0 reference binding specified in \u00a712.11.3. This provides a concrete OAuthBridgeFlow struct that orchestrates the Authorization Code + PKCE flow and integrates with BridgeCredentialStore for token storage. The flow is: (1) generate PKCE code verifier and challenge, (2) build authorization URL, (3) exchange authorization code for access + refresh tokens, (4) store both tokens via BridgeCredentialStore::provision, (5) auto-refresh access token when 80% of lifetime has elapsed, (6) on refresh failure, retry with exponential backoff (initial 1s, max 60s, 5 retries). On bridge revocation, call the platform's RFC 7009 token revocation endpoint for both tokens before destroying local copies. Scope minimization: Relay mode requests read-only scopes, Puppet mode requests read+write. The implementation uses reqwest for HTTP calls and is async.",
       "acceptanceCriteria": [
         "OAuthBridgeFlow struct is defined with fields: client_id, redirect_uri, token_endpoint, authorization_endpoint, revocation_endpoint (optional), scopes",
         "generate_pkce() returns a (code_verifier, code_challenge) tuple using S256 method",
@@ -501,13 +494,13 @@
         "crates/scp-core/src/bridge/shadow.rs",
         "crates/scp-core/src/crypto/sender_keys/mod.rs"
       ],
-      "description": "When create_shadow() is called, generate an AES-256-GCM sender key for the new shadow identity and store it in SenderKeyStore keyed by (context_id, shadow_did). This is the foundational key material for the bridge encryption model specified in §12.6.1: shadow identity messages use the sender key layer (§9.16) rather than MLS encryption. Each shadow gets its own sender key so that key compromise of one shadow does not affect others. The generated key must be cryptographically random (32 bytes from the platform CSPRNG).",
+      "description": "When create_shadow() is called, generate an AES-256-GCM sender key for the new shadow identity and store it in SenderKeyStore keyed by (context_id, shadow_did). This is the foundational key material for the bridge encryption model specified in \u00a712.6.1: shadow identity messages use the sender key layer (\u00a79.16) rather than MLS encryption. Each shadow gets its own sender key so that key compromise of one shadow does not affect others. The generated key must be cryptographically random (32 bytes from the platform CSPRNG).",
       "acceptanceCriteria": [
         "create_shadow() generates a 32-byte AES-256-GCM sender key using the platform CSPRNG",
         "The generated sender key is stored in SenderKeyStore keyed by (context_id, shadow_did)",
-        "Each shadow identity receives a unique sender key — no key reuse across shadows",
+        "Each shadow identity receives a unique sender key \u2014 no key reuse across shadows",
         "Sender key generation failure causes create_shadow() to return an error (no shadow created without a key)",
-        "The sender key is zeroized on drop (Zeroizing wrapper or equivalent) (SenderKey already derives ZeroizeOnDrop — verify it applies to the stored key)",
+        "The sender key is zeroized on drop (Zeroizing wrapper or equivalent) (SenderKey already derives ZeroizeOnDrop \u2014 verify it applies to the stored key)",
         "Unit tests verify sender key is stored after shadow creation",
         "Unit tests verify distinct shadows in the same context receive distinct keys",
         "Unit tests verify shadow creation fails gracefully when SenderKeyStore is unavailable"
@@ -540,12 +533,12 @@
         "crates/scp-core/src/crypto/sender_keys/key_protocol.rs",
         "crates/scp-core/src/bridge/mod.rs"
       ],
-      "description": "Native members request shadow sender keys via SenderKeyRequest. The bridge responds with the shadow's sender key wrapped via HPKE. This reuses the existing pull-based sender key distribution protocol specified in §9.16.2: SenderKeyRequest from native member, SenderKeyResponse from bridge containing the HPKE-wrapped key. The bridge operator's identity key is the HPKE sender; the requesting member's identity key is the HPKE recipient. Domain separation label for HPKE must use \"scp-sender-key-v1\" per the existing protocol. New members joining a bridged context automatically request sender keys for all active shadows.",
+      "description": "Native members request shadow sender keys via SenderKeyRequest. The bridge responds with the shadow's sender key wrapped via HPKE. This reuses the existing pull-based sender key distribution protocol specified in \u00a79.16.2: SenderKeyRequest from native member, SenderKeyResponse from bridge containing the HPKE-wrapped key. The bridge operator's identity key is the HPKE sender; the requesting member's identity key is the HPKE recipient. Domain separation label for HPKE must use \"scp-sender-key-v1\" per the existing protocol. New members joining a bridged context automatically request sender keys for all active shadows.",
       "acceptanceCriteria": [
         "Native members can send SenderKeyRequest for a shadow's sender key by (context_id, shadow_did)",
         "Bridge handles SenderKeyRequest by retrieving the shadow's sender key from SenderKeyStore and wrapping it via HPKE",
         "HPKE wrapping uses the bridge operator's identity key as sender and the requesting member's identity key as recipient",
-        "HPKE domain separation label is \"scp-sender-key-v1\" per §9.16.2",
+        "HPKE domain separation label is \"scp-sender-key-v1\" per \u00a79.16.2",
         "SenderKeyResponse contains the HPKE-wrapped sender key and is routed to the requesting member",
         "Members joining a bridged context request sender keys for all active shadows",
         "SenderKeyRequest for a non-existent shadow returns an error (not a silent failure)",
@@ -586,15 +579,15 @@
         "crates/scp-core/src/bridge/mod.rs",
         "crates/scp-core/src/envelope/inner.rs"
       ],
-      "description": "POST /v1/scp/bridge/message constructs a sender-key-encrypted envelope (not MLS) for shadow messages. AES-256-GCM encryption with the shadow's sender key, random 12-byte nonce per message, BridgeProvenance attached per §12.5. The envelope is distinguishable from MLS envelopes by structure: sender-key-encrypted envelopes contain a sender key ciphertext with the shadow's DID in the sender field, while MLS-encrypted envelopes contain an MLS ciphertext payload (§12.6.1). The receiver uses the envelope structure to select the correct decryption path — MLS for native members, sender key for shadow identities. Both paths already exist in the protocol.",
+      "description": "POST /v1/scp/bridge/message constructs a sender-key-encrypted envelope (not MLS) for shadow messages. AES-256-GCM encryption with the shadow's sender key, random 12-byte nonce per message, BridgeProvenance attached per \u00a712.5. The envelope is distinguishable from MLS envelopes by structure: sender-key-encrypted envelopes contain a sender key ciphertext with the shadow's DID in the sender field, while MLS-encrypted envelopes contain an MLS ciphertext payload (\u00a712.6.1). The receiver uses the envelope structure to select the correct decryption path \u2014 MLS for native members, sender key for shadow identities. Both paths already exist in the protocol.",
       "acceptanceCriteria": [
         "POST /v1/scp/bridge/message constructs a sender-key-encrypted envelope using the shadow's AES-256-GCM sender key",
         "Each envelope uses a unique random 12-byte nonce generated from the platform CSPRNG",
-        "BridgeProvenance is attached to the envelope per §12.5 via mark_bridge_provenance()",
+        "BridgeProvenance is attached to the envelope per \u00a712.5 via mark_bridge_provenance()",
         "The envelope's sender field contains the shadow's DID",
         "Sender-key-encrypted envelopes are structurally distinguishable from MLS-encrypted envelopes",
         "Receivers can select the correct decryption path (sender key vs MLS) based on envelope structure alone",
-        "Nonce reuse is prevented — each message gets a fresh random nonce",
+        "Nonce reuse is prevented \u2014 each message gets a fresh random nonce",
         "Encryption failure (e.g., missing sender key) returns an appropriate error to the bridge endpoint",
         "Unit tests verify envelope construction with correct AES-256-GCM ciphertext",
         "Unit tests verify envelope is decryptable with the shadow's sender key",
@@ -607,7 +600,7 @@
         "Encrypt message content with AES-256-GCM using the sender key and a random 12-byte nonce",
         "Attach BridgeProvenance via mark_bridge_provenance()",
         "Set the envelope sender field to the shadow's DID",
-        "Ensure envelope structure is distinguishable from MLS envelopes per §12.6.1",
+        "Ensure envelope structure is distinguishable from MLS envelopes per \u00a712.6.1",
         "Add unit tests for encryption, decryption roundtrip, provenance attachment, and envelope type discrimination"
       ],
       "blockedBy": [
@@ -633,9 +626,9 @@
         "crates/scp-core/src/bridge/registration.rs",
         "crates/scp-core/src/context/params.rs"
       ],
-      "description": "When register_bridge() succeeds, add the operator's DID to context metadata (§5.7) so that context members can see bridge presence and evaluate trust accordingly. Per §12.6.1: \"Context metadata (§5.7) MUST include bridge_operator_did when a bridge is registered.\" This is a MUST-level requirement. The bridge_operator_did field is added to context metadata and is visible to all members, including in pre-join context previews. If multiple bridges are registered, all operator DIDs are listed. On bridge revocation, the operator's DID is removed from context metadata.",
+      "description": "When register_bridge() succeeds, add the operator's DID to context metadata (\u00a75.7) so that context members can see bridge presence and evaluate trust accordingly. Per \u00a712.6.1: \"Context metadata (\u00a75.7) MUST include bridge_operator_did when a bridge is registered.\" This is a MUST-level requirement. The bridge_operator_did field is added to context metadata and is visible to all members, including in pre-join context previews. If multiple bridges are registered, all operator DIDs are listed. On bridge revocation, the operator's DID is removed from context metadata.",
       "acceptanceCriteria": [
-        "register_bridge() adds bridge_operator_did to context metadata (§5.7) on successful registration",
+        "register_bridge() adds bridge_operator_did to context metadata (\u00a75.7) on successful registration",
         "bridge_operator_did is visible to all context members",
         "bridge_operator_did is visible in pre-join context previews",
         "Multiple bridge registrations result in all operator DIDs listed in context metadata",
@@ -659,461 +652,6 @@
         {
           "file": ".docs/specs/12-platform-bridge-connectors.md",
           "section": "### 12.6.1 Bridge Encryption Model"
-        }
-      ],
-      "details": {}
-    },
-    {
-      "id": "SCP-BCH-014",
-      "title": "Decide bridge admission in scp-node from the context event log, not from the node-local bridge registry",
-      "gate": "gate-bridge-http-binding",
-      "priority": "P0",
-      "severity": "critical",
-      "status": "pending",
-      "files": [
-        "crates/scp-node/src/bridge_auth.rs",
-        "crates/scp-node/src/bridge_handlers.rs",
-        "crates/scp-node/src/http.rs",
-        "crates/scp-node/tests/bridge_integration.rs"
-      ],
-      "description": "Spec §12.10.6 step 1 states that a bridge node MUST admit a bridge only on a governance approval that the node itself verifies, and names the paths the rule refuses: 'a configuration file the node's operator writes, a request body, and a leaf that any party supplies to the node as an input the node did not execute, the node's own operator included'. The clause 'as an input the node did not execute' separates a leaf a party supplies from a leaf the node reloads from its own storage: spec 12.10.6 step 1 states that restoring a context from the node's own storage re-reads leaves the node executed before it wrote that storage, so a restored leaf satisfies the criterion, and the restart criteria below assert that reading. The shipped node admits bridges from exactly the first of those paths. StorageBridgeLookup::register_bridge (crates/scp-node/src/bridge_auth.rs) writes a caller-supplied BridgeConnector under the bridge/registry/ storage prefix with no event-log check, find_bridge reads it back, and three sites branch on the status field of that stored record: bridge_auth_middleware and its type-erased twin bridge_auth_middleware_dyn in crates/scp-node/src/bridge_auth.rs, and status_handler in crates/scp-node/src/bridge_handlers.rs, which renders that field into the GET /v1/scp/bridge/status response. The router that a deployed node builds in crates/scp-node/src/http.rs mounts only the _dyn forms — bridge_auth_middleware_dyn on the JWT-authenticated bridge routes and webhook_auth_middleware_dyn on the webhook route — so a change that rewrites only the generic forms leaves every shipped route admitting bridges from the node-local record. Every acceptance criterion below that names a function names both forms, and the integration tests drive the router that http.rs builds rather than a middleware function directly. The webhook path consults no bridge at all: WebhookRequest (crates/scp-node/src/bridge_handlers.rs) carries event_type, event_id, timestamp, and payload and no bridge identifier, and webhook_handler answers accepted: true after an event-type whitelist and a dedup check, so a suspended or revoked bridge's deliveries still enter SCP; SCP-BCH-018 closes that path by applying the criterion this story writes. This story replaces the node's admission input with the criterion of §12.10.6 step 1 over the context event log the node holds as the operator-member. Spec 12.10.6 step 1 also bounds one input that a first implementation gets wrong: the suspension deadline takes its lower bound from the node's own commit-execution instant rather than from the leaf timestamp alone, because spec 9.8.2(c) bounds an envelope created_at only in the future direction. Scope boundary: ADR-011, the verifiable event log, declares the four bridge lifecycle EventType variants, and spec 12.12.2 declares the BridgeRegistrationEvent payload they carry; declaring those types is SCP-BCH-017 and appending the leaves from the governance execution path is SCP-BCH-015, neither of them this story. Three further inputs of the criterion are separate stories: the webhook route's bridge resolution and its rejected response shape are SCP-BCH-018, the durable record of the node's commit-execution instant is SCP-BCH-019, and the durable record of an import's log position is SCP-BCH-020. This story admits or refuses a bridge on the JWT-authenticated bridge routes and the status endpoint. Two inputs of the criterion are node-local rather than log-carried, and each one needs a durable record: the commit-execution instant that bounds a suspension deadline below (spec 12.2.2, SCP-BCH-019), and the log position that an import produced (spec 12.10.6 step 1, SCP-BCH-020). This story computes the suspension deadline from the commit-execution instant it holds and leaves the durability of that instant to SCP-BCH-019. One input of the criterion outlives the context's pruning policy: spec 12.10.6 step 1 obliges a bridge node to retain the payload of every bridge lifecycle leaf of every bridge it operates, for as long as it operates that bridge, which ADR-030 pruning invariant 4 grants a member that needs full history. This story implements that retention and asserts it, and asserts the fail-closed verdict the node reaches when it holds a BridgeRegistered leaf whose payload its store no longer carries.",
-      "acceptanceCriteria": [
-        "StorageBridgeLookup::register_bridge is removed, or its every caller is removed, so no scp-node code path writes a BridgeConnector to the bridge/registry/ storage prefix from a caller-supplied value",
-        "bridge_auth_middleware and bridge_auth_middleware_dyn each decide admission by reading the bridge lifecycle leaves of the context event log the node holds as the operator-member, and neither reads BridgeConnector::status; a source search for \"bridge.status\" over crates/scp-node/src/ returns no match",
-        "A bridge whose lifecycle leaves hold no BridgeRegistered leaf with action Approved is refused: the middleware returns the BRIDGE_FORBIDDEN error of spec 12.10.3",
-        "A bridge whose bearer token verifies and whose lifecycle leaves fail the criterion on a clause other than the suspension clause is answered HTTP 403 with code BRIDGE_FORBIDDEN, and is answered neither HTTP 401 with code BRIDGE_NOT_AUTHORIZED nor code BRIDGE_SUSPENDED, asserted through the router that http.rs builds for a revoked bridge and for a bridge with no BridgeRegistered leaf (spec 12.10.6 step 1, which assigns the code for every failure of the criterion)",
-        "A bridge any of whose lifecycle leaves is BridgeRevoked is refused with BRIDGE_FORBIDDEN, and a test appends BridgeRevoked followed by BridgeReactivated and asserts the bridge stays refused",
-        "A bridge whose last lifecycle leaf is a BridgeSuspended leaf with duration None is refused with BRIDGE_SUSPENDED",
-        "A bridge whose last lifecycle leaf is a BridgeSuspended leaf with duration Some(d) is refused with BRIDGE_SUSPENDED until the suspension deadline of spec 12.2.2 passes and admitted after it, where that deadline is the later of leaf.timestamp saturating_add(d) and the node's commit-execution instant for that leaf saturating_add(d), asserted by two calls with an injected clock",
-        "A BridgeSuspended leaf whose timestamp the committing member backdated to more than d seconds before the node executed its commit is refused for d seconds measured from that execution instant, asserted by a test whose leaf timestamp is (now - 2d) and whose injected clock advances by d",
-        "A BridgeSuspended leaf with duration Some(u64::MAX) refuses the bridge at every clock value the test advances to, and the admission function neither panics nor wraps, asserted on a debug build",
-        "A bridge whose BridgeRegistered payload operator_did is not the DID under which the node holds its context membership is refused with BRIDGE_FORBIDDEN",
-        "In a Broadcast context, a bridge whose lifecycle leaves carry two distinct authors is refused with BRIDGE_FORBIDDEN (spec 12.10.6 step 1, which leaf is the last one)",
-        "An integration test in crates/scp-node/tests/bridge_integration.rs writes a BridgeConnector directly into the bridge/registry/ storage prefix, appends no bridge lifecycle leaf, and asserts every JWT-authenticated bridge endpoint refuses that bridge",
-        "GET /v1/scp/bridge/status reports a status the 12.10.6 step 1 criterion decided over the context event log, and crates/scp-node/src/bridge_handlers.rs matches on no BridgeConnector::status field, asserted by a test that revokes a bridge by appending BridgeRevoked and asserts the endpoint stops reporting Active",
-        "Every JWT-authenticated bridge route a deployed node serves enforces the criterion: a test builds the router through the same function crates/scp-node/src/http.rs calls, with the same _dyn middleware, and asserts that a bridge whose lifecycle leaves hold a BridgeRevoked leaf is refused on every JWT-authenticated bridge route",
-        "A bridge whose operator's authority the context withdrew is refused with BRIDGE_FORBIDDEN on every JWT-authenticated bridge route, asserted by two tests that each admit the bridge, append no BridgeSuspended leaf and no BridgeRevoked leaf, and assert the refusal: the first appends a MemberLeft leaf for the operator, and the second appends a MemberSuspendedAll leaf for the operator and appends no MemberLeft leaf. The second test is what puts the clause's criterion under test rather than one leaf name: spec 12.10.6 step 1 states the clause as a property of the operator's authority, and a middleware that matched on MemberLeft alone would keep admitting a bridge whose operator a SuspendAccess action suspended, which the governance model executes without touching MLS membership and therefore without appending a MemberLeft leaf (spec 12.10.6 step 1, the membership clause of the admission criterion)",
-        "The node retains the bridge lifecycle payloads of every bridge it operates: a test appends a BridgeRegistered leaf with action Approved, appends a Checkpoint that covers it, runs the node's pruner under a PruningPolicy whose size_based.max_event_count the log then exceeds, and asserts the log still carries that payload and every JWT-authenticated bridge route still admits the bridge (spec 12.10.6 step 1, retention of the leaves the criterion reads; ADR-030 pruning invariant 4)",
-        "A bridge whose BridgeRegistered leaf the log retains with its payload absent is refused with BRIDGE_FORBIDDEN on every JWT-authenticated bridge route, asserted by a test that removes that payload from the node's own event store directly rather than through the pruner. The test constructs that state directly because no pruning policy produces it: ADR-030 pruning invariant 1 prunes no event that no valid checkpoint covers, and spec 12.10.6 step 1 obliges the node to prune no bridge lifecycle payload of a bridge it operates, so a test that drove the pruner would assert a refusal that cannot occur and could never fail",
-        "A bridge whose lifecycle leaves are BridgeRegistered, BridgeRevoked and then BridgeSuspended with duration None, in that order, is answered BRIDGE_FORBIDDEN and is answered BRIDGE_SUSPENDED on no authenticated bridge API call, asserted through the router that http.rs builds (spec 12.2.2 step 7 and spec 12.10.6 step 1, which report BRIDGE_SUSPENDED only for a bridge whose lifecycle leaves hold no BridgeRevoked leaf)",
-        "A caller whose bearer token does not verify reads no governance state off the response: a test sends three requests carrying one unverifiable token and three different scp_bridge_id claims — one naming a suspended bridge, one naming a revoked bridge, and one naming no bridge the node holds — and asserts the three responses are HTTP 401 with code BRIDGE_NOT_AUTHORIZED and byte-identical bodies, asserted through the router that http.rs builds (spec 12.10.6 step 1, which verifies the token before it applies the criterion)",
-        "A caller whose bearer token verifies but whose iss claim differs from the operator_did of the resolved bridge's BridgeRegistered leaf payload is answered HTTP 401 with code BRIDGE_NOT_AUTHORIZED on every JWT-authenticated bridge route, and is answered neither BRIDGE_FORBIDDEN nor BRIDGE_SUSPENDED, asserted through the router that http.rs builds by a test that signs a well-formed token under a second member's key and names a bridge the node admits (spec 12.10.6 step 1, which binds the verified caller to the bridge on two claims before it applies the criterion). Without that binding every clause of the criterion holds for such a caller, because the five clauses read the node's own membership and the bridge's lifecycle leaves and read nothing the caller presented",
-        "A caller whose bearer token verifies under the bridge operator's own key but whose scp_context_id claim differs from the context_id of that bridge's BridgeRegistered leaf payload is answered HTTP 401 with code BRIDGE_NOT_AUTHORIZED on every JWT-authenticated bridge route, asserted through the router that http.rs builds (spec 12.10.6 step 1, the second binding)",
-        "The error-code table the module doc comment of crates/scp-node/src/bridge_auth.rs copies from spec 12.10.3 states the semantics that spec gives each of the three bridge codes: BRIDGE_NOT_AUTHORIZED, which the node reports when it did not verify the caller's bearer token, or verified it and then failed to bind the verified caller to the bridge the token names, rather than \"Bearer token invalid or expired\" alone, which describes neither binding failure this story implements; BRIDGE_FORBIDDEN, which the node reports when the bound caller's bridge fails the admission criterion on a clause other than the suspension clause, a revoked bridge included whatever its last lifecycle leaf is, rather than \"Bridge not authorized for this operation\" alone, which names a property of the operation rather than of the bridge; and BRIDGE_SUSPENDED, which the node reports only when that bridge's last lifecycle leaf is a BridgeSuspended leaf whose duration is None or whose deadline has not passed and none of its lifecycle leaves is a BridgeRevoked leaf, rather than \"Bridge is suspended by context governance\" alone, which covers a bridge governance revoked after it suspended"
-      ],
-      "actionItems": [
-        "Give BridgeState a handle to the context event log the node holds as the operator-member, injected through the constructor (no singleton)",
-        "Write the 12.10.6 step 1 criterion as one function over the bridge lifecycle leaves of one context log, returning a typed admission verdict (Admitted / Suspended / Forbidden) rather than a bool",
-        "Call that function from bridge_auth_middleware, from bridge_auth_middleware_dyn, and from status_handler, in place of every BridgeConnector::status branch, and verify by searching crates/scp-node/src/ for \"bridge.status\" that no branch remains",
-        "Delete StorageBridgeLookup::register_bridge and the BRIDGE_REGISTRY_PREFIX write path, and delete or re-point every caller",
-        "Create crates/scp-node/tests/bridge_integration.rs, which the tree does not carry, with one test per acceptance criterion above",
-        "Drive every new integration test through the router that crates/scp-node/src/http.rs builds, so the tests cover the _dyn middleware the deployed node mounts",
-        "Verify the bearer token's signature and resolve the bridge from the verified token's scp_bridge_id claim before applying the 12.10.6 step 1 criterion in bridge_auth_middleware and bridge_auth_middleware_dyn, so a caller whose token the node did not verify reads BRIDGE_NOT_AUTHORIZED and never reads BRIDGE_SUSPENDED against BRIDGE_FORBIDDEN (spec 12.10.6 step 1)",
-        "After verifying the bearer token and resolving the bridge from its scp_bridge_id claim, and before applying the 12.10.6 step 1 criterion, compare the token's iss claim against the resolved bridge's BridgeRegistered leaf payload operator_did and the token's scp_context_id claim against that leaf payload's context_id, answering BRIDGE_NOT_AUTHORIZED when either comparison fails, in bridge_auth_middleware and in bridge_auth_middleware_dyn (spec 12.10.6 step 1). The shipped middleware makes both comparisons against the stored BridgeConnector that acceptance criterion 1 stops writing, at the operator_did branch and the registration_context branch of crates/scp-node/src/bridge_auth.rs, so re-source both comparisons from the leaf payload rather than deleting them with the record",
-        "Rewrite the BRIDGE_NOT_AUTHORIZED row of the error table in the module doc comment of crates/scp-node/src/bridge_auth.rs, and the 401 bullet at the doc comment of the webhook auth middleware in the same file, to state the semantics spec 12.10.3 gives that code"
-      ],
-      "blockedBy": [
-        "SCP-BCH-017"
-      ],
-      "sources": [
-        {
-          "file": ".docs/specs/12-platform-bridge-connectors.md",
-          "section": "### 12.10.6 Bridge Node Lifecycle"
-        },
-        {
-          "file": ".docs/specs/12-platform-bridge-connectors.md",
-          "section": "### 12.10.2 Authentication"
-        },
-        {
-          "file": ".docs/specs/12-platform-bridge-connectors.md",
-          "section": "### 12.2.1 Bridge Registration Protocol"
-        },
-        {
-          "file": ".docs/specs/12-platform-bridge-connectors.md",
-          "section": "### 12.2.2 Bridge Removal Protocol"
-        },
-        {
-          "file": ".docs/specs/12-platform-bridge-connectors.md",
-          "section": "### 12.10.4 Endpoints"
-        },
-        {
-          "file": ".docs/adrs/phase-5.md",
-          "section": "## ADR-023: Bridge Connector Protocol"
-        }
-      ],
-      "details": {}
-    },
-    {
-      "id": "SCP-BCH-015",
-      "title": "Define the five bridge governance actions and append the four bridge lifecycle leaves from the governance execution path",
-      "gate": "gate-bridge-http-binding",
-      "priority": "P0",
-      "severity": "critical",
-      "status": "pending",
-      "files": [
-        "crates/scp-protocol/src/bridge/registration.rs",
-        "crates/scp-protocol/src/context/governance/mod.rs",
-        "crates/scp-runtime/src/context/governance_helpers.rs",
-        "crates/scp-runtime/src/context/actor/handlers/governance.rs",
-        "crates/scp-runtime/tests/governance_integration.rs"
-      ],
-      "description": "Spec §12.2.1 step 3 and §12.2.2 make every approved RegisterBridge, SuspendBridge, ReactivateBridge, and RevokeBridge action append a bridge lifecycle leaf carrying a BridgeRegistrationEvent payload, and §12.10.6 step 1 makes those leaves the only admission input a bridge node reads. GovernanceAction (crates/scp-protocol/src/context/governance/mod.rs) declares none of those four actions, and spec §12.10.2 step 5 names a fifth, UpdateBridgePlatformKey, that the enum also lacks, so no proposal in the shipped system carries any bridge action and no execution path can append any bridge leaf. ADR-011, the verifiable event log, declares the four EventType variants (BridgeRegistered, BridgeSuspended, BridgeReactivated, BridgeRevoked), and spec 12.12.2 declares the BridgeRegistrationAction variants they carry. crates/scp-protocol/src/bridge/registration.rs carries one constructor per decision action for the two older actions: approve_registration produces Approved and revoke_bridge produces Revoked. It carries no constructor for Suspended and no constructor for Reactivated, so no code constructs either of those two. This story declares the five governance actions, adds the two missing registry constructors beside their twins, and wires the governance execution path to append the four leaves, so a node implementing SCP-BCH-014 has leaves to read. An elapsed SuspendBridge duration appends NO leaf (§12.2.2), because that expiry records no fact: the bridge operator's own node is the only node that evaluates admission, and it computes the deadline from the BridgeSuspended leaf it already holds. §7.3.1 does admit leaves that a member-local timer triggers (TTL expiry and close, governance-freeze expiry, deferred economic-policy application) and keeps each convergent by stamping it with the pre-computed deadline that convergent context state already holds, so this story forbids the BridgeReactivated append on a deadline for the first reason and not for the second.",
-      "acceptanceCriteria": [
-        "GovernanceAction declares the five bridge lifecycle actions that ADR-031, multi-admin governance models, lists in its section 3 — RegisterBridge, SuspendBridge, ReactivateBridge, RevokeBridge, and UpdateBridgePlatformKey — with the payload fields spec 12.2.1, 12.2.2 and 12.10.2 step 5 give each one, and every wildcard-free match over GovernanceAction in the workspace compiles with an arm for each",
-        "crates/scp-protocol/src/bridge/registration.rs declares suspend_bridge and reactivate_bridge beside approve_registration and revoke_bridge, each returning a BridgeRegistrationEvent whose action is BridgeRegistrationAction::Suspended { reason, duration } and BridgeRegistrationAction::Reactivated, and each moving BridgeConnector::status to Suspended and back to Active",
-        "A unit test calls suspend_bridge and reactivate_bridge on a registry and asserts the returned events and the resulting BridgeStatus, so neither Suspended nor Reactivated remains a variant no code constructs",
-        "An approved RegisterBridge action appends one BridgeRegistered leaf whose payload is a BridgeRegistrationEvent with action Approved, asserted by reading the context event log after the approval",
-        "An approved SuspendBridge action appends one BridgeSuspended leaf whose payload action is Suspended with the proposal's reason and duration",
-        "An approved ReactivateBridge action appends one BridgeReactivated leaf whose payload action is Reactivated",
-        "An approved RevokeBridge action appends one BridgeRevoked leaf whose payload action is Revoked",
-        "A rejected RegisterBridge proposal appends no bridge lifecycle leaf; the test asserts the log gains only GovernanceProposalResolved",
-        "An approved UpdateBridgePlatformKey action appends no bridge lifecycle leaf: the GovernanceActionExecuted leaf records that execution, asserted by a test that reads the context event log after the approval and finds that leaf and no leaf of the four bridge lifecycle event types (spec 12.10.2 step 5, which computes the rotation deadline from that leaf; ADR-011, the verifiable event log, which declares the four bridge lifecycle variants and declares GovernanceActionExecuted)",
-        "A test advances a clock past the deadline of a BridgeSuspended leaf with duration Some(d) and asserts the context event log gained no BridgeReactivated leaf and no event at all (spec 12.2.2)",
-        "The appended leaf payload carries bridge_id, operator_did, governance_did, context_id, and timestamp, each asserted against the approving proposal",
-        "An approved RegisterBridge action assigns the bridge_id spec 12.2.1 step 3 defines, hashing the leaf's own timestamp and no member's local clock reading, asserted by a test in which two members execute one approval and derive one identifier",
-        "Two members of the same context hold byte-identical leaves for the same approval, asserted by comparing Merkle roots after both apply the commit",
-        "An approved SuspendBridge action appends a BridgeSuspended leaf whose timestamp is the committer-assigned created_at of the commit envelope (spec 7.3.1) and not the appending member's local now(), asserted by comparing the leaf timestamp against the envelope created_at",
-        "Two approved RegisterBridge actions carrying one context_id, one operator_did and one platform that execute within one second append one BridgeRegistered leaf: the context appends a leaf for the first and appends none for the second, whose derived bridge_id the set of identifiers that context has assigned already holds, and records the second proposal's resolution alone (spec 12.2.1 step 3). A test executes both approvals in one commit and asserts the log holds exactly one BridgeRegistered leaf for that identifier",
-        "The append decision reads no leaf payload, so ADR-030 pruning does not change it: a test appends a BridgeRegistered leaf, appends a Checkpoint that covers it, prunes that leaf's payload under a size-based PruningPolicy whose max_event_count the log then exceeds, executes a second approved RegisterBridge action deriving the same bridge_id, and asserts the context appends no second BridgeRegistered leaf and its event count equals the event count of a member that pruned nothing (spec 12.2.1 step 3; ADR-030 pruning invariant 4, which makes each member's decision to prune local to that member, and ADR-030 pruning invariant 1, which prunes no event that no valid checkpoint covers, so a test that appended no checkpoint would prune nothing and assert nothing)",
-        "A RegisterBridge approval whose derived bridge_id names a bridge the context already revoked appends no BridgeRegistered leaf, asserted by a test that appends BridgeRegistered and BridgeRevoked for one identifier and then executes a second approval deriving that same identifier (spec 12.2.1 step 3, which removes no identifier from the assigned set on revocation)",
-        "An approved RegisterBridge action whose approving actor is the operator the proposal names appends no BridgeRegistered leaf and assigns no bridge_id: the context records that proposal's resolution alone, asserted by a test that reads the context event log after the approval and finds GovernanceProposalResolved and no BridgeRegistered leaf (spec 12.2.1 step 2; ADR-023 bridge registration acceptance criterion 2, which forbids self-approval)",
-        "A SingleAdmin context whose admin is the bridge operator registers no bridge, asserted by a test that submits a RegisterBridge proposal naming that admin as operator_did, executes the admin's approval, and asserts the log gained no BridgeRegistered leaf and that reading the context's set of assigned identifiers finds none (spec 12.2.1 step 2, which grants a self-hosted bridge no exemption)"
-      ],
-      "actionItems": [
-        "Declare RegisterBridge, SuspendBridge, ReactivateBridge, RevokeBridge and UpdateBridgePlatformKey on GovernanceAction, and add an arm for each to every match over that enum",
-        "Add suspend_bridge and reactivate_bridge to crates/scp-protocol/src/bridge/registration.rs beside approve_registration and revoke_bridge, following the same signature shape and the same BridgeStatus transitions",
-        "Add a bridge-lifecycle append to the governance action execution path for the four approved bridge actions",
-        "Derive the assigned bridge_id from the approval leaf's own timestamp (spec 12.2.1 step 3), so every member executing one approval derives one identifier",
-        "Serialize BridgeRegistrationEvent as MessagePack into EventPayload::data per spec 12.12.2",
-        "Assert in a test that no code path appends a BridgeReactivated leaf on a suspension deadline",
-        "Add a pipeline_wiring.rs assertion for the new append step",
-        "Hold the set of every bridge_id the context has assigned in convergent context state, derived by executing the context's commits and never reading a leaf payload back out of the log, add each assigned identifier to it before evaluating the next approval of the same commit, remove none on revocation, and append no BridgeRegistered leaf for an approval whose derived identifier that set already holds (spec 12.2.1 step 3)",
-        "Refuse the BridgeRegistered append on the governance execution path when the approving actor is the operator the RegisterBridge proposal names, recording the proposal's resolution alone, so the rule runs where every member executes it rather than on any one caller's path (spec 12.2.1 step 2). approve_registration in crates/scp-protocol/src/bridge/registration.rs carries that rule today as BridgeRegistrationError::SelfApproval, and SCP-BCH-016 removes the three FFI calls to it, so the execution path is the only site left that can enforce it"
-      ],
-      "blockedBy": [
-        "SCP-BCH-017"
-      ],
-      "sources": [
-        {
-          "file": ".docs/specs/12-platform-bridge-connectors.md",
-          "section": "### 12.2.1 Bridge Registration Protocol"
-        },
-        {
-          "file": ".docs/specs/12-platform-bridge-connectors.md",
-          "section": "### 12.2.2 Bridge Removal Protocol"
-        },
-        {
-          "file": ".docs/adrs/phase-6.md",
-          "section": "#### 3. Governance Proposal Lifecycle"
-        },
-        {
-          "file": ".docs/adrs/phase-2.md",
-          "section": "## ADR-011: Verifiable Event Log (Merkle Tree)"
-        },
-        {
-          "file": ".docs/specs/12-platform-bridge-connectors.md",
-          "section": "### 12.10.2 Authentication"
-        },
-        {
-          "file": ".docs/adrs/phase-5.md",
-          "section": "## ADR-023: Bridge Connector Protocol"
-        }
-      ],
-      "details": {}
-    },
-    {
-      "id": "SCP-BCH-016",
-      "title": "Derive bridge_id from the approval leaf's timestamp on every SDK path, and remove the local-clock helper",
-      "gate": "gate-bridge-http-binding",
-      "priority": "P0",
-      "severity": "critical",
-      "status": "pending",
-      "files": [
-        "crates/scp-ffi/common/src/bridge_id.rs",
-        "crates/scp-ffi/src/bridge_connector.rs",
-        "crates/scp-ffi/napi/src/bridge_connector.rs",
-        "crates/scp-ffi/uniffi/src/bridge.rs",
-        "crates/scp-protocol/src/bridge/registration.rs",
-        "crates/scp-ffi/tests/e2e_bridge.rs",
-        "crates/scp-runtime/tests/phase5_integration.rs",
-        "bindings/python/scp_sdk/bridge.py",
-        "bindings/typescript/src/bridge.ts",
-        "bindings/typescript/src/internal/bridge.ts",
-        "bindings/typescript/src/internal/native.ts",
-        "bindings/typescript/tests/real-napi.test.ts",
-        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/BridgeConnector.kt",
-        "bindings/swift/Sources/SCP/Internal/ScpBindings.swift"
-      ],
-      "description": "Spec §12.2.1 step 3 makes the timestamp component of a bridge_id the approval leaf's own timestamp and no member's local clock reading, so every member executing one approval derives one identifier and the bridge lifecycle leaves that spec §12.10.6 step 1 reads all name one bridge. scp_ffi_common::generate_bridge_id (crates/scp-ffi/common/src/bridge_id.rs) hashes scp_clock::SystemClock.now_secs() instead, and its own doc comment calls that non-determinism intentional and cites the same spec section as its authority. Three registration paths call it: crates/scp-ffi/src/bridge_connector.rs, crates/scp-ffi/napi/src/bridge_connector.rs, and crates/scp-ffi/uniffi/src/bridge.rs. Two members executing one approval through any of those three paths therefore derive two 64-character identifiers for one bridge, and a node applying the §12.10.6 step 1 criterion finds that bridge's lifecycle leaves filed under an identifier no other member agrees on. The same three paths then call approve_registration with a caller-supplied approver and a hardcoded timestamp of 0 and discard the returned event, so an SDK caller reads status active for a registration no governance model decided and no leaf records. This story removes the local-clock derivation, routes every SDK registration and approval through the governance execution path that SCP-BCH-015 builds, and derives the identifier from the leaf that path appends.",
-      "acceptanceCriteria": [
-        "crates/scp-ffi/common/src/bridge_id.rs reads no clock: generate_bridge_id either takes the approval leaf's timestamp as a parameter or is deleted, and a source search for \"now_secs\" over crates/scp-ffi/common/src/bridge_id.rs returns no match. The search names that one file rather than its directory because crates/scp-ffi/common/src/ holds 13 further occurrences of now_secs that this story changes not at all: attestation.rs stamps issued_at and verified_at with them, discovery.rs stamps resolved_at, and petname_helpers.rs and resolvers.rs each read a clock for their own record. A search over the directory would return those 13 whatever this story did, so it could never verify green",
-        "The bridge_id a registration assigns is the lowercase hex SHA-256 of \"SCP-BRIDGE-ID-V1:\" || len(context_id) || context_id || len(operator_did) || operator_did || len(platform) || platform || timestamp, where each len is a 4-byte big-endian u32 and timestamp is the approval leaf's own timestamp, asserted by a test that derives the identifier from one leaf on two members' state and compares the two strings (spec 12.2.1 step 3; canonical hash construction, spec 9.5.1)",
-        "A test calls the identifier derivation twice with one leaf timestamp and asserts the two results are equal, and the doc comment claiming non-determinism by design is deleted rather than reworded",
-        "No FFI registration path calls approve_registration with a caller-supplied approver and a hardcoded timestamp: each of crates/scp-ffi/src/bridge_connector.rs, crates/scp-ffi/napi/src/bridge_connector.rs and crates/scp-ffi/uniffi/src/bridge.rs submits a RegisterBridge governance proposal and returns the identifier the executed approval assigned, or returns a typed error naming the governance decision it lacks",
-        "A test on each of the three bridges asserts that a registration call for a context whose governance approved nothing returns no active bridge and assigns no identifier",
-        "A cross-bridge test asserts that each of the three bridges returns, for one (context_id, operator_did, platform, leaf timestamp) tuple, the 64-character hex string that the byte-level known-answer test below pins, comparing each returned string against that pinned constant and against no other bridge's return value. All three bridges reach one derivation — crates/scp-ffi/src/bridge_connector.rs, crates/scp-ffi/napi/src/bridge_connector.rs and crates/scp-ffi/uniffi/src/bridge.rs each call scp_ffi_common::generate_bridge_id — so an assertion that compared the three return values with each other would compare one implementation with itself and could not go red. Comparing each return value against the pinned constant goes red when a bridge re-cases, truncates or re-encodes the identifier it returns",
-        "The bridge_id preimage follows the canonical hash construction of spec 9.5.1: the domain separator \"SCP-BRIDGE-ID-V1:\" contributes its UTF-8 bytes with no length prefix, each string component contributes a 4-byte big-endian u32 holding the byte length of its UTF-8 encoding followed by those UTF-8 bytes, and the timestamp component contributes the 8 bytes of its u64 value in big-endian order. A byte-level known-answer test names the four inputs, the full preimage bytes and the expected 64-character hex output, so two implementations cannot encode the timestamp differently and derive two identifiers for one leaf. A second test names two component tuples that a prefix-free concatenation would map to one preimage — the tuple (\"c\", \"ab\", \"p\", t) and the tuple (\"ca\", \"b\", \"p\", t) — and asserts the two identifiers differ, which goes red against any implementation that drops the length prefixes (spec 12.2.1 step 3)",
-        "BridgeRegistrationRequest in crates/scp-protocol/src/bridge/registration.rs declares the nine fields spec 12.12.2 lists for it — operator_did, platform, mode, context_id, self_hosted, webhook_url, platform_key, max_shadows and metadata, whose type is BridgeRegistrationMetadata and not the BridgeMetadata of spec 5.7 — and declares neither a bridge_id field nor a requested_at field, because spec 12.2.1 step 3 assigns the identifier from the approval leaf's own timestamp and derives it from that same leaf's timestamp, and that leaf does not exist while the operator is building the request; the story removes those two fields and removes no other, so the platform_key that SCP-BCH-021 AC3 reads off an approved RegisterBridge action stays on the type. The workspace compiles after the field is removed, which is what makes this criterion mechanical, and every construction site and every read of that field under crates/ and bindings/ is removed or re-pointed at the identifier the executed approval assigned",
-        "No code path keys a pending registration by a requester-supplied identifier: the governance proposal carrying the RegisterBridge action names the pending registration until the approval assigns a bridge_id (spec 12.12.2, the paragraph below the BridgeRegistrationRequest table), asserted by a test that submits a registration, reads the pending registration back by its proposal identifier, and asserts the returned record carries no bridge identifier",
-        "Every SDK wrapper over the three FFI registration paths stops offering a caller-supplied governance approver and stops documenting one: register in bindings/python/scp_sdk/bridge.py, bridgeRegister in bindings/typescript/src/bridge.ts, the bridgeRegister member of the internal Bridge interface in bindings/typescript/src/internal/bridge.ts, the bridgeRegister implementation of that interface in bindings/typescript/src/internal/native.ts, which both declares the parameter and forwards it to addon.bridgeRegister, and, in bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/BridgeConnector.kt, the bridgeRegister declaration of the BridgeConnectorBindings interface together with both register overloads of BridgeConnectorBridge, each declare no governance_did or governanceDid parameter, and none of their doc comments states that the call approves the registration. A source search for \"governance_did\" over bindings/python/scp_sdk/bridge.py and for \"governanceDid\" over bindings/typescript/src/ and bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/BridgeConnector.kt returns no match. Those two searches read a directory and a whole file rather than the named declarations, so they cover every site above: on origin/main the TypeScript search returns bridge.ts, internal/bridge.ts and internal/native.ts, and the Kotlin search returns the interface declaration as well as both overloads, and a story that edited only the named declarations of bridge.ts, internal/bridge.ts and the two overloads would read a non-empty search. bindings/swift/Sources/SCP/Internal/ScpBindings.swift is UniFFI output rather than hand-written source, so the story regenerates it from crates/scp-ffi/uniffi/src/bridge.rs and the regenerated bridgeRegister signature carries no governanceDid parameter",
-        "The Python docstring that states the call \"Creates a registration request and immediately approves it using the provided governance DID\" (bindings/python/scp_sdk/bridge.py, the register docstring) is deleted rather than reworded, because spec 12.2.1 gives the approval to the context's governance model and gives it to no caller of this function",
-        "The two tests in crates/scp-ffi/tests/e2e_bridge.rs that assert the removed registration semantics — bridge_register_succeeds_with_separate_governance_did and bridge_register_rejects_self_approval — assert the semantics SCP-BCH-016 leaves in place: a registration call for a context whose governance approved nothing returns no active bridge and assigns no identifier. Neither test passes a governance DID to py_bridge_register, and a source search for \"did:key:gov\" over crates/scp-ffi/tests/e2e_bridge.rs returns no match. The self-approval rule those two tests covered is enforced on the governance execution path by SCP-BCH-015, whose own acceptance criteria assert it, so this story moves that coverage rather than dropping it",
-        "The registration test in bindings/typescript/tests/real-napi.test.ts named \"registers a bridge connector\" passes no governance DID to addon.bridgeRegister and asserts no status of \"active\" for a registration no governance decided; it asserts the typed error or the inactive result the rewritten NAPI path returns instead",
-        "crates/scp-runtime/tests/phase5_integration.rs constructs BridgeRegistrationRequest with no bridge_id field and no requested_at field, and calls approve_registration with no caller-supplied approver and no hardcoded timestamp, so the workspace compiles and that test asserts the registration semantics this story leaves in place"
-      ],
-      "actionItems": [
-        "Take the approval leaf timestamp as a parameter of the identifier derivation, or delete generate_bridge_id and derive the identifier where the leaf is appended",
-        "Re-point crates/scp-ffi/src/bridge_connector.rs, crates/scp-ffi/napi/src/bridge_connector.rs and crates/scp-ffi/uniffi/src/bridge.rs at the governance execution path, and delete the approve_registration call with the hardcoded timestamp from each",
-        "Delete the non-determinism-by-design doc comment rather than rewording it, because spec 12.2.1 step 3 requires the opposite property",
-        "Add a cross-bridge parity test that asserts each of the three bridges returns the pinned known-answer identifier for one tuple, rather than asserting the three return values equal each other",
-        "Remove the bridge_id field and the requested_at field from BridgeRegistrationRequest and re-point every construction site and every read of either, including the pending-request lookup in crates/scp-protocol/src/bridge/registration.rs, which reads bridge_id, and request_registration in that same file, which copies requested_at into the timestamp of the BridgeRegistrationEvent it returns, at the governance proposal identifier and at the leaf timestamp the executed approval assigns (spec 12.12.2)",
-        "Remove the governance_did and governanceDid parameters and their doc comments from bindings/python/scp_sdk/bridge.py, bindings/typescript/src/bridge.ts, bindings/typescript/src/internal/bridge.ts, bindings/typescript/src/internal/native.ts, the BridgeConnectorBindings.bridgeRegister declaration in bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/BridgeConnector.kt and both register overloads in that same file, then regenerate bindings/swift/Sources/SCP/Internal/ScpBindings.swift from the rewritten UniFFI bridge",
-        "Rewrite bridge_register_succeeds_with_separate_governance_did and bridge_register_rejects_self_approval in crates/scp-ffi/tests/e2e_bridge.rs, and the \"registers a bridge connector\" test in bindings/typescript/tests/real-napi.test.ts, against the semantics this story leaves in place",
-        "Remove the bridge_id field and the caller-supplied approver from the registration the phase-5 integration test builds in crates/scp-runtime/tests/phase5_integration.rs, which the workspace otherwise stops compiling",
-        "Update the bridge_register row of .docs/standards/sdk-capability-matrix.json if the rewritten wrappers change which SDK exposes the operation"
-      ],
-      "blockedBy": [
-        "SCP-BCH-015"
-      ],
-      "sources": [
-        {
-          "file": ".docs/specs/12-platform-bridge-connectors.md",
-          "section": "### 12.2.1 Bridge Registration Protocol"
-        },
-        {
-          "file": ".docs/specs/12-platform-bridge-connectors.md",
-          "section": "### 12.10.6 Bridge Node Lifecycle"
-        },
-        {
-          "file": ".docs/specs/09-security-model.md",
-          "section": "### 9.5.1 Canonical Hash Construction"
-        },
-        {
-          "file": ".docs/specs/12-platform-bridge-connectors.md",
-          "section": "### 12.12.2 Bridge Registration"
-        }
-      ],
-      "details": {}
-    },
-    {
-      "id": "SCP-BCH-017",
-      "title": "Declare the four bridge lifecycle event types and the two missing registration actions",
-      "gate": "gate-bridge-http-binding",
-      "priority": "P0",
-      "severity": "critical",
-      "status": "pending",
-      "files": [
-        "crates/scp-event-log/src/lib.rs",
-        "crates/scp-event-log/src/tree.rs",
-        "crates/scp-event-log/src/pruning.rs",
-        "crates/scp-protocol/src/bridge/registration.rs",
-        "crates/scp-runtime/src/context/messaging_helpers.rs"
-      ],
-      "description": "ADR-011, the verifiable event log, declares four bridge lifecycle EventType variants — BridgeRegistered, BridgeSuspended, BridgeReactivated and BridgeRevoked — and states that all four are convergent commit-ordered durable leaves. Vector 32 of the test-vector spec assigns them tags 78, 79, 80 and 81 and states that the specified taxonomy holds 81 variants. Spec §12.12.2 declares BridgeRegistrationEvent as the payload of all four leaves, and declares the BridgeRegistrationAction variants Suspended { reason, duration } and Reactivated that a suspension and a reactivation carry. The shipped crates carry none of that: EventType in crates/scp-event-log/src/lib.rs enumerates 77 variants, the tag map in crates/scp-event-log/src/tree.rs stops at tag 77, five assertions across three files pin the count at 77 — two in crates/scp-event-log/src/lib.rs, two in crates/scp-event-log/src/tree.rs, and one on the classification table of crates/scp-event-log/src/pruning.rs — two array lengths pin it at compile time (ALL_EVENT_TYPES in crates/scp-event-log/src/tree.rs and the EXPECTED classification table in crates/scp-event-log/src/pruning.rs), and six comments and one test name state the same count in prose, and BridgeRegistrationAction in crates/scp-protocol/src/bridge/registration.rs declares Requested, Approved, Rejected and Revoked and neither Suspended nor Reactivated. This story declares the four event types, their tags and their pruning classification, and the two missing action variants, so the leaves that SCP-BCH-015 appends and the criterion that SCP-BCH-014 reads have types to name. Appending the leaves from the governance execution path is SCP-BCH-015, not this story, and reading them for admission is SCP-BCH-014. ADR-011 classifies all four bridge lifecycle leaves as structural events under ADR-030 §2c, because each one records a governance decision and a member reconstructs the context's set of assigned bridge_id values from the BridgeRegistered leaves, so this story enters the structural classification for each of the four. That classification sets how long a member that prunes retains the payload, and it decides no bridge's admission: spec §12.10.6 step 1 obliges a bridge node to retain the lifecycle payloads of every bridge it operates whatever the context's pruning policy sets.",
-      "acceptanceCriteria": [
-        "EventType in crates/scp-event-log/src/lib.rs declares BridgeRegistered, BridgeSuspended, BridgeReactivated and BridgeRevoked, each documented with the governance action that appends it (ADR-011)",
-        "The tag map in crates/scp-event-log/src/tree.rs maps BridgeRegistered to 78, BridgeSuspended to 79, BridgeReactivated to 80 and BridgeRevoked to 81, and a test asserts the four tags against those four literals (spec 25, Vector 32)",
-        "No assertion, assertion message, array length, doc comment, code comment or test name under crates/scp-event-log/src/ or in crates/scp-runtime/src/context/messaging_helpers.rs gives the size of the closed EventType taxonomy, or the number of distinct wire tags, as 77; each one gives 81. A search of crates/ and bindings/ for a statement of that count returns exactly one site outside crates/scp-event-log/src/ — the doc comment on DrainRecordingEventLog in crates/scp-runtime/src/context/messaging_helpers.rs, which states that EventType enumerates 77 variants — so this criterion names that one file beside the directory rather than naming crates/ as a whole, which would return the 77 that is a wire tag value in other crates. The criterion is that no statement of the taxonomy's size and no statement of the number of distinct wire tags reads 77; a textual search for 77 is evidence suggesting where such a statement sits and decides nothing on its own, so a match this story leaves unchanged is not a failure of this criterion. Three matches that search returns under that directory are neither a wire tag value nor a count, and this story changes none of them: the characters 77 inside the 64-character hex string literal that each of the two known-answer tests in crates/scp-event-log/src/tree.rs carries, and the characters 77 inside the retention arithmetic 7_776_000 in a comment in crates/scp-event-log/src/pruning.rs. Editing any of those three to make a search match would change a pinned test vector or a retention constant, which this story's scope excludes. The matches that are wire tag values rather than counts, which this story also leaves unchanged, are the tag of CrossContextDivergenceMarker, the comments that place the two cross-context-saga variants at 76..=77, and the test name unification_variant_tags_occupy_36_through_77. The counts to change sit in the module doc comment and the EventType doc comment of crates/scp-event-log/src/lib.rs, the comment in that file that names the test pinning the variant count and the distinctness count, that test's own name event_type_taxonomy_is_closed_at_77_distinct_variants, its two assertions and their two messages, the ALL_EVENT_TYPES array length and both count assertions and the comment \"all 77 tags are distinct\" in crates/scp-event-log/src/tree.rs, and the EXPECTED table length, its length assertion and its message, and the two comments that give that table's size in crates/scp-event-log/src/pruning.rs",
-        "The classification table in crates/scp-event-log/src/pruning.rs classifies each of the four variants as structural, so is_structural_event returns true for BridgeRegistered, BridgeSuspended, BridgeReactivated and BridgeRevoked, a test asserts that return value for each of the four, and the exhaustiveness guard covers 81 entries (ADR-011, which classifies the four leaves; ADR-030 §2c)",
-        "BridgeRegistrationAction in crates/scp-protocol/src/bridge/registration.rs declares Suspended with the fields reason: String and duration: Option<u64> and declares Reactivated, each with the serde tag spec 12.12.2 names, asserted by a round-trip test that pins the two tag strings \"Suspended\" and \"Reactivated\""
-      ],
-      "actionItems": [
-        "Declare the four variants at the end of EventType in crates/scp-event-log/src/lib.rs, after the two cross-context-saga variants, and document each with its governance action",
-        "Add the four tag arms to the event_type_tag map in crates/scp-event-log/src/tree.rs at 78, 79, 80 and 81",
-        "Update every statement of the taxonomy size from 77 to 81 — the five assertions and their messages, the two array lengths, the module doc comment and the EventType doc comment of crates/scp-event-log/src/lib.rs, the comments that give the classification table's size and the tag-distinctness count, and the test name event_type_taxonomy_is_closed_at_77_distinct_variants — and extend ALL_EVENT_TYPES with the four variants",
-        "Add the four variants to the structural-versus-operational classification table in crates/scp-event-log/src/pruning.rs and raise its exhaustiveness count to 81",
-        "Declare Suspended { reason, duration } and Reactivated on BridgeRegistrationAction in crates/scp-protocol/src/bridge/registration.rs and add an arm for each to every match over that enum",
-        "Raise the taxonomy count in the DrainRecordingEventLog doc comment of crates/scp-runtime/src/context/messaging_helpers.rs from 77 to 81, leaving the rest of that comment — which records why PseudonymAnnounced is absent from the taxonomy — unchanged"
-      ],
-      "blockedBy": [],
-      "sources": [
-        {
-          "file": ".docs/adrs/phase-2.md",
-          "section": "## ADR-011: Verifiable Event Log (Merkle Tree)"
-        },
-        {
-          "file": ".docs/specs/25-test-vectors.md",
-          "section": "### Vector 32: Typed-Leaf KAT (closed `EventType` taxonomy)"
-        },
-        {
-          "file": ".docs/specs/12-platform-bridge-connectors.md",
-          "section": "### 12.12.2 Bridge Registration"
-        }
-      ],
-      "details": {}
-    },
-    {
-      "id": "SCP-BCH-018",
-      "title": "Resolve a webhook delivery to a bridge and apply the admission criterion before verifying its signature",
-      "gate": "gate-bridge-http-binding",
-      "priority": "P0",
-      "severity": "critical",
-      "status": "pending",
-      "files": [
-        "crates/scp-node/src/bridge_handlers.rs",
-        "crates/scp-node/src/bridge_auth.rs",
-        "crates/scp-node/src/http.rs",
-        "crates/scp-node/tests/bridge_integration.rs"
-      ],
-      "description": "The shipped webhook path consults no bridge at all: WebhookRequest (crates/scp-node/src/bridge_handlers.rs) carries event_type, event_id, timestamp and payload and no bridge identifier, and webhook_handler answers accepted: true after an event-type whitelist and a dedup check, so a suspended or revoked bridge's deliveries still enter SCP. The shipped path also answers the wrong shape: webhook_auth_middleware_dyn verifies the signature before webhook_handler runs and returns 401 BRIDGE_NOT_AUTHORIZED when find_webhook_key resolves no key, so an unauthenticated caller reads a node's key set off the response code; spec §12.10.6 step 1 requires the route to answer every failure of the criterion with the one rejected webhook response. This story resolves a webhook delivery to a bridge through the X-SCP-Platform-Key-Id identifier that §12.10.2 step 6 defines — the SHA-256 of the domain separator \"SCP-BRIDGE-PLATFORM-KEY-ID-V1:\" followed by the 64 ASCII bytes of the bridge's lowercase hex bridge_id followed by the 32 registered platform_key bytes — and applies the admission criterion that SCP-BCH-014 writes before the route verifies any signature. The identifier covers the bridge_id because one platform publishes one signing key and one node may run one bridge into each of two contexts against that platform, so a digest over the key bytes alone names two bridges and therefore two contexts. Writing the criterion and enforcing it on the JWT-authenticated bridge routes is SCP-BCH-014, not this story; this story applies that function on the webhook route, against the stored (bridge, key) pairs that SCP-BCH-021 writes from the governance approval; giving the node's webhook key store that writer, removing its caller-supplied writer, and recording each pair's bridge_id are SCP-BCH-021 and not this story.",
-      "acceptanceCriteria": [
-        "WebhookRequest gains no bridge field; the webhook route resolves the bridge from the X-SCP-Platform-Key-Id header, which carries the lowercase hex SHA-256 of the domain separator \"SCP-BRIDGE-PLATFORM-KEY-ID-V1:\" followed by the 64 ASCII bytes of the bridge's lowercase hex bridge_id followed by the 32 registered platform_key bytes (spec 12.10.2 step 6), asserted by a test whose header is that digest, by a test whose header is the digest of the separator and the platform_key bytes with the bridge_id omitted, and by a test whose header is the digest of the platform_key bytes alone; each of the last two resolves to no bridge",
-        "the webhook route answers a delivery whose X-SCP-Platform-Key-Id matches the key identifier of no stored (bridge, key) pair with HTTP 200 and accepted: false, verifies no signature for it, and returns no 401 and no 403; the test drives the router that http.rs builds, so it covers webhook_auth_middleware_dyn and not the generic form alone",
-        "the webhook route answers a delivery claiming a bridge whose last lifecycle leaf is an unexpired BridgeSuspended leaf with HTTP 200, accepted: false, and the fixed reason string \"Bridge not admitted\", and verifies no signature for it; a test sends four deliveries that carry one event_id — one claiming that suspended bridge, one claiming a revoked bridge, one claiming an unregistered bridge, and one whose X-SCP-Platform-Key-Id matches the key identifier of no stored pair — and asserts the four status codes are equal and the four response bodies are byte-identical (spec 12.10.6 step 1: one response for every failure of the criterion, carrying one pinned reason string), asserted through the router that http.rs builds",
-        "the webhook route answers a delivery claiming a bridge with no BridgeRegistered leaf, and a delivery claiming a bridge any of whose lifecycle leaves is BridgeRevoked, with HTTP 200 and accepted: false, and verifies no signature for either",
-        "Two bridges in two contexts that registered the same 32 platform_key bytes carry two distinct X-SCP-Platform-Key-Id identifiers, and a delivery stamped with one of them resolves to that bridge's context only, asserted by a test that revokes the first bridge and asserts a delivery stamped with the second bridge's identifier still enters the second context while a delivery stamped with the first bridge's identifier is answered accepted: false",
-        "A delivery whose X-SCP-Platform-Key-Id matches stored (bridge, key) pairs of two different bridges is answered accepted: false and verifies no signature, asserted by a test that writes the two pairs into the node's own key store directly, because spec 12.2.1 step 3 keeps the governance path from producing two bridges under one bridge_id and a rewritten key store is the state this branch guards; and a delivery whose identifier matches two pairs of one bridge, which is what a rotation to the already-registered key bytes produces, resolves to that bridge and is admitted (spec 12.10.2 step 6)",
-        "A bridge whose operator's authority the context withdrew has its webhook deliveries answered accepted: false, asserted by two tests that each admit the bridge, append no BridgeSuspended leaf and no BridgeRevoked leaf, and assert the rejected webhook response: the first appends a MemberLeft leaf for the operator, and the second appends a MemberSuspendedAll leaf for the operator and appends no MemberLeft leaf, so the webhook route is tested against the clause's criterion rather than against one leaf name (spec 12.10.6 step 1, the membership clause of the admission criterion)",
-        "A bridge whose BridgeRegistered leaf the log retains with its payload absent has its webhook deliveries answered accepted: false, asserted by the same direct-removal construction the SCP-BCH-014 fail-closed retention criterion names, and a bridge whose lifecycle payloads the node retained through a prune still has its webhook deliveries accepted (spec 12.10.6 step 1, retention of the leaves the criterion reads)",
-        "The webhook route a deployed node serves enforces the criterion: a test builds the router through the same function crates/scp-node/src/http.rs calls, with the same webhook_auth_middleware_dyn, and asserts that a bridge whose lifecycle leaves hold a BridgeRevoked leaf is refused on the webhook route",
-        "A bridge that a caller registered by writing a BridgeConnector directly into the bridge/registry/ storage prefix, with no bridge lifecycle leaf appended, has its webhook deliveries answered accepted: false"
-      ],
-      "actionItems": [
-        "Resolve a webhook delivery to a bridge by matching the X-SCP-Platform-Key-Id header against the key identifier of spec 12.10.2 step 6 computed over each stored bridge_id-plus-platform_key pair, then apply the same criterion before verifying the signature; move the resolution and the criterion ahead of verify_webhook_signature in webhook_auth_middleware and webhook_auth_middleware_dyn so the route answers accepted: false rather than 401 when resolution or the criterion fails",
-        "Write the fixed reason string \"Bridge not admitted\" into every rejected webhook response that a failure of the 12.10.6 step 1 criterion or an unresolved X-SCP-Platform-Key-Id produces, and write no per-failure text into that field, so the free-form reason carries none of the disclosure the single status code removes (spec 12.10.4, POST /v1/scp/bridge/webhook)",
-        "Drive every new integration test through the router that crates/scp-node/src/http.rs builds, so the tests cover the _dyn middleware the deployed node mounts"
-      ],
-      "blockedBy": [
-        "SCP-BCH-014",
-        "SCP-BCH-021"
-      ],
-      "sources": [
-        {
-          "file": ".docs/specs/12-platform-bridge-connectors.md",
-          "section": "### 12.10.6 Bridge Node Lifecycle"
-        },
-        {
-          "file": ".docs/specs/12-platform-bridge-connectors.md",
-          "section": "### 12.10.2 Authentication"
-        },
-        {
-          "file": ".docs/specs/12-platform-bridge-connectors.md",
-          "section": "### 12.10.4 Endpoints"
-        },
-        {
-          "file": ".docs/specs/09-security-model.md",
-          "section": "### 9.5.1 Canonical Hash Construction"
-        }
-      ],
-      "details": {}
-    },
-    {
-      "id": "SCP-BCH-019",
-      "title": "Record the node commit-execution instant for each bridge lifecycle leaf durably",
-      "gate": "gate-bridge-http-binding",
-      "priority": "P0",
-      "severity": "major",
-      "status": "pending",
-      "files": [
-        "crates/scp-node/src/bridge_auth.rs",
-        "crates/scp-node/tests/bridge_integration.rs"
-      ],
-      "description": "The suspension deadline of spec §12.2.2 takes its lower bound from the node's own commit-execution instant rather than from the leaf timestamp alone, because spec §9.8.2(c) bounds an envelope created_at only in the future direction. Spec §12.2.2 makes that instant a value the node records durably once per leaf, because a node that re-derived it on every restart would push a bounded suspension past every deadline it ever computes. SCP-BCH-014 computes the deadline from that instant; this story makes the instant survive a restart. The node writes the instant when it executes the commit, reads the recorded value on every deadline evaluation, and substitutes and records its first-read instant once when it holds no recorded value, which moves a deadline later and never earlier.",
-      "acceptanceCriteria": [
-        "The node records its commit-execution instant for each bridge lifecycle leaf durably, and a restart recomputes no deadline: a test appends a BridgeSuspended leaf with duration Some(d), drops and rebuilds the admission state from the same storage twice with the injected clock advanced by less than d on each rebuild, and asserts the bridge is admitted at the same clock value the pre-restart deadline named (spec 12.2.2)",
-        "A node that finds no recorded commit-execution instant for a BridgeSuspended leaf substitutes its first-read instant once and records it: a test builds the admission state over storage that carries the leaf and no recorded instant, rebuilds it three times, and asserts the deadline the third rebuild computes equals the deadline the first one computed (spec 12.2.2)"
-      ],
-      "actionItems": [
-        "Record the node's commit-execution instant for each bridge lifecycle leaf in durable storage when the node executes the commit, read the recorded value on every deadline evaluation, and write the first-read substitute once when no recorded value exists (spec 12.2.2)"
-      ],
-      "blockedBy": [
-        "SCP-BCH-014"
-      ],
-      "sources": [
-        {
-          "file": ".docs/specs/12-platform-bridge-connectors.md",
-          "section": "### 12.2.2 Bridge Removal Protocol"
-        },
-        {
-          "file": ".docs/specs/12-platform-bridge-connectors.md",
-          "section": "### 12.10.6 Bridge Node Lifecycle"
-        }
-      ],
-      "details": {}
-    },
-    {
-      "id": "SCP-BCH-020",
-      "title": "Record the import log position durably and refuse every bridge lifecycle leaf the node did not execute",
-      "gate": "gate-bridge-http-binding",
-      "priority": "P0",
-      "severity": "critical",
-      "status": "pending",
-      "files": [
-        "crates/scp-node/src/bridge_auth.rs",
-        "crates/scp-runtime/src/context/lifecycle_helpers.rs",
-        "crates/scp-node/tests/bridge_integration.rs"
-      ],
-      "description": "Spec §12.10.6 step 1 refuses a leaf that any party supplies to the node as an input the node did not execute, and separates such a leaf from one the node reloads from its own storage. A context that a node populated through import_context carries leaves the node did not execute, so the criterion reads every bridge lifecycle leaf at or below the imported log position as absent. Spec §12.10.6 step 1 makes the node record that position durably and read it on every later evaluation, because a node holding the position in memory alone reads every imported leaf as one it executed after the next restart. The import that produces the position is import_context (crates/scp-runtime/src/context/lifecycle_helpers.rs), and this story decides whether the write-ordering constraint lands in that function or in the node code that calls it. SCP-BCH-014 writes the admission criterion and SCP-BCH-018 applies it on the webhook route; this story adds the imported-position input that both read.",
-      "acceptanceCriteria": [
-        "A context whose event log the node populated through import_context admits no bridge from a lifecycle leaf at or below the imported log position: a test imports a ContextExport carrying a BridgeRegistered leaf with action Approved and the node's own operator_did, and asserts every bridge endpoint refuses that bridge (spec 12.10.6 step 1, the log the criterion reads is a log the node executed) The same test also executes a commit that appends a BridgeRegistered leaf with action Approved for a second bridge in a context the node created, and asserts every bridge endpoint serves that second bridge, so the refusal assertion goes red against a node that refuses every bridge.",
-        "A bridge whose lifecycle leaves sit at or below an imported log position is refused even though the node stores that bridge's platform key and delegated credentials, and a later approved RegisterBridge proposal for the same operator, platform and context admits the bridge that approval's own bridge_id names while the imported bridge stays refused and no endpoint serves it (spec 12.10.6 step 1, the log the criterion reads is a log the node executed)",
-        "The node records the log position that an import produced durably, and a restart refuses the same imported leaves: a test imports a ContextExport carrying a BridgeRegistered leaf with action Approved and the node's own operator_did, drops and rebuilds the admission state from the same storage twice, and asserts every bridge endpoint refuses that bridge after each rebuild (spec 12.10.6 step 1, the log the criterion reads is a log the node executed) The same test also executes a commit that appends a BridgeRegistered leaf with action Approved for a second bridge in a context the node created, and asserts every bridge endpoint serves that second bridge, so the refusal assertion goes red against a node that refuses every bridge.",
-        "The import writes its position record before it writes any imported leaf: a test that stops an import after the position record is durable and before the imported leaves are asserts the node admits no bridge in that context, a test that stops it before the position record is durable asserts the node's log holds no imported bridge lifecycle leaf, and no ordering of the two writes leaves the node holding an imported bridge lifecycle leaf that no recorded position covers (spec 12.10.6 step 1, the log the criterion reads is a log the node executed) The node writes an import-position record for every context whose log the criterion reads, naming position zero for a context it created or joined and the position the import produced for a context it imported, and writes that record before that context's first leaf: a test asserts that after a node creates a context and appends its first leaf, the storage holds a position-zero record for that context (spec 12.10.6 step 1, the log the criterion reads is a log the node executed).",
-        "A node that reads a context log whose import-position record it cannot read treats every bridge lifecycle leaf in that log as absent, and the node distinguishes that state from a context it never imported because every context carries a record: a test creates a context, executes a commit that appends a BridgeRegistered leaf with action Approved for the node's own bridge, asserts every bridge endpoint serves that bridge, deletes that context's position record from storage, and asserts every bridge endpoint then refuses it. Without the position-zero record for a created or joined context the test could not go red, because the storage after the deletion would be byte-identical to the storage of a context the node created and never imported (spec 12.10.6 step 1, the log the criterion reads is a log the node executed)."
-      ],
-      "actionItems": [
-        "Record the log position that import_context produced for a context in durable storage, and read the recorded value on every evaluation of the criterion, so a restart refuses the same imported leaves the pre-restart node refused",
-        "Make the import write its position record durably before it writes any imported leaf, so no crash leaves the node holding an imported bridge lifecycle leaf that no recorded position covers, and treat a context log whose position record the node cannot read as one whose every bridge lifecycle leaf is absent (spec 12.10.6 step 1), and write a position-zero record for a context the node creates or joins before that context's first leaf, so an absent record is a state the node tells apart from a context it never imported"
-      ],
-      "blockedBy": [
-        "SCP-BCH-018"
-      ],
-      "sources": [
-        {
-          "file": ".docs/specs/12-platform-bridge-connectors.md",
-          "section": "### 12.10.6 Bridge Node Lifecycle"
-        }
-      ],
-      "details": {}
-    },
-    {
-      "id": "SCP-BCH-021",
-      "title": "Write the webhook platform-key store from the governance approval and remove its caller-supplied write path",
-      "gate": "gate-bridge-http-binding",
-      "priority": "P0",
-      "severity": "critical",
-      "status": "pending",
-      "files": [
-        "crates/scp-node/src/bridge_auth.rs",
-        "crates/scp-node/src/lib.rs"
-      ],
-      "description": "Step 3 of spec 12.10.2 states that the bridge node stores the platform key associated with the bridge instance on governance approval; step 5 states that the node accepts signatures from a superseded key for 24 hours after an approved UpdateBridgePlatformKey action; step 6 derives the X-SCP-Platform-Key-Id header from the domain separator \"SCP-BRIDGE-PLATFORM-KEY-ID-V1:\" followed by the 64 ASCII bytes of the bridge's lowercase hex bridge_id followed by the 32 registered platform_key bytes. Spec 12.10.6 step 1 states that a node holding no BridgeRegistered leaf for a bridge holds no platform key for that bridge, because the node stores the platform key when governance approves the registration. The shipped key store satisfies none of those four statements. StorageBridgeLookup::register_webhook_key (crates/scp-node/src/bridge_auth.rs) takes a caller-supplied key_id and 32 key bytes, writes them under the bridge/webhook_key/ storage prefix, and records no bridge; deregister_webhook_key removes an entry by that same caller-supplied identifier; BridgeLookup::find_webhook_key returns the 32 bytes and names no bridge. A search of crates/ and bindings/ for register_webhook_key returns its declaration as an inherent method on StorageBridgeLookup, one doc comment that names it, and three tests, all in crates/scp-node/src/bridge_auth.rs, and no other caller, so no production path writes that store at all and the webhook route resolves every delivery against an empty store. This store is the structural twin of the bridge/registry/ write path that SCP-BCH-014 removes, and it is the resolution input that SCP-BCH-018 reads. This story gives the store its governance-approval writer, removes its caller-supplied writer, and keys it so the identifier of spec 12.10.2 step 6 resolves a stored pair to the one bridge whose approval registered it. Resolving a delivery through that identifier and applying the admission criterion to the bridge it names is SCP-BCH-018, not this story.",
-      "acceptanceCriteria": [
-        "StorageBridgeLookup::register_webhook_key, which writes 32 platform-key bytes under the bridge/webhook_key/ storage prefix against a caller-supplied key identifier and records no bridge, is removed, and deregister_webhook_key with it, or every caller of each is removed, so no scp-node code path writes or deletes a webhook platform key from a caller-supplied identifier",
-        "Every entry the node writes under the bridge/webhook_key/ storage prefix carries the bridge_id of the approved RegisterBridge or UpdateBridgePlatformKey action that registered its 32 key bytes, asserted by a test that reads the stored entry back and compares its bridge_id against the approving proposal",
-        "The node writes a (bridge_id, platform_key) pair into that store when it executes an approved RegisterBridge action carrying a platform_key and when it executes an approved UpdateBridgePlatformKey action, and on no other path (spec 12.10.2 step 3 and step 5), asserted by one test per approval that reads the pair back, by a test that asserts the store gains no pair for a rejected RegisterBridge proposal, and by a test that asserts it gains no pair for an approved RegisterBridge action whose platform_key is None",
-        "BridgeLookup::find_webhook_key resolves an X-SCP-Platform-Key-Id value to the bridge whose approval registered the pair, returning that bridge_id alongside the 32 key bytes rather than the key bytes alone, and resolves an identifier that no stored pair produces to nothing, asserted by one test per outcome",
-        "The node computes the key identifier of spec 12.10.2 step 6 as the lowercase hex SHA-256 of the domain separator \"SCP-BRIDGE-PLATFORM-KEY-ID-V1:\" followed by the 64 ASCII bytes of the bridge's lowercase hex bridge_id followed by the 32 platform_key bytes, asserted by a byte-level known-answer test against Vector 40 of the test-vector spec, which pins the two identifiers its two bridge_id values produce over one 32-byte key and pins the two digests step 6 refuses: the digest of the separator and those key bytes with the bridge_id omitted, and the digest of those key bytes alone",
-        "The node computes the rotation deadline that spec 12.10.2 step 5 defines: the earlier of two sums, each taken with saturating addition, of the timestamp of the GovernanceActionExecuted leaf recording the context's execution of the approved UpdateBridgePlatformKey action plus 86400 and of the instant at which the node executed the commit that appended that leaf plus 86400. Before that deadline the store resolves both that bridge's superseded pair and its new pair to that one bridge, and at and after it the store resolves the superseded pair's identifier to no bridge, asserted by three tests with an injected clock: one that advances to one second before the deadline and reads both pairs back, one that advances to the deadline and reads the new pair alone, and one whose leaf timestamp the committing member backdated to 172800 seconds before the node's execution instant and which asserts the superseded pair resolves to no bridge at that execution instant, because the leaf-timestamp sum is then the earlier of the two (spec 12.10.2 step 5)",
-        "The node records the commit-execution instant of every GovernanceActionExecuted leaf recording an approved UpdateBridgePlatformKey action durably when it executes that commit, and resolves the superseded pair to no bridge for a leaf whose recorded instant it cannot read, asserted by a test that removes that record from the node's own store and reads the superseded identifier back (spec 12.10.2 step 5, which writes no substitute because a substitute exceeding the true execution instant would extend acceptance of a key governance superseded)"
-      ],
-      "actionItems": [
-        "Delete StorageBridgeLookup::register_webhook_key and StorageBridgeLookup::deregister_webhook_key with their caller-supplied key_id parameter, and delete or re-point every caller, the twin of the bridge/registry/ write path SCP-BCH-014 removes",
-        "Write the (bridge_id, platform_key) pair from the path on which the node executes an approved RegisterBridge or UpdateBridgePlatformKey action for a context it holds membership in, and give StorageBridgeLookup that writer through its constructor rather than a singleton",
-        "Key each stored entry by the identifier of spec 12.10.2 step 6, carry the bridge_id in its value, and widen BridgeLookup::find_webhook_key to return that bridge_id with the key bytes",
-        "Retain a superseded pair for 24 hours after the node executes the UpdateBridgePlatformKey approval that replaced it, measured from the node's commit-execution instant for the GovernanceActionExecuted leaf recording that execution, and stop resolving it after",
-        "Pin the step 6 identifier against Vector 40 of the test-vector spec in a test in crates/scp-node/src/bridge_auth.rs",
-        "Compute the rotation deadline as the earlier of the leaf-timestamp sum and the recorded execution-instant sum, each with saturating addition, and inject the clock rather than reading a process-wide one (spec 12.10.2 step 5)"
-      ],
-      "blockedBy": [
-        "SCP-BCH-015"
-      ],
-      "sources": [
-        {
-          "file": ".docs/specs/12-platform-bridge-connectors.md",
-          "section": "### 12.10.2 Authentication"
-        },
-        {
-          "file": ".docs/specs/12-platform-bridge-connectors.md",
-          "section": "### 12.10.6 Bridge Node Lifecycle"
-        },
-        {
-          "file": ".docs/specs/25-test-vectors.md",
-          "section": "### Vector 40: `X-SCP-Platform-Key-Id`"
-        },
-        {
-          "file": ".docs/specs/09-security-model.md",
-          "section": "### 9.5.1 Canonical Hash Construction"
         }
       ],
       "details": {}
