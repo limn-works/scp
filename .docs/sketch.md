@@ -1990,7 +1990,7 @@ Spending UCANs are AND-composed with action UCANs. Agent needs both `messagesWri
 
 ### Configure Payment Adapter (§19.2.4, §19.11)
 
-An identity's payment adapter is installed at construction, through `IdentityConfig`'s `payment` slot (`.docs/standards/construction.md`, `19-economic-governance.md` §19.11). No later call installs one, so a reader of a config that carries `payment: None` concludes that this identity spends nothing.
+An identity's payment adapters are installed at construction, through `IdentityConfig`'s `payment` set (`.docs/standards/construction.md`, `19-economic-governance.md` §19.11). No later call installs one, so a reader of a config whose `payment` set is empty concludes that this identity spends nothing.
 
 ### Context Creation with Economic Policy (§19.3, §19.11)
 
