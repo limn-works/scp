@@ -413,6 +413,12 @@ jobs:
         with:
           shared-key: workspace-debug
           save-if: false
+      # `maturin_artifact_entry` parses each maturin project file and its Cargo.toml
+      # with `tomllib`, which the Python standard library has held since 3.11, and
+      # it fails when no interpreter on PATH imports it.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: G1 — shipped-feature-graph ⊆ permitted-production allowlist (ZERO-nullifier mandate)
         run: bash scripts/check-shipped-feature-graph.sh
 
@@ -428,6 +434,12 @@ jobs:
         with:
           shared-key: workspace-debug
           save-if: false
+      # `maturin_artifact_entry` parses each maturin project file and its Cargo.toml
+      # with `tomllib`, which the Python standard library has held since 3.11, and
+      # it fails when no interpreter on PATH imports it.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: openssl-src reaches the PyPI wheel and no other shipped artifact
         run: bash scripts/check-vendored-openssl-scope.sh
 
