@@ -124,11 +124,64 @@ VENDOR_CRATE="openssl-src"
 VENDOR_FEATURE="vendored-openssl"
 FEATURE_GRAPH_GATE="scripts/check-shipped-feature-graph.sh"
 
-# The `ARTIFACTS` array is this repository's record of what it ships, and a tree
-# that ships fewer configurations than this floor has had entries deleted rather
-# than added. The floor makes a gate that prints a short list fail instead of
-# reporting that every artifact it found resolved correctly.
-MINIMUM_SHIPPED_CONFIGURATIONS=2
+# The program that enumerates the packages this workspace ships as binaries.
+#
+# CRITERION: a default workspace member that builds a `[[bin]]` target is an
+# artifact this repository ships, so a shipped-configuration list that names no
+# configuration for it leaves it unchecked.
+#
+# `run_gate` reads this list and fails when a package it names appears in no
+# configuration. A typed floor cannot state that property: this gate carried
+# `MINIMUM_SHIPPED_CONFIGURATIONS=2` against a list of ten, and an adversarial
+# review deleted eight entries, leaving the wheel and one bridge. Both gates
+# stayed green while `scp-node` and `scp-relay` — the two artifacts the CRITERION
+# section above names as the reason this gate exists — went uncovered, and the
+# final line still read "reaches no other shipped artifact".
+#
+# It reads `cargo metadata`, which resolves `default-members` and every `[[bin]]`
+# target for itself, rather than matching manifest text. An enumeration that comes
+# back empty fails, because "no binary to cover" and "the reader stopped working"
+# must not print the same verdict.
+read -r -d '' BINARY_PACKAGES_PROGRAM <<'PYTHON' || true
+import json
+import sys
+
+document = json.load(sys.stdin)
+default_members = set(
+    document.get("workspace_default_members")
+    or document.get("workspace_members")
+    or []
+)
+
+names = set()
+for package in document.get("packages", []):
+    if package.get("id") not in default_members:
+        continue
+    for target in package.get("targets", []):
+        if "bin" in (target.get("kind") or []):
+            names.add(package["name"])
+
+if not names:
+    print(
+        "cargo metadata named no default-member package building a [[bin]] target",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+for name in sorted(names):
+    print(name)
+PYTHON
+
+# The first interpreter on PATH. `json` is in every Python standard library, so
+# this needs no version floor; `default_member_binary_packages` fails when no
+# candidate is present rather than enumerating nothing.
+SCOPE_JSON_READER=""
+for scope_json_candidate in python3.12 python3 python; do
+  if command -v "$scope_json_candidate" >/dev/null 2>&1; then
+    SCOPE_JSON_READER="$scope_json_candidate"
+    break
+  fi
+done
 
 fixture_failures=0
 
@@ -164,17 +217,46 @@ feature_graph_gate_prints() {
 # shipped_configurations <gate-script>
 #   Emit one `<package>|<feature arguments>` line per entry of the gate script's
 #   `ARTIFACTS` array, in the order bash holds them. FAILS on anything
-#   feature_graph_gate_prints fails on, and when the mode yields fewer than
-#   MINIMUM_SHIPPED_CONFIGURATIONS entries.
+#   feature_graph_gate_prints fails on.
+#
+#   This reader applies no entry-count floor. `run_gate` checks every
+#   configuration this returns, so the list is its own coverage floor for what it
+#   names, and `default_member_binary_packages` below decides what it must name.
 shipped_configurations() {
-  local file="$1" entries count
-  entries="$(feature_graph_gate_prints "$file" --print-artifacts)" || return 1
-  count="$(printf '%s\n' "$entries" | grep -cE '.' || true)"
-  if [[ "$count" -lt "$MINIMUM_SHIPPED_CONFIGURATIONS" ]]; then
-    echo "$file --print-artifacts yielded $count entries, below the floor of $MINIMUM_SHIPPED_CONFIGURATIONS" >&2
+  local file="$1"
+  feature_graph_gate_prints "$file" --print-artifacts || return 1
+}
+
+# default_member_binary_packages
+#   Emit the package name of every default workspace member that builds a
+#   `[[bin]]` target, one per line, sorted. FAILS when no interpreter is on PATH,
+#   when cargo metadata exits non-zero, and when the enumeration is empty.
+default_member_binary_packages() {
+  local metadata rc=0
+  if [[ -z "$SCOPE_JSON_READER" ]]; then
+    echo "no python3.12, python3, or python on PATH, so this gate cannot read cargo metadata to enumerate the binaries this workspace ships" >&2
     return 1
   fi
-  printf '%s\n' "$entries"
+  metadata="$(cargo metadata --format-version 1 --no-deps 2>&1)" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    { echo "cargo metadata exited $rc, so this gate enumerated no shipped binary:"
+      printf '%s\n' "$metadata"; } >&2
+    return 1
+  fi
+  printf '%s' "$metadata" | "$SCOPE_JSON_READER" -c "$BINARY_PACKAGES_PROGRAM"
+}
+
+# host_target
+#   Emit the target triple this machine compiles for, read from `rustc -vV`.
+#   FAILS when that output names no host.
+host_target() {
+  local triple
+  triple="$(rustc -vV 2>/dev/null | sed -n 's/^host: //p')"
+  if [[ -z "$triple" ]]; then
+    echo "rustc -vV named no host triple, so this gate cannot resolve the wheel on the target it ships for" >&2
+    return 1
+  fi
+  printf '%s\n' "$triple"
 }
 
 # wheel_line <gate-script>
@@ -196,21 +278,133 @@ wheel_line() {
   printf '%s\n' "$lines"
 }
 
-# configuration_selects_feature <feature-arguments> <feature>
-#   Succeed when the cargo feature arguments name the feature as a whole token —
-#   separated from its neighbours by whitespace, by a comma, or by the `=` of
-#   `--features=a,b`. `not-vendored-openssl` and `vendored-openssl-experimental`
-#   are different features and do not match.
-configuration_selects_feature() {
-  printf '%s\n' "$1" | grep -qE "(^|[[:space:],=])$2([[:space:],]|\$)"
+# feature_list_is_wellformed <list>
+#   Succeed when the string is a comma-separated list of cargo feature names,
+#   each `name` or `package/name`. One regex decides the whole list, so no empty
+#   element and no leading or trailing comma can pass.
+#
+#   No segment may BEGIN with `-`, which is what keeps a flag standing where a
+#   feature list belongs — `--features --depth` — from reading as a feature named
+#   `--depth`. A `-` inside a name is ordinary and `vendored-openssl` needs it.
+feature_list_is_wellformed() {
+  local name='[A-Za-z0-9_.+][A-Za-z0-9_.+-]*'
+  local segment="${name}(/${name})?"
+  [[ "$1" =~ ^${segment}(,${segment})*$ ]]
 }
 
-# vendor_crate_occurrences <package> <feature-argument-string>
+# cargo_arguments_for <feature-argument-string>
+#   Emit one cargo argument per line, built from the fields the string names.
+#
+#   CRITERION: an entry of the `ARTIFACTS` array names a package's feature
+#   selection and nothing else. This reader accepts exactly four token shapes —
+#   `--no-default-features`, `--all-features`, `--features <list>`, and
+#   `--features=<list>` — and FAILS on every other token, which is every other
+#   cargo flag. It is a whitelist of the shapes an entry may carry, not a list of
+#   the flags an entry may not, so a flag nobody has thought of is refused by the
+#   same branch as one that is.
+#
+#   WHY THE GATE BUILDS THE COMMAND. An earlier revision spliced the whole
+#   feature-argument string into `cargo tree` unquoted, so an entry could carry
+#   any cargo argument. An adversarial review wrote
+#   `scp-ffi|--features scp-platform/vendored-openssl --depth 0` into the
+#   `ARTIFACTS` array: `--depth 0` truncates the tree to its root line, the
+#   occurrence count came back zero, and this gate printed `ok` for a bridge
+#   cdylib that genuinely reached `openssl-src` — the cdylib
+#   `.github/workflows/build-matrix.yml` uploads and `.github/workflows/release.yml`
+#   signs. The sibling gate resisted the same entry only because it proves
+#   PRESENCE, so a truncated tree hands it an empty resolution its non-empty guard
+#   rejects; this gate proves ABSENCE, and a truncated tree hands an absence proof
+#   exactly the answer it is looking for.
+#
+#   The repair is that data stops being argv. `run_gate` builds the argument list
+#   from the fields this reader validates, so no substring of an entry is ever
+#   word-split into a command, and a resolver flag cannot reach cargo through the
+#   array at all.
+cargo_arguments_for() {
+  local raw="$1" token expect_list=0
+  # The only word-splitting in this gate, and every token it produces is checked
+  # against the whitelist below before it is emitted.
+  # shellcheck disable=SC2086  # deliberate: the split feeds the whitelist.
+  for token in $raw; do
+    if [[ "$expect_list" -eq 1 ]]; then
+      if ! feature_list_is_wellformed "$token"; then
+        echo "a shipped configuration names something that is not a cargo feature list: '$token'" >&2
+        return 1
+      fi
+      printf '%s\n' "$token"
+      expect_list=0
+      continue
+    fi
+    case "$token" in
+      --no-default-features | --all-features)
+        printf '%s\n' "$token"
+        ;;
+      --features)
+        printf '%s\n' "$token"
+        expect_list=1
+        ;;
+      --features=*)
+        if ! feature_list_is_wellformed "${token#--features=}"; then
+          echo "a shipped configuration names something that is not a cargo feature list: '$token'" >&2
+          return 1
+        fi
+        printf '%s\n' "$token"
+        ;;
+      *)
+        echo "a shipped configuration names a cargo argument this gate does not build: '$token'. An entry names a package's feature selection — --no-default-features, --all-features, --features <list> — and nothing else, so no resolver flag reaches cargo through the ARTIFACTS array." >&2
+        return 1
+        ;;
+    esac
+  done
+  if [[ "$expect_list" -eq 1 ]]; then
+    echo "a shipped configuration ends with '--features' and names no feature list" >&2
+    return 1
+  fi
+}
+
+# configuration_selects_feature <built-arguments> <feature>
+#   Succeed when the configuration compiles the feature: its `--features` list
+#   names it, or it names `--all-features`, which selects every feature the
+#   package defines. Reads the argument list cargo_arguments_for validated, so it
+#   decides membership in a parsed list rather than matching a substring of a
+#   string. `not-vendored-openssl` and `vendored-openssl-experimental` are
+#   different features and do not match, because the comparison is on whole list
+#   elements.
+configuration_selects_feature() {
+  local built="$1" feature="$2" argument name
+  while IFS= read -r argument; do
+    [[ -z "$argument" ]] && continue
+    if [[ "$argument" == "--all-features" ]]; then
+      return 0
+    fi
+    local list=""
+    if [[ "$argument" == --features=* ]]; then
+      list="${argument#--features=}"
+    elif [[ "$argument" != --* ]]; then
+      list="$argument"
+    fi
+    [[ -z "$list" ]] && continue
+    for name in ${list//,/ }; do
+      if [[ "$name" == "$feature" ]]; then
+        return 0
+      fi
+    done
+  done <<<"$built"
+  return 1
+}
+
+# vendor_crate_occurrences <package> <built-arguments> <target>
 #   Emit the number of times the vendored crate appears in the package's shipped
 #   dependency graph, and return non-zero when cargo resolved no graph. `-e no-dev`
-#   drops dev-dependencies, which no shipped artifact compiles; `--target all`
-#   resolves every target triple, so a cfg-gated edge that is false on this runner
-#   stays visible.
+#   drops dev-dependencies, which no shipped artifact compiles.
+#
+#   The arguments arrive one per line from cargo_arguments_for, which validated
+#   every token, and this function puts them in an array. Nothing here word-splits
+#   a string into a command, so an `ARTIFACTS` entry cannot carry a resolver flag
+#   into this invocation.
+#
+#   <target> is the triple to resolve for, and the two halves of this gate pass
+#   different ones — see the SHIPPED-TARGET comment on the invocation below.
 #
 #   Cargo's exit status decides whether the count means anything, so this function
 #   reads that status. A count taken from a resolution that failed is the number
@@ -220,12 +414,23 @@ configuration_selects_feature() {
 #   configuration print `ok` and made the run print `PASS` while cargo had resolved
 #   nothing. Both call sites treat a non-zero return as a gate failure.
 vendor_crate_occurrences() {
-  local pkg="$1" feature_args="$2" tree count cargo_rc=0 grep_rc=0
-  # shellcheck disable=SC2086  # feature_args carries several cargo arguments.
-  tree="$(cargo tree -p "$pkg" $feature_args -e no-dev --target all --prefix none --format '{p}' 2>&1)" || cargo_rc=$?
+  local pkg="$1" built="$2" target="$3" tree count cargo_rc=0 grep_rc=0 argument
+  local -a args=()
+  while IFS= read -r argument; do
+    [[ -n "$argument" ]] && args+=("$argument")
+  done <<<"$built"
+  # SHIPPED-TARGET: the caller chooses. The absence half passes `all`, so a
+  # dependency edge under a `[target.'cfg(…)'.dependencies]` table that is false
+  # on this runner stays visible. The presence half passes the host triple,
+  # because `--target all` over-approximates there: it counts an edge only an
+  # unshipped target compiles, so moving the rusqlite dependency of
+  # crates/scp-platform/Cargo.toml under `[target.'cfg(windows)'.dependencies]`
+  # would keep the wheel's count at 1 while every manylinux wheel linked the build
+  # host's libcrypto.
+  tree="$(cargo tree -p "$pkg" ${args[@]+"${args[@]}"} -e no-dev --target "$target" --prefix none --format '{p}' 2>&1)" || cargo_rc=$?
   if [[ "$cargo_rc" -ne 0 ]]; then
     {
-      echo "cargo tree exited $cargo_rc for package '$pkg' with feature arguments '${feature_args:-none}':"
+      echo "cargo tree exited $cargo_rc for package '$pkg' on target '$target' with arguments '${args[*]:-none}':"
       printf '%s\n' "$tree"
     } >&2
     return 1
@@ -286,7 +491,7 @@ plant_gate() {
 
 run_fixtures() {
   echo ">> fixtures: the readers derive the shipped configurations and the wheel's configuration, and fail closed otherwise"
-  local dir file out rc wheel
+  local dir file out rc wheel built_depth coverage_out
   dir="$(mktemp -d)"
   trap 'rm -rf "$dir"' RETURN
 
@@ -310,12 +515,10 @@ run_fixtures() {
   wheel_line "$dir/absent.sh" >/dev/null 2>&1; rc=$?
   expect "a missing shipped-artifact list FAILS the wheel reader too" "FAIL" "$rc"
 
-  # A gate that writes a well-formed answer and THEN exits non-zero. Its
-  # --print-artifacts output clears the entry floor and its --print-wheel-entries
-  # output is exactly one line, so neither of those two checks can reject it and
-  # only the exit status can. Planting a gate that writes nothing proves less:
-  # the floor and the wheel count reject an empty answer on their own, so such a
-  # fixture stays green with the exit-status condition deleted.
+  # A gate that writes a well-formed answer and THEN exits non-zero: three valid
+  # entries, and exactly one wheel line, so the wheel count cannot reject it and
+  # only the exit status can. Planting a gate that writes nothing proves less,
+  # because the wheel count rejects an empty answer on its own.
   printf '%s\n' '#!/usr/bin/env bash' \
     'case "${1:-}" in' \
     '  --print-artifacts) printf "%s\n" "scp-node|" "scp-relay|" "scp-ffi|--features extension-module,vendored-openssl" ;;' \
@@ -324,17 +527,13 @@ run_fixtures() {
     'echo "this gate stopped partway through what it holds" >&2' \
     'exit 3' > "$file"
   out="$(shipped_configurations "$file" 2>/dev/null)"; rc=$?
-  expect "a gate whose --print-artifacts writes a floor-clearing list and then exits non-zero FAILS" "FAIL" "$rc"
+  expect "a gate whose --print-artifacts writes a well-formed list and then exits non-zero FAILS" "FAIL" "$rc"
   same_string "$out" ""; rc=$?
   expect "it hands back none of the lines that run wrote, so no artifact resolves off a run that failed" "PASS" "$rc"
   out="$(wheel_line "$file" 2>/dev/null)"; rc=$?
   expect "a gate whose --print-wheel-entries writes one well-formed line and then exits non-zero FAILS" "FAIL" "$rc"
   same_string "$out" ""; rc=$?
   expect "it hands back no wheel line either" "PASS" "$rc"
-
-  plant_gate "$file" "$wheel" "scp-node|"
-  shipped_configurations "$file" >/dev/null 2>&1; rc=$?
-  expect "a shipped-artifact list below the entry floor FAILS" "FAIL" "$rc"
 
   plant_gate "$file" "" "scp-node|" "scp-relay|"
   wheel_line "$file" >/dev/null 2>&1; rc=$?
@@ -344,17 +543,53 @@ run_fixtures() {
   wheel_line "$file" >/dev/null 2>&1; rc=$?
   expect "a gate naming two wheels FAILS rather than comparing against the first" "FAIL" "$rc"
 
-  configuration_selects_feature "--features extension-module,vendored-openssl" "vendored-openssl"; rc=$?
+  # (entry-whitelist) the four token shapes an entry may carry, and the refusal of
+  # everything else. `--depth 0` is the flag an adversarial review wrote into the
+  # ARTIFACTS array to truncate a tree to its root, which made this gate print ok
+  # for a bridge cdylib that reached openssl-src.
+  out="$(cargo_arguments_for "--no-default-features --features server")"; rc=$?
+  expect "(entry-whitelist) a two-flag entry is built" "PASS" "$rc"
+  same_string "$out" "$(printf '%s\n' '--no-default-features' '--features' 'server')"; rc=$?
+  expect "(entry-whitelist) it becomes three arguments, the list its own argument" "PASS" "$rc"
+  out="$(cargo_arguments_for "")"; rc=$?
+  expect "(entry-whitelist) a default-features entry is built" "PASS" "$rc"
+  same_string "$out" ""; rc=$?
+  expect "(entry-whitelist) it becomes no arguments at all" "PASS" "$rc"
+  cargo_arguments_for "--features=extension-module,vendored-openssl" >/dev/null 2>&1; rc=$?
+  expect "(entry-whitelist) the '--features=<list>' spelling is built" "PASS" "$rc"
+  cargo_arguments_for "--all-features" >/dev/null 2>&1; rc=$?
+  expect "(entry-whitelist) '--all-features' is built" "PASS" "$rc"
+
+  cargo_arguments_for "--features scp-platform/vendored-openssl --depth 0" >/dev/null 2>&1; rc=$?
+  expect "(entry-whitelist) the planted '--depth 0' entry is REFUSED, not counted as zero" "FAIL" "$rc"
+  cargo_arguments_for "--depth 0" >/dev/null 2>&1; rc=$?
+  expect "(entry-whitelist) '--depth 0' alone is REFUSED" "FAIL" "$rc"
+  cargo_arguments_for "-F vendored-openssl" >/dev/null 2>&1; rc=$?
+  expect "(entry-whitelist) cargo's '-F' short form is REFUSED, because this gate builds three shapes and no more" "FAIL" "$rc"
+  cargo_arguments_for "--features server --offline" >/dev/null 2>&1; rc=$?
+  expect "(entry-whitelist) a flag appended after a valid selection is REFUSED" "FAIL" "$rc"
+  cargo_arguments_for "--features" >/dev/null 2>&1; rc=$?
+  expect "(entry-whitelist) '--features' naming no list is REFUSED" "FAIL" "$rc"
+  cargo_arguments_for "--features --depth" >/dev/null 2>&1; rc=$?
+  expect "(entry-whitelist) a flag standing where the feature list belongs is REFUSED" "FAIL" "$rc"
+  cargo_arguments_for "--features a,,b" >/dev/null 2>&1; rc=$?
+  expect "(entry-whitelist) a feature list holding an empty element is REFUSED" "FAIL" "$rc"
+  cargo_arguments_for "--features 'a b'" >/dev/null 2>&1; rc=$?
+  expect "(entry-whitelist) a quoted pair inside the list is REFUSED, because each token is checked whole" "FAIL" "$rc"
+
+  configuration_selects_feature "$(cargo_arguments_for '--features extension-module,vendored-openssl')" "vendored-openssl"; rc=$?
   expect "a comma-separated feature list selects the feature" "PASS" "$rc"
-  configuration_selects_feature "--features=vendored-openssl" "vendored-openssl"; rc=$?
+  configuration_selects_feature "$(cargo_arguments_for '--features=vendored-openssl')" "vendored-openssl"; rc=$?
   expect "the '--features=<list>' spelling selects the feature" "PASS" "$rc"
-  configuration_selects_feature "--no-default-features --features server" "vendored-openssl"; rc=$?
+  configuration_selects_feature "$(cargo_arguments_for '--all-features')" "vendored-openssl"; rc=$?
+  expect "'--all-features' selects it, because it selects every feature the package defines" "PASS" "$rc"
+  configuration_selects_feature "$(cargo_arguments_for '--no-default-features --features server')" "vendored-openssl"; rc=$?
   expect "a configuration naming another feature does NOT select it" "FAIL" "$rc"
-  configuration_selects_feature "" "vendored-openssl"; rc=$?
+  configuration_selects_feature "$(cargo_arguments_for '')" "vendored-openssl"; rc=$?
   expect "a default-features configuration does NOT select it" "FAIL" "$rc"
-  configuration_selects_feature "--features not-vendored-openssl" "vendored-openssl"; rc=$?
+  configuration_selects_feature "$(cargo_arguments_for '--features not-vendored-openssl')" "vendored-openssl"; rc=$?
   expect "a longer feature name ending in it does NOT select it" "FAIL" "$rc"
-  configuration_selects_feature "--features vendored-openssl-experimental" "vendored-openssl"; rc=$?
+  configuration_selects_feature "$(cargo_arguments_for '--features vendored-openssl-experimental')" "vendored-openssl"; rc=$?
   expect "a longer feature name starting with it does NOT select it" "FAIL" "$rc"
 
   # `vendor_crate_occurrences` counts lines of a resolved graph, and these three
@@ -376,7 +611,7 @@ run_fixtures() {
     'echo "openssl-sys v0.9.109"' > "$dir/fakebin/cargo"
   chmod +x "$dir/fakebin/cargo"
   PATH="$dir/fakebin:$saved_path"
-  out="$(vendor_crate_occurrences "scp-ffi" "--features extension-module,vendored-openssl")"; rc=$?
+  out="$(vendor_crate_occurrences "scp-ffi" "$(cargo_arguments_for '--features extension-module,vendored-openssl')" "$(host_target)")"; rc=$?
   PATH="$saved_path"
   expect "a graph naming the vendored crate is counted" "PASS" "$rc"
   same_string "$out" "1"; rc=$?
@@ -388,7 +623,7 @@ run_fixtures() {
     'echo "openssl-sys v0.9.109"' > "$dir/fakebin/cargo"
   chmod +x "$dir/fakebin/cargo"
   PATH="$dir/fakebin:$saved_path"
-  out="$(vendor_crate_occurrences "scp-node" "")"; rc=$?
+  out="$(vendor_crate_occurrences "scp-node" "" all)"; rc=$?
   PATH="$saved_path"
   expect "a graph naming no $VENDOR_CRATE is counted" "PASS" "$rc"
   same_string "$out" "0"; rc=$?
@@ -400,17 +635,57 @@ run_fixtures() {
     'exit 101' > "$dir/fakebin/cargo"
   chmod +x "$dir/fakebin/cargo"
   PATH="$dir/fakebin:$saved_path"
-  vendor_crate_occurrences "scp-node" "--features gone" >/dev/null 2>&1; rc=$?
+  vendor_crate_occurrences "scp-node" "$(cargo_arguments_for '--features gone')" all >/dev/null 2>&1; rc=$?
   PATH="$saved_path"
   expect "a cargo tree that exits non-zero FAILS rather than counting zero" "FAIL" "$rc"
+
+  # (entry-whitelist) the argument vector vendor_crate_occurrences hands cargo.
+  # The fake cargo writes each argument it received on its own line, and this
+  # reads that file, so the assertion states what the function passed rather than
+  # restating the command this file already writes. A feature list must arrive as
+  # ONE argument: that is what makes a space inside an ARTIFACTS entry unable to
+  # become a second flag.
+  printf '%s\n' \
+    '#!/bin/sh' \
+    ': > "$ARGV_DUMP"' \
+    'for a in "$@"; do printf "%s\\n" "$a" >> "$ARGV_DUMP"; done' > "$dir/fakebin/cargo"
+  chmod +x "$dir/fakebin/cargo"
+  PATH="$dir/fakebin:$saved_path"
+  ARGV_DUMP="$dir/argv.txt" vendor_crate_occurrences \
+    "scp-ffi" "$(cargo_arguments_for '--no-default-features --features a,b')" all >/dev/null 2>&1
+  PATH="$saved_path"
+  same_string "$(cat "$dir/argv.txt")" "$(printf '%s\n' 'tree' '-p' 'scp-ffi' '--no-default-features' '--features' 'a,b' '-e' 'no-dev' '--target' 'all' '--prefix' 'none' '--format' '{p}')"; rc=$?
+  expect "(entry-whitelist) the feature list reaches cargo as ONE argument, so no space inside an entry becomes a second flag" "PASS" "$rc"
+
+  # And the same read against an entry the whitelist refuses: cargo_arguments_for
+  # fails, so the counter is never called and cargo is never run. The dump from
+  # the run above is deleted first, so a file still holding those lines would be
+  # the previous invocation's and this assertion would be reading a stale answer.
+  rm -f "$dir/argv.txt"
+  PATH="$dir/fakebin:$saved_path"
+  if built_depth="$(cargo_arguments_for '--features server --depth 0' 2>/dev/null)"; then
+    ARGV_DUMP="$dir/argv.txt" vendor_crate_occurrences "scp-ffi" "$built_depth" all >/dev/null 2>&1
+  fi
+  PATH="$saved_path"
+  if [[ -f "$dir/argv.txt" ]]; then rc=1; else rc=0; fi
+  expect "(entry-whitelist) a refused entry runs no cargo at all, so no truncated tree is counted" "PASS" "$rc"
 
   # run_gate end to end, against a planted gate and a cargo whose graph names
   # openssl-src exactly when the feature arguments select the vendored feature, so
   # the counter reports what each configuration asked for.
-  local gate_file
+  #
+  # Every planted cargo below also answers `metadata` out of $FAKE_METADATA,
+  # because run_gate reads the workspace's binary packages before it resolves
+  # anything. Each scenario therefore states the workspace it plants as well as
+  # the graph, and a scenario that plants a binary its configuration list omits
+  # fails on coverage rather than on the property it means to test.
+  local gate_file ffi_only_metadata binaries_metadata
   gate_file="$dir/scenario-gate.sh"
+  ffi_only_metadata='{"workspace_default_members":["c 0.1.0 (path+file:///w/scp-ffi)"],"packages":[{"id":"c 0.1.0 (path+file:///w/scp-ffi)","name":"scp-ffi","targets":[{"kind":["bin"],"name":"scp-ffi"}]}]}'
+  binaries_metadata='{"workspace_default_members":["a 0.1.0 (path+file:///w/scp-node)","b 0.1.0 (path+file:///w/scp-relay)"],"packages":[{"id":"a 0.1.0 (path+file:///w/scp-node)","name":"scp-node","targets":[{"kind":["bin"],"name":"scp-node"}]},{"id":"b 0.1.0 (path+file:///w/scp-relay)","name":"scp-relay","targets":[{"kind":["bin"],"name":"scp-relay"}]}]}'
   printf '%s\n' \
     '#!/bin/sh' \
+    'if [ "$1" = "metadata" ]; then printf "%s\\n" "$FAKE_METADATA"; exit 0; fi' \
     'echo "the-package v0.1.0"' \
     'case "$*" in' \
     "  *vendored-openssl*) echo \"${VENDOR_CRATE} v300.5.1+3.5.1\" ;;" \
@@ -425,7 +700,7 @@ run_fixtures() {
     "scp-ffi|" \
     "scp-ffi|--features extension-module"
   PATH="$dir/fakebin:$saved_path"
-  ( FEATURE_GRAPH_GATE="$gate_file" run_gate ) >/dev/null 2>&1; rc=$?
+  ( FAKE_METADATA="$ffi_only_metadata" FEATURE_GRAPH_GATE="$gate_file" run_gate ) >/dev/null 2>&1; rc=$?
   PATH="$saved_path"
   expect "run_gate FAILS when the vendored feature moves onto a sibling scp-ffi configuration" "FAIL" "$rc"
 
@@ -437,7 +712,7 @@ run_fixtures() {
     "scp-ffi|" \
     "scp-ffi|--features extension-module,vendored-openssl"
   PATH="$dir/fakebin:$saved_path"
-  ( FEATURE_GRAPH_GATE="$gate_file" run_gate ) >/dev/null 2>&1; rc=$?
+  ( FAKE_METADATA="$ffi_only_metadata" FEATURE_GRAPH_GATE="$gate_file" run_gate ) >/dev/null 2>&1; rc=$?
   PATH="$saved_path"
   expect "run_gate PASSES when that same tree keeps the vendored feature on the wheel" "PASS" "$rc"
 
@@ -453,6 +728,7 @@ run_fixtures() {
   local absent_out
   printf '%s\n' \
     '#!/bin/sh' \
+    'if [ "$1" = "metadata" ]; then printf "%s\\n" "$FAKE_METADATA"; exit 0; fi' \
     'echo "the-package v0.1.0"' \
     'case "$*" in' \
     "  *vendored-openssl*|*\"-p scp-node\"*|*\"-p scp-relay\"*) echo \"${VENDOR_CRATE} v300.5.1+3.5.1\" ;;" \
@@ -463,7 +739,7 @@ run_fixtures() {
     "scp-relay|" \
     "scp-ffi|--features extension-module,vendored-openssl"
   PATH="$dir/fakebin:$saved_path"
-  absent_out="$( FEATURE_GRAPH_GATE="$gate_file" run_gate 2>&1 )"; rc=$?
+  absent_out="$( FAKE_METADATA="$binaries_metadata" FEATURE_GRAPH_GATE="$gate_file" run_gate 2>&1 )"; rc=$?
   PATH="$saved_path"
   expect "(absent-reaches) run_gate FAILS when a binary that selects no feature reaches $VENDOR_CRATE" "FAIL" "$rc"
   printf '%s\n' "$absent_out" | grep -E "^ +FAIL — scp-node \[default features\] reaches $VENDOR_CRATE\.$" >/dev/null; rc=$?
@@ -476,15 +752,71 @@ run_fixtures() {
   # the two assertions above reject the planted edit rather than the tree shape.
   printf '%s\n' \
     '#!/bin/sh' \
+    'if [ "$1" = "metadata" ]; then printf "%s\\n" "$FAKE_METADATA"; exit 0; fi' \
     'echo "the-package v0.1.0"' \
     'case "$*" in' \
     "  *vendored-openssl*) echo \"${VENDOR_CRATE} v300.5.1+3.5.1\" ;;" \
     'esac' > "$dir/fakebin/cargo"
   chmod +x "$dir/fakebin/cargo"
   PATH="$dir/fakebin:$saved_path"
-  ( FEATURE_GRAPH_GATE="$gate_file" run_gate ) >/dev/null 2>&1; rc=$?
+  ( FAKE_METADATA="$binaries_metadata" FEATURE_GRAPH_GATE="$gate_file" run_gate ) >/dev/null 2>&1; rc=$?
   PATH="$saved_path"
   expect "(absent-reaches) run_gate PASSES on that same tree once only the wheel's configuration vendors" "PASS" "$rc"
+
+  # (binary-coverage) the deletion an adversarial review made: eight of the ten
+  # ARTIFACTS entries removed, leaving the wheel and one bridge. Every remaining
+  # configuration resolves correctly, so a gate that only checks what the list
+  # names prints PASS — and scp-node and scp-relay, the two artifacts the CRITERION
+  # section names as the reason this gate exists, are no longer checked at all.
+  # run_gate reads the workspace's own binary packages and fails, naming them.
+  #
+  # The fake cargo answers `metadata` with a workspace whose two default members
+  # build binaries, and answers `tree` with a graph that vendors only where the
+  # arguments ask, so the failure below is the coverage check and not a resolution.
+  local coverage_metadata
+  coverage_metadata='{"workspace_default_members":["a 0.1.0 (path+file:///w/scp-node)","b 0.1.0 (path+file:///w/scp-relay)","c 0.1.0 (path+file:///w/scp-ffi)"],"packages":[{"id":"a 0.1.0 (path+file:///w/scp-node)","name":"scp-node","targets":[{"kind":["bin"],"name":"scp-node"}]},{"id":"b 0.1.0 (path+file:///w/scp-relay)","name":"scp-relay","targets":[{"kind":["bin"],"name":"scp-relay"}]},{"id":"c 0.1.0 (path+file:///w/scp-ffi)","name":"scp-ffi","targets":[{"kind":["cdylib"],"name":"scp_ffi"}]}]}'
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'if [ "$1" = "metadata" ]; then printf "%s\\n" "$FAKE_METADATA"; exit 0; fi' \
+    'echo "the-package v0.1.0"' \
+    'case "$*" in' \
+    "  *vendored-openssl*) echo \"${VENDOR_CRATE} v300.5.1+3.5.1\" ;;" \
+    'esac' > "$dir/fakebin/cargo"
+  chmod +x "$dir/fakebin/cargo"
+
+  plant_gate "$gate_file" "$(printf 'bindings/python/pyproject.toml\tscp-ffi|--features extension-module,vendored-openssl')" \
+    "scp-ffi|--no-default-features --features server" \
+    "scp-ffi|--features extension-module,vendored-openssl"
+  PATH="$dir/fakebin:$saved_path"
+  coverage_out="$( FAKE_METADATA="$coverage_metadata" FEATURE_GRAPH_GATE="$gate_file" run_gate 2>&1 )"; rc=$?
+  PATH="$saved_path"
+  expect "(binary-coverage) run_gate FAILS when the shipped-configuration list names no configuration for a binary this workspace builds" "FAIL" "$rc"
+  printf '%s\n' "$coverage_out" | grep -E '^ +scp-node$' >/dev/null; rc=$?
+  expect "(binary-coverage) it names scp-node as uncovered" "PASS" "$rc"
+  printf '%s\n' "$coverage_out" | grep -E '^ +scp-relay$' >/dev/null; rc=$?
+  expect "(binary-coverage) it names scp-relay as uncovered" "PASS" "$rc"
+
+  # The positive control: the same tree with both binaries back in the list passes,
+  # so the two assertions above reject the deletion rather than the fixture shape.
+  plant_gate "$gate_file" "$(printf 'bindings/python/pyproject.toml\tscp-ffi|--features extension-module,vendored-openssl')" \
+    "scp-ffi|--no-default-features --features server" \
+    "scp-node|" \
+    "scp-relay|" \
+    "scp-ffi|--features extension-module,vendored-openssl"
+  PATH="$dir/fakebin:$saved_path"
+  ( FAKE_METADATA="$coverage_metadata" FEATURE_GRAPH_GATE="$gate_file" run_gate ) >/dev/null 2>&1; rc=$?
+  PATH="$saved_path"
+  expect "(binary-coverage) run_gate PASSES once both binaries appear in the list again" "PASS" "$rc"
+
+  # A cargo metadata this reader cannot enumerate fails the run rather than
+  # reporting that every binary is covered, which is what an empty enumeration
+  # would otherwise say.
+  printf '%s\n' '#!/bin/sh' 'if [ "$1" = "metadata" ]; then echo "{}"; exit 0; fi' 'echo "the-package v0.1.0"' > "$dir/fakebin/cargo"
+  chmod +x "$dir/fakebin/cargo"
+  PATH="$dir/fakebin:$saved_path"
+  ( FEATURE_GRAPH_GATE="$gate_file" run_gate ) >/dev/null 2>&1; rc=$?
+  PATH="$saved_path"
+  expect "(binary-coverage) a cargo metadata naming no binary package FAILS rather than covering nothing" "FAIL" "$rc"
 
   if [[ "$fixture_failures" -eq 0 ]]; then
     echo "   FIXTURES: all behavioural proofs passed."
@@ -497,7 +829,8 @@ run_fixtures() {
 # ---------------------------------------------------------------------------
 run_gate() {
   local failures=0 configuration pkg feature_args count wheel_entry wheel_file raw line tab
-  local -a configurations=() vendoring=() absent=()
+  local built binaries binary_package covered host
+  local -a configurations=() vendoring=() absent=() missing=()
 
   # A `while read` loop rather than `mapfile`, which bash 3.2 — the interpreter
   # `/bin/bash` runs on a developer's macOS — does not define.
@@ -520,8 +853,55 @@ run_gate() {
   echo "--> the wheel builds configuration '$wheel_entry', read from $wheel_file"
   echo
 
+  # Every configuration above is checked below, so the list is its own coverage
+  # floor for what it names. That says nothing about what the list OMITS, so this
+  # reads the workspace: a default member building a binary is an artifact this
+  # repository ships, and a list naming no configuration for it leaves it
+  # unchecked. A typed entry-count floor could not state that — this gate carried
+  # a floor of two against a list of ten, and deleting eight entries left
+  # scp-node and scp-relay uncovered under a green run.
+  if ! binaries="$(default_member_binary_packages)"; then
+    echo "FAIL — the binaries this workspace ships could not be enumerated, so this"
+    echo "       run cannot say whether the shipped-configuration list covers them."
+    return 1
+  fi
+  while IFS= read -r binary_package; do
+    [[ -z "$binary_package" ]] && continue
+    covered=0
+    for configuration in "${configurations[@]}"; do
+      if [[ "${configuration%%|*}" == "$binary_package" ]]; then
+        covered=1
+        break
+      fi
+    done
+    if [[ "$covered" -eq 0 ]]; then
+      missing+=("$binary_package")
+    fi
+  done <<<"$binaries"
+  if [[ "${#missing[@]}" -ne 0 ]]; then
+    echo "FAIL — this workspace ships ${#missing[@]} binary package(s) that the"
+    echo "       shipped-configuration list names no configuration for:"
+    printf '       %s\n' "${missing[@]}"
+    echo "       Each is a default workspace member building a [[bin]] target, so a"
+    echo "       build produces it and nothing here proved what it links. Add an"
+    echo "       ARTIFACTS entry for each in $FEATURE_GRAPH_GATE, or drop it from"
+    echo "       default-members if this repository no longer ships it."
+    return 1
+  fi
+  echo "--> every default-member binary package appears in that list"
+  echo
+
   for configuration in "${configurations[@]}"; do
-    if configuration_selects_feature "${configuration#*|}" "$VENDOR_FEATURE"; then
+    if ! built="$(cargo_arguments_for "${configuration#*|}")"; then
+      echo "FAIL — a shipped configuration carries a cargo argument this gate refuses"
+      echo "       to build, so no graph was resolved. The stderr above names the"
+      echo "       token. An entry names a package's feature selection and nothing"
+      echo "       else, which is what keeps a resolver flag — '--depth 0' truncates"
+      echo "       a tree to its root and makes every absence proof read zero — out"
+      echo "       of the command this gate runs."
+      return 1
+    fi
+    if configuration_selects_feature "$built" "$VENDOR_FEATURE"; then
       vendoring+=("$configuration")
     else
       absent+=("$configuration")
@@ -561,8 +941,14 @@ run_gate() {
     return 1
   fi
 
-  echo "--> the wheel's configuration: $pkg ${feature_args:-default features}"
-  if ! count="$(vendor_crate_occurrences "$pkg" "$feature_args")"; then
+  if ! host="$(host_target)"; then
+    echo "FAIL — the host triple could not be read, so the wheel's graph was not"
+    echo "       resolved on the target it ships for."
+    return 1
+  fi
+  built="$(cargo_arguments_for "$feature_args")" || return 1
+  echo "--> the wheel's configuration: $pkg ${feature_args:-default features}, resolved on $host"
+  if ! count="$(vendor_crate_occurrences "$pkg" "$built" "$host")"; then
     echo "FAIL — cargo resolved no dependency graph for the wheel's configuration,"
     echo "       so this run proved nothing about what the wheel carries. The stderr"
     echo "       above names what cargo rejected."
@@ -583,7 +969,8 @@ run_gate() {
   for configuration in "${absent[@]}"; do
     pkg="${configuration%%|*}"
     feature_args="${configuration#*|}"
-    if ! count="$(vendor_crate_occurrences "$pkg" "$feature_args")"; then
+    built="$(cargo_arguments_for "$feature_args")" || return 1
+    if ! count="$(vendor_crate_occurrences "$pkg" "$built" all)"; then
       echo "    FAIL — cargo resolved no dependency graph for $pkg [${feature_args:-default features}],"
       echo "           so this run proved nothing about that artifact. An entry of the"
       echo "           ARTIFACTS array of $FEATURE_GRAPH_GATE names a package or a feature"

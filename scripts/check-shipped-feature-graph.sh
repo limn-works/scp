@@ -1074,12 +1074,36 @@ assert_every_pipeline_reader_consumes_its_input() {
 #   one host triple.
 #
 #   CRITERION: every `cargo tree` invocation in every shell script under
-#   scripts/ names `--target all`. Without it cargo evaluates each
+#   scripts/ names `--target all`, or carries a `# SHIPPED-TARGET:` marker on the
+#   line directly above it. Without one of the two, cargo evaluates each
 #   `[target.'cfg(…)'.dependencies]` table against the triple the runner
 #   compiles for and DISCARDS every edge whose cfg is false there, so a
 #   dependency added under `cfg(target_os = "ios")` is absent from a graph
 #   resolved on ubuntu-latest while `.github/workflows/build-matrix.yml` compiles
 #   it into a signed xcframework.
+#
+#   THE MARKER, and why `--target all` is not always the answer. `--target all`
+#   resolves the UNION over every triple, which is the correct over-approximation
+#   for a proof that a crate is ABSENT: an edge this runner cannot see still
+#   counts. It is the wrong approximation for a proof that a crate is PRESENT,
+#   where the union accepts an edge only an unshipped target compiles.
+#   `scripts/check-vendored-openssl-scope.sh` proves both directions — the PyPI
+#   wheel must reach `openssl-src` and every other shipped artifact must not — so
+#   its absence half passes `all` and its presence half passes the host triple.
+#   Without the presence half naming a real target, moving the rusqlite
+#   dependency of crates/scp-platform/Cargo.toml under
+#   `[target.'cfg(windows)'.dependencies]` would keep that wheel's count at 1
+#   while every manylinux wheel linked the build host's libcrypto.
+#
+#   The marker is a line whose first non-blank content is `# SHIPPED-TARGET:`,
+#   sitting anywhere in the contiguous comment block directly above the
+#   invocation; the search stops at the first line that is not a comment, so a
+#   marker elsewhere in the file exempts nothing. This check reads whether that line is there
+#   and never whether the sentences after it are true, so the marker records that
+#   an author decided which shipped target the invocation resolves for; a reader
+#   still judges the reason. An invocation that names neither `--target all` nor a
+#   marker fails, which is every invocation in this repository that has not been
+#   thought about.
 #
 #   The criterion is decidable over these files because bash starts a command
 #   word at a line start, or after `$(`, an unescaped backtick, `|`, `;`, or `&`,
@@ -1094,29 +1118,59 @@ assert_every_pipeline_reader_consumes_its_input() {
 #   `[target.'cfg(target_arch = "wasm32")'.dependencies]` table, so the same
 #   host-triple blindness would hide a banned crate declared under a cfg.
 assert_every_cargo_tree_resolves_every_target() {
-  echo ">> fixture: every cargo tree invocation under scripts/ names --target all, so no cfg-gated dependency edge is invisible to an absence proof"
-  local script offenders all_offenders="" cmd_word
+  echo ">> fixture: every cargo tree invocation under scripts/ names --target all, or carries a SHIPPED-TARGET marker, so no cfg-gated dependency edge is invisible to an absence proof"
+  local script candidates all_offenders="" cmd_word line number above marked probe
   cmd_word='(^|[`;&|]|\$\()[[:space:]]*cargo[[:space:]]+tree[[:space:]]'
   while IFS= read -r script; do
-    offenders="$(sed -E 's/\\`//g' "$script" \
+    candidates="$(sed -E 's/\\`//g' "$script" \
       | grep -nE "$cmd_word" \
       | grep -vE '^[0-9]+:[[:space:]]*#' \
       | grep -vF -e '--target all' || true)"
-    if [[ -n "$offenders" ]]; then
-      all_offenders="$all_offenders$(printf '%s\n' "$offenders" | sed "s|^|${script}:|")
+    [[ -z "$candidates" ]] && continue
+    # Each candidate resolves one triple. It is exempt only when the line directly
+    # above it carries the marker, so the exemption is a property of the source an
+    # author wrote rather than of a name this check matches.
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      number="${line%%:*}"
+      # Walk up through the contiguous comment block directly above the
+      # invocation. A comment block is one unit a reader takes in together, so the
+      # marker may open it or close it; the walk stops at the first line that is
+      # not a comment, which is what keeps the exemption attached to THIS
+      # invocation rather than to a marker anywhere else in the file.
+      marked=0
+      probe=$((number - 1))
+      while [[ "$probe" -ge 1 ]]; do
+        above="$(sed -n "${probe}p" "$script")"
+        [[ "$above" =~ ^[[:space:]]*# ]] || break
+        if [[ "$above" =~ ^[[:space:]]*#[[:space:]]*SHIPPED-TARGET: ]]; then
+          marked=1
+          break
+        fi
+        probe=$((probe - 1))
+      done
+      if [[ "$marked" -eq 1 ]]; then
+        continue
+      fi
+      all_offenders="$all_offenders${script}:${line}
 "
-    fi
+    done <<<"$candidates"
   done < <(find scripts -type f -name '*.sh' | sort)
   if [[ -n "${all_offenders//[[:space:]]/}" ]]; then
-    echo "   FAIL — a cargo tree invocation below resolves only the runner's host"
-    echo "          triple, so every cfg-gated dependency edge that is false there"
-    echo "          is absent from a graph this repository reads as proof:"
+    echo "   FAIL — a cargo tree invocation below resolves one triple and carries no"
+    echo "          SHIPPED-TARGET marker, so every cfg-gated dependency edge that is"
+    echo "          false on that triple is absent from a graph this repository reads"
+    echo "          as proof:"
     printf '%s\n' "$all_offenders" | sed -E '/^$/d; s/^/       x /'
     echo "          Add '--target all' so cargo resolves the union over every triple."
+    echo "          If the invocation proves a crate is PRESENT, where that union"
+    echo "          accepts an edge only an unshipped target compiles, write a"
+    echo "          '# SHIPPED-TARGET:' comment directly above it naming the target it"
+    echo "          resolves for and why the union over-approximates there."
     fixture_failures=$((fixture_failures + 1))
     return
   fi
-  echo "   ok   — every cargo tree invocation under scripts/ resolves every target triple"
+  echo "   ok   — every cargo tree invocation under scripts/ resolves every target triple, or names the shipped target it resolves for"
 }
 
 # assert_print_modes_emit_what_this_gate_holds

@@ -821,6 +821,7 @@ GATES=(
     scripts/check-sdk-coverage.py
     scripts/check-shipped-feature-graph.sh
     scripts/check-toolchain-wiring.sh
+    scripts/check-vendored-openssl-scope.sh
     scripts/check-workflow-compile-steps.py
 )
 
