@@ -2,16 +2,16 @@
 
 An Owner section wraps a reproducible unit of its own text in a fragment marker:
 
-    <!-- scp:fragment id="rent-arithmetic" -->
-    One verified rent payment of `units` ... one declared period.
-    <!-- scp:end id="rent-arithmetic" -->
+    <!-- scp:fragment id="identity-backend-methods" -->
+    `IdentityBackend` carries six methods and no others ... and `fallback_set`.
+    <!-- scp:end id="identity-backend-methods" -->
 
 A mirroring site carries the matching include directive and the Owner's bytes
 between its two delimiters:
 
-    <!-- scp:include id="rent-arithmetic" from=".docs/specs/09-security-model.md" -->
-    One verified rent payment of `units` ... one declared period.
-    <!-- scp:end id="rent-arithmetic" -->
+    <!-- scp:include id="identity-backend-methods" from=".docs/specs/03-identity.md" -->
+    `IdentityBackend` carries six methods and no others ... and `fallback_set`.
+    <!-- scp:end id="identity-backend-methods" -->
 
 `scripts/resolve-doc-includes.py` rewrites every include body from the fragment
 its directive names. `scripts/check-doc-includes.py` re-runs that expansion into
