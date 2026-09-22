@@ -17,13 +17,6 @@
       ]
     },
     {
-      "id": "gate-relayres-3",
-      "name": "Relay-side validation + what may open or extend a chain at a routing id (+ companion ADR-004 update)",
-      "stories": [
-        "SCP-RELAYRES-003"
-      ]
-    },
-    {
       "id": "gate-relayres-4",
       "name": "Relay WRITE path (RelayPublisher + production RepublishManager wiring + loop fix)",
       "stories": [
@@ -166,65 +159,6 @@
       }
     },
     {
-      "id": "SCP-RELAYRES-003",
-      "title": "Relay-side validation for key-event record frames (SCP-native relay, OPTIONAL capability): decode → identifier-to-routing_id binding → chain verification (cheapest-first) → placing the frame's events on a chain under §9.7.4.2 R9; what may open or extend a chain at a routing id once one is established — with the companion ADR-004 storage-semantics update the spec mandates",
-      "gate": "gate-relayres-3",
-      "priority": "P0",
-      "severity": "major",
-      "status": "done",
-      "files": [
-        "crates/scp-transport/src/relay/key_event_validation.rs",
-        "crates/scp-transport/src/relay/mod.rs",
-        "crates/scp-node/src/projection.rs",
-        ".docs/adrs/phase-1.md"
-      ],
-      "description": "The relay-side anti-suppression behavior that makes the relay layer suppression-resistant (§3.10.2 'Relay-side validation', §3.10.8, §9.10.12). This is an OPTIONAL capability of SCP-native relays — the protocol MUST NOT require a validating relay; a foreign transport that cannot validate stores the frame opaquely and stays correct through the resolver's own verification (§3.10.2). §3.10.2 states relay-side validation and this story implements it by citation: on PUBLISH at a routing_id a validating SCP-native relay runs the ordered checks §3.10.2 lists, cheapest-first. §3.10.2 puts every check a relay can run before it decides whether to spend an outbound query ahead of `PaymentAdapter::verify`, the one call that leaves the relay's host: the declared rate limit, then structural decode as a KeyEventRecordV2 frame (SCP-RELAYRES-001), then the identifier-to-routing_id binding over the frame's `identifier` field, then the declared storage budgets, then the adapter call with the comparisons §3.10.2 states against its return, then chain verification and placement under §9.7.4.2 R9, at which the relay spends the rail-bound receipt identifier. A refusal under any declared policy term answers `4041` rather than `4040` (ADR-004). The chain authorizes the write, and no key the writer supplies does. §3.10.2 then states what may open or extend a chain at that routing id, under its four rules (a) through (d), and §9.7.4.2 R9 states what a relay keeps for one identity, what a chain holds, the write rule, the serving order and the ring buffer. Before the first valid frame the relay cannot recognize the routing_id as key-event domain (SHA-256 is one-way), so pre-seeded junk sits as ordinary opaque blobs until the first valid publish evicts it. This is an availability and anti-suppression measure, NEVER a trust dependency — the resolver verifies every event itself, so a relay that skips, botches or lies about validation degrades availability alone and never integrity. COMPANION ADR-004 UPDATE (upstream dependency the spec mandates): what may open or extend a chain at a routing id is a relay STORAGE behavior — the base relay stores multiple opaque blobs per routing_id with no per-routing_id cap (ADR-004) — so ADR-004 (`## ADR-004: SCP Native Relay Protocol`, .docs/adrs/phase-1.md) MUST be updated to state what may open or extend a key-event chain at a routing id once one is established. Per the artifact flow, that update is the FIRST step of this story, before the relay code.",
-      "acceptanceCriteria": [
-        "Companion ADR-004 update landed FIRST: `.docs/adrs/phase-1.md` ADR-004 section documents what may open or extend a key-event chain at a routing id (`SHA-256(\"scp:did:\" || identifier_bytes)`) once a binding-valid frame whose chain verifies establishes one — `grep -n 'open or extend a key-event chain' .docs/adrs/phase-1.md` matches within the ADR-004 section (per §3.10.2 mandate).",
-        "Validation runs local checks before remote ones and cheap checks before expensive ones, in the order §3.10.2 gives: the validating-relay path decodes the KeyEventRecordV2 frame, refusing a blob shorter than the frame's 33-byte fixed prefix, then checks the `SHA-256(\"scp:did:\" || identifier_bytes) == routing_id` binding over the frame's `identifier` field, then verifies the chain under §9.7.4.2 R2 and R3, in that order — a test asserts a wrong-binding frame is rejected WITHOUT any signature verification being performed (the binding check precedes chain verification, §3.10.2, at the structural decode and the identifier-to-routing-id binding).",
-        "Chain placement under §9.7.4.2 R9: a test asserts that two prefix-related chains are one chain and the relay keeps the longer, that a frame whose every event digest matches inside that chain's range leaves the relay's stored state unchanged, and that a frame diverging at a first differing position becomes a second chain (§3.10.2, at the check that verifies the chain and places its events).",
-        "Rule (a): once a chain exists at a routing_id, the relay accepts a later publish there only where that frame passes every check §3.10.2 orders — a test asserts the positive test alone decides, so a divergent chain is kept as a chain of its own while a blob that fails any of those checks is rejected (§3.10.2 rule (a), §9.7.4.2 R9).",
-        "Rule (b) — pre-seeded eviction: a test pre-seeds opaque junk blobs at a routing_id BEFORE any valid frame, then PUBLISHes the first binding-valid frame, and asserts the pre-existing opaque blobs are evicted when the first chain is established (§3.10.2, closing the pre-seeding gap).",
-        "Rule (c) — QUERY returns every chain and nothing else: after a chain is established, a test asserts QUERY at that routing_id returns every chain the routing id holds, a page at a time under R9's walk, and never any co-located junk.",
-        "Validation is OPTIONAL and never a trust dependency: a test asserts a non-validating storage path (foreign or opaque) still accepts and returns the frame as an opaque blob, so resolution stays correct through the resolver's own chain verification, and that relay acceptance is never consumed as a client trust input — §3.10.2 'Relay-side validation is an optional capability'.",
-        "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
-        "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
-      ],
-      "actionItems": [
-        "FIRST: update ADR-004 (.docs/adrs/phase-1.md, `## ADR-004: SCP Native Relay Protocol`) to state what may open or extend a key-event chain at a routing id once one is established (relay storage semantics), per the §3.10.2 mandate — artifact flow requires the ADR update before the relay code.",
-        "Implement the validating-relay key-event path (crates/scp-transport/src/relay/key_event_validation.rs): the §3.10.2 checks cheapest-first, then placing the frame's events on a chain under §9.7.4.2 R9; register in relay/mod.rs.",
-        "Wire §3.10.2 rules (a) through (d) into the relay blob store (crates/scp-node/src/projection.rs): accept a later PUBLISH only where the frame passes every check §3.10.2 orders; evict pre-existing opaque blobs when the first chain is established; QUERY returns every chain and nothing else; reject a client delete of a stored frame whose chain verifies, reading storage and failing closed on a read error.",
-        "Keep validation OPTIONAL — a transport that cannot validate stores the frame opaquely and the resolver verifies. Write the cheapest-first-order, chain-placement, rules-(a)-through-(d) and optional-validation tests; run full CI + review roster."
-      ],
-      "blockedBy": [
-        "SCP-RELAYRES-001"
-      ],
-      "sources": [
-        {
-          "file": ".docs/specs/03-identity.md",
-          "section": "### 3.10.2 Relay-Based Resolution"
-        },
-        {
-          "file": ".docs/specs/03-identity.md",
-          "section": "### 3.10.8 Security Analysis"
-        },
-        {
-          "file": ".docs/specs/09-security-model.md",
-          "section": "### 9.10.12 Relay Key-Event Record Frame"
-        },
-        {
-          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
-          "section": "## 10.4 Relay Architecture"
-        }
-      ],
-      "details": {
-        "phase": "2",
-        "feature": "issue #482 — relay-based DID resolution (Model B)",
-        "companion": "ADR-004 storage-semantics update (what may open or extend a key-event chain at a routing id) — spec-mandated upstream dependency, done as step 1 of this story",
-        "merged": "pull request #2270 on origin/main, whose commit subject reads \"feat(relay-res): relay-side DID-record validation + slot-exclusivity (SCP-RELAYRES-003, #482) (#2270)\" and predates the 2026-09-14 deletion of the word that subject uses for the unit; crates/scp-transport/src/relay/did_record_validation.rs and ADR-004's subsection \"What may open or extend a key-event chain at a routing id\" are both present on origin/main"
-      }
-    },
-    {
       "id": "SCP-RELAYRES-004",
       "title": "Relay WRITE path (§3.10.5 step 4): a real TransportRelayPublisher that PUBLISHes the KeyEventRecordV2 frame, an UNCONDITIONALLY-scheduled self-healing self-observation republish arm, and the single-writer live published-state seam the write path required (IdentityBackend::publish returns a PublishOutcome; one shared routing-ID derivation)",
       "gate": "gate-relayres-4",
@@ -324,7 +258,7 @@
         "rejected_design": "The one-shot relay latch: gating the relay arm on a `bound_relay_count()` readiness sample taken once at `RepublishManager` construction and calling `RepublishConfig::disable_relay()` when it read zero. Unfixable by construction — the sample necessarily ran before any relay client could exist, so the arm could never be true and, being latched, could never be woken. The per-tick re-evaluation variant an interim revision of this story proposed is ALSO rejected: it retains a readiness gate the arm does not need. Superseded by unconditional scheduling + fail-closed-per-tick + backoff + self-heal. No `bound_relay_count` accessor exists in the shipped code, and no scheduling decision reads a relay count.",
         "scopeException": "This story spans 23 files rather than the ~3 the PRD standard prefers, because the relay WRITE path and its root-cause fixes are one atomic unit: the publisher cannot build a frame the signing step discards (the publish path returning the record), and the republish arms cannot keep publishing the CURRENT frame from a build-time snapshot (the live published-state slots + single publish seam). Splitting them retroactively would invent a sequencing that never existed and leave stories that are done-on-arrival with a backwards dependency. Everything the branch built is owned by an acceptance criterion here; nothing is left justified only by rustdoc.",
         "weakened_by_collapse": "RESOLVED (Alec, 2026-08-13: \"we don't rely on convention for critical things — restore it structurally\" — the human scope decision the FIFTH-pass escalation asked for). HISTORY: `NodeDidPublisher` used to OWN the `PublishedDidRecord` slot as a required field and write it inside `publish`, so publishing without re-seeding was not constructible; its own comment called splitting them 'exactly the frozen-snapshot defect this seam exists to make unrepresentable'. The live-slot collapse (one `LiveSlot<NodePublishedState>` replacing `NodeDidDocument` + `NodeRelayUrl` + `PublishedDidRecord`) needs document + relay_url + record TOGETHER, so the slot could not exist before the startup publish that produces its `record` — which forced the write out to `build_domain_inner`, `build_no_domain_inner` and `apply_tier_change`. All three wrote it, so there was no live defect, but the compile-time guarantee was lost. RESTORE (shipped): the `DidPublisher` trait, `NodeDidPublisher`, the opaque `NodePublisher` handle and the publish-and-seed entry point `seed_from_startup_publish` now live inside the private `published_state` module, beside `LiveSlot::modify` and `apply_tier_change`. `DidPublisher::publish` takes a module-private `PublishAuthorization` token, so the publish operation is uncallable outside the module even for a future impl; the only publish paths are `seed_from_startup_publish` (startup — publish + build the seeded slot in one expression) and `apply_tier_change` (tier change — publish + advance the slot in one write), and both builders obtain `live_state` solely from `seed_from_startup_publish`. This is strictly stronger than the pre-collapse guarantee, which confined only the write and not the publish call. The story flips to `done` when this branch lands via the merge queue (the standard's `done` requires the code merged).",
-        "cycle_ownership_move": "The production `RepublishManager` was constructed in `self_host::serve_hosted_site`, so a node the self-hosting serve loop did not wrap published its key-event record once and never refreshed it — `start_node_in_memory` and `start_node_local` in `scp-ffi-common`, the FFI bridges' two node front doors, both call `Node::start`. A relay that does not validate stores the frame as an opaque blob and expires it under the shared blob TTL, and a validating relay may stop holding the record under the ring buffer of `09-security-model.md` §9.7.4.2 R9, which states when and what it displaces, so an identity that record names stops resolving there until the SDK's next self-check finds that entry holding no record and re-publishes to it. A node loads an identity in `Node::start`, so the cycle moved into the two terminal builders and `ApplicationNode` now owns it. AC-3, AC-4, AC-6 and AC-7 were repointed from `crates/scp-node/src/self_host.rs` to `crates/scp-node/src/republish.rs` for the same reason; no criterion was weakened, and one was added."
+        "cycle_ownership_move": "The production `RepublishManager` was constructed in `self_host::serve_hosted_site`, so a node the self-hosting serve loop did not wrap published its key-event record once and never refreshed it — `start_node_in_memory` and `start_node_local` in `scp-ffi-common`, the FFI bridges' two node front doors, both call `Node::start`. A relay that does not validate stores the frame as an opaque blob and expires it under the shared blob TTL, and a validating relay may stop holding the record on terms its operator declares (`09-security-model.md` §9.7.4.2 R9), so an identity that record names stops resolving there until the SDK's next self-check finds that entry holding no record and re-publishes to it. A node loads an identity in `Node::start`, so the cycle moved into the two terminal builders and `ApplicationNode` now owns it. AC-3, AC-4, AC-6 and AC-7 were repointed from `crates/scp-node/src/self_host.rs` to `crates/scp-node/src/republish.rs` for the same reason; no criterion was weakened, and one was added."
       }
     },
     {
@@ -354,7 +288,6 @@
         "Run full CI + review roster."
       ],
       "blockedBy": [
-        "SCP-RELAYRES-003",
         "SCP-RELAYRES-008"
       ],
       "sources": [
