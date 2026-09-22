@@ -657,6 +657,78 @@ jobs:
       - name: Run workflow-compile-steps cases
         run: bash scripts/tests/workflow-compile-steps/run-tests.sh
 
+  # ── The check a fix round runs before it pushes ──────────────────────
+  # scripts/fix-round-check.sh is the one entry point a fix agent runs in place
+  # of a gate set it assembles itself, so a regression in it hands that agent a
+  # verdict the agent has not earned and the agent pushes on that word.
+  # scripts/tests/fix-round-check/run-tests.sh holds it to its contract: it
+  # refuses to compile on a compiler rust-toolchain.toml does not name, each
+  # step's non-zero exit reaches the script's own exit code, and a run that
+  # names no crate derives its crate set from the files the branch changed or
+  # fails saying why.
+  #
+  # This job installs what case 3 of that suite needs, which is what the 29
+  # gates in the runner's list read: the tree-sitter grammars nine Python gates
+  # parse with, the PyYAML check-workflow-compile-steps.py reads every workflow
+  # file with, the ruff check-pyi-generated.sh runs, the jq
+  # check-bridge-symmetry.sh requires, a Rust toolchain for the twelve `cargo
+  # tree` resolutions check-shipped-feature-graph.sh and check-protocol-deps.sh
+  # run, and the base ref check-cross-layer.sh diffs against. No step here
+  # compiles a crate: the suite replaces `cargo check` and `cargo fmt` with
+  # stubs, because what it tests is what the runner does with their exit codes.
+  #
+  # The `if:` matches the one the cross-layer job above carries, and for the
+  # reason that job carries it: check-cross-layer.sh reads a declared exemption
+  # out of the pull request's body, a merge_group event publishes no body, and
+  # the 29 gates this suite runs include that one. Without the condition, a pull
+  # request whose exemption the cross-layer job accepted would fail this job in
+  # the merge queue over an exemption the queue cannot read. Every fix round
+  # pushes to a pull request, so the suite runs on the head each round produces.
+  fix-round-check-selftest:
+    needs: check-draft
+    if: github.event_name == 'pull_request'
+    name: enforcement / fix-round-check runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      # check-cross-layer.sh diffs against origin/$GITHUB_BASE_REF, and against
+      # origin/main when no base ref arrives, which is the merge-queue case.
+      - name: Fetch the base branch the cross-layer gate diffs against
+        run: git fetch origin ${{ github.base_ref || 'main' }} --depth=1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The same pins the sdk-coverage and pyi-generated jobs carry, for the
+      # same reason: a breaking upstream release cannot red a required check
+      # without a deliberate bump.
+      # PyYAML for check-workflow-compile-steps.py, which parses every workflow
+      # file and which the toolchain-wiring job installs the same pin for.
+      - run: pip install 'tree-sitter-rust>=0.21,<0.25' tree-sitter tree-sitter-python tree-sitter-typescript tree-sitter-kotlin tree-sitter-swift ruff==0.15.4 'pyyaml>=6,<7'
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - uses: dtolnay/rust-toolchain@stable
+      # This job reads the `workspace-debug` cache group for its registry alone,
+      # the way job shipped-feature-graph does: the twelve `cargo tree`
+      # resolutions the suite drives download the index and the `.crate` files,
+      # and no step here compiles a crate into `target/debug`. `save-if: false`
+      # keeps job rust-test the group's one writer, which is the shape the
+      # header comment of this file describes and
+      # scripts/check-workflow-compile-steps.py enforces: every rust-cache step
+      # names a `shared-key` and a `save-if`, and each group has exactly one
+      # writer, on `main`.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: false
+      - name: Run the fix-round-check cases
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: bash scripts/tests/fix-round-check/run-tests.sh
+
   # ── Mutable shared process-global enforcement (ADR-048, #1549 Phase 4) ──
   # Forward-prevention gates that forbid the DEFAULT_BRIDGE_INSTANCE pattern
   # from creeping back in any language. Every new piece of per-system state
@@ -2496,6 +2568,7 @@ jobs:
       - deleted-primitives
       - bridge-instance-lifecycle
       - toolchain-wiring
+      - fix-round-check-selftest
       - docker-image
       - no-mutable-globals-rust
       - no-mutable-globals-python
