@@ -66,7 +66,15 @@ mcp = []  # MCP server dependencies (if any beyond stdlib)
 [tool.maturin]
 python-source = "."
 module-name = "scp_sdk._scp_core"
-features = ["pyo3/extension-module"]
+manifest-path = "../../crates/scp-ffi/Cargo.toml"
+# Features of `scp-ffi`, not of pyo3: `extension-module` forwards
+# `pyo3/extension-module`, and `vendored-openssl` forwards
+# `scp-platform/vendored-openssl`, which compiles OpenSSL from source into
+# SQLCipher because a `pip install` runs no linker and the wheel installs onto a
+# machine whose OpenSSL the build never saw. This is the one shipped artifact
+# that vendors OpenSSL; `scripts/check-vendored-openssl-scope.sh` fails when a
+# second one does.
+features = ["extension-module", "vendored-openssl"]
 
 [tool.ruff]
 target-version = "py312"

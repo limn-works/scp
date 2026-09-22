@@ -44,6 +44,8 @@ PROTECTED_REPO_RELATIVE_PATHS=(
     "scripts/check-resolved-rustc.sh"
     "scripts/check-doc-citations.py"
     "scripts/check-agent-verdict-criterion.sh"
+    "scripts/check-shipped-feature-graph.sh"
+    "scripts/check-vendored-openssl-scope.sh"
     "scripts/hooks/pretooluse-enforcement-files.sh"
 )
 

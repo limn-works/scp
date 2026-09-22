@@ -103,6 +103,11 @@
 # Usage:
 #   scripts/check-shipped-feature-graph.sh            # gate the real workspace
 #   scripts/check-shipped-feature-graph.sh --self-test # run the fixture harness only
+#   scripts/check-shipped-feature-graph.sh --print-artifacts
+#       # write the ARTIFACTS array, one entry per line, and run no check
+#   scripts/check-shipped-feature-graph.sh --print-wheel-entries
+#       # write one `<maturin project file><TAB><ARTIFACTS entry>` line per
+#       # MATURIN_PROJECT_FILES entry, and run no check
 #
 set -euo pipefail
 
@@ -131,7 +136,7 @@ cd "$REPO_ROOT"
 # a future dependency edge pull plaintext key-per-file storage back into a
 # shipped graph with no gate failure to announce it.
 #
-# NINE ROWS NAME A FEATURE A ROOT PACKAGE ACTIVATES THROUGH ITS OWN `[features]`
+# TEN ROWS NAME A FEATURE A ROOT PACKAGE ACTIVATES THROUGH ITS OWN `[features]`
 # TABLE. `cargo tree -e features` renders no feature EDGE for any of them (see
 # "TWO RENDERINGS" in the header), so this gate could not observe one until it
 # began reading the per-package resolved-feature rendering. Their classification:
@@ -147,28 +152,40 @@ cd "$REPO_ROOT"
 #     is `["server"]`, which a bare `cargo build` at this root and the three
 #     default-feature bridge ARTIFACTS entries resolve.
 #   - `scp-ffi/extension-module` — `["pyo3/extension-module"]`, which tells pyo3
-#     to leave the Python symbols to the interpreter that loads the cdylib. The
-#     `scp-ffi|--features extension-module` ARTIFACTS entry, the PyPI wheel's
-#     configuration read from `[tool.maturin]`, resolves it. It activates no
-#     SCP-crate feature and no dependency edge.
+#     to leave the Python symbols to the interpreter that loads the cdylib. It
+#     activates no SCP-crate feature and no dependency edge.
+#   - `scp-ffi/vendored-openssl` — `["scp-platform/vendored-openssl"]`, which adds
+#     `rusqlite/bundled-sqlcipher-vendored-openssl` and compiles the same
+#     SQLCipher against an OpenSSL this build produces rather than one the host
+#     supplies. `scp-platform/vendored-openssl` carries its own row below, and
+#     `scripts/check-vendored-openssl-scope.sh` holds the property this gate does
+#     not read — that `openssl-src` reaches the wheel and reaches no other shipped
+#     artifact.
 #   - `scp-client-wasm/default` — an EMPTY feature list. Cargo reports `default`
 #     as enabled on that default member and it activates nothing.
-# None of the eight forwards a `testing` edge or an `allow_unencrypted_storage`
+# The `scp-ffi|--features extension-module,vendored-openssl` ARTIFACTS entry, the
+# PyPI wheel's configuration read from `[tool.maturin]`, resolves the two
+# `scp-ffi` rows above that no other entry reaches.
+# None of the ten forwards a `testing` edge or an `allow_unencrypted_storage`
 # edge. The reader reports cargo's RESOLVED list, so every feature a `default`
 # row expands to appears as its own row and meets this ⊆ check on its own —
 # permitting a `default` row therefore admits nothing beyond that row.
 # NULLIFIER_CONTROL_FEATURES names all five bridge/binary `testing` features, so
 # `assert_allowlist_has_no_nullifier` rejects an edit that adds one here.
 #
-# Nine artifact configurations are gated: the three shipped FFI bridges under
+# Ten artifact configurations are gated: the three shipped FFI bridges under
 # `--no-default-features --features server`, the same three under their DEFAULT
-# features, `scp-core`, and the scp-node and scp-relay binaries (built with
-# DEFAULT features — neither binary has a `server` feature). Each artifact's
-# resolved set is the UNION of the two renderings the header describes. This
-# single allowlist is a SUPERSET covering all nine plus the bare default-members
-# build — one list suffices. `cargo tree` DERIVES each artifact's resolved set
-# (never a hand-list); this allowlist is the hand-maintained set of what is
-# PERMITTED.
+# features, `scp-core`, the scp-node and scp-relay binaries (built with DEFAULT
+# features — neither binary has a `server` feature), and the PyPI wheel under
+# `--features extension-module,vendored-openssl`. Each artifact's resolved set is
+# the UNION of the two renderings the header describes. This single allowlist is a
+# SUPERSET covering all ten plus the bare default-members build — one list
+# suffices. `cargo tree` DERIVES each artifact's resolved set (never a hand-list);
+# this allowlist is the hand-maintained set of what is PERMITTED. An allowlist
+# covering every artifact says nothing about which artifact resolves which row, so
+# `scripts/check-vendored-openssl-scope.sh` decides that for the vendored-OpenSSL
+# rows: it reads the ARTIFACTS array below and fails unless exactly one entry
+# selects `vendored-openssl` and that entry builds the wheel's package.
 # ---------------------------------------------------------------------------
 PERMITTED_ALLOWLIST="$(cat <<'EOF'
 scp-client-wasm/default
@@ -191,6 +208,7 @@ scp-ffi-uniffi/server
 scp-ffi/default
 scp-ffi/extension-module
 scp-ffi/server
+scp-ffi/vendored-openssl
 scp-identity/default
 scp-identity/production-dht
 scp-mcp/default
@@ -204,6 +222,7 @@ scp-platform/in-memory-push
 scp-platform/in-memory-storage
 scp-platform/software_platform
 scp-platform/sqlite
+scp-platform/vendored-openssl
 scp-protocol/default
 scp-relay-client/default
 scp-runtime/default
@@ -235,7 +254,7 @@ EOF
 # build — the Dockerfile
 # `cargo build --release -p scp-relay -p scp-node`, a
 # `.github/workflows/release.yml` `cargo publish` step, `maturin`'s
-# `--manifest-path crates/scp-ffi/Cargo.toml` wheel build, and a
+# `working-directory: bindings/python` wheel build, and a
 # `.github/workflows/build-matrix.yml` "Build shipped bridge artifacts" step,
 # which builds one package per invocation into `target-shipped` so its uploaded
 # cdylibs resolve those same per-package sets these entries name. Three
@@ -251,8 +270,16 @@ EOF
 # maturin takes the wheel's cargo feature list from that table, and fails
 # unless ARTIFACTS carries the exact configuration that table selects. Today
 # that table selects `extension-module`, a pyo3-only feature that changes no
-# SCP-crate edge, and the `scp-ffi|--features extension-module` entry below is
-# the wheel's configuration.
+# SCP-crate edge, and `vendored-openssl`, which reaches
+# `scp-platform/vendored-openssl` and from there adds
+# `rusqlite/bundled-sqlcipher-vendored-openssl`. Neither nullifies a security
+# property: the first selects a Python linkage, and the second compiles the same
+# SQLCipher against an OpenSSL this build produced rather than one the host
+# supplies. The
+# `scp-ffi|--features extension-module,vendored-openssl` entry below is the
+# wheel's configuration, and `scripts/check-vendored-openssl-scope.sh` holds
+# the complementary property this gate does not read — that `openssl-src`
+# reaches the wheel and reaches no other shipped artifact.
 #
 # uniffi-bindgen (the third workspace `[[bin]]`, in `crates/scp-ffi/uniffi`) is
 # deliberately NOT a separate ARTIFACTS entry: it is a build-time code-generation
@@ -269,6 +296,17 @@ EOF
 # package's DEFAULT feature set — a different resolution from the
 # `--no-default-features --features server` one the three bridge entries above
 # gate, and one nothing gated until these entries existed.
+#
+# `scripts/check-vendored-openssl-scope.sh` reads this array as its list of what
+# this repository ships, so an entry added here is checked there on the same
+# commit. That gate invokes `--print-artifacts` below, which writes the array bash
+# holds, so the spelling of this assignment decides nothing about what that gate
+# reads: a second `ARTIFACTS=(` assignment, an `ARTIFACTS+=(` appender, a line
+# continuation, and a shell expansion all reach it, because bash expanded each one
+# before the mode wrote a line. An earlier revision of that gate parsed this file's
+# source text for an `ARTIFACTS=(` opener and read to the first `)`, and three
+# review rounds each found another spelling that parser did not see while bash held
+# the entries.
 ARTIFACTS=(
   "scp-ffi|--no-default-features --features server"
   "scp-ffi-napi|--no-default-features --features server"
@@ -284,7 +322,7 @@ ARTIFACTS=(
   # `assert_wheel_feature_selection_is_gated` fails when the string it derives
   # is not in this list, so an edit to that table changes what this gate
   # resolves or fails the gate.
-  "scp-ffi|--features extension-module"
+  "scp-ffi|--features extension-module,vendored-openssl"
 )
 
 # ---------------------------------------------------------------------------
@@ -301,10 +339,17 @@ SHIPPING_FILES=(
 # Maturin project files: every pyproject.toml whose `[tool.maturin]` table
 # maturin can read when a shipping file runs it. maturin reads the pyproject.toml
 # of its working directory when one exists, and otherwise the one beside the
-# Cargo.toml its `--manifest-path` names, so both files below are inputs of the
-# wheel build: build-matrix.yml runs maturin with
-# `working-directory: bindings/python` and `--manifest-path
-# crates/scp-ffi/Cargo.toml`. That table's `features`, `all-features`, and
+# Cargo.toml its `--manifest-path` names. build-matrix.yml runs maturin with
+# `working-directory: bindings/python` and passes no `--manifest-path`, because
+# `bindings/python/pyproject.toml` carries a `[tool.maturin] manifest-path` key,
+# so that one file is the wheel build's only input. `crates/scp-ffi/pyproject.toml`
+# sat in this list while the maturin step still passed `--manifest-path
+# crates/scp-ffi/Cargo.toml`; the step no longer does, and
+# `assert_maturin_project_files_are_complete` fails on the stale entry rather than
+# leaving a reader to notice. Restoring that argument, or adding any other line a
+# shipping file runs maturin from, fails the same assertion until this list names
+# the pyproject.toml the new line reaches. That table's `features`,
+# `all-features`, and
 # `no-default-features` keys select the wheel's cargo features, and the maturin
 # step passes no `--features` of its own, so a `testing` entry added to either
 # table compiles `scp-platform/testing`, `scp-dht/testing`, and `scp-testing`
@@ -318,7 +363,6 @@ SHIPPING_FILES=(
 # ---------------------------------------------------------------------------
 MATURIN_PROJECT_FILES=(
   "bindings/python/pyproject.toml"
-  "crates/scp-ffi/pyproject.toml"
 )
 
 # Every line of a SHIPPING_FILES file that lines_carrying_cargo_feature_selection
@@ -1030,12 +1074,36 @@ assert_every_pipeline_reader_consumes_its_input() {
 #   one host triple.
 #
 #   CRITERION: every `cargo tree` invocation in every shell script under
-#   scripts/ names `--target all`. Without it cargo evaluates each
+#   scripts/ names `--target all`, or carries a `# SHIPPED-TARGET:` marker on the
+#   line directly above it. Without one of the two, cargo evaluates each
 #   `[target.'cfg(…)'.dependencies]` table against the triple the runner
 #   compiles for and DISCARDS every edge whose cfg is false there, so a
 #   dependency added under `cfg(target_os = "ios")` is absent from a graph
 #   resolved on ubuntu-latest while `.github/workflows/build-matrix.yml` compiles
 #   it into a signed xcframework.
+#
+#   THE MARKER, and why `--target all` is not always the answer. `--target all`
+#   resolves the UNION over every triple, which is the correct over-approximation
+#   for a proof that a crate is ABSENT: an edge this runner cannot see still
+#   counts. It is the wrong approximation for a proof that a crate is PRESENT,
+#   where the union accepts an edge only an unshipped target compiles.
+#   `scripts/check-vendored-openssl-scope.sh` proves both directions — the PyPI
+#   wheel must reach `openssl-src` and every other shipped artifact must not — so
+#   its absence half passes `all` and its presence half passes the host triple.
+#   Without the presence half naming a real target, moving the rusqlite
+#   dependency of crates/scp-platform/Cargo.toml under
+#   `[target.'cfg(windows)'.dependencies]` would keep that wheel's count at 1
+#   while every manylinux wheel linked the build host's libcrypto.
+#
+#   The marker is a line whose first non-blank content is `# SHIPPED-TARGET:`,
+#   sitting anywhere in the contiguous comment block directly above the
+#   invocation; the search stops at the first line that is not a comment, so a
+#   marker elsewhere in the file exempts nothing. This check reads whether that line is there
+#   and never whether the sentences after it are true, so the marker records that
+#   an author decided which shipped target the invocation resolves for; a reader
+#   still judges the reason. An invocation that names neither `--target all` nor a
+#   marker fails, which is every invocation in this repository that has not been
+#   thought about.
 #
 #   The criterion is decidable over these files because bash starts a command
 #   word at a line start, or after `$(`, an unescaped backtick, `|`, `;`, or `&`,
@@ -1050,29 +1118,126 @@ assert_every_pipeline_reader_consumes_its_input() {
 #   `[target.'cfg(target_arch = "wasm32")'.dependencies]` table, so the same
 #   host-triple blindness would hide a banned crate declared under a cfg.
 assert_every_cargo_tree_resolves_every_target() {
-  echo ">> fixture: every cargo tree invocation under scripts/ names --target all, so no cfg-gated dependency edge is invisible to an absence proof"
-  local script offenders all_offenders="" cmd_word
+  echo ">> fixture: every cargo tree invocation under scripts/ names --target all, or carries a SHIPPED-TARGET marker, so no cfg-gated dependency edge is invisible to an absence proof"
+  local script candidates all_offenders="" cmd_word line number above marked probe
   cmd_word='(^|[`;&|]|\$\()[[:space:]]*cargo[[:space:]]+tree[[:space:]]'
   while IFS= read -r script; do
-    offenders="$(sed -E 's/\\`//g' "$script" \
+    candidates="$(sed -E 's/\\`//g' "$script" \
       | grep -nE "$cmd_word" \
       | grep -vE '^[0-9]+:[[:space:]]*#' \
       | grep -vF -e '--target all' || true)"
-    if [[ -n "$offenders" ]]; then
-      all_offenders="$all_offenders$(printf '%s\n' "$offenders" | sed "s|^|${script}:|")
+    [[ -z "$candidates" ]] && continue
+    # Each candidate resolves one triple. It is exempt only when the line directly
+    # above it carries the marker, so the exemption is a property of the source an
+    # author wrote rather than of a name this check matches.
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      number="${line%%:*}"
+      # Walk up through the contiguous comment block directly above the
+      # invocation. A comment block is one unit a reader takes in together, so the
+      # marker may open it or close it; the walk stops at the first line that is
+      # not a comment, which is what keeps the exemption attached to THIS
+      # invocation rather than to a marker anywhere else in the file.
+      marked=0
+      probe=$((number - 1))
+      while [[ "$probe" -ge 1 ]]; do
+        above="$(sed -n "${probe}p" "$script")"
+        [[ "$above" =~ ^[[:space:]]*# ]] || break
+        if [[ "$above" =~ ^[[:space:]]*#[[:space:]]*SHIPPED-TARGET: ]]; then
+          marked=1
+          break
+        fi
+        probe=$((probe - 1))
+      done
+      if [[ "$marked" -eq 1 ]]; then
+        continue
+      fi
+      all_offenders="$all_offenders${script}:${line}
 "
-    fi
+    done <<<"$candidates"
   done < <(find scripts -type f -name '*.sh' | sort)
   if [[ -n "${all_offenders//[[:space:]]/}" ]]; then
-    echo "   FAIL — a cargo tree invocation below resolves only the runner's host"
-    echo "          triple, so every cfg-gated dependency edge that is false there"
-    echo "          is absent from a graph this repository reads as proof:"
+    echo "   FAIL — a cargo tree invocation below resolves one triple and carries no"
+    echo "          SHIPPED-TARGET marker, so every cfg-gated dependency edge that is"
+    echo "          false on that triple is absent from a graph this repository reads"
+    echo "          as proof:"
     printf '%s\n' "$all_offenders" | sed -E '/^$/d; s/^/       x /'
     echo "          Add '--target all' so cargo resolves the union over every triple."
+    echo "          If the invocation proves a crate is PRESENT, where that union"
+    echo "          accepts an edge only an unshipped target compiles, write a"
+    echo "          '# SHIPPED-TARGET:' comment directly above it naming the target it"
+    echo "          resolves for and why the union over-approximates there."
     fixture_failures=$((fixture_failures + 1))
     return
   fi
-  echo "   ok   — every cargo tree invocation under scripts/ resolves every target triple"
+  echo "   ok   — every cargo tree invocation under scripts/ resolves every target triple, or names the shipped target it resolves for"
+}
+
+# assert_print_modes_emit_what_this_gate_holds
+#   CRITERION: `--print-artifacts` writes the ARTIFACTS array as bash holds it at
+#   the moment of the invocation, one entry per line and nothing else, and
+#   `--print-wheel-entries` writes the entry `maturin_artifact_entry` derives for
+#   each MATURIN_PROJECT_FILES file, beside that file's path.
+#
+#   `scripts/check-vendored-openssl-scope.sh` reads both lists through these two
+#   modes, so the modes are the interface between the two gates. That gate used to
+#   parse this file's source text instead: it searched for an `ARTIFACTS=(` opener
+#   and read the lines up to the first `)` at column 0. Three review rounds each
+#   found another way to write the assignment that the parser did not see, and each
+#   one left bash holding entries the parser never reported while that gate printed
+#   PASS. The two planted copies below close that class: bash expands every
+#   spelling before either mode writes a line, so a copy of this file carrying an
+#   appended `ARTIFACTS+=(` writes the appended entry, and a copy carrying a second
+#   `ARTIFACTS=(` assignment writes the replacement rather than the block this file
+#   holds.
+#
+#   Each plant copies this file rather than writing a small stand-in, so the
+#   fixture states what a caller gets from THIS gate, including the `cd` it runs
+#   before main and every other line the copy still carries.
+assert_print_modes_emit_what_this_gate_holds() {
+  echo ">> fixture: --print-artifacts writes the array bash holds and --print-wheel-entries writes one entry per maturin project file (the interface check-vendored-openssl-scope.sh reads)"
+  local self expected printed rc plant_dir copy last_line project_file
+
+  self="${BASH_SOURCE[0]}"
+  expected="$(printf '%s\n' "${ARTIFACTS[@]}")"
+  printed="$(bash "$self" --print-artifacts)"; rc=$?
+  expect "(print-modes) --print-artifacts exits 0" "PASS" "$rc"
+  same_string "$printed" "$expected"; rc=$?
+  expect "(print-modes) its output is the ARTIFACTS array and carries no other line this gate writes" "PASS" "$rc"
+
+  expected="$(for project_file in "${MATURIN_PROJECT_FILES[@]}"; do
+    printf '%s\t%s\n' "$project_file" "$(maturin_artifact_entry "$project_file")"
+  done)"
+  printed="$(bash "$self" --print-wheel-entries)"; rc=$?
+  expect "(print-modes) --print-wheel-entries exits 0" "PASS" "$rc"
+  same_string "$printed" "$expected"; rc=$?
+  expect "(print-modes) its output names each maturin project file and the entry maturin_artifact_entry derives from it" "PASS" "$rc"
+
+  # Each plant deletes the `main \"$@\"` line, adds an assignment, and writes that
+  # line back, so the added assignment runs before the dispatch reads the array. A
+  # copy whose last line held something else would carry dead code and prove
+  # nothing, so this reads the line it is about to delete.
+  plant_dir="$(mktemp -d)"
+  mkdir -p "$plant_dir/scripts"
+  copy="$plant_dir/scripts/gate.sh"
+  last_line="$(tail -n 1 "$self")"
+  same_string "$last_line" 'main "$@"'; rc=$?
+  expect "(print-modes) this file's last line invokes main, which is the line each plant below writes back" "PASS" "$rc"
+
+  sed '$d' "$self" > "$copy"
+  printf '%s\n' 'ARTIFACTS+=("planted-appender|")' 'main "$@"' >> "$copy"
+  printed="$(bash "$copy" --print-artifacts)"; rc=$?
+  expect "(print-modes) a copy carrying an ARTIFACTS+=( appender exits 0" "PASS" "$rc"
+  same_string "$printed" "$(printf '%s\n' "${ARTIFACTS[@]}"; echo 'planted-appender|')"; rc=$?
+  expect "(print-modes) that copy writes the appended entry, which a source-text parser reading to the first ')' never saw" "PASS" "$rc"
+
+  sed '$d' "$self" > "$copy"
+  printf '%s\n' 'ARTIFACTS=("planted-second|")' 'main "$@"' >> "$copy"
+  printed="$(bash "$copy" --print-artifacts)"; rc=$?
+  expect "(print-modes) a copy carrying a second ARTIFACTS=( assignment exits 0" "PASS" "$rc"
+  same_string "$printed" "planted-second|"; rc=$?
+  expect "(print-modes) that copy writes what bash holds after the second assignment, not the first block" "PASS" "$rc"
+  rm -rf "$plant_dir"
 }
 
 # ---------------------------------------------------------------------------
@@ -1283,113 +1448,127 @@ maturin_project_files_named_by_shipping_lines() {
   done <<<"$1" | sed -E 's#^\./##; /^$/d' | sort -u
 }
 
-# maturin_table_text <pyproject.toml>
-#   Emit the body of the `[tool.maturin]` table as one space-joined line, with
-#   comments removed. A `[tool.maturin.<sub>]` table is a different table and is
-#   not emitted. FAILS (non-zero, reason on stderr) when the file does not
-#   exist, or when the file spells a maturin key in a TOML form this reader does
-#   not parse — an inline table (`maturin = { … }`) or a dotted key
-#   (`tool.maturin.features = …`) — because a spelling the reader cannot parse
-#   must not read as "no features selected".
-maturin_table_text() {
-  local file="$1" unparsed
-  if [[ ! -f "$file" ]]; then
-    echo "maturin project file does not exist: $file" >&2
-    return 1
-  fi
-  unparsed="$(grep -nE '(^|[[:space:].])maturin[[:space:]]*=[[:space:]]*\{|(^|[[:space:].])maturin\.(features|all-features|no-default-features|manifest-path)[[:space:]]*=' "$file" || true)"
-  if [[ -n "$unparsed" ]]; then
-    { echo "$file spells a maturin key as an inline table or a dotted key, which this reader does not parse:"
-      printf '%s\n' "$unparsed" | sed 's/^/  /'; } >&2
-    return 1
-  fi
-  awk '
-    /^[[:space:]]*\[/ {
-      in_table = ($0 ~ /^[[:space:]]*\[[[:space:]]*tool[[:space:]]*\.[[:space:]]*maturin[[:space:]]*\][[:space:]]*(#.*)?$/)
-      next
-    }
-    in_table { sub(/(^|[[:space:]])#.*$/, ""); printf "%s ", $0 }
-    END { printf "\n" }
-  ' "$file"
-}
+# The program that derives a wheel's ARTIFACTS entry from a maturin project file.
+#
+# CRITERION: it reports the cargo configuration maturin compiles, for every TOML
+# spelling of that project file, or it fails.
+#
+# `tomllib` decides what the document says, so `[tool.maturin]`, `[tool."maturin"]`,
+# `tool.maturin.features = […]`, and `maturin = { features = […] }` are four
+# spellings of one table and reach one code path. The reader this replaced matched
+# the table header as source text and rejected two spellings by name: it read
+# `[tool."maturin"]`, which is valid TOML naming the table maturin reads, as an
+# absent table and derived `scp-ffi|`, an ARTIFACTS entry this gate already holds,
+# so `assert_wheel_feature_selection_is_gated` accepted a wheel compiling
+# `testing`. Naming one more forbidden spelling per review round is the
+# non-convergent enforcement CLAUDE.md forbids under "Guard against
+# over-engineering and non-convergent enforcement"; a parser closed by
+# construction is the convergent answer, and this repository already reads
+# `.mise.toml` this way in `scripts/check-toolchain-wiring.sh`.
+#
+# The program reads the `[package] name` of the manifest out of the same parser,
+# because a Cargo.toml is a TOML document and `[ "package" ]` names the same table
+# an awk matching a bare header would miss.
+#
+# It writes the entry in the spelling ARTIFACTS uses: `--all-features`, then
+# `--no-default-features`, then `--features a,b`, each present only when the table
+# selects it. It fails on a `features` that is not an array of strings, on an
+# `all-features` or `no-default-features` that is not a boolean, on a
+# `manifest-path` that is not a string, on a manifest it cannot read, and on a
+# manifest carrying no `[package] name` — because a value this reader cannot
+# interpret must not read as "no features selected".
+read -r -d '' MATURIN_ENTRY_PROGRAM <<'PYTHON' || true
+import os
+import sys
+import tomllib
 
-# maturin_feature_args <pyproject.toml>
-#   Emit the cargo feature arguments the `[tool.maturin]` table of the file
-#   selects, spelled the way ARTIFACTS spells them: `--all-features`, then
-#   `--no-default-features`, then `--features a,b`, each present only when the
-#   table selects it; an empty line when the table selects nothing. FAILS
-#   (non-zero) on anything maturin_table_text fails on, and on a key whose value
-#   is not a TOML array of strings (`features`) or a TOML boolean
-#   (`all-features`, `no-default-features`).
-maturin_feature_args() {
-  local file="$1" text args="" list features
-  text="$(maturin_table_text "$file")" || return 1
-  local re_all='(^|[[:space:]])all-features[[:space:]]*=[[:space:]]*(true|false)([[:space:]]|$)'
-  local re_nodef='(^|[[:space:]])no-default-features[[:space:]]*=[[:space:]]*(true|false)([[:space:]]|$)'
-  local re_feat='(^|[[:space:]])features[[:space:]]*=[[:space:]]*\[([^]]*)\]'
-  if [[ "$text" =~ (^|[[:space:]])all-features[[:space:]]*= ]]; then
-    if [[ ! "$text" =~ $re_all ]]; then
-      echo "$file: all-features is not a TOML boolean" >&2; return 1
-    fi
-    if [[ "${BASH_REMATCH[2]}" == "true" ]]; then args="--all-features"; fi
+
+def fail(message):
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+project_file = sys.argv[1]
+
+try:
+    with open(project_file, "rb") as handle:
+        document = tomllib.load(handle)
+except (OSError, tomllib.TOMLDecodeError) as error:
+    fail(f"{project_file}: {error}")
+
+tool = document.get("tool")
+table = tool.get("maturin", {}) if isinstance(tool, dict) else {}
+if not isinstance(table, dict):
+    fail(f"{project_file}: [tool.maturin] is not a table")
+
+args = []
+
+for key in ("all-features", "no-default-features"):
+    if key in table:
+        value = table[key]
+        if not isinstance(value, bool):
+            fail(f"{project_file}: {key} is not a TOML boolean")
+        if value:
+            args.append(f"--{key}")
+
+if "features" in table:
+    features = table["features"]
+    if not isinstance(features, list) or not all(
+        isinstance(name, str) for name in features
+    ):
+        fail(f"{project_file}: features is not a TOML array of strings")
+    names = [name.strip() for name in features if name.strip()]
+    if names:
+        args.append("--features " + ",".join(names))
+
+manifest = table.get("manifest-path", "Cargo.toml")
+if not isinstance(manifest, str):
+    fail(f"{project_file}: manifest-path is not a TOML string")
+if not os.path.isabs(manifest):
+    manifest = os.path.join(os.path.dirname(project_file) or ".", manifest)
+
+try:
+    with open(manifest, "rb") as handle:
+        cargo = tomllib.load(handle)
+except (OSError, tomllib.TOMLDecodeError) as error:
+    fail(f"{project_file}: manifest-path names no manifest this reader can read: {error}")
+
+package = cargo.get("package")
+name = package.get("name") if isinstance(package, dict) else None
+if not isinstance(name, str) or not name:
+    fail(f"{project_file}: {manifest} carries no [package] name")
+
+print(f"{name}|{' '.join(args)}")
+PYTHON
+
+# The first interpreter that ships `tomllib`, which the Python standard library
+# has held since 3.11. `maturin_artifact_entry` fails when no candidate imports
+# it, rather than deriving an entry some other way, and `--print-artifacts` needs
+# no interpreter at all, so a machine without Python still answers that mode.
+MATURIN_TOML_READER=""
+for maturin_toml_candidate in python3.12 python3 python; do
+  if command -v "$maturin_toml_candidate" >/dev/null 2>&1 &&
+    "$maturin_toml_candidate" -c 'import tomllib' >/dev/null 2>&1; then
+    MATURIN_TOML_READER="$maturin_toml_candidate"
+    break
   fi
-  if [[ "$text" =~ (^|[[:space:]])no-default-features[[:space:]]*= ]]; then
-    if [[ ! "$text" =~ $re_nodef ]]; then
-      echo "$file: no-default-features is not a TOML boolean" >&2; return 1
-    fi
-    if [[ "${BASH_REMATCH[2]}" == "true" ]]; then args="${args:+$args }--no-default-features"; fi
-  fi
-  if [[ "$text" =~ (^|[[:space:]])features[[:space:]]*= ]]; then
-    if [[ ! "$text" =~ $re_feat ]]; then
-      echo "$file: features is not a TOML array" >&2; return 1
-    fi
-    list="${BASH_REMATCH[2]}"
-    local re_bad='[^-A-Za-z0-9_./@:+, "'"'"']'
-    if [[ "$list" =~ $re_bad ]]; then
-      echo "$file: features carries a character no quoted cargo feature name uses: $list" >&2; return 1
-    fi
-    features="$(printf '%s\n' "$list" | tr -d "\"'" | tr ',' '\n' \
-      | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; /^$/d' | paste -sd, -)"
-    if [[ -n "$features" ]]; then args="${args:+$args }--features $features"; fi
-  fi
-  printf '%s\n' "$args"
-}
+done
 
 # maturin_artifact_entry <pyproject.toml>
 #   Emit the ARTIFACTS entry (`<package>|<feature-args>`) the file's
 #   `[tool.maturin]` table makes maturin build: the package is the `[package]
 #   name` of the Cargo.toml the table's `manifest-path` names, resolved against
 #   the pyproject.toml's directory, or of the Cargo.toml beside the
-#   pyproject.toml when the table names none. FAILS (non-zero) when
-#   maturin_feature_args fails, when that Cargo.toml does not exist, or when it
-#   carries no `[package] name`.
+#   pyproject.toml when the table names none. FAILS (non-zero, reason on stderr)
+#   on anything MATURIN_ENTRY_PROGRAM above fails on, and when no interpreter on
+#   PATH imports tomllib.
 maturin_artifact_entry() {
-  local file="$1" args text dir manifest pkg
-  args="$(maturin_feature_args "$file")" || return 1
-  text="$(maturin_table_text "$file")" || return 1
-  dir="$(dirname "$file")"
-  local re_mp='(^|[[:space:]])manifest-path[[:space:]]*=[[:space:]]*["'"'"']([^"'"'"']+)["'"'"']'
-  if [[ "$text" =~ $re_mp ]]; then
-    manifest="${BASH_REMATCH[2]}"
-    if [[ "$manifest" != /* ]]; then manifest="$dir/$manifest"; fi
-  else
-    manifest="$dir/Cargo.toml"
-  fi
-  if [[ ! -f "$manifest" ]]; then
-    echo "$file: manifest-path names no file: $manifest" >&2
+  local file="$1"
+  if [[ -z "$MATURIN_TOML_READER" ]]; then
+    echo "no python3.12, python3, or python on PATH imports tomllib, so this gate cannot read $file. tomllib has been in the Python standard library since 3.11; install Python 3.12, which .mise.toml already names." >&2
     return 1
   fi
-  pkg="$(awk '
-    /^[[:space:]]*\[/ { in_pkg = ($0 ~ /^[[:space:]]*\[package\][[:space:]]*(#.*)?$/); next }
-    in_pkg && /^[[:space:]]*name[[:space:]]*=/ {
-      sub(/^[[:space:]]*name[[:space:]]*=[[:space:]]*["'"'"']/, ""); sub(/["'"'"'].*$/, ""); print; exit
-    }
-  ' "$manifest")"
-  if [[ -z "$pkg" ]]; then
-    echo "$file: $manifest carries no [package] name" >&2
-    return 1
-  fi
-  printf '%s|%s\n' "$pkg" "$args"
+  "$MATURIN_TOML_READER" -c "$MATURIN_ENTRY_PROGRAM" "$file" || return 1
 }
 
 # assert_wheel_feature_selection_is_gated <pyproject.toml>...
@@ -1876,7 +2055,7 @@ TREE
     'requires = ["maturin>=1.0,<2.0"]' \
     '' \
     '[tool.maturin]' \
-    'features = ["extension-module"] # the pyo3 feature the wheel selects' \
+    'features = ["extension-module", "vendored-openssl"] # the features the wheel selects' \
     "manifest-path = \"$wheel_manifest\"" \
     'module-name = "scp_sdk._scp_core"' \
     '' \
@@ -1887,8 +2066,8 @@ TREE
     'features = ["not-read-from-another-table"]' > "$wheel_file"
   wheel_entry="$(maturin_artifact_entry "$wheel_file" 2>/dev/null)"; rc=$?
   expect "(wheel-drift) a [tool.maturin] table matching the shipped one derives an entry" "PASS" "$rc"
-  same_string "$wheel_entry" "scp-ffi|--features extension-module"; rc=$?
-  expect "(wheel-drift) that entry is 'scp-ffi|--features extension-module', read from the main table only" "PASS" "$rc"
+  same_string "$wheel_entry" "scp-ffi|--features extension-module,vendored-openssl"; rc=$?
+  expect "(wheel-drift) that entry is 'scp-ffi|--features extension-module,vendored-openssl', read from the main table only" "PASS" "$rc"
   ( fixture_failures=0; assert_wheel_feature_selection_is_gated "$wheel_file" >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
   expect "(wheel-drift) the assertion ACCEPTS a table whose configuration ARTIFACTS gates" "PASS" "$rc"
 
@@ -1932,18 +2111,87 @@ TREE
   same_string "$wheel_entry" "fixture-pkg|"; rc=$?
   expect "(wheel-drift) that entry is the package's default configuration" "PASS" "$rc"
 
+  # A `[tool.maturin]` table that is present and names no feature key. The case
+  # above deletes the table altogether, which takes a different branch of this
+  # reader, and a wheel whose table carries only `manifest-path` is what a
+  # default-features wheel looks like.
+  printf '%s\n' '[tool.maturin]' "manifest-path = \"$wheel_manifest\"" > "$wheel_file"
+  wheel_entry="$(maturin_artifact_entry "$wheel_file" 2>/dev/null)"; rc=$?
+  expect "(wheel-drift) a [tool.maturin] table naming no feature key derives an entry" "PASS" "$rc"
+  same_string "$wheel_entry" "scp-ffi|"; rc=$?
+  expect "(wheel-drift) that entry selects the package's default features" "PASS" "$rc"
+
+  # A manifest-path that names a file carrying no `[package] name` — a workspace
+  # root, say. The reader must fail rather than derive an entry whose package half
+  # is empty, which would compare equal to no ARTIFACTS entry and which
+  # scripts/check-vendored-openssl-scope.sh would hand to `cargo tree -p ''`.
+  printf '%s\n' '[workspace]' 'members = []' > "$wheel_dir/Cargo.toml"
+  printf '%s\n' '[build-system]' 'build-backend = "maturin"' > "$wheel_file"
+  maturin_artifact_entry "$wheel_file" >/dev/null 2>&1; rc=$?
+  expect "(wheel-drift) a manifest carrying no [package] name FAILS" "FAIL" "$rc"
+
+  # (wheel-drift, spellings) TOML names one table four ways, and maturin reads the
+  # same table however the document spells it, so each spelling below must derive
+  # the same entry. The reader this replaced matched the table header as source
+  # text: it rejected the dotted-key and inline-table spellings by name, and it
+  # read the quoted spelling as an absent table, which derived `scp-ffi|` — an
+  # entry ARTIFACTS holds — from a document selecting `testing`. Measured against
+  # that reader, `[tool."maturin"] features = ["extension-module",
+  # "vendored-openssl", "testing"]` returned `scp-ffi|` and exit 0.
+  local spelling_entry
+  printf '%s\n' '[tool."maturin"]' 'features = ["testing"]' "manifest-path = \"$wheel_manifest\"" > "$wheel_file"
+  spelling_entry="$(maturin_artifact_entry "$wheel_file" 2>/dev/null)"; rc=$?
+  expect "(wheel-drift, spellings) a quoted table header derives an entry" "PASS" "$rc"
+  same_string "$spelling_entry" "scp-ffi|--features testing"; rc=$?
+  expect "(wheel-drift, spellings) that entry names the feature, where the source-text reader read the table as absent and dropped it" "PASS" "$rc"
+
   printf '%s\n' 'tool.maturin.features = ["testing"]' "tool.maturin.manifest-path = \"$wheel_manifest\"" > "$wheel_file"
+  spelling_entry="$(maturin_artifact_entry "$wheel_file" 2>/dev/null)"; rc=$?
+  expect "(wheel-drift, spellings) a dotted-key spelling derives an entry" "PASS" "$rc"
+  same_string "$spelling_entry" "scp-ffi|--features testing"; rc=$?
+  expect "(wheel-drift, spellings) that entry names the feature too" "PASS" "$rc"
+
+  printf '%s\n' '[tool]' "maturin = { features = [\"testing\"], manifest-path = \"$wheel_manifest\" }" > "$wheel_file"
+  spelling_entry="$(maturin_artifact_entry "$wheel_file" 2>/dev/null)"; rc=$?
+  expect "(wheel-drift, spellings) an inline-table spelling derives an entry" "PASS" "$rc"
+  same_string "$spelling_entry" "scp-ffi|--features testing"; rc=$?
+  expect "(wheel-drift, spellings) that entry names the feature too, so all four spellings reach one code path" "PASS" "$rc"
+
+  # And the gate rejects that configuration, which is what makes reading every
+  # spelling load-bearing rather than a property with no consequence.
+  ( fixture_failures=0; assert_wheel_feature_selection_is_gated "$wheel_file" >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(wheel-drift, spellings) the assertion REJECTS an inline-table wheel selecting 'testing'" "FAIL" "$rc"
+
+  printf '%s\n' '[tool.maturin]' 'features = ["testing"]' 'manifest-path = 17' > "$wheel_file"
   maturin_artifact_entry "$wheel_file" >/dev/null 2>&1; rc=$?
-  expect "(wheel-drift) a dotted-key spelling FAILS instead of reading as 'no features'" "FAIL" "$rc"
-  printf '%s\n' '[tool]' 'maturin = { features = ["testing"] }' > "$wheel_file"
+  expect "(wheel-drift) a manifest-path that is not a TOML string FAILS" "FAIL" "$rc"
+  printf '%s\n' '[tool.maturin]' 'features = ["testing"' "manifest-path = \"$wheel_manifest\"" > "$wheel_file"
   maturin_artifact_entry "$wheel_file" >/dev/null 2>&1; rc=$?
-  expect "(wheel-drift) an inline-table spelling FAILS instead of reading as 'no features'" "FAIL" "$rc"
+  expect "(wheel-drift) a document no TOML parser accepts FAILS" "FAIL" "$rc"
+  printf '%s\n' '[tool.maturin]' 'features = ["testing", 17]' "manifest-path = \"$wheel_manifest\"" > "$wheel_file"
+  maturin_artifact_entry "$wheel_file" >/dev/null 2>&1; rc=$?
+  expect "(wheel-drift) a features array holding a non-string FAILS" "FAIL" "$rc"
   printf '%s\n' '[tool.maturin]' 'features = "testing"' "manifest-path = \"$wheel_manifest\"" > "$wheel_file"
   maturin_artifact_entry "$wheel_file" >/dev/null 2>&1; rc=$?
   expect "(wheel-drift) a features value that is not an array FAILS" "FAIL" "$rc"
   printf '%s\n' '[tool.maturin]' 'no-default-features = "yes"' "manifest-path = \"$wheel_manifest\"" > "$wheel_file"
   maturin_artifact_entry "$wheel_file" >/dev/null 2>&1; rc=$?
   expect "(wheel-drift) a boolean key whose value is not a TOML boolean FAILS" "FAIL" "$rc"
+  # A commented-out key above the live one. Each key regex takes the FIRST match
+  # in the joined table text, so an unstripped comment decided what this reader
+  # believed the wheel builds. `scripts/check-vendored-openssl-scope.sh` held this
+  # proof against its own copy of the reader until that copy was deleted in favour
+  # of `--print-wheel-entries`.
+  printf '%s\n' \
+    '[tool.maturin]' \
+    '# features = ["extension-module", "vendored-openssl"]' \
+    'features = ["extension-module"]' \
+    "manifest-path = \"$wheel_manifest\"" > "$wheel_file"
+  wheel_entry="$(maturin_artifact_entry "$wheel_file" 2>/dev/null)"; rc=$?
+  expect "(wheel-drift) a table whose live features key sits under a commented-out one derives an entry" "PASS" "$rc"
+  same_string "$wheel_entry" "scp-ffi|--features extension-module"; rc=$?
+  expect "(wheel-drift) that entry comes from the live key, so a commented-out key decides nothing" "PASS" "$rc"
+
   printf '%s\n' '[tool.maturin]' 'features = ["extension-module"]' 'manifest-path = "nowhere/Cargo.toml"' > "$wheel_file"
   maturin_artifact_entry "$wheel_file" >/dev/null 2>&1; rc=$?
   expect "(wheel-drift) a manifest-path naming no file FAILS" "FAIL" "$rc"
@@ -1954,25 +2202,47 @@ TREE
   expect "(wheel-drift) the assertion REJECTS a maturin project file it cannot read" "FAIL" "$rc"
   rm -rf "$wheel_dir"
 
-  # (wheel-drift, reach) the two places maturin looks for its pyproject.toml.
-  local reach_lines reached
+  # (wheel-drift, reach) the two places maturin looks for its pyproject.toml,
+  # proved on a planted tree rather than on this repository's own files. The
+  # earlier revision named `crates/scp-ffi/pyproject.toml` and
+  # `bindings/python/pyproject.toml`, so deleting either file turned a positive
+  # proof into a vacuous one — the reader would emit nothing and the fixture would
+  # report that it had stopped reaching a file that no longer existed. A planted
+  # tree states what the reader does for any tree.
+  local reach_lines reached reach_dir
+  reach_dir="$(mktemp -d)"
+  mkdir -p "$reach_dir/crates/a-bridge" "$reach_dir/crates/b-bridge" \
+           "$reach_dir/crates/no-project" "$reach_dir/bindings/a-binding" \
+           "$reach_dir/bindings/no-project"
+  : > "$reach_dir/crates/a-bridge/Cargo.toml"
+  : > "$reach_dir/crates/a-bridge/pyproject.toml"
+  : > "$reach_dir/crates/b-bridge/Cargo.toml"
+  : > "$reach_dir/crates/b-bridge/pyproject.toml"
+  : > "$reach_dir/crates/no-project/Cargo.toml"
+  : > "$reach_dir/bindings/a-binding/pyproject.toml"
   reach_lines="$(printf '%s\n' \
-    '            --manifest-path crates/scp-ffi/Cargo.toml' \
-    '          working-directory: bindings/python' \
-    '          working-directory: bindings/kotlin' \
-    '        run: cargo publish --manifest-path=crates/scp-node/Cargo.toml' \
+    "            --manifest-path $reach_dir/crates/a-bridge/Cargo.toml" \
+    "        run: maturin build --manifest-path=$reach_dir/crates/b-bridge/Cargo.toml" \
+    "          working-directory: $reach_dir/bindings/a-binding" \
+    "          working-directory: $reach_dir/bindings/no-project" \
+    "        run: cargo publish --manifest-path=$reach_dir/crates/no-project/Cargo.toml" \
     'echo not a maturin invocation at all')"
   reached="$(maturin_project_files_named_by_shipping_lines "$reach_lines")"
-  printf '%s\n' "$reached" | grep -xF 'crates/scp-ffi/pyproject.toml' >/dev/null; rc=$?
+  printf '%s\n' "$reached" | grep -xF "$reach_dir/crates/a-bridge/pyproject.toml" >/dev/null; rc=$?
   expect "(wheel-drift, reach) the pyproject.toml beside a --manifest-path Cargo.toml is reached" "PASS" "$rc"
-  printf '%s\n' "$reached" | grep -xF 'bindings/python/pyproject.toml' >/dev/null; rc=$?
+  printf '%s\n' "$reached" | grep -xF "$reach_dir/crates/b-bridge/pyproject.toml" >/dev/null; rc=$?
+  expect "(wheel-drift, reach) the --manifest-path=<file> spelling reaches it too" "PASS" "$rc"
+  printf '%s\n' "$reached" | grep -xF "$reach_dir/bindings/a-binding/pyproject.toml" >/dev/null; rc=$?
   expect "(wheel-drift, reach) the pyproject.toml of a working-directory: is reached" "PASS" "$rc"
-  printf '%s\n' "$reached" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 2 >/dev/null; rc=$?
+  printf '%s\n' "$reached" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 3 >/dev/null; rc=$?
   expect "(wheel-drift, reach) a directory with no pyproject.toml and a non-maturin line reach nothing" "PASS" "$rc"
+  rm -rf "$reach_dir"
 
   assert_every_pipeline_reader_consumes_its_input
 
   assert_every_cargo_tree_resolves_every_target
+
+  assert_print_modes_emit_what_this_gate_holds
 
   assert_allowlist_has_no_nullifier
 
@@ -1993,6 +2263,31 @@ TREE
 
 # ---------------------------------------------------------------------------
 main() {
+  # The two print modes hand this gate's own declarations to
+  # `scripts/check-vendored-openssl-scope.sh`, which holds the complementary
+  # property that `openssl-src` reaches the PyPI wheel and no other shipped
+  # artifact. `--print-artifacts` writes the ARTIFACTS array as bash holds it, and
+  # `--print-wheel-entries` writes the configuration each MATURIN_PROJECT_FILES
+  # file makes maturin build, beside the file it read. Each mode writes its lines
+  # and exits, because a caller asking what this gate declares is not asking this
+  # gate to resolve a dependency graph, and because that caller compares the whole
+  # output against the entries it expects, which a fixture line would break.
+  # `assert_print_modes_emit_what_this_gate_holds` proves both properties.
+  case "${1:-}" in
+    --print-artifacts)
+      printf '%s\n' "${ARTIFACTS[@]}"
+      exit 0
+      ;;
+    --print-wheel-entries)
+      local project_file wheel_entry
+      for project_file in "${MATURIN_PROJECT_FILES[@]}"; do
+        wheel_entry="$(maturin_artifact_entry "$project_file")" || exit 1
+        printf '%s\t%s\n' "$project_file" "$wheel_entry"
+      done
+      exit 0
+      ;;
+  esac
+
   # Always run the fixture harness first — a broken gate must fail loud before it
   # can pass a real (possibly regressed) tree.
   run_fixtures || exit 1
