@@ -1584,7 +1584,7 @@ signature (64 raw):   a77d28e5c20b588a75cc18f0891ec9ffea231e21ca23c9aa34bc23c603
 
 The signer is §25.2's secondary key, the `#active` key of Vector 41's identity.
 
-## 25.27 Witness-Layer, Relay-Proof and `RENT` Signature Vectors (§9.7.4.2 definitions, §9.7.4.2 R9, §9.7.4.3, §9.18.2)
+## 25.27 Witness-Layer and Relay-Proof Vectors (§9.7.4.2 definitions, §9.7.4.3, §9.18.2)
 
 The witness objects below name Vector 41's identity as their subject and Vector 41's event as the event a witness seeded at. **No object below names a position in a signer's own key state**, because a community-relay-list operator's key is non-transferable and has no position to name: a verifier reads that key from the operator's list entry, which Vector 49 pins.
 
@@ -1703,63 +1703,6 @@ Shared previous_cosigned_digest:
   4f3b9eb1add56bd34f3914f7addbc37026ed8ba8ef20247e065f766fdb6a7d14
   2f6f219050c1525bf6fe2d71e3b0056e6db05a1b9ec6b059ecd39e3c1e25d0ea
 ```
-
-### Vector 53: the `RENT` beneficiary signature preimage, with a receipt
-
-`09-security-model.md` §9.7.4.2 R9 obliges a `RENT` message to carry a signature by the key the key state at the head of the accepted chain lists `Current` in the `#active` role. The operand list is R9's:
-
-<!-- scp:include id="rent-preimage-operands" from=".docs/specs/09-security-model.md" -->**The `RENT` signature preimage is `SHA-256("SCP-RENT-V1:" ‖ identifier ‖ BE32(units) ‖ receipt_digest ‖ operator_key)`, and each operand is stated here so two implementations compose one preimage.** **The preimage is 113 bytes**: the twelve separator bytes and 32 + 4 + 32 + 33 = 101 field bytes. `identifier` is the 32 raw digest bytes. `BE32(units)` is the count as a four-byte big-endian integer, at least 1 on a message carrying a receipt and 0 on a message carrying none. **`receipt_digest` is `SHA-256(payment_receipt)` where the receipt is present and the 32 bytes `SHA-256(0x00)` where it is absent**, under §9.5.1's rule for an absent fixed-length optional field. **`operator_key` is the 33-byte SEC1 compressed operator key the addressed relay declares in its own `POLICY` answer**, which the controller reads before it sends and which the relay already holds as the key it proves control of.<!-- scp:end id="rent-preimage-operands" -->
-
-The signer here is §25.2's secondary key, and the operator key is the first community-relay-list entry's, which Vector 49 below prints.
-
-```
-identifier:             2c0f7f4478be94db0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf32
-units:                  3
-payment_receipt:        7363702d32352d72656e742d726563656970742d6279746573
-SHA-256(payment_receipt):
-  127e7a5428dc10a934ec982638c0987fdc4222d68a88d74b2720360191d90beb
-operator_key:
-  033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f30
-  27
-field bytes:            101
-preimage (113 bytes):
-  5343502d52454e542d56313a2c0f7f4478be94db0078311ef51ba3cc9934362b
-  0f154dcbf9c597572e46cf3200000003127e7a5428dc10a934ec982638c0987f
-  dc4222d68a88d74b2720360191d90beb033b1cac23f45cf1cdfdf0b32f8f777b
-  99166c1b69649c2295b1517883d47f3027
-canonical hash:
-  3195b889cfd24a044c76dd0fa695968c03ba0db415fa4202684d6e085b7545aa
-signature:
-  389ac921486da20a49c117e7fc05586732be34a1d90d862e871d6c49d63e429d
-  1c3ac8a525b1f8322343bda872b41c4702035392df9bb87dc990f34ded900be0
-```
-
-### Vector 54: the `RENT` beneficiary signature preimage, with no receipt
-
-This is the message `read_rent_state` sends (`03-identity.md` §3.10.10), which every controller runs every period to read whether it is covered. **`units` is exactly 0** (ADR-004, the SCP native relay protocol, Constraints line) **and the receipt operand takes its absent form**, the 32 bytes `SHA-256(0x00)` that §9.5.1 gives an absent fixed-length optional field. The two vectors differ in those two operands and in nothing else.
-
-```
-identifier:             2c0f7f4478be94db0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf32
-units:                  0
-payment_receipt:        absent
-receipt digest, absent form:
-  6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d
-operator_key:
-  033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f30
-  27
-field bytes:            101
-preimage (113 bytes):
-  5343502d52454e542d56313a2c0f7f4478be94db0078311ef51ba3cc9934362b
-  0f154dcbf9c597572e46cf32000000006e340b9cffb37a989ca544e6bb780a2c
-  78901d3fb33738768511a30617afa01d033b1cac23f45cf1cdfdf0b32f8f777b
-  99166c1b69649c2295b1517883d47f3027
-canonical hash:
-  de0291fa0ab79f9da32684d3ddac4cdafe1f57fb8940fbab16a8e2d7180322ff
-signature:
-  ee02b519e18cbc8a5e6e652cb7ce6adeee6a75fa87be40f9899c6588abe845e9
-  1964d77d0ea8e78483367acb7dd60b87309b052f26bf6d92e8dcdddd6e0c746b
-```
-
 
 ### Vector 49: the community relay list's encoding
 

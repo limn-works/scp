@@ -2041,68 +2041,6 @@ def emit_witness_and_relay_objects() -> None:
     )
     assert head_a != head_b, "vector_46: the two heads must differ"
 
-    # This block emits Vector 53, the paying `RENT` beneficiary signature, and
-    # Vector 54, the receipt-absent `RENT` the free rent read sends
-    # (`09-security-model.md` §9.7.4.2 R9). The preimage takes four operands
-    # after the separator: the 32-byte identifier of the identity the rent is
-    # credited to; `units` as a 4-byte big-endian integer; the receipt digest,
-    # which is SHA-256 over the receipt bytes where a receipt is present and
-    # the 32 bytes SHA-256(0x00) where it is absent, under §9.5.1's rule for an
-    # absent fixed-length optional field; and the 33-byte SEC1 compressed
-    # operator key the addressed relay declares in its own `POLICY` answer,
-    # which binds one signature to one operator. The whole preimage is 113
-    # bytes: 12 separator bytes and 101 field bytes. The signer is the key the
-    # key state at the head of the accepted chain lists `Current` in the
-    # `#active` role, which is §25.2's secondary key here.
-    # The two vectors differ in `units` and in the receipt operand and in
-    # nothing else, because the receipt-absent message is the path every
-    # controller runs every period and two implementations must compose one
-    # preimage for it.
-    rent_operator_key = RELAY_LIST_ENTRIES[0][1]
-
-    rent_receipt = b"scp-25-rent-receipt-bytes"
-    rent_receipt_digest = sha256(rent_receipt)
-    rent_units = 3
-    rent_fields = (
-        fixed_field(subject)
-        + u32(rent_units)
-        + fixed_field(rent_receipt_digest)
-        + fixed_field(rent_operator_key)
-    )
-    assert len(rent_fields) == 101, len(rent_fields)
-    emit_hex("vector_53.identifier", subject)
-    emit("vector_53.units", rent_units)
-    emit_hex("vector_53.payment_receipt", rent_receipt)
-    emit_hex("vector_53.payment_receipt_digest", rent_receipt_digest)
-    emit_hex("vector_53.operator_key", rent_operator_key)
-    emit("vector_53.field_bytes", len(rent_fields))
-    sign_and_emit(
-        "vector_53",
-        canonical_preimage("SCP-RENT-V1:", rent_fields),
-        REF_KEY_2,
-    )
-
-    # Vector 54: the receipt-absent `RENT`. `units` is exactly 0 (ADR-004's
-    # Constraints line) and the receipt operand takes its absent form.
-    absent_receipt_digest = sha256(bytes([0x00]))
-    free_read_fields = (
-        fixed_field(subject)
-        + u32(0)
-        + fixed_field(absent_receipt_digest)
-        + fixed_field(rent_operator_key)
-    )
-    assert len(free_read_fields) == 101, len(free_read_fields)
-    emit_hex("vector_54.identifier", subject)
-    emit("vector_54.units", 0)
-    emit_hex("vector_54.payment_receipt_digest_absent_form", absent_receipt_digest)
-    emit_hex("vector_54.operator_key", rent_operator_key)
-    emit("vector_54.field_bytes", len(free_read_fields))
-    sign_and_emit(
-        "vector_54",
-        canonical_preimage("SCP-RENT-V1:", free_read_fields),
-        REF_KEY_2,
-    )
-
     emit_community_relay_list()
 
 
