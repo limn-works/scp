@@ -14,21 +14,41 @@ sqlite = ["scp-platform/sqlite"]
 filesystem = ["scp-platform/filesystem"]
 sync = ["scp-platform/sync"]
 combined = ["scp-transport/combined"]
+# Compiles `helpers`, the only module here that names `scp_identity` or `scp_dht`. Both
+# nullifier features exist for that module alone: `scp-identity/testing` compiles the two
+# `DidDht` constructors it calls (both `#[cfg(any(test, feature = "testing"))]`), and
+# `scp-dht/testing` compiles the `InMemoryDhtClient` its `TestDidDht` alias names (the
+# §17.17.3 resolve nullifier). `[dev-dependencies]` below turns this feature on for this
+# crate's own test build, which is where the module's consumers live; a build that takes
+# this crate as a normal dependency never builds those dev-dependencies, so it resolves
+# both sibling crates without their nullifier features.
+helpers = ["scp-identity/testing", "scp-dht/testing"]
 
 [dependencies]
 async-trait = { workspace = true }
 scp-core = { path = "../scp-core", features = ["allow_unencrypted_storage", "testing"] }
-scp-identity = { path = "../scp-identity", features = ["testing"] }
+# Default features. `scp-identity/testing` rides on this crate's own `helpers` feature
+# instead, because this was the only line in the workspace that enabled it, and as a normal
+# dependency edge it reached every build that pulls this crate — `scp-ffi`'s `testing`
+# feature among them.
+scp-identity = { path = "../scp-identity" }
+# `scp-platform/testing` stays on the dependency line: `builder.rs`, `fullstack/node.rs`,
+# `simulator/identity.rs`, and `simulator/mod.rs` name `scp_platform::testing` and
+# `scp_platform::in_memory` outside the `helpers` module, so every build of this library
+# needs it.
 scp-platform = { path = "../scp-platform", features = ["testing"] }
-# NORMAL testing edge (not dev-dep): `helpers.rs` uses `InMemoryDhtClient` /
-# `TestDidDht` at LIB level (this whole crate is a test harness), mirroring its
-# existing normal `scp-platform/testing` edge. `scp-dht/testing` gates the
-# in-memory DHT nullifier; it never appears in a non-testing feature list
-# (ADR-062 §Decision 1).
-scp-dht = { path = "../scp-dht", features = ["testing"] }
+# Default features. `scp-dht/testing` gates `InMemoryDhtClient`, the §17.17.3 resolve
+# nullifier, and `helpers.rs` is the only module here that names it, so the feature rides
+# on this crate's own `helpers` feature (ADR-062 §Decision 1 keeps it out of every
+# non-testing feature list).
+scp-dht = { path = "../scp-dht" }
 scp-clock = { path = "../scp-clock" }
 scp-did = { path = "../scp-did" }
-scp-node = { path = "../scp-node", features = ["allow_unencrypted_storage"] }
+# Default features. `scp-node/allow_unencrypted_storage` gates
+# `Node::start_for_testing` and `SelfSignedTlsProvider`, which no module in this library
+# names — `tests/integration/node.rs` and `tests/integration/sdk_usability.rs` are the
+# only consumers, so the feature rides on the `[dev-dependencies]` entry below.
+scp-node = { path = "../scp-node" }
 scp-transport = { path = "../scp-transport" }
 scp-event-log = { path = "../scp-event-log" }
 scp-protocol = { path = "../scp-protocol" }
@@ -52,6 +72,17 @@ serde = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+# This crate, naming itself, to turn `helpers` on for its own test build and for no other.
+# `tests/integration/sdk_usability.rs` and `tests/integration/node.rs` are the module's only
+# consumers in the workspace. A `cargo test` or `cargo nextest` build of this crate unifies
+# dev-dependency features into the library, so the module compiles there; a build that takes
+# this crate as a normal dependency never builds these dev-dependencies and never gets it.
+scp-testing = { path = ".", features = ["helpers"] }
+# `tests/integration/node.rs` and `tests/integration/sdk_usability.rs` call
+# `Node::start_for_testing`, which crates/scp-node/src/config.rs compiles under
+# `allow_unencrypted_storage`. The feature rides here rather than on the `[dependencies]`
+# entry above, because no module in this library names the item it gates.
+scp-node = { path = "../scp-node", features = ["allow_unencrypted_storage"] }
 scp-core = { path = "../scp-core", features = ["testing"] }
 # The SDK-usability integration test builds relay wire messages directly; the
 # types live in the wasm-safe scp-relay-client leaf (ADR-057 Slice 3, D5).

@@ -108,7 +108,22 @@ tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
 scp-event-log = { path = "../../scp-event-log" }
-scp-identity = { path = "../../scp-identity" }
+# `tests/dht_capability_injection.rs` calls `DidDht::with_in_memory_custody` under
+# `#[cfg(feature = "testing")]`, and scp-identity compiles that constructor only
+# under its own `testing` feature. This crate's `testing` feature does NOT forward
+# `scp-identity/testing`, because that feature reaches every bridge test build; the
+# feature rides on this dev-dependency edge instead, which only this crate's own
+# test build activates. A `--workspace` run gets the feature anyway, through
+# `scp-testing`'s self dev-dependency; this line is what makes
+# `cargo nextest run -p scp-ffi-common --features testing` compile.
+# `scripts/check-shipped-feature-graph.sh`, the shipped-artifact feature-graph gate,
+# is what keeps `scp-identity/testing` out of every shipped artifact. That gate
+# resolves each artifact's feature set with `cargo tree -e features,no-dev --target
+# all` and fails on any resolved feature its allowlist does not name. The allowlist
+# names `scp-identity/default` and `scp-identity/production-dht` and no `testing`
+# feature of any crate, so a dependency edge that turned `testing` on for a shipped
+# artifact fails that gate whatever spelling the edge uses.
+scp-identity = { path = "../../scp-identity", features = ["testing"] }
 scp-platform = { path = "../../scp-platform", features = ["testing"] }
 # The crate's own tests (resolvers.rs, dht_capability_injection.rs) construct
 # `InMemoryDhtClient`; activate `scp-dht/testing` for this crate's test build.
