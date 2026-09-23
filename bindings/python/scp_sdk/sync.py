@@ -23,6 +23,8 @@ import threading
 from collections.abc import Coroutine
 from typing import Any, TypeVar
 
+from scp_sdk._extension import native_module
+
 _T = TypeVar("_T")
 
 _sync_loop: asyncio.AbstractEventLoop | None = None
@@ -80,18 +82,7 @@ def run_sync(coro: Coroutine[Any, Any, _T]) -> _T:
 
 def _bridge() -> Any:
     """Return the ``_scp_core`` extension module, imported lazily."""
-    try:
-        import _scp_core  # type: ignore[import-not-found]
-
-        return _scp_core
-    except ImportError as exc:
-        from scp_sdk.errors import ScpError
-
-        raise ScpError(
-            "The _scp_core extension module is not installed. "
-            "Install scp-python with: pip install scp-python",
-            code="SCP-UNKNOWN-0001",
-        ) from exc
+    return native_module()
 
 
 # stateless helper — no SCP-instance state; `bridge.sync_classify_offline` is

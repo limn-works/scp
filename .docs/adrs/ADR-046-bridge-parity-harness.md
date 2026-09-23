@@ -185,19 +185,25 @@ grows monotonically.
 A new job in `.github/workflows/ci.yml`:
 
 - Triggers when `python`, `typescript`, or `rust` paths change.
-- Sets up Python 3.12, Bun, Rust, wasm-pack.
-- Builds PyO3 (`maturin develop --release --features scp-core/testing,allow_in_memory_custody`).
-- Builds NAPI (`cargo build -p scp-ffi-napi --release --features scp-ffi-napi/allow_in_memory_custody,scp-core/testing`) and wires the addon into `bindings/typescript/node_modules/` mirroring `typescript-check`.
-- Builds WASM with `wasm-pack build --target nodejs --release --out-dir pkg-node`
-  and wires the output into `node_modules/@limn-works/scp-ts-wasm`. The
-  `nodejs` target (not `bundler`) is required because the parity harness
-  runs the WASM bridge under Bun, which uses a Node-style runtime loader.
-  `--target bundler` emits ESM with a bare `import * from "./X.wasm"` that
-  only works behind a bundler; `--target nodejs` emits a self-loading
-  CJS-compatible module Bun can consume directly. See the rationale
-  comment in `.github/workflows/ci.yml` (job `bridge-parity`, step "Build
-  WASM bridge").
-- Runs `pytest bindings/python/tests/bridge_parity/ -v -m parity`.
+- Sets up Python 3.12 and Bun. The job installs no Rust toolchain, because it
+  runs no cargo command: job `pyo3-module` and job `napi-addon` build the two
+  native bridges once per workflow run, and every job that needs one downloads
+  it.
+- Downloads the PyO3 extension module that job `pyo3-module` built with
+  `maturin develop --release --features testing` and uploaded as artifact
+  `pyo3-module-linux`.
+- Downloads the NAPI addon that job `napi-addon` built with
+  `cargo build -p scp-ffi-napi --release --features scp-ffi-napi/testing` and
+  uploaded as artifact `napi-addon-linux`, then wires the addon into
+  `bindings/typescript/node_modules/` mirroring `typescript-check`.
+- Runs `pytest tests/bridge_parity/ -v -m parity -k "napi"` from
+  `bindings/python`, so this job compares the PyO3 reference bridge against the
+  NAPI bridge alone. Job `bridge-parity-kotlin` selects `uniffi-kotlin` and job
+  `bridge-parity-swift` selects `uniffi-swift`, because each of those two jobs
+  supplies the UniFFI artifact and the parity runner its own target needs:
+  `bridge-parity-kotlin` builds the cdylib on Ubuntu, and
+  `bridge-parity-swift` downloads the XCFramework that job `xcframework`
+  built on macOS.
 - Joins the final `ci` aggregator gate.
 
 ## Alternatives considered

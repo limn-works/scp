@@ -18,7 +18,6 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { generateKeyPairSync } from "node:crypto";
-import { createRequire } from "node:module";
 import type { BridgeMode } from "../src/bridge";
 import { ContextError } from "../src/errors";
 import { __getNativeScp, SCP } from "../src/scp";
@@ -75,7 +74,8 @@ try {
   // Resolve the SDK bridge factory and probe the SCP class for the
   // Phase 4 surface. The probe SCP is discarded immediately — each test
   // will mint its own.
-  ({ createNativeBridge } = await import("../src/internal/native.js"));
+  const nativeModule = await import("../src/internal/native.js");
+  createNativeBridge = nativeModule.createNativeBridge;
   const probe = new SCP({ storage: { type: "in_memory" } });
   if (typeof (probe as unknown as Record<string, unknown>).relayStartInMemory !== "function") {
     skipReason = "SCP missing relayStartInMemory — rebuild with the Phase 4 changes";
@@ -88,21 +88,11 @@ try {
   probe.shutdown(1).catch(() => {});
 
   // Also load the raw addon — it still exports the stateless module-level
-  // helpers (discovery, bridge_evaluate_trust, bridge_register).
-  const req = createRequire(import.meta.url);
-  const platform = process.platform;
-  const arch = process.arch;
-  const platformMap: Record<string, string> = {
-    "linux-x64": "@limn-works/scp-ts-napi-linux-x64-gnu",
-    "linux-arm64": "@limn-works/scp-ts-napi-linux-arm64-gnu",
-    "darwin-x64": "@limn-works/scp-ts-napi-darwin-x64",
-    "darwin-arm64": "@limn-works/scp-ts-napi-darwin-arm64",
-    "win32-x64": "@limn-works/scp-ts-napi-win32-x64-msvc",
-  };
-  const pkg = platformMap[`${platform}-${arch}`];
-  if (pkg !== undefined) {
-    rawAddon = req(pkg) as NativeAddon;
-  }
+  // helpers (discovery, bridge_evaluate_trust, bridge_register). `loadNativeAddon`
+  // is the SDK's one loader: resolving the platform package here instead would let
+  // this file's copy of the platform map drift from the loader's, and this file
+  // would then skip over an addon the loader resolves.
+  rawAddon = nativeModule.loadNativeAddon() as NativeAddon;
 } catch (e: unknown) {
   const msg = e instanceof Error ? e.message : String(e);
   skipReason = `Native NAPI bridge not available: ${msg}`;

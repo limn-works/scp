@@ -24,7 +24,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -472,5 +472,53 @@ describe("dispatcher invariant (ADR-048 §1 + §7)", () => {
           "otherwise disambiguate at the Rust source (rename the free fn or remove the duplicate).",
       );
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Loader invariant: `internal/native.ts` holds the only addon loader
+// ---------------------------------------------------------------------------
+//
+// CRITERION: `loadNativeAddon` in `src/internal/native.ts` is the only code in
+// this package that names a `@limn-works/scp-ts-napi-*` platform package, so
+// every test loads the addon CI installed and verified.
+//
+// A test file that builds its own specifier resolves a package the CI wiring
+// step never creates — that file's `@limn-works/scp-ts-napi-linux-x64` against
+// the loader's `@limn-works/scp-ts-napi-linux-x64-gnu` — catches the resolution
+// error in its skip guard, and resolves its whole `describe` to `describe.skip`.
+// `bun test` then exits 0 over zero executed NAPI assertions while the ci.yml
+// step "Assert the downloaded addon loads and constructs" reports success,
+// because that step calls `loadNativeAddon()` and so reads a different
+// specifier than the skipped file read. Seventeen tests across
+// `scp-class.test.ts` and `e2e-fullstack.test.ts` skipped that way on every run
+// of the `typescript-check` job until this invariant was enforced.
+
+const TESTS_DIR = join(REPO_ROOT, "bindings", "typescript", "tests");
+const NAPI_PACKAGE_PREFIX = "@limn-works/scp-ts-napi";
+
+/** Removes block and line comments so prose naming a package is not a hit. */
+function stripComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+}
+
+describe("native addon loader invariant", () => {
+  test("no file under tests/ names a platform addon package in code", () => {
+    const offenders = readdirSync(TESTS_DIR)
+      .filter((name) => name.endsWith(".ts"))
+      // This file states the criterion, so it names the prefix in order to
+      // search for it; every other file naming it resolves the addon itself.
+      .filter((name) => name !== basename(__filename))
+      .filter((name) =>
+        stripComments(readFileSync(join(TESTS_DIR, name), "utf8")).includes(NAPI_PACKAGE_PREFIX),
+      );
+    expect(offenders).toEqual([]);
+  });
+
+  // Negative control: the scan above reports an empty list both when every test
+  // routes through the loader and when the scan cannot see the string at all.
+  // Reading the one file that must name the packages separates those two cases.
+  test("the SDK loader names the platform addon packages", () => {
+    expect(stripComments(readFileSync(DISPATCHER_TS, "utf8"))).toContain(NAPI_PACKAGE_PREFIX);
   });
 });
