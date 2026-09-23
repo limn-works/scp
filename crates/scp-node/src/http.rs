@@ -816,40 +816,44 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
 // Dev API spawning (extracted for clippy::too_many_lines)
 // ---------------------------------------------------------------------------
 
-/// Builds the bridge and webhook routers with appropriate auth middleware.
+/// Builds the bridge and webhook routers with their auth middleware.
 ///
 /// JWT-authenticated bridge routes use `bridge_auth_middleware_dyn` (Bearer
 /// token). The webhook route uses `webhook_auth_middleware_dyn`
-/// (`X-SCP-Signature` header). When no `BridgeLookup` is configured (dev
-/// mode), both are mounted without authentication.
+/// (`X-SCP-Signature` header). Each middleware inserts the request extension
+/// that carries the caller's authorized bridge and context, and every bridge
+/// handler restricts its work to that scope.
+///
+/// When no `BridgeLookup` is configured, this function mounts no bridge routes
+/// at all and both returned routers are empty, so every bridge path answers
+/// 404. Mounting the handlers without a lookup would serve them with no
+/// authenticated scope, which the node must never do: an unauthenticated caller
+/// would reach every context's shadows.
 ///
 /// See spec section 12.10.2.
-pub(crate) fn build_bridge_routers(
+pub fn build_bridge_routers(
     bridge_state: &Arc<crate::bridge_handlers::BridgeState>,
     bridge_lookup: Option<&Arc<dyn crate::bridge_auth::BridgeLookup>>,
 ) -> (Router, Router) {
-    let bridge = {
-        let base = crate::bridge_handlers::bridge_router(Arc::clone(bridge_state));
-        if let Some(lookup) = bridge_lookup {
-            base.layer(axum::middleware::from_fn_with_state(
-                Arc::clone(lookup),
-                crate::bridge_auth::bridge_auth_middleware_dyn,
-            ))
-        } else {
-            base
-        }
+    let Some(lookup) = bridge_lookup else {
+        tracing::warn!(
+            "no bridge lookup is configured, so the node serves no bridge endpoints; \
+             register a BridgeLookup to enable /v1/scp/bridge/*"
+        );
+        return (Router::new(), Router::new());
     };
-    let bridge_webhook = {
-        let base = crate::bridge_handlers::bridge_webhook_router(Arc::clone(bridge_state));
-        if let Some(lookup) = bridge_lookup {
-            base.layer(axum::middleware::from_fn_with_state(
-                Arc::clone(lookup),
-                crate::bridge_auth::webhook_auth_middleware_dyn,
-            ))
-        } else {
-            base
-        }
-    };
+
+    let bridge = crate::bridge_handlers::bridge_router(Arc::clone(bridge_state)).layer(
+        axum::middleware::from_fn_with_state(
+            Arc::clone(lookup),
+            crate::bridge_auth::bridge_auth_middleware_dyn,
+        ),
+    );
+    let bridge_webhook = crate::bridge_handlers::bridge_webhook_router(Arc::clone(bridge_state))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(lookup),
+            crate::bridge_auth::webhook_auth_middleware_dyn,
+        ));
     (bridge, bridge_webhook)
 }
 

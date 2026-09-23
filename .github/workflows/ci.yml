@@ -1105,7 +1105,16 @@ jobs:
           # filter that selects nothing must fail this shard rather than report
           # success over zero assertions, which is the zero-test defect
           # scripts/tests/ci-gate/ci_gate_selftest.py records.
-          cargo nextest run --workspace --no-tests=fail --partition count:${{ matrix.shard }}/4 --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/testing,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/testing,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/testing,scp-ffi-uniffi/outlet-capability-test-grant
+          #
+          # scp-node/testing gates ApplicationNode::dev, which every
+          # crates/scp-node test that drives a whole node builds through —
+          # crates/scp-node/tests/bridge_registration_wiring.rs among them.
+          # Without that feature those tests compile to empty binaries and
+          # assert nothing. A shipped node build still never enables it
+          # (ADR-062 §Decision 1 keeps it out of every default feature list),
+          # so the in-memory DHT test double stays absent from shipped
+          # artifacts; this line enables it for a test lane only.
+          cargo nextest run --workspace --no-tests=fail --partition count:${{ matrix.shard }}/4 --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/testing,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/testing,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/testing,scp-ffi-uniffi/outlet-capability-test-grant,scp-node/testing
 
   # ── Optional-feature test lanes ─────────────────────────────────────────────
   #

@@ -430,6 +430,13 @@ export interface Bridge {
     governanceDid: string,
     platform: string,
     mode: BridgeMode,
+    webhookUrl: string | undefined,
+    platformKey: Uint8Array | undefined,
+    platformKeyId: string | undefined,
+    maxShadows: number | undefined,
+    displayName: string | undefined,
+    description: string | undefined,
+    operatorContact: string | undefined,
   ): {
     bridge_id: string;
     operator_did: string;

@@ -17,8 +17,10 @@ use axum::{
     Extension, Json, Router,
     routing::{delete, get, post},
 };
-use scp_core::bridge::shadow::{CreateShadowParams, ShadowRegistry, create_shadow};
-use scp_core::bridge::{BridgeMode, ShadowProvenanceStatus};
+use scp_core::bridge::shadow::{
+    CreateShadowParams, ShadowError, ShadowRegistry, create_shadow, retire_shadow,
+};
+use scp_core::bridge::{BridgeMode, ShadowIdentity, ShadowProvenanceStatus};
 use scp_core::crypto::sender_keys::SenderKeyStore;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -67,17 +69,40 @@ pub struct BridgeState {
     /// Platform identity attestations, keyed by attestation ID.
     pub attestations: RwLock<HashMap<String, StoredAttestation>>,
 
-    /// Set of deleted shadow IDs (historical actions remain in event log).
-    pub deleted_shadows: RwLock<HashSet<String>>,
+    /// Shadows a bridge retired, keyed by `(context_id, bridge_id, shadow_id)`.
+    ///
+    /// Retirement removes the registry record and the sender key through
+    /// [`retire_shadow`], so every lookup, count, and roster reads live shadows
+    /// only. This set exists for one answer: spec §12.10.4 makes
+    /// `DELETE /v1/scp/bridge/shadow/{shadow_id}` idempotent, so a second
+    /// delete of a shadow this bridge retired returns 204 where a shadow this
+    /// bridge never held returns 404. Re-creating a retired shadow removes its
+    /// key here. Historical actions remain in the event log.
+    ///
+    /// Context ID and bridge ID are both part of the key so no caller learns,
+    /// through that 204, that a second bridge retired a shadow — whether that
+    /// bridge sits in another context or shares this one.
+    pub deleted_shadows: RwLock<HashSet<(String, String, String)>>,
 
-    /// Set of webhook event IDs already processed (deduplication).
-    pub processed_event_ids: RwLock<HashSet<String>>,
+    /// Webhook event IDs already processed, keyed by `(bridge_id, event_id)`
+    /// (deduplication).
+    ///
+    /// The bridge ID is part of the key because `event_id` is platform-assigned
+    /// (§12.10.4) and two platforms pick their event IDs independently. Keying
+    /// on `event_id` alone would let one platform suppress another platform's
+    /// event by claiming that ID first.
+    pub processed_event_ids: RwLock<HashSet<(String, String)>>,
 
     /// Emitted messages, keyed by message ID.
     pub messages: RwLock<Vec<EmittedMessage>>,
 
-    /// Monotonically increasing sequence counter for emitted messages.
-    pub message_sequence: RwLock<u64>,
+    /// Monotonically increasing per-context sequence counters for emitted
+    /// messages, keyed by context ID.
+    ///
+    /// Each context counts its own messages, so a bridge operator reading its
+    /// own sequence numbers learns nothing about how many messages other
+    /// contexts carried.
+    pub message_sequence: RwLock<HashMap<String, u64>>,
 
     /// Outbound webhook dispatcher for delivering context events
     /// to registered bridge webhook endpoints (spec §12.2.1).
@@ -95,8 +120,16 @@ pub struct BridgeState {
 pub struct EmittedMessage {
     /// Unique message ID.
     pub message_id: String,
+    /// The context the message was emitted into.
+    pub context_id: String,
+    /// The bridge that emitted it.
+    pub bridge_id: String,
     /// Shadow ID that emitted the message.
     pub shadow_id: String,
+    /// The platform's own identifier for the message, when the bridge supplied
+    /// one. A `message_edit` or `message_delete` webhook event names a message
+    /// through this identifier (spec §12.10.4).
+    pub platform_message_id: Option<String>,
     /// Message content.
     pub content: String,
     /// Content type.
@@ -118,7 +151,7 @@ impl BridgeState {
             deleted_shadows: RwLock::new(HashSet::new()),
             processed_event_ids: RwLock::new(HashSet::new()),
             messages: RwLock::new(Vec::new()),
-            message_sequence: RwLock::new(0),
+            message_sequence: RwLock::new(HashMap::new()),
             webhook_dispatcher: Arc::new(crate::webhook::WebhookDispatcher::new()),
         }
     }
@@ -235,8 +268,66 @@ pub struct AttestResponse {
 /// Default attestation TTL: 24 hours in seconds.
 const ATTESTATION_TTL_SECS: u64 = 86_400;
 
+/// Returns a 400 response carrying spec §12.10.3's `INVALID_REQUEST` code.
+///
+/// Every bridge endpoint reports a malformed request body under that code,
+/// which §12.10.3's error table pairs with HTTP 400. `ApiError::bad_request`
+/// answers `BAD_REQUEST` instead, which no §12.10.3 row defines, so bridge
+/// handlers use this helper.
+fn invalid_request(msg: impl Into<String>) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ApiError {
+            error: msg.into(),
+            code: "INVALID_REQUEST".to_owned(),
+        }),
+    )
+}
+
+/// Maximum request body any bridge route buffers, in bytes.
+///
+/// Spec §12.10.4 caps `content` at [`MAX_MESSAGE_CONTENT_BYTES`] and requires a
+/// larger request to answer `INVALID_REQUEST` (400). Axum's own 2 MiB default
+/// answers 413 instead for a body above it, so this limit sits just above that
+/// content cap: a body carrying content one byte over the cap still reaches
+/// [`emit_message_handler`], which answers the 400 §12.10.4 specifies, while a
+/// body far above it is refused before a node buffers it. The 8 KiB of headroom
+/// covers a request's JSON envelope — its field names, its `shadow_id`, its
+/// `content_type`, and JSON string escaping of the content itself.
+pub(crate) const MAX_BRIDGE_BODY_BYTES: usize = MAX_MESSAGE_CONTENT_BYTES + 8 * 1024;
+
+/// Maximum `content` size `POST /v1/scp/bridge/message` accepts, in bytes.
+///
+/// Spec §12.10.4 caps it at 262,144 bytes (256 KiB), matching a relay's default
+/// `max_blob_size` (§10), and requires a bridge node to reject a larger request
+/// before it attempts MLS envelope construction.
+const MAX_MESSAGE_CONTENT_BYTES: usize = 262_144;
+
 /// Maximum size of the processed webhook event ID dedup set (BLACK-302).
 const MAX_PROCESSED_EVENT_IDS: usize = 10_000;
+
+/// Maximum size of the retired-shadow set [`BridgeState::deleted_shadows`]
+/// holds.
+///
+/// A bridge creates and retires a shadow per platform user, so a bridge that
+/// churns users grows this set without a bound of its own. Evicting a
+/// retirement key turns the idempotent 204 that spec §12.10.4 gives a second
+/// `DELETE` of a shadow this bridge retired into the 404 it gives a shadow this
+/// bridge never held, which discloses nothing the 404 did not already disclose
+/// and deletes nothing. The set therefore takes the same bound
+/// [`MAX_PROCESSED_EVENT_IDS`] puts on the dedup set beside it.
+const MAX_DELETED_SHADOWS: usize = 10_000;
+
+/// Maximum number of emitted messages [`BridgeState::messages`] holds.
+///
+/// `message_edit` and `message_delete` act only on a `platform_message_id` this
+/// bridge emitted into this context (spec §12.10.4), and this list is what
+/// records that. It lives in this process and outlives no restart, so a node
+/// that restarted, or that emitted more than this many messages since, answers
+/// `accepted: false` to an edit or a delete naming a message it no longer
+/// holds. That is the same answer it gives a message another bridge emitted, so
+/// eviction narrows what the node acts on and widens nothing.
+const MAX_EMITTED_MESSAGES: usize = 10_000;
 
 // ---------------------------------------------------------------------------
 // Message endpoint types (SCP-BCH-003)
@@ -370,11 +461,43 @@ const VALID_EVENT_TYPES: &[&str] = &[
 // Handler
 // ---------------------------------------------------------------------------
 
+/// Escapes a segment so a colon-joined composite ID maps one identifier pair to
+/// one string.
+///
+/// A bare `format!("{a}:{b}")` is not injective: bridge `acme:pro` with platform
+/// user `u1` and bridge `acme` with platform user `pro:u1` both produce
+/// `acme:pro:u1`. Escaping `%` first and then `:` removes every colon from each
+/// segment, so a colon in the joined string only ever separates segments and no
+/// two distinct pairs collide. A bridge operator picks its own
+/// `platform_user_id` values, and a registrant picks its own bridge ID, so both
+/// segments carry attacker-chosen text and both need escaping.
+fn escape_id_segment(segment: &str) -> String {
+    segment.replace('%', "%25").replace(':', "%3A")
+}
+
 /// Derives a deterministic shadow ID from bridge and platform user IDs.
 ///
-/// The shadow ID is scoped to the bridge to prevent cross-bridge collisions.
+/// The shadow ID is scoped to the bridge to prevent cross-bridge collisions,
+/// and [`escape_id_segment`] keeps that scoping injective.
 fn derive_shadow_id(bridge_id: &str, platform_user_id: &str) -> String {
-    format!("shadow:{bridge_id}:{platform_user_id}")
+    format!(
+        "shadow:{}:{}",
+        escape_id_segment(bridge_id),
+        escape_id_segment(platform_user_id)
+    )
+}
+
+/// Derives a deterministic attestation ID from bridge and platform user IDs.
+///
+/// Uses the same injective join as [`derive_shadow_id`], so one bridge cannot
+/// overwrite a second bridge's attestation by choosing a `platform_user_id`
+/// that reproduces that bridge's composite key.
+fn derive_attestation_id(bridge_id: &str, platform_user_id: &str) -> String {
+    format!(
+        "attest:{}:{}",
+        escape_id_segment(bridge_id),
+        escape_id_segment(platform_user_id)
+    )
 }
 
 /// Handler for `POST /v1/scp/bridge/shadow`.
@@ -396,25 +519,35 @@ async fn create_shadow_handler(
 ) -> impl IntoResponse {
     // Validate required fields (serde handles presence, but check emptiness).
     if body.platform_handle.is_empty() {
-        return ApiError::bad_request("platform_handle must not be empty").into_response();
+        return invalid_request("platform_handle must not be empty").into_response();
     }
     if body.platform_user_id.is_empty() {
-        return ApiError::bad_request("platform_user_id must not be empty").into_response();
+        return invalid_request("platform_user_id must not be empty").into_response();
     }
 
-    let bridge_id = &auth_ctx.claims.scp_bridge_id;
-    let context_id = &auth_ctx.claims.scp_context_id;
+    let bridge_id = auth_ctx.bridge_id();
+    let context_id = auth_ctx.context_id();
     let shadow_id = derive_shadow_id(bridge_id, &body.platform_user_id);
 
     let mut registries = bridge_state.registries.write().await;
+    // `delete_shadow_handler` and the `user_departed` arm of
+    // `process_webhook_event` are the other two callers that hold both, and both
+    // take them in this order. `status_handler` takes `registries` alone.
+    let mut deleted = bridge_state.deleted_shadows.write().await;
 
     // Ensure a registry exists for this context.
     let registry = registries
-        .entry(context_id.clone())
-        .or_insert_with(|| ShadowRegistry::new(context_id.clone()));
+        .entry(context_id.to_owned())
+        .or_insert_with(|| ShadowRegistry::new(context_id.to_owned()));
 
-    // Idempotency: if a shadow with this ID already exists, return 200.
-    if let Some(existing) = registry.shadows().iter().find(|s| s.shadow_id == shadow_id) {
+    // Idempotency: if a shadow this bridge owns already carries this ID,
+    // return 200. Retirement removes a shadow's record, so a record found here
+    // is live.
+    if let Some(existing) = registry
+        .shadows()
+        .iter()
+        .find(|s| s.shadow_id == shadow_id && s.bridge_id == bridge_id)
+    {
         return (
             StatusCode::OK,
             Json(CreateShadowResponse {
@@ -426,6 +559,27 @@ async fn create_shadow_handler(
             }),
         )
             .into_response();
+    }
+
+    // Spec §12.2.1 makes `max_shadows` a governance-configured limit for this
+    // bridge, and `ShadowRegistry` holds one per-bridge limit for a whole
+    // context, so it cannot express two bridges with different limits. This
+    // check reads the limit governance approved for the calling bridge and
+    // counts that bridge's own shadows against it. The registry's own
+    // per-bridge limit stays as a second bound, at the protocol default
+    // §12.4 sets (10,000 per bridge). Both counts read live shadows only,
+    // because retirement removes a shadow's record.
+    let owned_shadows = registry
+        .shadows()
+        .iter()
+        .filter(|shadow| shadow.bridge_id == bridge_id)
+        .count();
+    if owned_shadows >= auth_ctx.bridge.max_shadows as usize {
+        return shadow_cap_reached(format!(
+            "bridge has reached its governance-configured shadow limit of {}",
+            auth_ctx.bridge.max_shadows
+        ))
+        .into_response();
     }
 
     let now = SystemTime::now()
@@ -446,19 +600,45 @@ async fn create_shadow_handler(
     let mut sender_key_store = bridge_state.sender_key_store.write().await;
 
     match create_shadow(registry, &mut sender_key_store, &params) {
-        Ok((shadow, _event)) => (
-            StatusCode::CREATED,
-            Json(CreateShadowResponse {
-                shadow_id: shadow.shadow_id,
-                platform_handle: shadow.platform_handle,
-                platform_user_id: body.platform_user_id,
-                attributed_role: shadow.attributed_role,
-                created_at: shadow.created_at,
-            }),
-        )
-            .into_response(),
+        Ok((shadow, _event)) => {
+            // A platform user who departs and returns derives the same
+            // identifier from the same `platform_user_id`, so this creation
+            // ends the earlier retirement: a later delete of this shadow must
+            // retire it again rather than answer the idempotent 204.
+            deleted.remove(&(
+                context_id.to_owned(),
+                bridge_id.to_owned(),
+                shadow.shadow_id.clone(),
+            ));
+            (
+                StatusCode::CREATED,
+                Json(CreateShadowResponse {
+                    shadow_id: shadow.shadow_id,
+                    platform_handle: shadow.platform_handle,
+                    platform_user_id: body.platform_user_id,
+                    attributed_role: shadow.attributed_role,
+                    created_at: shadow.created_at,
+                }),
+            )
+                .into_response()
+        }
+        Err(e @ ShadowError::CapacityExceeded { .. }) => {
+            shadow_cap_reached(e.to_string()).into_response()
+        }
         Err(e) => ApiError::internal_error(e.to_string()).into_response(),
     }
+}
+
+/// The response spec §12.4 defines for a bridge at its shadow cap:
+/// `RATE_LIMITED` (429) "with a message indicating the shadow cap".
+fn shadow_cap_reached(message: String) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(ApiError {
+            error: message,
+            code: "RATE_LIMITED".to_owned(),
+        }),
+    )
 }
 
 /// Validates the `platform_confidence` field value.
@@ -482,28 +662,28 @@ async fn attest_handler(
     Json(body): Json<AttestRequest>,
 ) -> impl IntoResponse {
     if body.platform_handle.is_empty() {
-        return ApiError::bad_request("platform_handle must not be empty").into_response();
+        return invalid_request("platform_handle must not be empty").into_response();
     }
     if body.platform_user_id.is_empty() {
-        return ApiError::bad_request("platform_user_id must not be empty").into_response();
+        return invalid_request("platform_user_id must not be empty").into_response();
     }
     if body.attestation_evidence.evidence_type.is_empty() {
-        return ApiError::bad_request("attestation_evidence.evidence_type must not be empty")
+        return invalid_request("attestation_evidence.evidence_type must not be empty")
             .into_response();
     }
     if body.attestation_evidence.verification_method.is_empty() {
-        return ApiError::bad_request("attestation_evidence.verification_method must not be empty")
+        return invalid_request("attestation_evidence.verification_method must not be empty")
             .into_response();
     }
     if !is_valid_confidence(&body.attestation_evidence.platform_confidence) {
-        return ApiError::bad_request(
+        return invalid_request(
             "attestation_evidence.platform_confidence must be \"high\", \"medium\", or \"low\"",
         )
         .into_response();
     }
 
-    let bridge_id = &auth_ctx.claims.scp_bridge_id;
-    let attestation_id = format!("attest:{bridge_id}:{}", body.platform_user_id);
+    let bridge_id = auth_ctx.bridge_id();
+    let attestation_id = derive_attestation_id(bridge_id, &body.platform_user_id);
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -512,7 +692,7 @@ async fn attest_handler(
     let stored = StoredAttestation {
         attestation_id: attestation_id.clone(),
         status: "active".to_owned(),
-        bridge_id: bridge_id.clone(),
+        bridge_id: bridge_id.to_owned(),
         platform_handle: body.platform_handle.clone(),
         platform_user_id: body.platform_user_id,
         evidence: body.attestation_evidence,
@@ -538,17 +718,30 @@ async fn attest_handler(
 // Message handler (SCP-BCH-003)
 // ---------------------------------------------------------------------------
 
-/// Finds a shadow identity across all registries and returns it with context info.
-fn find_shadow(
+/// Finds a shadow identity inside the caller's authorized scope.
+///
+/// Reads only the registry for `context_id` and returns a shadow only when
+/// `bridge_id` created it, so a caller authenticated for one bridge in one
+/// context never observes a shadow belonging to another bridge or another
+/// context. Spec §12.10.4 scopes the status roster the same way: "The
+/// `shadows` array includes all shadow identities managed by this bridge in
+/// this context."
+///
+/// Returning `None` for an out-of-scope shadow, rather than a distinct
+/// rejection, keeps the endpoint from telling one bridge operator whether a
+/// shadow ID exists somewhere else on the node.
+fn find_scoped_shadow(
     registries: &HashMap<String, ShadowRegistry>,
+    context_id: &str,
+    bridge_id: &str,
     shadow_id: &str,
-) -> Option<(String, scp_core::bridge::ShadowIdentity)> {
-    for (ctx_id, registry) in registries {
-        if let Some(shadow) = registry.shadows().iter().find(|s| s.shadow_id == shadow_id) {
-            return Some((ctx_id.clone(), shadow.clone()));
-        }
-    }
-    None
+) -> Option<scp_core::bridge::ShadowIdentity> {
+    registries
+        .get(context_id)?
+        .shadows()
+        .iter()
+        .find(|s| s.shadow_id == shadow_id && s.bridge_id == bridge_id)
+        .cloned()
 }
 
 /// Handler for `POST /v1/scp/bridge/message`.
@@ -557,6 +750,11 @@ fn find_shadow(
 /// provenance. Returns 202 Accepted with message ID, sequence, and
 /// provenance metadata.
 ///
+/// The handler resolves `shadow_id` only inside the authenticated bridge's
+/// context, so a bridge operator cannot emit a message as a shadow that belongs
+/// to another bridge or another context. A request naming such a shadow gets
+/// 404 `SHADOW_NOT_FOUND`.
+///
 /// See SCP-BCH-003 and spec section 12.10.4.
 async fn emit_message_handler(
     State(bridge_state): State<Arc<BridgeState>>,
@@ -564,28 +762,34 @@ async fn emit_message_handler(
     Json(body): Json<EmitMessageRequest>,
 ) -> impl IntoResponse {
     if body.shadow_id.is_empty() {
-        return ApiError::bad_request("shadow_id must not be empty").into_response();
+        return invalid_request("shadow_id must not be empty").into_response();
     }
     if body.content.is_empty() {
-        return ApiError::bad_request("content must not be empty").into_response();
+        return invalid_request("content must not be empty").into_response();
     }
     if body.content_type.is_empty() {
-        return ApiError::bad_request("content_type must not be empty").into_response();
+        return invalid_request("content_type must not be empty").into_response();
     }
+    // Spec §12.10.4 states this rejection message verbatim, and requires it
+    // before envelope construction.
+    if body.content.len() > MAX_MESSAGE_CONTENT_BYTES {
+        return invalid_request(format!(
+            "Content exceeds maximum size of {MAX_MESSAGE_CONTENT_BYTES} bytes"
+        ))
+        .into_response();
+    }
+
+    let context_id = auth_ctx.context_id().to_owned();
+    let bridge_id = auth_ctx.bridge_id();
 
     let registries = bridge_state.registries.read().await;
-    let deleted = bridge_state.deleted_shadows.read().await;
-
-    // Check if shadow was deleted.
-    if deleted.contains(&body.shadow_id) {
-        return ApiError::not_found("SHADOW_NOT_FOUND: shadow has been deleted").into_response();
-    }
-
-    let shadow_info = find_shadow(&registries, &body.shadow_id);
+    // A shadow this bridge retired has no record, so it and a shadow this
+    // bridge never owned both resolve to `None` and answer with one identical
+    // body: a response never tells a caller which of the two it hit.
+    let shadow_info = find_scoped_shadow(&registries, &context_id, bridge_id, &body.shadow_id);
     drop(registries);
-    drop(deleted);
 
-    let Some((_ctx_id, shadow)) = shadow_info else {
+    let Some(shadow) = shadow_info else {
         return (
             StatusCode::NOT_FOUND,
             Json(ApiError {
@@ -615,23 +819,39 @@ async fn emit_message_handler(
         operator_did: auth_ctx.bridge.operator_did.0.clone(),
     };
 
-    let mut seq = bridge_state.message_sequence.write().await;
-    *seq += 1;
-    let sequence = *seq;
-    drop(seq);
+    let mut sequences = bridge_state.message_sequence.write().await;
+    let counter = sequences.entry(context_id.clone()).or_insert(0);
+    *counter += 1;
+    let sequence = *counter;
+    drop(sequences);
 
-    let message_id = format!("msg:{}:{sequence}", auth_ctx.claims.scp_bridge_id);
+    let message_id = format!("msg:{}:{sequence}", auth_ctx.bridge_id());
 
     let emitted = EmittedMessage {
         message_id: message_id.clone(),
+        context_id,
+        bridge_id: bridge_id.to_owned(),
         shadow_id: body.shadow_id,
+        platform_message_id: body.platform_message_id,
         content: body.content,
         content_type: body.content_type,
         sequence,
         bridge_provenance: provenance_resp.clone(),
     };
 
-    bridge_state.messages.write().await.push(emitted);
+    {
+        let mut messages = bridge_state.messages.write().await;
+        messages.push(emitted);
+        // Oldest first, so the messages a `message_edit` or `message_delete`
+        // is likeliest to name are the ones that survive. Half the list goes at
+        // once, for the reason the dedup set beside it drops half: draining one
+        // element per message past the bound would shift the whole list on
+        // every message, and draining half amortizes that to one shift per
+        // half-list of messages.
+        if messages.len() > MAX_EMITTED_MESSAGES {
+            messages.drain(..MAX_EMITTED_MESSAGES / 2);
+        }
+    }
 
     (
         StatusCode::ACCEPTED,
@@ -650,8 +870,11 @@ async fn emit_message_handler(
 
 /// Handler for `GET /v1/scp/bridge/status`.
 ///
-/// Returns bridge status including shadow list, registration info, and
-/// rate limits.
+/// Returns bridge status and the shadow roster this bridge manages in its own
+/// context. Spec §12.10.4 defines that roster as "all shadow identities managed
+/// by this bridge in this context", so the handler reads the registry for the
+/// authenticated context and keeps only shadows the authenticated bridge
+/// created.
 ///
 /// See SCP-BCH-005 and spec section 12.10.4.
 #[allow(clippy::significant_drop_tightening)] // false positive on async RwLock guard scope
@@ -659,25 +882,29 @@ async fn status_handler(
     State(bridge_state): State<Arc<BridgeState>>,
     Extension(auth_ctx): Extension<crate::bridge_auth::BridgeAuthContext>,
 ) -> impl IntoResponse {
+    let context_id = auth_ctx.context_id();
+    let bridge_id = auth_ctx.bridge_id();
+
     let registries = bridge_state.registries.read().await;
-    let deleted = bridge_state.deleted_shadows.read().await;
 
     let mut shadows = Vec::new();
-    for registry in registries.values() {
+    if let Some(registry) = registries.get(context_id) {
+        // A retired shadow has no record, so this roster reads live shadows.
         for shadow in registry.shadows() {
-            if !deleted.contains(&shadow.shadow_id) {
-                let status_str = match shadow.provenance_status {
-                    ShadowProvenanceStatus::Shadow => "Shadow",
-                    ShadowProvenanceStatus::Claimed => "Claimed",
-                };
-                shadows.push(ShadowSummary {
-                    shadow_id: shadow.shadow_id.clone(),
-                    platform_handle: shadow.platform_handle.clone(),
-                    attributed_role: shadow.attributed_role.clone(),
-                    provenance_status: status_str.to_owned(),
-                    created_at: shadow.created_at,
-                });
+            if shadow.bridge_id != bridge_id {
+                continue;
             }
+            let status_str = match shadow.provenance_status {
+                ShadowProvenanceStatus::Shadow => "Shadow",
+                ShadowProvenanceStatus::Claimed => "Claimed",
+            };
+            shadows.push(ShadowSummary {
+                shadow_id: shadow.shadow_id.clone(),
+                platform_handle: shadow.platform_handle.clone(),
+                attributed_role: shadow.attributed_role.clone(),
+                provenance_status: status_str.to_owned(),
+                created_at: shadow.created_at,
+            });
         }
     }
 
@@ -716,67 +943,176 @@ async fn status_handler(
 
 /// Handler for `DELETE /v1/scp/bridge/shadow/{shadow_id}`.
 ///
-/// Deletes a shadow identity. Historical actions remain in the event log.
-/// Returns 204 on success, 404 if not found, 409 if claimed.
-/// Deletion is idempotent (re-deleting returns 204).
+/// Deletes a shadow identity the authenticated bridge created in its own
+/// context. Historical actions remain in the event log. Returns 204 on success,
+/// 404 if the authenticated bridge has no such shadow in its context, 409 if
+/// the shadow is claimed. Deletion is idempotent (re-deleting returns 204).
+///
+/// A shadow belonging to another bridge or another context is out of the
+/// caller's scope, so this handler answers 404 `SHADOW_NOT_FOUND` for it and
+/// deletes nothing.
 ///
 /// See SCP-BCH-005 and spec section 12.10.4.
 async fn delete_shadow_handler(
     State(bridge_state): State<Arc<BridgeState>>,
-    Extension(_auth_ctx): Extension<crate::bridge_auth::BridgeAuthContext>,
+    Extension(auth_ctx): Extension<crate::bridge_auth::BridgeAuthContext>,
     Path(shadow_id): Path<String>,
 ) -> impl IntoResponse {
-    let deleted = bridge_state.deleted_shadows.read().await;
+    let context_id = auth_ctx.context_id().to_owned();
+    let bridge_id = auth_ctx.bridge_id();
 
-    // Idempotent: already deleted returns 204.
-    if deleted.contains(&shadow_id) {
+    let mut registries = bridge_state.registries.write().await;
+    // `create_shadow_handler` and the `user_departed` arm of
+    // `process_webhook_event` take these two locks in this order too.
+    let mut deleted = bridge_state.deleted_shadows.write().await;
+    let retirement_key = (context_id.clone(), bridge_id.to_owned(), shadow_id.clone());
+
+    // Idempotent: a shadow this bridge already retired in this context
+    // returns 204. Matching on this bridge's own ID keeps a second bridge from
+    // reading that 204 as proof that this bridge retired that shadow.
+    if deleted.contains(&retirement_key) {
         return StatusCode::NO_CONTENT.into_response();
     }
-    drop(deleted);
 
-    let registries = bridge_state.registries.read().await;
-    let shadow_info = find_shadow(&registries, &shadow_id);
-    drop(registries);
+    let Some(registry) = registries.get_mut(&context_id) else {
+        return shadow_not_found().into_response();
+    };
+    let Some(shadow) = registry
+        .shadows()
+        .iter()
+        .find(|s| s.shadow_id == shadow_id && s.bridge_id == bridge_id)
+    else {
+        return shadow_not_found().into_response();
+    };
 
-    match shadow_info {
-        None => (
-            StatusCode::NOT_FOUND,
+    // Claimed shadows cannot be deleted.
+    if shadow.provenance_status == ShadowProvenanceStatus::Claimed {
+        return (
+            StatusCode::CONFLICT,
             Json(ApiError {
-                error: "shadow not found".to_owned(),
-                code: "SHADOW_NOT_FOUND".to_owned(),
+                error: "shadow has been claimed and cannot be deleted".to_owned(),
+                code: "SHADOW_ALREADY_CLAIMED".to_owned(),
             }),
         )
-            .into_response(),
-        Some((_ctx_id, shadow)) => {
-            // Claimed shadows cannot be deleted.
-            if shadow.provenance_status == ShadowProvenanceStatus::Claimed {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(ApiError {
-                        error: "shadow has been claimed and cannot be deleted".to_owned(),
-                        code: "SHADOW_ALREADY_CLAIMED".to_owned(),
-                    }),
-                )
-                    .into_response();
-            }
+            .into_response();
+    }
 
-            bridge_state.deleted_shadows.write().await.insert(shadow_id);
+    let mut sender_key_store = bridge_state.sender_key_store.write().await;
+    if let Err(e) = retire_shadow(registry, &mut sender_key_store, bridge_id, &shadow_id) {
+        return ApiError::internal_error(e.to_string()).into_response();
+    }
+    drop(sender_key_store);
+    drop(registries);
+    record_retirement(&mut deleted, retirement_key);
+    drop(deleted);
 
-            StatusCode::NO_CONTENT.into_response()
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Records a retirement key, and evicts down to [`MAX_DELETED_SHADOWS`] when
+/// recording it puts the set over that bound.
+///
+/// `HashSet` orders nothing, so this drains an arbitrary half rather than the
+/// oldest half. A caller whose key this drops reads the 404 of a shadow it never
+/// held instead of the 204 of one it retired, and the retirement itself already
+/// removed the registry record and the sender key, so the eviction changes no
+/// shadow's liveness.
+fn record_retirement(
+    deleted: &mut HashSet<(String, String, String)>,
+    retirement_key: (String, String, String),
+) {
+    deleted.insert(retirement_key);
+    if deleted.len() > MAX_DELETED_SHADOWS {
+        let to_remove: Vec<(String, String, String)> =
+            deleted.iter().take(deleted.len() / 2).cloned().collect();
+        for key in to_remove {
+            deleted.remove(&key);
         }
     }
+}
+
+/// The 404 every shadow endpoint answers for a shadow outside the caller's
+/// scope, whether that shadow was retired, belongs to another bridge, sits in
+/// another context, or never existed.
+fn shadow_not_found() -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ApiError {
+            error: "shadow not found".to_owned(),
+            code: "SHADOW_NOT_FOUND".to_owned(),
+        }),
+    )
 }
 
 // ---------------------------------------------------------------------------
 // Webhook handler (SCP-BCH-006)
 // ---------------------------------------------------------------------------
 
-/// Extracts the `shadow_id` field from a webhook event payload.
-fn extract_shadow_id(payload: &serde_json::Value) -> &str {
-    payload
-        .get("shadow_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
+/// Reads a string field from a webhook event payload, or `""` when absent.
+fn payload_str<'a>(payload: &'a serde_json::Value, field: &str) -> &'a str {
+    payload.get(field).and_then(|v| v.as_str()).unwrap_or("")
+}
+
+/// Names the shadow a webhook event concerns, or `None` when the payload
+/// names no shadow.
+///
+/// Spec §12.10.4 gives `message`, `presence`, `identity_update`, and
+/// `user_departed` payloads a `platform_user_id`, and a bridge derives a
+/// shadow's identifier from its own `bridge_id` and that user id
+/// ([`derive_shadow_id`]), so the payload's `shadow_id` when present and the
+/// derived identifier otherwise name the same shadow. The identifier this
+/// returns is a name, not proof of a shadow: every caller resolves it inside
+/// the signing bridge's scope, so a payload naming a shadow another bridge
+/// owns, or a shadow this bridge retired, resolves to nothing.
+fn event_shadow_id(bridge_id: &str, payload: &serde_json::Value) -> Option<String> {
+    let named = payload_str(payload, "shadow_id");
+    let platform_user_id = payload_str(payload, "platform_user_id");
+    if !named.is_empty() {
+        Some(named.to_owned())
+    } else if !platform_user_id.is_empty() {
+        Some(derive_shadow_id(bridge_id, platform_user_id))
+    } else {
+        None
+    }
+}
+
+/// Returns whether `shadows` holds a shadow that `bridge_id` owns under
+/// `shadow_id` and that a DID has claimed.
+///
+/// Spec §12.10.4 answers the bearer `DELETE` of a claimed shadow with 409
+/// `SHADOW_ALREADY_CLAIMED` and states why: the claimant owns a claimed shadow,
+/// and the bridge operator does not. §12.5 makes claiming one-way and
+/// irreversible, so no later action by that operator undoes it. A
+/// `user_departed` webhook is the bridge operator acting through its own
+/// platform, so `process_webhook_event` refuses to retire a claimed shadow for
+/// the reason the `DELETE` path refuses it. `delete_shadow_handler` applies the
+/// same criterion to the record it already resolved.
+fn claimed_by_this_bridge(shadows: &[ShadowIdentity], bridge_id: &str, shadow_id: &str) -> bool {
+    shadows.iter().any(|s| {
+        s.shadow_id == shadow_id
+            && s.bridge_id == bridge_id
+            && s.provenance_status == ShadowProvenanceStatus::Claimed
+    })
+}
+
+/// Returns whether the signing bridge emitted a message into its context
+/// under `platform_message_id`.
+///
+/// A `message_edit` or `message_delete` event names the message it concerns
+/// through the platform's own identifier (spec §12.10.4), and the node acts on
+/// it only when that identifier names a message this bridge emitted into this
+/// context, so a platform cannot edit or delete another bridge's message.
+async fn bridge_emitted_message(
+    bridge_state: &BridgeState,
+    context_id: &str,
+    bridge_id: &str,
+    platform_message_id: &str,
+) -> bool {
+    bridge_state.messages.read().await.iter().any(|m| {
+        m.context_id == context_id
+            && m.bridge_id == bridge_id
+            && m.platform_message_id.as_deref() == Some(platform_message_id)
+    })
 }
 
 /// Constructs a webhook rejection response (accepted: false).
@@ -792,102 +1128,121 @@ fn webhook_reject(event_id: String, reason: &str) -> axum::response::Response {
         .into_response()
 }
 
-/// Processes a single webhook event, returning `Some(response)` if the
-/// event should be rejected, or `None` if processing succeeded.
+/// Processes a single webhook event inside the signing platform's scope,
+/// returning `Some(reason)` if the event should be rejected, or `None` if
+/// processing succeeded.
+///
+/// `context_id` and `bridge_id` come from the verified
+/// [`WebhookAuthContext`](crate::bridge_auth::WebhookAuthContext), never from
+/// the request payload. Every shadow this function reads or deletes must belong
+/// to that bridge in that context, and every outbound dispatch targets that
+/// context, so a platform holding one registered webhook key cannot reach a
+/// second platform's shadows.
 ///
 /// On success, dispatches the event to any registered outbound webhook
 /// targets via [`WebhookDispatcher`](crate::webhook::WebhookDispatcher).
 async fn process_webhook_event(
     bridge_state: &BridgeState,
+    context_id: &str,
+    bridge_id: &str,
     event_type: &str,
-    event_id: &str,
     payload: &serde_json::Value,
 ) -> Option<String> {
-    // Derive the context ID for outbound dispatch. For message events the
-    // shadow registry tells us which context the shadow belongs to; for
-    // other event types we look for a `context_id` field in the payload.
-    let mut dispatch_context_id: Option<String> = None;
-
+    // Every event type spec §12.10.4 defines names either a shadow or a
+    // message, and the node acts on an event only when that shadow or message
+    // belongs to the signing bridge in the authenticated context. An event
+    // that names neither carries nothing this node can act on in scope, so it
+    // is rejected rather than forwarded under the bridge's authority.
     match event_type {
-        "message" => {
-            let shadow_id = extract_shadow_id(payload);
-            if shadow_id.is_empty() {
-                return Some("payload.shadow_id is required for message events".to_owned());
-            }
+        "message" | "presence" | "identity_update" => {
+            let Some(shadow_id) = event_shadow_id(bridge_id, payload) else {
+                return Some(format!("shadow not found for {event_type}"));
+            };
             let registries = bridge_state.registries.read().await;
-            let shadow_info = find_shadow(&registries, shadow_id);
+            let found = find_scoped_shadow(&registries, context_id, bridge_id, &shadow_id);
             drop(registries);
-            match shadow_info {
-                Some((ctx_id, _)) => {
-                    dispatch_context_id = Some(ctx_id);
-                }
-                None => {
-                    return Some("shadow not found".to_owned());
-                }
-            }
-        }
-        "identity_update" => {
-            let shadow_id = extract_shadow_id(payload);
-            if !shadow_id.is_empty() {
-                let registries = bridge_state.registries.read().await;
-                let shadow_info = find_shadow(&registries, shadow_id);
-                drop(registries);
-                match shadow_info {
-                    Some((ctx_id, _)) => {
-                        dispatch_context_id = Some(ctx_id);
-                    }
-                    None => {
-                        return Some("shadow not found for identity_update".to_owned());
-                    }
-                }
+            if found.is_none() {
+                return Some(format!("shadow not found for {event_type}"));
             }
         }
         "user_departed" => {
-            let shadow_id = extract_shadow_id(payload);
-            if !shadow_id.is_empty() {
-                // Look up context before deleting the shadow.
-                let registries = bridge_state.registries.read().await;
-                dispatch_context_id = find_shadow(&registries, shadow_id).map(|(ctx_id, _)| ctx_id);
-                drop(registries);
-
-                bridge_state
-                    .deleted_shadows
-                    .write()
-                    .await
-                    .insert(shadow_id.to_owned());
+            let Some(shadow_id) = event_shadow_id(bridge_id, payload) else {
+                return Some("shadow not found for user_departed".to_owned());
+            };
+            // Retire it exactly as `delete_shadow_handler` does, under the
+            // same locks in the same order: the record and sender key go, and
+            // the retirement key answers a later idempotent delete.
+            // `retire_shadow` matches on this bridge's id, so a shadow outside
+            // its scope, or one already retired, is not found.
+            let mut registries = bridge_state.registries.write().await;
+            let mut deleted = bridge_state.deleted_shadows.write().await;
+            let Some(registry) = registries.get_mut(context_id) else {
+                return Some("shadow not found for user_departed".to_owned());
+            };
+            if claimed_by_this_bridge(registry.shadows(), bridge_id, &shadow_id) {
+                return Some(
+                    "shadow has been claimed and cannot be retired by user_departed".to_owned(),
+                );
+            }
+            let mut sender_key_store = bridge_state.sender_key_store.write().await;
+            match retire_shadow(registry, &mut sender_key_store, bridge_id, &shadow_id) {
+                Ok(_) => {}
+                Err(ShadowError::ShadowNotFound { .. }) => {
+                    return Some("shadow not found for user_departed".to_owned());
+                }
+                Err(e) => return Some(format!("shadow retirement failed: {e}")),
+            }
+            drop(sender_key_store);
+            drop(registries);
+            record_retirement(
+                &mut deleted,
+                (context_id.to_owned(), bridge_id.to_owned(), shadow_id),
+            );
+            drop(deleted);
+        }
+        "message_edit" | "message_delete" => {
+            let platform_message_id = payload_str(payload, "platform_message_id");
+            if platform_message_id.is_empty() {
+                return Some(format!(
+                    "payload.platform_message_id is required for {event_type} events"
+                ));
+            }
+            if !bridge_emitted_message(bridge_state, context_id, bridge_id, platform_message_id)
+                .await
+            {
+                return Some(format!("message not found for {event_type}"));
             }
         }
-        // presence, message_edit, message_delete are accepted but
-        // don't require specific state changes in the current impl.
-        _ => {
-            // Attempt to extract context_id from payload for dispatch.
-            if let Some(ctx) = payload.get("context_id").and_then(|v| v.as_str()) {
-                dispatch_context_id = Some(ctx.to_owned());
-            }
-        }
+        // `webhook_handler` checks `event_type` against `VALID_EVENT_TYPES`
+        // first, so this arm answers only a type that list gains before this
+        // match does, and it fails closed.
+        other => return Some(format!("unknown event_type: {other}")),
     }
 
-    // Dispatch outbound webhook for processed events.
-    if let Some(ctx_id) = dispatch_context_id {
-        bridge_state
-            .webhook_dispatcher
-            .dispatch_event(&ctx_id, event_type, payload.clone())
-            .await;
-    }
+    // Every event that reached a shadow or message the signing bridge owns
+    // notifies the outbound webhook targets of the authenticated context.
+    bridge_state
+        .webhook_dispatcher
+        .dispatch_event(context_id, event_type, payload.clone())
+        .await;
 
-    let _ = event_id; // used by callers for dedup tracking
     None
 }
 
 /// Handler for `POST /v1/scp/bridge/webhook`.
 ///
-/// Accepts platform-initiated events with deduplication by `event_id`.
-/// Supports event types: message, presence, `identity_update`,
-/// `user_departed`, `message_edit`, `message_delete`.
+/// Accepts platform-initiated events with deduplication by `event_id` within
+/// the signing bridge. Supports event types: message, presence,
+/// `identity_update`, `user_departed`, `message_edit`, `message_delete`.
+///
+/// The `WebhookAuthContext` extension names the bridge whose registered
+/// platform key signed this request (spec §12.10.2), and the handler restricts
+/// every lookup, deletion, and dispatch to that bridge's context.
 ///
 /// See SCP-BCH-006 and spec section 12.10.4.
 async fn webhook_handler(
     State(bridge_state): State<Arc<BridgeState>>,
+    Extension(webhook_ctx): Extension<crate::bridge_auth::WebhookAuthContext>,
     Json(body): Json<WebhookRequest>,
 ) -> impl IntoResponse {
     if !VALID_EVENT_TYPES.contains(&body.event_type.as_str()) {
@@ -897,13 +1252,17 @@ async fn webhook_handler(
         );
     }
     if body.event_id.is_empty() {
-        return ApiError::bad_request("event_id must not be empty").into_response();
+        return invalid_request("event_id must not be empty").into_response();
     }
 
-    // Deduplication: if event_id was already processed, return accepted.
+    let context_id = webhook_ctx.context_id();
+    let bridge_id = webhook_ctx.bridge_id();
+    let dedup_key = (bridge_id.to_owned(), body.event_id.clone());
+
+    // Deduplication: if this bridge already sent event_id, return accepted.
     {
         let processed = bridge_state.processed_event_ids.read().await;
-        if processed.contains(&body.event_id) {
+        if processed.contains(&dedup_key) {
             return (
                 StatusCode::OK,
                 Json(WebhookResponse {
@@ -918,8 +1277,9 @@ async fn webhook_handler(
 
     if let Some(reason) = process_webhook_event(
         &bridge_state,
+        context_id,
+        bridge_id,
         &body.event_type,
-        &body.event_id,
         &body.payload,
     )
     .await
@@ -929,12 +1289,12 @@ async fn webhook_handler(
 
     {
         let mut processed = bridge_state.processed_event_ids.write().await;
-        processed.insert(body.event_id.clone());
+        processed.insert(dedup_key);
         // Cap dedup set to prevent unbounded memory growth (BLACK-302).
         if processed.len() > MAX_PROCESSED_EVENT_IDS {
             // Evict approximately half the set. HashSet has no LRU, so
             // we drain arbitrarily — dedup is best-effort anyway.
-            let to_remove: Vec<String> = processed
+            let to_remove: Vec<(String, String)> = processed
                 .iter()
                 .take(processed.len() / 2)
                 .cloned()
@@ -966,6 +1326,11 @@ async fn webhook_handler(
 /// `BridgeAuthContext` as a request extension (injected by the bridge
 /// auth middleware layer applied by the caller).
 pub fn bridge_router(state: Arc<BridgeState>) -> Router {
+    // `Router::layer` wraps whichever routes a router already holds and adds
+    // nothing to a route registered after it, so this call follows all five
+    // `route` calls. Applying it to `Router::new()` leaves axum's own 2 MiB
+    // default governing every bridge route, and the doc comment on
+    // `MAX_BRIDGE_BODY_BYTES` then describes a bound no request ever meets.
     Router::new()
         .route("/v1/scp/bridge/shadow", post(create_shadow_handler))
         .route(
@@ -975,6 +1340,7 @@ pub fn bridge_router(state: Arc<BridgeState>) -> Router {
         .route("/v1/scp/bridge/attest", post(attest_handler))
         .route("/v1/scp/bridge/message", post(emit_message_handler))
         .route("/v1/scp/bridge/status", get(status_handler))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BRIDGE_BODY_BYTES))
         .with_state(state)
 }
 
@@ -986,8 +1352,10 @@ pub fn bridge_router(state: Arc<BridgeState>) -> Router {
 /// `bridge_auth_middleware_dyn` to the webhook route would reject all
 /// legitimate platform webhook callbacks with 401.
 pub fn bridge_webhook_router(state: Arc<BridgeState>) -> Router {
+    // The layer follows the route for the reason `bridge_router` states.
     Router::new()
         .route("/v1/scp/bridge/webhook", post(webhook_handler))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BRIDGE_BODY_BYTES))
         .with_state(state)
 }
 
@@ -1036,18 +1404,36 @@ mod tests {
                 status: BridgeStatus::Active,
                 registration_context: "ctx-test-001".to_owned(),
                 registered_at: 1_700_000_000,
+                max_shadows: 10_000,
             },
         }
     }
 
-    /// Builds the router mirroring production routing topology.
+    /// Builds a bridge auth context for an arbitrary bridge and context, so a
+    /// test can drive two bridges against one `BridgeState` and check that
+    /// neither reaches the other's shadows.
+    fn auth_ctx_for(bridge_id: &str, context_id: &str) -> BridgeAuthContext {
+        let mut ctx = test_auth_ctx();
+        ctx.claims.scp_bridge_id = bridge_id.to_owned();
+        ctx.claims.scp_context_id = context_id.to_owned();
+        ctx.bridge.bridge_id = bridge_id.to_owned();
+        ctx.bridge.registration_context = context_id.to_owned();
+        ctx
+    }
+
+    /// Builds the router mirroring production routing topology for the given
+    /// bridge and context.
     ///
     /// JWT-authenticated routes carry `BridgeAuthContext` via an extension
-    /// layer (bypassing real auth middleware for unit tests). The webhook
-    /// route is mounted separately without the extension — matching
-    /// production where it uses `webhook_auth_middleware` instead.
-    fn test_app(state: Arc<BridgeState>) -> Router {
-        let auth_ctx = test_auth_ctx();
+    /// layer, and the webhook route carries `WebhookAuthContext` via its own
+    /// extension layer, bypassing the real auth middlewares for unit tests.
+    /// Production installs the same two extensions from
+    /// `bridge_auth_middleware_dyn` and `webhook_auth_middleware_dyn`.
+    fn test_app_for(state: Arc<BridgeState>, bridge_id: &str, context_id: &str) -> Router {
+        let auth_ctx = auth_ctx_for(bridge_id, context_id);
+        let webhook_ctx = crate::bridge_auth::WebhookAuthContext {
+            bridge: auth_ctx.bridge.clone(),
+        };
 
         // JWT-authenticated bridge routes (mirrors `bridge_router`).
         let authed = Router::new()
@@ -1062,12 +1448,320 @@ mod tests {
             .layer(axum::Extension(auth_ctx))
             .with_state(Arc::clone(&state));
 
-        // Webhook route — no BridgeAuthContext (mirrors `bridge_webhook_router`).
+        // Webhook route — signature-authenticated in production, so it carries
+        // `WebhookAuthContext` rather than `BridgeAuthContext`.
         let webhook = Router::new()
             .route("/v1/scp/bridge/webhook", post(webhook_handler))
+            .layer(axum::Extension(webhook_ctx))
             .with_state(state);
 
         authed.merge(webhook)
+    }
+
+    /// Builds the router for the default test bridge in the default test
+    /// context.
+    fn test_app(state: Arc<BridgeState>) -> Router {
+        test_app_for(state, "bridge-test-001", "ctx-test-001")
+    }
+
+    /// Builds the production [`bridge_router`] with the auth extension the
+    /// middleware installs, so a test drives the routes an operator reaches
+    /// rather than a hand-assembled copy of them.
+    fn production_bridge_app(state: Arc<BridgeState>) -> Router {
+        bridge_router(state).layer(axum::Extension(test_auth_ctx()))
+    }
+
+    /// Builds the production [`bridge_webhook_router`] with the webhook auth
+    /// extension, for the reason [`production_bridge_app`] exists.
+    fn production_webhook_app(state: Arc<BridgeState>) -> Router {
+        let webhook_ctx = crate::bridge_auth::WebhookAuthContext {
+            bridge: test_auth_ctx().bridge,
+        };
+        bridge_webhook_router(state).layer(axum::Extension(webhook_ctx))
+    }
+
+    /// Builds a request carrying `len` bytes of JSON string content.
+    fn request_of_body_len(uri: &str, len: usize) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(vec![b'x'; len]))
+            .expect("test")
+    }
+
+    // -----------------------------------------------------------------------
+    // Request body limit (spec §12.10.4)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_body_over_the_bridge_limit_is_refused_before_a_handler_runs() {
+        let state = Arc::new(BridgeState::new());
+        let app = production_bridge_app(state);
+
+        let req = request_of_body_len("/v1/scp/bridge/shadow", MAX_BRIDGE_BODY_BYTES + 1);
+
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a body one byte over MAX_BRIDGE_BODY_BYTES must not reach a handler"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_bridge_limit_is_refused_on_the_message_route() {
+        let state = Arc::new(BridgeState::new());
+        let app = production_bridge_app(state);
+
+        let req = request_of_body_len("/v1/scp/bridge/message", MAX_BRIDGE_BODY_BYTES + 1);
+
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_bridge_limit_is_refused_on_the_webhook_route() {
+        let state = Arc::new(BridgeState::new());
+        let app = production_webhook_app(state);
+
+        let req = request_of_body_len("/v1/scp/bridge/webhook", MAX_BRIDGE_BODY_BYTES + 1);
+
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn a_body_at_the_bridge_limit_reaches_the_handler() {
+        let state = Arc::new(BridgeState::new());
+        let app = production_bridge_app(state);
+
+        let req = request_of_body_len("/v1/scp/bridge/shadow", MAX_BRIDGE_BODY_BYTES);
+
+        let resp = app.oneshot(req).await.expect("test");
+        // The body is not valid JSON, so axum's own `Json` extractor rejects
+        // it. The assertion here is that the limit did not reject it first,
+        // which is what distinguishes a correctly-placed layer from one that
+        // rejects everything.
+        assert_ne!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // -----------------------------------------------------------------------
+    // Governance-configured shadow limit (spec §12.2.1)
+    // -----------------------------------------------------------------------
+
+    /// Builds the default test router with `max_shadows` set to `limit`.
+    fn test_app_with_shadow_limit(state: Arc<BridgeState>, limit: u32) -> Router {
+        let mut auth_ctx = test_auth_ctx();
+        auth_ctx.bridge.max_shadows = limit;
+        let webhook_ctx = crate::bridge_auth::WebhookAuthContext {
+            bridge: auth_ctx.bridge.clone(),
+        };
+        let authed = Router::new()
+            .route("/v1/scp/bridge/shadow", post(create_shadow_handler))
+            .route(
+                "/v1/scp/bridge/shadow/{shadow_id}",
+                delete(delete_shadow_handler),
+            )
+            .route("/v1/scp/bridge/message", post(emit_message_handler))
+            .route("/v1/scp/bridge/status", get(status_handler))
+            .layer(axum::Extension(auth_ctx))
+            .with_state(Arc::clone(&state));
+        let webhook = Router::new()
+            .route("/v1/scp/bridge/webhook", post(webhook_handler))
+            .layer(axum::Extension(webhook_ctx))
+            .with_state(state);
+        authed.merge(webhook)
+    }
+
+    fn create_shadow_request_for(platform_user_id: &str) -> Request<Body> {
+        create_request(serde_json::json!({
+            "platform_handle": format!("@{platform_user_id}"),
+            "platform_user_id": platform_user_id,
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_retired_shadow_stops_counting_against_the_governance_limit() {
+        let state = Arc::new(BridgeState::new());
+
+        let resp = test_app_with_shadow_limit(Arc::clone(&state), 1)
+            .oneshot(create_shadow_request_for("user-one"))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = test_app_with_shadow_limit(Arc::clone(&state), 1)
+            .oneshot(delete_shadow_request("shadow:bridge-test-001:user-one"))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // The bridge manages zero shadows now, so its one governance-granted
+        // slot is free.
+        let resp = test_app_with_shadow_limit(Arc::clone(&state), 1)
+            .oneshot(create_shadow_request_for("user-two"))
+            .await
+            .expect("test");
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a retired shadow must not hold a governance-granted slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_shadow_still_exhausts_the_governance_limit() {
+        let state = Arc::new(BridgeState::new());
+
+        let resp = test_app_with_shadow_limit(Arc::clone(&state), 1)
+            .oneshot(create_shadow_request_for("user-one"))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = test_app_with_shadow_limit(Arc::clone(&state), 1)
+            .oneshot(create_shadow_request_for("user-two"))
+            .await
+            .expect("test");
+        // Spec §12.4: at the cap, creation answers RATE_LIMITED (429).
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response_json(resp).await["code"], "RATE_LIMITED");
+    }
+
+    #[tokio::test]
+    async fn a_retired_shadow_frees_its_slot_under_the_registry_limit() {
+        // The registry's own per-bridge bound (the protocol default) reads
+        // live shadows, so a bridge that creates and retires over its life
+        // never exhausts it.
+        let state = Arc::new(BridgeState::new());
+        state.registries.write().await.insert(
+            "ctx-test-001".to_owned(),
+            ShadowRegistry::with_limits("ctx-test-001".to_owned(), 1, 10),
+        );
+
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(create_shadow_request_for("user-one"))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(create_shadow_request_for("user-two"))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response_json(resp).await["code"], "RATE_LIMITED");
+
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(delete_shadow_request("shadow:bridge-test-001:user-one"))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(
+            state.registries.read().await["ctx-test-001"]
+                .shadows()
+                .is_empty(),
+            "retirement must remove the registry record"
+        );
+        assert!(
+            state
+                .sender_key_store
+                .read()
+                .await
+                .get("ctx-test-001", "shadow:bridge-test-001:user-one")
+                .is_none(),
+            "retirement must remove the sender key"
+        );
+
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(create_shadow_request_for("user-two"))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn re_creating_a_retired_shadow_returns_it_to_the_roster() {
+        let state = Arc::new(BridgeState::new());
+        let shadow_id = "shadow:bridge-test-001:user-one";
+
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(create_shadow_request_for("user-one"))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(delete_shadow_request(shadow_id))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(status_request())
+            .await
+            .expect("test");
+        assert_eq!(response_json(resp).await["shadow_count"], 0);
+
+        // Re-creating the same platform user derives the same identifier.
+        // Retirement removed the record, so this is a creation (201), and the
+        // shadow it returns must be one the other endpoints see.
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(create_shadow_request_for("user-one"))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(response_json(resp).await["shadow_id"], shadow_id);
+
+        // A shadow re-created after retirement is live: a message goes through
+        // and a second delete retires it again instead of answering the
+        // idempotent 204 for the earlier retirement.
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(message_request(serde_json::json!({
+                "shadow_id": shadow_id,
+                "content": "back again",
+                "content_type": "text/plain"
+            })))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // The re-created shadow is on the roster the status endpoint reports.
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(status_request())
+            .await
+            .expect("test");
+        let json = response_json(resp).await;
+        assert_eq!(
+            json["shadow_count"], 1,
+            "a re-created shadow must appear in the roster the status endpoint reports"
+        );
+        assert_eq!(json["shadows"][0]["shadow_id"], shadow_id);
+
+        // A second retirement removes it again, and the roster drops back to
+        // zero, so re-creation returned a shadow every endpoint sees rather
+        // than a record only the create path knew about.
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(delete_shadow_request(shadow_id))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(
+            state.registries.read().await["ctx-test-001"]
+                .shadows()
+                .is_empty()
+        );
+
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(status_request())
+            .await
+            .expect("test");
+        let json = response_json(resp).await;
+        assert_eq!(
+            json["shadow_count"], 0,
+            "a second retirement must take the shadow off the roster again"
+        );
     }
 
     fn create_request(body: serde_json::Value) -> Request<Body> {
@@ -1361,10 +2055,19 @@ mod tests {
 
     /// Creates a shadow in the state and returns its `shadow_id`.
     async fn create_test_shadow(state: &Arc<BridgeState>) -> String {
+        create_test_shadow_for(state, "user-emitter-001").await
+    }
+
+    /// Creates one shadow for `platform_user_id` and returns its identifier.
+    ///
+    /// Asserts 201, so every caller passes a `platform_user_id` no earlier call
+    /// in the same test used: spec §12.10.4 makes a repeat creation idempotent
+    /// and answers 200, which is a different assertion than this one.
+    async fn create_test_shadow_for(state: &Arc<BridgeState>, platform_user_id: &str) -> String {
         let app = test_app(Arc::clone(state));
         let req = create_request(serde_json::json!({
-            "platform_handle": "@emitter#1234",
-            "platform_user_id": "user-emitter-001"
+            "platform_handle": format!("@{platform_user_id}#1234"),
+            "platform_user_id": platform_user_id
         }));
         let resp = app.oneshot(req).await.expect("test");
         assert_eq!(resp.status(), StatusCode::CREATED);
@@ -1428,6 +2131,66 @@ mod tests {
 
         let resp = app.oneshot(req).await.expect("test");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Spec §12.10.4 caps `content` at 262,144 bytes and states a verbatim
+    /// rejection message, and §12.10.3 pairs HTTP 400 with `INVALID_REQUEST`.
+    #[tokio::test]
+    async fn emit_message_over_the_content_limit_returns_invalid_request() {
+        let state = Arc::new(BridgeState::new());
+        let shadow_id = create_test_shadow(&state).await;
+
+        let app = test_app(state);
+        let req = message_request(serde_json::json!({
+            "shadow_id": shadow_id,
+            "content": "x".repeat(MAX_MESSAGE_CONTENT_BYTES + 1),
+            "content_type": "text/plain"
+        }));
+
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(resp).await;
+        assert_eq!(body["code"], "INVALID_REQUEST");
+        assert_eq!(
+            body["error"],
+            "Content exceeds maximum size of 262144 bytes"
+        );
+    }
+
+    /// Content at exactly the §12.10.4 limit is accepted.
+    #[tokio::test]
+    async fn emit_message_at_the_content_limit_is_accepted() {
+        let state = Arc::new(BridgeState::new());
+        let shadow_id = create_test_shadow(&state).await;
+
+        let app = test_app(state);
+        let req = message_request(serde_json::json!({
+            "shadow_id": shadow_id,
+            "content": "x".repeat(MAX_MESSAGE_CONTENT_BYTES),
+            "content_type": "text/plain"
+        }));
+
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    /// Every bridge 400 carries §12.10.3's `INVALID_REQUEST` code, not the
+    /// `BAD_REQUEST` code `ApiError::bad_request` produces.
+    #[tokio::test]
+    async fn a_malformed_bridge_request_carries_the_spec_error_code() {
+        let state = Arc::new(BridgeState::new());
+        let shadow_id = create_test_shadow(&state).await;
+
+        let app = test_app(state);
+        let req = message_request(serde_json::json!({
+            "shadow_id": shadow_id,
+            "content": "",
+            "content_type": "text/plain"
+        }));
+
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(resp).await["code"], "INVALID_REQUEST");
     }
 
     // -----------------------------------------------------------------------
@@ -1568,13 +2331,14 @@ mod tests {
     #[tokio::test]
     async fn webhook_deduplication() {
         let state = Arc::new(BridgeState::new());
+        let shadow_id = create_test_shadow(&state).await;
 
         let app = test_app(Arc::clone(&state));
         let req = webhook_request(serde_json::json!({
             "event_type": "presence",
             "event_id": "evt-dedup-001",
             "timestamp": 1_700_000_500,
-            "payload": {}
+            "payload": { "shadow_id": shadow_id }
         }));
         let resp = app.oneshot(req).await.expect("test");
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1635,9 +2399,193 @@ mod tests {
         let json = response_json(resp).await;
         assert_eq!(json["accepted"], true);
 
-        // Verify shadow was deleted.
+        // Verify shadow was retired in the authenticated context: the record is
+        // gone and a later delete answers the idempotent 204.
+        assert!(
+            state.registries.read().await["ctx-test-001"]
+                .shadows()
+                .is_empty()
+        );
         let deleted = state.deleted_shadows.read().await;
-        assert!(deleted.contains(&shadow_id));
+        assert!(deleted.contains(&(
+            "ctx-test-001".to_owned(),
+            "bridge-test-001".to_owned(),
+            shadow_id
+        )));
+    }
+
+    #[tokio::test]
+    async fn webhook_message_rejects_a_shadow_this_bridge_retired() {
+        let state = Arc::new(BridgeState::new());
+        let shadow_id = create_test_shadow(&state).await;
+
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(delete_shadow_request(&shadow_id))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // The JWT sibling answers 404 for this shadow, and the webhook path
+        // must give the same answer.
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(message_request(serde_json::json!({
+                "shadow_id": shadow_id,
+                "content": "x",
+                "content_type": "text/plain"
+            })))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        for event_type in ["message", "presence", "identity_update", "user_departed"] {
+            let resp = test_app(Arc::clone(&state))
+                .oneshot(webhook_request(serde_json::json!({
+                    "event_type": event_type,
+                    "event_id": format!("evt-retired-{event_type}"),
+                    "timestamp": 1_700_000_500,
+                    "payload": { "shadow_id": shadow_id, "content": "x" }
+                })))
+                .await
+                .expect("test");
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                response_json(resp).await["accepted"],
+                false,
+                "a {event_type} event for a retired shadow must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn webhook_shadow_events_reject_a_payload_naming_no_shadow() {
+        let state = Arc::new(BridgeState::new());
+        create_test_shadow(&state).await;
+
+        for event_type in ["message", "presence", "identity_update", "user_departed"] {
+            let resp = test_app(Arc::clone(&state))
+                .oneshot(webhook_request(serde_json::json!({
+                    "event_type": event_type,
+                    "event_id": format!("evt-noshadow-{event_type}"),
+                    "timestamp": 1_700_000_500,
+                    "payload": { "status": "online" }
+                })))
+                .await
+                .expect("test");
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                response_json(resp).await["accepted"],
+                false,
+                "a {event_type} event naming no shadow must be rejected"
+            );
+        }
+        assert!(state.deleted_shadows.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn webhook_resolves_a_shadow_from_its_platform_user_id() {
+        // Spec §12.10.4 payloads carry `platform_user_id`; the node derives the
+        // shadow the way the bridge did when it created it.
+        let state = Arc::new(BridgeState::new());
+        let shadow_id = create_test_shadow(&state).await;
+
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(webhook_request(serde_json::json!({
+                "event_type": "presence",
+                "event_id": "evt-presence-by-user",
+                "timestamp": 1_700_000_500,
+                "payload": { "platform_user_id": "user-emitter-001", "status": "online" }
+            })))
+            .await
+            .expect("test");
+        assert_eq!(response_json(resp).await["accepted"], true);
+
+        // A user id another bridge's shadow was derived from resolves to
+        // nothing under this bridge.
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(webhook_request(serde_json::json!({
+                "event_type": "user_departed",
+                "event_id": "evt-depart-by-user",
+                "timestamp": 1_700_000_500,
+                "payload": { "platform_user_id": "user-emitter-001", "reason": "left" }
+            })))
+            .await
+            .expect("test");
+        assert_eq!(response_json(resp).await["accepted"], true);
+        assert!(
+            !state.registries.read().await["ctx-test-001"]
+                .shadows()
+                .iter()
+                .any(|s| s.shadow_id == shadow_id),
+            "user_departed by platform_user_id must retire the derived shadow"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_message_edit_and_delete_require_a_message_this_bridge_emitted() {
+        let state = Arc::new(BridgeState::new());
+        let shadow_id = create_test_shadow(&state).await;
+
+        let resp = test_app(Arc::clone(&state))
+            .oneshot(message_request(serde_json::json!({
+                "shadow_id": shadow_id,
+                "content": "original",
+                "content_type": "text/plain",
+                "platform_message_id": "msg_ext_1"
+            })))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        for event_type in ["message_edit", "message_delete"] {
+            // The message this bridge emitted: accepted.
+            let resp = test_app(Arc::clone(&state))
+                .oneshot(webhook_request(serde_json::json!({
+                    "event_type": event_type,
+                    "event_id": format!("evt-own-{event_type}"),
+                    "timestamp": 1_700_000_500,
+                    "payload": { "platform_message_id": "msg_ext_1" }
+                })))
+                .await
+                .expect("test");
+            assert_eq!(response_json(resp).await["accepted"], true);
+
+            // A message nobody emitted through this bridge: rejected.
+            let resp = test_app(Arc::clone(&state))
+                .oneshot(webhook_request(serde_json::json!({
+                    "event_type": event_type,
+                    "event_id": format!("evt-foreign-{event_type}"),
+                    "timestamp": 1_700_000_500,
+                    "payload": { "platform_message_id": "msg_ext_other" }
+                })))
+                .await
+                .expect("test");
+            assert_eq!(response_json(resp).await["accepted"], false);
+
+            // No identifier at all: rejected.
+            let resp = test_app(Arc::clone(&state))
+                .oneshot(webhook_request(serde_json::json!({
+                    "event_type": event_type,
+                    "event_id": format!("evt-empty-{event_type}"),
+                    "timestamp": 1_700_000_500,
+                    "payload": {}
+                })))
+                .await
+                .expect("test");
+            assert_eq!(response_json(resp).await["accepted"], false);
+        }
+
+        // Another bridge in the same context cannot name this bridge's message.
+        let app_b = test_app_for(Arc::clone(&state), "bridge-b", "ctx-test-001");
+        let resp = app_b
+            .oneshot(webhook_request(serde_json::json!({
+                "event_type": "message_edit",
+                "event_id": "evt-cross-bridge-edit",
+                "timestamp": 1_700_000_500,
+                "payload": { "platform_message_id": "msg_ext_1" }
+            })))
+            .await
+            .expect("test");
+        assert_eq!(response_json(resp).await["accepted"], false);
     }
 
     #[tokio::test]
@@ -1655,17 +2603,28 @@ mod tests {
         .iter()
         .enumerate()
         {
-            // For message event, we need a shadow; for others, just empty payload.
-            let shadow_id = if *event_type == "message" {
-                create_test_shadow(&state).await
-            } else {
-                String::new()
-            };
-
-            let payload = if *event_type == "message" {
-                serde_json::json!({ "shadow_id": shadow_id, "content": "test" })
-            } else {
-                serde_json::json!({})
+            // Every event names a shadow or a message this bridge owns, because
+            // the node acts on nothing outside the signing bridge's scope. Each
+            // iteration names its own platform user, so every creation is a
+            // creation: the `user_departed` iteration retires the shadow it
+            // creates, and a shared platform user would make every later
+            // iteration an idempotent 200 instead.
+            let shadow_id = create_test_shadow_for(&state, &format!("user-event-type-{i}")).await;
+            let payload = match *event_type {
+                "message_edit" | "message_delete" => {
+                    let resp = test_app(Arc::clone(&state))
+                        .oneshot(message_request(serde_json::json!({
+                            "shadow_id": shadow_id,
+                            "content": "test",
+                            "content_type": "text/plain",
+                            "platform_message_id": format!("msg-{i}")
+                        })))
+                        .await
+                        .expect("test");
+                    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+                    serde_json::json!({ "platform_message_id": format!("msg-{i}") })
+                }
+                _ => serde_json::json!({ "shadow_id": shadow_id, "content": "test" }),
             };
 
             let app = test_app(Arc::clone(&state));
@@ -1684,6 +2643,112 @@ mod tests {
                 "event type '{event_type}' should be accepted"
             );
         }
+    }
+
+    fn shadow_record(
+        shadow_id: &str,
+        bridge_id: &str,
+        provenance_status: ShadowProvenanceStatus,
+    ) -> ShadowIdentity {
+        ShadowIdentity {
+            shadow_id: shadow_id.to_owned(),
+            platform_handle: "@claimed#1234".to_owned(),
+            bridge_id: bridge_id.to_owned(),
+            attributed_role: "observer".to_owned(),
+            provenance_status,
+            created_at: 1_700_000_000,
+        }
+    }
+
+    /// Spec §12.10.4 refuses to delete a claimed shadow, and §12.5 makes
+    /// claiming irreversible, so the `user_departed` webhook arm refuses one
+    /// too — and refuses nothing outside the signing bridge's scope, because a
+    /// claimed shadow another bridge owns is not this bridge's to read.
+    #[test]
+    fn a_claimed_shadow_this_bridge_owns_blocks_a_user_departed_retirement() {
+        let shadows = vec![
+            shadow_record("shadow:b1:u1", "b1", ShadowProvenanceStatus::Claimed),
+            shadow_record("shadow:b1:u2", "b1", ShadowProvenanceStatus::Shadow),
+            shadow_record("shadow:b2:u3", "b2", ShadowProvenanceStatus::Claimed),
+        ];
+
+        assert!(claimed_by_this_bridge(&shadows, "b1", "shadow:b1:u1"));
+        assert!(
+            !claimed_by_this_bridge(&shadows, "b1", "shadow:b1:u2"),
+            "an unclaimed shadow this bridge owns retires normally"
+        );
+        assert!(
+            !claimed_by_this_bridge(&shadows, "b1", "shadow:b2:u3"),
+            "a claimed shadow another bridge owns is outside this bridge's scope"
+        );
+        assert!(!claimed_by_this_bridge(&shadows, "b1", "shadow:b1:absent"));
+    }
+
+    /// `deleted_shadows` answers the idempotent 204 spec §12.10.4 gives a
+    /// second delete, and a bridge that churns platform users would otherwise
+    /// grow it without a bound.
+    #[tokio::test]
+    async fn the_retirement_set_stays_under_its_bound() {
+        let mut deleted = HashSet::new();
+        for i in 0..=MAX_DELETED_SHADOWS {
+            record_retirement(
+                &mut deleted,
+                ("ctx".to_owned(), "bridge".to_owned(), format!("shadow-{i}")),
+            );
+        }
+
+        assert!(
+            deleted.len() <= MAX_DELETED_SHADOWS,
+            "the retirement set grew past its bound: {}",
+            deleted.len()
+        );
+        assert!(!deleted.is_empty(), "eviction must not empty the set");
+    }
+
+    /// The emitted-message list backs the `message_edit` and `message_delete`
+    /// scope decision, so it takes a bound of its own rather than growing with
+    /// every message a bridge emits.
+    #[tokio::test]
+    async fn the_emitted_message_list_stays_under_its_bound() {
+        let state = Arc::new(BridgeState::new());
+        let shadow_id = create_test_shadow(&state).await;
+
+        for i in 0..=MAX_EMITTED_MESSAGES {
+            let resp = test_app(Arc::clone(&state))
+                .oneshot(message_request(serde_json::json!({
+                    "shadow_id": shadow_id,
+                    "content": "x",
+                    "content_type": "text/plain",
+                    "platform_message_id": format!("pm-{i}")
+                })))
+                .await
+                .expect("test");
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        }
+
+        let messages = state.messages.read().await;
+        assert!(
+            messages.len() <= MAX_EMITTED_MESSAGES,
+            "the emitted-message list grew past its bound: {}",
+            messages.len()
+        );
+        assert!(!messages.is_empty(), "eviction must not empty the list");
+        // Eviction drops the oldest, so the newest message is still the one a
+        // `message_edit` or `message_delete` finds, and the oldest is gone.
+        assert_eq!(
+            messages
+                .last()
+                .expect("test")
+                .platform_message_id
+                .as_deref(),
+            Some(format!("pm-{MAX_EMITTED_MESSAGES}").as_str())
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.platform_message_id.as_deref() == Some("pm-0")),
+            "eviction must drop the oldest message first"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1766,13 +2831,13 @@ mod tests {
         assert_eq!(shadows.len(), 1);
         assert_eq!(shadows[0]["shadow_id"], shadow_id);
 
-        // 5. Webhook event (presence).
+        // 5. Webhook event (presence) for the shadow this bridge created.
         let app = test_app(Arc::clone(&state));
         let req = webhook_request(serde_json::json!({
             "event_type": "presence",
             "event_id": "evt-lifecycle-001",
             "timestamp": 1_700_001_500,
-            "payload": {}
+            "payload": { "shadow_id": shadow_id }
         }));
         let resp = app.oneshot(req).await.expect("test");
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1939,5 +3004,562 @@ mod tests {
         }));
         let resp = router.clone().oneshot(req).await.expect("test");
         assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // -----------------------------------------------------------------------
+    // Authorized-scope tests
+    //
+    // A `BridgeAuthContext` authorizes one bridge instance inside one context
+    // (spec §12.10.2), and §12.10.4 scopes the status roster to "all shadow
+    // identities managed by this bridge in this context". Each test below
+    // drives two bridges against one `BridgeState` and requires that neither
+    // enumerates, deletes, or emits as the other's shadow. Reverting any
+    // handler to an unscoped registry sweep fails the matching test.
+    // -----------------------------------------------------------------------
+
+    /// Creates a shadow as `bridge_id` in `context_id` and returns its
+    /// `shadow_id`.
+    async fn create_shadow_as(
+        state: &Arc<BridgeState>,
+        bridge_id: &str,
+        context_id: &str,
+        platform_user_id: &str,
+    ) -> String {
+        let app = test_app_for(Arc::clone(state), bridge_id, context_id);
+        let req = create_request(serde_json::json!({
+            "platform_handle": format!("@{platform_user_id}"),
+            "platform_user_id": platform_user_id,
+        }));
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let json = response_json(resp).await;
+        json["shadow_id"].as_str().expect("shadow_id").to_owned()
+    }
+
+    /// Builds a state holding one shadow for bridge A in context A and one for
+    /// bridge B in context B, returning both shadow IDs.
+    async fn two_context_state() -> (Arc<BridgeState>, String, String) {
+        let state = Arc::new(BridgeState::new());
+        let shadow_a = create_shadow_as(&state, "bridge-a", "ctx-a", "user-a").await;
+        let shadow_b = create_shadow_as(&state, "bridge-b", "ctx-b", "user-b").await;
+        (state, shadow_a, shadow_b)
+    }
+
+    /// Builds a state holding one shadow for bridge A and one for bridge B,
+    /// both inside the same context, returning both shadow IDs.
+    async fn shared_context_state() -> (Arc<BridgeState>, String, String) {
+        let state = Arc::new(BridgeState::new());
+        let shadow_a = create_shadow_as(&state, "bridge-a", "ctx-shared", "user-a").await;
+        let shadow_b = create_shadow_as(&state, "bridge-b", "ctx-shared", "user-b").await;
+        (state, shadow_a, shadow_b)
+    }
+
+    /// Returns the `shadow_id` values a status response lists.
+    fn roster_ids(json: &serde_json::Value) -> Vec<String> {
+        json["shadows"]
+            .as_array()
+            .expect("shadows array")
+            .iter()
+            .map(|s| s["shadow_id"].as_str().expect("shadow_id").to_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn status_roster_omits_shadows_in_another_context() {
+        let (state, shadow_a, shadow_b) = two_context_state().await;
+
+        let app = test_app_for(state, "bridge-a", "ctx-a");
+        let resp = app.oneshot(status_request()).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let json = response_json(resp).await;
+        assert_eq!(json["shadow_count"], 1);
+        assert_eq!(roster_ids(&json), vec![shadow_a]);
+        assert!(
+            !roster_ids(&json).contains(&shadow_b),
+            "bridge A must not enumerate a shadow living in context B"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_roster_omits_another_bridge_in_the_same_context() {
+        let (state, shadow_a, shadow_b) = shared_context_state().await;
+
+        let app = test_app_for(state, "bridge-a", "ctx-shared");
+        let resp = app.oneshot(status_request()).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let json = response_json(resp).await;
+        assert_eq!(json["shadow_count"], 1);
+        assert_eq!(roster_ids(&json), vec![shadow_a]);
+        assert!(
+            !roster_ids(&json).contains(&shadow_b),
+            "spec section 12.10.4 scopes the roster to shadows this bridge manages"
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_message_rejects_a_shadow_in_another_context() {
+        let (state, _shadow_a, shadow_b) = two_context_state().await;
+
+        let app = test_app_for(Arc::clone(&state), "bridge-a", "ctx-a");
+        let req = message_request(serde_json::json!({
+            "shadow_id": shadow_b,
+            "content": "impersonation attempt",
+            "content_type": "text/plain",
+        }));
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let json = response_json(resp).await;
+        assert_eq!(json["code"], "SHADOW_NOT_FOUND");
+        assert!(
+            state.messages.read().await.is_empty(),
+            "a rejected emit must record no message"
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_message_rejects_another_bridges_shadow_in_the_same_context() {
+        let (state, _shadow_a, shadow_b) = shared_context_state().await;
+
+        let app = test_app_for(Arc::clone(&state), "bridge-a", "ctx-shared");
+        let req = message_request(serde_json::json!({
+            "shadow_id": shadow_b,
+            "content": "impersonation attempt",
+            "content_type": "text/plain",
+        }));
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(state.messages.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn message_sequence_counts_each_context_separately() {
+        let (state, shadow_a, shadow_b) = two_context_state().await;
+
+        let app_a = test_app_for(Arc::clone(&state), "bridge-a", "ctx-a");
+        let resp_a = app_a
+            .oneshot(message_request(serde_json::json!({
+                "shadow_id": shadow_a,
+                "content": "first in context A",
+                "content_type": "text/plain",
+            })))
+            .await
+            .expect("test");
+        assert_eq!(resp_a.status(), StatusCode::ACCEPTED);
+        assert_eq!(response_json(resp_a).await["sequence"], 1);
+
+        let app_b = test_app_for(Arc::clone(&state), "bridge-b", "ctx-b");
+        let resp_b = app_b
+            .oneshot(message_request(serde_json::json!({
+                "shadow_id": shadow_b,
+                "content": "first in context B",
+                "content_type": "text/plain",
+            })))
+            .await
+            .expect("test");
+        assert_eq!(resp_b.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            response_json(resp_b).await["sequence"],
+            1,
+            "context B counts its own messages, so its first message is sequence 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_shadow_rejects_a_shadow_in_another_context() {
+        let (state, _shadow_a, shadow_b) = two_context_state().await;
+
+        let app = test_app_for(Arc::clone(&state), "bridge-a", "ctx-a");
+        let resp = app
+            .oneshot(delete_shadow_request(&shadow_b))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        assert!(
+            state.deleted_shadows.read().await.is_empty(),
+            "a rejected delete must retire no shadow"
+        );
+
+        // Bridge B still sees its own shadow.
+        let app_b = test_app_for(state, "bridge-b", "ctx-b");
+        let status = app_b.oneshot(status_request()).await.expect("test");
+        let json = response_json(status).await;
+        assert_eq!(roster_ids(&json), vec![shadow_b]);
+    }
+
+    #[tokio::test]
+    async fn delete_shadow_rejects_another_bridges_shadow_in_the_same_context() {
+        let (state, _shadow_a, shadow_b) = shared_context_state().await;
+
+        let app = test_app_for(Arc::clone(&state), "bridge-a", "ctx-shared");
+        let resp = app
+            .oneshot(delete_shadow_request(&shadow_b))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(state.deleted_shadows.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_idempotency_does_not_reveal_another_contexts_deletion() {
+        let (state, shadow_a, _shadow_b) = two_context_state().await;
+
+        // Bridge A retires its own shadow.
+        let app_a = test_app_for(Arc::clone(&state), "bridge-a", "ctx-a");
+        let resp = app_a
+            .oneshot(delete_shadow_request(&shadow_a))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // Bridge B naming that same shadow ID gets 404, not the 204 that would
+        // tell it the ID was retired somewhere else on this node.
+        let app_b = test_app_for(state, "bridge-b", "ctx-b");
+        let resp = app_b
+            .oneshot(delete_shadow_request(&shadow_a))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn webhook_user_departed_rejects_a_shadow_in_another_context() {
+        let (state, _shadow_a, shadow_b) = two_context_state().await;
+
+        let app = test_app_for(Arc::clone(&state), "bridge-a", "ctx-a");
+        let req = webhook_request(serde_json::json!({
+            "event_type": "user_departed",
+            "event_id": "evt-cross-depart",
+            "timestamp": 1_700_000_500,
+            "payload": { "shadow_id": shadow_b },
+        }));
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let json = response_json(resp).await;
+        assert_eq!(json["accepted"], false);
+        assert!(
+            state.deleted_shadows.read().await.is_empty(),
+            "a webhook signed for bridge A must not retire a shadow in context B"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_message_rejects_a_shadow_in_another_context() {
+        let (state, _shadow_a, shadow_b) = two_context_state().await;
+
+        let app = test_app_for(state, "bridge-a", "ctx-a");
+        let req = webhook_request(serde_json::json!({
+            "event_type": "message",
+            "event_id": "evt-cross-message",
+            "timestamp": 1_700_000_500,
+            "payload": { "shadow_id": shadow_b },
+        }));
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(response_json(resp).await["accepted"], false);
+    }
+
+    #[tokio::test]
+    async fn webhook_ignores_a_context_id_supplied_in_the_payload() {
+        let (state, shadow_a, _shadow_b) = two_context_state().await;
+
+        // The payload names context B alongside bridge A's own shadow.
+        // Dispatch must still target the authenticated context A.
+        let app = test_app_for(Arc::clone(&state), "bridge-a", "ctx-a");
+        let req = webhook_request(serde_json::json!({
+            "event_type": "presence",
+            "event_id": "evt-payload-context",
+            "timestamp": 1_700_000_500,
+            "payload": { "context_id": "ctx-b", "shadow_id": shadow_a, "status": "online" },
+        }));
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(response_json(resp).await["accepted"], true);
+
+        // Context A's own shadow is untouched, and nothing was retired.
+        assert!(state.deleted_shadows.read().await.is_empty());
+        let app_a = test_app_for(state, "bridge-a", "ctx-a");
+        let status = app_a.oneshot(status_request()).await.expect("test");
+        assert_eq!(roster_ids(&response_json(status).await), vec![shadow_a]);
+    }
+
+    #[tokio::test]
+    async fn webhook_dedup_is_scoped_to_the_signing_bridge() {
+        let (state, shadow_a, shadow_b) = two_context_state().await;
+
+        // Bridge A sends event ID "evt-shared".
+        let app_a = test_app_for(Arc::clone(&state), "bridge-a", "ctx-a");
+        let resp = app_a
+            .oneshot(webhook_request(serde_json::json!({
+                "event_type": "message",
+                "event_id": "evt-shared",
+                "timestamp": 1_700_000_500,
+                "payload": { "shadow_id": shadow_a },
+            })))
+            .await
+            .expect("test");
+        assert_eq!(response_json(resp).await["accepted"], true);
+
+        // Bridge B reusing that event ID for its own shadow is processed, not
+        // suppressed as a duplicate of bridge A's event.
+        let app_b = test_app_for(Arc::clone(&state), "bridge-b", "ctx-b");
+        let resp = app_b
+            .oneshot(webhook_request(serde_json::json!({
+                "event_type": "message",
+                "event_id": "evt-shared",
+                "timestamp": 1_700_000_500,
+                "payload": { "shadow_id": shadow_b },
+            })))
+            .await
+            .expect("test");
+        assert_eq!(response_json(resp).await["accepted"], true);
+
+        let processed = state.processed_event_ids.read().await;
+        assert!(processed.contains(&("bridge-a".to_owned(), "evt-shared".to_owned())));
+        assert!(processed.contains(&("bridge-b".to_owned(), "evt-shared".to_owned())));
+    }
+
+    #[tokio::test]
+    async fn create_shadow_writes_into_the_authenticated_context_registry() {
+        let state = Arc::new(BridgeState::new());
+        let shadow_a = create_shadow_as(&state, "bridge-a", "ctx-a", "user-a").await;
+
+        let registries = state.registries.read().await;
+        assert_eq!(
+            registries.keys().collect::<Vec<_>>(),
+            vec!["ctx-a"],
+            "creation writes only into the authenticated context's registry"
+        );
+        let shadows = registries.get("ctx-a").expect("registry").shadows();
+        assert_eq!(shadows.len(), 1);
+        assert_eq!(shadows[0].shadow_id, shadow_a);
+        assert_eq!(shadows[0].bridge_id, "bridge-a");
+    }
+
+    #[tokio::test]
+    async fn attest_keys_each_bridges_attestation_separately() {
+        let state = Arc::new(BridgeState::new());
+
+        for bridge_id in ["bridge-a", "bridge-b"] {
+            let app = test_app_for(Arc::clone(&state), bridge_id, "ctx-shared");
+            let resp = app
+                .oneshot(attest_request(valid_attest_body()))
+                .await
+                .expect("test");
+            assert_eq!(resp.status(), StatusCode::CREATED);
+            let json = response_json(resp).await;
+            assert_eq!(
+                json["attestation_id"],
+                format!("attest:{bridge_id}:usr_abc123")
+            );
+        }
+
+        let attestations = state.attestations.read().await;
+        assert_eq!(
+            attestations.len(),
+            2,
+            "one bridge's attestation must not overwrite another's"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Composite-identifier injectivity and oracle tests
+    //
+    // A colon-joined composite ID built from two attacker-chosen segments is
+    // not injective: bridge `acme:pro` with platform user `u1` and bridge
+    // `acme` with platform user `pro:u1` both flatten to `acme:pro:u1`.
+    // `escape_id_segment` removes every colon from each segment, so a colon in
+    // a composite ID only ever separates segments.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn escaping_makes_a_composite_shadow_id_injective() {
+        // A bridge ID carrying a colon and a platform user ID carrying that
+        // same colon on its other side must not flatten to one string.
+        assert_ne!(
+            derive_shadow_id("acme:pro", "u1"),
+            derive_shadow_id("acme", "pro:u1")
+        );
+        // A percent sign is escaped first, so a segment cannot spell an escape
+        // sequence that reintroduces a colon.
+        assert_ne!(
+            derive_shadow_id("acme%3Apro", "u1"),
+            derive_shadow_id("acme:pro", "u1")
+        );
+    }
+
+    #[test]
+    fn escaping_makes_a_composite_attestation_id_injective() {
+        assert_ne!(
+            derive_attestation_id("acme:pro", "u1"),
+            derive_attestation_id("acme", "pro:u1")
+        );
+        assert_ne!(
+            derive_attestation_id("acme%3Apro", "u1"),
+            derive_attestation_id("acme:pro", "u1")
+        );
+    }
+
+    #[tokio::test]
+    async fn attest_cannot_overwrite_another_bridges_record_by_id_collision() {
+        let state = Arc::new(BridgeState::new());
+
+        // Bridge `acme` attests platform user `pro:u1` in its own context.
+        let victim = test_app_for(Arc::clone(&state), "acme", "ctx-1");
+        let mut body = valid_attest_body();
+        body["platform_user_id"] = serde_json::json!("pro:u1");
+        body["platform_handle"] = serde_json::json!("@honest");
+        let resp = victim.oneshot(attest_request(body)).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let victim_id = response_json(resp).await["attestation_id"]
+            .as_str()
+            .expect("attestation_id")
+            .to_owned();
+
+        // Bridge `acme:pro` attests platform user `u1` in a second context.
+        // Before escaping, both records keyed to `attest:acme:pro:u1`.
+        let attacker = test_app_for(Arc::clone(&state), "acme:pro", "ctx-2");
+        let mut body = valid_attest_body();
+        body["platform_user_id"] = serde_json::json!("u1");
+        body["platform_handle"] = serde_json::json!("@attacker");
+        let resp = attacker.oneshot(attest_request(body)).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let attacker_id = response_json(resp).await["attestation_id"]
+            .as_str()
+            .expect("attestation_id")
+            .to_owned();
+
+        assert_ne!(
+            victim_id, attacker_id,
+            "two bridges must not derive one attestation ID"
+        );
+
+        let attestations = state.attestations.read().await;
+        assert_eq!(attestations.len(), 2);
+        let victim_record = attestations.get(&victim_id).expect("victim record");
+        assert_eq!(
+            victim_record.platform_handle, "@honest",
+            "a second bridge must not overwrite this record"
+        );
+        assert_eq!(victim_record.bridge_id, "acme");
+    }
+
+    #[tokio::test]
+    async fn shadow_creation_cannot_squat_another_bridges_derived_id() {
+        let state = Arc::new(BridgeState::new());
+
+        // Bridge `acme:pro` creates platform user `u1` in a shared context.
+        let first_bridge = test_app_for(Arc::clone(&state), "acme:pro", "ctx-1");
+        let resp = first_bridge
+            .oneshot(create_request(serde_json::json!({
+                "platform_handle": "@squat",
+                "platform_user_id": "u1",
+            })))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let squatted = response_json(resp).await["shadow_id"]
+            .as_str()
+            .expect("shadow_id")
+            .to_owned();
+
+        // Bridge `acme` creating platform user `pro:u1` in that same context
+        // derives a different ID, so it succeeds.
+        let victim = test_app_for(Arc::clone(&state), "acme", "ctx-1");
+        let resp = victim
+            .oneshot(create_request(serde_json::json!({
+                "platform_handle": "@honest",
+                "platform_user_id": "pro:u1",
+            })))
+            .await
+            .expect("test");
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a second bridge must not be able to deny this bridge its own shadow ID"
+        );
+        let honest = response_json(resp).await["shadow_id"]
+            .as_str()
+            .expect("shadow_id")
+            .to_owned();
+        assert_ne!(squatted, honest);
+    }
+
+    #[tokio::test]
+    async fn delete_idempotency_does_not_reveal_another_bridges_deletion() {
+        let (state, shadow_a, _shadow_b) = shared_context_state().await;
+
+        // Bridge A retires its own shadow inside a context bridge B shares.
+        let app_a = test_app_for(Arc::clone(&state), "bridge-a", "ctx-shared");
+        let resp = app_a
+            .oneshot(delete_shadow_request(&shadow_a))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // Bridge B probing that shadow ID gets 404, not the 204 that would
+        // tell it bridge A retired that shadow.
+        let app_b = test_app_for(Arc::clone(&state), "bridge-b", "ctx-shared");
+        let resp = app_b
+            .oneshot(delete_shadow_request(&shadow_a))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // A shadow ID nobody ever created answers identically.
+        let app_b = test_app_for(state, "bridge-b", "ctx-shared");
+        let resp = app_b
+            .oneshot(delete_shadow_request("shadow:bridge-a:never"))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn emit_message_answers_identically_for_a_retired_and_an_unknown_shadow() {
+        let (state, shadow_a, _shadow_b) = shared_context_state().await;
+
+        let app_a = test_app_for(Arc::clone(&state), "bridge-a", "ctx-shared");
+        let resp = app_a
+            .oneshot(delete_shadow_request(&shadow_a))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // Bridge A naming its own retired shadow.
+        let app_a = test_app_for(Arc::clone(&state), "bridge-a", "ctx-shared");
+        let retired = app_a
+            .oneshot(message_request(serde_json::json!({
+                "shadow_id": shadow_a,
+                "content": "probe",
+                "content_type": "text/plain",
+            })))
+            .await
+            .expect("test");
+        assert_eq!(retired.status(), StatusCode::NOT_FOUND);
+        let retired_body = response_json(retired).await;
+
+        // Bridge A naming a shadow that never existed.
+        let app_a = test_app_for(state, "bridge-a", "ctx-shared");
+        let unknown = app_a
+            .oneshot(message_request(serde_json::json!({
+                "shadow_id": "shadow:bridge-a:never",
+                "content": "probe",
+                "content_type": "text/plain",
+            })))
+            .await
+            .expect("test");
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        let unknown_body = response_json(unknown).await;
+
+        assert_eq!(
+            retired_body, unknown_body,
+            "a retired shadow and an unknown shadow must answer identically, \
+             so a response never confirms that a shadow once existed"
+        );
     }
 }

@@ -736,6 +736,55 @@ pub fn can_exercise_capability(
 }
 
 // ---------------------------------------------------------------------------
+// retire_shadow
+// ---------------------------------------------------------------------------
+
+/// Retires a shadow identity a bridge manages, removing its registry record
+/// and its sender key.
+///
+/// Spec §12.10.4 `DELETE /v1/scp/bridge/shadow/{shadow_id}` retires a shadow:
+/// no endpoint acts on it afterwards, its slot under the bridge's shadow limit
+/// (§12.2.1 `max_shadows`) frees, and a later creation of the same
+/// `shadow_id` runs [`create_shadow`] again. The registry's own per-bridge
+/// count therefore reads live shadows only, so a bridge that creates and
+/// retires shadows over its life never exhausts a limit on records no
+/// endpoint acts on. Historical actions attributed to the shadow remain in
+/// the event log with their original provenance; this function removes only
+/// the registry record and the §12.6.1 sender key.
+///
+/// The record is matched on both `shadow_id` and `bridge_id`, so a bridge
+/// retires only a shadow it manages.
+///
+/// # Arguments
+///
+/// - `registry` -- The shadow registry holding the record.
+/// - `sender_key_store` -- The store holding the shadow's sender key.
+/// - `bridge_id` -- The bridge retiring the shadow.
+/// - `shadow_id` -- The shadow to retire.
+///
+/// # Errors
+///
+/// Returns [`ShadowError::ShadowNotFound`] when no shadow with that ID exists
+/// under that bridge in this registry.
+pub fn retire_shadow(
+    registry: &mut ShadowRegistry,
+    sender_key_store: &mut SenderKeyStore,
+    bridge_id: &str,
+    shadow_id: &str,
+) -> Result<ShadowIdentity, ShadowError> {
+    let index = registry
+        .shadows
+        .iter()
+        .position(|s| s.shadow_id == shadow_id && s.bridge_id == bridge_id)
+        .ok_or_else(|| ShadowError::ShadowNotFound {
+            shadow_id: shadow_id.to_owned(),
+        })?;
+    let shadow = registry.shadows.remove(index);
+    sender_key_store.remove(&registry.context_id, shadow_id);
+    Ok(shadow)
+}
+
+// ---------------------------------------------------------------------------
 // find_shadow
 // ---------------------------------------------------------------------------
 
@@ -1723,5 +1772,80 @@ mod tests {
         // Lookup by (context_id, bridge_id) should fail — the key is not
         // stored under the bridge ID.
         assert!(store.get(CTX, BRIDGE_ID).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // retire_shadow
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn retire_shadow_removes_the_record_and_its_sender_key() {
+        let mut registry = make_registry();
+        let mut store = SenderKeyStore::new();
+        create_test_shadow_with_store(&mut registry, &mut store, "shadow-1", "@one");
+        assert!(store.get(CTX, "shadow-1").is_some());
+
+        let retired = retire_shadow(&mut registry, &mut store, BRIDGE_ID, "shadow-1").unwrap();
+
+        assert_eq!(retired.shadow_id, "shadow-1");
+        assert!(registry.shadows().is_empty());
+        assert!(store.get(CTX, "shadow-1").is_none());
+        assert!(matches!(
+            find_shadow(&registry, "shadow-1"),
+            Err(ShadowError::ShadowNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn retire_shadow_frees_the_per_bridge_slot() {
+        let mut registry = ShadowRegistry::with_limits(CTX.to_owned(), 1, 10);
+        let mut store = SenderKeyStore::new();
+        create_test_shadow_with_store(&mut registry, &mut store, "shadow-1", "@one");
+        assert!(matches!(
+            create_shadow(&mut registry, &mut store, &make_params("shadow-2", "@two")),
+            Err(ShadowError::CapacityExceeded { .. })
+        ));
+
+        retire_shadow(&mut registry, &mut store, BRIDGE_ID, "shadow-1").unwrap();
+
+        create_shadow(&mut registry, &mut store, &make_params("shadow-2", "@two")).unwrap();
+        assert_eq!(registry.shadows().len(), 1);
+    }
+
+    #[test]
+    fn retire_shadow_recreates_under_the_same_id() {
+        let mut registry = make_registry();
+        let mut store = SenderKeyStore::new();
+        create_test_shadow_with_store(&mut registry, &mut store, "shadow-1", "@one");
+        retire_shadow(&mut registry, &mut store, BRIDGE_ID, "shadow-1").unwrap();
+
+        let (again, _) =
+            create_shadow(&mut registry, &mut store, &make_params("shadow-1", "@one")).unwrap();
+
+        assert_eq!(again.shadow_id, "shadow-1");
+        assert!(store.get(CTX, "shadow-1").is_some());
+    }
+
+    #[test]
+    fn retire_shadow_refuses_another_bridges_shadow() {
+        let mut registry = make_registry();
+        let mut store = SenderKeyStore::new();
+        create_test_shadow_with_store(&mut registry, &mut store, "shadow-1", "@one");
+
+        let err = retire_shadow(&mut registry, &mut store, "bridge-other", "shadow-1").unwrap_err();
+
+        assert!(matches!(err, ShadowError::ShadowNotFound { .. }));
+        assert_eq!(registry.shadows().len(), 1);
+        assert!(store.get(CTX, "shadow-1").is_some());
+    }
+
+    #[test]
+    fn retire_shadow_reports_an_unknown_shadow() {
+        let mut registry = make_registry();
+        let mut store = SenderKeyStore::new();
+
+        let err = retire_shadow(&mut registry, &mut store, BRIDGE_ID, "shadow-none").unwrap_err();
+
+        assert!(matches!(err, ShadowError::ShadowNotFound { .. }));
     }
 }
