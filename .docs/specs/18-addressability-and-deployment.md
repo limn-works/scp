@@ -168,9 +168,13 @@ The `relay_config` object exposes operational parameters that agents need to eva
 | `economic.payment_adapters` | array | — | Accepted payment adapter IDs (e.g., `["x402", "lightning"]`). |
 | `economic.payee` | string | — | The identifier the relay operator receives payments under. |
 
+**Three of these eleven rows are the write policy a publisher reads through `IdentityBackend::read_policy`, and the other eight are not**: `03-identity.md` §3.10.10 declares `DeclaredWritePolicy` and states its field set, so a binding author generating that type reads the field set there and reads the wire form here.
+
 **All fields are optional.** Absent fields indicate the relay uses protocol defaults or has no limit. An absent `economic` field indicates a free relay. What an absent term means:
 
 - An absent `rate_limit_publish` is 6,000 a minute, and a relay turns the term off by declaring zero.
+- An absent `max_blob_size` and an absent `max_blob_ttl` each declare no ceiling of the relay's own.
+- **An absent `relay_config` object is an entry that declares no write policy**, which `read_policy` answers with `None` and no error, and a publisher addressing that entry applies the defaults this list states for each term (`03-identity.md` §3.10.10).
 
 ADR-004 specifies that relay configuration is available "out-of-band." `.well-known/scp` is the canonical location for this out-of-band configuration. Agents evaluating whether to use a relay can fetch `/.well-known/scp` and inspect `relay_config` before establishing a WebSocket connection.
 

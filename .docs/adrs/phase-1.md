@@ -593,7 +593,7 @@ Implement a WebSocket-based store-and-forward relay server and its corresponding
    - Stop receiving blobs for this `routing_id` on this connection.
 
 4. **`QUERY { routing_id, since?, limit?, proof_nonce? }`**
-   - One-shot query: return stored blobs for a `routing_id`, optionally filtered by `since` timestamp, with optional `limit`.
+   - One-shot query: return stored blobs for a `routing_id`, optionally filtered by `since` timestamp, with optional `limit`. **`since` filters over a blob's `stored_at` and the response follows this record's backfill ordering below, which is oldest first by ascending relay receipt timestamp**, so a caller paging a `routing_id` advances its cursor over the order the relay served in and skips no blob the relay has not yet served — which is the page walk `09-security-model.md` §9.7.4.2 R9 states for a resolver.
    - <!-- scp:include id="relay-proof-wire-fields" from=".docs/specs/09-security-model.md" -->`QUERY` carries an optional `proof_nonce`, 32 bytes the resolver drew freshly for that query, REQUIRED on a first contact, and `BLOB` carries an optional `relay_proof`, 200 bytes, which a relay that received a `proof_nonce` and can sign under the operator identity its community-relay-list entry declares MUST return. **A resolver MUST NOT read a `relay_proof` whose nonce differs from the one it sent, and the proof covers the response and not the frame.**<!-- scp:end id="relay-proof-wire-fields" --> (`09-security-model.md` §9.10.12, §9.7.4.2 R11).
    - Does not create a subscription.
 
@@ -646,7 +646,7 @@ Implement a WebSocket-based store-and-forward relay server and its corresponding
 
 **Rationale:** Consistent with the envelope layer (ADR-002 uses `rmp-serde`). Native binary support eliminates Base64 overhead for encrypted blobs (~33% savings). MessagePack has mature libraries in all target languages. JSON text frames rejected — debuggability is solved by tooling, not wire format.
 
-**Backfill ordering:** Oldest-first (ascending relay receipt timestamp). Enables incremental processing, natural stream transition from backfill to real-time, and gets at-risk (expiring) messages to clients first.
+**Backfill ordering:** Oldest-first (ascending relay receipt timestamp), which is the order the `since` filter of `QUERY` above advances a caller's cursor over. Enables incremental processing, natural stream transition from backfill to real-time, and gets at-risk (expiring) messages to clients first.
 
 **Connection URL:** `wss://<host>/scp/v1`. TLS 1.3 required (§9.13). URL path encodes protocol version — no in-band version negotiation. Relay returns HTTP 404 for unsupported versions.
 
@@ -688,7 +688,7 @@ Every message is a MessagePack map with a required `op` field (string) plus oper
 
 #### Error Codes
 
-**Client errors (4xxx):** `4000` INVALID_MESSAGE, `4001` UNKNOWN_OP, `4002` MISSING_FIELD, `4003` INVALID_FIELD, `4010` BLOB_TOO_LARGE, `4011` TTL_TOO_LONG, `4012` LIMIT_EXCEEDED, `4020` RATE_LIMITED (the code a publisher records as `EntryResult::Refused`, `03-identity.md` §3.10.10, filling that variant's ceiling and retry interval from the `rate_limit_publish` term it read and from its own counter, because `ERR` carries `ref`, `code` and `msg` and carries no term and no value), `4021` TOO_MANY_SUBSCRIPTIONS, `4040` DID_RECORD_REJECTED (a validating SCP-native relay rejected an operation at an identity-domain `routing_id`: a PUBLISH of a frame that failed the identifier-to-routing-id binding or chain verification, a frame the relay could place on no chain, any blob published to a `routing_id` that already holds a chain and that is not a frame passing every check that relay runs, or a DELETE of a stored frame whose chain verifies. **Amended 2026-09-10:** the code's name carries the retired identifier-record vocabulary, and this ADR names the wire constant as it ships rather than inventing one).
+**Client errors (4xxx):** `4000` INVALID_MESSAGE, `4001` UNKNOWN_OP, `4002` MISSING_FIELD, `4003` INVALID_FIELD, `4010` BLOB_TOO_LARGE, `4011` TTL_TOO_LONG, `4012` LIMIT_EXCEEDED, `4020` RATE_LIMITED (the code a publisher records as `EntryResult::Refused`, `03-identity.md` §3.10.10, which states what that variant carries and where each of its figures comes from), `4021` TOO_MANY_SUBSCRIPTIONS, `4040` DID_RECORD_REJECTED (a validating SCP-native relay rejected an operation at an identity-domain `routing_id`: a PUBLISH of a frame that failed the identifier-to-routing-id binding or chain verification, a frame the relay could place on no chain, any blob published to a `routing_id` that already holds a chain and that is not a frame passing every check that relay runs, or a DELETE of a stored frame whose chain verifies. **Amended 2026-09-10:** the code's name carries the retired identifier-record vocabulary, and this ADR names the wire constant as it ships rather than inventing one).
 
 **Server errors (5xxx):** `5000` INTERNAL_ERROR, `5001` STORAGE_FULL, `5002` SHUTTING_DOWN.
 
