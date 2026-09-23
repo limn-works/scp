@@ -680,11 +680,11 @@
         "The root signs every establishment event and an operational key signs none (§9.7.4.2)",
         "An event's sequence is its predecessor's plus one, and the inception event's is zero (§9.7.4.2)",
         "Idempotent: a frame whose event digests all match the chain's leaves what the relay holds unchanged (§9.7.4.2 R9)",
-        "A PUBLISH at the `scp:did:` kind sets `retain: true` and a validating relay gives the record no TTL (§9.10.12, §9.7.4.2 R9)",
+        "A PUBLISH at the `scp:did:` kind sets `retain: true` and a validating relay gives the record no TTL (§9.10.12)",
         "Failure handling: exponential backoff on publish failure: 30s, 1m, 2m, 4m, 8m, 16m, capped at 30m",
         "Each retry re-reads the fallback set from the shipped community relay list (§18.5.1)",
         "After 6 consecutive failures, emit a publish-degraded warning to the application layer",
-        "The self-observation cadence starts when identity is loaded (Identity::load or Identity::create) and stops when identity is unloaded or SDK shuts down, and it decides all five relations a chain an entry serves can hold to the controller's own retained log — absent, identical, superseded, extending and diverged — publishing under the first, the third and the fifth, publishing nothing under the second and the fourth, and alerting the human at maximum severity under the fourth (`09-security-model.md` §9.7.4.2 R10)",
+        "The self-observation cadence starts when identity is loaded (Identity::load or Identity::create) and stops when identity is unloaded or SDK shuts down, and it decides all five relations a chain an entry serves can hold to the controller's own retained log — absent, identical, superseded, extending and diverged — publishing under the first, the third and the fifth, publishing nothing under the second and the fourth, and alerting the human at maximum severity under the fourth and the fifth; an entry that answered with frames chaining to nothing, or whose read the fetch bound stopped before any chain closed from an inception event to a head, takes the first relation's act and its alert (`09-security-model.md` §9.7.4.2 R10)",
         "Republish task is a background tokio task the identity module owns",
         "On SDK initialization, all persisted active identities are republished immediately (startup republish)",
         "resolve(identifier) returns a ResolutionOutcome from the SCP relay network, the one resolution layer (§3.10.4)",
@@ -724,12 +724,12 @@
         }
       ],
       "details": {
-        "republishStrategy": "A validating relay stores a `retain` PUBLISH under §9.7.4.2 R9 and gives it no TTL, so no republication cycle makes the record permanent there; §9.7.4.2 R9 states that a relay may stop holding what it once held on terms its operator declares, and §9.7.4.2 R10 states which of the five relations an entry's head can hold to the controller's own retained log carry a publication and what each one publishes. A transport that cannot validate stores the frame as an opaque blob under the shared blob TTL, and the cycle keeps that copy alive.",
+        "republishStrategy": "A validating relay stores a `retain` PUBLISH and gives it no TTL, which §9.10.12 states, so no republication cycle makes the record permanent there; §9.7.4.2 R9 states that a relay may stop holding what it once held on terms its operator declares, and §9.7.4.2 R10 states which of the five relations an entry's head can hold to the controller's own retained log carry a publication and what each one publishes. A transport that cannot validate stores the frame as an opaque blob under the shared blob TTL, and the cycle keeps that copy alive.",
         "cacheStrategy": "Resolution cache — TTL-based, 24h active / 7d inactive, head-sequence comparison for staleness (§9.10.7)",
         "stalenessIndicator": "A cached result the resolver has not refreshed within its window carries a staleness indicator. Callers SHOULD treat a stale result as valid but degraded. UCAN validation and MLS credential verification SHOULD resolve fresh first, and §9.7.1 check 2 bounds how stale a key state may be when it satisfies an attestation's current-key check."
       },
       "result": "Implemented identity publish/resolve, DhtClient trait abstraction, InMemoryDhtClient for testing, DidCache with TTL-based staleness detection (24h active/7d inactive), RepublishManager with exponential backoff. 40 new tests.",
-      "republishStrategy": "A validating relay stores a `retain` PUBLISH under §9.7.4.2 R9 and gives it no TTL, so no republication cycle makes the record permanent there; §9.7.4.2 R10 states the self-observation cadence that re-publishes where an entry no longer holds the record. Failure handling: exponential backoff 30s, 1m, 2m, 4m, 8m, 16m, capped at 30m; after 6 consecutive failures emit a publish-degraded warning."
+      "republishStrategy": "A validating relay stores a `retain` PUBLISH and gives it no TTL, which §9.10.12 states, so no republication cycle makes the record permanent there; §9.7.4.2 R10 states the self-observation cadence that re-publishes where an entry no longer holds the record. The retry schedule this story's acceptance criteria name is the implementation's own and states no protocol rule, because a story is downstream of a spec."
     },
     {
       "id": "SCP-008",
