@@ -38,12 +38,16 @@ cargo --version
 
 ### Python
 
-- Python >= 3.12 (use `python3.12`, not system `python3` which may be Xcode 3.9)
-- Rust toolchain (required for building the native extension via `maturin`)
+- Python >= 3.10. `crates/scp-ffi/Cargo.toml` builds the extension against CPython's
+  stable ABI as of 3.10, so one wheel per platform installs on 3.10 and every later
+  release. On macOS call `python3.12` rather than the system `python3`, which Xcode
+  ships at 3.9.
+- Rust toolchain, which a build from the sdist needs. A `pip install` on a platform
+  below carries no such requirement.
 - Pre-built wheels are available for Linux, macOS, and Windows
 
 ```bash
-python3.12 --version  # >= 3.12
+python3.12 --version  # >= 3.10
 ```
 
 ### TypeScript
