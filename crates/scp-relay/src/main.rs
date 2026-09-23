@@ -13,13 +13,22 @@
 //! The relay selects a blob storage backend via the `SCP_RELAY_STORAGE_BACKEND`
 //! environment variable. Valid values:
 //!
-//! | Value      | Backend    | Config env vars                              | Default |
+//! | Value      | Backend    | Config env vars                              | Compiled in by |
 //! |------------|------------|----------------------------------------------|---------|
-//! | `sqlite`   | `SQLite`     | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.db`) | **yes** |
-//! | `redb`     | redb       | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.redb`) | |
-//! | `postgres` | `PostgreSQL` | `SCP_RELAY_DATABASE_URL` (required)           | |
-//! | `s3`       | S3-compat  | `SCP_RELAY_S3_BUCKET` (required) + AWS env    | |
-//! | `memory`   | In-memory  | —                                             | |
+//! | `sqlite`   | `SQLite`     | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.db`) | always; the default value |
+//! | `redb`     | redb       | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.redb`) | always |
+//! | `postgres` | `PostgreSQL` | `SCP_RELAY_DATABASE_URL` (required)           | `cloud-blobs` |
+//! | `s3`       | S3-compat  | `SCP_RELAY_S3_BUCKET` (required) + AWS env    | `cloud-blobs` |
+//! | `memory`   | In-memory  | —                                             | always |
+//!
+//! The released binary leaves `cloud-blobs` off, because a relay running on
+//! `sqlite`, `redb` or `memory` never links the PostgreSQL and S3 clients.
+//! Enabling the feature resolves 75 extra crates into this binary's graph, 23 of
+//! them `aws-*`, measured with `cargo tree -e no-dev -p scp-relay` against the
+//! same command carrying `--features cloud-blobs`. Build with
+//! `cargo build --release -p scp-relay --features cloud-blobs` to run against
+//! PostgreSQL or S3. A relay built without the feature rejects those two values
+//! and names the feature; it never falls back to another backend.
 //!
 //! See §10.5 of the SCP infrastructure spec.
 

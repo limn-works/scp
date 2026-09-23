@@ -87,6 +87,16 @@ if $HAS_RUST; then
     cargo clippy --workspace --all-targets \
       --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing \
       -- -D warnings 2>&1 || { echo "  ✗ clippy failed"; exit 1; }
+    # `--workspace` resolves `scp-transport` without `postgres-blob` or
+    # `s3-blob`, because `scp-node` and `scp-relay` put both behind their
+    # off-by-default `cloud-blobs` feature, so the command above compiles
+    # neither `crates/scp-transport/src/native/postgres_blob.rs` nor
+    # `crates/scp-transport/src/native/s3_blob.rs`. Clippy is the only tool that
+    # reads the workspace's `unwrap_used`/`panic`/`todo` denials, so without
+    # this line those two modules stop being read by the Rust half of the stub
+    # policy. Job rust-clippy in .github/workflows/ci.yml carries the same line.
+    cargo clippy -p scp-transport --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob --all-targets \
+      -- -D warnings 2>&1 || { echo "  ✗ clippy (cloud blob backends) failed"; exit 1; }
     python3.12 scripts/check-protocol-sync.py 2>&1 || { echo "  ✗ async code in scp-protocol"; exit 1; }
     bash scripts/check-protocol-deps.sh 2>&1 || { echo "  ✗ banned deps in scp-protocol"; exit 1; }
   ) > "$TMPDIR/rust.log" 2>&1 && touch "$TMPDIR/rust.ok" &

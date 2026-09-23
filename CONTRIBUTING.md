@@ -24,6 +24,10 @@ Read `.docs/architecture.md` for system overview and `.docs/specs/` for protocol
    cargo clippy --workspace --all-targets \
      --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing \
      -- -D warnings
+   # `--workspace` resolves `scp-transport` without `postgres-blob` or
+   # `s3-blob`, so the command above compiles neither cloud blob backend.
+   cargo clippy -p scp-transport --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob --all-targets \
+     -- -D warnings
    ./scripts/test.sh
    ```
 5. **Commit atomically** with conventional commit messages.

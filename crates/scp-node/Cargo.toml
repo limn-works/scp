@@ -21,11 +21,14 @@ scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
 scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
 scp-identity = { path = "../scp-identity", version = "=0.1.0-beta.2", features = ["production-dht"] }
 scp-dht = { path = "../scp-dht", version = "=0.1.0-beta.2", features = ["production-dht"] }
+# `sqlite-blob` is ungated on purpose. §17.17 of the persistence spec requires a
+# shipped relay to retain a durable blob backend, and `build_host_site_node`
+# calls `BlobStorageBackend::sqlite` unconditionally, so every `host_site()`
+# consumer funnels through it. The two cloud backends sit behind `cloud-blobs`
+# below instead.
 scp-transport = { path = "../scp-transport", version = "=0.1.0-beta.2", features = [
     "sqlite-blob",
     "redb-blob",
-    "postgres-blob",
-    "s3-blob",
     "startup",
 ] }
 # Durability-only + real backends ONLY (ADR-062 §Decision 6). `testing` is NO
@@ -132,6 +135,24 @@ allow_unencrypted_storage = ["scp-core/allow_unencrypted_storage"]
 # a shipped node build never enables it, so an in-memory DHT nullifier is absent
 # from shipped artifacts.
 testing = ["scp-dht/testing", "scp-platform/testing", "allow_unencrypted_storage"]
+# The two cloud blob backends, OFF by default. Enabling `postgres-blob` and
+# `s3-blob` unconditionally resolved 56 extra crates into this crate's own graph,
+# and 53 to 55 into each of the three FFI bridges that depend on it — 23 of them
+# `aws-*` in every one of those four graphs, which is every `aws-*` crate in the
+# workspace graph. `cargo tree -e no-dev -p scp-node` against the same command
+# carrying `--features cloud-blobs` reports the first of those counts. No code in
+# this crate constructs either backend:
+# `storage_from_env` in `scp-transport` is their only caller, and it reaches
+# them only when an operator sets `SCP_RELAY_STORAGE_BACKEND=postgres` or `=s3`.
+# A build that leaves this feature off writes a "not compiled in" message
+# naming this feature to stderr and exits the process with code 1, rather than
+# falling back to another backend. `reject_backend_message` in
+# `crates/scp-transport/src/startup.rs` builds that message as a `String`, and
+# `storage_from_env` prints it and calls `std::process::exit(1)`; no error type
+# carries it, because `storage_from_env` returns the storage the caller asked
+# for and every failure path in it terminates the process. `sqlite`, `redb` and
+# `memory` are unaffected.
+cloud-blobs = ["scp-transport/postgres-blob", "scp-transport/s3-blob"]
 quic = ["scp-transport/quic", "dep:quinn"]
 http3 = ["scp-transport/http3"]
 udp = ["scp-transport/udp"]
