@@ -80,7 +80,7 @@ nothing:
                built scp-identity with `testing` on and compiled its two
                `#[cfg(not(feature = "testing"))]` assertions out — while the
                check reading that table reported each one running by name.
-               That normal-dependency line is now the `helpers` feature of the
+               That normal-dependency line is now the `testing` feature of the
                same manifest, which that crate's own `[dev-dependencies]` turn
                on, and crates/scp-runtime/Cargo.toml and
                crates/scp-ffi/common/Cargo.toml each carry the same edge in
@@ -2538,18 +2538,18 @@ def check_testing_unification_readers() -> None:
     live_edges, live_unresolved = command_testing_edges(workspace, "scp-identity")
     scp_testing_manifest = REPO / "crates" / "scp-testing" / "Cargo.toml"
     helpers_activators, helpers_unresolved = unconditional_feature_activators(
-        "scp-testing", "helpers", workspace
+        "scp-testing", "testing", workspace
     )
     # Two facts make the premise true, and testing_edge answers only the first:
     # crates/scp-testing/Cargo.toml's `[dev-dependencies]` give its scp-identity
     # entry `features = ["testing"]`, and that same table turns this crate's
-    # `helpers` feature on. The second fact is what gives the first one a reason
-    # to exist: `helpers` compiles src/helpers.rs, the only module in this crate
+    # `testing` feature on. The second fact is what gives the first one a reason
+    # to exist: `testing` compiles src/helpers.rs, the only module in this crate
     # naming the two `DidDht` constructors that `scp-identity/testing` gates.
     # testing_edge counts a dependency entry unconditionally (see its
     # docstring), so on the first fact alone this control would stay green after
     # someone deleted the self dev-dependency at crates/scp-testing/Cargo.toml
-    # that enables `helpers` — it would read the surviving entry and attest a
+    # that enables `testing` — it would read the surviving entry and attest a
     # feature edge no module in the build consumes.
     #
     # command_testing_edges and unconditional_feature_activators each hand their
@@ -2571,15 +2571,35 @@ def check_testing_unification_readers() -> None:
         f"got selection findings {live_unresolved!r} and "
         f"{helpers_unresolved!r}, edges "
         f"{sorted(str(manifest) for manifest in live_edges)} and "
-        f"`helpers` activators {sorted(helpers_activators.values())} — "
+        f"`testing` activators {sorted(helpers_activators.values())} — "
         f"crates/scp-testing/Cargo.toml gives its `[dev-dependencies]` entry on "
         f'scp-identity the feature "testing" AND that same table turns '
-        f"`helpers` on, and a reader that misses either half re-greens pairing "
+        f"its own `testing` on, and a reader that misses either half re-greens pairing "
         f"scp-identity's assertions with a workspace lane. This control names "
         f"the manifest rather than reading whichever edge sorts first, because "
         f"crates/scp-runtime/Cargo.toml and crates/scp-ffi/common/Cargo.toml "
         f"each carry their own such dev-dependency and sort ahead of it. A "
         f"non-None selection finding means this reader scanned no build at all",
+    )
+    # src/helpers.rs calls the two `DidDht` constructors `scp-identity/testing`
+    # compiles and names the `InMemoryDhtClient` `scp-dht/testing` compiles, so
+    # the feature that compiles that module must name both. With an empty list,
+    # `cargo check -p scp-testing --lib --features testing` builds no
+    # dev-dependency, resolves neither feature, and fails on unresolved imports,
+    # while every lane that builds this crate's test targets stays green because
+    # the dev-dependency entries supply both features.
+    scp_testing_document = tomllib.loads(scp_testing_manifest.read_text())
+    scp_testing_lib = (REPO / "crates" / "scp-testing" / "src" / "lib.rs").read_text()
+    helpers_feature_list = set(
+        (scp_testing_document.get("features") or {}).get("testing") or []
+    )
+    check(
+        "scp-testing's `testing` feature carries what src/helpers.rs needs",
+        '#[cfg(feature = "testing")]\npub mod helpers;' in scp_testing_lib
+        and {"scp-identity/testing", "scp-dht/testing"} <= helpers_feature_list,
+        f"crates/scp-testing/src/lib.rs must gate `pub mod helpers;` on the "
+        f'`testing` feature, and that feature must name "scp-identity/testing" '
+        f'and "scp-dht/testing"; it names {sorted(helpers_feature_list)}',
     )
     check(
         "a -p scp-identity build leaves scp-identity/testing off",

@@ -20,7 +20,7 @@
 //!   suppression detection, pseudonym unlinkability, blocking, epoch consistency).
 //! - [`presets`] — 8 pre-configured scenarios for common test patterns.
 //! - `helpers` — Test doubles for `ApplicationNode` (TLS providers, NAT
-//!   strategies, DID methods). Compiled only under this crate's `helpers`
+//!   strategies, DID methods). Compiled only under this crate's `testing`
 //!   feature, which this crate's own `[dev-dependencies]` turn on, so a
 //!   `cargo doc` run that builds no dev-dependencies documents no such module
 //!   and this line carries no link.
@@ -77,10 +77,10 @@ pub mod fullstack;
 // how the maturin and XCFramework builds of the `bridge-parity-swift` job came to resolve
 // `scp-identity` differently from each other and recompile seven shared crates. Behind
 // the feature, the integration tests that use the module still get it — this crate's own
-// `[dev-dependencies]` turn the feature on and carry both nullifier features, which
-// ADR-062 §Decision 1 permits only there or in a list named `testing` — and no other
-// build carries it.
-#[cfg(feature = "helpers")]
+// `[dev-dependencies]` turn the feature on — and no other build carries it. The feature
+// list names both nullifier features, which ADR-062 §Decision 1 permits only in a list
+// named `testing` or on a dev-dependency edge.
+#[cfg(feature = "testing")]
 pub mod helpers;
 pub mod presets;
 pub mod relay;

@@ -44,12 +44,14 @@ members = [
 # `scp_platform::in_memory`. Its `scp-identity`, `scp-dht` and `scp-node`
 # `[dependencies]` edges carry no such feature: `helpers.rs` is the only module
 # naming `scp_identity` and `scp_dht`, `lib.rs` compiles it under this crate's
-# `helpers` feature, and only this crate's own integration tests call the
+# `testing` feature, which names `scp-identity/testing` and `scp-dht/testing`,
+# and only this crate's own integration tests call the
 # `Node::start_for_testing` that `scp-node/allow_unencrypted_storage` gates. All
-# three features ride on `[dev-dependencies]` entries of
-# `crates/scp-testing/Cargo.toml` instead, which cargo resolves only when it
-# builds that crate's own test targets — ADR-062 §Decision 1 permits a nullifier
-# feature there or in a feature list named `testing` and nowhere else.
+# three features ride on `crates/scp-testing/Cargo.toml`'s `[dev-dependencies]`
+# entries instead, and its self entry there is the one edge that turns its
+# `testing` feature on; cargo resolves those entries only when it builds that
+# crate's own test targets. ADR-062 §Decision 1 permits a nullifier feature in a
+# feature list named `testing` or on a dev-dependency edge and nowhere else.
 #
 # This paragraph claims nothing about the rest of the workspace, where each of
 # the three has its own routes: `crates/scp-ffi/Cargo.toml`'s `testing` feature
