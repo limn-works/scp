@@ -4,7 +4,11 @@
 //! These tests exercise the binary's `SCP_RELAY_STORAGE_BACKEND` env-var
 //! driven backend selection, verifying that:
 //!
-//! - `SQLite` is the default and persists across restarts (AC 1, 2, 3, 8)
+//! - An unset `SCP_RELAY_STORAGE_BACKEND` exits non-zero and opens no store,
+//!   because §17.17.1 of the persistence spec (SCP-CAPSEL-8000) forbids a
+//!   default backend
+//! - An explicit `sqlite` selection opens a `SQLite` store that persists across
+//!   restarts (AC 1, 2, 3, 8)
 //! - Invalid backend names produce a non-zero exit and descriptive error (AC 9)
 //! - `postgres` without `SCP_RELAY_DATABASE_URL` produces a non-zero exit (AC 10)
 //! - `s3` without `SCP_RELAY_S3_BUCKET` produces a non-zero exit (AC 6)
@@ -330,11 +334,93 @@ fn sqlite_blob_persistence_across_reopens() {
     }
 }
 
-/// AC 2 (default): When `SCP_RELAY_STORAGE_BACKEND` is not set, the relay
-/// defaults to sqlite. Verify by starting the relay with a temp storage
+/// An unset `SCP_RELAY_STORAGE_BACKEND` is a missing selection. §17.17.1 of
+/// the persistence spec (SCP-CAPSEL-8000) requires a string-configured surface
+/// to reject it with a dedicated error, and §17.7 applies that rule to relay
+/// blob storage, so the relay exits non-zero, names the variable, and writes
+/// no store into its working directory.
+///
+/// The relay used to open `./scp-relay.db` here and keep serving, so this test
+/// polls for exit under a deadline instead of calling `output()`, which would
+/// block forever on a relay that picked a backend and started listening.
+#[test]
+fn unset_backend_exits_with_error() {
+    use std::io::Read;
+    use std::time::Duration;
+
+    let workdir = tempfile::tempdir().expect("failed to create tempdir");
+
+    let mut child = Command::new(relay_bin())
+        .current_dir(workdir.path())
+        .env_remove("SCP_RELAY_STORAGE_BACKEND")
+        .env_remove("SCP_RELAY_STORAGE_PATH")
+        .env_remove("RUST_LOG")
+        .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to start scp-relay");
+
+    let stderr_handle = child.stderr.take().expect("no stderr");
+    let output_thread = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let mut reader = stderr_handle;
+        let _ = reader.read_to_string(&mut buf);
+        buf
+    });
+
+    // The deadline bounds the wait for a relay that ignores the missing
+    // selection and starts serving. The one-minute figure follows the load
+    // measurements recorded in `sqlite_backend_creates_its_database_file`.
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
+    let mut exited_in_time = false;
+    while std::time::Instant::now() < deadline {
+        if child
+            .try_wait()
+            .expect("failed to poll scp-relay")
+            .is_some()
+        {
+            exited_in_time = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if !exited_in_time {
+        child.kill().ok();
+    }
+    let status = child.wait().expect("failed to reap scp-relay");
+    let stderr = output_thread.join().expect("output thread panicked");
+
+    assert!(
+        exited_in_time,
+        "scp-relay kept running with no backend selected; stderr: {stderr}"
+    );
+    assert!(
+        !status.success(),
+        "expected non-zero exit for an unset backend; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("SCP_RELAY_STORAGE_BACKEND is not set"),
+        "error should name the unset variable; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("sqlite") && stderr.contains("memory"),
+        "error should list the values this build accepts; got: {stderr}"
+    );
+    let written: Vec<_> = std::fs::read_dir(workdir.path())
+        .expect("failed to read the relay's working directory")
+        .collect();
+    assert!(
+        written.is_empty(),
+        "a relay with no backend selected must open no store; found {written:?}"
+    );
+}
+
+/// AC 2: An explicit `sqlite` selection opens a `SQLite` store at
+/// `SCP_RELAY_STORAGE_PATH`. Verify by starting the relay with a temp storage
 /// path and confirming the sqlite DB file is created.
 #[test]
-fn default_backend_is_sqlite() {
+fn sqlite_backend_creates_its_database_file() {
     use std::io::Read;
     use std::time::Duration;
 
@@ -342,7 +428,7 @@ fn default_backend_is_sqlite() {
     let db_path = tmp.path().join("default-backend.db");
 
     let mut child = Command::new(relay_bin())
-        .env_remove("SCP_RELAY_STORAGE_BACKEND") // not set = default
+        .env("SCP_RELAY_STORAGE_BACKEND", "sqlite")
         .env("SCP_RELAY_STORAGE_PATH", db_path.to_str().unwrap())
         .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
         .env("SCP_RELAY_LOG_FORMAT", "json")
@@ -393,7 +479,7 @@ fn default_backend_is_sqlite() {
 
     assert!(
         db_created,
-        "sqlite database file should be created when using default backend; output: {output}"
+        "sqlite database file should be created when sqlite is selected; output: {output}"
     );
 
     // Verify the relay used sqlite (logged "using sqlite blob storage").

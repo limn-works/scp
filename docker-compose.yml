@@ -5,6 +5,7 @@ services:
     ports:
       - "9000:9000"
     environment:
+      SCP_RELAY_STORAGE_BACKEND: "sqlite"
       SCP_RELAY_LOG_FORMAT: "pretty"
       SCP_RELAY_LOG_LEVEL: "info"
 
@@ -15,5 +16,6 @@ services:
       - "9001:9000"
     environment:
       SCP_NODE_DOMAIN: "localhost"
+      SCP_RELAY_STORAGE_BACKEND: "sqlite"
       SCP_RELAY_LOG_FORMAT: "pretty"
       SCP_RELAY_LOG_LEVEL: "info"

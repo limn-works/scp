@@ -16,9 +16,10 @@ path = "src/main.rs"
 
 [dependencies]
 # `sqlite-blob` is ungated on purpose: §17.17 of the persistence spec requires a
-# shipped relay to retain a durable blob backend, and `sqlite` is this binary's
-# default value for `SCP_RELAY_STORAGE_BACKEND`. The two cloud backends sit
-# behind `cloud-blobs` below instead.
+# shipped relay to retain a durable blob backend, and `sqlite` is the durable
+# value every build of this binary accepts for `SCP_RELAY_STORAGE_BACKEND`. The
+# variable has no default: the relay exits when it is unset. The two cloud
+# backends sit behind `cloud-blobs` below instead.
 scp-transport = { path = "../scp-transport", version = "=0.1.0-beta.2", features = [
     "sqlite-blob",
     "redb-blob",

@@ -216,7 +216,8 @@ ENVIRONMENT VARIABLES:
                                 (auto-generated and stored if not set)
     SCP_RELAY_BIND_ADDR         Relay bind address (default: 0.0.0.0:9000)
     SCP_RELAY_STORAGE_BACKEND   Blob storage backend for relay, one of: {backends}
-                                (default: sqlite). On any other value the relay prints
+                                (required; no default). When it is unset the node exits 1.
+                                On any other value the relay prints
                                 the cargo feature that compiles that backend, or reports
                                 the value as unknown, then exits 1. See
                                 docs/guides/relay-operations.md for the cloud backends.
@@ -569,8 +570,8 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 custody,
                 did_method,
                 Arc::clone(&node_storage_arc),
-                // Persistent mode: operator-configured durable blob backend
-                // (default SQLite), honoring `SCP_RELAY_STORAGE_BACKEND` /
+                // Persistent mode: operator-configured blob backend, read
+                // from `SCP_RELAY_STORAGE_BACKEND` (required, no default) /
                 // `SCP_RELAY_STORAGE_PATH` — the same explicit selection
                 // relay-only mode makes (SCP-CAPINJECT-010).
                 startup::storage_from_env().await,
@@ -601,8 +602,8 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 custody,
                 did_method,
                 Arc::clone(&node_storage_arc),
-                // Persistent mode: operator-configured durable blob backend
-                // (default SQLite), honoring `SCP_RELAY_STORAGE_BACKEND` /
+                // Persistent mode: operator-configured blob backend, read
+                // from `SCP_RELAY_STORAGE_BACKEND` (required, no default) /
                 // `SCP_RELAY_STORAGE_PATH` (SCP-CAPINJECT-010).
                 startup::storage_from_env().await,
             )
@@ -953,8 +954,8 @@ async fn run_node_with<
     // (that would re-introduce the SCP-CAPSEL-8002 anti-pattern the story kills,
     // and would break ephemeral mode's all-in-memory contract). Ephemeral mode
     // passes `ephemeral_blob_backend()` (in-memory, no persistence, env-ignoring);
-    // persistent mode passes `startup::storage_from_env()` (durable, default
-    // SQLite, honors env).
+    // persistent mode passes `startup::storage_from_env()` (the operator's
+    // `SCP_RELAY_STORAGE_BACKEND` selection, which has no default).
     blob_storage: BlobStorageBackend,
 ) {
     let use_self_signed = env_flag_is_truthy(env::var("SCP_NODE_TLS_SELF_SIGNED").ok().as_deref());
@@ -1278,8 +1279,8 @@ mod tests {
     /// Regression guard (SCP-CAPINJECT-010): ephemeral mode MUST select the
     /// in-memory blob backend — no persistence, env overrides ignored. This pins
     /// the ephemeral caller's boundary selection so it cannot silently regress to
-    /// a durable / env-driven backend (`startup::storage_from_env`, which defaults
-    /// to `Sqlite`), which would break the all-in-memory contract documented on
+    /// a durable / env-driven backend (`startup::storage_from_env`, which reads
+    /// the operator's `SCP_RELAY_STORAGE_BACKEND` selection), which would break the all-in-memory contract documented on
     /// `run_full_node_ephemeral` and re-persist blobs to disk. If someone swaps
     /// `ephemeral_blob_backend()` to any non-in-memory backend, this fails.
     #[test]

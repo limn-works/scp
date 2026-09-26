@@ -210,6 +210,24 @@ pub fn backend_binary_feature(name: &str) -> Option<&'static str> {
         .and_then(|b| b.binary_feature)
 }
 
+/// Writes the message [`storage_from_env`] prints before it exits when
+/// `SCP_RELAY_STORAGE_BACKEND` is unset, empty, or not valid UTF-8.
+///
+/// §17.17.1 of the persistence spec (SCP-CAPSEL-8000, whose storage error
+/// surface is `SCP-STORAGE-8000`) requires a string-configured surface to
+/// reject a missing selection at runtime with a dedicated error, and §17.7
+/// names relay blob storage as one of the capabilities that rule covers. The
+/// message therefore names the variable and the values this build accepts, and
+/// the relay picks no backend for the operator.
+fn missing_backend_message() -> String {
+    format!(
+        "error: SCP_RELAY_STORAGE_BACKEND is not set (SCP-STORAGE-8000). The relay \
+         selects no blob storage backend on the operator's behalf. Set it to one \
+         of: {}",
+        valid_backends()
+    )
+}
+
 /// Writes the message [`storage_from_env`] prints before it exits, for a
 /// `SCP_RELAY_STORAGE_BACKEND` value it will not construct.
 ///
@@ -248,16 +266,18 @@ fn reject_backend_message(requested: &str) -> String {
 
 /// Constructs the blob storage backend from environment configuration.
 ///
-/// Reads `SCP_RELAY_STORAGE_BACKEND` (default: `sqlite`) and delegates to the
-/// backend constructor that value names. On a value this build cannot
-/// construct, it prints the message the private `reject_backend_message` writes
-/// and calls [`std::process::exit`].
+/// Reads `SCP_RELAY_STORAGE_BACKEND`, which has no default, and delegates to
+/// the backend constructor that value names. When the variable is unset or
+/// empty, it prints the message the private `missing_backend_message` writes
+/// and calls [`std::process::exit`]. On a value this build cannot construct, it
+/// prints the message the private `reject_backend_message` writes and calls
+/// [`std::process::exit`].
 ///
 /// # Storage backend selection
 ///
 /// | Value | Backend | Config env vars | Compiled in by |
 /// |---|---|---|---|
-/// | `sqlite` | `SQLite` | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.db`) | always; the default value |
+/// | `sqlite` | `SQLite` | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.db`) | always |
 /// | `redb` | redb | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.redb`) | always |
 /// | `postgres` | `PostgreSQL` | `SCP_RELAY_DATABASE_URL` (required) | `cloud-blobs` |
 /// | `s3` | S3-compat | `SCP_RELAY_S3_BUCKET` (required) + AWS env | `cloud-blobs` |
@@ -267,7 +287,8 @@ fn reject_backend_message(requested: &str) -> String {
 ///
 /// Every failure path here exits the process with code 1 rather than returning,
 /// because a relay that cannot open its blob store has nothing to serve. The
-/// function exits when the requested backend names nothing, when it names a
+/// function exits when the variable is unset or empty, when the requested
+/// backend names nothing, when it names a
 /// backend this build did not compile, when a required env var is absent, and
 /// when the backend constructor fails.
 ///
@@ -293,9 +314,13 @@ fn reject_backend_message(requested: &str) -> String {
     )
 )]
 pub async fn storage_from_env() -> BlobStorageBackend {
-    let backend = env::var("SCP_RELAY_STORAGE_BACKEND")
-        .unwrap_or_else(|_| "sqlite".to_owned())
-        .to_lowercase();
+    let backend = match env::var("SCP_RELAY_STORAGE_BACKEND") {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_lowercase(),
+        _ => {
+            eprintln!("{}", missing_backend_message());
+            std::process::exit(1);
+        }
+    };
 
     match backend.as_str() {
         #[cfg(feature = "sqlite-blob")]
@@ -485,7 +510,29 @@ pub async fn start_relay_from_env() -> (
 
 #[cfg(test)]
 mod tests {
-    use super::{BACKENDS, backend_is_compiled, reject_backend_message, valid_backends};
+    use super::{
+        BACKENDS, backend_is_compiled, missing_backend_message, reject_backend_message,
+        valid_backends,
+    };
+
+    /// An unset selection is reported as a missing selection: the message names
+    /// the variable and the `SCP-STORAGE-8000` code, lists every backend this
+    /// build compiled, and offers no default. `unset_backend_exits_with_error`
+    /// in `crates/scp-relay/tests/storage_backend.rs` drives the binary through
+    /// the path that prints this message.
+    #[test]
+    fn a_missing_selection_names_the_variable_and_every_compiled_backend() {
+        let message = missing_backend_message();
+        assert!(
+            message.contains("SCP_RELAY_STORAGE_BACKEND is not set"),
+            "{message}"
+        );
+        assert!(message.contains("SCP-STORAGE-8000"), "{message}");
+        assert!(!message.contains("default"), "{message}");
+        for backend in BACKENDS.iter().filter(|b| b.compiled) {
+            assert!(message.contains(backend.name), "{message}");
+        }
+    }
 
     /// A value naming no backend reads as a typo, and the message lists what
     /// this build accepts instead of naming a rebuild.
