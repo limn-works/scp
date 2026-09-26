@@ -9,9 +9,10 @@
 //    nothing for that absence, so a typed error is an honest result and a
 //    locally minted token would assert a hardware guarantee no hardware
 //    produced.
-// 2. `verify(token:)` accepts a token satisfying all five clauses of
-//    acceptance criterion 3 in ADR-025, and rejects every token that fails a
-//    clause. Each case below that expects `false` names which clause it breaks.
+// 2. `verify(token:challenge:deviceId:)` accepts a token satisfying all six
+//    clauses of acceptance criterion 3 in ADR-025, and rejects every token
+//    that fails a clause. Each case below that expects `false` names which
+//    clause it breaks.
 // 3. Concurrent first calls to `attest` generate one App Attest key, because
 //    `resolveKeyId` reads a stored key ID and publishes its generation task
 //    inside one critical section.
@@ -19,7 +20,7 @@
 //    second `attest` therefore keeps the key a first `attest` got attested
 //    rather than reading a stale attestation record and discarding that key.
 //
-// Five clauses ADR-025 states, in `.docs/adrs/phase-5.md`:
+// Six clauses ADR-025 states, in `.docs/adrs/phase-5.md`:
 //
 // 1. Token bytes decode as a CBOR map whose key set is exactly `fmt`, `attStmt`,
 //    `authData`.
@@ -43,6 +44,11 @@
 //    base64-decoded. `AppAttestCredentialBindingTests` states why: without it a
 //    chain Apple issued for one app's key accepts authenticator data written
 //    for a second app.
+// 6. `x5c` element 0 carries extension `1.2.840.113635.100.8.2` once, and
+//    its 32-byte nonce equals SHA-256(authData ‖ clientDataHash), where
+//    `clientDataHash` derives from the `challenge` and `deviceId` passed to
+//    `verify`. `AppAttestNonceBindingTests` states why: without it no
+//    `authData` byte outside the credential ID is bound to `x5c`.
 //
 // See ADR-025 (Apple Platform Adapter) in `.docs/adrs/phase-5.md` and
 // `crates/scp-platform/src/traits.rs` `DeviceAttestation`.
@@ -359,7 +365,7 @@
 
     // MARK: - CBOR fixtures
 
-    /// Builds CBOR byte sequences these tests feed to `verify(token:)`.
+    /// Builds CBOR byte sequences these tests feed to `verify(token:challenge:deviceId:)`.
     ///
     /// This encoder covers only a definite-length subset an App Attest
     /// attestation object uses, which is all these fixtures need.
@@ -401,18 +407,36 @@
         /// credCert, and verify that it matches the key identifier from your
         /// app", so this value is what `DCAppAttestService.generateKey` would
         /// have handed an app holding this certificate, and it is what clause 5
-        /// requires both the credential ID and the stored key ID to equal.
-        static var credentialKeyIdentifier: [UInt8] {
-            keyIdentifier(of: credentialCertificate)
-        }
+        /// requires both the credential ID and the stored key ID to equal. It
+        /// hashes the key `TestPKI` issued that certificate for, so it reads no
+        /// certificate a case under test also reads.
+        static let credentialKeyIdentifier = TestPKI.keyIdentifier(of: TestPKI.credentialKey)
 
         /// The App Attest key identifier `rotatedCredentialCertificate` names.
         ///
         /// That certificate carries a different public key, so this identifier
         /// differs from `credentialKeyIdentifier`, which is what lets a case
         /// pair one genuinely anchored chain with a second chain's key.
-        static var rotatedCredentialKeyIdentifier: [UInt8] {
-            keyIdentifier(of: rotatedCredentialCertificate)
+        static let rotatedCredentialKeyIdentifier = TestPKI.keyIdentifier(of: TestPKI.rotatedCredentialKey)
+
+        /// A challenge every `verify` case passes, standing in for one a relay
+        /// issued to `attest(challenge:deviceId:)`.
+        static let challenge = Data("scp-test-challenge".utf8)
+
+        /// A device identifier every `verify` case passes.
+        static let deviceId = Data("scp-test-device".utf8)
+
+        /// `SHA-256` of the client data `attest(challenge:deviceId:)` builds
+        /// from `challenge` and `deviceId`, which clause 6 appends to
+        /// `authData` before hashing.
+        ///
+        /// Acceptance criterion 3 of ADR-025 fixes that client data's field
+        /// order and spelling. This fixture spells it out again rather than
+        /// calling the adapter, so a change to the adapter's formula fails
+        /// every accepting case.
+        static func clientDataHash(challenge: Data = CBORFixture.challenge, deviceId: Data = CBORFixture.deviceId) -> [UInt8] {
+            let json = "{\"challenge\":\"\(challenge.base64EncodedString())\",\"deviceId\":\"\(deviceId.base64EncodedString())\",\"type\":\"scp-device-attestation-v1\"}"
+            return Array(SHA256.hash(data: Data(json.utf8)))
         }
 
         /// `SHA-256` of the public key inside a DER certificate.
@@ -446,87 +470,61 @@
         /// anchor and builds chains beneath it. Cases in
         /// `AppAttestAppleAnchorTests` hand it no anchor, which binds it to
         /// Apple's root and pins what a production caller gets.
-        static let testRootCertificate = der(
-            """
-            MIIBsDCCAVegAwIBAgIUEpz+gnPq8BUXG9o06kMmMqbyqtswCgYIKoZIzj0EAwIwJTEjMCEGA1UEAw
-            waU0NQIEFwcEF0dGVzdCBUZXN0IFJvb3QgQ0EwIBcNMjYwODE3MDM0NjMwWhgPMjEyNjA3MjQwMzQ2
-            MzBaMCUxIzAhBgNVBAMMGlNDUCBBcHBBdHRlc3QgVGVzdCBSb290IENBMFkwEwYHKoZIzj0CAQYIKo
-            ZIzj0DAQcDQgAEZfm4GNde5LEPL6FZhUdmh6abr2NH+TB37bVtjw5uBM68LGSnS1P+IBzVkOY8wgHo
-            gu3E73x2NO8fe84Xsu/WQKNjMGEwHQYDVR0OBBYEFK0nJNceI7oHbymj/JEP7Codr7uTMB8GA1UdIw
-            QYMBaAFK0nJNceI7oHbymj/JEP7Codr7uTMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEG
-            MAoGCCqGSM49BAMCA0cAMEQCID9beOLHDTp1d83GLcWKVa3DOgnZ4RTvDHvKHyZxsixrAiBLPxfsXW
-            GkerYZlDr8YdZl4SGnyB17rOyJ3dsk8FRq5A==
-            """
-        )
-
-        /// A P-256 certificate in DER form, standing in for an App Attest
-        /// credential certificate. `intermediateCertificate` issued it, and
-        /// `testRootCertificate` issued that one, so element 0 of `x5c` heads a
-        /// path terminating at the anchor these cases inject.
-        static let credentialCertificate = der(
-            """
-            MIIBtzCCAVygAwIBAgIUKzq+jlxAiO0QFWbiw3dcNbYq/QkwCgYIKoZIzj0EAwIwKjEoMCYGA1UEAw
-            wfU0NQIEFwcEF0dGVzdCBUZXN0IEludGVybWVkaWF0ZTAgFw0yNjA4MTcwMzQ2MzdaGA8yMTI2MDcy
-            NDAzNDYzN1owKDEmMCQGA1UEAwwdU0NQIEFwcEF0dGVzdCBUZXN0IENyZWRlbnRpYWwwWTATBgcqhk
-            jOPQIBBggqhkjOPQMBBwNCAAS/MYXK3xIppZN/w0mpygVLeAawSBwQXTNJMCnjun6KXebSEX32+Tq1
-            ADYk97sKgiuBcZxYcWEIUh1jenJnIqQQo2AwXjAMBgNVHRMBAf8EAjAAMA4GA1UdDwEB/wQEAwIHgD
-            AdBgNVHQ4EFgQU+jxydDE6rguMUTwVLqPfxzU557cwHwYDVR0jBBgwFoAUb73SBIsV2BQv1QeKzoiA
-            TKBeYsUwCgYIKoZIzj0EAwIDSQAwRgIhAOpNoqafHHTYjXPHHM6kVI6Kfg0aHqOy3z0KkimW3Z55Ai
-            EAhMQon7aDotLnphdZ3IXjwxRmb4DoVbbM1qWThgFQKME=
-            """
+        static let testRootCertificate = TestPKI.certificate(
+            serial: 1,
+            issuer: TestPKI.rootName,
+            subject: TestPKI.rootName,
+            subjectKey: TestPKI.rootKey.publicKey,
+            signer: TestPKI.rootKey,
+            extensions: TestPKI.certificateAuthorityExtensions
         )
 
         /// A P-256 CA certificate in DER form, standing in for an Apple App
         /// Attest intermediate certificate. `testRootCertificate` issued it,
         /// and it issued `credentialCertificate`.
-        static let intermediateCertificate = der(
-            """
-            MIIBuDCCAV+gAwIBAgIUS9iGZBUof14MT+Byg6YxKYYX18UwCgYIKoZIzj0EAwIwJTEjMCEGA1UEAw
-            waU0NQIEFwcEF0dGVzdCBUZXN0IFJvb3QgQ0EwIBcNMjYwODE3MDM0NjM0WhgPMjEyNjA3MjQwMzQ2
-            MzRaMCoxKDAmBgNVBAMMH1NDUCBBcHBBdHRlc3QgVGVzdCBJbnRlcm1lZGlhdGUwWTATBgcqhkjOPQ
-            IBBggqhkjOPQMBBwNCAARKVbivGu3og+j+DO971GB6hWFyqXVXqXXItUwjlW6eluk89Hajxk3BZVxV
-            x/ypx0jqmzaIxLjvD1hWwYmlKzUZo2YwZDASBgNVHRMBAf8ECDAGAQH/AgEAMA4GA1UdDwEB/wQEAw
-            IBBjAdBgNVHQ4EFgQUb73SBIsV2BQv1QeKzoiATKBeYsUwHwYDVR0jBBgwFoAUrSck1x4jugdvKaP8
-            kQ/sKh2vu5MwCgYIKoZIzj0EAwIDRwAwRAIgTZ4ov4tnBH4JdHTIKA2g9T/OM8GtTV/bD1ktQFLJNS
-            ACIEc4Lq1tDjauQaxKqihn7/sQsmaA6qrgihEhqvdthTna
-            """
+        static let intermediateCertificate = TestPKI.certificate(
+            serial: 2,
+            issuer: TestPKI.rootName,
+            subject: TestPKI.intermediateName,
+            subjectKey: TestPKI.intermediateKey.publicKey,
+            signer: TestPKI.rootKey,
+            extensions: TestPKI.certificateAuthorityExtensions
         )
 
-        /// A second credential certificate in DER form, which
-        /// `rotatedIntermediateCertificate` issued.
-        ///
-        /// Apple replaces its App Attest intermediate certificate on its own
-        /// schedule. This pair, sharing `testRootCertificate` with
-        /// `credentialCertificate` and carrying a different subject name, a
-        /// different serial number, and a different public key, stands for a
-        /// chain Apple signed after such a replacement.
-        static let rotatedCredentialCertificate = der(
-            """
-            MIIBvDCCAWKgAwIBAgIUWMSrcbu2EaYH4fuYy9PvTitAYg8wCgYIKoZIzj0EAwIwLTErMCkGA1UEAw
-            wiU0NQIEFwcEF0dGVzdCBUZXN0IEludGVybWVkaWF0ZSBHMjAgFw0yNjA4MTcwMzQ3MDBaGA8yMTI2
-            MDcyNDAzNDcwMFowKzEpMCcGA1UEAwwgU0NQIEFwcEF0dGVzdCBUZXN0IENyZWRlbnRpYWwgRzIwWT
-            ATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATM8mH4eqBAfpU65IrimyCz7IDIHOYn+2lEiYQYG3eGCZMO
-            EjhE6lzCxuYek8W33xJO+QOtDZc2cuSMQiQ3QwVco2AwXjAMBgNVHRMBAf8EAjAAMA4GA1UdDwEB/w
-            QEAwIHgDAdBgNVHQ4EFgQUw+TvHe0B8vDvprIoeRT+Ztjy0NwwHwYDVR0jBBgwFoAUpAPjjE32T3ap
-            bnttMXmv+kLPvicwCgYIKoZIzj0EAwIDSAAwRQIhAM5eWObLS8wK6QmYbKQOeQcROqw2hPsc8oicCq
-            Cx4fw3AiBSOalFR/JR+ogpAIcx94iyNZj+8ib+LVVd0HTq46CyQQ==
-            """
+        /// A P-256 certificate in DER form, standing in for an App Attest
+        /// credential certificate. `intermediateCertificate` issued it, and
+        /// `testRootCertificate` issued that one, so element 0 of `x5c` heads a
+        /// path terminating at the anchor these cases inject. Its nonce commits
+        /// to `authenticatorData()` and `clientDataHash()`.
+        static let credentialCertificate = TestPKI.credentialCertificate(
+            committingTo: CBORFixture.authenticatorData()
         )
 
         /// A second intermediate certificate in DER form, which
         /// `testRootCertificate` issued and which issued
         /// `rotatedCredentialCertificate`.
-        static let rotatedIntermediateCertificate = der(
-            """
-            MIIBvDCCAWKgAwIBAgIUS9iGZBUof14MT+Byg6YxKYYX18YwCgYIKoZIzj0EAwIwJTEjMCEGA1UEAw
-            waU0NQIEFwcEF0dGVzdCBUZXN0IFJvb3QgQ0EwIBcNMjYwODE3MDM0NzAwWhgPMjEyNjA3MjQwMzQ3
-            MDBaMC0xKzApBgNVBAMMIlNDUCBBcHBBdHRlc3QgVGVzdCBJbnRlcm1lZGlhdGUgRzIwWTATBgcqhk
-            jOPQIBBggqhkjOPQMBBwNCAAQO7KxZFjoiqXPP22ENJJLwM6oklMRuodZ45Bq6mhnu/4+KyJtYVoLX
-            LAqPUhDSM1HwxvBXx9vzuPg/j9hFGuuMo2YwZDASBgNVHRMBAf8ECDAGAQH/AgEAMA4GA1UdDwEB/w
-            QEAwIBBjAdBgNVHQ4EFgQUpAPjjE32T3apbnttMXmv+kLPvicwHwYDVR0jBBgwFoAUrSck1x4jugdv
-            KaP8kQ/sKh2vu5MwCgYIKoZIzj0EAwIDSAAwRQIhAOfOe+roM7/b7eUvXSHmJEZusAmAzNPNUTYQo0
-            wkn7rLAiAWvBhfNJDwjU9x8GGTy5WU2TOfq6611QL4rCKqcIRpDQ==
-            """
+        ///
+        /// Apple replaces its App Attest intermediate certificate on its own
+        /// schedule. This certificate, sharing `testRootCertificate` with
+        /// `intermediateCertificate` and carrying a different subject name, a
+        /// different serial number, and a different public key, stands for an
+        /// intermediate Apple signed after such a replacement.
+        static let rotatedIntermediateCertificate = TestPKI.certificate(
+            serial: 3,
+            issuer: TestPKI.rootName,
+            subject: TestPKI.rotatedIntermediateName,
+            subjectKey: TestPKI.rotatedIntermediateKey.publicKey,
+            signer: TestPKI.rootKey,
+            extensions: TestPKI.certificateAuthorityExtensions
+        )
+
+        /// A second credential certificate in DER form, which
+        /// `rotatedIntermediateCertificate` issued for a different public key.
+        /// Its nonce commits to authenticator data carrying
+        /// `rotatedCredentialKeyIdentifier` as its credential ID.
+        static let rotatedCredentialCertificate = TestPKI.credentialCertificate(
+            committingTo: CBORFixture.authenticatorData(credentialId: CBORFixture.rotatedCredentialKeyIdentifier),
+            rotated: true
         )
 
         /// A credential certificate in DER form that a certification authority
@@ -566,23 +564,18 @@
             """
         )
 
-        /// `credentialCertificate` with one byte changed: its issuer name's
-        /// first `RelativeDistinguishedName` carries tag `SEQUENCE` where X.501
-        /// requires `SET`. Every enclosing length stays valid, so
-        /// `SecCertificateCreateWithData` still parses it, while the issuer
-        /// name it presents matches no certificate's subject name, so no path
-        /// builds from it.
-        static let retaggedIssuerCertificate = der(
-            """
-            MIIBtzCCAVygAwIBAgIUKzq+jlxAiO0QFWbiw3dcNbYq/QkwCgYIKoZIzj0EAwIwKjAoMCYGA1UEAw
-            wfU0NQIEFwcEF0dGVzdCBUZXN0IEludGVybWVkaWF0ZTAgFw0yNjA4MTcwMzQ2MzdaGA8yMTI2MDcy
-            NDAzNDYzN1owKDEmMCQGA1UEAwwdU0NQIEFwcEF0dGVzdCBUZXN0IENyZWRlbnRpYWwwWTATBgcqhk
-            jOPQIBBggqhkjOPQMBBwNCAAS/MYXK3xIppZN/w0mpygVLeAawSBwQXTNJMCnjun6KXebSEX32+Tq1
-            ADYk97sKgiuBcZxYcWEIUh1jenJnIqQQo2AwXjAMBgNVHRMBAf8EAjAAMA4GA1UdDwEB/wQEAwIHgD
-            AdBgNVHQ4EFgQU+jxydDE6rguMUTwVLqPfxzU557cwHwYDVR0jBBgwFoAUb73SBIsV2BQv1QeKzoiA
-            TKBeYsUwCgYIKoZIzj0EAwIDSQAwRgIhAOpNoqafHHTYjXPHHM6kVI6Kfg0aHqOy3z0KkimW3Z55Ai
-            EAhMQon7aDotLnphdZ3IXjwxRmb4DoVbbM1qWThgFQKME=
-            """
+        /// A credential certificate whose issuer name's first
+        /// `RelativeDistinguishedName` carries tag `SEQUENCE` where X.501
+        /// requires `SET`. `SecCertificateCreateWithData` still parses it,
+        /// while the issuer name it presents matches no certificate's subject
+        /// name, so no path builds from it.
+        static let retaggedIssuerCertificate = TestPKI.certificate(
+            serial: 5,
+            issuer: TestPKI.name("SCP AppAttest Test Intermediate", relativeNameTag: 0x30),
+            subject: TestPKI.name("SCP AppAttest Test Credential"),
+            subjectKey: TestPKI.credentialKey.publicKey,
+            signer: TestPKI.intermediateKey,
+            extensions: [TestPKI.nonceExtension(committingTo: CBORFixture.authenticatorData())]
         )
 
         /// A self-signed P-256 certificate in DER form that issued nothing and
@@ -696,25 +689,145 @@
         /// Assemble an attestation object, letting a caller replace one encoded
         /// value so a test can name one property it broke.
         ///
-        /// Both value parameters take already-encoded CBOR bytes, so a test can
-        /// hand `attStmt` or `authData` an item of a wrong major type.
+        /// `attestationStatementValue` and `authenticatorDataValue` take
+        /// already-encoded CBOR bytes, so a test can hand `attStmt` or
+        /// `authData` an item of a wrong major type. When a case passes no
+        /// `attestationStatementValue`, this function issues a credential
+        /// certificate whose nonce commits to `authenticatorData`, so a case
+        /// that varies one `authData` field breaks only the clause that field
+        /// belongs to, and clause 6 still holds.
         static func attestationObject(
             format: String = CBORFixture.appleFormat,
-            attestationStatementValue: [UInt8] = CBORFixture.attestationStatement(),
-            authenticatorDataValue: [UInt8] = CBORFixture.byteString(
-                CBORFixture.authenticatorData()
-            ),
+            attestationStatementValue: [UInt8]? = nil,
+            authenticatorData: [UInt8] = CBORFixture.authenticatorData(),
+            authenticatorDataValue: [UInt8]? = nil,
             extraKey: String? = nil
         ) -> Data {
+            let statement = attestationStatementValue ?? attestationStatement(
+                certificates: [
+                    TestPKI.credentialCertificate(committingTo: authenticatorData),
+                    intermediateCertificate
+                ]
+            )
             let entryCount = extraKey == nil ? 3 : 4
             var out = mapHeader(entryCount)
             out += text("fmt") + text(format)
-            out += text("attStmt") + attestationStatementValue
-            out += text("authData") + authenticatorDataValue
+            out += text("attStmt") + statement
+            out += text("authData") + (authenticatorDataValue ?? byteString(authenticatorData))
             if let extraKey {
                 out += text(extraKey) + text("value")
             }
             return Data(out)
+        }
+    }
+
+    /// Builds the X.509 certificates these tests anchor, issue, and hand to
+    /// `verify`.
+    ///
+    /// Clause 6 requires a credential certificate to carry a nonce committing
+    /// to one `authData` and one client-data hash, so a case that varies
+    /// `authData` needs a certificate issued for that `authData`, and issuing
+    /// one takes an issuer's private key. Each key here is generated once per
+    /// test process, so no private key sits in this file.
+    private enum TestPKI {
+        static let rootKey = P256.Signing.PrivateKey()
+        static let intermediateKey = P256.Signing.PrivateKey()
+        static let rotatedIntermediateKey = P256.Signing.PrivateKey()
+        static let credentialKey = P256.Signing.PrivateKey()
+        static let rotatedCredentialKey = P256.Signing.PrivateKey()
+
+        static let rootName = name("SCP AppAttest Test Root")
+        static let intermediateName = name("SCP AppAttest Test Intermediate")
+        static let rotatedIntermediateName = name("SCP AppAttest Test Rotated Intermediate")
+
+        /// `basicConstraints` (CA) and `keyUsage` (certificate and CRL
+        /// signing), both critical, which a basic X.509 policy requires of an
+        /// issuing certificate.
+        static let certificateAuthorityExtensions = [
+            tlv(0x30, tlv(0x06, [0x55, 0x1D, 0x13]) + [0x01, 0x01, 0xFF] + tlv(0x04, tlv(0x30, [0x01, 0x01, 0xFF]))),
+            tlv(0x30, tlv(0x06, [0x55, 0x1D, 0x0F]) + [0x01, 0x01, 0xFF] + tlv(0x04, [0x03, 0x02, 0x01, 0x06]))
+        ]
+
+        /// DER content bytes of object identifier `1.2.840.113635.100.8.2`.
+        static let nonceOid: [UInt8] = [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x63, 0x64, 0x08, 0x02]
+
+        /// Algorithm identifier `ecdsa-with-SHA256`.
+        static let ecdsaWithSHA256 = tlv(0x30, tlv(0x06, [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02]))
+
+        /// `SHA-256` of a public key's uncompressed X9.63 encoding, which is
+        /// how `DCAppAttestService` derives a key identifier.
+        static func keyIdentifier(of key: P256.Signing.PrivateKey) -> [UInt8] {
+            Array(SHA256.hash(data: key.publicKey.x963Representation))
+        }
+
+        /// A credential certificate issued for `credentialKey` (or, when
+        /// `rotated` is `true`, for `rotatedCredentialKey` under
+        /// `rotatedIntermediateCertificate`) whose nonce commits to
+        /// `authData` and `clientDataHash`.
+        static func credentialCertificate(
+            committingTo authData: [UInt8],
+            clientDataHash: [UInt8] = CBORFixture.clientDataHash(),
+            rotated: Bool = false
+        ) -> [UInt8] {
+            certificate(
+                serial: rotated ? 6 : 4,
+                issuer: rotated ? rotatedIntermediateName : intermediateName,
+                subject: name("SCP AppAttest Test Credential"),
+                subjectKey: (rotated ? rotatedCredentialKey : credentialKey).publicKey,
+                signer: rotated ? rotatedIntermediateKey : intermediateKey,
+                extensions: [nonceExtension(committingTo: authData, clientDataHash: clientDataHash)]
+            )
+        }
+
+        /// Extension `1.2.840.113635.100.8.2` as Apple writes it: an octet
+        /// string holding `SEQUENCE { [1] EXPLICIT OCTET STRING nonce }`, where
+        /// `nonce` is `SHA-256(authData ‖ clientDataHash)` unless a case
+        /// passes another value.
+        static func nonceExtension(
+            committingTo authData: [UInt8],
+            clientDataHash: [UInt8] = CBORFixture.clientDataHash(),
+            nonce: [UInt8]? = nil
+        ) -> [UInt8] {
+            let value = nonce ?? Array(SHA256.hash(data: Data(authData + clientDataHash)))
+            return tlv(0x30, tlv(0x06, nonceOid) + tlv(0x04, tlv(0x30, tlv(0xA1, tlv(0x04, value)))))
+        }
+
+        /// A distinguished name holding one common name. `relativeNameTag`
+        /// lets a case write `SEQUENCE` where X.501 requires `SET`.
+        static func name(_ commonName: String, relativeNameTag: UInt8 = 0x31) -> [UInt8] {
+            tlv(0x30, tlv(relativeNameTag, tlv(0x30, tlv(0x06, [0x55, 0x04, 0x03]) + tlv(0x0C, Array(commonName.utf8)))))
+        }
+
+        /// A DER X.509 v3 certificate that `signer` signed.
+        ///
+        /// - Returns: The certificate. This function answers an empty array
+        ///   when CryptoKit produces no signature; an empty array parses as no
+        ///   certificate, so a case built on it fails rather than passing
+        ///   vacuously.
+        static func certificate(
+            serial: UInt8,
+            issuer: [UInt8],
+            subject: [UInt8],
+            subjectKey: P256.Signing.PublicKey,
+            signer: P256.Signing.PrivateKey,
+            extensions: [[UInt8]]
+        ) -> [UInt8] {
+            let validity = tlv(0x30, tlv(0x17, Array("250101000000Z".utf8)) + tlv(0x18, Array("21250101000000Z".utf8)))
+            let tbs = tlv(
+                0x30,
+                tlv(0xA0, tlv(0x02, [0x02])) + tlv(0x02, [serial]) + ecdsaWithSHA256 + issuer + validity
+                    + subject + Array(subjectKey.derRepresentation) + tlv(0xA3, tlv(0x30, extensions.flatMap { $0 }))
+            )
+            guard let signature = try? signer.signature(for: Data(tbs)) else { return [] }
+            return tlv(0x30, tbs + ecdsaWithSHA256 + tlv(0x03, [0x00] + Array(signature.derRepresentation)))
+        }
+
+        /// One DER item: `tag`, a definite length, then `content`.
+        static func tlv(_ tag: UInt8, _ content: [UInt8]) -> [UInt8] {
+            let count = content.count
+            let length: [UInt8] = count < 0x80 ? [UInt8(count)]
+                : count <= 0xFF ? [0x81, UInt8(count)] : [0x82, UInt8(count >> 8), UInt8(count & 0xFF)]
+            return [tag] + length + content
         }
     }
 
@@ -728,7 +841,7 @@
 
     /// Build an adapter whose App Attest service reports itself unavailable.
     ///
-    /// - Parameter anchorCertificates: Certificates `verify(token:)` anchors an
+    /// - Parameter anchorCertificates: Certificates `verify(token:challenge:deviceId:)` anchors an
     ///   `x5c` chain at. This defaults to `CBORFixture.testAnchors()`, because
     ///   Apple holds its App Attest root's private key and no test can build a
     ///   chain that root signed. `makeAppleAnchoredAdapter()` builds the
@@ -1293,7 +1406,7 @@
         }
     }
 
-    // MARK: - verify(token:) acceptance tests
+    // MARK: - verify(token:challenge:deviceId:) acceptance tests
 
     struct AppAttestVerifyAcceptanceTests {
         /// Every `verify` case needs an adapter instance; a service double
@@ -1307,7 +1420,7 @@
             let harness = makeAdapter()
             let adapter = harness.adapter
 
-            #expect(adapter.verify(token: CBORFixture.attestationObject()) == true)
+            #expect(adapter.verify(token: CBORFixture.attestationObject(), challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == true)
         }
 
         @Test("verify accepts a development AAGUID clause 4 names alongside a production one")
@@ -1316,11 +1429,9 @@
             let adapter = harness.adapter
 
             let token = CBORFixture.attestationObject(
-                authenticatorDataValue: CBORFixture.byteString(
-                    CBORFixture.authenticatorData(aaguid: CBORFixture.developmentAaguid)
-                )
+                authenticatorData: CBORFixture.authenticatorData(aaguid: CBORFixture.developmentAaguid)
             )
-            #expect(adapter.verify(token: token) == true)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == true)
         }
 
         @Test("verify accepts an x5c array carrying more than two certificates clause 3 requires")
@@ -1337,7 +1448,7 @@
                     ]
                 )
             )
-            #expect(adapter.verify(token: token) == true)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == true)
         }
 
         @Test("verify accepts authenticator data longer than an 87-byte floor")
@@ -1347,9 +1458,9 @@
 
             let extended = CBORFixture.authenticatorData() + [UInt8](repeating: 0x77, count: 40)
             let token = CBORFixture.attestationObject(
-                authenticatorDataValue: CBORFixture.byteString(extended)
+                authenticatorData: extended
             )
-            #expect(adapter.verify(token: token) == true)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == true)
         }
 
         @Test("verify constrains no flags byte")
@@ -1358,11 +1469,9 @@
             let adapter = harness.adapter
 
             let token = CBORFixture.attestationObject(
-                authenticatorDataValue: CBORFixture.byteString(
-                    CBORFixture.authenticatorData(flags: 0x00)
-                )
+                authenticatorData: CBORFixture.authenticatorData(flags: 0x00)
             )
-            #expect(adapter.verify(token: token) == true)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == true)
         }
 
         @Test("verify rejects a token an adapter for another App ID accepts")
@@ -1386,16 +1495,14 @@
             )
 
             let token = CBORFixture.attestationObject(
-                authenticatorDataValue: CBORFixture.byteString(
-                    CBORFixture.authenticatorData(appId: CBORFixture.foreignAppId)
-                )
+                authenticatorData: CBORFixture.authenticatorData(appId: CBORFixture.foreignAppId)
             )
-            #expect(foreignAdapter.verify(token: token) == true)
-            #expect(harness.adapter.verify(token: token) == false)
+            #expect(foreignAdapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == true)
+            #expect(harness.adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
     }
 
-    // MARK: - verify(token:) rejection tests, clause 5 (credential binding)
+    // MARK: - verify(token:challenge:deviceId:) rejection tests, clause 5 (credential binding)
 
     /// Cases that pin clause 5 of acceptance criterion 3 in ADR-025: the
     /// credential certificate, the credential ID, and this adapter's stored App
@@ -1427,13 +1534,11 @@
                         CBORFixture.rotatedIntermediateCertificate
                     ]
                 ),
-                authenticatorDataValue: CBORFixture.byteString(
-                    CBORFixture.authenticatorData(
-                        credentialId: CBORFixture.rotatedCredentialKeyIdentifier
-                    )
+                authenticatorData: CBORFixture.authenticatorData(
+                    credentialId: CBORFixture.rotatedCredentialKeyIdentifier
                 )
             )
-            #expect(harness.adapter.verify(token: token) == false)
+            #expect(harness.adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects a credential ID that names this device's key and no certificate's key")
@@ -1454,7 +1559,7 @@
                     ]
                 )
             )
-            #expect(harness.adapter.verify(token: token) == false)
+            #expect(harness.adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects a credential ID that hashes no certificate public key")
@@ -1462,13 +1567,11 @@
             let harness = makeVerifyingAdapter()
 
             let token = CBORFixture.attestationObject(
-                authenticatorDataValue: CBORFixture.byteString(
-                    CBORFixture.authenticatorData(
-                        credentialId: CBORFixture.unboundCredentialId
-                    )
+                authenticatorData: CBORFixture.authenticatorData(
+                    credentialId: CBORFixture.unboundCredentialId
                 )
             )
-            #expect(harness.adapter.verify(token: token) == false)
+            #expect(harness.adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects every token while this adapter stores no App Attest key ID")
@@ -1478,7 +1581,7 @@
             // taken on clauses 1 through 4 alone.
             let harness = makeUnsupportedAdapter()
 
-            #expect(harness.adapter.verify(token: CBORFixture.attestationObject()) == false)
+            #expect(harness.adapter.verify(token: CBORFixture.attestationObject(), challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects a stored key ID that decodes to something other than 32 bytes")
@@ -1492,11 +1595,103 @@
                 anchorCertificates: CBORFixture.testAnchors()
             )
 
-            #expect(adapter.verify(token: CBORFixture.attestationObject()) == false)
+            #expect(adapter.verify(token: CBORFixture.attestationObject(), challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
     }
 
-    // MARK: - verify(token:) rejection tests, clauses 1 and 2
+    // MARK: - verify(token:challenge:deviceId:) rejection tests, clause 6 (nonce)
+
+    /// Cases that pin clause 6 of acceptance criterion 3 in ADR-025: the nonce
+    /// in extension `1.2.840.113635.100.8.2` of the credential certificate
+    /// equals `SHA-256(authData ‖ clientDataHash)`.
+    ///
+    /// Clause 5 binds bytes 55 through 86 of `authData` to the credential
+    /// certificate, and no other clause among 1 through 5 reads a certificate
+    /// and an `authData` byte together. Clause 4 leaves byte 32, the flags
+    /// byte, unconstrained, so without clause 6 anyone holding an attestation
+    /// object Apple issued could rewrite that byte and `verify` would still
+    /// return `true`. The first case below is that rewrite.
+    struct AppAttestNonceBindingTests {
+        @Test("verify rejects authenticator data its credential certificate's nonce does not commit to")
+        func verifyRejectsAuthenticatorDataItsCertificateDoesNotCommitTo() {
+            let harness = makeVerifyingAdapter()
+            let rewritten = CBORFixture.authenticatorData(flags: 0x41)
+
+            // `credentialCertificate` commits to `authenticatorData()`, whose
+            // flags byte is 0x40. Every clause 1 through 5 reads holds for this
+            // token, so clause 6 is what rejects it.
+            let token = CBORFixture.attestationObject(
+                attestationStatementValue: CBORFixture.attestationStatement(),
+                authenticatorData: rewritten
+            )
+            #expect(harness.adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
+
+            // A certificate issued for that same rewritten `authData` passes,
+            // so the flags value itself is not what the case above rejects.
+            let committed = CBORFixture.attestationObject(authenticatorData: rewritten)
+            #expect(harness.adapter.verify(token: committed, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == true)
+        }
+
+        @Test("verify rejects an attestation object checked against a challenge or device ID attest did not send")
+        func verifyRejectsAnotherClientData() {
+            let harness = makeVerifyingAdapter()
+            let token = CBORFixture.attestationObject()
+
+            #expect(harness.adapter.verify(token: token, challenge: Data("another-challenge".utf8), deviceId: CBORFixture.deviceId) == false)
+            #expect(harness.adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: Data("another-device".utf8)) == false)
+            #expect(harness.adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == true)
+        }
+
+        @Test("verify rejects a credential certificate that carries no nonce extension")
+        func verifyRejectsCertificateWithoutNonce() {
+            let harness = makeVerifyingAdapter()
+            // `basicConstraints` with an empty value stands in for every
+            // extension other than Apple's nonce.
+            let otherExtension = TestPKI.tlv(0x30, TestPKI.tlv(0x06, [0x55, 0x1D, 0x13]) + TestPKI.tlv(0x04, TestPKI.tlv(0x30, [])))
+            #expect(verifyWithCredentialExtensions([otherExtension], harness: harness) == false)
+        }
+
+        @Test("verify rejects a credential certificate that carries the nonce extension twice")
+        func verifyRejectsDuplicatedNonceExtension() {
+            // RFC 5280 §4.2 forbids a certificate from carrying one extension
+            // twice. Clause 3's path evaluation rejects this certificate before
+            // clause 6 reads it, which a run with clause 6 disabled measured,
+            // so this case pins that no copy of a nonce is ever picked.
+            let harness = makeVerifyingAdapter()
+            let nonce = TestPKI.nonceExtension(committingTo: CBORFixture.authenticatorData())
+            #expect(verifyWithCredentialExtensions([nonce], harness: harness) == true)
+            #expect(verifyWithCredentialExtensions([nonce, nonce], harness: harness) == false)
+        }
+
+        @Test("verify rejects a nonce one byte short of a SHA-256 digest")
+        func verifyRejectsShortNonce() {
+            let harness = makeVerifyingAdapter()
+            let digest = Array(SHA256.hash(data: Data(CBORFixture.authenticatorData() + CBORFixture.clientDataHash())))
+            let short = TestPKI.nonceExtension(committingTo: [], nonce: Array(digest.prefix(31)))
+            #expect(verifyWithCredentialExtensions([short], harness: harness) == false)
+        }
+
+        /// Verify a token whose credential certificate carries `extensions`,
+        /// with every other field matching `credentialCertificate`.
+        private func verifyWithCredentialExtensions(_ extensions: [[UInt8]], harness: AttestationHarness) -> Bool {
+            let certificate = TestPKI.certificate(
+                serial: 7,
+                issuer: TestPKI.intermediateName,
+                subject: TestPKI.name("SCP AppAttest Test Credential"),
+                subjectKey: TestPKI.credentialKey.publicKey,
+                signer: TestPKI.intermediateKey,
+                extensions: extensions
+            )
+            let token = CBORFixture.attestationObject(
+                attestationStatementValue: CBORFixture.attestationStatement(
+                    certificates: [certificate, CBORFixture.intermediateCertificate]
+                )
+            )
+            return harness.adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId)
+        }
+    }
+
+    // MARK: - verify(token:challenge:deviceId:) rejection tests, clauses 1 and 2
 
     struct AppleDeviceAttestationVerifyTests {
         /// Every `verify` case needs an adapter instance; a service double
@@ -1510,7 +1705,7 @@
             let harness = makeAdapter()
             let adapter = harness.adapter
 
-            #expect(adapter.verify(token: Data()) == false)
+            #expect(adapter.verify(token: Data(), challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects a synthetic software token this adapter once minted")
@@ -1521,7 +1716,7 @@
             // Before a fail-closed rewrite landed, `attest` minted this shape on
             // an unsupported device and `verify` returned true for it.
             let legacyToken = Data("software-attestation-\(UUID().uuidString)".utf8)
-            #expect(adapter.verify(token: legacyToken) == false)
+            #expect(adapter.verify(token: legacyToken, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects arbitrary non-CBOR bytes")
@@ -1529,8 +1724,8 @@
             let harness = makeAdapter()
             let adapter = harness.adapter
 
-            #expect(adapter.verify(token: Data(repeating: 0xFF, count: 256)) == false)
-            #expect(adapter.verify(token: Data("not an attestation".utf8)) == false)
+            #expect(adapter.verify(token: Data(repeating: 0xFF, count: 256), challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
+            #expect(adapter.verify(token: Data("not an attestation".utf8), challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects an attestation object whose fmt is not apple-appattest")
@@ -1539,7 +1734,7 @@
             let adapter = harness.adapter
 
             let token = CBORFixture.attestationObject(format: "packed")
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects an attestation object carrying an unknown key")
@@ -1548,7 +1743,7 @@
             let adapter = harness.adapter
 
             let token = CBORFixture.attestationObject(extraKey: "smuggled")
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects a truncated attestation object")
@@ -1558,7 +1753,7 @@
 
             let complete = CBORFixture.attestationObject()
             let truncated = complete.prefix(complete.count - 5)
-            #expect(adapter.verify(token: Data(truncated)) == false)
+            #expect(adapter.verify(token: Data(truncated), challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects an attestation object followed by trailing bytes")
@@ -1568,7 +1763,7 @@
 
             var token = CBORFixture.attestationObject()
             token.append(contentsOf: [0x00, 0x01])
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects a top-level item that is not a map")
@@ -1577,7 +1772,7 @@
             let adapter = harness.adapter
 
             let arrayToken = Data(CBORFixture.arrayHeader(0))
-            #expect(adapter.verify(token: arrayToken) == false)
+            #expect(adapter.verify(token: arrayToken, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects an array carrying six items a conformant map carries")
@@ -1595,7 +1790,7 @@
             out += CBORFixture.text("attStmt") + CBORFixture.attestationStatement()
             out += CBORFixture.text("authData")
                 + CBORFixture.byteString(CBORFixture.authenticatorData())
-            #expect(adapter.verify(token: Data(out)) == false)
+            #expect(adapter.verify(token: Data(out), challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects an indefinite-length map")
@@ -1608,7 +1803,7 @@
             var out: [UInt8] = [0xBF]
             out += CBORFixture.text("fmt") + CBORFixture.text(CBORFixture.appleFormat)
             out += [0xFF]
-            #expect(adapter.verify(token: Data(out)) == false)
+            #expect(adapter.verify(token: Data(out), challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects a map that declares more entries than its bytes hold")
@@ -1618,7 +1813,7 @@
 
             // A map header claiming 65535 entries followed by two bytes.
             let token = Data(CBORFixture.head(major: 5, argument: 0xFFFF) + [0x61, 0x66])
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects an attestation object missing a required key")
@@ -1629,7 +1824,7 @@
             var out = CBORFixture.mapHeader(2)
             out += CBORFixture.text("fmt") + CBORFixture.text(CBORFixture.appleFormat)
             out += CBORFixture.text("attStmt") + CBORFixture.attestationStatement()
-            #expect(adapter.verify(token: Data(out)) == false)
+            #expect(adapter.verify(token: Data(out), challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects a four-entry object that repeats a key")
@@ -1643,7 +1838,7 @@
             out += CBORFixture.text("attStmt") + CBORFixture.attestationStatement()
             out += CBORFixture.text("authData")
                 + CBORFixture.byteString(CBORFixture.authenticatorData())
-            #expect(adapter.verify(token: Data(out)) == false)
+            #expect(adapter.verify(token: Data(out), challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects a three-entry object that repeats a key and omits authData")
@@ -1658,7 +1853,7 @@
             out += CBORFixture.text("fmt") + CBORFixture.text(CBORFixture.appleFormat)
             out += CBORFixture.text("fmt") + CBORFixture.text(CBORFixture.appleFormat)
             out += CBORFixture.text("attStmt") + CBORFixture.attestationStatement()
-            #expect(adapter.verify(token: Data(out)) == false)
+            #expect(adapter.verify(token: Data(out), challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects a three-entry object whose third key is unknown")
@@ -1671,7 +1866,7 @@
             out += CBORFixture.text("attStmt") + CBORFixture.attestationStatement()
             out += CBORFixture.text("smuggled")
                 + CBORFixture.byteString(CBORFixture.authenticatorData())
-            #expect(adapter.verify(token: Data(out)) == false)
+            #expect(adapter.verify(token: Data(out), challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects an fmt value that is not a text string")
@@ -1685,7 +1880,7 @@
             out += CBORFixture.text("attStmt") + CBORFixture.attestationStatement()
             out += CBORFixture.text("authData")
                 + CBORFixture.byteString(CBORFixture.authenticatorData())
-            #expect(adapter.verify(token: Data(out)) == false)
+            #expect(adapter.verify(token: Data(out), challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects a map header declaring four billion entries")
@@ -1698,11 +1893,11 @@
             // token, and it returns rather than iterating a declared count that
             // its input cannot hold.
             let token = Data([0xBA, 0xFF, 0xFF, 0xFF, 0xFF, 0x61, 0x66])
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
     }
 
-    // MARK: - verify(token:) rejection tests, clause 3 (attStmt)
+    // MARK: - verify(token:challenge:deviceId:) rejection tests, clause 3 (attStmt)
 
     struct AppAttestStatementClauseTests {
         private func makeAdapter() -> AttestationHarness {
@@ -1731,7 +1926,7 @@
             let token = CBORFixture.attestationObject(
                 attestationStatementValue: CBORFixture.byteString([0x01, 0x02])
             )
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects an empty attStmt map")
@@ -1742,7 +1937,7 @@
             let token = CBORFixture.attestationObject(
                 attestationStatementValue: CBORFixture.mapHeader(0)
             )
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects an attStmt carrying a key outside x5c and receipt")
@@ -1759,7 +1954,7 @@
             statement += CBORFixture.text("smuggled") + CBORFixture.byteString([0x0B])
 
             let token = CBORFixture.attestationObject(attestationStatementValue: statement)
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects an attStmt missing receipt")
@@ -1774,7 +1969,7 @@
             statement += CBORFixture.byteString(CBORFixture.intermediateCertificate)
 
             let token = CBORFixture.attestationObject(attestationStatementValue: statement)
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects an attStmt that repeats x5c")
@@ -1791,7 +1986,7 @@
             }
 
             let token = CBORFixture.attestationObject(attestationStatementValue: statement)
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects an x5c array holding one certificate")
@@ -1804,7 +1999,7 @@
                     certificates: [CBORFixture.credentialCertificate]
                 )
             )
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects an x5c element that does not parse as a DER X.509 certificate")
@@ -1820,7 +2015,7 @@
                     certificates: [CBORFixture.credentialCertificate, notACertificate]
                 )
             )
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects an x5c that is not an array")
@@ -1834,7 +2029,7 @@
             statement += CBORFixture.text("receipt") + CBORFixture.byteString([0x0A])
 
             let token = CBORFixture.attestationObject(attestationStatementValue: statement)
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects an x5c map carrying two certificates as one key and one value")
@@ -1854,7 +2049,7 @@
             statement += CBORFixture.text("receipt") + CBORFixture.byteString([0x0A])
 
             let token = CBORFixture.attestationObject(attestationStatementValue: statement)
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects an x5c that repeats one certificate twice")
@@ -1871,13 +2066,11 @@
                         CBORFixture.intermediateCertificate
                     ]
                 ),
-                authenticatorDataValue: CBORFixture.byteString(
-                    CBORFixture.authenticatorData(
-                        credentialId: CBORFixture.keyIdentifier(of: CBORFixture.intermediateCertificate)
-                    )
+                authenticatorData: CBORFixture.authenticatorData(
+                    credentialId: CBORFixture.keyIdentifier(of: CBORFixture.intermediateCertificate)
                 )
             )
-            #expect(intermediateKeyedAdapter().verify(token: token) == false)
+            #expect(intermediateKeyedAdapter().verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects an x5c whose third element does not parse as a certificate")
@@ -1896,7 +2089,7 @@
                     ]
                 )
             )
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects a credential certificate carrying a malformed issuer name")
@@ -1914,13 +2107,11 @@
                         CBORFixture.intermediateCertificate
                     ]
                 ),
-                authenticatorDataValue: CBORFixture.byteString(
-                    CBORFixture.authenticatorData(
-                        credentialId: CBORFixture.keyIdentifier(of: CBORFixture.retaggedIssuerCertificate)
-                    )
+                authenticatorData: CBORFixture.authenticatorData(
+                    credentialId: CBORFixture.keyIdentifier(of: CBORFixture.retaggedIssuerCertificate)
                 )
             )
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects an x5c whose element 1 issued no element 0")
@@ -1937,11 +2128,9 @@
                         CBORFixture.intermediateCertificate
                     ]
                 ),
-                authenticatorDataValue: CBORFixture.byteString(
-                    CBORFixture.authenticatorData(credentialId: unrelatedKeyIdentifier)
-                )
+                authenticatorData: CBORFixture.authenticatorData(credentialId: unrelatedKeyIdentifier)
             )
-            #expect(adapterHoldingThatKey.verify(token: token) == false)
+            #expect(adapterHoldingThatKey.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects an x5c that carries a credential certificate after its issuer")
@@ -1958,13 +2147,11 @@
                         CBORFixture.credentialCertificate
                     ]
                 ),
-                authenticatorDataValue: CBORFixture.byteString(
-                    CBORFixture.authenticatorData(
-                        credentialId: CBORFixture.keyIdentifier(of: CBORFixture.intermediateCertificate)
-                    )
+                authenticatorData: CBORFixture.authenticatorData(
+                    credentialId: CBORFixture.keyIdentifier(of: CBORFixture.intermediateCertificate)
                 )
             )
-            #expect(intermediateKeyedAdapter().verify(token: token) == false)
+            #expect(intermediateKeyedAdapter().verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects an x5c element that is not a byte string")
@@ -1980,7 +2167,7 @@
             statement += CBORFixture.text("receipt") + CBORFixture.byteString([0x0A])
 
             let token = CBORFixture.attestationObject(attestationStatementValue: statement)
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects a two-entry attStmt whose keys are both unknown")
@@ -1993,7 +2180,7 @@
             statement += CBORFixture.text("proof") + CBORFixture.byteString([0x0B])
 
             let token = CBORFixture.attestationObject(attestationStatementValue: statement)
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects a receipt that is not a byte string")
@@ -2009,11 +2196,11 @@
             statement += CBORFixture.text("receipt") + CBORFixture.text("not bytes")
 
             let token = CBORFixture.attestationObject(attestationStatementValue: statement)
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
     }
 
-    // MARK: - verify(token:) rejection tests, clause 4 (authData)
+    // MARK: - verify(token:challenge:deviceId:) rejection tests, clause 4 (authData)
 
     struct AppAttestAuthDataClauseTests {
         private func makeAdapter() -> AttestationHarness {
@@ -2029,9 +2216,9 @@
                 + [0x40] + [0x00, 0x00, 0x00, 0x01]
             #expect(short.count == 37)
             let token = CBORFixture.attestationObject(
-                authenticatorDataValue: CBORFixture.byteString(short)
+                authenticatorData: short
             )
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects authenticator data one byte below an 87-byte floor")
@@ -2041,9 +2228,9 @@
 
             let short = Array(CBORFixture.authenticatorData().prefix(86))
             let token = CBORFixture.attestationObject(
-                authenticatorDataValue: CBORFixture.byteString(short)
+                authenticatorData: short
             )
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects a relying-party ID hash belonging to another App ID")
@@ -2052,11 +2239,9 @@
             let adapter = harness.adapter
 
             let token = CBORFixture.attestationObject(
-                authenticatorDataValue: CBORFixture.byteString(
-                    CBORFixture.authenticatorData(appId: CBORFixture.foreignAppId)
-                )
+                authenticatorData: CBORFixture.authenticatorData(appId: CBORFixture.foreignAppId)
             )
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects 87 bytes of authenticator data that carry no App Attest fields")
@@ -2065,11 +2250,9 @@
             let adapter = harness.adapter
 
             let token = CBORFixture.attestationObject(
-                authenticatorDataValue: CBORFixture.byteString(
-                    [UInt8](repeating: 0x11, count: 87)
-                )
+                authenticatorData: [UInt8](repeating: 0x11, count: 87)
             )
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects a sign counter other than zero")
@@ -2082,11 +2265,9 @@
             let adapter = harness.adapter
 
             let token = CBORFixture.attestationObject(
-                authenticatorDataValue: CBORFixture.byteString(
-                    CBORFixture.authenticatorData(signCounter: [0x00, 0x00, 0x00, 0x01])
-                )
+                authenticatorData: CBORFixture.authenticatorData(signCounter: [0x00, 0x00, 0x00, 0x01])
             )
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects an AAGUID that is neither App Attest value")
@@ -2095,13 +2276,11 @@
             let adapter = harness.adapter
 
             let token = CBORFixture.attestationObject(
-                authenticatorDataValue: CBORFixture.byteString(
-                    CBORFixture.authenticatorData(
-                        aaguid: [UInt8]("webauthn.io\u{0}\u{0}\u{0}\u{0}\u{0}".utf8)
-                    )
+                authenticatorData: CBORFixture.authenticatorData(
+                    aaguid: [UInt8]("webauthn.io\u{0}\u{0}\u{0}\u{0}\u{0}".utf8)
                 )
             )
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects an AAGUID that pads appattest with bytes other than zero")
@@ -2111,11 +2290,9 @@
 
             let padded = [UInt8]("appattest".utf8) + [UInt8](repeating: 0x20, count: 7)
             let token = CBORFixture.attestationObject(
-                authenticatorDataValue: CBORFixture.byteString(
-                    CBORFixture.authenticatorData(aaguid: padded)
-                )
+                authenticatorData: CBORFixture.authenticatorData(aaguid: padded)
             )
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects a credential-ID length other than 0x0020")
@@ -2124,11 +2301,9 @@
             let adapter = harness.adapter
 
             let token = CBORFixture.attestationObject(
-                authenticatorDataValue: CBORFixture.byteString(
-                    CBORFixture.authenticatorData(credentialIdLength: [0x00, 0x40])
-                )
+                authenticatorData: CBORFixture.authenticatorData(credentialIdLength: [0x00, 0x40])
             )
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects authenticator data that is not a byte string")
@@ -2139,14 +2314,14 @@
             let token = CBORFixture.attestationObject(
                 authenticatorDataValue: CBORFixture.text("authenticator data as text")
             )
-            #expect(adapter.verify(token: token) == false)
+            #expect(adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
     }
 
-    // MARK: - verify(token:) trust-anchor tests, clause 3
+    // MARK: - verify(token:challenge:deviceId:) trust-anchor tests, clause 3
 
     /// Cases that pin which certification authority clause 3 requires, and that
-    /// pin how `verify(token:)` reaches that decision.
+    /// pin how `verify(token:challenge:deviceId:)` reaches that decision.
     ///
     /// Clause 3 of acceptance criterion 3 in ADR-025 states that element 1 of
     /// `x5c` is an Apple App Attest intermediate certificate. `readCertificateChain`
@@ -2170,15 +2345,13 @@
                         CBORFixture.rogueRootCertificate
                     ]
                 ),
-                authenticatorDataValue: CBORFixture.byteString(
-                    CBORFixture.authenticatorData(credentialId: rogueKeyIdentifier)
-                )
+                authenticatorData: CBORFixture.authenticatorData(credentialId: rogueKeyIdentifier)
             )
 
             let appleAnchored = makeAppleAnchoredAdapter(storedKeyIdentifier: rogueKeyIdentifier)
             let testAnchored = makeVerifyingAdapter(storedKeyIdentifier: rogueKeyIdentifier)
-            #expect(appleAnchored.adapter.verify(token: token) == false)
-            #expect(testAnchored.adapter.verify(token: token) == false)
+            #expect(appleAnchored.adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
+            #expect(testAnchored.adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify rejects a chain reaching a root Apple did not sign")
@@ -2192,7 +2365,7 @@
                 storedKeyIdentifier: CBORFixture.credentialKeyIdentifier
             )
 
-            #expect(harness.adapter.verify(token: CBORFixture.attestationObject()) == false)
+            #expect(harness.adapter.verify(token: CBORFixture.attestationObject(), challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("verify accepts a chain carrying a replacement intermediate its root signed")
@@ -2213,13 +2386,11 @@
                         CBORFixture.rotatedIntermediateCertificate
                     ]
                 ),
-                authenticatorDataValue: CBORFixture.byteString(
-                    CBORFixture.authenticatorData(
-                        credentialId: CBORFixture.rotatedCredentialKeyIdentifier
-                    )
+                authenticatorData: CBORFixture.authenticatorData(
+                    credentialId: CBORFixture.rotatedCredentialKeyIdentifier
                 )
             )
-            #expect(harness.adapter.verify(token: token) == true)
+            #expect(harness.adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == true)
         }
 
         @Test("verify rejects a credential certificate its stated intermediate did not issue")
@@ -2239,19 +2410,19 @@
                     ]
                 )
             )
-            #expect(harness.adapter.verify(token: token) == false)
+            #expect(harness.adapter.verify(token: token, challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("an adapter carrying no anchor accepts no chain")
         func emptyAnchorSetAcceptsNothing() {
             // `AppAttestAnchor.appleAppAttestRoot()` returns an empty array if
             // its bytes ever stop parsing, and this case pins what
-            // `verify(token:)` does with such an array: it rejects a chain that
+            // `verify(token:challenge:deviceId:)` does with such an array: it rejects a chain that
             // an anchor would otherwise accept, rather than skipping the
             // evaluation.
             let harness = makeVerifyingAdapter(anchorCertificates: [])
 
-            #expect(harness.adapter.verify(token: CBORFixture.attestationObject()) == false)
+            #expect(harness.adapter.verify(token: CBORFixture.attestationObject(), challenge: CBORFixture.challenge, deviceId: CBORFixture.deviceId) == false)
         }
 
         @Test("this binary carries Apple's App Attest root certificate")

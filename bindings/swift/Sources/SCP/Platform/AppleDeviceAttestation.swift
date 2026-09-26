@@ -155,16 +155,16 @@
         ///
         /// Clause 4 of acceptance criterion 3 in ADR-025 requires bytes 0
         /// through 31 of authenticator data to equal `SHA-256` of this app's
-        /// App ID, so `verify(token:)` compares those bytes against this
+        /// App ID, so `verify(token:challenge:deviceId:)` compares those bytes against this
         /// digest.
         private let relyingPartyIdHash: Data
 
-        /// Certificates `verify(token:)` anchors an `x5c` chain at.
+        /// Certificates `verify(token:challenge:deviceId:)` anchors an `x5c` chain at.
         ///
         /// Clause 3 of acceptance criterion 3 in ADR-025 requires an `x5c`
         /// chain to terminate at Apple's App Attest root certificate, so the
         /// public initializer binds this property to that one certificate and
-        /// `verify(token:)` trusts nothing else.
+        /// `verify(token:challenge:deviceId:)` trusts nothing else.
         private let anchorCertificates: [SecCertificate]
 
         /// Whether this instance is running in hardware-backed mode.
@@ -188,9 +188,9 @@
         ///   `$(AppIdentifierPrefix)` already ends in a period, so joining both
         ///   halves with an added period yields a double period and an App ID
         ///   that matches nothing. Apple binds an App Attest attestation to this
-        ///   string, so `verify(token:)` requires a relying-party ID hash equal
+        ///   string, so `verify(token:challenge:deviceId:)` requires a relying-party ID hash equal
         ///   to `SHA-256` of it. No default value exists, because a wrong App ID
-        ///   would make `verify(token:)` reject every genuine attestation this
+        ///   would make `verify(token:challenge:deviceId:)` reject every genuine attestation this
         ///   app produced, and because a caller reads its own team ID and bundle
         ///   ID from its Xcode project.
         ///
@@ -213,7 +213,7 @@
         /// in-memory `UserDefaults` suite, and a certificate a test chain
         /// terminates at.
         ///
-        /// - Parameter anchorCertificates: Certificates `verify(token:)`
+        /// - Parameter anchorCertificates: Certificates `verify(token:challenge:deviceId:)`
         ///   anchors an `x5c` chain at. This parameter exists because no test
         ///   can produce a chain Apple's App Attest root signed, and it takes
         ///   Apple's root by default, so a test that passes no anchor exercises
@@ -487,11 +487,11 @@
         // MARK: - Token verification (client-side)
 
         /// Decide whether `token` is an Apple App Attest attestation object this
-        /// app's App Attest key produced.
+        /// app's App Attest key produced for `challenge` and `deviceId`.
         ///
         /// **Criterion this method applies:** acceptance criterion 3 of ADR-025
-        /// in `.docs/adrs/phase-5.md`, whose five clauses
-        /// `AppAttestAttestationObject.isWellFormed(_:relyingPartyIdHash:anchorCertificates:appAttestKeyIdentifier:)`
+        /// in `.docs/adrs/phase-5.md`, whose six clauses
+        /// `AppAttestAttestationObject.isWellFormed(_:relyingPartyIdHash:anchorCertificates:appAttestKeyIdentifier:clientDataHash:)`
         /// states in code:
         ///
         /// 1. `token` decodes as one complete CBOR map whose key set is
@@ -512,40 +512,48 @@
         /// 5. Bytes 55 through 86 of `authData` equal `SHA-256` of the public
         ///    key in `x5c` element 0, and equal the App Attest key identifier
         ///    this adapter stored, base64-decoded.
+        /// 6. `x5c` element 0 carries exactly one extension
+        ///    `1.2.840.113635.100.8.2`, whose value holds a 32-byte nonce equal
+        ///    to `SHA-256(authData ‖ clientDataHash)`, where `clientDataHash` is
+        ///    the value `attest(challenge:deviceId:)` computes from these same
+        ///    two arguments.
         ///
         /// A token that fails any clause makes this method return `false`.
         ///
-        /// **What clause 5 decides.** Clause 3 reads certificates and no
+        /// **What clauses 5 and 6 decide.** Clause 3 reads certificates and no
         /// `authData` byte, and clause 4 reads `authData` bytes and no
-        /// certificate, so a certificate chain Apple issued for one app's App
-        /// Attest key, paired with `authData` an attacker wrote naming a second
-        /// app, satisfies both clauses at once. Clause 5 makes the credential ID
-        /// one value both halves must agree on, and makes this adapter's stored
-        /// key identifier the value they must both agree with, so an accepted
-        /// token names a key this device's Secure Enclave holds.
+        /// certificate. Clause 5 ties bytes 55 through 86 of `authData` to the
+        /// credential certificate and to this device's stored key. Clause 6
+        /// ties every `authData` byte to the credential certificate: Apple
+        /// writes that nonce into the certificate it issues, so any `authData`
+        /// byte changed after issuance, and any `challenge` or `deviceId` other
+        /// than the pair `attest` sent, changes the digest the certificate must
+        /// equal.
         ///
-        /// **What this method does not decide:** it checks no receipt, it reads
-        /// no nonce out of the credential certificate, and it therefore binds
-        /// `token` to no challenge. An SCP relay performs those three checks. A
-        /// `true` result here means Apple issued that certificate for this app's
-        /// stored App Attest key, never that this attestation answers the
-        /// challenge a relay issued.
+        /// **What this method does not decide:** it checks no receipt, and it
+        /// does not decide whether `challenge` is fresh. A relay issues a
+        /// challenge, accepts it once, and validates the receipt.
         ///
         /// **What this method answers before `attest` runs:** `false`. Clause 5
         /// reads a stored App Attest key identifier, and a device that generated
         /// no App Attest key stores none. Such a device produced no attestation
         /// object, so rejecting every token is the honest answer for it.
         ///
-        /// - Parameter token: Raw attestation bytes to validate.
-        /// - Returns: `true` when `token` satisfies all five clauses above,
+        /// - Parameters:
+        ///   - token: Raw attestation bytes to validate.
+        ///   - challenge: The challenge `attest(challenge:deviceId:)` received.
+        ///   - deviceId: The device identifier `attest(challenge:deviceId:)`
+        ///     received.
+        /// - Returns: `true` when `token` satisfies all six clauses above,
         ///   `false` for every other input.
-        public func verify(token: Data) -> Bool {
+        public func verify(token: Data, challenge: Data, deviceId: Data) -> Bool {
             guard let keyIdentifier = storedKeyIdentifier() else { return false }
             return AppAttestAttestationObject.isWellFormed(
                 token,
                 relyingPartyIdHash: relyingPartyIdHash,
                 anchorCertificates: anchorCertificates,
-                appAttestKeyIdentifier: keyIdentifier
+                appAttestKeyIdentifier: keyIdentifier,
+                clientDataHash: computeClientDataHash(challenge: challenge, deviceId: deviceId)
             )
         }
 
@@ -559,7 +567,7 @@
         ///
         /// - Returns: The stored key identifier. This method answers `nil` when
         ///   this adapter stored no key ID, and when a stored key ID decodes to
-        ///   any byte count other than 32. `verify(token:)` rejects every token
+        ///   any byte count other than 32. `verify(token:challenge:deviceId:)` rejects every token
         ///   for a `nil` answer rather than skipping clause 5.
         private func storedKeyIdentifier() -> Data? {
             guard let keyId = loadKeyId(),
@@ -675,8 +683,9 @@
         /// where `clientDataJSON = {"challenge":"<b64>","deviceId":"<b64>","type":"scp-device-attestation-v1"}`.
         /// Field order is fixed to ensure cross-platform determinism.
         ///
-        /// The relay reconstructs this JSON with the same fixed-field-order formula
-        /// to verify the nonce embedded in the App Attest leaf certificate.
+        /// `verify(token:challenge:deviceId:)` recomputes this hash to check the
+        /// nonce embedded in the App Attest leaf certificate, and a relay
+        /// reconstructs this JSON with the same fixed-field-order formula.
         private func computeClientDataHash(challenge: Data, deviceId: Data) -> Data {
             let json = "{\"challenge\":\"\(challenge.base64EncodedString())\",\"deviceId\":\"\(deviceId.base64EncodedString())\",\"type\":\"scp-device-attestation-v1\"}"
             return Data(SHA256.hash(data: Data(json.utf8)))
@@ -850,7 +859,7 @@
         ///
         /// - Returns: One certificate, or an empty array when these bytes fail
         ///   to parse. An empty anchor array makes every chain evaluation fail,
-        ///   so `verify(token:)` rejects every token rather than accepting an
+        ///   so `verify(token:challenge:deviceId:)` rejects every token rather than accepting an
         ///   unanchored chain.
         static func appleAppAttestRoot() -> [SecCertificate] {
             guard let der = Data(base64Encoded: appleAppAttestRootBase64, options: .ignoreUnknownCharacters),
@@ -871,8 +880,8 @@
     /// holding `fmt`, `attStmt`, and `authData`, where `fmt` holds text
     /// `"apple-appattest"`.
     ///
-    /// `isWellFormed(_:relyingPartyIdHash:anchorCertificates:appAttestKeyIdentifier:)`
-    /// applies five clauses of acceptance criterion 3 in ADR-025,
+    /// `isWellFormed(_:relyingPartyIdHash:anchorCertificates:appAttestKeyIdentifier:clientDataHash:)`
+    /// applies six clauses of acceptance criterion 3 in ADR-025,
     /// `.docs/adrs/phase-5.md`. Each clause names which values it permits, so an
     /// accepted set stays closed by construction rather than by a list of
     /// rejected spellings. Clause 3 anchors the `x5c` chain at Apple's App
@@ -881,7 +890,10 @@
     /// structure. Clause 5 requires the credential certificate, the credential
     /// ID, and a caller's stored App Attest key identifier to name one key, so a
     /// chain Apple issued for one app's key fails this check when it arrives
-    /// beside authenticator data written for a different app.
+    /// beside authenticator data written for a different app. Clause 6 requires
+    /// the nonce Apple wrote into the credential certificate to equal
+    /// `SHA-256(authData ‖ clientDataHash)`, so a certificate Apple issued for
+    /// one `authData` and one challenge fails this check beside any other.
     enum AppAttestAttestationObject {
         /// Three keys an App Attest attestation object carries, and only three
         /// keys clause 1 accepts.
@@ -964,9 +976,16 @@
             /// Bytes 55 through 86 of `authData`, which clause 4 calls the
             /// credential ID.
             var credentialId: ArraySlice<UInt8>?
+
+            /// Every byte of `authData`, which clause 6 hashes.
+            var authenticatorData: ArraySlice<UInt8>?
         }
 
-        /// Report whether `token` satisfies all five clauses of acceptance
+        /// DER content bytes of object identifier `1.2.840.113635.100.8.2`,
+        /// which names the extension Apple writes an App Attest nonce into.
+        private static let nonceExtensionOid: [UInt8] = [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x63, 0x64, 0x08, 0x02]
+
+        /// Report whether `token` satisfies all six clauses of acceptance
         /// criterion 3 in ADR-025.
         ///
         /// - Parameters:
@@ -981,15 +1000,19 @@
         ///     identifies a caller's App Attest key by, which clause 5 requires
         ///     both the credential ID and `SHA-256` of the credential
         ///     certificate's public key to equal.
+        ///   - clientDataHash: `SHA-256` of the client data a caller attested,
+        ///     which clause 6 appends to `authData` before hashing.
         /// - Returns: `true` only for a complete, correctly keyed,
         ///   definite-length CBOR attestation object whose attestation
-        ///   statement and authenticator data satisfy clauses 3 and 4 and name
-        ///   the key clause 5 names; `false` for every other input.
+        ///   statement and authenticator data satisfy clauses 3 and 4, name
+        ///   the key clause 5 names, and carry the nonce clause 6 names;
+        ///   `false` for every other input.
         static func isWellFormed(
             _ token: Data,
             relyingPartyIdHash: Data,
             anchorCertificates: [SecCertificate],
-            appAttestKeyIdentifier: Data
+            appAttestKeyIdentifier: Data,
+            clientDataHash: Data
         ) -> Bool {
             var reader = CBORReader(token)
             guard let entryCount = reader.readMapHeader(),
@@ -1012,8 +1035,78 @@
                       ) else { return false }
             }
 
-            guard reader.isAtEnd else { return false }
-            return namesOneAppAttestKey(credential, identifier: appAttestKeyIdentifier)
+            guard reader.isAtEnd,
+                  namesOneAppAttestKey(credential, identifier: appAttestKeyIdentifier)
+            else { return false }
+            return commitsToAuthenticatorData(credential, clientDataHash: clientDataHash)
+        }
+
+        /// Apply clause 6: the nonce in the credential certificate equals
+        /// `SHA-256(authData ‖ clientDataHash)`.
+        ///
+        /// **The criterion this method applies.** Apple's article "Validating
+        /// Apps That Connect to Your Server" states it as steps 2 through 4:
+        /// append `clientDataHash` to `authData`, hash the result, then
+        /// "Obtain the value of the credCert extension with OID
+        /// 1.2.840.113635.100.8.2, which is a DER-encoded ASN.1 sequence.
+        /// Decode the sequence and extract the single octet string that it
+        /// contains. Verify that the string equals nonce." Apple writes that
+        /// extension into a certificate it signs, so this comparison binds
+        /// every `authData` byte, and the client data, to `x5c`.
+        private static func commitsToAuthenticatorData(
+            _ credential: AttestedCredential,
+            clientDataHash: Data
+        ) -> Bool {
+            guard let certificate = credential.certificate,
+                  let authenticatorData = credential.authenticatorData,
+                  let nonce = nonce(in: SecCertificateCopyData(certificate) as Data)
+            else { return false }
+            let expected = SHA256.hash(data: Data(authenticatorData) + clientDataHash)
+            return nonce.elementsEqual(expected)
+        }
+
+        /// Read the nonce out of extension `1.2.840.113635.100.8.2` of a DER
+        /// X.509 certificate. Clause 6 compares that nonce against a 32-byte
+        /// digest, and that comparison rejects a nonce of any other length.
+        ///
+        /// That extension's value is `SEQUENCE { [1] EXPLICIT OCTET STRING }`.
+        /// RFC 5280 §4.2 forbids a certificate from carrying one extension
+        /// twice, and clause 3's path evaluation rejects such a certificate
+        /// before this method runs, which
+        /// `AppAttestNonceBindingTests.verifyRejectsDuplicatedNonceExtension`
+        /// pins.
+        ///
+        /// - Returns: The nonce. This method answers `nil` when the certificate
+        ///   carries no such extension or carries a value of any other shape.
+        private static func nonce(in certificate: Data) -> ArraySlice<UInt8>? {
+            var outer = DERReader([UInt8](certificate)[...])
+            guard let certificateBody = outer.read(tag: 0x30), outer.isAtEnd else { return nil }
+            var body = DERReader(certificateBody)
+            guard var tbs = body.read(tag: 0x30).map(DERReader.init) else { return nil }
+            // `extensions [3] EXPLICIT` is the last field of a v3 TBSCertificate.
+            var extensionsField: ArraySlice<UInt8>?
+            while let field = tbs.next() {
+                extensionsField = field.tag == 0xA3 ? field.content : nil
+            }
+            guard tbs.isAtEnd, let extensionsField else { return nil }
+            var wrapper = DERReader(extensionsField)
+            guard var extensions = wrapper.read(tag: 0x30).map(DERReader.init),
+                  wrapper.isAtEnd else { return nil }
+            while !extensions.isAtEnd {
+                guard var entry = extensions.read(tag: 0x30).map(DERReader.init),
+                      let oid = entry.read(tag: 0x06) else { return nil }
+                guard oid.elementsEqual(nonceExtensionOid) else { continue }
+                // An extension may carry a `critical` BOOLEAN before its value.
+                _ = entry.read(tag: 0x01)
+                guard let value = entry.read(tag: 0x04), entry.isAtEnd else { return nil }
+                var sequence = DERReader(value)
+                guard var tagged = sequence.read(tag: 0x30).map(DERReader.init), sequence.isAtEnd,
+                      var octets = tagged.read(tag: 0xA1).map(DERReader.init), tagged.isAtEnd,
+                      let nonce = octets.read(tag: 0x04), octets.isAtEnd
+                else { return nil }
+                return nonce
+            }
+            return nil
         }
 
         /// Apply clause 5: one App Attest key identifier, named by the
@@ -1304,7 +1397,54 @@
             credential.credentialId = authenticatorData
                 .dropFirst(credentialIdOffset)
                 .prefix(credentialIdByteCount)
+            credential.authenticatorData = authenticatorData
             return true
+        }
+    }
+
+    /// Reads DER tag-length-value items (ITU-T X.690) whose tag fits one byte,
+    /// which every item clause 6 walks does. It never traps, never reads past
+    /// an end of its buffer, and rejects indefinite and non-minimal lengths.
+    private struct DERReader {
+        private let bytes: ArraySlice<UInt8>
+        private var index: Int
+
+        init(_ bytes: ArraySlice<UInt8>) {
+            self.bytes = bytes
+            index = bytes.startIndex
+        }
+
+        /// Whether the reader consumed every byte it was given.
+        var isAtEnd: Bool {
+            index == bytes.endIndex
+        }
+
+        /// Read one item whose tag equals `tag` and return its content bytes.
+        /// This method consumes nothing when the next item carries another tag.
+        mutating func read(tag: UInt8) -> ArraySlice<UInt8>? {
+            guard !isAtEnd, bytes[index] == tag else { return nil }
+            return next()?.content
+        }
+
+        /// Read one item of any tag. This method consumes nothing when the
+        /// buffer holds no complete item.
+        mutating func next() -> (tag: UInt8, content: ArraySlice<UInt8>)? {
+            var cursor = index
+            guard bytes.endIndex - cursor >= 2 else { return nil }
+            let tag = bytes[cursor]
+            var length = Int(bytes[cursor + 1])
+            cursor += 2
+            if length >= 0x80 {
+                let width = length - 0x80
+                guard (1 ... 3).contains(width), bytes.endIndex - cursor >= width,
+                      bytes[cursor] != 0 else { return nil }
+                length = bytes[cursor ..< cursor + width].reduce(0) { ($0 << 8) | Int($1) }
+                guard length >= 0x80 else { return nil }
+                cursor += width
+            }
+            guard bytes.endIndex - cursor >= length else { return nil }
+            index = cursor + length
+            return (tag, bytes[cursor ..< index])
         }
     }
 
