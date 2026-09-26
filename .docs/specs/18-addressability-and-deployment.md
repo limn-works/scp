@@ -254,7 +254,7 @@ How a new identity learns its first relay, and how a reader reaches an identity 
 
 **The rules that read the artifact** are the first-contact floor of `09-security-model.md` §9.7.4.2 R11, which is why a relay this list names MUST answer a QUERY carrying a `proof_nonce` with a relay proof of control, and the SDK's default witness set, which §9.7.4.3 draws from this list.
 
-**Curation happens outside the protocol, and nothing in the protocol detects a curation breach.** Curation is what would deliver operator independence, and `09-security-model.md` §9.7.4.3 records the supply-chain risk a badly curated list carries. Who curates the list and what obligations that curator carries are open.
+**Limn curates the list, outside the protocol, and nothing in the protocol detects a curation breach.** Curation is what would deliver operator independence, and `09-security-model.md` §9.7.4.3 records the supply-chain risk a badly curated list carries. The entry criterion is open: who may be listed, on what test, and how a removal propagates. The obligations the curator carries are open too.
 
 **A listed operator's key has no in-protocol revocation.** A party holding one signs relay proofs of control as that operator from any network position, for as long as parties run the release that ships the entry, and paired with a second entry it controls it satisfies `09-security-model.md` §9.7.4.2 R11's first-contact floor by itself. The honest operator cannot rotate and a reader cannot drop an entry, so a compromised operator key is removable only by the release that replaces it, and every party running an earlier release counts the thief as that operator until it upgrades. Whether an out-of-cycle release ships for that case is open.
 
