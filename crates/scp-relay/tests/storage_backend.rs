@@ -37,12 +37,12 @@ use std::process::Command;
 /// the relay binary links, so the answer here is the relay's behaviour rather
 /// than a proxy for it.
 ///
-/// It reads that flag rather than parsing `VALID_BACKENDS`, which is the
-/// constant the relay prints. Predicting the message out of the constant the
-/// message is assembled from would make `invalid_backend_exits_with_error`
-/// below compare `VALID_BACKENDS` against itself, and that comparison stays
-/// green through the exact regression that test's doc comment names: a
-/// `VALID_BACKENDS` reverted to the hardcoded `"sqlite, redb, postgres, s3,
+/// It reads that flag rather than parsing `valid_backends()`, which is the
+/// list the relay prints. Predicting the message out of the list the message
+/// is assembled from would make `invalid_backend_exits_with_error` below
+/// compare `valid_backends()` against itself, and that comparison stays green
+/// through the exact regression that test's doc comment names: a
+/// `valid_backends()` reverted to the hardcoded `"sqlite, redb, postgres, s3,
 /// memory"` while the arms stay `cfg`-gated.
 fn backend_is_compiled(name: &str) -> bool {
     scp_transport::startup::backend_is_compiled(name)

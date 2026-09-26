@@ -133,7 +133,7 @@ fn parse_cli_from(
 /// backend:
 ///
 /// 1. The `SCP_RELAY_STORAGE_BACKEND` line interpolates
-///    [`scp_transport::startup::VALID_BACKENDS`], the constant
+///    [`scp_transport::startup::valid_backends`], the list
 ///    `scp_transport::startup::storage_from_env` interpolates when it rejects a
 ///    value, so the accepted list and the rejection message cannot disagree.
 /// 2. The three variables that configure the two cloud backends —
@@ -229,7 +229,7 @@ ENVIRONMENT VARIABLES:
     SCP_RELAY_LOG_LEVEL         Log level (default: info)
     SCP_RELAY_LOG_FORMAT        Log format: 'json' or 'pretty' (default: pretty)
     RUST_LOG                    Override log level (takes precedence over SCP_RELAY_LOG_LEVEL)",
-        backends = startup::VALID_BACKENDS
+        backends = startup::valid_backends()
     )
 }
 
@@ -1178,10 +1178,10 @@ mod tests {
     use super::*;
 
     /// `--help` offers exactly the blob backends this build compiled, because
-    /// the help text interpolates the same `startup::VALID_BACKENDS` that
+    /// the help text interpolates the same `startup::valid_backends()` that
     /// `startup::storage_from_env` interpolates when it rejects a value.
     ///
-    /// `startup.rs` pins four sites that name a backend's gating feature, and
+    /// `startup.rs` pins the sites that name a backend's gating feature, and
     /// every one of its scanning tests reads `include_str!("startup.rs")`, so
     /// none of them reaches this binary's help text. That help text held its own
     /// hardcoded list of backend names until this assertion existed, which is
@@ -1190,27 +1190,27 @@ mod tests {
     ///
     /// The assertion goes red when someone writes the names out here again in
     /// any build that leaves a backend feature off, because the hardcoded list
-    /// then offers a name `VALID_BACKENDS` omits. Job rust-test in
+    /// then offers a name `valid_backends()` omits. Job rust-test in
     /// `.github/workflows/ci.yml` runs this test at default features, where
     /// `postgres-blob` and `s3-blob` are both off, so a hardcoded five-name
     /// list fails there. A build that resolves both cloud features makes
-    /// `VALID_BACKENDS` equal that same five-name list, and this assertion
+    /// `valid_backends()` equal that same five-name list, and this assertion
     /// cannot separate an interpolation from a literal that matches it, so it
     /// passes in that configuration either way. It stays green when a new
     /// backend joins the `BACKENDS` table, because the help text and the
-    /// expectation read the one constant.
+    /// expectation read the one function.
     #[test]
     fn the_help_text_offers_exactly_the_backends_this_build_compiled() {
         let help = help_text();
         let derived = format!(
             "Blob storage backend for relay, one of: {}",
-            startup::VALID_BACKENDS
+            startup::valid_backends()
         );
 
         assert!(
             help.contains(&derived),
             "the --help line for SCP_RELAY_STORAGE_BACKEND must interpolate \
-             startup::VALID_BACKENDS, so it names a backend exactly when this \
+             startup::valid_backends(), so it names a backend exactly when this \
              build compiled that backend's constructor; expected a line \
              reading '{derived}', and the help text read:\n{help}"
         );

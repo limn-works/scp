@@ -97,7 +97,7 @@ struct Backend {
 /// Every value [`storage_from_env`] recognizes, paired with whether this build
 /// compiled the arm that constructs it.
 ///
-/// A backend's gating feature is written in three places, and this table is one
+/// A backend's gating feature is written in two places, and this table is one
 /// of them:
 ///
 /// 1. The `#[cfg]` attribute on the arm of [`storage_from_env`] that constructs
@@ -105,18 +105,16 @@ struct Backend {
 /// 2. This table, twice per row: `transport_feature`, which
 ///    `reject_backend_message` prints in its rebuild instruction, and
 ///    `compiled`, which decides whether that message prints at all or the value
-///    reads as a typo instead.
-/// 3. The `cfg`-gated macro pair beneath this table that contributes the
-///    backend's name to [`VALID_BACKENDS`] — the options list both messages
-///    interpolate.
+///    reads as a typo instead. [`valid_backends`] reads the `compiled` column
+///    to build the options list both messages interpolate, so that list holds
+///    no copy of the feature names.
 ///
-/// Nothing in the type system holds the three in agreement, so a fifth backend
-/// needs an edit at all three and three tests fail on a missing one.
+/// Nothing in the type system holds the arm and its row in agreement, so a
+/// fifth backend needs an edit at both and two tests fail on a missing one.
 /// `every_site_names_the_same_feature_for_a_backend` reads the feature name out
 /// of each site's source text and fails when any two disagree, whatever
 /// features this build enabled. `every_constructor_arm_has_a_table_row` fails
-/// on an arm no row names. `the_constant_and_the_table_agree_on_what_is_compiled`
-/// fails when the constant offers a name the `compiled` column calls absent.
+/// on an arm no row names.
 const BACKENDS: &[Backend] = &[
     Backend {
         name: "sqlite",
@@ -150,84 +148,28 @@ const BACKENDS: &[Backend] = &[
     },
 ];
 
-// `VALID_BACKENDS` below stays a `&'static str`, because `scp-transport`
-// publishes that name and that type. Selecting one whole literal per feature
-// state would need a definition per combination, and four gated backends give
-// sixteen; these four macro pairs produce the same string from a list that
-// grows by one pair per backend instead. Each pair expands to its backend's
-// name and a separator when the `scp-transport` feature that compiles that
-// backend's arm of `storage_from_env` is enabled, and to nothing when it is
-// not, so every combination comes out exact. `memory` needs no pair: no feature
-// gates it, and it closes the list, so it carries no separator.
-#[cfg(feature = "sqlite-blob")]
-macro_rules! sqlite_entry {
-    () => {
-        "sqlite, "
-    };
-}
-#[cfg(not(feature = "sqlite-blob"))]
-macro_rules! sqlite_entry {
-    () => {
-        ""
-    };
-}
-#[cfg(feature = "redb-blob")]
-macro_rules! redb_entry {
-    () => {
-        "redb, "
-    };
-}
-#[cfg(not(feature = "redb-blob"))]
-macro_rules! redb_entry {
-    () => {
-        ""
-    };
-}
-#[cfg(feature = "postgres-blob")]
-macro_rules! postgres_entry {
-    () => {
-        "postgres, "
-    };
-}
-#[cfg(not(feature = "postgres-blob"))]
-macro_rules! postgres_entry {
-    () => {
-        ""
-    };
-}
-#[cfg(feature = "s3-blob")]
-macro_rules! s3_entry {
-    () => {
-        "s3, "
-    };
-}
-#[cfg(not(feature = "s3-blob"))]
-macro_rules! s3_entry {
-    () => {
-        ""
-    };
-}
-
 /// The `SCP_RELAY_STORAGE_BACKEND` values this build can construct, comma
 /// separated, for diagnostics and help text.
 ///
-/// A name appears here only when the `scp-transport` feature that compiles its
-/// arm of [`storage_from_env`] is enabled, so this constant never offers a
-/// backend the binary cannot open. A build with neither cloud feature reads
-/// `"sqlite, redb, memory"`; one with both reads
+/// This lists the rows of the private `BACKENDS` table whose `compiled`
+/// column is true, in table order, so it never offers a backend the binary
+/// cannot open. A build with neither cloud feature returns
+/// `"sqlite, redb, memory"`; one with both returns
 /// `"sqlite, redb, postgres, s3, memory"`.
 ///
 /// This was the hardcoded string `"sqlite, redb, postgres, s3, memory"` until
 /// `scp-node` and `scp-relay` stopped enabling `postgres-blob` and `s3-blob` by
 /// default, at which point a default build rejected `postgres` and then listed
 /// `postgres` among the valid options.
-pub const VALID_BACKENDS: &str = concat!(
-    sqlite_entry!(),
-    redb_entry!(),
-    postgres_entry!(),
-    s3_entry!(),
-    "memory"
-);
+#[must_use]
+pub fn valid_backends() -> String {
+    BACKENDS
+        .iter()
+        .filter(|b| b.compiled)
+        .map(|b| b.name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// Reports whether this build compiled the arm of [`storage_from_env`] that
 /// constructs `name`, for a caller that has to predict which of two outcomes a
@@ -235,10 +177,10 @@ pub const VALID_BACKENDS: &str = concat!(
 ///
 /// This reads the `compiled` column of the private `BACKENDS` table, which is a
 /// [`cfg!`] read of the same feature that gates the arm. It deliberately does
-/// not parse [`VALID_BACKENDS`]: a test that compared a binary's diagnostic
-/// against a prediction parsed out of the very constant that diagnostic is
-/// built from would assert a tautology, and would stay green through a revert of
-/// `VALID_BACKENDS` to the hardcoded list that named backends a default build
+/// not parse [`valid_backends`]: a test that compared a binary's diagnostic
+/// against a prediction parsed out of the very list that diagnostic is built
+/// from would assert a tautology, and would stay green through a revert of
+/// [`valid_backends`] to the hardcoded list that named backends a default build
 /// cannot construct.
 #[must_use]
 pub fn backend_is_compiled(name: &str) -> bool {
@@ -282,7 +224,8 @@ fn reject_backend_message(requested: &str) -> String {
 
     let Some(backend) = uncompiled else {
         return format!(
-            "error: unknown storage backend '{requested}'. Valid options: {VALID_BACKENDS}"
+            "error: unknown storage backend '{requested}'. Valid options: {}",
+            valid_backends()
         );
     };
 
@@ -298,7 +241,8 @@ fn reject_backend_message(requested: &str) -> String {
 
     format!(
         "error: storage backend '{requested}' is not compiled into this binary. \
-         {rebuild} Compiled-in options: {VALID_BACKENDS}"
+         {rebuild} Compiled-in options: {}",
+        valid_backends()
     )
 }
 
@@ -541,7 +485,7 @@ pub async fn start_relay_from_env() -> (
 
 #[cfg(test)]
 mod tests {
-    use super::{BACKENDS, VALID_BACKENDS, backend_is_compiled, reject_backend_message};
+    use super::{BACKENDS, backend_is_compiled, reject_backend_message, valid_backends};
 
     /// A value naming no backend reads as a typo, and the message lists what
     /// this build accepts instead of naming a rebuild.
@@ -556,13 +500,17 @@ mod tests {
         assert!(message.contains("memory"), "{message}");
     }
 
-    /// `VALID_BACKENDS` names a backend exactly when this build compiled that
-    /// backend's arm. The constant was hardcoded until `postgres-blob` and
-    /// `s3-blob` stopped being unconditional, and this test fails on that
-    /// hardcoded value for any build leaving a backend feature off.
+    /// [`valid_backends`] names a backend exactly when this build compiled
+    /// that backend's arm. The list was a hardcoded constant until
+    /// `postgres-blob` and `s3-blob` stopped being unconditional, and this test
+    /// fails on that hardcoded value for any build leaving a backend feature
+    /// off. It reads the features with its own `cfg!` calls rather than the
+    /// table's `compiled` column, so it fails on a row whose column reads the
+    /// wrong feature in any build that separates the two.
     #[test]
     fn the_options_list_names_every_compiled_backend_and_no_other() {
-        let names: Vec<&str> = VALID_BACKENDS.split(", ").collect();
+        let listed = valid_backends();
+        let names: Vec<&str> = listed.split(", ").collect();
 
         for (name, enabled) in [
             ("sqlite", cfg!(feature = "sqlite-blob")),
@@ -574,26 +522,10 @@ mod tests {
             assert_eq!(
                 names.contains(&name),
                 enabled,
-                "'{name}' should appear in VALID_BACKENDS exactly when its \
-                 feature is enabled; the constant read '{VALID_BACKENDS}'"
+                "'{name}' should appear in valid_backends() exactly when its \
+                 feature is enabled; the list read '{listed}'"
             );
         }
-    }
-
-    /// Two places read the same four `cfg` flags: the macro pairs that build
-    /// `VALID_BACKENDS`, and the `compiled` column of [`BACKENDS`] that decides
-    /// whether a name reads as absent or as a typo. Adding a backend to one and
-    /// forgetting the other would let the constant offer a name that
-    /// `reject_backend_message` calls uncompiled, so this pins the two together.
-    #[test]
-    fn the_constant_and_the_table_agree_on_what_is_compiled() {
-        let from_table = BACKENDS
-            .iter()
-            .filter(|b| b.compiled)
-            .map(|b| b.name)
-            .collect::<Vec<_>>()
-            .join(", ");
-        assert_eq!(VALID_BACKENDS, from_table);
     }
 
     /// The text of `storage_from_env`'s dispatch, from the `match` line to the
@@ -649,16 +581,6 @@ mod tests {
         line.trim_start()
             .strip_prefix("#[cfg(feature = \"")
             .and_then(|rest| rest.split_once("\")]"))
-            .map(|(feature, _)| feature)
-    }
-
-    /// The feature name in a line that reads `#[cfg(not(feature = "…"))]`, and
-    /// `None` for any other line — `#[cfg(feature = "…")]` included, since that
-    /// prefix does not match.
-    fn negative_cfg_feature(line: &str) -> Option<&str> {
-        line.trim_start()
-            .strip_prefix("#[cfg(not(feature = \"")
-            .and_then(|rest| rest.split_once("\"))]"))
             .map(|(feature, _)| feature)
     }
 
@@ -724,8 +646,8 @@ mod tests {
 
     /// Every site that names a backend's gating feature names the same one.
     ///
-    /// A backend's name and its `scp-transport` feature are written out four
-    /// times in this file, and no two of the four are tied together by the type
+    /// A backend's name and its `scp-transport` feature are written out three
+    /// times in this file, and no two of the three are tied together by the type
     /// system:
     ///
     /// 1. `#[cfg(feature = "…")]` on the arm of [`storage_from_env`] that
@@ -735,15 +657,13 @@ mod tests {
     ///    name `reject_backend_message` prints in its rebuild instruction.
     /// 3. `compiled: cfg!(feature = "…")` in that same row — what decides
     ///    whether the operator is told the value is unknown or is told to
-    ///    rebuild.
-    /// 4. The `#[cfg]` on the macro pair that contributes the name to
-    ///    [`VALID_BACKENDS`] — the options list both messages interpolate.
+    ///    rebuild, and whether [`valid_backends`] offers the name.
     ///
     /// Every other test in this module compares values a `cfg` already
     /// resolved, so each can see a mismatch only in a build whose feature state
     /// distinguishes the two sides it reads. The two states CI compiles — all
     /// four blob features off, and all four on — distinguish none of these: a
-    /// row, an arm, or a macro pair gated on a sibling backend's feature reads
+    /// row or an arm gated on a sibling backend's feature reads
     /// identically to a correct one when every sibling is off and when every
     /// sibling is on. So a copy-pasted row that kept `postgres-blob` in its
     /// `compiled` column while its arm reads `gcs-blob` passes both lanes, and
@@ -751,7 +671,7 @@ mod tests {
     /// cannot — the regression `crates/scp-relay/tests/storage_backend.rs`
     /// exists to keep out.
     ///
-    /// This scan reads the four literals out of the file's own text, which is
+    /// This scan reads the three literals out of the file's own text, which is
     /// the same text under every feature state, so it fails on the first
     /// compile whatever CI enabled.
     #[test]
@@ -812,55 +732,9 @@ mod tests {
             compiled_sites.push((name.unwrap_or_default(), feature));
         }
 
-        // Site 4: the `#[cfg]` on each positive half of a `*_entry` macro pair,
-        // paired with the name that half expands to. The negative halves read
-        // `#[cfg(not(feature = "…"))]`, which `positive_cfg_feature` skips, so
-        // their empty expansion finds no pending feature and contributes
-        // nothing.
-        let mut macro_sites: Vec<(&str, Option<&str>)> = Vec::new();
-        let mut pending_entry_feature: Option<&str> = None;
-        let entry_region = source_region(
-            "const BACKENDS: &[Backend] = &[",
-            "pub const VALID_BACKENDS",
-        );
-        for line in entry_region.lines() {
-            if let Some(feature) = positive_cfg_feature(line) {
-                pending_entry_feature = Some(feature);
-                continue;
-            }
-            // `take()` sits second in the chain, so it runs only on a line that
-            // is an expansion: the `macro_rules!` and `() => {` lines sit
-            // between a pair's `#[cfg]` and its expansion, and a `take()` on
-            // every line would clear the feature before the expansion reads it.
-            let expansion = line
-                .trim_start()
-                .strip_prefix('"')
-                .and_then(|rest| rest.strip_suffix('"'))
-                .and_then(|entry| entry.strip_suffix(", "));
-            if let Some(name) = expansion
-                && let Some(feature) = pending_entry_feature.take()
-            {
-                macro_sites.push((name, Some(feature)));
-            }
-        }
-        assert!(
-            !macro_sites.is_empty(),
-            "the macro-pair scan matched no entry, so it would pass over any drift"
-        );
-
-        // `memory` is gated by nothing and closes `VALID_BACKENDS` with no
-        // separator, so it is the one row with no macro pair.
-        let mut gated: Vec<(&str, Option<&str>)> = table
-            .iter()
-            .filter(|(_, feature)| feature.is_some())
-            .copied()
-            .collect();
-
         table.sort_unstable();
         arm_sites.sort_unstable();
         compiled_sites.sort_unstable();
-        macro_sites.sort_unstable();
-        gated.sort_unstable();
 
         assert_eq!(
             arm_sites, table,
@@ -874,133 +748,16 @@ mod tests {
              names in `transport_feature`; a row reading a sibling's feature \
              reports a compiled backend as absent"
         );
-        assert_eq!(
-            macro_sites, gated,
-            "each `*_entry` macro pair must be gated on the feature the row it \
-             names carries in `transport_feature`; a pair reading a sibling's \
-             feature makes VALID_BACKENDS offer a backend this build cannot open"
-        );
-    }
-
-    /// Both halves of every `*_entry` macro pair read one feature, and the
-    /// negative half expands to nothing.
-    ///
-    /// `every_site_names_the_same_feature_for_a_backend` above holds site 4 —
-    /// the `#[cfg]` on the macro pair that contributes a name to
-    /// [`VALID_BACKENDS`] — by reading the positive half of each pair. Each
-    /// pair carries two `#[cfg]` attributes, `positive_cfg_feature` returns
-    /// `None` for the negative one, and the negative half expands to `""`,
-    /// which fails that scan's `", "` suffix test, so four of the eight
-    /// attributes on the four pairs go unread there.
-    ///
-    /// The argument that test makes for scanning source text applies to those
-    /// four attributes. The two feature states CI compiles are all four blob
-    /// features off and all four on. A negative half gated on a sibling
-    /// backend's feature reads identically to a correct one in both: with every
-    /// blob feature off, the sibling-gated negative half is present and expands
-    /// to `""`, which is what the correct half does; with every blob feature
-    /// on, it is absent, which is also what the correct half does. The two
-    /// states that distinguish them are mixed states no CI command builds. In
-    /// one of them both definitions of the macro exist, the second shadows the
-    /// first, and `VALID_BACKENDS` drops a backend whose arm this build
-    /// compiled, so the relay refuses to offer an option it can open. In the
-    /// other neither definition exists and the crate does not compile.
-    ///
-    /// A negative half expands to `""`, which carries no backend name, so this
-    /// test ties a pair's two halves to each other through the macro's own
-    /// name. The test above ties the positive half to the [`BACKENDS`] row, so
-    /// the two tests together tie both halves to that row.
-    #[test]
-    fn both_halves_of_a_macro_pair_read_one_feature() {
-        let entry_region = source_region(
-            "const BACKENDS: &[Backend] = &[",
-            "pub const VALID_BACKENDS",
-        );
-
-        // Each definition, as `(macro name, feature, negated, expansion)`. A
-        // `#[cfg]` line sets the pending feature, the `macro_rules!` line below
-        // it consumes that feature and opens a definition, and the expansion
-        // line inside the body attaches to the definition most recently opened.
-        let mut halves: Vec<(&str, &str, bool, Option<&str>)> = Vec::new();
-        let mut pending: Option<(&str, bool)> = None;
-        for line in entry_region.lines() {
-            if let Some(feature) = positive_cfg_feature(line) {
-                pending = Some((feature, false));
-                continue;
-            }
-            if let Some(feature) = negative_cfg_feature(line) {
-                pending = Some((feature, true));
-                continue;
-            }
-            if let Some(name) = line
-                .trim_start()
-                .strip_prefix("macro_rules! ")
-                .and_then(|rest| rest.split_once(' '))
-                .map(|(name, _)| name)
-            {
-                assert!(
-                    pending.is_some(),
-                    "`macro_rules! {name}` carries no `#[cfg(feature = \"…\")]` \
-                     and no `#[cfg(not(feature = \"…\"))]` line above it, so \
-                     this scan cannot read the feature that definition gates on"
-                );
-                let (feature, negated) = pending.take().unwrap_or_default();
-                halves.push((name, feature, negated, None));
-                continue;
-            }
-            if let Some(expansion) = line
-                .trim_start()
-                .strip_prefix('"')
-                .and_then(|rest| rest.strip_suffix('"'))
-                && let Some(half) = halves.last_mut()
-            {
-                half.3 = Some(expansion);
-            }
-        }
-        assert!(
-            !halves.is_empty(),
-            "the macro-pair scan matched no definition, so it would pass over \
-             any drift"
-        );
-
-        let mut positives: Vec<(&str, &str)> = Vec::new();
-        let mut negatives: Vec<(&str, &str)> = Vec::new();
-        for &(name, feature, negated, expansion) in &halves {
-            if negated {
-                assert_eq!(
-                    expansion,
-                    Some(""),
-                    "the `#[cfg(not(feature = \"{feature}\"))]` half of \
-                     `{name}` must expand to the empty string, so a build \
-                     without that feature leaves the backend out of \
-                     VALID_BACKENDS"
-                );
-                negatives.push((name, feature));
-            } else {
-                positives.push((name, feature));
-            }
-        }
-        positives.sort_unstable();
-        negatives.sort_unstable();
-        assert_eq!(
-            negatives, positives,
-            "each `*_entry` macro pair must gate both of its halves on one \
-             feature, and must carry exactly one half of each sign; halves \
-             naming two features leave one feature state with both definitions, \
-             where the second shadows the first and VALID_BACKENDS omits a \
-             backend whose arm compiled, and another state with neither, where \
-             this crate does not compile"
-        );
     }
 
     /// [`backend_is_compiled`] answers from the `cfg!` reads in [`BACKENDS`],
-    /// not from [`VALID_BACKENDS`].
+    /// not from [`valid_backends`].
     ///
     /// That is what makes `scp-relay`'s `invalid_backend_exits_with_error` a
     /// comparison between the binary's message and this build's features. A
-    /// predicate that parsed `VALID_BACKENDS` would make that test compare the
-    /// constant against itself, which stays green through a revert of the
-    /// constant to a hardcoded list.
+    /// predicate that parsed [`valid_backends`] would make that test compare
+    /// the list against itself, which stays green through a revert of the list
+    /// to a hardcoded one.
     #[test]
     fn the_compiled_predicate_answers_from_the_features() {
         for (name, enabled) in [
