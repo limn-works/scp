@@ -67,8 +67,9 @@ pub mod builder;
 pub mod clock;
 pub mod conformance;
 pub mod fullstack;
-// `helpers` is the only module in this crate that names `scp_identity` or `scp_dht`, and
-// both crates compile what it calls behind a nullifier feature:
+// `helpers` is the only module in this crate that names `scp_identity`, `scp_dht` or
+// `scp_node` — the `testing` feature turns on all three optional dependency edges — and
+// the first two crates compile what it calls behind a nullifier feature:
 // `DidDht::with_in_memory_custody` and `DidDht::create_in_memory` are
 // `#[cfg(any(test, feature = "testing"))]` in crates/scp-identity/src/dht.rs, and
 // `InMemoryDhtClient` is `#[cfg(feature = "testing")]` in crates/scp-dht/src/lib.rs.

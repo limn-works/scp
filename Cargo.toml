@@ -42,9 +42,10 @@ members = [
 # `ProtocolRepository::new_for_testing`; and `builder.rs`, `fullstack/node.rs`
 # and `simulator/mod.rs` name `scp_platform::testing` and
 # `scp_platform::in_memory`. Its `scp-identity`, `scp-dht` and `scp-node`
-# `[dependencies]` edges carry no such feature: `helpers.rs` is the only module
-# naming `scp_identity` and `scp_dht`, `lib.rs` compiles it under this crate's
-# `testing` feature, which names `scp-identity/testing` and `scp-dht/testing`,
+# `[dependencies]` edges are optional and carry no such feature: `helpers.rs` is
+# the only module naming `scp_identity`, `scp_dht` and `scp_node`, `lib.rs`
+# compiles it under this crate's `testing` feature, which turns on all three
+# edges and names `scp-identity/testing` and `scp-dht/testing`,
 # and only this crate's own integration tests call the
 # `Node::start_for_testing` that `scp-node/allow_unencrypted_storage` gates. All
 # three features ride on `crates/scp-testing/Cargo.toml`'s `[dev-dependencies]`

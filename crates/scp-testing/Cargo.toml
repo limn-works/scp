@@ -14,7 +14,8 @@ sqlite = ["scp-platform/sqlite"]
 filesystem = ["scp-platform/filesystem"]
 sync = ["scp-platform/sync"]
 combined = ["scp-transport/combined"]
-# Compiles `helpers`, the only module in this library that names `scp_identity` or `scp_dht`,
+# Compiles `helpers`, the only module in this library that names `scp_identity`, `scp_dht`
+# or `scp_node`, turns on the three optional `[dependencies]` edges that name those crates,
 # and carries the two features that module's code needs, so this feature compiles the module
 # on its own: `scp-identity/testing` compiles the `DidDht::with_in_memory_custody` and
 # `DidDht::create_in_memory` constructors it calls (both `#[cfg(any(test, feature =
@@ -24,33 +25,42 @@ combined = ["scp-transport/combined"]
 # `testing` features and dev-dependencies" (§Decision 1). No manifest but this one names this
 # feature: its own `[dev-dependencies]` entry on this crate turns it on for this crate's test
 # build, and a build that takes this crate as a normal dependency leaves it off.
-testing = ["scp-identity/testing", "scp-dht/testing"]
+testing = [
+    "dep:scp-identity",
+    "scp-identity/testing",
+    "dep:scp-dht",
+    "scp-dht/testing",
+    "dep:scp-node",
+]
 
 [dependencies]
 async-trait = { workspace = true }
 scp-core = { path = "../scp-core", features = ["allow_unencrypted_storage", "testing"] }
-# Default features. `scp-identity/testing` rides on this crate's `testing` feature and its
-# `[dev-dependencies]` entry below instead, because as a normal
-# dependency edge it reached every build that pulls this crate — `scp-ffi`'s `testing`
-# feature among them.
-scp-identity = { path = "../scp-identity" }
+# Optional, default features. `helpers.rs` is the only module here that names
+# `scp_identity`, so this crate's `testing` feature turns the edge on together with
+# `scp-identity/testing`, and a build that takes this crate as a normal dependency —
+# `scp-ffi`'s `testing` feature among them — compiles no scp-identity for it. The
+# integration tests reach the crate through the `[dev-dependencies]` entry below.
+scp-identity = { path = "../scp-identity", optional = true }
 # `scp-platform/testing` stays on the dependency line: `builder.rs`, `fullstack/node.rs`,
 # `simulator/identity.rs`, and `simulator/mod.rs` name `scp_platform::testing` and
 # `scp_platform::in_memory` outside the `helpers` module, so every build of this library
 # needs it.
 scp-platform = { path = "../scp-platform", features = ["testing"] }
-# Default features. `scp-dht/testing` gates `InMemoryDhtClient`, the §17.17.3 resolve
-# nullifier, and `helpers.rs` is the only module here that names it, so the feature rides
-# on this crate's `testing` feature and its `[dev-dependencies]` entry below — the two
-# locations ADR-062 §Decision 1 permits for that feature.
-scp-dht = { path = "../scp-dht" }
+# Optional, default features. `scp-dht/testing` gates `InMemoryDhtClient`, the §17.17.3
+# resolve nullifier, and `helpers.rs` is the only module here that names `scp_dht`, so the
+# edge and the feature both ride on this crate's `testing` feature and its
+# `[dev-dependencies]` entry below — the two locations ADR-062 §Decision 1 permits for that
+# feature.
+scp-dht = { path = "../scp-dht", optional = true }
 scp-clock = { path = "../scp-clock" }
 scp-did = { path = "../scp-did" }
-# Default features. `scp-node/allow_unencrypted_storage` gates
-# `Node::start_for_testing` and `SelfSignedTlsProvider`, which no module in this library
-# names — `tests/integration/node.rs` and `tests/integration/sdk_usability.rs` are the
-# only consumers, so the feature rides on the `[dev-dependencies]` entry below.
-scp-node = { path = "../scp-node" }
+# Optional, default features. `helpers.rs` is the only module here that names `scp_node`,
+# so this crate's `testing` feature turns the edge on. `scp-node/allow_unencrypted_storage`
+# gates `Node::start_for_testing` and `SelfSignedTlsProvider`, which no module in this
+# library names — `tests/integration/node.rs` and `tests/integration/sdk_usability.rs` are
+# the only consumers, so the feature rides on the `[dev-dependencies]` entry below.
+scp-node = { path = "../scp-node", optional = true }
 scp-transport = { path = "../scp-transport" }
 scp-event-log = { path = "../scp-event-log" }
 scp-protocol = { path = "../scp-protocol" }
