@@ -192,53 +192,6 @@ async fn auto_wire_context_manager(
     }
 }
 
-/// Wires the local `Supervisor` event channel into the node's outbound webhook
-/// dispatcher and supervises the consumer under the bridge instance's lifecycle
-/// (spec §12.10.5).
-///
-/// Mirrors the `PyO3` reference bridge (`crates/scp-ffi/src/server.rs`). The
-/// production `Supervisor` built by `build_supervisor` in `crate::runtime` always
-/// enables its event channel, so `subscribe_events()` yields a receiver.
-/// Delegates the subscribe → wire → supervise block to the shared
-/// [`RunningNode::wire_and_supervise_context_events`] seam so all three bridges
-/// stay in lockstep. The consumer is aborted on bridge shutdown via the
-/// instance cancellation token, so it never leaks as a detached task.
-///
-/// # Precondition (identical across all three bridges)
-///
-/// This is one-shot wiring at node startup, so the readiness gate is the
-/// shared [`CoreFields::check_ready`](scp_ffi_common::bridge_instance::CoreFields::check_ready) — skip (log, never fail startup) if the
-/// instance is suspended OR shut down, then fetch the supervisor via
-/// [`CoreFields::try_supervisor`](scp_ffi_common::bridge_instance::CoreFields::try_supervisor). All three bridges (`PyO3`, `NAPI`, `UniFFI`)
-/// gate on the same `check_ready()` + `try_supervisor()` pair so they make the
-/// SAME decision about when to wire. (Previously this path used
-/// `context_manager_expect()` while `PyO3`/`NAPI` used the general-purpose
-/// `supervisor(bi)` accessor, whose warn-on-shutdown-and-proceed semantics suit
-/// per-op dispatch but not startup wiring.)
-async fn wire_node_webhook_events(
-    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
-    node: &RunningNode,
-) {
-    if let Err(reason) = bi.core.check_ready() {
-        tracing::warn!(
-            %reason,
-            "wire_node_webhook_events: bridge not ready — skipping webhook \
-             wiring; local context events will not reach the webhook dispatcher"
-        );
-        return;
-    }
-    let Some(supervisor) = bi.core.try_supervisor() else {
-        tracing::warn!(
-            "wire_node_webhook_events: no Supervisor attached — local context \
-             events will not reach the webhook dispatcher"
-        );
-        return;
-    };
-    let cancel = bi.core.cancel_token();
-    let mut tasks = bi.core.task_handle().await;
-    node.wire_and_supervise_context_events(supervisor, &mut tasks, cancel);
-}
-
 // ---------------------------------------------------------------------------
 // RelayHandle
 // ---------------------------------------------------------------------------
@@ -763,7 +716,6 @@ pub(crate) async fn node_start_in_memory_on(
     // `Scp::shutdown` stops it before `bridge_specific_shutdown` releases
     // anything (`scp_ffi_common::bridge_instance::InstanceBorrower`).
     let inner = server::register_node(&bi.core, RunningNode::InMemoryEncrypted(node));
-    wire_node_webhook_events(bi, &inner).await;
 
     let instance_id = bi.core.instance_id();
     increment_handle_count();
@@ -827,8 +779,6 @@ pub(crate) async fn node_start_local_on(
     let relay_url = inner.internal_relay_url();
     let bridge_token = inner.bridge_token_hex();
     auto_wire_context_manager(bi, &did, &relay_url, bridge_token).await;
-
-    wire_node_webhook_events(bi, &inner).await;
 
     let instance_id = bi.core.instance_id();
     increment_handle_count();
@@ -900,8 +850,7 @@ mod tests {
     /// `Supervisor` must have its event broadcast channel enabled, so
     /// `subscribe_events()` yields a receiver. Before the fix,
     /// `build_supervisor` did not enable the channel on this bridge and it was
-    /// `None`, so the webhook consumer could never be wired and local context
-    /// events never reached the dispatcher.
+    /// `None`.
     #[test]
     fn node_startup_enables_context_event_channel() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
@@ -913,8 +862,7 @@ mod tests {
             .expect("Supervisor must be attached after node startup");
         assert!(
             supervisor.subscribe_events().is_some(),
-            "node startup must enable the Supervisor event channel so the \
-             webhook dispatcher consumer can subscribe"
+            "node startup must enable the Supervisor event channel"
         );
 
         node.shutdown();

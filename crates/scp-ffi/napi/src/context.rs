@@ -1696,9 +1696,8 @@ pub(crate) async fn context_close_on(
     // Clean up UCAN state for this context.
     crate::runtime::remove_context(bi, &handle.context_id);
 
-    // Clean up per-context bridge connector state and economy state via the
-    // same NapiBridgeInstance's core (not the process-global bridge).
-    bi.core.remove_bridge_state(&handle.context_id);
+    // Clean up per-context economy state via the same NapiBridgeInstance's
+    // core (not the process-global bridge).
     bi.core.remove_economy_state(&handle.context_id);
 
     Ok(())

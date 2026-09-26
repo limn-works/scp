@@ -70,7 +70,6 @@ use std::time::Duration;
 use pyo3::prelude::*;
 
 pub mod bridge_adapters;
-pub mod bridge_connector;
 pub mod custody;
 pub mod discovery;
 pub mod error;
@@ -263,7 +262,6 @@ pub fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     provenance::register_provenance(m)?;
     mcp::register_mcp(m)?;
     trust::register_trust(m)?;
-    bridge_connector::register_bridge_connector(m)?;
     sync::register_sync(m)?;
     scpid::register_scpid(m)?;
     media::register_media(m)?;

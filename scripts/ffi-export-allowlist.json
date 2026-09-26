@@ -40,54 +40,6 @@
   ],
   "pyo3": [
     {
-      "name": "py_bridge_claim_shadow",
-      "path": "crates/scp-ffi/src/bridge_connector.rs",
-      "kind": "bridge-specific",
-      "reason": "Claims a bridge shadow identity via identity attestation (ADR-023; spec \u00a712.2.1). PyO3-only helper in bridge_connector.rs; the registered cross-bridge op is bridge_create_shadow, not claim. Not a parity gap."
-    },
-    {
-      "name": "py_bridge_derive_credential_key",
-      "path": "crates/scp-ffi/src/bridge_connector.rs",
-      "kind": "bridge-specific",
-      "reason": "Derives a per-bridge credential encryption key (ADR-023; spec \u00a712.11.2). PyO3-only crypto helper in bridge_connector.rs; the cross-bridge credential ops (bridge_credential_provision, bridge_credential_retrieve, bridge_credential_rotate, bridge_credential_revoke, bridge_credential_list, bridge_credential_store_key, bridge_credential_get_key, bridge_credential_delete_key) are registered separately. Not a parity gap."
-    },
-    {
-      "name": "py_bridge_generate_credential_key",
-      "path": "crates/scp-ffi/src/bridge_connector.rs",
-      "kind": "bridge-specific",
-      "reason": "Generates a random bridge credential key (ADR-023; spec \u00a712.11.2). PyO3-only crypto helper in bridge_connector.rs; the cross-bridge credential ops are registered separately. Not a parity gap."
-    },
-    {
-      "name": "py_bridge_oauth_build_auth_url",
-      "path": "crates/scp-ffi/src/bridge_connector.rs",
-      "kind": "bridge-specific",
-      "reason": "Builds an OAuth 2.0 authorization URL for a bridge connector (ADR-023; spec \u00a712.2.1). PyO3-only convenience helper in bridge_connector.rs; not among the 11 cross-bridge Bridge ops in .docs/standards/sdk-capability-matrix.json. Not a parity gap."
-    },
-    {
-      "name": "py_bridge_oauth_generate_pkce",
-      "path": "crates/scp-ffi/src/bridge_connector.rs",
-      "kind": "bridge-specific",
-      "reason": "PKCE S256 challenge generation for bridge-connector OAuth (ADR-023; spec \u00a712.2.1). PyO3-only convenience helper in bridge_connector.rs; not among the 11 cross-bridge Bridge ops in .docs/standards/sdk-capability-matrix.json. Not a parity gap."
-    },
-    {
-      "name": "py_bridge_oauth_scopes_for_mode",
-      "path": "crates/scp-ffi/src/bridge_connector.rs",
-      "kind": "bridge-specific",
-      "reason": "Returns recommended OAuth scopes for a bridge mode (ADR-023; spec \u00a712.2.1). PyO3-only convenience helper in bridge_connector.rs; not among the 11 cross-bridge Bridge ops in .docs/standards/sdk-capability-matrix.json. Not a parity gap."
-    },
-    {
-      "name": "py_bridge_open_shadow_envelope",
-      "path": "crates/scp-ffi/src/bridge_connector.rs",
-      "kind": "bridge-specific",
-      "reason": "Opens a sender-key-encrypted bridge shadow envelope (ADR-023; spec \u00a712.10.2). PyO3-only crypto helper in bridge_connector.rs; not among the 11 cross-bridge Bridge ops in .docs/standards/sdk-capability-matrix.json. Not a parity gap."
-    },
-    {
-      "name": "py_bridge_seal_shadow_envelope",
-      "path": "crates/scp-ffi/src/bridge_connector.rs",
-      "kind": "bridge-specific",
-      "reason": "Seals a sender-key-encrypted bridge shadow envelope (ADR-023; spec \u00a712.10.2). PyO3-only crypto helper in bridge_connector.rs; not among the 11 cross-bridge Bridge ops in .docs/standards/sdk-capability-matrix.json. Not a parity gap."
-    },
-    {
       "name": "__aiter__",
       "path": "crates/scp-ffi/src/context.rs",
       "kind": "dunder",

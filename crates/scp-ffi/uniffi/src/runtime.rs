@@ -38,7 +38,6 @@
 
 use async_trait::async_trait;
 use scp_ffi_common::bridge_instance::BridgeInstanceCore;
-use scp_ffi_common::credentials::FfiCredentialStore;
 // Re-export `CoreFields` at `crate::runtime::CoreFields` so bridge.rs
 // and server.rs can name it in impl blocks without pulling in the full
 // path.
@@ -345,18 +344,6 @@ pub struct UniffiBridgeInstance {
     /// supervisor exists — every constructor sets it to `Some`.
     pub(crate) durable_providers: Option<scp_core::context::supervisor::DurableProviders>,
 
-    /// Per-instance bridge credential store (spec §12.11).
-    ///
-    /// The **durable** [`FfiCredentialStore`] selected at construction from the
-    /// SAME storage handle that backs `mls_storage` and the saga journal (spec
-    /// §17.6) — a Sqlite selection persists bridge tokens across restart; an
-    /// encrypted-in-memory selection keeps them encrypted at rest. Per-instance,
-    /// so credentials are isolated from every other instance in the same process
-    /// (ADR-048 §1 multi-instance neutrality). There is no in-memory arm on this
-    /// shipped path — the in-memory store's `Default` impl that made it a
-    /// default selection was deleted (ADR-062 §Decision 5, SCP-CAPINJECT-009).
-    pub(crate) credential_store: FfiCredentialStore,
-
     /// Per-instance §5.4.5 streaming-outlet registry, keyed by the stream's
     /// `request_id` hex (`StreamHandleId`). Mirrors the `PyO3` reference bridge's
     /// `PyBridgeInstance::outlet_stream_registry` and the NAPI bridge's
@@ -413,9 +400,6 @@ impl UniffiBridgeInstance {
         // durable saga journal and the `mls_storage` view are bound into one
         // `DurableProviders` derived from the SAME `Arc`, so they cannot diverge
         // by construction (§17.6 / §17.16).
-        // Durable credential store over the SAME chosen handle (§17.6),
-        // selected before the handle is moved into the durable providers.
-        let credential_store = FfiCredentialStore::durable_from_handle(Arc::clone(&storage_handle));
         let durable_providers = durable_providers_from_handle(storage_handle);
         Self {
             core: CoreFields::new(),
@@ -427,7 +411,6 @@ impl UniffiBridgeInstance {
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             durable_providers: Some(durable_providers),
-            credential_store,
             outlet_stream_registry: Arc::new(DashMap::new()),
             outlet_streaming_saga_registry: Arc::new(DashMap::new()),
         }
@@ -448,9 +431,6 @@ impl UniffiBridgeInstance {
             scp_ffi_common::bridge_runtime::build_event_log_provider();
         // Saga journal + `mls_storage` bound into one `DurableProviders` derived
         // from one handle (§17.6 / §17.16).
-        // Durable credential store over the SAME chosen handle (§17.6),
-        // selected before the handle is moved into the durable providers.
-        let credential_store = FfiCredentialStore::durable_from_handle(Arc::clone(&storage_handle));
         let durable_providers = durable_providers_from_handle(storage_handle);
         Self {
             core: CoreFields::with_persistence(persistence),
@@ -462,7 +442,6 @@ impl UniffiBridgeInstance {
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             durable_providers: Some(durable_providers),
-            credential_store,
             outlet_stream_registry: Arc::new(DashMap::new()),
             outlet_streaming_saga_registry: Arc::new(DashMap::new()),
         }
@@ -561,10 +540,6 @@ impl UniffiBridgeInstance {
                 // and the journal is built over the SAME handle, so saga replay
                 // reads and writes the one `SQLCipher` connection (§17.6 /
                 // §17.16). They cannot diverge by construction.
-                // Durable credential store over the SAME `Arc<SqliteStorage>`
-                // (§17.6) — bridge tokens persist across restart with the DB.
-                let credential_store =
-                    FfiCredentialStore::durable_from_handle(Arc::clone(&arc_storage));
                 let durable_providers = durable_providers_from_handle(Arc::clone(&arc_storage));
                 drop(arc_storage);
 
@@ -572,7 +547,6 @@ impl UniffiBridgeInstance {
                     persistence,
                     ProtocolRepoVariant::Sqlite(event_log_repo),
                     durable_providers,
-                    credential_store,
                 ))
             }
         }
@@ -598,7 +572,6 @@ impl UniffiBridgeInstance {
         persistence: Arc<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>,
         protocol_repository: ProtocolRepoVariant,
         durable_providers: scp_core::context::supervisor::DurableProviders,
-        credential_store: FfiCredentialStore,
     ) -> Self {
         Self {
             core: CoreFields::with_persistence_arc(persistence),
@@ -610,7 +583,6 @@ impl UniffiBridgeInstance {
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             durable_providers: Some(durable_providers),
-            credential_store,
             outlet_stream_registry: Arc::new(DashMap::new()),
             outlet_streaming_saga_registry: Arc::new(DashMap::new()),
         }
@@ -639,14 +611,6 @@ impl UniffiBridgeInstance {
     #[must_use]
     pub const fn instance_id(&self) -> u64 {
         self.core.instance_id()
-    }
-
-    /// Returns a reference to this instance's **durable** bridge credential
-    /// store, selected at construction from the chosen storage backend
-    /// (ADR-062 §Decision 5, SCP-CAPINJECT-009).
-    #[must_use]
-    pub const fn credential_store(&self) -> &FfiCredentialStore {
-        &self.credential_store
     }
 
     /// Returns a reference to the typed UCAN registry.
@@ -1423,9 +1387,7 @@ impl scp_core::context::persistence::ContextPersistence for ArcContextPersistenc
 /// Bounded capacity of the supervisor's `ContextEvent` broadcast channel.
 ///
 /// Every production supervisor built here enables this channel so that local
-/// context events can be consumed by external sinks — notably the node's
-/// outbound webhook dispatcher (spec §12.10.5), wired in [`crate::server`] node
-/// startup. Lagging consumers drop the oldest events (logged, never panics);
+/// context events can be consumed by external sinks. Lagging consumers drop the oldest events (logged, never panics);
 /// `1024` matches the documented default shared with the `PyO3` reference
 /// bridge.
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
@@ -1448,8 +1410,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// [`scp_ffi_common::bridge_instance::CoreFields::persistence_arc_clone`].
 ///
 /// The event broadcast channel is always enabled (capacity
-/// [`EVENT_CHANNEL_CAPACITY`]) so downstream consumers — e.g. the node webhook
-/// dispatcher — can subscribe via
+/// [`EVENT_CHANNEL_CAPACITY`]) so downstream consumers can subscribe via
 /// [`Supervisor::subscribe_events`](scp_core::context::supervisor::Supervisor::subscribe_events).
 /// When no consumer subscribes, emitting into the channel is a cheap no-op: the
 /// retained sender has no receivers, so `send` returns `Err` and the event is
@@ -1468,8 +1429,8 @@ fn build_supervisor(
                 as Box<dyn scp_core::context::persistence::ContextPersistence>
         });
     // Enable the event broadcast channel so `subscribe_events()` yields a
-    // receiver for the node webhook dispatcher (§12.10.5). The unused receiver
-    // is dropped immediately; the retained sender keeps the channel open.
+    // receiver. The unused receiver is dropped immediately; the retained
+    // sender keeps the channel open.
     let (event_tx, _rx) = tokio::sync::broadcast::channel(EVENT_CHANNEL_CAPACITY);
     // Share the provider's exact hardened `Clock` Arc with the supervisor so the
     // "one hardened clock per node" invariant (see the `NodeMlsFactory::clock`

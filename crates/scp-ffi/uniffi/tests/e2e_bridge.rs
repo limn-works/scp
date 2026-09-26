@@ -32,8 +32,6 @@ use scp_ffi_uniffi::{
     OutletDefinition,
     OutletKind,
     Scp,
-    // Free functions — bridge trust
-    bridge_evaluate_trust,
     // Free functions — discovery
     discovery_create_query,
     discovery_normalize_address,
@@ -1129,39 +1127,6 @@ async fn evaluate_provenance_quality_rejects_invalid_source_type() {
     let result =
         evaluate_provenance_quality(None, "invalid_type".to_owned(), "active".to_owned(), vec![]);
     assert!(result.is_err(), "Invalid source type should be rejected");
-}
-
-// ---------------------------------------------------------------------------
-// Bridge trust evaluation
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn bridge_evaluate_trust_native() {
-    let _scp = Scp::new_in_memory_for_test();
-    // Non-bridged, native transport → highest trust
-    let level = bridge_evaluate_trust(false, true, "shadow".to_owned()).unwrap();
-    assert!(level > 0, "Native trust level should be positive");
-}
-
-#[tokio::test]
-async fn bridge_evaluate_trust_shadow_vs_claimed() {
-    let _scp = Scp::new_in_memory_for_test();
-    // Shadow bridged
-    let shadow = bridge_evaluate_trust(true, false, "shadow".to_owned()).unwrap();
-    // Claimed bridged
-    let claimed = bridge_evaluate_trust(true, false, "claimed".to_owned()).unwrap();
-    // Claimed should have equal or higher trust than shadow
-    assert!(
-        claimed >= shadow,
-        "Claimed should have >= trust than shadow: claimed={claimed}, shadow={shadow}"
-    );
-}
-
-#[tokio::test]
-async fn bridge_evaluate_trust_rejects_invalid_status() {
-    let _scp = Scp::new_in_memory_for_test();
-    let result = bridge_evaluate_trust(true, false, "invalid".to_owned());
-    assert!(result.is_err(), "Invalid shadow status should be rejected");
 }
 
 // ---------------------------------------------------------------------------

@@ -38,7 +38,7 @@ DashMap provides lock-free concurrent access with internal sharding — no globa
 `py_context_create` in `context.rs` registers FFI bridge state and delegates lifecycle to `Supervisor`. Other modules (`outlets.rs`, `ucan.rs`, `event_log.rs`) look up FFI state by context ID via `with_context` (alias for `with_ffi_state`).
 
 Known contexts (SCP-213), transport, storage provider, identity registry, UCAN registry,
-economy trackers, and bridge connector state are now owned by `BridgeInstance` and
+and economy trackers are now owned by `BridgeInstance` and
 accessed via `crate::runtime::bridge_instance()`. The old per-bridge `OnceLock` globals
 (`KNOWN_CONTEXTS`, `RELAY_CONNECTION`, `STORAGE_PROVIDER`, `IDENTITY_REGISTRY`, etc.)
 have been consolidated into `BridgeInstance` (see `scp-ffi-common/src/bridge_instance.rs`).
