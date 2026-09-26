@@ -115,7 +115,7 @@ Bridge functions in Rust use `py_` prefix:
 fn py_identity_create<'py>(py: Python<'py>, config: IdentityConfig) -> PyResult<Bound<'py, PyAny>> { ... }
 ```
 
-Python wrappers call these without the prefix. **`Identity.create` takes the four-slot config object `.docs/standards/construction.md` states, and `custody` carries the bridge's `KeyCustodyConfig` and carries no default**, because that slot decides where an identity's private key lives:
+Python wrappers call these without the prefix. **`Identity.create` takes the three-slot config object `.docs/standards/construction.md` states, and `custody` carries the bridge's `KeyCustodyConfig` and carries no default**, because that slot decides where an identity's private key lives:
 
 ```python
 from scp_sdk._scp_core import py_identity_create
@@ -128,8 +128,7 @@ class Identity:
 
 # IdentityConfig(backend=IdentityBackendConfig.RELAY_NETWORK,
 #                custody=KeyCustodyConfig.PLATFORM,   # required; no default
-#                persistence=None,                    # ephemeral
-#                payment=None)                        # no adapter
+#                persistence=None)                    # ephemeral
 ```
 
 ### Opaque types

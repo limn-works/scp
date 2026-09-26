@@ -159,7 +159,7 @@ func Shutdown() {
     C.scp_runtime_shutdown()
 }
 
-// IdentityConfig is the four-slot config object
+// IdentityConfig is the three-slot config object
 // `.docs/standards/construction.md` states. Its Custody slot carries the
 // bridge's KeyCustodyConfig and carries no default, because that slot decides
 // where an identity's private key lives.
